@@ -1589,6 +1589,21 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         })
     }
 
+    /// Run one quick action on a machine for an orchestrator (agent-aux.md
+    /// "Quick actions on an orchestrator"): the first machine of the
+    /// ordered list that is connected or connects, speaks nodeProtocol 18
+    /// and offers `request.provider`; never a cloud machine that is not
+    /// running. Exactly one machine is tried. A daemon without machines has
+    /// none.
+    fn machine_one_shot<'a>(
+        &'a self,
+        svc: &'a Services,
+        request: MachineOneShotRequest,
+    ) -> BoxFuture<'a, MachineOneShotAnswer> {
+        let _ = (svc, request);
+        Box::pin(async { MachineOneShotAnswer::NoMachine(NO_QUICK_ACTION_MACHINE.to_owned()) })
+    }
+
     /// The ordered machine list's keys, most preferred first (nodes.md
     /// "Ordered machine list"). A daemon without the remote feature has only
     /// "This computer".
@@ -1650,6 +1665,45 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
             )))
         })
     }
+}
+
+/// The reason an orchestrator's quick action is unavailable when its list
+/// has no machine.
+pub const NO_QUICK_ACTION_MACHINE: &str =
+    "no machine can run quick actions; add one under Settings → Machines";
+
+/// One quick action to run on a machine
+/// ([`RemoteLaunchPort::machine_one_shot`]).
+#[derive(Debug)]
+pub struct MachineOneShotRequest {
+    /// The call's workspace: a running sandbox of it is a candidate too.
+    pub workspace_id: Option<WorkspaceId>,
+    /// The base provider the machine must offer.
+    pub provider: String,
+    /// The frame sends a profile, so the machine's own sign-in does not
+    /// matter.
+    pub with_profile: bool,
+    /// Pin the machine (a backup attempt runs where the first one did).
+    pub node_id: Option<String>,
+    pub frame: intent_core::node_link::OneShot,
+}
+
+/// What [`RemoteLaunchPort::machine_one_shot`] got.
+#[derive(Debug)]
+pub enum MachineOneShotAnswer {
+    /// A machine answered.
+    Replied {
+        node_id: String,
+        machine: String,
+        reply: intent_core::node_link::OneShotReply,
+    },
+    /// No machine qualified; the reason names why.
+    NoMachine(String),
+    /// The chosen machine's link dropped before its reply.
+    Lost { machine: String },
+    /// The call's one deadline passed before the chosen machine replied;
+    /// the run there was cancelled.
+    TimedOut { machine: String, timeout_ms: u64 },
 }
 
 /// One secret frame for [`RemoteLaunchPort::machine_secret`]. `Debug`

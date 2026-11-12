@@ -1291,6 +1291,28 @@ pub async fn provider_auth_status<S: std::hash::BuildHasher>(
     Ok(json!({ "providers": providers }))
 }
 
+/// `host.providerAuthStatus` on an orchestrator (provider-profiles.md
+/// "Profiles on an orchestrator"): every provider is *configured*
+/// (`authenticated: null`) and nothing is probed.
+///
+/// # Errors
+///
+/// Returns an error string when `provider_id` names an unknown provider.
+pub fn unverified_auth_status(provider_id: Option<&str>) -> Result<Value, String> {
+    let selected: Vec<&'static str> = match provider_id {
+        Some(requested) => match AUTH_PROBE_PROVIDERS.iter().find(|id| **id == requested) {
+            Some(id) => vec![id],
+            None => return Err(format!("Unknown providerId: {requested}")),
+        },
+        None => AUTH_PROBE_PROVIDERS.to_vec(),
+    };
+    let providers: Vec<Value> = selected
+        .iter()
+        .map(|id| json!({ "id": id, "authenticated": null }))
+        .collect();
+    Ok(json!({ "providers": providers }))
+}
+
 /// One `providers[]` wire entry: `{ id, authenticated }` plus the additive
 /// `identity` object when the probe captured identity metadata.
 fn auth_status_entry(id: &str, verdict: &AuthVerdict) -> Value {

@@ -168,6 +168,14 @@ pub enum Error {
     #[error("not available in node mode: {0}")]
     NodeMode(String),
 
+    /// The daemon runs as an orchestrator (`intentd serve --orchestrator`
+    /// or `daemon.mode = "orchestrator"`): it never starts a provider
+    /// process itself, so local work (a local placement, a local agent's
+    /// start, a test prompt, a session import) is refused. Surfaces as
+    /// `-32003` with `error.data = { code: "orchestrator-mode", detail }`.
+    #[error("not available on an orchestrator: {0}")]
+    OrchestratorMode(String),
+
     /// A named provider profile request failed (PROTOCOL §5.54). `data`
     /// carries the machine-readable discriminator (`data.code`, e.g.
     /// `invalid-params` + `fieldErrors`, `provider-profile-in-use` + `inUse`,
@@ -805,7 +813,7 @@ impl Error {
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
-            Error::Forbidden(_) | Error::NodeMode(_) => -32003,
+            Error::Forbidden(_) | Error::NodeMode(_) | Error::OrchestratorMode(_) => -32003,
             Error::Invite(kind) => kind.code(),
         }
     }

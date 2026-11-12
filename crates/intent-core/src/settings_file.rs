@@ -1299,8 +1299,8 @@ pub enum RemoteAgentPermission {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct DaemonSettings {
-    /// `daemon.mode` — `regular` (default) or `node`. Changeable only over the
-    /// local UDS seat; read once at startup.
+    /// `daemon.mode` — `regular` (default), `node` or `orchestrator`.
+    /// Changeable only over the local UDS seat; read once at startup.
     pub mode: DaemonMode,
 }
 
@@ -1329,6 +1329,10 @@ pub enum DaemonMode {
     /// Orchestration off: the daemon serves only the node-mode method list
     /// and runs agents for the backends it is exposed to.
     Node,
+    /// Orchestration on, local agent execution off: every agent runs on an
+    /// exposed machine or a cloud machine, and the daemon never starts a
+    /// provider process itself.
+    Orchestrator,
 }
 
 /// `[updates]` — idle-triggered update-check knobs (`updates.*`). The raw

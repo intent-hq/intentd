@@ -372,8 +372,29 @@ impl Services {
     /// The saved choice of `reference` (a profile or a Default).
     fn choice_of(&self, reference: &str) -> Option<bool> {
         match parse_profile_ref(reference) {
-            Some((_, id)) => self.provider_profiles.profile_choice(id),
-            None => self.provider_profiles.default_choice(reference),
+            Some((_, id)) => self.effective_profile_choice(id),
+            None => self.effective_default_choice(reference),
+        }
+    }
+
+    /// A profile's "Use on remote machines" choice as launches read it: on
+    /// an orchestrator every profile is marked (provider-profiles.md
+    /// "Profiles on an orchestrator"), without changing the saved choice.
+    pub(crate) fn effective_profile_choice(&self, id: &str) -> Option<bool> {
+        if self.may_spawn_provider_locally() {
+            self.provider_profiles.profile_choice(id)
+        } else {
+            Some(true)
+        }
+    }
+
+    /// A Default's choice as launches read it, as
+    /// [`Self::effective_profile_choice`].
+    pub(crate) fn effective_default_choice(&self, base: &str) -> Option<bool> {
+        if self.may_spawn_provider_locally() {
+            self.provider_profiles.default_choice(base)
+        } else {
+            Some(true)
         }
     }
 
@@ -507,7 +528,7 @@ impl Services {
             let meta = saved.get(*base).cloned().unwrap_or_default();
             let value = match self.load_default_env(&meta).await {
                 Ok(env) => default_remote_launch(&classify(
-                    self.provider_profiles.default_choice(base),
+                    self.effective_default_choice(base),
                     &env.entries,
                     true,
                 )),
@@ -534,7 +555,7 @@ impl Services {
                 continue;
             };
             let entries = env.map(|doc| doc.entries).unwrap_or_default();
-            if classify(store.profile_choice(&meta.id), &entries, false)
+            if classify(self.effective_profile_choice(&meta.id), &entries, false)
                 == RemoteCompatibility::Compatible
             {
                 bases.push(meta.base_provider.clone());
@@ -550,7 +571,7 @@ impl Services {
                 continue;
             };
             if !env.entries.is_empty()
-                && classify(store.default_choice(base), &env.entries, true)
+                && classify(self.effective_default_choice(base), &env.entries, true)
                     == RemoteCompatibility::Compatible
             {
                 bases.push((*base).to_owned());

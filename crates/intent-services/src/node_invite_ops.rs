@@ -74,6 +74,7 @@ impl Services {
     /// [`intent_core::WorkspaceApi::executor_invite_create`].
     pub(crate) async fn executor_invite_create_op(&self, params: Value) -> Result<Value> {
         self.require_machine_owner("executor.invite.create").await?;
+        self.refuse_in_orchestrator_mode("executor.invite.create")?;
         let label = text_param(&params, "label", false)?.map(str::to_owned);
         let secs = expires_in_secs(&params)?;
         let host = link_host(&params)?;

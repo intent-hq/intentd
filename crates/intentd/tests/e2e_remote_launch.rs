@@ -41,6 +41,7 @@ mod forge_token;
 mod git_identity;
 mod machine_order;
 mod node_invite;
+mod orchestrator;
 mod push_on_commit;
 mod secrets;
 mod sub_agents;

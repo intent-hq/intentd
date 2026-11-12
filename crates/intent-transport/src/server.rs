@@ -53,6 +53,14 @@ pub trait ServerPairingInfo: Send + Sync {
     fn node_mode(&self) -> bool {
         false
     }
+    /// The running daemon's mode, reported as `pairing.getInfo` `daemonMode`.
+    fn daemon_mode(&self) -> intent_core::settings_file::DaemonMode {
+        if self.node_mode() {
+            intent_core::settings_file::DaemonMode::Node
+        } else {
+            intent_core::settings_file::DaemonMode::Regular
+        }
+    }
 }
 
 /// Point-in-time snapshot of pairing-relevant server state.

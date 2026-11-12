@@ -795,6 +795,23 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "outcome": reply.outcome,
             "error": reply.error.as_deref().map(field),
         }),
+        LinkFrame::OneShot(one_shot) => json!({
+            "type": "oneShot",
+            "requestId": one_shot.request_id,
+            "operation": one_shot.operation,
+            "timeoutMs": one_shot.timeout_ms,
+            "profileEnv": one_shot.profile_env.is_some(),
+        }),
+        LinkFrame::OneShotCancel(cancel) => json!({
+            "type": "oneShotCancel",
+            "requestId": cancel.request_id,
+        }),
+        LinkFrame::OneShotReply(reply) => json!({
+            "type": "oneShotReply",
+            "requestId": reply.request_id,
+            "outcome": reply.outcome,
+            "code": reply.error.as_ref().map(|error| field(&error.code)),
+        }),
         LinkFrame::CheckoutRead(read) => json!({
             "type": "checkoutRead",
             "requestId": read.request_id,

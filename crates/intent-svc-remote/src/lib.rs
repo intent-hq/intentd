@@ -53,6 +53,7 @@ mod lease;
 mod machine;
 mod methods;
 pub mod order;
+mod quick_action;
 mod rpc;
 mod runtime;
 mod view;

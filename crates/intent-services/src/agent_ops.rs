@@ -3303,8 +3303,6 @@ pub(crate) fn reject_self_targeted_send(
     Ok(())
 }
 
-/// The sentence a sub-agent's inherited-placement failure ends with: why
-/// it went to `node_name` and how to run it on the backend instead.
 /// Whether `error` is a row refusing a placement (the walk tries the next
 /// row) rather than a failure of the backend itself.
 fn is_placement_refusal(error: &Error) -> bool {
@@ -3318,7 +3316,13 @@ fn is_placement_refusal(error: &Error) -> bool {
     }
 }
 
-fn inherited_placement_hint(node_name: &str) -> String {
+/// The sentence a sub-agent's inherited-placement failure ends with: why
+/// it went to `node_name` and, where this backend runs agents, how to run
+/// it here instead.
+fn inherited_placement_hint(node_name: &str, backend_runs_agents: bool) -> String {
+    if !backend_runs_agents {
+        return format!("The sub-agent defaults to \"{node_name}\" because its parent runs there.");
+    }
     format!(
         "The sub-agent defaults to \"{node_name}\" because its parent runs there; pass placement {{ target: \"local\" }} to run it on the backend."
     )
@@ -6057,6 +6061,9 @@ impl Services {
             Some(placement) => placement.runs_on_backend()?,
             None => false,
         };
+        if on_backend {
+            self.refuse_in_orchestrator_mode("placement target \"local\"")?;
+        }
         let unplaced = requested.is_none();
         let (placement, inherited_from) = match requested {
             Some(_) if on_backend => (None, None),
@@ -6071,7 +6078,8 @@ impl Services {
         };
         let walked = if unplaced
             && placement.is_none()
-            && !Self::created_by_local_parent(plan.parent_agent_id.as_ref())
+            && !(self.may_run_agents_locally()
+                && Self::created_by_local_parent(plan.parent_agent_id.as_ref()))
         {
             self.walk_machine_order(&plan.provider, |placement| {
                 let workspace_id = &workspace_id;
@@ -6116,7 +6124,10 @@ impl Services {
                     view
                 }
                 (Err(error), Some(node_name)) => {
-                    return Err(error.with_hint(&inherited_placement_hint(&node_name)))
+                    return Err(error.with_hint(&inherited_placement_hint(
+                        &node_name,
+                        self.may_run_agents_locally(),
+                    )))
                 }
                 (Err(error), None) => return Err(error),
             };
@@ -6541,7 +6552,7 @@ impl Services {
                 .await;
         };
         if placement.runs_on_backend()? {
-            return Ok(());
+            return self.refuse_in_orchestrator_mode("placement target \"local\"");
         }
         let model = plan.model.clone();
         let admit = |reference: String, profile_fallback: bool| {
@@ -7503,6 +7514,8 @@ impl Services {
         model_id: String,
         provider_id: Option<String>,
     ) -> Result<Value> {
+        self.refuse_local_agent_in_orchestrator_mode(&agent_id, "agent.setModel")
+            .await?;
         let session = self.load_session_internal(&agent_id).await?;
         // A remote agent switches on its own machine (§5.54 "Switching a
         // remote agent's model"): the next turn stops its run and relaunches
@@ -9583,6 +9596,15 @@ impl Services {
         provider_id: Option<String>,
         force_refresh: bool,
     ) -> Result<Value> {
+        if !self.may_spawn_provider_locally() {
+            // No local catalog on an orchestrator: model pickers read the
+            // machines' reports (`remoteMachines.models`).
+            let mut empty = json!({ "models": [], "source": "static" });
+            if let Some(provider_id) = provider_id {
+                empty["providerId"] = Value::String(provider_id);
+            }
+            return Ok(empty);
+        }
         let Some(provider_id) = provider_id else {
             return self.models_list_auggie_op(force_refresh, false).await;
         };
@@ -9883,6 +9905,8 @@ impl Services {
         message_metadata: Option<Value>,
     ) -> Result<Value> {
         validate_submission_id(message_id.as_deref())?;
+        self.refuse_local_agent_in_orchestrator_mode(&agent_id, "agent.queueMessage")
+            .await?;
         // Attachment-reference validation (PROTOCOL §5.5) before any state
         // change, matching `agent.sendMessage`.
         validate_file_blocks("agent.queueMessage", file_blocks.as_ref())?;
@@ -10733,6 +10757,8 @@ impl Services {
         // intent-hq/intent#5669: an agent may not message itself — rejected
         // before any state change.
         reject_self_targeted_send("agent.sendMessage", &agent_id, message_metadata.as_ref())?;
+        self.refuse_local_agent_in_orchestrator_mode(&agent_id, "agent.sendMessage")
+            .await?;
         // Validate message_id length to prevent unbounded storage.
         if let Some(ref id) = message_id {
             if id.len() > MAX_MESSAGE_ID_LEN {
@@ -13843,6 +13869,9 @@ impl Services {
         // the ordered machine list (nodes.md "Batch placement").
         let mut input = input;
         if input.isolation.is_some() && input.placement.is_none() && !inherits {
+            // On an orchestrator nothing runs here: the whole call is
+            // refused before any task is admitted.
+            self.refuse_in_orchestrator_mode("agent.delegate with isolation")?;
             input.placement = Some(intent_core::placement::AgentPlacement {
                 target: Some(intent_core::placement::PlacementTarget::Local),
                 ..Default::default()
@@ -13851,7 +13880,8 @@ impl Services {
         if input.tasks.is_some() {
             // Some task runs on the backend: an explicit local placement, or
             // none from a parent that is not remote.
-            let any_on_backend = explicit_backend || (any_unplaced && !inherits);
+            let any_on_backend =
+                explicit_backend || (any_unplaced && !inherits && self.may_run_agents_locally());
             return self
                 .agent_delegate_batch_op(workspace_id, input, parent_agent_id, any_on_backend)
                 .await;
@@ -17355,6 +17385,10 @@ impl Services {
         // BOTH branches via `deliver_wake_message`.
         if let Some(session) = live_session {
             let agent_id = session.id.clone();
+            // A pre-switch local agent never wakes on an orchestrator: refused
+            // before any queue migration or delivery.
+            self.refuse_local_agent_in_orchestrator_mode(&agent_id, "agent.wakeOrCreate")
+                .await?;
             let agent_name = session.name.clone();
             let agent_status = serde_json::to_value(session.status)
                 .ok()
@@ -21860,6 +21894,10 @@ impl Services {
     ///
     /// Returns `Error::InvalidParams` if the agent is not in pending interrupted state (or was already resolved); `Error::Internal` if a store operation fails.
     pub async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
+        // Startup resume (`serve --resume-all`) and `resolveInterrupted`
+        // never start a local agent on an orchestrator; it stays listed.
+        self.refuse_local_agent_in_orchestrator_mode(agent_id, "resuming an interrupted agent")
+            .await?;
         crate::workspace_mutations::boxed(self.resume_interrupted_agent_admitted(agent_id)).await
     }
 

@@ -126,6 +126,11 @@ impl AgentManager {
     ) -> Result<ScratchAdapter> {
         self.services
             .refuse_in_node_mode("starting a provider adapter")?;
+        if !self.services.may_spawn_provider_locally() {
+            return Err(Error::OrchestratorMode(
+                "starting a provider adapter".into(),
+            ));
+        }
         let slot = crate::acp_adapter::adapter_slots()
             .acquire(std::time::Duration::from_secs(30))
             .await

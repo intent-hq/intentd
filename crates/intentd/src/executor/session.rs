@@ -13,7 +13,8 @@
 use intent_core::node_link::{
     FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
     MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, CHECKOUT_FILES_PROTOCOL,
-    FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL, NODE_LINK_PROTOCOLS, SKILLS_PROTOCOL,
+    FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL, NODE_LINK_PROTOCOLS, ONE_SHOT_PROTOCOL,
+    SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
@@ -384,6 +385,33 @@ pub(super) async fn serve_link(
                     let _ = link.send(&LinkFrame::CheckoutReadReply(reply)).await;
                 });
             }
+            // Quick actions for an orchestrator (nodeProtocol 18): each runs
+            // on its own task and answers once; a cancel ends it.
+            LinkEvent::Frame(LinkFrame::OneShot(frame)) if protocol >= ONE_SHOT_PROTOCOL => {
+                // A replaced session starts nothing, as for script frames.
+                let replaced = {
+                    let gate = runner.link_gate().lock().await;
+                    admit(gate.as_ref(), &binding, link.is_closed()) == Admission::Replaced
+                };
+                if replaced {
+                    tracing::debug!("node: dropping a quick action from a replaced link");
+                    continue;
+                }
+                let link = link.clone();
+                let runner = runner.clone();
+                // Registered here, before the task runs and under this link's
+                // generation, so this link's end always cancels it and never
+                // a newer link's.
+                let cancelled = runner.begin_one_shot(frame.request_id, binding.generation);
+                // caller-binding: allow — answers one quick action on its link
+                tokio::spawn(async move {
+                    let reply = runner.one_shot(frame, cancelled).await;
+                    let _ = link.send(&LinkFrame::OneShotReply(reply)).await;
+                });
+            }
+            LinkEvent::Frame(LinkFrame::OneShotCancel(cancel)) if protocol >= ONE_SHOT_PROTOCOL => {
+                runner.cancel_one_shot(cancel.request_id);
+            }
             LinkEvent::Frame(LinkFrame::ForgeToken(frame)) => {
                 // Handled in order, so it precedes any launch sent after it.
                 if let Some(reply) =
@@ -435,6 +463,8 @@ pub(super) async fn serve_link(
         }
     }
     streamer.abort();
+    // No quick action outlives the link that asked for it.
+    runner.cancel_binding_one_shots(binding.generation);
     // No script outlives the link that started it.
     runner.end_binding_scripts(binding.generation).await;
 }

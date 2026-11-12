@@ -63,6 +63,16 @@ pub trait WorkspaceApi: Send + Sync {
         false
     }
 
+    /// The running daemon's mode (`daemonMode` in `client.hello`,
+    /// `host.status` and `pairing.getInfo`). Fixed for the process lifetime.
+    fn daemon_mode(&self) -> crate::settings_file::DaemonMode {
+        if self.node_mode() {
+            crate::settings_file::DaemonMode::Node
+        } else {
+            crate::settings_file::DaemonMode::Regular
+        }
+    }
+
     /// Whether `client.hello` advertises `remoteMachines: 1`: this daemon
     /// is a backend that can place agents on exposed machines, which needs
     /// the remote feature and node mode off.

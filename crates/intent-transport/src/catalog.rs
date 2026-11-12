@@ -1046,11 +1046,12 @@ pub(crate) fn member_may_call(method: &str) -> bool {
 /// `host.status` and `pairing.getInfo` results): the running process's mode,
 /// so `serve --node` reports `node` whatever `daemon.mode` says.
 #[must_use]
-pub fn daemon_mode(node_mode: bool) -> &'static str {
-    if node_mode {
-        "node"
-    } else {
-        "regular"
+pub fn daemon_mode(mode: intent_core::settings_file::DaemonMode) -> &'static str {
+    use intent_core::settings_file::DaemonMode;
+    match mode {
+        DaemonMode::Regular => "regular",
+        DaemonMode::Node => "node",
+        DaemonMode::Orchestrator => "orchestrator",
     }
 }
 

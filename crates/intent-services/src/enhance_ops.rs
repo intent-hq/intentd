@@ -297,42 +297,75 @@ impl Services {
             }
             None => None,
         };
+        if !self.may_spawn_provider_locally() {
+            return self
+                .enhance_prompt_on_machine(prompt, mode, model, workspace_id, timeout_ms)
+                .await;
+        }
         let auggie = match &self.auggie_bin {
             Some(bin) => bin.clone(),
             None => intent_context::discovery::find_auggie()
                 .ok_or_else(|| Error::Internal("auggie CLI not found".to_string()))?,
         };
+        let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
+        let enhanced = enhance_with_auggie(
+            &auggie,
+            &prompt,
+            &mode,
+            model.as_deref(),
+            cwd.as_deref(),
+            timeout,
+        )
+        .await?;
+        Ok(json!({ "enhanced": enhanced, "original": prompt, "mode": mode }))
+    }
+}
+
+/// Run the enhancement (or layout) prompt through `auggie --print` and
+/// return the enhanced text: the extracted payload in `enhance` mode, the
+/// cleaned reply in `layout` mode.
+///
+/// # Errors
+///
+/// The CLI's failure, or an `enhance` reply without the tagged payload.
+pub(crate) async fn enhance_with_auggie(
+    auggie: &std::path::Path,
+    prompt: &str,
+    mode: &str,
+    model: Option<&str>,
+    cwd: Option<&std::path::Path>,
+    timeout: u64,
+) -> Result<String> {
+    {
         let system = if mode == "layout" {
             LAYOUT_SYSTEM_PROMPT
         } else {
             ENHANCE_SYSTEM_PROMPT
         };
         let message = if mode == "enhance" {
-            build_enhancement_prompt(&prompt)
+            build_enhancement_prompt(prompt)
         } else {
-            prompt.clone()
+            prompt.to_owned()
         };
         // `System: <system>\n\n<message>` mirrors the FE streamChat composition.
         let full_prompt = format!("System: {system}\n\n{message}");
-        let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
         let stdout = run_auggie_print(
-            &auggie,
-            model.as_deref(),
-            cwd.as_deref(),
+            auggie,
+            model,
+            cwd,
             &full_prompt,
             timeout,
             "Prompt enhancement",
         )
         .await?;
         let cleaned = clean_agent_message(&stdout);
-        let enhanced = if mode == "enhance" {
+        if mode == "enhance" {
             extract_enhanced_prompt(&cleaned).ok_or_else(|| {
                 Error::Internal("Failed to parse enhanced prompt from response".to_string())
-            })?
+            })
         } else {
-            cleaned
-        };
-        Ok(json!({ "enhanced": enhanced, "original": prompt, "mode": mode }))
+            Ok(cleaned)
+        }
     }
 }
 

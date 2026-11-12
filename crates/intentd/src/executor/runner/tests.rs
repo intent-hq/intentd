@@ -110,6 +110,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
     });
     let auth_failures = Arc::new(Mutex::new(Vec::new()));
     let runner = Runner::new(RunnerConfig {
+        one_shot: None,
         admission: admission.clone(),
         launch: Arc::new(FixtureLaunch(ProviderLaunch {
             config,
@@ -424,6 +425,7 @@ async fn a_pump_ending_without_an_exit_record_settles_it_as_lost() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(Storage::open(&dir.path().join("node"), None).unwrap());
     let runner = Runner::new(RunnerConfig {
+        one_shot: None,
         admission: Arc::new(CountAdmission {
             cap: 1,
             running: Mutex::new(Vec::new()),
@@ -2945,4 +2947,111 @@ fn signed_out_applies_only_to_providers_with_a_default_configuration() {
     );
     assert!(error.contains("marked for remote machines"), "{error}");
     assert!(exit_detail(None, Some(&error)).starts_with("the provider did not start"));
+}
+
+/// A quick action that never finishes, for the cancel tests.
+struct Hangs;
+
+impl super::MachineOneShot for Hangs {
+    fn run(
+        &self,
+        _frame: intent_core::node_link::OneShot,
+        _profile: Option<intent_acp::ProfileEnv>,
+    ) -> intent_core::BoxFuture<'static, intent_core::node_link::OneShotReply> {
+        Box::pin(std::future::pending())
+    }
+}
+
+fn quick_action_runner(dir: &std::path::Path) -> Runner {
+    let storage = Arc::new(Storage::open(&dir.join("node"), None).unwrap());
+    Runner::new(RunnerConfig {
+        one_shot: Some(Arc::new(Hangs)),
+        admission: Arc::new(CountAdmission {
+            cap: 1,
+            running: Mutex::new(Vec::new()),
+        }),
+        launch: Arc::new(FixtureLaunch(ProviderLaunch {
+            config: ProviderConfig {
+                ..*intent_providers::find_provider(PROVIDER).unwrap()
+            },
+            binary: None,
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            extra_env: BTreeMap::new(),
+        })),
+        checkouts: crate::executor::checkout::PlainCheckouts::new(storage.clone()),
+        journal: Journal::open(&storage.journal_dir()).unwrap(),
+        mcp_bridge_exe: std::env::current_exe().unwrap(),
+        git_socket: None,
+        pull_staging: storage.pull_staging_dir(),
+        forge_git: None,
+        home: None,
+        auth_failed: Arc::new(|_: &str| {}),
+    })
+}
+
+fn quick_action(id: u128) -> intent_core::node_link::OneShot {
+    use intent_core::node_link::{OneShotCompleteInput, OneShotInput, OneShotOperation};
+    intent_core::node_link::OneShot {
+        request_id: uuid::Uuid::from_u128(id),
+        operation: OneShotOperation::Complete,
+        input: OneShotInput::Complete(OneShotCompleteInput {
+            provider_id: "codex".into(),
+            prompt: "hi".into(),
+            system_prompt: None,
+            model: None,
+            effort: None,
+        }),
+        profile_env: None,
+        timeout_ms: 1_000,
+    }
+}
+
+/// `oneShotCancel` ends its quick action as `cancelled`; the end of the
+/// link ends every one still running.
+#[tokio::test]
+async fn quick_actions_end_on_cancel_and_on_link_loss() {
+    use intent_core::node_link::OneShotOutcome;
+    let dir = tempfile::tempdir().unwrap();
+    let runner = quick_action_runner(dir.path());
+    let first = tokio::spawn({
+        let runner = runner.clone();
+        let cancelled = runner.begin_one_shot(uuid::Uuid::from_u128(1), NodeCounter(1));
+        async move { runner.one_shot(quick_action(1), cancelled).await }
+    });
+    let second = tokio::spawn({
+        let runner = runner.clone();
+        let cancelled = runner.begin_one_shot(uuid::Uuid::from_u128(2), NodeCounter(1));
+        async move { runner.one_shot(quick_action(2), cancelled).await }
+    });
+    let third = tokio::spawn({
+        let runner = runner.clone();
+        let cancelled = runner.begin_one_shot(uuid::Uuid::from_u128(3), NodeCounter(2));
+        async move { runner.one_shot(quick_action(3), cancelled).await }
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    while lock(&runner.inner.one_shots).len() < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the runs never started"
+        );
+        tokio::task::yield_now().await;
+    }
+    runner.cancel_one_shot(uuid::Uuid::from_u128(1));
+    let reply = first.await.unwrap();
+    assert_eq!(reply.outcome, OneShotOutcome::Cancelled);
+    assert_eq!(reply.request_id, uuid::Uuid::from_u128(1));
+    runner.cancel_one_shot(uuid::Uuid::from_u128(9));
+    // The end of generation 1's link ends its runs only; generation 2's
+    // (a newer link of the same backend) keeps running.
+    runner.cancel_binding_one_shots(NodeCounter(1));
+    assert_eq!(second.await.unwrap().outcome, OneShotOutcome::Cancelled);
+    assert!(
+        !third.is_finished(),
+        "a newer link's quick action was cancelled"
+    );
+    assert_eq!(lock(&runner.inner.one_shots).len(), 1);
+    runner.cancel_binding_one_shots(NodeCounter(2));
+    assert_eq!(third.await.unwrap().outcome, OneShotOutcome::Cancelled);
+    assert!(lock(&runner.inner.one_shots).is_empty());
 }
