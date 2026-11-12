@@ -52,6 +52,7 @@ mod launch;
 mod lease;
 mod machine;
 mod methods;
+pub mod order;
 mod rpc;
 mod runtime;
 mod view;

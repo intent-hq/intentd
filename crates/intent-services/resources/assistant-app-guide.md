@@ -484,7 +484,11 @@ packages/intentd/scripts/install.sh (INTENTD_PAIR, INTENTD_LINK_MARKER). --> A m
 actions can also include **Let <backend> run agents here**, which asks to confirm with
 **Allow**, and **Stop letting <backend> run agents here**; machines allowed this way are
 listed under **Machines <backend> can run agents on**.
-Running agents on those machines is experimental. Agents see each machine's name and
+Running agents on those machines is experimental. That list is in the user's order of
+preference, and its first row is marked **Preferred**: **This computer** first by default, then machines and cloud entries as they
+were added. Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
+menu. An agent started without a **Start on** choice runs on the first row that can run
+it; a sub-agent started by an agent on this computer stays here. Agents see each machine's name and
 platform, and look up its providers, sign-in status and models when they need them.
 A Default with **Use on remote machines** turned on in **Settings → Providers** is
 always sent when it has saved settings, even to a machine signed in to that provider. Otherwise a machine uses its

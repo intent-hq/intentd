@@ -61,11 +61,12 @@ const REALISTIC_MAX_RATIO: f64 = 0.5;
 /// Measured on 3.12, which carries the released inline-visuals block from
 /// 3.11 (intentd #3240, 1,946 chars) and the `ws.agent.delegate` occupancy
 /// entry (#3248) on top of the 3.10 cuts, plus 3.13's explicit-rename
-/// Workspace Title rule (+51 chars). Revisit if
-/// either CLI's native load can be confirmed: add it to `native_rules` and
-/// drop its row.
+/// Workspace Title rule (+51 chars) and the ordered machine list's
+/// preference line (+168 chars, with a remote machine in the fixture).
+/// Revisit if either CLI's native load can be confirmed: add it to
+/// `native_rules` and drop its row.
 const REALISTIC_INJECTED_RULES_CEILING: &[(&str, usize, usize)] =
-    &[("droid", 58_060, 56_198), ("grok", 58_060, 56_198)];
+    &[("droid", 58_228, 56_366), ("grok", 58_228, 56_366)];
 
 /// Clean-fixture ceiling per provider: `(provider, top-level chars,
 /// sub-agent chars)`. Measured on harness 3.12: the 3.10 compact ws.*

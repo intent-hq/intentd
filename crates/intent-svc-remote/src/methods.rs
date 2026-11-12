@@ -9,6 +9,7 @@
 
 use serde_json::{json, Map, Value};
 
+use intent_core::machine_order::MachineOrderKey;
 use intent_core::machines::{ExposedMachine, RemoteMachineState};
 use intent_core::nodes::NodeCounter;
 use intent_core::{now_iso, AgentId, Error, ExecutorCredentialId, Result};
@@ -136,6 +137,8 @@ pub(crate) async fn call(
         "backendInfo" => backend_info(svc).await,
         "list" => list(feature, svc).await,
         "models" => models(feature, svc, &params).await,
+        "order" => crate::order::order(svc).await,
+        "setOrder" => crate::order::set_order(svc, &params).await,
         "add" => add(feature, svc, &params).await,
         "claim" => crate::claim::claim(feature, svc, &params).await,
         "remove" => remove(feature, svc, &params).await,
@@ -201,14 +204,15 @@ async fn list(feature: &RemoteFeature, svc: &Services) -> Result<Value> {
 }
 
 /// `remoteMachines.models`: each exposed machine's state and, from its last
-/// report, its providers' sign-in status and full model lists, in name
-/// order. Reads the saved rows only: no connect, no refresh. `nodeId`,
+/// report, its providers' sign-in status and full model lists, in the
+/// ordered machine list's order, with cloud entries as rows. Reads the saved rows only: no connect, no refresh. `nodeId`,
 /// `provider` and `model` filter by exact match.
 async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
     let node_id = text(params, "nodeId", false)?;
     let provider = text(params, "provider", false)?;
     let model = text(params, "model", false)?;
-    let mut rows = svc.store().list_exposed_machines().await?;
+    let all_rows = svc.store().list_exposed_machines().await?;
+    let mut rows = all_rows.clone();
     if let Some(node_id) = node_id {
         rows.retain(|row| row.id == node_id);
         if rows.is_empty() {
@@ -220,19 +224,87 @@ async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
             ));
         }
     }
-    rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-    let machines: Vec<Value> = rows
-        .iter()
-        .filter_map(|row| {
-            let live = feature.running_node(&row.id);
-            machine_models_json(
-                row,
-                live.as_ref().map(RemoteNode::shared_ref),
-                provider,
-                model,
-            )
-        })
-        .collect();
+    // The ordered machine list decides the rows' order and rank ("This
+    // computer" counts but is not a row); cloud entries are rows too.
+    let order = crate::order::current(svc).await?;
+    let entries = crate::cloud::config::load_all(svc).await?;
+    let sandboxes = if node_id.is_none() && model.is_none() {
+        svc.store().list_cloud_machines().await?
+    } else {
+        Vec::new()
+    };
+    let mut machines = Vec::new();
+    // `rank` numbers the rows the agent-facing list shows, whatever the
+    // filters keep: not "This computer", not a revoked machine.
+    let listed_rows = order.iter().filter(|row| match &row.key {
+        MachineOrderKey::Local => false,
+        MachineOrderKey::Machine { node_id } => all_rows
+            .iter()
+            .any(|machine| &machine.id == node_id && machine.state != RemoteMachineState::Revoked),
+        MachineOrderKey::Cloud { .. } => true,
+    });
+    for (at, listed) in listed_rows.enumerate() {
+        let rank = at + 1;
+        match &listed.key {
+            MachineOrderKey::Local => {}
+            MachineOrderKey::Machine { node_id } => {
+                let Some(row) = rows.iter().find(|row| &row.id == node_id) else {
+                    continue;
+                };
+                let live = feature.running_node(&row.id);
+                if let Some(mut machine) = machine_models_json(
+                    row,
+                    live.as_ref().map(RemoteNode::shared_ref),
+                    provider,
+                    model,
+                ) {
+                    machine["kind"] = json!("machine");
+                    machine["rank"] = json!(rank);
+                    machines.push(machine);
+                }
+            }
+            MachineOrderKey::Cloud { cloud_machine_id } => {
+                if node_id.is_some() || model.is_some() {
+                    continue;
+                }
+                let Some((_, entry)) = entries.iter().find(|(id, _)| id == cloud_machine_id) else {
+                    continue;
+                };
+                let providers: Vec<Value> = crate::cloud::config::agent_providers()
+                    .into_iter()
+                    .filter(|id| provider.is_none_or(|wanted| id == wanted))
+                    .map(|id| json!({ "id": id, "status": "unknown", "models": [], "modelsStale": true }))
+                    .collect();
+                if providers.is_empty() && provider.is_some() {
+                    continue;
+                }
+                let running: usize = sandboxes
+                    .iter()
+                    .filter(|row| {
+                        row.cloud
+                            .as_ref()
+                            .is_some_and(|cloud| &cloud.cloud_machine_id == cloud_machine_id)
+                    })
+                    .filter_map(|row| feature.running_node(&row.id))
+                    .map(|node| node.shared_ref().agents.live_count())
+                    .sum();
+                let state = if entry.state == crate::cloud::config::ProviderState::Ready {
+                    RemoteMachineState::Connected
+                } else {
+                    RemoteMachineState::Unreachable
+                };
+                machines.push(json!({
+                    "kind": "cloud",
+                    "cloudMachineId": cloud_machine_id,
+                    "name": listed.name,
+                    "rank": rank,
+                    "state": state,
+                    "runningAgents": running,
+                    "providers": providers,
+                }));
+            }
+        }
+    }
     Ok(json!({ "machines": machines }))
 }
 
@@ -559,6 +631,9 @@ pub(crate) async fn add_machine(
     node.shared_ref().set_target(accepted);
     let machine = machine_json(&row, Some(node.shared_ref()));
     publish_machine(svc, &row, Some(node.shared_ref())).await;
+    if !row.is_cloud() {
+        crate::order::publish(svc).await;
+    }
     let mut result = json!({ "machine": machine });
     if let Some(replaced) = replaced {
         result["replacedCredentialId"] = json!(replaced);
@@ -642,6 +717,13 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         .await?;
     svc.publish_remote_machine_changed(json!({ "machineId": machine_id, "removed": true }))
         .await;
+    crate::order::forget(
+        svc,
+        &MachineOrderKey::Machine {
+            node_id: machine_id.clone(),
+        },
+    )
+    .await;
     let mut result = json!({ "ok": true });
     if let Some(credential) = credential {
         result["credentialId"] = json!(credential);

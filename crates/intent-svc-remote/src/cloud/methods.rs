@@ -549,8 +549,12 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
     let provider = next.to_json(&id);
     svc.publish_cloud_machine_changed(json!({ "provider": provider.clone() }), None)
         .await;
+    let renamed = saved.as_ref().is_some_and(|saved| saved.name != next.name);
     if let Some(saved) = saved.filter(|saved| saved.name != next.name) {
         rename(feature, svc, &id, &saved.name, &next.name).await;
+    }
+    if creating || renamed {
+        crate::order::publish(svc).await;
     }
     Ok(json!({ "provider": provider }))
 }
@@ -847,6 +851,13 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     svc.delete_cloud_machine_key(&id).await?;
     svc.publish_cloud_machine_changed(json!({ "providerId": id, "removed": true }), None)
         .await;
+    crate::order::forget(
+        svc,
+        &intent_core::machine_order::MachineOrderKey::Cloud {
+            cloud_machine_id: id.clone(),
+        },
+    )
+    .await;
     Ok(json!({ "ok": true, "unconfirmedStops": unconfirmed }))
 }
 

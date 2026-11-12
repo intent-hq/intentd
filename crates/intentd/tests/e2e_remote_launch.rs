@@ -39,6 +39,7 @@ mod forge_fetch;
 mod forge_push;
 mod forge_token;
 mod git_identity;
+mod machine_order;
 mod node_invite;
 mod push_on_commit;
 mod secrets;

@@ -407,6 +407,34 @@ async fn remote_machines_are_owner_only_and_probe_before_saving_over_wss() {
         }
     }
 
+    // The ordered machine list: members read it, only the owner reorders,
+    // guests get neither.
+    let order = rpc(&mut owner, 20, "remoteMachines.order", json!({})).await;
+    assert_eq!(order["result"]["order"][0]["kind"], "local", "{order}");
+    let mut member = connect_as(port, cfg.clone(), MEMBER_TOKEN).await;
+    let read = rpc(&mut member, 21, "remoteMachines.order", json!({})).await;
+    assert_eq!(read["result"], order["result"], "{read}");
+    let reorder = rpc(
+        &mut member,
+        22,
+        "remoteMachines.setOrder",
+        json!({ "order": [{ "kind": "local" }] }),
+    )
+    .await;
+    assert_eq!(reorder["error"]["code"], -32003, "{reorder}");
+    let mut guest = connect_as(port, cfg.clone(), GUEST_TOKEN).await;
+    for (id, method, params) in [
+        (23, "remoteMachines.order", json!({})),
+        (
+            24,
+            "remoteMachines.setOrder",
+            json!({ "order": [{ "kind": "local" }] }),
+        ),
+    ] {
+        let refused = rpc(&mut guest, id, method, params).await;
+        assert_eq!(refused["error"]["code"], -32003, "{method}: {refused}");
+    }
+
     let log = std::fs::read_to_string(daemon.data_dir.join("daemon.log")).unwrap_or_default();
     assert!(
         !log.contains(&machine_token),

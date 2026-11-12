@@ -2199,6 +2199,13 @@ impl Services {
         self.node_mode
     }
 
+    /// Whether this daemon may run agents on its own host: the "This
+    /// computer" row of the ordered machine list.
+    #[must_use]
+    pub fn may_run_agents_locally(&self) -> bool {
+        true
+    }
+
     /// The node-mode refusal of a local front door that would start work.
     pub(crate) fn refuse_in_node_mode(&self, what: &str) -> Result<()> {
         if self.node_mode {
@@ -21446,6 +21453,11 @@ impl WorkspaceApi for Services {
                                         "initialAgent.placement: remote agents need a workspace with a git repository to start from".into(),
                                     ));
                                 }
+                                boxed_await(|| services.admit_remote_initial_agent(&mut plan))
+                                    .await?;
+                            } else if input.plain_folder != Some(true) {
+                                // No placement: walk the ordered machine
+                                // list (nodes.md "Ordered machine list").
                                 boxed_await(|| services.admit_remote_initial_agent(&mut plan))
                                     .await?;
                             }

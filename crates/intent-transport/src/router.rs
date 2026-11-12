@@ -1974,6 +1974,8 @@ async fn dispatch(
         "remoteMachines.remove" => remote_machines(api, "remove", params).await,
         "remoteMachines.models" => remote_machines(api, "models", params).await,
         "remoteMachines.refresh" => remote_machines(api, "refresh", params).await,
+        "remoteMachines.order" => remote_machines(api, "order", params).await,
+        "remoteMachines.setOrder" => remote_machines(api, "setOrder", params).await,
         "cloudMachines.configure" => cloud_machines(api, "configure", params).await,
         "cloudMachines.list" => cloud_machines(api, "list", params).await,
         "cloudMachines.remove" => cloud_machines(api, "remove", params).await,

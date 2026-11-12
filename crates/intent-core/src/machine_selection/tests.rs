@@ -176,22 +176,32 @@ fn model_failure(result: Result<Vec<String>>) -> ModelUnavailable {
     }
 }
 
+/// Candidates keep the user's order (the source lists machines in it),
+/// whatever their running count or last use; a full machine drops out.
 #[tokio::test]
-async fn picks_fewest_running_then_most_recently_used() {
+async fn picks_in_the_users_order() {
     let mut busy = report(MAC, FRESH, claude(&["opus"]));
     busy.capacity.running_agents = 2;
+    let mut full = report(MAC, FRESH, claude(&["opus"]));
+    full.capacity.running_agents = full.capacity.agent_cap;
     let mut older = machine("older", Some(report(MAC, FRESH, claude(&["opus"]))));
     older.last_connected_at = Some("2026-10-30T00:00:00Z".into());
     let mut newer = machine("newer", Some(report(MAC, FRESH, claude(&["opus"]))));
     newer.last_connected_at = Some("2026-10-31T09:00:00Z".into());
     let unused = machine("never", Some(report(MAC, FRESH, claude(&["opus"]))));
-    let fake = Fake::new(vec![machine("busy", Some(busy)), older, unused, newer]);
+    let fake = Fake::new(vec![
+        machine("busy", Some(busy)),
+        machine("full", Some(full)),
+        older,
+        unused,
+        newer,
+    ]);
     let placement = remote();
     assert_eq!(
         select(&fake, request(&placement, Some("opus")))
             .await
             .unwrap(),
-        ["newer", "older", "never", "busy"]
+        ["busy", "older", "never", "newer"]
     );
     assert!(
         fake.refreshed().is_empty(),
@@ -802,21 +812,22 @@ fn help_lists_machines_providers_and_sign_in_without_routes() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
         lines[0],
-        "Remote placement (experimental): machines exposed to this backend (2):"
+        "Remote placement (experimental): machines and cloud entries this backend can run agents on (2):"
     );
-    assert_eq!(
-        lines[1],
-        format!(
-            "- \"Mac mini\" (nodeId `d-mac`, macos/aarch64, connected, report {FRESH}): claude-code signed-in [opus, sonnet]"
-        )
-    );
+    assert_eq!(lines[1], PREFERENCE_LINE);
     assert_eq!(
         lines[2],
         format!(
-            "- \"d-box-name\" (nodeId `d-box`, linux/x86_64, last seen 2026-10-30T08:00:00Z, report {FRESH}): claude-code signed-in [opus]"
+            "1. \"Mac mini\" (nodeId `d-mac`, macos/aarch64, connected, report {FRESH}): claude-code signed-in [opus, sonnet]"
         )
     );
-    assert!(lines[3].starts_with("To run an agent on one, pass `placement"));
+    assert_eq!(
+        lines[3],
+        format!(
+            "2. \"d-box-name\" (nodeId `d-box`, linux/x86_64, last seen 2026-10-30T08:00:00Z, report {FRESH}): claude-code signed-in [opus]"
+        )
+    );
+    assert!(lines[4].starts_with("To run an agent on one, pass `placement"));
     assert!(text.contains("`profile-not-remote-compatible`"), "{text}");
     assert!(text.contains("`ws.agent.setModel` can switch it"), "{text}");
     assert_eq!(text.lines().last(), Some(REMOTE_LONG_COMMANDS_HINT));
@@ -840,7 +851,7 @@ fn help_caps_models_machines_and_bytes() {
     assert!(text.contains("model-9, +5 more]"), "{text}");
     assert!(!text.contains("model-10"));
     assert_eq!(
-        text.lines().filter(|l| l.starts_with("- \"")).count(),
+        text.lines().filter(|l| l.contains(". \"m")).count(),
         HELP_MAX_MACHINES
     );
     assert!(text.contains(
@@ -856,7 +867,7 @@ fn help_caps_models_machines_and_bytes() {
         })
         .collect();
     let text = exposed_machines_help(&PlacementHelpInputs::new(&wide, &|_| false)).unwrap();
-    let listed = text.lines().filter(|l| l.starts_with("- \"")).count();
+    let listed = text.lines().filter(|l| l.contains(". \"nnn")).count();
     assert!(listed < 8 && listed > 0, "{listed}");
     assert!(text.contains(&format!("- … {} more not shown", 8 - listed)));
 }
@@ -1029,7 +1040,7 @@ fn help_says_the_default_configuration_travels_before_the_machine_login() {
 }
 
 #[test]
-fn stable_help_lists_identity_only_in_name_order() {
+fn stable_help_lists_identity_only_in_the_users_order() {
     let mut mac = machine(
         "d-mac",
         Some(report(
@@ -1049,8 +1060,9 @@ fn stable_help_lists_identity_only_in_name_order() {
     assert_eq!(
         text,
         "Remote placement (experimental): machines exposed to this backend:\n\
-         - \"Attic box\" (nodeId `d-new`, platform unknown)\n\
-         - \"Mac mini\" (nodeId `d-mac`, macos/aarch64)\n\
+         Listed in the user's order of preference. When several can run what you need, use the first; pick a later one only when the task needs it (platform, model, capacity).\n\
+         1. \"Mac mini\" (nodeId `d-mac`, macos/aarch64)\n\
+         2. \"Attic box\" (nodeId `d-new`, platform unknown)\n\
          Before you choose a machine, provider or model for a remote agent, confirm it with `ws.agent.machineModels(nodeId?, { provider?, model? }?)`: each machine's state, provider sign-in status and full model list. How to place one: `ws.help(\"agent\")`.\n\
          On a remote machine, run anything over 30 s with `ws.script.start`; shell background jobs never wake you."
     );
@@ -1080,8 +1092,9 @@ fn stable_help_lists_identity_only_in_name_order() {
         "{reference}"
     );
     assert!(reference.starts_with(
-        "Remote placement (experimental): machines exposed to this backend:\n- \"Attic box\""
+        "Remote placement (experimental): machines exposed to this backend:\nListed in the user's order of preference."
     ));
+    assert!(reference.contains("\n1. \"Mac mini\""), "{reference}");
     assert!(reference.contains(
         "\n  ws.agent.machineModels(nodeId?, { provider?, model? }?) → { machines }  // Experimental."
     ));
@@ -1126,10 +1139,10 @@ fn stable_help_caps_machines_and_points_at_the_lookup() {
         .collect();
     let text = stable_machines_help(&PlacementHelpInputs::new(&rows, &|_| false)).unwrap();
     assert_eq!(
-        text.lines().filter(|l| l.starts_with("- \"")).count(),
+        text.lines().filter(|l| l.contains(". \"m")).count(),
         HELP_MAX_MACHINES
     );
-    assert!(text.contains("- \"m07-name\""), "{text}");
+    assert!(text.contains("8. \"m07-name\""), "{text}");
     assert!(!text.contains("m08"), "{text}");
     assert!(text.contains("- … 4 more; `ws.agent.machineModels()` lists them all.\n"));
 }
@@ -1568,4 +1581,98 @@ async fn a_profile_fallback_keeps_signed_out_machines_as_candidates() {
     .unwrap();
     chosen.sort();
     assert_eq!(chosen, ["failed", "out"], "a missing CLI is still out");
+}
+
+fn cloud_entry(id: &str, name: &str) -> HelpCloudEntry {
+    HelpCloudEntry {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        providers: vec!["claude-code".to_owned(), "codex".to_owned()],
+    }
+}
+
+/// Cloud entries are rows too, and every list follows the saved order; a
+/// machine the order does not name yet comes last.
+#[test]
+fn help_lists_machines_and_cloud_entries_in_the_saved_order() {
+    use crate::machine_order::MachineOrderKey;
+    let mut alpha = machine("m-a", Some(report(MAC, FRESH, claude(&["opus"]))));
+    alpha.name = "Alpha".into();
+    let mut beta = machine("m-b", Some(report(LINUX, FRESH, claude(&["opus"]))));
+    beta.name = "Beta".into();
+    let mut late = machine("m-c", None);
+    late.name = "Gamma".into();
+    let rows = [alpha, beta, late];
+    let entries = [cloud_entry("e2b", "E2B")];
+    let order = [
+        MachineOrderKey::Cloud {
+            cloud_machine_id: "e2b".into(),
+        },
+        MachineOrderKey::Local,
+        MachineOrderKey::Machine {
+            node_id: "m-b".into(),
+        },
+        MachineOrderKey::Machine {
+            node_id: "m-a".into(),
+        },
+    ];
+    let inputs = PlacementHelpInputs {
+        cloud_entries: &entries,
+        order: &order,
+        ..PlacementHelpInputs::new(&rows, &|_| false)
+    };
+    let text = stable_machines_help(&inputs).unwrap();
+    assert!(
+        text.contains(
+            "1. \"E2B\" (cloudMachineId `e2b`, cloud: a new sandbox for each agent; claude-code, codex)\n\
+             2. \"Beta\" (nodeId `m-b`, linux/x86_64)\n\
+             3. \"Alpha\" (nodeId `m-a`, macos/aarch64)\n\
+             4. \"Gamma\" (nodeId `m-c`, platform unknown)\n"
+        ),
+        "{text}"
+    );
+    let legacy_text = exposed_machines_help(&inputs).unwrap();
+    let numbered: Vec<&str> = legacy_text
+        .lines()
+        .filter(|line| line.starts_with(|c: char| c.is_ascii_digit()))
+        .collect();
+    assert_eq!(numbered.len(), 4, "{legacy_text}");
+    assert!(
+        numbered[0].starts_with("1. \"E2B\" (cloudMachineId `e2b`"),
+        "{legacy_text}"
+    );
+    assert!(
+        numbered[1].starts_with("2. \"Beta\" (nodeId `m-b`"),
+        "{legacy_text}"
+    );
+    assert!(legacy_text.contains("Listed in the user's order of preference."));
+
+    let reordered = [
+        MachineOrderKey::Machine {
+            node_id: "m-a".into(),
+        },
+        MachineOrderKey::Cloud {
+            cloud_machine_id: "e2b".into(),
+        },
+        MachineOrderKey::Machine {
+            node_id: "m-b".into(),
+        },
+    ];
+    let moved = stable_machines_help(&PlacementHelpInputs {
+        order: &reordered,
+        ..inputs
+    })
+    .unwrap();
+    assert_ne!(moved, text, "a reorder changes the text");
+    assert!(moved.contains("1. \"Alpha\""), "{moved}");
+
+    let only_cloud = stable_machines_help(&PlacementHelpInputs {
+        cloud_entries: &entries,
+        ..PlacementHelpInputs::new(&[], &|_| false)
+    })
+    .unwrap();
+    assert!(
+        only_cloud.contains("1. \"E2B\" (cloudMachineId `e2b`"),
+        "{only_cloud}"
+    );
 }

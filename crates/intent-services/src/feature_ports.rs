@@ -1589,6 +1589,26 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         })
     }
 
+    /// The ordered machine list's keys, most preferred first (nodes.md
+    /// "Ordered machine list"). A daemon without the remote feature has only
+    /// "This computer".
+    ///
+    /// # Errors
+    ///
+    /// When the list cannot be read.
+    fn machine_order<'a>(
+        &'a self,
+        svc: &'a Services,
+    ) -> BoxFuture<'a, Result<Vec<intent_core::machine_order::MachineOrderKey>>> {
+        Box::pin(async move {
+            Ok(if svc.may_run_agents_locally() {
+                vec![intent_core::machine_order::MachineOrderKey::Local]
+            } else {
+                Vec::new()
+            })
+        })
+    }
+
     /// `remoteMachines.<method>` with `params`, after the services checked
     /// the caller is the owner. A daemon without the remote feature has no
     /// exposed machines to manage.
