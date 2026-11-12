@@ -314,6 +314,34 @@ async fn a_bind_without_a_tailcat_address_keeps_the_last_known_one() {
     assert_eq!(row.tc_address.as_deref(), Some("tcmachine1"));
 }
 
+/// Adding a machine again from a link minted while its tunnel was down keeps
+/// the stored tailcat address; a bind that reports a new one replaces it.
+#[tokio::test]
+async fn adding_again_keeps_the_tailcat_address_until_the_machine_reports_another() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let mut params = machine.add_params();
+    params["tcAddress"] = json!("tcmachine1");
+    backend.call("add", params).await.unwrap();
+    machine.accept().await.closed_by_head().await;
+
+    let again = backend.call("add", machine.add_params()).await.unwrap();
+    machine.accept().await.closed_by_head().await;
+    assert_eq!(again["machine"]["tcAddress"], "tcmachine1");
+
+    *machine.host.tc_address.lock().unwrap() = Some("tcmachine2".into());
+    let again = backend.call("add", machine.add_params()).await.unwrap();
+    machine.accept().await.closed_by_head().await;
+    assert_eq!(again["machine"]["tcAddress"], "tcmachine2");
+    let row = backend
+        .store()
+        .get_exposed_machine(&machine.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.tc_address.as_deref(), Some("tcmachine2"));
+}
+
 /// With neither a host nor a tailcat address there is no route at all.
 #[tokio::test]
 async fn add_without_any_route_is_rejected_before_dialing() {
