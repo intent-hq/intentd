@@ -1091,7 +1091,7 @@ esac
             up: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             recycle: std::sync::Arc::new(tokio::sync::Notify::new()),
             stop_tx,
-            task: tokio::spawn(async { panic!("supervision task failed") }),
+            task: intent_core::spawn_daemon(async { panic!("supervision task failed") }),
         });
         sup.stop().await;
         assert!(
