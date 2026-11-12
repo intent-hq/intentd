@@ -1364,16 +1364,16 @@ selection updates when the primary changes; after reconnecting, wait for the
 current client and workspace browser state to refresh. Do not promise automatic
 failover or change the primary client without the user's instruction.
 
-An agent-owned browser tab shows the controlling agent's avatar and **Controlled by**
-with the agent's name in the panel header; click it to open that agent's conversation.
-Narrow panels show just the avatar; hover or focus it for the agent's name.
-When a tab runs on another computer, its name appears beside the address; click
-it for host details. For an agent-owned tab, these details explain that cookies
+An agent-owned browser tab shows the controlling agent's avatar in the panel
+header; hover or focus it for **Controlled by** and the agent's name, or click it
+to open that agent's conversation. Host, offline, and page-error controls also
+use icons with tooltips at every panel width. When a tab runs on another computer,
+the host icon beside the address names that computer in its tooltip; click it
+for host details. For an agent-owned tab, these details explain that cookies
 and page state stay on the other computer, so the page may differ from what the
-agent sees and its address can change on its own. **Offline** pauses navigation
+agent sees and its address can change on its own. The offline warning pauses navigation
 until that computer reconnects; click the status for details and **Close anyway**.
-Narrow panels show status icons with the same details and actions. Page errors
-appear beside Reload; click the error status for the message and **Retry**.
+Page-error icons appear beside Reload; click one for the message and **Retry**.
 If the page closed itself, its empty page shows the message and **Retry** directly.
 
 ## iOS workspace browser
