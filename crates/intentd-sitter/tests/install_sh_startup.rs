@@ -778,22 +778,6 @@ fn service_manager_stub(dir: &Path, os: &str, service_name: &str, main_pid: u32)
     bin
 }
 
-/// A `launchctl` stub that knows the service only in the `user/<uid>`
-/// domain, as after an install over SSH with nobody at the desktop.
-fn user_domain_launchctl_stub(dir: &Path, service_name: &str, main_pid: u32) -> PathBuf {
-    let bin = dir.join("stub-bin-user-domain");
-    fs::create_dir_all(&bin).unwrap();
-    write_executable(
-        &bin.join("launchctl"),
-        &format!(
-            "[ \"$1\" = print ] || exit 1\n\
-             [ \"$2\" = \"user/$(id -u)/{service_name}\" ] || exit 113\n\
-             printf '\\tstate = running\\n\\tpid = {main_pid}\\n'"
-        ),
-    );
-    bin
-}
-
 /// A stub where no service manager answers at all: both commands exist but
 /// fail, as `systemctl --user` does without a user manager session.
 fn unreachable_service_manager_stub(dir: &Path) -> PathBuf {
@@ -861,35 +845,6 @@ fn an_owner_that_is_the_services_main_pid_lets_the_install_proceed() {
             "{os}: the info line must name the service, got: {stdout}"
         );
     }
-}
-
-/// A service the installer fell back to registering in the `user/<uid>`
-/// domain is still this installer's own service: re-running it is an
-/// upgrade, not a conflict.
-#[test]
-fn an_owner_run_by_the_user_domain_service_lets_a_macos_install_proceed() {
-    let dir = tempfile::tempdir().unwrap();
-    let data_dir = dir.path().join("data");
-    let owner = LiveProcess::spawn();
-    write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
-    let stub = user_domain_launchctl_stub(dir.path(), SERVICE_NAME, owner.pid());
-
-    let output = run_owner_check_full(
-        None,
-        "Darwin",
-        dir.path(),
-        Some(data_dir.to_str().unwrap()),
-        Some(&stub),
-        Some(SERVICE_NAME),
-    );
-
-    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
-    let stdout = stdout_of(&output);
-    assert!(stdout.contains("PROCEEDED"), "{stdout}");
-    assert!(
-        stdout.contains("will be restarted onto the new binary"),
-        "{stdout}"
-    );
 }
 
 /// The owner is usually not the main pid itself: the service runs the sitter,

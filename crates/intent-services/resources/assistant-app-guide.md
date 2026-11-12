@@ -474,12 +474,11 @@ remote machine's actions include **Edit** and **Connect**, with **Test connectio
 its editing panel.
 <!-- Labs (SSH machine setup, desktop app only): describe only when the user asks about
 installing over SSH, and say it is Labs. With it on, the install cards also offer
-**Set it up for me over SSH**: sign in to a Linux computer or Mac (SSH agent, key file or
-password; nothing is saved), confirm an unknown host key, and the app installs, starts,
-pairs and adds the machine. A Linux server may need `sudo loginctl enable-linger <user>`
-so intentd keeps running after logout (the wizard shows it). On a Mac nobody is logged in
-to, intentd runs until the Mac restarts, then waits for a login; agents there may not
-sign in to providers that keep their sign-in in the locked login keychain.
+**Set it up for me over SSH** for Linux computers only (a Mac or Windows PC uses the
+command): sign in (SSH agent, key file or password; nothing is saved), confirm an unknown
+host key, and the app installs, starts, pairs and adds the machine. A server may need
+`sudo loginctl enable-linger <user>` so intentd keeps running after logout (the wizard
+shows it).
 Sources: packages/cloudlands-fe/src/features/machine-setup/,
 packages/intentd/scripts/install.sh (INTENTD_PAIR, INTENTD_LINK_MARKER). --> A machine's
 actions can also include **Let <backend> run agents here**, which asks to confirm with

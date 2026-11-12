@@ -701,19 +701,12 @@ process_path() {
 # the service is not registered, or it has no running main process. Linux:
 # systemd's MainPID (an unknown or stopped unit reports 0, which reads as
 # "none" here). macOS: the `pid = N` line of `launchctl print` for the label
-# in this user's gui domain, else in the user domain an install without a
-# desktop login falls back to (see setup_service_macos). Never fatal.
+# in this user's gui domain. Never fatal.
 service_main_pid() {
   if [ "$os" = "Darwin" ]; then
     command -v launchctl >/dev/null 2>&1 || return 0
-    for launchd_probe in gui user; do
-      main_pid=$(launchctl print "$launchd_probe/$(id -u)/${INTENTD_SERVICE_NAME:-com.intenthq.intentd}" 2>/dev/null |
-        sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*$/\1/p' | head -n 1)
-      if [ -n "$main_pid" ]; then
-        printf '%s' "$main_pid"
-        return 0
-      fi
-    done
+    launchctl print "gui/$(id -u)/${INTENTD_SERVICE_NAME:-com.intenthq.intentd}" 2>/dev/null |
+      sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*$/\1/p' | head -n 1
   else
     command -v systemctl >/dev/null 2>&1 || return 0
     main_pid=$(systemctl --user show --property=MainPID --value "${INTENTD_SERVICE_NAME:-intentd}.service" 2>/dev/null) || return 0
@@ -982,47 +975,26 @@ $env_block	<key>RunAtLoad</key>
 EOF
 
   uid=$(id -u)
-  # bootout tears down any previous registration (idempotent re-runs) in
-  # both domains this script may have used, so a re-run from the other kind
-  # of session never leaves two; bootstrap loads the fresh plist and
-  # RunAtLoad starts the agent. bootout is asynchronous — bootstrapping while
-  # the old agent is still tearing down fails with EIO — so wait until the
-  # label is gone.
-  for launchd_old in "gui/$uid" "user/$uid"; do
-    if launchctl bootout "$launchd_old/$label" 2>/dev/null; then
-      waited=0
-      while launchctl print "$launchd_old/$label" >/dev/null 2>&1; do
-        [ "$waited" -lt 10 ] || break
-        sleep 1
-        waited=$((waited + 1))
-      done
-    fi
-  done
+  # bootout tears down any previous registration (idempotent re-runs);
+  # bootstrap loads the fresh plist and RunAtLoad starts the agent. bootout
+  # is asynchronous — bootstrapping while the old agent is still tearing
+  # down fails with EIO — so wait until the label is gone.
+  if launchctl bootout "gui/$uid/$label" 2>/dev/null; then
+    waited=0
+    while launchctl print "gui/$uid/$label" >/dev/null 2>&1; do
+      [ "$waited" -lt 10 ] || break
+      sleep 1
+      waited=$((waited + 1))
+    done
+  fi
   # Log boundary after the old agent is fully torn down (its shutdown noise
   # stays out of the window) but before bootstrap starts the new one, so a
   # failure during the start itself lands inside the window verify_daemon
   # quotes.
   note_log_start
-  # The gui domain exists only while the user is logged in at the desktop;
-  # over SSH without that login, bootstrapping into it fails (errors 5/125,
-  # depending on the macOS version). The user domain lives as long as the
-  # user has any session or service, so the agent outlives the SSH session —
-  # but nothing loads it again after a restart until someone logs in.
-  # Decided once, by trying, and used for every launchctl call below.
-  if gui_err=$(launchctl bootstrap "gui/$uid" "$plist" 2>&1); then
-    launchd_domain="gui/$uid"
-  elif user_err=$(launchctl bootstrap "user/$uid" "$plist" 2>&1); then
-    launchd_domain="user/$uid"
-  else
-    fail "launchctl bootstrap failed for $plist:
-  gui/$uid: $gui_err
-  user/$uid: $user_err"
-  fi
-  restart_hint="launchctl kickstart -k $launchd_domain/$label"
+  launchctl bootstrap "gui/$uid" "$plist" \
+    || fail "launchctl bootstrap failed for $plist"
   info "LaunchAgent installed and started: $plist"
-  if [ "$launchd_domain" = "user/$uid" ]; then
-    info "nobody is logged in at this Mac's desktop, so intentd runs in the background domain: it keeps running after you log out, but if the Mac restarts it starts again only after someone logs in"
-  fi
 
   # apply_auto_resume only when the daemon actually answered: an undecided
   # wait already told the user how to apply the setting themselves.
@@ -1033,7 +1005,7 @@ EOF
   elif [ "$daemon_mode" = "node" ]; then
     warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
   fi
-  info "manage the service with: launchctl {print|bootout} $launchd_domain/$label"
+  info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
   [ "$daemon_mode" = "node" ] || [ "$paired" = "yes" ] \
     || info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }

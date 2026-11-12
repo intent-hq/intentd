@@ -433,20 +433,6 @@ struct PidFile {
     _lock: std::fs::File,
 }
 
-/// Whether [`PidFile::create`] failed because a live serve sitter holds the
-/// pidfile (its lock, or a live pid record), not because of an I/O fault.
-fn serve_owned_elsewhere(error: &io::Error) -> bool {
-    // ERROR_SHARING_VIOLATION: another process holds the exclusive handle.
-    #[cfg(windows)]
-    if error.raw_os_error() == Some(32) {
-        return true;
-    }
-    matches!(
-        error.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::AlreadyExists
-    )
-}
-
 impl PidFile {
     fn create(path: &Path) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -625,13 +611,6 @@ impl Supervisor {
         let pidfile = if supervised {
             match PidFile::create(&self.paths.pid_path) {
                 Ok(guard) => Some(guard),
-                // A clean exit: service managers restart only failures, so a
-                // second registration (a LaunchAgent loaded into both the
-                // gui/ and user/ domains) stays stopped instead of looping.
-                Err(e) if serve_owned_elsewhere(&e) => {
-                    eprintln!("intentd is already running under another supervisor ({e})");
-                    return 0;
-                }
                 Err(e) => {
                     eprintln!("intentd-sitter: cannot claim serve ownership: {e}");
                     return 1;

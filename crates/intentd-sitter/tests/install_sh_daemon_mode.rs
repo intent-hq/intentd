@@ -19,22 +19,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-/// The computer the fake `uname` reports. Darwin swaps `systemctl` /
-/// `loginctl` for a recording `launchctl`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Os {
-    Linux,
-    Darwin,
-}
-
-impl Os {
-    fn triple(self) -> &'static str {
-        match self {
-            Os::Linux => "x86_64-unknown-linux-musl",
-            Os::Darwin => "aarch64-apple-darwin",
-        }
-    }
-}
+const TRIPLE: &str = "x86_64-unknown-linux-musl";
 
 /// The fake installed `intentd`. Every call is appended to `$FAKE_STATE/calls`;
 /// settings persist as one file per path; `restart` starts a stand-in daemon
@@ -152,8 +137,8 @@ fn sh(dir: &Path, command: &str) {
 
 /// The release the fake `curl` serves: the archive with the fake `intentd`
 /// and its sha256 sidecar, laid out as the sitter-latest release.
-fn build_release(dir: &Path, os: Os) -> PathBuf {
-    let triple = os.triple();
+fn build_release(dir: &Path) -> PathBuf {
+    let triple = TRIPLE;
     let release = dir.join("release");
     let payload = release.join(format!("intentd-{triple}"));
     fs::create_dir_all(&payload).unwrap();
@@ -184,31 +169,7 @@ case "$1" in
 esac
 "#;
 
-/// `launchctl` records every call in `$FAKE_STATE/launchctl`. Nothing is
-/// loaded (`print` fails), `bootout` reports what `FAKE_BOOTOUT` says, and a
-/// `gui/` bootstrap fails as it does over SSH with nobody at the desktop when
-/// `FAKE_NO_GUI` is set (and a `user/` one when `FAKE_NO_USER` is).
-const FAKE_LAUNCHCTL: &str = r#"#!/bin/sh
-printf '%s\n' "$*" >>"$FAKE_STATE/launchctl"
-case "$1" in
-  bootstrap)
-    case "$2" in
-      gui/*)
-        if [ -n "${FAKE_NO_GUI:-}" ]; then
-          echo 'Bootstrap failed: 125: Domain does not support specified action' >&2; exit 125
-        fi ;;
-      user/*)
-        if [ -n "${FAKE_NO_USER:-}" ]; then
-          echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5
-        fi ;;
-    esac ;;
-  bootout) exit "${FAKE_BOOTOUT:-3}" ;;
-  print) exit 1 ;;
-esac
-exit 0
-"#;
-
-fn build_stubs(dir: &Path, os: Os) -> PathBuf {
+fn build_stubs(dir: &Path) -> PathBuf {
     let bin = dir.join("stubs");
     fs::create_dir_all(&bin).unwrap();
     write_executable(
@@ -225,26 +186,15 @@ done
 cp "$FAKE_RELEASE/${url##*/}" "$out"
 "#,
     );
-    match os {
-        Os::Linux => {
-            write_executable(
-                &bin.join("uname"),
-                "#!/bin/sh\ncase \"$1\" in -m) echo x86_64 ;; *) echo Linux ;; esac\n",
-            );
-            write_executable(
-                &bin.join("systemctl"),
-                "#!/bin/sh\ncase \"$*\" in *show*MainPID*) echo MainPID=0 ;; esac\nexit 0\n",
-            );
-            write_executable(&bin.join("loginctl"), FAKE_LOGINCTL);
-        }
-        Os::Darwin => {
-            write_executable(
-                &bin.join("uname"),
-                "#!/bin/sh\ncase \"$1\" in -m) echo arm64 ;; *) echo Darwin ;; esac\n",
-            );
-            write_executable(&bin.join("launchctl"), FAKE_LAUNCHCTL);
-        }
-    }
+    write_executable(
+        &bin.join("uname"),
+        "#!/bin/sh\ncase \"$1\" in -m) echo x86_64 ;; *) echo Linux ;; esac\n",
+    );
+    write_executable(
+        &bin.join("systemctl"),
+        "#!/bin/sh\ncase \"$*\" in *show*MainPID*) echo MainPID=0 ;; esac\nexit 0\n",
+    );
+    write_executable(&bin.join("loginctl"), FAKE_LOGINCTL);
     bin
 }
 
@@ -269,11 +219,10 @@ fn run_install(
         .into_iter()
         .chain(envs.iter().copied())
         .collect();
-    run_install_on(Os::Linux, terminal, args, &envs, node_already)
+    run_install_on(terminal, args, &envs, node_already)
 }
 
 fn run_install_on(
-    os: Os,
     terminal: Terminal,
     args: &[&str],
     envs: &[(&str, &str)],
@@ -291,8 +240,8 @@ fn run_install_on(
     if node_already {
         fs::write(state.join("setting.daemon.mode"), "node").unwrap();
     }
-    let release = build_release(root, os);
-    let stubs = build_stubs(root, os);
+    let release = build_release(root);
+    let stubs = build_stubs(root);
     let tty_out = root.join("tty.out");
     fs::write(&tty_out, "").unwrap();
 
@@ -592,13 +541,6 @@ fn recorded(run: &Run, tool: &str) -> Vec<String> {
         .collect()
 }
 
-fn uid() -> String {
-    String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout)
-        .unwrap()
-        .trim()
-        .to_string()
-}
-
 fn user() -> String {
     String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout)
         .unwrap()
@@ -746,7 +688,6 @@ fn the_link_marker_prints_one_link_line_for_a_node_even_on_a_terminal() {
 #[test]
 fn linux_service_setup_turns_lingering_on_without_sudo_when_allowed() {
     let run = run_install_on(
-        Os::Linux,
         Terminal::None,
         &["--service"],
         &[("FAKE_LINGER_ALLOWED", "1")],
@@ -767,7 +708,7 @@ fn linux_service_setup_turns_lingering_on_without_sudo_when_allowed() {
 
 #[test]
 fn linux_service_setup_prints_the_sudo_step_when_lingering_is_refused() {
-    let run = run_install_on(Os::Linux, Terminal::None, &["--service"], &[], false);
+    let run = run_install_on(Terminal::None, &["--service"], &[], false);
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(
         recorded(&run, "loginctl").contains(&format!("enable-linger {}", user())),
@@ -790,113 +731,6 @@ fn linux_service_setup_leaves_lingering_alone_when_it_is_on() {
         !recorded(&run, "loginctl")
             .iter()
             .any(|c| c.starts_with("enable-linger")),
-        "{}",
-        run.describe()
-    );
-}
-
-const LABEL: &str = "intentd-install-test";
-
-#[test]
-fn macos_service_boots_out_of_both_domains_then_uses_gui_when_it_works() {
-    let run = run_install_on(
-        Os::Darwin,
-        Terminal::None,
-        &["--service", "--pair"],
-        &[("FAKE_BOOTOUT", "0")],
-        false,
-    );
-    assert!(run.output.status.success(), "{}", run.describe());
-    let uid = uid();
-    let calls = recorded(&run, "launchctl");
-    let gui_out = format!("bootout gui/{uid}/{LABEL}");
-    let user_out = format!("bootout user/{uid}/{LABEL}");
-    let bootstraps: Vec<&String> = calls
-        .iter()
-        .filter(|c| c.starts_with("bootstrap"))
-        .collect();
-    assert_eq!(bootstraps.len(), 1, "{calls:?}");
-    assert!(
-        bootstraps[0].starts_with(&format!("bootstrap gui/{uid} ")),
-        "{calls:?}"
-    );
-    let first_bootstrap = calls
-        .iter()
-        .position(|c| c.starts_with("bootstrap"))
-        .unwrap();
-    for out in [&gui_out, &user_out] {
-        let at = calls.iter().position(|c| c == out);
-        assert!(
-            at.is_some_and(|at| at < first_bootstrap),
-            "`{out}` before bootstrap: {calls:?}"
-        );
-    }
-    let stdout = run.stdout();
-    assert!(
-        stdout.contains(&format!("launchctl {{print|bootout}} gui/{uid}/{LABEL}")),
-        "{}",
-        run.describe()
-    );
-    assert!(!stdout.contains("after a login"), "{}", run.describe());
-    assert!(run.called("pair --yes --tunnel"), "{}", run.describe());
-}
-
-#[test]
-fn macos_service_falls_back_to_the_user_domain_without_a_desktop_login() {
-    let run = run_install_on(
-        Os::Darwin,
-        Terminal::None,
-        &["--service", "--pair"],
-        &[("FAKE_NO_GUI", "1"), ("INTENTD_LINK_MARKER", "1")],
-        false,
-    );
-    assert!(run.output.status.success(), "{}", run.describe());
-    let uid = uid();
-    let calls = recorded(&run, "launchctl");
-    let bootstraps: Vec<&String> = calls
-        .iter()
-        .filter(|c| c.starts_with("bootstrap"))
-        .collect();
-    assert_eq!(bootstraps.len(), 2, "{calls:?}");
-    assert!(
-        bootstraps[0].starts_with(&format!("bootstrap gui/{uid} ")),
-        "{calls:?}"
-    );
-    assert!(
-        bootstraps[1].starts_with(&format!("bootstrap user/{uid} ")),
-        "{calls:?}"
-    );
-    let stdout = run.stdout();
-    assert!(
-        stdout.contains(&format!("launchctl {{print|bootout}} user/{uid}/{LABEL}")),
-        "{}",
-        run.describe()
-    );
-    assert!(
-        !stdout.contains(&format!("gui/{uid}")),
-        "no hint names the gui domain\n{}",
-        run.describe()
-    );
-    assert!(
-        stdout.contains("starts again only after someone logs in"),
-        "{}",
-        run.describe()
-    );
-    assert_only_the_marker(&run, PAIR_URI);
-}
-
-#[test]
-fn macos_service_fails_when_neither_domain_takes_the_agent() {
-    let run = run_install_on(
-        Os::Darwin,
-        Terminal::None,
-        &["--service"],
-        &[("FAKE_NO_GUI", "1"), ("FAKE_NO_USER", "1")],
-        false,
-    );
-    assert!(!run.output.status.success(), "{}", run.describe());
-    assert!(
-        run.stderr().contains("launchctl bootstrap failed"),
         "{}",
         run.describe()
     );
