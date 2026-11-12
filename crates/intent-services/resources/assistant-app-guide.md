@@ -678,7 +678,8 @@ The conversation header's **More** menu groups **Rename**, **Copy conversation**
 **Tasks**, and **Prompts** under **Conversation**. **Settings** contains **Font**
 and per-agent **Notifications**; lifecycle actions appear under **Agent** when
 available. The footer shows specialist and harness metadata when present; select
-the harness version for details. **Move panel** opens the pane movement controls.
+the harness version for details. The **Move Panel** direction controls appear
+directly in panel menus; choose an available arrow to move the panel.
 Other panel menus place **Rename** under **Actions** when renaming is available.
 
 The harness details list the agent's features as **On** or **Off**; hover or focus
