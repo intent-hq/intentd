@@ -24,8 +24,9 @@ const TRIPLE: &str = "x86_64-unknown-linux-musl";
 /// The fake installed `intentd`. Every call is appended to `$FAKE_STATE/calls`;
 /// settings persist as one file per path; `restart` starts a stand-in daemon
 /// and records its pid in the data dir's pidfile, as a real restart does;
-/// `pair` reads the picker selection from stdin unless `--yes` and prints a
-/// fake link (never a real token).
+/// `pair` reads the picker selection from stdin unless `--yes` and prints
+/// output shaped like the real `intentd pair` (QR block, `URL:`, `Token:`,
+/// `Fingerprint:`) with fake credentials, or the node link for `--node`.
 const FAKE_INTENTD: &str = r#"#!/bin/sh
 state="${FAKE_STATE:?}"
 printf '%s\n' "$*" >>"$state/calls"
@@ -53,7 +54,16 @@ case "$1" in
         read -r selection || selection=EOF
         printf '%s\n' "$selection" >"$state/pair-selection" ;;
     esac
-    printf '%s\n' 'URL:         intent://node?v=1&host=&port=5181&fp=FP&invite=ni-1&secret=s&tc=tc-fake' ;;
+    printf '%s\n' '█▀▀▀▀▀█ ▄▀ █▀▀▀▀▀█' '█ ███ █ ▀▄ █ ███ █' ''
+    case " $* " in
+      *" --node "*)
+        printf '%s\n' 'URL:         intent://node?v=1&host=&port=5181&fp=FP&invite=ni-1&secret=s&tc=tc-fake' ;;
+      *)
+        printf '%s\n' 'URL:         intent://pair?v=1&host=&port=5180&token=SECRET-TOKEN&fp=FP&tc=tc-fake' \
+          '             Same payload as the QR code.' \
+          'Token:       SECRET-TOKEN' \
+          'Fingerprint: FP' ;;
+    esac ;;
 esac
 exit 0
 "#;
@@ -128,19 +138,37 @@ fn sh(dir: &Path, command: &str) {
 /// The release the fake `curl` serves: the archive with the fake `intentd`
 /// and its sha256 sidecar, laid out as the sitter-latest release.
 fn build_release(dir: &Path) -> PathBuf {
+    let triple = TRIPLE;
     let release = dir.join("release");
-    let payload = release.join(format!("intentd-{TRIPLE}"));
+    let payload = release.join(format!("intentd-{triple}"));
     fs::create_dir_all(&payload).unwrap();
     write_executable(&payload.join("intentd"), FAKE_INTENTD);
-    let archive = format!("intentd-{TRIPLE}.tar.xz");
+    let archive = format!("intentd-{triple}.tar.xz");
     sh(
         &release,
         &format!(
-            "tar -cf - intentd-{TRIPLE} | xz -c >{archive} && sha256sum {archive} >{archive}.sha256"
+            "tar -cf - intentd-{triple} | xz -c >{archive} && sha256sum {archive} >{archive}.sha256"
         ),
     );
     release
 }
+
+/// `loginctl` keeps lingering in `$FAKE_STATE/linger`: `FAKE_LINGER=yes`
+/// starts it on, and `enable-linger` without sudo works only when
+/// `FAKE_LINGER_ALLOWED` is set (most servers refuse it). Calls are recorded
+/// in `$FAKE_STATE/loginctl`.
+const FAKE_LOGINCTL: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >>"$FAKE_STATE/loginctl"
+[ "${FAKE_LINGER:-}" = yes ] && : >"$FAKE_STATE/linger"
+while [ "${1#--}" != "$1" ]; do shift; done
+case "$1" in
+  show-user)
+    if [ -f "$FAKE_STATE/linger" ]; then echo Linger=yes; else echo Linger=no; fi ;;
+  enable-linger)
+    if [ -n "${FAKE_LINGER_ALLOWED:-}" ]; then : >"$FAKE_STATE/linger"; else
+      echo 'Could not enable linger: Access denied' >&2; exit 1; fi ;;
+esac
+"#;
 
 fn build_stubs(dir: &Path) -> PathBuf {
     let bin = dir.join("stubs");
@@ -167,7 +195,7 @@ cp "$FAKE_RELEASE/${url##*/}" "$out"
         &bin.join("systemctl"),
         "#!/bin/sh\ncase \"$*\" in *show*MainPID*) echo MainPID=0 ;; esac\nexit 0\n",
     );
-    write_executable(&bin.join("loginctl"), "#!/bin/sh\necho Linger=yes\n");
+    write_executable(&bin.join("loginctl"), FAKE_LOGINCTL);
     bin
 }
 
@@ -183,6 +211,19 @@ enum Terminal<'a> {
 /// as `terminal` says. `node_already` seeds a daemon whose saved
 /// `daemon.mode` is `node`.
 fn run_install(
+    terminal: Terminal,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    node_already: bool,
+) -> Run {
+    let envs: Vec<(&str, &str)> = [("FAKE_LINGER", "yes")]
+        .into_iter()
+        .chain(envs.iter().copied())
+        .collect();
+    run_install_on(terminal, args, &envs, node_already)
+}
+
+fn run_install_on(
     terminal: Terminal,
     args: &[&str],
     envs: &[(&str, &str)],
@@ -488,4 +529,210 @@ fn the_unasked_default_leaves_a_node_alone() {
         run.describe()
     );
     assert!(!run.called("restart"), "{}", run.describe());
+}
+
+const PAIR_URI: &str = "intent://pair?v=1&host=&port=5180&token=SECRET-TOKEN&fp=FP&tc=tc-fake";
+const NODE_URI: &str = "intent://node?v=1&host=&port=5181&fp=FP&invite=ni-1&secret=s&tc=tc-fake";
+
+fn recorded(run: &Run, tool: &str) -> Vec<String> {
+    fs::read_to_string(run.state.join(tool))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn user() -> String {
+    String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn the_pair_option_pairs_a_full_install_and_shows_the_link_without_a_terminal() {
+    for (args, envs) in [
+        (&["--pair"][..], &[("INTENTD_INSTALL_SERVICE", "1")][..]),
+        (
+            &[][..],
+            &[("INTENTD_INSTALL_SERVICE", "1"), ("INTENTD_PAIR", "1")][..],
+        ),
+    ] {
+        let run = run_install(Terminal::None, args, envs, false);
+        assert!(run.output.status.success(), "{}", run.describe());
+        assert!(
+            run.position("status") < run.position("pair --yes --tunnel"),
+            "pairs once the daemon answers\n{}",
+            run.describe()
+        );
+        let stdout = run.stdout();
+        assert!(
+            stdout.contains(&format!("URL:         {PAIR_URI}")),
+            "the normal pair output is shown\n{}",
+            run.describe()
+        );
+        assert!(!stdout.contains("INTENT_LINK="), "{}", run.describe());
+        assert!(!stdout.contains("Run: intentd pair"), "{}", run.describe());
+        assert!(mode_writes(&run).is_empty(), "{}", run.describe());
+    }
+}
+
+#[test]
+fn without_the_pair_option_a_full_install_pairs_nothing() {
+    let run = run_install(
+        Terminal::None,
+        &[],
+        &[("INTENTD_INSTALL_SERVICE", "1")],
+        false,
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(run.called("status"), "{}", run.describe());
+    assert!(
+        !run.calls.iter().any(|c| c.starts_with("pair")),
+        "{}",
+        run.describe()
+    );
+    assert!(
+        run.stdout().contains("Run: intentd pair"),
+        "{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn the_pair_option_without_a_service_says_how_to_pair_later() {
+    let run = run_install(
+        Terminal::None,
+        &["--pair"],
+        &[("INTENTD_INSTALL_SERVICE", "0")],
+        false,
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(
+        !run.calls.iter().any(|c| c.starts_with("pair")),
+        "{}",
+        run.describe()
+    );
+    assert!(
+        run.stderr().contains("pairing needs the service"),
+        "{}",
+        run.describe()
+    );
+}
+
+#[track_caller]
+fn assert_only_the_marker(run: &Run, uri: &str) {
+    let stdout = run.stdout();
+    let markers: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("INTENT_LINK="))
+        .collect();
+    assert_eq!(
+        markers,
+        vec![format!("INTENT_LINK={uri}").as_str()],
+        "{}",
+        run.describe()
+    );
+    let all = format!("{stdout}{}", run.stderr());
+    for line in all.lines().filter(|l| !l.starts_with("INTENT_LINK=")) {
+        assert!(
+            !line.contains("intent://")
+                && !line.contains("SECRET-TOKEN")
+                && !line.contains('█')
+                && !line.starts_with("URL:")
+                && !line.starts_with("Token:"),
+            "only the marker line may carry the link: `{line}`\n{}",
+            run.describe()
+        );
+    }
+}
+
+#[test]
+fn the_link_marker_prints_one_link_line_and_no_credentials_for_a_full_install() {
+    let run = run_install(
+        Terminal::None,
+        &["--pair"],
+        &[
+            ("INTENTD_INSTALL_SERVICE", "1"),
+            ("INTENTD_LINK_MARKER", "1"),
+        ],
+        false,
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(run.called("pair --yes --tunnel"), "{}", run.describe());
+    assert_only_the_marker(&run, PAIR_URI);
+}
+
+#[test]
+fn the_link_marker_prints_one_link_line_for_a_node_even_on_a_terminal() {
+    for terminal in [Terminal::None, Terminal::Answers("\n\n\n")] {
+        let run = run_install(
+            terminal,
+            &[],
+            &[
+                ("INTENTD_INSTALL_SERVICE", "1"),
+                ("INTENTD_DAEMON_MODE", "node"),
+                ("INTENTD_LINK_MARKER", "1"),
+            ],
+            false,
+        );
+        assert!(run.output.status.success(), "{}", run.describe());
+        assert!(
+            run.called("pair --node --tunnel --yes"),
+            "the marker never opens the picker\n{}",
+            run.describe()
+        );
+        assert_only_the_marker(&run, NODE_URI);
+    }
+}
+
+#[test]
+fn linux_service_setup_turns_lingering_on_without_sudo_when_allowed() {
+    let run = run_install_on(
+        Terminal::None,
+        &["--service"],
+        &[("FAKE_LINGER_ALLOWED", "1")],
+        false,
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(
+        recorded(&run, "loginctl").contains(&format!("--no-ask-password enable-linger {}", user())),
+        "{}",
+        run.describe()
+    );
+    assert!(
+        !run.stdout().contains("sudo loginctl enable-linger"),
+        "{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn linux_service_setup_prints_the_sudo_step_when_lingering_is_refused() {
+    let run = run_install_on(Terminal::None, &["--service"], &[], false);
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(
+        recorded(&run, "loginctl").contains(&format!("--no-ask-password enable-linger {}", user())),
+        "{}",
+        run.describe()
+    );
+    assert!(
+        run.stdout()
+            .contains(&format!("sudo loginctl enable-linger {}", user())),
+        "{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn linux_service_setup_leaves_lingering_alone_when_it_is_on() {
+    let run = run_install(Terminal::None, &["--service"], &[], false);
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(
+        !recorded(&run, "loginctl")
+            .iter()
+            .any(|c| c.contains("enable-linger")),
+        "{}",
+        run.describe()
+    );
 }

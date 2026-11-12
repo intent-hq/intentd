@@ -41,12 +41,18 @@
 # not to. $env:INTENTD_DAEMON_MODE = 'full'|'node' (or -DaemonMode <value>, on
 # direct runs) forces an answer.
 #
+# A full install can end by pairing, so the link a desktop app needs is on
+# screen: once the task's daemon answers, it runs `intentd pair --yes --tunnel`
+# and shows its QR code and intent://pair link. $env:INTENTD_PAIR = '1' (or
+# -Pair, on direct runs) turns it on.
+#
 # $env:INTENTD_SERVICE_NAME overrides the task name (testing).
 param(
     [switch]$Service,
     [switch]$NoService,
     [string]$AutoResume = '',
-    [string]$DaemonMode = ''
+    [string]$DaemonMode = '',
+    [switch]$Pair
 )
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1: silence the progress bar (it slows Invoke-WebRequest
@@ -112,6 +118,7 @@ if ($DaemonMode) {
 $installModeExplicit = [bool]$installMode
 # <<< END daemon-mode-choice
 $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+$pair = $Pair.IsPresent -or (@('1', 'true', 'yes', 'on') -contains "$env:INTENTD_PAIR".Trim().ToLowerInvariant())
 
 # >>> BEGIN resolve-data-dir (extracted verbatim and executed by
 # crates/intentd-sitter/tests/install_ps1_owner.rs — keep these markers).
@@ -660,8 +667,8 @@ if ($serviceMode -eq 'yes') {
     # >>> BEGIN daemon-mode-apply (extracted verbatim and executed by
     # crates/intentd-sitter/tests/install_ps1_daemon_mode.rs against a fake
     # $dest; keep this block free
-    # of anything beyond $dest, $verdict, $installMode, $installModeExplicit and
-    # $interactive)
+    # of anything beyond $dest, $verdict, $installMode, $installModeExplicit,
+    # $interactive and $pair)
     # Node: daemon.mode node and the tunnel on, a restart (the mode applies at
     # the next start; on Windows `intentd restart` waits for the replacement),
     # then the normal pairing flow, which prints the QR code and the link. An
@@ -709,12 +716,23 @@ if ($serviceMode -eq 'yes') {
             }
         }
     }
+    # The pair option (full installs): pair through the tunnel, unattended.
+    if ($pair -and $installMode -ne 'node' -and $verdict -eq 'up') {
+        Write-Host 'install.ps1: pairing - the link below adds this computer to the Intent desktop app'
+        & $dest pair --yes --tunnel
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'install.ps1: pairing did not finish - run it again with: intentd pair --tunnel'
+        }
+    }
     # <<< END daemon-mode-apply
     Write-Host "install.ps1: manage the service with: Get-ScheduledTask/Start-ScheduledTask/Stop-ScheduledTask/Unregister-ScheduledTask -TaskName $taskName"
-    if ($installMode -ne 'node') {
+    if ($installMode -ne 'node' -and -not $pair) {
         Write-Host 'install.ps1: connecting from another machine (desktop/mobile app)? Run: intentd pair'
     }
 } else {
+    if ($pair -and $installMode -ne 'node') {
+        Write-Warning 'install.ps1: pairing needs the service, so it did not run - once the daemon is running: intentd pair --tunnel'
+    }
     if ($serviceMode -eq 'skip') {
         Write-Host 'install.ps1: skipping service setup (non-interactive session). To set it up, re-run with $env:INTENTD_INSTALL_SERVICE = ''1'''
     }

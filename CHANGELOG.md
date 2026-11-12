@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.192] - 2026-11-12
+
+### 🚀 Features
+
+- *(permissions)* Send option kind and allow_always scope ([#3298](https://github.com/intent-hq/intentd/pull/3298))
+- *(agents)* Import existing provider sessions into a workspace ([#3293](https://github.com/intent-hq/intentd/pull/3293))
+
+### 🐛 Bug Fixes
+
+- *(remote)* Keep the last known tailcat address when a bind omits it ([#3301](https://github.com/intent-hq/intentd/pull/3301))
+- *(store)* Size transfer plans without loading large values ([#3302](https://github.com/intent-hq/intentd/pull/3302))
+- *(remote)* Accept Northflank API tokens longer than 512 bytes ([#3300](https://github.com/intent-hq/intentd/pull/3300))
+
+
 ## [0.11.191] - 2026-11-12
 
 ### 📚 Documentation

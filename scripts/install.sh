@@ -47,6 +47,21 @@
 #
 #   INTENTD_DAEMON_MODE=full|node  (or --daemon-mode=<value>, on direct runs)
 #
+# A full install can end by pairing, so the link a desktop app needs is on
+# screen: once the service's daemon answers, it runs `intentd pair --yes
+# --tunnel` (the Tailcat tunnel, so the link works from any network) and
+# shows its QR code and intent://pair link. Off by default:
+#
+#   INTENTD_PAIR=1  (or --pair, on direct runs)
+#
+# For a program that drives the install (the desktop app's SSH setup), the
+# link can instead be printed as exactly one machine-readable line, with the
+# QR code, URL and Token lines left out, for full (with the pair option) and
+# node installs alike:
+#
+#   INTENTD_LINK_MARKER=1  (or --link-marker, on direct runs)
+#                          prints: INTENT_LINK=<intent:// link>
+#
 # The release channel the daemon is installed from — and updated on — defaults
 # to stable. Choose another with:
 #
@@ -415,6 +430,47 @@ await_restarted_daemon() {
   return 1
 }
 
+# Is $1 a yes answer from a flag-less env var (1/true/yes/on, any case)?
+env_yes() {
+  case "$1" in
+    1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Run `intentd pair` with the given arguments and show its link. Normally its
+# output passes straight through (QR code, URL, Token). With the link marker
+# the output is captured instead and only the link leaves this script, on
+# one INTENT_LINK=<uri> line: the QR code and the Token line carry the owner
+# credential, and the program reading the marker must not have to scrub
+# them. Returns non-zero when pairing failed or printed no link.
+run_pair() {
+  if [ "$link_marker" != "yes" ]; then
+    "$install_dir/intentd" pair "$@"
+    return
+  fi
+  pair_out=$("$install_dir/intentd" pair "$@") || return 1
+  pair_link=$(printf '%s\n' "$pair_out" |
+    sed -n 's/^URL:[[:space:]]*\(intent:\/\/[^[:space:]]*\).*$/\1/p' | head -n 1)
+  pair_out=""
+  [ -n "$pair_link" ] || return 1
+  printf 'INTENT_LINK=%s\n' "$pair_link"
+  pair_link=""
+}
+
+# The pair option for a full install: once the daemon answers, pair through
+# the Tailcat tunnel unattended. A failure is a warning; the daemon is
+# installed and running either way.
+apply_pair() {
+  [ "$pair" = "yes" ] && [ "$daemon_mode" = "full" ] || return 0
+  info "pairing — the link below adds this computer to the Intent desktop app"
+  if run_pair --yes --tunnel; then
+    paired="yes"
+  else
+    warn "pairing did not finish — run it again with: intentd pair --tunnel"
+  fi
+}
+
 # The commands that finish node setup by hand, for any path that cannot.
 node_setup_hint() {
   printf '%s' "
@@ -468,11 +524,12 @@ apply_daemon_mode() {
     return 0
   fi
   info "node mode on — pair this computer with the Intent that will run agents here"
-  if (exec </dev/tty) 2>/dev/null; then
+  # The marker means a program, not a person, reads this run: no picker.
+  if [ "$link_marker" != "yes" ] && (exec </dev/tty) 2>/dev/null; then
     "$install_dir/intentd" pair --node --tunnel </dev/tty \
       || warn "pairing did not finish — run it again with: intentd pair --node --tunnel"
   else
-    "$install_dir/intentd" pair --node --tunnel --yes \
+    run_pair --node --tunnel --yes \
       || warn "pairing did not finish — run it again with: intentd pair --node --tunnel"
   fi
 }
@@ -834,12 +891,20 @@ EOF
   info "systemd user unit installed and started: $unit_dir/$unit_name.service"
 
   # User units only run while the user has a session; lingering starts them
-  # at boot — essential on headless boxes.
+  # at boot and keeps them up after the last session (an SSH login) ends —
+  # essential on headless boxes. Some systems let a user turn it on for
+  # themselves; try that before asking for sudo.
   if command -v loginctl >/dev/null 2>&1; then
     user=$(id -un)
     if [ "$(loginctl show-user "$user" --property=Linger 2>/dev/null)" != "Linger=yes" ]; then
-      info "note: user services run only while you are logged in. To start intentd at boot (headless/server), enable lingering:
+      # --no-ask-password: never stop at a polkit password prompt.
+      loginctl --no-ask-password enable-linger "$user" >/dev/null 2>&1 || true
+      if [ "$(loginctl show-user "$user" --property=Linger 2>/dev/null)" = "Linger=yes" ]; then
+        info "lingering on — intentd keeps running after you log out and starts at boot"
+      else
+        info "note: user services run only while you are logged in. To keep intentd running after you log out and start it at boot (headless/server), enable lingering:
   sudo loginctl enable-linger $user"
+      fi
     fi
   fi
 
@@ -848,11 +913,14 @@ EOF
   if verify_daemon; then
     apply_auto_resume
     apply_daemon_mode
+    apply_pair
   elif [ "$daemon_mode" = "node" ]; then
     warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
+  elif [ "$pair" = "yes" ]; then
+    warn "pairing did not run because the daemon is not up yet — once it is: intentd pair --tunnel"
   fi
   info "manage the service with: systemctl --user {status|stop|restart|disable} $unit_name"
-  [ "$daemon_mode" = "node" ] \
+  [ "$daemon_mode" = "node" ] || [ "$paired" = "yes" ] \
     || info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
 
@@ -936,11 +1004,14 @@ EOF
   if verify_daemon; then
     apply_auto_resume
     apply_daemon_mode
+    apply_pair
   elif [ "$daemon_mode" = "node" ]; then
     warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
+  elif [ "$pair" = "yes" ]; then
+    warn "pairing did not run because the daemon is not up yet — once it is: intentd pair --tunnel"
   fi
   info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
-  [ "$daemon_mode" = "node" ] \
+  [ "$daemon_mode" = "node" ] || [ "$paired" = "yes" ] \
     || info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
 
@@ -949,9 +1020,14 @@ main() {
   auto_resume_arg=""
   channel_arg=""
   daemon_mode_arg=""
+  pair=""
+  link_marker=""
+  paired=""
   for arg in "$@"; do
     case "$arg" in
       --service) service_arg="yes" ;;
+      --pair) pair="yes" ;;
+      --link-marker) link_marker="yes" ;;
       --no-service) service_arg="no" ;;
       --auto-resume=*)
         auto_resume_arg=$(normalize_auto_resume "${arg#--auto-resume=}")
@@ -965,7 +1041,7 @@ main() {
         daemon_mode_arg=$(normalize_daemon_mode "${arg#--daemon-mode=}")
         validate_daemon_mode "$daemon_mode_arg"
         ;;
-      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off, --channel=stable|beta|alpha, --daemon-mode=full|node)" ;;
+      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off, --channel=stable|beta|alpha, --daemon-mode=full|node, --pair, --link-marker)" ;;
     esac
   done
   # Validated before any download so garbage fails fast, interactive or not.
@@ -973,6 +1049,12 @@ main() {
   if [ -n "${INTENTD_AUTO_RESUME:-}" ]; then
     auto_resume_env=$(normalize_auto_resume "$INTENTD_AUTO_RESUME")
     validate_auto_resume "$auto_resume_env"
+  fi
+  if [ -z "$pair" ] && env_yes "${INTENTD_PAIR:-}"; then
+    pair="yes"
+  fi
+  if [ -z "$link_marker" ] && env_yes "${INTENTD_LINK_MARKER:-}"; then
+    link_marker="yes"
   fi
   # Daemon mode: flag beats the env var beats the prompt (asked later, after
   # the download). Unset and unasked means full, written nowhere.
@@ -1215,6 +1297,9 @@ main() {
     return 0
   fi
 
+  if [ "$pair" = "yes" ] && [ "$daemon_mode" = "full" ]; then
+    warn "pairing needs the service, so it did not run — once the daemon is running: intentd pair --tunnel"
+  fi
   if [ "$service_mode" = "skip" ]; then
     info "skipping service setup (no interactive terminal detected). To set it up, re-run with INTENTD_INSTALL_SERVICE=1"
   fi

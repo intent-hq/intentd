@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use intent_core::node_link::MachineSkill;
 use intent_core::remote_launch::{RemotePlacementView, REMOTE_PLACEMENT_METADATA_KEY};
-use intent_core::{now_iso, with_caller, AgentId, AgentSession, AgentStatus, BoxFuture, Caller};
+use intent_core::{now_iso, with_caller, AgentId, AgentSession, BoxFuture, Caller};
 use serde_json::Value;
 
 use super::leading_skill_name;
@@ -104,49 +104,14 @@ pub(crate) fn view(skills: Option<Vec<MachineSkill>>) -> RemotePlacementView {
 pub(crate) fn session(ws: &intent_core::WorkspaceId, id: &AgentId) -> AgentSession {
     let ts = now_iso();
     AgentSession {
-        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
-        harness_features: None,
         id: id.clone(),
         workspace_id: ws.clone(),
-        parent_agent_id: None,
-        backend_session_id: None,
-        acp_session_id: None,
         name: "Remote".to_string(),
-        name_explicitly_set: false,
-        model: None,
-        reasoning_effort: None,
-        effort_levels: None,
         provider: Some("auggie".to_string()),
-        system_prompt: None,
-        specialist: None,
-        status: AgentStatus::Pending,
         is_active: true,
-        messages: Vec::new(),
-        stats: None,
-        task_note_id: None,
-        skip_auto_commit: false,
-        completion_report: None,
-        completion_report_timestamp: None,
-        attention_request_kind: None,
-        attention_request_reason: None,
-        attention_request_timestamp: None,
-        delegation_depth: None,
-        initial_message: None,
-        context_references: None,
-        image_blocks: None,
-        file_blocks: None,
-        is_background: false,
-        metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
-        stop_reason: None,
-        stop_reason_timestamp: None,
-        session_corrupted: false,
-        pending_delete_at: None,
-        retired_at: None,
-        notifications_muted: false,
-        pinned: false,
-        permission_policy: None,
+        ..Default::default()
     }
 }
 

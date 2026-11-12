@@ -7272,6 +7272,7 @@ impl Services {
                 "{method}: encode agentFeatures snapshot failed: {e}"
             ))
         })?;
+        // agent-session-literal: allow — agent creation decides every field of a new session; a new field has to fail to compile here until its create-time value is chosen
         let session = AgentSession {
             id,
             workspace_id,
