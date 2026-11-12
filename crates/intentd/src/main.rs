@@ -3005,6 +3005,9 @@ async fn cmd_serve_owned(
     // `Linked-Note-Id:` trailers via `git_agent_commit`. No-op-safe without an
     // event bus. Aborted on clean shutdown.
     let auto_commit_loop = orchestration.spawn(|| services.spawn_auto_commit_loop());
+    // Push relay publisher: idle until `push.relayEnabled` is on and a phone
+    // is linked. Aborted on clean shutdown.
+    let push_publisher = orchestration.spawn(|| services.spawn_push_publisher());
     // Idle PR refresh worker: on `agent:idle`, check that workspace's branch
     // PR, git roots, and stale PR monitors once, through the same automatic
     // admission, rate-limit pause, and budgets as the 60 s sweep. No-op-safe
@@ -3768,6 +3771,8 @@ async fn cmd_serve_owned(
     let _ = completion_delivery.await;
     auto_commit_loop.abort();
     let _ = auto_commit_loop.await;
+    push_publisher.abort();
+    let _ = push_publisher.await;
     idle_pr_refresh_loop.abort();
     let _ = idle_pr_refresh_loop.await;
     agent_locks_loop.abort();

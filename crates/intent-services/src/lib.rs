@@ -261,6 +261,7 @@ mod provider_quota_cache;
 mod provider_return;
 pub mod provider_test_prompt;
 mod provider_version;
+mod push_relay;
 mod quota_failover;
 mod rate_limit;
 pub mod repo_config;
@@ -1349,6 +1350,8 @@ pub struct Services {
     /// (`principal.revokeSelf`), consumed by the transport to close their
     /// connections (multiplayer w4).
     principal_revocations: invite_ops::PrincipalRevocations,
+    /// Push relay key, link bookkeeping and publisher wake-up.
+    push_relay: Arc<push_relay::PushRelay>,
     /// Live feed of executor credentials just revoked, consumed by the
     /// transport to close their `/node/*` connections with `1008`.
     executor_revocations: executor_link::ExecutorRevocations,
@@ -1933,6 +1936,7 @@ impl Services {
                 invite_ops::REVOCATION_CHANNEL_CAPACITY,
             )
             .0,
+            push_relay: Arc::default(),
             executor_revocations: tokio::sync::broadcast::channel(
                 invite_ops::REVOCATION_CHANNEL_CAPACITY,
             )
@@ -34037,6 +34041,18 @@ impl WorkspaceApi for Services {
 
     fn principal_revoke_self(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.principal_revoke_self_op().await })
+    }
+
+    fn push_create_link(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.push_create_link_op().await })
+    }
+
+    fn push_revoke_link(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.push_revoke_link_op().await })
+    }
+
+    fn push_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.push_status_op().await })
     }
 
     fn subscribe_principal_revocations(

@@ -5963,6 +5963,35 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `push.createLink`: register this daemon with the push relay if needed
+    /// and mint a one-time link token for the caller's phone →
+    /// `{ linkToken, expiresAt, daemonId, relayUrl }`.
+    fn push_create_link(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::push_create_link not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `push.revokeLink`: unlink every phone the caller linked → `{ revoked }`.
+    fn push_revoke_link(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::push_revoke_link not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `push.status` → `{ enabled, relayUrl, daemonId, linked }`.
+    fn push_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::push_status not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Transport seam (multiplayer w4): a live feed of committed invalidations for principals whose
     /// credentials were just revoked, so a listener can close the connections
     /// still bound to them. `None` when the implementation has no principal

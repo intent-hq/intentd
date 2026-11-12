@@ -51,6 +51,7 @@ tempfile = "3"
 reqwest.workspace = true
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 sha2 = "0.11"
+ring = "0.17"
 tar = "0.4.46"
 getrandom = "0.4"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

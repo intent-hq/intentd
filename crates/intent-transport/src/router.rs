@@ -4828,6 +4828,15 @@ async fn dispatch(
             let r = api.principal_revoke_self().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // Push relay linking (§5.62): self-directed, no params. Owner and
+        // host members only (services refuse guests and agents).
+        "push.createLink" => match api.push_create_link().await {
+            Ok(v) => Ok(v),
+            Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+            Err(e) => Err(domain_to_rpc(e)),
+        },
+        "push.revokeLink" => api.push_revoke_link().await.map_err(domain_to_rpc),
+        "push.status" => api.push_status().await.map_err(domain_to_rpc),
         // `presence.snapshot` (multiplayer w5): the current `presence:changed`
         // roster of a member workspace, on demand. Member+; a non-member is
         // `-32602 not-found` like any other membership-narrowed read.

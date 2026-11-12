@@ -1,0 +1,13 @@
+{
+  "description": "Daemon proof golden vector: Ed25519 is deterministic, so intentd must produce this exact JWS from the seed and the request.",
+  "seed": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+  "method": "PUT",
+  "path": "/v1/daemons/ZbYGc9btiEvwHCwiLYKtoHQPKawzVdapJcgfF_R6J7g/workspaces/ws-1",
+  "body": "{\"state\":{\"title\":\"Fix login\",\"running\":true,\"lastActivity\":\"2026-11-12T17:00:00Z\"}}",
+  "iat": 1800000000,
+  "jti": "AAECAwQFBgcICQoLDA0ODw",
+  "publicKey": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+  "daemonId": "ZbYGc9btiEvwHCwiLYKtoHQPKawzVdapJcgfF_R6J7g",
+  "bsh": "NQcvK8k9yQxgBwczSu3U0LhJYIn1wTyDHu1itrkN_yY",
+  "jws": "eyJhbGciOiJFZERTQSIsInR5cCI6ImludGVudC1kYWVtb24rand0In0.eyJzdWIiOiJaYllHYzlidGlFdndIQ3dpTFlLdG9IUVBLYXd6VmRhcEpjZ2ZGX1I2SjdnIiwiaHRtIjoiUFVUIiwiaHR1IjoiL3YxL2RhZW1vbnMvWmJZR2M5YnRpRXZ3SEN3aUxZS3RvSFFQS2F3elZkYXBKY2dmRl9SNko3Zy93b3Jrc3BhY2VzL3dzLTEiLCJic2giOiJOUWN2SzhrOXlReGdCd2N6U3UzVTBMaEpZSW4xd1R5REh1MWl0cmtOX3lZIiwiaWF0IjoxODAwMDAwMDAwLCJqdGkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R3In0.opwtvtCvECDLddsOXJyQVczz3FRiOUcFLu4ibXmY3YkMZzF4piqWSd24zzpndYDy38NeYxNVghuW8VLIxKrbAQ"
+}

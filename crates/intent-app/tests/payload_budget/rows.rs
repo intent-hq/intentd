@@ -1510,6 +1510,11 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             vec![v("default", json!({}), Items("/machines", seed::CLOUD_MACHINES))],
         ),
         fixed(
+            "push.status",
+            "Four scalars about the caller's own push relay link.",
+            vec![v("default", json!({}), Fixed("/enabled"))],
+        ),
+        fixed(
             "remoteMachines.backendInfo",
             "This backend's own id, name and certificate pin.",
             vec![v("default", json!({}), Fixed("/backendId"))],
