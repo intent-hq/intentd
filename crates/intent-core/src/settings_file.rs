@@ -73,6 +73,7 @@ pub struct SettingsFile {
     pub mcp: McpSettings,
     pub notifications: NotificationsSettings,
     pub rtk: RtkSettings,
+    pub push: PushSettings,
     pub server: ServerSettings,
     pub sharing: SharingSettings,
     pub source_control: SourceControlSettings,
@@ -288,6 +289,16 @@ impl Default for NotificationsSettings {
 pub struct RtkSettings {
     /// `rtk.enabled` — enable RTK compressed CLI output mode in agent prompts.
     pub enabled: bool,
+}
+
+/// `[push]` — the push relay that keeps iOS Live Activities and alerts current
+/// while the app is closed (`push.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct PushSettings {
+    /// `push.relayEnabled` — publish workspace activity to the push relay
+    /// and allow `push.createLink`.
+    pub relay_enabled: bool,
 }
 
 /// `server.bindAddress` — a single IP string (back-compat) or a list of IP
@@ -1957,6 +1968,11 @@ volume = 0.5
 [rtk]
 # RTK enabled -- enable RTK compressed CLI output mode in agent prompts.
 enabled = false
+
+[push]
+# Push relay -- publish workspace activity to the push relay for iOS Live
+# Activities and alerts.
+relayEnabled = false
 
 [server]
 # Socket path -- Unix socket path for the UDS listener.

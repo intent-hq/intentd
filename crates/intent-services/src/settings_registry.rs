@@ -81,6 +81,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "notifications.soundOnlyWhenUnfocused",
     "notifications.volume",
     "rtk.enabled",
+    "push.relayEnabled",
     "server.socketPath",
     "server.bindAddress",
     "server.port",
