@@ -487,11 +487,23 @@ pub(crate) async fn add_machine(
     let welcome = dialed.welcome;
     let bound_at = NodeCounter(generation.load(std::sync::atomic::Ordering::SeqCst));
 
-    let (hosts, tc_address) = if welcome.hosts.is_empty() && welcome.tc_address.is_none() {
-        (params.hosts.clone(), params.tc_address.clone())
+    let hosts = if welcome.hosts.is_empty() && welcome.tc_address.is_none() {
+        params.hosts.clone()
     } else {
-        (welcome.hosts.clone(), welcome.tc_address.clone())
+        welcome.hosts.clone()
     };
+    // The tailcat address is stable, so a machine whose tunnel is down
+    // right now keeps the one it was added with or last reported.
+    let tc_address = welcome
+        .tc_address
+        .clone()
+        .or_else(|| params.tc_address.clone())
+        .or_else(|| {
+            previous
+                .as_ref()
+                .filter(|row| same_fingerprint(&row.fingerprint, &params.fingerprint))
+                .and_then(|row| row.tc_address.clone())
+        });
     let now = now_iso();
     let row = ExposedMachine {
         id: params.machine_id.clone(),
@@ -552,6 +564,17 @@ pub(crate) async fn add_machine(
         result["replacedCredentialId"] = json!(replaced);
     }
     Ok((row, result))
+}
+
+fn same_fingerprint(a: &str, b: &str) -> bool {
+    let normalize = |fingerprint: &str| {
+        fingerprint
+            .chars()
+            .filter(|c| *c != ':')
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    normalize(a) == normalize(b)
 }
 
 pub(crate) fn in_use(name: &str, running: usize) -> Error {
