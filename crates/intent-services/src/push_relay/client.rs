@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 use super::proof::DaemonKey;
 use super::state::WorkspaceState;
 
-pub(crate) const DEFAULT_RELAY_URL: &str = "https://push.intentapp.dev";
+pub(crate) const DEFAULT_RELAY_URL: &str =
+    "https://intentpush-relay-prod-jkmi3e44vhkw4lun.markshv.workers.dev";
 /// Test seam: a relay origin other than production. Only `https://` or a
 /// loopback `http://` origin is honored.
 pub(crate) const RELAY_URL_ENV: &str = "INTENTD_PUSH_RELAY_URL";
