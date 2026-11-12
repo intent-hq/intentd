@@ -75,6 +75,7 @@ mod host_ops;
 mod invite;
 pub mod lifecycle;
 pub mod listener;
+pub mod local_pairing;
 pub mod node_link;
 pub mod pairing;
 mod panic_guard;

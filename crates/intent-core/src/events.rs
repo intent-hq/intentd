@@ -553,6 +553,28 @@ pub const HOST_MEMBERS_CHANGED: &str = "host:members-changed";
 pub const HOST_INVITES_CHANGED: &str = "host:invites-changed";
 pub const HOST_EXECUTION_CONTEXT_CHANGED: &str = "host:execution-context-changed";
 
+// Local code pairing (§5.58). `pairing:localCode-changed` carries
+// `{ localCode: LocalPairingCode }`; `pairing:localCredentials-changed`
+// carries `{ credential: LocalPairingCredential }` or
+// `{ credentialId, revoked: true }`. Global, transient, never a code, hash or
+// token, and delivered only to local-transport (UDS / named pipe)
+// connections — see [`LOCAL_TRANSPORT_EVENT_TYPES`].
+pub const PAIRING_LOCAL_CODE_CHANGED: &str = "pairing:localCode-changed";
+pub const PAIRING_LOCAL_CREDENTIALS_CHANGED: &str = "pairing:localCredentials-changed";
+
+/// Event types delivered only to local-transport connections: every TCP/WSS
+/// subscriber skips them, whatever its authority.
+pub const LOCAL_TRANSPORT_EVENT_TYPES: &[&str] = &[
+    PAIRING_LOCAL_CODE_CHANGED,
+    PAIRING_LOCAL_CREDENTIALS_CHANGED,
+];
+
+/// Whether `event_type` is delivered only to local-transport connections.
+#[must_use]
+pub fn is_local_transport_event(event_type: &str) -> bool {
+    LOCAL_TRANSPORT_EVENT_TYPES.contains(&event_type)
+}
+
 pub const PRINCIPAL_IDENTITY_CHANGED: &str = "principal:identity-changed";
 
 // App-UI events (new in intentd; daemon-owned UI-driving surface for the
@@ -785,6 +807,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     HOST_MEMBERS_CHANGED,
     HOST_INVITES_CHANGED,
     HOST_EXECUTION_CONTEXT_CHANGED,
+    PAIRING_LOCAL_CODE_CHANGED,
+    PAIRING_LOCAL_CREDENTIALS_CHANGED,
     REMOTE_MACHINE_CHANGED,
     CLOUD_MACHINE_CHANGED,
     REMOTE_LINK_TRAFFIC_RECORDS,

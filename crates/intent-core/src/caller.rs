@@ -189,6 +189,13 @@ pub type CredentialLease = Box<dyn Send + Sync>;
 /// drops. Per-principal credentials are checked with durable role in the store.
 pub trait LegacyCredentialAuthority: Send + Sync {
     fn authorize(&self) -> crate::BoxFuture<'_, crate::Result<CredentialLease>>;
+
+    /// Whether this owner-authority binding comes from a local pairing
+    /// credential (§5.58) rather than the owner token itself. Methods that
+    /// need the owner token itself refuse such a connection.
+    fn is_local_pairing(&self) -> bool {
+        false
+    }
 }
 
 /// Exact wire admission provenance, independent of the caller's role snapshot.
@@ -214,6 +221,19 @@ impl WireCredential {
             }
         }
     }
+
+    /// Whether the connection was admitted with a local pairing credential.
+    #[must_use]
+    pub fn is_local_pairing(&self) -> bool {
+        matches!(self, Self::Legacy { authority, .. } if authority.is_local_pairing())
+    }
+}
+
+/// Whether the current request's connection was admitted with a local
+/// pairing credential (§5.58): owner authority, but never the owner token.
+#[must_use]
+pub fn current_is_local_pairing() -> bool {
+    current_wire_credential().is_some_and(|credential| credential.is_local_pairing())
 }
 
 tokio::task_local! {

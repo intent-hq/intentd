@@ -2479,6 +2479,8 @@ dependencies = [
  "ctor",
  "getrandom 0.4.3",
  "git2",
+ "hex",
+ "hmac 0.13.0",
  "ignore",
  "image",
  "intent-acp",

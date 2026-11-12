@@ -44,8 +44,13 @@ fastpath invite.challenge
 fastpath invite.inspect
 fastpath invite.prove
 fastpath note.presence.update
+fastpath pairing.cancelLocalCode
+fastpath pairing.createLocalCode
 fastpath pairing.getInfo
 fastpath pairing.getSelfInfo
+fastpath pairing.listLocalCredentials
+fastpath pairing.redeemLocalCode
+fastpath pairing.revokeLocalCredential
 fastpath presence.update
 fastpath server.pairingInfo
 fastpath server.rotateToken

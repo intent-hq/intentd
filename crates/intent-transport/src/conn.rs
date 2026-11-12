@@ -723,6 +723,22 @@ async fn process_captured_frame(
                     None => true,
                 };
             }
+            if let Some(req) = crate::local_pairing::classify(value)
+                .filter(|_| server_info.services() == crate::server::PairingServices::Full)
+            {
+                // §5.58: owner administration is local-only (real connection
+                // origin); redemption is served only on `/local-pair`.
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    crate::local_pairing::handle(req, api.as_ref(), server_info.as_ref()),
+                )
+                .await;
+                return match frame {
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                    None => true,
+                };
+            }
             if let Some(req) = crate::pairing::classify(value)
                 .filter(|_| server_info.services() == crate::server::PairingServices::Full)
             {

@@ -113,6 +113,8 @@
     "note:deleted",
     "note:presence",
     "note:updated",
+    "pairing:localCode-changed",
+    "pairing:localCredentials-changed",
     "pr:linked",
     "pr:unlinked",
     "pr:updated",

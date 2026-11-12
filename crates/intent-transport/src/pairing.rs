@@ -51,6 +51,22 @@ pub(crate) async fn handle_self(
     connection: &mut ConnectionPairing,
 ) -> Option<String> {
     let request = req.request;
+    // §5.58: a local pairing credential is never re-exported as an
+    // `intent://pair` link for another device.
+    if connection
+        .admitted
+        .as_ref()
+        .is_some_and(crate::auth::AdmittedCredential::is_local_pairing)
+    {
+        return request.id_present.then(|| {
+            error_frame_with_data(
+                &request.id_echo,
+                -32003,
+                "pairing.getSelfInfo is not available to a local pairing credential",
+                &json!({ "code": "local-pairing-credential" }),
+            )
+        });
+    }
     let result = if req.valid_params {
         get_self_info(
             provider.as_ref(),

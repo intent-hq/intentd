@@ -6538,6 +6538,15 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Transport seam (§5.58 local code pairing): the host-side code slot and
+    /// local pairing credentials. `None` when the composition root wires no
+    /// store (test stubs): the methods then fail and no credential resolves.
+    fn local_pairing(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::local_pairing::LocalPairingService>> {
+        None
+    }
+
     /// Transport seam (daemon-to-daemon executor link): resolve a presented
     /// `/node/*` bearer token, already hashed (hex SHA-256), to its **active**
     /// executor credential, touching its last use. Only the `/node/*` gate

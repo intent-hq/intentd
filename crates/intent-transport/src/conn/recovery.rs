@@ -364,6 +364,12 @@ impl Forwarder {
         if !intent_core::desktop::event_visible(event) {
             return Some(false);
         }
+        // §5.58: local pairing events reach local-transport connections only.
+        if intent_core::events::is_local_transport_event(&event.event_type)
+            && crate::context::is_tcp_connection()
+        {
+            return Some(false);
+        }
         loop {
             let Some(gate) = &mut self.gate else {
                 return Some(true);

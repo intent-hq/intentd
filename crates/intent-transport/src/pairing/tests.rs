@@ -64,6 +64,7 @@ async fn self_pairing_revalidates_after_profile_and_never_falls_back() {
             crate::auth::ResolvedCredential::Principal(PrincipalId::from("person")),
             "personal".into(),
             crate::auth::LegacyRotation::new(provider.token_store(), "personal"),
+            None,
         )),
         revoked: false,
     };

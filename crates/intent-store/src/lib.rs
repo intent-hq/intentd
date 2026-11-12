@@ -50,6 +50,7 @@ mod hook_repo;
 mod host_membership_repo;
 mod idempotency_repo;
 mod known_repo_repo;
+mod local_pairing_repo;
 mod mcp_oauth_repo;
 mod message_payload;
 mod message_thumbnails;
@@ -129,6 +130,7 @@ pub use host_membership_repo::{
     HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,
     OwnerQueuePermit,
 };
+pub use local_pairing_repo::{LocalPairingCredentialRow, LocalPairingRevocation};
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 pub use node_invite_repo::{NodeInvite, NodeInviteRefusal, NodeInviteRevocation};
 pub use note_search_repo::{NoteFtsCursor, NoteFtsMatch, NoteFtsOptions};

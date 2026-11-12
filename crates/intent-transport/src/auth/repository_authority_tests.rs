@@ -27,6 +27,7 @@ fn admitted(store: &AsyncTokenStore, token: &str) -> AdmittedCredential {
         ResolvedCredential::Legacy,
         token.into(),
         LegacyRotation::new(store, token),
+        None,
     )
 }
 
@@ -108,6 +109,7 @@ async fn personal_binding_preserves_its_admitted_principal_and_original_hash() {
         ResolvedCredential::Principal(principal.clone()),
         "personal-token".into(),
         LegacyRotation::new(&store, "personal-token"),
+        None,
     );
     let binding = original
         .binding(

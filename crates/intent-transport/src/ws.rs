@@ -778,7 +778,7 @@ impl WsInner {
             tokio::select! {
                 _ = &mut shutdown => break,
                 accepted = listener.accept() => match accepted {
-                    Ok((tcp, _peer)) => {
+                    Ok((tcp, peer)) => {
                         if let Some(failures) = backoff.on_success() {
                             tracing::info!(failures, "ws accept recovered");
                         }
@@ -791,10 +791,10 @@ impl WsInner {
                             let _ = tcp.set_nodelay(true);
                             let result = match me.acceptor.clone() {
                                 Some(acceptor) => match acceptor.accept(tcp).await {
-                                    Ok(tls) => me.handle_conn(tls, epoch).await,
+                                    Ok(tls) => me.handle_conn(tls, epoch, peer.ip()).await,
                                     Err(e) => Err(e),
                                 },
-                                None => me.handle_conn(tcp, epoch).await,
+                                None => me.handle_conn(tcp, epoch, peer.ip()).await,
                             };
                             if let Err(e) = result {
                                 tracing::debug!(error = %e, "ws connection setup failed");
@@ -865,7 +865,12 @@ impl WsInner {
     /// Parse the HTTP head from an established stream (TLS or plain TCP), and
     /// either answer `/health`, reject a bad `/ws` upgrade (401/403/404), or
     /// perform the WebSocket handshake and start the connection loop.
-    async fn handle_conn<S>(self: Arc<Self>, mut stream: S, epoch: u64) -> std::io::Result<()>
+    async fn handle_conn<S>(
+        self: Arc<Self>,
+        mut stream: S,
+        epoch: u64,
+        peer: IpAddr,
+    ) -> std::io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -996,6 +1001,13 @@ impl WsInner {
         // (auth off) is the local user, exactly like UDS.
         // Subscribe before admission so an upgrade racing revocation cannot miss it.
         let revocations = self.api.subscribe_principal_revocations();
+        // §5.58: a local pairing credential is looked up after the owner
+        // token and principal credentials, only on `/ws` and only from a
+        // loopback peer; its revocation feed is subscribed first for the same
+        // reason.
+        let local_pairing = (path == "/ws" && crate::local_pairing::is_loopback_peer(peer))
+            .then(|| crate::auth::LocalPairingGate::subscribe(self.api.as_ref()))
+            .flatten();
         let admitted = if self.auth_enabled {
             // Keychain-backed token reads can stall on a locked/prompting OS
             // keychain; [`AsyncTokenStore`] offloads to the blocking pool with
@@ -1007,9 +1019,16 @@ impl WsInner {
             ) {
                 (Some(store), Some(t)) => {
                     let rotation = crate::auth::LegacyRotation::new(store, &t);
-                    validate_token(store, self.api.as_ref(), &t)
-                        .await
-                        .map(|resolved| crate::auth::AdmittedCredential::new(resolved, t, rotation))
+                    let resolved = match validate_token(store, self.api.as_ref(), &t).await {
+                        Some(resolved) => Some(resolved),
+                        None => match &local_pairing {
+                            Some(gate) => crate::auth::validate_local_pairing_token(gate, &t).await,
+                            None => None,
+                        },
+                    };
+                    resolved.map(|resolved| {
+                        crate::auth::AdmittedCredential::new(resolved, t, rotation, local_pairing)
+                    })
                 }
                 _ => None,
             };
@@ -1023,7 +1042,10 @@ impl WsInner {
         let credential = admitted
             .as_ref()
             .map_or(ResolvedCredential::Legacy, |c| c.resolved.clone());
-        let principal_credential = matches!(credential, ResolvedCredential::Principal(_));
+        let principal_credential = matches!(
+            credential,
+            ResolvedCredential::Principal(_) | ResolvedCredential::LocalPairing(_)
+        );
         let caller = credential.into_caller(self.api.as_ref()).await;
         if principal_credential && caller.is_none() {
             return reject(&mut stream, 401, "Unauthorized").await;

@@ -67,6 +67,7 @@ mod auto_retire;
 mod executor_capabilities;
 mod executor_ops;
 mod link_traffic_ops;
+pub mod local_pairing;
 mod node_invite_ops;
 mod plain_folder;
 mod remote_machine_ops;
@@ -1360,6 +1361,10 @@ pub struct Services {
     /// Live status of executor credentials (`executor.list`), attached by
     /// the executor link; unset reads every credential as disconnected.
     executor_liveness: Arc<OnceLock<Arc<dyn intent_core::machines::ExecutorLiveness>>>,
+    /// §5.58 local code pairing: the in-memory code slot and the local
+    /// pairing credentials, created on first use (after the event bus is
+    /// wired) and shared by every clone.
+    local_pairing: Arc<OnceLock<Option<Arc<local_pairing::LocalPairing>>>>,
     human_instruction_authority: Arc<tokio::sync::RwLock<()>>,
     discussion_control_gates: Arc<agent_ops::AgentRetirementGates>,
     #[cfg(test)]
@@ -1935,6 +1940,7 @@ impl Services {
             machine_routes: Arc::new(OnceLock::new()),
             link_traffic: Arc::default(),
             executor_liveness: Arc::new(OnceLock::new()),
+            local_pairing: Arc::new(OnceLock::new()),
             presence: Arc::new(presence::PresenceRegistry::default()),
             github_api_base_uri: None,
             disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
@@ -34155,6 +34161,17 @@ impl WorkspaceApi for Services {
         principal_id: intent_core::PrincipalId,
     ) -> BoxFuture<'_, Result<intent_core::HostRole>> {
         Box::pin(async move { self.store.get_host_role(&principal_id).await })
+    }
+
+    fn local_pairing(&self) -> Option<Arc<dyn intent_core::local_pairing::LocalPairingService>> {
+        self.local_pairing
+            .get_or_init(|| {
+                local_pairing::LocalPairing::new(self.store.clone(), self.event_bus.clone())
+                    .map_err(|e| tracing::error!(error = %e, "local pairing unavailable"))
+                    .ok()
+            })
+            .clone()
+            .map(|p| p as Arc<dyn intent_core::local_pairing::LocalPairingService>)
     }
 
     // ========================================================================

@@ -131,6 +131,13 @@ impl Services {
     /// `executor.mint`: see [`intent_core::WorkspaceApi::executor_mint`].
     pub(crate) async fn executor_mint_op(&self, params: Value) -> Result<Value> {
         self.require_machine_owner("executor.mint").await?;
+        // §5.58: owner authority from a local pairing credential is not the
+        // owner token, so it cannot expose this machine to a backend.
+        if intent_core::caller::current_is_local_pairing() {
+            return Err(Error::Forbidden(
+                "executor.mint requires the owner token".into(),
+            ));
+        }
         let backend_id = text_param(&params, "backendId", true)?.unwrap_or_default();
         let backend_name = text_param(&params, "backendName", true)?.unwrap_or_default();
         let backend_fingerprint = text_param(&params, "backendFingerprint", false)?;

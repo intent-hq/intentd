@@ -74,6 +74,12 @@ impl Services {
     /// [`intent_core::WorkspaceApi::executor_invite_create`].
     pub(crate) async fn executor_invite_create_op(&self, params: Value) -> Result<Value> {
         self.require_machine_owner("executor.invite.create").await?;
+        // §5.58: a local pairing credential is not the owner token.
+        if intent_core::caller::current_is_local_pairing() {
+            return Err(Error::Forbidden(
+                "executor.invite.create requires the owner token".into(),
+            ));
+        }
         let label = text_param(&params, "label", false)?.map(str::to_owned);
         let secs = expires_in_secs(&params)?;
         let host = link_host(&params)?;

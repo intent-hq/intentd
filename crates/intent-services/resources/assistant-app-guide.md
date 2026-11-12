@@ -502,6 +502,17 @@ running in WSL on the same Windows PC, add a machine with host `localhost`;
 `intentd pair --host localhost` in WSL prints the port and token. Enabling access,
 changing listening addresses, and configuring a tunnel are separate choices from
 displaying pairing information. Read current state and respect the user's requested scope.
+<!-- Labs (local code pairing): not ready; do not promote. Describe only when the user
+asks about it, and say it is experimental. It connects another Intent on the same
+computer by typing a short code the host shows (6 characters, e.g. KTP-82M; 10 minutes;
+cancelled after 5 wrong tries; one code at a time). It needs the host's listener on
+(loopback only is enough). Each connected Intent gets its own credential, listed under
+**Intents on this computer** with **Remove**, which disconnects it at once; removing
+one never affects the owner token, phones or other machines. The desktop surfaces stay
+hidden until **Enable experimental local pairing** is run from Cmd+K (Labs).
+Sources: packages/intentd/crates/intent-services/src/local_pairing.rs;
+packages/intentd/crates/intent-transport/src/local_pairing.rs;
+docs/protocol/methods/local-code-pairing.md. -->
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts; packages/cloudlands-fe/src/features/intent-web/components/. -->
 

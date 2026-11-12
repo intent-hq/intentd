@@ -21,6 +21,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
+use intent_core::local_pairing::LocalPairingService;
 use intent_core::{Caller, Error, Result, WorkspaceApi};
 
 /// Secrets-store account/key for the bearer token (`server.auth.token`).
@@ -375,37 +376,115 @@ pub(crate) struct AdmittedCredential {
     pub(crate) resolved: ResolvedCredential,
     token: String,
     pub(crate) rotation: Option<LegacyRotation>,
+    /// Live-connection accounting for a local pairing credential (§5.58):
+    /// reports `connected` while the connection holds it.
+    local_lease: Option<LocalPairingLease>,
 }
 
-/// A secret-free change watch for the legacy owner credential. Subscribe before
-/// admission; comparing hashes also handles a rotation racing the upgrade.
+/// A secret-free invalidation watch for the admitted credential: the legacy
+/// owner token's rotation, or a local pairing credential's revocation.
+/// Subscribe before admission so a change racing the upgrade is not missed.
 pub(crate) struct LegacyRotation {
-    expected: String,
-    changes: watch::Receiver<Option<String>>,
+    watch: CredentialWatch,
+}
+
+enum CredentialWatch {
+    /// Comparing hashes also handles a rotation racing the upgrade.
+    Legacy {
+        expected: String,
+        changes: watch::Receiver<Option<String>>,
+    },
+    /// Fires when `credential_id` is revoked; a lagged feed rechecks.
+    LocalPairing {
+        credential_id: String,
+        revocations: tokio::sync::broadcast::Receiver<String>,
+        service: Arc<dyn LocalPairingService>,
+    },
 }
 
 impl LegacyRotation {
     pub(crate) fn new(store: &AsyncTokenStore, token: &str) -> Self {
         Self {
-            expected: hash_token(token),
-            changes: store.changes.subscribe(),
+            watch: CredentialWatch::Legacy {
+                expected: hash_token(token),
+                changes: store.changes.subscribe(),
+            },
         }
     }
 
     pub(crate) async fn revoked(&mut self) {
-        loop {
-            if self
-                .changes
-                .borrow_and_update()
-                .as_ref()
-                .is_some_and(|hash| hash != &self.expected)
-            {
-                return;
-            }
-            if self.changes.changed().await.is_err() {
-                return;
-            }
+        match &mut self.watch {
+            CredentialWatch::Legacy { expected, changes } => loop {
+                if changes
+                    .borrow_and_update()
+                    .as_ref()
+                    .is_some_and(|hash| hash != expected)
+                {
+                    return;
+                }
+                if changes.changed().await.is_err() {
+                    return;
+                }
+            },
+            CredentialWatch::LocalPairing {
+                credential_id,
+                revocations,
+                service,
+            } => loop {
+                use tokio::sync::broadcast::error::RecvError;
+                match revocations.recv().await {
+                    Ok(revoked) if &revoked == credential_id => return,
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(_)) => {
+                        if !service.credential_active(credential_id.clone()).await {
+                            return;
+                        }
+                    }
+                    Err(RecvError::Closed) => return,
+                }
+            },
         }
+    }
+}
+
+/// Counts one live `/ws` connection against a local pairing credential.
+struct LocalPairingLease {
+    service: Arc<dyn LocalPairingService>,
+    credential_id: String,
+}
+
+impl LocalPairingLease {
+    fn open(service: Arc<dyn LocalPairingService>, credential_id: String) -> Self {
+        service.connection_opened(&credential_id);
+        Self {
+            service,
+            credential_id,
+        }
+    }
+}
+
+impl Drop for LocalPairingLease {
+    fn drop(&mut self) {
+        self.service.connection_closed(&self.credential_id);
+    }
+}
+
+/// What a local pairing admission carries from the gate: the service, and the
+/// revocation feed subscribed before the token was resolved.
+pub(crate) struct LocalPairingGate {
+    pub(crate) service: Arc<dyn LocalPairingService>,
+    pub(crate) revocations: tokio::sync::broadcast::Receiver<String>,
+}
+
+impl LocalPairingGate {
+    /// Subscribe to revocations before resolving any token.
+    pub(crate) fn subscribe(api: &dyn WorkspaceApi) -> Option<Self> {
+        let service = api.local_pairing()?;
+        let revocations = service.subscribe_revocations();
+        Some(Self {
+            service,
+            revocations,
+        })
     }
 }
 
@@ -421,13 +500,33 @@ impl AdmittedCredential {
         resolved: ResolvedCredential,
         token: String,
         rotation: LegacyRotation,
+        local: Option<LocalPairingGate>,
     ) -> Self {
-        let rotation = matches!(resolved, ResolvedCredential::Legacy).then_some(rotation);
+        let (rotation, local_lease) = match (&resolved, local) {
+            (ResolvedCredential::Legacy, _) => (Some(rotation), None),
+            (ResolvedCredential::LocalPairing(credential_id), Some(gate)) => (
+                Some(LegacyRotation {
+                    watch: CredentialWatch::LocalPairing {
+                        credential_id: credential_id.clone(),
+                        revocations: gate.revocations,
+                        service: gate.service.clone(),
+                    },
+                }),
+                Some(LocalPairingLease::open(gate.service, credential_id.clone())),
+            ),
+            _ => (None, None),
+        };
         Self {
             resolved,
             token,
             rotation,
+            local_lease,
         }
+    }
+
+    /// Whether this connection was admitted with a local pairing credential.
+    pub(crate) fn is_local_pairing(&self) -> bool {
+        matches!(self.resolved, ResolvedCredential::LocalPairing(_))
     }
 
     pub(crate) fn binding(
@@ -448,6 +547,16 @@ impl AdmittedCredential {
             ResolvedCredential::Principal(admitted) => WireCredential::Principal {
                 principal_id: admitted.clone(),
                 token_hash: hash_token(&self.token),
+            },
+            // Owner authority without the owner token: services see a
+            // legacy-shaped binding whose authority revalidates the local
+            // pairing credential and reports itself as local pairing.
+            ResolvedCredential::LocalPairing(credential_id) => WireCredential::Legacy {
+                principal_id,
+                authority: Arc::new(LocalPairingAuthority {
+                    service: self.local_lease.as_ref()?.service.clone(),
+                    credential_id: credential_id.clone(),
+                }),
             },
         })
     }
@@ -485,7 +594,47 @@ impl AdmittedCredential {
                         .await
                         .is_ok_and(|resolved| resolved.as_ref() == Some(id))
             }
+            ResolvedCredential::LocalPairing(credential_id) => {
+                let Some(service) = api.local_pairing() else {
+                    return false;
+                };
+                api.primary_principal_id()
+                    .await
+                    .is_ok_and(|primary| &primary == id)
+                    && service.credential_active(credential_id.clone()).await
+            }
         }
+    }
+}
+
+/// Owner-authority lease for a local pairing credential: valid while the
+/// credential is unrevoked. Never the owner token.
+struct LocalPairingAuthority {
+    service: Arc<dyn LocalPairingService>,
+    credential_id: String,
+}
+
+impl intent_core::caller::LegacyCredentialAuthority for LocalPairingAuthority {
+    fn authorize(
+        &self,
+    ) -> intent_core::BoxFuture<'_, Result<intent_core::caller::CredentialLease>> {
+        Box::pin(async move {
+            if self
+                .service
+                .credential_active(self.credential_id.clone())
+                .await
+            {
+                Ok(Box::new(()) as intent_core::caller::CredentialLease)
+            } else {
+                Err(Error::Forbidden(
+                    "admitted credential is no longer valid".into(),
+                ))
+            }
+        })
+    }
+
+    fn is_local_pairing(&self) -> bool {
+        true
     }
 }
 
@@ -592,6 +741,9 @@ pub(crate) enum ResolvedCredential {
     /// A per-principal credential (`principal_credential` row, matched by
     /// hex SHA-256 of the token).
     Principal(intent_core::PrincipalId),
+    /// A local pairing credential (§5.58), by credential id: the primary
+    /// principal with owner authority, admitted on `/ws` from loopback only.
+    LocalPairing(String),
 }
 
 impl ResolvedCredential {
@@ -601,6 +753,15 @@ impl ResolvedCredential {
     /// (fail-closed for principal-gated consumers).
     pub(crate) async fn into_caller(self, api: &dyn WorkspaceApi) -> Option<Caller> {
         match self {
+            ResolvedCredential::LocalPairing(_) => {
+                api.primary_principal_id()
+                    .await
+                    .ok()
+                    .map(|principal_id| Caller::Wire {
+                        principal_id,
+                        host_role: intent_core::HostRole::Owner,
+                    })
+            }
             ResolvedCredential::Legacy => match api.primary_principal_id().await {
                 Ok(principal_id) => Some(Caller::Wire {
                     principal_id,
@@ -655,6 +816,22 @@ pub(crate) async fn validate_token(
             None
         }
     }
+}
+
+/// Resolve a token among the unrevoked local pairing credentials (§5.58).
+/// Only the `/ws` gate calls this, after [`validate_token`] and only for a
+/// loopback peer; `None` rejects the upgrade (401).
+pub(crate) async fn validate_local_pairing_token(
+    gate: &LocalPairingGate,
+    candidate: &str,
+) -> Option<ResolvedCredential> {
+    if candidate.is_empty() {
+        return None;
+    }
+    gate.service
+        .resolve_credential(hash_token(candidate))
+        .await
+        .map(ResolvedCredential::LocalPairing)
 }
 
 /// Hex SHA-256 of a presented token — the only form the store ever sees.
