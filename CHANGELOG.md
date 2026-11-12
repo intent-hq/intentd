@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.191] - 2026-11-12
+
+### 📚 Documentation
+
+- Update panel move and Full width help ([#3297](https://github.com/intent-hq/intentd/pull/3297))
+
+
 ## [0.11.190] - 2026-11-12
 
 ### 🚀 Features
