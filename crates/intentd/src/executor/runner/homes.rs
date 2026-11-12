@@ -111,19 +111,25 @@ impl Runner {
     /// a restart interrupted is journaled as failed.
     pub(in crate::executor) async fn resume_leased_homes(&self, lease: &[HomeRef]) {
         for home in lease {
+            // Under the open lock, so a `homeOpen` resent after the restart
+            // and this reopen never both open the same home.
+            let _opening = self.inner.home_opens.lock().await;
             if lock(&self.inner.homes).open.contains_key(&home.home_id) {
                 continue;
             }
             let Some(worktree) = self.inner.checkouts.existing_home(&home.home_id) else {
                 continue;
             };
-            let (opened, _) = self.insert_home(home.clone(), worktree.clone());
             let status = match setup::read_status(&worktree) {
                 Some(status) if status.state == setup::Recorded::Running => {
+                    // What the interrupted setup made stays out of `home/wip`.
+                    let pins = crate::executor::checkout::recorded_pins(&worktree);
+                    setup::exclude_interrupted(&worktree, &pins).await;
                     Some(status.interrupted())
                 }
                 _ => None,
             };
+            let (opened, _) = self.insert_home(home.clone(), worktree.clone());
             if let Some(status) = status {
                 setup::write_status(&worktree, &status);
                 self.journal_setup_finished(home, &status).await;
@@ -148,6 +154,7 @@ impl Runner {
     /// Make the home checkout `frame` names and answer once it exists (at
     /// most [`OPEN_TIMEOUT`] after the frame); its setup runs after.
     pub(in crate::executor) async fn home_open(&self, frame: HomeOpen) -> HomeOpenReply {
+        let deadline = tokio::time::Instant::now() + OPEN_TIMEOUT;
         let home = frame.home();
         let reply = |outcome, error: Option<String>| HomeOpenReply {
             request_id: frame.request_id,
@@ -164,21 +171,61 @@ impl Runner {
                 )),
             );
         }
-        let _opening = self.inner.home_opens.lock().await;
-        {
-            let mut homes = lock(&self.inner.homes);
-            homes.lease.insert(home.home_id.clone());
-            if homes.open.contains_key(&home.home_id) {
-                return reply(HomeOpenOutcome::Ready, None);
-            }
+        let other_workspace = || {
+            reply(
+                HomeOpenOutcome::Failed,
+                Some(format!(
+                    "{NODE_HOME_UNKNOWN}: home {} belongs to another workspace",
+                    home.home_id
+                )),
+            )
+        };
+        let timed_out = || {
+            reply(
+                HomeOpenOutcome::Failed,
+                Some(format!(
+                    "{}: the checkout took longer than {} minutes",
+                    codes::CHECKOUT,
+                    OPEN_TIMEOUT.as_secs() / 60
+                )),
+            )
+        };
+        // An open home answers at once, without waiting for another open.
+        match self.open_state(&home) {
+            OpenState::Open => return reply(HomeOpenOutcome::Ready, None),
+            OpenState::OtherWorkspace => return other_workspace(),
+            OpenState::Closed => {}
         }
+        let Ok(_opening) = tokio::time::timeout_at(deadline, self.inner.home_opens.lock()).await
+        else {
+            return timed_out();
+        };
+        match self.open_state(&home) {
+            OpenState::Open => return reply(HomeOpenOutcome::Ready, None),
+            OpenState::OtherWorkspace => return other_workspace(),
+            OpenState::Closed => {}
+        }
+        // A checkout on disk recorded for another workspace is not this
+        // home either.
+        let recorded = self
+            .inner
+            .checkouts
+            .homes()
+            .into_iter()
+            .find(|(id, _)| id == &home.home_id)
+            .and_then(|(_, workspace)| workspace);
+        if recorded.is_some_and(|workspace| workspace != home.workspace_id) {
+            return other_workspace();
+        }
+        lock(&self.inner.homes).lease.insert(home.home_id.clone());
+        let existed = self.inner.checkouts.existing_home(&home.home_id).is_some();
         let output = SetupOutput::new(
             intent_core::node_link::SetupOwner::Home(home.clone()),
             self.inner.head.clone(),
         );
         let progress = |text: &str| output.line(text);
-        let prepared = tokio::time::timeout(
-            OPEN_TIMEOUT,
+        let prepared = tokio::time::timeout_at(
+            deadline,
             self.inner.checkouts.prepare_home(
                 &home,
                 &frame.repo_key,
@@ -187,23 +234,26 @@ impl Runner {
             ),
         )
         .await;
-        let prepared = match prepared {
-            Ok(Ok(prepared)) => prepared,
-            Ok(Err(error)) => {
-                return reply(
-                    HomeOpenOutcome::Failed,
-                    Some(format!("{}: {error:#}", codes::CHECKOUT)),
-                )
-            }
-            Err(_) => {
-                return reply(
-                    HomeOpenOutcome::Failed,
-                    Some(format!(
-                        "{}: the checkout took longer than {} minutes",
-                        codes::CHECKOUT,
-                        OPEN_TIMEOUT.as_secs() / 60
-                    )),
-                )
+        let failed = match prepared {
+            Ok(Ok(prepared)) => Ok(prepared),
+            Ok(Err(error)) => Err(reply(
+                HomeOpenOutcome::Failed,
+                Some(format!("{}: {error:#}", codes::CHECKOUT)),
+            )),
+            Err(_) => Err(timed_out()),
+        };
+        let prepared = match failed {
+            Ok(prepared) => prepared,
+            Err(failed) => {
+                // A checkout this open started and could not finish is
+                // removed, so the next `homeOpen` makes it again instead of
+                // keeping it without its submodules or setup.
+                if !existed {
+                    if let Err(error) = self.inner.checkouts.remove_home(&home.home_id).await {
+                        tracing::warn!(home = %home.home_id, %error, "node: could not remove a partial home checkout");
+                    }
+                }
+                return failed;
             }
         };
         let (opened, stop) = self.insert_home(home.clone(), prepared.worktree.clone());
@@ -249,7 +299,8 @@ impl Runner {
                 )),
             );
         };
-        match self.push_home_now(&home, PUSH_TIMEOUT).await {
+        let deadline = tokio::time::Instant::now() + PUSH_TIMEOUT;
+        match self.push_home_now(&home, deadline).await {
             Ok(pushed) => reply(HomePushOutcome::Pushed, Some(&pushed), None),
             Err(error) => reply(
                 HomePushOutcome::Failed,
@@ -287,6 +338,14 @@ impl Runner {
         }
     }
 
+    fn open_state(&self, home: &HomeRef) -> OpenState {
+        match lock(&self.inner.homes).open.get(&home.home_id) {
+            None => OpenState::Closed,
+            Some(open) if open.of.workspace_id == home.workspace_id => OpenState::Open,
+            Some(_) => OpenState::OtherWorkspace,
+        }
+    }
+
     /// The open home `home_id` of `workspace_id`, when the lease names it.
     fn leased_home(
         &self,
@@ -318,9 +377,13 @@ impl Runner {
             setup_stop: Mutex::new(Some(stop)),
             closed: watch::channel(false).0,
         });
-        lock(&self.inner.homes)
+        // Callers hold `home_opens`; an entry already there is never
+        // replaced, so a home never has two watchers.
+        let opened = lock(&self.inner.homes)
             .open
-            .insert(opened.of.home_id.clone(), opened.clone());
+            .entry(opened.of.home_id.clone())
+            .or_insert(opened)
+            .clone();
         (opened, stopped)
     }
 
@@ -449,13 +512,21 @@ impl Runner {
     }
 
     /// Push the home checkout and journal `homePushed` when it moved.
-    async fn push_home_now(&self, home: &Home, timeout: Duration) -> anyhow::Result<Pushed> {
-        let mut last = home.pushed.lock().await;
+    /// The push, waiting for one under way first, ends by `deadline`.
+    async fn push_home_now(
+        &self,
+        home: &Home,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Pushed> {
+        let mut last = tokio::time::timeout_at(deadline, home.pushed.lock())
+            .await
+            .map_err(|_| anyhow::anyhow!("another push of the home did not end in time"))?;
         let previous = last.as_ref().map(|p| p.head.clone());
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let pushed = self
             .inner
             .checkouts
-            .push_home(&home.of, &home.worktree, previous.as_deref(), timeout)
+            .push_home(&home.of, &home.worktree, previous.as_deref(), left)
             .await?;
         *lock(&home.wip_pushed_at) = Instant::now();
         let moved = last
@@ -507,12 +578,20 @@ impl Runner {
                 if !(moved || due) {
                     continue;
                 }
-                if let Err(error) = runner.push_home_now(&home, PUSH_TIMEOUT).await {
+                let deadline = tokio::time::Instant::now() + PUSH_TIMEOUT;
+                if let Err(error) = runner.push_home_now(&home, deadline).await {
                     tracing::info!(home = %home.of.home_id, %error, "node: home backup push failed; retrying");
                 }
             }
         });
     }
+}
+
+/// Whether a home is open here, for a `homeOpen`.
+enum OpenState {
+    Open,
+    OtherWorkspace,
+    Closed,
 }
 
 /// A setup run's inputs for a home checkout.

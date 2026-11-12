@@ -201,6 +201,32 @@ async fn a_home_opens_once_and_is_backed_up_by_home() {
     })
     .await;
     assert_eq!(again.outcome, HomeOpenOutcome::Ready);
+    let made = worktree(dir.path(), &h1).with_file_name(checkout::TEST_HOME_MADE);
+    assert_eq!(
+        std::fs::read_to_string(&made).unwrap(),
+        "+",
+        "a repeated homeOpen makes no second checkout"
+    );
+
+    // The same homeId named for another workspace is not this home.
+    let elsewhere = HomeRef {
+        workspace_id: WorkspaceId::from("ws-2"),
+        home_id: h1.home_id.clone(),
+    };
+    dialed.link.send(&open(&elsewhere)).await.unwrap();
+    let refused = next_of(&mut dialed, |frame| match frame {
+        LinkFrame::HomeOpenReply(reply) => Some(reply),
+        _ => None,
+    })
+    .await;
+    assert_eq!(refused.outcome, HomeOpenOutcome::Failed);
+    assert!(
+        refused
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(NODE_HOME_UNKNOWN)),
+        "{refused:?}"
+    );
 
     let commit = "1".repeat(40);
     std::fs::write(
@@ -325,5 +351,68 @@ async fn the_bind_sweep_keeps_exactly_the_leased_homes() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    node.stop().await;
+}
+
+/// After a restart, a `homeOpen` the backend resends right after binding
+/// races the reopen of the leased home: the home is opened once, so one
+/// watcher backs it up and each commit is journaled once.
+#[tokio::test]
+async fn a_resent_home_open_after_a_restart_opens_the_home_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, leasing(1, Some(Vec::new())))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    dialed.link.send(&open(&h1)).await.unwrap();
+    next_of(&mut dialed, |frame| match frame {
+        LinkFrame::HomeOpenReply(reply) => Some(reply),
+        _ => None,
+    })
+    .await;
+    let head_file = worktree(dir.path(), &h1).join(checkout::TEST_HOME_HEAD);
+    drop(dialed);
+    let api = node.stop().await;
+
+    let node = Running::start_with_launch(
+        dir.path(),
+        api,
+        CountAdmission::new(4),
+        Arc::new(HomesLaunch(true)),
+        |storage, _cache| checkout::PlainCheckouts::new(storage),
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, leasing(2, Some(vec![h1.clone()])))
+        .await
+        .unwrap();
+    dialed.link.send(&open(&h1)).await.unwrap();
+    let reply = next_of(&mut dialed, |frame| match frame {
+        LinkFrame::HomeOpenReply(reply) => Some(reply),
+        _ => None,
+    })
+    .await;
+    assert_eq!(reply.outcome, HomeOpenOutcome::Ready, "{reply:?}");
+
+    let (first, second) = ("1".repeat(40), "2".repeat(40));
+    std::fs::write(&head_file, &first).unwrap();
+    let mut heads = Vec::new();
+    loop {
+        let head = next_pushed(&mut dialed, &h1).await;
+        if head == first && !heads.contains(&first) {
+            std::fs::write(&head_file, &second).unwrap();
+        }
+        let done = head == second;
+        heads.push(head);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        heads.iter().filter(|head| **head == first).count(),
+        1,
+        "one watcher: {heads:?}"
+    );
     node.stop().await;
 }

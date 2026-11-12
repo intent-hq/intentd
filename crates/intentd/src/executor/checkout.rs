@@ -652,6 +652,10 @@ pub(super) struct PlainCheckouts {
 #[cfg(test)]
 pub(super) const TEST_HOME_HEAD: &str = ".test-head";
 
+/// Beside a test home checkout: one `+` per checkout made there.
+#[cfg(test)]
+pub(super) const TEST_HOME_MADE: &str = "made";
+
 #[cfg(test)]
 impl PlainCheckouts {
     pub(super) fn new(storage: Arc<Storage>) -> Arc<Self> {
@@ -810,6 +814,9 @@ impl Checkouts for PlainCheckouts {
             std::fs::create_dir_all(&worktree)?;
             if fresh {
                 std::fs::write(worktree.join(TEST_HOME_HEAD), "0".repeat(40))?;
+                let made = dir.join(TEST_HOME_MADE);
+                let count = std::fs::read_to_string(&made).unwrap_or_default();
+                std::fs::write(made, format!("{count}+"))?;
             }
             let tmp = dir.join("tmp");
             std::fs::create_dir_all(&tmp)?;
