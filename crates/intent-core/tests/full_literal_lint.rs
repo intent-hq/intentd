@@ -537,6 +537,12 @@ mod fixtures {
                 .map(|h| h.line)
                 .collect();
         assert_eq!(lines, vec![1, 7]);
+        // The wrong-tag marker is the other type's marker over no literal of
+        // that type, so the Workspace scan reports it as stale.
+        assert!(scan(src).contains(&Hit {
+            line: 6,
+            kind: HitKind::StaleMarker
+        }));
     }
 
     #[test]

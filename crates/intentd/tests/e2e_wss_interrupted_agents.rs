@@ -365,8 +365,7 @@ async fn interrupted_agents_persisted_across_restart() {
             id: AgentId(agent_id.clone()),
             workspace_id: WorkspaceId(ws_id.to_string()),
             name: "Interrupted Agent".to_string(),
-            status: AgentStatus::Active,
-            // stale in-flight
+            status: AgentStatus::Active, // stale in-flight
             is_active: true,
             created_at: ts.clone(),
             updated_at: ts,

@@ -232,8 +232,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             id: AgentId(agent_resume.clone()),
             workspace_id: WorkspaceId(ws_id.to_string()),
             name: "Resume Agent".to_string(),
-            status: AgentStatus::RuntimeIdle,
-            // settled after heal
+            status: AgentStatus::RuntimeIdle, // settled after heal
             is_active: true,
             created_at: ts.clone(),
             updated_at: ts.clone(),
