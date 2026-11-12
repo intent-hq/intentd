@@ -1631,21 +1631,21 @@ fn help_lists_machines_and_cloud_entries_in_the_saved_order() {
         ),
         "{text}"
     );
-    let older = exposed_machines_help(&inputs).unwrap();
-    let numbered: Vec<&str> = older
+    let legacy_text = exposed_machines_help(&inputs).unwrap();
+    let numbered: Vec<&str> = legacy_text
         .lines()
         .filter(|line| line.starts_with(|c: char| c.is_ascii_digit()))
         .collect();
-    assert_eq!(numbered.len(), 4, "{older}");
+    assert_eq!(numbered.len(), 4, "{legacy_text}");
     assert!(
         numbered[0].starts_with("1. \"E2B\" (cloudMachineId `e2b`"),
-        "{older}"
+        "{legacy_text}"
     );
     assert!(
         numbered[1].starts_with("2. \"Beta\" (nodeId `m-b`"),
-        "{older}"
+        "{legacy_text}"
     );
-    assert!(older.contains("Listed in the user's order of preference."));
+    assert!(legacy_text.contains("Listed in the user's order of preference."));
 
     let reordered = [
         MachineOrderKey::Machine {
