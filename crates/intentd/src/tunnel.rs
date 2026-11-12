@@ -101,6 +101,45 @@ fn tailcat_spawn_error_impl(
     ))
 }
 
+/// How long [`TunnelSupervisor::stop`] waits for a cancelled sidecar child to
+/// exit before giving up and leaving local pairing blocked.
+const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wait until process `pid` no longer exists (`true`), or `timeout` passes
+/// (`false`). `0` means no child was ever spawned. Off unix the kill
+/// `kill_on_drop` issued on cancellation is taken as final.
+async fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(raw) = i32::try_from(pid) else {
+            return true;
+        };
+        if raw == 0 {
+            return true;
+        }
+        let target = nix::unistd::Pid::from_raw(raw);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if matches!(
+                nix::sys::signal::kill(target, None),
+                Err(nix::errno::Errno::ESRCH)
+            ) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            // timing-guard: poll for the killed sidecar's exit, bounded by `timeout`
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, timeout);
+        true
+    }
+}
+
 /// Supervisor for the tailcat sidecar. One instance lives in the composition
 /// root (`DaemonControl`); `start`/`stop` are idempotent and safe to call
 /// from concurrent settings updates (single async Mutex over the state).
@@ -128,6 +167,9 @@ pub type ActiveHook = std::sync::Arc<dyn Fn(bool) + Send + Sync>;
 /// so the address accessors stop advertising a route nothing is serving.
 struct Running {
     address: String,
+    /// Process id of the newest sidecar child (0 before the first spawn),
+    /// published as soon as each child is spawned.
+    child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
     up: std::sync::Arc<std::sync::atomic::AtomicBool>,
     recycle: std::sync::Arc<tokio::sync::Notify>,
     stop_tx: tokio::sync::watch::Sender<bool>,
@@ -195,12 +237,14 @@ impl TunnelSupervisor {
         // Active before the child exists, so nothing it forwards can reach a
         // loopback-only surface (§5.58) before local pairing is off.
         self.set_active(true);
+        let child_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let spawned = spawn_and_read_address(
             &self.bin,
             &self.key_path,
             ws_port,
             derp_url.as_deref(),
             self.address_timeout,
+            &child_pid,
         )
         .await;
         let (child, address) = match spawned {
@@ -224,9 +268,11 @@ impl TunnelSupervisor {
             stop_rx,
             std::sync::Arc::clone(&up),
             std::sync::Arc::clone(&recycle),
+            std::sync::Arc::clone(&child_pid),
         ));
         *state = Some(Running {
             address: address.clone(),
+            child_pid,
             up,
             recycle,
             stop_tx,
@@ -246,7 +292,21 @@ impl TunnelSupervisor {
                 .await
                 .is_err()
             {
+                // The task may be mid-restart (awaiting a new child's
+                // address) and not watching the stop signal. Cancelling it
+                // drops that child (`kill_on_drop`); wait for the
+                // cancellation, then for the process itself to be gone,
+                // before reopening local pairing (§5.58 fails closed).
                 running.task.abort();
+                let _ = (&mut running.task).await;
+                let pid = running.child_pid.load(std::sync::atomic::Ordering::SeqCst);
+                if !wait_for_exit(pid, STOP_CONFIRM_TIMEOUT).await {
+                    tracing::error!(
+                        pid,
+                        "tailcat sidecar still running after stop; local pairing stays blocked"
+                    );
+                    return;
+                }
             }
             self.set_active(false);
         }
@@ -359,10 +419,14 @@ async fn spawn_and_read_address(
     ws_port: u16,
     derp_url: Option<&str>,
     timeout: Duration,
+    child_pid: &std::sync::atomic::AtomicU32,
 ) -> Result<(Child, String)> {
     let mut child = serve_command(bin, key_path, ws_port, derp_url)
         .spawn()
         .map_err(|e| tailcat_spawn_error("serve", bin, &e))?;
+    if let Some(pid) = child.id() {
+        child_pid.store(pid, std::sync::atomic::Ordering::SeqCst);
+    }
     // Drain stderr into the daemon log so crash-loop causes (bad DERP map,
     // key parse failure, network errors) are diagnosable, and the child never
     // blocks on a full pipe.
@@ -442,6 +506,7 @@ async fn supervise(
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     up: std::sync::Arc<std::sync::atomic::AtomicBool>,
     recycle: std::sync::Arc<tokio::sync::Notify>,
+    child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     let mut backoff = RESTART_BACKOFF_INITIAL;
     loop {
@@ -508,6 +573,7 @@ async fn supervise(
                 ws_port,
                 derp_url.as_deref(),
                 address_timeout,
+                &child_pid,
             )
             .await
             {
@@ -677,6 +743,104 @@ esac
         sup.stop().await;
         assert!(!sup.is_active());
         assert_eq!(*seen.lock().unwrap(), vec![false, true, false]);
+    }
+
+    /// §5.58: a stop that has to cancel a restart still waiting for its
+    /// child's address keeps local pairing blocked until that child is gone.
+    #[tokio::test]
+    async fn stop_during_restart_reopens_pairing_only_after_the_child_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-tailcat.sh");
+        // First serve prints the address, then exits on the marker; the
+        // restarted one records its pid and never reports an address.
+        let script = r#"#!/bin/sh
+key=""
+for arg in "$@"; do
+  case "$arg" in
+    --key=*) key="${arg#--key=}" ;;
+  esac
+done
+dir=$(dirname "$key")
+case "$1" in
+  genkey)
+    printf 'k' > "$key"
+    ;;
+  serve)
+    n=$(cat "$dir/runs" 2>/dev/null || echo 0)
+    n=$((n+1))
+    echo "$n" > "$dir/runs"
+    if [ "$n" -eq 1 ]; then
+      printf '{"listenAddr":"tcTest"}\n'
+      while [ ! -f "$dir/exit-now" ]; do sleep 0.1; done
+      exit 1
+    fi
+    echo $$ > "$dir/restart-pid"
+    exec sleep 600
+    ;;
+esac
+"#;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The restart waits far longer than stop's five-second grace.
+        let sup =
+            TunnelSupervisor::new(path, dir.path()).with_address_timeout(Duration::from_secs(60));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        sup.set_active_hook(std::sync::Arc::new({
+            let seen = seen.clone();
+            move |active| seen.lock().unwrap().push(active)
+        }));
+        sup.start(5181, None).await.unwrap();
+        std::fs::write(dir.path().join("exit-now"), b"").unwrap();
+        let pid_file = dir.path().join("restart-pid");
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(15));
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "restart never spawned"
+            );
+            // timing-guard: poll for the restarted child's pid file, bounded by the deadline
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(sup.is_active());
+
+        sup.stop().await;
+        assert!(
+            matches!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                Err(nix::errno::Errno::ESRCH)
+            ),
+            "the restarted child is gone before pairing reopens"
+        );
+        assert!(!sup.is_active());
+        assert_eq!(*seen.lock().unwrap(), vec![false, true, false]);
+    }
+
+    #[tokio::test]
+    async fn wait_for_exit_reports_a_live_process_until_it_exits() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // fixed-deadline: allow — a short probe of a process that is alive by construction
+        assert!(!wait_for_exit(pid, Duration::from_millis(200)).await);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            wait_for_exit(
+                pid,
+                intentd_test_support::test_timeout(Duration::from_secs(5))
+            )
+            .await
+        );
+        assert!(wait_for_exit(0, Duration::ZERO).await);
     }
 
     /// A paused VM (E2B sandbox) or a sleeping host thaws the same tailcat
