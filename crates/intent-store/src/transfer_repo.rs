@@ -429,6 +429,8 @@ impl Store {
                 let size_expr = match columns.get(*table) {
                     Some(cols) if !cols.is_empty() => cols
                         .iter()
+                        // The argument must stay a bare column: any wrapper
+                        // (CAST, COLLATE, an expression) loads the value again.
                         .map(|c| format!("COALESCE(OCTET_LENGTH(\"{c}\"), 0)"))
                         .collect::<Vec<_>>()
                         .join(" + "),

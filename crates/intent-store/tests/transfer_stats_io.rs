@@ -95,8 +95,8 @@ async fn transfer_table_stats_skips_large_value_pages() {
             stat.approx_bytes
         );
     }
-    // Loading the values reads all of them; the record headers that carry
-    // their lengths fit in roughly one leaf page per row.
+    // Loading the values reads all of them; the leaf pages holding the record
+    // headers that carry their lengths are a small fraction of that.
     let value_bytes = 2 * ROWS * VALUE_BYTES;
     assert!(
         read < value_bytes / 4,
