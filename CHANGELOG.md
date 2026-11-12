@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.193] - 2026-11-12
+
+### 🚀 Features
+
+- *(install)* Pair option and link marker for the Add machine wizard ([#3304](https://github.com/intent-hq/intentd/pull/3304))
+
+### 🧪 Testing
+
+- Share an AgentSession default and lint full literals ([#3305](https://github.com/intent-hq/intentd/pull/3305))
+
+
 ## [0.11.192] - 2026-11-12
 
 ### 🚀 Features
