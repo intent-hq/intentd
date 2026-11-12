@@ -822,8 +822,9 @@ open the chat's settings menu and turn on **Ask before using tools**. The agent 
 pauses at each approval and shows **Allow** / **Deny** in the conversation; an
 unanswered request is cancelled after 5 minutes. When the agent offers an **Always allow**
 choice, a hint under it says how far it reaches: **This chat only**, **This workspace
-only** (Claude saves the rule in the workspace) or **All workspaces** (Cursor saves it in
-your Cursor settings). After that the agent stops asking for that action, even with
+only** (for example Claude's "don't ask again" rules, saved in the workspace) or **All
+workspaces** (saved in the agent's own settings, for example Cursor's "Allow always" or
+Codex's command rules). No hint means Intent does not know how far it reaches. After that the agent stops asking for that action, even with
 **Ask before using tools** on. The change applies from the next
 message, and a turn already running keeps its setting. Agents this chat starts, and
 agents on remote machines, do not use this setting. Codex works differently: with
