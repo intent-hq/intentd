@@ -764,6 +764,10 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     )
     .await;
     assert_eq!(oversized["code"], -32602, "{oversized}");
+    assert!(
+        oversized["message"].as_str().unwrap().contains("apiKey"),
+        "{oversized}"
+    );
     let listed = ok(&mut rpc_ws, 20, "cloudMachines.list", json!({})).await;
     assert_eq!(
         listed["providers"],
