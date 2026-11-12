@@ -160,6 +160,7 @@ fn build_release(dir: &Path) -> PathBuf {
 const FAKE_LOGINCTL: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >>"$FAKE_STATE/loginctl"
 [ "${FAKE_LINGER:-}" = yes ] && : >"$FAKE_STATE/linger"
+while [ "${1#--}" != "$1" ]; do shift; done
 case "$1" in
   show-user)
     if [ -f "$FAKE_STATE/linger" ]; then echo Linger=yes; else echo Linger=no; fi ;;
@@ -695,7 +696,7 @@ fn linux_service_setup_turns_lingering_on_without_sudo_when_allowed() {
     );
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(
-        recorded(&run, "loginctl").contains(&format!("enable-linger {}", user())),
+        recorded(&run, "loginctl").contains(&format!("--no-ask-password enable-linger {}", user())),
         "{}",
         run.describe()
     );
@@ -711,7 +712,7 @@ fn linux_service_setup_prints_the_sudo_step_when_lingering_is_refused() {
     let run = run_install_on(Terminal::None, &["--service"], &[], false);
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(
-        recorded(&run, "loginctl").contains(&format!("enable-linger {}", user())),
+        recorded(&run, "loginctl").contains(&format!("--no-ask-password enable-linger {}", user())),
         "{}",
         run.describe()
     );
@@ -730,7 +731,7 @@ fn linux_service_setup_leaves_lingering_alone_when_it_is_on() {
     assert!(
         !recorded(&run, "loginctl")
             .iter()
-            .any(|c| c.starts_with("enable-linger")),
+            .any(|c| c.contains("enable-linger")),
         "{}",
         run.describe()
     );

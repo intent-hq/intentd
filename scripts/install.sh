@@ -897,7 +897,8 @@ EOF
   if command -v loginctl >/dev/null 2>&1; then
     user=$(id -un)
     if [ "$(loginctl show-user "$user" --property=Linger 2>/dev/null)" != "Linger=yes" ]; then
-      loginctl enable-linger "$user" >/dev/null 2>&1 || true
+      # --no-ask-password: never stop at a polkit password prompt.
+      loginctl --no-ask-password enable-linger "$user" >/dev/null 2>&1 || true
       if [ "$(loginctl show-user "$user" --property=Linger 2>/dev/null)" = "Linger=yes" ]; then
         info "lingering on — intentd keeps running after you log out and starts at boot"
       else
@@ -915,6 +916,8 @@ EOF
     apply_pair
   elif [ "$daemon_mode" = "node" ]; then
     warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
+  elif [ "$pair" = "yes" ]; then
+    warn "pairing did not run because the daemon is not up yet — once it is: intentd pair --tunnel"
   fi
   info "manage the service with: systemctl --user {status|stop|restart|disable} $unit_name"
   [ "$daemon_mode" = "node" ] || [ "$paired" = "yes" ] \
@@ -1004,6 +1007,8 @@ EOF
     apply_pair
   elif [ "$daemon_mode" = "node" ]; then
     warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
+  elif [ "$pair" = "yes" ]; then
+    warn "pairing did not run because the daemon is not up yet — once it is: intentd pair --tunnel"
   fi
   info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
   [ "$daemon_mode" = "node" ] || [ "$paired" = "yes" ] \
