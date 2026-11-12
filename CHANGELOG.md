@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.197] - 2026-11-12
+
+### 📚 Documentation
+
+- *(browser)* Explain compact browser status controls ([#3321](https://github.com/intent-hq/intentd/pull/3321))
+
+
 ## [0.11.196] - 2026-11-12
 
 ### 📚 Documentation
