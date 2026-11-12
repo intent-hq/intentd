@@ -141,6 +141,30 @@ pub enum ToolRemovalStyle {
     CommaJoined,
 }
 
+/// How far an approval granted with a provider's `allow_always` option
+/// reaches (PROTOCOL §8 option `scope`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowAlwaysScope {
+    /// The current agent session only.
+    Chat,
+    /// Saved in the agent's workspace checkout.
+    Workspace,
+    /// Saved in the user's own CLI configuration.
+    AllWorkspaces,
+}
+
+impl AllowAlwaysScope {
+    /// The wire value.
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Workspace => "workspace",
+            Self::AllWorkspaces => "allWorkspaces",
+        }
+    }
+}
+
 /// Configuration for an ACP provider (port of `ACPProviderConfig`).
 ///
 /// UI-only fields from the TS interface (`ipcChannelPrefix`, `iconPath`) are
@@ -328,6 +352,10 @@ pub struct ProviderConfig {
     /// configuration (Cursor persists it to `~/.cursor/cli-config.json`'s
     /// allowlist): the daemon must never change user settings.
     pub auto_allow_once: bool,
+    /// Where the provider keeps an `allow_always` approval; `None` when
+    /// unknown. An option labelled "this session" / "this conversation"
+    /// reaches the chat only, whatever this says.
+    pub allow_always_scope: Option<AllowAlwaysScope>,
     /// Provider-specific section appended to the assembled system prompt
     /// (prompt-only policy for a provider with no tool-level knob). Cursor:
     /// its native `Task` subagent tool stays callable without the
@@ -402,6 +430,7 @@ impl ProviderConfig {
             kills_child_on_interrupt: false,
             supports_test_prompt: true,
             auto_allow_once: false,
+            allow_always_scope: None,
             system_prompt_note: None,
         }
     }
@@ -505,6 +534,8 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // The pinned CLI drops `run_in_background` from its Bash and Agent
         // tools and their prompt text when this is set.
         remote_launch_env: &[("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")],
+        // claude-agent-acp saves command, web and MCP rules to the checkout's `.claude/settings.local.json`.
+        allow_always_scope: Some(AllowAlwaysScope::Workspace),
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
@@ -548,6 +579,8 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         requires_secondary_binary: Some("codex"),
         npx_only_package: Some(CODEX_ACP_NPX_PACKAGE),
         short_name: "Codex",
+        // codex-acp's `acceptForSession` lasts for the session.
+        allow_always_scope: Some(AllowAlwaysScope::Chat),
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
     },
     ProviderConfig {
@@ -777,6 +810,8 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // though initialize never advertises `clientCapabilities.subagents`.
         // The restriction is prompt-only (user decision 2026-11-05).
         system_prompt_note: Some(CURSOR_SUBAGENT_PROMPT_NOTE),
+        // Cursor's `allow-always` writes `~/.cursor/cli-config.json`.
+        allow_always_scope: Some(AllowAlwaysScope::AllWorkspaces),
         ..ProviderConfig::empty("cursor", "Cursor", "cursor-agent")
     },
     ProviderConfig {

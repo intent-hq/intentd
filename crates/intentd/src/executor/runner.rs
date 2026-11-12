@@ -2140,7 +2140,8 @@ impl Runner {
             self.inner.launch.policy(),
             Arc::new(NodeSink),
         )
-        .with_auto_allow_once(launch.config.auto_allow_once);
+        .with_auto_allow_once(launch.config.auto_allow_once)
+        .with_allow_always_scope(launch.config.allow_always_scope);
         let serving = connection.clone();
         // caller-binding: allow — serves the provider's file and permission callbacks locally; the node has no service layer
         let serve = tokio::spawn(async move {

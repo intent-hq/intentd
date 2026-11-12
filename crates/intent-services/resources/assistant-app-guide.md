@@ -815,12 +815,16 @@ the normal order. Pins are saved by Intent, so they appear on every device
 connected to the same Intent. Only foreground agents that were not started by
 another agent can be pinned.
 
-<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/AgentViewSettingsDropdown.svelte; packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update permissionPolicy); packages/intentd/crates/intent-services/src/agent_manager.rs (permission_policy_for, respawn on change); packages/intentd/crates/intent-services/src/settings.rs (agents.permissionPolicy); packages/intentd/crates/intentd/src/main.rs (INTENTD_PERMISSION_POLICY override); packages/intentd/crates/intent-acp/src/spawn.rs (Codex INITIAL_AGENT_MODE); packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte (Agent defaults). -->
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/AgentViewSettingsDropdown.svelte; packages/cloudlands-fe/src/lib/components/chat/InlinePermissionRequest.svelte; packages/intentd/crates/intent-acp/src/permission.rs (option kind/scope); packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update permissionPolicy); packages/intentd/crates/intent-services/src/agent_manager.rs (permission_policy_for, respawn on change); packages/intentd/crates/intent-services/src/settings.rs (agents.permissionPolicy); packages/intentd/crates/intentd/src/main.rs (INTENTD_PERMISSION_POLICY override); packages/intentd/crates/intent-acp/src/spawn.rs (Codex INITIAL_AGENT_MODE); packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte (Agent defaults). -->
 
 By default agents use tools without asking. To approve each tool use in one chat,
 open the chat's settings menu and turn on **Ask before using tools**. The agent then
 pauses at each approval and shows **Allow** / **Deny** in the conversation; an
-unanswered request is cancelled after 5 minutes. The change applies from the next
+unanswered request is cancelled after 5 minutes. When the agent offers an **Always allow**
+choice, a hint under it says how far it reaches: **This chat only**, **This workspace
+only** (Claude saves the rule in the workspace) or **All workspaces** (Cursor saves it in
+your Cursor settings). After that the agent stops asking for that action, even with
+**Ask before using tools** on. The change applies from the next
 message, and a turn already running keeps its setting. Agents this chat starts, and
 agents on remote machines, do not use this setting. Codex works differently: with
 this setting on, it edits files in the workspace freely and asks only before writing

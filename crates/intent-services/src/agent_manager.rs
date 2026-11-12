@@ -4174,6 +4174,7 @@ impl AgentManager {
             )
             .with_terminal_host(terminal_host)
             .with_auto_allow_once(opts.provider.auto_allow_once)
+            .with_allow_always_scope(opts.provider.allow_always_scope)
             // Commands the daemon runs for the agent (ACP `terminal/create`)
             // share the agent process's private temp folder.
             .with_terminal_env_defaults(agent_tmp_env(agent_tmp_dir.as_ref())),
