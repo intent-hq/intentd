@@ -207,8 +207,8 @@ Open Settings and use these sidebar labels (English labels shown):
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
 In test builds with **Full width**, open **Settings → Appearance → Full width**.
-It is on by default. Turn it off to
-center the conversation, composer, and status content within an **800 px** limit.
+It uses the full panel width for messages, the composer, and status content and is
+on by default. Turn it off to center that content within an **800 px** limit.
 Narrower panels still use the available width, and aurora still covers the full
 panel. The chat pane's **More** menu also offers **Full width**, **Chat aurora**,
 and **Collapse tool activity** beside **Font**. These shortcuts change the same
