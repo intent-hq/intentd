@@ -106,8 +106,9 @@ fn tailcat_spawn_error_impl(
 const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wait until process `pid` no longer exists (`true`), or `timeout` passes
-/// (`false`). `0` means no child was ever spawned. Off unix the kill
-/// `kill_on_drop` issued on cancellation is taken as final.
+/// (`false`). `0` means no child was ever spawned. Off unix the exit cannot
+/// be observed from a pid here, so it is never confirmed (`false`): local
+/// pairing stays blocked rather than assume a requested kill finished.
 async fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
     #[cfg(unix)]
     {
@@ -135,8 +136,8 @@ async fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
     }
     #[cfg(not(unix))]
     {
-        let _ = (pid, timeout);
-        true
+        let _ = timeout;
+        pid == 0
     }
 }
 
@@ -245,6 +246,7 @@ impl TunnelSupervisor {
             derp_url.as_deref(),
             self.address_timeout,
             &child_pid,
+            None,
         )
         .await;
         let (child, address) = match spawned {
@@ -292,11 +294,12 @@ impl TunnelSupervisor {
                 .await
                 .is_err()
             {
-                // The task may be mid-restart (awaiting a new child's
-                // address) and not watching the stop signal. Cancelling it
-                // drops that child (`kill_on_drop`); wait for the
-                // cancellation, then for the process itself to be gone,
-                // before reopening local pairing (§5.58 fails closed).
+                // Every wait in the task watches the stop signal and kills
+                // its child with a confirmed wait, so this is a last resort
+                // (a wedged kill). Cancelling drops the child
+                // (`kill_on_drop` only requests termination): wait for the
+                // cancellation, then for the process to be gone, before
+                // reopening local pairing (§5.58 fails closed).
                 running.task.abort();
                 let _ = (&mut running.task).await;
                 let pid = running.child_pid.load(std::sync::atomic::Ordering::SeqCst);
@@ -420,6 +423,7 @@ async fn spawn_and_read_address(
     derp_url: Option<&str>,
     timeout: Duration,
     child_pid: &std::sync::atomic::AtomicU32,
+    mut stop_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(Child, String)> {
     let mut child = serve_command(bin, key_path, ws_port, derp_url)
         .spawn()
@@ -446,15 +450,35 @@ async fn spawn_and_read_address(
         .take()
         .ok_or_else(|| Error::Internal("tailcat stdout not captured".to_string()))?;
     let mut lines = BufReader::new(stdout).lines();
-    let address = tokio::time::timeout(timeout, async {
+    let read = tokio::time::timeout(timeout, async {
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some(addr) = parse_listen_addr(&line) {
                 return Some(addr);
             }
         }
         None
-    })
-    .await;
+    });
+    // A stop while waiting kills this child and waits for it to exit (on
+    // every platform), so `stop` never has to abandon a forwarding child.
+    let stopped = async {
+        match stop_rx.as_deref_mut() {
+            Some(rx) => {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                let _ = rx.changed().await;
+            }
+            None => std::future::pending().await,
+        }
+    };
+    let address = tokio::select! {
+        biased;
+        () = stopped => {
+            let _ = child.kill().await;
+            return Err(Error::Internal("tailcat stopped before reporting its address".to_string()));
+        }
+        address = read => address,
+    };
     match address {
         Ok(Some(addr)) => {
             // Keep draining stdout in the background so the child never
@@ -574,6 +598,7 @@ async fn supervise(
                 derp_url.as_deref(),
                 address_timeout,
                 &child_pid,
+                Some(&mut stop_rx),
             )
             .await
             {
@@ -591,6 +616,7 @@ async fn supervise(
                     up.store(true, std::sync::atomic::Ordering::Relaxed);
                     break new_child;
                 }
+                Err(_) if *stop_rx.borrow() => return,
                 Err(e) => {
                     tracing::warn!(error = %e, "tailcat tunnel restart failed; will retry");
                     delay = backoff;
@@ -745,8 +771,9 @@ esac
         assert_eq!(*seen.lock().unwrap(), vec![false, true, false]);
     }
 
-    /// §5.58: a stop that has to cancel a restart still waiting for its
-    /// child's address keeps local pairing blocked until that child is gone.
+    /// §5.58: a stop during a restart still waiting for its child's address
+    /// kills that child and waits for it to exit before local pairing
+    /// reopens.
     #[tokio::test]
     async fn stop_during_restart_reopens_pairing_only_after_the_child_exits() {
         let dir = tempfile::tempdir().unwrap();
@@ -781,7 +808,7 @@ esac
 "#;
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // The restart waits far longer than stop's five-second grace.
+        // The restart would wait far longer than stop's five-second grace.
         let sup =
             TunnelSupervisor::new(path, dir.path()).with_address_timeout(Duration::from_secs(60));
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
