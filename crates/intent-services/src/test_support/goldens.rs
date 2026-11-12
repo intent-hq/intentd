@@ -118,6 +118,7 @@ pub async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     svc.store()
         .insert_agent_session(&session)

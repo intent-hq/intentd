@@ -4061,6 +4061,7 @@ mod workspace_needs_attention {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         }
     }
 

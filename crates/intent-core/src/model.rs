@@ -3966,6 +3966,8 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "retiredAt",
     "notificationsMuted",
     "pinned",
+    "permissionPolicy",
+    "effectivePermissionPolicy",
     "harnessVersion",
     "nodeId",
     "nodeName",
@@ -4701,6 +4703,13 @@ pub struct AgentSession {
     /// full-row session writes never revert it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// Per-session permission policy override (PROTOCOL §8):
+    /// `interactive` | `allow` | `auto` | `deny`, or `None` to follow the
+    /// daemon default. Set through `agent.update { permissionPolicy }`; a
+    /// user preference like [`Self::pinned`], so ordinary full-row session
+    /// writes never revert it. Applied when the agent's process next starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_policy: Option<String>,
     /// Harness version this session was stamped with at creation
     /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
     /// upgrade never changes it, and there is no upgrade/migration/pinning
@@ -5263,6 +5272,18 @@ pub struct AgentLite {
     /// daemon accepts `agent.update { pinned }`; older daemons omit it.
     #[serde(default)]
     pub pinned: bool,
+    /// Per-session permission policy override; mirrors
+    /// [`AgentSession::permission_policy`]. Always emitted (`null` = the
+    /// daemon default), so its presence tells clients the daemon accepts
+    /// `agent.update { permissionPolicy }`.
+    #[serde(default)]
+    pub permission_policy: Option<String>,
+    /// The policy the agent's next process start uses: the override, else
+    /// the daemon default. Overlaid by the service projection (no runtime
+    /// context here); omitted for remote agents, whose machine applies
+    /// `remoteAgents.permission`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_permission_policy: Option<String>,
     /// Harness version the session was stamped with at creation; mirrors
     /// [`AgentSession::harness_version`] (intent-hq/monorepo#2459).
     #[serde(default = "default_harness_version")]
@@ -5414,6 +5435,8 @@ impl AgentLite {
             retired_at: session.retired_at,
             notifications_muted: session.notifications_muted,
             pinned: session.pinned,
+            permission_policy: session.permission_policy,
+            effective_permission_policy: None,
             harness_version: session.harness_version,
             harness_features: session.harness_features,
             node_id: remote
@@ -8927,6 +8950,7 @@ mod tests {
             retired_at: None,
             notifications_muted: true,
             pinned: false,
+            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
         };
@@ -9023,6 +9047,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
         };
@@ -9166,6 +9191,7 @@ mod tests {
                 retired_at: None,
                 notifications_muted: false,
                 pinned: false,
+                permission_policy: None,
                 created_at: "t0".to_string(),
                 updated_at: "t1".to_string(),
             };
@@ -9254,6 +9280,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
         };
@@ -9331,6 +9358,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
         };
@@ -9401,6 +9429,7 @@ mod tests {
                 retired_at: None,
                 notifications_muted: false,
                 pinned: false,
+                permission_policy: None,
                 created_at: "2026-09-21T04:00:00.000000000Z".to_string(),
                 updated_at: "2026-09-21T05:00:00.000000000Z".to_string(),
             };
@@ -9551,6 +9580,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
         };
@@ -9822,6 +9852,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
         };

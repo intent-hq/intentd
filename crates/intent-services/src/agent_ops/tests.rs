@@ -10552,6 +10552,7 @@ async fn worst_case_agent_list_row(
         "m".repeat(NAME_CAP)
     ));
     s.reasoning_effort = Some("medium".into());
+    s.permission_policy = Some("interactive".into());
     s.specialist = Some("developer".into());
     s.task_note_id = Some(intent_core::NoteId::from(
         "1d8c1e09-41fb-4b83-834a-781d012e2707",
@@ -10682,6 +10683,7 @@ async fn worst_case_agent_list_row(
     row.turn_in_flight = true;
     row.last_stream_activity_at = Some(ts.clone());
     row.session_corrupted = true;
+    row.effective_permission_policy = Some("interactive".into());
     row.retired_at = Some(ts);
     row.cap_list_previews();
     (id, row)

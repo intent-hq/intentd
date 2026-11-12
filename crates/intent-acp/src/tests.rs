@@ -4226,6 +4226,71 @@ mod client_served_tests {
             .contains(&"agent:permission:request".to_string()));
     }
 
+    /// A Codex session in a restricted sandbox still denies escalation under
+    /// every headless policy, but an interactive chat asks the user instead.
+    #[tokio::test]
+    async fn restricted_codex_escalation_asks_only_under_interactive() {
+        let modes: agent_client_protocol::schema::v1::SessionModeState = serde_json::from_value(
+            json!({"currentModeId":"workspace-write","availableModes":[{"id":"workspace-write","name":"Workspace"},{"id":"read-only","name":"Read"}]}),
+        )
+        .unwrap();
+        for policy in [
+            PermissionPolicy::AllowAll,
+            PermissionPolicy::AutoByRisk,
+            PermissionPolicy::Interactive,
+        ] {
+            let root = temp_dir();
+            let (handler, registry) = build_handler(
+                root.path(),
+                policy,
+                Arc::new(MockSink::default()),
+                PermissionRegistry::new(),
+            );
+            let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+            crate::codex_sandbox::configure(&conn, "codex", "acp-1", Some(&modes));
+            let req = send(
+                &mut writer,
+                &mut req_rx,
+                13,
+                "session/request_permission",
+                permission_params("Run curl outside the sandbox"),
+            )
+            .await;
+            let handler = Arc::new(handler);
+            let conn = Arc::new(conn);
+            let task = {
+                let (handler, conn) = (handler.clone(), conn.clone());
+                tokio::spawn(async move { handler.serve(&conn, req).await.unwrap() })
+            };
+            if policy == PermissionPolicy::Interactive {
+                let request_id = loop {
+                    if let Some(data) = registry.pending().first() {
+                        break data.request_id.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+                assert!(registry.resolve(
+                    &request_id,
+                    PermissionOutcome::Selected {
+                        option_id: "allow_once".to_string()
+                    }
+                ));
+            }
+            task.await.unwrap();
+            let resp = read_frame(&mut reader).await;
+            let expected = if policy == PermissionPolicy::Interactive {
+                "allow_once"
+            } else {
+                "reject_once"
+            };
+            assert_eq!(
+                resp["result"]["outcome"]["optionId"],
+                json!(expected),
+                "{policy:?}"
+            );
+        }
+    }
+
     /// Cursor's own permission request shape (cursor-agent 2026.11.05-86047df):
     /// `allow-always` first would persist an allowlist entry in the user's
     /// Cursor config, so it is deliberately listed ahead of `allow-once` here.
@@ -11457,6 +11522,8 @@ mod wsapi4_bindings_tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            effective_permission_policy: None,
+            permission_policy: None,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,
@@ -15242,6 +15309,8 @@ mod workspace_apply_proposal_tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            effective_permission_policy: None,
+            permission_policy: None,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,

@@ -3555,6 +3555,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     let mut active_session = mk_session("agent-slim-a", &ws_active);
     active_session.metadata = Some(serde_json::json!({
@@ -7810,6 +7811,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         })
         .await
         .expect("insert agent session");
@@ -19878,6 +19880,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     for (ws, agent, name) in [
         (&ws_a, "agent-fts-a", "Alpha Agent"),

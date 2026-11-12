@@ -385,6 +385,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
     store
         .insert_agent_session(&mk_agent(
@@ -609,6 +610,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     store
         .insert_agent_session(&mk_session("agent-1", &ws_active))
@@ -892,6 +894,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
                 retired_at: None,
                 notifications_muted: false,
                 pinned: false,
+                permission_policy: None,
             })
             .await
             .expect("session");
@@ -1192,6 +1195,7 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     store.insert_agent_session(&owner).await.expect("owner");
     for n in 0..8_i64 {
@@ -1440,6 +1444,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
 
     for i in 0..WORKSPACES {
@@ -1790,6 +1795,7 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     store
         .insert_agent_session(&session(&healthy, "agent-healthy-projection"))
@@ -2127,6 +2133,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -2958,6 +2965,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -5733,6 +5741,7 @@ async fn flipped_completion_recorded_on_agent_complete_boundary() {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         })
         .await
         .expect("session");
@@ -7910,6 +7919,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     svc.store
         .insert_agent_session(&session)
@@ -10500,6 +10510,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         })
         .await
         .expect("insert agent session");
@@ -10886,6 +10897,7 @@ mod change_event_parity {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -10968,6 +10980,7 @@ mod change_event_parity {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         let task_id = intent_core::NoteId::from("task-guard");
         // `linked-session` is linked via its session row; `linked-assigned`
@@ -11291,6 +11304,7 @@ mod change_event_parity {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -11444,6 +11458,7 @@ mod change_event_parity {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -13659,6 +13674,7 @@ mod change_event_parity {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         }
     }
 
@@ -17384,6 +17400,7 @@ mod mcp_callback {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -28979,6 +28996,7 @@ mod search_adapters {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -30496,6 +30514,7 @@ mod rules {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -30596,6 +30615,7 @@ mod rules {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -30695,6 +30715,7 @@ mod rules {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -30790,6 +30811,7 @@ mod rules {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -35711,6 +35733,7 @@ mod heal_stale_agent_sessions {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         }
     }
 
@@ -37884,6 +37907,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
         is_background: false,
         metadata: None,
     };
@@ -37929,6 +37953,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
         is_background: false,
         metadata: None,
     };
@@ -38053,6 +38078,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
         is_background: false,
         metadata: None,
     };
@@ -39409,6 +39435,7 @@ mod last_activity_events {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         }
     }
 
@@ -40104,6 +40131,7 @@ mod turn_token_usage {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         }
     }
 
@@ -43940,6 +43968,7 @@ mod agent_delete_grace_window {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             created_at: ts.clone(),
             updated_at: ts,
         }
@@ -45147,6 +45176,7 @@ mod derived_workspace_unread {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         }
     }
 

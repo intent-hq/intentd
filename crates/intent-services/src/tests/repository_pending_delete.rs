@@ -112,6 +112,7 @@ fn session(ws: &WorkspaceId, id: &str) -> AgentSession {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
         created_at: ts.clone(),
         updated_at: ts,
     }

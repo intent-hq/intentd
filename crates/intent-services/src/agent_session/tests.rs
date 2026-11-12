@@ -808,6 +808,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     }
 }
 

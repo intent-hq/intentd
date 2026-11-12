@@ -826,6 +826,7 @@ fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     }
 }
 

@@ -854,6 +854,8 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            effective_permission_policy: None,
+            permission_policy: None,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,

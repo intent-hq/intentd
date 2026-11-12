@@ -6455,6 +6455,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         }
     }
 

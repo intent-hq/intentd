@@ -2815,6 +2815,10 @@ struct AgentHandle {
     /// provider id, or the named profile reference whose overlay it carries.
     /// A different selection never reuses this child (PROTOCOL §5.54).
     spawned_selection: String,
+    /// The permission policy the child's request handler answers with: the
+    /// agent's override at spawn, else the manager default. A different
+    /// effective policy at the next turn respawns the child (PROTOCOL §8).
+    spawned_policy: PermissionPolicy,
     /// Activation registration of a child started under a named profile
     /// (the saved settings fingerprint it read at start); dropping the
     /// handle unregisters it (PROTOCOL §5.54 activation).
@@ -2981,7 +2985,9 @@ pub struct AgentManager {
     handles: Handles,
     sink: Arc<dyn EventSink>,
     permissions: Arc<PermissionRegistry>,
-    policy: PermissionPolicy,
+    /// Daemon-wide override of the `agents.permissionPolicy` setting
+    /// (`INTENTD_PERMISSION_POLICY`); `None` reads the setting.
+    policy: Option<PermissionPolicy>,
     mcp_bridge_exe: PathBuf,
     /// Root the per-agent stderr capture files live under (STAB-53), laid out
     /// as `<root>/<agent-id>/<YYYY-MM-DD>.log`. The composition root wires
@@ -3282,16 +3288,9 @@ impl AgentManager {
             handles: Arc::new(Mutex::new(HashMap::new())),
             sink,
             permissions: Arc::new(PermissionRegistry::new()),
-            // Shipped default (§6.7/M3.5): `AllowAll` for reference parity with
-            // the TS acp-provider — [`start_session`] additionally attempts
-            // `session/set_mode bypassPermissions` on providers that advertise
-            // set-mode (auggie today), and the local `AllowAll` auto-approve
-            // handles anything the provider still surfaces. An FE-attached
-            // deployment selects `Interactive` via `with_policy()` (wired from
-            // `INTENTD_PERMISSION_POLICY`) to drive the
-            // `agent.respondPermission` / `agent.pendingPermissions` RPCs;
-            // `AutoByRisk` / `DenyAll` remain selectable via the same env var.
-            policy: PermissionPolicy::AllowAll,
+            // No override: [`Self::policy`] reads the live
+            // `agents.permissionPolicy` setting (default `AllowAll`, §6.7/M3.5).
+            policy: None,
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             agent_log_root: None,
             agent_config_root: None,
@@ -3342,9 +3341,18 @@ impl AgentManager {
         }
     }
 
-    /// Override the permission policy used by spawned agents' client handlers.
+    /// Pin the default permission policy, overriding the
+    /// `agents.permissionPolicy` setting (`INTENTD_PERMISSION_POLICY`).
     #[must_use]
     pub fn with_policy(mut self, policy: PermissionPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// [`Self::with_policy`] when `policy` is set; `None` keeps reading the
+    /// `agents.permissionPolicy` setting.
+    #[must_use]
+    pub fn with_policy_override(mut self, policy: Option<PermissionPolicy>) -> Self {
         self.policy = policy;
         self
     }
@@ -3370,9 +3378,27 @@ impl AgentManager {
         }
     }
 
-    /// The active permission policy (headless `AutoByRisk` unless overridden).
+    /// The daemon-default permission policy: the [`Self::with_policy`]
+    /// override (`INTENTD_PERMISSION_POLICY`), else the live
+    /// `agents.permissionPolicy` setting (default `AllowAll`).
     pub fn policy(&self) -> PermissionPolicy {
-        self.policy
+        self.policy.unwrap_or_else(|| {
+            let setting = self.services.settings_registry().map_or_else(
+                intent_core::settings_file::AgentPermissionPolicy::default,
+                |registry| registry.snapshot().effective.agents.permission_policy,
+            );
+            PermissionPolicy::from_wire(setting.as_str()).unwrap_or(PermissionPolicy::AllowAll)
+        })
+    }
+
+    /// The policy `session`'s next spawn answers permission prompts with: its
+    /// `agent.update { permissionPolicy }` override, else [`Self::policy`].
+    pub(crate) fn permission_policy_for(&self, session: &AgentSession) -> PermissionPolicy {
+        session
+            .permission_policy
+            .as_deref()
+            .and_then(PermissionPolicy::from_wire)
+            .unwrap_or_else(|| self.policy())
     }
 
     /// Override the executable used as the generated `--mcp-config` bridge
@@ -4135,6 +4161,7 @@ impl AgentManager {
                 opts.provider.terminal_requires_shell,
                 Some(cwd.clone()),
             );
+        let spawned_policy = opts.permission_policy.unwrap_or_else(|| self.policy());
         let handler = Arc::new(
             ClientRequestHandler::new(
                 workspace_id.clone(),
@@ -4142,7 +4169,7 @@ impl AgentManager {
                 agent_name.into(),
                 FileService::new(cwd),
                 self.permissions.clone(),
-                self.policy,
+                spawned_policy,
                 self.sink.clone(),
             )
             .with_terminal_host(terminal_host)
@@ -4209,6 +4236,7 @@ impl AgentManager {
                 .profile_env
                 .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref)
                 .to_string(),
+            spawned_policy,
             _activation: activation,
             thought_level: None,
             config_options: None,
@@ -4645,7 +4673,15 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<StartedSession> {
-        let (conn, runtime, notes, repository_origin, session_mcp_servers, wake_gate) = {
+        let (
+            conn,
+            runtime,
+            notes,
+            repository_origin,
+            session_mcp_servers,
+            wake_gate,
+            spawned_policy,
+        ) = {
             let map = self.handles.lock().unwrap();
             let handle = map
                 .get(agent_id)
@@ -4659,6 +4695,7 @@ impl AgentManager {
                 handle.repository_origin.clone(),
                 handle.session_mcp_servers.clone(),
                 handle.wake_gate.clone(),
+                handle.spawned_policy,
             )
         };
         // Pause the idle wake listener for the whole session-open (monorepo#855):
@@ -4844,11 +4881,12 @@ impl AgentManager {
                     .await;
                 }
                 boxed_await(|| {
-                    self.maybe_bypass_permissions(
+                    Self::maybe_bypass_permissions(
                         conn.as_ref(),
                         provider,
                         &opened.session_id,
                         opened.modes.as_ref(),
+                        spawned_policy,
                     )
                 })
                 .await;
@@ -4962,11 +5000,12 @@ impl AgentManager {
             self.recreated.lock().unwrap().insert(agent_id.clone());
             self.arm_first_turn_prepend(agent_id, provider);
             boxed_await(|| {
-                self.maybe_bypass_permissions(
+                Self::maybe_bypass_permissions(
                     conn.as_ref(),
                     provider,
                     &opened.session_id,
                     opened.modes.as_ref(),
+                    spawned_policy,
                 )
             })
             .await;
@@ -5041,11 +5080,12 @@ impl AgentManager {
         self.force_recreate.lock().unwrap().remove(agent_id);
         self.arm_first_turn_prepend(agent_id, provider);
         boxed_await(|| {
-            self.maybe_bypass_permissions(
+            Self::maybe_bypass_permissions(
                 conn.as_ref(),
                 provider,
                 &opened.session_id,
                 opened.modes.as_ref(),
+                spawned_policy,
             )
         })
         .await;
@@ -5670,16 +5710,16 @@ impl AgentManager {
     /// triggering a `-32602`; every other policy is a no-op so Interactive /
     /// `AutoByRisk` / `DenyAll` decisions stay authoritative.
     async fn maybe_bypass_permissions(
-        &self,
         conn: &Connection,
         provider: &ProviderConfig,
         acp_session_id: &str,
         modes: Option<&SessionModeState>,
+        policy: PermissionPolicy,
     ) {
         intent_acp::codex_sandbox::configure(conn, provider.id, acp_session_id, modes);
         // Codex already reports its INITIAL_AGENT_MODE. Never replace an
         // explicit stricter choice or a retained policy fallback with bypass.
-        if provider.id == "codex" || self.policy != PermissionPolicy::AllowAll {
+        if provider.id == "codex" || policy != PermissionPolicy::AllowAll {
             return;
         }
         try_bypass_permissions_mode(conn, provider, acp_session_id, modes).await;
@@ -11906,6 +11946,8 @@ impl AgentManager {
             false,
         );
 
+        let permission_policy = self.permission_policy_for(&session);
+
         // Check if the agent's model/provider has changed (via agent.setModel).
         // If so, tear down the existing child and force a respawn with the new model.
         if self.contains(agent_id) {
@@ -11914,13 +11956,16 @@ impl AgentManager {
                 if let Some(handle) = handles.get(agent_id) {
                     // Compare the session's currently-resolved model/provider against
                     // the values the child was spawned with. A mismatch means
-                    // agent.setModel was called while the child was live.
+                    // agent.setModel was called while the child was live. A
+                    // changed permission policy (`agent.update
+                    // { permissionPolicy }`) also respawns: the handler and the
+                    // provider's bypass mode are fixed at spawn.
                     spawn_identity_changed(
                         handle.spawned_model.as_deref(),
                         &handle.spawned_provider,
                         &handle.spawned_selection,
                         &resolved,
-                    )
+                    ) || handle.spawned_policy != permission_policy
                 } else {
                     false
                 }
@@ -12161,6 +12206,7 @@ impl AgentManager {
         opts.npx_fallback_package = resolved.npx_fallback_package;
         opts.extra_env = resolved.extra_env.clone();
         opts.unsloth_endpoint = resolved.unsloth_endpoint.as_ref();
+        opts.permission_policy = Some(permission_policy);
         // monorepo#884 Phase 2.2: offer the daemon-backed
         // `intentd git-credential` helper to the provider child as a
         // github.com-scoped credential helper — no token bytes in the child
@@ -12425,6 +12471,7 @@ impl AgentManager {
             session_open_filled_model: None,
             spawned_provider: provider.clone(),
             spawned_selection: provider,
+            spawned_policy: PermissionPolicy::AllowAll,
             _activation: None,
             thought_level: None,
             config_options: None,
@@ -15074,6 +15121,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.profile_env = opts.profile_env;
     spawn_opts.agent_tmp_root = opts.agent_tmp_root;
     spawn_opts.agent_tmp_key = opts.agent_tmp_key;
+    spawn_opts.permission_policy = opts.permission_policy;
     spawn_opts
 }
 
@@ -20003,6 +20051,7 @@ mod role_reminder_tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         }
     }
 
@@ -21742,6 +21791,7 @@ mod dead_child_respawn_tests {
             spawned_model: None,
             spawned_provider: "node".to_string(),
             spawned_selection: crate::agent_manager::test_selection_for_command("node"),
+            spawned_policy: PermissionPolicy::AllowAll,
             _activation: None,
             thought_level: None,
             config_options: None,
@@ -24739,6 +24789,7 @@ mod agent_retry_tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         }
     }
 

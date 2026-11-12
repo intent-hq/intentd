@@ -2043,6 +2043,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         })
         .await
         .unwrap();
@@ -2090,6 +2091,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         })
         .await
         .unwrap();
@@ -2151,6 +2153,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         })
         .await
         .unwrap();
@@ -2247,6 +2250,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         })
         .await
         .unwrap();
@@ -2706,6 +2710,7 @@ fn mock_handle() -> AgentHandle {
         session_open_filled_model: None,
         spawned_provider: "auggie".to_string(),
         spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+        spawned_policy: intent_acp::PermissionPolicy::AllowAll,
         _activation: None,
         thought_level: None,
         config_options: None,
@@ -5888,6 +5893,7 @@ fn track_mock_agent_inner(
             session_open_filled_model: None,
             spawned_provider: "auggie".to_string(),
             spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            spawned_policy: mgr.policy(),
             _activation: None,
             thought_level: None,
             config_options: None,
@@ -6049,6 +6055,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
             session_open_filled_model: None,
             spawned_provider: spawned_provider.to_string(),
             spawned_selection: crate::agent_manager::test_selection_for_command(spawned_provider),
+            spawned_policy: mgr.policy(),
             _activation: None,
             thought_level: None,
             config_options: None,
@@ -6515,6 +6522,7 @@ async fn seed_agent_with_task_graph(
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     // The chief row is seeded by migration 0033; every other workspace is
     // created here.
@@ -9928,6 +9936,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             session_open_filled_model: None,
             spawned_provider: "auggie".to_string(),
             spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            spawned_policy: intent_acp::PermissionPolicy::AllowAll,
             _activation: None,
             thought_level: None,
             config_options: None,
@@ -13020,6 +13029,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     }
 }
 
@@ -13511,6 +13521,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     };
     mgr.services
         .store
@@ -24074,6 +24085,7 @@ mod harness_wake_tests {
             session_open_filled_model: None,
             spawned_provider: "auggie".to_string(),
             spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            spawned_policy: intent_acp::PermissionPolicy::AllowAll,
             _activation: None,
             thought_level: None,
             config_options: None,

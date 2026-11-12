@@ -19,6 +19,9 @@ mod creation_preferences;
 #[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
 mod structured_notices;
 
+#[path = "e2e_wss_agent_lifecycle/permission_policy.rs"]
+mod permission_policy;
+
 use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

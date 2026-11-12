@@ -404,6 +404,7 @@ async fn interrupted_agents_persisted_across_restart() {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         store
             .insert_agent_session(&session)
