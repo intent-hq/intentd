@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.190] - 2026-11-12
+
+### 🚀 Features
+
+- *(agents)* Per-chat permission policy and daemon-wide default ([#3289](https://github.com/intent-hq/intentd/pull/3289))
+
+
 ## [0.11.189] - 2026-11-11
 
 ### 🐛 Bug Fixes
