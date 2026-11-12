@@ -53,6 +53,12 @@ fn spawn_serve(data_dir: &Path) -> GuardedChild {
     spawn_serve_inner(data_dir, &[])
 }
 
+/// Spawn with the WSS listener enabled and extra environment.
+fn spawn_serve_with_env(data_dir: &Path, extra_env: &[(&str, &str)]) -> GuardedChild {
+    common::enable_ws_api(data_dir);
+    spawn_serve_inner(data_dir, extra_env)
+}
+
 /// Spawn without enabling the WSS listener — the daemon serves UDS only, so
 /// `pairing.getInfo` fails with the listener-down error.
 fn spawn_serve_wss_disabled(data_dir: &Path) -> GuardedChild {

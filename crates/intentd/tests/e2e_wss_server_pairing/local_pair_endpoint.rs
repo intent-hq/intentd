@@ -14,7 +14,6 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 const CODE_LIFETIME_MS: u64 = 3_000;
 
 fn spawn_named(data_dir: &Path, discovery: &Path, product: &str, lifetime: bool) -> GuardedChild {
-    common::enable_ws_api(data_dir);
     let discovery = discovery.to_string_lossy().to_string();
     let lifetime_ms = CODE_LIFETIME_MS.to_string();
     let mut env = vec![
@@ -27,7 +26,7 @@ fn spawn_named(data_dir: &Path, discovery: &Path, product: &str, lifetime: bool)
             lifetime_ms.as_str(),
         ));
     }
-    spawn_serve_inner(data_dir, &env)
+    spawn_serve_with_env(data_dir, &env)
 }
 
 /// The requester's list: every record in the folder that advertises
