@@ -1808,11 +1808,14 @@ async fn models_lists_every_machines_providers_and_filters_exactly() {
         .iter()
         .map(|m| m["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["Alpha box", "New box", "Zed box"]);
+    // The ordered machine list: no saved order, so the order they were added.
+    assert_eq!(names, ["Zed box", "Alpha box", "New box"]);
     assert_eq!(
-        machines[2],
+        machines[0],
         json!({
             "nodeId": "m-zed",
+            "kind": "machine",
+            "rank": 1,
             "name": "Zed box",
             "platform": { "os": "macos", "arch": "aarch64" },
             "state": "unreachable",
@@ -1831,8 +1834,8 @@ async fn models_lists_every_machines_providers_and_filters_exactly() {
             "disabledProviders": ["droid"]
         })
     );
-    assert_eq!(machines[1]["providers"], json!([]));
-    assert!(machines[1].get("platform").is_none());
+    assert_eq!(machines[2]["providers"], json!([]));
+    assert!(machines[2].get("platform").is_none());
     let text = all.to_string();
     for hidden in [
         "10.9.9.9",

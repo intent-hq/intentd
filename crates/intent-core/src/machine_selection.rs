@@ -6,7 +6,6 @@
 //! The backend's machine list and its on-demand connect are behind
 //! [`PlacementMachines`], so the rules are tested without a link.
 
-use std::cmp::Reverse;
 use std::fmt::Write as _;
 
 use time::format_description::well_known::Rfc3339;
@@ -41,7 +40,8 @@ pub enum RefreshFailure {
 
 /// The backend's view of its exposed machines.
 pub trait PlacementMachines: Send + Sync {
-    /// Every machine exposed to this backend, with its cached report.
+    /// Every machine exposed to this backend, with its cached report, in
+    /// the user's order (most preferred first).
     fn machines(&self) -> BoxFuture<'_, Result<Vec<ExposedMachine>>>;
 
     /// Connect to `machine_id` if needed and read a fresh report.
@@ -83,8 +83,8 @@ pub fn report_is_stale(observed_at: Option<&str>, now: OffsetDateTime) -> bool {
 
 /// The machines that can take the agent now, best first: platform, provider
 /// installed, the machine's own sign-in usable (unless a profile is
-/// selected), model listed and free capacity; ordered by fewest running
-/// agents, then most recently used. Machines without a report, with one
+/// selected), model listed and free capacity; in the source's order (the
+/// user's ordered machine list). Machines without a report, with one
 /// listing no providers yet, a stale model list lacking the requested
 /// model, or one older than [`REPORT_MAX_AGE`], or last seen needing an
 /// update are refreshed first. `placement.nodeId` names the only candidate.
@@ -226,7 +226,7 @@ pub async fn select_machines(
         ))));
     }
 
-    let mut free: Vec<ExposedMachine> = offering
+    let free: Vec<ExposedMachine> = offering
         .iter()
         .filter(|row| capacity_refusal(row).is_none())
         .map(|row| (*row).clone())
@@ -242,17 +242,6 @@ pub async fn select_machines(
             availability,
         ))));
     }
-    free.sort_by_key(|row| {
-        let running = row
-            .capabilities
-            .as_ref()
-            .map_or(u32::MAX, |caps| caps.capacity.running_agents);
-        let used = row
-            .last_connected_at
-            .as_deref()
-            .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok());
-        (running, Reverse(used))
-    });
     Ok(free)
 }
 
@@ -645,10 +634,28 @@ pub struct PlacementBackendFacts {
     pub remote_profile_bases: Vec<String>,
 }
 
+/// A cloud machine entry as the remote-placement text lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpCloudEntry {
+    /// The entry's `cloudMachineId`.
+    pub id: String,
+    pub name: String,
+    /// The base providers its sandboxes install.
+    pub providers: Vec<String>,
+}
+
+/// The line above every agent-facing machine list.
+pub const PREFERENCE_LINE: &str = "Listed in the user's order of preference. When several can run what you need, use the first; pick a later one only when the task needs it (platform, model, capacity).";
+
 /// What the remote-placement text is rendered from.
 #[derive(Clone, Copy)]
 pub struct PlacementHelpInputs<'a> {
     pub machines: &'a [ExposedMachine],
+    /// The cloud machine entries.
+    pub cloud_entries: &'a [HelpCloudEntry],
+    /// The user's order of the rows; rows it does not name follow, machines
+    /// first, in the order given.
+    pub order: &'a [crate::machine_order::MachineOrderKey],
     /// Whether a machine's link is up now.
     pub connected: &'a dyn Fn(&str) -> bool,
     /// Whether this backend has a provider turned off (Settings → Providers).
@@ -668,6 +675,8 @@ impl<'a> PlacementHelpInputs<'a> {
     pub fn new(machines: &'a [ExposedMachine], connected: &'a dyn Fn(&str) -> bool) -> Self {
         Self {
             machines,
+            cloud_entries: &[],
+            order: &[],
             connected,
             disabled: &|_| false,
             profiles: &[],
@@ -679,7 +688,7 @@ impl<'a> PlacementHelpInputs<'a> {
 
 /// How to place an agent on an exposed machine: the end of the 1.0–3.9
 /// prompt text, and of the 3.10 `ws.help("agent")` text.
-const PLACEMENT_HOW_TO: &str = "To run an agent on one, pass `placement: { target: \"remote\" }` (optionally `nodeId`, `os`, `arch`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, { create: { placement } })`. Without `nodeId` the backend picks a machine that runs the platform, offers the provider (the machine's own sign-in, signed in or unknown, for the Default; the provider installed, for a profile marked for remote machines) and lists the model, with free capacity. When none lists the model the call fails with `model-unavailable`; other refusals are `placement-unavailable` or `machine-update-required`. A remote agent's own sub-agents (`ws.agent.create`, `ws.agent.delegate`, `ws.agent.wakeOrCreate`) run on its machine when no `placement` is given, with the same checks and no fallback; pass `placement: { target: \"local\" }` to run one on the backend. A batch `ws.agent.delegate({ tasks })` takes one `placement` for all its tasks, and an object entry `{ taskNoteId, placement }` its own.\n\
+const PLACEMENT_HOW_TO: &str = "To run an agent on one, pass `placement: { target: \"remote\" }` (optionally `nodeId`, `os`, `arch`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, { create: { placement } })`. Without `nodeId` the backend picks a machine that runs the platform, offers the provider (the machine's own sign-in, signed in or unknown, for the Default; the provider installed, for a profile marked for remote machines) and lists the model, with free capacity. When none lists the model the call fails with `model-unavailable`; other refusals are `placement-unavailable` or `machine-update-required`. A remote agent's own sub-agents (`ws.agent.create`, `ws.agent.delegate`, `ws.agent.wakeOrCreate`) run on its machine when no `placement` is given, with the same checks and no fallback; pass `placement: { target: \"local\" }` to run one on the backend. A batch `ws.agent.delegate({ tasks })` takes one `placement` for all its tasks, and an object entry `{ taskNoteId, placement }` its own. A cloud entry starts a new sandbox for each agent placed there with `placement: { target: \"cloud\", cloudMachineId }`; it needs a provider profile that sends an API key or token.\n\
          A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment, or the provider's Default configuration settings when no profile is selected, only when the user marked that configuration for remote machines (an unmarked profile, or one that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR`, is refused with `profile-not-remote-compatible` and a message saying how to fix it), uses the machine's own provider sign-in when the Default sends nothing (refused when that machine is not signed in; pick a marked profile instead), and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree): right after each `ws.git.commit` (its result has `pushed`) and before each `ws.agent.reportToParent` is delivered, and at the end of each turn, which is when a plain `git commit` reaches the backend. `ws.agent.setModel` can switch it to another model or marked profile its machine offers; its next turn relaunches it there with the conversation history.\n";
 
 /// Renders the remote-placement text. Each harness version picks one;
@@ -691,6 +700,57 @@ pub type PlacementHelpRenderer = fn(inputs: &PlacementHelpInputs<'_>) -> Option<
 /// are off there, and nothing reports them back to wake it.
 pub const REMOTE_LONG_COMMANDS_HINT: &str = "On a remote machine, run anything over 30 s with `ws.script.start`; shell background jobs never wake you.";
 
+/// One row of an agent-facing machine list.
+#[derive(Clone, Copy)]
+enum HelpRow<'a> {
+    Machine(&'a ExposedMachine),
+    Cloud(&'a HelpCloudEntry),
+}
+
+/// The listed rows (machines not revoked, and cloud entries) in the
+/// user's order, then any the order does not name.
+fn help_rows<'a>(inputs: &PlacementHelpInputs<'a>) -> Vec<HelpRow<'a>> {
+    use crate::machine_order::MachineOrderKey;
+    let mut machines: Vec<&ExposedMachine> = inputs
+        .machines
+        .iter()
+        .filter(|row| row.state != RemoteMachineState::Revoked)
+        .collect();
+    let mut entries: Vec<&HelpCloudEntry> = inputs.cloud_entries.iter().collect();
+    let mut rows = Vec::with_capacity(machines.len() + entries.len());
+    for key in inputs.order {
+        match key {
+            MachineOrderKey::Local => {}
+            MachineOrderKey::Machine { node_id } => {
+                if let Some(at) = machines.iter().position(|row| &row.id == node_id) {
+                    rows.push(HelpRow::Machine(machines.remove(at)));
+                }
+            }
+            MachineOrderKey::Cloud { cloud_machine_id } => {
+                if let Some(at) = entries.iter().position(|e| &e.id == cloud_machine_id) {
+                    rows.push(HelpRow::Cloud(entries.remove(at)));
+                }
+            }
+        }
+    }
+    rows.extend(machines.into_iter().map(HelpRow::Machine));
+    rows.extend(entries.into_iter().map(HelpRow::Cloud));
+    rows
+}
+
+/// A cloud entry's identity line (without its number).
+fn cloud_line(entry: &HelpCloudEntry) -> String {
+    let providers = if entry.providers.is_empty() {
+        "no providers listed".to_owned()
+    } else {
+        entry.providers.join(", ")
+    };
+    format!(
+        "\"{}\" (cloudMachineId `{}`, cloud: a new sandbox for each agent; {providers})\n",
+        entry.name, entry.id
+    )
+}
+
 /// The `ws.agent` discovery text for the exposed machines: name, id,
 /// platform, connected or last seen, each usable provider with its sign-in
 /// status and up to [`HELP_MAX_MODELS`] models, and when the report was
@@ -701,23 +761,23 @@ pub const REMOTE_LONG_COMMANDS_HINT: &str = "On a remote machine, run anything o
 /// setting values. `None` with no usable machine.
 #[must_use]
 pub fn exposed_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
-    let listed: Vec<&ExposedMachine> = inputs
-        .machines
-        .iter()
-        .filter(|row| row.state != RemoteMachineState::Revoked)
-        .collect();
+    let listed = help_rows(inputs);
     if listed.is_empty() {
         return None;
     }
     let mut lines = String::new();
     let mut shown = 0;
     for row in &listed {
-        let line = help_line(
-            row,
-            (inputs.connected)(&row.id),
-            inputs.disabled,
-            inputs.remote_profile_bases,
-        );
+        let line = match row {
+            HelpRow::Machine(row) => help_line(
+                row,
+                (inputs.connected)(&row.id),
+                inputs.disabled,
+                inputs.remote_profile_bases,
+            ),
+            HelpRow::Cloud(entry) => cloud_line(entry),
+        };
+        let line = format!("{}. {line}", shown + 1);
         if shown == HELP_MAX_MACHINES || lines.len() + line.len() > HELP_MAX_BYTES {
             break;
         }
@@ -725,7 +785,7 @@ pub fn exposed_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String>
         shown += 1;
     }
     let mut text = format!(
-        "Remote placement (experimental): machines exposed to this backend ({}):\n{lines}",
+        "Remote placement (experimental): machines exposed to this backend ({}):\n{PREFERENCE_LINE}\n{lines}",
         listed.len()
     );
     if shown < listed.len() {
@@ -753,7 +813,7 @@ pub const MACHINE_MODELS_SIGNATURE: &str =
 /// platform. `None` with no usable machine.
 #[must_use]
 pub fn stable_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
-    let mut text = identity_list(inputs.machines)?;
+    let mut text = identity_list(inputs)?;
     let _ = writeln!(
         text,
         "Before you choose a machine, provider or model for a remote agent, confirm it with `{MACHINE_MODELS_SIGNATURE}`: each machine's state, provider sign-in status and full model list. How to place one: `ws.help(\"agent\")`."
@@ -819,10 +879,10 @@ fn push_remote(text: &mut String, remote: &ProfileRemote) {
 /// No live facts: those come only from the lookup.
 #[must_use]
 pub fn stable_machines_reference(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
-    let mut text = identity_list(inputs.machines)?;
+    let mut text = identity_list(inputs)?;
     let _ = writeln!(
         text,
-        "  {MACHINE_MODELS_SIGNATURE} → {{ machines }}  // Experimental. Per machine: `nodeId`, `name`, `platform`, `state`, `lastConnectedAt`, `observedAt`, `runningAgents`, `providers: [{{ id, status, models, modelsStale }}]` and `disabledProviders`, from its last report (up to 1 hour old; no connect). `nodeId` keeps one machine (unknown → `machine-unknown`); `provider` keeps that provider; `model` (exact id) keeps providers listing it. Each kept provider has its full model list. Confirm the machine, provider and model here before placing a remote agent."
+        "  {MACHINE_MODELS_SIGNATURE} → {{ machines }}  // Experimental. Per machine: `nodeId`, `name`, `platform`, `state`, `lastConnectedAt`, `observedAt`, `runningAgents`, `providers: [{{ id, status, models, modelsStale }}]` and `disabledProviders`, from its last report (up to 1 hour old; no connect). `nodeId` keeps one machine (unknown → `machine-unknown`); `provider` keeps that provider; `model` (exact id) keeps providers listing it. Each kept provider has its full model list. Rows follow the user's order (`rank`); a cloud entry's row has `kind: \"cloud\"` and `cloudMachineId` instead of `nodeId`, and lists its providers without models. Confirm the machine, provider and model here before placing a remote agent."
     );
     push_profiles(&mut text, inputs);
     text.push_str(PLACEMENT_HOW_TO);
@@ -830,32 +890,37 @@ pub fn stable_machines_reference(inputs: &PlacementHelpInputs<'_>) -> Option<Str
     Some(text)
 }
 
-/// The header and one identity line per listed machine (not revoked), in
-/// name order, within [`HELP_MAX_MACHINES`] and [`HELP_MAX_BYTES`].
-fn identity_list(machines: &[ExposedMachine]) -> Option<String> {
-    let mut listed: Vec<&ExposedMachine> = machines
-        .iter()
-        .filter(|row| row.state != RemoteMachineState::Revoked)
-        .collect();
+/// The header, the preference line and one numbered identity line per
+/// listed row (machines not revoked, cloud entries), in the user's order,
+/// within [`HELP_MAX_MACHINES`] and [`HELP_MAX_BYTES`]; the lowest-ranked
+/// rows are cut.
+fn identity_list(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
+    let listed = help_rows(inputs);
     if listed.is_empty() {
         return None;
     }
-    listed.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
     let mut lines = String::new();
     let mut shown = 0;
     for row in &listed {
-        let platform = row
-            .platform
-            .map_or_else(|| "platform unknown".to_owned(), |p| p.to_string());
-        let line = format!("- \"{}\" (nodeId `{}`, {platform})\n", row.name, row.id);
+        let line = match row {
+            HelpRow::Machine(row) => {
+                let platform = row
+                    .platform
+                    .map_or_else(|| "platform unknown".to_owned(), |p| p.to_string());
+                format!("\"{}\" (nodeId `{}`, {platform})\n", row.name, row.id)
+            }
+            HelpRow::Cloud(entry) => cloud_line(entry),
+        };
+        let line = format!("{}. {line}", shown + 1);
         if shown == HELP_MAX_MACHINES || lines.len() + line.len() > HELP_MAX_BYTES {
             break;
         }
         lines.push_str(&line);
         shown += 1;
     }
-    let mut text =
-        format!("Remote placement (experimental): machines exposed to this backend:\n{lines}");
+    let mut text = format!(
+        "Remote placement (experimental): machines exposed to this backend:\n{PREFERENCE_LINE}\n{lines}"
+    );
     if shown < listed.len() {
         let _ = writeln!(
             text,
@@ -888,10 +953,7 @@ fn help_line(
             |at| format!("last seen {at}"),
         ),
     };
-    let mut line = format!(
-        "- \"{}\" (nodeId `{}`, {platform}, {state}",
-        row.name, row.id
-    );
+    let mut line = format!("\"{}\" (nodeId `{}`, {platform}, {state}", row.name, row.id);
     if let Some(at) = &row.observed_at {
         let _ = write!(line, ", report {at}");
     }

@@ -36,8 +36,12 @@ impl Services {
         method: &'static str,
         params: Value,
     ) -> Result<Value> {
-        self.require_machine_owner(&format!("remoteMachines.{method}"))
-            .await?;
+        let what = format!("remoteMachines.{method}");
+        match method {
+            // The ordered list carries names only: members read it too.
+            "order" => self.require_host_execution(&what).await?,
+            _ => self.require_machine_owner(&what).await?,
+        }
         self.feature_remote_launch_port()
             .remote_machines(self, method, params)
             .await

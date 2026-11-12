@@ -316,8 +316,10 @@ remoteMachines.backendInfo
 remoteMachines.claim
 remoteMachines.list
 remoteMachines.models
+remoteMachines.order
 remoteMachines.refresh
 remoteMachines.remove
+remoteMachines.setOrder
 repo.list
 repo.remove
 repo.warmCache

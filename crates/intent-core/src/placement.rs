@@ -435,6 +435,10 @@ fn sorted_platforms(platforms: impl IntoIterator<Item = AgentPlatform>) -> Vec<A
     platforms
 }
 
+/// The `no-agent-machine` message: nowhere to run an agent.
+pub const NO_AGENT_MACHINE_MESSAGE: &str =
+    "Add a machine under Settings → Machines; agents on this backend only run on other machines.";
+
 /// `placement-unavailable` `reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -447,6 +451,9 @@ pub enum PlacementUnavailableReason {
     MachineUnknown,
     /// The machine revoked this backend's executor credential.
     MachineRevoked,
+    /// The ordered machine list has no row: an orchestrator with no
+    /// machine or cloud entry added.
+    NoAgentMachine,
 }
 
 impl PlacementUnavailableReason {
@@ -592,6 +599,7 @@ impl PlacementUnavailable {
                 PlacementUnavailableReason::MachineRevoked => {
                     format!("{name} revoked this backend's access")
                 }
+                PlacementUnavailableReason::NoAgentMachine => NO_AGENT_MACHINE_MESSAGE.to_owned(),
             };
         }
         let lead = match self.reason {
@@ -600,6 +608,9 @@ impl PlacementUnavailable {
             PlacementUnavailableReason::MachineUnreachable => "No reachable machine for",
             PlacementUnavailableReason::MachineUnknown => "No exposed machine for",
             PlacementUnavailableReason::MachineRevoked => "No machine accepts this backend for",
+            PlacementUnavailableReason::NoAgentMachine => {
+                return NO_AGENT_MACHINE_MESSAGE.to_owned()
+            }
         };
         format!(
             "{lead} {requested}; available: {}; supported: {}",

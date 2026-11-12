@@ -337,8 +337,10 @@ router remoteMachines.backendInfo
 router remoteMachines.claim
 router remoteMachines.list
 router remoteMachines.models
+router remoteMachines.order
 router remoteMachines.refresh
 router remoteMachines.remove
+router remoteMachines.setOrder
 router repo.list
 router repo.remove
 router repo.warmCache

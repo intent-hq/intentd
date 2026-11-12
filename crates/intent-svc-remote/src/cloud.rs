@@ -344,3 +344,17 @@ fn feature(svc: &Services) -> Result<&crate::RemoteFeature> {
     svc.remote_feature()
         .ok_or_else(|| Error::Unsupported("this daemon cannot start cloud machines".into()))
 }
+
+/// Every entry as `(cloudMachineId, name)`, in creation order: the cloud
+/// rows of the ordered machine list.
+///
+/// # Errors
+///
+/// When the store cannot be read.
+pub(crate) async fn entry_names(svc: &Services) -> Result<Vec<(String, String)>> {
+    Ok(config::load_all(svc)
+        .await?
+        .into_iter()
+        .map(|(id, config)| (id, config.name))
+        .collect())
+}

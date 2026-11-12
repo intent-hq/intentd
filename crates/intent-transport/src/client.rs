@@ -183,6 +183,9 @@ pub(crate) fn with_runtime_capabilities(
                 // `remoteMachines.claim`: add a machine from an
                 // `intent://node` link.
                 capabilities["remoteMachineClaim"] = json!(1);
+                // `remoteMachines.order` / `setOrder`: the user-ordered
+                // list that placements without a machine walk.
+                capabilities["machineOrder"] = json!(1);
             }
         }
         value.to_string()

@@ -6044,6 +6044,7 @@ impl Services {
             Some(placement) => placement.runs_on_backend()?,
             None => false,
         };
+        let unplaced = requested.is_none();
         let (placement, inherited_from) = match requested {
             Some(_) if on_backend => (None, None),
             Some(placement) => (Some(placement), None),
@@ -6055,16 +6056,44 @@ impl Services {
                 None => (None, None),
             },
         };
-        if let Some(placement) = placement {
-            let admitted = self
-                .admit_remote_agent(
+        let walked = if unplaced
+            && placement.is_none()
+            && !self.created_by_local_parent(plan.parent_agent_id.as_ref())
+        {
+            self.walk_machine_order(&plan.provider, |placement| {
+                let workspace_id = &workspace_id;
+                let provider = plan.provider.clone();
+                let model = plan.model.clone();
+                async move {
+                    self.admit_remote_agent(
+                        workspace_id,
+                        &provider,
+                        model.as_deref(),
+                        &placement,
+                        false,
+                    )
+                    .await
+                }
+            })
+            .await?
+        } else {
+            None
+        };
+        let admitted = match (walked, placement) {
+            (Some(walked), _) => Some(Ok(walked)),
+            (None, Some(placement)) => Some(
+                self.admit_remote_agent(
                     &workspace_id,
                     &plan.provider,
                     plan.model.as_deref(),
                     &placement,
                     inherited_from.is_some(),
                 )
-                .await;
+                .await,
+            ),
+            (None, None) => None,
+        };
+        if let Some(admitted) = admitted {
             let mut view = match (admitted, inherited_from) {
                 (Ok((view, picked)), _) => {
                     if let Some(picked) = picked {
@@ -6146,6 +6175,92 @@ impl Services {
                 view.node_name,
             )
         }))
+    }
+
+    /// Whether the caller is `parent` itself, an agent running on this
+    /// backend: its unplaced sub-agents stay here too, so reordering the
+    /// machine list never splits a local agent tree across machines (a
+    /// remote parent is handled by [`Self::inherited_placement`] first).
+    fn created_by_local_parent(&self, parent: Option<&AgentId>) -> bool {
+        parent.is_some_and(|parent| {
+            matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Agent { agent_id }) if agent_id == *parent
+            )
+        })
+    }
+
+    /// Walk the ordered machine list for a create with no placement
+    /// (nodes.md "Ordered machine list"): the first row that passes
+    /// admission ends the walk. `None` when that row is "This computer"
+    /// (the agent runs here); otherwise what `admit` decided for the
+    /// machine or cloud entry. "This computer" passes whenever `provider`
+    /// is enabled here; a machine or entry passes when `admit` does.
+    ///
+    /// # Errors
+    ///
+    /// When no row passes: the most preferred row's refusal, or
+    /// `placement-unavailable` reason `no-agent-machine` for an empty list.
+    pub(crate) async fn walk_machine_order<F, Fut, T>(
+        &self,
+        provider: &str,
+        admit: F,
+    ) -> Result<Option<T>>
+    where
+        F: Fn(intent_core::placement::AgentPlacement) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        use intent_core::machine_order::MachineOrderKey;
+        use intent_core::placement::{AgentPlacement, PlacementTarget};
+        let order = self.ports.remote_launch().machine_order(self).await?;
+        let base = crate::provider_profiles::parse_profile_ref(provider)
+            .map_or(provider, |(base, _)| base);
+        let mut first_refusal = None;
+        let mut local_disabled = false;
+        for key in order {
+            let placement = match key {
+                MachineOrderKey::Local => {
+                    let settings = self.effective_settings();
+                    if provider_is_disabled(base, settings.providers.enabled.as_ref()) {
+                        local_disabled = true;
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                MachineOrderKey::Machine { node_id } => AgentPlacement {
+                    target: Some(PlacementTarget::Remote),
+                    node_id: Some(node_id),
+                    ..Default::default()
+                },
+                MachineOrderKey::Cloud { cloud_machine_id } => AgentPlacement {
+                    target: Some(PlacementTarget::Cloud),
+                    cloud_machine_id: Some(cloud_machine_id),
+                    ..Default::default()
+                },
+            };
+            match admit(placement).await {
+                Ok(admitted) => return Ok(Some(admitted)),
+                Err(error) => {
+                    first_refusal.get_or_insert(error);
+                }
+            }
+        }
+        match first_refusal {
+            Some(refusal) => Err(refusal),
+            // Here the local create reports the disabled provider itself.
+            None if local_disabled => Ok(None),
+            None => {
+                let failure =
+                    intent_core::placement::PlatformAvailability::none(intent_core::now_iso())
+                        .unavailable(intent_core::placement::AgentPlacement::default());
+                Err(Error::PlacementUnavailable(Box::new(
+                    intent_core::placement::PlacementUnavailable {
+                        reason: intent_core::placement::PlacementUnavailableReason::NoAgentMachine,
+                        ..failure
+                    },
+                )))
+            }
+        }
     }
 
     /// Where the parent's work is for a backend sub-agent created by its
@@ -6371,7 +6486,42 @@ impl Services {
         plan: &mut AgentCreatePlan,
     ) -> Result<()> {
         let Some(placement) = plan.placement.take() else {
-            return Ok(());
+            let model = plan.model.clone();
+            let provider = plan.provider.clone();
+            let walked = self
+                .walk_machine_order(&provider, |placement| {
+                    let model = model.clone();
+                    let provider = &provider;
+                    async move {
+                        let admit = |reference: String, profile_fallback: bool| {
+                            let placement = &placement;
+                            let model = model.as_deref();
+                            async move {
+                                let mut needs = self
+                                    .remote_launch_needs(&reference, model, placement)
+                                    .await?;
+                                needs.profile_fallback = profile_fallback && needs.machine_sign_in;
+                                self.ports
+                                    .remote_launch()
+                                    .admit_new_workspace(self, placement, &needs)
+                                    .await
+                            }
+                        };
+                        self.admit_with_auto_pick(provider, &placement, admit).await
+                    }
+                })
+                .await?;
+            let Some((view, picked)) = walked else {
+                return Ok(());
+            };
+            if let Some(picked) = picked {
+                plan.provider.clone_from(&picked.provider_ref);
+                plan.auto_selected = Some(picked);
+            }
+            plan.remote = Some(view);
+            return self
+                .ensure_fits_planned_prompt("workspace.create", plan)
+                .await;
         };
         if placement.runs_on_backend()? {
             return Ok(());
@@ -13671,6 +13821,15 @@ impl Services {
             ));
         }
         let placed = inherits || explicit_remote;
+        // `isolation` keeps unplaced tasks on this backend: they never walk
+        // the ordered machine list (nodes.md "Batch placement").
+        let mut input = input;
+        if input.isolation.is_some() && input.placement.is_none() && !inherits {
+            input.placement = Some(intent_core::placement::AgentPlacement {
+                target: Some(intent_core::placement::PlacementTarget::Local),
+                ..Default::default()
+            });
+        }
         if input.tasks.is_some() {
             // Some task runs on the backend: an explicit local placement, or
             // none from a parent that is not remote.

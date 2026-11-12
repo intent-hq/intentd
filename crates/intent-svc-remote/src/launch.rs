@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use intent_core::machine_selection::{
-    select_machines, PlacementHelpInputs, PlacementHelpRenderer, PlacementMachines,
+    select_machines, HelpCloudEntry, PlacementHelpInputs, PlacementHelpRenderer, PlacementMachines,
     PlacementRequest, RefreshFailure,
 };
 use intent_core::machines::ExposedMachine;
@@ -512,7 +512,7 @@ impl PlacementMachines for ExposedMachines<'_> {
     /// hour old).
     fn machines(&self) -> BoxFuture<'_, Result<Vec<ExposedMachine>>> {
         Box::pin(async move {
-            let mut rows = self.svc.store().list_exposed_machines().await?;
+            let mut rows = ranked_machines(self.svc).await?;
             for row in &mut rows {
                 let attached = self
                     .feature
@@ -542,6 +542,21 @@ impl PlacementMachines for ExposedMachines<'_> {
     }
 }
 
+/// The exposed machines in the user's order (the ordered machine list);
+/// a machine the list does not name yet keeps its `addedAt` place at the
+/// end.
+pub(crate) async fn ranked_machines(svc: &Services) -> Result<Vec<ExposedMachine>> {
+    let mut rows = svc.store().list_exposed_machines().await?;
+    let order = crate::order::current(svc).await?;
+    let rank = |id: &str| {
+        order.iter().position(|row| {
+            matches!(&row.key, intent_core::machine_order::MachineOrderKey::Machine { node_id } if node_id == id)
+        })
+    };
+    rows.sort_by_key(|row| rank(&row.id).unwrap_or(usize::MAX));
+    Ok(rows)
+}
+
 /// The discovery text: the exposed machines with their providers, models
 /// and sign-in, and how to place an agent on one. `None` while no machine
 /// is exposed to this backend, so the model sees no remote-placement text.
@@ -551,7 +566,24 @@ async fn help_text(
     render: PlacementHelpRenderer,
 ) -> Option<String> {
     let rows = svc.store().list_exposed_machines().await.ok()?;
-    if rows.is_empty() {
+    let order: Vec<intent_core::machine_order::MachineOrderKey> = crate::order::current(svc)
+        .await
+        .ok()?
+        .into_iter()
+        .map(|row| row.key)
+        .collect();
+    let providers = crate::cloud::config::agent_providers();
+    let entries: Vec<HelpCloudEntry> = crate::cloud::entry_names(svc)
+        .await
+        .ok()?
+        .into_iter()
+        .map(|(id, name)| HelpCloudEntry {
+            id,
+            name,
+            providers: providers.clone(),
+        })
+        .collect();
+    if rows.is_empty() && entries.is_empty() {
         return None;
     }
     let feature = svc.remote_feature();
@@ -564,6 +596,8 @@ async fn help_text(
     let disabled = |id: &str| facts.disabled_providers.iter().any(|off| off == id);
     render(&PlacementHelpInputs {
         machines: &rows,
+        cloud_entries: &entries,
+        order: &order,
         connected: &connected,
         disabled: &disabled,
         profiles: &facts.profiles,
@@ -826,6 +860,19 @@ impl RemoteLaunchPort for RemoteLaunch {
 
     fn manages_machines(&self) -> bool {
         true
+    }
+
+    fn machine_order<'a>(
+        &'a self,
+        svc: &'a Services,
+    ) -> BoxFuture<'a, Result<Vec<intent_core::machine_order::MachineOrderKey>>> {
+        Box::pin(async move {
+            Ok(crate::order::current(svc)
+                .await?
+                .into_iter()
+                .map(|row| row.key)
+                .collect())
+        })
     }
 
     fn place_sub_agent<'a>(
