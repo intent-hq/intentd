@@ -6058,7 +6058,7 @@ impl Services {
         };
         let walked = if unplaced
             && placement.is_none()
-            && !self.created_by_local_parent(plan.parent_agent_id.as_ref())
+            && !Self::created_by_local_parent(plan.parent_agent_id.as_ref())
         {
             self.walk_machine_order(&plan.provider, |placement| {
                 let workspace_id = &workspace_id;
@@ -6181,7 +6181,7 @@ impl Services {
     /// backend: its unplaced sub-agents stay here too, so reordering the
     /// machine list never splits a local agent tree across machines (a
     /// remote parent is handled by [`Self::inherited_placement`] first).
-    fn created_by_local_parent(&self, parent: Option<&AgentId>) -> bool {
+    fn created_by_local_parent(parent: Option<&AgentId>) -> bool {
         parent.is_some_and(|parent| {
             matches!(
                 intent_core::current_caller(),

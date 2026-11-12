@@ -101,7 +101,7 @@ pub(crate) async fn publish(svc: &Services) {
     match current(svc).await {
         Ok(list) => publish_list(svc, &list).await,
         Err(error) => {
-            tracing::warn!(%error, "machine order: could not read the list to announce it")
+            tracing::warn!(%error, "machine order: could not read the list to announce it");
         }
     }
 }

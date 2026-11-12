@@ -470,7 +470,7 @@ actions can also include **Let <backend> run agents here**, which asks to confir
 **Allow**, and **Stop letting <backend> run agents here**; machines allowed this way are
 listed under **Machines <backend> can run agents on**.
 Running agents on those machines is experimental. That list is in the user's order of
-preference: **This computer** first by default, then machines and cloud entries as they
+preference, and its first row is marked **Preferred**: **This computer** first by default, then machines and cloud entries as they
 were added. Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
 menu. An agent started without a **Start on** choice runs on the first row that can run
 it; a sub-agent started by an agent on this computer stays here. Agents see each machine's name and
