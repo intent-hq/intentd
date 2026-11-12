@@ -16,7 +16,7 @@
 //! reaches the backend's log.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use intentd_test_support::ProcessGroup;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,7 +24,12 @@ use tokio::net::TcpListener;
 
 use super::*;
 
-const NF_TOKEN: &str = "nf-api-token-0123456789abcdef0123456789abcdef";
+/// A JWT about as long as a real Northflank API token (well over 1 KB).
+static NF_TOKEN: LazyLock<String> = LazyLock::new(|| {
+    let claims = "eyJ0b2tlbklkIjoibmYtdGVzdCIsInRlYW1JZCI6ImludGVudCIsInNjb3BlcyI6W10s".repeat(16);
+    let signature = "Qm9ndXNTaWduYXR1cmVGb3JUaGVGYWtlTm9ydGhmbGFua0FQSTAxMjM0NTY3ODk".repeat(6);
+    format!("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.{claims}.{signature}")
+});
 const PROJECT: &str = "intent-cloud";
 /// A project the token can see but not read.
 const LOCKED_PROJECT: &str = "locked-project";
@@ -236,7 +241,7 @@ impl FakeNorthflank {
                 error(404, "manifest unknown")
             };
         }
-        if headers.get("authorization").map(String::as_str) != Some(&format!("Bearer {NF_TOKEN}")) {
+        if headers.get("authorization").map(String::as_str) != Some(&format!("Bearer {}", *NF_TOKEN)) {
             return error(401, "Invalid API token");
         }
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -444,7 +449,7 @@ impl FakeNorthflank {
         let init: Value = serde_json::from_str(&init).unwrap();
         let send = |value: Value| Message::text(value.to_string());
         let refusal = self.state().exec_refusal.clone();
-        if init["data"]["auth"]["apiToken"] != NF_TOKEN || refusal.is_some() {
+        if init["data"]["auth"]["apiToken"] != NF_TOKEN.as_str() || refusal.is_some() {
             let message = refusal.unwrap_or_else(|| "Invalid token".into());
             let _ = ws
                 .send(send(
@@ -602,7 +607,7 @@ impl FakeNorthflank {
 }
 
 fn northflank_params(extra: &Value) -> Value {
-    let mut params = json!({ "provider": "northflank", "name": "Northflank", "apiKey": NF_TOKEN, "projectId": PROJECT });
+    let mut params = json!({ "provider": "northflank", "name": "Northflank", "apiKey": NF_TOKEN.as_str(), "projectId": PROJECT });
     for (k, v) in extra.as_object().unwrap() {
         params[k] = v.clone();
     }
@@ -740,6 +745,23 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
         .await;
         assert_eq!(invalid["code"], -32602, "{member}: {invalid}");
     }
+    assert!(NF_TOKEN.len() > 1024, "{}", NF_TOKEN.len());
+    let checked = ok(
+        &mut rpc_ws,
+        18,
+        "cloudMachines.configure",
+        northflank_params(&json!({ "validateOnly": true })),
+    )
+    .await;
+    assert!(checked["provider"].is_object(), "{checked}");
+    let oversized = refused(
+        &mut rpc_ws,
+        19,
+        "cloudMachines.configure",
+        northflank_params(&json!({ "apiKey": "x".repeat(8 * 1024 + 1) })),
+    )
+    .await;
+    assert_eq!(oversized["code"], -32602, "{oversized}");
     let listed = ok(&mut rpc_ws, 20, "cloudMachines.list", json!({})).await;
     assert_eq!(
         listed["providers"],
@@ -922,7 +944,7 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     fake.state().exec_refusal = None;
 
     let log = std::fs::read_to_string(head_dir.join("head.log")).unwrap_or_default();
-    let mut secrets = vec![NF_TOKEN.to_owned(), PROFILE_SECRET.to_owned()];
+    let mut secrets = vec![NF_TOKEN.clone(), PROFILE_SECRET.to_owned()];
     secrets.extend(fake.executor_tokens());
     for secret in &secrets {
         assert!(!log.contains(secret.as_str()), "a secret reached the log");
