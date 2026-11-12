@@ -19,6 +19,7 @@ use std::time::Duration;
 use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionKind, RequestPermissionRequest,
 };
+use intent_providers::AllowAlwaysScope;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
@@ -69,6 +70,14 @@ pub struct PermissionOptionView {
     pub description: Option<String>,
     /// Whether choosing this option rejects the operation.
     pub destructive: bool,
+    /// The ACP option kind (`allow_once`, `allow_always`, `reject_once`,
+    /// `reject_always`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+    /// For `allow_always`: how far the approval reaches (`chat`,
+    /// `workspace`, `allWorkspaces`); omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<&'static str>,
 }
 
 /// The normalized permission request pushed to clients and stored for recovery
@@ -309,34 +318,73 @@ pub(crate) fn default_options() -> Vec<PermissionOptionView> {
             label: "Allow".to_string(),
             description: None,
             destructive: false,
+            kind: Some("allow_once"),
+            scope: None,
         },
         PermissionOptionView {
             id: "reject_once".to_string(),
             label: "Deny".to_string(),
             description: None,
             destructive: true,
+            kind: Some("reject_once"),
+            scope: None,
         },
     ]
 }
 
 /// Normalize ACP [`PermissionOption`]s to the §8 client shape; an empty list
 /// falls back to [`default_options`]. `reject_*` kinds are marked destructive.
-pub(crate) fn normalize_options(options: &[PermissionOption]) -> Vec<PermissionOptionView> {
+pub(crate) fn normalize_options(
+    options: &[PermissionOption],
+    allow_always_scopes: &[(&str, AllowAlwaysScope)],
+) -> Vec<PermissionOptionView> {
     if options.is_empty() {
         return default_options();
     }
     options
         .iter()
-        .map(|opt| PermissionOptionView {
-            id: opt.option_id.0.to_string(),
-            label: opt.name.clone(),
-            description: None,
-            destructive: matches!(
-                opt.kind,
-                PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways
-            ),
+        .map(|opt| {
+            let kind = match opt.kind {
+                PermissionOptionKind::AllowOnce => Some("allow_once"),
+                PermissionOptionKind::AllowAlways => Some("allow_always"),
+                PermissionOptionKind::RejectOnce => Some("reject_once"),
+                PermissionOptionKind::RejectAlways => Some("reject_always"),
+                _ => None,
+            };
+            let scope = (opt.kind == PermissionOptionKind::AllowAlways)
+                .then(|| always_scope(&opt.option_id.0, &opt.name, allow_always_scopes))
+                .flatten()
+                .map(AllowAlwaysScope::as_wire);
+            PermissionOptionView {
+                id: opt.option_id.0.to_string(),
+                label: opt.name.clone(),
+                description: None,
+                destructive: matches!(
+                    opt.kind,
+                    PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways
+                ),
+                kind,
+                scope,
+            }
         })
         .collect()
+}
+
+/// Session-bound labels ("during this session", "for this conversation")
+/// reach the chat only; otherwise the provider's option-id prefixes decide.
+fn always_scope(
+    id: &str,
+    label: &str,
+    scopes: &[(&str, AllowAlwaysScope)],
+) -> Option<AllowAlwaysScope> {
+    let label = label.to_ascii_lowercase();
+    if label.contains("this session") || label.contains("this conversation") {
+        return Some(AllowAlwaysScope::Chat);
+    }
+    scopes
+        .iter()
+        .find(|(prefix, _)| id.starts_with(prefix))
+        .map(|(_, scope)| *scope)
 }
 
 /// Build the normalized [`PermissionRequestData`] for an incoming ACP
@@ -348,6 +396,7 @@ pub(crate) fn normalize_request(
     session_id: String,
     agent_name: String,
     req: &RequestPermissionRequest,
+    allow_always_scopes: &[(&str, AllowAlwaysScope)],
 ) -> PermissionRequestData {
     let title = req
         .tool_call
@@ -367,7 +416,7 @@ pub(crate) fn normalize_request(
         session_id,
         title,
         description,
-        options: normalize_options(&req.options),
+        options: normalize_options(&req.options, allow_always_scopes),
         agent_name,
         risk_level,
         timestamp: now_millis(),
@@ -404,6 +453,116 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use intent_providers::AllowAlwaysScope;
+
+    fn options(raw: Value) -> Vec<PermissionOption> {
+        serde_json::from_value(raw).unwrap()
+    }
+
+    fn scopes(provider: &str) -> &'static [(&'static str, AllowAlwaysScope)] {
+        intent_providers::find_provider(provider)
+            .unwrap()
+            .allow_always_scopes
+    }
+
+    #[test]
+    fn options_carry_kind_and_destructive() {
+        let claude = options(json!([
+            { "optionId": "allow-once", "name": "Yes", "kind": "allow_once" },
+            { "optionId": "reject", "name": "No", "kind": "reject_once" }
+        ]));
+        let wire = serde_json::to_value(normalize_options(&claude, scopes("claude-code"))).unwrap();
+        assert_eq!(wire[0]["kind"], "allow_once");
+        assert!(wire[0].get("scope").is_none(), "{wire}");
+        assert_eq!(wire[1]["kind"], "reject_once");
+        assert_eq!(wire[1]["destructive"], true);
+    }
+
+    /// Every `allow_always` option id and label in the pinned adapters
+    /// (claude-agent-acp 0.95.0, codex-acp 2.6.0, cursor-agent 2026.11.05),
+    /// with where the approval is kept. Unknown options get no scope.
+    #[test]
+    fn allow_always_scope_matches_where_each_adapter_keeps_the_approval() {
+        for (provider, id, name, expected) in [
+            (
+                "claude-code",
+                "allow-with-updates",
+                "Yes, and don't ask again for Bash commands",
+                Some("workspace"),
+            ),
+            (
+                "claude-code",
+                "allow-with-updates",
+                "Yes, allow all edits during this session",
+                Some("chat"),
+            ),
+            (
+                "claude-code",
+                "allow-skill-exact",
+                "Yes, and don't ask again for this skill",
+                Some("workspace"),
+            ),
+            (
+                "claude-code",
+                "exit-plan-auto",
+                "Yes, and use auto mode",
+                Some("chat"),
+            ),
+            (
+                "claude-code",
+                "exit-plan-bypass",
+                "Yes, and bypass permissions",
+                Some("chat"),
+            ),
+            (
+                "codex",
+                "allow_for_session",
+                "Yes, and don't ask again for this command in this session",
+                Some("chat"),
+            ),
+            (
+                "codex",
+                "allow_permissions_session",
+                "Yes, grant these permissions for this session",
+                Some("chat"),
+            ),
+            (
+                "codex",
+                "allow_session",
+                "Allow for this session",
+                Some("chat"),
+            ),
+            (
+                "codex",
+                "accept_execpolicy_amendment",
+                "Yes, and don't ask again for commands that start with `npm`",
+                Some("allWorkspaces"),
+            ),
+            (
+                "codex",
+                "apply_network_policy_amendment:0",
+                "Yes, and allow this host in the future",
+                None,
+            ),
+            ("codex", "allow_always", "Always allow", None),
+            (
+                "cursor",
+                "allow-always",
+                "Allow always",
+                Some("allWorkspaces"),
+            ),
+            ("mock", "allow_always", "Always allow", None),
+        ] {
+            let opts = options(json!([{ "optionId": id, "name": name, "kind": "allow_always" }]));
+            let wire = serde_json::to_value(normalize_options(&opts, scopes(provider))).unwrap();
+            assert_eq!(wire[0]["kind"], "allow_always");
+            assert_eq!(
+                wire[0]["scope"].as_str(),
+                expected,
+                "{provider} {id}: {name}"
+            );
+        }
+    }
 
     #[test]
     fn from_wire_parses_selected_and_cancelled() {

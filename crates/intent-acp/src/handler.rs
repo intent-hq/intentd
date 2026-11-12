@@ -77,6 +77,9 @@ pub struct ClientRequestHandler {
     /// Auto-approved prompts select the `allow_once` option (see
     /// [`intent_providers::ProviderConfig::auto_allow_once`]).
     auto_allow_once: bool,
+    /// Where the provider keeps an `allow_always` approval, by option-id
+    /// prefix (option `scope`).
+    allow_always_scopes: &'static [(&'static str, intent_providers::AllowAlwaysScope)],
 }
 
 /// Cursor's agent→client question request. Answered "skipped" so the agent
@@ -124,7 +127,18 @@ impl ClientRequestHandler {
             terminal_host: None,
             terminal_env_defaults: Vec::new(),
             auto_allow_once: false,
+            allow_always_scopes: &[],
         }
+    }
+
+    /// Label each `allow_always` option with how far its approval reaches.
+    #[must_use]
+    pub fn with_allow_always_scopes(
+        mut self,
+        scopes: &'static [(&'static str, intent_providers::AllowAlwaysScope)],
+    ) -> Self {
+        self.allow_always_scopes = scopes;
+        self
     }
 
     /// Answer auto-approved permission prompts with the `allow_once` option
@@ -268,6 +282,7 @@ impl ClientRequestHandler {
             self.agent_id.0.clone(),
             self.agent_name.clone(),
             &parsed,
+            self.allow_always_scopes,
         );
 
         // A restricted Codex sandbox never escalates silently; an interactive

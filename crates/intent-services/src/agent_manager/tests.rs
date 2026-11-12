@@ -13242,6 +13242,8 @@ fn prompt(request_id: &str, session_id: &str) -> PermissionRequestData {
             label: "Allow".to_string(),
             description: None,
             destructive: false,
+            kind: Some("allow_once"),
+            scope: None,
         }],
         agent_name: "auggie".to_string(),
         risk_level: RiskLevel::High,
