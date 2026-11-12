@@ -19,8 +19,9 @@ use intent_services::feature_api::Services;
 use super::config::{self, ProviderConfig};
 use crate::RemoteFeature;
 
-/// Longest accepted API key, in bytes.
-const MAX_KEY_BYTES: usize = 512;
+/// Longest accepted API key, in bytes: Northflank tokens are JWTs well over
+/// 1 KB, and 8 KiB is the usual cap on one HTTP header that carries the key.
+const MAX_KEY_BYTES: usize = 8 * 1024;
 /// Longest accepted template project slug, in bytes.
 const MAX_PROJECT_BYTES: usize = 64;
 /// Longest accepted Northflank image repository and plan id, in bytes.
