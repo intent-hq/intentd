@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.189] - 2026-11-11
+
+### 🐛 Bug Fixes
+
+- *(quota)* A machine sign-in quota failure does not mark this backend's account ([#3288](https://github.com/intent-hq/intentd/pull/3288))
+
+### 📚 Documentation
+
+- *(app-guide)* Describe owner groups in the starting context ([#3287](https://github.com/intent-hq/intentd/pull/3287))
+
+
 ## [0.11.188] - 2026-11-11
 
 ### 🚀 Features

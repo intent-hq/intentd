@@ -1,6 +1,6 @@
 [package]
 name = "intent-app"
-version = "0.11.188"
+version = "0.11.189"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,18 +8,18 @@ license.workspace = true
 description = "Composition root for intentd: registers the feature crates on the core services"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.188" }
-intent-svc-remote = { path = "../intent-svc-remote", version = "0.11.188" }
-intent-svc-runtime = { path = "../intent-svc-runtime", version = "0.11.188" }
-intent-svc-transfer = { path = "../intent-svc-transfer", version = "0.11.188" }
+intent-services = { path = "../intent-services", version = "0.11.189" }
+intent-svc-remote = { path = "../intent-svc-remote", version = "0.11.189" }
+intent-svc-runtime = { path = "../intent-svc-runtime", version = "0.11.189" }
+intent-svc-transfer = { path = "../intent-svc-transfer", version = "0.11.189" }
 
 [dev-dependencies]
 base64 = { workspace = true }
-intent-core = { path = "../intent-core", version = "0.11.188" }
+intent-core = { path = "../intent-core", version = "0.11.189" }
 # Disposable secret stores for the end-to-end tests (`Services::new_repository_fixture`).
-intent-services = { path = "../intent-services", version = "0.11.188", features = ["repository-test-fixtures"] }
-intent-store = { path = "../intent-store", version = "0.11.188" }
-intent-transport = { path = "../intent-transport", version = "0.11.188" }
+intent-services = { path = "../intent-services", version = "0.11.189", features = ["repository-test-fixtures"] }
+intent-store = { path = "../intent-store", version = "0.11.189" }
+intent-transport = { path = "../intent-transport", version = "0.11.189" }
 serde_json = { workspace = true }
 sha2 = "0.11"
 tempfile = "3"
