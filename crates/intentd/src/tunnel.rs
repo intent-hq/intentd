@@ -101,44 +101,122 @@ fn tailcat_spawn_error_impl(
     ))
 }
 
-/// How long [`TunnelSupervisor::stop`] waits for a cancelled sidecar child to
-/// exit before giving up and leaving local pairing blocked.
-const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Wait until process `pid` no longer exists (`true`), or `timeout` passes
-/// (`false`). `0` means no child was ever spawned. Off unix the exit cannot
-/// be observed from a pid here, so it is never confirmed (`false`): local
-/// pairing stays blocked rather than assume a requested kill finished.
-async fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+/// Whether process `pid` is known to be gone (`0`: no child). Off unix a
+/// pid cannot be probed here, so an unconfirmed child is never assumed gone
+/// and local pairing stays blocked (§5.58 fails closed).
+fn process_gone(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let Ok(raw) = i32::try_from(pid) else {
             return true;
         };
-        if raw == 0 {
-            return true;
-        }
-        let target = nix::unistd::Pid::from_raw(raw);
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if matches!(
-                nix::sys::signal::kill(target, None),
+        raw == 0
+            || matches!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None),
                 Err(nix::errno::Errno::ESRCH)
-            ) {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            // timing-guard: poll for the killed sidecar's exit, bounded by `timeout`
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+            )
     }
     #[cfg(not(unix))]
     {
-        let _ = timeout;
-        // Awaited so the function stays a real `async fn` on every target.
-        std::future::ready(pid == 0).await
+        pid == 0
+    }
+}
+
+/// How often children with an unconfirmed exit are re-checked.
+const ORPHAN_RECHECK: Duration = Duration::from_millis(500);
+
+/// Tunnel activity as local pairing sees it (§5.58): blocked while the
+/// sidecar runs (start to stop, restart backoff included) and while any
+/// child whose exit was never confirmed may still be alive. Survives across
+/// start attempts; shared with the supervision task.
+struct Activity {
+    running: std::sync::atomic::AtomicBool,
+    /// Pids of children whose kill could not be confirmed.
+    orphans: std::sync::Mutex<std::collections::HashSet<u32>>,
+    /// Last state told to the hook, and the hook.
+    published: std::sync::Mutex<(bool, Option<ActiveHook>)>,
+    /// A re-check task is running for `orphans`.
+    reaper: std::sync::atomic::AtomicBool,
+}
+
+impl Activity {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            running: std::sync::atomic::AtomicBool::new(false),
+            orphans: std::sync::Mutex::new(std::collections::HashSet::new()),
+            published: std::sync::Mutex::new((false, None)),
+            reaper: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn orphans(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<u32>> {
+        self.orphans.lock().expect("tunnel orphans poisoned")
+    }
+
+    /// Drop orphans that are gone; whether pairing must stay blocked.
+    fn blocked(&self) -> bool {
+        let mut orphans = self.orphans();
+        orphans.retain(|pid| !process_gone(*pid));
+        self.running.load(std::sync::atomic::Ordering::SeqCst) || !orphans.is_empty()
+    }
+
+    /// Tell the hook when the blocked state changed.
+    fn publish(&self) {
+        let mut published = self.published.lock().expect("tunnel hook poisoned");
+        let now = self.blocked();
+        if published.0 != now {
+            published.0 = now;
+            if let Some(hook) = published.1.as_ref() {
+                hook(now);
+            }
+        }
+    }
+
+    fn set_hook(&self, hook: ActiveHook) {
+        let mut published = self.published.lock().expect("tunnel hook poisoned");
+        published.0 = self.blocked();
+        hook(published.0);
+        published.1 = Some(hook);
+    }
+
+    fn set_running(&self, running: bool) {
+        self.running
+            .store(running, std::sync::atomic::Ordering::SeqCst);
+        self.publish();
+    }
+
+    /// Keep pairing blocked until `pid` is confirmed gone.
+    fn add_orphan(self: &std::sync::Arc<Self>, pid: u32) {
+        if pid == 0 {
+            return;
+        }
+        self.orphans().insert(pid);
+        self.publish();
+        self.ensure_reaper();
+    }
+
+    fn ensure_reaper(self: &std::sync::Arc<Self>) {
+        if self.reaper.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let me = std::sync::Arc::clone(self);
+        intent_core::spawn_daemon(async move {
+            loop {
+                // timing-guard: re-check interval for sidecar exits that could not be confirmed
+                tokio::time::sleep(ORPHAN_RECHECK).await;
+                me.publish();
+                if me.orphans().is_empty() {
+                    me.reaper.store(false, std::sync::atomic::Ordering::SeqCst);
+                    // An orphan added meanwhile saw a running reaper; take
+                    // the job back unless another reaper already did.
+                    if me.orphans().is_empty()
+                        || me.reaper.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        break;
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -158,6 +236,17 @@ async fn kill_confirmed(child: &mut Child) -> bool {
     }
 }
 
+/// Kill `child`; when its exit cannot be confirmed, keep local pairing
+/// blocked until that process is gone.
+async fn stop_child(child: &mut Child, activity: &std::sync::Arc<Activity>) {
+    let pid = child.id();
+    if !kill_confirmed(child).await {
+        if let Some(pid) = pid {
+            activity.add_orphan(pid);
+        }
+    }
+}
+
 /// Supervisor for the tailcat sidecar. One instance lives in the composition
 /// root (`DaemonControl`); `start`/`stop` are idempotent and safe to call
 /// from concurrent settings updates (single async Mutex over the state).
@@ -168,12 +257,10 @@ pub struct TunnelSupervisor {
     key_path: PathBuf,
     address_timeout: Duration,
     state: tokio::sync::Mutex<Option<Running>>,
-    /// Set from the moment a start begins (before the sidecar can forward
-    /// anything) until a stop has killed it, including restart backoff.
-    active: std::sync::atomic::AtomicBool,
-    /// Told about every change of `active`, synchronously (§5.58: local
-    /// pairing is off while the tunnel runs).
-    active_hook: std::sync::Mutex<Option<ActiveHook>>,
+    /// Whether local pairing is blocked (§5.58): running from the moment a
+    /// start begins (before the sidecar can forward anything) until a stop
+    /// has killed it, plus any child whose exit was never confirmed.
+    activity: std::sync::Arc<Activity>,
 }
 
 /// Observer of [`TunnelSupervisor`] activity.
@@ -191,8 +278,7 @@ struct Running {
     up: std::sync::Arc<std::sync::atomic::AtomicBool>,
     recycle: std::sync::Arc<tokio::sync::Notify>,
     stop_tx: tokio::sync::watch::Sender<bool>,
-    /// Resolves to whether every child it owned has a confirmed exit.
-    task: tokio::task::JoinHandle<bool>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl TunnelSupervisor {
@@ -204,16 +290,13 @@ impl TunnelSupervisor {
             key_path: state_dir.join("tailcat.private.json"),
             address_timeout: DEFAULT_ADDRESS_TIMEOUT,
             state: tokio::sync::Mutex::new(None),
-            active: std::sync::atomic::AtomicBool::new(false),
-            active_hook: std::sync::Mutex::new(None),
+            activity: Activity::new(),
         }
     }
 
     /// Install the activity observer and tell it the current state.
     pub fn set_active_hook(&self, hook: ActiveHook) {
-        let mut slot = self.active_hook.lock().expect("tunnel hook poisoned");
-        hook(self.active.load(std::sync::atomic::Ordering::SeqCst));
-        *slot = Some(hook);
+        self.activity.set_hook(hook);
     }
 
     /// Whether the sidecar is started (forwarding, starting, or in its
@@ -221,19 +304,11 @@ impl TunnelSupervisor {
     /// hides the address while the child is down.
     #[cfg(all(test, unix))]
     fn is_active(&self) -> bool {
-        self.active.load(std::sync::atomic::Ordering::SeqCst)
+        self.activity.blocked()
     }
 
     fn set_active(&self, active: bool) {
-        let slot = self.active_hook.lock().expect("tunnel hook poisoned");
-        let was = self
-            .active
-            .swap(active, std::sync::atomic::Ordering::SeqCst);
-        if was != active {
-            if let Some(hook) = slot.as_ref() {
-                hook(active);
-            }
-        }
+        self.activity.set_running(active);
     }
 
     /// Test seam: shorten the address wait so failure paths don't stall tests.
@@ -257,7 +332,6 @@ impl TunnelSupervisor {
         // loopback-only surface (§5.58) before local pairing is off.
         self.set_active(true);
         let child_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let mut confirmed = true;
         let spawned = spawn_and_read_address(
             &self.bin,
             &self.key_path,
@@ -266,19 +340,15 @@ impl TunnelSupervisor {
             self.address_timeout,
             &child_pid,
             None,
-            &mut confirmed,
+            &self.activity,
         )
         .await;
         let (child, address) = match spawned {
             Ok(spawned) => spawned,
             Err(error) => {
-                if confirmed {
-                    self.set_active(false);
-                } else {
-                    tracing::error!(
-                        "tailcat sidecar exit unconfirmed; local pairing stays blocked"
-                    );
-                }
+                // A child whose kill was unconfirmed is an orphan now and
+                // keeps pairing blocked on its own.
+                self.set_active(false);
                 return Err(error);
             }
         };
@@ -297,6 +367,7 @@ impl TunnelSupervisor {
             std::sync::Arc::clone(&up),
             std::sync::Arc::clone(&recycle),
             std::sync::Arc::clone(&child_pid),
+            std::sync::Arc::clone(&self.activity),
         ));
         *state = Some(Running {
             address: address.clone(),
@@ -316,31 +387,33 @@ impl TunnelSupervisor {
             let _ = running.stop_tx.send(true);
             // Give the supervision task a bounded window to kill the child
             // gracefully; `kill_on_drop` on the Command backstops the abort.
-            match tokio::time::timeout(Duration::from_secs(5), &mut running.task).await {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) => {
-                    tracing::error!(
-                        "tailcat sidecar exit unconfirmed after stop; local pairing stays blocked"
-                    );
-                    return;
-                }
-                Ok(Err(_)) | Err(_) => {
+            // A child whose kill the task could not confirm is already an
+            // orphan that keeps pairing blocked on its own.
+            let finished =
+                match tokio::time::timeout(Duration::from_secs(5), &mut running.task).await {
+                    Ok(Ok(())) => true,
+                    // The task panicked: it is gone, but its child's exit is
+                    // unconfirmed.
+                    Ok(Err(_)) => false,
                     // Every wait in the task watches the stop signal and kills
                     // its child with a confirmed wait, so this is a last resort
-                    // (a wedged kill). Cancelling drops the child
-                    // (`kill_on_drop` only requests termination): wait for the
-                    // cancellation, then for the process to be gone, before
-                    // reopening local pairing (§5.58 fails closed).
-                    running.task.abort();
-                    let _ = (&mut running.task).await;
-                    let pid = running.child_pid.load(std::sync::atomic::Ordering::SeqCst);
-                    if !wait_for_exit(pid, STOP_CONFIRM_TIMEOUT).await {
-                        tracing::error!(
-                            pid,
-                            "tailcat sidecar still running after stop; local pairing stays blocked"
-                        );
-                        return;
+                    // (a wedged kill). Cancelling drops the child (`kill_on_drop`
+                    // only requests termination), so its exit is unconfirmed.
+                    Err(_) => {
+                        running.task.abort();
+                        let _ = (&mut running.task).await;
+                        false
                     }
+                };
+            if !finished {
+                let pid = running.child_pid.load(std::sync::atomic::Ordering::SeqCst);
+                if !process_gone(pid) {
+                    tracing::error!(
+                        pid,
+                        "tailcat sidecar exit unconfirmed after stop; local pairing stays blocked"
+                    );
+                    // §5.58 fails closed until that process is gone.
+                    self.activity.add_orphan(pid);
                 }
             }
             self.set_active(false);
@@ -460,7 +533,7 @@ async fn spawn_and_read_address(
     timeout: Duration,
     child_pid: &std::sync::atomic::AtomicU32,
     mut stop_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
-    confirmed: &mut bool,
+    activity: &std::sync::Arc<Activity>,
 ) -> Result<(Child, String)> {
     let mut child = serve_command(bin, key_path, ws_port, derp_url)
         .spawn()
@@ -511,7 +584,7 @@ async fn spawn_and_read_address(
     let address = tokio::select! {
         biased;
         () = stopped => {
-            *confirmed &= kill_confirmed(&mut child).await;
+            stop_child(&mut child, activity).await;
             return Err(Error::Internal("tailcat stopped before reporting its address".to_string()));
         }
         address = read => address,
@@ -526,13 +599,13 @@ async fn spawn_and_read_address(
             Ok((child, addr))
         }
         Ok(None) => {
-            *confirmed &= kill_confirmed(&mut child).await;
+            stop_child(&mut child, activity).await;
             Err(Error::Internal(
                 "tailcat exited before reporting its address".to_string(),
             ))
         }
         Err(_) => {
-            *confirmed &= kill_confirmed(&mut child).await;
+            stop_child(&mut child, activity).await;
             Err(Error::Internal(format!(
                 "tailcat did not report its address within {}s",
                 timeout.as_secs()
@@ -568,10 +641,8 @@ async fn supervise(
     up: std::sync::Arc<std::sync::atomic::AtomicBool>,
     recycle: std::sync::Arc<tokio::sync::Notify>,
     child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
-) -> bool {
-    // Whether every child this task killed has a confirmed exit; returned so
-    // `stop` reopens local pairing only on proof (§5.58 fails closed).
-    let mut confirmed = true;
+    activity: std::sync::Arc<Activity>,
+) {
     let mut backoff = RESTART_BACKOFF_INITIAL;
     loop {
         let mut delay = backoff;
@@ -581,11 +652,12 @@ async fn supervise(
         tokio::select! {
             biased;
             _ = stop_rx.changed() => {
-                return kill_confirmed(&mut child).await && confirmed;
+                stop_child(&mut child, &activity).await;
+                return;
             }
             status = child.wait() => {
                 if *stop_rx.borrow() {
-                    return confirmed;
+                    return;
                 }
                 // Stop advertising the address while nothing serves it —
                 // pairing/status surfaces omit tcAddress until the restart
@@ -603,7 +675,7 @@ async fn supervise(
             }
             () = recycle.notified() => {
                 up.store(false, std::sync::atomic::Ordering::Relaxed);
-                confirmed &= kill_confirmed(&mut child).await;
+                stop_child(&mut child, &activity).await;
                 tracing::info!("tailcat tunnel sidecar restarting after a host resume");
                 backoff = RESTART_BACKOFF_INITIAL;
                 delay = Duration::ZERO;
@@ -617,7 +689,7 @@ async fn supervise(
             // so it does not recycle the child spawned next.
             tokio::select! {
                 biased;
-                _ = stop_rx.changed() => return confirmed,
+                _ = stop_rx.changed() => return,
                 () = recycle.notified() => {
                     backoff = RESTART_BACKOFF_INITIAL;
                     delay = Duration::ZERO;
@@ -625,7 +697,7 @@ async fn supervise(
                 () = tokio::time::sleep(delay) => {}
             }
             if *stop_rx.borrow() {
-                return confirmed;
+                return;
             }
             if !delay.is_zero() {
                 backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
@@ -638,7 +710,7 @@ async fn supervise(
                 address_timeout,
                 &child_pid,
                 Some(&mut stop_rx),
-                &mut confirmed,
+                &activity,
             )
             .await
             {
@@ -656,7 +728,7 @@ async fn supervise(
                     up.store(true, std::sync::atomic::Ordering::Relaxed);
                     break new_child;
                 }
-                Err(_) if *stop_rx.borrow() => return confirmed,
+                Err(_) if *stop_rx.borrow() => return,
                 Err(e) => {
                     tracing::warn!(error = %e, "tailcat tunnel restart failed; will retry");
                     delay = backoff;
@@ -899,77 +971,138 @@ esac
             .unwrap();
         let pid = live.id().unwrap();
         assert!(kill_confirmed(&mut live).await);
-        assert!(wait_for_exit(pid, Duration::ZERO).await);
+        assert!(process_gone(pid));
         let mut done = tokio::process::Command::new("true").spawn().unwrap();
         done.wait().await.unwrap();
         assert!(kill_confirmed(&mut done).await);
     }
 
-    /// Install a running state whose supervision task reports `confirmed`,
-    /// as if it had just been asked to stop.
-    async fn supervisor_reporting(
-        confirmed: bool,
-    ) -> (
-        TunnelSupervisor,
-        std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let sup = TunnelSupervisor::new(dir.path().join("unused"), dir.path());
+    /// A recording hook: every published blocked state, in order.
+    fn record(sup: &TunnelSupervisor) -> std::sync::Arc<std::sync::Mutex<Vec<bool>>> {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         sup.set_active_hook(std::sync::Arc::new({
             let seen = seen.clone();
             move |active| seen.lock().unwrap().push(active)
         }));
-        sup.set_active(true);
-        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
-        *sup.state.lock().await = Some(Running {
-            address: "tcTest".into(),
-            child_pid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            up: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            recycle: std::sync::Arc::new(tokio::sync::Notify::new()),
-            stop_tx,
-            task: tokio::spawn(async move { confirmed }),
-        });
-        (sup, seen)
+        seen
     }
 
-    /// §5.58 fails closed: when the supervision task could not confirm a
-    /// child's exit (a failed kill), `stop` leaves local pairing blocked.
+    /// A live process standing in for a sidecar child whose kill could not
+    /// be confirmed.
+    fn live_orphan() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap()
+    }
+
+    /// Wait (bounded) until the hook is told local pairing is unblocked.
+    async fn await_unblocked(seen: &std::sync::Mutex<Vec<bool>>) {
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
+        while seen.lock().unwrap().last() != Some(&false) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pairing still blocked after the orphan exited"
+            );
+            // timing-guard: poll the orphan re-check, bounded by the deadline
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[test]
+    fn process_gone_tracks_a_real_process() {
+        let mut child = live_orphan();
+        let pid = child.id();
+        assert!(!process_gone(pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(process_gone(pid));
+        assert!(process_gone(0));
+    }
+
+    /// §5.58 fails closed across attempts: a child left unconfirmed by a
+    /// failed start keeps pairing blocked through a later failed start, and
+    /// the block lifts once that child is gone.
     #[tokio::test]
-    async fn stop_keeps_pairing_blocked_when_exit_is_unconfirmed() {
-        let (sup, seen) = supervisor_reporting(false).await;
-        sup.stop().await;
+    async fn unconfirmed_child_survives_a_later_failed_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-tailcat.sh");
+        // genkey succeeds; serve exits without printing an address.
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$1\" in genkey) : > \"${2#--key=}\" ;; serve) exit 1 ;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sup =
+            TunnelSupervisor::new(path, dir.path()).with_address_timeout(Duration::from_secs(5));
+        let seen = record(&sup);
+        let mut orphan = live_orphan();
+        sup.activity.add_orphan(orphan.id());
+        assert!(sup.is_active());
+
+        let _ = start_retrying_etxtbsy(&sup).await;
         assert!(
             sup.is_active(),
-            "an unconfirmed exit must not reopen pairing"
+            "a later failed start must not reopen pairing"
         );
-        assert_eq!(*seen.lock().unwrap(), vec![false, true]);
 
-        let (sup, seen) = supervisor_reporting(true).await;
-        sup.stop().await;
-        assert!(!sup.is_active());
+        orphan.kill().unwrap();
+        orphan.wait().unwrap();
+        await_unblocked(&seen).await;
         assert_eq!(*seen.lock().unwrap(), vec![false, true, false]);
     }
 
+    /// A new child that starts and stops cleanly does not clear the block
+    /// while an older unconfirmed child is still alive.
     #[tokio::test]
-    async fn wait_for_exit_reports_a_live_process_until_it_exits() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        // fixed-deadline: allow — a short probe of a process that is alive by construction
-        assert!(!wait_for_exit(pid, Duration::from_millis(200)).await);
+    async fn clean_stop_keeps_blocking_while_an_old_child_lives() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_fake_tailcat(dir.path());
+        let sup = TunnelSupervisor::new(bin, dir.path());
+        let seen = record(&sup);
+        let mut orphan = live_orphan();
+        sup.activity.add_orphan(orphan.id());
+
+        sup.start(5181, None).await.unwrap();
+        sup.stop().await;
+        assert!(sup.is_active(), "the old child is still alive");
+
+        orphan.kill().unwrap();
+        orphan.wait().unwrap();
+        await_unblocked(&seen).await;
+        assert_eq!(*seen.lock().unwrap(), vec![false, true, false]);
+    }
+
+    /// A stop whose supervision task cannot finish (wedged or panicked)
+    /// records the newest child as unconfirmed while it lives.
+    #[tokio::test]
+    async fn stop_records_a_child_it_could_not_confirm() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = TunnelSupervisor::new(dir.path().join("unused"), dir.path());
+        let seen = record(&sup);
+        sup.set_active(true);
+        let mut child = live_orphan();
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        *sup.state.lock().await = Some(Running {
+            address: "tcTest".into(),
+            child_pid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(child.id())),
+            up: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            recycle: std::sync::Arc::new(tokio::sync::Notify::new()),
+            stop_tx,
+            task: tokio::spawn(async { panic!("supervision task failed") }),
+        });
+        sup.stop().await;
+        assert!(
+            sup.is_active(),
+            "an unconfirmed child must keep pairing blocked"
+        );
+
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(
-            wait_for_exit(
-                pid,
-                intentd_test_support::test_timeout(Duration::from_secs(5))
-            )
-            .await
-        );
-        assert!(wait_for_exit(0, Duration::ZERO).await);
+        await_unblocked(&seen).await;
+        assert_eq!(*seen.lock().unwrap(), vec![false, true, false]);
     }
 
     /// A paused VM (E2B sandbox) or a sleeping host thaws the same tailcat
