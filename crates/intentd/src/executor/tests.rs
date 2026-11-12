@@ -345,6 +345,23 @@ impl Running {
         providers: BTreeMap<String, ProviderLaunch>,
         make_checkouts: MakeCheckouts,
     ) -> Self {
+        Self::start_with_launch(
+            data_dir,
+            api,
+            admission,
+            Arc::new(FixedLaunch(providers)),
+            make_checkouts,
+        )
+        .await
+    }
+
+    async fn start_with_launch(
+        data_dir: &std::path::Path,
+        api: Arc<MachineApi>,
+        admission: Arc<CountAdmission>,
+        launch: Arc<dyn MachineLaunch>,
+        make_checkouts: MakeCheckouts,
+    ) -> Self {
         let report = Arc::new(FixedReport {
             refreshes: std::sync::atomic::AtomicUsize::new(0),
             primes: std::sync::atomic::AtomicUsize::new(0),
@@ -358,7 +375,7 @@ impl Running {
                 work_base: None,
                 node_id: NODE_ID.into(),
                 admission,
-                launch: Arc::new(FixedLaunch(providers)),
+                launch,
                 one_shot: None,
                 report: report.clone(),
                 executable: std::env::current_exe().unwrap(),
@@ -2393,3 +2410,5 @@ async fn a_remote_launch_carries_the_providers_remote_env() {
     );
     node.stop().await;
 }
+
+mod homes;

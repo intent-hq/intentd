@@ -93,9 +93,9 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     // server proxies, 12 the machine's skills, 13 sub-agent checkouts, 14
     // agent secrets on the machine, 15 the backend's forge token, 16 reads
     // of an agent's checkout files, 17 sub-agent fetch through the backend,
-    // 18 an orchestrator's quick actions on the machine; a protocol-7 peer
-    // still binds and runs agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 18 });
+    // 18 an orchestrator's quick actions on the machine, 19 workspace
+    // homes; a protocol-7 peer still binds and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 19 });
     assert_eq!(ONE_SHOT_PROTOCOL, 18);
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
@@ -108,9 +108,9 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     assert_eq!(FORGE_TOKEN_PROTOCOL, 15);
     assert_eq!(CHECKOUT_FILES_PROTOCOL, 16);
     assert_eq!(FORGE_FETCH_PROTOCOL, 17);
-    assert_eq!(ONE_SHOT_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(HOMES_PROTOCOL, NODE_LINK_PROTOCOLS.max);
     assert!(offers_prepared_checkout());
-    for version in 7..=18 {
+    for version in 7..=19 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -699,7 +699,137 @@ fn every_frame() -> Vec<LinkFrame> {
             "no-capacity",
             "every adapter slot is busy",
         )),
+        LinkFrame::HomeOpen(home_open()),
+        LinkFrame::HomeOpenReply(HomeOpenReply {
+            request_id,
+            workspace_id: WorkspaceId::from("ws-1"),
+            home_id: HomeId::from("home-1"),
+            outcome: HomeOpenOutcome::Ready,
+            error: None,
+        }),
+        LinkFrame::HomePush(HomePush {
+            request_id,
+            workspace_id: WorkspaceId::from("ws-1"),
+            home_id: HomeId::from("home-1"),
+        }),
+        LinkFrame::HomePushReply(HomePushReply {
+            request_id,
+            workspace_id: WorkspaceId::from("ws-1"),
+            home_id: HomeId::from("home-1"),
+            outcome: HomePushOutcome::Pushed,
+            head: Some("a".repeat(40)),
+            wip: Some("b".repeat(40)),
+            error: None,
+        }),
     ]
+}
+
+fn home_open() -> HomeOpen {
+    HomeOpen {
+        request_id: LinkId::new_v4(),
+        workspace_id: WorkspaceId::from("ws-1"),
+        home_id: HomeId::from("home-1"),
+        base_commit: "a".repeat(40),
+        repo_key: "repo".into(),
+        checkout: PreparedCheckout::default(),
+        restore: Some(HomeRestore {
+            head: "a".repeat(40),
+            wip: None,
+        }),
+    }
+}
+
+/// nodeProtocol 19 on the wire: a journal record and a setup output name
+/// exactly one owner, `checkoutOf` is a string for an agent and an object
+/// for a home, and every home addition needs protocol 19.
+#[test]
+fn home_owners_round_trip_and_need_protocol_19() {
+    let home = HomeRef {
+        workspace_id: WorkspaceId::from("ws-1"),
+        home_id: HomeId::from("home-1"),
+    };
+    let record = JournalRecord {
+        seq: NodeCounter(3),
+        owner: RecordOwner::Home(home.home_id.clone()),
+        workspace_id: home.workspace_id.clone(),
+        turn_id: None,
+        recorded_at: "2026-11-12T00:00:00Z".into(),
+        body: JournalBody::HomePushed {
+            head: Some("a".repeat(40)),
+            wip: None,
+            rewritten: Some("c".repeat(40)),
+        },
+    };
+    let wire = serde_json::to_value(&record).unwrap();
+    assert_eq!(wire["homeId"], "home-1");
+    assert!(wire.get("agentId").is_none(), "{wire}");
+    assert_eq!(wire["body"]["kind"], "homePushed");
+    assert_eq!(
+        serde_json::from_value::<JournalRecord>(wire.clone()).unwrap(),
+        record
+    );
+    let mut both = wire.clone();
+    both["agentId"] = json!("agent-1");
+    assert!(serde_json::from_value::<JournalRecord>(both).is_err());
+    let mut neither = wire;
+    neither.as_object_mut().unwrap().remove("homeId");
+    assert!(serde_json::from_value::<JournalRecord>(neither).is_err());
+    assert_eq!(LinkFrame::Journal(record).min_protocol(), HOMES_PROTOCOL);
+
+    let output = SetupOutput {
+        owner: SetupOwner::Home(home.clone()),
+        seq: 0,
+        data: "x".into(),
+    };
+    let wire = serde_json::to_value(&output).unwrap();
+    assert_eq!(
+        wire,
+        json!({ "workspaceId": "ws-1", "homeId": "home-1", "seq": 0, "data": "x" })
+    );
+    assert_eq!(serde_json::from_value::<SetupOutput>(wire).unwrap(), output);
+    assert!(serde_json::from_value::<SetupOutput>(
+        json!({ "agentId": "a", "homeId": "home-1", "seq": 0, "data": "x" })
+    )
+    .is_err());
+    assert!(serde_json::from_value::<SetupOutput>(
+        json!({ "homeId": "home-1", "seq": 0, "data": "x" })
+    )
+    .is_err());
+    assert_eq!(
+        LinkFrame::SetupOutput(output).min_protocol(),
+        HOMES_PROTOCOL
+    );
+
+    assert_eq!(
+        serde_json::to_value(CheckoutOf::Agent(AgentId::from("owner"))).unwrap(),
+        json!("owner")
+    );
+    assert_eq!(
+        serde_json::from_value::<CheckoutOf>(json!({ "workspaceId": "ws-1", "homeId": "home-1" }))
+            .unwrap(),
+        CheckoutOf::Home(home.clone())
+    );
+    assert!(serde_json::from_value::<CheckoutOf>(
+        json!({ "workspaceId": "ws-1", "homeId": "home-1", "extra": true })
+    )
+    .is_err());
+
+    let mut hello = serde_json::to_value(LinkFrame::Hello(LinkHello {
+        protocol: NODE_LINK_PROTOCOLS,
+        intentd_version: "test".into(),
+        binding: binding("head", 1),
+        acked_seq: NodeCounter(0),
+        lease_agents: Vec::new(),
+        head_session: None,
+        lease_homes: None,
+    }))
+    .unwrap();
+    assert!(hello.get("leaseHomes").is_none(), "{hello}");
+    hello["leaseHomes"] = json!([{ "workspaceId": "ws-1", "homeId": "home-1" }]);
+    let LinkFrame::Hello(decoded) = serde_json::from_value(hello).unwrap() else {
+        panic!("not a hello");
+    };
+    assert_eq!(decoded.lease_homes, Some(vec![home]));
 }
 
 fn script_start() -> ScriptStartCommand {
@@ -1239,7 +1369,16 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
             frame,
             LinkFrame::OneShot(_) | LinkFrame::OneShotCancel(_) | LinkFrame::OneShotReply(_)
         );
-        let expected = if one_shot {
+        let home = matches!(
+            frame,
+            LinkFrame::HomeOpen(_)
+                | LinkFrame::HomeOpenReply(_)
+                | LinkFrame::HomePush(_)
+                | LinkFrame::HomePushReply(_)
+        );
+        let expected = if home {
+            HOMES_PROTOCOL
+        } else if one_shot {
             ONE_SHOT_PROTOCOL
         } else if checkout {
             CHECKOUT_FILES_PROTOCOL

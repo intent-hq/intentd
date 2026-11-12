@@ -1283,6 +1283,18 @@ pub struct RemoteAgentsSettings {
     /// `remoteAgents.permission` — how remote agents' provider permission
     /// prompts are answered, since no client is attached.
     pub permission: RemoteAgentPermission,
+    /// `remoteAgents.allowHomes` — whether this machine may hold workspace
+    /// homes for the backends it is exposed to. Absent means `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_homes: Option<bool>,
+}
+
+impl RemoteAgentsSettings {
+    /// The effective `remoteAgents.allowHomes`.
+    #[must_use]
+    pub fn allows_homes(&self) -> bool {
+        self.allow_homes.unwrap_or(true)
+    }
 }
 
 /// `remoteAgents.permission` values.

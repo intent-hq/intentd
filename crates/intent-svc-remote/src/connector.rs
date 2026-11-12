@@ -1592,13 +1592,20 @@ impl Shared {
     /// Keep a `setupOutput` of an agent attached here (seq 0 starts the
     /// output over) and announce it, throttled.
     async fn setup_output(&self, output: intent_core::node_link::SetupOutput) {
-        let Some(workspace_id) = self.agents.workspace_of(&output.agent_id) else {
-            tracing::debug!(agent = %output.agent_id, "remote machine: setup output for an agent not attached here; dropped");
+        let intent_core::node_link::SetupOwner::Agent(agent_id) = &output.owner else {
+            tracing::debug!(
+                "remote machine: setup output for a home this backend does not hold; dropped"
+            );
+            return;
+        };
+        let agent_id = agent_id.clone();
+        let Some(workspace_id) = self.agents.workspace_of(&agent_id) else {
+            tracing::debug!(agent = %agent_id, "remote machine: setup output for an agent not attached here; dropped");
             return;
         };
         let publish = {
             let mut tails = lock(&self.setup_outputs);
-            let tail = tails.entry(output.agent_id.clone()).or_default();
+            let tail = tails.entry(agent_id.clone()).or_default();
             if output.seq == 0 {
                 tail.text.clear();
                 tail.truncated = false;
@@ -1623,7 +1630,7 @@ impl Shared {
         if publish {
             if let Some(services) = &self.services {
                 services
-                    .publish_agent_placement_changed(&workspace_id, &output.agent_id)
+                    .publish_agent_placement_changed(&workspace_id, &agent_id)
                     .await;
             }
         }

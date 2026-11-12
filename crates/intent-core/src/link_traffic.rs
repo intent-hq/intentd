@@ -748,11 +748,16 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "exitCode": exited.exit_code,
             "error": exited.error.as_deref().map(field),
         }),
-        LinkFrame::SetupOutput(output) => json!({
-            "type": "setupOutput",
-            "agentId": agent(&output.agent_id),
-            "seq": output.seq,
-        }),
+        LinkFrame::SetupOutput(output) => {
+            let mut light = json!({ "type": "setupOutput", "seq": output.seq });
+            match &output.owner {
+                crate::node_link::SetupOwner::Agent(id) => light["agentId"] = agent(id),
+                crate::node_link::SetupOwner::Home(home) => {
+                    light["homeId"] = field(home.home_id.as_str());
+                }
+            }
+            light
+        }
         LinkFrame::PushWip(request) => json!({
             "type": "pushWip",
             "requestId": request.request_id,

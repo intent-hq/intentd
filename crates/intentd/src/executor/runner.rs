@@ -45,6 +45,9 @@ use super::skills;
 use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
+mod homes;
+pub(crate) use homes::homes_ready;
+
 pub(super) mod codes {
     /// The machine's shared agent limits (count or memory) deny the launch.
     pub const CAPACITY: &str = "node-capacity";
@@ -137,6 +140,12 @@ pub(crate) trait MachineLaunch: Send + Sync {
     /// `remoteAgents.permission`: how provider permission prompts are
     /// answered.
     fn policy(&self) -> PermissionPolicy;
+    /// Whether this machine may hold workspace homes now: its
+    /// `remoteAgents.allowHomes`, behind the build's readiness gate
+    /// ([`homes_ready`]).
+    fn allows_homes(&self) -> bool {
+        homes_ready()
+    }
 }
 
 /// Runs a quick action a backend sent (`oneShot`, nodeProtocol 18) with
@@ -256,6 +265,10 @@ struct Inner {
     pulls: Arc<intent_services::checkout_transfer::PieceSource>,
     /// How long a provider may take to answer `initialize`.
     start_timeouts: Mutex<StartTimeouts>,
+    /// The bound backend's workspace homes (nodeProtocol 19).
+    homes: Mutex<homes::Homes>,
+    /// Home opens run one at a time.
+    home_opens: tokio::sync::Mutex<()>,
 }
 
 /// The longest a provider's first start after a link binds may take to
@@ -1000,6 +1013,8 @@ impl Runner {
                 head_session: Mutex::new(HeadSession::default()),
                 pulls,
                 start_timeouts: Mutex::new(StartTimeouts::default()),
+                homes: Mutex::new(homes::Homes::default()),
+                home_opens: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -3039,6 +3054,8 @@ impl Runner {
         };
         // An ordinary push under way gives way to each agent's last one.
         self.inner.closing_signal.send_replace(true);
+        // Home checkouts stay on disk; their setup and watcher end.
+        self.close_homes();
         // Script runs end first (bounded by their reap wait), so nothing
         // still writes to a checkout while its agent's last work is pushed.
         self.inner.scripts.stop_all().await;

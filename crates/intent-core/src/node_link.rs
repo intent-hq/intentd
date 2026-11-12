@@ -603,6 +603,8 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "heartbeat",
     "heartbeatReply",
     "hello",
+    "homeOpen",
+    "homePush",
     "launch",
     "oneShot",
     "oneShotCancel",
@@ -1745,14 +1747,77 @@ pub enum LinkFrame {
     HomePushReply(HomePushReply),
 }
 
-/// A chunk of an agent's checkout progress and setup output, `seq`
-/// counting from 0 per fresh checkout. The body is closed.
+/// A chunk of an agent's or (nodeProtocol 19) a home's checkout progress
+/// and setup output, `seq` counting from 0 per fresh checkout. The body is
+/// closed: `agentId`, or `workspaceId` with `homeId`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(try_from = "RawSetupOutput", into = "RawSetupOutput")]
 pub struct SetupOutput {
-    pub agent_id: AgentId,
+    pub owner: SetupOwner,
     pub seq: u64,
     pub data: String,
+}
+
+/// Whose checkout a [`SetupOutput`] is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupOwner {
+    Agent(AgentId),
+    Home(HomeRef),
+}
+
+impl From<AgentId> for SetupOwner {
+    fn from(agent: AgentId) -> Self {
+        Self::Agent(agent)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawSetupOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home_id: Option<HomeId>,
+    seq: u64,
+    data: String,
+}
+
+impl TryFrom<RawSetupOutput> for SetupOutput {
+    type Error = &'static str;
+
+    fn try_from(raw: RawSetupOutput) -> std::result::Result<Self, Self::Error> {
+        let owner = match (raw.agent_id, raw.workspace_id, raw.home_id) {
+            (Some(agent), None, None) => SetupOwner::Agent(agent),
+            (None, Some(workspace_id), Some(home_id)) => SetupOwner::Home(HomeRef {
+                workspace_id,
+                home_id,
+            }),
+            _ => return Err("setupOutput names an agentId, or a workspaceId with a homeId"),
+        };
+        Ok(Self {
+            owner,
+            seq: raw.seq,
+            data: raw.data,
+        })
+    }
+}
+
+impl From<SetupOutput> for RawSetupOutput {
+    fn from(output: SetupOutput) -> Self {
+        let (agent_id, workspace_id, home_id) = match output.owner {
+            SetupOwner::Agent(agent) => (Some(agent), None, None),
+            SetupOwner::Home(home) => (None, Some(home.workspace_id), Some(home.home_id)),
+        };
+        Self {
+            agent_id,
+            workspace_id,
+            home_id,
+            seq: output.seq,
+            data: output.data,
+        }
+    }
 }
 
 /// How an agent's setup ended, in [`JournalBody::SetupFinished`].
@@ -1855,6 +1920,9 @@ impl LinkFrame {
             Self::Launch(command) if command.forge.is_some() => FORGE_TOKEN_PROTOCOL,
             Self::Launch(command) if !command.mcp_proxies.is_empty() => MCP_PROXY_PROTOCOL,
             Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,
+            Self::SetupOutput(output) if matches!(output.owner, SetupOwner::Home(_)) => {
+                HOMES_PROTOCOL
+            }
             Self::SetupOutput(_) => PREPARED_CHECKOUT_PROTOCOL,
             Self::Skills(_) | Self::SkillsReply(_) => SKILLS_PROTOCOL,
             Self::Journal(record) if matches!(record.body, JournalBody::Skills { .. }) => {

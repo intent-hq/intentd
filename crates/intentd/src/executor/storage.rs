@@ -18,7 +18,7 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as 
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context as _};
-use intent_core::AgentId;
+use intent_core::{AgentId, HomeId, WorkspaceId};
 
 const LOCK: &str = "executor.lock";
 const JOURNAL: &str = "journal";
@@ -33,6 +33,12 @@ const HOME: &str = "home";
 const OWNER: &str = ".agent";
 const WORK: &str = "work";
 const TMP: &str = "tmp";
+/// The workspace homes' directories (nodeProtocol 19), one per `homeId`:
+/// `<work dir>/homes/<homeId>`, each holding the checkout (`work`), its
+/// temp folder and its setup files.
+const HOMES: &str = "homes";
+/// In a home's directory: the id of the workspace it belongs to.
+const HOME_WORKSPACE: &str = "workspace";
 
 /// Overrides the base of the agents' work dir (`~/.intentd/w`).
 pub(super) const WORK_DIR_ENV: &str = "INTENTD_EXECUTOR_WORK_DIR";
@@ -518,6 +524,83 @@ impl Storage {
             }
         }
         remove_dir(&record)
+    }
+
+    /// Where this backend's home directories live: in the work dir when
+    /// there is one, else in the root.
+    fn homes_dir(&self) -> PathBuf {
+        self.work.as_deref().unwrap_or(&self.root).join(HOMES)
+    }
+
+    /// `home_id`'s directory, made owner-only on first use with its
+    /// workspace recorded. Its checkout goes in `work` inside it.
+    pub(super) fn home_dir(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+    ) -> anyhow::Result<PathBuf> {
+        ensure!(valid_id(&home_id.0), "home id is not a safe path component");
+        ensure!(
+            valid_id(&workspace_id.0),
+            "workspace id is not a safe path component"
+        );
+        let _homes = self.lock_homes();
+        let dir = self.homes_dir().join(&home_id.0);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .context("create the home's directory")?;
+        let metadata = std::fs::symlink_metadata(&dir).context("inspect the home's directory")?;
+        ensure!(
+            metadata.is_dir() && metadata.uid() == nix::unistd::getuid().as_raw(),
+            "the home's directory must be a directory owned by the user running intentd"
+        );
+        std::fs::write(dir.join(HOME_WORKSPACE), workspace_id.0.as_bytes())
+            .context("record the home's workspace")?;
+        Ok(dir)
+    }
+
+    /// `home_id`'s checkout, if it has a directory here.
+    pub(super) fn existing_home_worktree(&self, home_id: &HomeId) -> Option<PathBuf> {
+        if !valid_id(&home_id.0) {
+            return None;
+        }
+        let dir = self.homes_dir().join(&home_id.0);
+        dir.is_dir().then(|| dir.join(WORK))
+    }
+
+    /// The homes with a directory here, with their recorded workspace (a
+    /// directory without one, from a crash before it was written, has
+    /// none).
+    pub(super) fn home_ids(&self) -> Vec<(HomeId, Option<WorkspaceId>)> {
+        let Ok(entries) = std::fs::read_dir(self.homes_dir()) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<(HomeId, Option<WorkspaceId>)> = entries
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| valid_id(name))
+            .map(|name| {
+                let workspace =
+                    std::fs::read_to_string(self.homes_dir().join(&name).join(HOME_WORKSPACE))
+                        .ok()
+                        .filter(|id| valid_id(id))
+                        .map(WorkspaceId::from);
+                (HomeId::from(name), workspace)
+            })
+            .collect();
+        ids.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        ids
+    }
+
+    /// Remove `home_id`'s directory, its checkout included; a missing one is
+    /// already removed.
+    pub(super) fn remove_home(&self, home_id: &HomeId) -> anyhow::Result<()> {
+        ensure!(valid_id(&home_id.0), "home id is not a safe path component");
+        let _homes = self.lock_homes();
+        remove_dir(&self.homes_dir().join(&home_id.0))
     }
 
     /// The machine-local stand-in for head's main checkout of the

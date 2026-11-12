@@ -612,7 +612,7 @@ async fn setup_records_and_output_reach_the_agents_placement() {
         assert!(link
             .link
             .try_send_setup_output(SetupOutput {
-                agent_id: agent.clone(),
+                owner: agent.clone().into(),
                 seq,
                 data: data.into(),
             })
