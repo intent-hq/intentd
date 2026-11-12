@@ -474,7 +474,8 @@ an intent:// link to paste back. A
 remote machine's actions include **Edit** and **Connect**, with **Test connection** inside
 its editing panel.
 <!-- Labs (SSH machine setup, desktop app only): describe only when the user asks about
-installing over SSH, and say it is Labs. With it on, the install cards also offer
+installing over SSH, and say it is Labs (turn on **SSH machine setup** in
+Settings → Advanced → Labs). With it on, the install cards also offer
 **Set it up for me over SSH** for Linux computers only (a Mac or Windows PC uses the
 command): sign in (SSH agent, key file or password; nothing is saved), confirm an unknown
 host key, and the app installs, starts, pairs and adds the machine. A server may need
@@ -526,14 +527,14 @@ running in WSL on the same Windows PC, add a machine with host `localhost`;
 changing listening addresses, and configuring a tunnel are separate choices from
 displaying pairing information. Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts; packages/cloudlands-fe/src/features/intent-web/components/. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/settings/LabsSettings.svelte; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts; packages/cloudlands-fe/src/features/intent-web/components/. -->
 
 ## Use Intent from a browser on another device (experimental)
 
-Browser access is experimental and hidden until the user runs **Enable experimental
-browser access** from Cmd+K (Labs). Do not offer it as a normal option; describe it only
-when the user asks about it, and say it is experimental. **Disable experimental browser
-access** hides the section and turns the server off.
+Browser access is experimental and hidden until the user turns on **Browser access** in
+**Settings → Advanced → Labs** (`/settings?tab=advanced#labs`). Do not offer it as a
+normal option; describe it only when the user asks about it, and say it is experimental.
+Turning that switch off hides the section and turns the server off.
 
 Once unlocked, **Settings → Mobile → Browser access** (`/settings?tab=mobile#mobile`) lets
 a browser on another device, such as a laptop, use the desktop app, including every
