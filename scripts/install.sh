@@ -47,6 +47,21 @@
 #
 #   INTENTD_DAEMON_MODE=full|node  (or --daemon-mode=<value>, on direct runs)
 #
+# A full install can end by pairing, so the link a desktop app needs is on
+# screen: once the service's daemon answers, it runs `intentd pair --yes
+# --tunnel` (the Tailcat tunnel, so the link works from any network) and
+# shows its QR code and intent://pair link. Off by default:
+#
+#   INTENTD_PAIR=1  (or --pair, on direct runs)
+#
+# For a program that drives the install (the desktop app's SSH setup), the
+# link can instead be printed as exactly one machine-readable line, with the
+# QR code, URL and Token lines left out, for full (with the pair option) and
+# node installs alike:
+#
+#   INTENTD_LINK_MARKER=1  (or --link-marker, on direct runs)
+#                          prints: INTENT_LINK=<intent:// link>
+#
 # The release channel the daemon is installed from — and updated on — defaults
 # to stable. Choose another with:
 #
@@ -415,6 +430,47 @@ await_restarted_daemon() {
   return 1
 }
 
+# Is $1 a yes answer from a flag-less env var (1/true/yes/on, any case)?
+env_yes() {
+  case "$1" in
+    1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Run `intentd pair` with the given arguments and show its link. Normally its
+# output passes straight through (QR code, URL, Token). With the link marker
+# the output is captured instead and only the link leaves this script, on
+# one INTENT_LINK=<uri> line: the QR code and the Token line carry the owner
+# credential, and the program reading the marker must not have to scrub
+# them. Returns non-zero when pairing failed or printed no link.
+run_pair() {
+  if [ "$link_marker" != "yes" ]; then
+    "$install_dir/intentd" pair "$@"
+    return
+  fi
+  pair_out=$("$install_dir/intentd" pair "$@") || return 1
+  pair_link=$(printf '%s\n' "$pair_out" |
+    sed -n 's/^URL:[[:space:]]*\(intent:\/\/[^[:space:]]*\).*$/\1/p' | head -n 1)
+  pair_out=""
+  [ -n "$pair_link" ] || return 1
+  printf 'INTENT_LINK=%s\n' "$pair_link"
+  pair_link=""
+}
+
+# The pair option for a full install: once the daemon answers, pair through
+# the Tailcat tunnel unattended. A failure is a warning; the daemon is
+# installed and running either way.
+apply_pair() {
+  [ "$pair" = "yes" ] && [ "$daemon_mode" = "full" ] || return 0
+  info "pairing — the link below adds this computer to the Intent desktop app"
+  if run_pair --yes --tunnel; then
+    paired="yes"
+  else
+    warn "pairing did not finish — run it again with: intentd pair --tunnel"
+  fi
+}
+
 # The commands that finish node setup by hand, for any path that cannot.
 node_setup_hint() {
   printf '%s' "
@@ -468,11 +524,12 @@ apply_daemon_mode() {
     return 0
   fi
   info "node mode on — pair this computer with the Intent that will run agents here"
-  if (exec </dev/tty) 2>/dev/null; then
+  # The marker means a program, not a person, reads this run: no picker.
+  if [ "$link_marker" != "yes" ] && (exec </dev/tty) 2>/dev/null; then
     "$install_dir/intentd" pair --node --tunnel </dev/tty \
       || warn "pairing did not finish — run it again with: intentd pair --node --tunnel"
   else
-    "$install_dir/intentd" pair --node --tunnel --yes \
+    run_pair --node --tunnel --yes \
       || warn "pairing did not finish — run it again with: intentd pair --node --tunnel"
   fi
 }
@@ -644,12 +701,19 @@ process_path() {
 # the service is not registered, or it has no running main process. Linux:
 # systemd's MainPID (an unknown or stopped unit reports 0, which reads as
 # "none" here). macOS: the `pid = N` line of `launchctl print` for the label
-# in this user's gui domain. Never fatal.
+# in this user's gui domain, else in the user domain an install without a
+# desktop login falls back to (see setup_service_macos). Never fatal.
 service_main_pid() {
   if [ "$os" = "Darwin" ]; then
     command -v launchctl >/dev/null 2>&1 || return 0
-    launchctl print "gui/$(id -u)/${INTENTD_SERVICE_NAME:-com.intenthq.intentd}" 2>/dev/null |
-      sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*$/\1/p' | head -n 1
+    for launchd_probe in gui user; do
+      main_pid=$(launchctl print "$launchd_probe/$(id -u)/${INTENTD_SERVICE_NAME:-com.intenthq.intentd}" 2>/dev/null |
+        sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*$/\1/p' | head -n 1)
+      if [ -n "$main_pid" ]; then
+        printf '%s' "$main_pid"
+        return 0
+      fi
+    done
   else
     command -v systemctl >/dev/null 2>&1 || return 0
     main_pid=$(systemctl --user show --property=MainPID --value "${INTENTD_SERVICE_NAME:-intentd}.service" 2>/dev/null) || return 0
@@ -834,12 +898,19 @@ EOF
   info "systemd user unit installed and started: $unit_dir/$unit_name.service"
 
   # User units only run while the user has a session; lingering starts them
-  # at boot — essential on headless boxes.
+  # at boot and keeps them up after the last session (an SSH login) ends —
+  # essential on headless boxes. Some systems let a user turn it on for
+  # themselves; try that before asking for sudo.
   if command -v loginctl >/dev/null 2>&1; then
     user=$(id -un)
     if [ "$(loginctl show-user "$user" --property=Linger 2>/dev/null)" != "Linger=yes" ]; then
-      info "note: user services run only while you are logged in. To start intentd at boot (headless/server), enable lingering:
+      loginctl enable-linger "$user" >/dev/null 2>&1 || true
+      if [ "$(loginctl show-user "$user" --property=Linger 2>/dev/null)" = "Linger=yes" ]; then
+        info "lingering on — intentd keeps running after you log out and starts at boot"
+      else
+        info "note: user services run only while you are logged in. To keep intentd running after you log out and start it at boot (headless/server), enable lingering:
   sudo loginctl enable-linger $user"
+      fi
     fi
   fi
 
@@ -848,11 +919,12 @@ EOF
   if verify_daemon; then
     apply_auto_resume
     apply_daemon_mode
+    apply_pair
   elif [ "$daemon_mode" = "node" ]; then
     warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
   fi
   info "manage the service with: systemctl --user {status|stop|restart|disable} $unit_name"
-  [ "$daemon_mode" = "node" ] \
+  [ "$daemon_mode" = "node" ] || [ "$paired" = "yes" ] \
     || info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
 
@@ -910,37 +982,59 @@ $env_block	<key>RunAtLoad</key>
 EOF
 
   uid=$(id -u)
-  # bootout tears down any previous registration (idempotent re-runs);
-  # bootstrap loads the fresh plist and RunAtLoad starts the agent. bootout
-  # is asynchronous — bootstrapping while the old agent is still tearing
-  # down fails with EIO — so wait until the label is gone.
-  if launchctl bootout "gui/$uid/$label" 2>/dev/null; then
-    waited=0
-    while launchctl print "gui/$uid/$label" >/dev/null 2>&1; do
-      [ "$waited" -lt 10 ] || break
-      sleep 1
-      waited=$((waited + 1))
-    done
-  fi
+  # bootout tears down any previous registration (idempotent re-runs) in
+  # both domains this script may have used, so a re-run from the other kind
+  # of session never leaves two; bootstrap loads the fresh plist and
+  # RunAtLoad starts the agent. bootout is asynchronous — bootstrapping while
+  # the old agent is still tearing down fails with EIO — so wait until the
+  # label is gone.
+  for launchd_old in "gui/$uid" "user/$uid"; do
+    if launchctl bootout "$launchd_old/$label" 2>/dev/null; then
+      waited=0
+      while launchctl print "$launchd_old/$label" >/dev/null 2>&1; do
+        [ "$waited" -lt 10 ] || break
+        sleep 1
+        waited=$((waited + 1))
+      done
+    fi
+  done
   # Log boundary after the old agent is fully torn down (its shutdown noise
   # stays out of the window) but before bootstrap starts the new one, so a
   # failure during the start itself lands inside the window verify_daemon
   # quotes.
   note_log_start
-  launchctl bootstrap "gui/$uid" "$plist" \
-    || fail "launchctl bootstrap failed for $plist"
+  # The gui domain exists only while the user is logged in at the desktop;
+  # over SSH without that login, bootstrapping into it fails (errors 5/125,
+  # depending on the macOS version). The user domain lives as long as the
+  # user has any session or service, so the agent outlives the SSH session —
+  # but nothing loads it again after a restart until someone logs in.
+  # Decided once, by trying, and used for every launchctl call below.
+  if gui_err=$(launchctl bootstrap "gui/$uid" "$plist" 2>&1); then
+    launchd_domain="gui/$uid"
+  elif user_err=$(launchctl bootstrap "user/$uid" "$plist" 2>&1); then
+    launchd_domain="user/$uid"
+  else
+    fail "launchctl bootstrap failed for $plist:
+  gui/$uid: $gui_err
+  user/$uid: $user_err"
+  fi
+  restart_hint="launchctl kickstart -k $launchd_domain/$label"
   info "LaunchAgent installed and started: $plist"
+  if [ "$launchd_domain" = "user/$uid" ]; then
+    info "nobody is logged in at this Mac's desktop, so intentd runs in the background domain: it keeps running after you log out, but if the Mac restarts it starts again only after someone logs in"
+  fi
 
   # apply_auto_resume only when the daemon actually answered: an undecided
   # wait already told the user how to apply the setting themselves.
   if verify_daemon; then
     apply_auto_resume
     apply_daemon_mode
+    apply_pair
   elif [ "$daemon_mode" = "node" ]; then
     warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
   fi
-  info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
-  [ "$daemon_mode" = "node" ] \
+  info "manage the service with: launchctl {print|bootout} $launchd_domain/$label"
+  [ "$daemon_mode" = "node" ] || [ "$paired" = "yes" ] \
     || info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
 
@@ -949,9 +1043,14 @@ main() {
   auto_resume_arg=""
   channel_arg=""
   daemon_mode_arg=""
+  pair=""
+  link_marker=""
+  paired=""
   for arg in "$@"; do
     case "$arg" in
       --service) service_arg="yes" ;;
+      --pair) pair="yes" ;;
+      --link-marker) link_marker="yes" ;;
       --no-service) service_arg="no" ;;
       --auto-resume=*)
         auto_resume_arg=$(normalize_auto_resume "${arg#--auto-resume=}")
@@ -965,7 +1064,7 @@ main() {
         daemon_mode_arg=$(normalize_daemon_mode "${arg#--daemon-mode=}")
         validate_daemon_mode "$daemon_mode_arg"
         ;;
-      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off, --channel=stable|beta|alpha, --daemon-mode=full|node)" ;;
+      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off, --channel=stable|beta|alpha, --daemon-mode=full|node, --pair, --link-marker)" ;;
     esac
   done
   # Validated before any download so garbage fails fast, interactive or not.
@@ -973,6 +1072,12 @@ main() {
   if [ -n "${INTENTD_AUTO_RESUME:-}" ]; then
     auto_resume_env=$(normalize_auto_resume "$INTENTD_AUTO_RESUME")
     validate_auto_resume "$auto_resume_env"
+  fi
+  if [ -z "$pair" ] && env_yes "${INTENTD_PAIR:-}"; then
+    pair="yes"
+  fi
+  if [ -z "$link_marker" ] && env_yes "${INTENTD_LINK_MARKER:-}"; then
+    link_marker="yes"
   fi
   # Daemon mode: flag beats the env var beats the prompt (asked later, after
   # the download). Unset and unasked means full, written nowhere.
@@ -1215,6 +1320,9 @@ main() {
     return 0
   fi
 
+  if [ "$pair" = "yes" ] && [ "$daemon_mode" = "full" ]; then
+    warn "pairing needs the service, so it did not run — once the daemon is running: intentd pair --tunnel"
+  fi
   if [ "$service_mode" = "skip" ]; then
     info "skipping service setup (no interactive terminal detected). To set it up, re-run with INTENTD_INSTALL_SERVICE=1"
   fi

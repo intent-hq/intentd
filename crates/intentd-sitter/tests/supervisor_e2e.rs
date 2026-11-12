@@ -3727,7 +3727,7 @@ fn shutdown_during_startup_check_releases_ownership_without_spawning() {
 }
 
 #[test]
-fn duplicate_serve_preserves_live_sitter_discovery() {
+fn duplicate_serve_exits_cleanly_and_preserves_live_sitter_discovery() {
     let _serial = SERVE_LOOP_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3768,8 +3768,17 @@ fn duplicate_serve_preserves_live_sitter_discovery() {
         owner.id().to_string(),
         "a failed duplicate start must preserve discovery of the live owner"
     );
-    assert_eq!(status.code(), Some(1), "duplicate must fail immediately");
-    assert!(read_or_empty(&stderr_path(dir.path())).contains("cannot claim serve ownership"));
+    // Exit 0, not a failure: launchd's KeepAlive (SuccessfulExit: false)
+    // and systemd's Restart=on-failure leave a clean exit stopped, so a
+    // second registration of the same LaunchAgent (gui/ and user/ domains
+    // after a desktop login) never restart-loops.
+    assert_eq!(status.code(), Some(0), "duplicate must stop cleanly");
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("intentd is already running under another supervisor"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cannot claim serve ownership"), "{stderr}");
     assert_eq!(
         fs::read(&paths.state_path).unwrap(),
         state_before,
