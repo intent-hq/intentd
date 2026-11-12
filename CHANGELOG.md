@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.196] - 2026-11-12
+
+### 📚 Documentation
+
+- *(assistant-guide)* Point Labs switches to Settings > Advanced ([#3319](https://github.com/intent-hq/intentd/pull/3319))
+
+
 ## [0.11.195] - 2026-11-12
 
 ### 🚀 Features
