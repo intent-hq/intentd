@@ -308,11 +308,20 @@ impl Runner {
             );
         };
         let deadline = tokio::time::Instant::now() + PUSH_TIMEOUT;
-        // The reply is due by the deadline, journaling included; a push cut
-        // short there is journaled by the next one (`pushed` is not moved).
-        let pushed = tokio::time::timeout_at(deadline, self.push_home_now(&home, deadline))
-            .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("the home push did not end in time")));
+        // The push runs to completion on its own task, holding the home's
+        // push lock through its journal append, so records keep their
+        // order; only the reply is bounded by the deadline.
+        let push = {
+            let runner = self.clone();
+            let home = home.clone();
+            // caller-binding: allow — node-local push of one home checkout
+            tokio::spawn(async move { runner.push_home_now(&home, deadline).await })
+        };
+        let pushed = match tokio::time::timeout_at(deadline, push).await {
+            Ok(Ok(pushed)) => pushed,
+            Ok(Err(panicked)) => Err(anyhow::anyhow!("the home push failed: {panicked}")),
+            Err(_) => Err(anyhow::anyhow!("the home push did not end in time")),
+        };
         match pushed {
             Ok(pushed) => reply(HomePushOutcome::Pushed, Some(&pushed), None),
             Err(error) => reply(
