@@ -466,7 +466,7 @@ for <backend>** badge), icons for the AI providers available there; hover an ico
 name. Switched-off providers are hidden, and offline or unknown machines show no
 icons. **Add machine** → **Set up a new machine** (also the machine rail's **Add machine**)
 offers **Paste an intent:// link**, **Enter connection details** (host, port and access
-token), **Install a backend** and, when the backend can run agents on other machines,
+token), **Install an Intent server** (a complete, independent Intent) and, when the backend can run agents on other machines,
 **Install a node**. The install cards show one command to copy and run on the other
 computer (macOS / Linux, or Windows); it installs intentd as a service and ends by printing
 an intent:// link to paste back. The same menu still lists the older direct items. A
