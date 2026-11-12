@@ -1341,7 +1341,7 @@ keeps using the installed CLI.
 
 ## Restore workspace browser use
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{SetPrimaryClientConfirmDialog.svelte,driving-indicator.ts}; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/lib/components/browser/BrowserTabNotices.svelte; src/features/layout/tab-types/BrowserTabType.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{SetPrimaryClientConfirmDialog.svelte,driving-indicator.ts}; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/lib/components/browser/{BrowserStatusControl,BrowserViewerTabHeader,EmbeddedBrowser}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/features/layout/tab-types/BrowserTabType.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
 
 The workspace sidebar's menu shows **Primary client**: the client that runs this
 workspace's agent browser tabs and tunnels. When that client is offline, the menu
@@ -1365,11 +1365,17 @@ selection updates when the primary changes; after reconnecting, wait for the
 current client and workspace browser state to refresh. Do not promise automatic
 failover or change the primary client without the user's instruction.
 
-An agent-owned browser tab shows **Controlled by** with the agent's name above
-its address bar; click it to open that agent's conversation. When the tab runs on
-another client that is online, a warning above it says this computer isn't primary for the tab:
-cookies and page state stay on the other client, so the page may differ from what
-the agent sees, and its address can change on its own.
+An agent-owned browser tab shows the controlling agent's avatar in the panel
+header; hover or focus it for **Controlled by** and the agent's name, or click it
+to open that agent's conversation. Host, offline, and page-error controls also
+use icons with tooltips at every panel width. When a tab runs on another computer,
+the host icon beside the address names that computer in its tooltip; click it
+for host details. For an agent-owned tab, these details explain that cookies
+and page state stay on the other computer, so the page may differ from what the
+agent sees and its address can change on its own. The offline warning pauses navigation
+until that computer reconnects; click the status for details and **Close anyway**.
+Page-error icons appear beside Reload; click one for the message and **Retry**.
+If the page closed itself, its empty page shows the message and **Retry** directly.
 
 ## iOS workspace browser
 
