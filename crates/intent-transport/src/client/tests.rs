@@ -988,7 +988,17 @@ fn runtime_capabilities_are_added_only_when_on() {
             false,
             false
         )),
-        json!({ "liveState": true })
+        json!({ "liveState": true, "localCodePairing": 1 })
+    );
+    assert_eq!(
+        caps(with_runtime_capabilities(
+            Some(ok.clone()),
+            true,
+            false,
+            false
+        )),
+        json!({ "liveState": true }),
+        "node mode does not serve local code pairing"
     );
     assert_eq!(
         caps(with_runtime_capabilities(
@@ -999,6 +1009,7 @@ fn runtime_capabilities_are_added_only_when_on() {
         )),
         json!({
             "liveState": true,
+            "localCodePairing": 1,
             "remoteLinkTraffic": 1,
             "remoteMachines": 1,
             "remoteInitialAgent": 1,
@@ -1019,6 +1030,7 @@ fn runtime_capabilities_are_added_only_when_on() {
         )),
         json!({
             "liveState": true,
+            "localCodePairing": 1,
             "remoteLinkTraffic": 1,
             "remoteMachines": 1,
             "remoteInitialAgent": 1,

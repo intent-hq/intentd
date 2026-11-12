@@ -41,11 +41,12 @@ pub const PRODUCT_NAME_ENV: &str = "INTENTD_PRODUCT_NAME";
 /// File in the daemon's data folder holding its stable `instanceId`.
 pub const INSTANCE_ID_FILE: &str = "local-instance-id";
 
-/// Whether this daemon implements the whole of §5.58. Until it does, the
-/// record omits `capabilities.localCodePairing`, which readers treat as
-/// unsupported. Flip together with the `client.hello` / `system.capabilities`
-/// advertisement once the endpoint, methods and credential land.
-pub const LOCAL_CODE_PAIRING_SUPPORTED: bool = false;
+/// Whether this daemon implements the whole of §5.58 (the five methods, the
+/// `/local-pair` endpoint, the credential, the events and this record). The
+/// record then carries `capabilities.localCodePairing: 1`, matching the
+/// `client.hello` / `system.capabilities` advertisement
+/// ([`intent_core::local_pairing::CAPABILITY_VERSION`]).
+pub const LOCAL_CODE_PAIRING_SUPPORTED: bool = true;
 
 /// Largest record readers accept (and the sweep considers).
 pub const MAX_RECORD_BYTES: u64 = 16 * 1024;
@@ -67,7 +68,8 @@ impl Capabilities {
     #[must_use]
     pub fn current() -> Self {
         Self {
-            local_code_pairing: LOCAL_CODE_PAIRING_SUPPORTED.then_some(1),
+            local_code_pairing: LOCAL_CODE_PAIRING_SUPPORTED
+                .then_some(intent_core::local_pairing::CAPABILITY_VERSION),
         }
     }
 }

@@ -31,6 +31,70 @@ pub const REDEEM_METHOD: &str = "pairing.redeemLocalCode";
 /// The `-32001` message for `pairing.redeemLocalCode` outside `/local-pair`.
 pub const REDEEM_ELSEWHERE_MESSAGE: &str = "pairing.redeemLocalCode is served only on /local-pair";
 
+/// The anonymous, loopback-only redemption endpoint (§5.58, §2.7).
+pub const LOCAL_PAIR_PATH: &str = "/local-pair";
+
+/// The `-32001` message for any other method on `/local-pair`.
+pub const LOCAL_PAIR_ONLY_MESSAGE: &str =
+    "the /local-pair endpoint serves pairing.redeemLocalCode only";
+
+/// Concurrent `/local-pair` connections the listener admits; more are `503`
+/// at upgrade.
+pub const MAX_LOCAL_PAIR_CONNECTIONS: usize = 8;
+
+/// Inbound message and frame cap on `/local-pair`: a redemption is well
+/// under 200 bytes.
+pub const MAX_LOCAL_PAIR_MESSAGE_BYTES: usize = 4 * 1024;
+
+/// A `/local-pair` connection with no request for this long is closed.
+pub const LOCAL_PAIR_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The `/local-pair` `Origin` rule: absent, or a loopback origin
+/// (`http(s)://localhost`, `127.0.0.1` or `[::1]`, any port). Stricter than
+/// the §2.2 allow-list: `null`, `file://`, an empty value, the host's own
+/// hostname and every other origin are refused, because only a native
+/// process should redeem. `origin` is `None` when the header is absent.
+#[must_use]
+pub fn is_local_pair_origin(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    let rest = if let Some(rest) = origin.strip_prefix("http://") {
+        rest
+    } else if let Some(rest) = origin.strip_prefix("https://") {
+        rest
+    } else {
+        return false;
+    };
+    // A serialized origin has no path, query, fragment or userinfo.
+    if rest.contains(['/', '?', '#', '@']) {
+        return false;
+    }
+    let host = if let Some(after) = rest.strip_prefix("[::1]") {
+        if after.is_empty() || valid_port_suffix(after) {
+            return true;
+        }
+        return false;
+    } else {
+        match rest.split_once(':') {
+            Some((host, port)) => {
+                if !valid_port_suffix(&format!(":{port}")) {
+                    return false;
+                }
+                host
+            }
+            None => rest,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1"
+}
+
+fn valid_port_suffix(suffix: &str) -> bool {
+    suffix
+        .strip_prefix(':')
+        .is_some_and(|port| !port.is_empty() && port.parse::<u16>().is_ok())
+}
+
 /// Whether a TCP peer is on this computer: `127.0.0.0/8`, `::1`, or an
 /// IPv4-mapped `::ffff:127.0.0.0/104`.
 #[must_use]
@@ -196,6 +260,37 @@ async fn admin(
         LocalPairingMethod::Redeem => Err(LocalPairingError::Internal(
             "redeem is not an administration method".into(),
         )),
+    }
+}
+
+/// Answer one parsed frame on a `/local-pair` connection. Only a
+/// `pairing.redeemLocalCode` request (with an `id`) runs [`redeem_grant`];
+/// every other frame that carries an `id` is `-32001`, and a notification is
+/// dropped without touching the code (a redemption nobody can read would
+/// only burn it). `None` when nothing is sent back.
+pub async fn local_pair_response(
+    value: &Value,
+    api: &dyn WorkspaceApi,
+    provider: &dyn ServerPairingInfo,
+    peer: IpAddr,
+    display_name: &str,
+) -> Option<String> {
+    match classify(value) {
+        Some(req) if req.method == LocalPairingMethod::Redeem => {
+            if !req.id_present {
+                return None;
+            }
+            Some(
+                match redeem_grant(api, provider, req.params.as_ref(), peer, display_name).await {
+                    Ok(grant) => success_frame(&req.id_echo, &grant),
+                    Err(error) => error_response(&req.id_echo, &error),
+                },
+            )
+        }
+        _ => {
+            let id = value.as_object()?.get("id")?;
+            Some(error_frame(id, -32001, LOCAL_PAIR_ONLY_MESSAGE))
+        }
     }
 }
 

@@ -14,6 +14,11 @@ use serde_json::{json, Value};
 
 use crate::BoxFuture;
 
+/// The `localCodePairing` capability value a daemon advertises in
+/// `client.hello`, `system.capabilities` and its discovery record when it
+/// implements §5.58. Only exactly this value means support.
+pub const CAPABILITY_VERSION: u8 = 1;
+
 /// Code alphabet: the browser sign-in alphabet (no `0`/`O`, `1`/`I`/`L`).
 pub const CODE_ALPHABET: &[u8; 31] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 /// Characters in a code, before the display hyphen.

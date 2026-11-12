@@ -139,7 +139,8 @@ pub(crate) fn server_json(
 }
 
 /// Add what depends on the running daemon to a successful hello `frame`:
-/// `server.daemonMode` (`regular` | `node`), `startupStatus: 1` when the full
+/// `server.daemonMode` (`regular` | `node`), `localCodePairing: 1` outside
+/// node mode, `startupStatus: 1` when the full
 /// composition tracks startup, `remoteMachines: 1` when this backend places
 /// agents on exposed machines (the remote feature, not node mode), together
 /// with `remoteInitialAgent: 1`: `workspace.create` accepts
@@ -157,6 +158,12 @@ pub(crate) fn with_runtime_capabilities(
             let capabilities = &mut value["result"]["server"]["capabilities"];
             if startup_status {
                 capabilities["startupStatus"] = json!(1);
+            }
+            // Local code pairing (§5.58): the five methods and `/local-pair`
+            // belong to the orchestration surface node mode turns off.
+            if !node_mode {
+                capabilities["localCodePairing"] =
+                    json!(intent_core::local_pairing::CAPABILITY_VERSION);
             }
             if remote_machines {
                 capabilities["remoteMachines"] = json!(1);

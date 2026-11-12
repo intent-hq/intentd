@@ -369,6 +369,9 @@ pub(crate) enum ConnCmd {
 
 /// Registry record for one live WebSocket client.
 pub(crate) struct ClientHandle {
+    /// Whether the connection counts as a client (`/health`,
+    /// `system.status`). `/local-pair` connections do not (§5.58).
+    pub counted: bool,
     pub cmd_tx: mpsc::Sender<ConnCmd>,
     /// Last pong receipt on the monotonic clock ([`mono_ms`]), NOT wall time.
     pub last_pong: Arc<AtomicI64>,
@@ -421,6 +424,10 @@ pub(crate) struct WsInner {
     /// Admission permits for `/node/claim` connections
     /// ([`MAX_INVITE_CONNECTIONS`]), held from before the `101` to the close.
     pub claim_permits: Arc<Semaphore>,
+    /// Admission permits for `/local-pair` connections
+    /// ([`crate::local_pairing::MAX_LOCAL_PAIR_CONNECTIONS`]), held from
+    /// before the `101` to the close.
+    pub local_pair_permits: Arc<Semaphore>,
     /// Listener-wide rate limit over the `/invite` requests that hash a
     /// secret ([`crate::invite::RedeemThrottle`]); shared by every `/invite`
     /// connection so a reconnect never resets it.
@@ -489,6 +496,9 @@ impl WsApiServer {
             recovery_bulk_gate: options.recovery_bulk_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             claim_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            local_pair_permits: Arc::new(Semaphore::new(
+                crate::local_pairing::MAX_LOCAL_PAIR_CONNECTIONS,
+            )),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
             executor_links: None,
@@ -538,6 +548,9 @@ impl WsApiServer {
             recovery_bulk_gate: options.recovery_bulk_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             claim_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            local_pair_permits: Arc::new(Semaphore::new(
+                crate::local_pairing::MAX_LOCAL_PAIR_CONNECTIONS,
+            )),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
             executor_links: None,
@@ -581,6 +594,9 @@ impl WsApiServer {
             recovery_bulk_gate: options.recovery_bulk_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             claim_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            local_pair_permits: Arc::new(Semaphore::new(
+                crate::local_pairing::MAX_LOCAL_PAIR_CONNECTIONS,
+            )),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
             executor_links: None,
@@ -732,7 +748,9 @@ impl WsApiServer {
             .clients
             .lock()
             .expect("ws clients poisoned")
-            .len()
+            .values()
+            .filter(|client| client.counted)
+            .count()
     }
 
     /// The pinned SHA-256 certificate fingerprint (colon-separated hex), or
@@ -947,6 +965,11 @@ impl WsInner {
                         epoch,
                     },
                 )
+                .await;
+        }
+        if path == crate::local_pairing::LOCAL_PAIR_PATH {
+            return self
+                .local_pair_upgrade(stream, peer, has_origin, origin.clone(), ws_key, ready)
                 .await;
         }
         if path != "/ws" && path != "/tunnel" && path != INVITE_PATH {
@@ -1203,6 +1226,7 @@ impl WsInner {
         self.clients.lock().expect("ws clients poisoned").insert(
             id,
             ClientHandle {
+                counted: true,
                 cmd_tx,
                 last_pong,
                 abort,
@@ -1252,6 +1276,7 @@ impl WsInner {
         self.clients.lock().expect("ws clients poisoned").insert(
             id,
             ClientHandle {
+                counted: true,
                 cmd_tx,
                 last_pong,
                 abort,
@@ -1290,6 +1315,7 @@ impl WsInner {
         self.clients.lock().expect("ws clients poisoned").insert(
             id,
             ClientHandle {
+                counted: true,
                 cmd_tx,
                 last_pong,
                 abort,
@@ -1418,6 +1444,177 @@ impl WsInner {
         // Dropping the set aborts every request still in flight for this
         // peer (the reaper's task abort drops it too).
         tasks.abort_all();
+        let _ = sink.close().await;
+    }
+
+    /// `/local-pair` upgrade (§5.58, §2.7), in contract order: the listener
+    /// is enabled, the TCP peer is loopback, the `Origin` is absent or
+    /// loopback (`has_origin` with `origin: None` is a present but empty
+    /// header, which is refused),
+    /// then the connection cap. No credential is resolved: an
+    /// `Authorization` header or `?token=` is ignored. A listener without a
+    /// certificate (the insecure dev seat) or a pairing provider has nothing
+    /// to pin and answers `404`; before startup finishes it is `503`.
+    async fn local_pair_upgrade<S>(
+        self: Arc<Self>,
+        mut stream: S,
+        peer: IpAddr,
+        has_origin: bool,
+        origin: Option<String>,
+        ws_key: Option<String>,
+        ready: bool,
+    ) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        if !self.enabled || !crate::local_pairing::is_loopback_peer(peer) {
+            return reject(&mut stream, 403, "Forbidden").await;
+        }
+        let origin_allowed = !has_origin
+            || origin
+                .as_deref()
+                .is_some_and(|o| crate::local_pairing::is_local_pair_origin(Some(o)));
+        if !origin_allowed {
+            return reject(&mut stream, 403, "Forbidden").await;
+        }
+        if self.fingerprint.is_none() {
+            return reject(&mut stream, 404, "Not Found").await;
+        }
+        if !ready {
+            return reject(&mut stream, 503, "Service Unavailable").await;
+        }
+        let Some(provider) = self.server_pairing_info.clone() else {
+            return reject(&mut stream, 404, "Not Found").await;
+        };
+        let Some(key) = ws_key else {
+            return reject(&mut stream, 400, "Bad Request").await;
+        };
+        let Ok(permit) = self.local_pair_permits.clone().try_acquire_owned() else {
+            return reject(&mut stream, 503, "Service Unavailable").await;
+        };
+        let accept = derive_accept_key(key.as_bytes());
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        );
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await?;
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(crate::local_pairing::MAX_LOCAL_PAIR_MESSAGE_BYTES))
+            .max_frame_size(Some(crate::local_pairing::MAX_LOCAL_PAIR_MESSAGE_BYTES));
+        let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
+        let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
+        let last_pong = Arc::new(AtomicI64::new(mono_ms()));
+        let this = self.clone();
+        let handle = tokio::spawn({
+            let last_pong = last_pong.clone();
+            async move {
+                let _permit = permit;
+                this.clone()
+                    .local_pair_connection_loop(ws, cmd_rx, last_pong, provider, peer)
+                    .await;
+                this.deregister(id);
+            }
+        });
+        let abort = handle.abort_handle();
+        self.clients.lock().expect("ws clients poisoned").insert(
+            id,
+            ClientHandle {
+                counted: false,
+                cmd_tx,
+                last_pong,
+                abort,
+            },
+        );
+        Ok(())
+    }
+
+    /// The host's display name for a `/local-pair` grant: the same value as
+    /// its discovery record (`sharing.machineName`, else the product name).
+    fn local_display_name(&self, provider: &dyn crate::server::ServerPairingInfo) -> String {
+        self.control
+            .as_ref()
+            .and_then(|control| control.collaboration_name())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| provider.product_name())
+    }
+
+    /// Drive one `/local-pair` connection (§5.58). No caller is bound and
+    /// only `pairing.redeemLocalCode` is served; no events, subscriptions,
+    /// reverse RPCs or `client.hello`. Requests run one at a time inline (a
+    /// redemption is a hash and one insert), so later frames wait in the
+    /// socket: one in-flight request per connection. The connection closes
+    /// after [`crate::local_pairing::LOCAL_PAIR_IDLE_TIMEOUT`] without a
+    /// request.
+    async fn local_pair_connection_loop<S>(
+        self: Arc<Self>,
+        ws: WebSocketStream<S>,
+        mut cmd_rx: mpsc::Receiver<ConnCmd>,
+        last_pong: Arc<AtomicI64>,
+        provider: Arc<dyn crate::server::ServerPairingInfo>,
+        peer: IpAddr,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut sink, mut stream) = ws.split();
+        let idle = tokio::time::sleep(crate::local_pairing::LOCAL_PAIR_IDLE_TIMEOUT);
+        tokio::pin!(idle);
+        loop {
+            tokio::select! {
+                () = &mut idle => break,
+                incoming = stream.next() => match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        idle.as_mut().reset(
+                            tokio::time::Instant::now() + crate::local_pairing::LOCAL_PAIR_IDLE_TIMEOUT,
+                        );
+                        let frame = match serde_json::from_str::<serde_json::Value>(&text) {
+                            Ok(value) => {
+                                let display_name = self.local_display_name(provider.as_ref());
+                                crate::local_pairing::local_pair_response(
+                                    &value,
+                                    self.api.as_ref(),
+                                    provider.as_ref(),
+                                    peer,
+                                    &display_name,
+                                )
+                                .await
+                            }
+                            Err(_) => Some(crate::events::error_frame(
+                                &serde_json::Value::Null, -32700, "Parse error")),
+                        };
+                        if let Some(frame) = frame {
+                            if sink.send(Message::Text(frame.into())).await.is_err() { break; }
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if sink.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => last_pong.store(mono_ms(), Ordering::Relaxed),
+                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
+                },
+                cmd = cmd_rx.recv() => match cmd {
+                    None => break,
+                    Some(ConnCmd::Ping) => {
+                        if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(ConnCmd::Close) => {
+                        let _ = sink
+                            .send(Message::Close(Some(CloseFrame {
+                                code: CloseCode::Away,
+                                reason: "Server shutting down".into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        }
         let _ = sink.close().await;
     }
 
@@ -1946,6 +2143,9 @@ pub(crate) fn mono_ms() -> i64 {
     let epoch = *EPOCH.get_or_init(Instant::now);
     i64::try_from(epoch.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
+
+#[cfg(test)]
+mod local_pair_tests;
 
 #[cfg(test)]
 mod tests {

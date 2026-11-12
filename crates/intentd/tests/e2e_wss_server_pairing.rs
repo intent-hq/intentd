@@ -12,6 +12,8 @@
 
 use crate::common;
 use crate::common::uds_exchange::uds_rpc;
+#[path = "e2e_wss_server_pairing/local_pair_endpoint.rs"]
+mod local_pair_endpoint;
 #[path = "e2e_wss_server_pairing/local_pairing.rs"]
 mod local_pairing;
 #[path = "e2e_wss_server_pairing/personal_pairing.rs"]

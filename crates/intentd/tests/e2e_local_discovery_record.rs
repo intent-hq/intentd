@@ -163,8 +163,12 @@ async fn two_daemons_publish_update_and_remove_their_records() {
             "{rec}"
         );
         assert!(rec["startedAt"].is_string() && rec["updatedAt"].is_string());
-        // Unsupported until the /local-pair endpoint lands: no flag at all.
-        assert_eq!(rec["capabilities"], json!({}), "{rec}");
+        // The daemon implements §5.58, so the record advertises it.
+        assert_eq!(
+            rec["capabilities"],
+            json!({ "localCodePairing": 1 }),
+            "{rec}"
+        );
     }
     assert_eq!(rec_a["displayName"], "Studio");
     // machineName wins; otherwise the install's product name.

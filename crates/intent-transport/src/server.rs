@@ -53,6 +53,12 @@ pub trait ServerPairingInfo: Send + Sync {
     fn node_mode(&self) -> bool {
         false
     }
+    /// The install's product name (for example `Intent Alpha`): the local
+    /// discovery record's and the `/local-pair` grant's `displayName` when
+    /// `sharing.machineName` is unset (§5.58).
+    fn product_name(&self) -> String {
+        "Intent".to_string()
+    }
 }
 
 /// Point-in-time snapshot of pairing-relevant server state.

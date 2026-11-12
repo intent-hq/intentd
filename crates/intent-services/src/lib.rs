@@ -18636,6 +18636,14 @@ impl WorkspaceApi for Services {
             // Reads answer bounded pages by default (default page sizes,
             // maximums and byte budgets), so a new app pages them.
             caps.insert("boundedReads".into(), serde_json::json!(1));
+            // Local code pairing (§5.58): the orchestration surface node
+            // mode turns off, and only when the service is wired.
+            if !self.node_mode() && WorkspaceApi::local_pairing(self).is_some() {
+                caps.insert(
+                    "localCodePairing".into(),
+                    serde_json::json!(intent_core::local_pairing::CAPABILITY_VERSION),
+                );
+            }
             Ok(serde_json::Value::Object(caps))
         })
     }

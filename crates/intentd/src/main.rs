@@ -5207,6 +5207,10 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
     fn node_mode(&self) -> bool {
         self.ws_runtime.api.node_mode()
     }
+
+    fn product_name(&self) -> String {
+        local_discovery::product_name()
+    }
 }
 
 impl SystemControl for DaemonControl {

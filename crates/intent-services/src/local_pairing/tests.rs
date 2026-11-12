@@ -5,7 +5,7 @@ use intent_core::local_pairing::{
 };
 use sha2::{Digest as _, Sha256};
 
-use super::LocalPairing;
+use super::{code_lifetime_from, LocalPairing, CODE_LIFETIME};
 use crate::{EventBus, SubscriptionFilter};
 
 struct Fixture {
@@ -345,4 +345,16 @@ fn drawn_codes_use_the_alphabet() {
             intent_core::local_pairing::normalize_code(&code).as_deref() == Some(code.as_str())
         );
     }
+}
+
+#[test]
+fn lifetime_seam_only_shortens() {
+    assert_eq!(code_lifetime_from(None), CODE_LIFETIME);
+    assert_eq!(
+        code_lifetime_from(Some("1500")),
+        std::time::Duration::from_millis(1500)
+    );
+    assert_eq!(code_lifetime_from(Some("50")), CODE_LIFETIME);
+    assert_eq!(code_lifetime_from(Some("junk")), CODE_LIFETIME);
+    assert_eq!(code_lifetime_from(Some("3600000")), CODE_LIFETIME);
 }

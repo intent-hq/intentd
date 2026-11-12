@@ -4,9 +4,8 @@
 //! `/tunnel`, revocation closing the live connection with 1008, and the two
 //! events reaching UDS subscribers only.
 //!
-//! The `/local-pair` redemption endpoint is not served yet, so the credential
-//! is seeded in the store (hash only, as redemption would) before the daemon
-//! starts.
+//! The credential is seeded in the store (hash only, as redemption would)
+//! before the daemon starts; `local_pair_endpoint` covers redemption itself.
 use super::*;
 use intent_store::Store;
 use tokio::io::{AsyncBufReadExt, BufReader};

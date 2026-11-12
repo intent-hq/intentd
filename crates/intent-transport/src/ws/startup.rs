@@ -67,6 +67,7 @@ impl WsInner {
         self.clients.lock().expect("ws clients poisoned").insert(
             id,
             ClientHandle {
+                counted: true,
                 cmd_tx,
                 last_pong,
                 abort: handle.abort_handle(),

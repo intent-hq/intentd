@@ -96,6 +96,20 @@ fn credential_json(row: &LocalPairingCredentialRow, connected: bool) -> LocalPai
     }
 }
 
+/// Test seam: a code lifetime in milliseconds that can only *shorten* the
+/// 10-minute [`CODE_LIFETIME`] (end-to-end expiry tests). Values that do not
+/// parse, are below 100 ms or exceed the contract lifetime are ignored.
+pub const CODE_LIFETIME_ENV: &str = "INTENTD_LOCAL_PAIRING_CODE_LIFETIME_MS";
+
+fn code_lifetime_from(env: Option<&str>) -> std::time::Duration {
+    env.and_then(|value| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .filter(|lifetime| {
+            *lifetime >= std::time::Duration::from_millis(100) && *lifetime < CODE_LIFETIME
+        })
+        .unwrap_or(CODE_LIFETIME)
+}
+
 impl LocalPairing {
     /// A new service with a fresh in-memory HMAC key.
     ///
@@ -103,7 +117,8 @@ impl LocalPairing {
     ///
     /// When the OS random source fails.
     pub fn new(store: Store, bus: Option<EventBus>) -> Result<Arc<Self>, LocalPairingError> {
-        Self::with_lifetime(store, bus, CODE_LIFETIME)
+        let lifetime = code_lifetime_from(std::env::var(CODE_LIFETIME_ENV).ok().as_deref());
+        Self::with_lifetime(store, bus, lifetime)
     }
 
     fn with_lifetime(
