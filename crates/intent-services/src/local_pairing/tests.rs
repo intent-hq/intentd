@@ -146,10 +146,13 @@ async fn code_expires_and_emits_expired() {
     let first = events.recv().await.unwrap();
     assert_eq!(first[0].data["localCode"]["state"], "active");
     // The timer emits `expired` on its own, without an attempt.
-    let expired = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .expect("expiry event")
-        .unwrap();
+    let expired = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .expect("expiry event")
+    .unwrap();
     assert_eq!(expired[0].data["localCode"]["state"], "expired");
     assert_eq!(
         expired[0].data["localCode"]["codeId"],

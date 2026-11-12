@@ -213,6 +213,11 @@ pub const CANNOT_EXERCISE: &[(&str, &str, &str)] = &[
         "-32601",
         "Served only on the WSS pairing handshake, not on UDS.",
     ),
+    (
+        "pairing.listLocalCredentials",
+        "-32601",
+        "A local-only fast path of the listener connection (§5.58), not routed through the JSON-RPC router this harness drives. One short row per paired Intent on this computer, each minted by typing a code.",
+    ),
 ];
 
 /// Golden: methods whose reply size depends on the live process, not on

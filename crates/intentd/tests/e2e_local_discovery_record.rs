@@ -86,6 +86,7 @@ async fn await_record(path: &Path, what: &str, pred: impl Fn(&Value) -> bool) ->
             "record {} never showed {what} within {budget:?}; last: {record:?}",
             path.display()
         );
+        // timing-guard: poll interval for the record file, bounded by the startup budget
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -99,6 +100,7 @@ async fn await_gone(path: &Path, what: &str) {
             "record {} not removed ({what}) within {budget:?}",
             path.display()
         );
+        // timing-guard: poll interval for the record file, bounded by the startup budget
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

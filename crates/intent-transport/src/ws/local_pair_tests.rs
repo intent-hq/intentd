@@ -230,14 +230,17 @@ async fn disabled_listener_refuses_and_connections_are_capped() {
     // Never counted as a client (`/health`, `system.status`).
     assert_eq!(f.server.client_count(), 0);
     drop(held);
-    let reopened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if upgrade(&f, LOOPBACK, "").await.0 == 101 {
-                return;
+    let reopened = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        async {
+            loop {
+                if upgrade(&f, LOOPBACK, "").await.0 == 101 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await;
     assert!(reopened.is_ok(), "a closed connection frees its slot");
 }

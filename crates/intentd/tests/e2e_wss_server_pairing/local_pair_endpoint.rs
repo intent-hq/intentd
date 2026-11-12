@@ -59,6 +59,7 @@ async fn await_peer(discovery: &Path, own_fingerprint: &str, port: u16) -> Value
             tokio::time::Instant::now() < deadline,
             "B never appeared alone in A's list within {budget:?}: {found:?}"
         );
+        // timing-guard: poll interval for the discovery folder, bounded by the startup budget
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -150,6 +151,7 @@ async fn two_daemons_pair_with_a_short_code() {
 
     // An expired code fails.
     let (stale, _) = create_code(&socket_b, 3).await;
+    // timing-guard: outlast B's shortened code lifetime; expiry is the daemon's own timer
     tokio::time::sleep(Duration::from_millis(CODE_LIFETIME_MS + 1_500)).await;
     let expired = redeem(port_b, &pinned, 4, &stale, "Intent A").await;
     assert_eq!(

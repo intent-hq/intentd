@@ -240,7 +240,7 @@ async fn local_pairing_credential_lifecycle() {
     assert_eq!(listed["result"]["credentials"], json!([]));
 
     // The owner's WSS subscription saw none of the local pairing events.
-    let leaked = timeout(Duration::from_millis(300), async {
+    let leaked = timeout(common::test_timeout(Duration::from_millis(300)), async {
         loop {
             match owner.next().await {
                 Some(Ok(Message::Text(frame))) => {

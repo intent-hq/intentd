@@ -348,7 +348,8 @@ impl LiveSource for FakeSource {
 }
 
 async fn wait_for(path: &Path, pred: impl Fn(Option<&LocalDaemonRecord>) -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     loop {
         if pred(read_record(path).as_ref()) {
             return;

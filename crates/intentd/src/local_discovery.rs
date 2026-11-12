@@ -250,12 +250,16 @@ pub fn ensure_dir(dir: &Path) -> std::io::Result<()> {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                builder.mode(0o700);
-            }
+            let builder = {
+                #[cfg_attr(not(unix), expect(unused_mut, reason = "mode is unix-only"))]
+                let mut builder = std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt as _;
+                    builder.mode(0o700);
+                }
+                builder
+            };
             match builder.create(dir) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
