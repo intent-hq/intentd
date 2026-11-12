@@ -621,6 +621,7 @@ async fn expose_node(svc: &Services, providers: Vec<intent_core::node_link::Prov
                 providers,
                 disabled_providers: vec![],
                 observed_at: observed_at.clone(),
+                homes: None,
             }),
             observed_at: Some(observed_at),
             state: intent_core::machines::RemoteMachineState::Disconnected,

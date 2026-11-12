@@ -178,6 +178,7 @@ pub(super) async fn bound_link_offering(
         acked_seq: NodeCounter(0),
         lease_agents: Vec::new(),
         head_session: None,
+        lease_homes: None,
     };
     let dialed = dial_link(&endpoint, hello).await.unwrap();
     let link = tokio::time::timeout(

@@ -203,12 +203,12 @@ async fn wait_for(
 }
 
 fn exited(id: &str) -> impl Fn(&JournalRecord) -> bool + '_ {
-    move |r| r.agent_id.0 == id && matches!(r.body, JournalBody::Exited { .. })
+    move |r| r.agent_id().is_some_and(|a| a.0 == id) && matches!(r.body, JournalBody::Exited { .. })
 }
 
 fn turn_ended<'a>(id: &'a str, turn: &'a str) -> impl Fn(&JournalRecord) -> bool + 'a {
     move |r| {
-        r.agent_id.0 == id
+        r.agent_id().is_some_and(|a| a.0 == id)
             && r.turn_id.as_deref() == Some(turn)
             && matches!(r.body, JournalBody::TurnEnded { .. })
     }
@@ -1067,7 +1067,9 @@ fn node_test_agent_fixture_exists() {
 }
 
 fn started(id: &str) -> impl Fn(&JournalRecord) -> bool + '_ {
-    move |r| r.agent_id.0 == id && matches!(r.body, JournalBody::Started { .. })
+    move |r| {
+        r.agent_id().is_some_and(|a| a.0 == id) && matches!(r.body, JournalBody::Started { .. })
+    }
 }
 
 /// Wait until the runner asked for `count` WIP pushes.
@@ -2626,7 +2628,10 @@ async fn node_runner_shutdown_cancels_a_turn_end_push_during_a_final_stop() {
 }
 
 fn setup_finished(id: &str) -> impl Fn(&JournalRecord) -> bool + '_ {
-    move |r| r.agent_id.0 == id && matches!(r.body, JournalBody::SetupFinished { .. })
+    move |r| {
+        r.agent_id().is_some_and(|a| a.0 == id)
+            && matches!(r.body, JournalBody::SetupFinished { .. })
+    }
 }
 
 /// Wait until `id` has journaled `count` exits.
@@ -2648,7 +2653,10 @@ async fn wait_exits(runner: &Runner, id: &str, count: usize) {
 }
 
 fn setup_started(id: &str) -> impl Fn(&JournalRecord) -> bool + '_ {
-    move |r| r.agent_id.0 == id && matches!(r.body, JournalBody::SetupStarted { .. })
+    move |r| {
+        r.agent_id().is_some_and(|a| a.0 == id)
+            && matches!(r.body, JournalBody::SetupStarted { .. })
+    }
 }
 
 /// A launch of `id` with a prepared checkout and `script` as its setup.
@@ -2691,7 +2699,7 @@ fn finished(
 /// prompt).
 fn told_setup_failed(all: &[JournalRecord], id: &str, turn: &str, needle: &str) -> bool {
     all.iter().any(|r| {
-        r.agent_id.0 == id
+        r.agent_id().is_some_and(|a| a.0 == id)
             && r.turn_id.as_deref() == Some(turn)
             && matches!(&r.body, JournalBody::Notification { notification }
                 if notification.to_string().contains("workspace setup failed")

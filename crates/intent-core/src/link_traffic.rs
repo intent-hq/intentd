@@ -663,12 +663,18 @@ fn light_frame(frame: &LinkFrame) -> Value {
             }
             light
         }
-        LinkFrame::Journal(record) => json!({
-            "type": "journal",
-            "seq": record.seq,
-            "agentId": agent(&record.agent_id),
-            "body": { "kind": journal_kind(&record.body) },
-        }),
+        LinkFrame::Journal(record) => {
+            let mut light = json!({
+                "type": "journal",
+                "seq": record.seq,
+                "body": { "kind": journal_kind(&record.body) },
+            });
+            match &record.owner {
+                crate::node_link::RecordOwner::Agent(id) => light["agentId"] = agent(id),
+                crate::node_link::RecordOwner::Home(id) => light["homeId"] = field(id.as_str()),
+            }
+            light
+        }
         LinkFrame::Ack { seq } => json!({ "type": "ack", "seq": seq }),
         LinkFrame::ReplayComplete { through_seq } => {
             json!({ "type": "replayComplete", "throughSeq": through_seq })
@@ -812,6 +818,31 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "outcome": reply.outcome,
             "code": reply.error.as_ref().map(|error| field(&error.code)),
         }),
+        LinkFrame::HomeOpen(open) => json!({
+            "type": "homeOpen",
+            "requestId": open.request_id,
+            "homeId": field(open.home_id.as_str()),
+            "restore": open.restore.is_some(),
+        }),
+        LinkFrame::HomeOpenReply(reply) => json!({
+            "type": "homeOpenReply",
+            "requestId": reply.request_id,
+            "homeId": field(reply.home_id.as_str()),
+            "outcome": reply.outcome,
+            "error": reply.error.as_deref().map(field),
+        }),
+        LinkFrame::HomePush(push) => json!({
+            "type": "homePush",
+            "requestId": push.request_id,
+            "homeId": field(push.home_id.as_str()),
+        }),
+        LinkFrame::HomePushReply(reply) => json!({
+            "type": "homePushReply",
+            "requestId": reply.request_id,
+            "homeId": field(reply.home_id.as_str()),
+            "outcome": reply.outcome,
+            "error": reply.error.as_deref().map(field),
+        }),
         LinkFrame::CheckoutRead(read) => json!({
             "type": "checkoutRead",
             "requestId": read.request_id,
@@ -853,6 +884,7 @@ fn journal_kind(body: &JournalBody) -> &'static str {
         JournalBody::SetupStarted { .. } => "setupStarted",
         JournalBody::SetupFinished { .. } => "setupFinished",
         JournalBody::Skills { .. } => "skills",
+        JournalBody::HomePushed { .. } => "homePushed",
     }
 }
 
@@ -906,8 +938,12 @@ fn summarize(frame_type: &str, frame: &Value) -> String {
         "cancel" | "stop" => format!("{frame_type} {agent}"),
         "stopAck" => format!("stopAck {agent}"),
         "journal" => format!(
-            "journal #{} {agent} {}",
+            "journal #{} {} {}",
             number(frame, "seq"),
+            frame
+                .get("homeId")
+                .and_then(Value::as_str)
+                .map_or_else(|| agent.to_owned(), |home| format!("home {home}")),
             frame
                 .pointer("/body/kind")
                 .and_then(Value::as_str)
@@ -972,6 +1008,12 @@ fn summarize(frame_type: &str, frame: &Value) -> String {
             }
             line
         }
+        "homeOpen" | "homePush" => format!("{frame_type} home {}", text(frame, "homeId")),
+        "homeOpenReply" | "homePushReply" => format!(
+            "{frame_type} home {} {}",
+            text(frame, "homeId"),
+            text(frame, "outcome")
+        ),
         other => other.to_owned(),
     }
 }

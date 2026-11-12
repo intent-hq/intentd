@@ -27,9 +27,9 @@ use intent_acp::{
     SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{
-    CheckoutRead, CheckoutReadOutcome, CheckoutReadReply, ExitFailure, FinalPush, ForgeFetchLaunch,
-    ForgeLaunch, GitIdentity, JournalBody, JournalRecord, LaunchCommand, LeaseBinding,
-    MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
+    CheckoutOf, CheckoutRead, CheckoutReadOutcome, CheckoutReadReply, ExitFailure, FinalPush,
+    ForgeFetchLaunch, ForgeLaunch, GitIdentity, JournalBody, JournalRecord, LaunchCommand,
+    LeaseBinding, MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -433,7 +433,7 @@ impl StopWait {
 /// A journal entry of `agent` with `body`, outside any turn.
 fn agent_entry(agent: &Agent, body: JournalBody) -> JournalEntry {
     JournalEntry {
-        agent_id: agent.id.clone(),
+        owner: agent.id.clone().into(),
         workspace_id: agent.workspace_id.clone(),
         turn_id: None,
         recorded_at: intent_core::now_iso(),
@@ -1423,7 +1423,7 @@ impl Runner {
             .map(|checkout| checkout.submodules)
             .unwrap_or_default();
         let refused = |error: String, failure: Option<ExitFailure>| JournalEntry {
-            agent_id: agent_id.clone(),
+            owner: agent_id.clone().into(),
             workspace_id: workspace_id.clone(),
             turn_id: None,
             recorded_at: intent_core::now_iso(),
@@ -1449,6 +1449,17 @@ impl Runner {
                 codes::CHECKOUT
             )));
         }
+        let checkout_of = match checkout_of {
+            None => None,
+            Some(CheckoutOf::Agent(owner)) => Some(owner),
+            Some(CheckoutOf::Home(_)) => {
+                drop(state);
+                return Some(exited(format!(
+                    "{}: this machine holds no such home",
+                    codes::CHECKOUT
+                )));
+            }
+        };
         if let Some(forge) = &forge {
             if checkout_of.is_some() || is_sub_agent || !forge.is_valid() {
                 drop(state);
@@ -1657,7 +1668,7 @@ impl Runner {
             let exit = matches!(body, JournalBody::Exited { .. });
             let appended = self
                 .append(JournalEntry {
-                    agent_id: agent_id.clone(),
+                    owner: agent_id.clone().into(),
                     workspace_id: workspace_id.clone(),
                     turn_id,
                     recorded_at: intent_core::now_iso(),
@@ -2423,7 +2434,7 @@ impl Runner {
             )
         };
         let refuse = |workspace_id: WorkspaceId, code: &str, detail: &str| JournalEntry {
-            agent_id: agent_id.clone(),
+            owner: agent_id.clone().into(),
             workspace_id,
             turn_id: Some(turn_id.clone()),
             recorded_at: intent_core::now_iso(),

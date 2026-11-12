@@ -116,7 +116,7 @@ pub use host_membership::{
     HostInvite, HostMember, HostMembershipState, HostRole, InviteScope, PrincipalRevocation,
 };
 pub use ids::{
-    AgentId, ClientId, ExecutorCredentialId, HookId, NoteId, PrMonitorId, PrincipalId,
+    AgentId, ClientId, ExecutorCredentialId, HomeId, HookId, NoteId, PrMonitorId, PrincipalId,
     WorkspaceGitRootId, WorkspaceId, CHIEF_WORKSPACE_ID,
 };
 pub use message_block_page::{

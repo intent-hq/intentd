@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::nodes::NodeCounter;
 use crate::placement::{AgentPlatform, CapacityRefusal};
-use crate::{AgentId, Error, Result, WorkspaceId};
+use crate::{AgentId, Error, HomeId, Result, WorkspaceId};
 
 /// Identifies one RPC request on the link.
 pub type LinkId = uuid::Uuid;
@@ -75,16 +75,17 @@ fn is_false(value: &bool) -> bool {
 /// machine ([`SECRETS_PROTOCOL`]); 15 adds the backend's forge token
 /// ([`FORGE_TOKEN_PROTOCOL`]); 16 adds reads of an agent's checkout files
 /// ([`CHECKOUT_FILES_PROTOCOL`]); 17 lets sub-agents fetch GitHub through the
-/// backend ([`FORGE_FETCH_PROTOCOL`]); each keeps everything the one before
-/// has. Neither 6 nor the single-node 5 ever
-/// shipped, and a protocol-6 peer cannot confirm a stop, so this build
-/// speaks 7 to 18: a backend never takes a stop as confirmed by a machine
+/// backend ([`FORGE_FETCH_PROTOCOL`]); 18 adds quick actions
+/// ([`ONE_SHOT_PROTOCOL`]); 19 adds workspace homes ([`HOMES_PROTOCOL`]);
+/// each keeps everything the one before has. Neither 6 nor the single-node
+/// 5 ever shipped, and a protocol-6 peer cannot confirm a stop, so this
+/// build speaks 7 to 19: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 18 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 19 };
 
 /// The first protocol with reads of an agent's checkout files for
 /// `ws.file.pull`: the [`LinkFrame::CheckoutRead`] /
@@ -105,6 +106,161 @@ pub const FORGE_FETCH_PROTOCOL: u32 = 17;
 /// `agent.completeOnce` / `agent.enhancePrompt` on a machine. The backend
 /// sends none of them on a link that negotiated less.
 pub const ONE_SHOT_PROTOCOL: u32 = 18;
+
+/// The first protocol with workspace homes: the workspace checkout owner
+/// ([`LinkFrame::HomeOpen`], [`LinkFrame::HomePush`] and their replies),
+/// [`LinkHello::lease_homes`], journal records owned by a home
+/// ([`RecordOwner::Home`], [`JournalBody::HomePushed`]),
+/// [`CheckoutOf::Home`] and [`MachineCapabilities::homes`]. The backend
+/// sends none of them on a link that negotiated less, and a machine there
+/// cannot be a home.
+pub const HOMES_PROTOCOL: u32 = 19;
+
+/// A home frame for a `homeId` the machine does not hold, or that is not in
+/// the bound hello's `leaseHomes`.
+pub const NODE_HOME_UNKNOWN: &str = "node-home-unknown";
+
+/// `homeOpen` on a machine that may not hold homes
+/// (`remoteAgents.allowHomes` off).
+pub const NODE_HOME_UNSUPPORTED: &str = "node-home-unsupported";
+
+/// One generation of a workspace's home on a machine. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeRef {
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+}
+
+/// The home refs a [`HomeOpen`] restores: a move, or a rebuilt cloud home.
+/// The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeRestore {
+    pub head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wip: Option<String>,
+}
+
+/// Backend to machine (nodeProtocol 19): make the workspace checkout of
+/// `home_id` and run its setup. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeOpen {
+    pub request_id: LinkId,
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+    /// As [`LaunchCommand::base_commit`].
+    pub base_commit: String,
+    /// As [`LaunchCommand::repo_key`].
+    pub repo_key: String,
+    pub checkout: PreparedCheckout,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<HomeRestore>,
+}
+
+impl HomeOpen {
+    #[must_use]
+    pub fn home(&self) -> HomeRef {
+        HomeRef {
+            workspace_id: self.workspace_id.clone(),
+            home_id: self.home_id.clone(),
+        }
+    }
+}
+
+/// How a [`HomeOpen`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HomeOpenOutcome {
+    /// The checkout exists; its setup runs after this reply.
+    Ready,
+    Failed,
+}
+
+/// Machine to backend (nodeProtocol 19): the answer to a [`HomeOpen`].
+/// `error` is `"<code>: <detail>"` on `failed`. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeOpenReply {
+    pub request_id: LinkId,
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+    pub outcome: HomeOpenOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Backend to machine (nodeProtocol 19): push the home checkout's
+/// `home/head` and `home/wip` now. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomePush {
+    pub request_id: LinkId,
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+}
+
+/// How a [`HomePush`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HomePushOutcome {
+    Pushed,
+    Failed,
+}
+
+/// Machine to backend (nodeProtocol 19): the answer to a [`HomePush`]:
+/// the pushed commits, or `error` on `failed`. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomePushReply {
+    pub request_id: LinkId,
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+    pub outcome: HomePushOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// [`LaunchCommand::checkout_of`]: the agent whose checkout a sub-agent
+/// works in (nodeProtocol 13, a string on the wire), or the workspace's
+/// home checkout (nodeProtocol 19, an object).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CheckoutOf {
+    Agent(AgentId),
+    Home(HomeRef),
+}
+
+impl CheckoutOf {
+    /// The owning agent, for an agent's checkout.
+    #[must_use]
+    pub fn agent(&self) -> Option<&AgentId> {
+        match self {
+            Self::Agent(agent) => Some(agent),
+            Self::Home(_) => None,
+        }
+    }
+
+    /// The home, for the home checkout.
+    #[must_use]
+    pub fn home(&self) -> Option<&HomeRef> {
+        match self {
+            Self::Agent(_) => None,
+            Self::Home(home) => Some(home),
+        }
+    }
+}
+
+impl From<AgentId> for CheckoutOf {
+    fn from(agent: AgentId) -> Self {
+        Self::Agent(agent)
+    }
+}
 
 /// Which quick action a [`OneShot`] runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,6 +703,11 @@ pub struct LinkHello {
     /// brings a different (or no) session: a backend restart ends them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_session: Option<String>,
+    /// nodeProtocol 19: the homes the backend expects on this machine. The
+    /// bind-time sweep keeps exactly these home checkouts; absent (an older
+    /// backend), it removes none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_homes: Option<Vec<HomeRef>>,
 }
 
 /// The node's reply to an accepted [`LinkHello`]: the negotiated protocol
@@ -577,6 +738,10 @@ pub struct LinkWelcome {
 pub struct MachineCapabilities {
     pub platform: AgentPlatform,
     pub intentd_version: String,
+    /// nodeProtocol 19: `false` when the machine may not hold workspace
+    /// homes (`remoteAgents.allowHomes` off); absent means it may.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homes: Option<bool>,
     pub capacity: MachineCapacity,
     pub providers: Vec<ProviderCapability>,
     /// The providers left out of `providers` because the machine's own
@@ -618,6 +783,7 @@ impl MachineCapabilities {
         Self {
             platform,
             intentd_version: intentd_version.into(),
+            homes: None,
             capacity: MachineCapacity {
                 running_agents: 0,
                 agent_cap,
@@ -721,10 +887,11 @@ pub struct LaunchCommand {
     #[serde(default, skip_serializing_if = "is_false")]
     pub compact_tool_descriptions: bool,
     /// The agent whose checkout on the machine this agent works in (its
-    /// owner); the launch then carries no `checkout`. Sent only on a link
-    /// of [`SHARED_CHECKOUT_PROTOCOL`] or later.
+    /// owner), or the workspace's home checkout; the launch then carries no
+    /// `checkout`. Sent only on a link of [`SHARED_CHECKOUT_PROTOCOL`] or
+    /// later, and naming a home only on [`HOMES_PROTOCOL`] or later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkout_of: Option<AgentId>,
+    pub checkout_of: Option<CheckoutOf>,
     /// A top-level agent's GitHub branch and remote. Sent only on a link of
     /// [`FORGE_TOKEN_PROTOCOL`] or later, never for a sub-agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1568,6 +1735,14 @@ pub enum LinkFrame {
     OneShotCancel(OneShotCancel),
     /// Machine to backend (nodeProtocol 18): the answer to a `oneShot`.
     OneShotReply(OneShotReply),
+    /// Backend to machine (nodeProtocol 19): make a home checkout.
+    HomeOpen(HomeOpen),
+    /// Machine to backend (nodeProtocol 19): the answer to a `homeOpen`.
+    HomeOpenReply(HomeOpenReply),
+    /// Backend to machine (nodeProtocol 19): push a home checkout now.
+    HomePush(HomePush),
+    /// Machine to backend (nodeProtocol 19): the answer to a `homePush`.
+    HomePushReply(HomePushReply),
 }
 
 /// A chunk of an agent's checkout progress and setup output, `seq`
@@ -1619,7 +1794,11 @@ impl LinkFrame {
             | Self::SecretList(_)
             | Self::SecretReply(_)
             | Self::ForgeToken(_)
-            | Self::ForgeTokenReply(_) => LinkChannel::Control,
+            | Self::ForgeTokenReply(_)
+            | Self::HomeOpen(_)
+            | Self::HomeOpenReply(_)
+            | Self::HomePush(_)
+            | Self::HomePushReply(_) => LinkChannel::Control,
             Self::Journal(_) | Self::Ack { .. } | Self::ReplayComplete { .. } => {
                 LinkChannel::Journal
             }
@@ -1645,6 +1824,24 @@ impl LinkFrame {
     #[must_use]
     pub fn min_protocol(&self) -> u32 {
         match self {
+            Self::HomeOpen(_)
+            | Self::HomeOpenReply(_)
+            | Self::HomePush(_)
+            | Self::HomePushReply(_) => HOMES_PROTOCOL,
+            Self::Launch(command)
+                if command
+                    .checkout_of
+                    .as_ref()
+                    .is_some_and(|of| of.home().is_some()) =>
+            {
+                HOMES_PROTOCOL
+            }
+            Self::Journal(record)
+                if matches!(record.owner, RecordOwner::Home(_))
+                    || matches!(record.body, JournalBody::HomePushed { .. }) =>
+            {
+                HOMES_PROTOCOL
+            }
             Self::Launch(command) if command.forge_fetch.is_some() => FORGE_FETCH_PROTOCOL,
             Self::Launch(command) if command.checkout_of.is_some() => SHARED_CHECKOUT_PROTOCOL,
             Self::PushWip(_) | Self::PushWipReply(_) => SHARED_CHECKOUT_PROTOCOL,
@@ -1701,7 +1898,9 @@ impl LinkFrame {
             | Self::ForgeToken(_)
             | Self::CheckoutRead(_)
             | Self::OneShot(_)
-            | Self::OneShotCancel(_) => true,
+            | Self::OneShotCancel(_)
+            | Self::HomeOpen(_)
+            | Self::HomePush(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
@@ -1718,7 +1917,9 @@ impl LinkFrame {
             | Self::SecretReply(_)
             | Self::ForgeTokenReply(_)
             | Self::CheckoutReadReply(_)
-            | Self::OneShotReply(_) => false,
+            | Self::OneShotReply(_)
+            | Self::HomeOpenReply(_)
+            | Self::HomePushReply(_) => false,
         }
     }
 
@@ -1775,18 +1976,111 @@ fn check_frame_size(len: usize) -> Result<()> {
     Ok(())
 }
 
-/// One durable record the node journals for an agent and streams to head.
-/// `seq` increases by one per record across the whole lease.
+/// One durable record the node journals for an agent or (nodeProtocol 19)
+/// a home, and streams to head. `seq` increases by one per record across
+/// the whole lease.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(try_from = "RawJournalRecord", into = "RawJournalRecord")]
 pub struct JournalRecord {
     pub seq: NodeCounter,
-    pub agent_id: AgentId,
+    pub owner: RecordOwner,
     pub workspace_id: WorkspaceId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     pub recorded_at: String,
     pub body: JournalBody,
+}
+
+impl JournalRecord {
+    /// The agent the record is about; `None` for a home's record.
+    #[must_use]
+    pub fn agent_id(&self) -> Option<&AgentId> {
+        self.owner.agent()
+    }
+}
+
+/// Whose record a [`JournalRecord`] is: exactly one of `agentId` or
+/// `homeId` on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RecordOwner {
+    Agent(AgentId),
+    Home(HomeId),
+}
+
+impl RecordOwner {
+    #[must_use]
+    pub fn agent(&self) -> Option<&AgentId> {
+        match self {
+            Self::Agent(agent) => Some(agent),
+            Self::Home(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn home(&self) -> Option<&HomeId> {
+        match self {
+            Self::Agent(_) => None,
+            Self::Home(home) => Some(home),
+        }
+    }
+}
+
+impl From<AgentId> for RecordOwner {
+    fn from(agent: AgentId) -> Self {
+        Self::Agent(agent)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawJournalRecord {
+    seq: NodeCounter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home_id: Option<HomeId>,
+    workspace_id: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
+    recorded_at: String,
+    body: JournalBody,
+}
+
+impl TryFrom<RawJournalRecord> for JournalRecord {
+    type Error = &'static str;
+
+    fn try_from(raw: RawJournalRecord) -> std::result::Result<Self, Self::Error> {
+        let owner = match (raw.agent_id, raw.home_id) {
+            (Some(agent), None) => RecordOwner::Agent(agent),
+            (None, Some(home)) => RecordOwner::Home(home),
+            _ => return Err("a journal record names exactly one of agentId or homeId"),
+        };
+        Ok(Self {
+            seq: raw.seq,
+            owner,
+            workspace_id: raw.workspace_id,
+            turn_id: raw.turn_id,
+            recorded_at: raw.recorded_at,
+            body: raw.body,
+        })
+    }
+}
+
+impl From<JournalRecord> for RawJournalRecord {
+    fn from(record: JournalRecord) -> Self {
+        let (agent_id, home_id) = match record.owner {
+            RecordOwner::Agent(agent) => (Some(agent), None),
+            RecordOwner::Home(home) => (None, Some(home)),
+        };
+        Self {
+            seq: record.seq,
+            agent_id,
+            home_id,
+            workspace_id: record.workspace_id,
+            turn_id: record.turn_id,
+            recorded_at: record.recorded_at,
+            body: record.body,
+        }
+    }
 }
 
 /// What a [`JournalRecord`] reports.
@@ -1838,6 +2132,18 @@ pub enum JournalBody {
     /// skills), before `started`.
     #[serde(rename_all = "camelCase")]
     Skills { skills: Vec<MachineSkill> },
+    /// nodeProtocol 19, a home's record: the machine pushed the home
+    /// checkout. `rewritten` is the old `home/head` tip a non-fast-forward
+    /// push replaced.
+    #[serde(rename_all = "camelCase")]
+    HomePushed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wip: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rewritten: Option<String>,
+    },
 }
 
 /// `exited.failure`: the structured form of an exit error. `data` is

@@ -9,7 +9,7 @@ use super::*;
 fn sharing(id: &str, owner: &str) -> LaunchCommand {
     LaunchCommand {
         is_sub_agent: true,
-        checkout_of: Some(AgentId::from(owner)),
+        checkout_of: Some(AgentId::from(owner).into()),
         forge: None,
         forge_fetch: None,
         git_identity: None,

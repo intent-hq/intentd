@@ -72,7 +72,7 @@ fn launch_frame() -> LinkFrame {
 fn journal_frame(seq: u64) -> LinkFrame {
     LinkFrame::Journal(JournalRecord {
         seq: NodeCounter(seq),
-        agent_id: AgentId::from_string("agent-1"),
+        owner: AgentId::from_string("agent-1").into(),
         workspace_id: WorkspaceId::from_string("ws-1"),
         turn_id: None,
         recorded_at: "2026-11-03T00:00:00Z".into(),

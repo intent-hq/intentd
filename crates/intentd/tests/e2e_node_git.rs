@@ -341,6 +341,7 @@ impl Fixture {
                 acked_seq: NodeCounter(0),
                 lease_agents: Vec::new(),
                 head_session: None,
+                lease_homes: None,
             },
         )
         .await

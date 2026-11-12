@@ -172,6 +172,7 @@ fn capabilities() -> MachineCapabilities {
         ],
         disabled_providers: vec![],
         observed_at: "2026-10-30T00:00:00Z".into(),
+        homes: None,
     }
 }
 
@@ -272,6 +273,7 @@ fn later_additions_within_a_version_decode_on_an_older_peer() {
         acked_seq: NodeCounter(0),
         lease_agents: Vec::new(),
         head_session: None,
+        lease_homes: None,
     }))
     .unwrap();
     assert!(
@@ -424,7 +426,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
 fn record(seq: u64, body: JournalBody) -> JournalRecord {
     JournalRecord {
         seq: NodeCounter(seq),
-        agent_id: AgentId::new(),
+        owner: AgentId::new().into(),
         workspace_id: WorkspaceId::new(),
         turn_id: Some("turn-1".into()),
         recorded_at: "2026-10-27T00:00:00Z".into(),
@@ -443,6 +445,7 @@ fn every_frame() -> Vec<LinkFrame> {
             acked_seq: NodeCounter(10),
             lease_agents: Vec::new(),
             head_session: None,
+            lease_homes: None,
         }),
         LinkFrame::Welcome(LinkWelcome {
             protocol: 7,
@@ -845,6 +848,7 @@ fn stop_and_stop_ack_wire_shapes() {
         acked_seq: NodeCounter(0),
         lease_agents: vec![agent_id.clone()],
         head_session: None,
+        lease_homes: None,
     };
     let value = serde_json::to_value(LinkFrame::Hello(hello.clone())).unwrap();
     assert_eq!(value["leaseAgents"], json!([agent_id.0]));
@@ -1459,7 +1463,7 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         is_sub_agent: true,
         profile_env: None,
         checkout: None,
-        checkout_of: Some(AgentId::from("parent")),
+        checkout_of: Some(AgentId::from("parent").into()),
         forge: None,
         forge_fetch: None,
         git_identity: None,
@@ -1609,6 +1613,7 @@ fn hello_head_session_is_optional() {
         acked_seq: NodeCounter(0),
         lease_agents: Vec::new(),
         head_session: None,
+        lease_homes: None,
     };
     let value = serde_json::to_value(LinkFrame::Hello(hello.clone())).unwrap();
     assert!(value.get("headSession").is_none(), "{value}");
@@ -1721,7 +1726,7 @@ fn launch_forge_fetch_needs_protocol_17_and_is_closed() {
     let LinkFrame::Launch(mut sharing) = frame.clone() else {
         unreachable!()
     };
-    sharing.checkout_of = Some(AgentId::from("agent-owner"));
+    sharing.checkout_of = Some(AgentId::from("agent-owner").into());
     assert_eq!(
         LinkFrame::Launch(sharing).min_protocol(),
         FORGE_FETCH_PROTOCOL

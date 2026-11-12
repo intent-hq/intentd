@@ -446,6 +446,7 @@ fn hello_from(head: &str, generation: u64, lease: &str, acked: u64) -> LinkHello
         acked_seq: NodeCounter(acked),
         lease_agents: Vec::new(),
         head_session: None,
+        lease_homes: None,
     }
 }
 
@@ -590,7 +591,7 @@ async fn executor_binds_reports_capabilities_and_streams_launch_outcomes() {
     dialed.link.send(&refused_launch("a1")).await.unwrap();
     let record = next_record(&mut dialed).await;
     assert_eq!(record.seq, NodeCounter(1));
-    assert_eq!(record.agent_id, AgentId::from("a1"));
+    assert_eq!(record.agent_id(), Some(&AgentId::from("a1")));
     assert!(
         matches!(&record.body, JournalBody::Exited { error: Some(e), .. }
             if e.starts_with(runner::codes::PROVIDER)),
@@ -698,7 +699,7 @@ async fn executor_replays_unacknowledged_records_after_rebind_and_restart() {
         .unwrap();
     let replayed = next_record(&mut third).await;
     assert_eq!(replayed.seq, NodeCounter(3));
-    assert_eq!(replayed.agent_id, AgentId::from("a3"));
+    assert_eq!(replayed.agent_id(), Some(&AgentId::from("a3")));
     assert_eq!(replay_complete(&mut third).await, NodeCounter(3));
     third
         .link
@@ -757,7 +758,7 @@ async fn executor_restarts_the_sequence_for_a_new_lease() {
     second.link.send(&refused_launch("a2")).await.unwrap();
     let record = next_record(&mut second).await;
     assert_eq!(
-        (record.seq, record.agent_id),
+        (record.seq, record.agent_id().cloned().unwrap()),
         (NodeCounter(1), AgentId::from("a2"))
     );
     node.stop().await;
@@ -860,14 +861,20 @@ async fn executor_shutdown_settles_launches_arriving_on_a_live_link() {
 
     let journal = Journal::open(&root.join("journal")).unwrap();
     let records = journal.records_after(NodeCounter(0)).unwrap();
-    let mut agents: Vec<&str> = records.iter().map(|r| r.agent_id.0.as_str()).collect();
+    let mut agents: Vec<&str> = records
+        .iter()
+        .filter_map(|r| r.agent_id().map(|a| a.0.as_str()))
+        .collect();
     agents.sort_unstable();
     agents.dedup();
     assert!(agents.contains(&"a0"), "{records:#?}");
     for agent in agents {
         let exits = records
             .iter()
-            .filter(|r| r.agent_id.0 == agent && matches!(r.body, JournalBody::Exited { .. }))
+            .filter(|r| {
+                r.agent_id().is_some_and(|a| a.0 == agent)
+                    && matches!(r.body, JournalBody::Exited { .. })
+            })
             .count();
         assert_eq!(exits, 1, "{agent}: {records:#?}");
     }
@@ -946,7 +953,7 @@ async fn a_long_data_dir_still_binds_and_launches() {
     assert_eq!(replay_complete(&mut dialed).await, NodeCounter(0));
     dialed.link.send(&refused_launch("a1")).await.unwrap();
     let record = next_record(&mut dialed).await;
-    assert_eq!(record.agent_id, AgentId::from("a1"));
+    assert_eq!(record.agent_id(), Some(&AgentId::from("a1")));
     let socket = storage::git_socket_path(
         &data_dir.join(EXECUTOR_DIR),
         &node.api.credential(&token()).id.0,
@@ -988,7 +995,7 @@ async fn each_credential_gets_its_own_storage_and_journal() {
     other.link.send(&refused_launch("b1")).await.unwrap();
     let record = next_record(&mut other).await;
     assert_eq!(
-        (record.seq, record.agent_id),
+        (record.seq, record.agent_id().cloned().unwrap()),
         (NodeCounter(1), AgentId::from("b1"))
     );
     for token in [token(), other_token()] {
