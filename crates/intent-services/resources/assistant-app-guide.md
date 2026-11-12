@@ -464,8 +464,9 @@ is connected to as **<name> (connected backend)**, then saved remote connections
 row shows a macOS, Windows or Linux icon and, after the version (or the **Runs agents
 for <backend>** badge), icons for the AI providers available there; hover an icon for its
 name. Switched-off providers are hidden, and offline or unknown machines show no
-icons. **Add machine** → **Set up a new machine** (also the machine rail's **Add machine**)
-offers **Paste an intent:// link**, **Enter connection details** (host, port and access
+icons. **Add machine** opens **Set up a new machine** (when cloud machines can be added, it
+is the first item of a menu next to **Add cloud**; the machine rail's **Add machine** opens
+it too), which offers **Paste an intent:// link**, **Enter connection details** (host, port and access
 token), **Install an Intent server** (a complete, independent Intent) and, when the backend can run agents on other machines,
 **Install a node**. The install cards show one command to copy and run on the other
 computer (macOS / Linux, or Windows); it installs intentd as a service and ends by printing
