@@ -21,6 +21,9 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::ThreadId;
 use std::time::Duration;
 
+/// Discovery folder override (§5.58), shared by daemon writers and readers.
+pub const LOCAL_DAEMONS_DIR_ENV: &str = "INTENT_LOCAL_DAEMONS_DIR";
+
 /// Names an async test helper's caller when the helper panics.
 ///
 /// `#[track_caller]` is a no-op on an `async fn` (rust-lang/rust#110011), so
@@ -696,6 +699,14 @@ pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Pat
     });
     if !resume_is_caller_owned {
         cmd.env(RESUME_ON_START_TEST_DEFAULT_ENV, "off");
+    }
+    // Keep fixture daemons out of the runner's real local-daemon discovery
+    // folder (§5.58) unless the test shares one folder between daemons.
+    let discovery_is_caller_owned = cmd
+        .get_envs()
+        .any(|(key, value)| key == std::ffi::OsStr::new(LOCAL_DAEMONS_DIR_ENV) && value.is_some());
+    if !discovery_is_caller_owned {
+        cmd.env(LOCAL_DAEMONS_DIR_ENV, data_dir.join("local-daemons"));
     }
     let gh_config_dir = data_dir.join("gh-config");
     match std::fs::create_dir(&gh_config_dir) {

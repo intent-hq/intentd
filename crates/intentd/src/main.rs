@@ -46,6 +46,7 @@ mod executor;
 mod git_credential;
 #[cfg(unix)]
 mod git_remote_intent;
+mod local_discovery;
 mod plugin_exec;
 mod rpc_profile;
 mod shutdown;
@@ -2157,6 +2158,8 @@ async fn cmd_serve_owned(
     prepared: intent_store::PreparedDaemonStore,
     bootstrap: &mut startup::Bootstrap,
 ) -> anyhow::Result<ExitCode> {
+    // `startedAt` of the local discovery record (§5.58).
+    let serve_started_at = intent_core::clock::now_iso();
     // Layered `config.toml` registry backing the TOML-backed `settings.*` keys
     // (defaults < file < startup pins). `Config::resolve()` above already
     // parsed the file strictly (malformed file → startup error), so a load
@@ -3383,6 +3386,21 @@ async fn cmd_serve_owned(
         None
     };
 
+    // Local discovery record (§5.58): written once the boot listener outcome
+    // is known, rewritten on listener/port/name changes, removed on clean exit.
+    let local_discovery = if boot_error.is_none() && !bootstrap.cancellation.stopping() {
+        start_local_discovery(
+            &config.data_dir,
+            tls_cert.as_ref(),
+            serve_started_at,
+            runtime.clone(),
+            settings_registry.clone(),
+        )
+        .await
+    } else {
+        None
+    };
+
     let (startup_stop, startup_stopping) =
         tokio::sync::watch::channel(boot_error.is_some() || bootstrap.cancellation.stopping());
     let shutdown = {
@@ -3723,6 +3741,11 @@ async fn cmd_serve_owned(
     if let Some(service) = &executor_service {
         let phase = shutdown::Phase::start("executor_shutdown");
         service.shutdown().await;
+        phase.complete();
+    }
+    if let Some(publisher) = local_discovery {
+        let phase = shutdown::Phase::start("local_discovery_remove");
+        publisher.shutdown().await;
         phase.complete();
     }
     let phase = shutdown::Phase::start("tunnel_stop");
@@ -5047,6 +5070,92 @@ async fn publish_starting_ws_server(
     }
     state.ws_server = Some(server);
     Ok(())
+}
+
+/// Live fields of the local discovery record (§5.58), read from the WSS
+/// runtime state (port, live certificate) and the settings registry
+/// (`sharing.machineName`).
+struct DiscoveryLiveSource {
+    ws_runtime: Arc<WsRuntimeControl>,
+    settings_registry: Arc<intent_services::SettingsRegistry>,
+}
+
+impl local_discovery::LiveSource for DiscoveryLiveSource {
+    fn live(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = local_discovery::LiveFields> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (port, fingerprint) = {
+                let state = self.ws_runtime.state.lock().await;
+                (
+                    state.port,
+                    state
+                        .ws_server
+                        .as_ref()
+                        .and_then(|s| s.fingerprint().map(str::to_string)),
+                )
+            };
+            let machine_name = self
+                .settings_registry
+                .snapshot()
+                .effective
+                .sharing
+                .collaboration_name()
+                .map(str::to_owned);
+            local_discovery::LiveFields {
+                port,
+                fingerprint,
+                machine_name,
+            }
+        })
+    }
+}
+
+/// Start the local discovery publisher (§5.58). `None` (no record) without a
+/// TLS certificate (`--insecure`: nothing to pin), under the private test
+/// profile (no TCP listener allowed), when no folder resolves, or when the
+/// folder is unsafe.
+async fn start_local_discovery(
+    data_dir: &Path,
+    tls_cert: Option<&intent_transport::TlsCertificate>,
+    started_at: String,
+    ws_runtime: Arc<WsRuntimeControl>,
+    settings_registry: Arc<intent_services::SettingsRegistry>,
+) -> Option<local_discovery::Publisher> {
+    let tls_cert = tls_cert?;
+    if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
+        return None;
+    }
+    let Some(dir) = local_discovery::resolve_dir() else {
+        tracing::warn!("local daemon discovery disabled: no home folder");
+        return None;
+    };
+    let instance_id = match local_discovery::load_or_create_instance_id(data_dir) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(%error, "local daemon discovery disabled: instance id unavailable");
+            return None;
+        }
+    };
+    let data_dir = std::fs::canonicalize(data_dir)
+        .or_else(|_| std::path::absolute(data_dir))
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let fields = local_discovery::StaticFields {
+        instance_id,
+        pid: std::process::id(),
+        started_at,
+        data_dir,
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_version: intent_transport::PROTOCOL_VERSION.to_string(),
+        fingerprint: tls_cert.fingerprint256.clone(),
+        product_name: local_discovery::product_name(),
+    };
+    let source = Arc::new(DiscoveryLiveSource {
+        ws_runtime,
+        settings_registry,
+    });
+    local_discovery::Publisher::start(dir, fields, source).await
 }
 
 /// Pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).

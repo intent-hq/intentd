@@ -23,6 +23,7 @@ mod e2e_detached_lifecycle;
 mod e2e_doctor_codex;
 mod e2e_doctor_database_safety;
 mod e2e_hook_lifecycle;
+mod e2e_local_discovery_record;
 mod e2e_mcp_bridge_resilience;
 mod e2e_native_review_wire;
 mod e2e_node_git;
