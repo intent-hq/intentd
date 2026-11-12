@@ -717,7 +717,7 @@ jobs:
         run: |
           cargo test -p intent-core --lib capture_login_shell_path_with_fake_shell
           cargo test -p intentd --test wss_integration wss_note_save_asset_round_trip
-      # The install.ps1 guard tests (intentd-sitter's install_ps1_owner.rs)
+      # The install.ps1 guard tests (intentd-sitter's install_ps1_*.rs suites)
       # execute the shipped PowerShell and self-skip when `pwsh` is absent —
       # which let the suite "pass" in ~0.014s without running a single block
       # (intent-hq/monorepo#4054). Provision pwsh 7.x here so the tests
@@ -795,19 +795,22 @@ jobs:
           echo "pwsh startup probe: $probe_out"
       # INTENTD_CI_EXPECT_PWSH makes a missing pwsh FAIL these tests instead
       # of skipping (see install_ps1_owner.rs), so a broken provisioning step
-      # above can never quietly turn this suite back into a no-op. The suite
-      # runs here rather than relying on coverage-all, where a pwsh-less
-      # runner would skip it silently. XDG_CACHE_HOME matches the provisioning
+      # above can never quietly turn these suites back into no-ops. The suites
+      # run here rather than relying on coverage-all, where a pwsh-less
+      # runner would skip them silently. The glob runs every install_ps1_*
+      # suite, so a new one cannot be left out: install_ps1_daemon_mode ran
+      # on no PR while this step named only install_ps1_owner (intentd#3304);
+      # test-ci-test-policy.py enforces the glob and the env. XDG_CACHE_HOME matches the provisioning
       # step's job-private cache (intent-hq/intent#5367, see above); the
       # harness narrows it further to a per-run dir for each pwsh it spawns.
-      - name: Installer guard tests (install_ps1_owner)
+      - name: Installer guard tests (install_ps1_*)
         env:
           INTENTD_CI_EXPECT_PWSH: 1
           INTENTD_ASSERT_BOUND_CALLER: "1"
           XDG_CACHE_HOME: ${{ runner.temp }}/xdg-cache
         run: |
           echo "pwsh: $(command -v pwsh) ($(pwsh --version)); XDG_CACHE_HOME=$XDG_CACHE_HOME; ulimit -s: $(ulimit -s)"
-          cargo test -p intentd-sitter --test install_ps1_owner
+          cargo test -p intentd-sitter --test 'install_ps1_*'
   # Windows cross lint, pull requests and merge queue: the native production
   # check and target-gated Clippy for the Windows GNU target on a Linux
   # runner, so a Windows-only lint error (an import only
@@ -2570,9 +2573,9 @@ jobs:
         run: python3 -S scripts/test-release-plz-changelog.py
 
   # install.ps1's Windows-only paths (intent-hq/intent#3229): the `check`
-  # job's install_ps1_owner suite runs the installer's ownership check under
-  # pwsh on Linux, but the Scheduled Task registration and the startup wait
-  # that polls the task's log need Windows — scripts/install.ps1.Tests.ps1
+  # job's install_ps1_* suites run the installer's owner and daemon-mode
+  # blocks under pwsh on Linux, but the Scheduled Task registration and the
+  # startup wait that polls the task's log need Windows — scripts/install.ps1.Tests.ps1
   # (Pester) executes those marked blocks of the shipped script with the Task
   # Scheduler cmdlets mocked. Runs under both Windows PowerShell 5.1 (what
   # `powershell -c "irm … | iex"` in the README uses) and pwsh 7.

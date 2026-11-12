@@ -480,9 +480,32 @@ def thread_sizing_violations(workflow):
     return errors
 
 
+INSTALLER_STEP = "Installer guard tests (install_ps1_*)"
+INSTALLER_RUN = "cargo test -p intentd-sitter --test 'install_ps1_*'"
+
+
+def installer_guard_violations(workflow, root=ROOT):
+    """Every install_ps1_* suite runs in one required step that fails without pwsh.
+
+    The suites self-skip without pwsh; install_ps1_daemon_mode ran nowhere on
+    PRs that way while only install_ps1_owner was named (intentd#3304).
+    """
+    errors = []
+    steps = [s for s in workflow["jobs"]["check"]["steps"] if s.get("name") == INSTALLER_STEP]
+    if (len(steps) != 1 or str(steps[0].get("env", {}).get("INTENTD_CI_EXPECT_PWSH", "")) != "1"
+            or INSTALLER_RUN not in str(steps[0].get("run", "")).splitlines()
+            or steps[0].get("if") or steps[0].get("continue-on-error")):
+        errors.append(f"check: {INSTALLER_STEP} must run {INSTALLER_RUN} with INTENTD_CI_EXPECT_PWSH=1")
+    for suite in sorted(Path(root).glob("crates/intentd-sitter/tests/install_ps1_*.rs")):
+        if "INTENTD_CI_EXPECT_PWSH" not in suite.read_text():
+            errors.append(f"{suite.relative_to(root)} must fail without pwsh under INTENTD_CI_EXPECT_PWSH")
+    return errors
+
+
 def violations(workflow, policy):
     errors = (coverage_budget_violations(workflow) + profile_pool_violations(workflow)
-              + thread_sizing_violations(workflow) + named_test_violations(workflow))
+              + thread_sizing_violations(workflow) + named_test_violations(workflow)
+              + installer_guard_violations(workflow))
     found = set()
     for name, job, step in test_steps(workflow):
         found.add(name)
@@ -529,7 +552,7 @@ REQUIRED_TEST_STEPS = {
     ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 2,
     ("check", "No provider CLIs on the runner"): 1,
     ("check", "Coverage-skipped tests (STAB-40/43)"): 2,
-    ("check", "Installer guard tests (install_ps1_owner)"): 1,
+    ("check", "Installer guard tests (install_ps1_*)"): 1,
     # None: indirect Python/Bash-array routes are executed with a stub below.
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"): None,
     ("build", "Retained capability gate fixture (macOS runtime)"): None,
@@ -948,6 +971,34 @@ else:
             workflow["jobs"]["release-scripts"]["steps"] = [s for s in steps if script not in s.get("run", "")]
             self.assertTrue(any(script in error for error in violations(workflow, "1")))
 
+    def test_installer_guard_step_runs_every_suite_with_pwsh_required(self):
+        expected = f"check: {INSTALLER_STEP} must run {INSTALLER_RUN} with INTENTD_CI_EXPECT_PWSH=1"
+        self.assertEqual(installer_guard_violations(self.workflow), [])
+        mutations = {
+            "one suite": lambda s: s.update(run=s["run"].replace("'install_ps1_*'", "install_ps1_owner")),
+            "unset": lambda s: s["env"].pop("INTENTD_CI_EXPECT_PWSH"),
+            "disabled": lambda s: s["env"].update(INTENTD_CI_EXPECT_PWSH="0"),
+            "optional": lambda s: s.update({"continue-on-error": True}),
+            "conditional": lambda s: s.update({"if": "github.event_name == 'push'"}),
+            "renamed": lambda s: s.update(name="Installer guard tests"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(mutation=label):
+                workflow = copy.deepcopy(self.workflow)
+                mutate(next(s for s in workflow["jobs"]["check"]["steps"] if s.get("name") == INSTALLER_STEP))
+                self.assertIn(expected, violations(workflow, "1"))
+
+    def test_installer_suite_without_pwsh_gate_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            tests = Path(root) / "crates/intentd-sitter/tests"
+            tests.mkdir(parents=True)
+            (tests / "install_ps1_gated.rs").write_text('std::env::var_os("INTENTD_CI_EXPECT_PWSH")\n')
+            (tests / "install_ps1_new.rs").write_text("fn pwsh() -> Option<PathBuf> { None }\n")
+            self.assertEqual(
+                installer_guard_violations(self.workflow, root),
+                ["crates/intentd-sitter/tests/install_ps1_new.rs must fail without pwsh under INTENTD_CI_EXPECT_PWSH"],
+            )
+
 
 # Independently audited from ci.yml: every step that names tests, and how many
 # names (filters, listing proofs, test targets) the check resolves in it.
@@ -958,7 +1009,7 @@ NAMED_TEST_STEPS = {
     ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 5,
     ("check", "No provider CLIs on the runner"): 1,
     ("check", "Coverage-skipped tests (STAB-40/43)"): 3,
-    ("check", "Installer guard tests (install_ps1_owner)"): 1,
+    ("check", "Installer guard tests (install_ps1_*)"): 1,
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"): 9,
     ("build", "Codex focused diagnostics (macOS runtime)"): 8,
     ("build", "Retained capability gate fixture (macOS runtime)"): 3,
@@ -1122,7 +1173,8 @@ class NamedTestTests(unittest.TestCase):
                     for kind, target in [("bins", t) for t in selection["bins"]] + [("tests", t) for t in selection["tests"]]:
                         with self.subTest(job=job, step=step_name, target=target):
                             crates = copy.deepcopy(real)
-                            del crates[package][kind][target]
+                            for name in fnmatch.filter(real[package][kind], target):
+                                del crates[package][kind][name]
                             with mock.patch.dict(globals(), crate_targets=lambda root: crates):
                                 errors = named_test_violations(self.workflow)
                             self.assertIn(f"{job}: {step_name}: names no {kind[:-1]} target {target} in {package}", errors)
