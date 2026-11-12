@@ -491,7 +491,9 @@ menu. An agent started without a **Start on** choice runs on the first row that 
 it; a sub-agent started by an agent on this computer stays here. A backend started as an
 orchestrator (`intentd serve --orchestrator`, experimental) runs every agent on those
 machines: its list has no **This computer** row, and **Settings → Providers** shows only
-the enable switches and profiles, with no **Test** button and no sign-in status. Agents see each machine's name and
+the enable switches and profiles, with no **Test** button and no sign-in status. On an
+orchestrator, **Start on** offers **First available machine** instead of the backend, plus
+each machine. Agents see each machine's name and
 platform, and look up its providers, sign-in status and models when they need them.
 A Default with **Use on remote machines** turned on in **Settings → Providers** is
 always sent when it has saved settings, even to a machine signed in to that provider. Otherwise a machine uses its
