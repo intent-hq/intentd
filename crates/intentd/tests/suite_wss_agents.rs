@@ -24,6 +24,7 @@ mod e2e_wss_agent_config_option;
 mod e2e_wss_agent_create_name_explicitly_set;
 mod e2e_wss_agent_cross_provider_history;
 mod e2e_wss_agent_idle_timeout;
+mod e2e_wss_agent_import_session;
 mod e2e_wss_agent_list_active;
 mod e2e_wss_agent_midturn_failure;
 mod e2e_wss_agent_provider_pin;

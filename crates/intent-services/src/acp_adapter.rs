@@ -116,7 +116,7 @@ impl AdapterSlots {
     /// Claim a slot, waiting at most `wait` for one to free up. `None` means
     /// the caller's budget expired while queued — the caller turns that into
     /// its own distinguishable queue-timeout error rather than spawning.
-    async fn acquire(&self, wait: Duration) -> Option<OwnedSemaphorePermit> {
+    pub(crate) async fn acquire(&self, wait: Duration) -> Option<OwnedSemaphorePermit> {
         // Fast path: a free slot costs no timer and no log line.
         if let Ok(permit) = self.permits.clone().try_acquire_owned() {
             return Some(permit);

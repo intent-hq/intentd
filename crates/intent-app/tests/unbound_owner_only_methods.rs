@@ -179,6 +179,11 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             "agent.enhancePrompt",
             json!({ "prompt": "p", "timeoutMs": 1 }),
         ),
+        (
+            "agent.importSession",
+            json!({ "workspaceId": ws, "provider": "claude-code", "sessionId": "s1" }),
+        ),
+        ("agent.importableSessions.list", json!({})),
         ("agent.memoryUsage", json!({})),
         (
             "agent.replaceMessages",

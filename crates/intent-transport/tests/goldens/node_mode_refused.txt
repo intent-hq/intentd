@@ -31,6 +31,8 @@ agent.getQueue
 agent.getSession
 agent.getSessionStats
 agent.getSubscriptions
+agent.importSession
+agent.importableSessions.list
 agent.list
 agent.listActive
 agent.listInterrupted

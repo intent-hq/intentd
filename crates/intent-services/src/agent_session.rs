@@ -1021,6 +1021,106 @@ impl Transcript {
     }
 }
 
+/// One Intent chat message rebuilt from a provider's `session/load` replay
+/// (`agent.importSession`): `role` is `user` or `assistant`, `blocks` the
+/// content blocks, without ids (the read path stamps `{messageId}:{index}`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplayedMessage {
+    pub(crate) role: &'static str,
+    pub(crate) blocks: Vec<Value>,
+}
+
+/// Rebuild the visible conversation from the notifications a `session/load`
+/// replayed, in order. `user_message_chunk` text opens (or extends) a user
+/// message; agent text, thoughts and tool calls accumulate into one
+/// assistant message per run, through the same [`Transcript`] a live turn
+/// uses, so imported blocks have the shape of native ones. Non-text user
+/// content, plans, modes, usage and notices are skipped.
+pub(crate) fn replay_to_messages(notes: &[IncomingNotification]) -> Vec<ReplayedMessage> {
+    fn strip_ids(mut blocks: Vec<Value>) -> Vec<Value> {
+        for block in &mut blocks {
+            if let Some(obj) = block.as_object_mut() {
+                obj.remove("id");
+            }
+        }
+        blocks
+    }
+    let mut out: Vec<ReplayedMessage> = Vec::new();
+    let mut user_text = String::new();
+    let mut assistant: Option<Transcript> = None;
+    let flush_user = |text: &mut String, out: &mut Vec<ReplayedMessage>| {
+        if !text.trim().is_empty() {
+            out.push(ReplayedMessage {
+                role: "user",
+                blocks: vec![json!({ "type": "text", "text": std::mem::take(text) })],
+            });
+        }
+        text.clear();
+    };
+    let flush_assistant = |t: &mut Option<Transcript>, out: &mut Vec<ReplayedMessage>| {
+        if let Some(t) = t.take() {
+            let blocks = strip_ids(t.into_blocks());
+            if !blocks.is_empty() {
+                out.push(ReplayedMessage {
+                    role: "assistant",
+                    blocks,
+                });
+            }
+        }
+    };
+    for note in notes {
+        if note.method != "session/update" {
+            continue;
+        }
+        let update = &note.params["update"];
+        if update["sessionUpdate"] == "user_message_chunk" {
+            flush_assistant(&mut assistant, &mut out);
+            if let Some(text) = update["content"]["text"].as_str() {
+                user_text.push_str(text);
+            }
+            continue;
+        }
+        let Some(mapped) = session::map_notification(note) else {
+            continue;
+        };
+        match mapped {
+            MappedUpdate::Chunk {
+                content,
+                text,
+                thought,
+            } => {
+                flush_user(&mut user_text, &mut out);
+                let t = assistant.get_or_insert_with(|| Transcript::new(String::new()));
+                match text {
+                    Some(text) => {
+                        t.push_chunk(&text, thought);
+                    }
+                    None => {
+                        t.push_block(content);
+                    }
+                }
+            }
+            MappedUpdate::ToolCall(mut call) => {
+                flush_user(&mut user_text, &mut out);
+                // A replay often carries the result only as `content`
+                // (no `rawOutput`): keep it as the tool's output.
+                if call.output.is_none() {
+                    call.output = update
+                        .get("content")
+                        .filter(|c| c.as_array().is_some_and(|a| !a.is_empty()))
+                        .cloned();
+                }
+                let t = assistant.get_or_insert_with(|| Transcript::new(String::new()));
+                t.record_tool(&call, Vec::new());
+            }
+            MappedUpdate::Usage(_) | MappedUpdate::Notice(_) => {}
+        }
+    }
+    flush_user(&mut user_text, &mut out);
+    flush_assistant(&mut assistant, &mut out);
+    out
+}
+
 /// The per-agent in-flight ("live") turn slot (CS-0 D5): the assistant message
 /// id minted at turn start plus a non-consuming [`Transcript::snapshot_blocks`]
 /// of the partial assistant content AS IT STANDS. Published while a

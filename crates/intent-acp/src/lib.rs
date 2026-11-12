@@ -32,6 +32,7 @@ pub mod permission;
 pub mod profile_env;
 pub mod review_monitoring;
 pub mod session;
+pub mod session_import;
 pub mod spawn;
 pub mod terminal;
 pub(crate) mod tool_restrictions;

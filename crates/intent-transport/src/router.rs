@@ -3461,6 +3461,29 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.importableSessions.list" => {
+            // Existing provider sessions that can become Intent agents
+            // (PROTOCOL §5.5). `provider` narrows to one provider (unknown
+            // is `-32602`); `query` filters title / cwd / sessionId.
+            let provider = opt_str_strict(params, "provider")?.filter(|p| !p.trim().is_empty());
+            let query = opt_str_strict(params, "query")?;
+            let cursor = opt_str_strict(params, "cursor")?;
+            let limit = opt_positive_usize(params, "limit")?;
+            api.agent_importable_sessions_list(provider, query, cursor, limit)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "agent.importSession" => {
+            // Import one listed session as a new top-level agent with its
+            // history (PROTOCOL §5.5). A missing session is `-32602 not-found`.
+            let ws = require_ws_note(params)?;
+            let provider = require_str_param(params, "provider")?;
+            let session_id = require_str_param(params, "sessionId")?;
+            let name = opt_str_strict(params, "name")?;
+            api.agent_import_session(ws, provider, session_id, name)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "agent.rename" => {
             let agent_id = require_agent_id(params)?;
             let name = require_str_param(params, "name")?;

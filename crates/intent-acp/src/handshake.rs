@@ -194,6 +194,21 @@ async fn initialize_with_offers(
     agent_workers: bool,
     timeout: Duration,
 ) -> AcpResult<(InitializeResponse, Arc<Generation>)> {
+    initialize_with_offers_raw(conn, offer, monitoring, agent_workers, timeout)
+        .await
+        .map(|(response, _, generation)| (response, generation))
+}
+
+/// [`initialize_with_offers`] that also returns the raw `initialize` result,
+/// so callers can read capabilities the typed schema does not model with the
+/// enabled crate features (`sessionCapabilities.fork`).
+async fn initialize_with_offers_raw(
+    conn: &Connection,
+    offer: CallbackOffer,
+    monitoring: ReviewMonitoringOffer,
+    agent_workers: bool,
+    timeout: Duration,
+) -> AcpResult<(InitializeResponse, Value, Arc<Generation>)> {
     let request = InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(
             ClientCapabilities::new()
@@ -223,9 +238,37 @@ async fn initialize_with_offers(
         params["clientCapabilities"]["_meta"] = Value::Object(meta);
     }
     let (result, generation) = conn.initialize_recipient(params, timeout).await?;
-    let response = serde_json::from_value(result)
+    let response = serde_json::from_value(result.clone())
         .map_err(|e| AcpError::Protocol(format!("invalid initialize response: {e}")))?;
-    Ok((response, generation))
+    Ok((response, result, generation))
+}
+
+/// [`handshake`] that also returns the raw `initialize` result (see
+/// [`crate::session_import::ImportCapabilities::from_initialize`]).
+///
+/// # Errors
+///
+/// Propagates errors from `initialize` and [`authenticate`].
+pub async fn handshake_raw(
+    conn: &Connection,
+    provider: &ProviderConfig,
+) -> AcpResult<(HandshakeResult, Value)> {
+    let (initialize, raw, _) = initialize_with_offers_raw(
+        conn,
+        CallbackOffer::Disabled,
+        ReviewMonitoringOffer::Disabled,
+        false,
+        initialize_timeout(),
+    )
+    .await?;
+    let authenticated = authenticate(conn, provider).await?;
+    Ok((
+        HandshakeResult {
+            initialize,
+            authenticated,
+        },
+        raw,
+    ))
 }
 
 /// Conditionally send `authenticate` (§6.4.2).

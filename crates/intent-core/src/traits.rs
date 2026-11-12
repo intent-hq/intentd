@@ -3152,6 +3152,41 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.importableSessions.list` (PROTOCOL §5.5): existing sessions of
+    /// the enabled providers whose adapters can list and load or fork them,
+    /// newest first, with a per-provider status.
+    fn agent_importable_sessions_list(
+        &self,
+        provider: Option<String>,
+        query: Option<String>,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, query, cursor, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_importable_sessions_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.importSession` (PROTOCOL §5.5): bring a provider session into
+    /// the workspace as a new top-level agent with its history.
+    fn agent_import_session(
+        &self,
+        workspace_id: WorkspaceId,
+        provider: String,
+        session_id: String,
+        name: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, provider, session_id, name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_import_session not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.rename`: rename an agent; `{ success: true, name }` (PROTOCOL §5.5).
     /// With `skip_if_explicitly_set = true`, an already-explicitly-named session
     /// is left untouched and the result carries `skipped: true` (P3-1.2b).

@@ -1207,6 +1207,131 @@ function getAndIncrementAttempt() {
   return count;
 }
 
+// Session import (`agent.importableSessions.list` / `agent.importSession`):
+// with `behavior.sessionImport` set, the mock keeps a Claude-style store under
+// `$CLAUDE_CONFIG_DIR` or `$HOME/.claude`: `projects/<slug(cwd)>/<id>.jsonl`.
+// It advertises `sessionCapabilities.list` (and `fork` when
+// `sessionImport.fork`), pages `session/list` by `sessionImport.pageSize`
+// (default 2), and `session/load` replays a stored transcript as
+// `session/update`s — found ONLY under the slug of the requested cwd, as
+// Claude Code does — then answers. Returns true when it handled `msg`.
+function claudeProjectsRoot() {
+  const config = process.env.CLAUDE_CONFIG_DIR || `${os.homedir()}/.claude`;
+  return `${config}/projects`;
+}
+function claudeSlug(cwd) {
+  return String(cwd).replace(/[^a-zA-Z0-9]/g, '-');
+}
+function readJsonl(path) {
+  return fs.readFileSync(path, 'utf8').split('\n').filter(Boolean).flatMap((line) => {
+    try { return [JSON.parse(line)]; } catch { return []; }
+  });
+}
+function storedSessions() {
+  const root = claudeProjectsRoot();
+  let dirs = [];
+  try { dirs = fs.readdirSync(root); } catch { return []; }
+  const out = [];
+  for (const dir of dirs) {
+    let files = [];
+    try { files = fs.readdirSync(`${root}/${dir}`); } catch { continue; }
+    for (const file of files.filter((f) => f.endsWith('.jsonl'))) {
+      const path = `${root}/${dir}/${file}`;
+      const rows = readJsonl(path);
+      const cwd = rows.find((r) => typeof r.cwd === 'string')?.cwd;
+      if (!cwd) continue;
+      const titles = rows.filter((r) => r.type === 'ai-title' || r.type === 'custom-title');
+      const last = titles[titles.length - 1];
+      out.push({
+        sessionId: file.slice(0, -'.jsonl'.length),
+        cwd,
+        title: last ? (last.customTitle || last.aiTitle) : undefined,
+        updatedAt: fs.statSync(path).mtime.toISOString(),
+      });
+    }
+  }
+  return out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+}
+function replayStoredSession(sessionId, rows) {
+  const update = (u) => note('session/update', { sessionId, update: u });
+  for (const row of rows) {
+    if (row.isSidechain || row.isMeta) continue;
+    const content = row.message?.content;
+    if (row.type === 'user') {
+      if (typeof content === 'string') {
+        update({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: content } });
+        continue;
+      }
+      for (const block of content || []) {
+        if (block.type === 'text') {
+          update({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: block.text } });
+        } else if (block.type === 'tool_result') {
+          const text = typeof block.content === 'string' ? block.content
+            : (block.content || []).map((c) => c.text || '').join('');
+          update({ sessionUpdate: 'tool_call_update', toolCallId: block.tool_use_id,
+            status: block.is_error ? 'failed' : 'completed',
+            content: [{ type: 'content', content: { type: 'text', text } }] });
+        }
+      }
+    } else if (row.type === 'assistant') {
+      for (const block of content || []) {
+        if (block.type === 'text') {
+          update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: block.text } });
+        } else if (block.type === 'tool_use') {
+          update({ sessionUpdate: 'tool_call', toolCallId: block.id, title: block.name,
+            kind: 'other', status: 'pending', rawInput: block.input });
+        }
+      }
+    }
+  }
+}
+function handleSessionImport(msg, behavior) {
+  const opts = behavior.sessionImport;
+  if (!opts) return false;
+  const params = msg.params || {};
+  if (msg.method === 'session/list') {
+    const size = opts.pageSize || 2;
+    const offset = params.cursor ? parseInt(String(params.cursor).slice('page:'.length), 10) || 0 : 0;
+    const all = storedSessions();
+    const page = all.slice(offset, offset + size);
+    result(msg.id, {
+      sessions: page,
+      ...(offset + size < all.length ? { nextCursor: `page:${offset + size}` } : {}),
+    });
+    return true;
+  }
+  if (msg.method === 'session/fork' && opts.fork) {
+    const source = storedSessions().find((s) => s.sessionId === params.sessionId);
+    if (!source) {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32002, message: 'Session not found' } });
+      return true;
+    }
+    const newId = `fork-${process.pid}-${Date.now()}`;
+    const from = `${claudeProjectsRoot()}/${claudeSlug(source.cwd)}/${source.sessionId}.jsonl`;
+    const dir = `${claudeProjectsRoot()}/${claudeSlug(params.cwd)}`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(`${dir}/${newId}.jsonl`, readJsonl(from)
+      .map((r) => JSON.stringify({ ...r, ...(r.sessionId ? { sessionId: newId } : {}), ...(r.cwd ? { cwd: params.cwd } : {}) }))
+      .join('\n') + '\n');
+    result(msg.id, { sessionId: newId });
+    return true;
+  }
+  if (msg.method === 'session/load') {
+    logSessionCall('session/load', params.sessionId, params._meta, params.cwd);
+    const path = `${claudeProjectsRoot()}/${claudeSlug(params.cwd)}/${params.sessionId}.jsonl`;
+    if (!fs.existsSync(path)) {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32002, message: `Session not found: ${params.sessionId}` } });
+      return true;
+    }
+    sessionFromLoad = true;
+    sessionMcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : [];
+    replayStoredSession(params.sessionId, readJsonl(path));
+    result(msg.id, {});
+    return true;
+  }
+  return false;
+}
+
 async function dispatch(msg) {
   if (process.env.MOCK_AGENT_RPC_LOG) {
     fs.appendFileSync(process.env.MOCK_AGENT_RPC_LOG, JSON.stringify({
@@ -1221,6 +1346,7 @@ async function dispatch(msg) {
     behavior = {};
   }
 
+  if (handleSessionImport(msg, behavior)) return;
   switch (msg.method) {
     case 'initialize':
       clientSupportsNotices = typeof msg.params?.clientCapabilities?.session?.notices === 'object'
@@ -1250,7 +1376,12 @@ async function dispatch(msg) {
       return result(msg.id, {
         protocolVersion: 1,
         agentCapabilities: {
-          loadSession: behavior.loadSession === true || behavior.advertiseLoadSession === true,
+          loadSession: behavior.loadSession === true || behavior.advertiseLoadSession === true
+            || Boolean(behavior.sessionImport),
+          ...(behavior.sessionImport ? { sessionCapabilities: {
+            list: {},
+            ...(behavior.sessionImport.fork ? { fork: {} } : {}),
+          } } : {}),
         },
         ...(behavior.agentInfo ? { agentInfo: behavior.agentInfo } : {}),
       });
