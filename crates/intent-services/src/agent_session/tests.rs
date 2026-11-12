@@ -763,52 +763,17 @@ fn workspace(id: &WorkspaceId) -> Workspace {
 fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
     let ts = now_iso();
     AgentSession {
-        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
-        harness_features: None,
         id: agent_id.clone(),
         workspace_id: workspace_id.clone(),
-        parent_agent_id: None,
-        backend_session_id: None,
-        acp_session_id: None,
         name: "Builder".to_string(),
-        name_explicitly_set: false,
-        model: None,
-        reasoning_effort: None,
-        effort_levels: None,
         // Pinned explicitly: seeded sessions predate monorepo#3044, when a
         // `None` provider still resolved positionally to auggie; resolution
         // now fails loudly with no provider and no configured default.
         provider: Some("auggie".to_string()),
-        system_prompt: None,
-        specialist: None,
-        status: AgentStatus::Pending,
         is_active: true,
-        messages: Vec::new(),
-        stats: None,
-        task_note_id: None,
-        skip_auto_commit: false,
-        completion_report: None,
-        completion_report_timestamp: None,
-        attention_request_kind: None,
-        attention_request_reason: None,
-        attention_request_timestamp: None,
-        delegation_depth: None,
-        initial_message: None,
-        context_references: None,
-        image_blocks: None,
-        file_blocks: None,
-        is_background: false,
-        metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
-        stop_reason: None,
-        stop_reason_timestamp: None,
-        session_corrupted: false,
-        pending_delete_at: None,
-        retired_at: None,
-        notifications_muted: false,
-        pinned: false,
-        permission_policy: None,
+        ..Default::default()
     }
 }
 

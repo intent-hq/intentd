@@ -347,7 +347,7 @@ pub enum WorkspaceDisplayStatus {
 /// `Idle`, no attention, `false`, `None`). Build rows with struct-update
 /// syntax — `Workspace { id, title, ..Default::default() }` — and set only
 /// the fields that matter, so a new optional field needs no edits outside
-/// this type. `workspace_literal_lint` rejects a full literal anywhere.
+/// this type. `full_literal_lint` rejects a full literal anywhere.
 /// Because the id is a fresh UUID, two default-built rows never compare
 /// equal; a test that compares or looks up rows should set `id` explicitly.
 // The bool fields mirror the protocol's wire shape; grouping them would
@@ -4732,6 +4732,65 @@ pub struct AgentSession {
     pub updated_at: String,
 }
 
+/// The one shared starting record: fresh [`AgentId`] / [`WorkspaceId`],
+/// [`AgentStatus::default`], the [`CURRENT_HARNESS_VERSION`] stamp, empty
+/// strings and timestamps, no messages, `false`, `None`. Build rows with
+/// struct-update syntax — `AgentSession { id, workspace_id, name,
+/// ..Default::default() }` — and set only the fields that matter, so a new
+/// field needs an edit here and nowhere else. `full_literal_lint` rejects a
+/// full literal anywhere. Because the ids are fresh UUIDs, two default-built
+/// rows never compare equal; a test that compares or looks up rows should set
+/// `id` (and `workspace_id`) explicitly.
+impl Default for AgentSession {
+    fn default() -> Self {
+        Self {
+            id: AgentId::new(),
+            workspace_id: WorkspaceId::new(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: String::new(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::default(),
+            is_active: false,
+            messages: Vec::new(),
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            retired_at: None,
+            notifications_muted: false,
+            pinned: false,
+            permission_policy: None,
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+}
+
 impl AgentSession {
     /// The question-dismissal marker persisted under
     /// [`DISMISSED_QUESTIONS_MESSAGE_ID_KEY`] in the session's free-form
@@ -7119,6 +7178,19 @@ pub struct KnownRepo {
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_session_default_is_a_fresh_current_harness_row() {
+        let a = AgentSession::default();
+        let b = AgentSession::default();
+        assert_eq!(a.harness_version, CURRENT_HARNESS_VERSION);
+        assert_eq!(a.status, AgentStatus::default());
+        assert!(a.messages.is_empty() && a.name.is_empty() && a.created_at.is_empty());
+        assert!(a.parent_agent_id.is_none() && a.permission_policy.is_none());
+        assert!(!a.is_active && !a.pinned && !a.skip_auto_commit);
+        assert_ne!(a.id, b.id, "each default row mints a fresh agent id");
+        assert_ne!(a.workspace_id, b.workspace_id, "and a fresh workspace id");
+    }
+
     use serde_json::json;
 
     /// [`Workspace::effective_path`] precedence (monorepo#3778): `path`, else
@@ -8906,53 +8978,24 @@ mod tests {
     fn agent_lite_metadata_and_activity_wire_shape() {
         let ts = "t1".to_string();
         let session = AgentSession {
-            harness_version: CURRENT_HARNESS_VERSION.to_string(),
-            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
             parent_agent_id: Some(AgentId::from("agent-parent")),
-            backend_session_id: None,
-            acp_session_id: None,
             name: "Builder".to_string(),
             name_explicitly_set: true,
-            model: None,
-            reasoning_effort: None,
-            effort_levels: None,
-            provider: None,
-            system_prompt: None,
             specialist: Some("implementor".to_string()),
             status: AgentStatus::Active,
             is_active: true,
-            messages: vec![],
-            stats: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            attention_request_kind: None,
-            attention_request_reason: None,
-            attention_request_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            file_blocks: None,
             is_background: true,
             metadata: Some(json!({
                 DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-q1",
                 LAST_SEEN_MESSAGE_ID_KEY: "msg-seen",
                 IS_INITIAL_AGENT_KEY: true,
             })),
-            stop_reason: None,
-            stop_reason_timestamp: None,
-            session_corrupted: false,
-            pending_delete_at: None,
-            retired_at: None,
             notifications_muted: true,
-            pinned: false,
-            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
+            ..Default::default()
         };
         let lite = AgentLite::from_session(
             session,
@@ -9002,54 +9045,22 @@ mod tests {
     #[test]
     fn agent_lite_cap_list_previews_bounds_preview_fields() {
         let session = AgentSession {
-            harness_version: CURRENT_HARNESS_VERSION.to_string(),
-            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
-            parent_agent_id: None,
-            backend_session_id: None,
-            acp_session_id: None,
             name: "n".repeat(AGENT_LIST_NAME_CAP_BYTES + 1),
             name_explicitly_set: true,
             model: Some("claude-sonnet-4-5-20250929".to_string()),
-            reasoning_effort: None,
-            effort_levels: None,
-            provider: None,
-            system_prompt: None,
-            specialist: None,
             status: AgentStatus::Active,
             is_active: true,
-            messages: vec![],
-            stats: None,
-            task_note_id: None,
-            skip_auto_commit: false,
             // Multi-byte tail: truncation must land on a char boundary.
             completion_report: Some(format!(
                 "{}{}",
                 "r".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES - 1),
                 "é".repeat(8)
             )),
-            completion_report_timestamp: None,
-            attention_request_kind: None,
-            attention_request_reason: None,
-            attention_request_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            file_blocks: None,
-            is_background: false,
-            metadata: None,
-            stop_reason: None,
-            stop_reason_timestamp: None,
-            session_corrupted: false,
-            pending_delete_at: None,
-            retired_at: None,
-            notifications_muted: false,
-            pinned: false,
-            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
+            ..Default::default()
         };
         let mut lite = AgentLite::from_session(
             session,
@@ -9151,49 +9162,15 @@ mod tests {
     fn agent_lite_cap_list_previews_keeps_write_time_truncation_flags() {
         let mk = |tool_use: serde_json::Value| {
             let session = AgentSession {
-                harness_version: CURRENT_HARNESS_VERSION.to_string(),
-                harness_features: None,
                 id: AgentId::from("agent-1"),
                 workspace_id: WorkspaceId::from("ws-1"),
-                parent_agent_id: None,
-                backend_session_id: None,
-                acp_session_id: None,
                 name: "Builder".to_string(),
                 name_explicitly_set: true,
-                model: None,
-                reasoning_effort: None,
-                effort_levels: None,
-                provider: None,
-                system_prompt: None,
-                specialist: None,
                 status: AgentStatus::Active,
                 is_active: true,
-                messages: vec![],
-                stats: None,
-                task_note_id: None,
-                skip_auto_commit: false,
-                completion_report: None,
-                completion_report_timestamp: None,
-                attention_request_kind: None,
-                attention_request_reason: None,
-                attention_request_timestamp: None,
-                delegation_depth: None,
-                initial_message: None,
-                context_references: None,
-                image_blocks: None,
-                file_blocks: None,
-                is_background: false,
-                metadata: None,
-                stop_reason: None,
-                stop_reason_timestamp: None,
-                session_corrupted: false,
-                pending_delete_at: None,
-                retired_at: None,
-                notifications_muted: false,
-                pinned: false,
-                permission_policy: None,
                 created_at: "t0".to_string(),
                 updated_at: "t1".to_string(),
+                ..Default::default()
             };
             let mut lite = AgentLite::from_session(session, 1, None, None, None, None, None);
             lite.last_tool_use = Some(tool_use);
@@ -9240,49 +9217,15 @@ mod tests {
     #[test]
     fn agent_lite_cap_list_previews_bounds_serialized_bytes() {
         let session = AgentSession {
-            harness_version: CURRENT_HARNESS_VERSION.to_string(),
-            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
-            parent_agent_id: None,
-            backend_session_id: None,
-            acp_session_id: None,
             name: "Builder".to_string(),
             name_explicitly_set: true,
-            model: None,
-            reasoning_effort: None,
-            effort_levels: None,
-            provider: None,
-            system_prompt: None,
-            specialist: None,
             status: AgentStatus::Active,
             is_active: true,
-            messages: vec![],
-            stats: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            attention_request_kind: None,
-            attention_request_reason: None,
-            attention_request_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            file_blocks: None,
-            is_background: false,
-            metadata: None,
-            stop_reason: None,
-            stop_reason_timestamp: None,
-            session_corrupted: false,
-            pending_delete_at: None,
-            retired_at: None,
-            notifications_muted: false,
-            pinned: false,
-            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
+            ..Default::default()
         };
         let mut lite = AgentLite::from_session(
             session,
@@ -9318,49 +9261,15 @@ mod tests {
     #[test]
     fn retired_sandbox_fields_are_not_emitted() {
         let session = AgentSession {
-            harness_version: CURRENT_HARNESS_VERSION.to_string(),
-            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
-            parent_agent_id: None,
-            backend_session_id: None,
-            acp_session_id: None,
             name: "Builder".to_string(),
             name_explicitly_set: true,
-            model: None,
-            reasoning_effort: None,
-            effort_levels: None,
-            provider: None,
-            system_prompt: None,
-            specialist: None,
             status: AgentStatus::Active,
             is_active: true,
-            messages: vec![],
-            stats: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            attention_request_kind: None,
-            attention_request_reason: None,
-            attention_request_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            file_blocks: None,
-            is_background: false,
-            metadata: None,
-            stop_reason: None,
-            stop_reason_timestamp: None,
-            session_corrupted: false,
-            pending_delete_at: None,
-            retired_at: None,
-            notifications_muted: false,
-            pinned: false,
-            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
+            ..Default::default()
         };
         let wire = serde_json::to_string(&session).unwrap();
         let lite = serde_json::to_string(&AgentLite::from_session(
@@ -9387,51 +9296,25 @@ mod tests {
     fn fit_agent_list_frame_tightens_previews_until_rows_fit() {
         let row = |i: usize| {
             let session = AgentSession {
-                harness_version: CURRENT_HARNESS_VERSION.to_string(),
-                harness_features: None,
                 id: AgentId::from(format!("agent-{i:0>36}").as_str()),
                 workspace_id: WorkspaceId::from("ws-1"),
                 parent_agent_id: Some(AgentId::from("agent-parent-0000-0000-0000-000000000000")),
-                backend_session_id: None,
                 acp_session_id: Some(format!("acp-{i:0>36}")),
                 name: "Delegated worker".to_string(),
-                name_explicitly_set: false,
                 model: Some("claude-sonnet-4-5-20250929".to_string()),
-                reasoning_effort: None,
-                effort_levels: None,
                 provider: Some("auggie".to_string()),
-                system_prompt: None,
                 specialist: Some("implementor".to_string()),
                 status: AgentStatus::Idle,
-                is_active: false,
-                messages: vec![],
-                stats: None,
                 task_note_id: Some(format!("task-{i:0>32}").into()),
-                skip_auto_commit: false,
                 completion_report: Some("r".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2)),
                 completion_report_timestamp: Some("2026-09-21T05:00:00.000000000Z".to_string()),
-                attention_request_kind: None,
-                attention_request_reason: None,
-                attention_request_timestamp: None,
                 delegation_depth: Some(1),
-                initial_message: None,
-                context_references: None,
-                image_blocks: None,
-                file_blocks: None,
-                is_background: false,
                 metadata: Some(
                     json!({ "createdByAgentId": "agent-parent-0000-0000-0000-000000000000" }),
                 ),
-                stop_reason: None,
-                stop_reason_timestamp: None,
-                session_corrupted: false,
-                pending_delete_at: None,
-                retired_at: None,
-                notifications_muted: false,
-                pinned: false,
-                permission_policy: None,
                 created_at: "2026-09-21T04:00:00.000000000Z".to_string(),
                 updated_at: "2026-09-21T05:00:00.000000000Z".to_string(),
+                ..Default::default()
             };
             let mut lite = AgentLite::from_session(
                 session,
@@ -9540,49 +9423,16 @@ mod tests {
     #[test]
     fn agent_lite_presence_sensitive_metadata_wire_shape() {
         let session = |metadata: Option<serde_json::Value>| AgentSession {
-            harness_version: CURRENT_HARNESS_VERSION.to_string(),
-            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
-            parent_agent_id: None,
-            backend_session_id: None,
-            acp_session_id: None,
             name: "Builder".to_string(),
             name_explicitly_set: true,
-            model: None,
-            reasoning_effort: None,
-            effort_levels: None,
-            provider: None,
-            system_prompt: None,
-            specialist: None,
             status: AgentStatus::Active,
             is_active: true,
-            messages: vec![],
-            stats: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            attention_request_kind: None,
-            attention_request_reason: None,
-            attention_request_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            file_blocks: None,
-            is_background: false,
             metadata,
-            stop_reason: None,
-            stop_reason_timestamp: None,
-            session_corrupted: false,
-            pending_delete_at: None,
-            retired_at: None,
-            notifications_muted: false,
-            pinned: false,
-            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
+            ..Default::default()
         };
         let project = |metadata: Option<serde_json::Value>| {
             let lite = AgentLite::from_session(session(metadata), 0, None, None, None, None, None);
@@ -9802,21 +9652,15 @@ mod tests {
     #[test]
     fn agent_session_camel_case_parity() {
         let session = AgentSession {
-            harness_version: CURRENT_HARNESS_VERSION.to_string(),
-            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
-            parent_agent_id: None,
             backend_session_id: Some(AgentId::from("backend-9")),
             acp_session_id: Some("acp-uuid".to_string()),
             name: "Builder".to_string(),
             name_explicitly_set: true,
             model: Some("opus".to_string()),
-            reasoning_effort: None,
             effort_levels: Some(vec!["low".to_string(), "high".to_string()]),
             provider: Some("auggie".to_string()),
-            system_prompt: None,
-            specialist: None,
             status: AgentStatus::Active,
             is_active: true,
             messages: vec![AgentMessage {
@@ -9830,31 +9674,9 @@ mod tests {
                 author: None,
                 created_at: "t0".to_string(),
             }],
-            stats: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            attention_request_kind: None,
-            attention_request_reason: None,
-            attention_request_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            file_blocks: None,
-            is_background: false,
-            metadata: None,
-            stop_reason: None,
-            stop_reason_timestamp: None,
-            session_corrupted: false,
-            pending_delete_at: None,
-            retired_at: None,
-            notifications_muted: false,
-            pinned: false,
-            permission_policy: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
+            ..Default::default()
         };
         assert_eq!(
             serde_json::to_value(&session).unwrap(),
