@@ -1457,7 +1457,11 @@ impl Shared {
         if !welcome.hosts.is_empty() || welcome.tc_address.is_some() {
             let mut target = lock(&self.target);
             target.hosts.clone_from(&welcome.hosts);
-            target.tc_address.clone_from(&welcome.tc_address);
+            // The tailcat address is stable: a bind while the machine's
+            // tunnel is down keeps the last known one.
+            if welcome.tc_address.is_some() {
+                target.tc_address.clone_from(&welcome.tc_address);
+            }
         }
     }
 
