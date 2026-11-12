@@ -532,8 +532,8 @@ displaying pairing information. Read current state and respect the user's reques
 ## Use Intent from a browser on another device (experimental)
 
 Browser access is experimental and hidden until the user turns on **Browser access** in
-**Settings → Advanced → Labs** (`/settings?tab=advanced#labs`). Do not offer it as a
-normal option; describe it only when the user asks about it, and say it is experimental.
+**Settings → Advanced → Labs**. Do not offer it as a normal option; describe it only
+when the user asks about it, and say it is experimental.
 Turning that switch off hides the section and turns the server off.
 
 Once unlocked, **Settings → Mobile → Browser access** (`/settings?tab=mobile#mobile`) lets
