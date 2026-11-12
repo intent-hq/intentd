@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.195] - 2026-11-12
+
+### 🚀 Features
+
+- Orchestrator mode — a backend that runs no agents itself ([#3308](https://github.com/intent-hq/intentd/pull/3308))
+
+### 📚 Documentation
+
+- *(guide)* Add machine opens the Set up a new machine wizard ([#3311](https://github.com/intent-hq/intentd/pull/3311))
+
+
 ## [0.11.194] - 2026-11-12
 
 ### 🚀 Features
