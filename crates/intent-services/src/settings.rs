@@ -2773,9 +2773,9 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         enumerated(
             "daemon.mode",
             "Daemon mode",
-            "regular runs the full daemon; node turns its own orchestration off (no workspaces, local agents, hooks, scripts or monitors) and serves only the node-mode method list. Changeable only over the local socket; takes effect at the next daemon start. intentd serve --node selects node mode for one run without changing this",
+            "regular runs the full daemon; node turns its own orchestration off (no workspaces, local agents, hooks, scripts or monitors) and serves only the node-mode method list; orchestrator keeps workspaces and the app here but runs every agent on other machines and never starts a provider process here. Changeable only over the local socket; takes effect at the next daemon start. intentd serve --node or --orchestrator selects a mode for one run without changing this",
             "daemon",
-            &["regular", "node"],
+            &["regular", "node", "orchestrator"],
             "regular",
         ),
     ]
@@ -8154,7 +8154,7 @@ mod tests {
         let SettingType::Enum(values) = find_definition("daemon.mode").unwrap().ty else {
             panic!("daemon.mode must be an enum");
         };
-        assert_eq!(values, ["regular", "node"]);
+        assert_eq!(values, ["regular", "node", "orchestrator"]);
 
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-remote-{tag}.db"));

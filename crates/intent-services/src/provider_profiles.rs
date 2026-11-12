@@ -1892,7 +1892,7 @@ impl Services {
             let mut row = meta.summary_json();
             match load_env(&self.secrets, &meta.id).await {
                 Ok(env) => classify(
-                    store.profile_choice(&meta.id),
+                    self.effective_profile_choice(&meta.id),
                     &env.unwrap_or_default().entries,
                     false,
                 )
@@ -1956,7 +1956,7 @@ impl Services {
             for meta in self.provider_profiles.profiles().unwrap_or_default().iter() {
                 let compat = match cached(meta.id.clone()).await {
                     Some(env) => remote(classify(
-                        store.profile_choice(&meta.id),
+                        self.effective_profile_choice(&meta.id),
                         &env.entries,
                         false,
                     )),
@@ -2019,6 +2019,21 @@ impl Services {
     ) -> Result<Value> {
         let single = provider_ref.is_some();
         let refs = provider_ref.map_or_else(|| self.provider_profile_refs(), |r| vec![r]);
+        if !self.may_spawn_provider_locally() {
+            // An orchestrator never probes: every profile is *configured*.
+            for reference in &refs {
+                if single && self.resolve_profile_env(reference).await?.is_none() {
+                    return Err(Error::InvalidParams(format!(
+                        "invalid params: not a provider profile reference: {reference}"
+                    )));
+                }
+            }
+            return Ok(Value::Array(
+                refs.iter()
+                    .map(|r| json!({ "id": r, "authenticated": null }))
+                    .collect(),
+            ));
+        }
         let paths = self.effective_settings().providers.paths;
         // Unknown until its probe reports; a panicked probe stays unknown.
         let mut entries: Vec<Value> = refs

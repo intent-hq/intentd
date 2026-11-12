@@ -297,7 +297,7 @@ pub(crate) async fn handle_with_host_environment(
                     .and_then(|host| host.hardware_model.as_deref()),
                 is_local,
             );
-            result["daemonMode"] = json!(crate::catalog::daemon_mode(api.node_mode()));
+            result["daemonMode"] = json!(crate::catalog::daemon_mode(api.daemon_mode()));
             success_frame(&id_echo, &result)
         }
         HostMethod::CheckGit => {
@@ -452,6 +452,16 @@ pub(crate) async fn handle_with_host_environment(
             );
             success_frame(&id_echo, &json!({"accepted": true}))
         }
+        HostMethod::ProviderDiscovery
+            if api.daemon_mode() == intent_core::settings_file::DaemonMode::Orchestrator =>
+        {
+            // An orchestrator checks no CLI (provider-profiles.md "Profiles
+            // on an orchestrator").
+            success_frame(
+                &id_echo,
+                &json!({ "providers": [], "npx": { "resolvedPath": null, "version": null, "versionOk": false } }),
+            )
+        }
         HostMethod::ProviderDiscovery => {
             // `providers.paths` overrides live in settings, above the
             // discovery seam — read them here so `installed` /
@@ -550,6 +560,28 @@ pub(crate) async fn handle_with_host_environment(
                     },
                 );
             }
+            if api.daemon_mode() == intent_core::settings_file::DaemonMode::Orchestrator {
+                // Configured, never probed: no sign-in check runs here.
+                return Some(
+                    match intent_services::provider_auth::unverified_auth_status(
+                        provider_id.as_deref(),
+                    ) {
+                        Ok(mut result) => {
+                            if include_profiles && provider_id.is_none() {
+                                if let Ok(Value::Array(entries)) =
+                                    api.provider_profiles_auth_status(None, false).await
+                                {
+                                    if let Some(rows) = result["providers"].as_array_mut() {
+                                        rows.extend(entries);
+                                    }
+                                }
+                            }
+                            success_frame(&id_echo, &result)
+                        }
+                        Err(msg) => error_frame(&id_echo, -32602, &msg),
+                    },
+                );
+            }
             let provider_paths = read_provider_paths(api).await;
             match intent_services::provider_auth::provider_auth_status(
                 provider_id.as_deref(),
@@ -600,6 +632,14 @@ pub(crate) async fn handle_with_host_environment(
                 }
                 Err(msg) => error_frame(&id_echo, -32602, &msg),
             }
+        }
+        HostMethod::ProviderTestPrompt
+            if api.daemon_mode() == intent_core::settings_file::DaemonMode::Orchestrator =>
+        {
+            crate::router::delivery_error(
+                &id_echo,
+                intent_core::Error::OrchestratorMode("the provider test prompt".into()),
+            )
         }
         HostMethod::ProviderTestPrompt => {
             let provider_id = match params.get("providerId").and_then(Value::as_str) {

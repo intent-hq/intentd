@@ -92,9 +92,11 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     // frames, 9 final stops, 10 the prepared checkout, 11 the user MCP
     // server proxies, 12 the machine's skills, 13 sub-agent checkouts, 14
     // agent secrets on the machine, 15 the backend's forge token, 16 reads
-    // of an agent's checkout files, 17 sub-agent fetch through the backend;
-    // a protocol-7 peer still binds and runs agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 17 });
+    // of an agent's checkout files, 17 sub-agent fetch through the backend,
+    // 18 an orchestrator's quick actions on the machine; a protocol-7 peer
+    // still binds and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 18 });
+    assert_eq!(ONE_SHOT_PROTOCOL, 18);
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
     assert_eq!(PREPARED_CHECKOUT_PROTOCOL, 10);
@@ -105,9 +107,10 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     assert_eq!(SECRETS_PROTOCOL, 14);
     assert_eq!(FORGE_TOKEN_PROTOCOL, 15);
     assert_eq!(CHECKOUT_FILES_PROTOCOL, 16);
-    assert_eq!(FORGE_FETCH_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(FORGE_FETCH_PROTOCOL, 17);
+    assert_eq!(ONE_SHOT_PROTOCOL, NODE_LINK_PROTOCOLS.max);
     assert!(offers_prepared_checkout());
-    for version in 7..=17 {
+    for version in 7..=18 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -350,6 +353,8 @@ fn executor_link_requests_golden() {
             "heartbeatReply",
             "hello",
             "launch",
+            "oneShot",
+            "oneShotCancel",
             "prompt",
             "pushWip",
             "response",
@@ -401,6 +406,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "checkoutReadReply",
             "forgeTokenReply",
             "journal",
+            "oneShotReply",
             "pushWipReply",
             "replayComplete",
             "request",
@@ -667,6 +673,29 @@ fn every_frame() -> Vec<LinkFrame> {
             piece: None,
             error: Some("file-pull-not-found: out/missing".into()),
         }),
+        LinkFrame::OneShot(OneShot {
+            request_id,
+            operation: OneShotOperation::Complete,
+            input: OneShotInput::Complete(OneShotCompleteInput {
+                provider_id: "codex".into(),
+                prompt: "canary-one-shot-prompt".into(),
+                system_prompt: None,
+                model: Some("gpt-5".into()),
+                effort: Some(EffortCandidates {
+                    requested: None,
+                    saved: vec!["high".into()],
+                }),
+            }),
+            profile_env: None,
+            timeout_ms: 30_000,
+        }),
+        LinkFrame::OneShotCancel(OneShotCancel { request_id }),
+        LinkFrame::OneShotReply(OneShotReply::refused(
+            request_id,
+            OneShotOutcome::Unavailable,
+            "no-capacity",
+            "every adapter slot is busy",
+        )),
     ]
 }
 
@@ -704,7 +733,7 @@ fn frames_are_routed_to_their_lane() {
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
             Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
             Control, Control, Control, Control, Control, Control, Control, Control, Script, Script,
-            Script
+            Script, Rpc, Rpc, Rpc
         ]
     );
 }
@@ -1202,7 +1231,13 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
             frame,
             LinkFrame::CheckoutRead(_) | LinkFrame::CheckoutReadReply(_)
         );
-        let expected = if checkout {
+        let one_shot = matches!(
+            frame,
+            LinkFrame::OneShot(_) | LinkFrame::OneShotCancel(_) | LinkFrame::OneShotReply(_)
+        );
+        let expected = if one_shot {
+            ONE_SHOT_PROTOCOL
+        } else if checkout {
             CHECKOUT_FILES_PROTOCOL
         } else if forge {
             FORGE_TOKEN_PROTOCOL
@@ -1949,4 +1984,32 @@ fn the_backend_trims_and_cuts_display_labels() {
         Some(title),
         "a cut label survives the machine's check"
     );
+}
+
+/// A `oneShot` whose input does not match its operation, or with a mistyped
+/// mode, does not decode; the timeout is clamped by the machine, not here.
+#[test]
+fn one_shot_input_must_match_its_operation() {
+    let frame = |operation: &str, input: Value| {
+        json!({
+            "type": "oneShot",
+            "requestId": "00000000-0000-0000-0000-000000000001",
+            "operation": operation,
+            "input": input,
+            "timeoutMs": 999_999_999u64,
+        })
+    };
+    let enhance = json!({ "prompt": "p", "mode": "layout" });
+    let complete = json!({ "providerId": "codex", "prompt": "p" });
+    let decode = |value: Value| LinkFrame::decode(&serde_json::to_vec(&value).unwrap());
+    assert!(decode(frame("enhance", enhance.clone())).is_ok());
+    assert!(decode(frame("complete", complete.clone())).is_ok());
+    assert!(decode(frame("complete", enhance)).is_err());
+    assert!(decode(frame("enhance", complete)).is_err());
+    assert!(decode(frame("enhance", json!({ "prompt": "p", "mode": "loud" }))).is_err());
+    assert!(decode(frame(
+        "complete",
+        json!({ "providerId": "codex", "prompt": "p", "extra": 1 })
+    ))
+    .is_err());
 }

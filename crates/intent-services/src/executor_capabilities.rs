@@ -81,6 +81,10 @@ impl Services {
     /// ([`Self::executor_provider_capabilities`]) replaces it.
     #[must_use]
     pub fn executor_provider_launch_statuses(&self) -> Vec<ProviderCapability> {
+        if !self.may_spawn_provider_locally() {
+            // An orchestrator runs no agent for anyone.
+            return Vec::new();
+        }
         let settings = self.effective_settings();
         intent_providers::ACP_PROVIDERS
             .iter()
@@ -132,6 +136,9 @@ impl Services {
         &self,
         auth_failures: &HashMap<String, Instant>,
     ) -> Vec<ProviderCapability> {
+        if !self.may_spawn_provider_locally() {
+            return Vec::new();
+        }
         let settings = self.effective_settings();
         let mut launchable = Vec::new();
         for provider in intent_providers::ACP_PROVIDERS {

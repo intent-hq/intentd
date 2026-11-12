@@ -134,6 +134,8 @@ pub(crate) struct ExecutorDeps {
     pub node_id: String,
     pub admission: Arc<dyn Admission>,
     pub launch: Arc<dyn MachineLaunch>,
+    /// Runs the quick actions backends send (nodeProtocol 18).
+    pub one_shot: Option<Arc<dyn runner::MachineOneShot>>,
     pub report: Arc<dyn MachineReport>,
     /// The intentd executable: the `git-remote-intent` helper and the
     /// agents' `mcp-bridge`.
@@ -397,6 +399,7 @@ impl ExecutorService {
             ),
         );
         let runner = Runner::new(RunnerConfig {
+            one_shot: self.deps.one_shot.clone(),
             admission: Arc::new(Scoped {
                 credential: credential.clone(),
                 admission: self.deps.admission.clone(),
@@ -916,11 +919,30 @@ impl Admission for RegistryAdmission {
     }
 }
 
+/// Quick actions run with the daemon's own one-shot route.
+pub(crate) struct ServicesOneShot(pub intent_services::Services);
+
+impl runner::MachineOneShot for ServicesOneShot {
+    fn run(
+        &self,
+        frame: intent_core::node_link::OneShot,
+        profile: Option<intent_acp::ProfileEnv>,
+    ) -> intent_core::BoxFuture<'static, intent_core::node_link::OneShotReply> {
+        let services = self.0.clone();
+        Box::pin(async move { services.machine_one_shot(frame, profile).await })
+    }
+}
+
 /// Providers resolve from the daemon's live settings, as a local spawn's.
-pub(crate) struct SettingsLaunch(pub Arc<intent_services::SettingsRegistry>);
+/// The flag is whether this daemon may start a provider at all (`false` on
+/// an orchestrator, which refuses every launch).
+pub(crate) struct SettingsLaunch(pub Arc<intent_services::SettingsRegistry>, pub bool);
 
 impl MachineLaunch for SettingsLaunch {
     fn resolve(&self, provider: &str) -> Result<ProviderLaunch, String> {
+        if !self.1 {
+            return Err("orchestrator-mode: this daemon runs no agents".into());
+        }
         let snapshot = self.0.snapshot();
         match intent_services::resolve_provider_launch(provider, &snapshot.effective) {
             Ok(spec) => Ok(ProviderLaunch {
@@ -1115,7 +1137,11 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
             ),
             node_id,
             admission: Arc::new(RegistryAdmission(parts.manager.clone())),
-            launch: Arc::new(SettingsLaunch(parts.settings.clone())),
+            launch: Arc::new(SettingsLaunch(
+                parts.settings.clone(),
+                parts.services.may_spawn_provider_locally(),
+            )),
+            one_shot: Some(Arc::new(ServicesOneShot(parts.services.clone()))),
             report: report.clone(),
             executable,
             link_traffic: Some(parts.services.link_traffic().clone()),

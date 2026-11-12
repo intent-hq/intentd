@@ -3688,6 +3688,11 @@ impl AgentManager {
     ) -> Result<()> {
         self.services
             .refuse_in_node_mode("starting a local agent")?;
+        // One gate for every local provider spawn (nodes.md "Orchestrator
+        // mode"): an orchestrator's agents run only on other machines.
+        if !self.services.may_spawn_provider_locally() {
+            return Err(Error::OrchestratorMode("starting a local agent".into()));
+        }
         let cleanup_lease = {
             let closed = self.admission_closed.lock().unwrap();
             if *closed {

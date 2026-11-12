@@ -78,13 +78,13 @@ fn is_false(value: &bool) -> bool {
 /// backend ([`FORGE_FETCH_PROTOCOL`]); each keeps everything the one before
 /// has. Neither 6 nor the single-node 5 ever
 /// shipped, and a protocol-6 peer cannot confirm a stop, so this build
-/// speaks 7 to 17: a backend never takes a stop as confirmed by a machine
+/// speaks 7 to 18: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 17 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 18 };
 
 /// The first protocol with reads of an agent's checkout files for
 /// `ws.file.pull`: the [`LinkFrame::CheckoutRead`] /
@@ -98,6 +98,243 @@ pub const CHECKOUT_FILES_PROTOCOL: u32 = 16;
 /// warning and the `node-git-push-refused` close code. The backend sends
 /// none of them on a link that negotiated less.
 pub const FORGE_FETCH_PROTOCOL: u32 = 17;
+
+/// The first protocol with quick actions on the machine: the
+/// [`LinkFrame::OneShot`], [`LinkFrame::OneShotCancel`] and
+/// [`LinkFrame::OneShotReply`] frames an orchestrator uses to run
+/// `agent.completeOnce` / `agent.enhancePrompt` on a machine. The backend
+/// sends none of them on a link that negotiated less.
+pub const ONE_SHOT_PROTOCOL: u32 = 18;
+
+/// Which quick action a [`OneShot`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OneShotOperation {
+    /// `agent.completeOnce`.
+    Complete,
+    /// `agent.enhancePrompt` (auggie only).
+    Enhance,
+}
+
+/// The effort candidates of a completion, resolved on the machine against
+/// its own live model with the §5.32 rules. The body is closed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EffortCandidates {
+    /// The request's own `reasoningEffort`: refused when unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
+    /// The saved quick-action values, tried in order; unsupported ones are
+    /// skipped.
+    #[serde(default)]
+    pub saved: Vec<String>,
+}
+
+/// The inputs of a `complete` one-shot. The body is closed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OneShotCompleteInput {
+    /// The base provider id, for example `claude-code`.
+    pub provider_id: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<EffortCandidates>,
+}
+
+/// `agent.enhancePrompt`'s mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EnhanceMode {
+    Enhance,
+    Layout,
+}
+
+impl EnhanceMode {
+    /// The wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enhance => "enhance",
+            Self::Layout => "layout",
+        }
+    }
+}
+
+/// The inputs of an `enhance` one-shot. The body is closed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OneShotEnhanceInput {
+    pub prompt: String,
+    pub mode: EnhanceMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// A one-shot's inputs, by operation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OneShotInput {
+    Complete(OneShotCompleteInput),
+    Enhance(OneShotEnhanceInput),
+}
+
+impl std::fmt::Debug for OneShotCompleteInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotCompleteInput")
+            .field("provider_id", &self.provider_id)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for OneShotEnhanceInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotEnhanceInput")
+            .field("mode", &self.mode)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for OneShotInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Complete(input) => input.fmt(f),
+            Self::Enhance(input) => input.fmt(f),
+        }
+    }
+}
+
+/// Backend to machine (nodeProtocol 18): run one quick action with the
+/// machine's own one-shot route. No agent, lease or journal record is
+/// made. The prompt and the overlay never reach a log. The body is closed,
+/// and `input` must be the inputs of `operation`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "RawOneShot")]
+pub struct OneShot {
+    pub request_id: LinkId,
+    pub operation: OneShotOperation,
+    pub input: OneShotInput,
+    /// The selected profile's environment, resolved on the backend, as for
+    /// a launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_env: Option<LaunchProfileEnv>,
+    /// What is left of the method's timeout, at most 120000.
+    pub timeout_ms: u64,
+}
+
+/// [`OneShot`] as decoded, before `input` is checked against `operation`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawOneShot {
+    request_id: LinkId,
+    operation: OneShotOperation,
+    input: Value,
+    #[serde(default)]
+    profile_env: Option<LaunchProfileEnv>,
+    timeout_ms: u64,
+}
+
+impl TryFrom<RawOneShot> for OneShot {
+    type Error = String;
+
+    fn try_from(raw: RawOneShot) -> std::result::Result<Self, Self::Error> {
+        let input = match raw.operation {
+            OneShotOperation::Complete => {
+                serde_json::from_value(raw.input).map(OneShotInput::Complete)
+            }
+            OneShotOperation::Enhance => {
+                serde_json::from_value(raw.input).map(OneShotInput::Enhance)
+            }
+        }
+        .map_err(|error| format!("oneShot input does not match its operation: {error}"))?;
+        Ok(Self {
+            request_id: raw.request_id,
+            operation: raw.operation,
+            input,
+            profile_env: raw.profile_env,
+            timeout_ms: raw.timeout_ms,
+        })
+    }
+}
+
+/// Backend to machine (nodeProtocol 18): end a running one-shot. The body
+/// is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OneShotCancel {
+    pub request_id: LinkId,
+}
+
+/// How a [`OneShot`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OneShotOutcome {
+    Ok,
+    /// The machine cannot run it (`provider-disabled`, `cli-missing`,
+    /// `no-capacity`, `gate-closed`).
+    Unavailable,
+    /// It started and failed (`timeout`, `adapter-failed`, `auth-required`,
+    /// `quota`, `effort-unsupported`).
+    Failed,
+    Cancelled,
+}
+
+/// A one-shot's failure: a fixed `code` and a message for the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OneShotFailure {
+    pub code: String,
+    pub message: String,
+}
+
+/// Machine to backend (nodeProtocol 18): the one answer to a [`OneShot`].
+/// The body is closed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OneShotReply {
+    pub request_id: LinkId,
+    pub outcome: OneShotOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<OneShotFailure>,
+}
+
+impl std::fmt::Debug for OneShotReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotReply")
+            .field("request_id", &self.request_id)
+            .field("outcome", &self.outcome)
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OneShotReply {
+    /// An `unavailable` or `failed` reply with `code` and `message`.
+    #[must_use]
+    pub fn refused(
+        request_id: LinkId,
+        outcome: OneShotOutcome,
+        code: &str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            request_id,
+            outcome,
+            text: None,
+            error: Some(OneShotFailure {
+                code: code.to_owned(),
+                message: message.into(),
+            }),
+        }
+    }
+}
 
 /// The first protocol with the backend's forge token on the machine: the
 /// [`LinkFrame::ForgeToken`] / [`LinkFrame::ForgeTokenReply`] frames and
@@ -196,7 +433,7 @@ impl std::fmt::Display for ProtocolRange {
 /// from an executor credential; the machine-to-backend frames (`welcome`,
 /// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
 /// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`, `secretReply`,
-/// `forgeTokenReply`, `checkoutReadReply`) and
+/// `forgeTokenReply`, `checkoutReadReply`, `oneShotReply`) and
 /// `cancelRequest` are
 /// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
@@ -211,6 +448,8 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "heartbeatReply",
     "hello",
     "launch",
+    "oneShot",
+    "oneShotCancel",
     "prompt",
     "pushWip",
     "response",
@@ -1323,6 +1562,12 @@ pub enum LinkFrame {
     CheckoutRead(CheckoutRead),
     /// Machine to backend (nodeProtocol 16): the answer to a `checkoutRead`.
     CheckoutReadReply(CheckoutReadReply),
+    /// Backend to machine (nodeProtocol 18): run one quick action.
+    OneShot(OneShot),
+    /// Backend to machine (nodeProtocol 18): end a running quick action.
+    OneShotCancel(OneShotCancel),
+    /// Machine to backend (nodeProtocol 18): the answer to a `oneShot`.
+    OneShotReply(OneShotReply),
 }
 
 /// A chunk of an agent's checkout progress and setup output, `seq`
@@ -1378,9 +1623,12 @@ impl LinkFrame {
             Self::Journal(_) | Self::Ack { .. } | Self::ReplayComplete { .. } => {
                 LinkChannel::Journal
             }
-            Self::Request(_) | Self::Response { .. } | Self::CancelRequest { .. } => {
-                LinkChannel::Rpc
-            }
+            Self::Request(_)
+            | Self::Response { .. }
+            | Self::CancelRequest { .. }
+            | Self::OneShot(_)
+            | Self::OneShotCancel(_)
+            | Self::OneShotReply(_) => LinkChannel::Rpc,
             Self::ScriptStart(_)
             | Self::ScriptStop(_)
             | Self::ScriptStarted(_)
@@ -1406,6 +1654,7 @@ impl LinkFrame {
             | Self::SecretReply(_) => SECRETS_PROTOCOL,
             Self::ForgeToken(_) | Self::ForgeTokenReply(_) => FORGE_TOKEN_PROTOCOL,
             Self::CheckoutRead(_) | Self::CheckoutReadReply(_) => CHECKOUT_FILES_PROTOCOL,
+            Self::OneShot(_) | Self::OneShotCancel(_) | Self::OneShotReply(_) => ONE_SHOT_PROTOCOL,
             Self::Launch(command) if command.forge.is_some() => FORGE_TOKEN_PROTOCOL,
             Self::Launch(command) if !command.mcp_proxies.is_empty() => MCP_PROXY_PROTOCOL,
             Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,
@@ -1450,7 +1699,9 @@ impl LinkFrame {
             | Self::SecretForget(_)
             | Self::SecretList(_)
             | Self::ForgeToken(_)
-            | Self::CheckoutRead(_) => true,
+            | Self::CheckoutRead(_)
+            | Self::OneShot(_)
+            | Self::OneShotCancel(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
@@ -1466,7 +1717,8 @@ impl LinkFrame {
             | Self::PushWipReply(_)
             | Self::SecretReply(_)
             | Self::ForgeTokenReply(_)
-            | Self::CheckoutReadReply(_) => false,
+            | Self::CheckoutReadReply(_)
+            | Self::OneShotReply(_) => false,
         }
     }
 

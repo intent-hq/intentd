@@ -769,6 +769,11 @@ pub(crate) async fn spawn_adapter(
     spawn_adapter_in(adapter_slots(), cmd, queue_wait).await
 }
 
+tokio::task_local! {
+    /// Set around a spawn that must take a free adapter slot at once or fail.
+    pub(crate) static NEVER_QUEUE: ();
+}
+
 /// [`spawn_adapter`] against a caller-supplied bound instead of the
 /// process-global one. Production always goes through [`spawn_adapter`]; this
 /// seam exists so a test can run against a private [`AdapterSlots`] and stay
@@ -779,6 +784,13 @@ pub(crate) async fn spawn_adapter_in(
     cmd: &AcpAdapterCommand,
     queue_wait: Duration,
 ) -> Result<SpawnedAdapter, SpawnError> {
+    // A quick action a machine runs for an orchestrator never queues: it
+    // takes a free slot now or is refused (node-link.md rule 5).
+    let queue_wait = if NEVER_QUEUE.try_with(|()| ()).is_ok() {
+        Duration::ZERO
+    } else {
+        queue_wait
+    };
     let started = std::time::Instant::now();
     let Some(slot) = slots.acquire(queue_wait).await else {
         let waited = started.elapsed();

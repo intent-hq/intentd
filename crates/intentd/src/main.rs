@@ -134,6 +134,14 @@ enum Command {
         /// does the same on every start; this flag does not change it.
         #[arg(long)]
         node: bool,
+        /// Orchestrator mode for this run: workspaces and the app connect
+        /// here, but every agent runs on an exposed machine or a cloud
+        /// machine and no provider process starts on this daemon; local
+        /// work is refused with `-32003` `orchestrator-mode`. The persisted
+        /// `daemon.mode = "orchestrator"` setting does the same on every
+        /// start; this flag does not change it.
+        #[arg(long, conflicts_with = "node")]
+        orchestrator: bool,
     },
     /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
     Call {
@@ -468,11 +476,19 @@ async fn async_main(cli: Cli) -> ExitCode {
                 // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
                 specialists_dir: _,
                 node,
+                orchestrator,
             } => {
                 // This measures the entire serve call, including startup and local
                 // destruction on return; cleanup has its own shutdown-only timer.
                 let serve = shutdown::Phase::start("serve_lifetime");
-                match cmd_serve(mode.as_deref(), insecure, resume_all, node).await {
+                match cmd_serve(
+                    mode.as_deref(),
+                    insecure,
+                    resume_all,
+                    mode_flag(node, orchestrator),
+                )
+                .await
+                {
                     Ok(code) => {
                         serve.complete();
                         code
@@ -2039,7 +2055,7 @@ async fn cmd_serve(
     mode: Option<&str>,
     insecure: bool,
     resume_all: bool,
-    node: bool,
+    node: Option<intent_core::settings_file::DaemonMode>,
 ) -> anyhow::Result<ExitCode> {
     // Build-identity banner on entering serve so every startup records
     // which build produced it (monorepo#3649). Same identity
@@ -2152,7 +2168,7 @@ async fn cmd_serve_owned(
     config: Config,
     insecure: bool,
     resume_all: bool,
-    node_flag: bool,
+    mode_flag: Option<intent_core::settings_file::DaemonMode>,
     locality_override: Option<bool>,
     prepared: intent_store::PreparedDaemonStore,
     bootstrap: &mut startup::Bootstrap,
@@ -2180,11 +2196,19 @@ async fn cmd_serve_owned(
     let boot_settings = settings_registry.snapshot();
     // Node mode is fixed for the process lifetime: `--node` or the persisted
     // `daemon.mode` read here, once (a later change applies at next start).
-    let node_mode = resolve_node_mode(node_flag, boot_settings.effective.daemon.mode);
+    let daemon_mode = resolve_daemon_mode(mode_flag, boot_settings.effective.daemon.mode);
+    let node_mode = daemon_mode == intent_core::settings_file::DaemonMode::Node;
+    let orchestrator_mode = daemon_mode == intent_core::settings_file::DaemonMode::Orchestrator;
     if node_mode {
         tracing::info!(
-            flag = node_flag,
+            flag = mode_flag.is_some(),
             "node mode: orchestration off, serving the node-mode method list"
+        );
+    }
+    if orchestrator_mode {
+        tracing::info!(
+            flag = mode_flag.is_some(),
+            "orchestrator mode: agents run only on other machines"
         );
     }
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
@@ -2535,7 +2559,8 @@ async fn cmd_serve_owned(
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent)
-        .with_node_mode(node_mode);
+        .with_node_mode(node_mode)
+        .with_orchestrator_mode(orchestrator_mode);
     // Remove secrets journaled by an interrupted profile create/delete.
     services.sweep_provider_profile_secrets().await;
     services.migrate_remote_choices().await;
@@ -5098,6 +5123,10 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
     fn node_mode(&self) -> bool {
         self.ws_runtime.api.node_mode()
     }
+
+    fn daemon_mode(&self) -> intent_core::settings_file::DaemonMode {
+        self.ws_runtime.api.daemon_mode()
+    }
 }
 
 impl SystemControl for DaemonControl {
@@ -5870,10 +5899,26 @@ fn ws_options_from_env() -> WsOptions {
     opts
 }
 
-/// Node mode for this run: `intentd serve --node`, or the persisted
-/// `daemon.mode = "node"` setting. The flag never changes the setting.
-fn resolve_node_mode(flag: bool, setting: intent_core::settings_file::DaemonMode) -> bool {
-    flag || setting == intent_core::settings_file::DaemonMode::Node
+/// The mode a `serve` flag selects: `--node` or `--orchestrator` (clap
+/// refuses both together), else none.
+fn mode_flag(node: bool, orchestrator: bool) -> Option<intent_core::settings_file::DaemonMode> {
+    use intent_core::settings_file::DaemonMode;
+    if node {
+        Some(DaemonMode::Node)
+    } else if orchestrator {
+        Some(DaemonMode::Orchestrator)
+    } else {
+        None
+    }
+}
+
+/// The mode for this run: the `serve` flag, else the persisted
+/// `daemon.mode` setting. The flag never changes the setting.
+fn resolve_daemon_mode(
+    flag: Option<intent_core::settings_file::DaemonMode>,
+    setting: intent_core::settings_file::DaemonMode,
+) -> intent_core::settings_file::DaemonMode {
+    flag.unwrap_or(setting)
 }
 
 /// Parse the optional `--mode` locality override (§5.14) into the transport
@@ -10837,12 +10882,39 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn node_mode_is_the_flag_or_the_setting() {
+    fn the_daemon_mode_is_the_flag_or_the_setting() {
         use intent_core::settings_file::DaemonMode;
-        assert!(!resolve_node_mode(false, DaemonMode::Regular));
-        assert!(resolve_node_mode(true, DaemonMode::Regular));
-        assert!(resolve_node_mode(false, DaemonMode::Node));
-        assert!(resolve_node_mode(true, DaemonMode::Node));
+        assert_eq!(
+            resolve_daemon_mode(None, DaemonMode::Regular),
+            DaemonMode::Regular
+        );
+        assert_eq!(
+            resolve_daemon_mode(None, DaemonMode::Node),
+            DaemonMode::Node
+        );
+        assert_eq!(
+            resolve_daemon_mode(None, DaemonMode::Orchestrator),
+            DaemonMode::Orchestrator
+        );
+        let node_flag = mode_flag(true, false);
+        assert_eq!(
+            resolve_daemon_mode(node_flag, DaemonMode::Orchestrator),
+            DaemonMode::Node
+        );
+        let orchestrator = mode_flag(false, true);
+        assert_eq!(
+            resolve_daemon_mode(orchestrator, DaemonMode::Node),
+            DaemonMode::Orchestrator
+        );
+        assert_eq!(mode_flag(false, false), None);
+        assert!(Cli::try_parse_from(["intentd", "serve", "--node", "--orchestrator"]).is_err());
+        match Cli::try_parse_from(["intentd", "serve", "--orchestrator"])
+            .unwrap()
+            .command
+        {
+            Command::Serve { orchestrator, .. } => assert!(orchestrator),
+            other => panic!("expected Serve, got {other:?}"),
+        }
     }
 
     #[test]

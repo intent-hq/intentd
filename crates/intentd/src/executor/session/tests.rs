@@ -60,6 +60,7 @@ fn harness() -> Harness {
     let storage = Arc::new(Storage::open(&dir.path().join("node"), None).unwrap());
     let journal = Journal::open(&storage.journal_dir()).unwrap();
     let runner = Runner::new(RunnerConfig {
+        one_shot: None,
         admission: Arc::new(Unlimited),
         launch: Arc::new(NoProviders),
         checkouts: crate::executor::checkout::PlainCheckouts::new(storage.clone()),

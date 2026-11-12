@@ -488,7 +488,10 @@ Running agents on those machines is experimental. That list is in the user's ord
 preference, and its first row is marked **Preferred**: **This computer** first by default, then machines and cloud entries as they
 were added. Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
 menu. An agent started without a **Start on** choice runs on the first row that can run
-it; a sub-agent started by an agent on this computer stays here. Agents see each machine's name and
+it; a sub-agent started by an agent on this computer stays here. A backend started as an
+orchestrator (`intentd serve --orchestrator`, experimental) runs every agent on those
+machines: its list has no **This computer** row, and **Settings → Providers** shows only
+the enable switches and profiles, with no **Test** button and no sign-in status. Agents see each machine's name and
 platform, and look up its providers, sign-in status and models when they need them.
 A Default with **Use on remote machines** turned on in **Settings → Providers** is
 always sent when it has saved settings, even to a machine signed in to that provider. Otherwise a machine uses its

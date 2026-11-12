@@ -554,6 +554,13 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: crate::catalog::NODE_MODE_ERROR_MESSAGE.to_string(),
             data: Some(crate::catalog::node_mode_error_data(&detail)),
         },
+        // Orchestrator mode (nodes.md "Orchestrator mode"): local work is
+        // refused with `data.code: "orchestrator-mode"`.
+        Error::OrchestratorMode(detail) => RpcErr {
+            code: crate::catalog::FORBIDDEN_ERROR_CODE,
+            message: format!("Not available on an orchestrator: {detail}"),
+            data: Some(json!({ "code": "orchestrator-mode", "detail": detail })),
+        },
         // Invite / identity-only join refusal (multiplayer w4): the kind's
         // own code with the stable `data.code` so an invite client can route
         // "expired" / "pin mismatch" / "denied" without matching on prose.

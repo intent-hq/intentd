@@ -864,6 +864,14 @@ impl RemoteLaunchPort for RemoteLaunch {
         true
     }
 
+    fn machine_one_shot<'a>(
+        &'a self,
+        svc: &'a Services,
+        request: intent_services::feature_api::feature_ports::MachineOneShotRequest,
+    ) -> BoxFuture<'a, intent_services::feature_api::feature_ports::MachineOneShotAnswer> {
+        Box::pin(crate::quick_action::machine_one_shot(svc, request))
+    }
+
     fn machine_order<'a>(
         &'a self,
         svc: &'a Services,

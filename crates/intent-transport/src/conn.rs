@@ -973,7 +973,7 @@ async fn process_captured_frame(
                 bound = outcome.bound;
                 client::with_runtime_capabilities(
                     outcome.frame,
-                    api.node_mode(),
+                    api.daemon_mode(),
                     control.and_then(|c| c.startup_status()).is_some(),
                     api.remote_machines_capability(),
                 )

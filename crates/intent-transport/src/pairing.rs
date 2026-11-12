@@ -340,7 +340,7 @@ fn pairing_json(
         "fingerprint": cert.fingerprint256,
         "token": token,
         "version": PAIRING_PAYLOAD_VERSION,
-        "daemonMode": crate::catalog::daemon_mode(node_mode),
+        "daemonMode": crate::catalog::daemon_mode(provider.daemon_mode()),
     });
     // Additive tunnel route (presence-detected): omitted when the tunnel is
     // disabled or down, so older clients are unaffected.

@@ -139,8 +139,20 @@ pub(crate) trait MachineLaunch: Send + Sync {
     fn policy(&self) -> PermissionPolicy;
 }
 
+/// Runs a quick action a backend sent (`oneShot`, nodeProtocol 18) with
+/// this machine's own one-shot route.
+pub(crate) trait MachineOneShot: Send + Sync {
+    fn run(
+        &self,
+        frame: intent_core::node_link::OneShot,
+        profile: Option<ProfileEnv>,
+    ) -> intent_core::BoxFuture<'static, intent_core::node_link::OneShotReply>;
+}
+
 /// What the runner needs.
 pub(super) struct RunnerConfig {
+    /// Runs quick actions; `None` answers every `oneShot` as unavailable.
+    pub one_shot: Option<Arc<dyn MachineOneShot>>,
     pub admission: Arc<dyn Admission>,
     pub launch: Arc<dyn MachineLaunch>,
     pub checkouts: Arc<dyn Checkouts>,
@@ -197,6 +209,12 @@ pub(super) struct Runner {
 }
 
 struct Inner {
+    one_shot: Option<Arc<dyn MachineOneShot>>,
+    /// Running quick actions, by request id, with the binding generation of
+    /// the link that asked for them: dropping the sender ends one.
+    one_shots: Mutex<
+        HashMap<intent_core::node_link::LinkId, (NodeCounter, tokio::sync::oneshot::Sender<()>)>,
+    >,
     admission: Arc<dyn Admission>,
     launch: Arc<dyn MachineLaunch>,
     checkouts: Arc<dyn Checkouts>,
@@ -958,6 +976,8 @@ impl Runner {
         intent_services::checkout_transfer::PieceSource::spawn_sweeper(&pulls);
         Self {
             inner: Arc::new(Inner {
+                one_shot: config.one_shot,
+                one_shots: Mutex::new(HashMap::new()),
                 admission: config.admission,
                 launch: config.launch,
                 checkouts: config.checkouts,
@@ -981,6 +1001,88 @@ impl Runner {
                 pulls,
                 start_timeouts: Mutex::new(StartTimeouts::default()),
             }),
+        }
+    }
+
+    /// Run a backend's quick action (`oneShot`, nodeProtocol 18) and return
+    /// its reply; `oneShotCancel` with the same id ends it as `cancelled`.
+    /// Register a quick action before its task runs, so a cancel or the
+    /// end of its link always finds it; pass the receiver to
+    /// [`Self::one_shot`].
+    pub(super) fn begin_one_shot(
+        &self,
+        id: intent_core::node_link::LinkId,
+        generation: NodeCounter,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        lock(&self.inner.one_shots).insert(id, (generation, cancel));
+        cancelled
+    }
+
+    pub(super) async fn one_shot(
+        &self,
+        frame: intent_core::node_link::OneShot,
+        cancelled: tokio::sync::oneshot::Receiver<()>,
+    ) -> intent_core::node_link::OneShotReply {
+        use intent_core::node_link::{OneShotOutcome, OneShotReply};
+        let id = frame.request_id;
+        let Some(runs) = self.inner.one_shot.clone() else {
+            lock(&self.inner.one_shots).remove(&id);
+            return OneShotReply::refused(
+                id,
+                OneShotOutcome::Unavailable,
+                "gate-closed",
+                "quick actions do not run on this machine",
+            );
+        };
+        let profile = match frame
+            .profile_env
+            .as_ref()
+            .map(|wire| self.node_profile(&wire.0))
+        {
+            None => None,
+            Some(Ok(profile)) => Some(profile),
+            Some(Err(error)) => {
+                lock(&self.inner.one_shots).remove(&id);
+                return OneShotReply::refused(id, OneShotOutcome::Failed, "adapter-failed", error);
+            }
+        };
+        let reply = tokio::select! {
+            reply = runs.run(frame, profile) => reply,
+            _ = cancelled => OneShotReply {
+                request_id: id,
+                outcome: OneShotOutcome::Cancelled,
+                text: None,
+                error: None,
+            },
+        };
+        lock(&self.inner.one_shots).remove(&id);
+        reply
+    }
+
+    /// End every running quick action that link generation `generation`
+    /// asked for: that link is gone, so no one waits for the replies
+    /// (node-link.md "Quick actions on the machine", rule 2). Quick actions
+    /// of a newer link of the same backend keep running.
+    pub(super) fn cancel_binding_one_shots(&self, generation: NodeCounter) {
+        let mut runs = lock(&self.inner.one_shots);
+        let ended: Vec<_> = runs
+            .iter()
+            .filter(|(_, (owner, _))| *owner == generation)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ended {
+            if let Some((_, cancel)) = runs.remove(&id) {
+                let _ = cancel.send(());
+            }
+        }
+    }
+
+    /// End a running quick action (`oneShotCancel`); an unknown or finished
+    /// id is ignored.
+    pub(super) fn cancel_one_shot(&self, id: intent_core::node_link::LinkId) {
+        if let Some((_, cancel)) = lock(&self.inner.one_shots).remove(&id) {
+            let _ = cancel.send(());
         }
     }
 

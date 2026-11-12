@@ -362,6 +362,8 @@ pub(crate) struct Shared {
     /// Waiting for the machine's `secretReply`, by request id
     /// (nodeProtocol 14).
     secret_waiters: Mutex<HashMap<LinkId, oneshot::Sender<SecretReply>>>,
+    /// `oneShot`s waiting for their reply (nodeProtocol 18).
+    one_shot_waiters: Mutex<HashMap<LinkId, oneshot::Sender<intent_core::node_link::OneShotReply>>>,
     /// Secret forgets for a machine that was not connected (nodeProtocol
     /// 14): sent after the next bind. Memory only; a backend restart drops
     /// them, and its new `headSession` drops the values on the machine.
@@ -523,6 +525,7 @@ impl Shared {
             || !lock(&self.skills_waiters).is_empty()
             || !lock(&self.push_waiters).is_empty()
             || !lock(&self.checkout_waiters).is_empty()
+            || !lock(&self.one_shot_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
             || (self
                 .survivors_unclaimed
@@ -541,6 +544,7 @@ impl Shared {
             || !lock(&self.skills_waiters).is_empty()
             || !lock(&self.push_waiters).is_empty()
             || !lock(&self.checkout_waiters).is_empty()
+            || !lock(&self.one_shot_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
     }
 
@@ -1693,6 +1697,7 @@ impl RemoteNode {
             skills_waiters: Mutex::new(HashMap::new()),
             push_waiters: Mutex::new(HashMap::new()),
             checkout_waiters: Mutex::new(HashMap::new()),
+            one_shot_waiters: Mutex::new(HashMap::new()),
             secret_waiters: Mutex::new(HashMap::new()),
             secret_forgets: Mutex::new(Vec::new()),
             secret_locks: Mutex::new(HashMap::new()),
@@ -2046,6 +2051,64 @@ impl RemoteNode {
         self.shared.wait_stops(agents, deadline).await
     }
 
+    /// Run one quick action on the machine (`oneShot`, nodeProtocol 18),
+    /// waiting up to `wait` for its reply. When this future is dropped, or
+    /// `wait` runs out, the machine is told to end the run
+    /// (`oneShotCancel`). The link must already be up.
+    ///
+    /// # Errors
+    ///
+    /// The send error; `node-link-timeout` when the machine does not answer
+    /// in time; `node-link-closed` when the link drops first.
+    pub(crate) async fn one_shot(
+        &self,
+        frame: intent_core::node_link::OneShot,
+        wait: Duration,
+    ) -> Result<intent_core::node_link::OneShotReply> {
+        /// Forgets the waiter, and cancels the run unless it answered.
+        struct Pending {
+            shared: Arc<Shared>,
+            request_id: LinkId,
+            answered: bool,
+        }
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                lock(&self.shared.one_shot_waiters).remove(&self.request_id);
+                if self.answered {
+                    return;
+                }
+                let shared = self.shared.clone();
+                let cancel = LinkFrame::OneShotCancel(intent_core::node_link::OneShotCancel {
+                    request_id: self.request_id,
+                });
+                // caller-binding: allow — best-effort cancel of an abandoned quick action on its link
+                tokio::spawn(async move {
+                    let _ = shared.send(&cancel).await;
+                });
+            }
+        }
+        let request_id = frame.request_id;
+        let (tx, rx) = oneshot::channel();
+        lock(&self.shared.one_shot_waiters).insert(request_id, tx);
+        let mut pending = Pending {
+            shared: self.shared.clone(),
+            request_id,
+            answered: false,
+        };
+        self.shared.send(&LinkFrame::OneShot(frame)).await?;
+        let reply = tokio::time::timeout(wait, rx)
+            .await
+            .map_err(|_| {
+                Error::Internal(format!(
+                    "{}: the machine did not answer the quick action",
+                    link::codes::TIMEOUT
+                ))
+            })?
+            .map_err(|_| Error::Internal(link::codes::CLOSED.into()))?;
+        pending.answered = true;
+        Ok(reply)
+    }
+
     /// Send a control frame (such as a launch) on the current link.
     ///
     /// # Errors
@@ -2365,6 +2428,7 @@ async fn run(
                 lock(&shared.skills_waiters).clear();
                 lock(&shared.push_waiters).clear();
                 lock(&shared.checkout_waiters).clear();
+                lock(&shared.one_shot_waiters).clear();
                 lock(&shared.secret_waiters).clear();
                 retry = shared.wants_link();
                 if retry {
@@ -2439,6 +2503,7 @@ async fn run(
             lock(&shared.skills_waiters).clear();
             lock(&shared.push_waiters).clear();
             lock(&shared.checkout_waiters).clear();
+            lock(&shared.one_shot_waiters).clear();
             lock(&shared.secret_waiters).clear();
             shared.announce().await;
             retry = shared.wants_link();
@@ -2559,6 +2624,7 @@ async fn run(
         lock(&shared.skills_waiters).clear();
         lock(&shared.push_waiters).clear();
         lock(&shared.checkout_waiters).clear();
+        lock(&shared.one_shot_waiters).clear();
         lock(&shared.secret_waiters).clear();
         // The machine stops this binding's scripts when its link closes.
         shared
@@ -2675,6 +2741,13 @@ async fn serve(
                     LinkEvent::Frame(LinkFrame::SkillsReply(reply)) => {
                         if let Some(waiter) = lock(&shared.skills_waiters).remove(&reply.query_id) {
                             let _ = waiter.send(reply.skills);
+                        }
+                    }
+                    LinkEvent::Frame(LinkFrame::OneShotReply(reply)) => {
+                        if let Some(waiter) =
+                            lock(&shared.one_shot_waiters).remove(&reply.request_id)
+                        {
+                            let _ = waiter.send(reply);
                         }
                     }
                     LinkEvent::Frame(LinkFrame::CheckoutReadReply(reply)) => {

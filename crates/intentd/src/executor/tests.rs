@@ -359,6 +359,7 @@ impl Running {
                 node_id: NODE_ID.into(),
                 admission,
                 launch: Arc::new(FixedLaunch(providers)),
+                one_shot: None,
                 report: report.clone(),
                 executable: std::env::current_exe().unwrap(),
                 link_traffic: Some(Arc::new(intent_core::link_traffic::LinkTraffic::new())),
@@ -2209,7 +2210,7 @@ fn the_machine_refuses_a_provider_disabled_in_its_own_settings() {
             serde_json::json!({ "codex": false }),
         )])
         .unwrap();
-    let launch = SettingsLaunch(settings);
+    let launch = SettingsLaunch(settings, true);
     assert_eq!(
         launch.resolve("codex").err().as_deref(),
         Some("unknown or disabled")

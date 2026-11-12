@@ -337,6 +337,7 @@ impl Services {
     ) -> Result<Value> {
         // The sessions are the host account's files: administrator only.
         Self::require_administrator("agent.importableSessions.list")?;
+        self.refuse_in_orchestrator_mode("agent.importableSessions.list")?;
         let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
         if limit == 0 || limit > MAX_LIMIT {
             return Err(Error::InvalidParams(format!(
@@ -438,6 +439,7 @@ impl Services {
     /// `-32602` for an unknown provider or a workspace without a checkout,
     /// `-32602 not-found` for a session the provider does not have.
     pub async fn agent_import_session_op(&self, params: ImportSessionParams) -> Result<Value> {
+        self.refuse_in_orchestrator_mode("agent.importSession")?;
         let ImportSessionParams {
             workspace_id,
             provider,
