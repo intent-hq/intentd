@@ -508,7 +508,9 @@ computer by typing a short code the host shows (6 characters, e.g. KTP-82M; 10 m
 cancelled after 5 wrong tries; one code at a time). It needs the host's listener on
 (loopback only is enough). Each connected Intent gets its own credential, listed under
 **Intents on this computer** with **Remove**, which disconnects it at once; removing
-one never affects the owner token, phones or other machines. The desktop surfaces stay
+one never affects the owner token, phones or other machines. Local pairing is off
+while remote access through the Intent tunnel is on (paired Intents disconnect until it
+is turned off; they are not removed). The desktop surfaces stay
 hidden until **Enable experimental local pairing** is run from Cmd+K (Labs).
 Sources: packages/intentd/crates/intent-services/src/local_pairing.rs;
 packages/intentd/crates/intent-transport/src/local_pairing.rs;

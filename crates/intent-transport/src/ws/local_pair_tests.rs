@@ -348,3 +348,54 @@ async fn a_redemption_notification_never_spends_the_code() {
     .await;
     assert!(grant["result"]["token"].is_string(), "{grant}");
 }
+
+/// §5.58: while Intent's remote-access tunnel runs, tunnelled peers arrive
+/// from loopback too, so `/local-pair` is refused like a non-loopback peer,
+/// and a connection opened before the tunnel started is closed.
+#[tokio::test]
+async fn the_tunnel_closes_local_pair() {
+    let f = fixture(true).await;
+    let created = f.pairing.create_code().await.unwrap();
+    let (status, stream) = upgrade(&f, LOOPBACK, "").await;
+    assert_eq!(status, 101);
+    let mut early = WebSocketStream::from_raw_socket(stream.unwrap(), Role::Client, None).await;
+
+    f.pairing.set_tunnel_active(true);
+    // The open connection is closed; new upgrades are refused.
+    let close = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        async {
+            loop {
+                match early.next().await {
+                    Some(Ok(Message::Close(frame))) => return frame,
+                    Some(Ok(_)) => {}
+                    other => panic!("expected a close frame, got {other:?}"),
+                }
+            }
+        },
+    )
+    .await
+    .expect("close deadline")
+    .expect("close frame");
+    assert_eq!(u16::from(close.code), 1008);
+    assert_eq!(close.reason, "tunnel active");
+    assert_eq!(upgrade(&f, LOOPBACK, "").await.0, 403);
+
+    f.pairing.set_tunnel_active(false);
+    // The code shown before the tunnel started was cancelled.
+    assert_eq!(
+        f.pairing.redeem(&created.code, "Intent Alpha").await.err(),
+        Some(intent_core::local_pairing::LocalPairingError::Expired)
+    );
+    let (status, stream) = upgrade(&f, LOOPBACK, "").await;
+    assert_eq!(status, 101);
+    let mut ws = WebSocketStream::from_raw_socket(stream.unwrap(), Role::Client, None).await;
+    let fresh = f.pairing.create_code().await.unwrap();
+    let grant = call(
+        &mut ws,
+        json!({"jsonrpc":"2.0","id":2,"method":"pairing.redeemLocalCode",
+            "params":{"code":fresh.code,"appName":"Intent Alpha"}}),
+    )
+    .await;
+    assert!(grant["result"]["token"].is_string(), "{grant}");
+}

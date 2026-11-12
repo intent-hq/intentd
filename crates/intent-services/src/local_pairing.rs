@@ -19,7 +19,7 @@ use intent_core::local_pairing::{
     display_code, normalize_code, validate_app_name, CreatedLocalCode, LocalPairingCancelReason,
     LocalPairingCode, LocalPairingCodeState, LocalPairingCredential, LocalPairingError,
     LocalPairingService, RedeemedLocalCode, CODE_ALPHABET, CODE_HMAC_CONTEXT, CODE_LENGTH,
-    CODE_LIFETIME, MAX_WRONG_TRIES,
+    CODE_LIFETIME, MAX_WRONG_TRIES, SUSPEND_ALL_SIGNAL,
 };
 use intent_core::{events, BoxFuture, WorkspaceId};
 use intent_store::{LocalPairingCredentialRow, LocalPairingRevocation, NewEvent, Store};
@@ -42,6 +42,9 @@ struct Slot {
     /// The keyed hash; dropped as soon as the code leaves `active`.
     hash: Option<Vec<u8>>,
     deadline: Instant,
+    /// [`LocalPairing::tunnel_starts`] when the code was created; a later
+    /// tunnel start cancels it (`tunnel-active`).
+    tunnel_epoch: u64,
 }
 
 /// Host-side local pairing service. Construct with [`LocalPairing::new`].
@@ -53,6 +56,11 @@ pub struct LocalPairing {
     connections: Mutex<HashMap<String, usize>>,
     revocations: broadcast::Sender<String>,
     lifetime: std::time::Duration,
+    /// Intent's remote-access tunnel is running (see
+    /// [`LocalPairingService::set_tunnel_active`]).
+    tunnel_active: std::sync::atomic::AtomicBool,
+    /// Tunnel starts so far; bumped after `tunnel_active` is set.
+    tunnel_starts: std::sync::atomic::AtomicU64,
     me: Weak<Self>,
 }
 
@@ -135,6 +143,8 @@ impl LocalPairing {
             connections: Mutex::new(HashMap::new()),
             revocations: broadcast::channel(REVOCATION_CAPACITY).0,
             lifetime,
+            tunnel_active: std::sync::atomic::AtomicBool::new(false),
+            tunnel_starts: std::sync::atomic::AtomicU64::new(0),
             me: me.clone(),
         }))
     }
@@ -187,6 +197,18 @@ impl LocalPairing {
     /// Apply expiry: an active code past its deadline becomes `expired`
     /// (emitted), and any code past its deadline leaves the slot.
     fn settle(&self, slot: &mut Option<Slot>) {
+        // A tunnel start after the code was created cancels it, whether or
+        // not the start's own cleanup task has run yet.
+        let starts = self.tunnel_starts.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(current) = slot.as_mut() {
+            if current.code.state == LocalPairingCodeState::Active && current.tunnel_epoch != starts
+            {
+                current.code.state = LocalPairingCodeState::Cancelled;
+                current.code.cancel_reason = Some(LocalPairingCancelReason::TunnelActive);
+                current.hash = None;
+                self.publish_code(&current.code);
+            }
+        }
         if slot.as_ref().is_some_and(|s| Instant::now() >= s.deadline) {
             let mut done = slot.take().expect("checked above");
             if done.code.state == LocalPairingCodeState::Active {
@@ -229,6 +251,11 @@ impl LocalPairing {
         };
         let deadline = Instant::now() + self.lifetime;
         let mut slot = self.slot.lock().await;
+        // Read the start count before the flag (see `set_tunnel_active`).
+        let tunnel_epoch = self.tunnel_starts.load(std::sync::atomic::Ordering::SeqCst);
+        if self.tunnel_is_active() {
+            return Err(LocalPairingError::TunnelActive);
+        }
         self.settle(&mut slot);
         if let Some(old) = slot.as_mut() {
             if old.code.state == LocalPairingCodeState::Active {
@@ -242,6 +269,7 @@ impl LocalPairing {
             code: code.clone(),
             hash: Some(hash),
             deadline,
+            tunnel_epoch,
         });
         self.publish_code(&code);
         drop(slot);
@@ -289,6 +317,12 @@ impl LocalPairing {
         })?;
         let app_name = validate_app_name(app_name)?;
         let mut slot = self.slot.lock().await;
+        // Checked under the slot lock, before the code's state: while the
+        // tunnel runs there is no redeemable code (§5.58: the active one is
+        // cancelled), so a tunnelled attempt never counts or spends anything.
+        if self.tunnel_is_active() {
+            return Err(LocalPairingError::Expired);
+        }
         self.settle(&mut slot);
         let Some(current) = slot.as_mut() else {
             return Err(LocalPairingError::Expired);
@@ -371,6 +405,16 @@ impl LocalPairing {
         }
     }
 
+    fn tunnel_is_active(&self) -> bool {
+        self.tunnel_active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Emit the tunnel cancellation promptly ([`Self::settle`] applies it).
+    async fn cancel_for_tunnel(&self) {
+        let mut slot = self.slot.lock().await;
+        self.settle(&mut slot);
+    }
+
     /// Adjust the live-connection count and emit on a `connected` flip.
     fn connection_delta(&self, credential_id: &str, opened: bool) {
         let flipped = {
@@ -439,6 +483,9 @@ impl LocalPairingService for LocalPairing {
 
     fn resolve_credential(&self, token_hash: String) -> BoxFuture<'_, Option<String>> {
         Box::pin(async move {
+            if self.tunnel_is_active() {
+                return None;
+            }
             self.store
                 .resolve_local_pairing_credential(&token_hash)
                 .await
@@ -451,10 +498,11 @@ impl LocalPairingService for LocalPairing {
 
     fn credential_active(&self, credential_id: String) -> BoxFuture<'_, bool> {
         Box::pin(async move {
-            matches!(
-                self.store.get_local_pairing_credential(&credential_id).await,
-                Ok(Some(row)) if row.revoked_at.is_none()
-            )
+            !self.tunnel_is_active()
+                && matches!(
+                    self.store.get_local_pairing_credential(&credential_id).await,
+                    Ok(Some(row)) if row.revoked_at.is_none()
+                )
         })
     }
 
@@ -468,6 +516,35 @@ impl LocalPairingService for LocalPairing {
 
     fn connection_closed(&self, credential_id: &str) {
         self.connection_delta(credential_id, false);
+    }
+
+    fn set_tunnel_active(&self, active: bool) {
+        let was = self
+            .tunnel_active
+            .swap(active, std::sync::atomic::Ordering::SeqCst);
+        if active {
+            // After the flag: a create that read the old count before this
+            // bump is cancelled by it; one that reads the new count has
+            // already seen the flag and refused (see `create`).
+            self.tunnel_starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if !active || was {
+            return;
+        }
+        // Credentials stay valid; their live connections close (1008) and
+        // admission refuses them until the tunnel stops.
+        let _ = self.revocations.send(SUSPEND_ALL_SIGNAL.to_owned());
+        let me = self.me.clone();
+        intent_core::spawn_daemon(async move {
+            if let Some(me) = me.upgrade() {
+                me.cancel_for_tunnel().await;
+            }
+        });
+    }
+
+    fn tunnel_active(&self) -> bool {
+        self.tunnel_is_active()
     }
 }
 

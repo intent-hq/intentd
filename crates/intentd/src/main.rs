@@ -3194,6 +3194,13 @@ async fn cmd_serve_owned(
     };
 
     let tunnel_supervisor = bootstrap.tunnel.clone();
+    // §5.58: tunnelled traffic reaches the listener from loopback, so local
+    // code pairing is off while the remote-access tunnel runs.
+    if let Some(local_pairing) = api.local_pairing() {
+        tunnel_supervisor.set_active_hook(Arc::new(move |active| {
+            local_pairing.set_tunnel_active(active);
+        }));
+    }
     // A resumed VM (paused E2B sandbox) or woken host keeps a tailcat that
     // no dial reaches; restart it on each resume. Needs the clock-skew
     // detector, so `wakeResume.enabled = false` turns this off too.

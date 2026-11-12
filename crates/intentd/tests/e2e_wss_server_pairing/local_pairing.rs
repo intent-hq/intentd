@@ -296,3 +296,118 @@ async fn local_pairing_methods_are_refused_over_wss() {
         "pairing.redeemLocalCode is served only on /local-pair"
     );
 }
+
+async fn set_tunnel(socket: &Path, id: i64, enabled: bool) {
+    let reply = uds_rpc(
+        socket,
+        id,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.enabled", "value": enabled }] }),
+    )
+    .await;
+    assert!(reply.get("error").is_none(), "tunnel={enabled}: {reply}");
+}
+
+/// Poll `pairing.createLocalCode` until `pred` accepts the reply.
+async fn await_create(socket: &Path, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+    let budget = common::test_timeout(Duration::from_secs(20));
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut id = 100;
+    loop {
+        id += 1;
+        let reply = uds_rpc(socket, id, "pairing.createLocalCode", json!({})).await;
+        if pred(&reply) {
+            return reply;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "createLocalCode never {what} within {budget:?}: {reply}"
+        );
+        // timing-guard: poll interval while the tunnel settles, bounded by the budget
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// §5.58: tunnelled traffic reaches the listener from loopback, so local
+/// code pairing is off while Intent's remote-access tunnel runs. Starting
+/// it cancels the active code (`tunnel-active`) and closes live credential
+/// connections with 1008; codes are refused, `/local-pair` is `403` and the
+/// credential `401`. Credentials are not revoked: everything works again
+/// once the tunnel stops. Uses the fake tailcat sidecar.
+#[tokio::test]
+async fn the_tunnel_suspends_local_pairing() {
+    let dir = temp_data_dir();
+    let token_hash = intent_transport::hash_token(LOCAL_TOKEN);
+    {
+        let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
+        store
+            .insert_local_pairing_credential("lp-1", &token_hash, "Intent Alpha")
+            .await
+            .unwrap();
+    }
+    let tailcat = write_fake_tailcat(dir.path());
+    let _daemon = spawn_serve_with_tailcat(dir.path(), &tailcat);
+    let socket = dir.path().join("intentd.sock");
+    let (port, fingerprint) = boot(dir.path()).await;
+    let mut uds_events = UdsEvents::subscribe(&socket).await;
+
+    let url = format!("wss://localhost:{port}/ws?token={LOCAL_TOKEN}");
+    let mut paired = common::wss_connect_with_retry(port, client_config(&fingerprint), &url).await;
+    let connected = uds_events
+        .next_event("pairing:localCredentials-changed")
+        .await;
+    assert_eq!(connected["credential"]["connected"], true);
+    let created = uds_rpc(&socket, 2, "pairing.createLocalCode", json!({})).await;
+    let code_id = created["result"]["localCode"]["codeId"].clone();
+    let active = uds_events.next_event("pairing:localCode-changed").await;
+    assert_eq!(active["localCode"]["state"], "active");
+
+    set_tunnel(&socket, 3, true).await;
+
+    // The live credential connection closes with 1008.
+    let close = timeout(common::rpc_read_timeout(), async {
+        loop {
+            match paired.next().await {
+                Some(Ok(Message::Close(frame))) => return frame,
+                Some(Ok(_)) => {}
+                other => panic!("expected a close frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("close deadline")
+    .expect("close frame");
+    assert_eq!(u16::from(close.code), 1008);
+    assert_eq!(close.reason, "tunnel active");
+    // The active code is cancelled for the tunnel.
+    let cancelled = uds_events.next_event("pairing:localCode-changed").await;
+    assert_eq!(cancelled["localCode"]["codeId"], code_id);
+    assert_eq!(cancelled["localCode"]["state"], "cancelled");
+    assert_eq!(cancelled["localCode"]["cancelReason"], "tunnel-active");
+
+    // New codes are refused; /local-pair is 403; the credential is 401.
+    let refused = uds_rpc(&socket, 4, "pairing.createLocalCode", json!({})).await;
+    assert_eq!(refused["error"]["code"], -32603, "{refused}");
+    assert_eq!(refused["error"]["data"]["code"], "tunnel-active");
+    assert_eq!(
+        refused_status(port, &fingerprint, "/local-pair").await,
+        Some(403)
+    );
+    assert_eq!(refused_status(port, &fingerprint, "/ws").await, Some(401));
+    // Suspended, not revoked.
+    let listed = uds_rpc(&socket, 5, "pairing.listLocalCredentials", json!({})).await;
+    assert_eq!(listed["result"]["credentials"][0]["credentialId"], "lp-1");
+
+    set_tunnel(&socket, 6, false).await;
+    let created = await_create(&socket, "succeeded after the tunnel stopped", |r| {
+        r["result"]["code"].is_string()
+    })
+    .await;
+    assert!(created["result"]["localCode"]["codeId"].is_string());
+    let mut again = common::wss_connect_with_retry(port, client_config(&fingerprint), &url).await;
+    let listed = send(&mut again, 1, "workspace.list", json!({})).await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    let local_pair = format!("wss://localhost:{port}/local-pair");
+    let _redeem =
+        common::wss_connect_with_retry(port, client_config(&fingerprint), &local_pair).await;
+}

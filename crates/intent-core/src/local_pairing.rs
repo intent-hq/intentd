@@ -88,7 +88,15 @@ pub enum LocalPairingCodeState {
 pub enum LocalPairingCancelReason {
     User,
     Replaced,
+    /// Intent's remote-access tunnel started while the code was active.
+    #[serde(rename = "tunnel-active")]
+    TunnelActive,
 }
+
+/// Sent on the revocation feed instead of a credential id when every live
+/// local pairing connection must close (the remote-access tunnel started).
+/// Never a valid credential id.
+pub const SUSPEND_ALL_SIGNAL: &str = "";
 
 /// `LocalPairingCode` on the wire. Never carries the code or its hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -151,6 +159,9 @@ pub enum LocalPairingError {
     NotLoopback,
     /// The host has no TCP listener.
     ListenerDown,
+    /// Intent's remote-access tunnel is running: tunnelled traffic reaches
+    /// the listener from loopback, so local pairing is off while it runs.
+    TunnelActive,
     /// Any other failure (storage, randomness).
     Internal(String),
 }
@@ -166,7 +177,7 @@ impl LocalPairingError {
             | Self::InvalidParams(_)
             | Self::NotFound => -32602,
             Self::NotLoopback => -32001,
-            Self::ListenerDown | Self::Internal(_) => -32603,
+            Self::ListenerDown | Self::TunnelActive | Self::Internal(_) => -32603,
         }
     }
 
@@ -185,6 +196,9 @@ impl LocalPairingError {
             Self::ListenerDown => {
                 "connections are off; turn on connections before creating a code".into()
             }
+            Self::TunnelActive => {
+                "local pairing is off while remote access through the Intent tunnel is on".into()
+            }
             Self::Internal(message) => format!("internal error: {message}"),
         }
     }
@@ -202,6 +216,7 @@ impl LocalPairingError {
             Self::NotFound => json!({ "code": "not-found" }),
             Self::NotLoopback => json!({ "code": "not-loopback" }),
             Self::ListenerDown => json!({ "code": "listener-down" }),
+            Self::TunnelActive => json!({ "code": "tunnel-active" }),
             Self::Internal(_) => return None,
         })
     }
@@ -261,6 +276,21 @@ pub trait LocalPairingService: Send + Sync {
 
     /// A `/ws` connection admitted with this credential closed.
     fn connection_closed(&self, credential_id: &str);
+
+    /// Record whether Intent's remote-access tunnel is running. While it
+    /// is, codes cannot be created or redeemed and credentials are not
+    /// admitted (they stay valid). Turning it on cancels the active code
+    /// (`tunnel-active`) and closes every live credential connection
+    /// ([`SUSPEND_ALL_SIGNAL`]). Takes effect before it returns.
+    fn set_tunnel_active(&self, active: bool) {
+        let _ = active;
+    }
+
+    /// Whether [`set_tunnel_active`](Self::set_tunnel_active) last reported
+    /// the tunnel running.
+    fn tunnel_active(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +356,15 @@ mod tests {
         assert_eq!(
             LocalPairingError::Locked.data().unwrap()["code"],
             "local-code-locked"
+        );
+        assert_eq!(LocalPairingError::TunnelActive.code(), -32603);
+        assert_eq!(
+            LocalPairingError::TunnelActive.data().unwrap(),
+            json!({"code": "tunnel-active"})
+        );
+        assert_eq!(
+            serde_json::to_value(LocalPairingCancelReason::TunnelActive).unwrap(),
+            json!("tunnel-active")
         );
         assert_eq!(
             LocalPairingError::Expired.data().unwrap()["code"],

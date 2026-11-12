@@ -433,7 +433,12 @@ impl LegacyRotation {
             } => loop {
                 use tokio::sync::broadcast::error::RecvError;
                 match revocations.recv().await {
-                    Ok(revoked) if &revoked == credential_id => return,
+                    Ok(revoked)
+                        if &revoked == credential_id
+                            || revoked == intent_core::local_pairing::SUSPEND_ALL_SIGNAL =>
+                    {
+                        return
+                    }
                     Ok(_) => {}
                     Err(RecvError::Lagged(_)) => {
                         if !service.credential_active(credential_id.clone()).await {
@@ -522,6 +527,12 @@ impl AdmittedCredential {
             rotation,
             local_lease,
         }
+    }
+
+    /// The local pairing service behind a local pairing credential, so the
+    /// close path can tell a tunnel suspension from a revocation.
+    pub(crate) fn local_pairing_service(&self) -> Option<Arc<dyn LocalPairingService>> {
+        self.local_lease.as_ref().map(|lease| lease.service.clone())
     }
 
     /// Whether this connection was admitted with a local pairing credential.

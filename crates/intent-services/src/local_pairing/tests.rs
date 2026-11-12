@@ -361,3 +361,99 @@ fn lifetime_seam_only_shortens() {
     assert_eq!(code_lifetime_from(Some("junk")), CODE_LIFETIME);
     assert_eq!(code_lifetime_from(Some("3600000")), CODE_LIFETIME);
 }
+
+/// §5.58: while Intent's remote-access tunnel runs, nothing pairs or admits;
+/// starting it cancels the active code and closes live credential
+/// connections; credentials are not revoked and work again once it stops.
+#[tokio::test]
+async fn tunnel_suspends_codes_and_credentials_without_revoking() {
+    let f = fixture_default().await;
+    let created = f.pairing.create_code().await.unwrap();
+    let grant = f.pairing.redeem(&created.code, "Intent").await.unwrap();
+    let pending = f.pairing.create_code().await.unwrap();
+    let mut revocations = f.pairing.subscribe_revocations();
+    let mut events = f.bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::PAIRING_LOCAL_CODE_CHANGED.into()],
+        ..Default::default()
+    });
+
+    f.pairing.set_tunnel_active(true);
+    assert!(f.pairing.tunnel_active());
+    assert_eq!(
+        revocations.recv().await.unwrap(),
+        intent_core::local_pairing::SUSPEND_ALL_SIGNAL
+    );
+    let cancelled = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .expect("cancel event")
+    .unwrap();
+    let code = &cancelled[0].data["localCode"];
+    assert_eq!(code["codeId"], pending.local_code.code_id.as_str());
+    assert_eq!(code["state"], "cancelled");
+    assert_eq!(code["cancelReason"], "tunnel-active");
+
+    assert_eq!(
+        f.pairing.create_code().await.err(),
+        Some(LocalPairingError::TunnelActive)
+    );
+    assert_eq!(
+        f.pairing.redeem(&pending.code, "Intent").await.err(),
+        Some(LocalPairingError::Expired)
+    );
+    assert_eq!(f.pairing.resolve_credential(hash(&grant.token)).await, None);
+    assert!(
+        !f.pairing
+            .credential_active(grant.credential_id.clone())
+            .await
+    );
+    // Suspended, not revoked: still listed.
+    assert_eq!(f.pairing.list_credentials().await.unwrap().len(), 1);
+
+    // A second "on" is not a new transition.
+    f.pairing.set_tunnel_active(true);
+    assert!(revocations.try_recv().is_err());
+
+    f.pairing.set_tunnel_active(false);
+    assert!(!f.pairing.tunnel_active());
+    assert_eq!(
+        f.pairing.resolve_credential(hash(&grant.token)).await,
+        Some(grant.credential_id.clone())
+    );
+    assert!(f.pairing.credential_active(grant.credential_id).await);
+    let again = f.pairing.create_code().await.unwrap();
+    assert!(f.pairing.redeem(&again.code, "Intent B").await.is_ok());
+}
+
+/// A try while the tunnel runs is `local-code-expired` before the
+/// comparison, so it never counts.
+#[tokio::test]
+async fn tunnelled_tries_do_not_count() {
+    let f = fixture_default().await;
+    let created = f.pairing.create_code().await.unwrap();
+    f.pairing.set_tunnel_active(true);
+    for _ in 0..6 {
+        assert_eq!(
+            f.pairing.redeem(wrong(&created.code), "Intent").await.err(),
+            Some(LocalPairingError::Expired)
+        );
+    }
+}
+
+/// A tunnel that starts and stops at once still cancels the code shown
+/// before it, without waiting for the start's cleanup task.
+#[tokio::test]
+async fn a_brief_tunnel_still_cancels_the_code() {
+    let f = fixture_default().await;
+    let created = f.pairing.create_code().await.unwrap();
+    f.pairing.set_tunnel_active(true);
+    f.pairing.set_tunnel_active(false);
+    assert_eq!(
+        f.pairing.redeem(&created.code, "Intent").await.err(),
+        Some(LocalPairingError::Expired)
+    );
+    let fresh = f.pairing.create_code().await.unwrap();
+    assert!(f.pairing.redeem(&fresh.code, "Intent").await.is_ok());
+}

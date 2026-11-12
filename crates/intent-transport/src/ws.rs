@@ -54,6 +54,31 @@ use crate::reverse::{PrimaryReverseRegistry, ReverseChannel, ReverseTransport};
 use crate::rpc_limit::RpcLimiter;
 use crate::tls::TlsCertificate;
 
+/// Resolves when the built-in tunnel starts (§5.58): the suspend signal on the
+/// revocation feed, or a lag or closed feed while the tunnel is running.
+/// Never resolves without a local pairing service.
+async fn local_pair_suspended(
+    service: Option<&dyn intent_core::local_pairing::LocalPairingService>,
+    suspensions: &mut Option<tokio::sync::broadcast::Receiver<String>>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    let (Some(service), Some(rx)) = (service, suspensions.as_mut()) else {
+        return std::future::pending().await;
+    };
+    loop {
+        match rx.recv().await {
+            Ok(signal) if signal == intent_core::local_pairing::SUSPEND_ALL_SIGNAL => return,
+            Ok(_) => {}
+            Err(RecvError::Lagged(_)) => {
+                if service.tunnel_active() {
+                    return;
+                }
+            }
+            Err(RecvError::Closed) => return,
+        }
+    }
+}
+
 /// Maximum bytes accepted for an HTTP request head before `\r\n\r\n`.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 
@@ -1483,6 +1508,15 @@ impl WsInner {
         if !ready {
             return reject(&mut stream, 503, "Service Unavailable").await;
         }
+        // While Intent's remote-access tunnel runs, tunnelled peers arrive
+        // from loopback too: refuse like a non-loopback peer.
+        if self
+            .api
+            .local_pairing()
+            .is_none_or(|service| service.tunnel_active())
+        {
+            return reject(&mut stream, 403, "Forbidden").await;
+        }
         let Some(provider) = self.server_pairing_info.clone() else {
             return reject(&mut stream, 404, "Not Found").await;
         };
@@ -1560,9 +1594,33 @@ impl WsInner {
         let (mut sink, mut stream) = ws.split();
         let idle = tokio::time::sleep(crate::local_pairing::LOCAL_PAIR_IDLE_TIMEOUT);
         tokio::pin!(idle);
+        // §5.58: starting the built-in tunnel closes open `/local-pair`
+        // connections. Subscribe first, then check, so a start racing this
+        // connection's upgrade is never missed.
+        let service = self.api.local_pairing();
+        let mut suspensions = service.as_ref().map(|s| s.subscribe_revocations());
+        let already = service.as_ref().is_none_or(|s| s.tunnel_active());
         loop {
+            if already {
+                let _ = sink
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Policy,
+                        reason: "tunnel active".into(),
+                    })))
+                    .await;
+                break;
+            }
             tokio::select! {
                 () = &mut idle => break,
+                () = local_pair_suspended(service.as_deref(), &mut suspensions) => {
+                    let _ = sink
+                        .send(Message::Close(Some(CloseFrame {
+                            code: CloseCode::Policy,
+                            reason: "tunnel active".into(),
+                        })))
+                        .await;
+                    break;
+                }
                 incoming = stream.next() => match incoming {
                     Some(Ok(Message::Text(text))) => {
                         idle.as_mut().reset(
@@ -1686,6 +1744,9 @@ impl WsInner {
         .await;
         let mut discard_private_output = false;
         let mut rotation = admitted.as_mut().and_then(|c| c.rotation.take());
+        let local_pairing = admitted
+            .as_ref()
+            .and_then(crate::auth::AdmittedCredential::local_pairing_service);
         subs.pairing.admitted = admitted;
         // Bind reverse authority independently of hello metadata. Members may
         // serve ordinary workspace browsers, while guests remain ineligible.
@@ -1812,10 +1873,20 @@ impl WsInner {
                                         break;
                                     }
                                 }
+                                // §5.58: the remote-access tunnel suspends
+                                // local pairing credentials without revoking.
+                                let reason = if local_pairing
+                                    .as_ref()
+                                    .is_some_and(|service| service.tunnel_active())
+                                {
+                                    "tunnel active"
+                                } else {
+                                    "credential revoked"
+                                };
                                 let _ = sink
                                     .send(Message::Close(Some(CloseFrame {
                                         code: CloseCode::Policy,
-                                        reason: "credential revoked".into(),
+                                        reason: reason.into(),
                                     })))
                                     .await;
                                 break;

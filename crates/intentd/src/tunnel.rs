@@ -111,7 +111,16 @@ pub struct TunnelSupervisor {
     key_path: PathBuf,
     address_timeout: Duration,
     state: tokio::sync::Mutex<Option<Running>>,
+    /// Set from the moment a start begins (before the sidecar can forward
+    /// anything) until a stop has killed it, including restart backoff.
+    active: std::sync::atomic::AtomicBool,
+    /// Told about every change of `active`, synchronously (§5.58: local
+    /// pairing is off while the tunnel runs).
+    active_hook: std::sync::Mutex<Option<ActiveHook>>,
 }
+
+/// Observer of [`TunnelSupervisor`] activity.
+pub type ActiveHook = std::sync::Arc<dyn Fn(bool) + Send + Sync>;
 
 /// Live sidecar state: the stable address plus handles to stop the
 /// supervision task (which owns the child). `up` is cleared by the
@@ -134,6 +143,35 @@ impl TunnelSupervisor {
             key_path: state_dir.join("tailcat.private.json"),
             address_timeout: DEFAULT_ADDRESS_TIMEOUT,
             state: tokio::sync::Mutex::new(None),
+            active: std::sync::atomic::AtomicBool::new(false),
+            active_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Install the activity observer and tell it the current state.
+    pub fn set_active_hook(&self, hook: ActiveHook) {
+        let mut slot = self.active_hook.lock().expect("tunnel hook poisoned");
+        hook(self.active.load(std::sync::atomic::Ordering::SeqCst));
+        *slot = Some(hook);
+    }
+
+    /// Whether the sidecar is started (forwarding, starting, or in its
+    /// restart backoff). Wider than [`address`](Self::address), which
+    /// hides the address while the child is down.
+    #[cfg(all(test, unix))]
+    fn is_active(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_active(&self, active: bool) {
+        let slot = self.active_hook.lock().expect("tunnel hook poisoned");
+        let was = self
+            .active
+            .swap(active, std::sync::atomic::Ordering::SeqCst);
+        if was != active {
+            if let Some(hook) = slot.as_ref() {
+                hook(active);
+            }
         }
     }
 
@@ -154,14 +192,24 @@ impl TunnelSupervisor {
             return Ok(running.address.clone());
         }
         self.ensure_key(derp_url.as_deref()).await?;
-        let (child, address) = spawn_and_read_address(
+        // Active before the child exists, so nothing it forwards can reach a
+        // loopback-only surface (§5.58) before local pairing is off.
+        self.set_active(true);
+        let spawned = spawn_and_read_address(
             &self.bin,
             &self.key_path,
             ws_port,
             derp_url.as_deref(),
             self.address_timeout,
         )
-        .await?;
+        .await;
+        let (child, address) = match spawned {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                self.set_active(false);
+                return Err(error);
+            }
+        };
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let recycle = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -200,6 +248,7 @@ impl TunnelSupervisor {
             {
                 running.task.abort();
             }
+            self.set_active(false);
         }
     }
 
@@ -594,10 +643,16 @@ esac
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let sup =
             TunnelSupervisor::new(path, dir.path()).with_address_timeout(Duration::from_secs(2));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        sup.set_active_hook(std::sync::Arc::new({
+            let seen = seen.clone();
+            move |active| seen.lock().unwrap().push(active)
+        }));
 
         let addr = sup.start(5181, None).await.unwrap();
         assert_eq!(addr, "tcTest");
         assert_eq!(sup.address().await.as_deref(), Some("tcTest"));
+        assert!(sup.is_active());
 
         // Kill the child; the supervisor must stop advertising the address
         // while the restart/backoff loop has nothing serving it.
@@ -615,7 +670,13 @@ esac
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(sup.address_now(), None);
+        // §5.58: the restart backoff still counts as running (fail closed),
+        // even though no address is advertised.
+        assert!(sup.is_active(), "backoff must keep local pairing blocked");
+        assert_eq!(*seen.lock().unwrap(), vec![false, true]);
         sup.stop().await;
+        assert!(!sup.is_active());
+        assert_eq!(*seen.lock().unwrap(), vec![false, true, false]);
     }
 
     /// A paused VM (E2B sandbox) or a sleeping host thaws the same tailcat
@@ -800,6 +861,10 @@ esac
         assert!(
             err.to_string().contains("before reporting"),
             "unexpected error: {err}"
+        );
+        assert!(
+            !sup.is_active(),
+            "a failed start leaves the tunnel inactive"
         );
     }
 
