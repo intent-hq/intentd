@@ -268,7 +268,7 @@ struct Inner {
     /// The bound backend's workspace homes (nodeProtocol 19).
     homes: Mutex<homes::Homes>,
     /// Home opens run one at a time.
-    home_opens: tokio::sync::Mutex<()>,
+    home_opens: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The longest a provider's first start after a link binds may take to
@@ -1014,7 +1014,7 @@ impl Runner {
                 pulls,
                 start_timeouts: Mutex::new(StartTimeouts::default()),
                 homes: Mutex::new(homes::Homes::default()),
-                home_opens: tokio::sync::Mutex::new(()),
+                home_opens: Arc::new(tokio::sync::Mutex::new(())),
             }),
         }
     }

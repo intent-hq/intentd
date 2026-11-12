@@ -196,7 +196,8 @@ impl Runner {
             OpenState::OtherWorkspace => return other_workspace(),
             OpenState::Closed => {}
         }
-        let Ok(_opening) = tokio::time::timeout_at(deadline, self.inner.home_opens.lock()).await
+        let Ok(opening) =
+            tokio::time::timeout_at(deadline, self.inner.home_opens.clone().lock_owned()).await
         else {
             return timed_out();
         };
@@ -247,11 +248,18 @@ impl Runner {
             Err(failed) => {
                 // A checkout this open started and could not finish is
                 // removed, so the next `homeOpen` makes it again instead of
-                // keeping it without its submodules or setup.
+                // keeping it without its submodules or setup. The reply does
+                // not wait for it; the next open does (it holds the lock).
                 if !existed {
-                    if let Err(error) = self.inner.checkouts.remove_home(&home.home_id).await {
-                        tracing::warn!(home = %home.home_id, %error, "node: could not remove a partial home checkout");
-                    }
+                    let checkouts = self.inner.checkouts.clone();
+                    let home_id = home.home_id.clone();
+                    // caller-binding: allow — node-local removal of a partial home checkout
+                    tokio::spawn(async move {
+                        if let Err(error) = checkouts.remove_home(&home_id).await {
+                            tracing::warn!(home = %home_id, %error, "node: could not remove a partial home checkout");
+                        }
+                        drop(opening);
+                    });
                 }
                 return failed;
             }
@@ -523,11 +531,14 @@ impl Runner {
             .map_err(|_| anyhow::anyhow!("another push of the home did not end in time"))?;
         let previous = last.as_ref().map(|p| p.head.clone());
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let pushed = self
-            .inner
-            .checkouts
-            .push_home(&home.of, &home.worktree, previous.as_deref(), left)
-            .await?;
+        let pushed = tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .checkouts
+                .push_home(&home.of, &home.worktree, previous.as_deref(), left),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the home push did not end in time"))??;
         *lock(&home.wip_pushed_at) = Instant::now();
         let moved = last
             .as_ref()
