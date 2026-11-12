@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.194] - 2026-11-12
+
+### 🚀 Features
+
+- *(remote)* Ordered machine list for agent placement ([#3307](https://github.com/intent-hq/intentd/pull/3307))
+
+
 ## [0.11.193] - 2026-11-12
 
 ### 🚀 Features
