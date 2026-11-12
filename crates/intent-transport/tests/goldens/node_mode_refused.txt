@@ -282,6 +282,11 @@ note.subscribe
 note.unsubscribe
 note.update
 note.updateMetadata
+pairing.cancelLocalCode
+pairing.createLocalCode
+pairing.listLocalCredentials
+pairing.redeemLocalCode
+pairing.revokeLocalCredential
 plugin.install
 plugin.list
 plugin.toggle

@@ -196,6 +196,11 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          bound to this installation's owner, not workspace state; a target must mint its own",
     ),
     (
+        "local_pairing_credential",
+        "credentials another Intent on this computer redeemed are machine-local owner \
+         authority over loopback, not workspace state; they must never move with a workspace",
+    ),
+    (
         "node_invite",
         "node invites this machine minted are its owner's consent to lend it to a backend; \
          they follow the executor credentials they mint, which never transfer",

@@ -209,7 +209,8 @@ async fn admin(
 ///
 /// The §5.58 redemption errors, in contract order: peer, params, code state,
 /// comparison. `ListenerDown` / `Internal` when the listener or certificate
-/// cannot be described (the code is then already spent).
+/// cannot be described; these are checked before the code is touched, so
+/// the code stays active and no try is counted.
 pub async fn redeem_grant(
     api: &dyn WorkspaceApi,
     provider: &dyn ServerPairingInfo,
@@ -233,6 +234,14 @@ pub async fn redeem_grant(
             ))
         }
     };
+    // Contract order: params are fully validated (a malformed code or name
+    // is `invalid-params` and never a try) before anything else is checked.
+    if intent_core::local_pairing::normalize_code(&code).is_none() {
+        return Err(LocalPairingError::InvalidParams(
+            "code must be 6 characters from the pairing alphabet".into(),
+        ));
+    }
+    intent_core::local_pairing::validate_app_name(&app_name)?;
     // Describe the listener before spending the code, so a down listener or
     // unreadable certificate never burns it.
     let port = provider

@@ -393,3 +393,30 @@ fn error_frames_carry_contract_data() {
         json!({"code":"local-code-invalid","attemptsRemaining":2})
     );
 }
+
+#[tokio::test]
+async fn malformed_params_win_over_listener_down() {
+    let f = fixture(None).await;
+    let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    for params in [
+        json!({"code": "AB", "appName": "A"}),
+        json!({"code": "ABC-DEF", "appName": "  "}),
+    ] {
+        assert!(matches!(
+            redeem_grant(&f.api, &f.provider, Some(&params), peer, "B").await,
+            Err(LocalPairingError::InvalidParams(_))
+        ));
+    }
+    assert_eq!(
+        redeem_grant(
+            &f.api,
+            &f.provider,
+            Some(&json!({"code": "ABC-DEF", "appName": "A"})),
+            peer,
+            "B"
+        )
+        .await
+        .err(),
+        Some(LocalPairingError::ListenerDown)
+    );
+}
