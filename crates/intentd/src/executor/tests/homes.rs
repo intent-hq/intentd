@@ -107,6 +107,14 @@ fn worktree(dir: &std::path::Path, home: &HomeRef) -> std::path::PathBuf {
         .join("work")
 }
 
+/// Past the replay of the records an earlier link left unacknowledged.
+async fn replayed(dialed: &mut DialedLink) {
+    next_of(dialed, |frame| {
+        matches!(frame, LinkFrame::ReplayComplete { .. }).then_some(())
+    })
+    .await;
+}
+
 async fn until(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + wait();
     while !done() {
@@ -288,14 +296,14 @@ async fn the_bind_sweep_keeps_exactly_the_leased_homes() {
     )
     .await;
     let mut dialed = dial_link(&node.endpoint, leasing(2, None)).await.unwrap();
-    replay_complete(&mut dialed).await;
+    replayed(&mut dialed).await;
     assert!(kept_dir.is_dir() && dropped_dir.is_dir());
     drop(dialed);
 
     let mut dialed = dial_link(&node.endpoint, leasing(3, Some(vec![kept.clone()])))
         .await
         .unwrap();
-    replay_complete(&mut dialed).await;
+    replayed(&mut dialed).await;
     until("the unleased home is swept", || !dropped_dir.exists()).await;
     assert!(kept_dir.is_dir());
     // The leased home reopens after the restart (on its own task, after

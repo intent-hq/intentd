@@ -58,7 +58,7 @@ pub(super) struct Homes {
 
 /// One open home checkout.
 pub(super) struct Home {
-    home: HomeRef,
+    of: HomeRef,
     worktree: PathBuf,
     /// The last `home/head` and `home/wip` this machine pushed; a push holds
     /// it, so the checkout's pushes run one at a time.
@@ -300,7 +300,7 @@ impl Runner {
         homes
             .open
             .get(home_id)
-            .filter(|home| &home.home.workspace_id == workspace_id)
+            .filter(|home| &home.of.workspace_id == workspace_id)
             .cloned()
     }
 
@@ -309,7 +309,7 @@ impl Runner {
     fn insert_home(&self, home: HomeRef, worktree: PathBuf) -> (Arc<Home>, oneshot::Receiver<()>) {
         let (stop, stopped) = oneshot::channel();
         let opened = Arc::new(Home {
-            home,
+            of: home,
             worktree,
             pushed: tokio::sync::Mutex::new(None),
             wip_pushed_at: Mutex::new(Instant::now()),
@@ -320,7 +320,7 @@ impl Runner {
         });
         lock(&self.inner.homes)
             .open
-            .insert(opened.home.home_id.clone(), opened.clone());
+            .insert(opened.of.home_id.clone(), opened.clone());
         (opened, stopped)
     }
 
@@ -363,7 +363,7 @@ impl Runner {
             }
         };
         setup::write_status(cwd, &status);
-        self.journal_setup_finished(&home.home, &status).await;
+        self.journal_setup_finished(&home.of, &status).await;
     }
 
     #[expect(
@@ -408,7 +408,7 @@ impl Runner {
             },
         );
         self.append(home_entry(
-            &home.home,
+            &home.of,
             JournalBody::SetupStarted {
                 started_at: started_at.clone(),
             },
@@ -455,7 +455,7 @@ impl Runner {
         let pushed = self
             .inner
             .checkouts
-            .push_home(&home.home, &home.worktree, previous.as_deref(), timeout)
+            .push_home(&home.of, &home.worktree, previous.as_deref(), timeout)
             .await?;
         *lock(&home.wip_pushed_at) = Instant::now();
         let moved = last
@@ -463,7 +463,7 @@ impl Runner {
             .is_none_or(|was| was.head != pushed.head || was.wip != pushed.wip);
         if moved {
             self.append(home_entry(
-                &home.home,
+                &home.of,
                 JournalBody::HomePushed {
                     head: Some(pushed.head.clone()),
                     wip: Some(pushed.wip.clone()),
@@ -508,7 +508,7 @@ impl Runner {
                     continue;
                 }
                 if let Err(error) = runner.push_home_now(&home, PUSH_TIMEOUT).await {
-                    tracing::info!(home = %home.home.home_id, %error, "node: home backup push failed; retrying");
+                    tracing::info!(home = %home.of.home_id, %error, "node: home backup push failed; retrying");
                 }
             }
         });

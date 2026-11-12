@@ -354,6 +354,8 @@ fn executor_link_requests_golden() {
             "heartbeat",
             "heartbeatReply",
             "hello",
+            "homeOpen",
+            "homePush",
             "launch",
             "oneShot",
             "oneShotCancel",
@@ -407,6 +409,8 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "capabilitiesReply",
             "checkoutReadReply",
             "forgeTokenReply",
+            "homeOpenReply",
+            "homePushReply",
             "journal",
             "oneShotReply",
             "pushWipReply",
@@ -866,7 +870,7 @@ fn frames_are_routed_to_their_lane() {
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
             Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
             Control, Control, Control, Control, Control, Control, Control, Control, Script, Script,
-            Script, Rpc, Rpc, Rpc
+            Script, Rpc, Rpc, Rpc, Control, Control, Control, Control,
         ]
     );
 }

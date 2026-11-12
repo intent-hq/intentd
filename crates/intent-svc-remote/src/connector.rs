@@ -3059,7 +3059,7 @@ async fn ingest_record(shared: &Shared, record: intent_core::node_link::JournalR
     };
     record_placement(shared, &agent_id, &record).await;
     let exited = Shared::exited_agent(&agent_id, &record);
-    shared.agents.deliver(agent_id, record);
+    shared.agents.deliver(&agent_id, record);
     shared.stop_exit_ingested(exited);
 }
 
@@ -3164,7 +3164,7 @@ async fn record_skills(
     skills: Vec<MachineSkill>,
 ) {
     match crate::view::update(&shared.store, &record.workspace_id, agent_id, move |view| {
-        view.skills = Some(skills)
+        view.skills = Some(skills);
     })
     .await
     {
