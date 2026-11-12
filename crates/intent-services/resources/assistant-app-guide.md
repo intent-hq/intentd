@@ -464,8 +464,23 @@ is connected to as **<name> (connected backend)**, then saved remote connections
 row shows a macOS, Windows or Linux icon and, after the version (or the **Runs agents
 for <backend>** badge), icons for the AI providers available there; hover an icon for its
 name. Switched-off providers are hidden, and offline or unknown machines show no
-icons. **Add machine** opens the connection form; a remote machine's actions include
-**Edit** and **Connect**, with **Test connection** inside its editing panel. A machine's
+icons. **Add machine** → **Set up a new machine** (also the machine rail's **Add machine**)
+offers **Paste an intent:// link**, **Enter connection details** (host, port and access
+token), **Install an Intent server** (a complete, independent Intent) and, when the backend can run agents on other machines,
+**Install a node**. The install cards show one command to copy and run on the other
+computer (macOS / Linux, or Windows); it installs intentd as a service and ends by printing
+an intent:// link to paste back. The same menu still lists the older direct items. A
+remote machine's actions include **Edit** and **Connect**, with **Test connection** inside
+its editing panel.
+<!-- Labs (SSH machine setup, desktop app only): describe only when the user asks about
+installing over SSH, and say it is Labs. With it on, the install cards also offer
+**Set it up for me over SSH** for Linux computers only (a Mac or Windows PC uses the
+command): sign in (SSH agent, key file or password; nothing is saved), confirm an unknown
+host key, and the app installs, starts, pairs and adds the machine. A server may need
+`sudo loginctl enable-linger <user>` so intentd keeps running after logout (the wizard
+shows it).
+Sources: packages/cloudlands-fe/src/features/machine-setup/,
+packages/intentd/scripts/install.sh (INTENTD_PAIR, INTENTD_LINK_MARKER). --> A machine's
 actions can also include **Let <backend> run agents here**, which asks to confirm with
 **Allow**, and **Stop letting <backend> run agents here**; machines allowed this way are
 listed under **Machines <backend> can run agents on**.

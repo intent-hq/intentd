@@ -65,6 +65,7 @@ printf '%s\n' "$*" >>"$FAKE_STATE/calls"
 case "$*" in
   "settings daemon.mode") printf 'daemon.mode = %s\n' "$(cat "$FAKE_STATE/mode" 2>/dev/null || echo regular)" ;;
   "pair --node --tunnel --yes") echo 'URL:         intent://node?v=1&host=&port=5181&fp=FP&invite=ni-1&secret=s&tc=tc-fake' ;;
+  "pair --yes --tunnel") echo 'URL:         intent://pair?v=1&host=&port=5180&token=T&fp=FP&tc=tc-fake' ;;
 esac
 exit 0
 "#;
@@ -134,8 +135,19 @@ fn choice(pwsh: &Path, param: &str, env: Option<&str>) -> String {
 }
 
 fn apply(pwsh: &Path, mode: &str, explicit: bool, verdict: &str, saved: Option<&str>) -> Outcome {
+    apply_with_pair(pwsh, mode, explicit, verdict, saved, false)
+}
+
+fn apply_with_pair(
+    pwsh: &Path,
+    mode: &str,
+    explicit: bool,
+    verdict: &str,
+    saved: Option<&str>,
+    pair: bool,
+) -> Outcome {
     let body = format!(
-        "$installMode = '{mode}'\n$installModeExplicit = ${explicit}\n$verdict = '{verdict}'\n$interactive = $false\n{}",
+        "$installMode = '{mode}'\n$installModeExplicit = ${explicit}\n$verdict = '{verdict}'\n$interactive = $false\n$pair = ${pair}\n{}",
         ps_region("daemon-mode-apply")
     );
     run(pwsh, &body, &[], saved)
@@ -242,4 +254,34 @@ fn an_explicit_full_answer_switches_a_node_back_and_the_default_does_not() {
         "{}",
         already_full.output
     );
+}
+
+#[test]
+fn the_pair_option_pairs_a_full_install_once_the_daemon_is_up() {
+    let Some(pwsh) = pwsh() else { return };
+    for mode in ["", "full"] {
+        let outcome = apply_with_pair(&pwsh, mode, !mode.is_empty(), "up", None, true);
+        assert_eq!(
+            outcome.calls.last().map(String::as_str),
+            Some("pair --yes --tunnel"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("intent://pair?"),
+            "{}",
+            outcome.output
+        );
+    }
+    let waiting = apply_with_pair(&pwsh, "", false, "undecided", None, true);
+    assert!(waiting.calls.is_empty(), "{:?}", waiting.calls);
+    let node = apply_with_pair(&pwsh, "node", true, "up", None, true);
+    assert_eq!(
+        node.calls.iter().filter(|c| c.starts_with("pair")).count(),
+        1,
+        "a node pairs once, as a node: {:?}",
+        node.calls
+    );
+    let off = apply(&pwsh, "", false, "up", None);
+    assert!(off.calls.is_empty(), "{:?}", off.calls);
 }
