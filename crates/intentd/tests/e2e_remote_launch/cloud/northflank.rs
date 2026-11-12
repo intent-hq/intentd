@@ -241,7 +241,9 @@ impl FakeNorthflank {
                 error(404, "manifest unknown")
             };
         }
-        if headers.get("authorization").map(String::as_str) != Some(&format!("Bearer {}", *NF_TOKEN)) {
+        if headers.get("authorization").map(String::as_str)
+            != Some(&format!("Bearer {}", *NF_TOKEN))
+        {
             return error(401, "Invalid API token");
         }
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
