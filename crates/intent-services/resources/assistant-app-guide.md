@@ -1564,6 +1564,13 @@ made to them in the file panel are not saved yet.
 
 Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
 
+For an inline workspace image, use `![description](intent://local/file/{path})` with a
+workspace-relative path and percent-encoded path segments, or embed the exact URL returned
+by `ws.note.saveAsset`. An absolute filesystem path is not a workspace media URL, even
+when the file exists on the daemon's computer.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/utils/workspace-file-image.ts; packages/cloudlands-fe/src/main/protocol-handlers.ts; packages/intentd/crates/intent-acp/src/mcp_server/bindings/note.rs (saveAsset). -->
+
 With a supporting daemon, a tool output too large to load in one read shows its first part in agent chat with **Output truncated — showing <size> of <size>**, or a preview with **Too large to show in full — showing a preview**. An image too large to load keeps its thumbnail with **The full image is too large to show**. Regenerating a message re-sends its original images even when they are too large to show. A single message too large for one page shows its first part, without the parts that did not fit, and a **Show full message** button that loads the rest.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{ToolCall,ChatImageBlock,ChatMessage}.svelte; packages/cloudlands-fe/src/lib/components/chat/block-hydration.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-session/sagas/regenerate-from-message-saga.ts; packages/cloudlands-fe/messages/en.json (chat_toolCall_outputTruncated_label, chat_toolCall_outputTooLarge_label, chat_imageBlock_tooLarge_label, chat_chatMessage_showFullMessage_button). Test-build behavior pending its frontend release. -->
