@@ -812,8 +812,10 @@ provider that fails to list shows an error without hiding the others. Only
 sessions on the machine Intent runs on are listed: for a remote daemon,
 sessions on your Mac do not appear. A session whose folder has no git
 repository shows "No git repository found" and cannot be picked. Picking a
-session selects its repository and last branch; the **Codebase** row shows the
-session title with the provider icon. Picking another codebase cancels the
+session selects its repository, and its last branch when that branch still
+exists locally or on a remote; otherwise the form keeps its default, so check
+the **Branch** field before you create. The **Codebase** row shows the session
+title with the provider icon. Picking another codebase cancels the
 import. The session becomes the workspace's first agent with its history in
 the chat, and your next message continues it with the full context. With that
 message the agent is told the session moved into Intent and gets Intent's
