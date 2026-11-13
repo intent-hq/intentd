@@ -948,6 +948,7 @@ async fn a_forge_checkout_gets_its_own_branch_and_origin() {
 /// home session cannot write a ref that merely contains its names
 /// (`home/rewritten/agents/x/head`), a pin of its own, or an agent's ref;
 /// an agent session cannot write another agent's; no prefix, no push.
+#[cfg(unix)]
 #[test]
 fn the_hook_stays_inside_the_sessions_prefix() {
     // Its own copy: the installed hooks directory is process-wide state
