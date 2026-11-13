@@ -816,7 +816,10 @@ To continue a session you started in a provider's own CLI, open the
 tab of the **Choose a project** step. The list loads only when that tab opens
 and shows sessions from your enabled providers whose adapters support it (such
 as Claude Code and Codex), newest first, with search and **Refresh**; a
-provider that fails to list shows an error without hiding the others. Only
+provider that fails to list shows an error without hiding the others. Intent
+keeps each provider's list for 30 seconds, so **Refresh** shows a newer session
+only after that. With a very large session history, the list and search may
+cover only the newest sessions. Only
 sessions on the machine Intent runs on are listed: for a remote daemon,
 sessions on your Mac do not appear. A session whose folder has no git
 repository shows "No git repository found" and cannot be picked. Picking a

@@ -161,12 +161,13 @@ fn spawn_serve(
     script: &str,
     session_log: &Path,
     rpc_log: &Path,
+    behavior: &Value,
+    extra_env: &[(&str, String)],
 ) -> Daemon {
     common::enable_ws_api(data_dir);
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir workspaces dir");
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("daemon log");
-    let behavior = json!({ "sessionImport": { "pageSize": 2 }, "response": "resumed" });
     let mut command = common::hermetic_serve_command(data_dir);
     command
         .env("INTENTD_DATA_DIR", data_dir)
@@ -182,6 +183,9 @@ fn spawn_serve(
         .env("MOCK_AGENT_RPC_LOG", rpc_log)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     common::hermetic_fixture_identity(&mut command, data_dir);
     let child = GuardedChild::spawn(&mut command).expect("spawn intentd serve");
     Daemon { child }
@@ -314,7 +318,16 @@ async fn lists_and_imports_a_claude_session_over_real_wss() {
     );
 
     let workspace_id = seed_workspace(&data_dir, &worktree).await;
-    let _daemon = spawn_serve(&data_dir, &home, &script, &session_log, &rpc_log);
+    let behavior = json!({ "sessionImport": { "pageSize": 2 }, "response": "resumed" });
+    let _daemon = spawn_serve(
+        &data_dir,
+        &home,
+        &script,
+        &session_log,
+        &rpc_log,
+        &behavior,
+        &[],
+    );
     let status = common::await_wss_status_logged(
         &data_dir.join("intentd.sock"),
         &data_dir.join("daemon.log"),
@@ -588,6 +601,155 @@ async fn lists_and_imports_a_claude_session_over_real_wss() {
     let rendered = convo["result"]["messages"].to_string();
     assert!(!rendered.contains("<system>"), "{convo}");
     assert!(rendered.contains("\"continue\""), "{convo}");
+}
+
+/// The `method` of every request the mock adapters received, in order.
+fn adapter_methods(rpc_log: &Path) -> Vec<String> {
+    std::fs::read_to_string(rpc_log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|e| e["method"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn count(methods: &[String], method: &str) -> usize {
+    methods.iter().filter(|m| *m == method).count()
+}
+
+/// Regression for intent-hq/intent#9232: an adapter whose `session/list`
+/// cannot page through a huge store in time. The list reads only the pages
+/// the requested window needs, keeps the rows read before the deadline when
+/// the adapter stops answering (with `truncated` and a WARN), and serves
+/// later calls from the same listing instead of starting another adapter.
+#[tokio::test]
+async fn list_reads_only_needed_pages_and_keeps_rows_when_the_adapter_stalls() {
+    let Some(script) = mock_agent_script() else {
+        return;
+    };
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itd-wss-import-stall-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let home = data_dir.join("home");
+    let session_log = data_dir.join("sessions.log");
+    let rpc_log = data_dir.join("rpc.log");
+    for n in 1..=5u64 {
+        let id = format!("stall-{n}");
+        let cwd = format!("/home/dev/stall/{n}");
+        let row = json!({ "type": "user", "cwd": cwd, "sessionId": id,
+            "message": { "role": "user", "content": "work" } });
+        store_session(
+            &home,
+            &cwd,
+            &id,
+            format!("{row}\n").as_bytes(),
+            at(1_790_000_000 + n * 1000),
+        );
+    }
+
+    // Two sessions per page; the second page never answers.
+    let behavior = json!({ "sessionImport": { "pageSize": 2, "stallAfterPages": 1 } });
+    let budget = common::test_timeout(Duration::from_secs(10));
+    let _daemon = spawn_serve(
+        &data_dir,
+        &home,
+        &script,
+        &session_log,
+        &rpc_log,
+        &behavior,
+        &[(
+            "INTENTD_SESSION_IMPORT_TIMEOUT_MS",
+            budget.as_millis().to_string(),
+        )],
+    );
+    let status = common::await_wss_status_logged(
+        &data_dir.join("intentd.sock"),
+        &data_dir.join("daemon.log"),
+    )
+    .await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("WSS port"))
+        .expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    let mut ws = common::wss_connect_with_retry(port, client_config(fingerprint), &url).await;
+    let row = |n: u64, updated: &str| {
+        json!({ "provider": "mock", "sessionId": format!("stall-{n}"),
+            "title": format!("stall-{n}"), "cwd": format!("/home/dev/stall/{n}"),
+            "updatedAt": updated })
+    };
+    let newest = row(5, "2026-09-21T15:36:40.000Z");
+    let second = row(4, "2026-09-21T15:20:00.000Z");
+
+    // The first window fits in the first page: one `session/list`, and a
+    // cursor because the adapter has more.
+    let first = rpc_envelope(
+        &mut ws,
+        1,
+        "agent.importableSessions.list",
+        json!({ "provider": "mock", "limit": 2 }),
+    )
+    .await;
+    assert_eq!(
+        first,
+        json!({ "jsonrpc": "2.0", "id": 1, "result": {
+            "sessions": [newest, second],
+            "providers": [{ "id": "mock", "label": "Mock (E2E)", "status": "ok" }],
+            "nextCursor": "o:2",
+        }})
+    );
+    let methods = adapter_methods(&rpc_log);
+    assert_eq!(count(&methods, "initialize"), 1, "{methods:?}");
+    assert_eq!(count(&methods, "session/list"), 1, "{methods:?}");
+
+    // A search needs every page: the second one stalls, so the call keeps
+    // the first page's rows and marks the provider truncated.
+    let searched = rpc_envelope(
+        &mut ws,
+        2,
+        "agent.importableSessions.list",
+        json!({ "provider": "mock", "query": "/home/dev/stall" }),
+    )
+    .await;
+    assert_eq!(
+        searched,
+        json!({ "jsonrpc": "2.0", "id": 2, "result": {
+            "sessions": [newest, second],
+            "providers": [{ "id": "mock", "label": "Mock (E2E)", "status": "ok",
+                "truncated": true }],
+        }})
+    );
+    let methods = adapter_methods(&rpc_log);
+    assert_eq!(count(&methods, "initialize"), 2, "{methods:?}");
+    assert_eq!(count(&methods, "session/list"), 3, "{methods:?}");
+    let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap_or_default();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WARN") && l.contains("timed out") && l.contains("mock")),
+        "no WARN for the provider timeout:\n{log}"
+    );
+
+    // Paging and searching again reuse that listing: no new adapter.
+    let again = rpc_envelope(
+        &mut ws,
+        3,
+        "agent.importableSessions.list",
+        json!({ "provider": "mock", "query": "stall-4" }),
+    )
+    .await;
+    assert_eq!(again["result"]["sessions"], json!([second]), "{again}");
+    let paged = rpc_envelope(
+        &mut ws,
+        4,
+        "agent.importableSessions.list",
+        json!({ "provider": "mock", "limit": 1, "cursor": "o:1" }),
+    )
+    .await;
+    assert_eq!(paged["result"]["sessions"], json!([second]), "{paged}");
+    assert!(paged["result"].get("nextCursor").is_none(), "{paged}");
+    let methods = adapter_methods(&rpc_log);
+    assert_eq!(count(&methods, "initialize"), 2, "{methods:?}");
+    assert_eq!(count(&methods, "session/list"), 3, "{methods:?}");
 }
 
 /// The text of every `session/prompt` the mock received, in order, once at

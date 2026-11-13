@@ -1212,7 +1212,9 @@ function getAndIncrementAttempt() {
 // `$CLAUDE_CONFIG_DIR` or `$HOME/.claude`: `projects/<slug(cwd)>/<id>.jsonl`.
 // It advertises `sessionCapabilities.list` (and `fork` when
 // `sessionImport.fork`), pages `session/list` by `sessionImport.pageSize`
-// (default 2), and `session/load` replays a stored transcript as
+// (default 2) — and stops answering it after `sessionImport.stallAfterPages`
+// pages, as an adapter swamped by a huge store does — and `session/load`
+// replays a stored transcript as
 // `session/update`s — found ONLY under the slug of the requested cwd, as
 // Claude Code does — then answers. Returns true when it handled `msg`.
 function claudeProjectsRoot() {
@@ -1285,11 +1287,14 @@ function replayStoredSession(sessionId, rows) {
     }
   }
 }
+let listPagesServed = 0;
 function handleSessionImport(msg, behavior) {
   const opts = behavior.sessionImport;
   if (!opts) return false;
   const params = msg.params || {};
   if (msg.method === 'session/list') {
+    if (opts.stallAfterPages != null && listPagesServed >= opts.stallAfterPages) return true;
+    listPagesServed += 1;
     const size = opts.pageSize || 2;
     const offset = params.cursor ? parseInt(String(params.cursor).slice('page:'.length), 10) || 0 : 0;
     const all = storedSessions();
