@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.203] - 2026-11-13
+
+### 📚 Documentation
+
+- *(guide)* Describe per-action quick action model pickers ([#3340](https://github.com/intent-hq/intentd/pull/3340))
+
+
 ## [0.11.202] - 2026-11-13
 
 ### 🚀 Features
