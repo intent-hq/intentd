@@ -23,6 +23,7 @@ use intent_pty::{OutputSink, PtyHost, PtyId, PtySize, SpawnSpec};
 use intent_services::feature_api::shell::{default_shell, scrubbed_env_vars_except, shell_args};
 use intent_transport::node_link::NodeLink;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// How long terminals outlive a lost link, waiting for the next bind.
 pub(super) const LINK_LOSS_GRACE: Duration = Duration::from_secs(60);
@@ -36,8 +37,12 @@ const UNKNOWN: &str = "node-pty-unknown";
 /// backend keeps the terminal's buffer; this only backs the PTY.
 const SCROLLBACK_BYTES: usize = 64 * 1024;
 
-/// How long an exit waits for the last output to be read.
+/// After the process exits, how long its last output may take to arrive
+/// while the output is not waiting for acknowledgements.
 const OUTPUT_EOF_WAIT: Duration = Duration::from_secs(2);
+
+/// Poll interval while a process group empties.
+const GROUP_POLL: Duration = Duration::from_millis(20);
 
 const TERM: &str = "xterm-256color";
 
@@ -80,6 +85,11 @@ struct Term {
     /// Wakes the terminal's sender: new output, an ack, a bind or the exit.
     wake: tokio::sync::Notify,
     process: Mutex<Process>,
+    /// Input, written in order by the terminal's one writer.
+    input: mpsc::UnboundedSender<Vec<u8>>,
+    /// Turns true when the terminal is ended from here (kill on a new
+    /// session, the grace, shutdown): its supervisor stops waiting.
+    ended: watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -98,25 +108,39 @@ struct Outbox {
 }
 
 enum Process {
-    Pty(PtyId),
-    Exec {
-        stdin: Option<tokio::process::ChildStdin>,
-        kill: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Reserved by `ptyOpen`; its process is not started yet. A kill or a
+    /// resize meanwhile applies when it starts.
+    Pending {
+        killed: bool,
+        size: Option<PtySize>,
     },
+    Pty(PtyId),
+    Exec(Option<oneshot::Sender<()>>),
     Gone,
 }
 
-/// `cwd` inside `checkout`: relative, with no `..` or root component.
+/// A terminal `ptyOpen` reserved: [`HomeTerminals::start`] starts it.
+pub(super) struct Reserved {
+    term: Arc<Term>,
+    input: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+/// `cwd` inside `checkout`: relative, with no `..` or root component, and
+/// still inside the checkout once symlinks are resolved.
 fn resolve_cwd(checkout: &Path, cwd: Option<&str>) -> Option<PathBuf> {
-    match cwd.filter(|cwd| !cwd.is_empty()) {
-        None => Some(checkout.to_path_buf()),
-        Some(rel) => {
-            let rel = Path::new(rel);
-            rel.components()
-                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
-                .then(|| checkout.join(rel))
-        }
+    let Some(rel) = cwd.filter(|cwd| !cwd.is_empty()) else {
+        return Some(checkout.to_path_buf());
+    };
+    let rel = Path::new(rel);
+    if !rel
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return None;
     }
+    let root = std::fs::canonicalize(checkout).ok()?;
+    let resolved = std::fs::canonicalize(checkout.join(rel)).ok()?;
+    resolved.starts_with(&root).then_some(resolved)
 }
 
 /// Login arguments for a default interactive shell, as a local terminal.
@@ -137,15 +161,22 @@ fn login_args(shell: &str) -> Vec<String> {
 }
 
 impl Term {
-    fn new(id: String, process: Process) -> Arc<Self> {
-        Arc::new(Self {
+    fn new(id: String) -> (Arc<Self>, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (input, rx) = mpsc::unbounded_channel();
+        let term = Arc::new(Self {
             id,
             out: Mutex::default(),
             room: Condvar::new(),
             room_async: tokio::sync::Notify::new(),
             wake: tokio::sync::Notify::new(),
-            process: Mutex::new(process),
-        })
+            process: Mutex::new(Process::Pending {
+                killed: false,
+                size: None,
+            }),
+            input,
+            ended: watch::channel(false).0,
+        });
+        (term, rx)
     }
 
     /// Queue `bytes` as numbered frames. Returns whether the unacknowledged
@@ -169,6 +200,12 @@ impl Term {
         full
     }
 
+    /// Whether the output waits for acknowledgements now.
+    fn paused(&self) -> bool {
+        let out = lock(&self.out);
+        out.unacked_bytes >= PTY_UNACKED_BYTES && !out.ended
+    }
+
     /// Block the PTY reader thread until there is room again.
     fn wait_room_blocking(&self) {
         let out = lock(&self.out);
@@ -185,11 +222,8 @@ impl Term {
             let notified = self.room_async.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
-                let out = lock(&self.out);
-                if out.unacked_bytes < PTY_UNACKED_BYTES || out.ended {
-                    return;
-                }
+            if !self.paused() {
+                return;
             }
             notified.await;
         }
@@ -212,19 +246,29 @@ impl Term {
         self.wake.notify_one();
     }
 
+    /// The process ended and all its output is queued: report the exit.
     fn finish(&self, exited: PtyExited) {
+        *lock(&self.process) = Process::Gone;
         let mut out = lock(&self.out);
         out.ended = true;
         if out.exited.is_none() {
             out.exited = Some(exited);
         }
         drop(out);
-        *lock(&self.process) = Process::Gone;
         self.release_room();
         self.wake.notify_one();
     }
 
-    /// Resend everything unacknowledged on the next link.
+    fn refuse(&self, code: &str, detail: &str) {
+        self.finish(PtyExited {
+            terminal_id: self.id.clone(),
+            exit_code: None,
+            error: Some(format!("{code}: {detail}")),
+        });
+    }
+
+    /// Resend everything unacknowledged on the next link. Called under the
+    /// state lock, so a sender reads the link and the epoch together.
     fn rewind(&self) {
         let mut out = lock(&self.out);
         out.epoch += 1;
@@ -232,6 +276,12 @@ impl Term {
         out.exited_sent = false;
         drop(out);
         self.wake.notify_one();
+    }
+
+    /// Whether the terminal was ended from here.
+    async fn ended_here(&self) {
+        let mut ended = self.ended.subscribe();
+        let _ = ended.wait_for(|ended| *ended).await;
     }
 }
 
@@ -281,9 +331,10 @@ impl HomeTerminals {
         None
     }
 
-    /// A link bound with `head_session`: a new backend session ends every
-    /// terminal of the previous one; the same session gets the
-    /// unacknowledged output again.
+    /// A link bound as `generation` with `head_session`: a new backend
+    /// session ends every terminal of the previous one; the same session
+    /// gets the unacknowledged output again. An older binding changes
+    /// nothing.
     pub(super) fn bound(
         &self,
         link: NodeLink,
@@ -291,6 +342,9 @@ impl HomeTerminals {
         head_session: Option<&str>,
     ) {
         let mut state = lock(&self.shared.state);
+        if state.generation.is_some_and(|current| current > generation) {
+            return;
+        }
         if let Some(grace) = state.grace.take() {
             grace.abort();
         }
@@ -301,13 +355,12 @@ impl HomeTerminals {
         let ended: Vec<Arc<Term>> = if restarted {
             state.terms.drain().map(|(_, term)| term).collect()
         } else {
+            for term in state.terms.values() {
+                term.rewind();
+            }
             Vec::new()
         };
-        let kept: Vec<Arc<Term>> = state.terms.values().cloned().collect();
         drop(state);
-        for term in kept {
-            term.rewind();
-        }
         for term in ended {
             self.end(&term);
         }
@@ -358,9 +411,9 @@ impl HomeTerminals {
         }
     }
 
-    /// Kill a terminal's process; nothing more is sent for it.
+    /// End a terminal from here: its process is killed (its supervisor
+    /// reaps the group) and nothing more is sent for it.
     fn end(&self, term: &Arc<Term>) {
-        let process = std::mem::replace(&mut *lock(&term.process), Process::Gone);
         {
             let mut out = lock(&term.out);
             out.ended = true;
@@ -368,18 +421,27 @@ impl HomeTerminals {
             out.unacked.clear();
             out.unacked_bytes = 0;
         }
+        term.ended.send_replace(true);
         term.release_room();
         term.wake.notify_one();
-        match process {
+        self.kill_process(term);
+    }
+
+    fn kill_process(&self, term: &Arc<Term>) {
+        let mut process = lock(&term.process);
+        match &mut *process {
+            Process::Pending { killed, .. } => *killed = true,
             Process::Pty(pty_id) => {
+                let pty_id = *pty_id;
+                drop(process);
                 let pty = self.shared.pty.clone();
-                // caller-binding: allow — node-local terminal teardown
+                // caller-binding: allow — node-local home terminal kill; its supervisor reports the exit
                 tokio::spawn(async move {
                     pty.kill(pty_id).await;
                 });
             }
-            Process::Exec { kill, .. } => {
-                if let Some(kill) = kill {
+            Process::Exec(kill) => {
+                if let Some(kill) = kill.take() {
                     let _ = kill.send(());
                 }
             }
@@ -387,50 +449,54 @@ impl HomeTerminals {
         }
     }
 
-    /// Start `frame`'s process in `checkout`, the home checkout (`None`
-    /// when this machine does not hold the home). A refused start answers
-    /// `ptyExited` with `error`.
-    pub(super) fn open(&self, frame: &PtyOpen, checkout: Option<&Path>) {
+    /// Reserve `frame`'s terminal at once, so input sent after the
+    /// `ptyOpen` waits for its process; `None` for a repeated `ptyOpen` or
+    /// after shutdown.
+    pub(super) fn reserve(&self, frame: &PtyOpen) -> Option<Reserved> {
         let mut state = lock(&self.shared.state);
         if state.closed || state.terms.contains_key(&frame.terminal_id) {
-            return;
+            return None;
         }
-        let refused = |code: &str, detail: String| {
-            let term = Term::new(frame.terminal_id.clone(), Process::Gone);
-            term.finish(PtyExited {
-                terminal_id: frame.terminal_id.clone(),
-                exit_code: None,
-                error: Some(format!("{code}: {detail}")),
-            });
-            term
-        };
-        let term = match checkout {
-            None => refused(
-                NODE_HOME_UNKNOWN,
-                format!("this machine holds no home {}", frame.home_id),
-            ),
-            Some(checkout) => match resolve_cwd(checkout, frame.cwd.as_deref()) {
-                None => refused(
-                    INVALID_CWD,
-                    "cwd must stay inside the home checkout".to_owned(),
-                ),
-                Some(cwd) => {
-                    let started = match frame.mode {
-                        PtyMode::Terminal => self.start_pty(frame, cwd),
-                        PtyMode::Exec => Self::start_exec(frame, &cwd),
-                    };
-                    match started {
-                        Ok(term) => term,
-                        Err(error) => refused(START_FAILED, error),
-                    }
-                }
-            },
-        };
+        let (term, input) = Term::new(frame.terminal_id.clone());
         state.terms.insert(frame.terminal_id.clone(), term.clone());
         drop(state);
         let this = self.clone();
+        let sender = term.clone();
         // caller-binding: allow — node-local sender of one home terminal's frames
-        tokio::spawn(async move { this.send_loop(term).await });
+        tokio::spawn(async move { this.send_loop(sender).await });
+        Some(Reserved { term, input })
+    }
+
+    /// Start a reserved terminal's process in `checkout`, the home checkout
+    /// (`None` when this machine does not hold the home). A refused start
+    /// answers `ptyExited` with `error`.
+    pub(super) fn start(&self, reserved: Reserved, frame: &PtyOpen, checkout: Option<&Path>) {
+        let Reserved { term, input } = reserved;
+        if matches!(&*lock(&term.process), Process::Pending { killed: true, .. }) {
+            term.refuse(START_FAILED, "the terminal ended before it started");
+            return;
+        }
+        let Some(checkout) = checkout else {
+            term.refuse(
+                NODE_HOME_UNKNOWN,
+                &format!("this machine holds no home {}", frame.home_id),
+            );
+            return;
+        };
+        let Some(cwd) = resolve_cwd(checkout, frame.cwd.as_deref()) else {
+            term.refuse(
+                INVALID_CWD,
+                "cwd must be a directory inside the home checkout",
+            );
+            return;
+        };
+        let started = match frame.mode {
+            PtyMode::Terminal => self.start_pty(&term, input, frame, cwd),
+            PtyMode::Exec => Self::start_exec(&term, input, frame, &cwd),
+        };
+        if let Err(error) = started {
+            term.refuse(START_FAILED, &error);
+        }
     }
 
     fn env(frame: &PtyOpen) -> Vec<(String, String)> {
@@ -450,15 +516,38 @@ impl HomeTerminals {
         env
     }
 
-    fn start_pty(&self, frame: &PtyOpen, cwd: PathBuf) -> Result<Arc<Term>, String> {
+    /// Record the started process, unless the terminal was ended while it
+    /// started: then end the new process too.
+    fn adopt(&self, term: &Arc<Term>, started: Process) -> bool {
+        let mut process = lock(&term.process);
+        let Process::Pending { killed, size } = &*process else {
+            return false;
+        };
+        let (killed, size) = (*killed, *size);
+        *process = started;
+        drop(process);
+        if killed {
+            self.kill_process(term);
+        } else if let (Some(size), Process::Pty(pty_id)) = (size, &*lock(&term.process)) {
+            let _ = self.shared.pty.resize(*pty_id, size);
+        }
+        true
+    }
+
+    fn start_pty(
+        &self,
+        term: &Arc<Term>,
+        mut input: mpsc::UnboundedReceiver<Vec<u8>>,
+        frame: &PtyOpen,
+        cwd: PathBuf,
+    ) -> Result<(), String> {
         let shell = default_shell();
         let args = frame
             .command
             .as_deref()
             .filter(|command| !command.is_empty())
             .map_or_else(|| login_args(&shell), |command| shell_args(&shell, command));
-        let command = shell;
-        let mut spec = SpawnSpec::new(format!("home-terminal:{}", frame.home_id), command);
+        let mut spec = SpawnSpec::new(format!("home-terminal:{}", frame.home_id), shell);
         spec.args = args;
         spec.env = Self::env(frame);
         spec.env_remove = scrubbed_env_vars_except(&spec.env);
@@ -468,8 +557,7 @@ impl HomeTerminals {
         if let (Some(cols), Some(rows)) = (frame.cols, frame.rows) {
             spec.size = PtySize { rows, cols };
         }
-        let term = Term::new(frame.terminal_id.clone(), Process::Gone);
-        let sink_term = Arc::downgrade(&term);
+        let sink_term = Arc::downgrade(term);
         spec.output_sink = Some(OutputSink::new(move |bytes| {
             if let Some(term) = sink_term.upgrade() {
                 if term.push(bytes, None) {
@@ -478,14 +566,37 @@ impl HomeTerminals {
             }
         }));
         let pty_id = self.shared.pty.spawn(spec).map_err(|e| e.to_string())?;
-        *lock(&term.process) = Process::Pty(pty_id);
+        let _ = self.adopt(term, Process::Pty(pty_id));
+        let pty = self.shared.pty.clone();
+        // caller-binding: allow — node-local writer of one home terminal's input, in order
+        tokio::spawn(async move {
+            while let Some(bytes) = input.recv().await {
+                let pty = pty.clone();
+                let written = tokio::task::spawn_blocking(move || pty.write(pty_id, &bytes)).await;
+                if !matches!(written, Ok(Ok(()))) {
+                    return;
+                }
+            }
+        });
         let pty = self.shared.pty.clone();
         let reaped = term.clone();
         // caller-binding: allow — node-local home terminal process supervision
         tokio::spawn(async move {
             let exit = pty.wait(pty_id).await;
             pty.reap_group_stragglers(pty_id).await;
-            let _ = tokio::time::timeout(OUTPUT_EOF_WAIT, pty.wait_output_eof(pty_id)).await;
+            // Every byte before the exit: the output may be waiting for
+            // acknowledgements, which keeps the reader (and so the end)
+            // waiting too.
+            loop {
+                tokio::select! {
+                    eof = tokio::time::timeout(OUTPUT_EOF_WAIT, pty.wait_output_eof(pty_id)) => {
+                        if eof.is_ok() || !reaped.paused() {
+                            break;
+                        }
+                    }
+                    () = reaped.ended_here() => break,
+                }
+            }
             pty.kill(pty_id).await;
             let exit_code = match exit {
                 Ok(exit) if exit.observed => i32::try_from(exit.exit_code).unwrap_or(-1),
@@ -497,10 +608,15 @@ impl HomeTerminals {
                 error: None,
             });
         });
-        Ok(term)
+        Ok(())
     }
 
-    fn start_exec(frame: &PtyOpen, cwd: &Path) -> Result<Arc<Term>, String> {
+    fn start_exec(
+        term: &Arc<Term>,
+        mut input: mpsc::UnboundedReceiver<Vec<u8>>,
+        frame: &PtyOpen,
+        cwd: &Path,
+    ) -> Result<(), String> {
         let shell = default_shell();
         let command = frame.command.as_deref().unwrap_or_default();
         let mut cmd = tokio::process::Command::new(&shell);
@@ -518,33 +634,66 @@ impl HomeTerminals {
         #[cfg(unix)]
         cmd.process_group(0);
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        let pgid = child.id();
         let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let (kill, killed) = tokio::sync::oneshot::channel();
-        let term = Term::new(
-            frame.terminal_id.clone(),
-            Process::Exec {
-                stdin,
-                kill: Some(kill),
-            },
-        );
-        let readers = [
-            stdout.map(|pipe| read_pipe(term.clone(), pipe, PtyStream::Stdout)),
-            stderr.map(|pipe| read_pipe(term.clone(), pipe, PtyStream::Stderr)),
-        ];
+        let readers: Vec<tokio::task::JoinHandle<()>> = [
+            child
+                .stdout
+                .take()
+                .map(|pipe| read_pipe(term.clone(), pipe, PtyStream::Stdout)),
+            child
+                .stderr
+                .take()
+                .map(|pipe| read_pipe(term.clone(), pipe, PtyStream::Stderr)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let (kill, killed) = oneshot::channel();
+        // A start racing an end kills the process at once (the supervisor
+        // below reaps it).
+        let _ = HomeTerminals::adopt_exec(term, kill);
+        if let Some(mut stdin) = stdin {
+            // caller-binding: allow — node-local writer of one exec process's stdin, in order
+            tokio::spawn(async move {
+                while let Some(bytes) = input.recv().await {
+                    if stdin.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
         let reaped = term.clone();
         // caller-binding: allow — node-local home exec process supervision
         tokio::spawn(async move {
             let status = tokio::select! {
                 status = child.wait() => status.ok(),
-                _ = killed => {
-                    kill_child(&mut child).await;
-                    child.wait().await.ok()
-                }
+                _ = killed => None,
             };
-            for reader in readers.into_iter().flatten() {
-                let _ = tokio::time::timeout(OUTPUT_EOF_WAIT, reader).await;
+            // Whatever is left of the process group ends too.
+            end_group(pgid, &mut child).await;
+            let status = match status {
+                Some(status) => Some(status),
+                None => child.wait().await.ok(),
+            };
+            for mut reader in readers {
+                loop {
+                    tokio::select! {
+                        done = tokio::time::timeout(OUTPUT_EOF_WAIT, &mut reader) => {
+                            if done.is_ok() {
+                                break;
+                            }
+                            if !reaped.paused() {
+                                reader.abort();
+                                break;
+                            }
+                        }
+                        () = reaped.ended_here() => {
+                            reader.abort();
+                            break;
+                        }
+                    }
+                }
             }
             reaped.finish(PtyExited {
                 terminal_id: reaped.id.clone(),
@@ -552,7 +701,22 @@ impl HomeTerminals {
                 error: None,
             });
         });
-        Ok(term)
+        Ok(())
+    }
+
+    /// [`Self::adopt`] for an exec process, which has no PTY to resize.
+    fn adopt_exec(term: &Arc<Term>, kill: oneshot::Sender<()>) -> bool {
+        let mut process = lock(&term.process);
+        let Process::Pending { killed, .. } = &*process else {
+            return false;
+        };
+        if *killed {
+            let _ = kill.send(());
+            *process = Process::Exec(None);
+        } else {
+            *process = Process::Exec(Some(kill));
+        }
+        true
     }
 
     /// Send the terminal's frames on the current link, in order; resend
@@ -563,9 +727,11 @@ impl HomeTerminals {
             let notified = term.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let link = lock(&self.shared.state).link.clone();
-            if let Some(link) = link {
-                let (epoch, frames, exited) = {
+            // The link and the epoch are read together: a bind changes both
+            // under the state lock.
+            let current = {
+                let state = lock(&self.shared.state);
+                state.link.clone().map(|link| {
                     let out = lock(&term.out);
                     let frames: Vec<PtyOutput> = out
                         .unacked
@@ -574,8 +740,10 @@ impl HomeTerminals {
                         .cloned()
                         .collect();
                     let exited = (!out.exited_sent).then(|| out.exited.clone()).flatten();
-                    (out.epoch, frames, exited)
-                };
+                    (link, out.epoch, frames, exited)
+                })
+            };
+            if let Some((link, epoch, frames, exited)) = current {
                 let mut sent_all = true;
                 for frame in frames {
                     let seq = frame.seq;
@@ -622,6 +790,7 @@ impl HomeTerminals {
         }
     }
 
+    /// Queue input for the terminal's writer; it never blocks the link.
     pub(super) fn input(&self, frame: &PtyInput) {
         let Some(term) = self.term_or_unknown(&frame.terminal_id) else {
             return;
@@ -630,71 +799,34 @@ impl HomeTerminals {
             tracing::debug!(terminal = %frame.terminal_id, "node: undecodable ptyInput dropped");
             return;
         };
-        let mut process = lock(&term.process);
-        match &mut *process {
-            Process::Pty(pty_id) => {
-                let _ = self.shared.pty.write(*pty_id, &bytes);
-            }
-            Process::Exec { stdin, .. } => {
-                if let Some(mut pipe) = stdin.take() {
-                    let term = term.clone();
-                    drop(process);
-                    // caller-binding: allow — node-local write to one exec process's stdin
-                    tokio::spawn(async move {
-                        let ok = pipe.write_all(&bytes).await.is_ok();
-                        if ok {
-                            if let Process::Exec { stdin, .. } = &mut *lock(&term.process) {
-                                *stdin = Some(pipe);
-                            }
-                        }
-                    });
-                }
-            }
-            Process::Gone => {}
-        }
+        let _ = term.input.send(bytes);
     }
 
     pub(super) fn resize(&self, frame: &PtyResize) {
         let Some(term) = self.term_or_unknown(&frame.terminal_id) else {
             return;
         };
-        let pty_id = match &*lock(&term.process) {
+        let size = PtySize {
+            rows: frame.rows,
+            cols: frame.cols,
+        };
+        let pty_id = match &mut *lock(&term.process) {
+            Process::Pending { size: pending, .. } => {
+                *pending = Some(size);
+                None
+            }
             Process::Pty(pty_id) => Some(*pty_id),
-            _ => None,
+            Process::Exec(_) | Process::Gone => None,
         };
         if let Some(pty_id) = pty_id {
-            let _ = self.shared.pty.resize(
-                pty_id,
-                PtySize {
-                    rows: frame.rows,
-                    cols: frame.cols,
-                },
-            );
+            let _ = self.shared.pty.resize(pty_id, size);
         }
     }
 
     /// End a terminal's process; its `ptyExited` follows.
     pub(super) fn kill(&self, frame: &PtyKill) {
-        let Some(term) = self.term_or_unknown(&frame.terminal_id) else {
-            return;
-        };
-        let mut process = lock(&term.process);
-        match &mut *process {
-            Process::Pty(pty_id) => {
-                let pty_id = *pty_id;
-                drop(process);
-                let pty = self.shared.pty.clone();
-                // caller-binding: allow — node-local home terminal kill; its reaper reports the exit
-                tokio::spawn(async move {
-                    pty.kill(pty_id).await;
-                });
-            }
-            Process::Exec { kill, .. } => {
-                if let Some(kill) = kill.take() {
-                    let _ = kill.send(());
-                }
-            }
-            Process::Gone => {}
+        if let Some(term) = self.term_or_unknown(&frame.terminal_id) {
+            self.kill_process(&term);
         }
     }
 
@@ -725,21 +857,35 @@ fn read_pipe(
     })
 }
 
-async fn kill_child(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        use nix::sys::signal::{killpg, Signal};
-        use nix::unistd::Pid;
-        let group = Pid::from_raw(pid.cast_signed());
-        let _ = killpg(group, Signal::SIGTERM);
-        if tokio::time::timeout(intent_pty::TERM_GRACE, child.wait())
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        let _ = killpg(group, Signal::SIGKILL);
+/// End what is left of the process group `pgid` (the exec process leads
+/// it): SIGTERM, then SIGKILL unless the group empties within the grace.
+/// Reaps `child` meanwhile, as a zombie leader keeps the group occupied.
+#[cfg(unix)]
+async fn end_group(pgid: Option<u32>, child: &mut tokio::process::Child) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    let Some(pgid) = pgid else {
+        let _ = child.start_kill();
+        return;
+    };
+    let group = Pid::from_raw(pgid.cast_signed());
+    let empty = || matches!(killpg(group, None), Err(nix::errno::Errno::ESRCH));
+    if empty() {
         return;
     }
+    let _ = killpg(group, Signal::SIGTERM);
+    let deadline = tokio::time::Instant::now() + intent_pty::TERM_GRACE;
+    while tokio::time::Instant::now() < deadline {
+        let _ = child.try_wait();
+        if empty() {
+            return;
+        }
+        tokio::time::sleep(GROUP_POLL).await;
+    }
+    let _ = killpg(group, Signal::SIGKILL);
+}
+
+#[cfg(not(unix))]
+async fn end_group(_pgid: Option<u32>, child: &mut tokio::process::Child) {
     let _ = child.start_kill();
 }

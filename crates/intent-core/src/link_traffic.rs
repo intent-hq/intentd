@@ -590,13 +590,25 @@ fn render(captured: &Captured, payloads: bool, max_payload_bytes: usize) -> Draf
     }
 }
 
-/// `frame` as the capture keeps it: an agent secret's value and a
-/// terminal's input never enter the queue.
+/// `frame` as the capture keeps it: an agent secret's value, a terminal's
+/// input, command and environment values never enter the queue.
 fn masked_copy(frame: &LinkFrame) -> LinkFrame {
     match frame {
         LinkFrame::PtyInput(input) => LinkFrame::PtyInput(crate::node_link::PtyInput {
             terminal_id: input.terminal_id.clone(),
             data: MASK.to_owned(),
+        }),
+        LinkFrame::PtyOpen(open) => LinkFrame::PtyOpen(crate::node_link::PtyOpen {
+            command: open.command.as_ref().map(|_| MASK.to_owned()),
+            env: open
+                .env
+                .iter()
+                .map(|var| crate::node_link::PtyEnvVar {
+                    key: var.key.clone(),
+                    value: MASK.to_owned(),
+                })
+                .collect(),
+            ..open.clone()
         }),
         LinkFrame::SecretPut(put) => LinkFrame::SecretPut(crate::node_link::SecretPut {
             value: crate::node_link::SecretValue::from(MASK),

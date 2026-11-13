@@ -616,7 +616,13 @@ async fn a_home_terminal_runs_in_the_home_checkout_and_takes_input() {
         .await
         .unwrap();
     let seen = watch_terminal(&mut dialed, "t1", true, |_, exited| exited).await;
-    assert!(seen.exited.unwrap().exit_code.is_some());
+    let exited = seen.exited.unwrap();
+    assert_eq!(exited.error, None, "{exited:?}");
+    assert_ne!(
+        exited.exit_code,
+        Some(0),
+        "killed, not a clean exit: {exited:?}"
+    );
     node.stop().await;
 }
 
@@ -738,15 +744,18 @@ async fn a_new_backend_session_ends_the_previous_sessions_terminals() {
         .await
         .unwrap();
     replayed(&mut dialed).await;
-    let quiet = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            match next_frame(&mut dialed).await {
-                Some(LinkFrame::PtyOutput(_) | LinkFrame::PtyExited(_)) => return true,
-                Some(_) => {}
-                None => return false,
+    let quiet = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            loop {
+                match next_frame(&mut dialed).await {
+                    Some(LinkFrame::PtyOutput(_) | LinkFrame::PtyExited(_)) => return true,
+                    Some(_) => {}
+                    None => return false,
+                }
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(quiet.is_err(), "no frame of the old session's terminal");
     assert!(!marker.exists(), "the old session's process was ended");
@@ -780,7 +789,12 @@ async fn terminal_output_waits_for_acknowledgements_past_the_limit() {
     let mut received = 0usize;
     let mut last_seq = None;
     let stalled = loop {
-        match tokio::time::timeout(Duration::from_secs(2), next_frame(&mut dialed)).await {
+        match tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            next_frame(&mut dialed),
+        )
+        .await
+        {
             Err(_) => break true,
             Ok(Some(LinkFrame::PtyOutput(output))) => {
                 received += unb64(&output.data).len();
@@ -837,5 +851,164 @@ async fn a_frame_for_an_unknown_terminal_is_answered_with_its_end() {
     assert!(exited
         .error
         .is_some_and(|e| e.starts_with("node-pty-unknown")),);
+    node.stop().await;
+}
+
+/// Input frames reach an exec process's stdin in order, none dropped,
+/// also when they arrive faster than it reads.
+#[cfg(unix)]
+#[tokio::test]
+async fn exec_input_arrives_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    dialed
+        .link
+        .send(&pty_open(
+            &h1,
+            "x1",
+            PtyMode::Exec,
+            Some("sleep 1; head -n 3"),
+        ))
+        .await
+        .unwrap();
+    for line in ["one\n", "two\n", "three\n"] {
+        dialed
+            .link
+            .send(&LinkFrame::PtyInput(PtyInput {
+                terminal_id: "x1".into(),
+                data: b64(line),
+            }))
+            .await
+            .unwrap();
+    }
+    let seen = watch_terminal(&mut dialed, "x1", true, |_, exited| exited).await;
+    assert_eq!(seen.text(), "one\ntwo\nthree\n");
+    assert_eq!(seen.exited.unwrap().exit_code, Some(0));
+    node.stop().await;
+}
+
+/// A large paste into a terminal whose output waits for acknowledgements
+/// does not hold up the link: the acknowledgement that frees the output
+/// still arrives, and the program finishes.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_paste_while_the_output_waits_does_not_block_the_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    let total = PTY_UNACKED_BYTES * 2;
+    dialed
+        .link
+        .send(&pty_open(
+            &h1,
+            "t1",
+            PtyMode::Terminal,
+            Some(&format!(
+                "head -c {total} /dev/zero; stty -echo; cat > /dev/null"
+            )),
+        ))
+        .await
+        .unwrap();
+    // Let the output fill the window without acknowledging it.
+    let mut last_seq = 0;
+    let mut received = 0usize;
+    let filled = tokio::time::Instant::now() + wait();
+    while received < PTY_UNACKED_BYTES {
+        let frame = tokio::time::timeout_at(filled, next_frame(&mut dialed))
+            .await
+            .expect("the output never filled the window");
+        if let Some(LinkFrame::PtyOutput(output)) = frame {
+            received += unb64(&output.data).len();
+            last_seq = output.seq;
+        }
+    }
+    let paste = "x".repeat(256 * 1024);
+    for _ in 0..4 {
+        dialed
+            .link
+            .send(&LinkFrame::PtyInput(PtyInput {
+                terminal_id: "t1".into(),
+                data: b64(&paste),
+            }))
+            .await
+            .unwrap();
+    }
+    dialed
+        .link
+        .send(&LinkFrame::PtyAck(PtyAck {
+            terminal_id: "t1".into(),
+            seq: last_seq,
+        }))
+        .await
+        .unwrap();
+    // The rest of the output arrives (the ack was read), acknowledged as
+    // it comes; the input reached the program, which still runs.
+    let deadline = tokio::time::Instant::now() + wait();
+    while received < total {
+        let frame = tokio::time::timeout_at(deadline, next_frame(&mut dialed))
+            .await
+            .unwrap_or_else(|_| panic!("stuck after {received} bytes"))
+            .expect("the link closed");
+        if let LinkFrame::PtyOutput(output) = frame {
+            received += unb64(&output.data).len();
+            dialed
+                .link
+                .send(&LinkFrame::PtyAck(PtyAck {
+                    terminal_id: "t1".into(),
+                    seq: output.seq,
+                }))
+                .await
+                .unwrap();
+        }
+    }
+    dialed
+        .link
+        .send(&LinkFrame::PtyKill(PtyKill {
+            terminal_id: "t1".into(),
+        }))
+        .await
+        .unwrap();
+    let seen = watch_terminal(&mut dialed, "t1", true, |_, exited| exited).await;
+    assert_eq!(seen.exited.unwrap().error, None);
+    node.stop().await;
+}
+
+/// A `cwd` that is a symlink out of the home checkout is refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cwd_symlinked_out_of_the_checkout_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), worktree(dir.path(), &h1).join("out")).unwrap();
+    let LinkFrame::PtyOpen(mut open) = pty_open(&h1, "x1", PtyMode::Exec, Some("pwd")) else {
+        unreachable!()
+    };
+    open.cwd = Some("out".into());
+    dialed.link.send(&LinkFrame::PtyOpen(open)).await.unwrap();
+    let seen = watch_terminal(&mut dialed, "x1", true, |_, exited| exited).await;
+    assert!(seen.frames.is_empty());
+    assert!(seen
+        .exited
+        .unwrap()
+        .error
+        .is_some_and(|e| e.starts_with("node-pty-invalid-cwd")));
     node.stop().await;
 }

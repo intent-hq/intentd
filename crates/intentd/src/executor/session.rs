@@ -487,7 +487,7 @@ pub(super) async fn serve_link(
                 }
                 let terminals = runner.terminals();
                 match frame {
-                    LinkFrame::PtyOpen(open) => runner.pty_open(&open).await,
+                    LinkFrame::PtyOpen(open) => runner.pty_open(open),
                     LinkFrame::PtyInput(input) => terminals.input(&input),
                     LinkFrame::PtyResize(resize) => terminals.resize(&resize),
                     LinkFrame::PtyKill(kill) => terminals.kill(&kill),

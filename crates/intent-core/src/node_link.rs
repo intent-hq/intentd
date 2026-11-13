@@ -254,8 +254,9 @@ pub struct PtyEnvVar {
 }
 
 /// Backend to machine (nodeProtocol 19): start a terminal (or an exec
-/// process) in a home checkout. The body is closed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// process) in a home checkout. The body is closed. `Debug` leaves out the
+/// command and the environment values, which can hold tokens.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PtyOpen {
     pub terminal_id: String,
@@ -273,6 +274,29 @@ pub struct PtyOpen {
     pub cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<u16>,
+}
+
+impl std::fmt::Debug for PtyOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyOpen")
+            .field("terminal_id", &self.terminal_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("home_id", &self.home_id)
+            .field("mode", &self.mode)
+            .field("cwd", &self.cwd)
+            .field("command", &self.command.as_ref().map(|_| "…"))
+            .field(
+                "env",
+                &self
+                    .env
+                    .iter()
+                    .map(|var| var.key.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .finish()
+    }
 }
 
 impl PtyOpen {
