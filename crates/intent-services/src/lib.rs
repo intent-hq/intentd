@@ -21582,17 +21582,15 @@ impl WorkspaceApi for Services {
                     // On an orchestrator the workspace's files live on its
                     // home (nodes.md "Workspace homes"): chosen here, before
                     // any workspace effect, so no machine fails the create.
-                    let home = if services.workspace_homes() && input.plain_folder != Some(true) {
-                        let initial = planned_initial_agent
-                            .as_ref()
-                            .and_then(|(plan, _, _)| plan.remote.as_ref());
-                        Some(
-                            boxed_await(|| services.ports.remote_launch().choose_home(&services, initial))
-                                .await?,
+                    let home = boxed_await(|| {
+                        services.choose_workspace_home(
+                            input.plain_folder == Some(true),
+                            planned_initial_agent
+                                .as_ref()
+                                .and_then(|(plan, _, _)| plan.remote.as_ref()),
                         )
-                    } else {
-                        None
-                    };
+                    })
+                    .await?;
                     // Kept alongside the resolved parent below: the known-repo
                     // registration hook checks BOTH roots (a configured
                     // `worktreesLocation` may differ from the boot root, and a
@@ -23219,23 +23217,7 @@ impl WorkspaceApi for Services {
                     // the replay guard: on retry the stored result comes back
                     // and this branch never re-runs.
                     boxed_await(|| ensure_spec_note(&store, bus.as_ref(), &ws.id)).await?;
-                    if let Some(home) = &home {
-                        boxed_await(|| store.set_workspace_home(&ws.id, home)).await?;
-                        services.publish_workspace_home_changed(&ws.id).await;
-                        let opener = services.clone();
-                        let workspace_id = ws.id.clone();
-                        // caller-binding: allow — opens the new workspace's home on its machine
-                        tokio::spawn(async move {
-                            if let Err(error) = opener
-                                .ports
-                                .remote_launch()
-                                .open_home(&opener, &workspace_id)
-                                .await
-                            {
-                                tracing::warn!(workspace = %workspace_id, %error, "could not open the workspace's home; it opens at the machine's next bind");
-                            }
-                        });
-                    }
+                    boxed_await(|| services.record_workspace_home(&ws.id, home)).await?;
                     // Daemon-owned initial-agent orchestration (§5.1): when the
                     // request carries an `initialAgent`, always create the agent
                     // row (reference parity: `workspace.service.ts` persists the

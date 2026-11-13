@@ -266,6 +266,62 @@ impl Services {
         .await;
     }
 
+    /// The home of a workspace being created (nodes.md "Workspace homes" →
+    /// "Choosing the home"): only on an orchestrator serving homes, and
+    /// never for a plain folder. Nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// The remote feature's refusal when no machine can be a home.
+    pub(crate) async fn choose_workspace_home(
+        &self,
+        plain_folder: bool,
+        initial: Option<&intent_core::remote_launch::RemotePlacementView>,
+    ) -> Result<Option<Box<intent_core::WorkspaceHome>>> {
+        if !self.workspace_homes() || plain_folder {
+            return Ok(None);
+        }
+        let home = self
+            .ports
+            .remote_launch()
+            .choose_home(self, initial)
+            .await?;
+        Ok(Some(Box::new(home)))
+    }
+
+    /// Record the new workspace's home (when it has one), announce it and open it on its
+    /// machine in the background (it opens again at the machine's next
+    /// bind when this fails).
+    ///
+    /// # Errors
+    ///
+    /// The store's error.
+    pub(crate) async fn record_workspace_home(
+        &self,
+        workspace_id: &WorkspaceId,
+        home: Option<Box<intent_core::WorkspaceHome>>,
+    ) -> Result<()> {
+        let Some(home) = home else {
+            return Ok(());
+        };
+        self.store.set_workspace_home(workspace_id, &home).await?;
+        self.publish_workspace_home_changed(workspace_id).await;
+        let opener = self.clone();
+        let workspace_id = workspace_id.clone();
+        // caller-binding: allow — opens the new workspace's home on its machine
+        tokio::spawn(async move {
+            if let Err(error) = opener
+                .ports
+                .remote_launch()
+                .open_home(&opener, &workspace_id)
+                .await
+            {
+                tracing::warn!(workspace = %workspace_id, %error, "could not open the workspace's home; it opens at the machine's next bind");
+            }
+        });
+        Ok(())
+    }
+
     /// Announce the workspace's home (nodes.md "Workspace homes") as the
     /// existing `workspace:updated` with `changes: { home }`.
     pub async fn publish_workspace_home_changed(&self, workspace_id: &WorkspaceId) {

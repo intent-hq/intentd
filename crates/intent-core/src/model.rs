@@ -570,8 +570,10 @@ pub struct Workspace {
     /// `docs/protocol/methods/nodes.md`, "Workspace homes"): the machine that
     /// holds its home checkout. Kept in its own table and overlaid by the
     /// service layer; omitted on a regular daemon.
+    /// Boxed: the row is held by long-running futures (`workspace.create`
+    /// has a stack budget), and most rows have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub home: Option<WorkspaceHome>,
+    pub home: Option<Box<WorkspaceHome>>,
 }
 
 /// A workspace's home (nodes.md "Workspace homes").

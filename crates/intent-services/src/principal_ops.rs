@@ -1565,7 +1565,7 @@ impl Services {
         }
         if self.workspace_homes() {
             match self.store.get_workspace_home(&ws.id).await {
-                Ok(home) => ws.home = home,
+                Ok(home) => ws.home = home.map(Box::new),
                 Err(e) => tracing::debug!(error = %e, "workspace.get: home failed"),
             }
         }
@@ -1596,7 +1596,7 @@ impl Services {
             match self.store.list_workspace_homes().await {
                 Ok(mut homes) => {
                     for ws in list.iter_mut() {
-                        ws.home = homes.remove(&ws.id);
+                        ws.home = homes.remove(&ws.id).map(Box::new);
                     }
                 }
                 Err(e) => tracing::debug!(error = %e, "workspace.list: homes failed"),
