@@ -63,7 +63,11 @@ pub(crate) fn checkout_path(workspace: &Workspace) -> Option<PathBuf> {
 
 /// Point the agent's `base` ref in submodule `pin`'s repository at its
 /// pinned commit, after checking it is still that submodule of `checkout`.
-fn write_module_base_ref(checkout: &Path, remote: &AgentRemote, pin: &SubmodulePin) -> Result<()> {
+pub(crate) fn write_module_base_ref(
+    checkout: &Path,
+    remote: &AgentRemote,
+    pin: &SubmodulePin,
+) -> Result<()> {
     let module =
         node_git::module_repository(checkout, &pin.path, &pin.module_key).map_err(|refusal| {
             Error::Internal(format!(
@@ -714,6 +718,22 @@ pub(crate) async fn launch_linked(svc: &Services, request: RemoteLaunchRequest) 
 impl RemoteLaunchPort for RemoteLaunch {
     fn placements<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<PlatformAvailability>> {
         Box::pin(machines_availability(svc))
+    }
+
+    fn choose_home<'a>(
+        &'a self,
+        svc: &'a Services,
+        initial: Option<&'a RemotePlacementView>,
+    ) -> BoxFuture<'a, Result<intent_core::WorkspaceHome>> {
+        Box::pin(crate::homes::choose_home(svc, initial))
+    }
+
+    fn open_home<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(crate::homes::open_home(svc, workspace_id))
     }
 
     fn placement_help<'a>(

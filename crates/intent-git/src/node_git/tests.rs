@@ -943,3 +943,65 @@ async fn a_forge_checkout_gets_its_own_branch_and_origin() {
     fixture.cache.delete_branch("intent/a").await;
     assert_eq!(try_ref(&b, "refs/heads/intent/a"), None);
 }
+
+/// The hook takes only refs under the receiving session's own prefix: a
+/// home session cannot write a ref that merely contains its names
+/// (`home/rewritten/agents/x/head`), a pin of its own, or an agent's ref;
+/// an agent session cannot write another agent's; no prefix, no push.
+#[cfg(unix)]
+#[test]
+fn the_hook_stays_inside_the_sessions_prefix() {
+    // Its own copy: the installed hooks directory is process-wide state
+    // the other tests' pushes use.
+    let data = tempfile::tempdir().unwrap();
+    let hook = data.path().join("update");
+    std::fs::write(&hook, UPDATE_HOOK).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let zero = "0".repeat(40);
+    let sha = "a".repeat(40);
+    let allowed = |prefix: Option<&str>, name: &str| {
+        let mut command = std::process::Command::new(&hook);
+        command
+            .args([name, zero.as_str(), sha.as_str()])
+            .env_remove(PREFIX_ENV);
+        if let Some(prefix) = prefix {
+            command.env(PREFIX_ENV, prefix);
+        }
+        command.output().unwrap().status.success()
+    };
+    let home = "refs/intent/ws/w1/home/";
+    let agent = "refs/intent/ws/w1/agents/a1/";
+    for name in ["head", "wip"] {
+        assert!(allowed(Some(home), &format!("{home}{name}")), "home {name}");
+        assert!(
+            allowed(Some(agent), &format!("{agent}{name}")),
+            "agent {name}"
+        );
+    }
+    for refused in [
+        format!("{home}rewritten/agents/x/head"),
+        format!("{home}orphaned/agents/x/wip"),
+        format!("{home}rewritten/{sha}"),
+        format!("{home}head/extra"),
+        format!("{agent}head"),
+        "refs/intent/ws/w2/home/head".to_owned(),
+    ] {
+        assert!(
+            !allowed(Some(home), &refused),
+            "home session wrote {refused}"
+        );
+    }
+    assert!(!allowed(Some(agent), "refs/intent/ws/w1/agents/a2/head"));
+    assert!(!allowed(Some(agent), &format!("{home}head")));
+    assert!(
+        !allowed(None, &format!("{agent}head")),
+        "no prefix, no push"
+    );
+    assert!(
+        !allowed(Some("refs/"), "refs/heads/main"),
+        "a prefix outside refs/intent/ws"
+    );
+}

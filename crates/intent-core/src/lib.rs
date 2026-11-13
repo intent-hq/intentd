@@ -207,6 +207,7 @@ pub use model::{
     BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
     BrowserTabVisibility,
 };
+pub use model::{HomeState, WorkspaceHome};
 pub use model::{
     InvitePin, InviteProofClaim, Principal, PrincipalCredential, PrincipalIdentity,
     WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole,

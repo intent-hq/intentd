@@ -13,7 +13,7 @@ use super::*;
 /// Switch a backend data dir to orchestrator mode, with Codex as the default
 /// provider of its quick actions. The daemon wrote every setting at its last start,
 /// so the existing `[daemon]` and `[model]` keys are rewritten in place.
-fn orchestrator_config(data_dir: &Path) {
+pub(super) fn orchestrator_config(data_dir: &Path) {
     let path = data_dir.join("config.toml");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut out = String::new();

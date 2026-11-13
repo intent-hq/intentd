@@ -38,12 +38,9 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 /// How often a changing checkout's `home/wip` is pushed at least.
 const WIP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// Whether this build holds workspace homes. Homes ship in steps; until
-/// every home frame is served, a machine reports `homes: false` and refuses
-/// `homeOpen`, so no backend makes it a home it cannot fully serve.
-/// `INTENTD_UNSTABLE_HOMES=1` lifts the gate for tests.
+/// Whether this build holds workspace homes ([`intent_core::node_link::homes_ready`]).
 pub(crate) fn homes_ready() -> bool {
-    std::env::var_os("INTENTD_UNSTABLE_HOMES").is_some_and(|value| value == "1")
+    intent_core::node_link::homes_ready()
 }
 
 /// The homes of the bound backend.

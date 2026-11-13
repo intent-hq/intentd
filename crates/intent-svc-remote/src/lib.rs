@@ -47,6 +47,7 @@ mod connector;
 mod final_stop;
 mod forge_token;
 mod git;
+mod homes;
 mod ingest;
 mod launch;
 mod lease;
@@ -272,7 +273,25 @@ async fn resume_exposed_machines(svc: &Services) -> Vec<String> {
     let mut started = Vec::new();
     for machine_id in candidates {
         match feature.node(svc, &machine_id).await {
-            Ok(_) => started.push(machine_id),
+            Ok(node) => {
+                // A machine holding a home is dialed now (and kept), so its
+                // home is backed up without waiting for other work there.
+                let holds_homes = svc
+                    .store()
+                    .homes_on_machine(&machine_id)
+                    .await
+                    .is_ok_and(|homes| !homes.is_empty());
+                if holds_homes {
+                    node.shared_ref().set_holds_homes(true);
+                    // caller-binding: allow — dials a home's machine at start; the connector retries with backoff
+                    tokio::spawn(async move {
+                        if let Err(error) = node.connect().await {
+                            tracing::info!(%error, "remote machine: a home's machine is not reachable yet");
+                        }
+                    });
+                }
+                started.push(machine_id);
+            }
             Err(error) => {
                 tracing::warn!(machine = %machine_id, %error, "remote machine: could not start its connector at start");
             }
@@ -282,7 +301,7 @@ async fn resume_exposed_machines(svc: &Services) -> Vec<String> {
 }
 
 /// The exposed machines with a live lease that records agents that may
-/// still run.
+/// still run, or that hold a workspace's home.
 async fn machines_with_live_records(svc: &Services) -> Result<Vec<String>> {
     let store = svc.store();
     let head_id = store.daemon_id().await?;
@@ -305,7 +324,9 @@ async fn machines_with_live_records(svc: &Services) -> Result<Vec<String>> {
             }
             Some(_) => {}
         }
-        if connector::has_live_records(store, &lease.owner.lease_id).await? {
+        if connector::has_live_records(store, &lease.owner.lease_id).await?
+            || !store.homes_on_machine(machine_id).await?.is_empty()
+        {
             machines.push(machine_id.clone());
         }
     }

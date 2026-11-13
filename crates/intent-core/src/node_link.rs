@@ -116,6 +116,15 @@ pub const ONE_SHOT_PROTOCOL: u32 = 18;
 /// cannot be a home.
 pub const HOMES_PROTOCOL: u32 = 19;
 
+/// Whether this build serves workspace homes. Homes ship in steps; until
+/// every home frame is served, a machine reports `homes: false` and refuses
+/// `homeOpen`, and an orchestrator neither chooses nor opens homes.
+/// `INTENTD_UNSTABLE_HOMES=1` lifts the gate for tests.
+#[must_use]
+pub fn homes_ready() -> bool {
+    std::env::var_os("INTENTD_UNSTABLE_HOMES").is_some_and(|value| value == "1")
+}
+
 /// A home frame for a `homeId` the machine does not hold, or that is not in
 /// the bound hello's `leaseHomes`.
 pub const NODE_HOME_UNKNOWN: &str = "node-home-unknown";

@@ -185,6 +185,12 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          and an imported agent does not run on the source head's node",
     ),
     (
+        "workspace_home",
+        "the machine (exposed machine or cloud entry of this daemon) holding the workspace's \
+         home checkout on an orchestrator; the target daemon has neither, so the workspace \
+         gets a home of its own there",
+    ),
+    (
         "remote_final_stop",
         "pending final stops this head owes a machine under its own lease (stop ids, a local \
          repository path); the target head has no such lease, so it could neither send nor \

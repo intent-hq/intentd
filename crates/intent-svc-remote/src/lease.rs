@@ -7,7 +7,7 @@
 //! the machine minted the credential for. Each credential gets its own
 //! lease, so a re-added machine starts a fresh journal.
 
-use intent_core::node_link::{LeaseBinding, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS};
+use intent_core::node_link::{HomeRef, LeaseBinding, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS};
 use intent_core::nodes::{
     LeaseOwner, LeaseState, NodeArch, NodeCapacity, NodeCounter, NodeKind, NodeLease, NodeOs,
     NodeRecord, NodeState,
@@ -216,6 +216,7 @@ impl HeadLease {
         };
         let generation = self.store.next_node_link_generation(&self.owner).await?;
         let lease_agents = self.lease_agents().await?;
+        let lease_homes = self.lease_homes().await?;
         Ok(LinkHello {
             protocol: NODE_LINK_PROTOCOLS,
             intentd_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -228,8 +229,24 @@ impl HeadLease {
             acked_seq: acked,
             lease_agents,
             head_session: Some(head_session().to_owned()),
-            lease_homes: None,
+            lease_homes: Some(lease_homes),
         })
+    }
+
+    /// The homes the machine keeps (nodeProtocol 19): every workspace's
+    /// current home on it. The machine sweeps every other home checkout of
+    /// this backend.
+    pub(crate) async fn lease_homes(&self) -> Result<Vec<HomeRef>> {
+        Ok(self
+            .store
+            .homes_on_machine(&self.owner.node_id)
+            .await?
+            .into_iter()
+            .map(|(workspace_id, home)| HomeRef {
+                workspace_id,
+                home_id: home.home_id,
+            })
+            .collect())
     }
 
     /// Record what the node reported for a new link.

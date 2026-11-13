@@ -1551,7 +1551,8 @@ impl Services {
     }
 
     /// Attach the membership summary to one `workspace.get` row, relative
-    /// to the current caller (one SQL query; a failure omits the fields).
+    /// to the current caller (one SQL query; a failure omits the fields),
+    /// and on an orchestrator its home (one more).
     pub(crate) async fn attach_workspace_membership(&self, ws: &mut Workspace) {
         let viewer = caller_principal_id(&self.store).await.ok().flatten();
         match self
@@ -1562,10 +1563,17 @@ impl Services {
             Ok(mut map) => ws.membership = map.remove(&ws.id),
             Err(e) => tracing::debug!(error = %e, "workspace.get: membership summary failed"),
         }
+        if self.workspace_homes() {
+            match self.store.get_workspace_home(&ws.id).await {
+                Ok(home) => ws.home = home.map(Box::new),
+                Err(e) => tracing::debug!(error = %e, "workspace.get: home failed"),
+            }
+        }
     }
 
     /// Attach membership summaries to `workspace.list` rows in one query
-    /// scoped to exactly the rows being returned (an empty list issues none).
+    /// scoped to exactly the rows being returned (an empty list issues none),
+    /// and on an orchestrator their homes (one more).
     pub(crate) async fn attach_workspace_memberships(&self, list: &mut [Workspace]) {
         if list.is_empty() {
             return;
@@ -1583,6 +1591,16 @@ impl Services {
                 }
             }
             Err(e) => tracing::debug!(error = %e, "workspace.list: membership summary failed"),
+        }
+        if self.workspace_homes() {
+            match self.store.list_workspace_homes().await {
+                Ok(mut homes) => {
+                    for ws in list.iter_mut() {
+                        ws.home = homes.remove(&ws.id).map(Box::new);
+                    }
+                }
+                Err(e) => tracing::debug!(error = %e, "workspace.list: homes failed"),
+            }
         }
     }
 }
