@@ -307,6 +307,12 @@ pub struct RemotePlacementView {
     /// projected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_checkout_of: Option<crate::AgentId>,
+    /// The workspace home (its `homeId`) whose checkout the agent works in
+    /// on its machine (nodeProtocol 19), set when it was placed on the
+    /// home's machine without an explicit checkout; sent as `checkoutOf`
+    /// while it is still the workspace's home there. Never projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_checkout: Option<crate::HomeId>,
     /// The parent whose work this sub-agent, on another machine than the
     /// parent's, starts from (nodeProtocol 13); never projected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -596,6 +602,11 @@ pub fn launch_notice_with_setup(
 #[must_use]
 pub fn sub_agent_notice(view: &RemotePlacementView) -> Option<String> {
     let node_name = &view.node_name;
+    if view.home_checkout.is_some() {
+        return Some(format!(
+            "The agent runs on \"{node_name}\" in the workspace's home checkout there: it sees the user's and other agents' changes as they happen, and its work is backed up with the home."
+        ));
+    }
     if view.shared_checkout_of.is_some() {
         return Some(format!(
             "The agent runs on execution node \"{node_name}\" in its parent's checkout there: it sees the parent's uncommitted changes as they happen, and its work reaches the backend in the parent's refs."

@@ -99,6 +99,7 @@ fn view(node: Option<(&crate::RemoteNode, &str)>, entry: &EntryRef) -> RemotePla
         parent_work: None,
         launched_on: None,
         launched_machine_sign_in: None,
+        home_checkout: None,
     }
 }
 

@@ -6,7 +6,8 @@
 //! makes the home checkout from `home/head`; a commit there reaches the
 //! hub's `home/head`, moves `lastBackupAt` and the orchestrator's mirror
 //! worktree; a rewrite keeps the old tip pinned at `home/rewritten/<sha>`,
-//! and a fast-forward pins nothing; after an orchestrator restart the
+//! and a fast-forward pins nothing; an agent placed on the home's machine
+//! works in the home checkout; after an orchestrator restart the
 //! home's machine is dialed again and backups keep arriving.
 
 use super::*;
@@ -228,6 +229,31 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
         .unwrap_or_else(|| panic!("{list}"))
         .clone();
     assert_eq!(row["home"]["homeId"], home_id.as_str(), "{row}");
+
+    // An agent placed on the home's machine with no checkout of its own
+    // works in the home checkout: the fixture's start file lands there.
+    id += 1;
+    let agent = ok(
+        &mut rpc_ws,
+        id,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Sharer", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = agent["agent"]["id"].as_str().unwrap().to_owned();
+    // A remote agent starts on its machine with its first message.
+    id += 1;
+    ok(
+        &mut rpc_ws,
+        id,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello" }),
+    )
+    .await;
+    until("the sharing agent started in the home checkout", || {
+        work.join("agent.pid").is_file().then_some(())
+    })
+    .await;
 
     // After an orchestrator restart, the home's machine is dialed again on
     // its own: a commit there still reaches home/head.

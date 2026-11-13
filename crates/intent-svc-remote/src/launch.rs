@@ -791,7 +791,11 @@ impl RemoteLaunchPort for RemoteLaunch {
             let base = self.checkout_base(svc, workspace_id).await?;
             view.base_commit = base.commit;
             view.submodules = Some(base.submodules);
-            check_machine_prepares(svc, workspace_id, &view).await?;
+            view.home_checkout =
+                crate::homes::home_checkout_for(svc, workspace_id, placement, &view).await;
+            if view.home_checkout.is_none() {
+                check_machine_prepares(svc, workspace_id, &view).await?;
+            }
             Ok(view)
         })
     }
@@ -868,6 +872,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 launched_on: None,
                 launched_machine_sign_in: None,
                 cloud_start: None,
+                home_checkout: None,
             })
         })
     }
@@ -912,6 +917,16 @@ impl RemoteLaunchPort for RemoteLaunch {
         child: &'a mut RemotePlacementView,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            // A parent in the home checkout has no checkout of its own: a
+            // child on the home's machine works in the home checkout too
+            // (when it was placed there), one elsewhere starts from the
+            // workspace's base, the home's last backup.
+            if parent_view.home_checkout.is_some() {
+                if child.node_id != parent_view.node_id {
+                    child.home_checkout = None;
+                }
+                return Ok(());
+            }
             // A parent that shares a checkout passes on that checkout's owner.
             let owner = parent_view
                 .shared_checkout_of
@@ -919,7 +934,9 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .unwrap_or_else(|| parent.clone());
             // A child waiting for a new sandbox never shares, even while
             // its parent's own sandbox is still starting (both unlinked).
+            // It continues the parent's work, so it leaves the home.
             if child.is_unlinked() || child.node_id != parent_view.node_id {
+                child.home_checkout = None;
                 child.parent_work = Some(ParentWork {
                     agent_id: owner,
                     copied: None,
@@ -930,6 +947,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             let node = feature.node(svc, &child.node_id).await?;
             if link_protocol(&node).await? >= SHARED_CHECKOUT_PROTOCOL {
                 child.shared_checkout_of = Some(owner);
+                child.home_checkout = None;
             }
             Ok(())
         })
@@ -942,6 +960,11 @@ impl RemoteLaunchPort for RemoteLaunch {
         (parent, parent_view): (&'a AgentId, &'a RemotePlacementView),
     ) -> BoxFuture<'a, Result<Option<BackendParentWork>>> {
         Box::pin(async move {
+            // A parent in the home checkout has no refs of its own: the
+            // sub-agent starts from the workspace, which follows the home.
+            if parent_view.home_checkout.is_some() {
+                return Ok(None);
+            }
             let owner = parent_view
                 .shared_checkout_of
                 .clone()
@@ -1248,6 +1271,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             // build does not offer the prepared checkout, starts as before.
             // A sub-agent sharing its parent's checkout (nodeProtocol 13)
             // gets no checkout of its own.
+            let home = crate::homes::current_home_checkout(svc, &record, &view).await;
             let checkout_of = view.shared_checkout_of.clone();
             if checkout_of.is_some() {
                 let protocol = link_protocol(&node).await?;
@@ -1258,7 +1282,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     )));
                 }
             }
-            let checkout = if checkout_of.is_some() {
+            let checkout = if checkout_of.is_some() || home.is_some() {
                 None
             } else if view.submodules.is_some() && node.shared_ref().offers_prepared_checkout() {
                 let protocol = link_protocol(&node).await?;
@@ -1303,7 +1327,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             let git_identity = git_identity(checkout_dir.clone()).await;
             let repo_key = blocking(move || node_git::repo_key(&checkout_dir)).await?;
             // Only a top-level agent gets the workspace branch and `origin`.
-            let forge = if is_sub_agent || checkout_of.is_some() {
+            let forge = if is_sub_agent || checkout_of.is_some() || home.is_some() {
                 None
             } else {
                 forge_launch(svc, &record.workspace_id).await
@@ -1324,7 +1348,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             node.shared_ref().launching(agent_id);
             // A sub-agent reaches GitHub through this backend (nodeProtocol
             // 17); the connector drops it on an older link.
-            let forge_fetch = if is_sub_agent || checkout_of.is_some() {
+            let forge_fetch = if is_sub_agent || checkout_of.is_some() || home.is_some() {
                 forge_fetch_launch(svc, &record.workspace_id).await
             } else {
                 None
@@ -1353,7 +1377,9 @@ impl RemoteLaunchPort for RemoteLaunch {
                     checkout,
                     mcp_proxies,
                     compact_tool_descriptions,
-                    checkout_of: checkout_of.map(Into::into),
+                    checkout_of: home
+                        .map(intent_core::node_link::CheckoutOf::Home)
+                        .or_else(|| checkout_of.map(Into::into)),
                     forge,
                     forge_fetch,
                     git_identity,

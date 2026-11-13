@@ -544,6 +544,9 @@ struct Agent {
     /// The owner of the checkout the agent works in, when it is not its own
     /// (nodeProtocol 13): its pushes go to the owner's refs.
     checkout_of: Option<AgentId>,
+    /// The workspace home whose checkout the agent works in (nodeProtocol
+    /// 19): its pushes go to `home/*`, one at a time with the home's own.
+    home: Option<intent_core::node_link::HomeRef>,
     /// Its workspace branch and GitHub remote (nodeProtocol 15): top-level
     /// agents only.
     forge: Option<ForgeLaunch>,
@@ -1475,19 +1478,23 @@ impl Runner {
                 codes::CHECKOUT
             )));
         }
-        let checkout_of = match checkout_of {
-            None => None,
-            Some(CheckoutOf::Agent(owner)) => Some(owner),
+        // An agent sharing the workspace's home checkout (nodeProtocol 19)
+        // has no checkout owner agent: it works in the home's.
+        let (checkout_of, home) = match checkout_of {
+            None => (None, None),
+            Some(CheckoutOf::Agent(owner)) => (Some(owner), None),
+            Some(CheckoutOf::Home(home)) if home.workspace_id == workspace_id => (None, Some(home)),
             Some(CheckoutOf::Home(_)) => {
                 drop(state);
                 return Some(exited(format!(
-                    "{}: this machine holds no such home",
+                    "{}: the home belongs to another workspace",
                     codes::CHECKOUT
                 )));
             }
         };
+        let shares = checkout_of.is_some() || home.is_some();
         if let Some(forge) = &forge {
-            if checkout_of.is_some() || is_sub_agent || !forge.is_valid() {
+            if shares || is_sub_agent || !forge.is_valid() {
                 drop(state);
                 return Some(exited(format!(
                     "{}: the launch's forge branch or remote is not usable",
@@ -1496,7 +1503,7 @@ impl Runner {
             }
         }
         if let Some(fetch) = &forge_fetch {
-            let sub_agent = is_sub_agent || checkout_of.is_some();
+            let sub_agent = is_sub_agent || shares;
             if forge.is_some() || !sub_agent || fetch.owner_repo().is_none() {
                 drop(state);
                 return Some(exited(format!(
@@ -1578,6 +1585,7 @@ impl Runner {
             skills_catalog: Mutex::new(None),
             wip: self.push_lock(checkout_of.as_ref().unwrap_or(&agent_id)),
             checkout_of: checkout_of.clone(),
+            home,
             final_stop: std::sync::atomic::AtomicBool::new(false),
             final_push: Mutex::new(None),
             stop: Mutex::new(Some(stop_tx)),
@@ -1776,6 +1784,11 @@ impl Runner {
         };
         let prepared = if let Some(owner) = &agent.checkout_of {
             Some(self.shared_checkout(&agent.id, owner))
+        } else if let Some(home) = &agent.home {
+            tokio::select! {
+                prepared = self.home_checkout_for(&agent.id, home) => Some(prepared),
+                _ = &mut stop => None,
+            }
         } else {
             tokio::select! {
                 prepared = self.inner.checkouts.prepare(
@@ -1795,7 +1808,7 @@ impl Runner {
         let prepared = match prepared {
             Some(Ok(ready)) => {
                 let configured = async {
-                    if agent.checkout_of.is_none() {
+                    if agent.checkout_of.is_none() && agent.home.is_none() {
                         self.inner
                             .checkouts
                             .forge(&agent.id, &ready.worktree, agent.forge.as_ref())
@@ -1981,7 +1994,8 @@ impl Runner {
                 forge.remote_url
             ));
         }
-        let sub_agent = agent.gates.is_sub_agent || agent.checkout_of.is_some();
+        let sub_agent =
+            agent.gates.is_sub_agent || agent.checkout_of.is_some() || agent.home.is_some();
         let token = (sub_agent && self.inner.head.forge().get().is_some()).then(|| {
             "`GH_TOKEN` is set so that `gh` can read from GitHub. Use it only to read: do not push, and do not create or change anything on GitHub. Your work goes back to your parent agent through Intent.".to_owned()
         });
@@ -2596,10 +2610,15 @@ impl Runner {
             return;
         }
         let owner = agent.checkout_owner();
-        let push = |timeout| {
+        let worktree = &worktree;
+        let push = |timeout: Duration| async move {
+            if let Some(home) = &agent.home {
+                return self.push_home_for(home, timeout).await;
+            }
             self.inner
                 .checkouts
-                .push_wip(owner, &agent.workspace_id, &worktree, timeout)
+                .push_wip(owner, &agent.workspace_id, worktree, timeout)
+                .await
         };
         let pushed = if kind == Push::Exit && (final_stop || closing) {
             // The agent's last push here, bounded like a final stop's.
