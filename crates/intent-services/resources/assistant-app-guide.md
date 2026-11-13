@@ -853,19 +853,21 @@ in Intent and a notice says so. Uncommitted changes from where the session ran
 are not carried over.
 
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/InlineProposal.svelte; src/lib/components/chat/proposals/open-created-workspace.ts; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/lib/components/chat/proposals/proposal-pinned-provider.ts; src/lib/components/chat/proposals/ProposalProviderAlert.svelte; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/InlineProposal.svelte; src/lib/components/chat/proposals/open-created-workspace.ts; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/lib/components/chat/proposals/proposal-pinned-provider.ts; src/lib/components/chat/proposals/ProposalProviderAlert.svelte; src/lib/components/workspace/initializer/initial-agent-defaults.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
 
 An agent can suggest a follow-up workspace as a card in its conversation. Review
 it and choose **Create workspace** on the card, or ask the agent to apply it.
 Unless the agent named one, the card starts with the agent last used in New
 workspace for that repository, and uses that agent's last model and reasoning
 effort while it stays selected. The card's **Model** row, the same picker as in
-New workspace, shows the model and effort it will use and changes them for this
-workspace only; picking another agent resets it. If the selected agent always
-runs on a provider that is turned off in **Settings > Providers**, the card says
-so and **Create workspace** waits: pick a model from another provider in the
-**Model** row (the agent's own setting is unchanged), choose another agent, or
-turn the provider back on with **Open provider settings**. The new workspace opens as a tab at the end of
+New workspace, shows the provider, model and effort it will use and changes them
+for this workspace only. Like New workspace, it starts on your active provider
+(or the first available one) and names that provider's default model for the
+agent; picking another agent resets it, and it never starts on a provider that
+is turned off in **Settings > Providers**. If creation still fails because the
+provider was turned off meanwhile, the card says so: pick a model from another
+provider in the **Model** row, choose another agent, or turn the provider back
+on with **Open provider settings**. The new workspace opens as a tab at the end of
 the top tab strip, and the current workspace stays selected. Once created, the
 card shows **Open workspace**, whoever applied it; if that workspace was deleted,
 a message says it no longer exists.
