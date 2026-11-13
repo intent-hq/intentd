@@ -982,3 +982,27 @@ async fn forge_token_values_are_masked() {
         }
     }
 }
+
+/// A home terminal's input (`ptyInput`, nodeProtocol 19) can hold a
+/// password: it is masked in both the full and the light capture.
+#[tokio::test]
+async fn pty_input_is_masked() {
+    use crate::node_link::PtyInput;
+    for payloads in [true, false] {
+        let (traffic, _) = traffic(limits(10, 1 << 16, 1 << 16));
+        traffic.start(payloads);
+        let frame = LinkFrame::PtyInput(PtyInput {
+            terminal_id: "t1".into(),
+            data: "canary-typed-password".into(),
+        });
+        LinkTap::new(traffic.clone(), machine()).observe(TrafficDirection::Out, &frame, 10);
+        settle(&traffic, 1).await;
+        let record = traffic.snapshot(None, None)["records"][0].clone();
+        let text = record.to_string();
+        assert!(!text.contains("canary-typed-password"), "{text}");
+        assert_eq!(record["frameType"], "ptyInput", "{text}");
+        if payloads {
+            assert_eq!(record["payload"]["data"], "***", "{text}");
+        }
+    }
+}

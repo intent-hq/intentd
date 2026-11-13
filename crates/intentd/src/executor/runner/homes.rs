@@ -354,6 +354,19 @@ impl Runner {
         })
     }
 
+    /// Start a terminal in the home checkout `frame` names; a home this
+    /// machine does not hold answers `ptyExited` with `node-home-unknown`.
+    pub(in crate::executor) async fn pty_open(&self, frame: &intent_core::node_link::PtyOpen) {
+        let home = frame.home();
+        if self.leased_unopened(&home) {
+            self.resume_leased_homes(std::slice::from_ref(&home)).await;
+        }
+        let worktree = self
+            .leased_home(&home.workspace_id, &home.home_id)
+            .map(|opened| opened.worktree.clone());
+        self.inner.terminals.open(frame, worktree.as_deref());
+    }
+
     /// Push the home checkout for an agent sharing `home`, after its turn.
     pub(super) async fn push_home_for(
         &self,

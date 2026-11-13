@@ -283,6 +283,15 @@ pub(super) async fn serve_link(
             // Before any frame of this link: a restarted backend's hello
             // drops the secrets the previous process handed over.
             runner.adopt_head(hello.head_session.as_deref(), &hello.lease_agents);
+            // Terminals from the same backend session resume on this link;
+            // a new session (or a link without homes) ends them.
+            runner.terminals().bound(
+                link.clone(),
+                binding.generation,
+                (protocol >= HOMES_PROTOCOL)
+                    .then_some(hello.head_session.as_deref())
+                    .flatten(),
+            );
             if protocol < FORGE_TOKEN_PROTOCOL {
                 runner.drop_forge();
             }
@@ -458,6 +467,34 @@ pub(super) async fn serve_link(
                     let _ = link.send(&reply).await;
                 });
             }
+            // Home terminals (nodeProtocol 19): input, resize, kill and
+            // acks apply at once, in order; an open may first reopen a
+            // leased home. A replaced session touches none.
+            LinkEvent::Frame(
+                frame @ (LinkFrame::PtyOpen(_)
+                | LinkFrame::PtyInput(_)
+                | LinkFrame::PtyResize(_)
+                | LinkFrame::PtyKill(_)
+                | LinkFrame::PtyAck(_)),
+            ) if protocol >= HOMES_PROTOCOL => {
+                let replaced = {
+                    let gate = runner.link_gate().lock().await;
+                    admit(gate.as_ref(), &binding, link.is_closed()) == Admission::Replaced
+                };
+                if replaced {
+                    tracing::debug!("node: dropping a terminal frame from a replaced link");
+                    continue;
+                }
+                let terminals = runner.terminals();
+                match frame {
+                    LinkFrame::PtyOpen(open) => runner.pty_open(&open).await,
+                    LinkFrame::PtyInput(input) => terminals.input(&input),
+                    LinkFrame::PtyResize(resize) => terminals.resize(&resize),
+                    LinkFrame::PtyKill(kill) => terminals.kill(&kill),
+                    LinkFrame::PtyAck(ack) => terminals.ack(&ack),
+                    _ => {}
+                }
+            }
             LinkEvent::Frame(LinkFrame::ForgeToken(frame)) => {
                 // Handled in order, so it precedes any launch sent after it.
                 if let Some(reply) =
@@ -513,6 +550,8 @@ pub(super) async fn serve_link(
     runner.cancel_binding_one_shots(binding.generation);
     // No script outlives the link that started it.
     runner.end_binding_scripts(binding.generation).await;
+    // Terminals wait for the next bind, up to the link-loss grace.
+    runner.terminals().link_ended(binding.generation);
 }
 
 /// Send every record after `acked`, then `ReplayComplete`, then each new

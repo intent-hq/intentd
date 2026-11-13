@@ -270,6 +270,8 @@ struct Inner {
     homes: Mutex<homes::Homes>,
     /// Home opens run one at a time.
     home_opens: Arc<tokio::sync::Mutex<()>>,
+    /// Terminals on the bound backend's homes (nodeProtocol 19).
+    terminals: crate::executor::terminals::HomeTerminals,
 }
 
 /// The longest a provider's first start after a link binds may take to
@@ -1020,6 +1022,7 @@ impl Runner {
                 pumps: Mutex::new(Vec::new()),
                 link_gate: tokio::sync::Mutex::new(None),
                 scripts: ScriptProcesses::new(pty.clone()),
+                terminals: crate::executor::terminals::HomeTerminals::new(pty.clone()),
                 pty,
                 swept: tokio::sync::Notify::new(),
                 push_locks: Mutex::new(HashMap::new()),
@@ -1289,6 +1292,11 @@ impl Runner {
         process: &intent_core::node_link::ScriptProcessRef,
     ) {
         self.inner.scripts.stop(link, process);
+    }
+
+    /// The terminals on the bound backend's homes.
+    pub(super) fn terminals(&self) -> &crate::executor::terminals::HomeTerminals {
+        &self.inner.terminals
     }
 
     /// Kill every script process the link binding `generation` started:
@@ -3136,8 +3144,9 @@ impl Runner {
         };
         // An ordinary push under way gives way to each agent's last one.
         self.inner.closing_signal.send_replace(true);
-        // Home checkouts stay on disk; their setup and watcher end.
+        // Home checkouts stay on disk; their setup, watcher and terminals end.
         self.close_homes();
+        self.inner.terminals.close();
         // Script runs end first (bounded by their reap wait), so nothing
         // still writes to a checkout while its agent's last work is pushed.
         self.inner.scripts.stop_all().await;
