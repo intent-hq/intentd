@@ -758,7 +758,7 @@ watches, its last update on GitHub as of the watch's latest check). Home's short
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,BranchSelector,SetupScriptPicker,SetupScriptEditor,StartOnPicker,WorkspaceCreateButton,CreateButtonProgress}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,BranchSelector,SetupScriptPicker,SetupScriptEditor,StartOnPicker,WorkspaceCreateButton,CreateButtonProgress}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/src/features/hardware-console/voice/transcription-service.ts; packages/cloudlands-fe/messages/en.json. -->
 
 <!-- The searchable Machines picker for initial-agent placement is Labs-only;
 do not list it among the normal workspace settings below. -->
@@ -771,6 +771,9 @@ truncate to fit. The settings beside the prompt (below it on narrow
 windows) are **Codebase**, **Branch**, **Setup script**, **Initial agent**, and **Model**.
 Use **+** below the prompt to add context, the paperclip to attach files, or the
 microphone to dictate. These controls are grouped on the left.
+**Transcribing…** stays visible while dictation is transcribed. If transcription
+fails, Intent retries up to three times and shows a toast for each retry before
+it reports the failure; a missing or rejected provider key fails right away.
 These controls open a picker or editor and preserve your prompt draft. **Codebase** lists
 your repositories once each, most recently used first, with search at the top;
 the selected codebase is included even if it has not reached your history yet.
