@@ -566,6 +566,57 @@ pub struct Workspace {
     /// row was not served through the service layer.
     #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
     pub membership: Option<WorkspaceMembership>,
+    /// The workspace's home on an orchestrator (monorepo
+    /// `docs/protocol/methods/nodes.md`, "Workspace homes"): the machine that
+    /// holds its home checkout. Kept in its own table and overlaid by the
+    /// service layer; omitted on a regular daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<WorkspaceHome>,
+}
+
+/// A workspace's home (nodes.md "Workspace homes").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceHome {
+    /// This home's generation: a new id at create and at every move.
+    pub home_id: crate::HomeId,
+    /// An exposed machine, or a running cloud home's machine row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// A cloud home's entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_machine_id: Option<String>,
+    /// The machine's or entry's name.
+    pub name: String,
+    pub state: HomeState,
+    /// When `state` last changed.
+    pub since: String,
+    /// The last push of `home/head` or `home/wip` the orchestrator holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_backup_at: Option<String>,
+    /// `true` once backups have failed for 15 minutes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backup_warning: bool,
+}
+
+/// [`WorkspaceHome::state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HomeState {
+    Attached,
+    Detached,
+    Moving,
+}
+
+impl HomeState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Detached => "detached",
+            Self::Moving => "moving",
+        }
+    }
 }
 
 /// The membership fields carried on a [`Workspace`] row (multiplayer w1).

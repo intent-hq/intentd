@@ -1434,6 +1434,42 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         })
     }
 
+    /// The home of a workspace being created on an orchestrator (nodes.md
+    /// "Workspace homes" → "Choosing the home"): the initial agent's machine
+    /// when it can be a home, else the first row of the ordered machine
+    /// list that can be one now. A fresh `homeId`, `attached`. Nothing is
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MachineUpdateRequired`] when the only candidates are below
+    /// nodeProtocol 19; [`Error::PlacementUnavailable`] (`no-agent-machine`)
+    /// when no machine can be a home; that error by default.
+    fn choose_home<'a>(
+        &'a self,
+        svc: &'a Services,
+        initial: Option<&'a intent_core::remote_launch::RemotePlacementView>,
+    ) -> BoxFuture<'a, Result<intent_core::WorkspaceHome>> {
+        let _ = (svc, initial);
+        Box::pin(async { Err(no_execution_node()) })
+    }
+
+    /// Open the workspace's recorded home on its machine (`homeOpen`): its
+    /// `home/head` is written first when the hub has none. Answers once the
+    /// machine replied; a no-op by default.
+    ///
+    /// # Errors
+    ///
+    /// The machine's refusal or the link's error.
+    fn open_home<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Result<()>> {
+        let _ = (svc, workspace_id);
+        Box::pin(async { Ok(()) })
+    }
+
     /// What a remote agent of `workspace_id` starts from: its checkout's
     /// `HEAD` and the commits of its populated submodules.
     ///

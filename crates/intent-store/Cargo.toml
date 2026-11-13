@@ -26,6 +26,7 @@ test-support = []
 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.200" }
+time = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

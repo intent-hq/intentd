@@ -193,6 +193,28 @@ impl Services {
         workspace_id: &WorkspaceId,
         view: &intent_core::remote_launch::RemotePlacementView,
     ) -> Result<Option<intent_core::node_link::SetupCommand>> {
+        self.setup_command_with(workspace_id, view.setup_script.as_deref())
+            .await
+    }
+
+    /// The workspace's setup script for its home checkout (nodes.md
+    /// "Workspace homes"): the repository's, else the workspace's.
+    ///
+    /// # Errors
+    ///
+    /// The workspace read's error.
+    pub async fn home_setup_command(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<intent_core::node_link::SetupCommand>> {
+        self.setup_command_with(workspace_id, None).await
+    }
+
+    async fn setup_command_with(
+        &self,
+        workspace_id: &WorkspaceId,
+        explicit: Option<&str>,
+    ) -> Result<Option<intent_core::node_link::SetupCommand>> {
         let ws = self.store.get_workspace(workspace_id).await?;
         if ws.skip_worktree || ws.plain_folder {
             return Ok(None);
@@ -204,7 +226,7 @@ impl Services {
             let script = script.trim();
             (!script.is_empty()).then(|| script.to_owned())
         };
-        let script = match view.setup_script.as_deref().and_then(nonblank) {
+        let script = match explicit.and_then(nonblank) {
             Some(explicit) => Some(explicit),
             None => crate::repo_config::read_repo_config(&worktree)
                 .await
@@ -240,6 +262,23 @@ impl Services {
             agent_id,
             intent_core::events::AGENT_UPDATED,
             serde_json::json!({ "agentId": agent_id.0 }),
+        )
+        .await;
+    }
+
+    /// Announce the workspace's home (nodes.md "Workspace homes") as the
+    /// existing `workspace:updated` with `changes: { home }`.
+    pub async fn publish_workspace_home_changed(&self, workspace_id: &WorkspaceId) {
+        let home = match self.store.get_workspace_home(workspace_id).await {
+            Ok(home) => home,
+            Err(error) => {
+                tracing::warn!(workspace = %workspace_id, %error, "could not read the workspace's home to announce it");
+                return;
+            }
+        };
+        crate::publish_event(
+            self.event_bus.as_ref(),
+            crate::workspace_updated_event(workspace_id, &serde_json::json!({ "home": home })),
         )
         .await;
     }

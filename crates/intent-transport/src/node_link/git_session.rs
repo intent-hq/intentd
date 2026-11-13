@@ -203,6 +203,22 @@ pub trait NodeGitAccess: Send + Sync {
     fn forge_supported(&self) -> bool {
         false
     }
+
+    /// Whether home remotes are served (nodeProtocol 19, on an orchestrator
+    /// serving homes); a home session otherwise is [`codes::INVALID`].
+    fn homes_supported(&self) -> bool {
+        false
+    }
+
+    /// After a receive-pack for `remote` ended, whatever its outcome.
+    fn received<'a>(
+        &'a self,
+        binding: &'a LeaseBinding,
+        remote: &'a AgentRemote,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (binding, remote);
+        Box::pin(async {})
+    }
 }
 
 struct HeadSession {
@@ -331,8 +347,7 @@ async fn run_service(
     let open: OpenRequest = serde_json::from_slice(open).map_err(|_| codes::INVALID)?;
     let service = GitService::parse(&open.service).map_err(|_| codes::INVALID)?;
     let remote = AgentRemote::parse(&open.url).map_err(|_| codes::INVALID)?;
-    // Home checkouts (nodeProtocol 19) are not served by this backend yet.
-    if remote.is_home() {
+    if remote.is_home() && !access.homes_supported() {
         return Err(codes::INVALID);
     }
     let (command, accept) = if remote.is_forge() {
@@ -418,6 +433,9 @@ async fn run_service(
     streamed?;
     let mut child = service.child.take().ok_or(codes::FAILED)?;
     let status = child.wait().await.map_err(|_| codes::FAILED)?;
+    if drain {
+        access.received(binding, &remote).await;
+    }
     if status.success() {
         Ok(())
     } else {

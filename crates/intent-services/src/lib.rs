@@ -2223,6 +2223,14 @@ impl Services {
         self.run_mode == intent_core::settings_file::DaemonMode::Orchestrator
     }
 
+    /// Whether this daemon keeps its workspaces' files, terminals and
+    /// scripts on homes (nodes.md "Workspace homes"): an orchestrator, once
+    /// this build serves homes ([`intent_core::node_link::homes_ready`]).
+    #[must_use]
+    pub fn workspace_homes(&self) -> bool {
+        self.orchestrator_mode() && intent_core::node_link::homes_ready()
+    }
+
     /// Whether this daemon may run agents on its own host: the "This
     /// computer" row of the ordered machine list. `false` on an
     /// orchestrator.
@@ -14384,7 +14392,10 @@ pub async fn publish_workspace_created(
 /// FE emitter — `changes` is the caller-supplied `WorkspaceUpdate` diff (the
 /// applied delta, not the full row) so clients see exactly which fields
 /// moved.
-fn workspace_updated_event(workspace_id: &WorkspaceId, changes: &serde_json::Value) -> NewEvent {
+pub(crate) fn workspace_updated_event(
+    workspace_id: &WorkspaceId,
+    changes: &serde_json::Value,
+) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),
         timestamp: now_iso(),
@@ -21568,6 +21579,20 @@ impl WorkspaceApi for Services {
                         }
                         None => None,
                     };
+                    // On an orchestrator the workspace's files live on its
+                    // home (nodes.md "Workspace homes"): chosen here, before
+                    // any workspace effect, so no machine fails the create.
+                    let home = if services.workspace_homes() && input.plain_folder != Some(true) {
+                        let initial = planned_initial_agent
+                            .as_ref()
+                            .and_then(|(plan, _, _)| plan.remote.as_ref());
+                        Some(
+                            boxed_await(|| services.ports.remote_launch().choose_home(&services, initial))
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
                     // Kept alongside the resolved parent below: the known-repo
                     // registration hook checks BOTH roots (a configured
                     // `worktreesLocation` may differ from the boot root, and a
@@ -23194,6 +23219,23 @@ impl WorkspaceApi for Services {
                     // the replay guard: on retry the stored result comes back
                     // and this branch never re-runs.
                     boxed_await(|| ensure_spec_note(&store, bus.as_ref(), &ws.id)).await?;
+                    if let Some(home) = &home {
+                        boxed_await(|| store.set_workspace_home(&ws.id, home)).await?;
+                        services.publish_workspace_home_changed(&ws.id).await;
+                        let opener = services.clone();
+                        let workspace_id = ws.id.clone();
+                        // caller-binding: allow — opens the new workspace's home on its machine
+                        tokio::spawn(async move {
+                            if let Err(error) = opener
+                                .ports
+                                .remote_launch()
+                                .open_home(&opener, &workspace_id)
+                                .await
+                            {
+                                tracing::warn!(workspace = %workspace_id, %error, "could not open the workspace's home; it opens at the machine's next bind");
+                            }
+                        });
+                    }
                     // Daemon-owned initial-agent orchestration (§5.1): when the
                     // request carries an `initialAgent`, always create the agent
                     // row (reference parity: `workspace.service.ts` persists the

@@ -12,7 +12,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use intent_core::node_link::{
-    ForgeFetchLaunch, LeaseBinding, FORGE_FETCH_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL,
+    ForgeFetchLaunch, LeaseBinding, FORGE_FETCH_PROTOCOL, HOMES_PROTOCOL,
+    PREPARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::remote_launch::RemotePlacementView;
 use intent_core::{AgentId, BoxFuture, Error, Result, WorkspaceId};
@@ -21,14 +22,22 @@ use intent_transport::node_link::{git_codes, ForgeServe, NodeGitAccess, FORGE_RE
 use tokio::time::Instant;
 
 use crate::connector::Shared;
+use crate::lock;
+use intent_services::feature_api::Services;
 
 pub(crate) struct HeadGitAccess {
     shared: Arc<Shared>,
+    /// Rewritten pins this access made before a home push, by workspace:
+    /// dropped once the push turned out a fast-forward.
+    fresh_pins: Mutex<HashMap<WorkspaceId, Vec<String>>>,
 }
 
 impl HeadGitAccess {
     pub(crate) fn new(shared: Arc<Shared>) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            fresh_pins: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -188,9 +197,129 @@ impl HeadGitAccess {
     }
 }
 
+impl HeadGitAccess {
+    /// The workspace checkout of `remote`'s home and its workspace: only on
+    /// the current binding, for the workspace's current home, on this
+    /// machine.
+    async fn home_checkout(
+        &self,
+        binding: &LeaseBinding,
+        remote: &AgentRemote,
+    ) -> Result<(PathBuf, WorkspaceId)> {
+        let current = self
+            .shared
+            .current_link()
+            .ok_or_else(|| Error::InvalidParams("node-link-stale".into()))?;
+        binding.ensure_current(current.binding())?;
+        let workspace_id = WorkspaceId::from(remote.workspace_id());
+        let home = self
+            .shared
+            .store
+            .get_workspace_home(&workspace_id)
+            .await?
+            .ok_or_else(denied)?;
+        if home.home_id.as_str() != remote.agent_id()
+            || home.node_id.as_deref() != Some(self.shared.machine_id().as_str())
+        {
+            return Err(denied());
+        }
+        let workspace = self.shared.store.get_workspace(&workspace_id).await?;
+        let checkout = crate::launch::checkout_path(&workspace).ok_or_else(denied)?;
+        Ok((checkout, workspace_id))
+    }
+
+    /// The repository a home session reaches (nodes.md "Workspace homes" →
+    /// "Refs"): the workspace checkout, or one of its submodules. Before a
+    /// push of the superproject, the current `home/head` is pinned as
+    /// `home/rewritten/<sha>`, so a rewrite keeps the old commits; a push
+    /// that cannot be pinned is refused.
+    async fn home_repository(
+        &self,
+        binding: &LeaseBinding,
+        remote: &AgentRemote,
+        service: GitService,
+    ) -> Result<PathBuf> {
+        let (checkout, workspace_id) = self.home_checkout(binding, remote).await?;
+        if let Some(key) = remote.module_key() {
+            let key = key.to_owned();
+            let module = tokio::task::spawn_blocking(move || {
+                let pin = node_git::submodule_pins(&checkout)
+                    .ok()
+                    .and_then(|pins| pins.into_iter().find(|pin| pin.module_key == key));
+                pin.map(|pin| node_git::module_repository(&checkout, &pin.path, &key))
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("node git: resolve the submodule: {e}")))?;
+            return match module {
+                Some(Ok(module)) => Ok(module.worktree),
+                Some(Err(ModuleRefusal::Unavailable(what))) => Err(unavailable(&what)),
+                Some(Err(ModuleRefusal::Denied)) | None => Err(denied()),
+            };
+        }
+        if service == GitService::ReceivePack {
+            let repository = checkout.clone();
+            let remote = remote.clone();
+            let pinned = tokio::task::spawn_blocking(move || {
+                crate::homes::pin_home_head(&repository, &remote)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
+            .map_err(|error| unavailable(&format!("could not pin the home's head: {error}")))?;
+            if let Some(sha) = pinned {
+                lock(&self.fresh_pins)
+                    .entry(workspace_id)
+                    .or_default()
+                    .push(sha);
+            }
+        }
+        Ok(checkout)
+    }
+}
+
 impl NodeGitAccess for HeadGitAccess {
     fn forge_supported(&self) -> bool {
         self.shared.protocol() >= FORGE_FETCH_PROTOCOL
+    }
+
+    fn homes_supported(&self) -> bool {
+        self.shared.protocol() >= HOMES_PROTOCOL
+            && self
+                .shared
+                .services()
+                .is_some_and(Services::workspace_homes)
+    }
+
+    fn received<'a>(
+        &'a self,
+        binding: &'a LeaseBinding,
+        remote: &'a AgentRemote,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if !remote.is_home() || remote.module_key().is_some() {
+                return;
+            }
+            let workspace_id = WorkspaceId::from(remote.workspace_id());
+            let pins = lock(&self.fresh_pins)
+                .remove(&workspace_id)
+                .unwrap_or_default();
+            let Ok((checkout, _)) = self.home_checkout(binding, remote).await else {
+                return;
+            };
+            let remote = remote.clone();
+            let settled = tokio::task::spawn_blocking(move || {
+                crate::homes::settle_home_push(&checkout, &remote, &pins)
+            })
+            .await;
+            match settled {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not settle a home push");
+                }
+                Err(error) => {
+                    tracing::warn!(workspace = %workspace_id, %error, "remote machine: settling a home push panicked");
+                }
+            }
+        })
     }
 
     fn forge<'a>(
@@ -243,6 +372,9 @@ impl NodeGitAccess for HeadGitAccess {
             if remote.module_key().is_some() && self.shared.protocol() < PREPARED_CHECKOUT_PROTOCOL
             {
                 return Err(Error::InvalidParams(git_codes::INVALID.into()));
+            }
+            if remote.is_home() {
+                return self.home_repository(binding, remote, service).await;
             }
             let agent_id = AgentId::from(remote.agent_id());
             // A final stop admits the agent's last push (receive-pack only)

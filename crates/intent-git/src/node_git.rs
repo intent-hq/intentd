@@ -42,9 +42,10 @@ const UNAPPLIED: &str = "unapplied/";
 /// submodules' caches: `<repoKey>.modules/<moduleKey>.git`.
 const MODULE_CACHES: &str = ".modules";
 
-/// Head's `update` hook for node pushes. Inside the agent's prefix (the
-/// only refs a session can reach) it allows exactly `head`, `wip` and
-/// `unapplied/<full lowercase hex sha>`. An `unapplied/` ref is create-only
+/// Head's `update` hook for node pushes. Inside the agent's or the home's
+/// prefix (the only refs a session can reach) it allows exactly `head`,
+/// `wip` and `unapplied/<full lowercase hex sha>`; a home's `rewritten/*`
+/// and `orphaned/*` are never a node push's. An `unapplied/` ref is create-only
 /// and named by the commit it holds; pinning the same commit again is a
 /// no-op success, so a pin whose answer was lost can be retried.
 const UPDATE_HOOK: &str = r#"#!/bin/sh
@@ -56,10 +57,10 @@ refuse() {
   exit 1
 }
 case "$ref" in
-refs/intent/ws/*/agents/*/*) ;;
-*) refuse "not an agent ref" ;;
+refs/intent/ws/*/agents/*/*) name="${ref#refs/intent/ws/*/agents/*/}" ;;
+refs/intent/ws/*/home/*) name="${ref#refs/intent/ws/*/home/}" ;;
+*) refuse "not an agent or home ref" ;;
 esac
-name="${ref#refs/intent/ws/*/agents/*/}"
 case "$name" in
 head|wip) exit 0 ;;
 unapplied/*)
@@ -341,7 +342,7 @@ fn sanitized_git() -> Command {
 /// repository setting.
 #[must_use]
 pub fn scope_args(remote: &AgentRemote) -> Vec<String> {
-    let settings = [
+    let mut settings = vec![
         "transfer.hideRefs=refs/".to_owned(),
         "transfer.hideRefs=HEAD".to_owned(),
         format!("transfer.hideRefs=!{}", remote.ref_prefix()),
@@ -355,6 +356,14 @@ pub fn scope_args(remote: &AgentRemote) -> Vec<String> {
         "receive.denyNonFastForwards=false".to_owned(),
         "receive.denyDeletes=false".to_owned(),
     ];
+    // A home reads every agent's work of its workspace (so the user can
+    // merge it there) and writes none of it.
+    if remote.is_home() && remote.module_key().is_none() {
+        settings.push(format!(
+            "uploadpack.hideRefs=!refs/intent/ws/{}/agents/",
+            remote.workspace_id()
+        ));
+    }
     settings
         .into_iter()
         .flat_map(|setting| ["-c".to_owned(), setting])

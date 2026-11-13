@@ -364,6 +364,12 @@ pub(crate) struct Shared {
     secret_waiters: Mutex<HashMap<LinkId, oneshot::Sender<SecretReply>>>,
     /// `oneShot`s waiting for their reply (nodeProtocol 18).
     one_shot_waiters: Mutex<HashMap<LinkId, oneshot::Sender<intent_core::node_link::OneShotReply>>>,
+    /// `homeOpen`s and `homePush`es waiting for their reply (nodeProtocol
+    /// 19).
+    pub(crate) home_waiters: Mutex<HashMap<LinkId, oneshot::Sender<crate::homes::HomeReply>>>,
+    /// The machine holds a home of this backend's workspaces: its link stays
+    /// up, so the home is backed up and reachable.
+    pub(crate) holds_homes: std::sync::atomic::AtomicBool,
     /// Secret forgets for a machine that was not connected (nodeProtocol
     /// 14): sent after the next bind. Memory only; a backend restart drops
     /// them, and its new `headSession` drops the values on the machine.
@@ -527,6 +533,8 @@ impl Shared {
             || !lock(&self.checkout_waiters).is_empty()
             || !lock(&self.one_shot_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
+            || !lock(&self.home_waiters).is_empty()
+            || self.holds_homes.load(std::sync::atomic::Ordering::SeqCst)
             || (self
                 .survivors_unclaimed
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -546,6 +554,7 @@ impl Shared {
             || !lock(&self.checkout_waiters).is_empty()
             || !lock(&self.one_shot_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
+            || !lock(&self.home_waiters).is_empty()
     }
 
     /// Whether something would keep a link up now (see the module docs).
@@ -1449,7 +1458,7 @@ impl Shared {
         lock(&self.target).clone()
     }
 
-    fn machine_id(&self) -> String {
+    pub(crate) fn machine_id(&self) -> String {
         lock(&self.status).node_id.clone()
     }
 
@@ -1708,6 +1717,8 @@ impl RemoteNode {
             push_waiters: Mutex::new(HashMap::new()),
             checkout_waiters: Mutex::new(HashMap::new()),
             one_shot_waiters: Mutex::new(HashMap::new()),
+            home_waiters: Mutex::new(HashMap::new()),
+            holds_homes: std::sync::atomic::AtomicBool::new(false),
             secret_waiters: Mutex::new(HashMap::new()),
             secret_forgets: Mutex::new(Vec::new()),
             secret_locks: Mutex::new(HashMap::new()),
@@ -2119,6 +2130,40 @@ impl RemoteNode {
         Ok(reply)
     }
 
+    /// Send a home frame (`homeOpen` or `homePush`, nodeProtocol 19) whose
+    /// request id is `request_id`, connecting first, and wait up to `wait`
+    /// for its reply.
+    ///
+    /// # Errors
+    ///
+    /// As [`RemoteNode::connect`]; `node-link-timeout` when the machine does
+    /// not answer in time; `node-link-closed` when the link drops first.
+    pub(crate) async fn home_request(
+        &self,
+        request_id: LinkId,
+        frame: LinkFrame,
+        wait: Duration,
+    ) -> Result<crate::homes::HomeReply> {
+        let (tx, rx) = oneshot::channel();
+        lock(&self.shared.home_waiters).insert(request_id, tx);
+        let reply = async {
+            self.connect().await?;
+            self.shared.send(&frame).await?;
+            tokio::time::timeout(wait, rx)
+                .await
+                .map_err(|_| {
+                    Error::Internal(format!(
+                        "{}: the machine did not answer the home request",
+                        link::codes::TIMEOUT
+                    ))
+                })?
+                .map_err(|_| Error::Internal(link::codes::CLOSED.into()))
+        }
+        .await;
+        lock(&self.shared.home_waiters).remove(&request_id);
+        reply
+    }
+
     /// Send a control frame (such as a launch) on the current link.
     ///
     /// # Errors
@@ -2439,6 +2484,7 @@ async fn run(
                 lock(&shared.push_waiters).clear();
                 lock(&shared.checkout_waiters).clear();
                 lock(&shared.one_shot_waiters).clear();
+                lock(&shared.home_waiters).clear();
                 lock(&shared.secret_waiters).clear();
                 retry = shared.wants_link();
                 if retry {
@@ -2514,6 +2560,7 @@ async fn run(
             lock(&shared.push_waiters).clear();
             lock(&shared.checkout_waiters).clear();
             lock(&shared.one_shot_waiters).clear();
+            lock(&shared.home_waiters).clear();
             lock(&shared.secret_waiters).clear();
             shared.announce().await;
             retry = shared.wants_link();
@@ -2594,6 +2641,7 @@ async fn run(
         for waiter in waiters.drain(..) {
             let _ = waiter.send(Ok(()));
         }
+        crate::homes::after_bind(&shared, &link);
         tracing::info!(
             machine = %target.id,
             generation = link.binding().generation.0,
@@ -2635,6 +2683,7 @@ async fn run(
         lock(&shared.push_waiters).clear();
         lock(&shared.checkout_waiters).clear();
         lock(&shared.one_shot_waiters).clear();
+        lock(&shared.home_waiters).clear();
         lock(&shared.secret_waiters).clear();
         // The machine stops this binding's scripts when its link closes.
         shared
@@ -2752,6 +2801,16 @@ async fn serve(
                             lock(&shared.one_shot_waiters).remove(&reply.request_id)
                         {
                             let _ = waiter.send(reply);
+                        }
+                    }
+                    LinkEvent::Frame(LinkFrame::HomeOpenReply(reply)) => {
+                        if let Some(waiter) = lock(&shared.home_waiters).remove(&reply.request_id) {
+                            let _ = waiter.send(crate::homes::HomeReply::Open(reply));
+                        }
+                    }
+                    LinkEvent::Frame(LinkFrame::HomePushReply(reply)) => {
+                        if let Some(waiter) = lock(&shared.home_waiters).remove(&reply.request_id) {
+                            let _ = waiter.send(crate::homes::HomeReply::Push(reply));
                         }
                     }
                     LinkEvent::Frame(LinkFrame::CheckoutReadReply(reply)) => {
@@ -3051,10 +3110,7 @@ async fn serve_git(
 /// homes.
 async fn ingest_record(shared: &Shared, record: intent_core::node_link::JournalRecord) {
     let Some(agent_id) = record.agent_id().cloned() else {
-        tracing::debug!(
-            seq = record.seq.0,
-            "remote machine: record for a home this backend does not hold; dropped"
-        );
+        crate::homes::ingest(shared, record).await;
         return;
     };
     record_placement(shared, &agent_id, &record).await;
