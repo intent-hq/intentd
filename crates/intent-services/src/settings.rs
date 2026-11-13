@@ -3171,7 +3171,16 @@ fn fold_quick_action_snapshot(bag: &mut serde_json::Map<String, Value>, provider
         .map(str::to_string);
     let mut changed = false;
     if let Some(raw) = model.filter(|m| !m.is_empty()) {
-        if let Some(shared) = shared_model_for(&raw, Some(provider)) {
+        let folded = shared_model_for(&raw, Some(provider));
+        if folded.is_none() {
+            tracing::warn!(
+                model = raw.as_str(),
+                provider,
+                "provider snapshot's shared quick action model names another \
+                 provider; dropping it"
+            );
+        }
+        if let Some(shared) = folded {
             let entry = bag
                 .entry("typeOverrides")
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
@@ -3223,7 +3232,16 @@ pub fn migrate_quick_action_shared_default(registry: &SettingsRegistry) -> Resul
     let provider = nonblank_str(registry.get("model.defaultProvider").as_ref());
     let mut changes: Vec<(String, Value)> = Vec::new();
     if let Some(raw) = &model {
-        if let Some(shared) = shared_model_for(raw, provider.as_deref()) {
+        let folded = shared_model_for(raw, provider.as_deref());
+        if folded.is_none() {
+            tracing::warn!(
+                model = raw.as_str(),
+                provider = provider.as_deref(),
+                "shared quick action model names another provider; dropping it \
+                 (per-action models accept bare ids only)"
+            );
+        }
+        if let Some(shared) = folded {
             let mut map = registry
                 .get("quickActions.typeOverrides")
                 .and_then(|v| v.as_object().cloned())
@@ -9263,6 +9281,14 @@ mod tests {
     /// True when the TOML text still carries an `active` key line — matched
     /// as a key assignment, not a bare substring, so fixture keys that merely
     /// contain "active" (e.g. `interactive`) can never false-fail.
+    fn has_active_key(text: &str) -> bool {
+        text.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix("active")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+    }
+
     /// The retired shared quick action model and effort are copied into each
     /// action that inherited them, in the live keys and in every provider
     /// snapshot, so no quick action changes model or effort at upgrade. A
@@ -9338,6 +9364,7 @@ mod tests {
             text,
             "a migrated file is never rewritten"
         );
+
         let _ = std::fs::remove_file(&config_path);
     }
 
@@ -9387,14 +9414,6 @@ mod tests {
                 tmp.display()
             )));
         }
-    }
-
-    fn has_active_key(text: &str) -> bool {
-        text.lines().any(|l| {
-            l.trim_start()
-                .strip_prefix("active")
-                .is_some_and(|rest| rest.trim_start().starts_with('='))
-        })
     }
 
     /// Upgrade path: a config that predates `model.defaultProvider` and only

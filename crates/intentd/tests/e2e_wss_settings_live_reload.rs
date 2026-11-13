@@ -919,15 +919,16 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
     let config_path = data_dir.join("config.toml");
     std::fs::write(
         &config_path,
-        "[backgroundAgents]\ndefaultModel = \"auggie:haiku\"\ntypeOverrides = { commit = \"auggie:fast\" }\n",
+        "[providers]\nactive = \"auggie\"\n\n[backgroundAgents]\ndefaultModel = \"auggie:haiku\"\ntypeOverrides = { commit = \"auggie:fast\" }\n",
     )
     .expect("seed legacy config.toml");
 
     let (_daemon, mut rpc, _sub) = boot_with_wss(&data_dir).await;
 
     // The legacy values landed on the renamed keys, read back over the wire.
-    // The carried-over shared model is then retired: with no default provider
-    // its compound value names no own provider, so nothing is copied.
+    // The carried-over shared model is then retired: `providers.active` has
+    // become the default provider by then, so its own-provider compound value
+    // is copied into each action as a bare id.
     let get = wss_rpc(
         &mut rpc,
         10,
@@ -945,7 +946,9 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
     .await;
     assert_eq!(
         get["result"]["value"],
-        json!({ "commit": "auggie:fast" }),
+        json!({
+            "commit": "auggie:fast", "pr": "haiku", "review": "haiku", "walkthrough": "haiku"
+        }),
         "{get}"
     );
 
