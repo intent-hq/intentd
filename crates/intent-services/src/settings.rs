@@ -3229,7 +3229,10 @@ fn fold_quick_action_snapshot(bag: &mut serde_json::Map<String, Value>, provider
 pub fn migrate_quick_action_shared_default(registry: &SettingsRegistry) -> Result<()> {
     let model = nonblank_str(registry.get("quickActions.defaultModel").as_ref());
     let effort = nonblank_str(registry.get("quickActions.defaultReasoningEffort").as_ref());
-    let provider = nonblank_str(registry.get("model.defaultProvider").as_ref());
+    // `providers.active` is still set when its carry-over into
+    // `model.defaultProvider` has not succeeded; it names the same provider.
+    let provider = nonblank_str(registry.get("model.defaultProvider").as_ref())
+        .or_else(|| nonblank_str(registry.get(DEPRECATED_ACTIVE_PROVIDER_PATH).as_ref()));
     let mut changes: Vec<(String, Value)> = Vec::new();
     if let Some(raw) = &model {
         let folded = shared_model_for(raw, provider.as_deref());
@@ -9365,6 +9368,30 @@ mod tests {
             "a migrated file is never rewritten"
         );
 
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// The fold does not depend on the `providers.active` carry-over having
+    /// succeeded: while that legacy key is still in the file, it names the
+    /// provider whose compound shared model is kept.
+    #[tokio::test]
+    async fn quick_action_shared_default_migration_reads_a_pending_active_provider() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-qaactive-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[providers]\nactive = \"codex\"\n\n[quickActions]\ndefaultModel = \"codex:gpt-5\"\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        migrate_quick_action_shared_default(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("quickActions.typeOverrides"),
+            Some(json!({
+                "commit": "gpt-5", "pr": "gpt-5", "review": "gpt-5", "walkthrough": "gpt-5"
+            }))
+        );
         let _ = std::fs::remove_file(&config_path);
     }
 
