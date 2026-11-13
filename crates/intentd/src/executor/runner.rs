@@ -27,9 +27,9 @@ use intent_acp::{
     SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{
-    CheckoutRead, CheckoutReadOutcome, CheckoutReadReply, ExitFailure, FinalPush, ForgeFetchLaunch,
-    ForgeLaunch, GitIdentity, JournalBody, JournalRecord, LaunchCommand, LeaseBinding,
-    MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
+    CheckoutOf, CheckoutRead, CheckoutReadOutcome, CheckoutReadReply, ExitFailure, FinalPush,
+    ForgeFetchLaunch, ForgeLaunch, GitIdentity, JournalBody, JournalRecord, LaunchCommand,
+    LeaseBinding, MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -45,6 +45,9 @@ use super::skills;
 use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
+mod homes;
+pub(crate) use homes::homes_ready;
+
 pub(super) mod codes {
     /// The machine's shared agent limits (count or memory) deny the launch.
     pub const CAPACITY: &str = "node-capacity";
@@ -137,6 +140,12 @@ pub(crate) trait MachineLaunch: Send + Sync {
     /// `remoteAgents.permission`: how provider permission prompts are
     /// answered.
     fn policy(&self) -> PermissionPolicy;
+    /// Whether this machine may hold workspace homes now: its
+    /// `remoteAgents.allowHomes`, behind the build's readiness gate
+    /// ([`homes_ready`]).
+    fn allows_homes(&self) -> bool {
+        homes_ready()
+    }
 }
 
 /// Runs a quick action a backend sent (`oneShot`, nodeProtocol 18) with
@@ -256,6 +265,10 @@ struct Inner {
     pulls: Arc<intent_services::checkout_transfer::PieceSource>,
     /// How long a provider may take to answer `initialize`.
     start_timeouts: Mutex<StartTimeouts>,
+    /// The bound backend's workspace homes (nodeProtocol 19).
+    homes: Mutex<homes::Homes>,
+    /// Home opens run one at a time.
+    home_opens: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The longest a provider's first start after a link binds may take to
@@ -433,7 +446,7 @@ impl StopWait {
 /// A journal entry of `agent` with `body`, outside any turn.
 fn agent_entry(agent: &Agent, body: JournalBody) -> JournalEntry {
     JournalEntry {
-        agent_id: agent.id.clone(),
+        owner: agent.id.clone().into(),
         workspace_id: agent.workspace_id.clone(),
         turn_id: None,
         recorded_at: intent_core::now_iso(),
@@ -1000,6 +1013,8 @@ impl Runner {
                 head_session: Mutex::new(HeadSession::default()),
                 pulls,
                 start_timeouts: Mutex::new(StartTimeouts::default()),
+                homes: Mutex::new(homes::Homes::default()),
+                home_opens: Arc::new(tokio::sync::Mutex::new(())),
             }),
         }
     }
@@ -1423,7 +1438,7 @@ impl Runner {
             .map(|checkout| checkout.submodules)
             .unwrap_or_default();
         let refused = |error: String, failure: Option<ExitFailure>| JournalEntry {
-            agent_id: agent_id.clone(),
+            owner: agent_id.clone().into(),
             workspace_id: workspace_id.clone(),
             turn_id: None,
             recorded_at: intent_core::now_iso(),
@@ -1449,6 +1464,17 @@ impl Runner {
                 codes::CHECKOUT
             )));
         }
+        let checkout_of = match checkout_of {
+            None => None,
+            Some(CheckoutOf::Agent(owner)) => Some(owner),
+            Some(CheckoutOf::Home(_)) => {
+                drop(state);
+                return Some(exited(format!(
+                    "{}: this machine holds no such home",
+                    codes::CHECKOUT
+                )));
+            }
+        };
         if let Some(forge) = &forge {
             if checkout_of.is_some() || is_sub_agent || !forge.is_valid() {
                 drop(state);
@@ -1657,7 +1683,7 @@ impl Runner {
             let exit = matches!(body, JournalBody::Exited { .. });
             let appended = self
                 .append(JournalEntry {
-                    agent_id: agent_id.clone(),
+                    owner: agent_id.clone().into(),
                     workspace_id: workspace_id.clone(),
                     turn_id,
                     recorded_at: intent_core::now_iso(),
@@ -2423,7 +2449,7 @@ impl Runner {
             )
         };
         let refuse = |workspace_id: WorkspaceId, code: &str, detail: &str| JournalEntry {
-            agent_id: agent_id.clone(),
+            owner: agent_id.clone().into(),
             workspace_id,
             turn_id: Some(turn_id.clone()),
             recorded_at: intent_core::now_iso(),
@@ -3028,6 +3054,8 @@ impl Runner {
         };
         // An ordinary push under way gives way to each agent's last one.
         self.inner.closing_signal.send_replace(true);
+        // Home checkouts stay on disk; their setup and watcher end.
+        self.close_homes();
         // Script runs end first (bounded by their reap wait), so nothing
         // still writes to a checkout while its agent's last work is pushed.
         self.inner.scripts.stop_all().await;

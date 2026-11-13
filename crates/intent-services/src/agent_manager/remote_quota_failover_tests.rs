@@ -1095,6 +1095,7 @@ async fn expose_claude_node(mgr: &AgentManager, models: &[&str]) {
                 }],
                 disabled_providers: vec![],
                 observed_at: observed_at.clone(),
+                homes: None,
             }),
             observed_at: Some(observed_at),
             state: intent_core::machines::RemoteMachineState::Disconnected,

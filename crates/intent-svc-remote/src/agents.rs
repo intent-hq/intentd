@@ -149,7 +149,9 @@ impl AgentSink {
             JournalBody::Started { .. }
             | JournalBody::SetupStarted { .. }
             | JournalBody::SetupFinished { .. }
-            | JournalBody::Skills { .. } => {}
+            | JournalBody::Skills { .. }
+            // A home's record; never routed to an agent.
+            | JournalBody::HomePushed { .. } => {}
             JournalBody::Notification { notification } => {
                 self.requests.fetch_add(1, Ordering::SeqCst);
                 // The manager may have dropped the stream; nothing to do then.
@@ -276,14 +278,14 @@ impl Agents {
     /// Hand an ingested record to its agent. Records of agents not
     /// attached on head (stopped, or from before a head restart) and records
     /// naming a different workspace than the agent's are dropped.
-    pub(crate) fn deliver(&self, record: JournalRecord) {
-        let sink = lock(&self.sinks).get(&record.agent_id).cloned();
+    pub(crate) fn deliver(&self, agent_id: &AgentId, record: JournalRecord) {
+        let sink = lock(&self.sinks).get(agent_id).cloned();
         let Some(sink) = sink else {
-            tracing::debug!(agent = %record.agent_id, seq = record.seq.0, "remote node: record for an agent not attached here; dropped");
+            tracing::debug!(agent = %agent_id, seq = record.seq.0, "remote node: record for an agent not attached here; dropped");
             return;
         };
         if sink.workspace_id != record.workspace_id {
-            tracing::warn!(agent = %record.agent_id, seq = record.seq.0, "remote node: record names another workspace; dropped");
+            tracing::warn!(agent = %agent_id, seq = record.seq.0, "remote node: record names another workspace; dropped");
             return;
         }
         sink.deliver(record);

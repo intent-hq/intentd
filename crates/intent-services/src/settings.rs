@@ -2770,6 +2770,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             &["allowAll", "autoByRisk", "denyAll"],
             "allowAll",
         ),
+        boolean(
+            "remoteAgents.allowHomes",
+            "Allow workspace homes",
+            "Whether backends this machine is exposed to may keep a workspace's home here: its checkout, terminals and app scripts, run under this account",
+            "remoteAgents",
+            true,
+        ),
         enumerated(
             "daemon.mode",
             "Daemon mode",
@@ -4588,6 +4595,7 @@ mod tests {
             "specialists.dir",
             "linear.token",
             "remoteAgents.permission",
+            "remoteAgents.allowHomes",
             "daemon.mode",
             "agents.permissionPolicy",
         ] {
@@ -8133,6 +8141,7 @@ mod tests {
     async fn remote_agents_settings_round_trip_via_registry() {
         for (path, category, default) in [
             ("remoteAgents.permission", "remoteAgents", json!("allowAll")),
+            ("remoteAgents.allowHomes", "remoteAgents", json!(true)),
             ("daemon.mode", "daemon", json!("regular")),
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
@@ -8175,13 +8184,16 @@ mod tests {
             effective.daemon.mode,
             intent_core::settings_file::DaemonMode::Regular
         );
+        assert!(effective.remote_agents.allows_homes());
 
         svc.update(&json!([
             { "path": "remoteAgents.permission", "value": "denyAll" },
+            { "path": "remoteAgents.allowHomes", "value": false },
             { "path": "daemon.mode", "value": "node" },
         ]))
         .await
         .expect("update");
+        assert!(!registry.snapshot().effective.remote_agents.allows_homes());
         let effective = registry.snapshot().effective.clone();
         assert_eq!(
             effective.remote_agents.permission,

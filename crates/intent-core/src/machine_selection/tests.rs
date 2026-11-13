@@ -54,6 +54,7 @@ fn report(
         providers,
         disabled_providers: vec![],
         observed_at: observed_at.into(),
+        homes: None,
     }
 }
 

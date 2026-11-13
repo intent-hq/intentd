@@ -40,6 +40,7 @@ pub(crate) fn probe_hello(owner: &LeaseOwner, generation: NodeCounter) -> LinkHe
         acked_seq: NodeCounter(0),
         lease_agents: Vec::new(),
         head_session: Some(head_session().to_owned()),
+        lease_homes: None,
     }
 }
 
@@ -227,6 +228,7 @@ impl HeadLease {
             acked_seq: acked,
             lease_agents,
             head_session: Some(head_session().to_owned()),
+            lease_homes: None,
         })
     }
 

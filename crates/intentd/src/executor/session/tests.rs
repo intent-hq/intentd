@@ -141,7 +141,7 @@ async fn wait_records(runner: &Runner, count: usize) -> Vec<JournalRecord> {
 fn exited_agents(all: &[JournalRecord]) -> Vec<&str> {
     all.iter()
         .filter(|r| matches!(r.body, JournalBody::Exited { .. }))
-        .map(|r| r.agent_id.0.as_str())
+        .filter_map(|r| r.agent_id().map(|a| a.0.as_str()))
         .collect()
 }
 

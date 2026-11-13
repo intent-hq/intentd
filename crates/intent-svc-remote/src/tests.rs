@@ -469,7 +469,7 @@ fn workspace() -> WorkspaceId {
 fn note(seq: u64, agent: &AgentId, text: &str) -> JournalRecord {
     JournalRecord {
         seq: NodeCounter(seq),
-        agent_id: agent.clone(),
+        owner: agent.clone().into(),
         workspace_id: workspace(),
         turn_id: None,
         recorded_at: intent_core::now_iso(),
@@ -485,7 +485,7 @@ fn note(seq: u64, agent: &AgentId, text: &str) -> JournalRecord {
 fn turn_ended(seq: u64, agent: &AgentId, turn: &str, error: Option<&str>) -> JournalRecord {
     JournalRecord {
         seq: NodeCounter(seq),
-        agent_id: agent.clone(),
+        owner: agent.clone().into(),
         workspace_id: workspace(),
         turn_id: Some(turn.into()),
         recorded_at: intent_core::now_iso(),
@@ -504,7 +504,7 @@ fn turn_ended(seq: u64, agent: &AgentId, turn: &str, error: Option<&str>) -> Jou
 fn exited(seq: u64, agent: &AgentId) -> JournalRecord {
     JournalRecord {
         seq: NodeCounter(seq),
-        agent_id: agent.clone(),
+        owner: agent.clone().into(),
         workspace_id: workspace(),
         turn_id: None,
         recorded_at: intent_core::now_iso(),

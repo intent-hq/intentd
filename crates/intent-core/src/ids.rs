@@ -141,6 +141,12 @@ id_newtype!(
     ExecutorCredentialId
 );
 id_newtype!(
+    /// Identifier for one generation of a workspace's home: a new id at
+    /// workspace create and at every home move, also a move to the same
+    /// machine.
+    HomeId
+);
+id_newtype!(
     /// Identifier for a principal (a person, keyed locally; stable across
     /// GitHub identity linking). The daemon's primary user is minted by
     /// migration `0125_principals`.

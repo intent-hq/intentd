@@ -1,8 +1,9 @@
 use super::*;
+use intent_core::AgentId;
 
 fn entry(text: &str) -> JournalEntry {
     JournalEntry {
-        agent_id: AgentId::from("agent-1"),
+        owner: AgentId::from("agent-1").into(),
         workspace_id: WorkspaceId::from("ws-1"),
         turn_id: Some("turn-1".into()),
         recorded_at: "2026-10-27T00:00:00Z".into(),

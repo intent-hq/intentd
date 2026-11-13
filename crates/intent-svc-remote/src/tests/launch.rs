@@ -349,7 +349,7 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
 
     link.journal(JournalRecord {
         seq: NodeCounter(1),
-        agent_id: agent.clone(),
+        owner: agent.clone().into(),
         workspace_id: workspace(),
         turn_id: None,
         recorded_at: intent_core::now_iso(),
@@ -390,7 +390,7 @@ async fn the_isolation_change_is_announced_to_the_agent_list() {
 
     link.journal(JournalRecord {
         seq: NodeCounter(1),
-        agent_id: agent.clone(),
+        owner: agent.clone().into(),
         workspace_id: workspace(),
         turn_id: None,
         recorded_at: intent_core::now_iso(),
@@ -587,7 +587,7 @@ async fn a_start_failure_is_the_agents_placement_error() {
     let runtime = f.port().runtime(&f.services, &agent).await.unwrap();
     link.journal(JournalRecord {
         seq: NodeCounter(1),
-        agent_id: agent.clone(),
+        owner: agent.clone().into(),
         workspace_id: workspace(),
         turn_id: None,
         recorded_at: intent_core::now_iso(),

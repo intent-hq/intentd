@@ -3,14 +3,15 @@
 //! the link's git connection, and the WIP pushes that send the agent's work
 //! back under its own refs.
 
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 
-use intent_core::node_link::{forge_agent_branch, ForgeLaunch, SubmodulePin};
-use intent_core::{AgentId, BoxFuture, WorkspaceId};
+use intent_core::node_link::{forge_agent_branch, ForgeLaunch, HomeRef, SubmodulePin};
+use intent_core::{AgentId, BoxFuture, HomeId, WorkspaceId};
 use intent_git::node_git::{self, AgentRemote, CheckoutCache, ModuleCheckout};
 
 use super::storage::Storage;
@@ -32,6 +33,16 @@ pub(super) struct Prepared {
     pub(super) unrestored: Vec<String>,
     /// This launch created the checkout (it did not keep one).
     pub(super) fresh: bool,
+}
+
+/// What one push of a home checkout sent (nodeProtocol 19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HomePush {
+    pub(super) head: String,
+    pub(super) wip: String,
+    /// The previous `home/head` tip this push replaced without
+    /// fast-forwarding (an amend, rebase or reset).
+    pub(super) rewritten: Option<String>,
 }
 
 /// How the runner gets an agent's working directory and sends its work back.
@@ -104,6 +115,42 @@ pub(super) trait Checkouts: Send + Sync {
         let _ = (worktree, remote_url);
         Box::pin(async { Ok(()) })
     }
+
+    /// The checkout of the workspace home `home` (nodeProtocol 19), made
+    /// from the workspace's `home/head` with `home/wip` restored on top,
+    /// with `submodules` at their pins; an existing one is kept as it is
+    /// (`fresh: false`).
+    fn prepare_home<'a>(
+        &'a self,
+        home: &'a HomeRef,
+        repo_key: &'a str,
+        submodules: &'a [SubmodulePin],
+        progress: &'a (dyn Fn(&str) + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Prepared>>;
+
+    /// The home's checkout on this machine, if it has one.
+    fn existing_home(&self, home_id: &HomeId) -> Option<PathBuf>;
+
+    /// The homes with a directory here, with their workspace.
+    fn homes(&self) -> Vec<(HomeId, Option<WorkspaceId>)>;
+
+    /// Push the home checkout's `HEAD` to `home/head` and a commit of its
+    /// dirty tree to `home/wip`, within `timeout`. `previous` is the
+    /// `home/head` this machine pushed last, for [`HomePush::rewritten`].
+    fn push_home<'a>(
+        &'a self,
+        home: &'a HomeRef,
+        worktree: &'a Path,
+        previous: Option<&'a str>,
+        timeout: Duration,
+    ) -> BoxFuture<'a, anyhow::Result<HomePush>>;
+
+    /// The commit `worktree`'s `HEAD` is at, for the backup watcher.
+    fn head_commit<'a>(&'a self, worktree: &'a Path) -> BoxFuture<'a, Option<String>>;
+
+    /// Remove the home's directory and its worktree's registration in the
+    /// caches; removing a home with none is a no-op.
+    fn remove_home<'a>(&'a self, home_id: &'a HomeId) -> BoxFuture<'a, anyhow::Result<()>>;
 
     /// Test seam: runs as the bind sweep is about to remove a checkout.
     #[cfg(test)]
@@ -290,9 +337,158 @@ impl Checkouts for GitCheckouts {
                 .map_err(|e| anyhow::anyhow!("set up the sub-agent's origin: {e}"))
         })
     }
+
+    fn prepare_home<'a>(
+        &'a self,
+        home: &'a HomeRef,
+        repo_key: &'a str,
+        submodules: &'a [SubmodulePin],
+        progress: &'a (dyn Fn(&str) + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Prepared>> {
+        Box::pin(async move {
+            node_git::validate_pins(submodules).context("the home's submodule pins")?;
+            let (dir, worktree, fresh) = self.home_paths(home)?;
+            let remote = AgentRemote::home(&home.workspace_id.0, &home.home_id.0)?;
+            let mut notices = Vec::new();
+            if fresh {
+                progress("Fetching the checkout…");
+                let checkout = self
+                    .cache
+                    .checkout(repo_key, &remote, &worktree)
+                    .await
+                    .context("fetch the home's refs from head")?;
+                notices.extend(
+                    checkout
+                        .unrestored_wip
+                        .map(|wip| unrestored_wip(&remote, &checkout.at, &wip)),
+                );
+                write_pins(&pins_file(&worktree), submodules)?;
+                let modules = self
+                    .cache
+                    .checkout_modules_reporting(repo_key, &remote, &worktree, submodules, &|path| {
+                        progress(&format!("Fetching {path}…"));
+                    })
+                    .await;
+                if let Err(error) = modules {
+                    self.discard(&worktree).await;
+                    return Err(anyhow::anyhow!("{error}").context("check out the submodules"));
+                }
+            }
+            let tmp = dir.join("tmp");
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&tmp)
+                .context("create the home's temp folder")?;
+            Ok(Prepared {
+                worktree,
+                tmp,
+                unrestored: notices,
+                fresh,
+            })
+        })
+    }
+
+    fn existing_home(&self, home_id: &HomeId) -> Option<PathBuf> {
+        let worktree = self.storage.existing_home_worktree(home_id)?;
+        worktree.join(".git").exists().then_some(worktree)
+    }
+
+    fn homes(&self) -> Vec<(HomeId, Option<WorkspaceId>)> {
+        self.storage.home_ids()
+    }
+
+    fn push_home<'a>(
+        &'a self,
+        home: &'a HomeRef,
+        worktree: &'a Path,
+        previous: Option<&'a str>,
+        timeout: Duration,
+    ) -> BoxFuture<'a, anyhow::Result<HomePush>> {
+        Box::pin(async move {
+            let remote = AgentRemote::home(&home.workspace_id.0, &home.home_id.0)?;
+            let pins = read_pins(&pins_file(worktree));
+            let pushed = tokio::time::timeout(
+                timeout,
+                self.cache.git().push_work_excluding(
+                    worktree,
+                    &remote,
+                    &pins,
+                    Some(&super::setup::excludes_dir(worktree)),
+                ),
+            )
+            .await
+            .context("home push timed out")??;
+            let rewritten = match previous {
+                Some(old)
+                    if old != pushed.head && !is_ancestor(worktree, old, &pushed.head).await =>
+                {
+                    Some(old.to_owned())
+                }
+                _ => None,
+            };
+            Ok(HomePush {
+                head: pushed.head,
+                wip: pushed.wip,
+                rewritten,
+            })
+        })
+    }
+
+    fn head_commit<'a>(&'a self, worktree: &'a Path) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(worktree)
+                .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .kill_on_drop(true)
+                .output()
+                .await
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .filter(|commit| !commit.is_empty())
+        })
+    }
+
+    fn remove_home<'a>(&'a self, home_id: &'a HomeId) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.storage.remove_home(home_id)?;
+            self.cache
+                .prune()
+                .await
+                .map_err(|e| anyhow::anyhow!("prune the checkout caches: {e}"))
+        })
+    }
+}
+
+/// Whether `old` is in `new`'s history in `worktree`'s repository. An
+/// unknown commit (pruned, or never fetched) counts as not.
+async fn is_ancestor(worktree: &Path, old: &str, new: &str) -> bool {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["merge-base", "--is-ancestor", old, new])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true)
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
 }
 
 impl GitCheckouts {
+    /// The home's directory, its checkout, and whether the checkout must
+    /// still be made.
+    fn home_paths(&self, home: &HomeRef) -> anyhow::Result<(PathBuf, PathBuf, bool)> {
+        let dir = self.storage.home_dir(&home.workspace_id, &home.home_id)?;
+        let worktree = dir.join("work");
+        let fresh = !worktree.join(".git").exists();
+        Ok((dir, worktree, fresh))
+    }
+
     /// Remove a checkout this launch created and could not finish, so the
     /// next launch starts fresh.
     async fn discard(&self, worktree: &Path) {
@@ -447,7 +643,18 @@ pub(super) struct PlainCheckouts {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// The home checkouts prepared, in order.
+    pub(super) prepared_homes: std::sync::Mutex<Vec<HomeId>>,
 }
+
+/// In a test home checkout: the commit its `HEAD` is at, which a test
+/// rewrites to stand for a commit.
+#[cfg(test)]
+pub(super) const TEST_HOME_HEAD: &str = ".test-head";
+
+/// Beside a test home checkout: one `+` per checkout made there.
+#[cfg(test)]
+pub(super) const TEST_HOME_MADE: &str = "made";
 
 #[cfg(test)]
 impl PlainCheckouts {
@@ -466,6 +673,7 @@ impl PlainCheckouts {
             prepared_pins: std::sync::Mutex::default(),
             push_gate: None,
             hold_sweep: std::sync::Mutex::default(),
+            prepared_homes: std::sync::Mutex::default(),
         })
     }
 
@@ -579,5 +787,84 @@ impl Checkouts for PlainCheckouts {
                 let _ = release.await;
             }
         })
+    }
+
+    fn prepare_home<'a>(
+        &'a self,
+        home: &'a HomeRef,
+        _repo_key: &'a str,
+        submodules: &'a [SubmodulePin],
+        progress: &'a (dyn Fn(&str) + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Prepared>> {
+        Box::pin(async move {
+            for pin in submodules {
+                progress(&format!("Fetching {}…", pin.path));
+            }
+            anyhow::ensure!(
+                !self.fail.load(std::sync::atomic::Ordering::SeqCst),
+                "head refused the fetch"
+            );
+            self.prepared_homes
+                .lock()
+                .unwrap()
+                .push(home.home_id.clone());
+            let dir = self.storage.home_dir(&home.workspace_id, &home.home_id)?;
+            let worktree = dir.join("work");
+            let fresh = !worktree.exists();
+            std::fs::create_dir_all(&worktree)?;
+            if fresh {
+                std::fs::write(worktree.join(TEST_HOME_HEAD), "0".repeat(40))?;
+                let made = dir.join(TEST_HOME_MADE);
+                let count = std::fs::read_to_string(&made).unwrap_or_default();
+                std::fs::write(made, format!("{count}+"))?;
+            }
+            let tmp = dir.join("tmp");
+            std::fs::create_dir_all(&tmp)?;
+            Ok(Prepared {
+                worktree,
+                tmp,
+                unrestored: Vec::new(),
+                fresh,
+            })
+        })
+    }
+
+    fn existing_home(&self, home_id: &HomeId) -> Option<PathBuf> {
+        self.storage
+            .existing_home_worktree(home_id)
+            .filter(|dir| dir.is_dir())
+    }
+
+    fn homes(&self) -> Vec<(HomeId, Option<WorkspaceId>)> {
+        self.storage.home_ids()
+    }
+
+    fn push_home<'a>(
+        &'a self,
+        _home: &'a HomeRef,
+        worktree: &'a Path,
+        _previous: Option<&'a str>,
+        _timeout: Duration,
+    ) -> BoxFuture<'a, anyhow::Result<HomePush>> {
+        Box::pin(async move {
+            anyhow::ensure!(
+                !self.fail_pushes.load(std::sync::atomic::Ordering::SeqCst),
+                "head refused the push"
+            );
+            let head = std::fs::read_to_string(worktree.join(TEST_HOME_HEAD))?;
+            Ok(HomePush {
+                rewritten: None,
+                wip: head.clone(),
+                head,
+            })
+        })
+    }
+
+    fn head_commit<'a>(&'a self, worktree: &'a Path) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move { std::fs::read_to_string(worktree.join(TEST_HOME_HEAD)).ok() })
+    }
+
+    fn remove_home<'a>(&'a self, home_id: &'a HomeId) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move { self.storage.remove_home(home_id) })
     }
 }

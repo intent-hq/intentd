@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use intent_core::node_link::{JournalBody, JournalRecord};
+use intent_core::node_link::{JournalBody, JournalRecord, RecordOwner};
 use intent_core::nodes::NodeCounter;
-use intent_core::{AgentId, Error, Result, WorkspaceId};
+use intent_core::{Error, Result, WorkspaceId};
 
 const STATE: &str = "state.json";
 const RECORD_SUFFIX: &str = ".record";
@@ -37,7 +37,7 @@ struct State {
 /// One record to append; the journal assigns its sequence.
 #[derive(Debug, Clone)]
 pub struct JournalEntry {
-    pub agent_id: AgentId,
+    pub owner: RecordOwner,
     pub workspace_id: WorkspaceId,
     pub turn_id: Option<String>,
     pub recorded_at: String,
@@ -212,7 +212,7 @@ impl Journal {
             .ok_or_else(|| Error::Internal("node-journal: sequence exhausted".into()))?;
         let record = JournalRecord {
             seq: NodeCounter(seq),
-            agent_id: entry.agent_id,
+            owner: entry.owner,
             workspace_id: entry.workspace_id,
             turn_id: entry.turn_id,
             recorded_at: entry.recorded_at,

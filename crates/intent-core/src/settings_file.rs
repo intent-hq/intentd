@@ -1277,12 +1277,32 @@ impl Default for PrCacheSettings {
 
 /// `[remoteAgents]` — machine side of daemon-to-daemon remote agents
 /// (`remoteAgents.*`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct RemoteAgentsSettings {
     /// `remoteAgents.permission` — how remote agents' provider permission
     /// prompts are answered, since no client is attached.
     pub permission: RemoteAgentPermission,
+    /// `remoteAgents.allowHomes` — whether this machine may hold workspace
+    /// homes for the backends it is exposed to (default `true`).
+    pub allow_homes: bool,
+}
+
+impl Default for RemoteAgentsSettings {
+    fn default() -> Self {
+        Self {
+            permission: RemoteAgentPermission::default(),
+            allow_homes: true,
+        }
+    }
+}
+
+impl RemoteAgentsSettings {
+    /// The effective `remoteAgents.allowHomes`.
+    #[must_use]
+    pub fn allows_homes(&self) -> bool {
+        self.allow_homes
+    }
 }
 
 /// `remoteAgents.permission` values.

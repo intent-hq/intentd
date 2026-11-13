@@ -96,9 +96,15 @@ pub struct AgentRemote {
     agent_id: String,
     module_key: Option<String>,
     forge: bool,
+    /// A workspace home's checkout (nodeProtocol 19): `agent_id` holds the
+    /// `homeId`, and the refs are the workspace's `home/*`.
+    home: bool,
 }
 
 const MODULES: &str = "/modules/";
+
+/// The path segment of a home's remote: `intent://ws/<wsId>/homes/<homeId>`.
+const HOMES: &str = "/homes/";
 
 /// Suffix of a sub-agent's forge remote (nodeProtocol 17).
 const FORGE: &str = "/forge";
@@ -120,7 +126,28 @@ impl AgentRemote {
             agent_id: agent_id.into(),
             module_key: None,
             forge: false,
+            home: false,
         })
+    }
+
+    /// The home checkout `home_id` of the workspace (nodeProtocol 19). Its
+    /// refs are `refs/intent/ws/<wsId>/home/{head,wip}`; it has no `base`
+    /// of its own, so [`AgentRef::Base`] names `home/head` too.
+    ///
+    /// # Errors
+    ///
+    /// `node-git-invalid-remote` when either id is not a safe ref component.
+    pub fn home(workspace_id: &str, home_id: &str) -> Result<Self> {
+        Ok(Self {
+            home: true,
+            ..Self::new(workspace_id, home_id)?
+        })
+    }
+
+    /// Whether this remote names a home checkout.
+    #[must_use]
+    pub fn is_home(&self) -> bool {
+        self.home
     }
 
     /// The same agent's forge remote (nodeProtocol 17): the workspace's
@@ -130,6 +157,7 @@ impl AgentRemote {
         Self {
             module_key: None,
             forge: true,
+            home: false,
             ..self.clone()
         }
     }
@@ -164,6 +192,16 @@ impl AgentRemote {
     /// `node-git-invalid-remote` for any other spelling.
     pub fn parse(url: &str) -> Result<Self> {
         let rest = url.strip_prefix(URL_PREFIX).ok_or_else(invalid_remote)?;
+        if let Some((workspace, home)) = rest.split_once(HOMES) {
+            let remote = match home.split_once(MODULES) {
+                Some((home, module_key)) => Self::home(workspace, home)?.with_module(module_key)?,
+                None => Self::home(workspace, home)?,
+            };
+            if remote.url() != url {
+                return Err(invalid_remote());
+            }
+            return Ok(remote);
+        }
         let (workspace, agent) = rest.split_once("/agents/").ok_or_else(invalid_remote)?;
         let remote = match agent.split_once(MODULES) {
             Some((agent, module_key)) => Self::new(workspace, agent)?.with_module(module_key)?,
@@ -180,7 +218,8 @@ impl AgentRemote {
 
     #[must_use]
     pub fn url(&self) -> String {
-        let url = format!("{URL_PREFIX}{}/agents/{}", self.workspace_id, self.agent_id);
+        let owner = if self.home { HOMES } else { "/agents/" };
+        let url = format!("{URL_PREFIX}{}{owner}{}", self.workspace_id, self.agent_id);
         match &self.module_key {
             Some(key) => format!("{url}{MODULES}{key}"),
             None if self.forge => format!("{url}{FORGE}"),
@@ -209,6 +248,9 @@ impl AgentRemote {
     /// for this remote may read or update.
     #[must_use]
     pub fn ref_prefix(&self) -> String {
+        if self.home {
+            return format!("refs/intent/ws/{}/home/", self.workspace_id);
+        }
         format!(
             "refs/intent/ws/{}/agents/{}/",
             self.workspace_id, self.agent_id
@@ -218,6 +260,7 @@ impl AgentRemote {
     #[must_use]
     pub fn ref_name(&self, kind: AgentRef) -> String {
         let suffix = match kind {
+            AgentRef::Base if self.home => "head",
             AgentRef::Base => "base",
             AgentRef::Head => "head",
             AgentRef::Wip => "wip",

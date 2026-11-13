@@ -1270,8 +1270,11 @@ impl Shared {
     }
 
     /// The agent `record` reports exited, if it is an exit record.
-    fn exited_agent(record: &intent_core::node_link::JournalRecord) -> Option<AgentId> {
-        matches!(record.body, JournalBody::Exited { .. }).then(|| record.agent_id.clone())
+    fn exited_agent(
+        agent_id: &AgentId,
+        record: &intent_core::node_link::JournalRecord,
+    ) -> Option<AgentId> {
+        matches!(record.body, JournalBody::Exited { .. }).then(|| agent_id.clone())
     }
 
     /// An exit record for `exited` was delivered: it settles its agent's
@@ -1589,13 +1592,20 @@ impl Shared {
     /// Keep a `setupOutput` of an agent attached here (seq 0 starts the
     /// output over) and announce it, throttled.
     async fn setup_output(&self, output: intent_core::node_link::SetupOutput) {
-        let Some(workspace_id) = self.agents.workspace_of(&output.agent_id) else {
-            tracing::debug!(agent = %output.agent_id, "remote machine: setup output for an agent not attached here; dropped");
+        let intent_core::node_link::SetupOwner::Agent(agent_id) = &output.owner else {
+            tracing::debug!(
+                "remote machine: setup output for a home this backend does not hold; dropped"
+            );
+            return;
+        };
+        let agent_id = agent_id.clone();
+        let Some(workspace_id) = self.agents.workspace_of(&agent_id) else {
+            tracing::debug!(agent = %agent_id, "remote machine: setup output for an agent not attached here; dropped");
             return;
         };
         let publish = {
             let mut tails = lock(&self.setup_outputs);
-            let tail = tails.entry(output.agent_id.clone()).or_default();
+            let tail = tails.entry(agent_id.clone()).or_default();
             if output.seq == 0 {
                 tail.text.clear();
                 tail.truncated = false;
@@ -1620,7 +1630,7 @@ impl Shared {
         if publish {
             if let Some(services) = &self.services {
                 services
-                    .publish_agent_placement_changed(&workspace_id, &output.agent_id)
+                    .publish_agent_placement_changed(&workspace_id, &agent_id)
                     .await;
             }
         }
@@ -2684,10 +2694,7 @@ async fn serve(
                         let seq = record.seq;
                         match ingest.accept(seq) {
                             Step::Ingest => {
-                                record_placement(shared, &record).await;
-                                let exited = Shared::exited_agent(&record);
-                                shared.agents.deliver(record);
-                                shared.stop_exit_ingested(exited);
+                                ingest_record(shared, record).await;
                             }
                             Step::IngestAfterLoss { lost } => {
                                 tracing::warn!(
@@ -2695,10 +2702,7 @@ async fn serve(
                                     through = lost.1 .0,
                                     "remote machine: journal records were lost on the machine"
                                 );
-                                record_placement(shared, &record).await;
-                                let exited = Shared::exited_agent(&record);
-                                shared.agents.deliver(record);
-                                shared.stop_exit_ingested(exited);
+                                ingest_record(shared, record).await;
                             }
                             Step::Skip => {}
                             Step::Resync => {
@@ -3042,9 +3046,30 @@ async fn serve_git(
 /// Keep a remote agent's projected placement current: `isolated` once the
 /// node reports its checkout and session ready, and the start error of an
 /// agent that never got there.
-async fn record_placement(shared: &Shared, record: &intent_core::node_link::JournalRecord) {
+/// Hand one ingested record on: an agent's to its placement and sink. A
+/// home's record is acknowledged and dropped while this backend holds no
+/// homes.
+async fn ingest_record(shared: &Shared, record: intent_core::node_link::JournalRecord) {
+    let Some(agent_id) = record.agent_id().cloned() else {
+        tracing::debug!(
+            seq = record.seq.0,
+            "remote machine: record for a home this backend does not hold; dropped"
+        );
+        return;
+    };
+    record_placement(shared, &agent_id, &record).await;
+    let exited = Shared::exited_agent(&agent_id, &record);
+    shared.agents.deliver(&agent_id, record);
+    shared.stop_exit_ingested(exited);
+}
+
+async fn record_placement(
+    shared: &Shared,
+    agent_id: &AgentId,
+    record: &intent_core::node_link::JournalRecord,
+) {
     if let JournalBody::Skills { skills } = &record.body {
-        record_skills(shared, record, skills.clone()).await;
+        record_skills(shared, agent_id, record, skills.clone()).await;
         return;
     }
     let update: Box<dyn FnOnce(&mut intent_core::remote_launch::RemotePlacementView) + Send> =
@@ -3112,26 +3137,19 @@ async fn record_placement(shared: &Shared, record: &intent_core::node_link::Jour
             }
             _ => return,
         };
-    match crate::view::update(
-        &shared.store,
-        &record.workspace_id,
-        &record.agent_id,
-        update,
-    )
-    .await
-    {
+    match crate::view::update(&shared.store, &record.workspace_id, agent_id, update).await {
         // Announce the change so the agent list follows it (the list row
         // carries `effectiveIsolation` / `placementError`).
         Ok(true) => {
             if let Some(services) = &shared.services {
                 services
-                    .publish_agent_placement_changed(&record.workspace_id, &record.agent_id)
+                    .publish_agent_placement_changed(&record.workspace_id, agent_id)
                     .await;
             }
         }
         Ok(false) => {}
         Err(error) => {
-            tracing::warn!(agent = %record.agent_id, %error, "remote node: could not record the agent's placement state");
+            tracing::warn!(agent = %agent_id, %error, "remote node: could not record the agent's placement state");
         }
     }
 }
@@ -3141,27 +3159,25 @@ async fn record_placement(shared: &Shared, record: &intent_core::node_link::Jour
 /// agent.
 async fn record_skills(
     shared: &Shared,
+    agent_id: &AgentId,
     record: &intent_core::node_link::JournalRecord,
     skills: Vec<MachineSkill>,
 ) {
-    match crate::view::update(
-        &shared.store,
-        &record.workspace_id,
-        &record.agent_id,
-        move |view| view.skills = Some(skills),
-    )
+    match crate::view::update(&shared.store, &record.workspace_id, agent_id, move |view| {
+        view.skills = Some(skills);
+    })
     .await
     {
         Ok(true) => {
             if let Some(services) = &shared.services {
                 services
-                    .publish_agent_skills_changed(&record.workspace_id, &record.agent_id)
+                    .publish_agent_skills_changed(&record.workspace_id, agent_id)
                     .await;
             }
         }
         Ok(false) => {}
         Err(error) => {
-            tracing::warn!(agent = %record.agent_id, %error, "remote node: could not record the agent's skills");
+            tracing::warn!(agent = %agent_id, %error, "remote node: could not record the agent's skills");
         }
     }
 }

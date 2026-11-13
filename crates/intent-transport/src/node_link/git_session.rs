@@ -331,6 +331,10 @@ async fn run_service(
     let open: OpenRequest = serde_json::from_slice(open).map_err(|_| codes::INVALID)?;
     let service = GitService::parse(&open.service).map_err(|_| codes::INVALID)?;
     let remote = AgentRemote::parse(&open.url).map_err(|_| codes::INVALID)?;
+    // Home checkouts (nodeProtocol 19) are not served by this backend yet.
+    if remote.is_home() {
+        return Err(codes::INVALID);
+    }
     let (command, accept) = if remote.is_forge() {
         if !access.forge_supported() {
             return Err(codes::INVALID);

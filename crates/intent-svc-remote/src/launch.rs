@@ -1333,7 +1333,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     checkout,
                     mcp_proxies,
                     compact_tool_descriptions,
-                    checkout_of,
+                    checkout_of: checkout_of.map(Into::into),
                     forge,
                     forge_fetch,
                     git_identity,

@@ -17,9 +17,9 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use intent_core::node_link::{
-    SetupCommand, SetupState, SubmodulePin, MAX_SCRIPT_OUTPUT_BYTES, PREPARED_CHECKOUT_PROTOCOL,
+    SetupCommand, SetupOwner, SetupState, SubmodulePin, HOMES_PROTOCOL, MAX_SCRIPT_OUTPUT_BYTES,
+    PREPARED_CHECKOUT_PROTOCOL,
 };
-use intent_core::AgentId;
 use intent_pty::{OutputSink, PtyHost, SpawnSpec};
 use intent_services::feature_api::shell::{saved_script_env_overlay, scrubbed_env_vars_except};
 use intent_transport::node_link::NodeLink;
@@ -201,7 +201,7 @@ pub(super) fn write_status(worktree: &Path, status: &SetupStatus) {
 /// room; the last [`OUTPUT_TAIL_BYTES`] are kept and resent once after a
 /// reconnect.
 pub(super) struct SetupOutput {
-    agent_id: AgentId,
+    owner: SetupOwner,
     head: HeadLink,
     state: Mutex<OutputState>,
     /// The log in the agent's storage directory, appended as output
@@ -219,9 +219,9 @@ struct OutputState {
 }
 
 impl SetupOutput {
-    pub(super) fn new(agent_id: AgentId, head: HeadLink) -> Arc<Self> {
+    pub(super) fn new(owner: impl Into<SetupOwner>, head: HeadLink) -> Arc<Self> {
         Arc::new(Self {
-            agent_id,
+            owner: owner.into(),
             head,
             state: Mutex::new(OutputState::default()),
             log: Mutex::new(None),
@@ -340,7 +340,7 @@ impl SetupOutput {
 
     fn try_send_on(&self, link: &NodeLink, state: &mut OutputState, data: &str) -> bool {
         let sent = link.try_send_setup_output(intent_core::node_link::SetupOutput {
-            agent_id: self.agent_id.clone(),
+            owner: self.owner.clone(),
             seq: state.seq,
             data: data.to_owned(),
         });
@@ -352,9 +352,11 @@ impl SetupOutput {
     }
 
     fn link(&self) -> Option<NodeLink> {
-        self.head
-            .get()
-            .filter(|link| link.protocol() >= PREPARED_CHECKOUT_PROTOCOL)
+        let needs = match self.owner {
+            SetupOwner::Agent(_) => PREPARED_CHECKOUT_PROTOCOL,
+            SetupOwner::Home(_) => HOMES_PROTOCOL,
+        };
+        self.head.get().filter(|link| link.protocol() >= needs)
     }
 }
 

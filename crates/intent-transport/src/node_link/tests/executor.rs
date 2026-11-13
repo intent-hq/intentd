@@ -1027,7 +1027,7 @@ async fn frames_outside_the_executor_list_close_the_link() {
     let (_, link, _) = machine.accepted_link().await;
     let journal = LinkFrame::Journal(JournalRecord {
         seq: NodeCounter(1),
-        agent_id: AgentId::new(),
+        owner: AgentId::new().into(),
         workspace_id: intent_core::WorkspaceId::new(),
         turn_id: None,
         recorded_at: "2026-10-30T00:00:00Z".into(),

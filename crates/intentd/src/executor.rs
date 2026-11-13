@@ -319,6 +319,7 @@ impl ExecutorService {
             .into_iter()
             .filter(|id| !capabilities.providers.iter().any(|p| p.id == *id))
             .collect();
+        capabilities.homes = (!self.deps.launch.allows_homes()).then_some(false);
         capabilities
     }
 
@@ -955,6 +956,10 @@ impl MachineLaunch for SettingsLaunch {
             Err(intent_core::Error::NotFound(_)) => Err("unknown or disabled".into()),
             Err(_) => Err("its runtime is not installed".into()),
         }
+    }
+
+    fn allows_homes(&self) -> bool {
+        self.1 && runner::homes_ready() && self.0.snapshot().effective.remote_agents.allows_homes()
     }
 
     fn policy(&self) -> intent_acp::PermissionPolicy {

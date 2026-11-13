@@ -13,8 +13,8 @@
 use intent_core::node_link::{
     FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
     MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, CHECKOUT_FILES_PROTOCOL,
-    FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL, NODE_LINK_PROTOCOLS, ONE_SHOT_PROTOCOL,
-    SKILLS_PROTOCOL,
+    FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL, HOMES_PROTOCOL, NODE_LINK_PROTOCOLS,
+    ONE_SHOT_PROTOCOL, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
@@ -288,6 +288,9 @@ pub(super) async fn serve_link(
             }
             runner.head_link().set(link.clone());
             runner.resend_setup_output(&link);
+            if protocol >= HOMES_PROTOCOL {
+                runner.resend_home_setup_output(&link);
+            }
             // The backend listed the agents it still records: the
             // checkouts of any others are orphans.
             // The list is taken now, before any frame of this link (a
@@ -301,6 +304,20 @@ pub(super) async fn serve_link(
                         runner.sweep_checkouts(candidates).await;
                     });
                 }
+            }
+            // The homes this backend expects here: the others' checkouts
+            // are orphans, and leased ones left by a restart reopen.
+            let lease_homes = (protocol >= HOMES_PROTOCOL)
+                .then_some(hello.lease_homes.as_deref())
+                .flatten();
+            let swept = runner.adopt_home_lease(lease_homes);
+            if let Some(lease) = lease_homes.map(<[_]>::to_vec) {
+                let runner = runner.clone();
+                // caller-binding: allow — node-local home sweep and resume for one bound backend
+                tokio::spawn(async move {
+                    runner.sweep_homes(swept).await;
+                    runner.resume_leased_homes(&lease).await;
+                });
             }
         }
         Adopted::Replaced => {
@@ -411,6 +428,35 @@ pub(super) async fn serve_link(
             }
             LinkEvent::Frame(LinkFrame::OneShotCancel(cancel)) if protocol >= ONE_SHOT_PROTOCOL => {
                 runner.cancel_one_shot(cancel.request_id);
+            }
+            // Workspace homes (nodeProtocol 19): each answers once on its
+            // own task; a replaced session starts nothing.
+            LinkEvent::Frame(frame @ (LinkFrame::HomeOpen(_) | LinkFrame::HomePush(_)))
+                if protocol >= HOMES_PROTOCOL =>
+            {
+                let replaced = {
+                    let gate = runner.link_gate().lock().await;
+                    admit(gate.as_ref(), &binding, link.is_closed()) == Admission::Replaced
+                };
+                if replaced {
+                    tracing::debug!("node: dropping a home frame from a replaced link");
+                    continue;
+                }
+                let link = link.clone();
+                let runner = runner.clone();
+                // caller-binding: allow — answers one home frame on its link
+                tokio::spawn(async move {
+                    let reply = match frame {
+                        LinkFrame::HomeOpen(open) => {
+                            LinkFrame::HomeOpenReply(runner.home_open(open).await)
+                        }
+                        LinkFrame::HomePush(push) => {
+                            LinkFrame::HomePushReply(runner.home_push(push).await)
+                        }
+                        _ => return,
+                    };
+                    let _ = link.send(&reply).await;
+                });
             }
             LinkEvent::Frame(LinkFrame::ForgeToken(frame)) => {
                 // Handled in order, so it precedes any launch sent after it.
