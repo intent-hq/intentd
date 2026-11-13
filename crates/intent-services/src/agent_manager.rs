@@ -16225,11 +16225,12 @@ async fn run_message_worker(
                             // `retry_spawn` with the SAME content/options.
                             silent_redrive_used = true;
                             keep_failover_chain = true;
-                            tracing::warn!(
-                                agent = %agent_id,
-                                error = %e,
-                                "transport closed before output — redriving the prompt once on a fresh child"
-                            );
+                            let message = "transport closed before output — redriving the prompt once on a fresh child";
+                            if silent_redrive_log_level(&e) == tracing::Level::INFO {
+                                tracing::info!(agent = %agent_id, error = %e, "{message}");
+                            } else {
+                                tracing::warn!(agent = %agent_id, error = %e, "{message}");
+                            }
                             boxed_await(|| mgr.kill_child_only(&agent_id)).await;
                             continue 'outer;
                         } else if crate::quota_failover::is_quota_failover_error(&e) {
@@ -19145,6 +19146,21 @@ fn pre_output_transport_failure(err: &Error) -> bool {
         Error::Internal(msg)
             if msg.starts_with(crate::agent_session::PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX)
     )
+}
+
+/// The level to log a silent redrive at: INFO when the machine started again
+/// from its disk (expected, the relaunch reloads the session), WARN otherwise.
+/// The reason ends the error chain, so a provider message that only quotes it
+/// keeps WARN.
+fn silent_redrive_log_level(err: &Error) -> tracing::Level {
+    match err {
+        Error::Internal(msg)
+            if msg.ends_with(intent_core::node_link::DISK_RESUME_TRANSPORT_CLOSED) =>
+        {
+            tracing::Level::INFO
+        }
+        _ => tracing::Level::WARN,
+    }
 }
 
 /// Whether a `run_turn` error carries the spurious-cancel marker from

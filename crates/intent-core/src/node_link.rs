@@ -129,6 +129,11 @@ pub fn homes_ready() -> bool {
 /// the bound hello's `leaseHomes`.
 pub const NODE_HOME_UNKNOWN: &str = "node-home-unknown";
 
+/// The reason a runtime ends with when its machine started again from its
+/// disk. The backend relaunches the agent and reloads its session, so a
+/// prompt redriven for this reason is expected.
+pub const DISK_RESUME_TRANSPORT_CLOSED: &str = "the machine started again from its disk";
+
 /// `homeOpen` on a machine that may not hold homes
 /// (`remoteAgents.allowHomes` off).
 pub const NODE_HOME_UNSUPPORTED: &str = "node-home-unsupported";
