@@ -420,12 +420,13 @@ impl Services {
         }
         // Newest first; ISO-8601 UTC strings order lexically. Undated last.
         rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        let page: Vec<Value> = rows
+        let mut page: Vec<Value> = rows
             .iter()
             .skip(offset)
             .take(limit)
             .map(Listed::to_wire)
             .collect();
+        attach_repo_roots(&mut page).await;
         let mut out = json!({ "sessions": page, "providers": providers });
         if offset + limit < rows.len() {
             out["nextCursor"] = json!(format!("o:{}", offset + limit));
@@ -835,6 +836,84 @@ async fn collect_replay(
         }
     }
     notes
+}
+
+/// Bound on one `git rev-parse --show-toplevel` for a listed session's cwd.
+const REPO_ROOT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The git top-level of `cwd` on this host, or `None` when `cwd` is not an
+/// absolute existing folder, is not inside a git work tree, or git fails or
+/// exceeds [`REPO_ROOT_TIMEOUT`]. Runs `git` directly (no shell) with the
+/// caller's `GIT_*` location variables removed so they cannot redirect it.
+pub(crate) async fn resolve_repo_root(cwd: &str) -> Option<String> {
+    let path = Path::new(cwd);
+    if cwd.is_empty() || !path.is_absolute() || !path.is_dir() {
+        return None;
+    }
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .kill_on_drop(true);
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_CONFIG",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        command.env_remove(key);
+    }
+    let output = tokio::time::timeout(REPO_ROOT_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let top = String::from_utf8(output.stdout).ok()?;
+    let top = top.strip_suffix('\n').unwrap_or(&top);
+    (!top.is_empty() && !top.contains(['\n', '\r', '\0']) && Path::new(top).is_absolute())
+        .then(|| top.to_owned())
+}
+
+/// Sets `repoRoot` on each wire row whose `cwd` resolves to a git work
+/// tree. Each distinct cwd is resolved once, all in parallel.
+async fn attach_repo_roots(page: &mut [Value]) {
+    let mut distinct: Vec<String> = page
+        .iter()
+        .filter_map(|row| row["cwd"].as_str().filter(|c| !c.is_empty()))
+        .map(str::to_owned)
+        .collect();
+    distinct.sort();
+    distinct.dedup();
+    let mut tasks = tokio::task::JoinSet::new();
+    for cwd in distinct {
+        tasks.spawn(async move {
+            let root = resolve_repo_root(&cwd).await;
+            (cwd, root)
+        });
+    }
+    let mut roots = std::collections::HashMap::new();
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((cwd, Some(root))) = joined {
+            roots.insert(cwd, root);
+        }
+    }
+    for row in page.iter_mut() {
+        if let Some(root) = row["cwd"].as_str().and_then(|c| roots.get(c)) {
+            row["repoRoot"] = json!(root);
+        }
+    }
 }
 
 /// Shared by the unit tests.

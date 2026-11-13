@@ -125,6 +125,10 @@ const SITES: &[(&str, Spawn)] = &[
         Spawn::Other("git reads of a repository"),
     ),
     ("rtk.rs", Spawn::Other("the rtk output compressor")),
+    (
+        "session_import.rs",
+        Spawn::Other("git rev-parse of a listed session's folder"),
+    ),
     ("unsloth_server.rs", Spawn::Provider(&[SPAWN])),
 ];
 
