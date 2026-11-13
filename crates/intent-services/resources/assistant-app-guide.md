@@ -468,9 +468,11 @@ finding the QR control.
 
 **Settings → Machines** lists **<name> (local)** first, then the backend this window
 is connected to as **<name> (connected backend)**, then saved remote connections. Each
-row shows a macOS, Windows or Linux icon and, after the version (or, outside **Where <backend>
-runs agents**, the **Runs agents for <backend>** badge), icons for the AI providers available there; hover an icon for its
-name. Switched-off providers are hidden, and offline or unknown machines show no
+row shows an online/offline dot, a macOS, Windows or Linux icon and icons for the AI providers
+available there; hover an icon for its name. Cloud entries show a cloud icon, a dot that is green
+while the entry is ready, and Linux. A badge appears only while a machine is being made available
+(**Exposing**) or for a problem (unreachable, revoked, update required, key rejected), and the
+version only when the machine's intentd is older than the app expects. Switched-off providers are hidden, and offline or unknown machines show no
 icons, except a machine the backend runs agents on: while idle (disconnected) it still
 shows the providers from its last report, or **No providers ready**. **Add machine** opens **Set up a new machine** (when cloud machines can be added, it
 is the first item of a menu next to **Add cloud**; the machine rail's **Add machine** opens
