@@ -887,7 +887,7 @@ Home. With no open workspace tabs, these shortcuts do nothing. Customize them in
 
 <!-- Numbered navigation requires the matching frontend release. Until it ships,
 describe these bindings only when explicitly asked or testing this change. -->
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/shared/keyboard-shortcut-bindings.ts; src/store/renderer/slices/machine-rail/machine-rail-selectors.ts; src/features/machine-rail/MachineRail.svelte. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/shared/keyboard-shortcut-bindings.ts; src/store/renderer/slices/machine-rail/machine-rail-selectors.ts; src/features/machine-rail/MachineRail.svelte; src/features/backend/main/backend.ipc.ts; src/main/machine-rail-state.ts. -->
 
 Use **Cmd+Alt+1–9** (**Ctrl+Alt+1–9** on Windows/Linux) to select **Home**
 or a workspace tab: **1** opens Home, **2–8** open the first seven workspace
@@ -897,7 +897,11 @@ Home/workspace numbering. User-customized shortcuts take precedence over these
 defaults.
 
 <!-- Labs (device rail): describe only when explicitly asked about the device rail
-or when developing or testing it, and say it is Labs. With the rail visible,
+or when developing or testing it, and say it is Labs. In the desktop app,
+Settings → Labs → Machine rail shows the machines kept in this window.
+An open machine keeps its name and icon when duplicate saved entries are hidden;
+details that are not available yet show a generic device icon and Unknown machine.
+With the rail visible,
 Cmd+1–9 (Ctrl+1–9 on Windows/Linux) selects devices in displayed rail order:
 1–8 select the first eight devices and 9 selects the last. Own devices come before
 guest hosts, as displayed. Cmd+Alt+1–9 (Ctrl+Alt+1–9 on Windows/Linux) continues
