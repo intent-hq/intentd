@@ -173,6 +173,15 @@ fn close_message(session: u32, error: Option<&'static str>) -> Vec<u8> {
 }
 
 /// Head's authority over node git sessions.
+/// What [`NodeGitAccess::before_receive`] holds for one push.
+#[derive(Default)]
+pub struct ReceiveHold {
+    /// Given back to [`NodeGitAccess::received`].
+    pub token: Option<String>,
+    /// Dropped once the receive-pack process has exited.
+    pub guard: Option<Box<dyn Send>>,
+}
+
 pub trait NodeGitAccess: Send + Sync {
     /// The repository holding `remote`'s refs for `service`, only if
     /// `binding` is the node's current binding and `remote`'s agent runs on
@@ -210,21 +219,24 @@ pub trait NodeGitAccess: Send + Sync {
         false
     }
 
-    /// Right before a receive-pack for `remote` into `repository` starts:
-    /// what [`Self::received`] gets back once it ended. An error refuses
-    /// the push, mapped as for [`Self::repository`].
+    /// Right before a receive-pack for `remote` into `repository` starts.
+    /// The hold's guard is kept until that receive-pack process has exited
+    /// (also when its session ended first and it drains on its own); its
+    /// token goes back to [`Self::received`]. An error refuses the push,
+    /// mapped as for [`Self::repository`].
     fn before_receive<'a>(
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
         repository: &'a std::path::Path,
-    ) -> BoxFuture<'a, Result<Option<String>>> {
+    ) -> BoxFuture<'a, Result<ReceiveHold>> {
         let _ = (binding, remote, repository);
-        Box::pin(async { Ok(None) })
+        Box::pin(async { Ok(ReceiveHold::default()) })
     }
 
     /// After that receive-pack ended, whatever its outcome, with the token
-    /// [`Self::before_receive`] returned for it.
+    /// [`Self::before_receive`] returned for it, while its guard is still
+    /// held. Not called when the session ended before the process did.
     fn received<'a>(
         &'a self,
         binding: &'a LeaseBinding,
@@ -365,7 +377,7 @@ async fn run_service(
     if remote.is_home() && !access.homes_supported() {
         return Err(codes::INVALID);
     }
-    let mut token = None;
+    let mut hold = ReceiveHold::default();
     let (command, accept) = if remote.is_forge() {
         if !access.forge_supported() {
             return Err(codes::INVALID);
@@ -393,7 +405,7 @@ async fn run_service(
             .await
             .map_err(|error| access_code(&error))?;
         if service == GitService::ReceivePack {
-            token = access
+            hold = access
                 .before_receive(binding, &remote, &repository)
                 .await
                 .map_err(|error| access_code(&error))?;
@@ -417,6 +429,7 @@ async fn run_service(
         stdout: Some(stdout),
         drain,
         slot: Some(slot),
+        hold: hold.guard.take(),
     };
     sender
         .send(encode(ACCEPT, id, &accept))
@@ -456,7 +469,7 @@ async fn run_service(
     let mut child = service.child.take().ok_or(codes::FAILED)?;
     let status = child.wait().await.map_err(|_| codes::FAILED)?;
     if drain {
-        access.received(binding, &remote, token).await;
+        access.received(binding, &remote, hold.token.take()).await;
     }
     if status.success() {
         Ok(())
@@ -482,6 +495,8 @@ struct Service {
     stdout: Option<tokio::process::ChildStdout>,
     drain: bool,
     slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// [`ReceiveHold::guard`]: kept until the process exits.
+    hold: Option<Box<dyn Send>>,
 }
 
 impl Drop for Service {
@@ -499,6 +514,7 @@ impl Drop for Service {
             return;
         };
         let slot = self.slot.take();
+        let hold = self.hold.take();
         runtime.spawn(async move {
             let drain = async {
                 if let Some(mut stdout) = stdout {
@@ -511,6 +527,7 @@ impl Drop for Service {
                 let _ = child.kill().await;
             }
             drop(slot);
+            drop(hold);
         });
     }
 }

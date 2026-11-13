@@ -18,7 +18,9 @@ use intent_core::node_link::{
 use intent_core::remote_launch::RemotePlacementView;
 use intent_core::{AgentId, BoxFuture, Error, Result, WorkspaceId};
 use intent_git::node_git::{self, forge, AgentRemote, GitService, ModuleRefusal};
-use intent_transport::node_link::{git_codes, ForgeServe, NodeGitAccess, FORGE_REFRESH_FAILED};
+use intent_transport::node_link::{
+    git_codes, ForgeServe, NodeGitAccess, ReceiveHold, FORGE_REFRESH_FAILED,
+};
 use tokio::time::Instant;
 
 use crate::connector::Shared;
@@ -26,11 +28,17 @@ use intent_services::feature_api::Services;
 
 pub(crate) struct HeadGitAccess {
     shared: Arc<Shared>,
+    /// One home push at a time per workspace, from its pin to its
+    /// settlement: no push drops a pin another one still relies on.
+    home_pushes: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl HeadGitAccess {
     pub(crate) fn new(shared: Arc<Shared>) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            home_pushes: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -276,17 +284,31 @@ impl NodeGitAccess for HeadGitAccess {
         _binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
         repository: &'a Path,
-    ) -> BoxFuture<'a, Result<Option<String>>> {
+    ) -> BoxFuture<'a, Result<ReceiveHold>> {
         Box::pin(async move {
             if !remote.is_home() || remote.module_key().is_some() {
-                return Ok(None);
+                return Ok(ReceiveHold::default());
             }
+            let slot = self
+                .home_pushes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(WorkspaceId::from(remote.workspace_id()))
+                .or_default()
+                .clone();
+            let guard = slot.lock_owned().await;
             let repository = repository.to_path_buf();
             let remote = remote.clone();
-            tokio::task::spawn_blocking(move || crate::homes::pin_home_head(&repository, &remote))
-                .await
-                .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
-                .map_err(|error| unavailable(&format!("could not pin the home's head: {error}")))
+            let token = tokio::task::spawn_blocking(move || {
+                crate::homes::pin_home_head(&repository, &remote)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
+            .map_err(|error| unavailable(&format!("could not pin the home's head: {error}")))?;
+            Ok(ReceiveHold {
+                token,
+                guard: Some(Box::new(guard)),
+            })
         })
     }
 
