@@ -79,6 +79,40 @@ pub(crate) struct RelayClient {
     http: reqwest::Client,
 }
 
+/// Phones linked to this daemon and link tokens not yet used, as the relay
+/// reports them after every publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LinkCounts {
+    pub(crate) linked_devices: u64,
+    pub(crate) pending_links: u64,
+}
+
+impl LinkCounts {
+    /// No phone can receive updates and none can link without a new token.
+    pub(crate) fn is_empty(self) -> bool {
+        self.linked_devices == 0 && self.pending_links == 0
+    }
+
+    /// `None` for a relay that does not report counts.
+    fn from_reply(reply: Option<Value>) -> Option<Self> {
+        let reply = reply?;
+        Some(Self {
+            linked_devices: reply.get("linkedDevices")?.as_u64()?,
+            pending_links: reply.get("pendingLinks")?.as_u64()?,
+        })
+    }
+}
+
+/// The relay sends Unix seconds; `push.createLink` answers ISO 8601.
+fn expires_at(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => chrono::DateTime::from_timestamp(n.as_i64()?, 0)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        _ => None,
+    }
+}
+
 impl RelayClient {
     pub(crate) fn new(base: String) -> Self {
         let http = reqwest::Client::builder()
@@ -151,8 +185,11 @@ impl RelayClient {
             )
             .await?
             .unwrap_or_default();
-        let field = |name: &str| reply.get(name).and_then(Value::as_str).map(str::to_string);
-        match (field("linkToken"), field("expiresAt")) {
+        let token = reply
+            .get("linkToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match (token, expires_at(reply.get("expiresAt"))) {
             (Some(token), Some(expires)) => Ok((token, expires)),
             _ => Err(RelayError::Status(
                 200,
@@ -178,7 +215,7 @@ impl RelayClient {
         key: &DaemonKey,
         workspace_id: &str,
         state: Option<&WorkspaceState>,
-    ) -> Result<(), RelayError> {
+    ) -> Result<Option<LinkCounts>, RelayError> {
         let path = format!("/v1/daemons/{}/workspaces/{workspace_id}", key.daemon_id());
         self.send(
             key,
@@ -187,14 +224,14 @@ impl RelayClient {
             Some(&json!({ "state": state })),
         )
         .await
-        .map(|_| ())
+        .map(LinkCounts::from_reply)
     }
 
     pub(crate) async fn put_all(
         &self,
         key: &DaemonKey,
         workspaces: &BTreeMap<String, WorkspaceState>,
-    ) -> Result<(), RelayError> {
+    ) -> Result<Option<LinkCounts>, RelayError> {
         let path = format!("/v1/daemons/{}/workspaces", key.daemon_id());
         self.send(
             key,
@@ -203,6 +240,6 @@ impl RelayClient {
             Some(&json!({ "workspaces": workspaces })),
         )
         .await
-        .map(|_| ())
+        .map(LinkCounts::from_reply)
     }
 }

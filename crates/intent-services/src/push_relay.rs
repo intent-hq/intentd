@@ -12,6 +12,7 @@ mod state;
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ use serde_json::{json, Value};
 use tokio::time::Instant;
 
 use crate::{EventBus, Services, SubscriptionFilter};
-use client::{RelayClient, RelayError};
+use client::{LinkCounts, RelayClient, RelayError};
 use proof::DaemonKey;
 use state::{Facts, IdleAgent, Notice, Pending, WorkspaceState};
 
@@ -72,6 +73,13 @@ pub(crate) struct PushRelay {
     key: tokio::sync::Mutex<Option<Arc<DaemonKey>>>,
     persisted: tokio::sync::Mutex<Option<Persisted>>,
     wake: tokio::sync::Notify,
+    /// The relay reported no linked phone and no unused link token. Cleared
+    /// by `push.createLink`, the only way a phone can link to this daemon.
+    dormant: AtomicBool,
+    /// The publisher is online and sending updates.
+    publishing: AtomicBool,
+    /// The relay's answer to the last publish.
+    last_counts: std::sync::Mutex<Option<LinkCounts>>,
     #[cfg(test)]
     url: std::sync::Mutex<Option<String>>,
 }
@@ -232,6 +240,7 @@ impl Services {
             p.links.insert(subject)
         })
         .await?;
+        self.push_relay.dormant.store(false, Ordering::Relaxed);
         self.push_relay.wake.notify_one();
         Ok(json!({
             "linkToken": link_token,
@@ -249,7 +258,7 @@ impl Services {
         Ok(json!({ "revoked": revoked }))
     }
 
-    /// `push.status` → `{enabled, relayUrl, daemonId, linked}`.
+    /// `push.status` → `{enabled, relayUrl, daemonId, linked, linkedDevices, publishing}`.
     pub(crate) async fn push_status_op(&self) -> Result<Value> {
         let subject = self.push_caller_subject("push.status").await?;
         let enabled = self.push_relay_enabled();
@@ -259,11 +268,19 @@ impl Services {
         } else {
             None
         };
+        let linked_devices = self
+            .push_relay
+            .last_counts
+            .lock()
+            .unwrap()
+            .map(|c| c.linked_devices);
         Ok(json!({
             "enabled": enabled,
             "relayUrl": self.push_relay_url(),
             "daemonId": daemon_id,
             "linked": linked,
+            "linkedDevices": linked_devices,
+            "publishing": enabled && self.push_relay.publishing.load(Ordering::Relaxed),
         }))
     }
 
@@ -351,10 +368,14 @@ impl Services {
         }
         loop {
             let active = self.push_relay_enabled()
+                && !self.push_relay.dormant.load(Ordering::Relaxed)
                 && self
                     .push_persisted(|p| !p.links.is_empty())
                     .await
                     .unwrap_or(false);
+            self.push_relay
+                .publishing
+                .store(active && publisher.online, Ordering::Relaxed);
             let now = Instant::now();
             let mut wake = now + IDLE_RECHECK;
             if active {
@@ -410,13 +431,21 @@ impl Services {
                 }
             }
             if !active {
+                if publisher.online && !self.push_relay_enabled() {
+                    if let Err(e) = self.push_clear_all().await {
+                        tracing::debug!(error = %e, "push relay clear on disable failed");
+                    }
+                }
                 publisher.go_offline(Duration::ZERO);
                 continue;
             }
             if !publisher.online {
                 if publisher.next_sync.is_none_or(|at| Instant::now() >= at) {
                     match self.push_sync_all(&mut publisher).await {
-                        Ok(()) => publisher.online = true,
+                        Ok(()) => {
+                            publisher.online = true;
+                            self.push_relay.publishing.store(true, Ordering::Relaxed);
+                        }
                         Err(e) => {
                             tracing::debug!(error = %e, "push relay full publish failed");
                             publisher.go_offline(next_backoff(publisher.backoff));
@@ -470,8 +499,10 @@ impl Services {
             states.insert(ws.id.0.clone(), state::build_state(ws, &agents, &now));
             facts.insert(ws.id.clone(), Facts::of(ws));
         }
-        self.push_call(&client, &key, || client.put_all(&key, &states))
+        let counts = self
+            .push_call(&client, &key, || client.put_all(&key, &states))
             .await?;
+        self.push_note_link_counts(counts);
         publisher.facts = facts;
         publisher.sent = states
             .into_iter()
@@ -497,10 +528,12 @@ impl Services {
             Ok(_) | Err(Error::NotFound(_)) => {
                 publisher.facts.remove(workspace);
                 if publisher.sent.remove(workspace).is_some() {
-                    self.push_call(&client, &key, || {
-                        client.put_workspace(&key, &workspace.0, None)
-                    })
-                    .await?;
+                    let counts = self
+                        .push_call(&client, &key, || {
+                            client.put_workspace(&key, &workspace.0, None)
+                        })
+                        .await?;
+                    self.push_note_link_counts(counts);
                 }
                 return Ok(());
             }
@@ -529,12 +562,42 @@ impl Services {
                 .or_else(|| next.agent_name.clone()),
             at: now,
         });
-        self.push_call(&client, &key, || {
-            client.put_workspace(&key, &workspace.0, Some(&next))
-        })
-        .await?;
+        let counts = self
+            .push_call(&client, &key, || {
+                client.put_workspace(&key, &workspace.0, Some(&next))
+            })
+            .await?;
+        self.push_note_link_counts(counts);
         publisher.sent.insert(workspace.clone(), plain);
         Ok(())
+    }
+
+    /// Turning the relay off removes this machine's rows, so phones end
+    /// their Live Activities instead of showing stale rows.
+    async fn push_clear_all(&self) -> std::result::Result<(), RelayError> {
+        let key = self
+            .push_key()
+            .await
+            .map_err(|e| RelayError::Network(e.to_string()))?;
+        let client = RelayClient::new(self.push_relay_url());
+        let empty = BTreeMap::new();
+        self.push_call(&client, &key, || client.put_all(&key, &empty))
+            .await
+            .map(|_| ())
+    }
+
+    /// Pauses publishing once the relay has nobody to deliver to.
+    fn push_note_link_counts(&self, counts: Option<LinkCounts>) {
+        if counts.is_some() {
+            *self.push_relay.last_counts.lock().unwrap() = counts;
+        }
+        if counts.is_some_and(LinkCounts::is_empty)
+            && !self.push_relay.dormant.swap(true, Ordering::Relaxed)
+        {
+            tracing::info!(
+                "push relay: no phone is linked; publishing paused until push.createLink"
+            );
+        }
     }
 }
 
