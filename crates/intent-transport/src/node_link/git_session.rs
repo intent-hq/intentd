@@ -234,16 +234,17 @@ pub trait NodeGitAccess: Send + Sync {
         Box::pin(async { Ok(ReceiveHold::default()) })
     }
 
-    /// After that receive-pack ended, whatever its outcome, with the token
-    /// [`Self::before_receive`] returned for it, while its guard is still
-    /// held. Not called when the session ended before the process did.
+    /// After that receive-pack ended, whatever its outcome, with the hold
+    /// [`Self::before_receive`] returned for it (its guard included, so the
+    /// implementation keeps it as long as its own work runs). Not called
+    /// when the session ended before the process did.
     fn received<'a>(
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
-        token: Option<String>,
+        hold: ReceiveHold,
     ) -> BoxFuture<'a, ()> {
-        let _ = (binding, remote, token);
+        let _ = (binding, remote, hold);
         Box::pin(async {})
     }
 }
@@ -469,7 +470,16 @@ async fn run_service(
     let mut child = service.child.take().ok_or(codes::FAILED)?;
     let status = child.wait().await.map_err(|_| codes::FAILED)?;
     if drain {
-        access.received(binding, &remote, hold.token.take()).await;
+        access
+            .received(
+                binding,
+                &remote,
+                ReceiveHold {
+                    token: hold.token.take(),
+                    guard: service.hold.take(),
+                },
+            )
+            .await;
     }
     if status.success() {
         Ok(())

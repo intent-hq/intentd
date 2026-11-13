@@ -296,15 +296,25 @@ impl NodeGitAccess for HeadGitAccess {
                 .entry(WorkspaceId::from(remote.workspace_id()))
                 .or_default()
                 .clone();
-            let guard = slot.lock_owned().await;
             let repository = repository.to_path_buf();
             let remote = remote.clone();
-            let token = tokio::task::spawn_blocking(move || {
-                crate::homes::pin_home_head(&repository, &remote)
+            // Its own task, owning the lock: a session that ends meanwhile
+            // never lets another push in while the pin is being made.
+            // caller-binding: allow — pins a home's head for one push under its workspace lock
+            let pinned = tokio::spawn(async move {
+                let guard = slot.lock_owned().await;
+                let pinned = tokio::task::spawn_blocking(move || {
+                    crate::homes::pin_home_head(&repository, &remote)
+                })
+                .await;
+                (guard, pinned)
             })
             .await
-            .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
-            .map_err(|error| unavailable(&format!("could not pin the home's head: {error}")))?;
+            .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?;
+            let (guard, pinned) = pinned;
+            let token = pinned
+                .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
+                .map_err(|error| unavailable(&format!("could not pin the home's head: {error}")))?;
             Ok(ReceiveHold {
                 token,
                 guard: Some(Box::new(guard)),
@@ -316,29 +326,38 @@ impl NodeGitAccess for HeadGitAccess {
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
-        token: Option<String>,
+        hold: ReceiveHold,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             if !remote.is_home() || remote.module_key().is_some() {
                 return;
             }
             let workspace_id = WorkspaceId::from(remote.workspace_id());
-            let pins: Vec<String> = token.into_iter().collect();
             let Ok((checkout, _)) = self.home_checkout(binding, remote).await else {
                 return;
             };
+            let pins: Vec<String> = hold.token.into_iter().collect();
+            let guard = hold.guard;
             let remote = remote.clone();
-            let settled = tokio::task::spawn_blocking(move || {
-                crate::homes::settle_home_push(&checkout, &remote, &pins)
+            // Its own task, owning the lock until the settlement is done,
+            // also when this session ends meanwhile.
+            // caller-binding: allow — settles one home push under its workspace lock
+            let settled = tokio::spawn(async move {
+                let settled = tokio::task::spawn_blocking(move || {
+                    crate::homes::settle_home_push(&checkout, &remote, &pins)
+                })
+                .await;
+                drop(guard);
+                settled
             })
             .await;
             match settled {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
                     tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not settle a home push");
                 }
-                Err(error) => {
-                    tracing::warn!(workspace = %workspace_id, %error, "remote machine: settling a home push panicked");
+                Ok(Err(error)) | Err(error) => {
+                    tracing::warn!(workspace = %workspace_id, %error, "remote machine: settling a home push failed");
                 }
             }
         })
