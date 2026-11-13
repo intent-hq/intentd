@@ -2380,16 +2380,17 @@ impl Runner {
             .resumed_from_disk
             .then(|| self.inner.checkouts.provider_session(&agent.id))
             .flatten()
-            .filter(|recorded| recorded.provider == agent.provider && recorded.model == agent.model);
+            .filter(|recorded| {
+                recorded.provider == agent.provider && recorded.model == agent.model
+            });
         let setup = async {
             let handshake =
                 intent_acp::handshake_within(connection, &launch.config, initialize_timeout)
                     .await?;
-            if let Some(recorded) = recorded.filter(|_| {
-                intent_acp::session::supports_load_session(&handshake.initialize)
-            }) {
-                match load_recorded(agent, connection, cwd, mcp.clone(), &recorded.session_id)
-                    .await
+            if let Some(recorded) = recorded
+                .filter(|_| intent_acp::session::supports_load_session(&handshake.initialize))
+            {
+                match load_recorded(agent, connection, cwd, mcp.clone(), &recorded.session_id).await
                 {
                     Ok(()) => return Ok(recorded.session_id),
                     Err(error) => {

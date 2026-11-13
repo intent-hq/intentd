@@ -1786,7 +1786,10 @@ mod stop_acks {
             .await;
         })
         .await;
-        assert!(launched.is_ok(), "the relaunch waited for a lost exit record");
+        assert!(
+            launched.is_ok(),
+            "the relaunch waited for a lost exit record"
+        );
         let relaunched = tokio::time::timeout(wait(), launching)
             .await
             .unwrap()

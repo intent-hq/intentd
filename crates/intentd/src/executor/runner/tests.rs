@@ -2381,8 +2381,10 @@ async fn node_runner_loads_the_recorded_session_after_a_disk_resume() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let all = records(&h.runner).await;
     assert!(
-        !all.iter().any(|r| matches!(&r.body, JournalBody::Notification { notification }
-            if notification.to_string().contains("replayed:"))),
+        !all.iter().any(
+            |r| matches!(&r.body, JournalBody::Notification { notification }
+            if notification.to_string().contains("replayed:"))
+        ),
         "{all:#?}"
     );
     stopped().await;
