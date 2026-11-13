@@ -800,20 +800,29 @@ uses the most recent setup. Changes you make in the form are kept when you switc
 repositories.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/session_import.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/session-import/ImportSessionTab.svelte; src/features/session-import/importable-sessions.client.ts; src/lib/components/workspace/initializer/RepoSelector.svelte; src/features/onboarding/messages/ProjectPickerMessage.svelte; messages/en.json. -->
 
-To continue a session you started in a provider's own CLI, choose **Import a
-session** in **New workspace**. It lists sessions from your enabled providers
-whose adapters support it (such as Claude Code and Codex), newest first, with search; a
+To continue a session you started in a provider's own CLI, open the
+**Codebase** row in **New workspace** and choose **Import a session**. It opens
+**Add codebase** on the **Sessions** tab. In onboarding, use the **Sessions**
+tab of the **Choose a project** step. The list loads only when that tab opens
+and shows sessions from your enabled providers whose adapters support it (such
+as Claude Code and Codex), newest first, with search and **Refresh**; a
 provider that fails to list shows an error without hiding the others. Only
-sessions on the machine Intent runs on are listed: for a remote daemon, sessions
-on your Mac do not appear. Pick the session's repository, and usually its last
-branch. The session becomes the workspace's first agent with its history in the
-chat, and your next message continues it with the full context. With that
+sessions on the machine Intent runs on are listed: for a remote daemon,
+sessions on your Mac do not appear. A session whose folder has no git
+repository shows "No git repository found" and cannot be picked. Picking a
+session selects its repository, and its last branch when that branch still
+exists locally or on a remote; otherwise the form keeps its default, so check
+the **Branch** field before you create. The **Codebase** row shows the session
+title with the provider icon. Picking another codebase cancels the
+import. The session becomes the workspace's first agent with its history in
+the chat, and your next message continues it with the full context. With that
 message the agent is told the session moved into Intent and gets Intent's
-instructions and tools. Intent copies
-the session into the workspace (the original stays untouched); when a provider
-cannot copy, the original continues in Intent and a notice says so. Uncommitted
-changes from where the session ran are not carried over.
+instructions and tools. Intent copies the session into the workspace (the
+original stays untouched); when a provider cannot copy, the original continues
+in Intent and a notice says so. Uncommitted changes from where the session ran
+are not carried over.
 
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/InlineProposal.svelte; src/lib/components/chat/proposals/open-created-workspace.ts; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
