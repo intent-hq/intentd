@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.199] - 2026-11-13
+
+### 🚀 Features
+
+- Workspace home checkouts on the machine (nodeProtocol 19) ([#3314](https://github.com/intent-hq/intentd/pull/3314))
+
+### 📚 Documentation
+
+- *(guide)* Import a session from the codebase selector ([#3329](https://github.com/intent-hq/intentd/pull/3329))
+- *(guide)* SSH setup pairs computers that already run intentd ([#3324](https://github.com/intent-hq/intentd/pull/3324))
+- *(guide)* Start on offers First available machine on an orchestrator ([#3313](https://github.com/intent-hq/intentd/pull/3313))
+
+
 ## [0.11.198] - 2026-11-13
 
 ### 🚀 Features
