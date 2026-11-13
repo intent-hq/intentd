@@ -20,9 +20,10 @@ that it exists or present it as ready for general use. Ordinary setup or permiss
 requirements do not, by themselves, make a supported feature experimental.
 
 Multiplayer is always on: there is no switch to enable or disable it, and opening an
-invitation link shows connection progress and sign-in in the app window being used,
-without an enable step or a detour through Home. What’s New waits until invitation
-dialogs close. Workspace sharing, guest roles,
+invitation link joins directly without an enable step. In released frontends, check
+Home if an invitation prompt does not appear while viewing another machine.
+Active-machine prompts and deferring What’s New are pending a companion frontend
+release. Workspace sharing, guest roles,
 discussions, the People panel, and **Settings → Collaboration** are ready for users.
 Personal device pairing is still experimental; do not introduce it in routine answers
 about settings, devices, or mobile pairing.
