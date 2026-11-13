@@ -281,6 +281,38 @@ async fn lists_and_imports_a_claude_session_over_real_wss() {
         at(1_794_000_000),
     );
 
+    // A session started in a subfolder of a git repo lists the repo's
+    // top-level as `repoRoot`; the sessions above (folders that do not
+    // exist on this host) have none.
+    let repo = data_dir.join("repo");
+    let repo_sub = repo.join("apps/web");
+    std::fs::create_dir_all(&repo_sub).expect("mkdir repo subfolder");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .status()
+        .expect("run git init");
+    assert!(init.success(), "git init failed");
+    let repo_root = repo
+        .canonicalize()
+        .expect("canonical repo")
+        .to_string_lossy()
+        .into_owned();
+    let repo_cwd = repo_sub.to_string_lossy().into_owned();
+    let in_repo = format!(
+        "{{\"type\":\"user\",\"cwd\":{cwd},\"sessionId\":\"repo-1\",\"message\":{{\"role\":\"user\",\"content\":\"Repo work\"}}}}\n",
+        cwd = json!(repo_cwd)
+    );
+    store_session(
+        &home,
+        &repo_cwd,
+        "repo-1",
+        in_repo.as_bytes(),
+        at(1_791_000_000),
+    );
+
     let workspace_id = seed_workspace(&data_dir, &worktree).await;
     let _daemon = spawn_serve(&data_dir, &home, &script, &session_log, &rpc_log);
     let status = common::await_wss_status_logged(
@@ -319,6 +351,9 @@ async fn lists_and_imports_a_claude_session_over_real_wss() {
                   "updatedAt": "2026-10-26T07:33:20.000Z" },
                 { "provider": "mock", "sessionId": "older-1", "title": "older-1",
                   "cwd": "/home/dev/old", "updatedAt": "2026-10-14T17:46:40.000Z" },
+                { "provider": "mock", "sessionId": "repo-1", "title": "repo-1",
+                  "cwd": repo_cwd, "repoRoot": repo_root,
+                  "updatedAt": "2026-10-03T04:00:00.000Z" },
             ],
             "providers": [{ "id": "mock", "label": "Mock (E2E)", "status": "ok" }],
         }})
