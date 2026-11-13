@@ -859,11 +859,13 @@ An agent can suggest a follow-up workspace as a card in its conversation. Review
 it and choose **Create workspace** on the card, or ask the agent to apply it.
 Unless the agent named one, the card starts with the agent last used in New
 workspace for that repository, and uses that agent's last model and reasoning
-effort while it stays selected. If the selected agent always runs on a provider
-that is turned off in **Settings > Providers**, the card says so and **Create
-workspace** waits: pick another provider for this workspace (the agent's own
-setting is unchanged), choose another agent, or turn the provider back on with
-**Open provider settings**. The new workspace opens as a tab at the end of
+effort while it stays selected. The card's **Model** row, the same picker as in
+New workspace, shows the model and effort it will use and changes them for this
+workspace only; picking another agent resets it. If the selected agent always
+runs on a provider that is turned off in **Settings > Providers**, the card says
+so and **Create workspace** waits: pick a model from another provider in the
+**Model** row (the agent's own setting is unchanged), choose another agent, or
+turn the provider back on with **Open provider settings**. The new workspace opens as a tab at the end of
 the top tab strip, and the current workspace stays selected. Once created, the
 card shows **Open workspace**, whoever applied it; if that workspace was deleted,
 a message says it no longer exists.
