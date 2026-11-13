@@ -590,10 +590,26 @@ fn render(captured: &Captured, payloads: bool, max_payload_bytes: usize) -> Draf
     }
 }
 
-/// `frame` as the capture keeps it: an agent secret's value never enters
-/// the queue.
+/// `frame` as the capture keeps it: an agent secret's value, a terminal's
+/// input, command and environment values never enter the queue.
 fn masked_copy(frame: &LinkFrame) -> LinkFrame {
     match frame {
+        LinkFrame::PtyInput(input) => LinkFrame::PtyInput(crate::node_link::PtyInput {
+            terminal_id: input.terminal_id.clone(),
+            data: MASK.to_owned(),
+        }),
+        LinkFrame::PtyOpen(open) => LinkFrame::PtyOpen(crate::node_link::PtyOpen {
+            command: open.command.as_ref().map(|_| MASK.to_owned()),
+            env: open
+                .env
+                .iter()
+                .map(|var| crate::node_link::PtyEnvVar {
+                    key: var.key.clone(),
+                    value: MASK.to_owned(),
+                })
+                .collect(),
+            ..open.clone()
+        }),
         LinkFrame::SecretPut(put) => LinkFrame::SecretPut(crate::node_link::SecretPut {
             value: crate::node_link::SecretValue::from(MASK),
             ..put.clone()
@@ -847,6 +863,44 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "homeId": field(reply.home_id.as_str()),
             "outcome": reply.outcome,
             "error": reply.error.as_deref().map(field),
+        }),
+        LinkFrame::PtyOpen(open) => json!({
+            "type": "ptyOpen",
+            "terminalId": field(&open.terminal_id),
+            "homeId": field(open.home_id.as_str()),
+            "mode": open.mode,
+        }),
+        LinkFrame::PtyInput(input) => json!({
+            "type": "ptyInput",
+            "terminalId": field(&input.terminal_id),
+            "bytes": input.data.len(),
+        }),
+        LinkFrame::PtyResize(resize) => json!({
+            "type": "ptyResize",
+            "terminalId": field(&resize.terminal_id),
+            "cols": resize.cols,
+            "rows": resize.rows,
+        }),
+        LinkFrame::PtyKill(kill) => json!({
+            "type": "ptyKill",
+            "terminalId": field(&kill.terminal_id),
+        }),
+        LinkFrame::PtyAck(ack) => json!({
+            "type": "ptyAck",
+            "terminalId": field(&ack.terminal_id),
+            "seq": ack.seq,
+        }),
+        LinkFrame::PtyOutput(output) => json!({
+            "type": "ptyOutput",
+            "terminalId": field(&output.terminal_id),
+            "seq": output.seq,
+            "bytes": output.data.len(),
+        }),
+        LinkFrame::PtyExited(exited) => json!({
+            "type": "ptyExited",
+            "terminalId": field(&exited.terminal_id),
+            "exitCode": exited.exit_code,
+            "error": exited.error.as_deref().map(field),
         }),
         LinkFrame::CheckoutRead(read) => json!({
             "type": "checkoutRead",

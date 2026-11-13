@@ -354,6 +354,34 @@ impl Runner {
         })
     }
 
+    /// Start a terminal in the home checkout `frame` names; a home this
+    /// machine does not hold answers `ptyExited` with `node-home-unknown`.
+    /// The terminal is reserved at once, so input sent after the
+    /// `ptyOpen` waits for it; it starts on its own task, which may first
+    /// reopen a leased home, so no other frame waits.
+    pub(in crate::executor) fn pty_open(&self, frame: intent_core::node_link::PtyOpen) {
+        let Some(reserved) = self.inner.terminals.reserve(&frame) else {
+            return;
+        };
+        let runner = self.clone();
+        // caller-binding: allow — node-local start of one home terminal
+        tokio::spawn(async move {
+            let home = frame.home();
+            if runner.leased_unopened(&home) {
+                runner
+                    .resume_leased_homes(std::slice::from_ref(&home))
+                    .await;
+            }
+            let worktree = runner
+                .leased_home(&home.workspace_id, &home.home_id)
+                .map(|opened| opened.worktree.clone());
+            runner
+                .inner
+                .terminals
+                .start(reserved, &frame, worktree.as_deref());
+        });
+    }
+
     /// Push the home checkout for an agent sharing `home`, after its turn.
     pub(super) async fn push_home_for(
         &self,

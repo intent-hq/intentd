@@ -235,6 +235,175 @@ pub struct HomePushReply {
     pub error: Option<String>,
 }
 
+/// How a [`PtyOpen`] runs its process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PtyMode {
+    /// An interactive terminal on a PTY.
+    Terminal,
+    /// `host.execStream`: the command on pipes, stdout and stderr apart.
+    Exec,
+}
+
+/// One environment variable a [`PtyOpen`] adds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PtyEnvVar {
+    pub key: String,
+    pub value: String,
+}
+
+/// Backend to machine (nodeProtocol 19): start a terminal (or an exec
+/// process) in a home checkout. The body is closed. `Debug` leaves out the
+/// command and the environment values, which can hold tokens.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PtyOpen {
+    pub terminal_id: String,
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+    pub mode: PtyMode,
+    /// Relative to the home checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<PtyEnvVar>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+}
+
+impl std::fmt::Debug for PtyOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyOpen")
+            .field("terminal_id", &self.terminal_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("home_id", &self.home_id)
+            .field("mode", &self.mode)
+            .field("cwd", &self.cwd)
+            .field("command", &self.command.as_ref().map(|_| "…"))
+            .field(
+                "env",
+                &self
+                    .env
+                    .iter()
+                    .map(|var| var.key.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .finish()
+    }
+}
+
+impl PtyOpen {
+    /// The home this terminal runs in.
+    #[must_use]
+    pub fn home(&self) -> HomeRef {
+        HomeRef {
+            workspace_id: self.workspace_id.clone(),
+            home_id: self.home_id.clone(),
+        }
+    }
+}
+
+/// Backend to machine (nodeProtocol 19): input for a terminal, base64.
+/// `Debug` leaves out the input, which can hold a password.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PtyInput {
+    pub terminal_id: String,
+    pub data: String,
+}
+
+/// Backend to machine (nodeProtocol 19): a terminal's new size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PtyResize {
+    pub terminal_id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Backend to machine (nodeProtocol 19): end a terminal's process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PtyKill {
+    pub terminal_id: String,
+}
+
+/// Backend to machine (nodeProtocol 19): every `ptyOutput` of the
+/// terminal through `seq` has arrived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PtyAck {
+    pub terminal_id: String,
+    pub seq: u64,
+}
+
+impl std::fmt::Debug for PtyInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyInput")
+            .field("terminal_id", &self.terminal_id)
+            .field("len", &self.data.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Which pipe an exec-mode [`PtyOutput`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PtyStream {
+    Stdout,
+    Stderr,
+}
+
+/// Machine to backend (nodeProtocol 19): the next piece of a terminal's
+/// output, base64, `seq` counting from 0 per terminal. `Debug` leaves out
+/// the output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PtyOutput {
+    pub terminal_id: String,
+    pub seq: u64,
+    pub data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<PtyStream>,
+}
+
+impl std::fmt::Debug for PtyOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyOutput")
+            .field("terminal_id", &self.terminal_id)
+            .field("seq", &self.seq)
+            .field("len", &self.data.len())
+            .field("stream", &self.stream)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Machine to backend (nodeProtocol 19): a terminal's process ended, or
+/// (`error`, no `exitCode`) never started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PtyExited {
+    pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The largest raw chunk one [`PtyOutput`] carries, before base64.
+pub const MAX_PTY_OUTPUT_BYTES: usize = 32 * 1024;
+
+/// The most unacknowledged terminal output a machine keeps per terminal;
+/// past it the terminal's reader waits for acknowledgements.
+pub const PTY_UNACKED_BYTES: usize = 4 * 1024 * 1024;
+
 /// [`LaunchCommand::checkout_of`]: the agent whose checkout a sub-agent
 /// works in (nodeProtocol 13, a string on the wire), or the workspace's
 /// home checkout (nodeProtocol 19, an object).
@@ -592,13 +761,15 @@ impl std::fmt::Display for ProtocolRange {
 /// responses to the machine's forwarded `workspace.call` requests, and
 /// starting and stopping script runs (protocol 8), the skills query
 /// (protocol 12), the push request (protocol 13), the agent secret
-/// frames (protocol 14), the forge token (protocol 15) and checkout reads
-/// (protocol 16). Nothing else is
+/// frames (protocol 14), the forge token (protocol 15), checkout reads
+/// (protocol 16), quick actions (protocol 18) and the home and terminal
+/// frames (protocol 19). Nothing else is
 /// admitted
 /// from an executor credential; the machine-to-backend frames (`welcome`,
 /// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
 /// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`, `secretReply`,
-/// `forgeTokenReply`, `checkoutReadReply`, `oneShotReply`) and
+/// `forgeTokenReply`, `checkoutReadReply`, `oneShotReply`, `homeOpenReply`,
+/// `homePushReply`, `ptyOutput`, `ptyExited`) and
 /// `cancelRequest` are
 /// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
@@ -618,6 +789,11 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "oneShot",
     "oneShotCancel",
     "prompt",
+    "ptyAck",
+    "ptyInput",
+    "ptyKill",
+    "ptyOpen",
+    "ptyResize",
     "pushWip",
     "response",
     "scriptStart",
@@ -1754,6 +1930,20 @@ pub enum LinkFrame {
     HomePush(HomePush),
     /// Machine to backend (nodeProtocol 19): the answer to a `homePush`.
     HomePushReply(HomePushReply),
+    /// Backend to machine (nodeProtocol 19): start a home terminal.
+    PtyOpen(PtyOpen),
+    /// Backend to machine (nodeProtocol 19): a home terminal's input.
+    PtyInput(PtyInput),
+    /// Backend to machine (nodeProtocol 19): resize a home terminal.
+    PtyResize(PtyResize),
+    /// Backend to machine (nodeProtocol 19): end a home terminal.
+    PtyKill(PtyKill),
+    /// Backend to machine (nodeProtocol 19): a home terminal's output arrived.
+    PtyAck(PtyAck),
+    /// Machine to backend (nodeProtocol 19): a home terminal's output.
+    PtyOutput(PtyOutput),
+    /// Machine to backend (nodeProtocol 19): a home terminal ended.
+    PtyExited(PtyExited),
 }
 
 /// A chunk of an agent's or (nodeProtocol 19) a home's checkout progress
@@ -1872,7 +2062,13 @@ impl LinkFrame {
             | Self::HomeOpen(_)
             | Self::HomeOpenReply(_)
             | Self::HomePush(_)
-            | Self::HomePushReply(_) => LinkChannel::Control,
+            | Self::HomePushReply(_)
+            // Input first: typing works while output floods.
+            | Self::PtyOpen(_)
+            | Self::PtyInput(_)
+            | Self::PtyResize(_)
+            | Self::PtyKill(_)
+            | Self::PtyAck(_) => LinkChannel::Control,
             Self::Journal(_) | Self::Ack { .. } | Self::ReplayComplete { .. } => {
                 LinkChannel::Journal
             }
@@ -1890,7 +2086,9 @@ impl LinkFrame {
             | Self::SetupOutput(_)
             // Up to 4 MB of file bytes: behind every control frame.
             | Self::CheckoutRead(_)
-            | Self::CheckoutReadReply(_) => LinkChannel::Script,
+            | Self::CheckoutReadReply(_)
+            | Self::PtyOutput(_)
+            | Self::PtyExited(_) => LinkChannel::Script,
         }
     }
 
@@ -1901,7 +2099,14 @@ impl LinkFrame {
             Self::HomeOpen(_)
             | Self::HomeOpenReply(_)
             | Self::HomePush(_)
-            | Self::HomePushReply(_) => HOMES_PROTOCOL,
+            | Self::HomePushReply(_)
+            | Self::PtyOpen(_)
+            | Self::PtyInput(_)
+            | Self::PtyResize(_)
+            | Self::PtyKill(_)
+            | Self::PtyAck(_)
+            | Self::PtyOutput(_)
+            | Self::PtyExited(_) => HOMES_PROTOCOL,
             Self::Launch(command)
                 if command
                     .checkout_of
@@ -1977,7 +2182,12 @@ impl LinkFrame {
             | Self::OneShot(_)
             | Self::OneShotCancel(_)
             | Self::HomeOpen(_)
-            | Self::HomePush(_) => true,
+            | Self::HomePush(_)
+            | Self::PtyOpen(_)
+            | Self::PtyInput(_)
+            | Self::PtyResize(_)
+            | Self::PtyKill(_)
+            | Self::PtyAck(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
@@ -1996,7 +2206,9 @@ impl LinkFrame {
             | Self::CheckoutReadReply(_)
             | Self::OneShotReply(_)
             | Self::HomeOpenReply(_)
-            | Self::HomePushReply(_) => false,
+            | Self::HomePushReply(_)
+            | Self::PtyOutput(_)
+            | Self::PtyExited(_) => false,
         }
     }
 

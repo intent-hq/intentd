@@ -360,6 +360,11 @@ fn executor_link_requests_golden() {
             "oneShot",
             "oneShotCancel",
             "prompt",
+            "ptyAck",
+            "ptyInput",
+            "ptyKill",
+            "ptyOpen",
+            "ptyResize",
             "pushWip",
             "response",
             "scriptStart",
@@ -413,6 +418,8 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "homePushReply",
             "journal",
             "oneShotReply",
+            "ptyExited",
+            "ptyOutput",
             "pushWipReply",
             "replayComplete",
             "request",
@@ -725,6 +732,47 @@ fn every_frame() -> Vec<LinkFrame> {
             wip: Some("b".repeat(40)),
             error: None,
         }),
+        LinkFrame::PtyOpen(PtyOpen {
+            terminal_id: "t1".into(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            home_id: HomeId::from("home-1"),
+            mode: PtyMode::Terminal,
+            cwd: Some("src".into()),
+            command: None,
+            env: vec![PtyEnvVar {
+                key: "TERM".into(),
+                value: "xterm-256color".into(),
+            }],
+            cols: Some(80),
+            rows: Some(24),
+        }),
+        LinkFrame::PtyInput(PtyInput {
+            terminal_id: "t1".into(),
+            data: "bHMK".into(),
+        }),
+        LinkFrame::PtyResize(PtyResize {
+            terminal_id: "t1".into(),
+            cols: 120,
+            rows: 40,
+        }),
+        LinkFrame::PtyKill(PtyKill {
+            terminal_id: "t1".into(),
+        }),
+        LinkFrame::PtyAck(PtyAck {
+            terminal_id: "t1".into(),
+            seq: 3,
+        }),
+        LinkFrame::PtyOutput(PtyOutput {
+            terminal_id: "t1".into(),
+            seq: 3,
+            data: "b2sK".into(),
+            stream: Some(PtyStream::Stderr),
+        }),
+        LinkFrame::PtyExited(PtyExited {
+            terminal_id: "t1".into(),
+            exit_code: Some(0),
+            error: None,
+        }),
     ]
 }
 
@@ -836,6 +884,47 @@ fn home_owners_round_trip_and_need_protocol_19() {
     assert_eq!(decoded.lease_homes, Some(vec![home]));
 }
 
+/// The terminal frames (nodeProtocol 19): closed bodies, base64 data,
+/// and an optional exec stream.
+#[test]
+fn pty_frame_wire_shapes() {
+    let open = serde_json::to_value(LinkFrame::PtyOpen(PtyOpen {
+        terminal_id: "t1".into(),
+        workspace_id: WorkspaceId::from("ws-1"),
+        home_id: HomeId::from("home-1"),
+        mode: PtyMode::Exec,
+        cwd: None,
+        command: Some("ls".into()),
+        env: Vec::new(),
+        cols: None,
+        rows: None,
+    }))
+    .unwrap();
+    assert_eq!(
+        open,
+        json!({ "type": "ptyOpen", "terminalId": "t1", "workspaceId": "ws-1", "homeId": "home-1", "mode": "exec", "command": "ls" })
+    );
+    let mut extra = open;
+    extra["shell"] = json!("zsh");
+    assert!(serde_json::from_value::<LinkFrame>(extra).is_err());
+    let output = serde_json::to_value(LinkFrame::PtyOutput(PtyOutput {
+        terminal_id: "t1".into(),
+        seq: 0,
+        data: "aGk=".into(),
+        stream: None,
+    }))
+    .unwrap();
+    assert_eq!(
+        output,
+        json!({ "type": "ptyOutput", "terminalId": "t1", "seq": 0, "data": "aGk=" })
+    );
+    let input = LinkFrame::PtyInput(PtyInput {
+        terminal_id: "t1".into(),
+        data: "c2VjcmV0".into(),
+    });
+    assert!(!format!("{input:?}").contains("c2VjcmV0"));
+}
+
 fn script_start() -> ScriptStartCommand {
     ScriptStartCommand {
         agent_id: AgentId::from("a1"),
@@ -870,7 +959,8 @@ fn frames_are_routed_to_their_lane() {
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
             Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
             Control, Control, Control, Control, Control, Control, Control, Control, Script, Script,
-            Script, Rpc, Rpc, Rpc, Control, Control, Control, Control,
+            Script, Rpc, Rpc, Rpc, Control, Control, Control, Control, Control, Control, Control,
+            Control, Control, Script, Script,
         ]
     );
 }
@@ -1379,6 +1469,13 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
                 | LinkFrame::HomeOpenReply(_)
                 | LinkFrame::HomePush(_)
                 | LinkFrame::HomePushReply(_)
+                | LinkFrame::PtyOpen(_)
+                | LinkFrame::PtyInput(_)
+                | LinkFrame::PtyResize(_)
+                | LinkFrame::PtyKill(_)
+                | LinkFrame::PtyAck(_)
+                | LinkFrame::PtyOutput(_)
+                | LinkFrame::PtyExited(_)
         );
         let expected = if home {
             HOMES_PROTOCOL

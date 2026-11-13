@@ -982,3 +982,48 @@ async fn forge_token_values_are_masked() {
         }
     }
 }
+
+/// A home terminal's input (`ptyInput`, nodeProtocol 19) can hold a
+/// password: it is masked in both the full and the light capture.
+#[tokio::test]
+async fn pty_input_and_open_secrets_are_masked() {
+    use crate::node_link::PtyInput;
+    for payloads in [true, false] {
+        let (traffic, _) = traffic(limits(10, 1 << 16, 1 << 16));
+        traffic.start(payloads);
+        let frame = LinkFrame::PtyInput(PtyInput {
+            terminal_id: "t1".into(),
+            data: "canary-typed-password".into(),
+        });
+        LinkTap::new(traffic.clone(), machine()).observe(TrafficDirection::Out, &frame, 10);
+        let open = LinkFrame::PtyOpen(crate::node_link::PtyOpen {
+            terminal_id: "t2".into(),
+            workspace_id: crate::WorkspaceId::from("ws-1"),
+            home_id: crate::HomeId::from("h1"),
+            mode: crate::node_link::PtyMode::Exec,
+            cwd: None,
+            command: Some("curl -H canary-command-token".into()),
+            env: vec![crate::node_link::PtyEnvVar {
+                key: "API_TOKEN".into(),
+                value: "canary-env-token".into(),
+            }],
+            cols: None,
+            rows: None,
+        });
+        assert!(!format!("{open:?}").contains("canary"));
+        LinkTap::new(traffic.clone(), machine()).observe(TrafficDirection::Out, &open, 10);
+        settle(&traffic, 2).await;
+        let records = traffic.snapshot(None, None)["records"].clone();
+        let text = records.to_string();
+        assert!(!text.contains("canary"), "{text}");
+        let record = records[0].clone();
+        assert_eq!(record["frameType"], "ptyInput", "{text}");
+        if payloads {
+            assert_eq!(record["payload"]["data"], "***", "{text}");
+            assert_eq!(
+                records[1]["payload"]["env"][0]["key"], "API_TOKEN",
+                "{text}"
+            );
+        }
+    }
+}
