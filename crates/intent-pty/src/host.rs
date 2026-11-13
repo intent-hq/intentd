@@ -21,8 +21,11 @@ use crate::scrollback::{LineSnapshot, OutputChunk, Scrollback, DEFAULT_SCROLLBAC
 
 #[cfg(any(windows, test))]
 mod conpty_startup;
+mod remote;
 #[cfg(unix)]
 mod unix_io;
+
+pub use remote::{RemotePty, RemoteSpec};
 
 /// Broadcast backlog of output chunks buffered per subscriber before lagging.
 const FANOUT_CAPACITY: usize = 2048;
@@ -309,6 +312,9 @@ struct PtySession {
     /// Exit watcher thread: reaps the child, then releases `slave` once the
     /// reader has drained the queue (see `exit_watch_loop`).
     watcher: Mutex<Option<JoinHandle<()>>>,
+    /// Set for a terminal whose process runs on another machine: its exit
+    /// as the machine reported it (see `remote.rs`).
+    remote_exit: Option<Arc<Mutex<Option<portable_pty::ExitStatus>>>>,
     /// Cached exit status, latched the first time the child is observed exited so
     /// it survives later teardown/removal (the `portable-pty` child only yields
     /// its status once).
@@ -528,6 +534,7 @@ impl PtyHost {
             stop_reader,
             watcher: Mutex::new(None),
             exit: Mutex::new(None),
+            remote_exit: None,
         });
 
         let watcher_session = Arc::clone(&session);

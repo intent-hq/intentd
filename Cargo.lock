@@ -2431,6 +2431,7 @@ dependencies = [
 name = "intent-pty"
 version = "0.11.203"
 dependencies = [
+ "anyhow",
  "intent-core",
  "intentd-test-support",
  "libc",
