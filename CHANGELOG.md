@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.206] - 2026-11-13
+
+### 📚 Documentation
+
+- Explain browser errors shown in the preview ([#3356](https://github.com/intent-hq/intentd/pull/3356))
+
+
 ## [0.11.205] - 2026-11-13
 
 ### 📚 Documentation
