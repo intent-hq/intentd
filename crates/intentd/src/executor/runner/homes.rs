@@ -331,12 +331,16 @@ impl Runner {
 
     /// The home checkout an agent sharing `home` works in (nodeProtocol
     /// 19): once the home is open here and its setup has finished, with the
-    /// agent's own temp folder. A home this machine does not hold fails.
+    /// agent's own temp folder. A leased home not reopened yet after a
+    /// restart is reopened first; a home this machine does not hold fails.
     pub(super) async fn home_checkout_for(
         &self,
         agent_id: &intent_core::AgentId,
         home: &HomeRef,
     ) -> anyhow::Result<crate::executor::checkout::Prepared> {
+        if self.leased_unopened(home) {
+            self.resume_leased_homes(std::slice::from_ref(home)).await;
+        }
         let opened = self
             .leased_home(&home.workspace_id, &home.home_id)
             .ok_or_else(|| anyhow::anyhow!("this machine holds no home {}", home.home_id))?;
@@ -400,6 +404,23 @@ impl Runner {
     }
 
     /// The open home `home_id` of `workspace_id`, when the lease names it.
+    /// Whether `home` is leased here, not open, and its checkout on disk
+    /// is not recorded for another workspace.
+    fn leased_unopened(&self, home: &HomeRef) -> bool {
+        {
+            let homes = lock(&self.inner.homes);
+            if !homes.lease.contains(&home.home_id) || homes.open.contains_key(&home.home_id) {
+                return false;
+            }
+        }
+        self.inner
+            .checkouts
+            .homes()
+            .into_iter()
+            .find(|(id, _)| id == &home.home_id)
+            .is_some_and(|(_, workspace)| workspace.is_none_or(|ws| ws == home.workspace_id))
+    }
+
     fn leased_home(
         &self,
         workspace_id: &intent_core::WorkspaceId,
