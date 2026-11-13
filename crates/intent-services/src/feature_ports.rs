@@ -48,6 +48,8 @@ pub struct HomeTerminalOpen {
     pub rows: u16,
     /// Relative to the home checkout.
     pub cwd: Option<String>,
+    /// The directory `terminal.list` shows (the orchestrator's mirror path).
+    pub display_cwd: Option<String>,
     pub command: Option<String>,
     pub env: Vec<(String, String)>,
 }
@@ -1464,6 +1466,21 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<intent_core::WorkspaceHome>> {
         let _ = (svc, initial);
         Box::pin(async { Err(no_execution_node()) })
+    }
+
+    /// Dial the workspace's home machine before a terminal start (outside
+    /// the archive fence); a no-op by default.
+    ///
+    /// # Errors
+    ///
+    /// `home-unavailable` when the home's machine cannot be reached.
+    fn connect_home<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Result<()>> {
+        let _ = (svc, workspace_id);
+        Box::pin(async { Ok(()) })
     }
 
     /// Start a terminal (or an exec process) on the workspace's home

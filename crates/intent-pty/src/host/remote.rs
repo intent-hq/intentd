@@ -63,10 +63,31 @@ impl RemoteSpec {
 
 type ExitSlot = Arc<Mutex<Option<ExitStatus>>>;
 
+/// What the host keeps of a remote terminal besides its stand-in parts.
+pub(super) struct RemoteHandle {
+    io: Arc<dyn RemotePty>,
+    exit: ExitSlot,
+}
+
+impl RemoteHandle {
+    /// `PtyHost::signal` for a remote terminal: Ctrl-C as input, the
+    /// others end it.
+    pub(super) fn signal(&self, sig: super::PtySignal) -> Result<()> {
+        match sig {
+            super::PtySignal::Interrupt => self.io.write(&[0x03]).map_err(super::io_error),
+            super::PtySignal::Terminate | super::PtySignal::Kill => {
+                self.io.kill();
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Remote {
     io: Arc<dyn RemotePty>,
     exit: ExitSlot,
+    fanout: Arc<Mutex<Fanout>>,
 }
 
 impl std::fmt::Debug for Remote {
@@ -76,8 +97,25 @@ impl std::fmt::Debug for Remote {
 }
 
 impl ChildKiller for Remote {
+    /// Ask the machine to end the process. The terminal ends here at once
+    /// (its session is being released), so nothing waits on the machine.
     fn kill(&mut self) -> std::io::Result<()> {
         self.io.kill();
+        {
+            let mut exit = self
+                .exit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if exit.is_none() {
+                *exit = Some(ExitStatus::with_exit_code(PtyExit::UNOBSERVABLE_CODE));
+            }
+        }
+        let mut fanout = self
+            .fanout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fanout.eof = true;
+        fanout.eof_notify.notify_waiters();
         Ok(())
     }
 
@@ -192,11 +230,19 @@ impl PtyHost {
     /// Panics if the sessions mutex is poisoned.
     pub fn spawn_remote(&self, spec: RemoteSpec, io: Arc<dyn RemotePty>) -> Result<PtyId> {
         let exit: ExitSlot = Arc::default();
+        let (tx, _rx) = broadcast::channel(FANOUT_CAPACITY);
+        let fanout = Arc::new(Mutex::new(Fanout {
+            eof: false,
+            eof_notify: Arc::default(),
+            framing: intent_core::script_output::LineDecoder::new(false),
+            scrollback: Scrollback::new(spec.scrollback_bytes),
+            tx,
+        }));
         let remote = Remote {
             io: io.clone(),
             exit: exit.clone(),
+            fanout: fanout.clone(),
         };
-        let (tx, _rx) = broadcast::channel(FANOUT_CAPACITY);
         let session = Arc::new(PtySession {
             scope: spec.scope,
             name: spec.name,
@@ -209,22 +255,16 @@ impl PtyHost {
                 size: Mutex::new(spec.size.to_portable()),
             }))),
             slave: Mutex::new(None),
-            writer: Arc::new(Mutex::new(Box::new(Writer(io)))),
+            writer: Arc::new(Mutex::new(Box::new(Writer(io.clone())))),
             child: Mutex::new(Box::new(remote.clone())),
             killer: Mutex::new(Box::new(remote)),
-            fanout: Arc::new(Mutex::new(Fanout {
-                eof: false,
-                eof_notify: Arc::default(),
-                framing: intent_core::script_output::LineDecoder::new(false),
-                scrollback: Scrollback::new(spec.scrollback_bytes),
-                tx,
-            })),
+            fanout,
             reader: Mutex::new(None),
             #[cfg(unix)]
             stop_reader: Arc::default(),
             watcher: Mutex::new(None),
             exit: Mutex::new(None),
-            remote_exit: Some(exit),
+            remote: Some(RemoteHandle { io, exit }),
         });
         let id = PtyId(
             self.next_id
@@ -261,7 +301,7 @@ impl PtyHost {
     /// Panics if a per-session mutex is poisoned.
     pub fn remote_exited(&self, id: PtyId, exit_code: Option<i32>) -> Result<()> {
         let session = self.get(id)?;
-        let Some(slot) = &session.remote_exit else {
+        let Some(slot) = session.remote.as_ref().map(|remote| &remote.exit) else {
             return Err(internal("not a remote terminal"));
         };
         let exit = match exit_code.and_then(|code| u32::try_from(code).ok()) {
@@ -291,8 +331,7 @@ impl PtyHost {
     /// Whether `id` is a remote terminal.
     #[must_use]
     pub fn is_remote(&self, id: PtyId) -> bool {
-        self.get(id)
-            .is_ok_and(|session| session.remote_exit.is_some())
+        self.get(id).is_ok_and(|session| session.remote.is_some())
     }
 }
 

@@ -50,9 +50,31 @@ struct State {
 struct Term {
     pty: Arc<PtyHost>,
     id: PtyId,
-    /// The highest `seq` appended.
+    /// The highest `seq` appended; output is taken only in order from 0.
     received: Option<u64>,
     size: Arc<Mutex<PtySize>>,
+    /// Released here (`terminal.kill`, archive): its `ptyKill` is sent
+    /// again after each bind until the machine reports the end.
+    killed: bool,
+    /// The home's name, for a start failure shown in the terminal.
+    home_name: String,
+}
+
+impl Drop for HomeTerminals {
+    /// The machine's connector is going away (it was removed or replaced):
+    /// its terminals end here rather than stay open with no machine.
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(grace) = state.grace.take() {
+            grace.abort();
+        }
+        for (_, term) in state.terms.drain() {
+            let _ = term.pty.remote_exited(term.id, None);
+        }
+    }
 }
 
 impl HomeTerminals {
@@ -60,41 +82,67 @@ impl HomeTerminals {
         lock(&self.state).terms.is_empty()
     }
 
-    /// Append a `ptyOutput` and acknowledge it. A frame of a terminal
-    /// released here is acknowledged too, so the machine can let it go.
+    /// Append a `ptyOutput` that comes next in order, and acknowledge the
+    /// highest contiguous `seq`. A resent frame is acknowledged again; one
+    /// past a gap is not taken. A frame of a terminal released here is
+    /// acknowledged too, so the machine can let it go.
     pub(crate) async fn output(&self, link: &NodeLink, frame: PtyOutput) {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&frame.data)
-            .unwrap_or_default();
-        {
+        let ack = {
             let mut state = lock(&self.state);
-            let released = match state.terms.get_mut(&frame.terminal_id) {
-                Some(term) if term.received.is_none_or(|seen| frame.seq > seen) => {
-                    term.received = Some(frame.seq);
-                    term.pty.push_remote_output(term.id, &bytes).is_err()
+            match state.terms.get_mut(&frame.terminal_id) {
+                None => Some(frame.seq),
+                Some(term) => {
+                    let next = term.received.map_or(0, |seen| seen + 1);
+                    if frame.seq == next {
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(&frame.data)
+                            .unwrap_or_else(|error| {
+                                tracing::warn!(terminal = %frame.terminal_id, seq = frame.seq, %error, "remote machine: undecodable home terminal output dropped");
+                                Vec::new()
+                            });
+                        term.received = Some(frame.seq);
+                        if term.pty.push_remote_output(term.id, &bytes).is_err() {
+                            state.terms.remove(&frame.terminal_id);
+                        }
+                        Some(frame.seq)
+                    } else {
+                        if frame.seq > next {
+                            tracing::warn!(terminal = %frame.terminal_id, seq = frame.seq, expected = next, "remote machine: home terminal output out of order");
+                        }
+                        term.received
+                    }
                 }
-                _ => false,
-            };
-            if released {
-                state.terms.remove(&frame.terminal_id);
             }
+        };
+        if let Some(seq) = ack {
+            let _ = link
+                .send(&LinkFrame::PtyAck(PtyAck {
+                    terminal_id: frame.terminal_id,
+                    seq,
+                }))
+                .await;
         }
-        let _ = link
-            .send(&LinkFrame::PtyAck(PtyAck {
-                terminal_id: frame.terminal_id,
-                seq: frame.seq,
-            }))
-            .await;
     }
 
-    /// A terminal ended on the machine.
+    /// A terminal ended on the machine. One that never started shows why.
     pub(crate) fn exited(&self, frame: &PtyExited) {
         let term = lock(&self.state).terms.remove(&frame.terminal_id);
         if let Some(term) = term {
-            if let Some(error) = &frame.error {
-                tracing::debug!(terminal = %frame.terminal_id, %error, "remote machine: home terminal ended");
+            if let (Some(error), None) = (&frame.error, frame.exit_code) {
+                let line = format!(
+                    "\r\n[intent] the terminal on {} ended: {error}\r\n",
+                    term.home_name
+                );
+                let _ = term.pty.push_remote_output(term.id, line.as_bytes());
             }
             let _ = term.pty.remote_exited(term.id, frame.exit_code);
+        }
+    }
+
+    /// The terminal was released here: its process must end on the machine.
+    fn killed(&self, terminal_id: &str) {
+        if let Some(term) = lock(&self.state).terms.get_mut(terminal_id) {
+            term.killed = true;
         }
     }
 
@@ -111,6 +159,9 @@ impl HomeTerminals {
                 .iter()
                 .map(|(terminal_id, term)| {
                     let terminal_id = terminal_id.clone();
+                    if term.killed {
+                        return LinkFrame::PtyKill(PtyKill { terminal_id });
+                    }
                     term.received.map_or_else(
                         || {
                             let size = *lock(&term.size);
@@ -182,6 +233,7 @@ struct LinkPty {
     terminal_id: OnceLock<String>,
     size: Arc<Mutex<PtySize>>,
     frames: mpsc::UnboundedSender<LinkFrame>,
+    home: Box<intent_core::WorkspaceHome>,
 }
 
 impl LinkPty {
@@ -198,8 +250,9 @@ impl LinkPty {
             .upgrade()
             .is_some_and(|shared| shared.current_link().is_some());
         if !linked {
-            return Err(std::io::Error::other(format!(
-                "{HOME_UNAVAILABLE}: the workspace's home machine is not connected"
+            return Err(std::io::Error::other(home_unavailable(
+                &self.home,
+                "its machine is not connected",
             )));
         }
         self.frames
@@ -227,6 +280,10 @@ impl RemotePty for LinkPty {
 
     fn kill(&self) {
         if let Ok(terminal_id) = self.id() {
+            // Sent again after the next bind when the link is down now.
+            if let Some(shared) = self.shared.upgrade() {
+                shared.terminals.killed(&terminal_id);
+            }
             let _ = self
                 .frames
                 .send(LinkFrame::PtyKill(PtyKill { terminal_id }));
@@ -250,6 +307,34 @@ fn home_unavailable(home: &intent_core::WorkspaceHome, detail: &str) -> Error {
             "retryable": true,
         }),
     )
+}
+
+/// Dial `workspace_id`'s home machine ahead of a terminal start, outside
+/// the workspace's archive fence; nothing when it has no home on one.
+///
+/// # Errors
+///
+/// `home-unavailable` when the home's machine cannot be reached.
+pub(crate) async fn connect_home(svc: &Services, workspace_id: &WorkspaceId) -> Result<()> {
+    if !svc.workspace_homes() {
+        return Ok(());
+    }
+    let Some(home) = svc.store().get_workspace_home(workspace_id).await? else {
+        return Ok(());
+    };
+    let Some(node_id) = home.node_id.clone() else {
+        return Ok(());
+    };
+    let feature = svc
+        .remote_feature()
+        .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;
+    let node = feature
+        .node(svc, &node_id)
+        .await
+        .map_err(|error| home_unavailable(&home, &error.to_string()))?;
+    node.connect()
+        .await
+        .map_err(|error| home_unavailable(&home, &error.to_string()))
 }
 
 /// Start a terminal (or, in `exec` mode, a command) on `workspace_id`'s
@@ -302,11 +387,13 @@ pub(crate) async fn open(
         shared: shared.weak(),
         terminal_id: OnceLock::new(),
         size: size_slot.clone(),
-        frames,
+        frames: frames.clone(),
+        home: Box::new(home.clone()),
     });
     let mut spec = RemoteSpec::new(workspace_id.as_str());
     spec.size = size;
     spec.listed = open.mode == PtyMode::Terminal;
+    spec.cwd.clone_from(&open.display_cwd);
     let id = pty.spawn_remote(spec, io.clone())?;
     let terminal_id = id.to_string();
     let _ = io.terminal_id.set(terminal_id.clone());
@@ -317,20 +404,15 @@ pub(crate) async fn open(
             id,
             received: None,
             size: size_slot,
+            killed: false,
+            home_name: home.name.clone(),
         },
     );
-    let forwarder = shared.weak();
-    // caller-binding: allow — sends one home terminal's input, resizes and kill in order
-    tokio::spawn(async move {
-        while let Some(frame) = queued.recv().await {
-            let Some(shared) = forwarder.upgrade() else {
-                return;
-            };
-            let _ = shared.send(&frame).await;
-        }
-    });
-    let frame = LinkFrame::PtyOpen(PtyOpen {
-        terminal_id: terminal_id.clone(),
+    // `ptyOpen` goes first on the terminal's own queue, so no input,
+    // resize or kill a client sends meanwhile reaches the machine ahead of
+    // it.
+    let _ = frames.send(LinkFrame::PtyOpen(PtyOpen {
+        terminal_id,
         workspace_id: workspace_id.clone(),
         home_id: home.home_id.clone(),
         mode: open.mode,
@@ -343,12 +425,17 @@ pub(crate) async fn open(
             .collect(),
         cols: Some(open.cols),
         rows: Some(open.rows),
+    }));
+    let forwarder = shared.weak();
+    // caller-binding: allow — sends one home terminal's open, input, resizes and kill in order
+    tokio::spawn(async move {
+        while let Some(frame) = queued.recv().await {
+            let Some(shared) = forwarder.upgrade() else {
+                return;
+            };
+            let _ = shared.send(&frame).await;
+        }
     });
-    if let Err(error) = shared.send(&frame).await {
-        lock(&shared.terminals.state).terms.remove(&terminal_id);
-        pty.kill(id).await;
-        return Err(home_unavailable(&home, &error.to_string()));
-    }
     shared.wake();
     Ok(Some(id))
 }

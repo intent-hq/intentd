@@ -12,6 +12,7 @@
 //! home's machine is dialed again and backups keep arriving.
 
 use super::*;
+use base64::Engine as _;
 
 const HOMES: (&str, &str) = ("INTENTD_UNSTABLE_HOMES", "1");
 
@@ -141,7 +142,6 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
     // A terminal opened from the app runs in the home checkout on the
     // machine: typing reaches it, its output is served by the orchestrator,
     // it is listed, and a kill ends it there.
-    use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
     id += 1;
     let terminal = ok(
@@ -165,7 +165,7 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
         &mut rpc_ws,
         id,
         "terminal.write",
-        json!({ "terminalId": terminal_id, "data": b64.encode("echo at:$(pwd -P):$(stty size)\n") }),
+        json!({ "terminalId": terminal_id, "data": b64.encode("echo $$ > .term-pid; echo at:$(pwd -P):$(stty size)\n") }),
     )
     .await;
     let expected = format!(
@@ -218,6 +218,21 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
         json!({ "terminalId": terminal_id }),
     )
     .await;
+    // The kill reached the machine: the shell there is gone.
+    let pid = std::fs::read_to_string(work.join(".term-pid"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    until("the home shell ended", || {
+        (!std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .unwrap()
+            .success())
+        .then_some(())
+    })
+    .await;
+    std::fs::remove_file(work.join(".term-pid")).unwrap();
 
     // A commit there reaches home/head, the mirror and lastBackupAt.
     let first = commit_on(&work, "notes.txt", "one\n", "first");

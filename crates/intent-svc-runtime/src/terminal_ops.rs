@@ -148,11 +148,13 @@ pub(crate) async fn create_owned(
 /// `terminal.create` on the workspace's home, when it has one on a machine
 /// (nodeProtocol 19): a remote PTY whose output streams like a local one.
 /// `None` runs the terminal here. An absolute `cwd` inside the workspace's
-/// worktree is sent relative to the home checkout; any other is dropped.
+/// worktree is sent relative to the home checkout.
 ///
 /// # Errors
 ///
-/// `home-unavailable` when the home's machine cannot run it now.
+/// `home-unavailable` when the home's machine cannot run it now;
+/// `InvalidParams` for an absolute `cwd` outside the workspace's worktree
+/// or a relative one that leaves it.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn create_on_home(
     svc: &intent_services::Services,
@@ -169,11 +171,22 @@ pub(crate) async fn create_on_home(
         return Ok(None);
     }
     let worktree = default_cwd(svc.store(), workspace_id, None).await;
+    let rel = cwd
+        .map(|cwd| home_relative_cwd(worktree.as_deref(), cwd))
+        .transpose()?
+        .flatten();
+    let display_cwd = worktree.as_ref().map(|worktree| {
+        rel.as_deref()
+            .map_or_else(|| worktree.clone(), |rel| worktree.join(rel))
+            .to_string_lossy()
+            .into_owned()
+    });
     let open = intent_services::feature_api::feature_ports::HomeTerminalOpen {
         mode: intent_core::node_link::PtyMode::Terminal,
         cols,
         rows,
-        cwd: cwd.and_then(|cwd| home_relative_cwd(worktree.as_deref(), cwd)),
+        cwd: rel,
+        display_cwd,
         command: command.map(str::to_owned),
         env: env
             .map(|env| env.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -198,16 +211,37 @@ pub(crate) async fn create_on_home(
     Ok(Some(json!({ "terminalId": terminal_id })))
 }
 
-/// `cwd` as a path relative to the home checkout: a relative path as is,
-/// an absolute one inside `worktree` stripped of it, anything else `None`.
-fn home_relative_cwd(worktree: Option<&std::path::Path>, cwd: &str) -> Option<String> {
+/// `cwd` as a path relative to the home checkout (`None` for its root): a
+/// relative path that stays inside it as is, an absolute one inside
+/// `worktree` (symlinks resolved on both) stripped of it.
+///
+/// # Errors
+///
+/// `InvalidParams` for an absolute path outside `worktree` or a relative
+/// one with a `..` or root part.
+fn home_relative_cwd(worktree: Option<&std::path::Path>, cwd: &str) -> Result<Option<String>> {
+    use std::path::Component;
+    let outside = || Error::InvalidParams(format!("cwd {cwd} is outside the workspace's checkout"));
     let path = std::path::Path::new(cwd);
-    if path.is_relative() {
-        return Some(cwd.to_owned());
+    let rel = if path.is_absolute() {
+        let worktree = worktree.ok_or_else(outside)?;
+        let canonical =
+            |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        canonical(path)
+            .strip_prefix(canonical(worktree))
+            .map_err(|_| outside())?
+            .to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    if !rel
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(outside());
     }
-    let rel = path.strip_prefix(worktree?).ok()?;
     let rel = rel.to_string_lossy().into_owned();
-    (!rel.is_empty()).then_some(rel)
+    Ok((!rel.is_empty() && rel != ".").then_some(rel))
 }
 
 #[cfg(all(test, unix))]
@@ -924,6 +958,47 @@ fn observed_exit_code(exit: &PtyExit) -> Option<u32> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// A home terminal's `cwd`: relative paths stay inside the checkout,
+    /// absolute ones must be inside the worktree (symlinks resolved), and
+    /// anything else is refused.
+    #[test]
+    fn home_cwd_is_relative_to_the_checkout_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("wt");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        let wt = Some(worktree.as_path());
+        assert_eq!(
+            home_relative_cwd(wt, "src").unwrap().as_deref(),
+            Some("src")
+        );
+        assert_eq!(home_relative_cwd(wt, ".").unwrap(), None);
+        assert_eq!(
+            home_relative_cwd(wt, worktree.join("src").to_str().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("src")
+        );
+        assert_eq!(
+            home_relative_cwd(wt, worktree.to_str().unwrap()).unwrap(),
+            None
+        );
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&worktree, &link).unwrap();
+        assert_eq!(
+            home_relative_cwd(wt, link.join("src").to_str().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("src")
+        );
+        for bad in ["../x", "/etc", "src/../../x"] {
+            assert!(
+                matches!(home_relative_cwd(wt, bad), Err(Error::InvalidParams(_))),
+                "{bad}"
+            );
+        }
+        assert!(home_relative_cwd(None, "/etc").is_err());
+    }
 
     use std::time::Instant;
 

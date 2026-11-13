@@ -2657,6 +2657,9 @@ async fn run(
                     ours
                 });
                 shared.disconnected();
+                shared
+                    .terminals
+                    .link_lost(shared.weak(), shared.tuning.link_loss_grace);
                 demanded = asked;
                 retry = shared.wants_link();
                 continue;

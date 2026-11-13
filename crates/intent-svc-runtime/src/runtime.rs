@@ -897,6 +897,11 @@ impl RuntimePort for RuntimeFeature {
             // Management admission also permits deletion retries for missing
             // workspaces; a member must not spawn an unmanageable terminal there.
             svc.require_member(&workspace_id).await?;
+            // A home terminal's machine is dialed first, so the fence below
+            // never waits on a dial.
+            svc.feature_remote_launch_port()
+                .connect_home(svc, &workspace_id)
+                .await?;
             // Held from the retired check through the spawn: retire flips
             // the row and sweeps the workspace's PTYs under the same fence,
             // so a create admitted before the flip finishes spawning before
