@@ -37,10 +37,6 @@ const UNKNOWN: &str = "node-pty-unknown";
 /// backend keeps the terminal's buffer; this only backs the PTY.
 const SCROLLBACK_BYTES: usize = 64 * 1024;
 
-/// After the process exits, how long its last output may take to arrive
-/// while the output is not waiting for acknowledgements.
-const OUTPUT_EOF_WAIT: Duration = Duration::from_secs(2);
-
 /// Poll interval while a process group empties.
 const GROUP_POLL: Duration = Duration::from_millis(20);
 
@@ -584,18 +580,12 @@ impl HomeTerminals {
         tokio::spawn(async move {
             let exit = pty.wait(pty_id).await;
             pty.reap_group_stragglers(pty_id).await;
-            // Every byte before the exit: the output may be waiting for
-            // acknowledgements, which keeps the reader (and so the end)
-            // waiting too.
-            loop {
-                tokio::select! {
-                    eof = tokio::time::timeout(OUTPUT_EOF_WAIT, pty.wait_output_eof(pty_id)) => {
-                        if eof.is_ok() || !reaped.paused() {
-                            break;
-                        }
-                    }
-                    () = reaped.ended_here() => break,
-                }
+            // Every byte before the exit, however long the output waits
+            // for acknowledgements; only an end from here (or a ptyKill,
+            // which releases the reader) stops the wait.
+            tokio::select! {
+                _ = pty.wait_output_eof(pty_id) => {}
+                () = reaped.ended_here() => {}
             }
             pty.kill(pty_id).await;
             let exit_code = match exit {
@@ -666,9 +656,10 @@ impl HomeTerminals {
         let reaped = term.clone();
         // caller-binding: allow — node-local home exec process supervision
         tokio::spawn(async move {
-            let status = tokio::select! {
-                status = child.wait() => status.ok(),
-                _ = killed => None,
+            let mut killed = killed;
+            let (status, kill_pending) = tokio::select! {
+                status = child.wait() => (status.ok(), true),
+                _ = &mut killed => (None, false),
             };
             // Whatever is left of the process group ends too.
             end_group(pgid, &mut child).await;
@@ -676,23 +667,29 @@ impl HomeTerminals {
                 Some(status) => Some(status),
                 None => child.wait().await.ok(),
             };
+            // Every byte before the exit, however long the output waits for
+            // acknowledgements; only an end from here or a ptyKill stops
+            // the readers, which are awaited before the exit is reported.
+            let mut kill = kill_pending.then_some(killed);
+            let mut stopped = false;
             for mut reader in readers {
-                loop {
-                    tokio::select! {
-                        done = tokio::time::timeout(OUTPUT_EOF_WAIT, &mut reader) => {
-                            if done.is_ok() {
-                                break;
+                stopped = stopped
+                    || tokio::select! {
+                        _ = &mut reader => false,
+                        () = reaped.ended_here() => true,
+                        () = async {
+                            match kill.as_mut() {
+                                Some(kill) => { let _ = kill.await; }
+                                None => std::future::pending::<()>().await,
                             }
-                            if !reaped.paused() {
-                                reader.abort();
-                                break;
-                            }
+                        } => {
+                            kill = None;
+                            true
                         }
-                        () = reaped.ended_here() => {
-                            reader.abort();
-                            break;
-                        }
-                    }
+                    };
+                if stopped {
+                    reader.abort();
+                    let _ = reader.await;
                 }
             }
             reaped.finish(PtyExited {
