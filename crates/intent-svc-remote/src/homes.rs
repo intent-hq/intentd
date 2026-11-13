@@ -397,7 +397,7 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
             {
                 Ok(true) => {
                     svc.publish_workspace_home_changed(&record.workspace_id)
-                        .await
+                        .await;
                 }
                 Ok(false) => {
                     tracing::debug!(home = %home_id, "remote machine: backup of a home that is not current; dropped");
