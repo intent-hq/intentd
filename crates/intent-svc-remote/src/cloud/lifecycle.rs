@@ -565,7 +565,10 @@ async fn disk_resumed(svc: &Services, feature: &RemoteFeature, machine_id: &str)
                 let ids: Vec<_> = agents.into_iter().map(|agent| agent.agent_id).collect();
                 node.shared_ref().processes_lost(
                     &ids,
-                    "transport closed: the machine started again from its disk",
+                    &format!(
+                        "transport closed: {}",
+                        intent_core::node_link::DISK_RESUME_TRANSPORT_CLOSED
+                    ),
                 );
             }
         }

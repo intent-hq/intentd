@@ -17782,6 +17782,37 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
     );
 }
 
+/// A redrive after the machine started again from its disk is expected
+/// (the relaunch reloads the session), so it logs at INFO; any other
+/// pre-output transport failure still logs at WARN.
+#[test]
+fn redrive_after_disk_resume_logs_at_info() {
+    use super::silent_redrive_log_level;
+    use tracing::Level;
+    let prefix = crate::agent_session::PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX;
+    let disk = intent_core::node_link::DISK_RESUME_TRANSPORT_CLOSED;
+    for msg in [
+        format!("{prefix} transport error: node-agent-not-running: {disk}"),
+        format!("{prefix} {disk}"),
+    ] {
+        assert_eq!(
+            silent_redrive_log_level(&Error::Internal(msg.clone())),
+            Level::INFO,
+            "{msg}"
+        );
+    }
+    for msg in [
+        format!("{prefix} transport error: node-agent-not-running: the agent has exited"),
+        format!("{prefix} broken pipe"),
+    ] {
+        assert_eq!(
+            silent_redrive_log_level(&Error::Internal(msg.clone())),
+            Level::WARN,
+            "{msg}"
+        );
+    }
+}
+
 /// monorepo#764: a transport-closed prompt failure BEFORE any streamed output
 /// is silently redriven once on a fresh child — the turn completes with NO
 /// `agent:failed`, no Error status, and no requeue (no Retry surface). The
