@@ -1768,7 +1768,10 @@ mod stop_acks {
         let (agent, runtime, mut link) = live(&mut machine, &node).await;
         node.shared_ref().processes_lost(
             std::slice::from_ref(&agent),
-            "transport closed: the machine started again from its disk",
+            &format!(
+                "transport closed: {}",
+                intent_core::node_link::DISK_RESUME_TRANSPORT_CLOSED
+            ),
         );
         runtime.stop().await;
         let first = link.stop_for(&agent).await;

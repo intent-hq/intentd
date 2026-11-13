@@ -19150,10 +19150,12 @@ fn pre_output_transport_failure(err: &Error) -> bool {
 
 /// The level to log a silent redrive at: INFO when the machine started again
 /// from its disk (expected, the relaunch reloads the session), WARN otherwise.
+/// The reason ends the error chain, so a provider message that only quotes it
+/// keeps WARN.
 fn silent_redrive_log_level(err: &Error) -> tracing::Level {
     match err {
         Error::Internal(msg)
-            if msg.contains(intent_core::node_link::DISK_RESUME_TRANSPORT_CLOSED) =>
+            if msg.ends_with(intent_core::node_link::DISK_RESUME_TRANSPORT_CLOSED) =>
         {
             tracing::Level::INFO
         }

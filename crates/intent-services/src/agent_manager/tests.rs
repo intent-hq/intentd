@@ -17791,9 +17791,13 @@ fn redrive_after_disk_resume_logs_at_info() {
     use tracing::Level;
     let prefix = crate::agent_session::PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX;
     let disk = intent_core::node_link::DISK_RESUME_TRANSPORT_CLOSED;
+    // The chain a disk resume takes: `processes_lost` ends the runtime with
+    // this reason, and the remote runtime wraps it as `node-agent-not-running`.
+    let ended = AcpError::Transport(format!("transport closed: {disk}"));
+    let not_running = AcpError::Transport(format!("node-agent-not-running: {ended}"));
     for msg in [
-        format!("{prefix} transport error: node-agent-not-running: {disk}"),
-        format!("{prefix} {disk}"),
+        format!("{prefix} {not_running}"),
+        format!("{prefix} {ended}"),
     ] {
         assert_eq!(
             silent_redrive_log_level(&Error::Internal(msg.clone())),
@@ -17802,8 +17806,12 @@ fn redrive_after_disk_resume_logs_at_info() {
         );
     }
     for msg in [
-        format!("{prefix} transport error: node-agent-not-running: the agent has exited"),
-        format!("{prefix} broken pipe"),
+        format!(
+            "{prefix} {}",
+            AcpError::Transport("node-agent-not-running: the agent has exited".into())
+        ),
+        format!("{prefix} {}", AcpError::Transport("broken pipe".into())),
+        format!("{prefix} {not_running} (provider said: try again)"),
     ] {
         assert_eq!(
             silent_redrive_log_level(&Error::Internal(msg.clone())),
