@@ -28,19 +28,20 @@ use intent_services::feature_api::Services;
 
 pub(crate) struct HeadGitAccess {
     shared: Arc<Shared>,
-    /// One home push at a time per workspace, from its pin to its
-    /// settlement: no push drops a pin another one still relies on.
-    home_pushes: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl HeadGitAccess {
     pub(crate) fn new(shared: Arc<Shared>) -> Self {
-        Self {
-            shared,
-            home_pushes: Mutex::new(HashMap::new()),
-        }
+        Self { shared }
     }
 }
+
+/// One home push at a time per workspace, from its pin to its settlement,
+/// across every connection of this process (a push of a closed connection
+/// may still be draining while a new one runs): no push drops a pin
+/// another one still relies on.
+static HOME_PUSHES: LazyLock<Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Mutex::default);
 
 fn denied() -> Error {
     Error::Forbidden(git_codes::DENIED.into())
@@ -289,8 +290,7 @@ impl NodeGitAccess for HeadGitAccess {
             if !remote.is_home() || remote.module_key().is_some() {
                 return Ok(ReceiveHold::default());
             }
-            let slot = self
-                .home_pushes
+            let slot = HOME_PUSHES
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entry(WorkspaceId::from(remote.workspace_id()))
