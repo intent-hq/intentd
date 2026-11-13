@@ -849,8 +849,8 @@ Home. With no open workspace tabs, these shortcuts do nothing. Customize them in
 **Settings → Input and shortcuts → Keyboard shortcuts**.
 
 <!-- Numbered navigation requires the matching frontend release. Until it ships,
-describe these bindings only when explicitly asked or testing this change.
-Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/shared/keyboard-shortcut-bindings.ts; src/store/renderer/slices/machine-rail/machine-rail-selectors.ts; src/features/machine-rail/MachineRail.svelte. -->
+describe these bindings only when explicitly asked or testing this change. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/shared/keyboard-shortcut-bindings.ts; src/store/renderer/slices/machine-rail/machine-rail-selectors.ts; src/features/machine-rail/MachineRail.svelte. -->
 
 Use **Cmd+Alt+1–9** (**Ctrl+Alt+1–9** on Windows/Linux) to select **Home**
 or a workspace tab: **1** opens Home, **2–8** open the first seven workspace
