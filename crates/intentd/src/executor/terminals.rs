@@ -115,6 +115,15 @@ enum Process {
     Gone,
 }
 
+/// Turns its channel true when dropped: with the PTY's output sink.
+struct ReaderDone(watch::Sender<bool>);
+
+impl Drop for ReaderDone {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
 /// A terminal `ptyOpen` reserved: [`HomeTerminals::start`] starts it.
 pub(super) struct Reserved {
     term: Arc<Term>,
@@ -559,7 +568,12 @@ impl HomeTerminals {
             spec.size = PtySize { rows, cols };
         }
         let sink_term = Arc::downgrade(term);
+        // The PTY host drops the sink when the terminal's reader thread
+        // ends, so this turns true once every byte has been read.
+        let (read_all, mut reader_done) = watch::channel(false);
+        let read_all = ReaderDone(read_all);
         spec.output_sink = Some(OutputSink::new(move |bytes| {
+            let _ = &read_all;
             if let Some(term) = sink_term.upgrade() {
                 if term.push(bytes, None) {
                     term.wait_room_blocking();
@@ -586,12 +600,10 @@ impl HomeTerminals {
             let exit = pty.wait(pty_id).await;
             pty.reap_group_stragglers(pty_id).await;
             // Every byte before the exit, however long the output waits
-            // for acknowledgements; only an end from here (or a ptyKill,
-            // which releases the reader) stops the wait.
-            tokio::select! {
-                _ = pty.wait_output_eof(pty_id) => {}
-                () = reaped.ended_here() => {}
-            }
+            // for acknowledgements: the exit is reported only once the
+            // reader has ended. A kill (or an end from here) releases a
+            // paused reader and stops it, so this wait always ends with it.
+            let _ = reader_done.wait_for(|done| *done).await;
             pty.kill(pty_id).await;
             let exit_code = match exit {
                 Ok(exit) if exit.observed => i32::try_from(exit.exit_code).unwrap_or(-1),
