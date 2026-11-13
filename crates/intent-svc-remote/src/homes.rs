@@ -392,7 +392,12 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
         JournalBody::HomePushed { .. } => {
             match svc
                 .store()
-                .record_workspace_home_backup(&record.workspace_id, home_id, &record.recorded_at)
+                .record_workspace_home_backup(
+                    &record.workspace_id,
+                    home_id,
+                    &shared.machine_id(),
+                    &record.recorded_at,
+                )
                 .await
             {
                 Ok(true) => {

@@ -210,13 +210,28 @@ pub trait NodeGitAccess: Send + Sync {
         false
     }
 
-    /// After a receive-pack for `remote` ended, whatever its outcome.
+    /// Right before a receive-pack for `remote` into `repository` starts:
+    /// what [`Self::received`] gets back once it ended. An error refuses
+    /// the push, mapped as for [`Self::repository`].
+    fn before_receive<'a>(
+        &'a self,
+        binding: &'a LeaseBinding,
+        remote: &'a AgentRemote,
+        repository: &'a std::path::Path,
+    ) -> BoxFuture<'a, Result<Option<String>>> {
+        let _ = (binding, remote, repository);
+        Box::pin(async { Ok(None) })
+    }
+
+    /// After that receive-pack ended, whatever its outcome, with the token
+    /// [`Self::before_receive`] returned for it.
     fn received<'a>(
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
+        token: Option<String>,
     ) -> BoxFuture<'a, ()> {
-        let _ = (binding, remote);
+        let _ = (binding, remote, token);
         Box::pin(async {})
     }
 }
@@ -350,6 +365,7 @@ async fn run_service(
     if remote.is_home() && !access.homes_supported() {
         return Err(codes::INVALID);
     }
+    let mut token = None;
     let (command, accept) = if remote.is_forge() {
         if !access.forge_supported() {
             return Err(codes::INVALID);
@@ -376,6 +392,12 @@ async fn run_service(
             .repository(binding, &remote, service)
             .await
             .map_err(|error| access_code(&error))?;
+        if service == GitService::ReceivePack {
+            token = access
+                .before_receive(binding, &remote, &repository)
+                .await
+                .map_err(|error| access_code(&error))?;
+        }
         (
             service_command(service, &repository, &remote).map_err(|_| codes::FAILED)?,
             Vec::new(),
@@ -434,7 +456,7 @@ async fn run_service(
     let mut child = service.child.take().ok_or(codes::FAILED)?;
     let status = child.wait().await.map_err(|_| codes::FAILED)?;
     if drain {
-        access.received(binding, &remote).await;
+        access.received(binding, &remote, token).await;
     }
     if status.success() {
         Ok(())

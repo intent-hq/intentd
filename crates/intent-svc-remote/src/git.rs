@@ -22,22 +22,15 @@ use intent_transport::node_link::{git_codes, ForgeServe, NodeGitAccess, FORGE_RE
 use tokio::time::Instant;
 
 use crate::connector::Shared;
-use crate::lock;
 use intent_services::feature_api::Services;
 
 pub(crate) struct HeadGitAccess {
     shared: Arc<Shared>,
-    /// Rewritten pins this access made before a home push, by workspace:
-    /// dropped once the push turned out a fast-forward.
-    fresh_pins: Mutex<HashMap<WorkspaceId, Vec<String>>>,
 }
 
 impl HeadGitAccess {
     pub(crate) fn new(shared: Arc<Shared>) -> Self {
-        Self {
-            shared,
-            fresh_pins: Mutex::new(HashMap::new()),
-        }
+        Self { shared }
     }
 }
 
@@ -256,22 +249,7 @@ impl HeadGitAccess {
                 Some(Err(ModuleRefusal::Denied)) | None => Err(denied()),
             };
         }
-        if service == GitService::ReceivePack {
-            let repository = checkout.clone();
-            let remote = remote.clone();
-            let pinned = tokio::task::spawn_blocking(move || {
-                crate::homes::pin_home_head(&repository, &remote)
-            })
-            .await
-            .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
-            .map_err(|error| unavailable(&format!("could not pin the home's head: {error}")))?;
-            if let Some(sha) = pinned {
-                lock(&self.fresh_pins)
-                    .entry(workspace_id)
-                    .or_default()
-                    .push(sha);
-            }
-        }
+        let _ = (service, workspace_id);
         Ok(checkout)
     }
 }
@@ -289,19 +267,41 @@ impl NodeGitAccess for HeadGitAccess {
                 .is_some_and(Services::workspace_homes)
     }
 
+    /// Before a home push of the superproject, pin the current `home/head`
+    /// as `home/rewritten/<sha>` so a rewrite keeps the old commits; a push
+    /// that cannot be pinned is refused. The token is the pin this push
+    /// made, if any.
+    fn before_receive<'a>(
+        &'a self,
+        _binding: &'a LeaseBinding,
+        remote: &'a AgentRemote,
+        repository: &'a Path,
+    ) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(async move {
+            if !remote.is_home() || remote.module_key().is_some() {
+                return Ok(None);
+            }
+            let repository = repository.to_path_buf();
+            let remote = remote.clone();
+            tokio::task::spawn_blocking(move || crate::homes::pin_home_head(&repository, &remote))
+                .await
+                .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
+                .map_err(|error| unavailable(&format!("could not pin the home's head: {error}")))
+        })
+    }
+
     fn received<'a>(
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
+        token: Option<String>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             if !remote.is_home() || remote.module_key().is_some() {
                 return;
             }
             let workspace_id = WorkspaceId::from(remote.workspace_id());
-            let pins = lock(&self.fresh_pins)
-                .remove(&workspace_id)
-                .unwrap_or_default();
+            let pins: Vec<String> = token.into_iter().collect();
             let Ok((checkout, _)) = self.home_checkout(binding, remote).await else {
                 return;
             };

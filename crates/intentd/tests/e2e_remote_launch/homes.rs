@@ -6,7 +6,8 @@
 //! makes the home checkout from `home/head`; a commit there reaches the
 //! hub's `home/head`, moves `lastBackupAt` and the orchestrator's mirror
 //! worktree; a rewrite keeps the old tip pinned at `home/rewritten/<sha>`,
-//! and a fast-forward pins nothing.
+//! and a fast-forward pins nothing; after an orchestrator restart the
+//! home's machine is dialed again and backups keep arriving.
 
 use super::*;
 
@@ -73,7 +74,7 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
     let (head, _, _, _) = start_backend(&head_dir, &repo).await;
     drop(head);
     super::orchestrator::orchestrator_config(&head_dir);
-    let (_head, port, cfg) = serve_backend(&head_dir, &[HOMES]).await;
+    let (head, port, cfg) = serve_backend(&head_dir, &[HOMES]).await;
     let mut rpc_ws = connect(port, cfg).await;
 
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
@@ -173,6 +174,11 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
         (try_rev(&mirror, &home_ref("head")).as_deref() == Some(second.as_str())).then_some(())
     })
     .await;
+    // The pin is settled before the mirror moves: wait for the mirror.
+    until("the mirror at the second commit", || {
+        (git(&mirror, &["rev-parse", "HEAD"]) == second).then_some(())
+    })
+    .await;
     assert_eq!(
         try_rev(&mirror, &home_ref(&format!("rewritten/{first}"))),
         None
@@ -217,4 +223,15 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
         .unwrap_or_else(|| panic!("{list}"))
         .clone();
     assert_eq!(row["home"]["homeId"], home_id.as_str(), "{row}");
+
+    // After an orchestrator restart, the home's machine is dialed again on
+    // its own: a commit there still reaches home/head.
+    drop(rpc_ws);
+    drop(head);
+    let (_head, _, _) = serve_backend(&head_dir, &[HOMES]).await;
+    let third = commit_on(&work, "notes.txt", "three\n", "third");
+    until("home/head at the third commit after a restart", || {
+        (try_rev(&mirror, &home_ref("head")).as_deref() == Some(third.as_str())).then_some(())
+    })
+    .await;
 }

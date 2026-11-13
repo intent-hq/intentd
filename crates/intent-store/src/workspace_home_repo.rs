@@ -170,8 +170,9 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Record a backup of the workspace's home `home_id` at `at`: it ends a
-    /// failing streak. `false` when that is not its home.
+    /// Record a backup of the workspace's home `home_id` at `at`, reported
+    /// by the machine `node_id`: it ends a failing streak. `false` when that
+    /// is not its home, or not on that machine.
     ///
     /// # Errors
     ///
@@ -180,15 +181,17 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         home_id: &HomeId,
+        node_id: &str,
         at: &str,
     ) -> Result<bool> {
         let done = sqlx::query(
             "UPDATE workspace_home SET last_backup_at = ?, backup_failing_since = NULL \
-             WHERE workspace_id = ? AND home_id = ?",
+             WHERE workspace_id = ? AND home_id = ? AND node_id = ?",
         )
         .bind(at)
         .bind(&workspace_id.0)
         .bind(&home_id.0)
+        .bind(node_id)
         .execute(self.write_pool())
         .await
         .map_err(db)?;

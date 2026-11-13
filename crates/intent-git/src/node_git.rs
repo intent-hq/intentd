@@ -42,10 +42,11 @@ const UNAPPLIED: &str = "unapplied/";
 /// submodules' caches: `<repoKey>.modules/<moduleKey>.git`.
 const MODULE_CACHES: &str = ".modules";
 
-/// Head's `update` hook for node pushes. Inside the agent's or the home's
-/// prefix (the only refs a session can reach) it allows exactly `head`,
-/// `wip` and `unapplied/<full lowercase hex sha>`; a home's `rewritten/*`
-/// and `orphaned/*` are never a node push's. An `unapplied/` ref is create-only
+/// Head's `update` hook for node pushes. Inside the session's own prefix
+/// ([`PREFIX_ENV`], the agent's or the home's refs; the only refs a session
+/// can reach) it allows exactly `head`, `wip` and
+/// `unapplied/<full lowercase hex sha>`; a home's `rewritten/*` and
+/// `orphaned/*` are never a node push's. An `unapplied/` ref is create-only
 /// and named by the commit it holds; pinning the same commit again is a
 /// no-op success, so a pin whose answer was lost can be retried.
 const UPDATE_HOOK: &str = r#"#!/bin/sh
@@ -56,10 +57,14 @@ refuse() {
   echo "intent: $ref: $1" >&2
   exit 1
 }
+prefix="$INTENT_NODE_GIT_PREFIX"
+case "$prefix" in
+refs/intent/ws/*/) ;;
+*) refuse "no session prefix" ;;
+esac
 case "$ref" in
-refs/intent/ws/*/agents/*/*) name="${ref#refs/intent/ws/*/agents/*/}" ;;
-refs/intent/ws/*/home/*) name="${ref#refs/intent/ws/*/home/}" ;;
-*) refuse "not an agent or home ref" ;;
+"$prefix"*) name="${ref#"$prefix"}" ;;
+*) refuse "not this session's ref" ;;
 esac
 case "$name" in
 head|wip) exit 0 ;;
@@ -82,6 +87,10 @@ unapplied/*)
 *) refuse "not a ref a node may push" ;;
 esac
 "#;
+
+/// The environment variable naming a receive session's ref prefix
+/// ([`AgentRemote::ref_prefix`]) to [`UPDATE_HOOK`].
+pub const PREFIX_ENV: &str = "INTENT_NODE_GIT_PREFIX";
 
 /// Where head keeps its receive hooks (see [`configure_receive_hooks`]).
 static HOOKS_DIR: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
@@ -388,6 +397,7 @@ pub fn service_command(
     command.args(scope_args(remote));
     if service == GitService::ReceivePack {
         command.args(receive_hook_args()?);
+        command.env(PREFIX_ENV, remote.ref_prefix());
     }
     command
         .arg(service.subcommand())
@@ -998,7 +1008,8 @@ impl NodeGit {
         #[cfg(test)]
         if let Some(head) = &self.test_head {
             return format!(
-                "ext::git {} {} %s {}",
+                "ext::env {PREFIX_ENV}={} git {} {} %s {}",
+                remote.ref_prefix(),
                 scope_args(remote).join(" "),
                 receive_hook_args().unwrap_or_default().join(" "),
                 head.display()
@@ -1805,7 +1816,7 @@ async fn run(mut command: Command) -> Result<String> {
     // The end of git's stderr names the failure; keep a bounded tail.
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
-    let skip = stderr.chars().count().saturating_sub(600);
+    let skip = stderr.chars().count().saturating_sub(1200);
     let detail: String = stderr.chars().skip(skip).collect();
     Err(Error::Internal(format!("node-git-failed: {detail}")))
 }

@@ -68,7 +68,7 @@ async fn homes_are_kept_per_workspace_and_updated_by_home_id() {
         .await
         .unwrap());
     assert!(!store
-        .record_workspace_home_backup(&ws1, &stale, &now_iso())
+        .record_workspace_home_backup(&ws1, &stale, "node-a", &now_iso())
         .await
         .unwrap());
     let h1 = HomeId::from("h1");
@@ -84,8 +84,15 @@ async fn homes_are_kept_per_workspace_and_updated_by_home_id() {
         "an unchanged state is not a change"
     );
     let at = now_iso();
+    assert!(
+        !store
+            .record_workspace_home_backup(&ws1, &h1, "node-b", &at)
+            .await
+            .unwrap(),
+        "only the home's machine reports its backups"
+    );
     assert!(store
-        .record_workspace_home_backup(&ws1, &h1, &at)
+        .record_workspace_home_backup(&ws1, &h1, "node-a", &at)
         .await
         .unwrap());
     let got = store.get_workspace_home(&ws1).await.unwrap().unwrap();
@@ -140,7 +147,7 @@ async fn backup_warning_follows_the_failing_streak() {
         "rewriting the same home keeps its streak"
     );
     store
-        .record_workspace_home_backup(&ws, &h1, &now_iso())
+        .record_workspace_home_backup(&ws, &h1, "node-a", &now_iso())
         .await
         .unwrap();
     assert!(
