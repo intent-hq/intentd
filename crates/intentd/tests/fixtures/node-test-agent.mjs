@@ -13,6 +13,18 @@
 //                           working directory (profile-overlay tests)
 //   --fail-setup-echo <VAR> fail session/new with an error quoting $VAR
 //   --auth-required-setup   fail session/new with ACP's auth-required error
+//   --sessions <dir>        keep each session's prompts in <dir>/<id>.json
+//                           (or $NODE_TEST_AGENT_SESSIONS) and offer
+//                           session/load: a new session gets a fresh id, a
+//                           load replays the stored prompts as
+//                           "replayed: <text>" updates (one of them after
+//                           its answer), and an unknown id is refused
+//   --crash-on-load         exit with 4 when asked to session/load, while a
+//                           helper keeps its stdout open (the load never
+//                           answers, so its exit is seen first)
+//
+// With sessions, a prompt "recall <word>" streams "recall <word>: yes" when
+// an earlier prompt of the session contained <word>, else ": no".
 //
 // A prompt "echo-env <VAR>" streams $VAR as a chunk and then fails the turn
 // with an error quoting it (credential echo tests); "auth-required" fails
@@ -68,6 +80,17 @@ const failSetupAt = argv.indexOf('--fail-setup-echo');
 const failSetupVar = failSetupAt >= 0 ? argv[failSetupAt + 1] : undefined;
 const detachedHelper = argv.includes('--detached-helper');
 const authRequiredSetup = argv.includes('--auth-required-setup');
+const sessionsAt = argv.indexOf('--sessions');
+const sessionsDir = sessionsAt >= 0 ? argv[sessionsAt + 1] : process.env.NODE_TEST_AGENT_SESSIONS;
+const sessionFile = (id) => `${sessionsDir}/${id}.json`;
+const readHistory = (id) => {
+  try {
+    return JSON.parse(fs.readFileSync(sessionFile(id), 'utf8'));
+  } catch {
+    return undefined;
+  }
+};
+let currentSession;
 const AUTH_REQUIRED = { code: -32000, message: 'Authentication required' };
 if (argv.includes('--dump-env')) fs.writeFileSync('agent.env.json', JSON.stringify(process.env));
 
@@ -200,7 +223,10 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
   switch (msg.method) {
     case 'initialize':
       if (slowInitMs) await new Promise((resolve) => setTimeout(resolve, slowInitMs));
-      return send({ id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      return send({
+        id: msg.id,
+        result: { protocolVersion: 1, agentCapabilities: sessionsDir ? { loadSession: true } : {} },
+      });
     case 'authenticate':
       return send({ id: msg.id, result: {} });
     case 'session/new':
@@ -215,9 +241,54 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
           error: { code: -32000, message: `rejected credential ${value}`, data: { credential: value } },
         });
       }
-      return send({ id: msg.id, result: { sessionId: SESSION } });
+      if (!sessionsDir) return send({ id: msg.id, result: { sessionId: SESSION } });
+      currentSession = `s-${crypto.randomUUID()}`;
+      fs.mkdirSync(sessionsDir, { recursive: true });
+      fs.writeFileSync(sessionFile(currentSession), '[]');
+      return send({ id: msg.id, result: { sessionId: currentSession } });
+    case 'session/load': {
+      if (argv.includes('--crash-on-load')) {
+        spawn('sleep', ['3'], { stdio: ['ignore', 'inherit', 'ignore'] });
+        process.exit(4);
+      }
+      const id = msg.params?.sessionId;
+      const stored = sessionsDir ? readHistory(id) : undefined;
+      if (!stored) return send({ id: msg.id, error: { code: -32002, message: `Resource not found: ${id}` } });
+      currentSession = id;
+      mcpServers = msg.params?.mcpServers ?? [];
+      const replay = (text) =>
+        send({
+          method: 'session/update',
+          params: {
+            sessionId: id,
+            update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: `replayed: ${text}` } },
+          },
+        });
+      stored.forEach(replay);
+      send({ id: msg.id, result: {} });
+      // A provider may flush the last of its replay just after the answer.
+      if (stored.length) setTimeout(() => replay(stored[stored.length - 1]), 10);
+      return;
+    }
     case 'session/prompt': {
       const text = promptText(msg.params);
+      const earlier = currentSession ? readHistory(currentSession) ?? [] : [];
+      if (currentSession) fs.writeFileSync(sessionFile(currentSession), JSON.stringify([...earlier, text]));
+      const recall = currentSession && text.match(/recall (\S[^\n]*)$/);
+      if (recall) {
+        const seen = earlier.some((prompt) => prompt.includes(recall[1]));
+        send({
+          method: 'session/update',
+          params: {
+            sessionId: currentSession,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `recall ${recall[1]}: ${seen ? 'yes' : 'no'}` },
+            },
+          },
+        });
+        return send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      }
       if ((msg.params?.prompt ?? []).some((block) => promptText({ prompt: [block] }) === 'echo-raw')) {
         const raw = (msg.params?.prompt ?? []).map((block) => block?.text ?? '').join('\n');
         send({

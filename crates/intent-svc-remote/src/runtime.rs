@@ -173,6 +173,7 @@ impl RemoteAgentRuntime {
         };
         // A prompt may cause provider side effects; a retry must not repeat it.
         self.sink.requests.fetch_add(1, Ordering::SeqCst);
+        self.shared.note_activity();
         // A prompt during a reconnect waits for the link, up to the grace.
         let undelivered =
             || transport("node-link-unavailable: the prompt was not delivered to the node");

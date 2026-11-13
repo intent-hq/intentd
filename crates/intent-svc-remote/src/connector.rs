@@ -326,6 +326,10 @@ pub(crate) struct Shared {
     /// disk: a `not-running` stop answer for one is final, no exit record
     /// is coming.
     lost_processes: Mutex<HashSet<AgentId>>,
+    /// When the machine last had agent activity: a prompt sent, or a
+    /// journal record of an agent ingested. A cloud machine's idle pause
+    /// counts from it (intent-hq/intent#9237).
+    last_activity: Mutex<Instant>,
     /// Agents whose machine runs an acknowledged final stop settled.
     #[cfg(test)]
     final_settles: Mutex<Vec<AgentId>>,
@@ -546,6 +550,16 @@ impl Shared {
             || !lock(&self.checkout_waiters).is_empty()
             || !lock(&self.one_shot_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
+    }
+
+    /// When the machine last had agent activity (see `last_activity`).
+    pub(crate) fn last_activity(&self) -> Instant {
+        *lock(&self.last_activity)
+    }
+
+    /// The machine has agent activity now.
+    pub(crate) fn note_activity(&self) {
+        *lock(&self.last_activity) = Instant::now();
     }
 
     /// Whether something would keep a link up now (see the module docs).
@@ -1335,8 +1349,13 @@ impl Shared {
     }
 
     /// A new process of `agent_id` is launched here: the mark of one lost
-    /// in a disk resume no longer applies.
+    /// in a disk resume no longer applies. While the lost process's stop
+    /// is still out, its answer settles the mark instead: a resend answered
+    /// `not-running` owes no exit record (intent-hq/intent#9238).
     pub(crate) fn launching(&self, agent_id: &AgentId) {
+        if self.stop_queued(agent_id) || lock(&self.stop_exits).contains_key(agent_id) {
+            return;
+        }
         lock(&self.lost_processes).remove(agent_id);
     }
 
@@ -1695,6 +1714,7 @@ impl RemoteNode {
             resending: Mutex::new(HashMap::new()),
             stop_exits: Mutex::new(HashMap::new()),
             lost_processes: Mutex::default(),
+            last_activity: Mutex::new(Instant::now()),
             #[cfg(test)]
             final_settles: Mutex::default(),
             #[cfg(test)]
@@ -3057,6 +3077,7 @@ async fn ingest_record(shared: &Shared, record: intent_core::node_link::JournalR
         );
         return;
     };
+    shared.note_activity();
     record_placement(shared, &agent_id, &record).await;
     let exited = Shared::exited_agent(&agent_id, &record);
     shared.agents.deliver(&agent_id, record);

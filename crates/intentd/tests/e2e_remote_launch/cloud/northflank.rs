@@ -11,7 +11,8 @@
 //! service of that entry (one volume, the size's plan, the backend's tags)
 //! with a resolved `target: "e2b"`; a pause and resume, and a container
 //! restart Northflank does on its own, keep the machine and its identity
-//! and tell the agent's next turn once what its disk kept and lost;
+//! and tell the agent's next turn once what its disk kept and lost, with
+//! its conversation loaded from the disk;
 //! `cloudMachines.kill` deletes the service with its volume; the token never
 //! reaches the backend's log.
 
@@ -577,6 +578,12 @@ impl FakeNorthflank {
             dir.join("workspaces").to_string_lossy().into_owned(),
         ));
         env.push(("INTENTD_AUTH_TOKEN".into(), TOKEN.into()));
+        // The fixture keeps its sessions on the volume, as a provider keeps
+        // its transcripts in the home folder.
+        env.push((
+            "NODE_TEST_AGENT_SESSIONS".into(),
+            home.join(".node-test-agent").to_string_lossy().into_owned(),
+        ));
         // One port for the container's life, as its settings would fix one:
         // a restarted daemon must listen where the machine row dials.
         env.retain(|(key, _)| key != "INTENTD_TCP_PORT");
@@ -875,6 +882,26 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     let resumed = echoed(&mut rpc_ws, agent, "after the pause", 70).await;
     assert!(resumed.contains(DISK_NOTICE), "{resumed}");
     assert_eq!(resumed.matches("Note from Intent").count(), 1, "{resumed}");
+    // The old process is known gone after a disk resume: the relaunch never
+    // waits for its exit record (intent-hq/intent#9238).
+    let log = std::fs::read_to_string(head_dir.join("head.log")).unwrap_or_default();
+    assert!(
+        !log.contains("exit record did not arrive in time"),
+        "the relaunch waited for a lost exit record"
+    );
+    // The relaunch loaded the session from the disk: the conversation
+    // carries over (intent-hq/intent#9236), and the history the load
+    // replays never reaches the transcript.
+    let recalled = echoed(&mut rpc_ws, agent, "recall first turn", 75).await;
+    assert!(recalled.contains("recall first turn: yes"), "{recalled}");
+    let convo = ok(
+        &mut rpc_ws,
+        78,
+        "agent.getConversation",
+        json!({ "workspaceId": agent.0, "agentId": agent.1 }),
+    )
+    .await;
+    assert!(!convo.to_string().contains("replayed:"), "{convo}");
     assert!(fake
         .calls_for(&service)
         .iter()
@@ -899,6 +926,8 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     fake.restart_container(&service);
     let restarted = echoed(&mut rpc_ws, agent, "after the restart", 100).await;
     assert!(restarted.contains(DISK_NOTICE), "{restarted}");
+    let recalled = echoed(&mut rpc_ws, agent, "recall a later turn", 105).await;
+    assert!(recalled.contains("recall a later turn: yes"), "{recalled}");
     let same = machine_until(&mut rpc_ws, 110, &service, |m| m.is_some())
         .await
         .unwrap();

@@ -179,14 +179,23 @@ impl CloudState {
         self.transition_lock(machine_id).try_lock().is_err()
     }
 
-    /// The machine's activity, first seen now, with `busy` noted.
-    fn activity(&self, machine_id: &str, busy: bool) -> lifecycle::Activity {
+    /// The machine's activity, first seen now, with `busy` noted and the
+    /// time its link last saw agent activity (`last_active`): a turn that
+    /// ran between two checks counts too (intent-hq/intent#9237).
+    fn activity(
+        &self,
+        machine_id: &str,
+        busy: bool,
+        last_active: Option<tokio::time::Instant>,
+    ) -> lifecycle::Activity {
         let mut activity = crate::lock(&self.activity);
         let entry = activity
             .entry(machine_id.to_owned())
             .or_insert_with(lifecycle::Activity::fresh);
         if busy {
             entry.touch();
+        } else if let Some(at) = last_active {
+            entry.active_at(at);
         }
         *entry
     }
