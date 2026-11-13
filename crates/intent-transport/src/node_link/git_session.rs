@@ -467,8 +467,16 @@ async fn run_service(
         }
     };
     streamed?;
-    let mut child = service.child.take().ok_or(codes::FAILED)?;
-    let status = child.wait().await.map_err(|_| codes::FAILED)?;
+    // Waited on inside `service`, so a session ended meanwhile leaves the
+    // process (and what it holds) to `Service`'s drain.
+    let status = service
+        .child
+        .as_mut()
+        .ok_or(codes::FAILED)?
+        .wait()
+        .await
+        .map_err(|_| codes::FAILED)?;
+    service.child = None;
     if drain {
         access
             .received(
