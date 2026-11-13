@@ -137,6 +137,8 @@ pub(crate) struct ExecutorDeps {
     pub launch: Arc<dyn MachineLaunch>,
     /// Runs the quick actions backends send (nodeProtocol 18).
     pub one_shot: Option<Arc<dyn runner::MachineOneShot>>,
+    /// Answers the home calls backends send (nodeProtocol 19).
+    pub home_records: Option<Arc<dyn runner::HomeRecords>>,
     pub report: Arc<dyn MachineReport>,
     /// The intentd executable: the `git-remote-intent` helper and the
     /// agents' `mcp-bridge`.
@@ -402,6 +404,7 @@ impl ExecutorService {
         );
         let runner = Runner::new(RunnerConfig {
             one_shot: self.deps.one_shot.clone(),
+            home_records: self.deps.home_records.clone(),
             admission: Arc::new(Scoped {
                 credential: credential.clone(),
                 admission: self.deps.admission.clone(),
@@ -935,6 +938,148 @@ impl runner::MachineOneShot for ServicesOneShot {
     }
 }
 
+/// Home calls run through the daemon's own JSON-RPC router, against hidden
+/// workspace records of the home checkouts (node-link.md "Files and git on
+/// the home").
+pub(crate) struct ServicesHomeRecords(pub intent_services::Services);
+
+impl ServicesHomeRecords {
+    /// Remove the hidden records a previous run of this daemon left: each
+    /// open home makes a new one.
+    pub(crate) async fn purge(&self) {
+        let store = self.0.store();
+        let Ok(records) = store.home_record_ids().await else {
+            return;
+        };
+        for record in records {
+            if let Err(error) = store.delete_workspace(&record).await {
+                tracing::warn!(%error, "executor: could not remove a stale home record");
+            }
+        }
+    }
+}
+
+impl runner::HomeRecords for ServicesHomeRecords {
+    fn register(
+        &self,
+        home: &intent_core::node_link::HomeRef,
+        worktree: &std::path::Path,
+    ) -> intent_core::BoxFuture<'static, anyhow::Result<intent_core::WorkspaceId>> {
+        let store = self.0.store().clone();
+        let home = home.clone();
+        let worktree = worktree.to_string_lossy().into_owned();
+        Box::pin(async move {
+            let id = intent_core::WorkspaceId::new_home_record();
+            let now = intent_core::now_iso();
+            let record = intent_core::Workspace {
+                id: id.clone(),
+                title: format!("home {}", home.home_id),
+                branch: home_branch(&worktree).await,
+                status: intent_core::WorkspaceStatus::Active,
+                created_at: now.clone(),
+                updated_at: now,
+                repository_path: Some(worktree.clone()),
+                worktree_path: Some(worktree),
+                ..Default::default()
+            };
+            store.insert_workspace(&record).await?;
+            Ok(id)
+        })
+    }
+
+    fn remove(&self, record: intent_core::WorkspaceId) -> intent_core::BoxFuture<'static, ()> {
+        let store = self.0.store().clone();
+        Box::pin(async move {
+            if let Err(error) = store.delete_workspace(&record).await {
+                tracing::warn!(%error, "executor: could not remove a home record");
+            }
+        })
+    }
+
+    fn dispatch(
+        &self,
+        method: String,
+        params: serde_json::Map<String, serde_json::Value>,
+    ) -> intent_core::BoxFuture<
+        'static,
+        Result<serde_json::Value, intent_core::node_link::HomeCallError>,
+    > {
+        let services = self.0.clone();
+        Box::pin(intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            async move { dispatch_home_call(&services, &method, params).await },
+        ))
+    }
+}
+
+/// The branch `worktree` has checked out, or `""` when detached.
+async fn home_branch(worktree: &str) -> String {
+    let output = tokio::process::Command::new("git")
+        .args(["-C", worktree, "symbolic-ref", "--quiet", "--short", "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true)
+        .output()
+        .await;
+    output
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// Run one home method in-process: `host.exec` with the daemon's exec
+/// runtime, every other one through the JSON-RPC router, past the
+/// connection's node-mode gate, exactly as a client's request runs.
+async fn dispatch_home_call(
+    services: &intent_services::Services,
+    method: &str,
+    params: serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, intent_core::node_link::HomeCallError> {
+    use intent_core::node_link::HomeCallError;
+    if method == "host.exec" {
+        let parsed =
+            intent_services::host_exec::parse_args(&params).map_err(|error| HomeCallError {
+                code: i64::from(error.code),
+                message: error.message,
+                data: None,
+            })?;
+        return services
+            .host_exec_runtime()
+            .run(services, parsed)
+            .await
+            .map_err(|error| HomeCallError {
+                code: i64::from(error.code),
+                message: error.message,
+                data: None,
+            });
+    }
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    })
+    .to_string();
+    let internal = |message: &str| HomeCallError {
+        code: -32603,
+        message: message.to_owned(),
+        data: None,
+    };
+    let reply = intent_transport::router::handle_message(services, &request)
+        .await
+        .ok_or_else(|| internal("the method gave no reply"))?;
+    let mut reply: serde_json::Value =
+        serde_json::from_str(&reply).map_err(|_| internal("the method's reply is not JSON"))?;
+    if let Some(error) = reply.get_mut("error").map(serde_json::Value::take) {
+        return Err(serde_json::from_value(error)
+            .unwrap_or_else(|_| internal("the method's error is malformed")));
+    }
+    Ok(reply
+        .get_mut("result")
+        .map(serde_json::Value::take)
+        .unwrap_or_default())
+}
+
 /// Providers resolve from the daemon's live settings, as a local spawn's.
 /// The flag is whether this daemon may start a provider at all (`false` on
 /// an orchestrator, which refuses every launch).
@@ -1127,6 +1272,8 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
             return None;
         }
     };
+    let home_records = Arc::new(ServicesHomeRecords(parts.services.clone()));
+    home_records.purge().await;
     let report = Arc::new(DaemonReport {
         services: parts.services.clone(),
         routes: parts.routes,
@@ -1148,6 +1295,7 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
                 parts.services.may_spawn_provider_locally(),
             )),
             one_shot: Some(Arc::new(ServicesOneShot(parts.services.clone()))),
+            home_records: Some(home_records),
             report: report.clone(),
             executable,
             link_traffic: Some(parts.services.link_traffic().clone()),

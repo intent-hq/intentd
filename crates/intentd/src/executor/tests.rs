@@ -362,6 +362,17 @@ impl Running {
         launch: Arc<dyn MachineLaunch>,
         make_checkouts: MakeCheckouts,
     ) -> Self {
+        Self::start_with_records(data_dir, api, admission, launch, make_checkouts, None).await
+    }
+
+    async fn start_with_records(
+        data_dir: &std::path::Path,
+        api: Arc<MachineApi>,
+        admission: Arc<CountAdmission>,
+        launch: Arc<dyn MachineLaunch>,
+        make_checkouts: MakeCheckouts,
+        home_records: Option<Arc<dyn runner::HomeRecords>>,
+    ) -> Self {
         let report = Arc::new(FixedReport {
             refreshes: std::sync::atomic::AtomicUsize::new(0),
             primes: std::sync::atomic::AtomicUsize::new(0),
@@ -377,6 +388,7 @@ impl Running {
                 admission,
                 launch,
                 one_shot: None,
+                home_records,
                 report: report.clone(),
                 executable: std::env::current_exe().unwrap(),
                 link_traffic: Some(Arc::new(intent_core::link_traffic::LinkTraffic::new())),

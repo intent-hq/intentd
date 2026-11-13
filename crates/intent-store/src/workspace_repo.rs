@@ -41,6 +41,11 @@ pub(crate) const DELETE_WORKSPACE_BROWSER_BATCH_SQL: &str =
     (SELECT rowid FROM browser_tab WHERE workspace_id = ? LIMIT ?) RETURNING tab_id";
 pub(crate) const DELETE_WORKSPACE_SQL: &str = "DELETE FROM workspace WHERE id = ?";
 
+/// The SQL predicate that leaves out a machine's hidden home records
+/// ([`intent_core::HOME_RECORD_PREFIX`]) on `workspace.id`: they are never
+/// listed.
+pub(crate) const NOT_HOME_RECORD: &str = "substr(id, 1, 9) <> '__home__:'";
+
 /// Facts from the original Store deletion, never Services/cleanup completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepositoryWorkspaceDeleteDisposition {
@@ -1584,8 +1589,8 @@ impl Store {
             (false, false) => "archived = 0 AND status <> ?",
         };
         let sql = format!(
-            "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND ({predicate}) \
-             ORDER BY created_at"
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND {NOT_HOME_RECORD} \
+             AND ({predicate}) ORDER BY created_at"
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(CHIEF_WORKSPACE_ID)
@@ -1622,8 +1627,8 @@ impl Store {
             ""
         };
         let sql = format!(
-            "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND ({predicate}){keyset} \
-             ORDER BY created_at, id LIMIT ?"
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND {NOT_HOME_RECORD} \
+             AND ({predicate}){keyset} ORDER BY created_at, id LIMIT ?"
         );
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(CHIEF_WORKSPACE_ID)
@@ -1835,17 +1840,34 @@ impl Store {
         Ok(flipped)
     }
 
+    /// The ids of the machine's hidden home records
+    /// ([`intent_core::HOME_RECORD_PREFIX`]), for the executor's purge of
+    /// records a previous run left.
+    ///
+    /// # Errors
+    /// Returns `Internal` on a database failure.
+    pub async fn home_record_ids(&self) -> Result<Vec<WorkspaceId>> {
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM workspace WHERE substr(id, 1, 9) = '__home__:'")
+                .fetch_all(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("home record ids failed: {e}")))?;
+        Ok(ids.into_iter().map(WorkspaceId).collect())
+    }
+
     /// Ordinary workspace keys for inherited host access, without hydrating
     /// rows or issuing a role lookup per workspace. Includes archived rows.
     ///
     /// # Errors
     /// Returns `Internal` on a database failure.
     pub async fn ordinary_workspace_ids(&self) -> Result<Vec<WorkspaceId>> {
-        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM workspace WHERE id <> ?")
-            .bind(CHIEF_WORKSPACE_ID)
-            .fetch_all(self.read_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("workspace keys failed: {e}")))?;
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM workspace WHERE id <> ? AND substr(id, 1, 9) <> '__home__:'",
+        )
+        .bind(CHIEF_WORKSPACE_ID)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("workspace keys failed: {e}")))?;
         Ok(ids.into_iter().map(WorkspaceId).collect())
     }
 
@@ -1863,8 +1885,8 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces_referencing_pr_url(&self, url: &str) -> Result<Vec<Workspace>> {
         let sql = format!(
-            "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND archived = 0 \
-             AND is_remote = 0 AND (pr_url = ? COLLATE NOCASE OR (pull_requests IS NOT NULL \
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND {NOT_HOME_RECORD} \
+             AND archived = 0 AND is_remote = 0 AND (pr_url = ? COLLATE NOCASE OR (pull_requests IS NOT NULL \
              AND json_valid(pull_requests) AND EXISTS (\
              SELECT 1 FROM json_each(workspace.pull_requests) AS je \
              WHERE je.value ->> '$.url' = ? COLLATE NOCASE))) ORDER BY created_at"
@@ -1901,7 +1923,8 @@ impl Store {
         let rows = sqlx::query(
             "SELECT w.id, w.title, w.archived, p.linked_at FROM pull_request_workspace AS p \
              JOIN workspace AS w ON w.id = p.workspace_id \
-             WHERE p.pr_key = ? AND w.id <> ? AND w.is_remote = 0 \
+             WHERE p.pr_key = ? AND w.id <> ? AND substr(w.id, 1, 9) <> '__home__:' \
+             AND w.is_remote = 0 \
              AND (? OR w.status <> ?) \
              ORDER BY p.linked_at DESC, w.id ASC",
         )

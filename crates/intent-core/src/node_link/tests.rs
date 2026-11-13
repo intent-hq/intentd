@@ -354,6 +354,8 @@ fn executor_link_requests_golden() {
             "heartbeat",
             "heartbeatReply",
             "hello",
+            "homeCall",
+            "homeCallCancel",
             "homeOpen",
             "homePush",
             "launch",
@@ -414,6 +416,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "capabilitiesReply",
             "checkoutReadReply",
             "forgeTokenReply",
+            "homeCallReply",
             "homeOpenReply",
             "homePushReply",
             "journal",
@@ -773,7 +776,89 @@ fn every_frame() -> Vec<LinkFrame> {
             exit_code: Some(0),
             error: None,
         }),
+        LinkFrame::HomeCall(home_call()),
+        LinkFrame::HomeCallCancel(HomeCallCancel {
+            request_id: LinkId::nil(),
+        }),
+        LinkFrame::HomeCallReply(HomeCallReply::ok(LinkId::nil(), json!({ "content": "hi" }))),
     ]
+}
+
+fn home_call() -> HomeCall {
+    HomeCall {
+        request_id: LinkId::nil(),
+        workspace_id: WorkspaceId::from("ws-1"),
+        home_id: HomeId::from("home-1"),
+        method: "file.read".into(),
+        params: json!({ "path": "src/main.rs" })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        timeout_ms: 30_000,
+    }
+}
+
+/// The home call frames (nodeProtocol 19): closed bodies on the rpc lane,
+/// the call and its cancel from the backend only, and no params or result
+/// in `Debug`.
+#[test]
+fn home_call_wire_shapes() {
+    let call = serde_json::to_value(LinkFrame::HomeCall(home_call())).unwrap();
+    assert_eq!(
+        call,
+        json!({
+            "type": "homeCall",
+            "requestId": LinkId::nil(),
+            "workspaceId": "ws-1",
+            "homeId": "home-1",
+            "method": "file.read",
+            "params": { "path": "src/main.rs" },
+            "timeoutMs": 30000,
+        })
+    );
+    let mut extra = call;
+    extra["agentId"] = json!("a1");
+    assert!(serde_json::from_value::<LinkFrame>(extra).is_err());
+    let reply = serde_json::to_value(LinkFrame::HomeCallReply(HomeCallReply::err(
+        LinkId::nil(),
+        -32603,
+        "home-reply-too-large: 9 MB".into(),
+        Some(json!({ "code": HOME_REPLY_TOO_LARGE })),
+    )))
+    .unwrap();
+    assert_eq!(
+        reply,
+        json!({
+            "type": "homeCallReply",
+            "requestId": LinkId::nil(),
+            "outcome": "err",
+            "error": {
+                "code": -32603,
+                "message": "home-reply-too-large: 9 MB",
+                "data": { "code": "home-reply-too-large" },
+            },
+        })
+    );
+    let cancel = serde_json::to_value(LinkFrame::HomeCallCancel(HomeCallCancel {
+        request_id: LinkId::nil(),
+    }))
+    .unwrap();
+    assert_eq!(
+        cancel,
+        json!({ "type": "homeCallCancel", "requestId": LinkId::nil() })
+    );
+    let mut secret = home_call();
+    secret
+        .params
+        .insert("content".into(), json!("canary-file-body"));
+    assert!(!format!("{secret:?}").contains("canary"));
+    let answered = HomeCallReply::ok(LinkId::nil(), json!({ "content": "canary-result" }));
+    assert!(!format!("{answered:?}").contains("canary"));
+    let mut sorted = HOME_METHODS.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted, HOME_METHODS, "sorted and unique");
+    assert_eq!(HOME_METHODS.len(), 44);
 }
 
 fn home_open() -> HomeOpen {
@@ -960,7 +1045,7 @@ fn frames_are_routed_to_their_lane() {
             Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
             Control, Control, Control, Control, Control, Control, Control, Control, Script, Script,
             Script, Rpc, Rpc, Rpc, Control, Control, Control, Control, Control, Control, Control,
-            Control, Control, Script, Script,
+            Control, Control, Script, Script, Rpc, Rpc, Rpc,
         ]
     );
 }
@@ -1476,6 +1561,9 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
                 | LinkFrame::PtyAck(_)
                 | LinkFrame::PtyOutput(_)
                 | LinkFrame::PtyExited(_)
+                | LinkFrame::HomeCall(_)
+                | LinkFrame::HomeCallCancel(_)
+                | LinkFrame::HomeCallReply(_)
         );
         let expected = if home {
             HOMES_PROTOCOL

@@ -438,6 +438,33 @@ pub(super) async fn serve_link(
             LinkEvent::Frame(LinkFrame::OneShotCancel(cancel)) if protocol >= ONE_SHOT_PROTOCOL => {
                 runner.cancel_one_shot(cancel.request_id);
             }
+            // Files and git on the home (nodeProtocol 19): each call runs on
+            // its own task and answers once, unless cancelled; a replaced
+            // session starts nothing.
+            LinkEvent::Frame(LinkFrame::HomeCall(frame)) if protocol >= HOMES_PROTOCOL => {
+                let replaced = {
+                    let gate = runner.link_gate().lock().await;
+                    admit(gate.as_ref(), &binding, link.is_closed()) == Admission::Replaced
+                };
+                if replaced {
+                    tracing::debug!("node: dropping a home call from a replaced link");
+                    continue;
+                }
+                let link = link.clone();
+                let runner = runner.clone();
+                // Registered before the task runs, under this link's
+                // generation, so this link's end always ends it.
+                let cancelled = runner.begin_home_call(frame.request_id, binding.generation);
+                // caller-binding: allow — answers one home call on its link
+                tokio::spawn(async move {
+                    if let Some(reply) = runner.home_call(frame, cancelled).await {
+                        let _ = link.send(&LinkFrame::HomeCallReply(reply)).await;
+                    }
+                });
+            }
+            LinkEvent::Frame(LinkFrame::HomeCallCancel(cancel)) if protocol >= HOMES_PROTOCOL => {
+                runner.cancel_home_call(cancel.request_id);
+            }
             // Workspace homes (nodeProtocol 19): each answers once on its
             // own task; a replaced session starts nothing.
             LinkEvent::Frame(frame @ (LinkFrame::HomeOpen(_) | LinkFrame::HomePush(_)))
@@ -548,6 +575,8 @@ pub(super) async fn serve_link(
     streamer.abort();
     // No quick action outlives the link that asked for it.
     runner.cancel_binding_one_shots(binding.generation);
+    // So do its home calls; the backend fails them itself.
+    runner.cancel_binding_home_calls(binding.generation);
     // No script outlives the link that started it.
     runner.end_binding_scripts(binding.generation).await;
     // Terminals wait for the next bind, up to the link-loss grace.

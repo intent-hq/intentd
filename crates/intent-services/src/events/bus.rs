@@ -234,6 +234,11 @@ impl EventBus {
     /// # Panics
     /// Panics if the writer admission mutex is poisoned.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
+        // A machine's hidden home record is never seen: its events are
+        // neither stored nor broadcast.
+        if ev.workspace_id.is_home_record() {
+            return Ok(unpublished(ev));
+        }
         if matches!(
             ev.event_type.as_str(),
             intent_core::events::NOTE_CREATED
@@ -349,19 +354,10 @@ impl EventBus {
     /// B's persisted event commits, even if B's call started first.
     #[must_use]
     pub fn publish_transient(&self, ev: &NewEvent) -> Event {
-        let id = Uuid::now_v7().to_string();
-        let event = Event {
-            id,
-            workspace_id: ev.workspace_id.clone(),
-            timestamp: ev.timestamp.clone(),
-            event_type: ev.event_type.clone(),
-            actor: ev.actor.clone(),
-            session_id: ev.session_id.clone(),
-            correlation_id: ev.correlation_id.clone(),
-            parent_event_id: ev.parent_event_id.clone(),
-            metadata: ev.metadata.clone(),
-            data: ev.data.clone(),
-        };
+        let event = unpublished(ev);
+        if ev.workspace_id.is_home_record() {
+            return event;
+        }
         // Broadcast on the same channel so transient/persisted events interleave
         // correctly for subscribers (ordering preserved from a single publisher).
         self.tx
@@ -1050,4 +1046,20 @@ fn utf8_prefix(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// `ev` as an [`Event`] with a new id, not stored or broadcast.
+fn unpublished(ev: &NewEvent) -> Event {
+    Event {
+        id: Uuid::now_v7().to_string(),
+        workspace_id: ev.workspace_id.clone(),
+        timestamp: ev.timestamp.clone(),
+        event_type: ev.event_type.clone(),
+        actor: ev.actor.clone(),
+        session_id: ev.session_id.clone(),
+        correlation_id: ev.correlation_id.clone(),
+        parent_event_id: ev.parent_event_id.clone(),
+        metadata: ev.metadata.clone(),
+        data: ev.data.clone(),
+    }
 }

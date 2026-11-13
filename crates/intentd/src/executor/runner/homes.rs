@@ -38,6 +38,9 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 /// How often a changing checkout's `home/wip` is pushed at least.
 const WIP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+/// How long after the last writing home call `home/wip` is pushed.
+pub(super) const WIP_DEBOUNCE: Duration = Duration::from_secs(2);
+
 /// Whether this build holds workspace homes ([`intent_core::node_link::homes_ready`]).
 pub(crate) fn homes_ready() -> bool {
     intent_core::node_link::homes_ready()
@@ -55,8 +58,15 @@ pub(super) struct Homes {
 
 /// One open home checkout.
 pub(super) struct Home {
-    of: HomeRef,
-    worktree: PathBuf,
+    pub(super) of: HomeRef,
+    pub(super) worktree: PathBuf,
+    /// The machine's hidden workspace record of this checkout, which home
+    /// calls run against; made on open, or by the first call after a
+    /// failed make.
+    pub(super) record: tokio::sync::Mutex<Option<intent_core::WorkspaceId>>,
+    /// When a writing home call last ended: `home/wip` is pushed
+    /// [`WIP_DEBOUNCE`] after it.
+    pub(super) wip_due: Mutex<Option<Instant>>,
     /// The last `home/head` and `home/wip` this machine pushed; a push holds
     /// it, so the checkout's pushes run one at a time.
     pushed: tokio::sync::Mutex<Option<Pushed>>,
@@ -133,6 +143,7 @@ impl Runner {
             }
             opened.setup_done.send_replace(true);
             self.watch_home(&opened);
+            self.make_home_record(&opened);
         }
     }
 
@@ -263,6 +274,7 @@ impl Runner {
         };
         let (opened, stop) = self.insert_home(home.clone(), prepared.worktree.clone());
         *lock(&opened.output) = Some(output.clone());
+        self.make_home_record(&opened);
         let runner = self.clone();
         let setup = SetupJob {
             command: frame.checkout.setup.clone(),
@@ -438,6 +450,7 @@ impl Runner {
         for home in homes {
             lock(&home.setup_stop).take();
             home.closed.send_replace(true);
+            self.drop_home_record(&home);
         }
     }
 
@@ -452,7 +465,7 @@ impl Runner {
     /// The open home `home_id` of `workspace_id`, when the lease names it.
     /// Whether `home` is leased here, not open, and its checkout on disk
     /// is not recorded for another workspace.
-    fn leased_unopened(&self, home: &HomeRef) -> bool {
+    pub(super) fn leased_unopened(&self, home: &HomeRef) -> bool {
         {
             let homes = lock(&self.inner.homes);
             if !homes.lease.contains(&home.home_id) || homes.open.contains_key(&home.home_id) {
@@ -467,7 +480,7 @@ impl Runner {
             .is_some_and(|(_, workspace)| workspace.is_none_or(|ws| ws == home.workspace_id))
     }
 
-    fn leased_home(
+    pub(super) fn leased_home(
         &self,
         workspace_id: &intent_core::WorkspaceId,
         home_id: &HomeId,
@@ -490,6 +503,8 @@ impl Runner {
         let opened = Arc::new(Home {
             of: home,
             worktree,
+            record: tokio::sync::Mutex::new(None),
+            wip_due: Mutex::new(None),
             pushed: tokio::sync::Mutex::new(None),
             wip_pushed_at: Mutex::new(Instant::now()),
             setup_done: watch::channel(false).0,
@@ -633,7 +648,7 @@ impl Runner {
 
     /// Push the home checkout and journal `homePushed` when it moved.
     /// The push, waiting for one under way first, ends by `deadline`.
-    async fn push_home_now(
+    pub(super) async fn push_home_now(
         &self,
         home: &Home,
         deadline: tokio::time::Instant,
@@ -698,7 +713,16 @@ impl Runner {
                 let head = runner.inner.checkouts.head_commit(&home.worktree).await;
                 let moved = head.is_some() && head != home.last_head().await;
                 let due = lock(&home.wip_pushed_at).elapsed() >= WIP_INTERVAL;
-                if !(moved || due) {
+                // A writing home call asked for a push of `home/wip`.
+                let written = {
+                    let mut wip_due = lock(&home.wip_due);
+                    let elapsed = wip_due.is_some_and(|at| at.elapsed() >= WIP_DEBOUNCE);
+                    if elapsed {
+                        *wip_due = None;
+                    }
+                    elapsed
+                };
+                if !(moved || due || written) {
                     continue;
                 }
                 let deadline = tokio::time::Instant::now() + PUSH_TIMEOUT;

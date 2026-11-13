@@ -567,7 +567,8 @@ impl Store {
         if removed || revoke_guest {
             if removed {
                 result.affected_workspaces = sqlx::query_scalar::<_, String>(
-                    "SELECT id FROM workspace WHERE id != '__chief__' ORDER BY id",
+                    "SELECT id FROM workspace WHERE id != '__chief__' \
+                     AND substr(id, 1, 9) <> '__home__:' ORDER BY id",
                 )
                 .fetch_all(&mut *tx)
                 .await

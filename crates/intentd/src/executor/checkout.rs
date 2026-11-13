@@ -678,6 +678,15 @@ pub(super) const TEST_HOME_HEAD: &str = ".test-head";
 #[cfg(test)]
 pub(super) const TEST_HOME_MADE: &str = "made";
 
+/// Beside a test home checkout: one `+` per push of it.
+#[cfg(test)]
+pub(super) const TEST_HOME_PUSHED: &str = "pushed";
+
+/// Beside a test home checkout: while it exists, every push of the home
+/// fails, like a head that refuses it.
+#[cfg(test)]
+pub(super) const TEST_HOME_PUSH_FAILS: &str = "push-fails";
+
 #[cfg(test)]
 impl PlainCheckouts {
     pub(super) fn new(storage: Arc<Storage>) -> Arc<Self> {
@@ -885,7 +894,15 @@ impl Checkouts for PlainCheckouts {
                 !self.fail_pushes.load(std::sync::atomic::Ordering::SeqCst),
                 "head refused the push"
             );
+            let beside = worktree.parent().unwrap_or(worktree);
+            anyhow::ensure!(
+                !beside.join(TEST_HOME_PUSH_FAILS).exists(),
+                "head refused the push"
+            );
             let head = std::fs::read_to_string(worktree.join(TEST_HOME_HEAD))?;
+            let pushed = beside.join(TEST_HOME_PUSHED);
+            let count = std::fs::read_to_string(&pushed).unwrap_or_default();
+            std::fs::write(pushed, format!("{count}+"))?;
             Ok(HomePush {
                 rewritten: None,
                 wip: head.clone(),

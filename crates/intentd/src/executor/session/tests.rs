@@ -61,6 +61,7 @@ fn harness() -> Harness {
     let journal = Journal::open(&storage.journal_dir()).unwrap();
     let runner = Runner::new(RunnerConfig {
         one_shot: None,
+        home_records: None,
         admission: Arc::new(Unlimited),
         launch: Arc::new(NoProviders),
         checkouts: crate::executor::checkout::PlainCheckouts::new(storage.clone()),

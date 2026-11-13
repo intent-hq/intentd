@@ -46,6 +46,7 @@ use super::storage::ProviderSession;
 use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
+mod home_calls;
 mod homes;
 pub(crate) use homes::homes_ready;
 
@@ -159,10 +160,37 @@ pub(crate) trait MachineOneShot: Send + Sync {
     ) -> intent_core::BoxFuture<'static, intent_core::node_link::OneShotReply>;
 }
 
+/// The machine's hidden workspace records of open home checkouts and the
+/// in-process dispatch of a backend's home calls against them
+/// (nodeProtocol 19, node-link.md "Files and git on the home").
+pub(crate) trait HomeRecords: Send + Sync {
+    /// Create a hidden record ([`intent_core::WorkspaceId::new_home_record`])
+    /// whose checkout is `worktree`.
+    fn register(
+        &self,
+        home: &intent_core::node_link::HomeRef,
+        worktree: &std::path::Path,
+    ) -> intent_core::BoxFuture<'static, anyhow::Result<intent_core::WorkspaceId>>;
+    /// Remove a record [`Self::register`] made.
+    fn remove(&self, record: intent_core::WorkspaceId) -> intent_core::BoxFuture<'static, ()>;
+    /// Run `method` with `params` (whose `workspaceId` names the record) as
+    /// the daemon does for a client, as the daemon caller.
+    fn dispatch(
+        &self,
+        method: String,
+        params: serde_json::Map<String, serde_json::Value>,
+    ) -> intent_core::BoxFuture<
+        'static,
+        Result<serde_json::Value, intent_core::node_link::HomeCallError>,
+    >;
+}
+
 /// What the runner needs.
 pub(super) struct RunnerConfig {
     /// Runs quick actions; `None` answers every `oneShot` as unavailable.
     pub one_shot: Option<Arc<dyn MachineOneShot>>,
+    /// Answers home calls; `None` refuses every `homeCall`.
+    pub home_records: Option<Arc<dyn HomeRecords>>,
     pub admission: Arc<dyn Admission>,
     pub launch: Arc<dyn MachineLaunch>,
     pub checkouts: Arc<dyn Checkouts>,
@@ -220,6 +248,12 @@ pub(super) struct Runner {
 
 struct Inner {
     one_shot: Option<Arc<dyn MachineOneShot>>,
+    home_records: Option<Arc<dyn HomeRecords>>,
+    /// Running home calls, by request id, with the binding generation of
+    /// the link that asked for them: dropping the sender ends one.
+    home_calls: Mutex<
+        HashMap<intent_core::node_link::LinkId, (NodeCounter, tokio::sync::oneshot::Sender<()>)>,
+    >,
     /// Running quick actions, by request id, with the binding generation of
     /// the link that asked for them: dropping the sender ends one.
     one_shots: Mutex<
@@ -1007,6 +1041,8 @@ impl Runner {
             inner: Arc::new(Inner {
                 one_shot: config.one_shot,
                 one_shots: Mutex::new(HashMap::new()),
+                home_records: config.home_records,
+                home_calls: Mutex::new(HashMap::new()),
                 admission: config.admission,
                 launch: config.launch,
                 checkouts: config.checkouts,

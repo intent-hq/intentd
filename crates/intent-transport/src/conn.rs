@@ -635,6 +635,12 @@ async fn process_captured_frame(
         if !method.is_empty() && api.node_mode() && !catalog::node_mode_may_call(&method) {
             return refuse_node_mode(&method, rpc_id, out_tx).await;
         }
+        // A machine's hidden home record (nodeProtocol 19) answers only the
+        // backend's home calls, which never come through a connection: a
+        // client naming it gets the unknown-workspace answer.
+        if names_home_record(value) {
+            return refuse_home_record(rpc_id, out_tx).await;
+        }
         // Multiplayer w3 — default-deny allowlist for non-administrator
         // connections. Runs before every classify and dispatch path (control,
         // server/pairing, provider setup, host, browser, client,
@@ -1352,6 +1358,34 @@ async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &Outbound
                 &id,
                 catalog::FORBIDDEN_ERROR_CODE,
                 catalog::FORBIDDEN_ERROR_MESSAGE,
+            ))
+            .await
+            .is_ok(),
+        None => !out_tx.is_closed(),
+    }
+}
+
+/// Whether a request's `params.workspaceId` names a machine's hidden home
+/// record ([`intent_core::HOME_RECORD_PREFIX`]).
+pub(crate) fn names_home_record(value: &Value) -> bool {
+    value
+        .get("params")
+        .and_then(|params| params.get("workspaceId"))
+        .and_then(Value::as_str)
+        .is_some_and(intent_core::is_home_record_id)
+}
+
+/// Answer a request naming a hidden home record as one naming a workspace
+/// that does not exist (`-32602`, `data.code: "not-found"`); a notification
+/// is dropped. Returns `false` only when the outbound channel is closed.
+async fn refuse_home_record(rpc_id: Option<Value>, out_tx: &OutboundSender) -> bool {
+    match rpc_id {
+        Some(id) => out_tx
+            .send_priority(events::error_frame_with_data(
+                &id,
+                -32602,
+                "Workspace not found",
+                &json!({ "code": "not-found" }),
             ))
             .await
             .is_ok(),
@@ -3267,6 +3301,67 @@ mod tests {
             Some("durable")
         );
         // Idle peer remains alive throughout drain; no socket-close handshake.
+        bus.shutdown().await.unwrap();
+        store.close().await;
+    }
+
+    /// A client naming a machine's hidden home record (nodeProtocol 19) is
+    /// answered as for a workspace that does not exist, before any handler
+    /// runs; other workspace ids are not affected.
+    #[tokio::test]
+    async fn a_request_naming_a_home_record_is_answered_not_found() {
+        struct NoApi;
+        impl WorkspaceApi for NoApi {}
+        let dir = tempfile::tempdir().unwrap();
+        let store = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(NoApi);
+        let bus = EventBus::new(store.clone());
+        let (tx, mut rx) = outbound_channel();
+        let reverse = ReverseChannel::new(tx.priority_sender());
+        let primary = crate::reverse::PrimaryReverseRegistry::new();
+        let guard = primary.register(reverse.clone(), crate::reverse::ReverseTransport::Wss);
+        let limiter = RpcLimiter::unlimited();
+        let mut subs = ConnSubs::default();
+        let mut client = None;
+        let hidden = intent_core::WorkspaceId::new_home_record();
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "r1",
+            "method": "file.read",
+            "params": { "workspaceId": hidden.as_str(), "path": "a.txt" },
+        })
+        .to_string();
+        assert!(
+            process_frame(
+                &frame,
+                &api,
+                &bus,
+                &tx,
+                &mut subs,
+                &reverse,
+                &guard,
+                None,
+                None,
+                &mut client,
+                true,
+                &limiter
+            )
+            .await
+        );
+        let reply: Value =
+            serde_json::from_str(&rx.priority.try_recv().expect("answered")).unwrap();
+        assert_eq!(reply["id"], "r1");
+        assert_eq!(reply["error"]["code"], -32602);
+        assert_eq!(reply["error"]["data"]["code"], "not-found");
+        assert!(names_home_record(
+            &json!({ "params": { "workspaceId": hidden.as_str() } })
+        ));
+        assert!(!names_home_record(
+            &json!({ "params": { "workspaceId": "ws-1" } })
+        ));
+        assert!(!names_home_record(&json!({ "params": {} })));
         bus.shutdown().await.unwrap();
         store.close().await;
     }

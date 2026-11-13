@@ -11894,3 +11894,55 @@ async fn guest_roles_upgrade_preserves_grants_counts_and_authority_triggers() {
         Some(WorkspaceRole::Owner)
     );
 }
+
+/// A machine's hidden home record (`__home__:` ids) reads by id but never
+/// lists, and the prefix the SQL spells is the core constant.
+#[tokio::test]
+async fn home_records_are_never_listed() {
+    assert_eq!(intent_core::HOME_RECORD_PREFIX, "__home__:");
+    assert_eq!(intent_core::HOME_RECORD_PREFIX.len(), 9);
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let shown = WorkspaceId::from("ws-shown");
+    let hidden = WorkspaceId::new_home_record();
+    assert!(hidden.is_home_record());
+    store
+        .insert_workspace(&sample_workspace(&shown, "shown", false))
+        .await
+        .unwrap();
+    store
+        .insert_workspace(&sample_workspace(&hidden, "home", false))
+        .await
+        .unwrap();
+    assert_eq!(store.get_workspace(&hidden).await.unwrap().id, hidden);
+    let listed: Vec<_> = store
+        .list_workspaces(intent_core::WorkspaceListFilter {
+            include_archived: true,
+            include_retired: true,
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|ws| ws.id)
+        .collect();
+    assert_eq!(listed, std::slice::from_ref(&shown));
+    let paged: Vec<_> = store
+        .list_workspaces_page(intent_core::WorkspaceListFilter::default(), None, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|ws| ws.id)
+        .collect();
+    assert_eq!(paged, std::slice::from_ref(&shown));
+    assert!(!store
+        .ordinary_workspace_ids()
+        .await
+        .unwrap()
+        .contains(&hidden));
+    assert_eq!(
+        store.home_record_ids().await.unwrap(),
+        std::slice::from_ref(&hidden)
+    );
+    store.delete_workspace(&hidden).await.unwrap();
+    assert!(store.home_record_ids().await.unwrap().is_empty());
+}
