@@ -147,12 +147,14 @@ pub struct ModelSettings {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct QuickActionsSettings {
-    /// `quickActions.defaultModel` — model for quick actions.
+    /// `quickActions.defaultModel` — deprecated shared model; boot copies it
+    /// into `type_overrides` and removes it. Never consulted.
     pub default_model: Option<String>,
     /// `quickActions.typeOverrides` — per-quick-action model overrides
     /// (`commit`, `pr`, `review`, `fast`).
     pub type_overrides: BTreeMap<String, String>,
-    /// Shared effort for quick actions; blank reads as unset.
+    /// Deprecated shared effort; boot copies it into
+    /// `type_reasoning_effort_overrides` and removes it. Never consulted.
     #[serde(deserialize_with = "de_blank_as_none")]
     pub default_reasoning_effort: Option<String>,
     /// Per-action effort, independent of the per-action model override.
@@ -1920,14 +1922,12 @@ providerDefaults = {}
 # defaultReasoningEffort = "high"
 
 [quickActions]
-# Quick action default model -- model for single-shot quick actions (commit
-# messages and PR descriptions); never applied to agent sessions.
-# defaultModel = "claude-sonnet-4-5"
-# Quick action type overrides -- per-quick-action model overrides.
+# Quick action models -- model per single-shot quick action (commit, pr,
+# review, walkthrough); never applied to agent sessions. Blank or absent
+# uses the provider default.
 typeOverrides = {}
-# Quick action effort -- provider-defined; blank means provider default.
-# defaultReasoningEffort = "high"
-# Per-action effort overrides; blank or absent inherits the shared effort.
+# Per-action effort -- provider-defined; blank or absent uses the provider
+# default.
 typeReasoningEffortOverrides = {}
 # Quick action provider settings -- per-provider quick-action settings.
 providerSettings = {}

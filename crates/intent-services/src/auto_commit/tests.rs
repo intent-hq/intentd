@@ -1136,7 +1136,6 @@ async fn generation_applies_commit_quick_action_effort_before_prompt() {
         .apply(&[
             ("model.defaultProvider".into(), json!("claude-code")),
             ("providers.paths".into(), json!({"claude-code":bin})),
-            ("quickActions.defaultReasoningEffort".into(), json!("low")),
             (
                 "quickActions.typeReasoningEffortOverrides".into(),
                 json!({"commit":"high"}),

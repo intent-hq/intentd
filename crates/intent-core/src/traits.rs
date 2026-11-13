@@ -3097,8 +3097,8 @@ pub trait WorkspaceApi: Send + Sync {
     ///
     /// `quick_action_type` is the optional quick-action `type` hint keying
     /// `quickActions.typeOverrides`; with no explicit `model` the daemon
-    /// resolves that override then `quickActions.defaultModel` before the
-    /// provider CLI default (monorepo#1734). An explicit `model` must be a
+    /// resolves that override before the provider CLI default
+    /// (monorepo#1734). An explicit `model` must be a
     /// bare model id (compound `provider:model` ids reject `-32602` at the
     /// wire boundary, §5.5). `reasoning_effort` independently overrides the
     /// quick-action effort settings; live ACP validation happens after model

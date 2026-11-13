@@ -926,6 +926,8 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
     let (_daemon, mut rpc, _sub) = boot_with_wss(&data_dir).await;
 
     // The legacy values landed on the renamed keys, read back over the wire.
+    // The carried-over shared model is then retired: with no default provider
+    // its compound value names no own provider, so nothing is copied.
     let get = wss_rpc(
         &mut rpc,
         10,
@@ -933,7 +935,7 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
         json!({ "path": "quickActions.defaultModel" }),
     )
     .await;
-    assert_eq!(get["result"]["value"], json!("auggie:haiku"), "{get}");
+    assert_eq!(get["result"]["value"], Value::Null, "{get}");
     let get = wss_rpc(
         &mut rpc,
         11,
@@ -995,7 +997,7 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
     .await;
     assert_eq!(
         get["result"]["value"],
-        json!("auggie:haiku"),
+        Value::Null,
         "an ignored retired write must not change the renamed key: {get}"
     );
 }
@@ -1177,27 +1179,27 @@ async fn quick_action_effort_persists_emits_changes_and_resets_over_wss() {
     let (daemon, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
     await_config_watcher_ready(dir.path()).await;
     let paths = [
-        "quickActions.defaultReasoningEffort",
         "quickActions.typeReasoningEffortOverrides",
         "quickActions.providerSettings",
     ];
     let initial = settings_snapshot(&mut rpc, &paths).await;
-    assert_eq!(initial[0]["value"], Value::Null);
-    assert_eq!(initial[1]["value"], json!({}));
+    assert_eq!(initial[0]["value"], json!({}));
     let revision = initial[0]["revision"].as_u64().unwrap();
     let values = [
-        json!(" High "),
         json!({"commit":"low"}),
-        json!({
-            "codex":{"defaultReasoningEffort":"high","typeReasoningEffortOverrides":{"commit":"low"}},
-            "claude-code":{"defaultModel":"old-snapshot"}
-        }),
+        json!({"codex":{"typeReasoningEffortOverrides":{"commit":"low"}}}),
     ];
-    let changes: Vec<Value> = paths
-        .iter()
-        .zip(&values)
-        .map(|(path, value)| json!({"path":path,"value":value}))
-        .collect();
+    // A released client still sends the deprecated shared effort in the same
+    // batch; it is ignored and the rest of the batch applies.
+    let mut changes: Vec<Value> = vec![json!({
+        "path":"quickActions.defaultReasoningEffort","value":" High "
+    })];
+    changes.extend(
+        paths
+            .iter()
+            .zip(&values)
+            .map(|(path, value)| json!({"path":path,"value":value})),
+    );
     let update = wss_rpc(&mut rpc, 20, "settings.update", json!({"changes":changes})).await;
     let applied: Vec<Value> = paths
         .iter()
@@ -1212,60 +1214,37 @@ async fn quick_action_effort_persists_emits_changes_and_resets_over_wss() {
     drop(sub);
     drop(rpc);
     drop(daemon);
-    let (restarted_daemon, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
+    let (_restarted_daemon, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
     await_config_watcher_ready(dir.path()).await;
     let reloaded = settings_snapshot(&mut rpc, &paths).await;
     for (got, value) in reloaded.iter().zip(&values) {
         assert_eq!(got["value"], *value);
     }
+    let shared = settings_snapshot(&mut rpc, &["quickActions.defaultReasoningEffort"]).await;
+    assert_eq!(shared[0]["value"], Value::Null);
     let revision = reloaded[0]["revision"].as_u64().unwrap();
     let reset = wss_rpc(&mut rpc, 21, "settings.reset", json!({"path":paths[0]})).await;
-    assert_eq!(
-        reset,
-        json!({"jsonrpc":"2.0","id":21,"result":{"path":paths[0],"value":null,"origin":"default","revision":revision+1}})
-    );
+    assert_eq!(reset["result"]["origin"], json!("default"), "{reset}");
+    assert_eq!(reset["result"]["revision"], json!(revision + 1), "{reset}");
     assert_settings_change(
         &mut sub,
-        &json!([{"path":paths[0],"value":null,"origin":"default"}]),
+        &json!([{"path":paths[0],"value":reset["result"]["value"],"origin":"default"}]),
         revision + 1,
     )
     .await;
     let after = settings_snapshot(&mut rpc, &paths).await;
-    assert_eq!(after[0]["value"], Value::Null);
+    assert_eq!(after[0]["value"], json!({}));
     assert_eq!(after[1]["value"], values[1]);
-    assert_eq!(after[2]["value"], values[2]);
     for invalid in [json!({"commit":false}), json!({"commit":null})] {
         let rejected = wss_rpc(
             &mut rpc,
             22,
             "settings.update",
-            json!({"changes":[{"path":paths[1],"value":invalid}]}),
+            json!({"changes":[{"path":paths[0],"value":invalid}]}),
         )
         .await;
         assert_eq!(rejected["error"]["code"], -32602);
     }
-    // Blank writes read as unset immediately and after a daemon restart.
-    for blank in ["", "   "] {
-        let updated = wss_rpc(
-            &mut rpc,
-            23,
-            "settings.update",
-            json!({"changes":[{"path":paths[0],"value":blank}]}),
-        )
-        .await;
-        assert!(updated.get("error").is_none(), "{updated}");
-        assert_eq!(
-            settings_snapshot(&mut rpc, &paths).await[0]["value"],
-            Value::Null
-        );
-    }
-    drop(sub);
-    drop(rpc);
-    drop(restarted_daemon);
-    let (_blank_restart, mut rpc, _sub) = boot_with_wss(dir.path()).await;
-    let blank_reloaded = settings_snapshot(&mut rpc, &paths).await;
-    assert_eq!(blank_reloaded[0]["value"], Value::Null);
-    assert_eq!(blank_reloaded[1]["value"], values[1]);
 }
 
 /// `workspace.purgeArchivedAfterDays` (§5.12) over WSS: advertised as an

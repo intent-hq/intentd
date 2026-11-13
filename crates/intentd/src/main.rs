@@ -2469,6 +2469,10 @@ async fn cmd_serve_owned(
         // already-set ones are left alone.
         intent_services::migrate_quick_action_settings(&settings_registry)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // One-time fold of the deprecated shared quick action model and effort
+        // into each action, after the carry-over above can fill them.
+        intent_services::migrate_quick_action_shared_default(&settings_registry)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         // One-time removal of the deprecated `providers.active` from config.toml
         // (comment-preserving rewrite; runs only when the key exists). Its value
         // is carried over into `model.defaultProvider` (which superseded it)
