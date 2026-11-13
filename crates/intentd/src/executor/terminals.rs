@@ -423,7 +423,12 @@ impl HomeTerminals {
         self.kill_process(term);
     }
 
+    /// Kill the terminal's process. Its output stops waiting for
+    /// acknowledgements, so a reader paused at the window drains and the
+    /// teardown that joins it can finish; the exit follows.
     fn kill_process(&self, term: &Arc<Term>) {
+        lock(&term.out).ended = true;
+        term.release_room();
         let mut process = lock(&term.process);
         match &mut *process {
             Process::Pending { killed, .. } => *killed = true,
@@ -671,7 +676,8 @@ impl HomeTerminals {
             // acknowledgements; only an end from here or a ptyKill stops
             // the readers, which are awaited before the exit is reported.
             let mut kill = kill_pending.then_some(killed);
-            let mut stopped = false;
+            // A kill that came before the exit stops the readers too.
+            let mut stopped = !kill_pending;
             for mut reader in readers {
                 stopped = stopped
                     || tokio::select! {

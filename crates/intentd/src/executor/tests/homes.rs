@@ -1012,3 +1012,74 @@ async fn a_cwd_symlinked_out_of_the_checkout_is_refused() {
         .is_some_and(|e| e.starts_with("node-pty-invalid-cwd")));
     node.stop().await;
 }
+
+/// A kill ends a terminal whose output is paused at the acknowledgement
+/// window, in both modes: its `ptyExited` still arrives.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_kill_ends_a_terminal_whose_output_is_paused() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    for (terminal, mode) in [("t1", PtyMode::Terminal), ("x1", PtyMode::Exec)] {
+        dialed
+            .link
+            .send(&pty_open(
+                &h1,
+                terminal,
+                mode,
+                Some(&format!(
+                    "head -c {} /dev/zero; sleep 600",
+                    PTY_UNACKED_BYTES * 2
+                )),
+            ))
+            .await
+            .unwrap();
+        let filled = tokio::time::Instant::now() + wait();
+        let mut received = 0usize;
+        while received < PTY_UNACKED_BYTES {
+            let frame = tokio::time::timeout_at(filled, next_frame(&mut dialed))
+                .await
+                .expect("the output never filled the window");
+            if let Some(LinkFrame::PtyOutput(output)) = frame {
+                if output.terminal_id == terminal {
+                    received += unb64(&output.data).len();
+                }
+            }
+        }
+        dialed
+            .link
+            .send(&LinkFrame::PtyKill(PtyKill {
+                terminal_id: terminal.into(),
+            }))
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + wait();
+        loop {
+            let frame = tokio::time::timeout_at(deadline, next_frame(&mut dialed))
+                .await
+                .unwrap_or_else(|_| panic!("{terminal} never ended after the kill"))
+                .expect("the link closed");
+            match frame {
+                LinkFrame::PtyExited(exited) if exited.terminal_id == terminal => break,
+                LinkFrame::PtyOutput(output) if output.terminal_id == terminal => {
+                    dialed
+                        .link
+                        .send(&LinkFrame::PtyAck(PtyAck {
+                            terminal_id: terminal.into(),
+                            seq: output.seq,
+                        }))
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+    node.stop().await;
+}
