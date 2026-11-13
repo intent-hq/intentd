@@ -22,8 +22,9 @@ requirements do not, by themselves, make a supported feature experimental.
 Multiplayer is always on: there is no switch to enable or disable it, and opening an
 invitation link joins directly without an enable step. In released frontends, check
 Home if an invitation prompt does not appear while viewing another machine.
-Active-machine prompts and deferring What’s New are pending a companion frontend
-release. Workspace sharing, guest roles,
+Showing prompts on the visible machine and deferring What’s New await the
+[companion frontend fix](https://github.com/intent-hq/cloudlands-fe/pull/4586).
+Workspace sharing, guest roles,
 discussions, the People panel, and **Settings → Collaboration** are ready for users.
 Personal device pairing is still experimental; do not introduce it in routine answers
 about settings, devices, or mobile pairing.
