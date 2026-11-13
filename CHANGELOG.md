@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.205] - 2026-11-13
+
+### 📚 Documentation
+
+- Explain machine rail device icon recovery ([#3350](https://github.com/intent-hq/intentd/pull/3350))
+- Clarify supported workspace image links ([#3353](https://github.com/intent-hq/intentd/pull/3353))
+- Explain recovery when inline visuals cannot start ([#3352](https://github.com/intent-hq/intentd/pull/3352))
+
+
 ## [0.11.204] - 2026-11-13
 
 ### 🚀 Features
