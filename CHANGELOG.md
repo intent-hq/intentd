@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.198] - 2026-11-13
+
+### 🚀 Features
+
+- *(agents)* List the git repository root of importable sessions ([#3326](https://github.com/intent-hq/intentd/pull/3326))
+
+### 📚 Documentation
+
+- Explain device and workspace number shortcuts ([#3327](https://github.com/intent-hq/intentd/pull/3327))
+
+
 ## [0.11.197] - 2026-11-12
 
 ### 📚 Documentation
