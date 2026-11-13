@@ -145,6 +145,71 @@ pub(crate) async fn create_owned(
     Ok(json!({ "terminalId": terminal_id }))
 }
 
+/// `terminal.create` on the workspace's home, when it has one on a machine
+/// (nodeProtocol 19): a remote PTY whose output streams like a local one.
+/// `None` runs the terminal here. An absolute `cwd` inside the workspace's
+/// worktree is sent relative to the home checkout; any other is dropped.
+///
+/// # Errors
+///
+/// `home-unavailable` when the home's machine cannot run it now.
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn create_on_home(
+    svc: &intent_services::Services,
+    tasks: &intent_services::feature_api::delivery_tasks::DeliveryTasks,
+    pty: &Arc<PtyHost>,
+    bus: Option<EventBus>,
+    workspace_id: &WorkspaceId,
+    (cols, rows): (u16, u16),
+    cwd: Option<&str>,
+    command: Option<&str>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<Option<Value>> {
+    if !svc.workspace_homes() {
+        return Ok(None);
+    }
+    let worktree = default_cwd(svc.store(), workspace_id, None).await;
+    let open = intent_services::feature_api::feature_ports::HomeTerminalOpen {
+        mode: intent_core::node_link::PtyMode::Terminal,
+        cols,
+        rows,
+        cwd: cwd.and_then(|cwd| home_relative_cwd(worktree.as_deref(), cwd)),
+        command: command.map(str::to_owned),
+        env: env
+            .map(|env| env.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default(),
+    };
+    let Some(pty_id) = svc
+        .feature_remote_launch_port()
+        .open_home_terminal(svc, workspace_id, pty, open)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let terminal_id = pty_id.to_string();
+    spawn_output_stream(
+        tasks,
+        pty.clone(),
+        bus,
+        workspace_id.clone(),
+        pty_id,
+        terminal_id.clone(),
+    );
+    Ok(Some(json!({ "terminalId": terminal_id })))
+}
+
+/// `cwd` as a path relative to the home checkout: a relative path as is,
+/// an absolute one inside `worktree` stripped of it, anything else `None`.
+fn home_relative_cwd(worktree: Option<&std::path::Path>, cwd: &str) -> Option<String> {
+    let path = std::path::Path::new(cwd);
+    if path.is_relative() {
+        return Some(cwd.to_owned());
+    }
+    let rel = path.strip_prefix(worktree?).ok()?;
+    let rel = rel.to_string_lossy().into_owned();
+    (!rel.is_empty()).then_some(rel)
+}
+
 #[cfg(all(test, unix))]
 #[expect(clippy::too_many_arguments)]
 async fn create(

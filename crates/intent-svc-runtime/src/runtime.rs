@@ -903,6 +903,23 @@ impl RuntimePort for RuntimeFeature {
             // the sweep lists terminals, and one after it is refused.
             let _archive = svc.feature_archive_fence().acquire(&workspace_id).await;
             svc.refuse_if_retired(&workspace_id).await?;
+            // On an orchestrator a workspace with a home runs its terminals
+            // there (nodeProtocol 19).
+            if let Some(terminal) = terminal_ops::create_on_home(
+                svc,
+                svc.feature_terminal_tasks(),
+                &pty,
+                bus.clone(),
+                &workspace_id,
+                (cols, rows),
+                cwd.as_deref(),
+                command.as_deref(),
+                env.as_ref(),
+            )
+            .await?
+            {
+                return Ok(terminal);
+            }
             terminal_ops::create_owned(
                 svc.feature_terminal_tasks(),
                 pty,

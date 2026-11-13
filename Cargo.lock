@@ -2585,6 +2585,7 @@ dependencies = [
  "intent-git",
  "intent-nodes",
  "intent-providers",
+ "intent-pty",
  "intent-services",
  "intent-store",
  "intent-transport",

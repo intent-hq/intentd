@@ -374,6 +374,8 @@ pub(crate) struct Shared {
     /// The machine holds a home of this backend's workspaces: its link stays
     /// up, so the home is backed up and reachable.
     pub(crate) holds_homes: std::sync::atomic::AtomicBool,
+    /// Terminals on this machine's homes (nodeProtocol 19).
+    pub(crate) terminals: crate::terminals::HomeTerminals,
     /// Secret forgets for a machine that was not connected (nodeProtocol
     /// 14): sent after the next bind. Memory only; a backend restart drops
     /// them, and its new `headSession` drops the values on the machine.
@@ -486,7 +488,7 @@ impl Shared {
             .store(protocol, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn weak(&self) -> std::sync::Weak<Shared> {
+    pub(crate) fn weak(&self) -> std::sync::Weak<Shared> {
         lock(&self.self_ref).clone()
     }
 
@@ -539,6 +541,7 @@ impl Shared {
             || !lock(&self.secret_waiters).is_empty()
             || !lock(&self.home_waiters).is_empty()
             || self.holds_homes.load(std::sync::atomic::Ordering::SeqCst)
+            || !self.terminals.is_empty()
             || (self
                 .survivors_unclaimed
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -559,6 +562,7 @@ impl Shared {
             || !lock(&self.one_shot_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
             || !lock(&self.home_waiters).is_empty()
+            || !self.terminals.is_empty()
     }
 
     /// When the machine last had agent activity (see `last_activity`).
@@ -1739,6 +1743,7 @@ impl RemoteNode {
             one_shot_waiters: Mutex::new(HashMap::new()),
             home_waiters: Mutex::new(HashMap::new()),
             holds_homes: std::sync::atomic::AtomicBool::new(false),
+            terminals: crate::terminals::HomeTerminals::default(),
             secret_waiters: Mutex::new(HashMap::new()),
             secret_forgets: Mutex::new(Vec::new()),
             secret_locks: Mutex::new(HashMap::new()),
@@ -2662,6 +2667,7 @@ async fn run(
             let _ = waiter.send(Ok(()));
         }
         crate::homes::after_bind(&shared, &link);
+        shared.terminals.after_bind(&link);
         tracing::info!(
             machine = %target.id,
             generation = link.binding().generation.0,
@@ -2705,6 +2711,10 @@ async fn run(
         lock(&shared.one_shot_waiters).clear();
         lock(&shared.home_waiters).clear();
         lock(&shared.secret_waiters).clear();
+        // Home terminals wait out the link-loss grace for the next bind.
+        shared
+            .terminals
+            .link_lost(shared.weak(), shared.tuning.link_loss_grace);
         // The machine stops this binding's scripts when its link closes.
         shared
             .machine_runs_lost("remote-script-lost: the machine disconnected")
@@ -2827,6 +2837,12 @@ async fn serve(
                         if let Some(waiter) = lock(&shared.home_waiters).remove(&reply.request_id) {
                             let _ = waiter.send(crate::homes::HomeReply::Open(reply));
                         }
+                    }
+                    LinkEvent::Frame(LinkFrame::PtyOutput(output)) => {
+                        shared.terminals.output(link, output).await;
+                    }
+                    LinkEvent::Frame(LinkFrame::PtyExited(exited)) => {
+                        shared.terminals.exited(&exited);
                     }
                     LinkEvent::Frame(LinkFrame::HomePushReply(reply)) => {
                         if let Some(waiter) = lock(&shared.home_waiters).remove(&reply.request_id) {

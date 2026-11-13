@@ -57,6 +57,7 @@ pub mod order;
 mod quick_action;
 mod rpc;
 mod runtime;
+mod terminals;
 mod view;
 
 pub use connector::{NodeStatus, RemoteNode};
