@@ -131,6 +131,11 @@ impl Activity {
         self.last_busy = Instant::now();
     }
 
+    /// The machine had activity at `at`; an earlier time changes nothing.
+    pub(super) fn active_at(&mut self, at: Instant) {
+        self.last_busy = self.last_busy.max(at);
+    }
+
     pub(super) fn renewed(&mut self) {
         self.last_renew = Some(Instant::now());
     }
@@ -728,7 +733,8 @@ async fn check(
     match cloud.state {
         CloudSandboxState::Running => {
             let busy = node.as_ref().is_some_and(|node| node.shared_ref().busy());
-            let activity = feature.cloud.activity(&row.id, busy);
+            let last_active = node.as_ref().map(|node| node.shared_ref().last_activity());
+            let activity = feature.cloud.activity(&row.id, busy, last_active);
             // A provider without a lease has nothing to renew and no
             // continuous-run cap: only the idle pause below stops it.
             let lease = client.has_lease();

@@ -836,6 +836,55 @@ async fn records_of_agents_not_attached_here_are_acked_and_dropped() {
     node.shutdown();
 }
 
+/// intent-hq/intent#9237: a cloud machine's idle window counts from the
+/// end of its last activity. A turn that starts and ends between two idle
+/// checks is never seen busy, so the machine notes the time itself.
+#[tokio::test]
+async fn a_turn_between_idle_checks_counts_as_activity() {
+    let (mut machine, _backend, node) = exposed().await;
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+    let mut link = machine.accept().await;
+    link.replay_complete(0).await;
+    bound(&node).await;
+    let before = node.shared_ref().last_activity();
+    // timing-guard: the clock moves past the earlier activity
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let prompt = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            let activity = ActivityTracker::new();
+            runtime
+                .prompt("head-session", text_prompt("hello"), &activity)
+                .await
+        })
+    };
+    let turn = link
+        .expect(|frame| match frame {
+            LinkFrame::Prompt {
+                agent_id, turn_id, ..
+            } if agent_id == agent => Some(turn_id),
+            _ => None,
+        })
+        .await;
+    let sent = node.shared_ref().last_activity();
+    assert!(sent > before, "sending a prompt is activity");
+    // timing-guard: the turn ends later than it started
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    link.journal(turn_ended(1, &agent, &turn, None)).await;
+    tokio::time::timeout(wait(), prompt)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("the turn ends normally");
+    assert!(!node.shared_ref().busy());
+    assert!(
+        node.shared_ref().last_activity() > sent,
+        "the idle window starts when the turn ends"
+    );
+    node.shutdown();
+}
+
 #[tokio::test]
 async fn a_prompt_completes_with_its_turn_end() {
     let (mut machine, _backend, node) = exposed().await;
@@ -1696,6 +1745,48 @@ mod stop_acks {
             _ => None,
         })
         .await;
+        let relaunched = tokio::time::timeout(wait(), launching)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(relaunched.is_running());
+        node.shutdown();
+    }
+
+    /// intent-hq/intent#9238: after the machine started again from its disk
+    /// the old process is gone. The relaunch marks its new process before
+    /// the old stop is answered; a resent stop answered `not-running` still
+    /// owes no exit record, so the launch goes out without the stop wait.
+    #[tokio::test]
+    async fn a_relaunch_after_a_disk_resume_does_not_wait_for_the_lost_exit() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        let mut slow = tuning();
+        slow.stop_wait = Duration::from_secs(60);
+        let node = backend.bare_with(&machine, slow).await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        node.shared_ref().processes_lost(
+            std::slice::from_ref(&agent),
+            "transport closed: the machine started again from its disk",
+        );
+        runtime.stop().await;
+        let first = link.stop_for(&agent).await;
+        // As the launch path does, before the connector's own launch.
+        node.shared_ref().launching(&agent);
+        let launching = relaunch(&node, &agent);
+        let resent = link.stop_for(&agent).await;
+        assert_eq!(resent, first, "a resend reuses the stop id");
+        link.ack_stop(resent, &agent, StopOutcome::NotRunning).await;
+        let launched = tokio::time::timeout(test_timeout(Duration::from_secs(2)), async {
+            link.expect(|frame| match frame {
+                LinkFrame::Launch(command) if command.agent_id == agent => Some(()),
+                _ => None,
+            })
+            .await;
+        })
+        .await;
+        assert!(launched.is_ok(), "the relaunch waited for a lost exit record");
         let relaunched = tokio::time::timeout(wait(), launching)
             .await
             .unwrap()
