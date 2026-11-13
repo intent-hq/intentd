@@ -524,8 +524,12 @@ idle cloud machine pauses. A paused E2B sandbox resumes with its memory; a pause
 Northflank machine resumes from its disk only: the checkout, uncommitted changes and
 home folder stay, while running processes, terminals and scripts stop, and software
 installed outside the home folder may be gone. The agent is told this at its next turn.
+While its machine is paused or gone, the agent's model picker lists no models and says
+the machine isn't running; the next message resumes it or starts a new one, and its
+models then appear. **Check again** is not offered for a cloud machine.
 Sources: packages/intentd/crates/intent-svc-remote/src/cloud/ (config.rs, lifecycle.rs),
-packages/intentd/crates/intentd/src/executor/checkout.rs (first_turn_notice). -->
+packages/intentd/crates/intentd/src/executor/checkout.rs (first_turn_notice),
+packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte (remoteCloudEmpty). -->
 Workspaces and agents belong to a host, so identify the intended device before
 explaining missing work or changing host settings. **Mobile** follows the active
 connection and its permissions; do not describe a remote connection's QR as belonging
