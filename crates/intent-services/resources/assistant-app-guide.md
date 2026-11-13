@@ -137,6 +137,8 @@ Visuals use app typography and theme colors, fit the chat width, and retain loca
 inputs through theme and size changes. They cannot access external libraries,
 network resources, arbitrary app APIs, navigation, popups or embedded frames.
 **Source** shows the code; **Reload** restores the last published configuration.
+If a completed visual cannot start, it shows an error instead of loading indefinitely.
+Choose **Reload** to retry; **Source** remains available to inspect the code.
 
 Visuals publish bounded JSON state, inputs and derived results through
 `window.intentVisual`. The host toolbar can **Save scenario** (up to six),
@@ -152,7 +154,7 @@ agents the authoring, layout, theme and persistence rules. Native author preview
 returns a screenshot, content height and console messages at a chosen width and
 appearance, so the agent can correct the visual before it appears in chat.
 
-<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-runtime.ts,inline-html-styles.ts}; packages/cloudlands-fe/src/features/browser/main/inline-html-preview-service.ts; packages/cloudlands-fe/src/lib/components/browser/BrowserViewportMenu.svelte; packages/intentd/crates/intent-acp/src/mcp_server/bindings/browser_docs/overview.md. Visual workflow, layout and theme rules adapted from T3 Code (MIT, see packages/intentd/NOTICE). -->
+<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-runtime.ts,inline-html-styles.ts}; packages/cloudlands-fe/static/inline-html-sandbox.html; packages/cloudlands-fe/src/features/browser/main/inline-html-preview-service.ts; packages/cloudlands-fe/src/lib/components/browser/BrowserViewportMenu.svelte; packages/intentd/crates/intent-acp/src/mcp_server/bindings/browser_docs/overview.md. Visual workflow, layout and theme rules adapted from T3 Code (MIT, see packages/intentd/NOTICE). -->
 
 ## Finding things
 
