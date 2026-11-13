@@ -478,7 +478,7 @@ while the entry is ready, and Linux. A badge appears only while a machine is bei
 (**Exposing**) or for a problem (unreachable, revoked, update required, key rejected), and the
 version only when the machine's intentd is older than the app expects. Switched-off providers are hidden, and offline or unknown machines show no
 icons, except a machine the backend runs agents on: while idle (disconnected) it still
-shows the providers from its last report, or **No providers ready**. **Add machine** opens **Set up a new machine** (when cloud machines can be added, it
+shows the providers from its last report, or **Needs Node.js** when some providers would run once Node.js is installed (they fetch their adapter through `npx`; hover it for which ones), else **No providers ready**. **Add machine** opens **Set up a new machine** (when cloud machines can be added, it
 is the first item of a menu next to **Add cloud**; the machine rail's **Add machine** opens
 it too), which offers **Paste an intent:// link**, **Enter connection details** (host, port and access
 token), **Install an Intent server** (a complete, independent Intent) and, when the backend can run agents on other machines,
