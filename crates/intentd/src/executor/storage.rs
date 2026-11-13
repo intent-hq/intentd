@@ -292,7 +292,6 @@ pub(super) fn remove_agent_homes(root: &Path, work_base: Option<&Path>) -> bool 
     removed
 }
 
-/// Whether `id` is safe as one path component.
 /// The ACP session an agent's provider last opened here, with the
 /// provider and model it ran: a launch after a disk resume loads it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -303,6 +302,7 @@ pub(super) struct ProviderSession {
     pub(super) model: Option<String>,
 }
 
+/// Whether `id` is safe as one path component.
 pub(super) fn valid_id(id: &str) -> bool {
     (1..=128).contains(&id.len())
         && id != "."

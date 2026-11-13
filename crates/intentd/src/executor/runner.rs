@@ -535,6 +535,10 @@ struct Agent {
     /// Head says the machine resumed from its disk since this agent last
     /// ran here: its first turn's notice says what was kept and lost.
     resumed_from_disk: bool,
+    /// Whether this launch still tries to load the recorded provider
+    /// session (a disk resume): once only, so the start retried after a
+    /// provider that died loading it opens a new session.
+    load_recorded: std::sync::atomic::AtomicBool,
     /// The machine's skills catalog block, added to the agent's first turn.
     skills_catalog: Mutex<Option<String>>,
     /// The owner of the checkout the agent works in, when it is not its own
@@ -1570,6 +1574,7 @@ impl Runner {
             notice: Mutex::new(None),
             new_machine: new_machine.map(|machine| machine.0),
             resumed_from_disk,
+            load_recorded: std::sync::atomic::AtomicBool::new(resumed_from_disk),
             skills_catalog: Mutex::new(None),
             wip: self.push_lock(checkout_of.as_ref().unwrap_or(&agent_id)),
             checkout_of: checkout_of.clone(),
@@ -2377,7 +2382,8 @@ impl Runner {
         // disk: load the session the agent last ran with, so the
         // conversation carries over (intent-hq/intent#9236).
         let recorded = agent
-            .resumed_from_disk
+            .load_recorded
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
             .then(|| self.inner.checkouts.provider_session(&agent.id))
             .flatten()
             .filter(|recorded| {

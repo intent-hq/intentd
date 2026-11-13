@@ -2418,6 +2418,48 @@ async fn node_runner_loads_the_recorded_session_after_a_disk_resume() {
     stopped().await;
 }
 
+/// A provider that dies loading the recorded session (a transcript the
+/// pause cut short) is started once more with a new session: the launch
+/// still starts instead of failing on the same load twice.
+#[tokio::test]
+async fn node_runner_starts_a_new_session_when_the_load_kills_the_provider() {
+    let sessions = tempfile::tempdir().unwrap();
+    let dir = sessions.path().to_string_lossy().into_owned();
+    let Some(h) = harness(1, &["--sessions", &dir, "--crash-on-load"]) else {
+        return;
+    };
+    let a1 = AgentId::from("a1");
+    h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&a1, "t1".into(), text("remember apples"))
+        .await;
+    wait_for(&h.runner, "first turn end", turn_ended("a1", "t1")).await;
+    tokio::time::timeout(wait(), h.runner.stop(&a1).wait())
+        .await
+        .unwrap();
+    let mut resumed = launch("a1");
+    resumed.resumed_from_disk = true;
+    h.runner.launch(resumed).await;
+    h.runner
+        .prompt(&a1, "t2".into(), text("recall apples"))
+        .await;
+    let all = wait_for(&h.runner, "fresh turn end", turn_ended("a1", "t2")).await;
+    assert_eq!(
+        turn_end(find(&all, turn_ended("a1", "t2"))).1,
+        None,
+        "{all:#?}"
+    );
+    assert!(
+        all.iter().any(|r| r.turn_id.as_deref() == Some("t2")
+            && matches!(&r.body, JournalBody::Notification { notification }
+                if notification.to_string().contains("recall apples: no"))),
+        "{all:#?}"
+    );
+    tokio::time::timeout(wait(), h.runner.stop(&a1).wait())
+        .await
+        .unwrap();
+}
+
 /// Every remote agent's first turn on the machine opens with the
 /// long-commands hint, before any checkout notice; later turns do not.
 #[tokio::test]
