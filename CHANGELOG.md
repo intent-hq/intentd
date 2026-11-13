@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.204] - 2026-11-13
+
+### 🚀 Features
+
+- Terminals on the workspace home, machine side ([#3342](https://github.com/intent-hq/intentd/pull/3342))
+- Terminals on the workspace home, orchestrator side ([#3343](https://github.com/intent-hq/intentd/pull/3343))
+
+### 🐛 Bug Fixes
+
+- Log the redrive after a disk restart at info, not warn ([#3346](https://github.com/intent-hq/intentd/pull/3346))
+
+### 📚 Documentation
+
+- *(guide)* Machine rows show status, platform and providers ([#3345](https://github.com/intent-hq/intentd/pull/3345))
+
+
 ## [0.11.203] - 2026-11-13
 
 ### 📚 Documentation
