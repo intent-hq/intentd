@@ -811,3 +811,31 @@ async fn terminal_output_waits_for_acknowledgements_past_the_limit() {
     assert_eq!(rest.exited.unwrap().exit_code, Some(0));
     node.stop().await;
 }
+
+/// A frame for a terminal the machine does not run (after a restart of
+/// the machine, say) is answered with `ptyExited` `node-pty-unknown`, so
+/// the backend ends its copy.
+#[tokio::test]
+async fn a_frame_for_an_unknown_terminal_is_answered_with_its_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    dialed
+        .link
+        .send(&LinkFrame::PtyAck(PtyAck {
+            terminal_id: "gone".into(),
+            seq: 4,
+        }))
+        .await
+        .unwrap();
+    let seen = watch_terminal(&mut dialed, "gone", false, |_, exited| exited).await;
+    let exited = seen.exited.unwrap();
+    assert_eq!(exited.exit_code, None);
+    assert!(exited
+        .error
+        .is_some_and(|e| e.starts_with("node-pty-unknown")),);
+    node.stop().await;
+}

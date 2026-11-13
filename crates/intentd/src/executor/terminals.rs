@@ -30,6 +30,7 @@ pub(super) const LINK_LOSS_GRACE: Duration = Duration::from_secs(60);
 /// `ptyExited.error` codes besides [`NODE_HOME_UNKNOWN`].
 const START_FAILED: &str = "node-pty-start-failed";
 const INVALID_CWD: &str = "node-pty-invalid-cwd";
+const UNKNOWN: &str = "node-pty-unknown";
 
 /// In-memory scrollback of a home terminal's PTY on the machine. The
 /// backend keeps the terminal's buffer; this only backs the PTY.
@@ -253,8 +254,31 @@ impl HomeTerminals {
         }
     }
 
-    fn term(&self, terminal_id: &str) -> Option<Arc<Term>> {
-        lock(&self.shared.state).terms.get(terminal_id).cloned()
+    /// The terminal `terminal_id`; one this machine does not run (it
+    /// restarted, or the terminal ended) is answered with `ptyExited`
+    /// `node-pty-unknown`, so the backend ends its copy.
+    fn term_or_unknown(&self, terminal_id: &str) -> Option<Arc<Term>> {
+        let link = {
+            let state = lock(&self.shared.state);
+            if let Some(term) = state.terms.get(terminal_id) {
+                return Some(term.clone());
+            }
+            state.link.clone()
+        };
+        if let Some(link) = link {
+            let frame = LinkFrame::PtyExited(PtyExited {
+                terminal_id: terminal_id.to_owned(),
+                exit_code: None,
+                error: Some(format!(
+                    "{UNKNOWN}: this machine runs no terminal {terminal_id}"
+                )),
+            });
+            // caller-binding: allow — node-local answer for an unknown home terminal
+            tokio::spawn(async move {
+                let _ = link.send(&frame).await;
+            });
+        }
+        None
     }
 
     /// A link bound with `head_session`: a new backend session ends every
@@ -599,7 +623,7 @@ impl HomeTerminals {
     }
 
     pub(super) fn input(&self, frame: &PtyInput) {
-        let Some(term) = self.term(&frame.terminal_id) else {
+        let Some(term) = self.term_or_unknown(&frame.terminal_id) else {
             return;
         };
         let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&frame.data) else {
@@ -631,7 +655,7 @@ impl HomeTerminals {
     }
 
     pub(super) fn resize(&self, frame: &PtyResize) {
-        let Some(term) = self.term(&frame.terminal_id) else {
+        let Some(term) = self.term_or_unknown(&frame.terminal_id) else {
             return;
         };
         let pty_id = match &*lock(&term.process) {
@@ -651,7 +675,7 @@ impl HomeTerminals {
 
     /// End a terminal's process; its `ptyExited` follows.
     pub(super) fn kill(&self, frame: &PtyKill) {
-        let Some(term) = self.term(&frame.terminal_id) else {
+        let Some(term) = self.term_or_unknown(&frame.terminal_id) else {
             return;
         };
         let mut process = lock(&term.process);
@@ -675,7 +699,7 @@ impl HomeTerminals {
     }
 
     pub(super) fn ack(&self, frame: &PtyAck) {
-        if let Some(term) = self.term(&frame.terminal_id) {
+        if let Some(term) = self.term_or_unknown(&frame.terminal_id) {
             term.ack(frame.seq);
         }
     }

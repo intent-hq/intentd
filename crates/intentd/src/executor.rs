@@ -42,6 +42,7 @@ mod session;
 mod setup;
 mod skills;
 mod storage;
+mod terminals;
 #[cfg(test)]
 mod test_link;
 mod workspace_api;
