@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -13,7 +14,7 @@ use super::state::{
     build_state, choose_notice, idle_alert_allowed, transition_notice, Facts, IdleAgent,
     NoticeKind, Pending, DEBOUNCE,
 };
-use super::{proof::DaemonKey, subject_for};
+use super::{proof::DaemonKey, subject_for, Publisher};
 use crate::test_support::capability_fixtures::host_role::fixture;
 use crate::test_support::fixtures::{session, TempDb};
 use crate::Services;
@@ -213,12 +214,15 @@ struct FakeRelay {
     seen: Arc<Mutex<Vec<(String, String, Value)>>>,
     delete_status: Arc<Mutex<u16>>,
     forget_daemon: Arc<Mutex<bool>>,
+    /// The publish reply, as the relay counts linked phones and unused tokens.
+    link_counts: Arc<Mutex<Value>>,
 }
 
 impl FakeRelay {
     async fn start() -> (Self, String) {
         let relay = Self::default();
         *relay.delete_status.lock().unwrap() = 204;
+        *relay.link_counts.lock().unwrap() = json!({"linkedDevices": 1, "pendingLinks": 0});
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = relay.clone();
@@ -295,9 +299,10 @@ impl FakeRelay {
             }
             "POST" => (
                 200,
-                json!({"linkToken": "token-1", "expiresAt": "2026-11-12T18:10:00Z"}).to_string(),
+                json!({"linkToken": "token-1", "expiresAt": 1_800_000_600}).to_string(),
             ),
             "DELETE" => (*self.delete_status.lock().unwrap(), String::new()),
+            "PUT" => (200, self.link_counts.lock().unwrap().to_string()),
             _ => (204, String::new()),
         };
         let response = format!(
@@ -344,7 +349,7 @@ async fn links_are_created_and_revoked_at_the_relay() {
     let key = svc.push_key().await.unwrap();
     let daemon = key.daemon_id();
     assert_eq!(link["linkToken"], "token-1");
-    assert_eq!(link["expiresAt"], "2026-11-12T18:10:00Z");
+    assert_eq!(link["expiresAt"], "2027-01-15T08:10:00Z");
     assert_eq!(link["daemonId"], daemon.as_str());
     let owner_subject = subject_for(&owner);
     assert_eq!(
@@ -463,4 +468,42 @@ async fn an_unknown_signer_registers_again_and_retries_once() {
         paths,
         [link_path.clone(), "POST /v1/daemons".into(), link_path]
     );
+}
+
+/// The full publish as the publisher loop runs it: under the daemon caller.
+async fn sync_all(svc: &Services) {
+    let svc = svc.clone();
+    intent_core::spawn_daemon(async move { svc.push_sync_all(&mut Publisher::default()).await })
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn publishing_pauses_while_no_phone_can_receive_it() {
+    let tmp = TempDb::new();
+    let (svc, owner, _, relay) = linked_services(&tmp, true).await;
+    with_caller(wire(&owner, HostRole::Owner), svc.push_create_link_op())
+        .await
+        .unwrap();
+
+    sync_all(&svc).await;
+    assert!(!svc.push_relay.dormant.load(Ordering::Relaxed));
+    let status = with_caller(wire(&owner, HostRole::Owner), svc.push_status_op())
+        .await
+        .unwrap();
+    assert_eq!(status["linkedDevices"], 1);
+
+    *relay.link_counts.lock().unwrap() = json!({"linkedDevices": 0, "pendingLinks": 0});
+    sync_all(&svc).await;
+    assert!(svc.push_relay.dormant.load(Ordering::Relaxed));
+    let status = with_caller(wire(&owner, HostRole::Owner), svc.push_status_op())
+        .await
+        .unwrap();
+    assert_eq!(status["linkedDevices"], 0);
+
+    with_caller(wire(&owner, HostRole::Owner), svc.push_create_link_op())
+        .await
+        .unwrap();
+    assert!(!svc.push_relay.dormant.load(Ordering::Relaxed));
 }
