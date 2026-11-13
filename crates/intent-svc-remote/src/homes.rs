@@ -251,6 +251,55 @@ pub(crate) fn settle_home_push(
     Ok(())
 }
 
+/// The home an agent placed on `view`'s machine works in (nodes.md
+/// "Workspace homes" → "Sharing"): the workspace's home when it is on that
+/// machine, the placement names no checkout, and the link speaks
+/// nodeProtocol 19.
+pub(crate) async fn home_checkout_for(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    placement: &AgentPlacement,
+    view: &RemotePlacementView,
+) -> Option<HomeId> {
+    if !svc.workspace_homes() || placement.checkout.is_some() || view.is_cloud() {
+        return None;
+    }
+    let home = svc.store().get_workspace_home(workspace_id).await.ok()??;
+    if home.node_id.as_deref() != Some(view.node_id.as_str()) {
+        return None;
+    }
+    // The protocol the machine's last bind negotiated, from its row: the
+    // placement that calls this may hold the machine's connector.
+    let row = svc
+        .store()
+        .get_exposed_machine(&view.node_id)
+        .await
+        .ok()??;
+    (row.node_protocol.unwrap_or_default() >= HOMES_PROTOCOL).then_some(home.home_id)
+}
+
+/// The home checkout `record`'s agent launches into now: the one it was
+/// placed in, while it is still the workspace's home on its machine.
+/// After a move it gets a checkout of its own.
+pub(crate) async fn current_home_checkout(
+    svc: &Services,
+    record: &intent_core::remote_launch::RemoteAgentRecord,
+    view: &RemotePlacementView,
+) -> Option<intent_core::node_link::HomeRef> {
+    let placed = view.home_checkout.as_ref()?;
+    let home = svc
+        .store()
+        .get_workspace_home(&record.workspace_id)
+        .await
+        .ok()??;
+    (&home.home_id == placed && home.node_id.as_deref() == Some(record.node_id.as_str())).then(
+        || intent_core::node_link::HomeRef {
+            workspace_id: record.workspace_id.clone(),
+            home_id: home.home_id,
+        },
+    )
+}
+
 /// See [`intent_services::feature_api::feature_ports::RemoteLaunchPort::open_home`].
 pub(crate) async fn open_home(svc: &Services, workspace_id: &WorkspaceId) -> Result<()> {
     let Some(home) = svc.store().get_workspace_home(workspace_id).await? else {

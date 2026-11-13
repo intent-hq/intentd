@@ -10650,6 +10650,7 @@ async fn worst_case_agent_list_row(
         cloud_start: Some(intent_core::machines::CloudStart {
             step: intent_core::machines::CloudStartStep::CreatingSandbox,
         }),
+        home_checkout: None,
     };
     svc.store()
         .set_agent_session_metadata_key_json(

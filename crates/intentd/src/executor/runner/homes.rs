@@ -329,6 +329,40 @@ impl Runner {
         }
     }
 
+    /// The home checkout an agent sharing `home` works in (nodeProtocol
+    /// 19): once the home is open here and its setup has finished, with the
+    /// agent's own temp folder. A home this machine does not hold fails.
+    pub(super) async fn home_checkout_for(
+        &self,
+        agent_id: &intent_core::AgentId,
+        home: &HomeRef,
+    ) -> anyhow::Result<crate::executor::checkout::Prepared> {
+        let opened = self
+            .leased_home(&home.workspace_id, &home.home_id)
+            .ok_or_else(|| anyhow::anyhow!("this machine holds no home {}", home.home_id))?;
+        let mut done = opened.setup_done.subscribe();
+        let _ = done.wait_for(|done| *done).await;
+        Ok(crate::executor::checkout::Prepared {
+            worktree: opened.worktree.clone(),
+            tmp: self.inner.checkouts.agent_tmp(agent_id)?,
+            unrestored: Vec::new(),
+            fresh: false,
+        })
+    }
+
+    /// Push the home checkout for an agent sharing `home`, after its turn.
+    pub(super) async fn push_home_for(
+        &self,
+        home: &HomeRef,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let opened = self
+            .leased_home(&home.workspace_id, &home.home_id)
+            .ok_or_else(|| anyhow::anyhow!("this machine holds no home {}", home.home_id))?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.push_home_now(&opened, deadline).await.map(|_| ())
+    }
+
     /// Resend the kept setup output of every home whose setup still runs.
     pub(in crate::executor) fn resend_home_setup_output(
         &self,
