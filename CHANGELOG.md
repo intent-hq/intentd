@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.202] - 2026-11-13
+
+### 🚀 Features
+
+- Agents share the workspace's home checkout ([#3337](https://github.com/intent-hq/intentd/pull/3337))
+
+### 📚 Documentation
+
+- *(guide)* Note voice transcription retries ([#3334](https://github.com/intent-hq/intentd/pull/3334))
+- *(guide)* Idle remote machine rows show their providers ([#3338](https://github.com/intent-hq/intentd/pull/3338))
+
+
 ## [0.11.201] - 2026-11-13
 
 ### 🚀 Features
