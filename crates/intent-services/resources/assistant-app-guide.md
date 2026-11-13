@@ -1438,6 +1438,8 @@ and page state stay on the other computer, so the page may differ from what the
 agent sees and its address can change on its own. The offline warning pauses navigation
 until that computer reconnects; click the status for details and **Close anyway**.
 Page-error icons appear beside Reload; click one for the message and **Retry**.
+In test builds, page-load failures also show the same message and **Retry** directly
+in the preview. Test-build behavior pending its frontend release.
 If the page closed itself, its empty page shows the message and **Retry** directly.
 
 ## iOS workspace browser
