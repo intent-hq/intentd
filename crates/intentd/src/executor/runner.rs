@@ -966,7 +966,7 @@ enum Mark {
     Replaying { ack: oneshot::Sender<()> },
     /// The load answered: drop what it still replays until the provider
     /// is quiet, then acknowledge.
-    Replayed { ack: oneshot::Sender<()> },
+    Replayed { ack: Option<oneshot::Sender<()>> },
     Exited {
         exit_code: Option<i32>,
         error: Option<String>,
@@ -1685,7 +1685,9 @@ impl Runner {
                     Mark::Replayed { ack } => {
                         settle_replay(&mut notes).await;
                         replaying = false;
-                        let _ = ack.send(());
+                        if let Some(ack) = ack {
+                            let _ = ack.send(());
+                        }
                         continue;
                     }
                     Mark::TurnEnded { turn_id, stop_reason, error } => {
@@ -3262,17 +3264,41 @@ async fn load_recorded(
     session_id: &str,
 ) -> Result<(), intent_acp::AcpError> {
     let (ack, acked) = oneshot::channel();
-    if agent.marks.send(Mark::Replaying { ack }).is_ok() {
-        let _ = acked.await;
+    if agent.marks.send(Mark::Replaying { ack }).is_err() {
+        return Err(intent_acp::AcpError::Protocol(
+            "the agent's journal is closed".into(),
+        ));
     }
+    // Cancelled with the load (the provider exited first), the guard still
+    // ends the replay, so a retried start's output is journaled.
+    let mut replay = ReplayGuard(Some(&agent.marks));
+    let _ = acked.await;
     let loaded = intent_acp::session::load_session(connection, session_id, cwd, mcp, None)
         .await
         .map(drop);
     let (ack, acked) = oneshot::channel();
-    if agent.marks.send(Mark::Replayed { ack }).is_ok() {
+    if replay.end(Some(ack)) {
         let _ = acked.await;
     }
     loaded
+}
+
+/// Ends a load's replay on the pump once, when the load finishes or is
+/// dropped.
+struct ReplayGuard<'a>(Option<&'a mpsc::UnboundedSender<Mark>>);
+
+impl ReplayGuard<'_> {
+    fn end(&mut self, ack: Option<oneshot::Sender<()>>) -> bool {
+        self.0
+            .take()
+            .is_some_and(|marks| marks.send(Mark::Replayed { ack }).is_ok())
+    }
+}
+
+impl Drop for ReplayGuard<'_> {
+    fn drop(&mut self) {
+        self.end(None);
+    }
 }
 
 /// How long the provider stays quiet before a load's replay counts as

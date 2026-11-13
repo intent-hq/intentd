@@ -19,7 +19,9 @@
 //                           load replays the stored prompts as
 //                           "replayed: <text>" updates (one of them after
 //                           its answer), and an unknown id is refused
-//   --crash-on-load         exit with 4 when asked to session/load
+//   --crash-on-load         exit with 4 when asked to session/load, while a
+//                           helper keeps its stdout open (the load never
+//                           answers, so its exit is seen first)
 //
 // With sessions, a prompt "recall <word>" streams "recall <word>: yes" when
 // an earlier prompt of the session contained <word>, else ": no".
@@ -245,7 +247,10 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       fs.writeFileSync(sessionFile(currentSession), '[]');
       return send({ id: msg.id, result: { sessionId: currentSession } });
     case 'session/load': {
-      if (argv.includes('--crash-on-load')) process.exit(4);
+      if (argv.includes('--crash-on-load')) {
+        spawn('sleep', ['3'], { stdio: ['ignore', 'inherit', 'ignore'] });
+        process.exit(4);
+      }
       const id = msg.params?.sessionId;
       const stored = sessionsDir ? readHistory(id) : undefined;
       if (!stored) return send({ id: msg.id, error: { code: -32002, message: `Resource not found: ${id}` } });
