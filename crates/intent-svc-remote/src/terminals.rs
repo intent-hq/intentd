@@ -84,7 +84,7 @@ impl HomeTerminals {
 
     /// Append a `ptyOutput` that comes next in order, and acknowledge the
     /// highest contiguous `seq`. A resent frame is acknowledged again; one
-    /// past a gap is not taken. A frame of a terminal released here is
+    /// past a gap is not taken. A frame of a terminal no longer held is
     /// acknowledged too, so the machine can let it go.
     pub(crate) async fn output(&self, link: &NodeLink, frame: PtyOutput) {
         let ack = {
@@ -101,8 +101,11 @@ impl HomeTerminals {
                                 Vec::new()
                             });
                         term.received = Some(frame.seq);
+                        // A released session drops the output, but the
+                        // terminal stays held (its kill pending) until the
+                        // machine reports the end or the grace ends it.
                         if term.pty.push_remote_output(term.id, &bytes).is_err() {
-                            state.terms.remove(&frame.terminal_id);
+                            term.killed = true;
                         }
                         Some(frame.seq)
                     } else {
