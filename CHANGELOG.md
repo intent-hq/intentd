@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.201] - 2026-11-13
+
+### 🚀 Features
+
+- Workspace homes on the orchestrator ([#3331](https://github.com/intent-hq/intentd/pull/3331))
+
+### 🐛 Bug Fixes
+
+- *(session-import)* Keep partial listings and reuse them across calls ([#3333](https://github.com/intent-hq/intentd/pull/3333))
+- Keep the conversation, idle timer and fast relaunch after a Northflank disk resume ([#3336](https://github.com/intent-hq/intentd/pull/3336))
+
+### 📚 Documentation
+
+- *(guide)* Say the model picker waits for a cloud machine's next start ([#3335](https://github.com/intent-hq/intentd/pull/3335))
+
+
 ## [0.11.200] - 2026-11-13
 
 ### 📚 Documentation
