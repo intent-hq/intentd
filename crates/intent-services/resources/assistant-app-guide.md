@@ -312,8 +312,8 @@ Quick action models live under **Settings → Providers → Quick Actions**
 (`/settings?tab=providers#utility-default-model`). **Commit message** and **PR
 description** each have one model picker for the default provider; its default option
 is the provider's own default model, and effort is set in the same picker. There is no
-shared quick action model. A shared default saved by an older version still applies
-until the first change there, which copies it into each action.
+shared quick action model or effort: Intent copies one saved by an older version into
+each action at startup.
 
 **Built-in coding specialists.** Developer implements directly, plans as needed,
 and delegates focused work to general agents. Lead, Coordinator, Implementor, and

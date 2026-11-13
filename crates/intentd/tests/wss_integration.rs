@@ -13627,8 +13627,8 @@ async fn wss_agent_complete_once_gate_follows_model_default_provider() {
 async fn wss_agent_complete_once_resolves_quick_action_settings() {
     // monorepo#1734: over the wire, a `agent.completeOnce` call with no
     // explicit `model` picks up the user's quick-action settings —
-    // `quickActions.typeOverrides[type]` first, then
-    // `quickActions.defaultModel` — while an explicit `model` still wins.
+    // `quickActions.typeOverrides[type]`, else the CLI default — while an
+    // explicit `model` still wins. The deprecated shared model is ignored.
     // The fixture CLI echoes its own argv so the resolved `--model` is
     // observable in the `{ text }` envelope.
     let (_auggie_dir, bin) = fake_auggie_script("quick-actions", "printf '🤖\\n%s\\n' \"$*\"");
@@ -13661,8 +13661,8 @@ async fn wss_agent_complete_once_resolves_quick_action_settings() {
     .await;
     let text = resp["result"]["text"].as_str().unwrap_or_default();
     assert!(
-        text.contains("--model sonnet4.5"),
-        "an unset override falls through to quickActions.defaultModel, got {resp}"
+        !text.contains("--model"),
+        "an unset override falls through to the CLI default, got {resp}"
     );
 
     let resp = wss_call(
@@ -13687,7 +13687,7 @@ async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_prov
     ) {
         return;
     }
-    // A user-authored `quickActions.defaultModel = "codex:gpt-5"` (legacy
+    // A user-authored `quickActions.typeOverrides.commit = "codex:gpt-5"` (legacy
     // compound; the wire rejects compounds but user files are never
     // rejected) splits on read into a (codex, gpt-5) pair and routes the
     // one-shot over the ephemeral ACP route — with `model.defaultProvider`
@@ -13705,7 +13705,7 @@ async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_prov
     // edited config.toml — since settings.update rejects compound values.
     srv.registry
         .reload(&format!(
-            "[providers.paths]\ncodex = {:?}\n\n[quickActions]\ndefaultModel = \"codex:gpt-5\"\n",
+            "[providers.paths]\ncodex = {:?}\n\n[quickActions.typeOverrides]\ncommit = \"codex:gpt-5\"\n",
             bin.to_string_lossy()
         ))
         .expect("reload legacy config");
@@ -13713,7 +13713,7 @@ async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_prov
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
-        r#"{"jsonrpc":"2.0","id":52,"method":"agent.completeOnce","params":{"prompt":"msg"}}"#,
+        r#"{"jsonrpc":"2.0","id":52,"method":"agent.completeOnce","params":{"prompt":"msg","type":"commit"}}"#,
     )
     .await;
     assert_eq!(resp["id"], 52);
@@ -23751,9 +23751,8 @@ async fn wss_quick_action_effort_settings_and_execution_contract() {
         serde_json::json!({"commit":"action-model"}),
     );
     let changes = serde_json::json!([
-        {"path":"quickActions.defaultReasoningEffort","value":"low"},
-        {"path":"quickActions.typeReasoningEffortOverrides","value":{"commit":"high","pr":"stale"}},
-        {"path":"quickActions.providerSettings","value":{"claude-code":{"defaultReasoningEffort":"low","typeReasoningEffortOverrides":{"commit":"high"}}}}
+        {"path":"quickActions.typeReasoningEffortOverrides","value":{"commit":"high","pr":"low"}},
+        {"path":"quickActions.providerSettings","value":{"claude-code":{"typeReasoningEffortOverrides":{"commit":"high"}}}}
     ]);
     let updated = wss_call(
         srv.port,
@@ -23784,7 +23783,6 @@ async fn wss_quick_action_effort_settings_and_execution_contract() {
         ("commit", Value::Null, "high", Some("chosen")),
         ("commit", serde_json::json!(" "), "high", Some("chosen")),
         ("pr", Value::Null, "low", Some("chosen")),
-        ("fast", Value::Null, "low", Some("chosen")),
         ("commit", serde_json::json!("low"), "low", Some("chosen")),
         (" commit ", Value::Null, "high", Some("chosen")),
         ("commit", Value::Null, "high", None),

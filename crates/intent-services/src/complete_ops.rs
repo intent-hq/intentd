@@ -126,6 +126,8 @@ pub(crate) fn one_shot_session_shape(
 
 /// Effort is independent of model selection, and saved choices belong only
 /// to the active provider. Never filter these against cached capabilities.
+/// The deprecated shared `quickActions.defaultReasoningEffort` is never a
+/// candidate: boot copies it into each action.
 fn resolve_quick_action_effort(
     settings: &intent_core::settings_file::SettingsFile,
     quick_action_type: Option<&str>,
@@ -146,22 +148,20 @@ fn resolve_quick_action_effort(
         {
             saved.push(value);
         }
-        if let Some(value) = quick.default_reasoning_effort.as_deref().and_then(nonblank) {
-            saved.push(value);
-        }
     }
     OneShotEffort { explicit, saved }
 }
 
 /// Resolve the quick-action model for a one-shot completion the caller sent no
 /// `model` for (monorepo#1734): `quickActions.typeOverrides[type]`, then
-/// `quickActions.defaultModel`, then `None` — the provider CLI default.
-/// `quick_action_type` is the caller's optional `type` hint (`commit`, `pr`,
-/// `review`, `fast`); the override map is FE-owned, so an unknown key simply
-/// misses and falls through to the default.
+/// `None` — the provider CLI default. The deprecated shared
+/// `quickActions.defaultModel` is not a rung: boot copies it into each
+/// action. `quick_action_type` is the caller's optional `type` hint
+/// (`commit`, `pr`, `review`, `walkthrough`); the override map is FE-owned,
+/// so an unknown key simply misses and falls through to the CLI default.
 ///
 /// `quickActions.providerSettings` is deliberately NOT a rung: it is the FE's
-/// opaque per-provider snapshot cache (restored into the two keys above on a
+/// opaque per-provider snapshot cache (restored into the override map on a
 /// provider switch), not an additional precedence tier.
 ///
 /// The result is a `(provider, bare model)` pair — quick-action settings
@@ -171,7 +171,7 @@ fn resolve_quick_action_effort(
 /// the prefix names the provider to run on when it is registered AND can
 /// serve one-shots (auggie or [`ACP_ONE_SHOT_PROVIDERS`]) — a registered but
 /// one-shot-incapable prefix (e.g. `grok:m`) drops the rung so stale
-/// settings degrade gracefully to the next rung instead of routing to a
+/// settings degrade gracefully to the CLI default instead of routing to a
 /// hard `{ available: false }` — the remainder is the bare model. Either
 /// shape is provider-guarded — the CLI must never be fed a foreign model id
 /// — via `agent.create`'s asymmetric cached-catalog evidence rule
@@ -187,11 +187,9 @@ fn resolve_quick_action_effort(
 /// when the chain produces no pair AND there is no effective provider to
 /// fall back to — the caller's closed gate.
 ///
-/// Every drop is PER RUNG and falls to the next one rather than erroring or
-/// skipping the chain: a dropped type override still tries
-/// `quickActions.defaultModel`, and only when every rung drops does the
-/// effective provider's CLI default apply — a `-32602` here would reject a
-/// model the caller never sent.
+/// A dropped override falls through to the effective provider's CLI default
+/// rather than erroring — a `-32602` here would reject a model the caller
+/// never sent.
 ///
 /// This chain is scoped to one-shot quick actions only — agent sessions,
 /// delegated ones included, keep the background-agnostic creation-time chain
@@ -250,14 +248,6 @@ fn resolve_quick_action_model(
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .and_then(vet)
-        .or_else(|| {
-            quick
-                .default_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .and_then(vet)
-        })
         .map(|(provider, model)| (provider, Some(model)))
         .or_else(|| effective_provider.map(|p| (p.to_string(), None)))
 }
@@ -410,8 +400,8 @@ impl Services {
     ///
     /// With no explicit `model`, the daemon resolves the user's quick-action
     /// settings itself ([`resolve_quick_action_model`], monorepo#1734) so any
-    /// client — not just the FE — gets `quickActions.typeOverrides[type]` /
-    /// `quickActions.defaultModel` for free; `quick_action_type` is the
+    /// client — not just the FE — gets `quickActions.typeOverrides[type]`
+    /// for free; `quick_action_type` is the
     /// caller's optional `type` hint keying the override map. The chain
     /// resolves to a `(provider, model)` pair, so a legacy compound value
     /// naming another registered provider routes the one-shot there.
@@ -1008,7 +998,10 @@ mod tests {
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             let (_tmp, services) = services_with_settings(&[
                 ("model.defaultProvider", json!(provider)),
-                ("quickActions.defaultReasoningEffort", json!("high")),
+                (
+                    "quickActions.typeReasoningEffortOverrides",
+                    json!({"commit":"high"}),
+                ),
                 ("providers.paths", json!({provider:bin})),
             ])
             .await;
@@ -1024,7 +1017,7 @@ mod tests {
                         "inspect".into(),
                         None,
                         Some("supported".into()),
-                        None,
+                        Some("commit".into()),
                         None,
                         None,
                         None,
@@ -2161,18 +2154,25 @@ rl.on('line', (line) => {
         assert_eq!(v["text"], "System: be terse\n\nwhy?");
     }
 
-    /// A `SettingsFile` carrying only the quick-action model keys.
+    /// A `SettingsFile` carrying only the per-action quick-action models.
     fn quick_action_settings(
-        default_model: Option<&str>,
         type_overrides: &[(&str, &str)],
     ) -> intent_core::settings_file::SettingsFile {
         let mut settings = intent_core::settings_file::SettingsFile::default();
-        settings.quick_actions.default_model = default_model.map(str::to_string);
         settings.quick_actions.type_overrides = type_overrides
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         settings
+    }
+
+    /// Resolve the `commit` action against `settings` on the given catalog.
+    fn commit_model(
+        settings: &intent_core::settings_file::SettingsFile,
+        catalog: &crate::model_catalog::ModelCatalogCache,
+        effective: Option<&str>,
+    ) -> Option<(String, Option<String>)> {
+        resolve_quick_action_model(settings, &catalog.reader(None), Some("commit"), effective)
     }
 
     /// Empty catalog cache: no cached entry for any provider, so bare ids pass
@@ -2198,64 +2198,44 @@ rl.on('line', (line) => {
 
     #[test]
     fn quick_action_model_precedence() {
-        // typeOverrides[type] outranks defaultModel; an absent/blank override
-        // (and an unknown type key) falls through to the default; nothing
-        // configured resolves to the CLI default. Bare values pair with the
-        // effective provider.
+        // typeOverrides[type] is the only rung; an absent/blank override, an
+        // unknown type key, or no type resolves to the CLI default. Bare
+        // values pair with the effective provider.
         let catalog = empty_catalog();
-        let settings = quick_action_settings(Some("sonnet4.5"), &[("commit", "haiku4.5")]);
+        let settings = quick_action_settings(&[("commit", "haiku4.5")]);
         assert_eq!(
-            resolve_quick_action_model(
-                &settings,
-                &catalog.reader(None),
-                Some("commit"),
-                Some("auggie")
-            ),
+            commit_model(&settings, &catalog, Some("auggie")),
             on("auggie", "haiku4.5")
         );
+        for kind in [Some("pr"), Some("not-a-type"), None] {
+            assert_eq!(
+                resolve_quick_action_model(&settings, &catalog.reader(None), kind, Some("auggie")),
+                cli_default("auggie"),
+                "{kind:?} has no override"
+            );
+        }
+        let blank = quick_action_settings(&[("commit", "  ")]);
         assert_eq!(
-            resolve_quick_action_model(
-                &settings,
-                &catalog.reader(None),
-                Some("pr"),
-                Some("auggie")
-            ),
-            on("auggie", "sonnet4.5")
-        );
-        assert_eq!(
-            resolve_quick_action_model(
-                &settings,
-                &catalog.reader(None),
-                Some("not-a-type"),
-                Some("auggie")
-            ),
-            on("auggie", "sonnet4.5")
-        );
-        assert_eq!(
-            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
-            on("auggie", "sonnet4.5")
-        );
-
-        let blank = quick_action_settings(Some("  "), &[("commit", "")]);
-        assert_eq!(
-            resolve_quick_action_model(
-                &blank,
-                &catalog.reader(None),
-                Some("commit"),
-                Some("auggie")
-            ),
+            commit_model(&blank, &catalog, Some("auggie")),
             cli_default("auggie"),
             "blank values read as unset, not as an empty model id"
         );
-        assert_eq!(
-            resolve_quick_action_model(
-                &intent_core::settings_file::SettingsFile::default(),
-                &catalog.reader(None),
-                Some("commit"),
-                Some("auggie")
-            ),
-            cli_default("auggie")
-        );
+    }
+
+    #[test]
+    fn quick_action_shared_model_is_never_a_rung() {
+        // The deprecated shared model is copied into each action at boot; a
+        // value left in the file must not change any resolution.
+        let catalog = empty_catalog();
+        let mut settings = quick_action_settings(&[("commit", "not-a-provider:haiku")]);
+        settings.quick_actions.default_model = Some("sonnet4.5".into());
+        for kind in [Some("commit"), Some("pr"), None] {
+            assert_eq!(
+                resolve_quick_action_model(&settings, &catalog.reader(None), kind, Some("auggie")),
+                cli_default("auggie"),
+                "{kind:?} must not fall back to the shared model"
+            );
+        }
     }
 
     #[test]
@@ -2264,14 +2244,14 @@ rl.on('line', (line) => {
         // pair: a registered prefix routes the one-shot to that provider —
         // even a foreign one — instead of being dropped.
         let catalog = empty_catalog();
-        let settings = quick_action_settings(Some("auggie:sonnet4.5"), &[]);
+        let settings = quick_action_settings(&[("commit", "auggie:sonnet4.5")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+            commit_model(&settings, &catalog, Some("auggie")),
             on("auggie", "sonnet4.5")
         );
-        let settings = quick_action_settings(Some("codex:gpt-5"), &[]);
+        let settings = quick_action_settings(&[("commit", "codex:gpt-5")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+            commit_model(&settings, &catalog, Some("auggie")),
             on("codex", "gpt-5"),
             "a foreign registered prefix routes the one-shot to that provider"
         );
@@ -2283,23 +2263,22 @@ rl.on('line', (line) => {
         // pair when the default provider is undecidable; a bare rung has
         // nothing to pair with and the chain resolves to None (closed gate).
         let catalog = empty_catalog();
-        let compound = quick_action_settings(Some("codex:gpt-5"), &[]);
+        let compound = quick_action_settings(&[("commit", "codex:gpt-5")]);
         assert_eq!(
-            resolve_quick_action_model(&compound, &catalog.reader(None), None, None),
+            commit_model(&compound, &catalog, None),
             on("codex", "gpt-5"),
             "a decidable compound rung must open the gate on its own"
         );
-        let bare = quick_action_settings(Some("sonnet4.5"), &[]);
+        let bare = quick_action_settings(&[("commit", "sonnet4.5")]);
         assert_eq!(
-            resolve_quick_action_model(&bare, &catalog.reader(None), None, None),
+            commit_model(&bare, &catalog, None),
             None,
             "a bare rung with no effective provider must close the gate"
         );
         assert_eq!(
-            resolve_quick_action_model(
+            commit_model(
                 &intent_core::settings_file::SettingsFile::default(),
-                &catalog.reader(None),
-                None,
+                &catalog,
                 None
             ),
             None,
@@ -2319,9 +2298,9 @@ rl.on('line', (line) => {
             "auggie:",
             "codex:org:model",
         ] {
-            let settings = quick_action_settings(Some(legacy), &[]);
+            let settings = quick_action_settings(&[("commit", legacy)]);
             assert_eq!(
-                resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+                commit_model(&settings, &catalog, Some("auggie")),
                 cli_default("auggie"),
                 "{legacy} must fall through to the CLI default"
             );
@@ -2336,58 +2315,18 @@ rl.on('line', (line) => {
         // hard `{ available: false }`.
         let catalog = empty_catalog();
         for legacy in ["grok:m", "droid:m", "opencode:m"] {
-            let settings = quick_action_settings(Some(legacy), &[]);
+            let settings = quick_action_settings(&[("commit", legacy)]);
             assert_eq!(
-                resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+                commit_model(&settings, &catalog, Some("auggie")),
                 cli_default("auggie"),
                 "{legacy} must fall through to the CLI default"
             );
             assert_eq!(
-                resolve_quick_action_model(&settings, &catalog.reader(None), None, None),
+                commit_model(&settings, &catalog, None),
                 None,
                 "{legacy} with no effective provider must close the gate"
             );
         }
-        // The dropped override still falls to a capable default rung.
-        let settings = quick_action_settings(Some("codex:gpt-5"), &[("commit", "grok:m")]);
-        assert_eq!(
-            resolve_quick_action_model(&settings, &catalog.reader(None), Some("commit"), None),
-            on("codex", "gpt-5"),
-            "a dropped non-one-shot override must fall to the default-model rung"
-        );
-    }
-
-    #[test]
-    fn quick_action_dropped_override_falls_to_default_model() {
-        // A drop is per rung: a malformed type override still falls through
-        // to a valid quickActions.defaultModel — the documented override →
-        // default → CLI-default chain — rather than skipping straight to the
-        // CLI default.
-        let catalog = empty_catalog();
-        let settings =
-            quick_action_settings(Some("sonnet4.5"), &[("commit", "not-a-provider:haiku")]);
-        assert_eq!(
-            resolve_quick_action_model(
-                &settings,
-                &catalog.reader(None),
-                Some("commit"),
-                Some("auggie")
-            ),
-            on("auggie", "sonnet4.5"),
-            "a dropped override must fall to the default-model rung"
-        );
-        // Both rungs malformed ⇒ CLI default.
-        let settings =
-            quick_action_settings(Some("bogus:gpt-5"), &[("commit", "not-a-provider:haiku")]);
-        assert_eq!(
-            resolve_quick_action_model(
-                &settings,
-                &catalog.reader(None),
-                Some("commit"),
-                Some("auggie")
-            ),
-            cli_default("auggie")
-        );
     }
 
     #[test]
@@ -2396,14 +2335,9 @@ rl.on('line', (line) => {
         // cached catalog for the effective provider the id passes, and it is
         // dropped only when that provider's own catalog disproves ownership
         // while another provider claims it.
-        let settings = quick_action_settings(Some("grok-4"), &[]);
+        let settings = quick_action_settings(&[("commit", "grok-4")]);
         assert_eq!(
-            resolve_quick_action_model(
-                &settings,
-                &empty_catalog().reader(None),
-                None,
-                Some("auggie")
-            ),
+            commit_model(&settings, &empty_catalog(), Some("auggie")),
             on("auggie", "grok-4"),
             "no cached evidence must not drop a bare id"
         );
@@ -2421,13 +2355,13 @@ rl.on('line', (line) => {
             vec![serde_json::json!({ "id": "grok-4", "provider": "grok" })],
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+            commit_model(&settings, &catalog, Some("auggie")),
             cli_default("auggie"),
             "a bare id the effective provider's catalog disproves is dropped"
         );
-        let owned = quick_action_settings(Some("sonnet4.5"), &[]);
+        let owned = quick_action_settings(&[("commit", "sonnet4.5")]);
         assert_eq!(
-            resolve_quick_action_model(&owned, &catalog.reader(None), None, Some("auggie")),
+            commit_model(&owned, &catalog, Some("auggie")),
             on("auggie", "sonnet4.5")
         );
         // The ownership guard applies to a compound rung's own pair too: a
@@ -2443,9 +2377,9 @@ rl.on('line', (line) => {
             &codex_version,
             vec![serde_json::json!({ "id": "gpt-5", "provider": "codex" })],
         );
-        let foreign = quick_action_settings(Some("codex:sonnet4.5"), &[]);
+        let foreign = quick_action_settings(&[("commit", "codex:sonnet4.5")]);
         assert_eq!(
-            resolve_quick_action_model(&foreign, &catalog.reader(None), None, Some("auggie")),
+            commit_model(&foreign, &catalog, Some("auggie")),
             cli_default("auggie"),
             "a split pair failing its own provider's ownership guard drops"
         );
@@ -2462,8 +2396,8 @@ rl.on('line', (line) => {
     #[tokio::test]
     async fn complete_once_applies_quick_action_settings_when_model_omitted() {
         // monorepo#1734: with no explicit `model`, the daemon resolves the
-        // user's quick-action settings itself — the `type` override first,
-        // then the default — so any client gets the setting for free.
+        // user's quick-action settings itself — the `type` override, else the
+        // CLI default — so any client gets the setting for free.
         let (_bin_dir, bin) = fake_auggie_echoing_args("quick-actions");
         let (tmp, services) = services_with_bin(bin).await;
         let registry = crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
@@ -2473,10 +2407,6 @@ rl.on('line', (line) => {
                 (
                     "model.defaultProvider".to_string(),
                     serde_json::json!("auggie"),
-                ),
-                (
-                    "quickActions.defaultModel".to_string(),
-                    serde_json::json!("sonnet4.5"),
                 ),
                 (
                     "quickActions.typeOverrides".to_string(),
@@ -2508,8 +2438,8 @@ rl.on('line', (line) => {
             .await
             .unwrap();
         assert!(
-            v["text"].as_str().unwrap().contains("--model sonnet4.5"),
-            "an unset override falls through to the quick-action default, got {v:?}"
+            !v["text"].as_str().unwrap().contains("--model"),
+            "an unset override falls through to the CLI default, got {v:?}"
         );
 
         // An explicit client model always wins over the settings chain.
@@ -2594,7 +2524,11 @@ rl.on('line', (line) => {
                 "codex",
                 explicit,
             );
-            assert_eq!(resolved.saved, ["high", "low"]);
+            assert_eq!(
+                resolved.saved,
+                ["high"],
+                "the shared effort is never a candidate"
+            );
             assert_eq!(
                 resolved.explicit.as_deref(),
                 explicit.filter(|s| !s.trim().is_empty())
@@ -2603,7 +2537,7 @@ rl.on('line', (line) => {
         assert_eq!(
             resolve_quick_action_effort(&settings, Some(" commit "), Some("codex"), "codex", None)
                 .saved,
-            ["high", "low"],
+            ["high"],
             "action type normalization must match model resolution"
         );
         let other = resolve_quick_action_effort(
@@ -2615,9 +2549,10 @@ rl.on('line', (line) => {
         );
         assert!(other.saved.is_empty());
         assert_eq!(other.explicit.as_deref(), Some("high"));
-        assert_eq!(
-            resolve_quick_action_effort(&settings, None, Some("codex"), "codex", None).saved,
-            ["low"]
+        assert!(
+            resolve_quick_action_effort(&settings, None, Some("codex"), "codex", None)
+                .saved
+                .is_empty()
         );
     }
 
@@ -2628,19 +2563,19 @@ rl.on('line', (line) => {
         let (_tmp, svc) = services_with_settings(&[
             ("model.defaultProvider", json!("claude-code")),
             ("providers.paths", json!({"claude-code":bin})),
-            ("quickActions.defaultReasoningEffort", json!("low")),
             (
                 "quickActions.typeReasoningEffortOverrides",
-                json!({"commit":"high", "pr":"stale", "fast":""}),
+                json!({"commit":"high", "pr":"low", "fast":""}),
             ),
             ("model.defaultReasoningEffort", json!("ordinary-agent-only")),
         ])
         .await;
+        // "medium" is the adapter's own default: nothing was applied.
         for (kind, explicit, expected) in [
             (Some("commit"), None, "high"),
             (Some("pr"), None, "low"),
-            (Some("fast"), None, "low"),
-            (None, None, "low"),
+            (Some("fast"), None, "medium"),
+            (None, None, "medium"),
             (Some("commit"), Some("low"), "low"),
             (Some("commit"), Some("  "), "high"),
         ] {
@@ -2682,10 +2617,21 @@ rl.on('line', (line) => {
         svc.settings_registry
             .as_ref()
             .unwrap()
-            .apply(&[("quickActions.defaultReasoningEffort".into(), json!("high"))])
+            .apply(&[(
+                "quickActions.typeReasoningEffortOverrides".into(),
+                json!({"commit":"high"}),
+            )])
             .unwrap();
         let reply = svc
-            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                Some("commit".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(!reply["text"].as_str().unwrap().contains("effort"));
@@ -2693,14 +2639,15 @@ rl.on('line', (line) => {
     #[cfg(unix)]
     #[tokio::test]
     async fn quick_action_effort_live_selector_overrules_nonempty_cached_levels() {
-        for (cached, live, expected) in [("low", "high", "high"), ("high", "low", "low")] {
+        // An unsupported saved effort is skipped: no shared fallback remains,
+        // so the adapter keeps its own default ("medium").
+        for (cached, live, expected) in [("low", "high", "high"), ("high", "low", "medium")] {
             let (_dir, bin, _, _cli_env) =
                 crate::test_support::quick_action_effort_adapter(&json!({"modelValues":[live]}));
             let (_tmp, svc) = services_with_settings(&[
                 ("model.defaultProvider", json!("claude-code")),
                 ("providers.paths", json!({"claude-code":bin})),
-                ("quickActions.defaultModel", json!("chosen")),
-                ("quickActions.defaultReasoningEffort", json!("low")),
+                ("quickActions.typeOverrides", json!({"commit":"chosen"})),
                 (
                     "quickActions.typeReasoningEffortOverrides",
                     json!({"commit":"high"}),
@@ -2761,7 +2708,7 @@ rl.on('line', (line) => {
         let (tmp, svc) =
             services_with_settings(&[("providers.paths", json!({"claude-code":bin}))]).await;
         let config = tmp.dir.path().join("legacy.toml");
-        std::fs::write(&config, format!("[model]\ndefaultProvider = \"codex\"\n[quickActions]\ndefaultModel = \"claude-code:chosen\"\ndefaultReasoningEffort = \"low\"\n[quickActions.typeReasoningEffortOverrides]\ncommit = \"high\"\n[providers.paths]\nclaude-code = {bin:?}\n")).unwrap();
+        std::fs::write(&config, format!("[model]\ndefaultProvider = \"codex\"\n[quickActions.typeOverrides]\ncommit = \"claude-code:chosen\"\n[quickActions.typeReasoningEffortOverrides]\ncommit = \"high\"\n[providers.paths]\nclaude-code = {bin:?}\n")).unwrap();
         let svc = svc.with_settings_registry(std::sync::Arc::new(
             crate::SettingsRegistry::load(config).unwrap(),
         ));

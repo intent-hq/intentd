@@ -532,7 +532,7 @@ async fn disabling_default_profile_preserves_selection_and_requires_replacement(
         .settings_update_checking_profiles(json!([
             { "path": "model.defaultProvider", "value": work },
             { "path": "model.providerDefaults", "value": { work.clone(): "gpt-5" } },
-            { "path": "quickActions.defaultModel", "value": "gpt-5" }
+            { "path": "quickActions.typeOverrides", "value": { "commit": "gpt-5" } }
         ]))
         .await
         .unwrap();
@@ -548,10 +548,7 @@ async fn disabling_default_profile_preserves_selection_and_requires_replacement(
         Some(work.as_str())
     );
     assert_eq!(settings.model.provider_defaults[&work], "gpt-5");
-    assert_eq!(
-        settings.quick_actions.default_model.as_deref(),
-        Some("gpt-5")
-    );
+    assert_eq!(settings.quick_actions.type_overrides["commit"], "gpt-5");
     let err = fx
         .svc
         .agent_complete_once_op("hi".into(), None, None, None, None, None, None)

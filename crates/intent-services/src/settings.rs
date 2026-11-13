@@ -82,6 +82,18 @@ pub(crate) const RETIRED_BACKGROUND_AGENT_PATHS: &[&str] = &[
 /// `config.toml`.
 pub(crate) const DEPRECATED_ACTIVE_PROVIDER_PATH: &str = "providers.active";
 
+/// The shared quick action model and effort, superseded by the per-action
+/// `quickActions.typeOverrides` / `typeReasoningEffortOverrides`. Like
+/// `providers.active` they keep a read-only catalog entry during the
+/// deprecation window (released clients read them from `settings.list` and
+/// write them in every quick action batch), `settings.update` tolerates and
+/// ignores writes, and [`migrate_quick_action_shared_default`] folds a stored
+/// value into each action once at boot. The one-shot chain never reads them.
+pub(crate) const DEPRECATED_QUICK_ACTION_SHARED_PATHS: &[&str] = &[
+    "quickActions.defaultModel",
+    "quickActions.defaultReasoningEffort",
+];
+
 /// Settings path of the user-editable transcription vocabulary (§5.12).
 pub(crate) const VOICE_VOCABULARY_PATH: &str = "voice.vocabulary";
 
@@ -1770,6 +1782,27 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         None,
     );
     providers_active.read_only = true;
+    // Deprecated like `providers.active`: superseded by the per-action keys
+    // and folded into them once at boot.
+    let mut quick_action_shared_model = string(
+        "quickActions.defaultModel",
+        "Shared quick action model (deprecated)",
+        "Deprecated: superseded by quickActions.typeOverrides (copied into each action and \
+         removed from config.toml once at startup; never consulted; read-only on the wire)",
+        "providers",
+        None,
+    );
+    quick_action_shared_model.read_only = true;
+    let mut quick_action_shared_effort = string(
+        "quickActions.defaultReasoningEffort",
+        "Shared quick action effort (deprecated)",
+        "Deprecated: superseded by quickActions.typeReasoningEffortOverrides (copied into each \
+         action and removed from config.toml once at startup; never consulted; read-only on \
+         the wire)",
+        "providers",
+        None,
+    );
+    quick_action_shared_effort.read_only = true;
     vec![
         // --- Group A: providers / agents -----------------------------------
         providers_active,
@@ -1822,31 +1855,19 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "providers",
             None,
         ),
-        string(
-            "quickActions.defaultModel",
-            "Default quick action model",
-            "Model for single-shot quick actions (commit messages and PR descriptions); never applied to agent sessions",
-            "providers",
-            None,
-        ),
+        quick_action_shared_model,
         object(
             "quickActions.typeOverrides",
             "Quick action model overrides",
-            "Per-quick-action model overrides (commit, pr, review, fast)",
+            "Model per quick action (commit, pr, review, walkthrough); blank or absent uses the provider default",
             "providers",
             Some(json!({})),
         ),
-        string(
-            "quickActions.defaultReasoningEffort",
-            "Default quick action effort",
-            "Reasoning effort for quick actions; blank uses the provider default",
-            "providers",
-            None,
-        ),
+        quick_action_shared_effort,
         object(
             "quickActions.typeReasoningEffortOverrides",
             "Quick action effort overrides",
-            "Per-action reasoning effort; blank or absent inherits the shared quick action effort",
+            "Per-action reasoning effort; blank or absent uses the provider default",
             "providers",
             Some(json!({})),
         ),
@@ -3091,6 +3112,200 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
     Ok(())
 }
 
+/// Action types that inherited the shared quick action model and effort.
+/// `walkthrough` has no settings row but resolves through the same chain.
+const QUICK_ACTION_SHARED_TYPES: [&str; 4] = ["commit", "pr", "review", "walkthrough"];
+
+/// Copy a shared quick action value into each action type whose own value
+/// is blank or absent.
+fn fold_shared_into_actions(map: &mut serde_json::Map<String, Value>, shared: &str) {
+    for key in QUICK_ACTION_SHARED_TYPES {
+        let blank = map
+            .get(key)
+            .and_then(Value::as_str)
+            .is_none_or(|v| v.trim().is_empty());
+        if blank {
+            map.insert(key.to_string(), Value::String(shared.to_string()));
+        }
+    }
+}
+
+/// The bare model a shared value names for `provider`. A legacy compound
+/// value counts only when its prefix is `provider` (or the base provider of a
+/// profile) and its remainder is a bare id: the per-action keys accept bare
+/// ids only, so a model of another provider is dropped.
+fn shared_model_for(value: &str, provider: Option<&str>) -> Option<String> {
+    let value = value.trim();
+    let model = match value.split_once(':') {
+        None => value,
+        Some((prefix, rest)) => {
+            let own = provider.map(intent_providers::base_provider_id) == Some(prefix.trim());
+            let rest = rest.trim();
+            if !own || rest.contains(':') {
+                return None;
+            }
+            rest
+        }
+    };
+    (!model.is_empty()).then(|| model.to_string())
+}
+
+fn nonblank_str(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Fold one provider snapshot bag (`quickActions.providerSettings.<id>`).
+/// Returns whether the bag changed.
+fn fold_quick_action_snapshot(bag: &mut serde_json::Map<String, Value>, provider: &str) -> bool {
+    let model = bag
+        .get("defaultModel")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let effort = bag
+        .get("defaultReasoningEffort")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut changed = false;
+    if let Some(raw) = model.filter(|m| !m.is_empty()) {
+        let folded = shared_model_for(&raw, Some(provider));
+        if folded.is_none() {
+            tracing::warn!(
+                model = raw.as_str(),
+                provider,
+                "provider snapshot's shared quick action model names another \
+                 provider; dropping it"
+            );
+        }
+        if let Some(shared) = folded {
+            let entry = bag
+                .entry("typeOverrides")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(map) = entry.as_object_mut() {
+                fold_shared_into_actions(map, &shared);
+            }
+        }
+        bag.insert("defaultModel".to_string(), Value::String(String::new()));
+        changed = true;
+    }
+    if let Some(raw) = effort.filter(|e| !e.is_empty()) {
+        if let Some(shared) = nonblank_str(Some(&Value::String(raw))) {
+            let entry = bag
+                .entry("typeReasoningEffortOverrides")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(map) = entry.as_object_mut() {
+                fold_shared_into_actions(map, &shared);
+            }
+        }
+        bag.insert(
+            "defaultReasoningEffort".to_string(),
+            Value::String(String::new()),
+        );
+        changed = true;
+    }
+    changed
+}
+
+/// One-time boot migration of the deprecated shared quick action model and
+/// effort (`quickActions.defaultModel` / `defaultReasoningEffort`). Each
+/// action type that inherited a shared value gets it as its own
+/// (`typeOverrides` / `typeReasoningEffortOverrides`), so no quick action
+/// changes model or effort at upgrade; then both shared keys are removed from
+/// `config.toml`. The same fold runs on every provider snapshot in
+/// `quickActions.providerSettings`, so a later provider switch restores
+/// per-action values too. A compound shared model keeps only a bare id of its
+/// own provider. Runs after [`migrate_quick_action_settings`], which can
+/// carry a legacy `[backgroundAgents]` default into the shared key. A file
+/// without a shared value or snapshot default is never rewritten.
+///
+/// # Errors
+///
+/// Never errors today: migration failures are logged and skipped (the file
+/// stays intact, so the next boot retries). The `Result` keeps parity with
+/// the other startup migrations.
+pub fn migrate_quick_action_shared_default(registry: &SettingsRegistry) -> Result<()> {
+    let model = nonblank_str(registry.get("quickActions.defaultModel").as_ref());
+    let effort = nonblank_str(registry.get("quickActions.defaultReasoningEffort").as_ref());
+    // `providers.active` is still set when its carry-over into
+    // `model.defaultProvider` has not succeeded; it names the same provider.
+    let provider = nonblank_str(registry.get("model.defaultProvider").as_ref())
+        .or_else(|| nonblank_str(registry.get(DEPRECATED_ACTIVE_PROVIDER_PATH).as_ref()));
+    let mut changes: Vec<(String, Value)> = Vec::new();
+    if let Some(raw) = &model {
+        let folded = shared_model_for(raw, provider.as_deref());
+        if folded.is_none() {
+            tracing::warn!(
+                model = raw.as_str(),
+                provider = provider.as_deref(),
+                "shared quick action model names another provider; dropping it \
+                 (per-action models accept bare ids only)"
+            );
+        }
+        if let Some(shared) = folded {
+            let mut map = registry
+                .get("quickActions.typeOverrides")
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            fold_shared_into_actions(&mut map, &shared);
+            changes.push(("quickActions.typeOverrides".to_string(), Value::Object(map)));
+        }
+    }
+    if let Some(shared) = &effort {
+        let mut map = registry
+            .get("quickActions.typeReasoningEffortOverrides")
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        fold_shared_into_actions(&mut map, shared);
+        changes.push((
+            "quickActions.typeReasoningEffortOverrides".to_string(),
+            Value::Object(map),
+        ));
+    }
+    if let Some(mut snapshots) = registry
+        .get("quickActions.providerSettings")
+        .and_then(|v| v.as_object().cloned())
+    {
+        let mut folded_any = false;
+        for (id, bag) in &mut snapshots {
+            if let Some(bag) = bag.as_object_mut() {
+                folded_any |= fold_quick_action_snapshot(bag, id);
+            }
+        }
+        if folded_any {
+            changes.push((
+                "quickActions.providerSettings".to_string(),
+                Value::Object(snapshots),
+            ));
+        }
+    }
+    for path in DEPRECATED_QUICK_ACTION_SHARED_PATHS {
+        if registry.origin(path) != Some(SettingOrigin::Default) {
+            changes.push(((*path).to_string(), Value::Null));
+        }
+    }
+    if changes.is_empty() {
+        return Ok(());
+    }
+    if let Err(e) = registry.apply(&changes) {
+        tracing::warn!(
+            error = %e,
+            "failed to fold the shared quick action default into each action; \
+             continuing (next boot retries)"
+        );
+        return Ok(());
+    }
+    tracing::info!(
+        model = model.as_deref(),
+        effort = effort.as_deref(),
+        "copied the shared quick action default into each action and removed it \
+         from config.toml"
+    );
+    Ok(())
+}
+
 /// One-time boot migration of the deprecated `providers.active` OUT of
 /// `config.toml`: when the file still carries the legacy key, its value is
 /// carried over into `model.defaultProvider` (which superseded it as the
@@ -3656,6 +3871,7 @@ impl<'a> SettingsService<'a> {
             // hard rejection would fail whole batches from old clients).
             if RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
                 || path == DEPRECATED_ACTIVE_PROVIDER_PATH
+                || DEPRECATED_QUICK_ACTION_SHARED_PATHS.contains(&path)
                 || path == DEPRECATED_AUTO_RETIRE_PATH
                 || path == "agents.flushQueuedMessages"
                 || path == RETIRED_COW_ISOLATION_PATH
@@ -4479,9 +4695,7 @@ mod tests {
             "model.defaultProvider",
             "model.providerDefaults",
             "model.defaultReasoningEffort",
-            "quickActions.defaultModel",
             "quickActions.typeOverrides",
-            "quickActions.defaultReasoningEffort",
             "quickActions.typeReasoningEffortOverrides",
             "specialists.default",
             "workspace.branchPrefix",
@@ -8933,15 +9147,15 @@ mod tests {
         let applied = svc
             .update(&json!([
                 { "path": "backgroundAgents.defaultModel", "value": "auggie:haiku" },
-                { "path": "quickActions.defaultModel", "value": "opus" },
+                { "path": "quickActions.typeOverrides", "value": { "commit": "opus" } },
             ]))
             .await
             .expect("mixed batch must apply its live entry");
         assert_eq!(applied.len(), 1);
-        assert_eq!(applied[0]["path"], "quickActions.defaultModel");
+        assert_eq!(applied[0]["path"], "quickActions.typeOverrides");
         assert_eq!(
-            registry.get("quickActions.defaultModel"),
-            Some(json!("opus"))
+            registry.get("quickActions.typeOverrides"),
+            Some(json!({ "commit": "opus" }))
         );
 
         let _ = std::fs::remove_file(&config_path);
@@ -9076,6 +9290,157 @@ mod tests {
                 .strip_prefix("active")
                 .is_some_and(|rest| rest.trim_start().starts_with('='))
         })
+    }
+
+    /// The retired shared quick action model and effort are copied into each
+    /// action that inherited them, in the live keys and in every provider
+    /// snapshot, so no quick action changes model or effort at upgrade. A
+    /// compound value keeps only a bare id of its own provider. Both shared
+    /// keys are then removed from the file, and a second boot is a no-op.
+    #[tokio::test]
+    async fn quick_action_shared_default_migration_folds_into_each_action() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-qashared-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# keep me\n\
+             [model]\ndefaultProvider = \"codex@pwork00000001\"\n\n\
+             [quickActions]\ndefaultModel = \"codex:gpt-5\"\ndefaultReasoningEffort = \" low \"\n\n\
+             [quickActions.typeOverrides]\ncommit = \"pinned\"\npr = \" \"\n\n\
+             [quickActions.typeReasoningEffortOverrides]\npr = \"high\"\n\n\
+             [quickActions.providerSettings.claude-code]\ndefaultModel = \"claude-code:sonnet\"\n\
+             defaultReasoningEffort = \"max\"\ntypeOverrides = { commit = \"\" }\n\n\
+             [quickActions.providerSettings.auggie]\ndefaultModel = \"codex:foreign\"\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        migrate_quick_action_shared_default(&registry).expect("migrate");
+        assert_eq!(
+            registry.origin("quickActions.defaultModel"),
+            Some(SettingOrigin::Default)
+        );
+        assert_eq!(
+            registry.origin("quickActions.defaultReasoningEffort"),
+            Some(SettingOrigin::Default)
+        );
+        assert_eq!(
+            registry.get("quickActions.typeOverrides"),
+            Some(json!({
+                "commit": "pinned", "pr": "gpt-5", "review": "gpt-5", "walkthrough": "gpt-5"
+            })),
+            "blank and missing actions inherit the bare shared model"
+        );
+        assert_eq!(
+            registry.get("quickActions.typeReasoningEffortOverrides"),
+            Some(json!({ "commit": "low", "pr": "high", "review": "low", "walkthrough": "low" })),
+        );
+        let snapshots = registry
+            .get("quickActions.providerSettings")
+            .expect("snapshots");
+        assert_eq!(
+            snapshots["claude-code"],
+            json!({
+                "defaultModel": "",
+                "defaultReasoningEffort": "",
+                "typeOverrides": {
+                    "commit": "sonnet", "pr": "sonnet", "review": "sonnet", "walkthrough": "sonnet"
+                },
+                "typeReasoningEffortOverrides": {
+                    "commit": "max", "pr": "max", "review": "max", "walkthrough": "max"
+                },
+            })
+        );
+        assert_eq!(
+            snapshots["auggie"],
+            json!({ "defaultModel": "" }),
+            "a model of another provider is dropped, never routed elsewhere"
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read migrated config");
+        assert!(text.contains("# keep me"), "{text}");
+
+        let registry2 = SettingsRegistry::load(&config_path).expect("reload registry");
+        migrate_quick_action_shared_default(&registry2).expect("migrate again");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("re-read config"),
+            text,
+            "a migrated file is never rewritten"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// The fold does not depend on the `providers.active` carry-over having
+    /// succeeded: while that legacy key is still in the file, it names the
+    /// provider whose compound shared model is kept.
+    #[tokio::test]
+    async fn quick_action_shared_default_migration_reads_a_pending_active_provider() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-qaactive-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[providers]\nactive = \"codex\"\n\n[quickActions]\ndefaultModel = \"codex:gpt-5\"\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        migrate_quick_action_shared_default(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("quickActions.typeOverrides"),
+            Some(json!({
+                "commit": "gpt-5", "pr": "gpt-5", "review": "gpt-5", "walkthrough": "gpt-5"
+            }))
+        );
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// The shared keys stay in the catalog, read-only, during deprecation:
+    /// released clients read them from `settings.list` and write them in
+    /// every quick action batch, so a write is ignored instead of failing
+    /// the whole batch.
+    #[tokio::test]
+    async fn quick_action_shared_default_update_is_tolerated_and_ignored() {
+        for path in DEPRECATED_QUICK_ACTION_SHARED_PATHS {
+            let def = find_definition(path).expect("deprecated path stays in the catalog");
+            assert!(def.read_only, "{path} must be read-only");
+        }
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-qawrite-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-qawrite-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let applied = svc
+            .update(&json!([
+                { "path": "quickActions.defaultModel", "value": "gpt-5" },
+                { "path": "quickActions.defaultReasoningEffort", "value": "low" },
+                { "path": "quickActions.typeOverrides", "value": { "commit": "c" } },
+            ]))
+            .await
+            .expect("a released client's quick action batch must still apply");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["path"], "quickActions.typeOverrides");
+        assert_eq!(
+            registry.origin("quickActions.defaultModel"),
+            Some(SettingOrigin::Default)
+        );
+        assert_eq!(
+            registry.origin("quickActions.defaultReasoningEffort"),
+            Some(SettingOrigin::Default)
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// Upgrade path: a config that predates `model.defaultProvider` and only
@@ -9310,7 +9675,6 @@ mod tests {
 
         for (path, value) in [
             ("model.default", json!("codex:gpt-5")),
-            ("quickActions.defaultModel", json!("auggie:haiku")),
             ("model.providerDefaults", json!({ "codex": "codex:gpt-5" })),
             (
                 "quickActions.typeOverrides",

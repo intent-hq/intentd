@@ -2475,6 +2475,12 @@ async fn cmd_serve_owned(
         // first; an already-set target is never clobbered.
         intent_services::migrate_active_provider_setting(&settings_registry)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // One-time fold of the deprecated shared quick action model and effort
+        // into each action. Runs after both carry-overs above: the first can
+        // fill the shared key, the second the default provider that decides
+        // whether a legacy compound model is the active provider's own.
+        intent_services::migrate_quick_action_shared_default(&settings_registry)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         // One-time rename of `workspace.autoRetireArchivedAfterDays` to
         // `workspace.purgeArchivedAfterDays` (comment-preserving rewrite; runs
         // only when the legacy key exists; an already-set new key wins).
