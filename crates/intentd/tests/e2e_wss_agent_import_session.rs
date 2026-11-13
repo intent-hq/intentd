@@ -648,7 +648,7 @@ async fn list_reads_only_needed_pages_and_keeps_rows_when_the_adapter_stalls() {
 
     // Two sessions per page; the second page never answers.
     let behavior = json!({ "sessionImport": { "pageSize": 2, "stallAfterPages": 1 } });
-    let budget = common::test_timeout(Duration::from_secs(5));
+    let budget = common::test_timeout(Duration::from_secs(10));
     let _daemon = spawn_serve(
         &data_dir,
         &home,

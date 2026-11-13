@@ -289,8 +289,14 @@ fn decode_cursor(cursor: Option<&str>) -> Result<usize> {
     }
 }
 
-/// The sessions read from one provider's adapter, newest first (adapters
-/// list newest first, so the rows read are the provider's newest).
+/// Whether `provider`'s adapter pages `session/list` newest `updatedAt`
+/// first, so that its first pages hold its newest sessions. Codex lists by
+/// creation time: a resumed old thread can sit on a late page.
+fn lists_newest_first(provider: &str) -> bool {
+    matches!(provider, "claude-code" | "pi" | "mock")
+}
+
+/// The sessions read from one provider's adapter.
 #[derive(Debug)]
 struct ProviderSessions {
     sessions: Vec<Value>,
@@ -320,10 +326,17 @@ struct CachedListing {
     at: tokio::time::Instant,
 }
 
-/// The last listing of each provider. A provider's slot is held while it is
-/// listed, so concurrent calls wait for one adapter instead of each starting
-/// their own.
-type ListingSlot = Arc<tokio::sync::Mutex<Option<CachedListing>>>;
+/// One provider's last listing and last failure.
+#[derive(Default)]
+struct SlotState {
+    listing: Option<CachedListing>,
+    failed: Option<(String, tokio::time::Instant)>,
+}
+
+/// The listing state of each provider. A provider's slot is held while it
+/// is listed, so concurrent calls wait for one adapter instead of each
+/// starting their own.
+type ListingSlot = Arc<tokio::sync::Mutex<SlotState>>;
 
 static LISTINGS: LazyLock<std::sync::Mutex<HashMap<String, ListingSlot>>> =
     LazyLock::new(Default::default);
@@ -338,26 +351,53 @@ fn listing_slot(provider: &str) -> ListingSlot {
 }
 
 /// `provider`'s sessions: the cached listing when it is fresh and covers
-/// `need` rows, else a new one (cached when it lists anything).
+/// `need` rows, else a new one (cached when it lists anything). Waiting for
+/// another call's listing counts against this call's deadline, and a listing
+/// that failed while this call waited fails it too.
 async fn cached_or_list(
     manager: &crate::AgentManager,
     provider: &str,
     cwd: &Path,
     need: usize,
 ) -> ProviderListing {
+    let started = tokio::time::Instant::now();
+    let deadline = started + provider_timeout();
+    let need = if lists_newest_first(provider) {
+        need
+    } else {
+        usize::MAX
+    };
     let slot = listing_slot(provider);
-    let mut cached = slot.lock().await;
-    if let Some(entry) = cached.as_ref() {
+    let Ok(mut state) = tokio::time::timeout_at(deadline, slot.lock()).await else {
+        tracing::warn!(
+            provider,
+            "importable sessions listing timed out waiting for another listing"
+        );
+        return ProviderListing::Error("timed out".into());
+    };
+    if let Some(entry) = state.listing.as_ref() {
         if entry.at.elapsed() < LISTING_TTL && entry.listing.covers(need) {
             return ProviderListing::Ok(entry.listing.clone());
         }
     }
-    let listing = list_one_provider(manager, provider, cwd, need).await;
-    if let ProviderListing::Ok(sessions) = &listing {
-        *cached = Some(CachedListing {
-            listing: sessions.clone(),
-            at: tokio::time::Instant::now(),
-        });
+    if let Some((error, at)) = state.failed.as_ref() {
+        if *at >= started {
+            return ProviderListing::Error(error.clone());
+        }
+    }
+    let listing = list_one_provider(manager, provider, cwd, need, deadline).await;
+    match &listing {
+        ProviderListing::Ok(sessions) => {
+            state.listing = Some(CachedListing {
+                listing: sessions.clone(),
+                at: tokio::time::Instant::now(),
+            });
+            state.failed = None;
+        }
+        ProviderListing::Error(error) => {
+            state.failed = Some((error.clone(), tokio::time::Instant::now()));
+        }
+        ProviderListing::Unsupported => {}
     }
     listing
 }
@@ -366,8 +406,11 @@ async fn cached_or_list(
 /// when a fresh listing holds it.
 fn cached_listed(provider: &str, session_id: &str) -> Option<(Option<String>, Option<String>)> {
     let slot = listing_slot(provider);
-    let cached = slot.try_lock().ok()?;
-    let entry = cached.as_ref().filter(|e| e.at.elapsed() < LISTING_TTL)?;
+    let state = slot.try_lock().ok()?;
+    let entry = state
+        .listing
+        .as_ref()
+        .filter(|e| e.at.elapsed() < LISTING_TTL)?;
     entry
         .listing
         .sessions
@@ -678,7 +721,9 @@ impl Services {
         }
         let (title, listed_cwd) = match cached_listed(provider, source_id) {
             Some(found) => found,
-            None => find_listed(adapter, source_id).await,
+            None => tokio::time::timeout(provider_timeout(), find_listed(adapter, source_id))
+                .await
+                .unwrap_or_default(),
         };
         let mut source_cwd = listed_cwd;
         let timeout = provider_timeout().max(Duration::from_secs(60));
@@ -844,16 +889,16 @@ enum ListEnd {
 }
 
 /// Start `provider`'s adapter and read `session/list` pages until it has no
-/// more, the rows cover `need`, or the provider's deadline passes. The rows
-/// read before a deadline or a failure are kept.
+/// more, the rows cover `need`, or `deadline` passes. The rows read before a
+/// deadline or a failure are kept.
 async fn list_one_provider(
     manager: &crate::AgentManager,
     provider: &str,
     cwd: &Path,
     need: usize,
+    deadline: tokio::time::Instant,
 ) -> ProviderListing {
     let budget = provider_timeout();
-    let deadline = tokio::time::Instant::now() + budget;
     let adapter = match tokio::time::timeout_at(
         deadline,
         manager.open_scratch_adapter(provider, cwd),
