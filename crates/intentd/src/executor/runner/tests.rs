@@ -2337,6 +2337,85 @@ async fn node_runner_tells_the_first_turn_after_a_disk_resume() {
     }
 }
 
+/// A launch after a disk-only resume (Northflank) loads the provider
+/// session the agent last ran with, which its transcript on the disk still
+/// holds, so the next turn sees the earlier ones (intent-hq/intent#9236).
+/// The history the load replays is never journaled. A session the provider
+/// cannot load, or one recorded with another model, starts a new session.
+#[tokio::test]
+async fn node_runner_loads_the_recorded_session_after_a_disk_resume() {
+    let sessions = tempfile::tempdir().unwrap();
+    let dir = sessions.path().to_string_lossy().into_owned();
+    let Some(h) = harness(1, &["--sessions", &dir]) else {
+        return;
+    };
+    let a1 = AgentId::from("a1");
+    let said = |all: &[JournalRecord], turn: &str, expected: &str| {
+        all.iter().any(|r| {
+            r.turn_id.as_deref() == Some(turn)
+                && matches!(&r.body, JournalBody::Notification { notification }
+                    if notification.to_string().contains(expected))
+        })
+    };
+    let stopped = || async {
+        tokio::time::timeout(wait(), h.runner.stop(&a1).wait())
+            .await
+            .unwrap();
+    };
+    h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&a1, "t1".into(), text("remember apples"))
+        .await;
+    wait_for(&h.runner, "first turn end", turn_ended("a1", "t1")).await;
+    stopped().await;
+
+    let mut resumed = launch("a1");
+    resumed.resumed_from_disk = true;
+    h.runner.launch(resumed.clone()).await;
+    h.runner
+        .prompt(&a1, "t2".into(), text("recall apples"))
+        .await;
+    let all = wait_for(&h.runner, "resumed turn end", turn_ended("a1", "t2")).await;
+    assert!(said(&all, "t2", "recall apples: yes"), "{all:#?}");
+    // The replay's straggler lands after the load answered.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let all = records(&h.runner).await;
+    assert!(
+        !all.iter().any(|r| matches!(&r.body, JournalBody::Notification { notification }
+            if notification.to_string().contains("replayed:"))),
+        "{all:#?}"
+    );
+    stopped().await;
+
+    // The provider lost the transcript: the load is refused and a new
+    // session starts.
+    for entry in std::fs::read_dir(sessions.path()).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    h.runner.launch(resumed.clone()).await;
+    h.runner
+        .prompt(&a1, "t3".into(), text("recall apples"))
+        .await;
+    let all = wait_for(&h.runner, "fresh turn end", turn_ended("a1", "t3")).await;
+    assert!(said(&all, "t3", "recall apples: no"), "{all:#?}");
+    assert_eq!(turn_end(find(&all, turn_ended("a1", "t3"))).1, None);
+    stopped().await;
+
+    // A launch with another model than the recorded session's starts a
+    // new one.
+    let mut other_model = resumed;
+    other_model.model = Some("other-model".into());
+    h.runner.launch(other_model).await;
+    h.runner
+        .prompt(&a1, "t4".into(), text("recall apples"))
+        .await;
+    let all = wait_for(&h.runner, "other model turn end", turn_ended("a1", "t4")).await;
+    assert!(said(&all, "t4", "recall apples: no"), "{all:#?}");
+    stopped().await;
+
+    stopped().await;
+}
+
 /// Every remote agent's first turn on the machine opens with the
 /// long-commands hint, before any checkout notice; later turns do not.
 #[tokio::test]

@@ -14,7 +14,7 @@ use intent_core::node_link::{forge_agent_branch, ForgeLaunch, HomeRef, Submodule
 use intent_core::{AgentId, BoxFuture, HomeId, WorkspaceId};
 use intent_git::node_git::{self, AgentRemote, CheckoutCache, ModuleCheckout};
 
-use super::storage::Storage;
+use super::storage::{ProviderSession, Storage};
 
 /// Longest a WIP push may take; a lost git connection fails it sooner.
 pub(super) const WIP_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -87,6 +87,16 @@ pub(super) trait Checkouts: Send + Sync {
 
     /// The agents with a directory here.
     fn agents(&self) -> Vec<AgentId>;
+
+    /// The provider session the agent last ran with here, if recorded.
+    fn provider_session(&self, agent_id: &AgentId) -> Option<ProviderSession>;
+
+    /// Record the provider session the agent runs with now.
+    fn record_provider_session(
+        &self,
+        agent_id: &AgentId,
+        session: &ProviderSession,
+    ) -> anyhow::Result<()>;
 
     /// Remove the agent's directory and its worktree's registration in the
     /// caches; removing an agent with none is a no-op.
@@ -173,6 +183,18 @@ impl GitCheckouts {
 }
 
 impl Checkouts for GitCheckouts {
+    fn provider_session(&self, agent_id: &AgentId) -> Option<ProviderSession> {
+        self.storage.provider_session(agent_id)
+    }
+
+    fn record_provider_session(
+        &self,
+        agent_id: &AgentId,
+        session: &ProviderSession,
+    ) -> anyhow::Result<()> {
+        self.storage.record_provider_session(agent_id, session)
+    }
+
     fn main_checkout(&self, repo_key: &str) -> anyhow::Result<PathBuf> {
         self.storage.main_checkout(repo_key)
     }
@@ -690,6 +712,18 @@ impl PlainCheckouts {
 
 #[cfg(test)]
 impl Checkouts for PlainCheckouts {
+    fn provider_session(&self, agent_id: &AgentId) -> Option<ProviderSession> {
+        self.storage.provider_session(agent_id)
+    }
+
+    fn record_provider_session(
+        &self,
+        agent_id: &AgentId,
+        session: &ProviderSession,
+    ) -> anyhow::Result<()> {
+        self.storage.record_provider_session(agent_id, session)
+    }
+
     fn main_checkout(&self, repo_key: &str) -> anyhow::Result<PathBuf> {
         self.storage.main_checkout(repo_key)
     }

@@ -29,6 +29,8 @@ const REPOS: &str = "repos";
 const GIT_SOCKET: &str = "git.sock";
 const PULLS: &str = "pulls";
 const HOME: &str = "home";
+/// The provider session an agent last ran with, in its record.
+const PROVIDER_SESSION: &str = "provider-session.json";
 /// In an agent's home: the id of the agent that owns it.
 const OWNER: &str = ".agent";
 const WORK: &str = "work";
@@ -291,6 +293,16 @@ pub(super) fn remove_agent_homes(root: &Path, work_base: Option<&Path>) -> bool 
 }
 
 /// Whether `id` is safe as one path component.
+/// The ACP session an agent's provider last opened here, with the
+/// provider and model it ran: a launch after a disk resume loads it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ProviderSession {
+    pub(super) session_id: String,
+    pub(super) provider: String,
+    pub(super) model: Option<String>,
+}
+
 pub(super) fn valid_id(id: &str) -> bool {
     (1..=128).contains(&id.len())
         && id != "."
@@ -502,6 +514,41 @@ impl Storage {
             .collect();
         ids.sort_by(|a, b| a.0.cmp(&b.0));
         ids
+    }
+
+    /// The provider session `agent_id` last ran with here, if recorded.
+    pub(super) fn provider_session(&self, agent_id: &AgentId) -> Option<ProviderSession> {
+        if !valid_id(&agent_id.0) {
+            return None;
+        }
+        let bytes = std::fs::read(self.record_dir(agent_id).join(PROVIDER_SESSION)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Record `session` as the one `agent_id` runs with, in its record.
+    pub(super) fn record_provider_session(
+        &self,
+        agent_id: &AgentId,
+        session: &ProviderSession,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            valid_id(&agent_id.0),
+            "agent id is not a safe path component"
+        );
+        let record = self.record_dir(agent_id);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&record)
+            .context("create agent directory")?;
+        let scratch = record.join("provider-session.tmp");
+        let written = std::fs::write(&scratch, serde_json::to_vec(session)?)
+            .and_then(|()| std::fs::rename(&scratch, record.join(PROVIDER_SESSION)));
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&scratch);
+            return Err(error).context("record the provider session");
+        }
+        Ok(())
     }
 
     /// Remove `agent_id`'s home (its worktree included), then its record;

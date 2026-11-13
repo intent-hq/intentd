@@ -42,6 +42,7 @@ use super::checkout::{Checkouts, Prepared, FINAL_PUSH_TIMEOUT, WIP_PUSH_TIMEOUT}
 use super::scripts::ScriptProcesses;
 use super::setup::{self, SetupOutput, SetupStatus};
 use super::skills;
+use super::storage::ProviderSession;
 use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
@@ -956,6 +957,12 @@ enum Mark {
         stop_reason: String,
         error: Option<String>,
     },
+    /// A `session/load` begins: drop the history it replays from now on.
+    /// Acknowledged before the load is sent.
+    Replaying { ack: oneshot::Sender<()> },
+    /// The load answered: drop what it still replays until the provider
+    /// is quiet, then acknowledge.
+    Replayed { ack: oneshot::Sender<()> },
     Exited {
         exit_code: Option<i32>,
         error: Option<String>,
@@ -1643,12 +1650,13 @@ impl Runner {
         journaled: watch::Sender<ExitRecord>,
     ) {
         let mut turn: Option<String> = None;
+        let mut replaying = false;
         loop {
             let (turn_id, body) = tokio::select! {
                 biased;
                 Some(note) = notes.recv() => {
                     activity.touch();
-                    if note.method != "session/update" {
+                    if replaying || note.method != "session/update" {
                         continue;
                     }
                     let mut notification = note.params;
@@ -1661,6 +1669,17 @@ impl Runner {
                     }
                     Mark::TurnStarted { turn_id, ack } => {
                         turn = Some(turn_id);
+                        let _ = ack.send(());
+                        continue;
+                    }
+                    Mark::Replaying { ack } => {
+                        replaying = true;
+                        let _ = ack.send(());
+                        continue;
+                    }
+                    Mark::Replayed { ack } => {
+                        settle_replay(&mut notes).await;
+                        replaying = false;
                         let _ = ack.send(());
                         continue;
                     }
@@ -2354,9 +2373,32 @@ impl Runner {
     ) -> Outcome {
         // The agent's workspace MCP server and its proxied user servers ride
         // `session/new`, which every ACP agent accepts stdio servers on.
+        // After a disk resume the provider's transcript is still on the
+        // disk: load the session the agent last ran with, so the
+        // conversation carries over (intent-hq/intent#9236).
+        let recorded = agent
+            .resumed_from_disk
+            .then(|| self.inner.checkouts.provider_session(&agent.id))
+            .flatten()
+            .filter(|recorded| recorded.provider == agent.provider && recorded.model == agent.model);
         let setup = async {
-            intent_acp::handshake_within(connection, &launch.config, initialize_timeout).await?;
-            intent_acp::session::new_session(connection, cwd, mcp, None).await
+            let handshake =
+                intent_acp::handshake_within(connection, &launch.config, initialize_timeout)
+                    .await?;
+            if let Some(recorded) = recorded.filter(|_| {
+                intent_acp::session::supports_load_session(&handshake.initialize)
+            }) {
+                match load_recorded(agent, connection, cwd, mcp.clone(), &recorded.session_id)
+                    .await
+                {
+                    Ok(()) => return Ok(recorded.session_id),
+                    Err(error) => {
+                        tracing::warn!(agent = %agent.id, %error, "node: could not load the agent's provider session; starting a new one");
+                    }
+                }
+            }
+            let session = intent_acp::session::new_session(connection, cwd, mcp, None).await?;
+            Ok::<_, intent_acp::AcpError>(session.session_id.to_string())
         };
         let session = tokio::select! {
             result = setup => match result {
@@ -2401,9 +2443,21 @@ impl Runner {
         let _ = agent.marks.send(Mark::Started {
             base_commit: agent.base_commit.clone(),
         });
+        let recorded = ProviderSession {
+            session_id: session.clone(),
+            provider: agent.provider.clone(),
+            model: agent.model.clone(),
+        };
+        if let Err(error) = self
+            .inner
+            .checkouts
+            .record_provider_session(&agent.id, &recorded)
+        {
+            tracing::warn!(agent = %agent.id, error = %format!("{error:#}"), "node: could not record the agent's provider session");
+        }
         ready.send_replace(Some(Arc::new(Ready {
             connection: connection.clone(),
-            session_id: session.session_id.to_string(),
+            session_id: session,
         })));
         tokio::select! {
             status = child.wait() => Outcome::Exited(status.ok().and_then(|s| s.code())),
@@ -3188,6 +3242,47 @@ fn exit_detail(exit_code: Option<i32>, error: Option<&str>) -> String {
         (Some(error), _) => format!("the agent has exited ({error})"),
         (None, Some(code)) => format!("the provider exited with status {code}"),
         (None, None) => "the agent has exited".to_owned(),
+    }
+}
+
+/// Load the agent's recorded provider session `session_id`; the history
+/// the provider replays is never journaled.
+async fn load_recorded(
+    agent: &Agent,
+    connection: &Connection,
+    cwd: &std::path::Path,
+    mcp: Vec<intent_acp::session::McpServer>,
+    session_id: &str,
+) -> Result<(), intent_acp::AcpError> {
+    let (ack, acked) = oneshot::channel();
+    if agent.marks.send(Mark::Replaying { ack }).is_ok() {
+        let _ = acked.await;
+    }
+    let loaded = intent_acp::session::load_session(connection, session_id, cwd, mcp, None)
+        .await
+        .map(drop);
+    let (ack, acked) = oneshot::channel();
+    if agent.marks.send(Mark::Replayed { ack }).is_ok() {
+        let _ = acked.await;
+    }
+    loaded
+}
+
+/// How long the provider stays quiet before a load's replay counts as
+/// over, and the longest a replay is waited out after the load answered.
+const REPLAY_SETTLE: Duration = Duration::from_millis(50);
+const REPLAY_SETTLE_CAP: Duration = Duration::from_millis(500);
+
+/// Drop what a load still replays after its answer, until the provider is
+/// quiet for [`REPLAY_SETTLE`] or [`REPLAY_SETTLE_CAP`] passed.
+async fn settle_replay(notes: &mut mpsc::UnboundedReceiver<IncomingNotification>) {
+    let cap = tokio::time::Instant::now() + REPLAY_SETTLE_CAP;
+    loop {
+        let quiet = (tokio::time::Instant::now() + REPLAY_SETTLE).min(cap);
+        match tokio::time::timeout_at(quiet, notes.recv()).await {
+            Ok(Some(_)) if tokio::time::Instant::now() < cap => {}
+            _ => return,
+        }
     }
 }
 
