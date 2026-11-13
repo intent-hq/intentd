@@ -8,7 +8,10 @@
 //!   `sessionCapabilities.list` and `loadSession` (`sessionCapabilities.fork`
 //!   is optional);
 //! - the list is `session/list` on every importable, enabled provider in
-//!   parallel (each bounded by a timeout), merged newest first;
+//!   parallel, merged newest first. Each provider has one deadline for its
+//!   start-up and pages; the rows read before it are kept (`truncated`).
+//!   Without a `query` only the pages the requested window needs are read,
+//!   and a listing serves later calls for [`LISTING_TTL`];
 //! - the import brings the session into the workspace's checkout, then loads
 //!   it once and stores the `session/load` replay as the agent's chat
 //!   history. The agent's next turn resumes it with the ordinary
@@ -24,8 +27,10 @@
 //! 3. Otherwise the original id is loaded (`forked: false`): the provider's
 //!    session continues in Intent.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, PoisonError};
 use std::time::Duration;
 
 use intent_acp::transport::IncomingNotification;
@@ -43,6 +48,9 @@ pub const DEFAULT_LIMIT: usize = 50;
 pub const MAX_LIMIT: usize = 200;
 /// Pages read from one adapter's `session/list` at most.
 const MAX_PAGES_PER_PROVIDER: usize = 40;
+/// How long one provider's listing answers later calls (paging, search)
+/// before its adapter is started again.
+const LISTING_TTL: Duration = Duration::from_secs(30);
 /// Settle window and cap for replay notifications arriving after the
 /// `session/load` response.
 const REPLAY_SETTLE: Duration = Duration::from_millis(100);
@@ -281,11 +289,105 @@ fn decode_cursor(cursor: Option<&str>) -> Result<usize> {
     }
 }
 
+/// The sessions read from one provider's adapter, newest first (adapters
+/// list newest first, so the rows read are the provider's newest).
+#[derive(Debug)]
+struct ProviderSessions {
+    sessions: Vec<Value>,
+    /// The adapter has pages this listing did not read: the rows already
+    /// covered the requested window.
+    more: bool,
+    /// The deadline, the page cap or a page failure ended the listing.
+    truncated: bool,
+}
+
+impl ProviderSessions {
+    /// Whether this listing answers a call that needs the newest `need` rows.
+    fn covers(&self, need: usize) -> bool {
+        !self.more || self.sessions.len() >= need
+    }
+}
+
 /// Outcome of listing one provider.
 enum ProviderListing {
-    Ok(Vec<Value>),
+    Ok(Arc<ProviderSessions>),
     Unsupported,
     Error(String),
+}
+
+struct CachedListing {
+    listing: Arc<ProviderSessions>,
+    at: tokio::time::Instant,
+}
+
+/// The last listing of each provider. A provider's slot is held while it is
+/// listed, so concurrent calls wait for one adapter instead of each starting
+/// their own.
+type ListingSlot = Arc<tokio::sync::Mutex<Option<CachedListing>>>;
+
+static LISTINGS: LazyLock<std::sync::Mutex<HashMap<String, ListingSlot>>> =
+    LazyLock::new(Default::default);
+
+fn listing_slot(provider: &str) -> ListingSlot {
+    LISTINGS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(provider.to_owned())
+        .or_default()
+        .clone()
+}
+
+/// `provider`'s sessions: the cached listing when it is fresh and covers
+/// `need` rows, else a new one (cached when it lists anything).
+async fn cached_or_list(
+    manager: &crate::AgentManager,
+    provider: &str,
+    cwd: &Path,
+    need: usize,
+) -> ProviderListing {
+    let slot = listing_slot(provider);
+    let mut cached = slot.lock().await;
+    if let Some(entry) = cached.as_ref() {
+        if entry.at.elapsed() < LISTING_TTL && entry.listing.covers(need) {
+            return ProviderListing::Ok(entry.listing.clone());
+        }
+    }
+    let listing = list_one_provider(manager, provider, cwd, need).await;
+    if let ProviderListing::Ok(sessions) = &listing {
+        *cached = Some(CachedListing {
+            listing: sessions.clone(),
+            at: tokio::time::Instant::now(),
+        });
+    }
+    listing
+}
+
+/// The title and folder of `session_id` in `provider`'s cached listing,
+/// when a fresh listing holds it.
+fn cached_listed(provider: &str, session_id: &str) -> Option<(Option<String>, Option<String>)> {
+    let slot = listing_slot(provider);
+    let cached = slot.try_lock().ok()?;
+    let entry = cached.as_ref().filter(|e| e.at.elapsed() < LISTING_TTL)?;
+    entry
+        .listing
+        .sessions
+        .iter()
+        .find(|s| s["sessionId"].as_str() == Some(session_id))
+        .map(listed_fields)
+}
+
+/// The trimmed `title` and `cwd` of a `session/list` row.
+fn listed_fields(row: &Value) -> (Option<String>, Option<String>) {
+    let title = row["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned);
+    let cwd = row["cwd"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned);
+    (title, cwd)
 }
 
 impl Services {
@@ -345,6 +447,18 @@ impl Services {
             )));
         }
         let offset = decode_cursor(params.cursor.as_deref())?;
+        let query = params
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty());
+        // A search filters every row; a plain page needs each provider's
+        // newest `offset + limit` only.
+        let need = if query.is_some() {
+            usize::MAX
+        } else {
+            offset.saturating_add(limit)
+        };
         let candidates = self.import_candidates(params.provider.as_deref())?;
         let manager = self.require_import_manager()?;
         let cwd = std::env::temp_dir();
@@ -364,15 +478,7 @@ impl Services {
                         ProviderListing::Error("provider is not enabled".into()),
                     );
                 }
-                let listing = match tokio::time::timeout(
-                    provider_timeout(),
-                    list_one_provider(&manager, &provider, &cwd),
-                )
-                .await
-                {
-                    Ok(listing) => listing,
-                    Err(_) => ProviderListing::Error("timed out".into()),
-                };
+                let listing = cached_or_list(&manager, &provider, &cwd, need).await;
                 (index, listing)
             });
         }
@@ -387,17 +493,23 @@ impl Services {
             .map(|l| l.unwrap_or_else(|| ProviderListing::Error("listing task failed".into())));
         let mut rows = Vec::new();
         let mut providers = Vec::new();
+        let mut more = false;
         for (provider, listing) in candidates.iter().zip(listings) {
             let label = intent_providers::provider_config(provider).display_name;
             match listing {
-                ProviderListing::Ok(sessions) => {
-                    providers.push(json!({ "id": provider, "label": label, "status": "ok" }));
-                    rows.extend(sessions.into_iter().filter_map(|raw| {
+                ProviderListing::Ok(listed) => {
+                    let mut status = json!({ "id": provider, "label": label, "status": "ok" });
+                    if listed.truncated {
+                        status["truncated"] = json!(true);
+                    }
+                    providers.push(status);
+                    more |= listed.more;
+                    rows.extend(listed.sessions.iter().filter_map(|raw| {
                         raw["sessionId"].as_str().filter(|id| !id.is_empty())?;
                         let updated_at = raw["updatedAt"].as_str().map(str::to_owned);
                         Some(Listed {
                             provider: provider.clone(),
-                            raw,
+                            raw: raw.clone(),
                             updated_at,
                         })
                     }));
@@ -409,12 +521,7 @@ impl Services {
                 ),
             }
         }
-        if let Some(query) = params
-            .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|q| !q.is_empty())
-        {
+        if let Some(query) = query {
             let needle = query.to_lowercase();
             rows.retain(|row| row.matches(&needle));
         }
@@ -428,7 +535,7 @@ impl Services {
             .collect();
         attach_repo_roots(&mut page).await;
         let mut out = json!({ "sessions": page, "providers": providers });
-        if offset + limit < rows.len() {
+        if offset + limit < rows.len() || more {
             out["nextCursor"] = json!(format!("o:{}", offset + limit));
         }
         Ok(out)
@@ -569,7 +676,10 @@ impl Services {
                 "provider: \"{provider}\" cannot load its sessions"
             )));
         }
-        let (title, listed_cwd) = find_listed(adapter, source_id).await;
+        let (title, listed_cwd) = match cached_listed(provider, source_id) {
+            Some(found) => found,
+            None => find_listed(adapter, source_id).await,
+        };
         let mut source_cwd = listed_cwd;
         let timeout = provider_timeout().max(Duration::from_secs(60));
         let mut relocated: Option<PathBuf> = None;
@@ -722,49 +832,110 @@ fn claude_config_dir(overlay: Option<&intent_acp::ProfileEnv>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".claude"))
 }
 
+/// How one provider's paging ended.
+enum ListEnd {
+    /// The adapter has no more pages.
+    Done,
+    /// The rows cover the requested window; the adapter has more.
+    Enough,
+    PageCap,
+    TimedOut,
+    Failed(String),
+}
+
+/// Start `provider`'s adapter and read `session/list` pages until it has no
+/// more, the rows cover `need`, or the provider's deadline passes. The rows
+/// read before a deadline or a failure are kept.
 async fn list_one_provider(
     manager: &crate::AgentManager,
     provider: &str,
     cwd: &Path,
+    need: usize,
 ) -> ProviderListing {
-    let adapter = match manager.open_scratch_adapter(provider, cwd).await {
-        Ok(adapter) => adapter,
-        Err(error) => return ProviderListing::Error(error.to_string()),
+    let budget = provider_timeout();
+    let deadline = tokio::time::Instant::now() + budget;
+    let adapter = match tokio::time::timeout_at(
+        deadline,
+        manager.open_scratch_adapter(provider, cwd),
+    )
+    .await
+    {
+        Ok(Ok(adapter)) => adapter,
+        Ok(Err(error)) => return ProviderListing::Error(error.to_string()),
+        Err(_) => {
+            tracing::warn!(
+                provider,
+                budget_ms = budget.as_millis(),
+                "importable sessions listing timed out starting the adapter"
+            );
+            return ProviderListing::Error("timed out".into());
+        }
     };
-    let listing = if adapter.capabilities.importable() {
-        let mut sessions = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut failure = None;
-        for _ in 0..MAX_PAGES_PER_PROVIDER {
-            match intent_acp::session_import::list_sessions(
+    if !adapter.capabilities.importable() {
+        adapter.close().await;
+        return ProviderListing::Unsupported;
+    }
+    let mut sessions = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    let end = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let page = tokio::time::timeout(
+            remaining,
+            intent_acp::session_import::list_sessions(
                 adapter.connection(),
                 cursor.as_deref(),
-                provider_timeout(),
-            )
-            .await
-            {
-                Ok(page) => {
-                    sessions.extend(page.sessions);
-                    match page.next_cursor {
-                        Some(next) => cursor = Some(next),
-                        None => break,
-                    }
-                }
-                Err(error) => {
-                    failure = Some(error.to_string());
-                    break;
+                remaining,
+            ),
+        )
+        .await;
+        match page {
+            Ok(Ok(page)) => {
+                pages += 1;
+                sessions.extend(page.sessions);
+                match page.next_cursor {
+                    None => break ListEnd::Done,
+                    Some(_) if sessions.len() >= need => break ListEnd::Enough,
+                    Some(_) if pages >= MAX_PAGES_PER_PROVIDER => break ListEnd::PageCap,
+                    Some(next) => cursor = Some(next),
                 }
             }
+            Ok(Err(error)) if tokio::time::Instant::now() < deadline => {
+                break ListEnd::Failed(error.to_string())
+            }
+            _ => break ListEnd::TimedOut,
         }
-        match failure {
-            Some(error) if sessions.is_empty() => ProviderListing::Error(error),
-            _ => ProviderListing::Ok(sessions),
-        }
-    } else {
-        ProviderListing::Unsupported
     };
     adapter.close().await;
-    listing
+    let rows = sessions.len();
+    match &end {
+        ListEnd::Done | ListEnd::Enough => {}
+        ListEnd::PageCap => tracing::warn!(
+            provider,
+            pages,
+            rows,
+            "importable sessions listing stopped at the page cap"
+        ),
+        ListEnd::TimedOut => tracing::warn!(
+            provider,
+            pages,
+            rows,
+            budget_ms = budget.as_millis(),
+            "importable sessions listing timed out; keeping the rows read"
+        ),
+        ListEnd::Failed(error) => {
+            tracing::warn!(provider, pages, rows, %error, "importable sessions listing failed");
+        }
+    }
+    match end {
+        ListEnd::TimedOut if sessions.is_empty() => ProviderListing::Error("timed out".into()),
+        ListEnd::Failed(error) if sessions.is_empty() => ProviderListing::Error(error),
+        end => ProviderListing::Ok(Arc::new(ProviderSessions {
+            sessions,
+            more: matches!(end, ListEnd::Enough),
+            truncated: !matches!(end, ListEnd::Done | ListEnd::Enough),
+        })),
+    }
 }
 
 /// The listed title and folder of `session_id`, best effort (a few pages
@@ -792,16 +963,7 @@ async fn find_listed(
             .iter()
             .find(|s| s["sessionId"].as_str() == Some(session_id))
         {
-            let title = found["title"]
-                .as_str()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_owned);
-            let cwd = found["cwd"]
-                .as_str()
-                .filter(|c| !c.is_empty())
-                .map(str::to_owned);
-            return (title, cwd);
+            return listed_fields(found);
         }
         match page.next_cursor {
             Some(next) => cursor = Some(next),
