@@ -478,7 +478,12 @@ installing over SSH, and say it is Labs (turn on **SSH machine setup** in
 Settings → Advanced → Labs). With it on, the install cards also offer
 **Set it up for me over SSH** for Linux computers only (a Mac or Windows PC uses the
 command): sign in (SSH agent, key file or password; nothing is saved), confirm an unknown
-host key, and the app installs, starts, pairs and adds the machine. A server may need
+host key, and the app installs, starts, pairs and adds the machine. On a computer that
+already runs intentd it never reinstalls, restarts or changes its role: it starts a
+stopped daemon, pairs it (which may turn on remote connections and the Tailcat tunnel; the
+wizard says so) and adds it. On **Install a node**, a full backend keeps its role and also
+becomes a node (a backend set to run no agents itself gets an error). A node set up from
+the Install cards is made available without the "Make available" prompt. A server may need
 `sudo loginctl enable-linger <user>` so intentd keeps running after logout (the wizard
 shows it).
 Sources: packages/cloudlands-fe/src/features/machine-setup/,
