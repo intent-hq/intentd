@@ -136,9 +136,8 @@ If controls do not respond in a scaled embedded-browser preview, choose
 Visuals use app typography and theme colors, fit the chat width, and retain local
 inputs through theme and size changes. They cannot access external libraries,
 network resources, arbitrary app APIs, navigation, popups or embedded frames.
-**Source** shows the code; **Reload** restores the last published configuration.
-If a completed visual cannot start, it shows an error instead of loading indefinitely.
-Choose **Reload** to retry; **Source** remains available to inspect the code.
+If a visual does not load, choose **Source** to inspect its code or **Reload** to
+retry from the last published configuration.
 
 Visuals publish bounded JSON state, inputs and derived results through
 `window.intentVisual`. The host toolbar can **Save scenario** (up to six),
