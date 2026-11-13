@@ -289,7 +289,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,provider_version,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace/workspace-selectors.ts (selectHidesProviderProfileNames). -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog,BackgroundAgentSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/background-agent-settings/background-agent-settings-slice.ts (editQuickAction); packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,provider_version,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace/workspace-selectors.ts (selectHidesProviderProfileNames). -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -303,6 +303,13 @@ in the Settings sidebar's Agents group. Create one at
 existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
+
+Quick action models live under **Settings → Providers → Quick Actions**
+(`/settings?tab=providers#utility-default-model`). **Commit message** and **PR
+description** each have one model picker for the default provider; its default option
+is the provider's own default model, and effort is set in the same picker. There is no
+shared quick action model. A shared default saved by an older version still applies
+until the first change there, which copies it into each action.
 
 **Built-in coding specialists.** Developer implements directly, plans as needed,
 and delegates focused work to general agents. Lead, Coordinator, Implementor, and
