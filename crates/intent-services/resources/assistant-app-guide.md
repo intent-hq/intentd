@@ -848,6 +848,25 @@ previous opens the last, regardless of which workspace was selected before
 Home. With no open workspace tabs, these shortcuts do nothing. Customize them in
 **Settings → Input and shortcuts → Keyboard shortcuts**.
 
+<!-- Numbered navigation requires the matching frontend release. Until it ships,
+describe these bindings only when explicitly asked or testing this change.
+Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/shared/keyboard-shortcut-bindings.ts; src/store/renderer/slices/machine-rail/machine-rail-selectors.ts; src/features/machine-rail/MachineRail.svelte. -->
+
+Use **Cmd+Alt+1–9** (**Ctrl+Alt+1–9** on Windows/Linux) to select **Home**
+or a workspace tab: **1** opens Home, **2–8** open the first seven workspace
+tabs in displayed order, and **9** opens the last workspace tab. When the device
+rail is hidden, **Cmd+1–9** (**Ctrl+1–9** on Windows/Linux) also uses this
+Home/workspace numbering. User-customized shortcuts take precedence over these
+defaults.
+
+<!-- Labs (device rail): describe only when explicitly asked about the device rail
+or when developing or testing it, and say it is Labs. With the rail visible,
+Cmd+1–9 (Ctrl+1–9 on Windows/Linux) selects devices in displayed rail order:
+1–8 select the first eight devices and 9 selects the last. Own devices come before
+guest hosts, as displayed. Cmd+Alt+1–9 (Ctrl+Alt+1–9 on Windows/Linux) continues
+to select Home/workspace tabs using the numbering above whether the rail is visible
+or hidden. User-customized shortcuts take precedence. -->
+
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/AgentCard.svelte (toggle-pinned menu item); packages/cloudlands-fe/src/lib/components/workspace/{WorkspaceAgentsList.svelte,workspace-agents-list-utils.ts}; packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update pinned). -->
 
 To keep an agent at the top of a workspace's agent list, right-click it in the
