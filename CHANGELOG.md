@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.200] - 2026-11-13
+
+### 📚 Documentation
+
+- *(guide)* Ordered machine list shows status badges only for exceptions ([#3325](https://github.com/intent-hq/intentd/pull/3325))
+
+
 ## [0.11.199] - 2026-11-13
 
 ### 🚀 Features
