@@ -21,8 +21,11 @@ use crate::scrollback::{LineSnapshot, OutputChunk, Scrollback, DEFAULT_SCROLLBAC
 
 #[cfg(any(windows, test))]
 mod conpty_startup;
+mod remote;
 #[cfg(unix)]
 mod unix_io;
+
+pub use remote::{RemotePty, RemoteSpec};
 
 /// Broadcast backlog of output chunks buffered per subscriber before lagging.
 const FANOUT_CAPACITY: usize = 2048;
@@ -309,6 +312,9 @@ struct PtySession {
     /// Exit watcher thread: reaps the child, then releases `slave` once the
     /// reader has drained the queue (see `exit_watch_loop`).
     watcher: Mutex<Option<JoinHandle<()>>>,
+    /// Set for a terminal whose process runs on another machine (see
+    /// `remote.rs`).
+    remote: Option<remote::RemoteHandle>,
     /// Cached exit status, latched the first time the child is observed exited so
     /// it survives later teardown/removal (the `portable-pty` child only yields
     /// its status once).
@@ -346,6 +352,19 @@ fn observe_exit(session: &PtySession) -> Option<PtyExit> {
 
 fn internal(e: impl std::fmt::Display) -> Error {
     Error::Internal(e.to_string())
+}
+
+/// An I/O error as the service error it carries (a remote terminal's
+/// `home-unavailable`, say), else `Internal`.
+fn io_error(e: std::io::Error) -> Error {
+    let text = e.to_string();
+    match e
+        .into_inner()
+        .map(<dyn std::error::Error + Send + Sync>::downcast::<Error>)
+    {
+        Some(Ok(error)) => *error,
+        _ => Error::Internal(text),
+    }
 }
 
 /// Open a fresh PTY pair, retrying transient failures with bounded backoff
@@ -528,6 +547,7 @@ impl PtyHost {
             stop_reader,
             watcher: Mutex::new(None),
             exit: Mutex::new(None),
+            remote: None,
         });
 
         let watcher_session = Arc::clone(&session);
@@ -758,8 +778,8 @@ impl PtyHost {
     pub fn write(&self, id: PtyId, data: &[u8]) -> Result<()> {
         let session = self.get(id)?;
         let mut writer = session.writer.lock().unwrap();
-        writer.write_all(data).map_err(internal)?;
-        writer.flush().map_err(internal)?;
+        writer.write_all(data).map_err(io_error)?;
+        writer.flush().map_err(io_error)?;
         Ok(())
     }
 
@@ -778,7 +798,12 @@ impl PtyHost {
         let master = guard
             .as_ref()
             .ok_or_else(|| internal("pty master already torn down"))?;
-        master.resize(size.to_portable()).map_err(internal)
+        master
+            .resize(size.to_portable())
+            .map_err(|e| match e.downcast::<std::io::Error>() {
+                Ok(io) => io_error(io),
+                Err(other) => internal(other),
+            })
     }
 
     /// Deliver a signal to the PTY's process group (SIGINT/Ctrl-C, etc.).
@@ -792,6 +817,9 @@ impl PtyHost {
     /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn signal(&self, id: PtyId, sig: PtySignal) -> Result<()> {
         let session = self.get(id)?;
+        if let Some(remote) = &session.remote {
+            return remote.signal(sig);
+        }
         #[cfg(unix)]
         {
             let pid = session

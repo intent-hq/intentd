@@ -16,6 +16,8 @@ intent-acp = { path = "../intent-acp", version = "0.11.203" }
 intent-git = { path = "../intent-git", version = "0.11.203" }
 intent-providers = { path = "../intent-providers", version = "0.11.203" }
 intent-nodes = { path = "../intent-nodes", version = "0.11.203" }
+intent-pty = { path = "../intent-pty", version = "0.11.203" }
+base64 = { workspace = true }
 serde = { workspace = true }
 git2 = { workspace = true }
 serde_json = { workspace = true }

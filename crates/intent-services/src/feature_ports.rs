@@ -40,6 +40,20 @@ use intent_core::{
 
 use crate::Services;
 
+/// What [`RemoteLaunchPort::open_home_terminal`] starts on the home.
+#[derive(Debug, Clone)]
+pub struct HomeTerminalOpen {
+    pub mode: intent_core::node_link::PtyMode,
+    pub cols: u16,
+    pub rows: u16,
+    /// Relative to the home checkout.
+    pub cwd: Option<String>,
+    /// The directory `terminal.list` shows (the orchestrator's mirror path).
+    pub display_cwd: Option<String>,
+    pub command: Option<String>,
+    pub env: Vec<(String, String)>,
+}
+
 /// Maximum DECODED bytes per transfer chunk (`workspace.import.chunk`, and
 /// `workspace.export.read`). Base64 inflates this by 4/3 on the wire
 /// (~21.4 MiB), keeping the full JSON-RPC frame comfortably under the
@@ -1452,6 +1466,39 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<intent_core::WorkspaceHome>> {
         let _ = (svc, initial);
         Box::pin(async { Err(no_execution_node()) })
+    }
+
+    /// Dial the workspace's home machine before a terminal start (outside
+    /// the archive fence); a no-op by default.
+    ///
+    /// # Errors
+    ///
+    /// `home-unavailable` when the home's machine cannot be reached.
+    fn connect_home<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Result<()>> {
+        let _ = (svc, workspace_id);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Start a terminal (or an exec process) on the workspace's home
+    /// (nodeProtocol 19) as a remote PTY in `pty`. `None` when the
+    /// workspace has no home on a machine, so the caller runs it here.
+    ///
+    /// # Errors
+    ///
+    /// `home-unavailable` when the home's machine cannot run it now.
+    fn open_home_terminal<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        pty: &'a Arc<intent_pty::PtyHost>,
+        open: HomeTerminalOpen,
+    ) -> BoxFuture<'a, Result<Option<intent_pty::PtyId>>> {
+        let _ = (svc, workspace_id, pty, open);
+        Box::pin(async { Ok(None) })
     }
 
     /// Open the workspace's recorded home on its machine (`homeOpen`): its
