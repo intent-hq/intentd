@@ -121,14 +121,19 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
     let mirror = PathBuf::from(created["worktreePath"].as_str().unwrap());
     let base = git(&mirror, &["rev-parse", "HEAD"]);
     let home_ref = |name: &str| format!("refs/intent/ws/{ws_id}/home/{name}");
-    assert_eq!(
-        try_rev(&mirror, &home_ref("head")).as_deref(),
-        Some(base.as_str())
-    );
+    // The home opens in the background: home/head is seeded first.
+    until("home/head at the base", || {
+        (try_rev(&mirror, &home_ref("head")).as_deref() == Some(base.as_str())).then_some(())
+    })
+    .await;
 
     // The machine made the home checkout at the workspace's base.
-    let work = until("the home checkout", || home_checkout(&node_dir, &home_id)).await;
-    assert_eq!(git(&work, &["rev-parse", "HEAD"]), base);
+    // `.git` appears before `git worktree add` has checked anything out.
+    let work = until("the home checkout at the base", || {
+        home_checkout(&node_dir, &home_id)
+            .filter(|work| try_rev(work, "HEAD").as_deref() == Some(base.as_str()))
+    })
+    .await;
     assert!(work.join("README.md").is_file());
 
     // A commit there reaches home/head, the mirror and lastBackupAt.
