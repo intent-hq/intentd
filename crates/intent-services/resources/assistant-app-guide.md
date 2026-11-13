@@ -898,9 +898,11 @@ defaults.
 
 <!-- Labs (device rail): describe only when explicitly asked about the device rail
 or when developing or testing it, and say it is Labs. In the desktop app,
-Settings → Labs → Machine rail shows the machines kept in this window.
-An open machine keeps its name and icon when duplicate saved entries are hidden;
-details that are not available yet show a generic device icon and Unknown machine.
+Settings → Advanced → Labs → Machine rail shows the machines kept in this window.
+Device-detail recovery requires the frontend release containing intent-hq/cloudlands-fe#4583.
+Until that release, do not describe it as available. With that release, an open
+machine keeps its name and icon when duplicate saved entries are hidden;
+missing details show a generic device icon labeled Unknown machine.
 With the rail visible,
 Cmd+1–9 (Ctrl+1–9 on Windows/Linux) selects devices in displayed rail order:
 1–8 select the first eight devices and 9 selects the last. Own devices come before
