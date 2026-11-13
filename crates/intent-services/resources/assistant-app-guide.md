@@ -20,7 +20,10 @@ that it exists or present it as ready for general use. Ordinary setup or permiss
 requirements do not, by themselves, make a supported feature experimental.
 
 Multiplayer is always on: there is no switch to enable or disable it, and opening an
-invitation link joins directly without an enable step. Workspace sharing, guest roles,
+invitation link joins directly without an enable step. Desktop v2.334.5 and later
+show invitation prompts in the current app window; What’s New waits until those
+dialogs close. These fixes first shipped on alpha. On older desktop versions, check
+Home if a prompt does not appear while viewing another machine. Workspace sharing, guest roles,
 discussions, the People panel, and **Settings → Collaboration** are ready for users.
 Personal device pairing is still experimental; do not introduce it in routine answers
 about settings, devices, or mobile pairing.
@@ -35,7 +38,7 @@ invitations to GitLab accounts and a guest can join with a GitLab identity; on h
 that support GitLab checkout, **Add codebase → Clone** also lists GitLab projects. An
 older connected daemon shows an update note instead of the GitLab setup.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts; packages/cloudlands-fe/src/lib/components/settings/GitLabAuthConnection.svelte; packages/cloudlands-fe/src/features/onboarding/steps/OnboardingForgeStep.svelte; packages/cloudlands-fe/src/features/collaboration-auth/renderer/CollaborationSignInModal.svelte. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/deeplink/main/invite-attempt.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts; packages/cloudlands-fe/src/routes/(app)/+layout.svelte; packages/cloudlands-fe/src/lib/components/settings/GitLabAuthConnection.svelte; packages/cloudlands-fe/src/features/onboarding/steps/OnboardingForgeStep.svelte; packages/cloudlands-fe/src/features/collaboration-auth/renderer/CollaborationSignInModal.svelte. -->
 
 Workspace guest roles: the default collaborator role is Participant. The workspace owner
 can change a direct guest between Participant and Manager in Share. Managers can
