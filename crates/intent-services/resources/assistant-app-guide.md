@@ -461,8 +461,8 @@ finding the QR control.
 
 **Settings → Machines** lists **<name> (local)** first, then the backend this window
 is connected to as **<name> (connected backend)**, then saved remote connections. Each
-row shows a macOS, Windows or Linux icon and, after the version (or the **Runs agents
-for <backend>** badge), icons for the AI providers available there; hover an icon for its
+row shows a macOS, Windows or Linux icon and, after the version (or, under **Nodes**, the **Runs
+agents for <backend>** badge), icons for the AI providers available there; hover an icon for its
 name. Switched-off providers are hidden, and offline or unknown machines show no
 icons. **Add machine** opens **Set up a new machine** (when cloud machines can be added, it
 is the first item of a menu next to **Add cloud**; the machine rail's **Add machine** opens
@@ -488,7 +488,8 @@ actions can also include **Let <backend> run agents here**, which asks to confir
 listed under **Machines <backend> can run agents on**.
 Running agents on those machines is experimental. That list is in the user's order of
 preference, and its first row is marked **Preferred**: **This computer** first by default, then machines and cloud entries as they
-were added. Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
+were added. In **Where <backend> runs agents**, a row shows a status badge only when it cannot run agents (such as
+**Unreachable** or **Update required**). Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
 menu. An agent started without a **Start on** choice runs on the first row that can run
 it; a sub-agent started by an agent on this computer stays here. A backend started as an
 orchestrator (`intentd serve --orchestrator`, experimental) runs every agent on those
