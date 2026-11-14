@@ -56,7 +56,7 @@ base64 = "0.23"
 # `unstable_end_turn_token_usage` surfaces the optional end-of-turn `usage`
 # snapshot on `PromptResponse` (cumulative-per-session token counts).
 # `unstable_session_notices` keeps provider diagnostics separate from assistant text.
-agent-client-protocol = { version = "2.0", features = ["unstable_end_turn_token_usage", "unstable_session_notices"] }
+agent-client-protocol = { version = "3.2", features = ["unstable_end_turn_token_usage", "unstable_session_notices"] }
 # octocrab 0.54.9 switched its default JWT backend to aws-lc-rs, whose aws-lc-sys
 # build needs NASM and breaks the x86_64-pc-windows-gnu cross lint. Keep the
 # pre-0.54.9 defaults (ring TLS, RustCrypto JWT) spelled out explicitly, and
