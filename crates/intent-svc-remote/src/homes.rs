@@ -419,11 +419,22 @@ pub(crate) fn after_bind(shared: &Arc<Shared>, link: &NodeLink) {
         if !svc.workspace_homes() {
             return;
         }
-        crate::home_state::attach_homes(&svc, &shared, &homes).await;
+        crate::home_state::attach_homes(&svc, &homes).await;
+        let mut opened = Vec::new();
         for (workspace_id, _) in homes {
-            if let Err(error) = open_home(&svc, &workspace_id).await {
-                tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not open the workspace's home");
+            match open_home(&svc, &workspace_id).await {
+                Ok(()) => opened.push(workspace_id),
+                Err(error) => {
+                    tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not open the workspace's home");
+                }
             }
+        }
+        for workspace_id in opened {
+            let svc = svc.clone();
+            // caller-binding: allow — asks one home attached again for a backup, apart from the others
+            tokio::spawn(async move {
+                crate::home_state::push_failing(&svc, &workspace_id).await;
+            });
         }
     });
 }

@@ -119,8 +119,9 @@ pub(crate) async fn push_home(
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
     let pushed = push_once(svc, home, workspace_id).await;
-    if pushed.is_err() {
-        crate::home_state::backup_failed(svc, workspace_id, home).await;
+    match &pushed {
+        Ok(()) => crate::home_state::backup_succeeded(svc, workspace_id, home).await,
+        Err(_) => crate::home_state::backup_failed(svc, workspace_id, home).await,
     }
     pushed
 }

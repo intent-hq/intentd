@@ -401,10 +401,8 @@ async fn host_exec_and_exec_stream_of_a_workspace_with_a_home_run_on_the_home() 
         )
         .await
     }] {
-        assert!(
-            written["error"]["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("home-unavailable")),
+        assert_eq!(
+            written["error"]["data"]["code"], "home-unavailable",
             "{written}"
         );
     }

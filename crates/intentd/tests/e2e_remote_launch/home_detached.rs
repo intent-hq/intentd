@@ -4,13 +4,20 @@
 //! link-loss grace, `workspace:updated` carries `home.state: "detached"`
 //! with a new `since`, and a file call fails with `home-unavailable` and
 //! its documented data; when the machine binds again the home is
-//! `"attached"` and files work again.
+//! `"attached"` and files work again. The failing backup streak the loss
+//! began keeps `backupWarning` on until the home backs up again
+//! ("Continuous backup").
 
 use super::homes::{commit_on, home_checkout, until, HOMES};
 use super::*;
 
 /// The orchestrator's link-loss grace in this test (60 s in production).
 const GRACE: (&str, &str) = ("INTENTD_LINK_LOSS_GRACE_MS", "1500");
+
+/// How long backups fail before `backupWarning` shows in this test (15
+/// minutes in production): shorter than the grace, so the warning is on
+/// by the time the home is detached.
+const WARNING: (&str, &str) = ("INTENTD_BACKUP_WARNING_MS", "1000");
 
 /// The next `workspace:updated` of `ws_id` whose home matches `wanted`.
 async fn home_update(
@@ -51,7 +58,7 @@ async fn a_home_whose_link_is_lost_is_detached_and_attached_again_at_the_next_bi
     let (head, _, _, _) = start_backend(&head_dir, &repo).await;
     drop(head);
     super::orchestrator::orchestrator_config(&head_dir);
-    let (_head, port, cfg) = serve_backend(&head_dir, &[HOMES, GRACE]).await;
+    let (_head, port, cfg) = serve_backend(&head_dir, &[HOMES, GRACE, WARNING]).await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
@@ -115,6 +122,8 @@ async fn a_home_whose_link_is_lost_is_detached_and_attached_again_at_the_next_bi
     let detached = home_update(&mut events, &ws_id, |home| home["state"] == "detached").await;
     assert_eq!(detached["homeId"], home_id.as_str(), "{detached}");
     assert_ne!(detached["since"], attached_since.as_str(), "{detached}");
+    // Backups have failed since the link was lost, past the warning.
+    assert_eq!(detached["backupWarning"], true, "{detached}");
     id += 1;
     let row = ok(
         &mut rpc_ws,
@@ -155,8 +164,26 @@ async fn a_home_whose_link_is_lost_is_detached_and_attached_again_at_the_next_bi
     assert_eq!(again_port, machine_port, "the machine keeps its WSS port");
     let attached = home_update(&mut events, &ws_id, |home| home["state"] == "attached").await;
     assert_ne!(attached["since"], detached["since"], "{attached}");
-    // The streak the loss began ends with the bind.
-    assert_ne!(attached["backupWarning"], true, "{attached}");
+    // The bind alone does not end the streak the loss began: only a backup
+    // the orchestrator holds does, and it moves `lastBackupAt`.
+    let detached_since = detached["since"].as_str().unwrap();
+    let backed_up_since_loss = |home: &Value| {
+        home["lastBackupAt"]
+            .as_str()
+            .is_some_and(|at| at > detached_since)
+    };
+    assert!(
+        attached["backupWarning"] == true || backed_up_since_loss(&attached),
+        "the warning stays on until a backup: {attached}"
+    );
+    // The orchestrator asks the home it attached again for a backup, which
+    // ends the streak.
+    let cleared = if attached["backupWarning"] == true {
+        home_update(&mut events, &ws_id, |home| home["backupWarning"] != true).await
+    } else {
+        attached.clone()
+    };
+    assert!(backed_up_since_loss(&cleared), "{cleared}");
     id += 1;
     let read = ok(
         &mut rpc_ws,

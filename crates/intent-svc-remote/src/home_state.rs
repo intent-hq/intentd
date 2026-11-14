@@ -174,7 +174,7 @@ async fn detach_homes(shared: &std::sync::Arc<Shared>, lost_at: &str) {
             Ok(true) if shared.current_link().is_some() => {
                 // The machine bound while this ran: its bind's attach may
                 // have passed already, so undo the detach here.
-                attach_homes(svc, shared, &[(workspace_id, home)]).await;
+                attach_homes(svc, &[(workspace_id, home)]).await;
             }
             Ok(true) => {
                 tracing::info!(workspace = %workspace_id, %machine, "remote machine: the workspace's home is detached");
@@ -189,25 +189,12 @@ async fn detach_homes(shared: &std::sync::Arc<Shared>, lost_at: &str) {
     }
 }
 
-/// After a bind: each detached home of the machine is attached again, and
-/// the failing backup streak its loss began ends (the machine pushes again
-/// on its next change).
-pub(crate) async fn attach_homes(
-    svc: &Services,
-    shared: &Shared,
-    homes: &[(WorkspaceId, WorkspaceHome)],
-) {
+/// After a bind: each detached home of the machine is attached again. The
+/// failing backup streak its loss began goes on until a backup arrives
+/// ("Continuous backup": the warning holds until the next success); the
+/// bind asks each home with a streak for one (see [`push_failing`]).
+pub(crate) async fn attach_homes(svc: &Services, homes: &[(WorkspaceId, WorkspaceHome)]) {
     for (workspace_id, home) in homes {
-        if home.state == HomeState::Detached {
-            shared.home_link.backed_up(&home.home_id);
-            if let Err(error) = svc
-                .store()
-                .clear_workspace_home_backup_failure(workspace_id, &home.home_id)
-                .await
-            {
-                tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not end the home's failing backup streak");
-            }
-        }
         match svc
             .store()
             .move_workspace_home_state(
@@ -252,6 +239,64 @@ async fn record_failure(
         Err(error) => {
             tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not record a failed home backup");
         }
+    }
+}
+
+/// A backup the orchestrator asked `home` for succeeded: the orchestrator
+/// holds the home's commits as of now, so `lastBackupAt` moves and a
+/// failing streak ends (a push that moved nothing journals no
+/// `homePushed`, so this is recorded here).
+pub(crate) async fn backup_succeeded(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home: &WorkspaceHome,
+) {
+    let Some(node_id) = home.node_id.as_deref() else {
+        return;
+    };
+    match svc
+        .store()
+        .record_workspace_home_backup(
+            workspace_id,
+            &home.home_id,
+            node_id,
+            &intent_core::now_iso(),
+        )
+        .await
+    {
+        Ok(true) => {
+            if let Some(node) = svc
+                .remote_feature()
+                .and_then(|feature| feature.running_node(node_id))
+            {
+                node.shared_ref().home_link.backed_up(&home.home_id);
+            }
+            svc.publish_workspace_home_changed(workspace_id).await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not record a home backup");
+        }
+    }
+}
+
+/// After a bind opened the machine's homes: ask each home whose backups
+/// have been failing (its link was lost, or a push failed) for a backup
+/// now, so the streak ends as soon as one succeeds rather than at the
+/// home's next change.
+pub(crate) async fn push_failing(svc: &Services, workspace_id: &WorkspaceId) {
+    let Ok(Some(home)) = svc.store().get_workspace_home(workspace_id).await else {
+        return;
+    };
+    let failing = svc
+        .store()
+        .workspace_home_backup_failing_since(workspace_id, &home.home_id)
+        .await;
+    if !matches!(failing, Ok(Some(_))) {
+        return;
+    }
+    if let Err(error) = crate::home_calls::push_home(svc, &home, workspace_id).await {
+        tracing::info!(workspace = %workspace_id, %error, "remote machine: the home attached again could not back up yet");
     }
 }
 

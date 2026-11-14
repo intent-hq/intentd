@@ -12,6 +12,18 @@ use crate::Store;
 /// How long home backups may keep failing before `backupWarning` shows.
 pub const BACKUP_WARNING_AFTER: time::Duration = time::Duration::minutes(15);
 
+/// [`BACKUP_WARNING_AFTER`], or `INTENTD_BACKUP_WARNING_MS` (a test seam,
+/// like `INTENTD_LINK_LOSS_GRACE_MS`, so an e2e need not wait 15 minutes).
+fn backup_warning_after() -> time::Duration {
+    static AFTER: std::sync::OnceLock<time::Duration> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| {
+        std::env::var("INTENTD_BACKUP_WARNING_MS")
+            .ok()
+            .and_then(|ms| ms.parse::<i64>().ok())
+            .map_or(BACKUP_WARNING_AFTER, time::Duration::milliseconds)
+    })
+}
+
 const SELECT: &str = "SELECT workspace_id, home_id, node_id, cloud_machine_id, name, state, \
     since, last_backup_at, backup_failing_since FROM workspace_home";
 
@@ -34,7 +46,7 @@ fn state_from_db(text: &str) -> Result<HomeState> {
 #[must_use]
 pub fn backup_warning_in(failing_since: &str, now: time::OffsetDateTime) -> Option<time::Duration> {
     let since = parse_iso(failing_since)?;
-    Some((since + BACKUP_WARNING_AFTER - now).max(time::Duration::ZERO))
+    Some((since + backup_warning_after() - now).max(time::Duration::ZERO))
 }
 
 fn warning(failing_since: Option<&str>, now: time::OffsetDateTime) -> bool {
@@ -230,29 +242,6 @@ impl Store {
         .fetch_optional(self.write_pool())
         .await
         .map_err(db)
-    }
-
-    /// End the failing backup streak of the workspace's home `home_id`
-    /// without a backup: its machine is linked again, so backups can flow.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
-    pub async fn clear_workspace_home_backup_failure(
-        &self,
-        workspace_id: &WorkspaceId,
-        home_id: &HomeId,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE workspace_home SET backup_failing_since = NULL \
-             WHERE workspace_id = ? AND home_id = ?",
-        )
-        .bind(&workspace_id.0)
-        .bind(&home_id.0)
-        .execute(self.write_pool())
-        .await
-        .map_err(db)?;
-        Ok(())
     }
 
     /// When the failing backup streak of the workspace's home `home_id`
