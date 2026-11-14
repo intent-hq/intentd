@@ -79,6 +79,9 @@ async fn opened(m: &Machine, dir: &std::path::Path) -> (DialedLink, HomeRef, std
     next_pushed(&mut dialed, &h1).await;
     let work = worktree(dir, &h1);
     git(&work, &["init", "-q", "-b", "main"]);
+    // CI runners have no global identity; `git.agentCommit` reads the repo's.
+    git(&work, &["config", "user.name", "Test"]);
+    git(&work, &["config", "user.email", "test@example.com"]);
     std::fs::write(work.join("README.md"), "hello\n").unwrap();
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "init"]);
