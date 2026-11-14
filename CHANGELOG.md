@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.207] - 2026-11-14
+
+### 🔧 Refactor
+
+- *(settings)* Retire the shared quick action model and effort ([#3349](https://github.com/intent-hq/intentd/pull/3349))
+
+### 📚 Documentation
+
+- Describe shipped invitation dialog behavior ([#3354](https://github.com/intent-hq/intentd/pull/3354))
+- *(guide)* Needs Node.js on machine rows ([#3347](https://github.com/intent-hq/intentd/pull/3347))
+
+
 ## [0.11.206] - 2026-11-13
 
 ### 📚 Documentation
