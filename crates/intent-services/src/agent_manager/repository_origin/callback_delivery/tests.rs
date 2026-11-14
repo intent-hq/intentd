@@ -8342,7 +8342,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             ),
         ));
         executable("npx", format!(
-            "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf '11.19.0\\n'; exit 0; fi\n[ \"$#\" = 3 ] && [ \"$1\" = --workspaces=false ] && [ \"$2\" = -y ] && [ \"$3\" = {package} ] || exit 92\n[ \"$CLAUDE_CODE_EXECUTABLE\" = {runtime} ] || exit 93\nprintf '%s\\n' \"$PWD\" >> {record}\nexec {launcher}\n",
+            "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf '11.19.0\\n'; exit 0; fi\n[ \"$#\" = 4 ] && [ \"$1\" = --workspaces=false ] && [ \"$2\" = --save=true ] && [ \"$3\" = -y ] && [ \"$4\" = {package} ] || exit 92\n[ \"$CLAUDE_CODE_EXECUTABLE\" = {runtime} ] || exit 93\nprintf '%s\\n' \"$PWD\" >> {record}\nexec {launcher}\n",
             package = quoted(Path::new(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)),
             runtime = quoted(&bin.join("claude")),
             record = quoted(&scratch.join("npx-launches")),
