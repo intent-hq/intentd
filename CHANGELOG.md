@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.214] - 2026-11-14
+
+### 🚀 Features
+
+- Detach a home whose machine's link stays down, and warn on failing backups ([#3377](https://github.com/intent-hq/intentd/pull/3377))
+
+
 ## [0.11.213] - 2026-11-14
 
 ### 🚀 Features
