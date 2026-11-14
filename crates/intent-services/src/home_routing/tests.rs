@@ -12,6 +12,7 @@ fn file_git_and_search_calls_are_routed_but_hub_and_upload_calls_are_not() {
         "file-tracking.getChanges",
         "search.inFiles",
         "file.getAttachmentInfo",
+        "host.exec",
     ] {
         assert!(routed(method), "{method}");
     }
@@ -26,7 +27,7 @@ fn file_git_and_search_calls_are_routed_but_hub_and_upload_calls_are_not() {
         "file.attachmentUpload.chunk",
         "file.attachmentUpload.commit",
         "file.attachmentUpload.abort",
-        "host.exec",
+        "host.execStream",
         "terminal.create",
     ] {
         assert!(!routed(method), "{method}");
@@ -413,6 +414,30 @@ async fn search_cancel_ends_a_search_running_on_the_home() {
     }
 }
 
+#[test]
+fn an_exec_stream_cwd_maps_like_a_terminal_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let worktree = dir.path().join("work");
+    std::fs::create_dir_all(worktree.join("sub")).unwrap();
+    let under = worktree.join("sub");
+    assert_eq!(
+        exec_cwd(&worktree, &under.to_string_lossy()).unwrap(),
+        Some("sub".to_owned())
+    );
+    assert_eq!(exec_cwd(&worktree, "sub").unwrap(), Some("sub".to_owned()));
+    assert_eq!(exec_cwd(&worktree, ".").unwrap(), None);
+    assert_eq!(
+        exec_cwd(&worktree, &worktree.to_string_lossy()).unwrap(),
+        None
+    );
+    for refused in ["/etc", "../elsewhere", "sub/../../x"] {
+        assert!(
+            matches!(exec_cwd(&worktree, refused), Err(Error::InvalidParams(_))),
+            "{refused}"
+        );
+    }
+}
+
 /// A search without a `requestId` gets one here, so the home searches
 /// under the id the reply names.
 #[intent_test_macros::daemon_test]
@@ -488,4 +513,23 @@ async fn next_event(sub: &mut crate::Subscription) -> Value {
     .expect("event delivered")
     .expect("subscription open");
     serde_json::to_value(&batch[0]).unwrap()
+}
+
+#[test]
+fn a_routed_exec_waits_past_its_own_timeout() {
+    let params = |value: Value| value.as_object().cloned().unwrap();
+    assert_eq!(
+        call_timeout("host.exec", &params(json!({ "timeoutMs": 2_000 }))),
+        Duration::from_secs(2) + EXEC_REPLY_MARGIN
+    );
+    // Capped as a local exec caps it.
+    assert_eq!(
+        call_timeout("host.exec", &params(json!({ "timeoutMs": u64::MAX }))),
+        Duration::from_millis(crate::host_exec::MAX_TIMEOUT_MS) + EXEC_REPLY_MARGIN
+    );
+    assert_eq!(call_timeout("host.exec", &Map::new()), EXEC_UNBOUNDED);
+    assert_eq!(
+        call_timeout("file.read", &Map::new()),
+        Duration::from_secs(60)
+    );
 }

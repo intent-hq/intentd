@@ -374,7 +374,7 @@ fn script_row<'a>(list: &'a Value, name: &str) -> Option<&'a Value> {
 
 /// Whether process `pid` is gone, or a zombie its parent has yet to reap
 /// (it holds nothing then: no ports, no files).
-fn process_gone(pid: &str) -> bool {
+pub(super) fn process_gone(pid: &str) -> bool {
     if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         // The state follows the parenthesised command name.
         return stat
