@@ -278,6 +278,32 @@ async fn moving_the_home_carries_its_work_to_another_machine_and_stops_the_old_o
     let orphaned = orphaned_heads(&mirror, &ws_id);
     assert_eq!(orphaned.len(), 1, "{orphaned:?}");
     assert_eq!(git(&mirror, &["rev-parse", &orphaned[0]]), kept);
+    // The notice is written once the stop's ack is recorded.
+    let deadline = tokio::time::Instant::now() + wait();
+    loop {
+        let id = s.id();
+        let notes = ok(
+            &mut s.rpc_ws,
+            id,
+            "note.list",
+            json!({ "workspaceId": ws_id }),
+        )
+        .await;
+        let named = notes["notes"].as_array().is_some_and(|notes| {
+            notes.iter().any(|note| {
+                note["title"] == "Work left on the old home"
+                    && note["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(&orphaned[0]))
+            })
+        });
+        if named {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no notice: {notes}");
+        // timing-guard: poll until the ack's notice is written
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     drop(s.rpc_ws);
     drop(s.head);
     let store = intent_store::Store::open(&s.head_dir.join("intentd.db"))
