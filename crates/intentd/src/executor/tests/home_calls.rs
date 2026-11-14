@@ -410,20 +410,18 @@ async fn a_cancelled_or_timed_out_home_call_ends_without_a_reply() {
         runner.home_calls_for_test() == 0
     })
     .await;
-    // Neither command outlives its call.
+    // A call leaves the running calls only once its command is reaped:
+    // neither process is left by then.
     #[cfg(unix)]
     for file in ["cancelled.pid", "late.pid"] {
         let pid = std::fs::read_to_string(work.join(file)).unwrap();
-        let pid = pid.trim().to_owned();
-        until(&format!("{file} reaped"), || {
-            !std::process::Command::new("kill")
-                .args(["-0", &pid])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success()
-        })
-        .await;
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "{file}: the command outlived its call");
     }
 }
 
@@ -500,7 +498,8 @@ async fn home_attachments_survive_a_machine_restart() {
         .await
         .unwrap();
     replayed(&mut dialed).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while !services.store().home_record_ids().await.unwrap().is_empty() {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -508,5 +507,120 @@ async fn home_attachments_survive_a_machine_restart() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    node.stop().await;
+}
+
+/// Home records whose calls ignore their stop and end only when released:
+/// a cleanup that does not finish.
+struct StuckRecords {
+    release: tokio::sync::watch::Sender<bool>,
+    started: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl runner::HomeRecords for StuckRecords {
+    fn register(
+        &self,
+        _home: &HomeRef,
+        _worktree: &std::path::Path,
+    ) -> intent_core::BoxFuture<'static, anyhow::Result<intent_core::WorkspaceId>> {
+        Box::pin(async { Ok(intent_core::WorkspaceId::new_home_record()) })
+    }
+
+    fn forget(&self, _worktree: &std::path::Path) -> intent_core::BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
+
+    fn dispatch(
+        &self,
+        _method: String,
+        _params: serde_json::Map<String, Value>,
+        _stop: tokio::sync::watch::Receiver<bool>,
+    ) -> intent_core::BoxFuture<'static, Result<Value, intent_core::node_link::HomeCallError>> {
+        let mut release = self.release.subscribe();
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            let _ = release.wait_for(|released| *released).await;
+            Ok(json!({ "late": true }))
+        })
+    }
+}
+
+/// A cancelled call whose cleanup outlasts the stop budget stays a running
+/// call (its `requestId` still refused) until that cleanup really ends, and
+/// is never answered.
+#[tokio::test]
+async fn a_cancelled_call_stays_running_until_its_cleanup_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let (release, _) = tokio::sync::watch::channel(false);
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let records: Arc<dyn runner::HomeRecords> = Arc::new(StuckRecords {
+        release: release.clone(),
+        started: started.clone(),
+    });
+    let node = Running::start_with_records(
+        dir.path(),
+        MachineApi::new(),
+        CountAdmission::new(4),
+        Arc::new(HomesLaunch(true)),
+        |storage, _cache| checkout::PlainCheckouts::new(storage),
+        Some(records),
+    )
+    .await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, leasing(1, Some(Vec::new())))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    dialed.link.send(&open(&h1)).await.unwrap();
+    let opened = next_of(&mut dialed, |frame| match frame {
+        LinkFrame::HomeOpenReply(reply) => Some(reply),
+        _ => None,
+    })
+    .await;
+    assert_eq!(opened.outcome, HomeOpenOutcome::Ready);
+
+    let stuck = call_frame(&h1, "file.exists", json!({ "path": "a" }), 60_000);
+    let id = stuck.request_id;
+    let again = stuck.clone();
+    dialed.link.send(&LinkFrame::HomeCall(stuck)).await.unwrap();
+    until("the call started", || {
+        started.load(std::sync::atomic::Ordering::SeqCst) == 1
+    })
+    .await;
+    dialed
+        .link
+        .send(&LinkFrame::HomeCallCancel(HomeCallCancel {
+            request_id: id,
+        }))
+        .await
+        .unwrap();
+    // Well past the stop budget, the call is still outstanding: a call
+    // reusing its id is refused.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let runner = node.service.runners_for_test()[0].clone();
+    assert_eq!(runner.home_calls_for_test(), 1);
+    dialed.link.send(&LinkFrame::HomeCall(again)).await.unwrap();
+    let refused = next_of(&mut dialed, |frame| match frame {
+        LinkFrame::HomeCallReply(reply) => Some(reply),
+        _ => None,
+    })
+    .await;
+    assert_eq!(refused.request_id, id);
+    assert_eq!(err(&refused).0, -32602, "{refused:?}");
+    assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    release.send_replace(true);
+    until("the cleanup ended", || runner.home_calls_for_test() == 0).await;
+    // The late result is not answered.
+    let probe = call_frame(&h1, "file.exists", json!({ "path": "b" }), 30_000);
+    let probe_id = probe.request_id;
+    dialed.link.send(&LinkFrame::HomeCall(probe)).await.unwrap();
+    let answered = next_of(&mut dialed, |frame| match frame {
+        LinkFrame::HomeCallReply(reply) => Some(reply),
+        _ => None,
+    })
+    .await;
+    assert_eq!(answered.request_id, probe_id, "{answered:?}");
     node.stop().await;
 }

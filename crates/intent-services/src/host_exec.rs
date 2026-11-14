@@ -41,6 +41,10 @@ use crate::file_ops;
 #[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
+/// The longest a cancelled or timed-out command's reap waits for the killed
+/// child to exit, and then for its output pipes to close.
+const REAP_WAIT: Duration = Duration::from_secs(5);
+
 /// Wire error codes surfaced by `host.exec` (PROTOCOL §9: `-32602` for invalid
 /// params, `-32603` for internal execution failures).
 pub const INVALID_PARAMS: i32 = -32602;
@@ -542,16 +546,27 @@ async fn run_prepared(
                     HostExecError::internal(format!("command cancellation failed: {error}"))
                 })?;
             }
+            // Bounded: a child the kill cannot end (uninterruptible
+            // sleep) or a pipe an escaped process still holds open never
+            // keeps this reap waiting past [`REAP_WAIT`] each.
+            let status = match tokio::time::timeout(REAP_WAIT, child.wait()).await {
+                Ok(status) => status,
+                Err(_) => Err(std::io::Error::other(
+                    "the killed command did not exit in time",
+                )),
+            };
             // Best-effort drain of whatever the child produced pre-timeout.
-            let status = child.wait().await;
             let mut out = Vec::new();
-            if let Some(mut r) = stdout_reader.take() {
-                let _ = r.read_to_end(&mut out).await;
-            }
             let mut err = Vec::new();
-            if let Some(mut r) = stderr_reader.take() {
-                let _ = r.read_to_end(&mut err).await;
-            }
+            let _ = tokio::time::timeout(REAP_WAIT, async {
+                if let Some(mut r) = stdout_reader.take() {
+                    let _ = r.read_to_end(&mut out).await;
+                }
+                if let Some(mut r) = stderr_reader.take() {
+                    let _ = r.read_to_end(&mut err).await;
+                }
+            })
+            .await;
             (out, err, status, true)
         };
     if shutting_down {
@@ -619,13 +634,25 @@ impl HostExecRuntime {
         let tasks = self.tasks.clone();
         let (result, done) = tokio::sync::oneshot::channel();
         let Some(_handle) = self.tasks.spawn_draining(async move {
-            let ended = async move {
-                tokio::select! {
-                    () = tasks.closed() => {}
-                    () = stop => {}
+            let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ended = {
+                let stopped = stopped.clone();
+                async move {
+                    tokio::select! {
+                        () = tasks.closed() => {}
+                        () = stop => stopped.store(true, std::sync::atomic::Ordering::SeqCst),
+                    }
                 }
             };
             let outcome = run_prepared(args, cwd, ended).await;
+            // A stop reaps the command as shutdown does; it is reported as
+            // what it is.
+            let outcome = match outcome {
+                Err(_) if stopped.load(std::sync::atomic::Ordering::SeqCst) => {
+                    Err(HostExecError::internal("host.exec stopped"))
+                }
+                outcome => outcome,
+            };
             let _ = result.send(outcome);
         }) else {
             return Err(HostExecError::internal("daemon shutting down"));
@@ -753,6 +780,67 @@ mod tests {
         .await
         .unwrap();
         assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
+        store.close().await;
+    }
+
+    /// A stopped command whose output pipe an escaped process (its own
+    /// session, no longer a descendant) still holds open: the reap gives up
+    /// on the drain after its bound instead of waiting for that process.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_stopped_commands_reap_is_bounded_by_an_escaped_pipe_holder() {
+        let tmp = crate::test_support::test_tempdir("intentd-exec-reap-");
+        let store = intent_store::Store::open(&tmp.path().join("store.db"))
+            .await
+            .unwrap();
+        let services = crate::Services::new_isolated(store.clone());
+        let runtime = services.host_exec_runtime();
+        let pid_file = tmp.path().join("escaped");
+        let args = parse_args(&map(&json!({
+            "command": "sh",
+            "args": ["-c", "(setsid sh -c 'echo $$ > \"$1\"; exec sleep 60' escaped \"$1\" &); exec sleep 60", "reap-child", pid_file]
+        })))
+        .unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let call = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .run_until(&services, args, async move {
+                        let _ = stopped.await;
+                    })
+                    .await
+            })
+        };
+        let escaped = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = pid.trim().parse::<i32>() {
+                            break pid;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let started = std::time::Instant::now();
+        stop.send(()).unwrap();
+        let ended = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            call,
+        )
+        .await
+        .expect("the reap waited on the escaped process")
+        .unwrap();
+        let took = started.elapsed();
+        let escaped = nix::unistd::Pid::from_raw(escaped);
+        let _ = nix::sys::signal::kill(escaped, nix::sys::signal::Signal::SIGKILL);
+        assert!(took < REAP_WAIT * 2 + TERM_GRACE * 2, "{took:?}");
+        assert_eq!(ended.unwrap_err().message, "host.exec stopped");
         store.close().await;
     }
 

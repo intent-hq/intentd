@@ -160,6 +160,10 @@ pub(crate) trait MachineOneShot: Send + Sync {
     ) -> intent_core::BoxFuture<'static, intent_core::node_link::OneShotReply>;
 }
 
+/// A running home call: the binding generation of the link that asked for
+/// it, and the sender that ends it (taken once sent).
+type RunningHomeCall = (NodeCounter, Option<tokio::sync::oneshot::Sender<()>>);
+
 /// The machine's hidden workspace records of open home checkouts and the
 /// in-process dispatch of a backend's home calls against them
 /// (nodeProtocol 19, node-link.md "Files and git on the home").
@@ -255,10 +259,10 @@ struct Inner {
     one_shot: Option<Arc<dyn MachineOneShot>>,
     home_records: Option<Arc<dyn HomeRecords>>,
     /// Running home calls, by request id, with the binding generation of
-    /// the link that asked for them: dropping the sender ends one.
-    home_calls: Mutex<
-        HashMap<intent_core::node_link::LinkId, (NodeCounter, tokio::sync::oneshot::Sender<()>)>,
-    >,
+    /// the link that asked for them and the sender that ends one (taken
+    /// once sent: an ended call stays listed until what it started is
+    /// cleaned up).
+    home_calls: Mutex<HashMap<intent_core::node_link::LinkId, RunningHomeCall>>,
     /// Running quick actions, by request id, with the binding generation of
     /// the link that asked for them: dropping the sender ends one.
     one_shots: Mutex<

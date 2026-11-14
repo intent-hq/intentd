@@ -42,9 +42,13 @@ const COMMIT_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 const REPLY_MARGIN: Duration = Duration::from_secs(2);
 
 /// How long a call ended early (cancelled, timed out or its link gone)
-/// waits for what it started to stop: a command's process tree is reaped
-/// within this.
-const STOP_WAIT: Duration = Duration::from_secs(30);
+/// waits for what it started to stop before it logs that the cleanup is
+/// slow; it keeps waiting after.
+const STOP_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(30)
+};
 
 /// The longest a home call may run (one hour); a larger `timeoutMs` is
 /// clamped.
@@ -124,7 +128,7 @@ impl Runner {
             // first keeps running and can still be cancelled.
             std::collections::hash_map::Entry::Occupied(_) => None,
             std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert((generation, cancel));
+                slot.insert((generation, Some(cancel)));
                 Some(cancelled)
             }
         }
@@ -146,9 +150,13 @@ impl Runner {
         lock(&self.inner.home_calls).len()
     }
 
-    /// End the home call `id`; it is not answered.
+    /// End the home call `id`; it is not answered. It stays listed (its
+    /// `requestId` refused for a new call) until its cleanup is done.
     pub(in crate::executor) fn cancel_home_call(&self, id: LinkId) {
-        if let Some((_, cancel)) = lock(&self.inner.home_calls).remove(&id) {
+        let cancel = lock(&self.inner.home_calls)
+            .get_mut(&id)
+            .and_then(|(_, cancel)| cancel.take());
+        if let Some(cancel) = cancel {
             let _ = cancel.send(());
         }
     }
@@ -156,16 +164,13 @@ impl Runner {
     /// End every home call link generation `generation` asked for: that
     /// link is gone, and the backend fails them itself.
     pub(in crate::executor) fn cancel_binding_home_calls(&self, generation: NodeCounter) {
-        let mut calls = lock(&self.inner.home_calls);
-        let ended: Vec<_> = calls
-            .iter()
-            .filter(|(_, (owner, _))| *owner == generation)
-            .map(|(id, _)| *id)
+        let ended: Vec<_> = lock(&self.inner.home_calls)
+            .values_mut()
+            .filter(|(owner, _)| *owner == generation)
+            .filter_map(|(_, cancel)| cancel.take())
             .collect();
-        for id in ended {
-            if let Some((_, cancel)) = calls.remove(&id) {
-                let _ = cancel.send(());
-            }
+        for cancel in ended {
+            let _ = cancel.send(());
         }
     }
 
@@ -190,10 +195,17 @@ impl Runner {
             Ok(()) = cancelled => None,
         };
         if answer.is_none() {
-            // Ended early: what the call started (a command) is stopped and
-            // cleaned up before the call counts as ended.
+            // Ended early: what the call started (a command) is stopped,
+            // and the call counts as ended (and leaves the running calls)
+            // only once that cleanup is confirmed, however long it takes.
             stop.send_replace(true);
-            let _ = tokio::time::timeout(STOP_WAIT, &mut answering).await;
+            if tokio::time::timeout(STOP_WAIT, &mut answering)
+                .await
+                .is_err()
+            {
+                tracing::warn!(request = %id, "node: an ended home call's cleanup is still running");
+                let _ = answering.await;
+            }
         }
         lock(&self.inner.home_calls).remove(&id);
         let (result, shown) = answer?;
