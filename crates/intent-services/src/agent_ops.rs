@@ -8417,6 +8417,12 @@ impl Services {
                 manager.retire(&session.id).await;
             }
         }
+        // Its temp folder goes now, or when a still-running process ends.
+        if let Some(manager) = self.agent_manager() {
+            manager
+                .remove_agent_tmp_dirs(std::slice::from_ref(&session.id))
+                .await;
+        }
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Drop the retired agent's event subscriptions: the wake target is
         // inert, so matching/batching for it is pure leak (same rationale
@@ -8532,6 +8538,7 @@ impl Services {
         }
         if let Some(manager) = self.agent_manager() {
             manager.restore_retired(&agent_id);
+            manager.keep_agent_tmp_dirs(std::slice::from_ref(&agent_id));
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         crate::publish_event(

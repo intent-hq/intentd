@@ -12,9 +12,10 @@
 //! by its process: the idle reaper, memory pressure, a model switch and a
 //! daemon restart all relaunch the provider between turns, and the agent must
 //! find the files it left in `$TMPDIR` on the previous turn. The folder
-//! therefore outlives each process and is reclaimed by
-//! [`sweep_agent_tmp_root`] once no launch holds it and it has sat unused for
-//! [`AGENT_TMP_MAX_IDLE`].
+//! therefore outlives each process. It is removed when the agent is deleted,
+//! retired or its workspace archived ([`remove_agent_tmp_dir`]), and
+//! otherwise reclaimed by [`sweep_agent_tmp_root`] once no launch holds it
+//! and it has sat unused for [`AGENT_TMP_MAX_IDLE`].
 //!
 //! The folders live under a per-daemon root in the OS temp dir
 //! ([`agent_tmp_root`]), not under the data dir: tools put Unix sockets in
@@ -53,8 +54,8 @@ struct Holders {
     /// Live [`AgentTempDir`]s (a relaunch can overlap the previous
     /// process's teardown).
     count: usize,
-    /// The agent was deleted while a holder was live: remove the folder when
-    /// the last one is dropped.
+    /// The agent was deleted, retired or archived while a holder was live:
+    /// remove the folder when the last one is dropped.
     remove_on_release: bool,
 }
 
@@ -250,8 +251,9 @@ fn agent_dir_path(root: &Path, agent_key: &str) -> PathBuf {
     root.join(format!("{AGENT_TMP_DIR_PREFIX}{hash:012x}"))
 }
 
-/// Remove `agent_key`'s folder under `root` because the agent was deleted.
-/// A folder a live launch still holds is removed when the last holder drops.
+/// Remove `agent_key`'s folder under `root` because the agent was deleted,
+/// retired or archived. A folder a live launch still holds is removed when
+/// the last holder drops, unless [`keep_agent_tmp_dir`] cancels it first.
 pub fn remove_agent_tmp_dir(root: &Path, agent_key: &str) {
     let path = agent_dir_path(root, agent_key);
     let aside = {
@@ -264,6 +266,15 @@ pub fn remove_agent_tmp_dir(root: &Path, agent_key: &str) {
     };
     if let Some(aside) = aside {
         remove_entry(&aside);
+    }
+}
+
+/// Cancel a removal [`remove_agent_tmp_dir`] deferred to the last release
+/// of `agent_key`'s folder, because the agent is back in service (restored
+/// or unarchived). An already removed folder stays removed.
+pub fn keep_agent_tmp_dir(root: &Path, agent_key: &str) {
+    if let Some(holders) = in_use().get_mut(&agent_dir_path(root, agent_key)) {
+        holders.remove_on_release = false;
     }
 }
 
@@ -552,6 +563,24 @@ mod tests {
         drop(b);
         assert!(!path.exists(), "the last release removes it");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn keep_cancels_a_deferred_removal() {
+        let base = base();
+        let root = base.path().join("root");
+        prepare_agent_tmp_root(&root).unwrap();
+        let held = AgentTempDir::for_agent(&root, "back").unwrap();
+        let path = held.path().to_path_buf();
+        remove_agent_tmp_dir(&root, "back");
+        keep_agent_tmp_dir(&root, "back");
+        drop(held);
+        assert!(path.is_dir(), "a kept folder survives the last release");
+
+        keep_agent_tmp_dir(&root, "never-launched");
+        remove_agent_tmp_dir(&root, "back");
+        keep_agent_tmp_dir(&root, "back");
+        assert!(!path.exists(), "keep cannot undo a removal already done");
     }
 
     #[test]

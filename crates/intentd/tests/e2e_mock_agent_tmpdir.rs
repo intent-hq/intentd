@@ -5,7 +5,9 @@
 //! not its process: after the idle reaper kills both processes, a relaunched
 //! agent gets the same folder with the file its previous process wrote. The
 //! sweep reclaims an idle agent's folder but never one a live launch holds,
-//! and deleting the agent removes its folder.
+//! and deleting the agent removes its folder. Retiring an agent or archiving
+//! its workspace removes the folder too (when its process ends, if it still
+//! runs); a restore or unarchive before then keeps it.
 //!
 //! The mock fixture's `MOCK_AGENT_SESSION_LOG` + `MOCK_AGENT_LOG_TMPDIR`
 //! seam records what the child saw at `session/new`. Gated on `node` and the
@@ -257,4 +259,193 @@ async fn agent_tmpdir_is_private_and_survives_relaunch() {
     );
 
     manager.shutdown().await;
+}
+
+struct Harness {
+    services: Services,
+    manager: Arc<AgentManager>,
+    provider: ProviderConfig,
+    ws: WorkspaceId,
+    cwd: PathBuf,
+    scratch: PathBuf,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+impl Harness {
+    async fn new() -> Option<Self> {
+        let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+            format!(
+                "{}/tests/fixtures/mock-acp-agent.mjs",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+        if intent_providers::resolve_on_path("node").is_none() || !Path::new(&script).exists() {
+            eprintln!("skipping tmpdir E2E: node or the mock script is missing");
+            return None;
+        }
+        let db_dir = common::test_tempdir("intentd-e2e-tmpdir-");
+        let store = Store::open(&db_dir.path().join("intentd.db"))
+            .await
+            .expect("open store");
+        let bus = EventBus::new(store.clone());
+        let ws_root = common::hermetic_workspaces_root();
+        let services = Services::new_isolated(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
+            .with_event_bus(bus.clone());
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("insert ws");
+        let script_static: &'static str = Box::leak(script.into_boxed_str());
+        let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+        let provider = ProviderConfig {
+            command: "node",
+            base_args,
+            supports_authenticate: true,
+            supports_mcp_config: true,
+            mcp_config_flag: Some("--mcp-config"),
+            ..*intent_providers::find_provider("mock").unwrap()
+        };
+        let scratch = common::test_tempdir_in("/tmp", "itd-agtmp-");
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        let manager = Arc::new(
+            AgentManager::new(services.clone(), sink, 8)
+                .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"))
+                .with_agent_tmp_root(scratch.path().join("root")),
+        );
+        services.attach_agent_manager(&manager);
+        let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+        Some(Self {
+            services,
+            manager,
+            provider,
+            ws,
+            cwd: cwd_dir.path().to_path_buf(),
+            scratch: scratch.path().to_path_buf(),
+            _dirs: vec![db_dir, ws_root, scratch, cwd_dir],
+        })
+    }
+
+    /// Create and launch an agent; returns it and the file its child left
+    /// in its temp folder.
+    async fn agent(&self, tag: &str) -> (AgentId, PathBuf) {
+        let created = self
+            .services
+            .agent_create(
+                self.ws.clone(),
+                Some(format!("Tmp {tag}")),
+                None,
+                None,
+                None,
+                None,
+                intent_core::AgentCreateExtra::default(),
+            )
+            .await
+            .expect("create agent");
+        let agent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let report = launch(
+            &self.manager,
+            &self.provider,
+            &self.ws,
+            &agent_id,
+            &self.cwd,
+            &self.scratch,
+            tag,
+        )
+        .await;
+        let file = PathBuf::from(report.raw["mktemp"].as_str().expect("mktemp ran"));
+        assert!(file.is_file(), "{tag}: the agent wrote into its folder");
+        (agent_id, file)
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn retire_and_archive_remove_agent_tmpdirs() {
+    let Some(h) = Harness::new().await else {
+        return;
+    };
+    let ws = Some(h.ws.clone());
+
+    // Retire after the process ended: the folder goes at once.
+    let (stopped, stopped_file) = h.agent("retire-stopped").await;
+    assert!(h.manager.stop(&stopped).await);
+    h.services
+        .agent_retire(stopped.clone(), ws.clone(), None)
+        .await
+        .expect("retire stopped agent");
+    assert!(
+        !stopped_file.parent().unwrap().exists(),
+        "retiring an agent removes its folder"
+    );
+
+    // Retire while the process runs (self-retire keeps it alive): the
+    // folder goes when the process ends.
+    let (running, running_file) = h.agent("retire-running").await;
+    h.services
+        .agent_retire(running.clone(), ws.clone(), None)
+        .await
+        .expect("retire running agent");
+    assert!(running_file.is_file(), "a live process keeps its folder");
+    assert!(h.manager.stop(&running).await);
+    assert!(
+        !running_file.parent().unwrap().exists(),
+        "the folder goes once the retired agent's process ends"
+    );
+
+    // Restore before the process ends: the folder stays.
+    let (restored, restored_file) = h.agent("retire-restored").await;
+    h.services
+        .agent_retire(restored.clone(), ws.clone(), None)
+        .await
+        .expect("retire agent");
+    h.services
+        .agent_restore(restored.clone(), ws.clone())
+        .await
+        .expect("restore agent");
+    assert!(h.manager.stop(&restored).await);
+    assert!(
+        restored_file.is_file(),
+        "a restored agent keeps its temp files"
+    );
+
+    // Archive: a stopped agent's folder goes at once, a running agent's
+    // when its process ends, unless the workspace is unarchived first.
+    let (idle, idle_file) = h.agent("archive-idle").await;
+    assert!(h.manager.stop(&idle).await);
+    let (live, live_file) = h.agent("archive-live").await;
+    h.services
+        .archive_workspace(h.ws.clone(), None)
+        .await
+        .expect("archive");
+    assert!(
+        !idle_file.parent().unwrap().exists(),
+        "archiving removes an idle agent's folder"
+    );
+    assert!(live_file.is_file(), "a live process keeps its folder");
+    assert!(
+        !restored_file.parent().unwrap().exists(),
+        "archiving removes every agent's folder"
+    );
+    h.services
+        .unarchive_workspace(h.ws.clone())
+        .await
+        .expect("unarchive");
+    assert!(h.manager.stop(&live).await);
+    assert!(
+        live_file.is_file(),
+        "an agent unarchived before its process ended keeps its files"
+    );
+
+    h.services
+        .archive_workspace(h.ws.clone(), None)
+        .await
+        .expect("archive again");
+    assert!(
+        !live_file.parent().unwrap().exists(),
+        "archiving removes a stopped agent's folder"
+    );
+
+    h.manager.shutdown().await;
 }

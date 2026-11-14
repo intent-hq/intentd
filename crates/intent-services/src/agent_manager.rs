@@ -3458,9 +3458,9 @@ impl AgentManager {
         Some(root.clone())
     }
 
-    /// Remove the private temp folders of deleted agents. Call after their
-    /// runtimes are stopped; a folder a late teardown still holds goes when
-    /// that holder drops.
+    /// Remove the private temp folders of deleted, retired or archived
+    /// agents. Call after their runtimes are stopped; a folder a live process
+    /// still holds goes when that holder drops.
     pub async fn remove_agent_tmp_dirs(&self, agent_ids: &[AgentId]) {
         let Some(root) = self.agent_tmp_root.clone() else {
             return;
@@ -3474,6 +3474,17 @@ impl AgentManager {
         .await;
         if let Err(e) = removed {
             tracing::warn!(error = %e, "agent temp folder removal task failed");
+        }
+    }
+
+    /// Cancel the deferred removal of restored or unarchived agents' temp
+    /// folders (see [`Self::remove_agent_tmp_dirs`]).
+    pub fn keep_agent_tmp_dirs(&self, agent_ids: &[AgentId]) {
+        let Some(root) = self.agent_tmp_root.as_deref() else {
+            return;
+        };
+        for id in agent_ids {
+            intent_core::keep_agent_tmp_dir(root, &id.0);
         }
     }
 

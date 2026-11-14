@@ -35791,6 +35791,16 @@ impl Services {
         if let Some(manager) = manager {
             match store.list_agent_session_summaries(&id).await {
                 Ok(sessions) => {
+                    // Keep the temp folders the archive left to running
+                    // processes; a retired agent's still go.
+                    if flipped {
+                        let active: Vec<AgentId> = sessions
+                            .iter()
+                            .filter(|s| s.retired_at.is_none())
+                            .map(|s| s.id.clone())
+                            .collect();
+                        manager.keep_agent_tmp_dirs(&active);
+                    }
                     for session in sessions {
                         if self.has_ready_to_send(&session.id) {
                             manager
@@ -38974,6 +38984,25 @@ impl Services {
         self.archive_workspace_inner(id, caller_agent_id, automatic, true)
     }
 
+    /// Remove the temp folders of every agent in `id` (archive). A folder a
+    /// running process holds goes when it ends, unless unarchive keeps it.
+    async fn remove_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) {
+        let Some(manager) = self.agent_manager() else {
+            return;
+        };
+        match self.store.list_agent_session_summaries(id).await {
+            Ok(sessions) => {
+                let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
+                manager.remove_agent_tmp_dirs(&ids).await;
+            }
+            Err(e) => tracing::warn!(
+                workspace = %id.as_str(),
+                error = %e,
+                "workspace.archive: agent listing failed; temp folders left to the idle sweep"
+            ),
+        }
+    }
+
     /// [`Self::archive_workspace_with_mode`]; with `run_archive_script` the
     /// committed archive starts the workspace's `archiveScript` in the
     /// background. Retire passes `false`: it runs the script itself, and
@@ -39222,6 +39251,8 @@ impl Services {
                     }
                 };
                 if still_archived {
+                    // Under the fence, so an unarchive's keep runs after it.
+                    this.remove_workspace_agent_tmp_dirs(&ws.id).await;
                     publish_event(
                         bus.as_ref(),
                         workspace_updated_event(
