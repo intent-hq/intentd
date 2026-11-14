@@ -164,21 +164,26 @@ pub(crate) trait MachineOneShot: Send + Sync {
 /// in-process dispatch of a backend's home calls against them
 /// (nodeProtocol 19, node-link.md "Files and git on the home").
 pub(crate) trait HomeRecords: Send + Sync {
-    /// Create a hidden record ([`intent_core::WorkspaceId::new_home_record`])
-    /// whose checkout is `worktree`.
+    /// The hidden record ([`intent_core::WorkspaceId::new_home_record`])
+    /// whose checkout is `worktree`: the one an earlier open of the same
+    /// checkout made (kept across reopens and restarts, so what calls
+    /// stored under it stays), or a new one.
     fn register(
         &self,
         home: &intent_core::node_link::HomeRef,
         worktree: &std::path::Path,
     ) -> intent_core::BoxFuture<'static, anyhow::Result<intent_core::WorkspaceId>>;
-    /// Remove a record [`Self::register`] made.
-    fn remove(&self, record: intent_core::WorkspaceId) -> intent_core::BoxFuture<'static, ()>;
+    /// Remove the record [`Self::register`] made for `worktree`: its home
+    /// is being removed.
+    fn forget(&self, worktree: &std::path::Path) -> intent_core::BoxFuture<'static, ()>;
     /// Run `method` with `params` (whose `workspaceId` names the record) as
-    /// the daemon does for a client, as the daemon caller.
+    /// the daemon does for a client, as the daemon caller. When `stop`
+    /// turns `true` the call ends early, a command it started reaped first.
     fn dispatch(
         &self,
         method: String,
         params: serde_json::Map<String, serde_json::Value>,
+        stop: tokio::sync::watch::Receiver<bool>,
     ) -> intent_core::BoxFuture<
         'static,
         Result<serde_json::Value, intent_core::node_link::HomeCallError>,

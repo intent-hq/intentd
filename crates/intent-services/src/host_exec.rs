@@ -599,11 +599,33 @@ impl HostExecRuntime {
         api: &dyn WorkspaceApi,
         args: HostExecArgs,
     ) -> Result<Value, HostExecError> {
+        self.run_until(api, args, std::future::pending()).await
+    }
+
+    /// [`Self::run`], ended early when `stop` resolves: the command's
+    /// process tree is reaped as at shutdown, and the call returns only
+    /// after that cleanup.
+    ///
+    /// # Errors
+    /// Returns validation/execution errors, or an internal error when
+    /// stopped or shutting down.
+    pub async fn run_until(
+        &self,
+        api: &dyn WorkspaceApi,
+        args: HostExecArgs,
+        stop: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<Value, HostExecError> {
         let cwd = prepare(api, &args, &AllowAllPolicy).await?;
         let tasks = self.tasks.clone();
         let (result, done) = tokio::sync::oneshot::channel();
         let Some(_handle) = self.tasks.spawn_draining(async move {
-            let outcome = run_prepared(args, cwd, tasks.closed()).await;
+            let ended = async move {
+                tokio::select! {
+                    () = tasks.closed() => {}
+                    () = stop => {}
+                }
+            };
+            let outcome = run_prepared(args, cwd, ended).await;
             let _ = result.send(outcome);
         }) else {
             return Err(HostExecError::internal("daemon shutting down"));

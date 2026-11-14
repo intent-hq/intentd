@@ -348,12 +348,12 @@ async fn home_calls_refuse_escapes_unknown_methods_and_oversized_replies() {
 async fn a_cancelled_or_timed_out_home_call_ends_without_a_reply() {
     let dir = tempfile::tempdir().unwrap();
     let m = machine(dir.path()).await;
-    let (mut dialed, h1, _work) = opened(&m, dir.path()).await;
+    let (mut dialed, h1, work) = opened(&m, dir.path()).await;
 
     let sleeping = call_frame(
         &h1,
         "host.exec",
-        json!({ "command": "sleep", "args": ["30"], "timeoutMs": 60_000 }),
+        json!({ "command": "sh", "args": ["-c", "echo $$ > cancelled.pid; exec sleep 30"], "timeoutMs": 60_000 }),
         60_000,
     );
     let cancelled = sleeping.request_id;
@@ -377,12 +377,15 @@ async fn a_cancelled_or_timed_out_home_call_ends_without_a_reply() {
     let late = call_frame(
         &h1,
         "host.exec",
-        json!({ "command": "sleep", "args": ["30"], "timeoutMs": 60_000 }),
+        json!({ "command": "sh", "args": ["-c", "echo $$ > late.pid; exec sleep 30"], "timeoutMs": 60_000 }),
         200,
     );
     let timed_out = late.request_id;
     dialed.link.send(&LinkFrame::HomeCall(late)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until("both commands started", || {
+        work.join("cancelled.pid").exists() && work.join("late.pid").exists()
+    })
+    .await;
     dialed
         .link
         .send(&LinkFrame::HomeCallCancel(HomeCallCancel {
@@ -402,6 +405,108 @@ async fn a_cancelled_or_timed_out_home_call_ends_without_a_reply() {
     .await;
     assert_eq!(answered.request_id, probe_id, "{answered:?}");
     assert!(![cancelled, timed_out].contains(&answered.request_id));
-    let calls = m.node.service.runners_for_test()[0].home_calls_for_test();
-    assert_eq!(calls, 0, "no call is left running");
+    let runner = m.node.service.runners_for_test()[0].clone();
+    until("no call is left running", || {
+        runner.home_calls_for_test() == 0
+    })
+    .await;
+    // Neither command outlives its call.
+    #[cfg(unix)]
+    for file in ["cancelled.pid", "late.pid"] {
+        let pid = std::fs::read_to_string(work.join(file)).unwrap();
+        let pid = pid.trim().to_owned();
+        until(&format!("{file} reaped"), || {
+            !std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        })
+        .await;
+    }
+}
+
+/// What calls stored under a home's record (an attachment and its
+/// `idempotencyKey`) survives the machine's restart: the home reopens with
+/// the same record.
+#[tokio::test]
+async fn home_attachments_survive_a_machine_restart() {
+    use base64::Engine as _;
+    let dir = tempfile::tempdir().unwrap();
+    let m = machine(dir.path()).await;
+    let (mut dialed, h1, _work) = opened(&m, dir.path()).await;
+    let place = json!({
+        "workspaceId": "ws-1",
+        "fileName": "note.txt",
+        "data": base64::engine::general_purpose::STANDARD.encode(b"kept bytes"),
+        "idempotencyKey": "place-1",
+    });
+    let placed = ok(call(&mut dialed, &h1, "file.placeAttachment", place.clone()).await);
+    let attachment = placed["attachmentId"].clone();
+    assert!(attachment.is_string(), "{placed}");
+    let records = m.services.store().home_record_ids().await.unwrap();
+    drop(dialed);
+
+    // Restart: the daemon purges records whose home is gone, and this one
+    // is not.
+    let Machine {
+        node,
+        services,
+        _store,
+    } = m;
+    let api = node.stop().await;
+    crate::executor::ServicesHomeRecords(services.clone())
+        .purge()
+        .await;
+    assert_eq!(services.store().home_record_ids().await.unwrap(), records);
+    let node = Running::start_with_records(
+        dir.path(),
+        api,
+        CountAdmission::new(4),
+        Arc::new(HomesLaunch(true)),
+        |storage, _cache| checkout::PlainCheckouts::new(storage),
+        Some(Arc::new(crate::executor::ServicesHomeRecords(
+            services.clone(),
+        ))),
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, leasing(2, Some(vec![h1.clone()])))
+        .await
+        .unwrap();
+    replayed(&mut dialed).await;
+
+    let info = ok(call(
+        &mut dialed,
+        &h1,
+        "file.getAttachmentInfo",
+        json!({ "workspaceId": "ws-1", "attachmentId": attachment }),
+    )
+    .await);
+    assert_eq!(info["attachmentId"], attachment, "{info}");
+    assert_eq!(info["exists"], true, "{info}");
+    let replayed_place = ok(call(&mut dialed, &h1, "file.placeAttachment", place).await);
+    assert_eq!(
+        replayed_place["attachmentId"], attachment,
+        "{replayed_place}"
+    );
+    assert_eq!(services.store().home_record_ids().await.unwrap(), records);
+
+    // A swept home takes its record with it (open homes are never swept,
+    // so it is closed first, as at a shutdown).
+    drop(dialed);
+    node.service.runners_for_test()[0].close_homes();
+    let mut dialed = dial_link(&node.endpoint, leasing(3, Some(Vec::new())))
+        .await
+        .unwrap();
+    replayed(&mut dialed).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !services.store().home_record_ids().await.unwrap().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the swept home's record stays"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    node.stop().await;
 }

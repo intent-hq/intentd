@@ -41,6 +41,11 @@ const COMMIT_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// its `backupPending` reply still reaches the backend in time.
 const REPLY_MARGIN: Duration = Duration::from_secs(2);
 
+/// How long a call ended early (cancelled, timed out or its link gone)
+/// waits for what it started to stop: a command's process tree is reaped
+/// within this.
+const STOP_WAIT: Duration = Duration::from_secs(30);
+
 /// The longest a home call may run (one hour); a larger `timeoutMs` is
 /// clamped.
 const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
@@ -176,12 +181,20 @@ impl Runner {
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(frame.timeout_ms.min(MAX_TIMEOUT_MS));
         let shown_as = frame.workspace_id.clone();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let answering = self.answer_home_call(frame, deadline, stopped);
+        tokio::pin!(answering);
         let answer = tokio::select! {
-            answer = tokio::time::timeout_at(deadline, self.answer_home_call(frame, deadline)) => {
-                answer.ok()
-            }
+            answer = &mut answering => Some(answer),
+            () = tokio::time::sleep_until(deadline) => None,
             Ok(()) = cancelled => None,
         };
+        if answer.is_none() {
+            // Ended early: what the call started (a command) is stopped and
+            // cleaned up before the call counts as ended.
+            stop.send_replace(true);
+            let _ = tokio::time::timeout(STOP_WAIT, &mut answering).await;
+        }
         lock(&self.inner.home_calls).remove(&id);
         let (result, shown) = answer?;
         Some(fit_reply(id, result, &shown.with_workspace(shown_as)))
@@ -192,6 +205,7 @@ impl Runner {
         &self,
         frame: HomeCall,
         deadline: tokio::time::Instant,
+        stopped: tokio::sync::watch::Receiver<bool>,
     ) -> (Result<Value, HomeCallError>, Hidden) {
         if !HOME_METHODS.contains(&frame.method.as_str()) {
             return (
@@ -253,10 +267,14 @@ impl Runner {
             Ok(params) => params,
             Err(error) => return (Err(error), hidden),
         };
-        let result = records.dispatch(method.clone(), params).await;
-        if WRITING_METHODS.contains(&method.as_str()) {
-            *lock(&home.wip_due) = Some(Instant::now());
-        }
+        // A write counts once tried and again whenever it ends, even
+        // cancelled, timed out or dropped with its link: it may already
+        // have changed the checkout, and the push follows the last change.
+        let writing = WRITING_METHODS
+            .contains(&method.as_str())
+            .then(|| WipDue::mark(&home));
+        let result = records.dispatch(method.clone(), params, stopped).await;
+        drop(writing);
         let result = match (method.as_str(), result) {
             ("git.agentCommit", Ok(mut committed)) => {
                 // The commit landed: a failed push still answers success, so
@@ -323,19 +341,22 @@ impl Runner {
             }
         });
     }
+}
 
-    /// Remove the hidden record of a home being closed, on its own task.
-    pub(super) fn drop_home_record(&self, home: &Arc<Home>) {
-        let Some(records) = self.inner.home_records.clone() else {
-            return;
-        };
-        let home = home.clone();
-        // caller-binding: allow — node-local removal of one home's record
-        tokio::spawn(async move {
-            if let Some(record) = home.record.lock().await.take() {
-                records.remove(record).await;
-            }
-        });
+/// Marks a home's `home/wip` push due when made and when dropped: a writing
+/// call holds one while it runs.
+struct WipDue<'a>(&'a Home);
+
+impl<'a> WipDue<'a> {
+    fn mark(home: &'a Home) -> Self {
+        *lock(&home.wip_due) = Some(Instant::now());
+        Self(home)
+    }
+}
+
+impl Drop for WipDue<'_> {
+    fn drop(&mut self) {
+        *lock(&self.0.wip_due) = Some(Instant::now());
     }
 }
 
@@ -471,13 +492,44 @@ fn trimmed(value: &Value) -> Value {
 }
 
 /// What a reply must not show: the checkout's absolute paths (made
-/// relative) and the hidden record's id (shown as the backend's workspace).
+/// relative), its git directory's (shown as `.git`), and the hidden
+/// record's id (shown as the backend's workspace).
 #[derive(Default)]
 struct Hidden {
-    /// The checkout as given and canonical, longest first.
-    roots: Vec<String>,
+    /// The paths not shown, longest first.
+    roots: Vec<Root>,
     record: Option<String>,
     workspace: Option<String>,
+}
+
+/// One absolute path a reply does not show, and what it shows instead
+/// (`""` for the checkout itself: paths in it become relative).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Root {
+    path: String,
+    shown: &'static str,
+}
+
+impl Root {
+    fn checkout(path: String) -> Self {
+        Self { path, shown: "" }
+    }
+
+    fn git_dir(path: String) -> Self {
+        Self {
+            path,
+            shown: ".git",
+        }
+    }
+
+    /// `rest` (a path under the root) as shown.
+    fn under(&self, rest: &str) -> String {
+        if self.shown.is_empty() {
+            rest.to_owned()
+        } else {
+            format!("{}/{rest}", self.shown)
+        }
+    }
 }
 
 impl Hidden {
@@ -496,41 +548,54 @@ impl Hidden {
             }
         }
         for root in &self.roots {
-            if text == root {
-                return Some(String::new());
+            if text == root.path {
+                return Some(root.shown.to_owned());
             }
             if let Some(rest) = text
-                .strip_prefix(root.as_str())
+                .strip_prefix(root.path.as_str())
                 .and_then(|rest| rest.strip_prefix('/'))
             {
-                return Some(rest.to_owned());
+                return Some(root.under(rest));
             }
         }
         None
     }
 
-    /// An error message: each checkout path in it made relative (the
-    /// checkout itself `.`), only where the root ends a path component,
-    /// and the record shown as the backend's workspace.
+    /// Text: each hidden path in it made relative (the checkout itself
+    /// `.`), only where the root ends a path component, and the record
+    /// shown as the backend's workspace.
     fn message(&self, text: &str) -> String {
         let mut text = text.to_owned();
         if let (Some(record), Some(workspace)) = (&self.record, &self.workspace) {
             text = text.replace(record.as_str(), workspace);
         }
         for root in &self.roots {
+            if !text.contains(root.path.as_str()) {
+                continue;
+            }
             let mut out = String::with_capacity(text.len());
             let mut rest = text.as_str();
-            while let Some(at) = rest.find(root.as_str()) {
+            while let Some(at) = rest.find(root.path.as_str()) {
                 out.push_str(&rest[..at]);
-                let after = &rest[at + root.len()..];
+                let after = &rest[at + root.path.len()..];
                 match after.chars().next() {
-                    Some('/') => rest = &after[1..],
+                    Some('/') => {
+                        if !root.shown.is_empty() {
+                            out.push_str(root.shown);
+                            out.push('/');
+                        }
+                        rest = &after[1..];
+                    }
                     Some(next) if next.is_alphanumeric() || "-_.".contains(next) => {
-                        out.push_str(root);
+                        out.push_str(&root.path);
                         rest = after;
                     }
                     _ => {
-                        out.push('.');
+                        out.push_str(if root.shown.is_empty() {
+                            "."
+                        } else {
+                            root.shown
+                        });
                         rest = after;
                     }
                 }
@@ -541,14 +606,25 @@ impl Hidden {
         text
     }
 
-    /// `value` with every path-shaped string and key made relative, never
-    /// touching the members of [`CONTENT_KEYS`].
+    /// `value` with every hidden path made relative: a whole path-shaped
+    /// string or key as [`Self::whole`], and one inside the text of an
+    /// object member (a git error in an ok result) as [`Self::message`].
+    /// A bare string result (`file.read`'s contents) and the members of
+    /// [`CONTENT_KEYS`] are never rewritten inside.
     fn value(&self, value: Value) -> Value {
+        self.scrub(value, false)
+    }
+
+    fn scrub(&self, value: Value, member: bool) -> Value {
         match value {
+            Value::String(text) if member => Value::String(self.text(&text)),
             Value::String(text) => Value::String(self.whole(&text).unwrap_or(text)),
-            Value::Array(items) => {
-                Value::Array(items.into_iter().map(|item| self.value(item)).collect())
-            }
+            Value::Array(items) => Value::Array(
+                items
+                    .into_iter()
+                    .map(|item| self.scrub(item, member))
+                    .collect(),
+            ),
             Value::Object(object) => Value::Object(
                 object
                     .into_iter()
@@ -556,28 +632,58 @@ impl Hidden {
                         let item = if CONTENT_KEYS.contains(&key.as_str()) {
                             item
                         } else {
-                            self.value(item)
+                            self.scrub(item, true)
                         };
-                        (self.whole(&key).unwrap_or(key), item)
+                        (self.text(&key), item)
                     })
                     .collect(),
             ),
             other => other,
         }
     }
+
+    fn text(&self, text: &str) -> String {
+        self.whole(text).unwrap_or_else(|| self.message(text))
+    }
 }
 
-/// The checkout's absolute path as given and canonical, longest first: no
-/// reply shows either.
-fn shown_roots(checkout: &Path) -> Vec<String> {
-    let mut roots = vec![checkout.to_string_lossy().into_owned()];
-    if let Ok(canonical) = std::fs::canonicalize(checkout) {
-        roots.push(canonical.to_string_lossy().into_owned());
+/// The paths no reply shows, longest first: the checkout as given and
+/// canonical, and, for a linked worktree (a `.git` file), its git
+/// directory and the repository's common one.
+fn shown_roots(checkout: &Path) -> Vec<Root> {
+    let mut roots = Vec::new();
+    let mut add = |path: &Path, make: fn(String) -> Root| {
+        roots.push(make(path.to_string_lossy().into_owned()));
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            roots.push(make(canonical.to_string_lossy().into_owned()));
+        }
+    };
+    add(checkout, Root::checkout);
+    for git_dir in linked_git_dirs(checkout) {
+        add(&git_dir, Root::git_dir);
     }
-    roots.retain(|root| !root.is_empty() && root != "/");
-    roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
-    roots.dedup();
+    roots.retain(|root| !root.path.is_empty() && root.path != "/");
+    roots.sort_by(|a, b| b.path.len().cmp(&a.path.len()).then(a.path.cmp(&b.path)));
+    roots.dedup_by(|a, b| a.path == b.path);
     roots
+}
+
+/// The git directory a linked worktree's `.git` file names, and the
+/// repository's common directory; none when `.git` is a directory (it is
+/// under the checkout then).
+fn linked_git_dirs(checkout: &Path) -> Vec<PathBuf> {
+    let Ok(link) = std::fs::read_to_string(checkout.join(".git")) else {
+        return Vec::new();
+    };
+    let Some(git_dir) = link.trim().strip_prefix("gitdir:").map(str::trim) else {
+        return Vec::new();
+    };
+    let git_dir = checkout.join(git_dir);
+    let mut dirs = vec![git_dir.clone()];
+    if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
+        dirs.push(git_dir.join(common.trim()));
+    }
+    dirs
 }
 
 /// The reply for `result`, without the checkout's absolute paths, and
@@ -720,7 +826,11 @@ mod tests {
     #[test]
     fn replies_never_show_the_checkout_path_or_the_record() {
         let hidden = Hidden {
-            roots: vec!["/srv/homes/h1/work".to_owned()],
+            roots: vec![
+                Root::git_dir("/srv/cache/r.git/worktrees/w1".to_owned()),
+                Root::checkout("/srv/homes/h1/work".to_owned()),
+                Root::git_dir("/srv/cache/r.git".to_owned()),
+            ],
             record: Some("__home__:r1".to_owned()),
             workspace: Some("ws-1".to_owned()),
         };
@@ -731,6 +841,10 @@ mod tests {
             "workspaceId": "__home__:r1",
             "content": "built in /srv/homes/h1/work/build/out",
             "hunks": [{ "patch": "+/srv/homes/h1/work/x", "path": "/srv/homes/h1/work/x" }],
+            "ok": false,
+            "error": "fatal: Unable to create '/srv/homes/h1/work/.git/index.lock': File exists.",
+            "gitError": "fatal: Unable to create '/srv/cache/r.git/worktrees/w1/index.lock' in /srv/cache/r.git",
+            "gitDir": "/srv/cache/r.git/worktrees/w1",
         }));
         assert_eq!(
             shown,
@@ -741,14 +855,56 @@ mod tests {
                 "workspaceId": "ws-1",
                 "content": "built in /srv/homes/h1/work/build/out",
                 "hunks": [{ "patch": "+/srv/homes/h1/work/x", "path": "x" }],
+                "ok": false,
+                "error": "fatal: Unable to create '.git/index.lock': File exists.",
+                "gitError": "fatal: Unable to create '.git/index.lock' in .git",
+                "gitDir": ".git",
             })
         );
+        // A bare string result is contents: only a whole path is shown
+        // relative.
+        assert_eq!(
+            hidden.value(json!("built in /srv/homes/h1/work/out")),
+            json!("built in /srv/homes/h1/work/out")
+        );
+        assert_eq!(hidden.value(json!("/srv/homes/h1/work/out")), json!("out"));
         assert_eq!(
             hidden.message(
                 "fatal: /srv/homes/h1/work/d is outside /srv/homes/h1/work; see /srv/homes/h1/work2 for __home__:r1"
             ),
             "fatal: d is outside .; see /srv/homes/h1/work2 for ws-1"
         );
+    }
+
+    #[test]
+    fn a_linked_worktree_hides_its_git_dirs_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let work = base.join("homes/h1/work");
+        let git_dir = base.join("cache/r.git/worktrees/w1");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            work.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        let hidden = Hidden {
+            roots: shown_roots(&work),
+            ..Hidden::default()
+        };
+        let common = base.join("cache/r.git");
+        let shown = hidden.value(json!({
+            "error": format!("fatal: '{}/index.lock' and {}/HEAD in {}", git_dir.display(), common.display(), work.display()),
+        }));
+        assert_eq!(
+            shown,
+            json!({ "error": "fatal: '.git/index.lock' and .git/HEAD in ." })
+        );
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(plain.path().join(".git")).unwrap();
+        assert!(linked_git_dirs(plain.path()).is_empty());
     }
 
     #[test]

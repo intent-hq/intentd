@@ -944,19 +944,63 @@ impl runner::MachineOneShot for ServicesOneShot {
 pub(crate) struct ServicesHomeRecords(pub intent_services::Services);
 
 impl ServicesHomeRecords {
-    /// Remove the hidden records a previous run of this daemon left: each
-    /// open home makes a new one.
+    /// Remove the hidden records whose home is gone: a record lives as
+    /// long as its home checkout (whose directory names it in
+    /// [`home_record_file`]), across reopens and restarts.
     pub(crate) async fn purge(&self) {
         let store = self.0.store();
         let Ok(records) = store.home_record_ids().await else {
             return;
         };
         for record in records {
+            let kept = store.get_workspace(&record).await.is_ok_and(|workspace| {
+                workspace.worktree_path.is_some_and(|worktree| {
+                    read_home_record(std::path::Path::new(&worktree)).as_ref() == Some(&record)
+                })
+            });
+            if kept {
+                continue;
+            }
             if let Err(error) = store.delete_home_record(&record).await {
                 tracing::warn!(%error, "executor: could not remove a stale home record");
             }
         }
     }
+}
+
+/// Where a home checkout's hidden record id is kept: beside the checkout,
+/// in the home's own directory, so it goes when the home is removed and no
+/// call into the checkout reads it.
+fn home_record_file(worktree: &std::path::Path) -> std::path::PathBuf {
+    worktree.with_file_name("record")
+}
+
+/// The hidden record [`home_record_file`] names for `worktree`, if any.
+fn read_home_record(worktree: &std::path::Path) -> Option<intent_core::WorkspaceId> {
+    let text = std::fs::read_to_string(home_record_file(worktree)).ok()?;
+    let id = intent_core::WorkspaceId(text.trim().to_owned());
+    id.is_home_record().then_some(id)
+}
+
+/// Keep `record` as `worktree`'s hidden record (written whole, owner-only).
+fn write_home_record(
+    worktree: &std::path::Path,
+    record: &intent_core::WorkspaceId,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+    let file = home_record_file(worktree);
+    let tmp = file.with_extension("tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut out = options.open(&tmp).context("write the home's record id")?;
+    out.write_all(record.as_str().as_bytes())
+        .and_then(|()| out.sync_all())
+        .context("write the home's record id")?;
+    std::fs::rename(&tmp, &file).context("keep the home's record id")?;
+    Ok(())
 }
 
 impl runner::HomeRecords for ServicesHomeRecords {
@@ -967,8 +1011,25 @@ impl runner::HomeRecords for ServicesHomeRecords {
     ) -> intent_core::BoxFuture<'static, anyhow::Result<intent_core::WorkspaceId>> {
         let store = self.0.store().clone();
         let home = home.clone();
+        let checkout = worktree.to_owned();
         let worktree = worktree.to_string_lossy().into_owned();
         Box::pin(async move {
+            // The home's record from an earlier open (or run) is kept, so
+            // what calls stored under it (attachments, idempotency keys)
+            // stays as it was.
+            if let Some(kept) = read_home_record(&checkout) {
+                match store.get_workspace(&kept).await {
+                    Ok(record) if record.worktree_path.as_deref() == Some(worktree.as_str()) => {
+                        return Ok(kept);
+                    }
+                    Ok(_) => {
+                        // The checkout moved (another data directory): a
+                        // new record names it.
+                        store.delete_home_record(&kept).await?;
+                    }
+                    Err(_) => {}
+                }
+            }
             let id = intent_core::WorkspaceId::new_home_record();
             let now = intent_core::now_iso();
             let record = intent_core::Workspace {
@@ -983,13 +1044,21 @@ impl runner::HomeRecords for ServicesHomeRecords {
                 ..Default::default()
             };
             store.insert_workspace(&record).await?;
+            if let Err(error) = write_home_record(&checkout, &id) {
+                let _ = store.delete_home_record(&id).await;
+                return Err(error);
+            }
             Ok(id)
         })
     }
 
-    fn remove(&self, record: intent_core::WorkspaceId) -> intent_core::BoxFuture<'static, ()> {
+    fn forget(&self, worktree: &std::path::Path) -> intent_core::BoxFuture<'static, ()> {
         let store = self.0.store().clone();
+        let record = read_home_record(worktree);
         Box::pin(async move {
+            let Some(record) = record else {
+                return;
+            };
             if let Err(error) = store.delete_home_record(&record).await {
                 tracing::warn!(%error, "executor: could not remove a home record");
             }
@@ -1000,6 +1069,7 @@ impl runner::HomeRecords for ServicesHomeRecords {
         &self,
         method: String,
         params: serde_json::Map<String, serde_json::Value>,
+        stop: tokio::sync::watch::Receiver<bool>,
     ) -> intent_core::BoxFuture<
         'static,
         Result<serde_json::Value, intent_core::node_link::HomeCallError>,
@@ -1007,7 +1077,7 @@ impl runner::HomeRecords for ServicesHomeRecords {
         let services = self.0.clone();
         Box::pin(intent_core::with_caller(
             intent_core::Caller::Daemon,
-            async move { dispatch_home_call(&services, &method, params).await },
+            async move { dispatch_home_call(&services, &method, params, stop).await },
         ))
     }
 }
@@ -1064,6 +1134,7 @@ async fn dispatch_home_call(
     services: &intent_services::Services,
     method: &str,
     params: serde_json::Map<String, serde_json::Value>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<serde_json::Value, intent_core::node_link::HomeCallError> {
     use intent_core::node_link::HomeCallError;
     if method == "host.exec" {
@@ -1073,9 +1144,14 @@ async fn dispatch_home_call(
                 message: error.message,
                 data: None,
             })?;
+        // The command is reaped when the call ends early; the runtime
+        // keeps it otherwise until it exits.
+        let stopped = async move {
+            let _ = stop.wait_for(|stop| *stop).await;
+        };
         return services
             .host_exec_runtime()
-            .run(services, parsed)
+            .run_until(services, parsed, stopped)
             .await
             .map_err(|error| HomeCallError {
                 code: i64::from(error.code),

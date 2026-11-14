@@ -1842,7 +1842,7 @@ impl Store {
 
     /// The ids of the machine's hidden home records
     /// ([`intent_core::HOME_RECORD_PREFIX`]), for the executor's purge of
-    /// records a previous run left.
+    /// records whose home is gone.
     ///
     /// # Errors
     /// Returns `Internal` on a database failure.
@@ -1856,8 +1856,9 @@ impl Store {
     }
 
     /// Remove a machine's hidden home record and (by cascade) its rows,
-    /// leaving no deletion marker: a record is made per home open, and its
-    /// id is never reused or transferred. Any other id is refused.
+    /// leaving no deletion marker: a record lives as long as its home
+    /// checkout, and its id is never reused or transferred once removed.
+    /// Any other id is refused.
     ///
     /// # Errors
     /// `InvalidParams` for an id that is not a home record; `Internal` on a

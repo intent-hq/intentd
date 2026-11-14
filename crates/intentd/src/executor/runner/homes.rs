@@ -153,6 +153,12 @@ impl Runner {
             if lock(&self.inner.homes).lease.contains(&home_id) {
                 continue;
             }
+            if let (Some(records), Some(worktree)) = (
+                self.inner.home_records.as_ref(),
+                self.inner.checkouts.existing_home(&home_id),
+            ) {
+                records.forget(&worktree).await;
+            }
             if let Err(error) = self.inner.checkouts.remove_home(&home_id).await {
                 tracing::warn!(home = %home_id, %error, "node: could not remove a swept home checkout");
             }
@@ -449,8 +455,8 @@ impl Runner {
             .collect();
         for home in homes {
             lock(&home.setup_stop).take();
+            // Its record stays: the home reopens with it after a restart.
             home.closed.send_replace(true);
-            self.drop_home_record(&home);
         }
     }
 
