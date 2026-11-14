@@ -1697,6 +1697,44 @@ async fn installed_cli_preparation_retains_actual_directories_on_owner_failure()
     }
 }
 
+// Kernels without /proc/<pid>/task/<tid>/children (e.g. NVIDIA Jetson L4T)
+// cannot confirm teardown. A version the CLI already reported must survive.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_cli_version_survives_unconfirmed_cleanup() {
+    use crate::codex_diagnostics::process::test_control::{Control, Stage};
+    let root = crate::test_support::test_tempdir("installed-version-cleanup");
+    let context = owner_failure_context(root.path());
+    let mut command = Command::new(context.runtime.path());
+    command
+        .arg("--version")
+        .env_clear()
+        .env("HOME", root.path())
+        .env("CODEX_HOME", root.path())
+        .current_dir(root.path());
+    let (control, mut events) = Control::new(Stage::AdapterVersion, true);
+    control.release();
+    let bytes = control
+        .scope(version_output(command, None))
+        .await
+        .expect("a reported version is kept when only cleanup is unconfirmed");
+    assert_eq!(
+        std::str::from_utf8(&bytes).unwrap().trim(),
+        current(InstalledCli::Codex)
+    );
+    let injected = crate::codex_diagnostics::process::test_control::next(
+        &mut events,
+        Stage::AdapterVersion,
+        true,
+    )
+    .await;
+    assert!(
+        injected.home.is_dir(),
+        "unconfirmed cleanup still retains the probe directory"
+    );
+    std::fs::remove_dir_all(&injected.home).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) async fn cancel_version_owner(operation: tokio::task::JoinHandle<()>, root: &Path) {
     tokio::time::timeout(

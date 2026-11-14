@@ -26,7 +26,7 @@ pub(super) fn ensure_supported() -> Result<(), UnknownReason> {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-pub(super) mod test_control;
+pub(crate) mod test_control;
 
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
