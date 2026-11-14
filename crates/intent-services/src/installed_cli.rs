@@ -882,10 +882,13 @@ async fn version_output(
     })
     .await
     .unwrap_or(Err("installed CLI version check timed out"));
-    guard
-        .cleanup()
-        .await
-        .map_err(|_| "installed CLI version cleanup failed")?;
+    // A failed or unconfirmed cleanup must not hide a version the CLI already
+    // reported; the guard keeps any directory it could not release. Linux
+    // kernels without /proc/<pid>/task/<tid>/children (e.g. Jetson L4T) never
+    // confirm teardown.
+    if guard.cleanup().await.is_err() {
+        tracing::warn!("installed CLI version probe cleanup failed or was unconfirmed");
+    }
     result.map_err(str::to_owned)
 }
 
