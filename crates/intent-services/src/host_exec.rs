@@ -553,17 +553,15 @@ async fn run_prepared(
         // again and logged every [`REAP_WAIT`], and the caller (a home
         // call) stays outstanding meanwhile.
         let status = loop {
-            match tokio::time::timeout(REAP_WAIT, child.wait()).await {
-                Ok(status) => break status,
-                Err(_) => {
-                    tracing::warn!(pid = ?pid, command = %args.command, "host.exec: a killed command has not exited yet");
-                    #[cfg(unix)]
-                    if let Some(pid) = pid {
-                        kill_group(pid, nix::sys::signal::Signal::SIGKILL);
-                    }
-                    let _ = child.start_kill();
-                }
+            if let Ok(status) = tokio::time::timeout(REAP_WAIT, child.wait()).await {
+                break status;
             }
+            tracing::warn!(pid = ?pid, command = %args.command, "host.exec: a killed command has not exited yet");
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                kill_group(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+            let _ = child.start_kill();
         };
         // Best-effort drain of whatever the child produced before the
         // kill, bounded: a pipe an escaped process still holds open
