@@ -281,24 +281,81 @@ pub(crate) async fn home_checkout_for(
 
 /// The home checkout `record`'s agent launches into now: the one it was
 /// placed in, while it is still the workspace's home on its machine.
-/// After a move it gets a checkout of its own.
+/// After a move it gets a checkout of its own ([`leave_moved_home`]).
+///
+/// # Errors
+///
+/// The store's error: an unread home is not a moved one.
 pub(crate) async fn current_home_checkout(
     svc: &Services,
     record: &intent_core::remote_launch::RemoteAgentRecord,
     view: &RemotePlacementView,
-) -> Option<intent_core::node_link::HomeRef> {
-    let placed = view.home_checkout.as_ref()?;
-    let home = svc
+) -> Result<Option<intent_core::node_link::HomeRef>> {
+    let Some(placed) = view.home_checkout.as_ref() else {
+        return Ok(None);
+    };
+    let Some(home) = svc
         .store()
         .get_workspace_home(&record.workspace_id)
-        .await
-        .ok()??;
-    (&home.home_id == placed && home.node_id.as_deref() == Some(record.node_id.as_str())).then(
-        || intent_core::node_link::HomeRef {
-            workspace_id: record.workspace_id.clone(),
-            home_id: home.home_id,
-        },
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(
+        (&home.home_id == placed && home.node_id.as_deref() == Some(record.node_id.as_str()))
+            .then(|| intent_core::node_link::HomeRef {
+                workspace_id: record.workspace_id.clone(),
+                home_id: home.home_id,
+            }),
     )
+}
+
+/// nodes.md "Moving the home" step 4: `record`'s agent shared a home that
+/// is no longer the workspace's, so it starts in a checkout of its own on
+/// the same machine. Its `base` and `wip` refs are written from the hub's
+/// `home/head` and `home/wip` (each submodule's too), `view` drops the home
+/// and takes the new base, and the agent and the user get a notice.
+pub(crate) async fn leave_moved_home(
+    svc: &Services,
+    record: &intent_core::remote_launch::RemoteAgentRecord,
+    view: &mut RemotePlacementView,
+) -> Result<()> {
+    let workspace_id = &record.workspace_id;
+    let agent_id = &record.agent_id;
+    let checkout = crate::launch::workspace_checkout(svc, workspace_id).await?;
+    let home = AgentRemote::home(workspace_id.as_str(), &HomeId::new().0)?;
+    let agent = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
+    let pins = view.pins().to_vec();
+    let base = view.base_commit.clone();
+    let (base, pins) = crate::launch::blocking(move || {
+        let (base, pins) = match crate::launch::copy_work(&checkout, &home, &agent, pins.clone())? {
+            Some(copied) => copied,
+            None => {
+                tracing::warn!("the moved home has no saved head; the agent starts from its base");
+                (base, pins)
+            }
+        };
+        crate::launch::write_base_refs(&checkout, &agent, &base, &pins)?;
+        Ok((base, pins))
+    })
+    .await?;
+    view.home_checkout = None;
+    view.base_commit = base;
+    if view.submodules.is_some() {
+        view.submodules = Some(pins);
+    }
+    let notice = intent_core::remote_launch::home_moved_notice(&view.node_name);
+    svc.post_home_moved_agent_notice(workspace_id, agent_id, &notice)
+        .await?;
+    let stored = view.clone();
+    crate::view::update(svc.store(), workspace_id, agent_id, move |current| {
+        current.home_checkout = None;
+        current.base_commit = stored.base_commit;
+        current.submodules = stored.submodules;
+    })
+    .await?;
+    tracing::info!(workspace = %workspace_id, agent = %agent_id, "the agent's home moved; it starts in a checkout of its own");
+    Ok(())
 }
 
 /// See [`intent_services::feature_api::feature_ports::RemoteLaunchPort::open_home`].

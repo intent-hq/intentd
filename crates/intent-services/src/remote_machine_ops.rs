@@ -355,6 +355,49 @@ impl Services {
         Ok(())
     }
 
+    /// Tell agent `agent_id` and the user that it now works in a checkout of
+    /// its own after the home it shared moved (nodes.md "Moving the home"
+    /// step 4): `notice` waits for the agent's next turn, and shows in its
+    /// transcript as a system row.
+    ///
+    /// # Errors
+    ///
+    /// The store's error when the turn's notice cannot be left; the
+    /// transcript row is best-effort.
+    pub async fn post_home_moved_agent_notice(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &intent_core::AgentId,
+        notice: &str,
+    ) -> Result<()> {
+        self.store
+            .set_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_HOME_MOVED_NOTICE_KEY,
+                notice,
+                None,
+                None,
+            )
+            .await?;
+        let content = serde_json::json!([{ "type": "text", "text": notice }]);
+        match self
+            .store
+            .append_agent_message(agent_id, "system", &content, &now_iso())
+            .await
+        {
+            Ok(message) => {
+                self.invalidate_agent_list_cache(workspace_id);
+                self.publish_agent_message_events(workspace_id, agent_id, &message, None)
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, %error, "could not add the home-moved notice to the transcript");
+            }
+        }
+        Ok(())
+    }
+
     /// The workspace's notice that a moved home's leftover work was pushed
     /// to `refs` (nodes.md "Moving the home" step 5): a note naming them, so
     /// nothing is merged automatically and the user can pick them up.

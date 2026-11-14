@@ -597,6 +597,15 @@ pub fn launch_notice_with_setup(
     notice
 }
 
+/// What an agent that shared the workspace's home checkout, and the user,
+/// are told when it starts in a checkout of its own after the home moved.
+#[must_use]
+pub fn home_moved_notice(node_name: &str) -> String {
+    format!(
+        "The workspace's home moved. This agent stays on \"{node_name}\" and now works in its own checkout there, made from the home's last saved work. Its changes no longer show in the home, and the home's later changes don't show here."
+    )
+}
+
 /// The launch notice of a remote agent's sub-agent that starts from its
 /// parent's work (nodeProtocol 13), or `None` for any other agent.
 #[must_use]
