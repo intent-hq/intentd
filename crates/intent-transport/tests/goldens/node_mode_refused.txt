@@ -308,6 +308,9 @@ providers.profiles.delete
 providers.profiles.reorder
 providers.profiles.update
 providers.profiles.updateDefault
+push.createLink
+push.revokeLink
+push.status
 remoteLinkTraffic.snapshot
 remoteLinkTraffic.start
 remoteLinkTraffic.stop

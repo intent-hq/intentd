@@ -1372,6 +1372,7 @@ const PROPOSAL_EXCLUDED_PREFIXES: &[&str] = &[
     "sourceControl.",
     "accounts.",
     "remoteAgents.",
+    "push.",
 ];
 
 /// Individual settings an Assistant chat card must never change: the primary
@@ -2008,6 +2009,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "RTK enabled",
             "Enable RTK compressed CLI output mode in agent prompts",
             "tools",
+            false,
+        ),
+        boolean(
+            "push.relayEnabled",
+            "Push relay",
+            "Publish workspace activity to the push relay for iOS Live Activities and alerts",
+            "notifications",
             false,
         ),
         // --- Group B: server / transport ------------------------------------

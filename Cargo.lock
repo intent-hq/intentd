@@ -2503,6 +2503,7 @@ dependencies = [
  "pprof",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",
