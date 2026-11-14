@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.212] - 2026-11-14
+
+### 🚀 Features
+
+- Run host.exec and host.execStream on the workspace home ([#3371](https://github.com/intent-hq/intentd/pull/3371))
+
+### 🐛 Bug Fixes
+
+- *(installed-cli)* Keep a reported version when probe cleanup is unconfirmed ([#3374](https://github.com/intent-hq/intentd/pull/3374))
+- *(settings)* Run boot settings migrations as one tested chain ([#3372](https://github.com/intent-hq/intentd/pull/3372))
+
+
 ## [0.11.211] - 2026-11-14
 
 ### 🐛 Bug Fixes
