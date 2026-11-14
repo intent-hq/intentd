@@ -470,24 +470,33 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
                 tracing::info!(home = %home_id, "remote machine: the home's setup failed; no autoStart");
                 return;
             }
-            let current = svc
-                .store()
-                .get_workspace_home(&record.workspace_id)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|home| {
-                    &home.home_id == home_id
-                        && home.node_id.as_deref() == Some(shared.machine_id().as_str())
-                });
-            if !current || !svc.workspace_homes() {
-                tracing::debug!(home = %home_id, "remote machine: setup of a home that is not current; no autoStart");
+            if !svc.workspace_homes() {
                 return;
             }
-            // Once per home in this process: a record replayed before its
-            // ack was saved does not start them again.
-            if !shared.home_scripts.first_auto_start(home_id) {
-                return;
+            // Once per new checkout, durably: the claim names this record
+            // (its lease's journal and sequence), so a record replayed
+            // before its ack was saved, also after a restart, starts
+            // nothing again. A home that is not current claims nothing.
+            match svc
+                .store()
+                .claim_workspace_home_auto_start(
+                    &record.workspace_id,
+                    home_id,
+                    &shared.machine_id(),
+                    &shared.lease_id(),
+                    record.seq.0,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(home = %home_id, seq = record.seq.0, "remote machine: setup of a home that is not current, or autoStart already claimed; no autoStart");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(home = %home_id, %error, "remote machine: could not claim the home's autoStart");
+                    return;
+                }
             }
             let svc = svc.clone();
             let workspace_id = record.workspace_id.clone();

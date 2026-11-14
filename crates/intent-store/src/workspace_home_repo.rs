@@ -54,7 +54,7 @@ fn map_row(row: &SqliteRow, now: time::OffsetDateTime) -> Result<(WorkspaceId, W
 
 impl Store {
     /// Record `home` as the workspace's home, replacing any other. A new
-    /// `homeId` starts with no backup failure.
+    /// `homeId` starts with no backup failure and no `autoStart` claimed.
     ///
     /// # Errors
     ///
@@ -73,7 +73,11 @@ impl Store {
              name = excluded.name, state = excluded.state, since = excluded.since, \
              last_backup_at = excluded.last_backup_at, \
              backup_failing_since = CASE WHEN workspace_home.home_id = excluded.home_id \
-             THEN workspace_home.backup_failing_since END",
+             THEN workspace_home.backup_failing_since END, \
+             auto_start_lease_id = CASE WHEN workspace_home.home_id = excluded.home_id \
+             THEN workspace_home.auto_start_lease_id END, \
+             auto_start_seq = CASE WHEN workspace_home.home_id = excluded.home_id \
+             THEN workspace_home.auto_start_seq END",
         )
         .bind(&workspace_id.0)
         .bind(&home.home_id.0)
@@ -192,6 +196,47 @@ impl Store {
         .bind(&workspace_id.0)
         .bind(&home_id.0)
         .bind(node_id)
+        .execute(self.write_pool())
+        .await
+        .map_err(db)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Claim the `autoStart` of the workspace's home `home_id` on machine
+    /// `node_id` for the `setupFinished` record `seq` of lease `lease_id`'s
+    /// journal: `true` once per new checkout, so the caller starts the
+    /// home's `autoStart` scripts. A record at or below the one that
+    /// claimed it on the same lease (a replay, also after a restart) claims
+    /// nothing; a later record, or one of another lease (a fresh journal),
+    /// claims again. `false` too when `home_id` is not the workspace's home
+    /// (any more) or is not on `node_id`. The claim is made before the
+    /// scripts start: a crash between the two leaves them for the user.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn claim_workspace_home_auto_start(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        node_id: &str,
+        lease_id: &str,
+        seq: u64,
+    ) -> Result<bool> {
+        let seq = i64::try_from(seq).map_err(db)?;
+        let done = sqlx::query(
+            "UPDATE workspace_home SET auto_start_lease_id = ?, auto_start_seq = ? \
+             WHERE workspace_id = ? AND home_id = ? AND node_id = ? \
+             AND (auto_start_lease_id IS NULL OR auto_start_lease_id != ? \
+             OR auto_start_seq IS NULL OR auto_start_seq < ?)",
+        )
+        .bind(lease_id)
+        .bind(seq)
+        .bind(&workspace_id.0)
+        .bind(&home_id.0)
+        .bind(node_id)
+        .bind(lease_id)
+        .bind(seq)
         .execute(self.write_pool())
         .await
         .map_err(db)?;

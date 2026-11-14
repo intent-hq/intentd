@@ -196,3 +196,77 @@ async fn a_deleted_workspace_has_no_home() {
     store.delete_workspace(&ws).await.unwrap();
     assert!(store.list_workspace_homes().await.unwrap().is_empty());
 }
+
+/// `autoStart` is claimed once per new checkout, by the `setupFinished`
+/// record that reported it (its lease's journal and sequence), and the
+/// claim is durable: after a restart (the store reopened) a replay of the
+/// same record claims nothing. A later checkout's record (a higher
+/// sequence on the lease, or a fresh lease's journal) claims again; a
+/// record of another home, or from another machine, claims nothing.
+#[tokio::test]
+async fn auto_start_is_claimed_once_per_setup_record_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("homes.db");
+    let ws1 = WorkspaceId::from("ws-1");
+    let h1 = HomeId::from("h1");
+    {
+        let store = Store::open(&path).await.unwrap();
+        store
+            .insert_workspace(&Workspace {
+                id: ws1.clone(),
+                title: "ws-1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .set_workspace_home(&ws1, &home("h1", "node-a"))
+            .await
+            .unwrap();
+        assert!(store
+            .claim_workspace_home_auto_start(&ws1, &h1, "node-a", "lease-1", 10)
+            .await
+            .unwrap());
+        assert!(!store
+            .claim_workspace_home_auto_start(&ws1, &h1, "node-a", "lease-1", 10)
+            .await
+            .unwrap());
+    }
+    // The orchestrator restarts: the record, ingested but not acked yet,
+    // is replayed.
+    let store = Store::open(&path).await.unwrap();
+    let claim = |lease: &'static str, seq: u64| {
+        let store = &store;
+        let ws1 = &ws1;
+        let h1 = &h1;
+        async move {
+            store
+                .claim_workspace_home_auto_start(ws1, h1, "node-a", lease, seq)
+                .await
+                .unwrap()
+        }
+    };
+    assert!(!claim("lease-1", 10).await, "a replay starts nothing");
+    assert!(!claim("lease-1", 9).await, "an older record starts nothing");
+    assert!(claim("lease-1", 20).await, "a new checkout on the lease");
+    assert!(!claim("lease-1", 20).await);
+    assert!(claim("lease-2", 3).await, "a fresh lease's journal");
+    assert!(!claim("lease-2", 3).await);
+    assert!(!store
+        .claim_workspace_home_auto_start(&ws1, &HomeId::from("h0"), "node-a", "lease-2", 50)
+        .await
+        .unwrap());
+    assert!(!store
+        .claim_workspace_home_auto_start(&ws1, &h1, "node-b", "lease-2", 50)
+        .await
+        .unwrap());
+    // A new home starts unclaimed, even on the same lease.
+    store
+        .set_workspace_home(&ws1, &home("h2", "node-a"))
+        .await
+        .unwrap();
+    assert!(store
+        .claim_workspace_home_auto_start(&ws1, &HomeId::from("h2"), "node-a", "lease-2", 3)
+        .await
+        .unwrap());
+}

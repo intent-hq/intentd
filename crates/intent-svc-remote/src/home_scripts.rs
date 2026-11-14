@@ -40,8 +40,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Default)]
 pub(crate) struct HomeScripts {
     runs: Mutex<HashMap<String, Run>>,
-    /// The homes whose `autoStart` scripts were started by this process.
-    auto_started: Mutex<std::collections::HashSet<intent_core::HomeId>>,
 }
 
 struct Run {
@@ -106,12 +104,6 @@ impl Drop for HomeScripts {
 }
 
 impl HomeScripts {
-    /// Whether `home_id`'s `autoStart` scripts are due: `true` the first
-    /// time only.
-    pub(crate) fn first_auto_start(&self, home_id: &intent_core::HomeId) -> bool {
-        lock(&self.auto_started).insert(home_id.clone())
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         lock(&self.runs).is_empty()
     }
