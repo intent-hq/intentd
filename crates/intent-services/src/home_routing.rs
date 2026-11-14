@@ -278,7 +278,24 @@ impl Services {
         if method == "git.agentCommit" {
             self.check_home_commit(workspace_id, params).await?;
         }
-        let params = home_params(&worktree, params.clone())?;
+        let mut params = home_params(&worktree, params.clone())?;
+        if method == "git.agentCommit" {
+            // The home commits as a remote agent's launch would: with the
+            // identity this backend's git config gives the workspace.
+            let checkout = worktree.clone();
+            let identity = tokio::task::spawn_blocking(move || {
+                intent_git::identity::commit_identity(&checkout)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some((name, email)) = identity {
+                params.insert(
+                    "gitIdentity".into(),
+                    json!({ "name": name, "email": email }),
+                );
+            }
+        }
         let result = port
             .home_call(
                 self,

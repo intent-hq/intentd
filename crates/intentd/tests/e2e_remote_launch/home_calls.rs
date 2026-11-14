@@ -27,6 +27,10 @@ async fn files_and_git_of_a_workspace_with_a_home_run_on_the_home() {
     git(&repo, &["add", "README.md"]);
     git(&repo, &["commit", "--quiet", "-m", "base"]);
     let branch = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    // The backend's identity for the workspace; the machine has none of
+    // its own when its global config is empty (as on CI).
+    git(&repo, &["config", "user.name", "Backend User"]);
+    git(&repo, &["config", "user.email", "backend@example.invalid"]);
     // The forge the hub pushes to.
     let origin = scratch.path().join("origin.git");
     git(
@@ -182,6 +186,11 @@ async fn files_and_git_of_a_workspace_with_a_home_run_on_the_home() {
     .await;
     let hash = committed["hash"].as_str().unwrap().to_owned();
     assert_eq!(git(&work, &["rev-parse", "HEAD"]), hash, "{committed}");
+    // It is authored as the backend's identity for the workspace.
+    assert_eq!(
+        git(&work, &["log", "-1", "--format=%an <%ae>|%cn <%ce>"]),
+        "Backend User <backend@example.invalid>|Backend User <backend@example.invalid>"
+    );
     let home_head = format!("refs/intent/ws/{ws_id}/home/head");
     until("home/head at the app commit", || {
         (try_rev(&mirror, &home_head).as_deref() == Some(hash.as_str())).then_some(())

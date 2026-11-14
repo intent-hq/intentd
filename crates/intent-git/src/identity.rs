@@ -76,6 +76,55 @@ pub fn commit_identity(cwd: &Path) -> Option<(String, String)> {
     (!name.is_empty() && !email.is_empty()).then_some((name, email))
 }
 
+/// Commit identities set for one checkout each, by its canonical path: a
+/// machine's home checkout commits with the identity its backend resolved
+/// for the workspace (monorepo `docs/protocol/node-link.md`, "Files and
+/// git on the home"), never written into any git config.
+static CHECKOUT_IDENTITIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (String, String)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn checkout_key(checkout: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf())
+}
+
+/// Commit in `checkout` as `identity` from now on (`None` returns it to
+/// its git config). An empty name or email sets nothing.
+pub fn set_checkout_identity(checkout: &Path, identity: Option<(String, String)>) {
+    let key = checkout_key(checkout);
+    let mut identities = CHECKOUT_IDENTITIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match identity {
+        Some((name, email)) if !name.is_empty() && !email.is_empty() => {
+            identities.insert(key, (name, email));
+        }
+        _ => {
+            identities.remove(&key);
+        }
+    }
+}
+
+/// The signature a commit in `repo` is made with: the identity set for its
+/// checkout ([`set_checkout_identity`]), else git's own resolution.
+///
+/// # Errors
+///
+/// When neither gives a name and email.
+pub fn commit_signature(repo: &git2::Repository) -> Result<git2::Signature<'static>, git2::Error> {
+    let set = repo.workdir().and_then(|workdir| {
+        CHECKOUT_IDENTITIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&checkout_key(workdir))
+            .cloned()
+    });
+    match set {
+        Some((name, email)) => git2::Signature::now(&name, &email),
+        None => repo.signature(),
+    }
+}
+
 /// Pure pairing seam: both a non-empty name AND email are required (git
 /// itself rejects a commit with only one half, and exporting a partial
 /// identity would mask the other half's absence).
@@ -223,5 +272,22 @@ mod tests {
         assert_eq!(head.author().email().ok(), Some("test@example.com"));
         assert_eq!(head.committer().name().ok(), Some("Test"));
         assert_eq!(head.committer().email().ok(), Some("test@example.com"));
+    }
+
+    #[test]
+    fn a_checkout_identity_wins_over_config_until_cleared() {
+        let dir = init_repo("identity-set");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        set_checkout_identity(
+            &workdir,
+            Some(("Home User".into(), "home@example.com".into())),
+        );
+        let sig = commit_signature(&repo).unwrap();
+        assert_eq!(sig.name().ok(), Some("Home User"));
+        assert_eq!(sig.email().ok(), Some("home@example.com"));
+        set_checkout_identity(&workdir, None);
+        let sig = commit_signature(&repo).unwrap();
+        assert_eq!(sig.email().ok(), Some("test@example.com"));
     }
 }
