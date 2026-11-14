@@ -45,6 +45,26 @@ const READ_BUF_SIZE: usize = 4096;
 /// want.
 const STDIN_QUEUE_CAP: usize = 32;
 
+/// The `-32602` message prefix of an `eof` write to a stream on the
+/// workspace's home.
+pub const HOME_EXEC_EOF_UNSUPPORTED: &str = "home-exec-eof-unsupported";
+
+/// How long a home stream that was cancelled or timed out waits for its
+/// machine to report the process's end before it ends here anyway.
+const HOME_KILL_WAIT: Duration = Duration::from_secs(30);
+
+/// [`HOME_KILL_WAIT`] at shutdown, which must not wait on a machine that
+/// is away.
+const HOME_KILL_WAIT_AT_SHUTDOWN: Duration = Duration::from_millis(500);
+
+fn kill_wait() -> Duration {
+    if registry().inner.lock().expect("registry poisoned").closed {
+        HOME_KILL_WAIT_AT_SHUTDOWN
+    } else {
+        HOME_KILL_WAIT
+    }
+}
+
 /// Parsed `host.execStream` params: the shared exec fields (validated by
 /// [`host_exec::parse_args`]) plus the streaming-only `requestId` / initial
 /// `stdin` payload.
@@ -122,12 +142,23 @@ fn decode_base64_field(s: &str, field: &str) -> Result<Vec<u8>, HostExecError> {
         })
 }
 
-/// Per-stream handle held by [`HostExecStreamRegistry`]. The stdin sender is
-/// consumed by the forwarder task; the cancel token is polled by the wait task
-/// so `host.execStream.cancel` reaps the whole process group.
+/// Per-stream handle held by [`HostExecStreamRegistry`]. The cancel token is
+/// polled by the wait task so `host.execStream.cancel` reaps the whole
+/// process group.
 struct StreamHandle {
-    stdin_tx: mpsc::Sender<StdinMsg>,
+    stdin: StreamStdin,
     cancel_token: Arc<AtomicBool>,
+}
+
+/// Where a stream's stdin goes.
+#[derive(Clone)]
+enum StreamStdin {
+    /// A local child: the forwarder task drains this sender into its pipe.
+    Local(mpsc::Sender<StdinMsg>),
+    /// A process on the workspace's home: each write goes to its machine
+    /// at once (so a write while the machine is away fails as itself, and
+    /// later ones still go), and its stdin cannot be closed.
+    Home(Arc<dyn crate::feature_api::feature_ports::HomeExecControl>),
 }
 
 /// Stdin control channel messages. `Data` is written verbatim to the child;
@@ -246,12 +277,15 @@ impl HostExecStreamRegistry {
                     message: "daemon is shutting down".into(),
                 });
             }
-            map.streams.get(request_id).map(|h| h.stdin_tx.clone())
+            map.streams.get(request_id).map(|h| h.stdin.clone())
         };
-        let sender = sender.ok_or_else(|| HostExecError {
+        let sender = match sender.ok_or_else(|| HostExecError {
             code: -32603,
             message: format!("unknown host.execStream requestId: {request_id}"),
-        })?;
+        })? {
+            StreamStdin::Local(sender) => sender,
+            StreamStdin::Home(control) => return write_home(&control, data, eof),
+        };
         if let Some(bytes) = data {
             if !bytes.is_empty() {
                 let send = sender.send(StdinMsg::Data(bytes));
@@ -432,7 +466,7 @@ pub async fn start_stream(
     admission.streams.insert(
         request_id.clone(),
         StreamHandle {
-            stdin_tx,
+            stdin: StreamStdin::Local(stdin_tx),
             cancel_token: cancel_token.clone(),
         },
     );
@@ -648,6 +682,242 @@ fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
     let _ = killpg(Pid::from_raw(pid.cast_signed()), sig);
 }
 
+/// `command` and `args` as one shell command line that runs them as given,
+/// in place of the shell (`exec`): each word single-quoted, with a quote
+/// or backslash written outside the quotes so POSIX shells and fish read
+/// it the same.
+pub(crate) fn shell_command(command: &str, args: &[String]) -> String {
+    let mut line = String::from("exec");
+    for word in std::iter::once(command).chain(args.iter().map(String::as_str)) {
+        line.push_str(" '");
+        for c in word.chars() {
+            match c {
+                '\'' => line.push_str("'\\''"),
+                '\\' => line.push_str("'\\\\'"),
+                c => line.push(c),
+            }
+        }
+        line.push('\'');
+    }
+    line
+}
+
+/// Start a streaming exec on the workspace's home (node-link.md § Files and
+/// git on the home, point 4): an exec-mode `ptyOpen` through the remote
+/// launch port, registered like a local stream so `host.execStream.write`
+/// and `.cancel` reach it. `cwd` is relative to the home checkout. Its
+/// output and end are published as a local stream's are, the end after all
+/// output.
+///
+/// # Errors
+///
+/// `InvalidParams` for a `requestId` already live; `home-unavailable` when
+/// the home's machine cannot run it; internal when shutting down.
+///
+/// # Panics
+/// Panics if the registry mutex is poisoned.
+pub(crate) async fn start_home_stream(
+    svc: &crate::Services,
+    bus: EventBus,
+    workspace_id: &WorkspaceId,
+    args: HostExecStreamArgs,
+    cwd: Option<String>,
+) -> intent_core::Result<String> {
+    use crate::feature_api::feature_ports::HomeExecOpen;
+    let HostExecStreamArgs {
+        common,
+        request_id,
+        stdin,
+    } = args;
+    let request_id = request_id.unwrap_or_else(mint_request_id);
+    let admit = || -> intent_core::Result<()> {
+        let admission = registry().inner.lock().expect("registry poisoned");
+        if admission.closed {
+            return Err(intent_core::Error::Internal(
+                "daemon is shutting down".into(),
+            ));
+        }
+        if admission.streams.contains_key(&request_id) {
+            return Err(intent_core::Error::InvalidParams(
+                "host.execStream requestId is already active".into(),
+            ));
+        }
+        Ok(())
+    };
+    admit()?;
+    let open = HomeExecOpen {
+        cwd,
+        command: shell_command(&common.command, &common.args),
+        env: common.env.into_iter().collect(),
+    };
+    let exec = svc
+        .feature_remote_launch_port()
+        .open_home_exec(svc, workspace_id, open)
+        .await?
+        .ok_or_else(|| {
+            intent_core::Error::Internal("the workspace's home is not on a machine".into())
+        })?;
+    // The initial stdin goes out right behind the `ptyOpen`, ahead of any
+    // write a client sends once the stream is registered.
+    if let Some(seed) = stdin.filter(|seed| !seed.is_empty()) {
+        if let Err(error) = exec.control.write(&seed) {
+            exec.control.kill();
+            return Err(intent_core::Error::Internal(error.to_string()));
+        }
+    }
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    let mut tasks = registry().terminal_tasks.lock().await;
+    {
+        // Checked again: the open awaited, and shutdown or another stream
+        // with this id may have come meanwhile.
+        if let Err(error) = admit() {
+            exec.control.kill();
+            return Err(error);
+        }
+        registry()
+            .inner
+            .lock()
+            .expect("registry poisoned")
+            .streams
+            .insert(
+                request_id.clone(),
+                StreamHandle {
+                    stdin: StreamStdin::Home(exec.control.clone()),
+                    cancel_token: cancel_token.clone(),
+                },
+            );
+    }
+    let terminal = intent_core::spawn_daemon(run_home_wait(
+        bus,
+        workspace_id.clone(),
+        request_id.clone(),
+        exec,
+        cancel_token,
+        common.timeout_ms,
+    ));
+    tasks.retain(|task| !task.is_finished());
+    tasks.push(terminal);
+    Ok(request_id)
+}
+
+/// A `host.execStream.write` to a process on the workspace's home.
+fn write_home(
+    control: &Arc<dyn crate::feature_api::feature_ports::HomeExecControl>,
+    data: Option<Vec<u8>>,
+    eof: bool,
+) -> Result<(), HostExecError> {
+    if eof {
+        return Err(HostExecError {
+            code: INVALID_PARAMS,
+            message: format!(
+                "{HOME_EXEC_EOF_UNSUPPORTED}: the stdin of a process on the workspace's home cannot be closed; nothing was written"
+            ),
+        });
+    }
+    match data {
+        Some(bytes) if !bytes.is_empty() => control.write(&bytes).map_err(|error| HostExecError {
+            code: -32603,
+            message: error.to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Publish a home stream's output until its end, ending it on the machine
+/// at a cancel or its `timeoutMs`; then publish its one `host:exec:exit`.
+async fn run_home_wait(
+    bus: EventBus,
+    workspace_id: WorkspaceId,
+    request_id: String,
+    exec: crate::feature_api::feature_ports::HomeExec,
+    cancel_token: Arc<AtomicBool>,
+    timeout_ms: Option<u64>,
+) {
+    use crate::feature_api::feature_ports::HomeExecEvent;
+    let crate::feature_api::feature_ports::HomeExec {
+        mut events,
+        control,
+    } = exec;
+    let deadline = timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let mut killed_at: Option<tokio::time::Instant> = None;
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let (exit_code, error) = loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(HomeExecEvent::Output { stderr, bytes }) => {
+                    let kind = if stderr { HOST_EXEC_STDERR } else { HOST_EXEC_STDOUT };
+                    let chunk = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    let _ = bus.publish_transient(&chunk_event(&workspace_id, &request_id, kind, &chunk));
+                }
+                Some(HomeExecEvent::Exited { exit_code, error }) => break (exit_code, error),
+                None => break (None, Some("the home's process was dropped".to_owned())),
+            },
+            _ = tick.tick() => {
+                let now = tokio::time::Instant::now();
+                match killed_at {
+                    None if cancel_token.load(Ordering::SeqCst) => {
+                        cancelled = true;
+                        control.kill();
+                        killed_at = Some(now);
+                    }
+                    None if deadline.is_some_and(|deadline| now >= deadline) => {
+                        timed_out = true;
+                        control.kill();
+                        killed_at = Some(now);
+                    }
+                    // The machine ends it after its next bind; this
+                    // stream ends here now, at once when shutting down.
+                    Some(at) if now.duration_since(at) >= kill_wait() => break (None, None),
+                    _ => {}
+                }
+            }
+        }
+    };
+    if let (Some(error), None) = (&error, exit_code) {
+        let line = format!("intent: {error}\n");
+        let chunk = base64::engine::general_purpose::STANDARD.encode(line.as_bytes());
+        let _ = bus.publish_transient(&chunk_event(
+            &workspace_id,
+            &request_id,
+            HOST_EXEC_STDERR,
+            &chunk,
+        ));
+    }
+    // The machine reports a process ended by a signal as -1: no exit code.
+    let exit_code = exit_code.filter(|code| *code >= 0);
+    let mut data = json!({
+        "requestId": &request_id,
+        "ok": exit_code == Some(0) && !cancelled && !timed_out,
+    });
+    if let Some(code) = exit_code {
+        data["exitCode"] = json!(code);
+    }
+    if timed_out {
+        data["timedOut"] = json!(true);
+    }
+    if cancelled {
+        data["cancelled"] = json!(true);
+    }
+    let ev = NewEvent {
+        workspace_id,
+        timestamp: now_iso(),
+        event_type: HOST_EXEC_EXIT.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    };
+    if let Err(e) = bus.publish(&ev).await {
+        tracing::warn!(error = %e, "failed to publish host:exec:exit");
+    }
+    registry().remove(&request_id);
+}
+
 /// Build a `host:exec:{stdout,stderr}` event with the base64 chunk payload.
 fn chunk_event(
     workspace_id: &WorkspaceId,
@@ -675,6 +945,39 @@ fn chunk_event(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A shell runs the quoted line as the argv it came from, whatever the
+    /// words hold.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_stream_command_line_runs_its_argv_as_given() {
+        let args: Vec<String> = [
+            "%s|",
+            "plain",
+            "it's",
+            r"back\slash",
+            r"\'mixed'\",
+            "$HOME `id` $(id) ; && * ~",
+            "two  spaces\nnewline",
+            "",
+        ]
+        .map(str::to_owned)
+        .into();
+        let line = shell_command("printf", &args);
+        assert!(line.starts_with("exec 'printf' "), "{line}");
+        for shell in ["/bin/sh", "bash", "zsh", "fish"] {
+            if !shell.starts_with('/') && intent_providers::resolve_on_path(shell).is_none() {
+                continue;
+            }
+            let out = std::process::Command::new(shell)
+                .args(["-c", &line])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{shell}: {out:?}");
+            let expected = args[1..].join("|") + "|";
+            assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{shell}");
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

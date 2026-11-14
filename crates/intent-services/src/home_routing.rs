@@ -6,7 +6,8 @@
 //! `git.getConfig`, `git.getRemoteUrl`, `git.removeLockFile`) stay here;
 //! `git.push` first has the home push its commits to the hub. Attachments
 //! are kept here while they upload and placed on the home in pieces of at
-//! most [`HOME_PIECE_BYTES`].
+//! most [`HOME_PIECE_BYTES`]. `host.exec` runs on the home as a home call
+//! too, and `host.execStream` as an exec-mode `ptyOpen` there.
 
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -33,17 +34,28 @@ const PATH_LIST_PARAMS: &[&str] = &["paths", "files"];
 /// `workspaceId` only routes them.
 const REPO_PATH_METHODS: &[&str] = &["git.pull", "git.getBranches", "git.branchStatus"];
 
-/// Home methods that do not go to the home from here: `host.exec` is not a
-/// workspace call; uploads are kept here, and the placement then sends
-/// them on through [`Services::place_on_home`].
+/// Home methods that do not go to the home from here: uploads are kept
+/// here, and the placement then sends them on through
+/// [`Services::place_on_home`].
 const NOT_ROUTED: &[&str] = &[
     "file.attachmentUpload.abort",
     "file.attachmentUpload.begin",
     "file.attachmentUpload.chunk",
     "file.attachmentUpload.commit",
     "file.placeAttachment",
-    "host.exec",
 ];
+
+/// The streaming exec, which runs on the home as an exec-mode `ptyOpen`
+/// rather than a home call.
+const EXEC_STREAM: &str = "host.execStream";
+
+/// The margin a routed `host.exec` leaves past its own `timeoutMs`, so the
+/// home's timed-out result arrives before the call's deadline.
+const EXEC_REPLY_MARGIN: Duration = Duration::from_secs(10);
+
+/// The longest a routed `host.exec` without a `timeoutMs` may run: the
+/// machine's bound on any home call.
+const EXEC_UNBOUNDED: Duration = Duration::from_secs(60 * 60);
 
 /// Routed methods that change the checkout or its history: like local
 /// writes, they are refused while the workspace is being deleted.
@@ -93,8 +105,17 @@ fn cancelled_search(method: &str, request_id: &str) -> Value {
 }
 
 /// How long a routed call may run on the home.
-fn call_timeout(method: &str) -> Duration {
+fn call_timeout(method: &str, params: &Map<String, Value>) -> Duration {
     match method {
+        "host.exec" => {
+            params
+                .get("timeoutMs")
+                .and_then(Value::as_u64)
+                .map_or(EXEC_UNBOUNDED, |ms| {
+                    Duration::from_millis(ms.min(crate::host_exec::MAX_TIMEOUT_MS))
+                        + EXEC_REPLY_MARGIN
+                })
+        }
         // Below the app's own 150 s bound for a pull, so the home's answer
         // arrives first.
         "git.pull" => Duration::from_secs(130),
@@ -156,6 +177,22 @@ fn resolve_existing(path: &Path) -> Option<PathBuf> {
         rest.push(existing.file_name()?.to_owned());
         existing = existing.parent()?;
     }
+}
+
+/// A `host.execStream` `cwd` relative to the home checkout (`None` for
+/// its root), mapped as [`checkout_relative`] maps a path; a relative one
+/// that leaves the checkout is refused here, as a local stream refuses it
+/// before it starts.
+fn exec_cwd(worktree: &Path, cwd: &str) -> Result<Option<String>> {
+    let cwd = cwd.trim();
+    let rel = checkout_relative(worktree, cwd).ok_or_else(|| outside("cwd", cwd))?;
+    if !Path::new(&rel)
+        .components()
+        .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(outside("cwd", cwd));
+    }
+    Ok((!rel.is_empty() && rel != ".").then_some(rel))
 }
 
 fn outside(param: &str, path: &str) -> Error {
@@ -271,7 +308,7 @@ impl Services {
         method: &str,
         params: &Map<String, Value>,
     ) -> Option<std::result::Result<Value, HomeCallFailure>> {
-        if method != "git.push" && !routed(method) {
+        if method != "git.push" && method != EXEC_STREAM && !routed(method) {
             return None;
         }
         let workspace_id = WorkspaceId::from(params.get("workspaceId")?.as_str()?);
@@ -316,6 +353,17 @@ impl Services {
         if REPO_PATH_METHODS.contains(&method) && !names_checkout(&worktree, params) {
             return Ok(None);
         }
+        if method == EXEC_STREAM {
+            return self
+                .home_exec_stream(workspace_id, &worktree, params)
+                .await
+                .map(|request_id| Some(Ok(json!({ "requestId": request_id }))));
+        }
+        if method == "host.exec" {
+            // Refused here as a local exec refuses it (`secretEnv`, a
+            // missing command), before the home is asked.
+            crate::host_exec::parse_args(params).map_err(crate::host_exec::domain_err)?;
+        }
         if params.get("gitRootId").is_some_and(|id| !id.is_null()) {
             // The home's record knows no registered git roots of this
             // workspace.
@@ -327,6 +375,7 @@ impl Services {
         if method == "git.agentCommit" {
             self.check_home_commit(workspace_id, params).await?;
         }
+        let timeout = call_timeout(method, params);
         let mut params = home_params(&worktree, params.clone())?;
         if method == "git.agentCommit" {
             // The home commits as a remote agent's launch would: with the
@@ -355,14 +404,7 @@ impl Services {
             params.insert("requestId".into(), Value::String(id.clone()));
             id
         });
-        let call = port.home_call(
-            self,
-            home,
-            workspace_id,
-            method,
-            params,
-            call_timeout(method),
-        );
+        let call = port.home_call(self, home, workspace_id, method, params, timeout);
         let result = match search_id {
             Some(request_id) => {
                 let token = self
@@ -390,6 +432,29 @@ impl Services {
             other => other,
         };
         Ok(Some(result.map_err(HomeCallFailure::Home)))
+    }
+
+    /// `host.execStream` on the home: the stream's `requestId`.
+    async fn home_exec_stream(
+        &self,
+        workspace_id: &WorkspaceId,
+        worktree: &Path,
+        params: &Map<String, Value>,
+    ) -> Result<String> {
+        let args =
+            crate::host_exec_stream::parse_args(params).map_err(crate::host_exec::domain_err)?;
+        let cwd = args
+            .common
+            .cwd
+            .as_deref()
+            .map(|cwd| exec_cwd(worktree, cwd))
+            .transpose()?
+            .flatten();
+        let bus = self
+            .event_bus
+            .clone()
+            .ok_or_else(|| Error::Internal("host.execStream requires an event bus".into()))?;
+        crate::host_exec_stream::start_home_stream(self, bus, workspace_id, args, cwd).await
     }
 
     /// The home answers a code search inline; more matches than a client
@@ -756,11 +821,22 @@ impl Drop for OpenUpload {
 
 /// The home's error for an attachment call, as a domain error: its
 /// message, `-32602` as invalid params, anything else internal.
-fn home_error(error: &intent_core::node_link::HomeCallError) -> Error {
+pub(crate) fn home_error(error: &intent_core::node_link::HomeCallError) -> Error {
     if error.code == -32602 {
         Error::InvalidParams(error.message.clone())
     } else {
         Error::Internal(error.message.clone())
+    }
+}
+
+/// The home's error as this daemon's, keeping its `data` (`data.code`,
+/// such as `node-home-unknown`) when it carries one.
+pub(crate) fn home_error_with_data(error: intent_core::node_link::HomeCallError) -> Error {
+    match error.data {
+        Some(data) if data.get("code").is_some_and(Value::is_string) => {
+            Error::remote_machine(error.code != -32602, error.message, data)
+        }
+        _ => home_error(&error),
     }
 }
 

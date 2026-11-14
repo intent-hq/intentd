@@ -882,6 +882,16 @@ fn home_call_to_rpc(failure: intent_core::node_link::HomeCallFailure) -> RpcErr 
     }
 }
 
+/// The JSON-RPC error frame of a call the workspace's home failed, for
+/// the fast paths that route to the home outside [`dispatch`].
+pub(crate) fn home_failure_frame(
+    id: &Value,
+    failure: intent_core::node_link::HomeCallFailure,
+) -> String {
+    let err = home_call_to_rpc(failure);
+    error_string(id, err.code, &err.message, err.data)
+}
+
 fn millis_u64(millis: u128) -> u64 {
     u64::try_from(millis.min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
 }

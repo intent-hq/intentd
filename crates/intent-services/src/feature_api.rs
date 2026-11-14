@@ -100,12 +100,13 @@ pub mod delivery_tasks {
 pub mod feature_ports {
     pub use crate::feature_ports::{
         monitor_id, wake_id, AgentWakePort, ArchiveScriptOutcome, ArchiveScriptRun,
-        ArchiveScriptTrigger, CancelSettlement, CommandScriptActivity, HomeScriptOpen,
-        HomeTerminalOpen, MachineOneShotAnswer, MachineOneShotRequest, MachineScriptLink,
-        MachineSecretAnswer, MachineSecretOp, MachineSkills, RemoteLaunchPort, RemoteRuntime,
-        RemoteScriptCaller, RuntimePort, ScriptFrameSender, ScriptsClosing, SetupScriptRun,
-        TransferPort, UnavailableAgentWake, UnavailableRemoteLaunch, ARCHIVE_SCRIPT_TIMEOUT,
-        IMPORT_MAX_CHUNK_BYTES, NO_QUICK_ACTION_MACHINE,
+        ArchiveScriptTrigger, CancelSettlement, CommandScriptActivity, HomeExec, HomeExecControl,
+        HomeExecEvent, HomeExecOpen, HomeScriptOpen, HomeTerminalOpen, MachineOneShotAnswer,
+        MachineOneShotRequest, MachineScriptLink, MachineSecretAnswer, MachineSecretOp,
+        MachineSkills, RemoteLaunchPort, RemoteRuntime, RemoteScriptCaller, RuntimePort,
+        ScriptFrameSender, ScriptsClosing, SetupScriptRun, TransferPort, UnavailableAgentWake,
+        UnavailableRemoteLaunch, ARCHIVE_SCRIPT_TIMEOUT, IMPORT_MAX_CHUNK_BYTES,
+        NO_QUICK_ACTION_MACHINE,
     };
 }
 
