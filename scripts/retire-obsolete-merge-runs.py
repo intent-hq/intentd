@@ -24,7 +24,8 @@ https://docs.github.com/en/rest/actions/workflow-runs#cancel-a-workflow-run
 Production integration must prove actual workflow-token visibility of bypass
 metadata in dry-run before enabling apply; local gh visibility is insufficient.
 The injectable transport is the sole network/cancellation boundary. 202 means
-accepted, not stopped. No retries, force-cancel, or replacement-run targeting.
+accepted, not stopped. No retries, force-cancel, or replacement-run targeting;
+only a self-inconsistent run-list read is re-read, and only a consistent one is used.
 """
 import argparse
 import json
@@ -36,6 +37,7 @@ from urllib.parse import parse_qs, urlsplit
 WORKFLOWS = {'intent-hq/intentd': '.github/workflows/ci.yml',
              'intent-hq/cloudlands-fe': '.github/workflows/intent-pr.yml'}
 LIVE = ('queued', 'in_progress', 'waiting', 'pending', 'requested')
+INVENTORY_READS = 3  # GitHub counts and lists filtered runs separately; a status change skews one read.
 QUEUE_STATES = {'QUEUED', 'AWAITING_CHECKS', 'MERGEABLE', 'UNMERGEABLE', 'LOCKED'}
 REQUIRED_RULES = {'deletion', 'non_fast_forward', 'required_linear_history'}
 QUEUE_REF = re.compile(r'gh-readonly-queue/main/pr-[1-9][0-9]*-[0-9a-f]{40}')
@@ -52,6 +54,10 @@ QUEUE_QUERY = '''query($owner:String!,$name:String!,$cursor:String){
 
 class SafetyError(ValueError):
     """Incomplete or inconsistent evidence: stop the scan without retrying."""
+
+
+class Inconsistent(SafetyError):
+    """A run-list snapshot disagreed with itself (rows vs total_count); re-read it, bounded."""
 
 
 class Skip(ValueError):
@@ -180,19 +186,32 @@ def context(client):
             'workflow_id': workflow['id'], 'path': path}
 
 
+def run_snapshot(client, path):
+    total, runs = None, []
+    for page in client.pages(path):
+        count = page['total_count']
+        require(integer(count) and count <= 1000, 'filtered run search truncated')
+        if total is not None and total != count:
+            raise Inconsistent('run count changed during pagination')
+        total = count
+        require(isinstance(page['workflow_runs'], list) and len(page['workflow_runs']) <= 100, 'invalid run page')
+        runs.extend(page['workflow_runs'])
+    if len(runs) != total:
+        raise Inconsistent('incomplete run pages')
+    return runs
+
+
 def discover(client, ctx):
     discovered = {}
     for status in LIVE:
         path = client.root + f'/actions/workflows/{ctx["workflow_id"]}/runs?event=merge_group&status={status}&per_page=100'
-        total, runs = None, []
-        for page in client.pages(path):
-            count = page['total_count']
-            require(integer(count) and count <= 1000, 'filtered run search truncated')
-            require(total is None or total == count, 'run count changed during pagination')
-            total = count
-            require(isinstance(page['workflow_runs'], list) and len(page['workflow_runs']) <= 100, 'invalid run page')
-            runs.extend(page['workflow_runs'])
-        require(len(runs) == total, 'incomplete run pages')
+        for attempt in range(1, INVENTORY_READS + 1):
+            try:
+                runs = run_snapshot(client, path)
+                break
+            except Inconsistent:
+                if attempt == INVENTORY_READS:
+                    raise
         for run in runs:
             require(integer(run['id'], 1) and run['id'] not in discovered, 'duplicate or invalid run ID')
             discovered[run['id']] = run

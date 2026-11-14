@@ -391,6 +391,31 @@ class Scenarios:
         self.api.list_pages = [{'total_count': 2, 'workflow_runs': [self.api.runs[10]]}]*2
         self.assert_skips(max_pages=1)
 
+    def test_self_inconsistent_run_snapshot_is_reread_within_a_bound(self):
+        # Shape of cloudlands-fe run 43235620671 / intentd run 43364575898: one page, no Link,
+        # total_count disagreeing with workflow_runs while runs change status.
+        path = self.api.root + '/actions/workflows/123/runs?event=merge_group&status=queued&per_page=100'
+        for skewed_reads, mutations in ((1, self.expected()), (2, self.expected()), (3, [])):
+            with self.subTest(skewed_reads=skewed_reads):
+                self.api = FakeGitHub(self.REPO)
+                self.api.override = lambda method, p, body, n: self.api.response(
+                    {'total_count': 2, 'workflow_runs': [self.api.runs[10]]}) if p == path and n <= skewed_reads else None
+                result = self.scan()
+                self.assertEqual(self.api.mutations, mutations, result)
+                self.assertEqual(self.api.counts[('GET', path)], min(skewed_reads + 1, P.INVENTORY_READS))
+                if not mutations:
+                    self.assertEqual(result['error'], 'incomplete run pages')
+
+    def test_run_count_change_between_pages_is_reread(self):
+        self.api.runs[20] = self.api.make_run(20)
+        self.api.list_pages = [{'total_count': 2, 'workflow_runs': [self.api.runs[10]]},
+                               {'total_count': 2, 'workflow_runs': [self.api.runs[20]]}]
+        second = self.api.root + '/actions/workflows/123/runs?event=merge_group&status=queued&per_page=100&page=2'
+        self.api.override = lambda method, p, body, n: self.api.response(
+            {'total_count': 3, 'workflow_runs': [self.api.runs[20]]}) if p == second and n == 1 else None
+        result = self.scan()
+        self.assertEqual(self.api.mutations, self.expected() + self.expected(20), result)
+
     def test_pagination_must_not_escape_repo_or_loop(self):
         for link in ('https://evil.invalid/runs', 'https://api.github.com/repos/other/repo/runs',
                      'https://api.github.com' + self.api.root + '/rules/branches/main?per_page=100'):
