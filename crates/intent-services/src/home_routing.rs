@@ -6,13 +6,17 @@
 //! `git.getConfig`, `git.getRemoteUrl`, `git.removeLockFile`) stay here;
 //! `git.push` first has the home push its commits to the hub. Attachments
 //! are kept here while they upload and placed on the home in pieces of at
-//! most [`HOME_PIECE_BYTES`].
+//! most [`HOME_PIECE_BYTES`]. The home's file and git events come back as
+//! `homeEvents` and are published here for the workspace
+//! ([`Services::publish_home_events`]).
 
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
-use intent_core::node_link::{HomeCallFailure, HOME_METHODS};
+use intent_core::node_link::{
+    HomeCallFailure, HomeEvents, HOME_EVENT_TYPES, HOME_METHODS, MAX_HOME_EVENTS,
+};
 use intent_core::{Error, Result, WorkspaceHome, WorkspaceId};
 use serde_json::{json, Map, Value};
 use sha2::Digest as _;
@@ -247,6 +251,65 @@ impl Services {
                 cancel.cancel();
                 running.await
             }
+        }
+    }
+
+    /// Publish a machine's `homeEvents` for the workspace they name, as the
+    /// client events of their types (node-link.md "File and git events of a
+    /// home"). Dropped whole when (`workspaceId`, `homeId`) is not the
+    /// workspace's current home on `node_id`; an event of a type a home
+    /// does not relay, or without object data, is dropped alone.
+    pub async fn publish_home_events(&self, node_id: &str, frame: HomeEvents) {
+        let workspace_id = frame.workspace_id.clone();
+        let Ok(Some(current)) = self.machine_home(&workspace_id).await else {
+            tracing::debug!(workspace = %workspace_id, "home events for a workspace without a home on a machine; dropped");
+            return;
+        };
+        if current.node_id.as_deref() != Some(node_id) || current.home_id != frame.home_id {
+            tracing::debug!(workspace = %workspace_id, home = %frame.home_id, "home events of a home that is not the workspace's current one; dropped");
+            return;
+        }
+        let mut row = None;
+        for event in frame.events.into_iter().take(MAX_HOME_EVENTS) {
+            if !HOME_EVENT_TYPES.contains(&event.event_type.as_str()) {
+                continue;
+            }
+            let Value::Object(mut data) = event.data else {
+                continue;
+            };
+            if !event.event_type.starts_with("file:") {
+                data.insert("workspaceId".into(), json!(workspace_id.as_str()));
+            }
+            if event.event_type == intent_core::events::CHANGES_GIT_STATUS {
+                // The home holds no PR record: the workspace's is this
+                // backend's.
+                if row.is_none() {
+                    row = self.store.get_workspace(&workspace_id).await.ok();
+                }
+                if let (Some(workspace), Some(Value::Object(status))) =
+                    (row.as_ref(), data.get_mut("status"))
+                {
+                    status.insert(
+                        "existingPR".into(),
+                        crate::accept_changes::existing_pr_value(workspace).unwrap_or(Value::Null),
+                    );
+                }
+            }
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                intent_store::NewEvent {
+                    workspace_id: workspace_id.clone(),
+                    timestamp: intent_core::now_iso(),
+                    event_type: event.event_type,
+                    actor: crate::system_actor(),
+                    session_id: None,
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: Value::Object(data),
+                },
+            )
+            .await;
         }
     }
 

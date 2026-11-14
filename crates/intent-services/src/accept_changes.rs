@@ -126,7 +126,7 @@ fn pr_state_word(status: PullRequestStatus) -> &'static str {
 }
 
 /// Build the `existingPR` fragment from the workspace's linked PR snapshot.
-fn existing_pr_value(ws: &Workspace) -> Option<Value> {
+pub(crate) fn existing_pr_value(ws: &Workspace) -> Option<Value> {
     let pr = ws.active_pull_request.as_ref()?;
     Some(json!({
         "number": pr.number,

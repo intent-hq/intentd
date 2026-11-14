@@ -23,10 +23,12 @@ async fn machine(dir: &std::path::Path) -> Machine {
     let store = intent_store::Store::open(&store_dir.path().join("machine.db"))
         .await
         .unwrap();
+    let bus = intent_services::EventBus::new(store.clone());
     let services = intent_services::Services::new(store)
-        .with_workspaces_root(store_dir.path().join("workspaces"));
+        .with_workspaces_root(store_dir.path().join("workspaces"))
+        .with_event_bus(bus);
     let records: Arc<dyn runner::HomeRecords> =
-        Arc::new(crate::executor::ServicesHomeRecords(services.clone()));
+        Arc::new(crate::executor::ServicesHomeRecords::new(services.clone()));
     let node = Running::start_with_records(
         dir,
         MachineApi::new(),
@@ -458,7 +460,7 @@ async fn home_attachments_survive_a_machine_restart() {
         _store,
     } = m;
     let api = node.stop().await;
-    crate::executor::ServicesHomeRecords(services.clone())
+    crate::executor::ServicesHomeRecords::new(services.clone())
         .purge()
         .await;
     assert_eq!(services.store().home_record_ids().await.unwrap(), records);
@@ -468,7 +470,7 @@ async fn home_attachments_survive_a_machine_restart() {
         CountAdmission::new(4),
         Arc::new(HomesLaunch(true)),
         |storage, _cache| checkout::PlainCheckouts::new(storage),
-        Some(Arc::new(crate::executor::ServicesHomeRecords(
+        Some(Arc::new(crate::executor::ServicesHomeRecords::new(
             services.clone(),
         ))),
     )
@@ -708,7 +710,7 @@ async fn a_cancelled_home_call_stops_its_search() {
         .unwrap();
     let services = intent_services::Services::new(store)
         .with_workspaces_root(store_dir.path().join("workspaces"));
-    let records = crate::executor::ServicesHomeRecords(services);
+    let records = crate::executor::ServicesHomeRecords::new(services);
     let checkout = store_dir.path().join("home").join("checkout");
     std::fs::create_dir_all(&checkout).unwrap();
     for n in 0..40 {
@@ -750,4 +752,125 @@ async fn a_cancelled_home_call_stops_its_search() {
             "{method}: {full}"
         );
     }
+}
+
+/// The next `homeEvents` of `home` with an event `pick` takes; every
+/// event read on the way is kept in `seen`.
+async fn next_home_event(
+    dialed: &mut DialedLink,
+    home: &HomeRef,
+    seen: &mut Vec<intent_core::node_link::HomeEvent>,
+    pick: impl Fn(&intent_core::node_link::HomeEvent) -> bool,
+) -> intent_core::node_link::HomeEvent {
+    loop {
+        let frame = next_frame(dialed).await.expect("the link closed");
+        let LinkFrame::HomeEvents(events) = frame else {
+            continue;
+        };
+        assert_eq!(events.home(), *home);
+        assert!(!events.events.is_empty());
+        assert!(events.events.len() <= intent_core::node_link::MAX_HOME_EVENTS);
+        for event in events.events {
+            seen.push(event.clone());
+            if pick(&event) {
+                return event;
+            }
+        }
+    }
+}
+
+/// File and git events of a home (node-link.md "File and git events of a
+/// home"): what the watch and the home calls emit reaches the backend as
+/// `homeEvents`, without the machine's paths or its hidden record, and
+/// nothing follows once the home is closed.
+#[tokio::test]
+async fn a_homes_file_and_git_events_reach_the_backend_until_it_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = machine(dir.path()).await;
+    let (mut dialed, h1, work) = opened(&m, dir.path()).await;
+    let mut seen = Vec::new();
+
+    // The watch arms once the setup is done: write until it reports.
+    let budget = intentd_test_support::test_timeout(Duration::from_secs(60));
+    let file = tokio::time::timeout(budget, async {
+        let mut n = 0;
+        loop {
+            n += 1;
+            let name = format!("new-{n}.txt");
+            ok(call(
+                &mut dialed,
+                &h1,
+                "file.write",
+                json!({ "path": name, "content": "x\n" }),
+            )
+            .await);
+            let got = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(3)),
+                next_home_event(&mut dialed, &h1, &mut seen, |event| {
+                    event.event_type.starts_with("file:")
+                        && event.data["path"]
+                            .as_str()
+                            .is_some_and(|path| path.starts_with("new-"))
+                }),
+            )
+            .await;
+            if let Ok(event) = got {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("no file event of the home");
+    let path = file.data["path"].as_str().unwrap().to_owned();
+    assert!(path.starts_with("new-"), "{:?}", file.data);
+
+    // A commit through a home call gives `git:commit` for the backend's
+    // workspace.
+    let committed = ok(call(
+        &mut dialed,
+        &h1,
+        "git.agentCommit",
+        json!({ "message": "new", "files": [path], "userRequested": true }),
+    )
+    .await);
+    let commit = next_home_event(&mut dialed, &h1, &mut seen, |event| {
+        event.event_type == "git:commit"
+    })
+    .await;
+    assert_eq!(
+        commit.data["commit"], committed["hash"],
+        "{:?}",
+        commit.data
+    );
+    assert_eq!(commit.data["workspaceId"], h1.workspace_id.as_str());
+    let status = next_home_event(&mut dialed, &h1, &mut seen, |event| {
+        event.event_type == "changes:git-status"
+    })
+    .await;
+    assert_eq!(status.data["workspaceId"], h1.workspace_id.as_str());
+    let shown = serde_json::to_string(&seen).unwrap();
+    for hidden in [
+        dir.path().to_string_lossy().into_owned(),
+        std::fs::canonicalize(dir.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        "__home__".to_owned(),
+    ] {
+        assert!(!shown.contains(&hidden), "{hidden} shown in {shown}");
+    }
+
+    // Closed, the home sends nothing more of what changes after (frames
+    // sent before the close may still arrive).
+    m.node.service.runners_for_test()[0].close_homes();
+    std::fs::write(work.join("after-close.txt"), "x\n").unwrap();
+    let more = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        next_home_event(&mut dialed, &h1, &mut seen, |event| {
+            event.data.to_string().contains("after-close")
+        }),
+    )
+    .await;
+    assert!(more.is_err(), "an event after close: {more:?}");
+    m.node.stop().await;
 }

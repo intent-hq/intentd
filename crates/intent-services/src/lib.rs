@@ -375,13 +375,14 @@ pub use agent_session::SuspendOverlapQuery;
 pub use agent_subscriptions::StartupCompletionRecovery;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
-// The individual watcher families are constructed only by `WatcherRegistry`,
-// so only the registry, the shared-stream hub it and `ConfigWatcher` ride
-// (created by the composition root; intent-hq/intent#4953), and the
-// bus/refresher surface leave the crate.
+// The individual watcher families are constructed only by `WatcherRegistry`
+// and, for a machine's home checkouts, `HomeWatches`, so only those, the
+// shared-stream hub the registry and `ConfigWatcher` ride (created by the
+// composition root; intent-hq/intent#4953), and the bus/refresher surface
+// leave the crate.
 pub use events::{
-    Delivery, EventBus, FenceHandle, GitStatusRefresher, SharedWatchHub, Subscription,
-    SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, FenceHandle, GitStatusRefresher, HomeWatch, HomeWatches, SharedWatchHub,
+    Subscription, SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use note_write::persist_system_new_note;

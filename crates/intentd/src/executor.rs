@@ -941,9 +941,19 @@ impl runner::MachineOneShot for ServicesOneShot {
 /// Home calls run through the daemon's own JSON-RPC router, against hidden
 /// workspace records of the home checkouts (node-link.md "Files and git on
 /// the home").
-pub(crate) struct ServicesHomeRecords(pub intent_services::Services);
+pub(crate) struct ServicesHomeRecords(
+    pub intent_services::Services,
+    /// The home checkouts' watches (node-link.md "File and git events of a
+    /// home"); `None` without an event bus.
+    Option<intent_services::HomeWatches>,
+);
 
 impl ServicesHomeRecords {
+    pub(crate) fn new(services: intent_services::Services) -> Self {
+        let watches = services.home_watches();
+        Self(services, watches)
+    }
+
     /// Remove the hidden records whose home is gone: a record lives as
     /// long as its home checkout (whose directory names it in
     /// [`home_record_file`]), across reopens and restarts.
@@ -1079,6 +1089,25 @@ impl runner::HomeRecords for ServicesHomeRecords {
             intent_core::Caller::Daemon,
             async move { dispatch_home_call(&services, &method, params, stop).await },
         ))
+    }
+
+    fn watch(
+        &self,
+        record: &intent_core::WorkspaceId,
+        worktree: &std::path::Path,
+    ) -> Option<runner::HomeWatchGuard> {
+        let watches = self.1.as_ref()?;
+        Some(Box::new(watches.watch(record, worktree)))
+    }
+
+    fn events(&self) -> Option<tokio::sync::broadcast::Receiver<Arc<intent_core::Event>>> {
+        Some(self.1.as_ref()?.events())
+    }
+
+    fn refresh(&self, record: &intent_core::WorkspaceId) {
+        if let Some(watches) = &self.1 {
+            watches.refresh(record);
+        }
     }
 }
 
@@ -1419,7 +1448,7 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
             return None;
         }
     };
-    let home_records = Arc::new(ServicesHomeRecords(parts.services.clone()));
+    let home_records = Arc::new(ServicesHomeRecords::new(parts.services.clone()));
     home_records.purge().await;
     let report = Arc::new(DaemonReport {
         services: parts.services.clone(),

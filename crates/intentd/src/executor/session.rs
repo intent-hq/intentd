@@ -299,6 +299,9 @@ pub(super) async fn serve_link(
             runner.resend_setup_output(&link);
             if protocol >= HOMES_PROTOCOL {
                 runner.resend_home_setup_output(&link);
+                // Events of the homes were dropped while no link was bound:
+                // a fresh git status catches the backend up.
+                runner.refresh_home_events();
             }
             // The backend listed the agents it still records: the
             // checkouts of any others are orphans.

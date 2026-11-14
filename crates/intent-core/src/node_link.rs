@@ -600,6 +600,71 @@ impl HomeCallReply {
     }
 }
 
+/// The client event types a home relays in [`HomeEvents`] (monorepo
+/// `docs/protocol/node-link.md`, "File and git events of a home").
+pub const HOME_EVENT_TYPES: &[&str] = &[
+    "file:changed",
+    "file:created",
+    "file:deleted",
+    "git:commit",
+    "git:pull",
+    "changes:git-status",
+];
+
+/// The most events one [`HomeEvents`] carries.
+pub const MAX_HOME_EVENTS: usize = 256;
+
+/// Machine to backend (nodeProtocol 19, script lane): file and git events
+/// of a home checkout, oldest first, for the backend to publish to its
+/// clients. Best effort: no `seq`, no ack. The body is closed. `Debug`
+/// leaves out the events' data.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeEvents {
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+    pub events: Vec<HomeEvent>,
+}
+
+impl std::fmt::Debug for HomeEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HomeEvents")
+            .field("workspace_id", &self.workspace_id)
+            .field("home_id", &self.home_id)
+            .field(
+                "events",
+                &self
+                    .events
+                    .iter()
+                    .map(|event| event.event_type.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl HomeEvents {
+    /// The home these events are of.
+    #[must_use]
+    pub fn home(&self) -> HomeRef {
+        HomeRef {
+            workspace_id: self.workspace_id.clone(),
+            home_id: self.home_id.clone(),
+        }
+    }
+}
+
+/// One event of a [`HomeEvents`]: a client event's `type` and `data`.
+/// `type` is kept as sent, so a backend drops a type it does not relay
+/// instead of the whole frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeEvent {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub data: Value,
+}
+
 /// [`LaunchCommand::checkout_of`]: the agent whose checkout a sub-agent
 /// works in (nodeProtocol 13, a string on the wire), or the workspace's
 /// home checkout (nodeProtocol 19, an object).
@@ -2207,6 +2272,8 @@ pub enum LinkFrame {
     HomeCallCancel(HomeCallCancel),
     /// Machine to backend (nodeProtocol 19): a home call's answer.
     HomeCallReply(HomeCallReply),
+    /// Machine to backend (nodeProtocol 19): a home's file and git events.
+    HomeEvents(HomeEvents),
 }
 
 /// A chunk of an agent's or (nodeProtocol 19) a home's checkout progress
@@ -2404,7 +2471,8 @@ impl LinkFrame {
             | Self::CheckoutRead(_)
             | Self::CheckoutReadReply(_)
             | Self::PtyOutput(_)
-            | Self::PtyExited(_) => LinkChannel::Script,
+            | Self::PtyExited(_)
+            | Self::HomeEvents(_) => LinkChannel::Script,
         }
     }
 
@@ -2438,7 +2506,8 @@ impl LinkFrame {
             | Self::PtyExited(_)
             | Self::HomeCall(_)
             | Self::HomeCallCancel(_)
-            | Self::HomeCallReply(_) => HOMES_PROTOCOL,
+            | Self::HomeCallReply(_)
+            | Self::HomeEvents(_) => HOMES_PROTOCOL,
             _ if self
                 .script_owner()
                 .is_some_and(|owner| owner.home().is_some()) =>
@@ -2549,7 +2618,8 @@ impl LinkFrame {
             | Self::HomePushReply(_)
             | Self::PtyOutput(_)
             | Self::PtyExited(_)
-            | Self::HomeCallReply(_) => false,
+            | Self::HomeCallReply(_)
+            | Self::HomeEvents(_) => false,
         }
     }
 

@@ -2929,6 +2929,14 @@ async fn serve(
                             let _ = waiter.send(reply);
                         }
                     }
+                    LinkEvent::Frame(LinkFrame::HomeEvents(events)) => {
+                        // In order: one frame's events before the next's.
+                        if let Some(services) = &shared.services {
+                            services
+                                .publish_home_events(&shared.machine_id(), events)
+                                .await;
+                        }
+                    }
                     LinkEvent::Frame(LinkFrame::HomePushReply(reply)) => {
                         if let Some(waiter) = lock(&shared.home_waiters).remove(&reply.request_id) {
                             let _ = waiter.send(crate::homes::HomeReply::Push(reply));

@@ -417,6 +417,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "checkoutReadReply",
             "forgeTokenReply",
             "homeCallReply",
+            "homeEvents",
             "homeOpenReply",
             "homePushReply",
             "journal",
@@ -781,7 +782,59 @@ fn every_frame() -> Vec<LinkFrame> {
             request_id: LinkId::nil(),
         }),
         LinkFrame::HomeCallReply(HomeCallReply::ok(LinkId::nil(), json!({ "content": "hi" }))),
+        LinkFrame::HomeEvents(home_events()),
     ]
+}
+
+fn home_events() -> HomeEvents {
+    HomeEvents {
+        workspace_id: WorkspaceId::from("ws-1"),
+        home_id: HomeId::from("home-1"),
+        events: vec![HomeEvent {
+            event_type: "file:changed".into(),
+            data: json!({ "path": "src/main.rs", "relativePath": "src/main.rs", "action": "modify" }),
+        }],
+    }
+}
+
+/// `homeEvents` (nodeProtocol 19): a closed body on the script lane, from
+/// the machine only, with no event data in `Debug`; an unknown event type
+/// still decodes, so the backend drops that event and not the frame.
+#[test]
+fn home_events_wire_shape() {
+    let frame = LinkFrame::HomeEvents(home_events());
+    let value = serde_json::to_value(&frame).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "type": "homeEvents",
+            "workspaceId": "ws-1",
+            "homeId": "home-1",
+            "events": [{
+                "type": "file:changed",
+                "data": { "path": "src/main.rs", "relativePath": "src/main.rs", "action": "modify" },
+            }],
+        })
+    );
+    assert_eq!(frame.channel(), LinkChannel::Script);
+    assert_eq!(frame.min_protocol(), HOMES_PROTOCOL);
+    assert!(!frame.admitted_from_executor());
+    let mut extra = value.clone();
+    extra["agentId"] = json!("a1");
+    assert!(serde_json::from_value::<LinkFrame>(extra).is_err());
+    let mut extra_event = value.clone();
+    extra_event["events"][0]["seq"] = json!(1);
+    assert!(serde_json::from_value::<LinkFrame>(extra_event).is_err());
+    let mut unknown = value;
+    unknown["events"][0]["type"] = json!("agent:stream:delta");
+    assert!(serde_json::from_value::<LinkFrame>(unknown).is_ok());
+    let mut secret = home_events();
+    secret.events[0].data = json!({ "path": "canary-path" });
+    assert!(!format!("{secret:?}").contains("canary"));
+    let mut sorted = HOME_EVENT_TYPES.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), HOME_EVENT_TYPES.len(), "unique");
 }
 
 fn home_call() -> HomeCall {
@@ -1564,6 +1617,7 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
                 | LinkFrame::HomeCall(_)
                 | LinkFrame::HomeCallCancel(_)
                 | LinkFrame::HomeCallReply(_)
+                | LinkFrame::HomeEvents(_)
         );
         let expected = if home {
             HOMES_PROTOCOL
