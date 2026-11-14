@@ -1098,7 +1098,7 @@ fn frames_are_routed_to_their_lane() {
             Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
             Control, Control, Control, Control, Control, Control, Control, Control, Script, Script,
             Script, Rpc, Rpc, Rpc, Control, Control, Control, Control, Control, Control, Control,
-            Control, Control, Script, Script, Rpc, Rpc, Rpc,
+            Control, Control, Script, Script, Rpc, Rpc, Rpc, Script,
         ]
     );
 }
