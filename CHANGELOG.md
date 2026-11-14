@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.210] - 2026-11-14
+
+### 🚀 Features
+
+- Route a home workspace's files and git to its machine ([#3363](https://github.com/intent-hq/intentd/pull/3363))
+
+
 ## [0.11.209] - 2026-11-14
 
 ### 🚀 Features
