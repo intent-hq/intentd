@@ -12,11 +12,13 @@ use std::time::Duration;
 use base64::Engine as _;
 use intent_core::node_link::{
     LinkFrame, PtyAck, PtyEnvVar, PtyExited, PtyInput, PtyKill, PtyMode, PtyOpen, PtyOutput,
-    PtyResize, HOMES_PROTOCOL,
+    PtyResize, PtyStream, HOMES_PROTOCOL,
 };
 use intent_core::{Error, Result, WorkspaceId};
 use intent_pty::{PtyHost, PtyId, PtySize, RemotePty, RemoteSpec};
-use intent_services::feature_api::feature_ports::HomeTerminalOpen;
+use intent_services::feature_api::feature_ports::{
+    HomeExec, HomeExecControl, HomeExecEvent, HomeExecOpen, HomeTerminalOpen,
+};
 use intent_services::Services;
 use intent_transport::node_link::NodeLink;
 use tokio::sync::mpsc;
@@ -48,8 +50,7 @@ struct State {
 }
 
 struct Term {
-    pty: Arc<PtyHost>,
-    id: PtyId,
+    sink: Sink,
     /// The highest `seq` appended; output is taken only in order from 0.
     received: Option<u64>,
     size: Arc<Mutex<PtySize>>,
@@ -58,6 +59,64 @@ struct Term {
     killed: bool,
     /// The home's name, for a start failure shown in the terminal.
     home_name: String,
+}
+
+/// Where a home terminal's output and end go.
+enum Sink {
+    /// A terminal: a remote PTY in the backend's [`PtyHost`].
+    Pty { pty: Arc<PtyHost>, id: PtyId },
+    /// A `host.execStream` process: its output by stream, then its end.
+    Exec(mpsc::UnboundedSender<HomeExecEvent>),
+}
+
+impl Term {
+    /// Take output bytes; `false` once nothing here wants them anymore.
+    fn push(&self, bytes: &[u8], stream: Option<PtyStream>) -> bool {
+        match &self.sink {
+            Sink::Pty { pty, id } => pty.push_remote_output(*id, bytes).is_ok(),
+            Sink::Exec(events) => events
+                .send(HomeExecEvent::Output {
+                    stderr: stream == Some(PtyStream::Stderr),
+                    bytes: bytes.to_vec(),
+                })
+                .is_ok(),
+        }
+    }
+
+    /// The process ended; a start failure (an `error` and no exit code)
+    /// shows why.
+    fn end(self, exit_code: Option<i32>, error: Option<&str>) {
+        match self.sink {
+            Sink::Pty { pty, id } => {
+                if let (Some(error), None) = (error, exit_code) {
+                    let line = format!(
+                        "\r\n[intent] the terminal on {} ended: {error}\r\n",
+                        self.home_name
+                    );
+                    let _ = pty.push_remote_output(id, line.as_bytes());
+                }
+                let _ = pty.remote_exited(id, exit_code);
+            }
+            Sink::Exec(events) => {
+                let _ = events.send(HomeExecEvent::Exited {
+                    exit_code,
+                    error: error.map(str::to_owned),
+                });
+            }
+        }
+    }
+
+    /// The process is lost with the machine's link.
+    fn lost(self) {
+        let error = format!(
+            "{HOME_UNAVAILABLE}: the workspace's home {} is not reachable",
+            self.home_name
+        );
+        match &self.sink {
+            Sink::Pty { .. } => self.end(None, None),
+            Sink::Exec(_) => self.end(None, Some(&error)),
+        }
+    }
 }
 
 impl Drop for HomeTerminals {
@@ -72,7 +131,7 @@ impl Drop for HomeTerminals {
             grace.abort();
         }
         for (_, term) in state.terms.drain() {
-            let _ = term.pty.remote_exited(term.id, None);
+            term.lost();
         }
     }
 }
@@ -104,7 +163,7 @@ impl HomeTerminals {
                         // A released session drops the output, but the
                         // terminal stays held (its kill pending) until the
                         // machine reports the end or the grace ends it.
-                        if term.pty.push_remote_output(term.id, &bytes).is_err() {
+                        if !term.push(&bytes, frame.stream) {
                             term.killed = true;
                         }
                         Some(frame.seq)
@@ -131,14 +190,7 @@ impl HomeTerminals {
     pub(crate) fn exited(&self, frame: &PtyExited) {
         let term = lock(&self.state).terms.remove(&frame.terminal_id);
         if let Some(term) = term {
-            if let (Some(error), None) = (&frame.error, frame.exit_code) {
-                let line = format!(
-                    "\r\n[intent] the terminal on {} ended: {error}\r\n",
-                    term.home_name
-                );
-                let _ = term.pty.push_remote_output(term.id, line.as_bytes());
-            }
-            let _ = term.pty.remote_exited(term.id, frame.exit_code);
+            term.end(frame.exit_code, frame.error.as_deref());
         }
     }
 
@@ -223,7 +275,7 @@ impl HomeTerminals {
                 state.terms.drain().map(|(_, term)| term).collect()
             };
             for term in ended {
-                let _ = term.pty.remote_exited(term.id, None);
+                term.lost();
             }
         }));
     }
@@ -261,6 +313,16 @@ impl LinkPty {
         self.frames
             .send(frame)
             .map_err(|_| std::io::Error::other("the terminal is closed"))
+    }
+}
+
+impl HomeExecControl for LinkPty {
+    fn write(&self, data: &[u8]) -> std::io::Result<()> {
+        RemotePty::write(self, data)
+    }
+
+    fn kill(&self) {
+        RemotePty::kill(self);
     }
 }
 
@@ -340,20 +402,12 @@ pub(crate) async fn connect_home(svc: &Services, workspace_id: &WorkspaceId) -> 
         .map_err(|error| home_unavailable(&home, &error.to_string()))
 }
 
-/// Start a terminal (or, in `exec` mode, a command) on `workspace_id`'s
-/// home as a remote PTY in `pty`. `None` when the workspace has no home on
-/// a machine, so the caller runs it here.
-///
-/// # Errors
-///
-/// `home-unavailable` when the home's machine cannot be reached or does
-/// not speak nodeProtocol 19.
-pub(crate) async fn open(
+/// The connected machine of `workspace_id`'s home, speaking nodeProtocol
+/// 19; `None` when the workspace has no home on a machine.
+async fn linked_home(
     svc: &Services,
     workspace_id: &WorkspaceId,
-    pty: &Arc<PtyHost>,
-    open: HomeTerminalOpen,
-) -> Result<Option<PtyId>> {
+) -> Result<Option<(intent_core::WorkspaceHome, crate::connector::RemoteNode)>> {
     if !svc.workspace_homes() {
         return Ok(None);
     }
@@ -373,19 +427,72 @@ pub(crate) async fn open(
     node.connect()
         .await
         .map_err(|error| home_unavailable(&home, &error.to_string()))?;
-    let shared = node.shared_ref();
-    if shared.protocol() < HOMES_PROTOCOL {
+    if node.shared_ref().protocol() < HOMES_PROTOCOL {
         return Err(home_unavailable(
             &home,
             "its machine needs an intentd update for workspace homes",
         ));
     }
+    Ok(Some((home, node)))
+}
+
+/// Hold `term` as `terminal_id` and send its `ptyOpen` on the terminal's
+/// own queue, so no input, resize or kill sent meanwhile reaches the
+/// machine ahead of it.
+fn start(
+    shared: &Shared,
+    term: Term,
+    open: PtyOpen,
+    frames: &mpsc::UnboundedSender<LinkFrame>,
+    mut queued: mpsc::UnboundedReceiver<LinkFrame>,
+) {
+    lock(&shared.terminals.state)
+        .terms
+        .insert(open.terminal_id.clone(), term);
+    let _ = frames.send(LinkFrame::PtyOpen(open));
+    let forwarder = shared.weak();
+    // caller-binding: allow — sends one home terminal's open, input, resizes and kill in order
+    tokio::spawn(async move {
+        while let Some(frame) = queued.recv().await {
+            let Some(shared) = forwarder.upgrade() else {
+                return;
+            };
+            let _ = shared.send(&frame).await;
+        }
+    });
+    shared.wake();
+}
+
+fn env_vars(env: Vec<(String, String)>) -> Vec<PtyEnvVar> {
+    env.into_iter()
+        .map(|(key, value)| PtyEnvVar { key, value })
+        .collect()
+}
+
+/// Start a terminal (or, in `exec` mode, a command) on `workspace_id`'s
+/// home as a remote PTY in `pty`. `None` when the workspace has no home on
+/// a machine, so the caller runs it here.
+///
+/// # Errors
+///
+/// `home-unavailable` when the home's machine cannot be reached or does
+/// not speak nodeProtocol 19.
+pub(crate) async fn open(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    pty: &Arc<PtyHost>,
+    open: HomeTerminalOpen,
+) -> Result<Option<PtyId>> {
+    let Some((home, node)) = linked_home(svc, workspace_id).await? else {
+        return Ok(None);
+    };
+    let shared = node.shared_ref();
     let size = PtySize {
         rows: open.rows,
         cols: open.cols,
     };
     let size_slot = Arc::new(Mutex::new(size));
-    let (frames, mut queued) = mpsc::unbounded_channel::<LinkFrame>();
+    let (frames, queued) = mpsc::unbounded_channel::<LinkFrame>();
     let io = Arc::new(LinkPty {
         shared: shared.weak(),
         terminal_id: OnceLock::new(),
@@ -400,45 +507,156 @@ pub(crate) async fn open(
     let id = pty.spawn_remote(spec, io.clone())?;
     let terminal_id = id.to_string();
     let _ = io.terminal_id.set(terminal_id.clone());
-    lock(&shared.terminals.state).terms.insert(
-        terminal_id.clone(),
-        Term {
+    let term = Term {
+        sink: Sink::Pty {
             pty: pty.clone(),
             id,
-            received: None,
-            size: size_slot,
-            killed: false,
-            home_name: home.name.clone(),
         },
-    );
-    // `ptyOpen` goes first on the terminal's own queue, so no input,
-    // resize or kill a client sends meanwhile reaches the machine ahead of
-    // it.
-    let _ = frames.send(LinkFrame::PtyOpen(PtyOpen {
+        received: None,
+        size: size_slot,
+        killed: false,
+        home_name: home.name.clone(),
+    };
+    let frame = PtyOpen {
         terminal_id,
         workspace_id: workspace_id.clone(),
         home_id: home.home_id.clone(),
         mode: open.mode,
         cwd: open.cwd,
         command: open.command,
-        env: open
-            .env
-            .into_iter()
-            .map(|(key, value)| PtyEnvVar { key, value })
-            .collect(),
+        env: env_vars(open.env),
         cols: Some(open.cols),
         rows: Some(open.rows),
-    }));
-    let forwarder = shared.weak();
-    // caller-binding: allow — sends one home terminal's open, input, resizes and kill in order
-    tokio::spawn(async move {
-        while let Some(frame) = queued.recv().await {
-            let Some(shared) = forwarder.upgrade() else {
-                return;
-            };
-            let _ = shared.send(&frame).await;
-        }
-    });
-    shared.wake();
+    };
+    start(shared, term, frame, &frames, queued);
     Ok(Some(id))
+}
+
+/// Start a `host.execStream` process on `workspace_id`'s home: an
+/// exec-mode `ptyOpen` whose output arrives by stream, then its end.
+/// `None` when the workspace has no home on a machine.
+///
+/// # Errors
+///
+/// `home-unavailable` when the home's machine cannot be reached or does
+/// not speak nodeProtocol 19.
+pub(crate) async fn open_exec(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    open: HomeExecOpen,
+) -> Result<Option<HomeExec>> {
+    let Some((home, node)) = linked_home(svc, workspace_id).await? else {
+        return Ok(None);
+    };
+    let shared = node.shared_ref();
+    // No PTY: the size only answers a probe after a bind.
+    let size_slot = Arc::new(Mutex::new(PtySize::default()));
+    let (frames, queued) = mpsc::unbounded_channel::<LinkFrame>();
+    let terminal_id = format!("hexec-{}", uuid::Uuid::new_v4());
+    let io = Arc::new(LinkPty {
+        shared: shared.weak(),
+        terminal_id: OnceLock::from(terminal_id.clone()),
+        size: size_slot.clone(),
+        frames: frames.clone(),
+        home: Box::new(home.clone()),
+    });
+    let (events, received) = mpsc::unbounded_channel();
+    let term = Term {
+        sink: Sink::Exec(events),
+        received: None,
+        size: size_slot,
+        killed: false,
+        home_name: home.name.clone(),
+    };
+    let frame = PtyOpen {
+        terminal_id,
+        workspace_id: workspace_id.clone(),
+        home_id: home.home_id.clone(),
+        mode: PtyMode::Exec,
+        cwd: open.cwd,
+        command: Some(open.command),
+        env: env_vars(open.env),
+        cols: None,
+        rows: None,
+    };
+    start(shared, term, frame, &frames, queued);
+    Ok(Some(HomeExec {
+        events: received,
+        control: io,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exec_term() -> (Term, mpsc::UnboundedReceiver<HomeExecEvent>) {
+        let (events, received) = mpsc::unbounded_channel();
+        let term = Term {
+            sink: Sink::Exec(events),
+            received: None,
+            size: Arc::new(Mutex::new(PtySize::default())),
+            killed: false,
+            home_name: "Machine A".into(),
+        };
+        (term, received)
+    }
+
+    /// An exec process's output keeps its stream, and its end follows.
+    #[test]
+    fn an_exec_sink_takes_output_by_stream_then_its_end() {
+        let (term, mut received) = exec_term();
+        assert!(term.push(b"out", Some(PtyStream::Stdout)));
+        assert!(term.push(b"err", Some(PtyStream::Stderr)));
+        term.end(Some(3), None);
+        assert_eq!(
+            received.try_recv().unwrap(),
+            HomeExecEvent::Output {
+                stderr: false,
+                bytes: b"out".to_vec()
+            }
+        );
+        assert_eq!(
+            received.try_recv().unwrap(),
+            HomeExecEvent::Output {
+                stderr: true,
+                bytes: b"err".to_vec()
+            }
+        );
+        assert_eq!(
+            received.try_recv().unwrap(),
+            HomeExecEvent::Exited {
+                exit_code: Some(3),
+                error: None
+            }
+        );
+    }
+
+    /// A lost home ends an exec process with home-unavailable, also when
+    /// the machine's terminals are dropped with its connector.
+    #[test]
+    fn a_lost_home_ends_an_exec_process_with_home_unavailable() {
+        let (term, mut received) = exec_term();
+        let terminals = HomeTerminals::default();
+        lock(&terminals.state).terms.insert("hexec-1".into(), term);
+        drop(terminals);
+        match received.try_recv().unwrap() {
+            HomeExecEvent::Exited {
+                exit_code: None,
+                error: Some(error),
+            } => {
+                assert!(error.starts_with(HOME_UNAVAILABLE), "{error}");
+                assert!(error.contains("Machine A"), "{error}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Output nobody takes any more reports so, and the process is ended.
+    #[test]
+    fn an_exec_sink_whose_stream_ended_refuses_output() {
+        let (term, received) = exec_term();
+        drop(received);
+        assert!(!term.push(b"late", None));
+    }
 }

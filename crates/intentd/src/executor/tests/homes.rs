@@ -663,6 +663,37 @@ async fn exec_mode_streams_stdout_and_stderr_apart_and_reports_the_exit_code() {
     node.stop().await;
 }
 
+/// An exec-mode process (`host.execStream`) runs under a plain `/bin/sh`,
+/// not the user's login shell: no profile runs ahead of the command to
+/// print into its output or reorder its PATH.
+#[cfg(unix)]
+#[tokio::test]
+async fn exec_mode_runs_under_plain_sh_not_the_login_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    dialed
+        .link
+        .send(&pty_open(&h1, "x1", PtyMode::Exec, Some("echo \"$0\"")))
+        .await
+        .unwrap();
+    let seen = watch_terminal(&mut dialed, "x1", true, |_, exited| exited).await;
+    assert_eq!(seen.exited.unwrap().exit_code, Some(0));
+    let out: Vec<u8> = seen
+        .frames
+        .iter()
+        .filter(|frame| frame.stream == Some(PtyStream::Stdout))
+        .flat_map(|frame| unb64(&frame.data))
+        .collect();
+    assert_eq!(String::from_utf8_lossy(&out), "/bin/sh\n");
+    node.stop().await;
+}
+
 /// Output the backend has not acknowledged is resent, with the same
 /// `seq`, on the next link of the same backend session; the process keeps
 /// running across the reconnect.

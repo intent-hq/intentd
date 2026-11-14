@@ -785,6 +785,15 @@ impl RemoteLaunchPort for RemoteLaunch {
         Box::pin(crate::terminals::open(svc, workspace_id, pty, open))
     }
 
+    fn open_home_exec<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        open: intent_services::feature_api::feature_ports::HomeExecOpen,
+    ) -> BoxFuture<'a, Result<Option<intent_services::feature_api::feature_ports::HomeExec>>> {
+        Box::pin(crate::terminals::open_exec(svc, workspace_id, open))
+    }
+
     fn open_home_script<'a>(
         &'a self,
         svc: &'a Services,

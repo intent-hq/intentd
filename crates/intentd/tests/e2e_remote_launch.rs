@@ -40,6 +40,7 @@ mod forge_push;
 mod forge_token;
 mod git_identity;
 mod home_calls;
+mod home_exec;
 mod homes;
 mod machine_order;
 mod node_invite;

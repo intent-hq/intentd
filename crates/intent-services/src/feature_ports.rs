@@ -54,6 +54,50 @@ pub struct HomeTerminalOpen {
     pub env: Vec<(String, String)>,
 }
 
+/// What [`RemoteLaunchPort::open_home_exec`] starts on the home: one
+/// `host.execStream` process, as an exec-mode `ptyOpen`.
+#[derive(Debug, Clone)]
+pub struct HomeExecOpen {
+    /// Relative to the home checkout.
+    pub cwd: Option<String>,
+    /// The shell command line the machine runs.
+    pub command: String,
+    pub env: Vec<(String, String)>,
+}
+
+/// What a home exec process reports, in order: its output, then its end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HomeExecEvent {
+    Output {
+        stderr: bool,
+        bytes: Vec<u8>,
+    },
+    /// The process ended; `error` without `exit_code` when it never started
+    /// or the home was lost.
+    Exited {
+        exit_code: Option<i32>,
+        error: Option<String>,
+    },
+}
+
+/// Input and kill of one home exec process, sent to its machine in order.
+pub trait HomeExecControl: Send + Sync {
+    /// Send `data` to the process's stdin.
+    ///
+    /// # Errors
+    ///
+    /// When the home's machine is not connected or the process ended.
+    fn write(&self, data: &[u8]) -> std::io::Result<()>;
+    /// End the process on the machine; its [`HomeExecEvent::Exited`] follows.
+    fn kill(&self);
+}
+
+/// A home exec process started by [`RemoteLaunchPort::open_home_exec`].
+pub struct HomeExec {
+    pub events: tokio::sync::mpsc::UnboundedReceiver<HomeExecEvent>,
+    pub control: Arc<dyn HomeExecControl>,
+}
+
 /// What [`RemoteLaunchPort::open_home_script`] starts on the home: one
 /// process of a saved script's home run.
 #[derive(Debug, Clone)]
@@ -1526,6 +1570,23 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         open: HomeTerminalOpen,
     ) -> BoxFuture<'a, Result<Option<intent_pty::PtyId>>> {
         let _ = (svc, workspace_id, pty, open);
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Start a `host.execStream` process on the workspace's home
+    /// (nodeProtocol 19, an exec-mode `ptyOpen`). `None` when the workspace
+    /// has no home on a machine, so the caller runs it here.
+    ///
+    /// # Errors
+    ///
+    /// `home-unavailable` when the home's machine cannot run it now.
+    fn open_home_exec<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        open: HomeExecOpen,
+    ) -> BoxFuture<'a, Result<Option<HomeExec>>> {
+        let _ = (svc, workspace_id, open);
         Box::pin(async { Ok(None) })
     }
 

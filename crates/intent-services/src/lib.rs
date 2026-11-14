@@ -35346,6 +35346,19 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_host_execution("host.exec").await?;
+            // A workspace whose home is on a machine runs it there.
+            if let serde_json::Value::Object(map) = &params {
+                let mut routed = map.clone();
+                routed.insert("workspaceId".into(), workspace_id.as_str().into());
+                if let Some(result) = self.home_route("host.exec", &routed).await {
+                    return result.map_err(|failure| match failure {
+                        intent_core::node_link::HomeCallFailure::Local(error) => error,
+                        intent_core::node_link::HomeCallFailure::Home(error) => {
+                            home_routing::home_error_with_data(error)
+                        }
+                    });
+                }
+            }
             self.host_exec_runtime
                 .run_for_workspace(self, workspace_id, params)
                 .await

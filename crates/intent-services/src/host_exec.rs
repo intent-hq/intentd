@@ -735,7 +735,7 @@ fn workspace_args(workspace_id: &WorkspaceId, params: Value) -> intent_core::Res
 }
 
 /// Fold a [`HostExecError`] onto the domain error enum for the trait seam.
-fn domain_err(e: HostExecError) -> intent_core::Error {
+pub(crate) fn domain_err(e: HostExecError) -> intent_core::Error {
     match e.code {
         INVALID_PARAMS => intent_core::Error::InvalidParams(e.message),
         _ => intent_core::Error::Internal(e.message),

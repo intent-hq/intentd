@@ -795,9 +795,14 @@ pub(crate) async fn handle_with_host_environment(
                     return Some(error_frame(&id_echo, e.code, &e.message));
                 }
             };
-            match exec_runtime.run(api, parsed).await {
-                Ok(v) => success_frame(&id_echo, &v),
-                Err(e) => error_frame(&id_echo, e.code, &e.message),
+            // A workspace whose home is on a machine runs it there.
+            match api.home_route("host.exec", &params).await {
+                Some(Ok(v)) => success_frame(&id_echo, &v),
+                Some(Err(failure)) => crate::router::home_failure_frame(&id_echo, failure),
+                None => match exec_runtime.run(api, parsed).await {
+                    Ok(v) => success_frame(&id_echo, &v),
+                    Err(e) => error_frame(&id_echo, e.code, &e.message),
+                },
             }
         }
         HostMethod::ExecStream => {
@@ -822,9 +827,19 @@ pub(crate) async fn handle_with_host_environment(
                     return Some(error_frame(&id_echo, e.code, &e.message));
                 }
             };
-            match intent_services::host_exec_stream::start_stream(api, bus, parsed).await {
-                Ok(request_id) => success_frame(&id_echo, &json!({ "requestId": request_id })),
-                Err(e) => error_frame(&id_echo, e.code, &e.message),
+            // A workspace whose home is on a machine runs it there, as an
+            // exec-mode `ptyOpen`.
+            match api.home_route("host.execStream", &params).await {
+                Some(Ok(started)) => success_frame(&id_echo, &started),
+                Some(Err(failure)) => crate::router::home_failure_frame(&id_echo, failure),
+                None => {
+                    match intent_services::host_exec_stream::start_stream(api, bus, parsed).await {
+                        Ok(request_id) => {
+                            success_frame(&id_echo, &json!({ "requestId": request_id }))
+                        }
+                        Err(e) => error_frame(&id_echo, e.code, &e.message),
+                    }
+                }
             }
         }
         HostMethod::ExecStreamWrite => {
