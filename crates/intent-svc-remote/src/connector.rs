@@ -113,6 +113,9 @@ pub(crate) struct Tuning {
     pub forge_refresh: Duration,
     /// How often the token's watcher looks for a credential or gate change.
     pub forge_check: Duration,
+    /// How often a linked machine's pending home stops are sent again
+    /// (a `failed` ack, or none): every bind sends them too.
+    pub home_stop_resend: Duration,
     /// Test seam: fail every ack write while set.
     #[cfg(test)]
     pub fail_ack_writes: Arc<std::sync::atomic::AtomicBool>,
@@ -216,6 +219,7 @@ impl Default for Tuning {
             connect: ConnectTuning::default(),
             forge_refresh: Duration::from_secs(5 * 60),
             forge_check: Duration::from_secs(2),
+            home_stop_resend: Duration::from_secs(2 * 60),
             #[cfg(test)]
             fail_ack_writes: Arc::default(),
             #[cfg(test)]

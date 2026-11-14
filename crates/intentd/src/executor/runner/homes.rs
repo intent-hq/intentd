@@ -378,8 +378,9 @@ impl Runner {
             tracing::warn!(home = %home.home_id, "node: a moved home's stop names no valid orphanedAt");
             return Some(ack(HomeStopOutcome::Failed, None));
         }
-        // No open or reopen of this home runs meanwhile.
-        let _opening = self.inner.home_opens.lock().await;
+        // One home stop at a time (a resend joins the queue and then finds
+        // the checkout gone); opens of other homes are not held up.
+        let _stopping = self.inner.home_stops.lock().await;
         let recorded = self
             .inner
             .checkouts
@@ -394,9 +395,11 @@ impl Runner {
             tracing::warn!(home = %home.home_id, "node: a home stop for a checkout of another workspace");
             return Some(ack(HomeStopOutcome::Failed, None));
         }
-        // Closed first: its watcher ends, no home frame reaches it, and it
-        // never pushes `home/head` or `home/wip` on its own again.
+        // Closed first, under the open lock so no open or reopen of it
+        // races: its watcher ends, no home frame reaches it, and it never
+        // pushes `home/head` or `home/wip` on its own again.
         let opened = {
+            let _opening = self.inner.home_opens.lock().await;
             let mut homes = lock(&self.inner.homes);
             homes.lease.remove(&home.home_id);
             homes.open.remove(&home.home_id)
@@ -448,24 +451,24 @@ impl Runner {
                 }
             }
         } else {
-            {
-                // A retired home's last backup; a refused one (its
-                // workspace was deleted) does not keep the checkout.
-                let deadline = tokio::time::Instant::now() + STOP_PUSH_TIMEOUT;
-                let pushed = if let Some(opened) = &opened {
-                    self.push_home_now(opened, deadline).await.map(drop)
-                } else {
-                    self.inner
-                        .checkouts
-                        .push_home(&home, &worktree, None, STOP_PUSH_TIMEOUT)
-                        .await
-                        .map(drop)
-                };
-                if let Err(error) = pushed {
-                    tracing::info!(home = %home.home_id, error = %format!("{error:#}"), "node: a retired home's last push did not land");
-                }
-                None
+            // A retired home's last backup (the backend takes a deleted
+            // workspace's into a sink). The checkout stays until it lands:
+            // the next resend pushes again.
+            let deadline = tokio::time::Instant::now() + STOP_PUSH_TIMEOUT;
+            let pushed = if let Some(opened) = &opened {
+                self.push_home_now(opened, deadline).await.map(drop)
+            } else {
+                self.inner
+                    .checkouts
+                    .push_home(&home, &worktree, None, STOP_PUSH_TIMEOUT)
+                    .await
+                    .map(drop)
+            };
+            if let Err(error) = pushed {
+                tracing::warn!(home = %home.home_id, error = %format!("{error:#}"), "node: a retired home's last push failed; its checkout stays");
+                return Some(ack(HomeStopOutcome::Failed, None));
             }
+            None
         };
         if let Some(records) = self.inner.home_records.as_ref() {
             records.forget(&worktree).await;

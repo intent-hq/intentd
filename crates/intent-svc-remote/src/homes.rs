@@ -406,6 +406,7 @@ pub(crate) fn after_bind(shared: &Arc<Shared>, link: &NodeLink) {
         return;
     };
     let shared = shared.clone();
+    let link_generation = link.binding().generation;
     // caller-binding: allow — opens one machine's homes after its bind
     tokio::spawn(async move {
         let machine = shared.machine_id();
@@ -424,9 +425,15 @@ pub(crate) fn after_bind(shared: &Arc<Shared>, link: &NodeLink) {
             }
         };
         shared.set_holds_homes(!homes.is_empty() || !stops.is_empty());
-        // Every pending stop goes again after each bind until its ack.
+        // Every pending stop goes again after each bind until its ack, and
+        // on a timer while this link lasts: a `failed` ack (a moved home's
+        // push did not land) or one that never came is retried.
+        let pending = !stops.is_empty();
         for stop in stops {
             send_stop(&shared, &stop).await;
+        }
+        if pending {
+            resend_while_linked(shared.clone(), link_generation);
         }
         if !svc.workspace_homes() {
             return;
@@ -586,6 +593,62 @@ async fn send_stop(shared: &Shared, stop: &HomeStopRecord) {
     if let Err(error) = shared.send(&LinkFrame::HomeStop(stop.frame())).await {
         tracing::info!(home = %stop.home_id, %error, "remote machine: could not send a home stop; it goes after the next bind");
     }
+}
+
+/// Send the machine's pending home stops again every
+/// `tuning.home_stop_resend` while the link of `generation` is current,
+/// until none is left.
+fn resend_while_linked(shared: Arc<Shared>, generation: intent_core::nodes::NodeCounter) {
+    // caller-binding: allow — resends one machine's pending home stops while its link lasts
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(shared.tuning.home_stop_resend).await;
+            let current = shared
+                .current_link()
+                .is_some_and(|link| link.binding().generation == generation);
+            if !current {
+                return;
+            }
+            let stops = match shared.store.list_home_stops(&shared.machine_id()).await {
+                Ok(stops) => stops,
+                Err(error) => {
+                    tracing::warn!(%error, "remote machine: could not read its home stops");
+                    continue;
+                }
+            };
+            if stops.is_empty() {
+                return;
+            }
+            for stop in stops {
+                send_stop(&shared, &stop).await;
+            }
+        }
+    });
+}
+
+/// Make `home` the workspace's home and record a `moved` stop of the
+/// machine home it replaces, in one store transaction
+/// ([`intent_store::Store::switch_workspace_home`]), holding the
+/// workspace's home push slot: a push the old home started before the
+/// switch lands first, and none of it lands after. The switch step of a
+/// home move (nodes.md "Moving the home" step 3).
+///
+/// # Errors
+///
+/// The store's error.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "workspace.setHome (homes step 4.4c) calls it")
+)]
+pub(crate) async fn switch_home(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home: &WorkspaceHome,
+) -> Result<Option<HomeStopRecord>> {
+    let _pushes = crate::git::home_push_slot(workspace_id).await?;
+    svc.store()
+        .switch_workspace_home(workspace_id, home, &intent_core::now_iso())
+        .await
 }
 
 /// See [`intent_services::feature_api::feature_ports::RemoteLaunchPort::send_home_stops`].

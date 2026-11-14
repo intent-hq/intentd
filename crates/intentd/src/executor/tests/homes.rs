@@ -1562,6 +1562,49 @@ async fn a_moved_home_keeps_its_checkout_until_its_push_lands() {
     node.stop().await;
 }
 
+/// A retired home whose last push fails (a hub briefly unreachable, a
+/// timeout) keeps its checkout and acks `failed`; the resend pushes and
+/// removes it.
+#[tokio::test]
+async fn a_retired_home_keeps_its_checkout_until_its_last_push_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, leasing(1, Some(Vec::new())))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    let checkout = worktree(dir.path(), &h1);
+    let fails = checkout.with_file_name(checkout::TEST_HOME_PUSH_FAILS);
+    std::fs::write(&fails, "").unwrap();
+    dialed
+        .link
+        .send(&home_stop(&h1, "stop-1", None))
+        .await
+        .unwrap();
+    let ack = stop_acked(&mut dialed, "stop-1").await;
+    assert_eq!(ack.outcome, HomeStopOutcome::Failed, "{ack:?}");
+    assert!(checkout.is_dir(), "the work stays on the machine");
+    std::fs::remove_file(&fails).unwrap();
+    dialed
+        .link
+        .send(&home_stop(&h1, "stop-1", None))
+        .await
+        .unwrap();
+    let ack = stop_acked(&mut dialed, "stop-1").await;
+    assert_eq!(ack.outcome, HomeStopOutcome::Removed, "{ack:?}");
+    assert!(!checkout.exists());
+    let pushes = home_pushes(dir.path());
+    assert_eq!(
+        pushes
+            .last()
+            .map(|(id, target, _)| (id.as_str(), target.as_str())),
+        Some(("h1", "home"))
+    );
+    node.stop().await;
+}
+
 /// A moved stop without a usable `orphanedAt`, or for a checkout of
 /// another workspace, changes nothing and acks `failed`.
 #[tokio::test]

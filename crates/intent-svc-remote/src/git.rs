@@ -43,6 +43,57 @@ impl HeadGitAccess {
 static HOME_PUSHES: LazyLock<Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Mutex::default);
 
+/// Hold `workspace_id`'s home push slot: no home push of the workspace runs
+/// while it is held, and one under way ends first. A home switch holds it,
+/// so a push decided for the old home never lands after the switch. Taken
+/// on its own task, so a caller that is dropped meanwhile leaves no
+/// half-taken lock.
+pub(crate) async fn home_push_slot(
+    workspace_id: &WorkspaceId,
+) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+    let slot = HOME_PUSHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(workspace_id.clone())
+        .or_default()
+        .clone();
+    // caller-binding: allow — takes one workspace's home push lock
+    tokio::spawn(slot.lock_owned())
+        .await
+        .map_err(|e| Error::Internal(format!("node git: take the home push lock: {e}")))
+}
+
+/// The directory name prefix of a sink: an empty repository that takes a
+/// deleted workspace's home's last push and is removed after it, so the
+/// push succeeds and nothing of it is kept.
+const SINK_PREFIX: &str = "intentd-home-sink-";
+
+/// A new sink repository (see [`SINK_PREFIX`]).
+fn new_sink() -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("{SINK_PREFIX}{}", uuid::Uuid::new_v4()));
+    git2::Repository::init_bare(&dir)
+        .map_err(|e| unavailable(&format!("could not make a sink: {e}")))?;
+    Ok(dir)
+}
+
+/// Whether `repository` is a sink this process made.
+fn is_sink(repository: &Path) -> bool {
+    repository.parent() == Some(std::env::temp_dir().as_path())
+        && repository
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(SINK_PREFIX))
+}
+
+/// Removes a sink once its push's process has exited.
+struct SinkCleanup(PathBuf);
+
+impl Drop for SinkCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn denied() -> Error {
     Error::Forbidden(git_codes::DENIED.into())
 }
@@ -255,8 +306,9 @@ impl HeadGitAccess {
 
     /// The repository a stopped home's last push lands in: receive-pack
     /// only, into the workspace's repository (its refs outlive an archived
-    /// workspace's removed worktree), or a submodule of its checkout. A
-    /// deleted workspace's home pushes nothing.
+    /// workspace's removed worktree), or a submodule of its checkout (else
+    /// of the repository's). A deleted workspace's home pushes into a sink,
+    /// so its stop goes on with nothing kept.
     async fn stopped_home_repository(
         &self,
         remote: &AgentRemote,
@@ -265,15 +317,29 @@ impl HeadGitAccess {
         if service != GitService::ReceivePack {
             return Err(denied());
         }
-        let workspace = self
+        let workspace = match self
             .shared
             .store
             .get_workspace(&WorkspaceId::from(remote.workspace_id()))
             .await
-            .map_err(|_| denied())?;
+        {
+            Ok(workspace) => workspace,
+            Err(Error::NotFound(_)) => return new_sink(),
+            Err(error) => return Err(error),
+        };
         if let Some(key) = remote.module_key() {
-            let checkout = crate::launch::checkout_path(&workspace).ok_or_else(denied)?;
-            return module_of(checkout, key).await;
+            // An archived workspace's worktree may be gone: its repository
+            // holds the same submodules.
+            let worktree = crate::launch::checkout_path(&workspace).filter(|dir| dir.is_dir());
+            let repository = PathBuf::from(crate::final_stop::repo_path(&workspace));
+            let mut last = Err(denied());
+            for checkout in worktree.into_iter().chain([repository]) {
+                last = module_of(checkout, key).await;
+                if last.is_ok() {
+                    break;
+                }
+            }
+            return last;
         }
         let repo = PathBuf::from(crate::final_stop::repo_path(&workspace));
         if !repo.is_dir() {
@@ -338,10 +404,14 @@ impl NodeGitAccess for HeadGitAccess {
                 .is_some_and(Services::workspace_homes)
     }
 
-    /// Before a home push of the superproject, pin the current `home/head`
-    /// as `home/rewritten/<sha>` so a rewrite keeps the old commits; a push
-    /// that cannot be pinned is refused. The token is the pin this push
-    /// made, if any.
+    /// Every home push holds its workspace's push slot until its process
+    /// exits, and is authorized again under it: a moved home's last push
+    /// creates only its orphaned refs, a deleted workspace's goes to a
+    /// sink, and any other must still be the workspace's current home.
+    /// Before a push of the superproject the current `home/head` is pinned
+    /// as `home/rewritten/<sha>`, so a rewrite keeps the old commits; a
+    /// push that cannot be pinned is refused. The token is the pin this
+    /// push made, if any.
     fn before_receive<'a>(
         &'a self,
         binding: &'a LeaseBinding,
@@ -352,54 +422,41 @@ impl NodeGitAccess for HeadGitAccess {
             if !remote.is_home() {
                 return Ok(ReceiveHold::default());
             }
-            // A moved home's last push creates only its orphaned refs, in
-            // each repository; nothing of `home/head` is pinned for it.
-            if let Some(stop) = self.home_stop(binding, remote).await? {
-                if stop.reason == HomeStopReason::Moved {
+            let sink = is_sink(repository).then(|| SinkCleanup(repository.to_path_buf()));
+            let guard = home_push_slot(&WorkspaceId::from(remote.workspace_id())).await?;
+            let hold = |token: Option<String>, orphaned: Option<String>| ReceiveHold {
+                token,
+                guard: Some(Box::new((guard, sink))),
+                orphaned,
+            };
+            match self.home_stop(binding, remote).await? {
+                Some(stop) if stop.reason == HomeStopReason::Moved => {
                     let at = stop
                         .frame()
                         .orphaned()
                         .map(str::to_owned)
                         .ok_or_else(denied)?;
-                    return Ok(ReceiveHold {
-                        orphaned: Some(at),
-                        ..ReceiveHold::default()
-                    });
+                    return Ok(hold(None, Some(at)));
+                }
+                Some(_) if is_sink(repository) => return Ok(hold(None, None)),
+                Some(_) => {}
+                None => {
+                    // Switched away meanwhile: not this home's to write.
+                    self.home_checkout(binding, remote).await?;
                 }
             }
             if remote.module_key().is_some() {
-                return Ok(ReceiveHold::default());
+                return Ok(hold(None, None));
             }
-            let slot = HOME_PUSHES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(WorkspaceId::from(remote.workspace_id()))
-                .or_default()
-                .clone();
-            let repository = repository.to_path_buf();
-            let remote = remote.clone();
-            // Its own task, owning the lock: a session that ends meanwhile
-            // never lets another push in while the pin is being made.
-            // caller-binding: allow — pins a home's head for one push under its workspace lock
-            let pinned = tokio::spawn(async move {
-                let guard = slot.lock_owned().await;
-                let pinned = tokio::task::spawn_blocking(move || {
-                    crate::homes::pin_home_head(&repository, &remote)
-                })
-                .await;
-                (guard, pinned)
+            let pin_repository = repository.to_path_buf();
+            let pin_remote = remote.clone();
+            let pinned = tokio::task::spawn_blocking(move || {
+                crate::homes::pin_home_head(&pin_repository, &pin_remote)
             })
             .await
-            .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?;
-            let (guard, pinned) = pinned;
-            let token = pinned
-                .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
-                .map_err(|error| unavailable(&format!("could not pin the home's head: {error}")))?;
-            Ok(ReceiveHold {
-                token,
-                guard: Some(Box::new(guard)),
-                orphaned: None,
-            })
+            .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
+            .map_err(|error| unavailable(&format!("could not pin the home's head: {error}")))?;
+            Ok(hold(pinned, None))
         })
     }
 

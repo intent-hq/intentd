@@ -75,6 +75,7 @@ fn tuning() -> Tuning {
         },
         forge_refresh: Duration::from_secs(600),
         forge_check: Duration::from_millis(20),
+        home_stop_resend: Duration::from_millis(200),
         fail_ack_writes: Arc::default(),
         fail_claim_reads: Arc::default(),
         before_publish: crate::connector::BeforePublish::default(),
@@ -3136,7 +3137,8 @@ mod home_stops {
 
         ack(&link, &stop, "another-stop", HomeStopOutcome::Removed).await;
         ack(&link, &stop, &stop.stop_id, HomeStopOutcome::Failed).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // A failed ack (or none) is retried on this same link, on a timer.
+        assert_eq!(sent_stop(&mut link).await, stop.frame());
         assert!(backend
             .store()
             .get_home_stop(&stop.home_id)
@@ -3227,16 +3229,169 @@ mod home_stops {
                 .await
                 .is_err());
         }
+        // A deleted workspace's home pushes into a sink, removed after.
         backend
             .store()
             .delete_workspace(&workspace())
             .await
             .unwrap();
-        assert!(access
+        let sink = access
             .repository(binding, &remote("h-retired"), GitService::ReceivePack)
             .await
-            .is_err());
+            .unwrap();
+        assert_ne!(sink, repo.path());
+        assert!(git2::Repository::open_bare(&sink).is_ok());
+        let hold = access
+            .before_receive(binding, &remote("h-retired"), &sink)
+            .await
+            .unwrap();
+        assert!(hold.token.is_none() && hold.orphaned.is_none());
+        drop(hold);
+        assert!(!sink.exists(), "the sink goes with the push");
         let _ = retired;
         node.shutdown();
+    }
+
+    /// After an archive removed the worktree, a stopped home's submodule
+    /// push resolves through the workspace's repository.
+    #[tokio::test]
+    async fn a_stopped_homes_submodule_push_outlives_the_worktree() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        let node = backend.expose(&mut machine).await;
+        let dir = tempfile::tempdir().unwrap();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+                .args([
+                    "-c",
+                    "protocol.file.allow=always",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let sub = dir.path().join("sub");
+        let repo = dir.path().join("repo");
+        for path in [&sub, &repo] {
+            std::fs::create_dir_all(path).unwrap();
+            git(path, &["init", "--quiet"]);
+            std::fs::write(path.join("README.md"), "x\n").unwrap();
+            git(path, &["add", "README.md"]);
+            git(path, &["commit", "--quiet", "-m", "base"]);
+        }
+        git(
+            &repo,
+            &["submodule", "--quiet", "add", sub.to_str().unwrap(), "lib"],
+        );
+        git(&repo, &["commit", "--quiet", "-m", "lib"]);
+        let now = intent_core::now_iso();
+        backend
+            .store()
+            .insert_workspace(&intent_core::Workspace {
+                id: workspace(),
+                title: "Remote".into(),
+                branch: "main".into(),
+                repository_path: Some(repo.to_string_lossy().into_owned()),
+                worktree_path: Some(dir.path().join("gone").to_string_lossy().into_owned()),
+                created_at: now.clone(),
+                updated_at: now,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        backend
+            .store()
+            .record_home_stop(&stop_of(&machine, "h1", HomeStopReason::Retired))
+            .await
+            .unwrap();
+        let key = intent_git::node_git::submodule_pins(&repo)
+            .unwrap()
+            .into_iter()
+            .find(|pin| pin.path == "lib")
+            .unwrap()
+            .module_key;
+        node.connect().await.unwrap();
+        let link = machine.accept().await;
+        link.replay_complete(0).await;
+        bound(&node).await;
+        let access = crate::git::HeadGitAccess::new(node.shared());
+        let module = AgentRemote::home(workspace().as_str(), "h1")
+            .unwrap()
+            .with_module(&key)
+            .unwrap();
+        let resolved = access
+            .repository(&link.hello.binding, &module, GitService::ReceivePack)
+            .await
+            .unwrap();
+        assert!(resolved.starts_with(&repo), "{resolved:?}");
+        node.shutdown();
+    }
+
+    /// A home switch waits for a push of the workspace's home that is under
+    /// way, so nothing the old home pushed lands after it.
+    #[tokio::test]
+    async fn a_home_switch_waits_for_a_push_under_way() {
+        let backend = Backend::new().await;
+        let now = intent_core::now_iso();
+        backend
+            .store()
+            .insert_workspace(&intent_core::Workspace {
+                id: workspace(),
+                title: "Remote".into(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let home = |id: &str| intent_core::WorkspaceHome {
+            home_id: HomeId::from(id),
+            node_id: Some("node-a".into()),
+            cloud_machine_id: None,
+            name: "A".into(),
+            state: intent_core::HomeState::Attached,
+            since: now.clone(),
+            last_backup_at: None,
+            backup_warning: false,
+        };
+        backend
+            .store()
+            .set_workspace_home(&workspace(), &home("h1"))
+            .await
+            .unwrap();
+        let pushing = crate::git::home_push_slot(&workspace()).await.unwrap();
+        let services = backend.services.clone();
+        let next = home("h2");
+        let switch =
+            tokio::spawn(
+                async move { crate::homes::switch_home(&services, &workspace(), &next).await },
+            );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!switch.is_finished(), "the switch waits for the push");
+        assert_eq!(
+            backend
+                .store()
+                .get_workspace_home(&workspace())
+                .await
+                .unwrap()
+                .unwrap()
+                .home_id,
+            HomeId::from("h1")
+        );
+        drop(pushing);
+        let stop = switch.await.unwrap().unwrap().unwrap();
+        assert_eq!(stop.home_id, HomeId::from("h1"));
+        assert_eq!(stop.reason, HomeStopReason::Moved);
     }
 }
