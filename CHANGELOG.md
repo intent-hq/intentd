@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.211] - 2026-11-14
+
+### 🐛 Bug Fixes
+
+- Search.cancel ends a search running on the workspace's home ([#3370](https://github.com/intent-hq/intentd/pull/3370))
+
+
 ## [0.11.210] - 2026-11-14
 
 ### 🚀 Features
