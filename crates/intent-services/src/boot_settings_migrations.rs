@@ -72,13 +72,13 @@ async fn run_steps(
         before_step(step);
         match step {
             BootSettingsMigration::QuickActionCarryOver => {
-                legacy_carried = migrate_quick_action_settings(registry)?;
+                legacy_carried = migrate_quick_action_settings(registry);
             }
-            BootSettingsMigration::ActiveProvider => migrate_active_provider_setting(registry)?,
+            BootSettingsMigration::ActiveProvider => migrate_active_provider_setting(registry),
             BootSettingsMigration::QuickActionSharedDefault => {
-                migrate_quick_action_shared_default(registry)?;
+                migrate_quick_action_shared_default(registry);
             }
-            BootSettingsMigration::AutoRetire => migrate_auto_retire_setting(registry)?,
+            BootSettingsMigration::AutoRetire => migrate_auto_retire_setting(registry),
             BootSettingsMigration::ImportLegacy if !legacy_carried => {
                 tracing::warn!(
                     "keeping legacy config.toml keys until [backgroundAgents] is carried over \
@@ -217,12 +217,10 @@ mod tests {
             );
         }
         let text = fx.text();
-        for kept in ["# keep me"] {
-            assert!(
-                text.contains(kept),
-                "{context}: {kept} missing from:\n{text}"
-            );
-        }
+        assert!(
+            text.contains("# keep me"),
+            "{context}: comment lost:\n{text}"
+        );
         for key in [
             "active",
             "backgroundAgents",
