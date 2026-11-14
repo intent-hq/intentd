@@ -33,6 +33,8 @@ pub(crate) mod test_control;
 mod platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
+#[cfg(target_os = "linux")]
+pub(crate) use platform::fallback::dispatch as dispatch_fallback_owner;
 #[cfg(windows)]
 #[path = "windows.rs"]
 mod platform;

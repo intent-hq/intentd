@@ -53,6 +53,14 @@ use stack_frame::boxed_await;
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
+/// Private process-owner entry point. Call before starting threads or a runtime.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+#[must_use]
+pub fn dispatch_diagnostic_owner() -> Option<std::process::ExitCode> {
+    codex_diagnostics::process::dispatch_fallback_owner()
+}
+
 mod acp_adapter;
 mod agent_locks;
 mod agent_manager;
