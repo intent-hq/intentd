@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.213] - 2026-11-14
+
+### 🚀 Features
+
+- Relay a home's file and git events to the orchestrator's clients ([#3373](https://github.com/intent-hq/intentd/pull/3373))
+
+
 ## [0.11.212] - 2026-11-14
 
 ### 🚀 Features
