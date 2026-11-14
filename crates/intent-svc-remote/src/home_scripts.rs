@@ -172,25 +172,38 @@ impl HomeScripts {
     }
 
     /// Stop the run of PTY `id` in `pty` and wait, up to `wait`, for the
-    /// machine to report its end, as a machine run's stop does: a restart
-    /// then never starts the next process while the last one still holds
-    /// its resources. `false` when it did not end in time (or is not a home
-    /// run of this machine); the caller's release of the PTY then drops it.
-    pub(crate) async fn stop(&self, pty: &Arc<PtyHost>, id: PtyId, wait: Duration) -> bool {
+    /// machine to report its end, as a machine run's stop does. The run
+    /// stays held until its `scriptExited` (or a lost link) ends it, so a
+    /// late end still settles it, and no new run of the same script starts
+    /// on the home meanwhile ([`Self::stopping`]).
+    pub(crate) async fn stop(&self, pty: &Arc<PtyHost>, id: PtyId, wait: Duration) -> Stopped {
         let mut done = {
             let mut runs = lock(&self.runs);
             let Some(run) = runs
                 .values_mut()
                 .find(|run| run.id == id && Arc::ptr_eq(&run.pty, pty))
             else {
-                return false;
+                return Stopped::NotHeld;
             };
             run.send_stop();
             run.done.subscribe()
         };
-        tokio::time::timeout(wait, done.wait_for(|done| *done))
+        let ended = tokio::time::timeout(wait, done.wait_for(|done| *done))
             .await
-            .is_ok_and(|ended| ended.is_ok())
+            .is_ok();
+        if ended {
+            Stopped::Ended
+        } else {
+            Stopped::Unconfirmed
+        }
+    }
+
+    /// Whether a run of `script_id` on `home` was stopped and has not ended
+    /// yet: its process may still hold what a new run needs.
+    pub(crate) fn stopping(&self, home: &HomeRef, script_id: &str) -> bool {
+        lock(&self.runs)
+            .values()
+            .any(|run| &run.home == home && run.script_id == script_id && run.stopping)
     }
 
     /// The link closed: every home run on it is lost (the machine ends the
@@ -223,17 +236,18 @@ impl RemotePty for LinkRun {
     }
 
     fn kill(&self) {
-        // The run ends here at once (its PTY is released); the machine's
-        // `scriptExited` for it is dropped. A run that already ended, or
-        // whose stop already went out, sends none.
+        // The PTY is being released. The run stays held, stopping, until
+        // the machine reports its end (or the link is lost), so no new run
+        // of the script starts on the home while it may still run. A run
+        // that already ended, or whose stop already went out, sends none.
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
-        let held = lock(&shared.home_scripts.runs).remove(&self.spawn_id);
-        if let Some(mut run) = held {
+        let mut runs = lock(&shared.home_scripts.runs);
+        if let Some(run) = runs.get_mut(&self.spawn_id) {
             run.send_stop();
-            run.done.send_replace(true);
         }
+        drop(runs);
     }
 }
 
@@ -283,6 +297,12 @@ pub(crate) async fn open(
         workspace_id: workspace_id.clone(),
         home_id: home.home_id.clone(),
     };
+    if shared.home_scripts.stopping(&of, &open.script_id) {
+        return Err(home_unavailable(
+            &home,
+            "the script's last run has not ended there yet",
+        ));
+    }
     let spawn_id = uuid::Uuid::new_v4().to_string();
     let owner = CheckoutOwner::Home(of.clone());
     let (frames, mut queued) = mpsc::unbounded_channel::<LinkFrame>();
@@ -358,6 +378,17 @@ pub(crate) async fn open(
     Ok(Some(id))
 }
 
+/// How [`HomeScripts::stop`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stopped {
+    /// The machine reported the run's end.
+    Ended,
+    /// Not a run held here (it already ended).
+    NotHeld,
+    /// No end within the wait: the run stays held, stopping.
+    Unconfirmed,
+}
+
 /// See [`intent_services::feature_api::feature_ports::RemoteLaunchPort::stop_home_script`].
 pub(crate) async fn stop(
     svc: &Services,
@@ -365,22 +396,26 @@ pub(crate) async fn stop(
     pty: &Arc<PtyHost>,
     id: PtyId,
     wait: Duration,
-) -> bool {
-    let Ok(Some(node_id)) = svc
-        .store()
-        .get_workspace_home(workspace_id)
-        .await
-        .map(|home| home.and_then(|home| home.node_id))
-    else {
-        return false;
+) -> Result<()> {
+    let Some(home) = svc.store().get_workspace_home(workspace_id).await? else {
+        return Ok(());
+    };
+    let Some(node_id) = home.node_id.clone() else {
+        return Ok(());
     };
     let Some(feature) = svc.remote_feature() else {
-        return false;
+        return Ok(());
     };
     let Ok(node) = feature.node(svc, &node_id).await else {
-        return false;
+        return Ok(());
     };
-    node.shared_ref().home_scripts.stop(pty, id, wait).await
+    match node.shared_ref().home_scripts.stop(pty, id, wait).await {
+        Stopped::Ended | Stopped::NotHeld => Ok(()),
+        Stopped::Unconfirmed => Err(home_unavailable(
+            &home,
+            "the run's stop was not confirmed in time; it is still stopping there",
+        )),
+    }
 }
 
 /// The run's frame could not reach the machine: it is lost.
@@ -553,17 +588,51 @@ mod tests {
         assert!(matches!(&frame, LinkFrame::ScriptStop(stop) if stop.spawn_id == "p1"));
         assert!(!stopping.is_finished(), "the stop waits for the machine");
         scripts.frame(exited(Some(143), None));
-        assert!(stopping.await.unwrap());
+        assert_eq!(stopping.await.unwrap(), Stopped::Ended);
         assert_eq!(pty.try_exit(id).unwrap().unwrap().exit_code, 143);
-        assert!(!scripts.stop(&pty, id, Duration::from_millis(10)).await);
+        assert_eq!(
+            scripts.stop(&pty, id, Duration::from_millis(10)).await,
+            Stopped::NotHeld
+        );
         assert!(sent.try_recv().is_err());
     }
 
-    /// A stop the machine never confirms gives up after its wait.
+    /// A stop the machine does not confirm in time is reported unconfirmed;
+    /// the run stays held and stopping (a new run of the script is refused)
+    /// even once its PTY is released, until its late `scriptExited` ends
+    /// it; a second stop sends no second `scriptStop`.
     #[tokio::test]
-    async fn an_unconfirmed_stop_gives_up() {
+    async fn an_unconfirmed_stop_keeps_the_run_until_its_late_exit() {
+        let pty = Arc::new(PtyHost::new());
+        let (frames, mut sent) = mpsc::unbounded_channel();
+        let (scripts, id) = held_with(&pty, frames);
+        assert!(!scripts.stopping(&home(), "s1"));
+        assert_eq!(
+            scripts.stop(&pty, id, Duration::from_millis(20)).await,
+            Stopped::Unconfirmed
+        );
+        assert!(matches!(sent.try_recv(), Ok(LinkFrame::ScriptStop(_))));
+        assert!(scripts.stopping(&home(), "s1"));
+        assert!(!scripts.stopping(&home(), "s2"));
+        // The supervisor's release of the PTY keeps the run held.
+        pty.kill(id).await;
+        assert!(scripts.stopping(&home(), "s1"));
+        assert!(sent.try_recv().is_err(), "one scriptStop only");
+        scripts.frame(exited(Some(143), None));
+        assert!(!scripts.stopping(&home(), "s1"));
+        assert!(scripts.is_empty());
+    }
+
+    /// A lost link ends a stopping run too.
+    #[tokio::test]
+    async fn a_lost_link_ends_a_stopping_run() {
         let pty = Arc::new(PtyHost::new());
         let (scripts, id) = held(&pty);
-        assert!(!scripts.stop(&pty, id, Duration::from_millis(20)).await);
+        assert_eq!(
+            scripts.stop(&pty, id, Duration::from_millis(10)).await,
+            Stopped::Unconfirmed
+        );
+        scripts.link_lost(LOST_DISCONNECTED);
+        assert!(!scripts.stopping(&home(), "s1"));
     }
 }

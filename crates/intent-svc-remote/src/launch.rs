@@ -771,7 +771,7 @@ impl RemoteLaunchPort for RemoteLaunch {
         pty: &'a std::sync::Arc<intent_pty::PtyHost>,
         id: intent_pty::PtyId,
         wait: std::time::Duration,
-    ) -> BoxFuture<'a, bool> {
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(crate::home_scripts::stop(svc, workspace_id, pty, id, wait))
     }
 

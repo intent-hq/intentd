@@ -128,23 +128,21 @@ impl ScriptManager {
         }
     }
 
-    /// Before `pty_id` is killed: when it is a home run, stop it on the
-    /// machine and wait (bounded) for the end, as a machine run's stop
-    /// does, so a restart never overlaps the last process.
-    pub(super) async fn stop_home_run(&self, ws: &WorkspaceId, pty_id: PtyId) {
-        if !self.home_ptys.lock().unwrap().contains(&pty_id) {
-            return;
-        }
+    /// Stop home run `pty_id` on its machine and wait (bounded) for the
+    /// end, as a machine run's stop does, so nothing settles or replaces it
+    /// while its process may still run.
+    ///
+    /// # Errors
+    ///
+    /// `home-unavailable` when the machine did not confirm the end in time:
+    /// the run stays live here, and a later end still settles it.
+    pub(super) async fn stop_home_run(&self, ws: &WorkspaceId, pty_id: PtyId) -> Result<()> {
         let Some(svc) = &self.owner_services else {
-            return;
+            return Ok(());
         };
-        let ended = svc
-            .feature_remote_launch_port()
+        svc.feature_remote_launch_port()
             .stop_home_script(svc, ws, &self.pty, pty_id, HOME_STOP_WAIT)
-            .await;
-        if !ended {
-            tracing::warn!(workspace = %ws, "a home run's stop was not confirmed in time; releasing it");
-        }
+            .await
     }
 
     /// Dial `ws`'s home machine ahead of a start, outside every script

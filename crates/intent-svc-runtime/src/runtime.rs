@@ -63,6 +63,9 @@ pub(crate) struct RuntimeFeature {
     /// Remote agents' machine runs, shared by every manager view; set up by
     /// the first view built over the owner's services.
     pub(crate) machine_runs: Arc<std::sync::OnceLock<script_ops::machine_runs::MachineRuns>>,
+    /// The PTYs of home runs on workspace homes, shared by every manager
+    /// view (nodeProtocol 19).
+    pub(crate) home_ptys: script_ops::HomePtys,
 }
 
 /// The runtime feature state and script output store, on [`Services`].
@@ -104,6 +107,7 @@ impl RuntimeStateExt for Services {
         .with_output_store(self.script_output_store())
         .with_tasks(self.feature_store_tasks().clone())
         .with_machine_runs(self.runtime().machine_runs.clone())
+        .with_home_ptys(self.runtime().home_ptys.clone())
         .with_owner_services(self.clone())
     }
 }

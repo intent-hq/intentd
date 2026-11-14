@@ -35,6 +35,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::MissedTickBehavior;
 
 mod home_runs;
+
+/// The PTYs of home runs (nodeProtocol 19) until released, shared by every
+/// manager view.
+pub(crate) type HomePtys = Arc<std::sync::Mutex<HashSet<PtyId>>>;
 mod lifecycle;
 pub(crate) mod machine_runs;
 mod monitors;
@@ -360,7 +364,7 @@ pub struct ScriptManager {
     machine_runs: Arc<std::sync::OnceLock<machine_runs::MachineRuns>>,
     /// The PTYs of home runs on a workspace home (nodeProtocol 19), until
     /// released: a stopped one ends with no status from the machine.
-    home_ptys: Arc<std::sync::Mutex<HashSet<PtyId>>>,
+    home_ptys: HomePtys,
 }
 
 /// Holds a workspace's closing mark (see [`ScriptManager::close_workspace`]);
@@ -577,6 +581,11 @@ impl ScriptManager {
     }
 
     /// Share `runs` (the runtime feature's) instead of a private registry.
+    pub(crate) fn with_home_ptys(mut self, home_ptys: HomePtys) -> Self {
+        self.home_ptys = home_ptys;
+        self
+    }
+
     pub(crate) fn with_machine_runs(
         mut self,
         runs: Arc<std::sync::OnceLock<machine_runs::MachineRuns>>,
@@ -2181,6 +2190,26 @@ impl ScriptManager {
         reason: &'static str,
     ) -> Result<Value> {
         let key = (workspace_id.clone(), script_id.to_string());
+        // A home run (nodeProtocol 19) is stopped on its machine first, and
+        // nothing here settles or replaces it until the machine confirms
+        // its end. Flagged first, so an end that comes later is a stop, not
+        // a crash to restart.
+        let home_pty = {
+            let mut guard = self.scripts.lock().unwrap();
+            let m = guard
+                .get_mut(&key)
+                .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
+            let home = m
+                .pty_id
+                .filter(|id| self.home_ptys.lock().unwrap().contains(id));
+            if home.is_some() {
+                m.stopped_by_user = true;
+            }
+            home
+        };
+        if let Some(pty_id) = home_pty {
+            self.stop_home_run(workspace_id, pty_id).await?;
+        }
         let (handle, pty_id, was_running, run_done) = {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
@@ -2196,7 +2225,6 @@ impl ScriptManager {
             )
         };
         if let Some(pty_id) = pty_id {
-            self.stop_home_run(workspace_id, pty_id).await;
             self.pty.kill(pty_id).await;
         }
         if let Some(handle) = handle {

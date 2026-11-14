@@ -1548,8 +1548,14 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
     }
 
     /// Stop the home run of PTY `id` (from [`Self::open_home_script`]) and
-    /// wait up to `wait` for its machine to report the end. `false` when it
-    /// did not end in time or is not a home run; the default.
+    /// wait up to `wait` for its machine to report the end; `Ok` too when
+    /// it is not a home run (the default).
+    ///
+    /// # Errors
+    ///
+    /// `home-unavailable` when the machine did not confirm the end in time:
+    /// the run is still stopping there, and no new run of the script starts
+    /// on the home until it ends.
     fn stop_home_script<'a>(
         &'a self,
         svc: &'a Services,
@@ -1557,9 +1563,9 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         pty: &'a Arc<intent_pty::PtyHost>,
         id: intent_pty::PtyId,
         wait: std::time::Duration,
-    ) -> BoxFuture<'a, bool> {
+    ) -> BoxFuture<'a, Result<()>> {
         let _ = (svc, workspace_id, pty, id, wait);
-        Box::pin(async { false })
+        Box::pin(async { Ok(()) })
     }
 
     /// Open the workspace's recorded home on its machine (`homeOpen`): its

@@ -413,8 +413,10 @@ async fn home_runs_and_autostart_run_in_the_home_checkout() {
         serde_json::to_string_pretty(&json!({
             "scripts": [{
                 "name": "auto",
+                // Ignores SIGTERM, so its end comes only after the machine's
+                // kill escalates: a restart must wait for that slow end.
                 // timing-guard: a long-lived service process for the run to stop, not a wait
-                "command": "echo $$ > auto.pid; echo auto:$(pwd -P) > auto.txt; exec sleep 600",
+                "command": "trap '' TERM; echo $$ > auto.pid; echo auto:$(pwd -P) > auto.txt; while :; do sleep 1; done",
                 "mode": "service",
                 "autoStart": true,
             }]
@@ -556,7 +558,8 @@ async fn home_runs_and_autostart_run_in_the_home_checkout() {
     assert_eq!(status["exitCode"], 3, "{status}");
 
     // A restart from the app waits for the machine to end the old process
-    // before it starts the next one.
+    // (which ignores SIGTERM, so it ends only at the kill's escalation)
+    // before it starts the next one: never two at once.
     let old = std::fs::read_to_string(work.join("auto.pid"))
         .unwrap()
         .trim()
