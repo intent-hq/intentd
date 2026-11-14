@@ -754,26 +754,63 @@ async fn a_cancelled_home_call_stops_its_search() {
     }
 }
 
-/// The next `homeEvents` of `home` with an event `pick` takes; every
-/// event read on the way is kept in `seen`.
-async fn next_home_event(
-    dialed: &mut DialedLink,
-    home: &HomeRef,
-    seen: &mut Vec<intent_core::node_link::HomeEvent>,
-    pick: impl Fn(&intent_core::node_link::HomeEvent) -> bool,
-) -> intent_core::node_link::HomeEvent {
-    loop {
-        let frame = next_frame(dialed).await.expect("the link closed");
+/// The home events a test read: `pending` not yet taken, `seen` all.
+#[derive(Default)]
+struct HomeEventsRead {
+    pending: std::collections::VecDeque<intent_core::node_link::HomeEvent>,
+    seen: Vec<intent_core::node_link::HomeEvent>,
+}
+
+impl HomeEventsRead {
+    /// Keep a `homeEvents` frame of `home`; any other frame is returned.
+    fn keep(&mut self, home: &HomeRef, frame: LinkFrame) -> Option<LinkFrame> {
         let LinkFrame::HomeEvents(events) = frame else {
-            continue;
+            return Some(frame);
         };
         assert_eq!(events.home(), *home);
         assert!(!events.events.is_empty());
         assert!(events.events.len() <= intent_core::node_link::MAX_HOME_EVENTS);
-        for event in events.events {
-            seen.push(event.clone());
-            if pick(&event) {
-                return event;
+        self.seen.extend(events.events.iter().cloned());
+        self.pending.extend(events.events);
+        None
+    }
+
+    /// The next event `pick` takes, kept or still to come; the ones before
+    /// it are passed over.
+    async fn next(
+        &mut self,
+        dialed: &mut DialedLink,
+        home: &HomeRef,
+        pick: impl Fn(&intent_core::node_link::HomeEvent) -> bool,
+    ) -> intent_core::node_link::HomeEvent {
+        loop {
+            while let Some(event) = self.pending.pop_front() {
+                if pick(&event) {
+                    return event;
+                }
+            }
+            let frame = next_frame(dialed).await.expect("the link closed");
+            let _ = self.keep(home, frame);
+        }
+    }
+
+    /// Send one home call and wait for its reply, keeping the home events
+    /// that arrive before it (a call's own events can precede its reply).
+    async fn call(
+        &mut self,
+        dialed: &mut DialedLink,
+        home: &HomeRef,
+        method: &str,
+        params: Value,
+    ) -> HomeCallReply {
+        let frame = call_frame(home, method, params, 30_000);
+        let id = frame.request_id;
+        dialed.link.send(&LinkFrame::HomeCall(frame)).await.unwrap();
+        loop {
+            let frame = next_frame(dialed).await.expect("the link closed");
+            match self.keep(home, frame) {
+                Some(LinkFrame::HomeCallReply(reply)) if reply.request_id == id => return reply,
+                _ => {}
             }
         }
     }
@@ -788,7 +825,7 @@ async fn a_homes_file_and_git_events_reach_the_backend_until_it_closes() {
     let dir = tempfile::tempdir().unwrap();
     let m = machine(dir.path()).await;
     let (mut dialed, h1, work) = opened(&m, dir.path()).await;
-    let mut seen = Vec::new();
+    let mut read = HomeEventsRead::default();
 
     // The watch arms once the setup is done: write until it reports.
     let budget = intentd_test_support::test_timeout(Duration::from_secs(60));
@@ -797,16 +834,17 @@ async fn a_homes_file_and_git_events_reach_the_backend_until_it_closes() {
         loop {
             n += 1;
             let name = format!("new-{n}.txt");
-            ok(call(
-                &mut dialed,
-                &h1,
-                "file.write",
-                json!({ "path": name, "content": "x\n" }),
-            )
-            .await);
+            ok(read
+                .call(
+                    &mut dialed,
+                    &h1,
+                    "file.write",
+                    json!({ "path": name, "content": "x\n" }),
+                )
+                .await);
             let got = tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(3)),
-                next_home_event(&mut dialed, &h1, &mut seen, |event| {
+                read.next(&mut dialed, &h1, |event| {
                     event.event_type.starts_with("file:")
                         && event.data["path"]
                             .as_str()
@@ -826,29 +864,30 @@ async fn a_homes_file_and_git_events_reach_the_backend_until_it_closes() {
 
     // A commit through a home call gives `git:commit` for the backend's
     // workspace.
-    let committed = ok(call(
-        &mut dialed,
-        &h1,
-        "git.agentCommit",
-        json!({ "message": "new", "files": [path], "userRequested": true }),
-    )
-    .await);
-    let commit = next_home_event(&mut dialed, &h1, &mut seen, |event| {
-        event.event_type == "git:commit"
-    })
-    .await;
+    let committed = ok(read
+        .call(
+            &mut dialed,
+            &h1,
+            "git.agentCommit",
+            json!({ "message": "new", "files": [path], "userRequested": true }),
+        )
+        .await);
+    let commit = read
+        .next(&mut dialed, &h1, |event| event.event_type == "git:commit")
+        .await;
     assert_eq!(
         commit.data["commit"], committed["hash"],
         "{:?}",
         commit.data
     );
     assert_eq!(commit.data["workspaceId"], h1.workspace_id.as_str());
-    let status = next_home_event(&mut dialed, &h1, &mut seen, |event| {
-        event.event_type == "changes:git-status"
-    })
-    .await;
+    let status = read
+        .next(&mut dialed, &h1, |event| {
+            event.event_type == "changes:git-status"
+        })
+        .await;
     assert_eq!(status.data["workspaceId"], h1.workspace_id.as_str());
-    let shown = serde_json::to_string(&seen).unwrap();
+    let shown = serde_json::to_string(&read.seen).unwrap();
     for hidden in [
         dir.path().to_string_lossy().into_owned(),
         std::fs::canonicalize(dir.path())
@@ -866,7 +905,7 @@ async fn a_homes_file_and_git_events_reach_the_backend_until_it_closes() {
     std::fs::write(work.join("after-close.txt"), "x\n").unwrap();
     let more = tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(3)),
-        next_home_event(&mut dialed, &h1, &mut seen, |event| {
+        read.next(&mut dialed, &h1, |event| {
             event.data.to_string().contains("after-close")
         }),
     )
