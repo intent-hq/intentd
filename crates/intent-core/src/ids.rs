@@ -94,6 +94,33 @@ impl WorkspaceId {
     pub fn is_chief(&self) -> bool {
         self.0 == CHIEF_WORKSPACE_ID
     }
+
+    /// A new, unguessable [`HOME_RECORD_PREFIX`] id for a machine's hidden
+    /// record of an open home checkout.
+    #[must_use]
+    pub fn new_home_record() -> Self {
+        Self(format!("{HOME_RECORD_PREFIX}{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Whether this id names a machine's hidden home record
+    /// ([`HOME_RECORD_PREFIX`]).
+    #[must_use]
+    pub fn is_home_record(&self) -> bool {
+        is_home_record_id(&self.0)
+    }
+}
+
+/// The prefix of a machine's hidden workspace record of an open home
+/// checkout (monorepo `docs/protocol/node-link.md`, "Files and git on the
+/// home"): the machine answers a backend's `homeCall` by running the wire
+/// method against that record. The record is never listed, its events are
+/// never published, and no client or agent request may name it.
+pub const HOME_RECORD_PREFIX: &str = "__home__:";
+
+/// Whether `id` names a hidden home record ([`HOME_RECORD_PREFIX`]).
+#[must_use]
+pub fn is_home_record_id(id: &str) -> bool {
+    id.starts_with(HOME_RECORD_PREFIX)
 }
 id_newtype!(
     /// Identifier for a note.

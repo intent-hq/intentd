@@ -1027,3 +1027,62 @@ async fn pty_input_and_open_secrets_are_masked() {
         }
     }
 }
+
+/// A home call's params and result (nodeProtocol 19) never enter the light
+/// capture, and a home `host.exec`'s command, arguments and environment
+/// are masked in the full one.
+#[tokio::test]
+async fn home_call_payloads_stay_out_of_light_captures_and_exec_secrets_are_masked() {
+    use crate::node_link::{HomeCall, HomeCallReply, LinkId};
+    for payloads in [true, false] {
+        let (traffic, _) = traffic(limits(10, 1 << 16, 1 << 16));
+        traffic.start(payloads);
+        let call = |method: &str, params: serde_json::Value| {
+            LinkFrame::HomeCall(HomeCall {
+                request_id: LinkId::nil(),
+                workspace_id: crate::WorkspaceId::from("ws-1"),
+                home_id: crate::HomeId::from("h1"),
+                method: method.into(),
+                params: params.as_object().cloned().unwrap(),
+                timeout_ms: 1000,
+            })
+        };
+        let tap = LinkTap::new(traffic.clone(), machine());
+        tap.observe(
+            TrafficDirection::Out,
+            &call(
+                "file.write",
+                json!({ "path": "a", "content": "canary-light-body" }),
+            ),
+            10,
+        );
+        tap.observe(
+            TrafficDirection::Out,
+            &call(
+                "host.exec",
+                json!({ "command": "curl canary-exec-token", "args": ["canary-arg"], "env": { "K": "canary-env" } }),
+            ),
+            10,
+        );
+        tap.observe(
+            TrafficDirection::In,
+            &LinkFrame::HomeCallReply(HomeCallReply::ok(
+                LinkId::nil(),
+                json!({ "content": "canary-light-result" }),
+            )),
+            10,
+        );
+        settle(&traffic, 3).await;
+        let records = traffic.snapshot(None, None)["records"].clone();
+        let text = records.to_string();
+        assert!(!text.contains("canary-exec"), "{text}");
+        assert!(!text.contains("canary-arg"), "{text}");
+        assert!(!text.contains("canary-env"), "{text}");
+        if payloads {
+            assert!(text.contains("canary-light-body"), "{text}");
+        } else {
+            assert!(!text.contains("canary"), "{text}");
+            assert_eq!(records[0]["frameType"], "homeCall", "{text}");
+        }
+    }
+}

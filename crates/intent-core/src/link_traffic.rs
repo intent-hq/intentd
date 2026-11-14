@@ -621,6 +621,20 @@ fn masked_copy(frame: &LinkFrame) -> LinkFrame {
                 .map(|_| crate::node_link::SecretValue::from(MASK)),
             ..forge.clone()
         }),
+        // A home `host.exec`'s command, arguments and environment can hold
+        // tokens, as a terminal's can.
+        LinkFrame::HomeCall(call) if call.method == "host.exec" => {
+            let mut params = call.params.clone();
+            for key in ["command", "args", "env"] {
+                if let Some(value) = params.get_mut(key) {
+                    *value = json!(MASK);
+                }
+            }
+            LinkFrame::HomeCall(crate::node_link::HomeCall {
+                params,
+                ..call.clone()
+            })
+        }
         other => other.clone(),
     }
 }
@@ -858,6 +872,23 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "outcome": reply.outcome,
             "code": reply.error.as_ref().map(|error| field(&error.code)),
         }),
+        LinkFrame::HomeCall(call) => json!({
+            "type": "homeCall",
+            "requestId": call.request_id,
+            "homeId": field(call.home_id.as_str()),
+            "method": field(&call.method),
+            "timeoutMs": call.timeout_ms,
+        }),
+        LinkFrame::HomeCallCancel(cancel) => json!({
+            "type": "homeCallCancel",
+            "requestId": cancel.request_id,
+        }),
+        LinkFrame::HomeCallReply(reply) => json!({
+            "type": "homeCallReply",
+            "requestId": reply.request_id,
+            "outcome": reply.outcome,
+            "code": reply.error.as_ref().map(|error| error.code),
+        }),
         LinkFrame::HomeOpen(open) => json!({
             "type": "homeOpen",
             "requestId": open.request_id,
@@ -1087,6 +1118,15 @@ fn summarize(frame_type: &str, frame: &Value) -> String {
             line
         }
         "homeOpen" | "homePush" => format!("{frame_type} home {}", text(frame, "homeId")),
+        "homeCall" => format!(
+            "homeCall {} on home {}",
+            text(frame, "method"),
+            text(frame, "homeId")
+        ),
+        "homeCallReply" => match frame.get("code").and_then(Value::as_i64) {
+            Some(code) => format!("homeCallReply {} code {code}", text(frame, "outcome")),
+            None => format!("homeCallReply {}", text(frame, "outcome")),
+        },
         "homeOpenReply" | "homePushReply" => format!(
             "{frame_type} home {} {}",
             text(frame, "homeId"),

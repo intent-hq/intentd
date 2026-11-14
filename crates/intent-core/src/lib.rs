@@ -115,9 +115,10 @@ pub use git_remote_url::GitRemoteUrl;
 pub use host_membership::{
     HostInvite, HostMember, HostMembershipState, HostRole, InviteScope, PrincipalRevocation,
 };
+pub use ids::is_home_record_id;
 pub use ids::{
     AgentId, ClientId, ExecutorCredentialId, HomeId, HookId, NoteId, PrMonitorId, PrincipalId,
-    WorkspaceGitRootId, WorkspaceId, CHIEF_WORKSPACE_ID,
+    WorkspaceGitRootId, WorkspaceId, CHIEF_WORKSPACE_ID, HOME_RECORD_PREFIX,
 };
 pub use message_block_page::{
     page_message_block, MessageBlockPage, AGENT_MESSAGE_BLOCK_MAX_BYTES, MESSAGE_BLOCK_MAX_BYTES,

@@ -1657,3 +1657,41 @@ async fn persisted_event_is_broadcast_before_its_publisher_wakes() {
         assert_eq!(orx.await.expect("resolved").expect("ok").id, id);
     }
 }
+
+/// A machine's hidden home record never publishes: its events, persisted
+/// or transient, are neither stored nor broadcast, while another
+/// workspace's still are.
+#[tokio::test]
+async fn home_record_events_are_never_published() {
+    let (_tmp, bus) = bus().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let hidden = WorkspaceId::new_home_record();
+    let mut persisted = new_event("file:changed", None, ActorType::System);
+    persisted.workspace_id = hidden.clone();
+    bus.publish(&persisted).await.expect("publish");
+    let mut transient = new_event("chat:stream:delta", None, ActorType::System);
+    transient.workspace_id = hidden.clone();
+    let _ = bus.publish_transient(&transient);
+    let shown = bus
+        .publish(&new_event("note:created", None, ActorType::System))
+        .await
+        .expect("publish");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].id, shown.id);
+    let stored = bus
+        .store()
+        .query_events(&EventQuery {
+            workspace_id: Some(hidden),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert!(stored.is_empty(), "{stored:?}");
+}

@@ -753,6 +753,7 @@ impl Store {
         sqlx::query_scalar::<_, String>(
             "SELECT workspace_id FROM workspace_member WHERE principal_id = ? \
              UNION SELECT w.id FROM workspace w WHERE w.id <> ? \
+             AND substr(w.id, 1, 9) <> '__home__:' \
              AND EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)",
         )
         .bind(principal.as_str())

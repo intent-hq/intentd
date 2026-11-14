@@ -409,6 +409,177 @@ pub const MAX_PTY_OUTPUT_BYTES: usize = 32 * 1024;
 /// past it the terminal's reader waits for acknowledgements.
 pub const PTY_UNACKED_BYTES: usize = 4 * 1024 * 1024;
 
+/// The wire methods a [`HomeCall`] may name (nodeProtocol 19): the machine
+/// answers each as the method of that name does on a regular daemon,
+/// against the home checkout. Sorted.
+pub const HOME_METHODS: &[&str] = &[
+    "file-tracking.getAgentLocks",
+    "file-tracking.getChanges",
+    "file-tracking.loadCommits",
+    "file-tracking.stage",
+    "file-tracking.unstage",
+    "file.delete",
+    "file.exists",
+    "file.getAttachmentInfo",
+    "file.list",
+    "file.mkdir",
+    "file.placeAttachment",
+    "file.read",
+    "file.readChunk",
+    "file.rename",
+    "file.stat",
+    "file.tree",
+    "file.write",
+    "git.agentCommit",
+    "git.branchDiff",
+    "git.branchStatus",
+    "git.changes",
+    "git.checkMergeConflicts",
+    "git.checkoutBranch",
+    "git.commitDetails",
+    "git.commits",
+    "git.createBranch",
+    "git.diffs",
+    "git.discard",
+    "git.fetch",
+    "git.getBranches",
+    "git.numstat",
+    "git.pull",
+    "git.renameBranch",
+    "git.showFile",
+    "git.showFileChunk",
+    "git.stage",
+    "git.stageHunk",
+    "git.status",
+    "git.unstage",
+    "git.unstageHunk",
+    "host.exec",
+    "search.codebase",
+    "search.fileNames",
+    "search.inFiles",
+];
+
+/// The error a [`HomeCallReply`] carries when the result does not fit one
+/// frame (`-32603`).
+pub const HOME_REPLY_TOO_LARGE: &str = "home-reply-too-large";
+
+/// Backend to machine (nodeProtocol 19, rpc lane): run one wire method of
+/// [`HOME_METHODS`] against a home checkout. The body is closed. `Debug`
+/// leaves out `params`, which can hold file contents and commands.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeCall {
+    pub request_id: LinkId,
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+    pub method: String,
+    /// The wire method's own params; `workspaceId` names nothing on the
+    /// machine and is replaced there.
+    pub params: serde_json::Map<String, Value>,
+    pub timeout_ms: u64,
+}
+
+impl std::fmt::Debug for HomeCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HomeCall")
+            .field("request_id", &self.request_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("home_id", &self.home_id)
+            .field("method", &self.method)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HomeCall {
+    /// The home this call runs in.
+    #[must_use]
+    pub fn home(&self) -> HomeRef {
+        HomeRef {
+            workspace_id: self.workspace_id.clone(),
+            home_id: self.home_id.clone(),
+        }
+    }
+}
+
+/// Backend to machine (nodeProtocol 19, rpc lane): end the [`HomeCall`]
+/// `request_id`; it is not answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeCallCancel {
+    pub request_id: LinkId,
+}
+
+/// How a [`HomeCall`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HomeCallOutcome {
+    Ok,
+    Err,
+}
+
+/// A [`HomeCall`]'s JSON-RPC error, as the wire method answers it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeCallError {
+    pub code: i64,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+/// Machine to backend (nodeProtocol 19, rpc lane): the answer to a
+/// [`HomeCall`]: the wire method's `result`, or its `error`. `Debug`
+/// leaves out the result.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeCallReply {
+    pub request_id: LinkId,
+    pub outcome: HomeCallOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<HomeCallError>,
+}
+
+impl std::fmt::Debug for HomeCallReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HomeCallReply")
+            .field("request_id", &self.request_id)
+            .field("outcome", &self.outcome)
+            .field("error", &self.error.as_ref().map(|e| e.code))
+            .finish_non_exhaustive()
+    }
+}
+
+impl HomeCallReply {
+    /// An `ok` reply carrying `result`.
+    #[must_use]
+    pub fn ok(request_id: LinkId, result: Value) -> Self {
+        Self {
+            request_id,
+            outcome: HomeCallOutcome::Ok,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    /// An `err` reply with `code`, `message` and `data`.
+    #[must_use]
+    pub fn err(request_id: LinkId, code: i64, message: String, data: Option<Value>) -> Self {
+        Self {
+            request_id,
+            outcome: HomeCallOutcome::Err,
+            result: None,
+            error: Some(HomeCallError {
+                code,
+                message,
+                data,
+            }),
+        }
+    }
+}
+
 /// [`LaunchCommand::checkout_of`]: the agent whose checkout a sub-agent
 /// works in (nodeProtocol 13, a string on the wire), or the workspace's
 /// home checkout (nodeProtocol 19, an object).
@@ -774,7 +945,7 @@ impl std::fmt::Display for ProtocolRange {
 /// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
 /// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`, `secretReply`,
 /// `forgeTokenReply`, `checkoutReadReply`, `oneShotReply`, `homeOpenReply`,
-/// `homePushReply`, `ptyOutput`, `ptyExited`) and
+/// `homePushReply`, `ptyOutput`, `ptyExited`, `homeCallReply`) and
 /// `cancelRequest` are
 /// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
@@ -788,6 +959,8 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "heartbeat",
     "heartbeatReply",
     "hello",
+    "homeCall",
+    "homeCallCancel",
     "homeOpen",
     "homePush",
     "launch",
@@ -2008,6 +2181,12 @@ pub enum LinkFrame {
     PtyOutput(PtyOutput),
     /// Machine to backend (nodeProtocol 19): a home terminal ended.
     PtyExited(PtyExited),
+    /// Backend to machine (nodeProtocol 19): a file or git call on a home.
+    HomeCall(HomeCall),
+    /// Backend to machine (nodeProtocol 19): end a home call.
+    HomeCallCancel(HomeCallCancel),
+    /// Machine to backend (nodeProtocol 19): a home call's answer.
+    HomeCallReply(HomeCallReply),
 }
 
 /// A chunk of an agent's or (nodeProtocol 19) a home's checkout progress
@@ -2191,7 +2370,10 @@ impl LinkFrame {
             | Self::CancelRequest { .. }
             | Self::OneShot(_)
             | Self::OneShotCancel(_)
-            | Self::OneShotReply(_) => LinkChannel::Rpc,
+            | Self::OneShotReply(_)
+            | Self::HomeCall(_)
+            | Self::HomeCallCancel(_)
+            | Self::HomeCallReply(_) => LinkChannel::Rpc,
             Self::ScriptStart(_)
             | Self::ScriptStop(_)
             | Self::ScriptStarted(_)
@@ -2233,7 +2415,10 @@ impl LinkFrame {
             | Self::PtyKill(_)
             | Self::PtyAck(_)
             | Self::PtyOutput(_)
-            | Self::PtyExited(_) => HOMES_PROTOCOL,
+            | Self::PtyExited(_)
+            | Self::HomeCall(_)
+            | Self::HomeCallCancel(_)
+            | Self::HomeCallReply(_) => HOMES_PROTOCOL,
             _ if self
                 .script_owner()
                 .is_some_and(|owner| owner.home().is_some()) =>
@@ -2320,7 +2505,9 @@ impl LinkFrame {
             | Self::PtyInput(_)
             | Self::PtyResize(_)
             | Self::PtyKill(_)
-            | Self::PtyAck(_) => true,
+            | Self::PtyAck(_)
+            | Self::HomeCall(_)
+            | Self::HomeCallCancel(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
@@ -2341,7 +2528,8 @@ impl LinkFrame {
             | Self::HomeOpenReply(_)
             | Self::HomePushReply(_)
             | Self::PtyOutput(_)
-            | Self::PtyExited(_) => false,
+            | Self::PtyExited(_)
+            | Self::HomeCallReply(_) => false,
         }
     }
 

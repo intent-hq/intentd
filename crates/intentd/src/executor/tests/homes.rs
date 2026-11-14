@@ -1291,3 +1291,6 @@ async fn stopping_a_home_run_ends_it_and_an_agent_stop_does_not() {
     assert_ne!(exited.exit_code, Some(0), "killed: {exited:?}");
     node.stop().await;
 }
+
+#[path = "home_calls.rs"]
+mod home_calls;

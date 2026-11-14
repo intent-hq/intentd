@@ -41,6 +41,11 @@ use crate::file_ops;
 #[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
+/// How often a cancelled or timed-out command's reap re-kills (and logs) a
+/// child that has not exited yet, and the longest it waits for the output
+/// pipes to close once the child has exited.
+const REAP_WAIT: Duration = Duration::from_secs(5);
+
 /// Wire error codes surfaced by `host.exec` (PROTOCOL §9: `-32602` for invalid
 /// params, `-32603` for internal execution failures).
 pub const INVALID_PARAMS: i32 = -32602;
@@ -513,47 +518,67 @@ async fn run_prepared(
         result = wait_fut => Some(result),
         () = deadline => None,
     };
-    let (stdout_bytes, stderr_bytes, wait_result, timed_out) =
-        if let Some((out, err, status)) = completed {
-            (out, err, status, false)
-        } else {
-            // Reap the whole process group: SIGTERM → grace → SIGKILL,
-            // plus a snapshot-before-kill descendant sweep for anything
-            // that escaped into its own process group
-            // (`intent_acp::descendant_sweep`). On non-Unix explicitly kill
-            // the direct child before awaiting it: kill_on_drop cannot help
-            // while this scope is still waiting for that child to exit.
+    let (stdout_bytes, stderr_bytes, wait_result, timed_out) = if let Some((out, err, status)) =
+        completed
+    {
+        (out, err, status, false)
+    } else {
+        // Reap the whole process group: SIGTERM → grace → SIGKILL,
+        // plus a snapshot-before-kill descendant sweep for anything
+        // that escaped into its own process group
+        // (`intent_acp::descendant_sweep`). On non-Unix explicitly kill
+        // the direct child before awaiting it: kill_on_drop cannot help
+        // while this scope is still waiting for that child to exit.
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            let descendants = intent_acp::descendant_pids(pid).await;
+            kill_group(pid, nix::sys::signal::Signal::SIGTERM);
+            tokio::time::sleep(TERM_GRACE).await;
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                // exited during grace
+            } else {
+                kill_group(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+            intent_acp::sweep_escaped_descendants(&descendants).await;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            child.start_kill().map_err(|error| {
+                HostExecError::internal(format!("command cancellation failed: {error}"))
+            })?;
+        }
+        // The reap owns the child until its exit is observed: one the
+        // kill has not ended yet (uninterruptible sleep) is killed
+        // again and logged every [`REAP_WAIT`], and the caller (a home
+        // call) stays outstanding meanwhile.
+        let status = loop {
+            if let Ok(status) = tokio::time::timeout(REAP_WAIT, child.wait()).await {
+                break status;
+            }
+            tracing::warn!(pid = ?pid, command = %args.command, "host.exec: a killed command has not exited yet");
             #[cfg(unix)]
             if let Some(pid) = pid {
-                let descendants = intent_acp::descendant_pids(pid).await;
-                kill_group(pid, nix::sys::signal::Signal::SIGTERM);
-                tokio::time::sleep(TERM_GRACE).await;
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    // exited during grace
-                } else {
-                    kill_group(pid, nix::sys::signal::Signal::SIGKILL);
-                }
-                intent_acp::sweep_escaped_descendants(&descendants).await;
+                kill_group(pid, nix::sys::signal::Signal::SIGKILL);
             }
-            #[cfg(not(unix))]
-            {
-                let _ = pid;
-                child.start_kill().map_err(|error| {
-                    HostExecError::internal(format!("command cancellation failed: {error}"))
-                })?;
-            }
-            // Best-effort drain of whatever the child produced pre-timeout.
-            let status = child.wait().await;
-            let mut out = Vec::new();
+            let _ = child.start_kill();
+        };
+        // Best-effort drain of whatever the child produced before the
+        // kill, bounded: a pipe an escaped process still holds open
+        // never keeps the reap past [`REAP_WAIT`].
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = tokio::time::timeout(REAP_WAIT, async {
             if let Some(mut r) = stdout_reader.take() {
                 let _ = r.read_to_end(&mut out).await;
             }
-            let mut err = Vec::new();
             if let Some(mut r) = stderr_reader.take() {
                 let _ = r.read_to_end(&mut err).await;
             }
-            (out, err, status, true)
-        };
+        })
+        .await;
+        (out, err, status, true)
+    };
     if shutting_down {
         return Err(HostExecError::internal("daemon shutting down"));
     }
@@ -599,11 +624,45 @@ impl HostExecRuntime {
         api: &dyn WorkspaceApi,
         args: HostExecArgs,
     ) -> Result<Value, HostExecError> {
+        self.run_until(api, args, std::future::pending()).await
+    }
+
+    /// [`Self::run`], ended early when `stop` resolves: the command's
+    /// process tree is reaped as at shutdown, and the call returns only
+    /// after that cleanup.
+    ///
+    /// # Errors
+    /// Returns validation/execution errors, or an internal error when
+    /// stopped or shutting down.
+    pub async fn run_until(
+        &self,
+        api: &dyn WorkspaceApi,
+        args: HostExecArgs,
+        stop: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<Value, HostExecError> {
         let cwd = prepare(api, &args, &AllowAllPolicy).await?;
         let tasks = self.tasks.clone();
         let (result, done) = tokio::sync::oneshot::channel();
         let Some(_handle) = self.tasks.spawn_draining(async move {
-            let outcome = run_prepared(args, cwd, tasks.closed()).await;
+            let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ended = {
+                let stopped = stopped.clone();
+                async move {
+                    tokio::select! {
+                        () = tasks.closed() => {}
+                        () = stop => stopped.store(true, std::sync::atomic::Ordering::SeqCst),
+                    }
+                }
+            };
+            let outcome = run_prepared(args, cwd, ended).await;
+            // A stop reaps the command as shutdown does; it is reported as
+            // what it is.
+            let outcome = match outcome {
+                Err(_) if stopped.load(std::sync::atomic::Ordering::SeqCst) => {
+                    Err(HostExecError::internal("host.exec stopped"))
+                }
+                outcome => outcome,
+            };
             let _ = result.send(outcome);
         }) else {
             return Err(HostExecError::internal("daemon shutting down"));
@@ -731,6 +790,65 @@ mod tests {
         .await
         .unwrap();
         assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
+        store.close().await;
+    }
+
+    /// A stopped command whose output pipe an escaped process (its own
+    /// session, no longer a descendant) still holds open: the reap gives up
+    /// on the drain after its bound instead of waiting for that process,
+    /// which outlives the test's hang guard.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_stopped_commands_reap_is_bounded_by_an_escaped_pipe_holder() {
+        let tmp = crate::test_support::test_tempdir("intentd-exec-reap-");
+        let store = intent_store::Store::open(&tmp.path().join("store.db"))
+            .await
+            .unwrap();
+        let services = crate::Services::new_isolated(store.clone());
+        let runtime = services.host_exec_runtime();
+        let pid_file = tmp.path().join("escaped");
+        let args = parse_args(&map(&json!({
+            "command": "sh",
+            "args": ["-c", "(setsid sh -c 'echo $$ > \"$1\"; exec sleep 600' escaped \"$1\" &); exec sleep 60", "reap-child", pid_file]
+        })))
+        .unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let call = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .run_until(&services, args, async move {
+                        let _ = stopped.await;
+                    })
+                    .await
+            })
+        };
+        let escaped = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = pid.trim().parse::<i32>() {
+                            break pid;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .unwrap();
+        stop.send(()).unwrap();
+        let ended = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            call,
+        )
+        .await
+        .expect("the reap waited on the escaped process")
+        .unwrap();
+        let escaped = nix::unistd::Pid::from_raw(escaped);
+        let _ = nix::sys::signal::kill(escaped, nix::sys::signal::Signal::SIGKILL);
+        assert_eq!(ended.unwrap_err().message, "host.exec stopped");
         store.close().await;
     }
 
