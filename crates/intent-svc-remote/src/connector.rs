@@ -1494,6 +1494,12 @@ impl Shared {
         lock(&self.status).node_id.clone()
     }
 
+    /// The lease this connector binds: its journal's sequences are this
+    /// lease's.
+    pub(crate) fn lease_id(&self) -> String {
+        lock(&self.status).lease_id.clone()
+    }
+
     fn welcome(&self, welcome: &LinkWelcome) {
         self.protocol
             .store(welcome.protocol, std::sync::atomic::Ordering::SeqCst);

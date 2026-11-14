@@ -463,30 +463,16 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
         // A new home checkout finished its setup (nodeProtocol 19 journals
         // it once per checkout): its `autoStart` scripts start now, not when
         // a later `homeOpen` answers `ready` for the checkout it holds.
-        JournalBody::SetupFinished { state, .. } => {
-            // A failed setup leaves the checkout unfit to run services in;
-            // the user starts them once it is fixed.
-            if *state == intent_core::node_link::SetupState::Failed {
-                tracing::info!(home = %home_id, "remote machine: the home's setup failed; no autoStart");
-                return;
-            }
-            let current = svc
-                .store()
-                .get_workspace_home(&record.workspace_id)
+        JournalBody::SetupFinished { .. } => {
+            if !svc.workspace_homes()
+                || !auto_start_due(
+                    svc.store(),
+                    &shared.machine_id(),
+                    &shared.lease_id(),
+                    &record,
+                )
                 .await
-                .ok()
-                .flatten()
-                .is_some_and(|home| {
-                    &home.home_id == home_id
-                        && home.node_id.as_deref() == Some(shared.machine_id().as_str())
-                });
-            if !current || !svc.workspace_homes() {
-                tracing::debug!(home = %home_id, "remote machine: setup of a home that is not current; no autoStart");
-                return;
-            }
-            // Once per home in this process: a record replayed before its
-            // ack was saved does not start them again.
-            if !shared.home_scripts.first_auto_start(home_id) {
+            {
                 return;
             }
             let svc = svc.clone();
@@ -505,10 +491,137 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
     }
 }
 
+/// Whether a home's `setupFinished` `record`, from machine `machine_id` on
+/// lease `lease_id`, starts the home's `autoStart` scripts: a new checkout
+/// whose setup completed or was skipped, of the workspace's current home on
+/// that machine, once. The claim is durable and names the record (its
+/// lease's journal and sequence), so a record replayed before its ack was
+/// saved, also after a restart, starts nothing again. It is made before the
+/// scripts start, so a crash or a store error between the two leaves them
+/// for the user to start (the record is acked all the same): at most once.
+async fn auto_start_due(
+    store: &intent_store::Store,
+    machine_id: &str,
+    lease_id: &str,
+    record: &JournalRecord,
+) -> bool {
+    let (RecordOwner::Home(home_id), JournalBody::SetupFinished { state, .. }) =
+        (&record.owner, &record.body)
+    else {
+        return false;
+    };
+    // A failed setup leaves the checkout unfit to run services in; the
+    // user starts them once it is fixed.
+    if *state == intent_core::node_link::SetupState::Failed {
+        tracing::info!(home = %home_id, "remote machine: the home's setup failed; no autoStart");
+        return false;
+    }
+    match store
+        .claim_workspace_home_auto_start(
+            &record.workspace_id,
+            home_id,
+            machine_id,
+            lease_id,
+            record.seq.0,
+        )
+        .await
+    {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::debug!(home = %home_id, seq = record.seq.0, "remote machine: setup of a home that is not current, or autoStart already claimed; no autoStart");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(home = %home_id, %error, "remote machine: could not claim the home's autoStart; it is not started");
+            false
+        }
+    }
+}
+
 impl Shared {
     /// Whether the machine holds a home of this backend (keeps the link up).
     pub(crate) fn set_holds_homes(&self, holds: bool) {
         self.holds_homes
             .store(holds, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use intent_core::node_link::SetupState;
+    use intent_core::nodes::NodeCounter;
+    use intent_core::Workspace;
+    use intent_store::Store;
+
+    use super::*;
+
+    fn setup_finished(home: &str, seq: u64, state: SetupState) -> JournalRecord {
+        JournalRecord {
+            seq: NodeCounter(seq),
+            owner: RecordOwner::Home(HomeId::from(home)),
+            workspace_id: WorkspaceId::from("ws-1"),
+            turn_id: None,
+            recorded_at: intent_core::now_iso(),
+            body: JournalBody::SetupFinished {
+                state,
+                exit_code: Some(0),
+                error: None,
+                finished_at: intent_core::now_iso(),
+            },
+        }
+    }
+
+    /// A home's `setupFinished` starts its `autoStart` once per checkout:
+    /// a record replayed after the orchestrator restarted (the store
+    /// reopened, nothing kept in memory) starts nothing, nor does a failed
+    /// setup, a record from another machine or of a home that is not
+    /// current; a later checkout's record starts them again.
+    #[tokio::test]
+    async fn setup_finished_starts_auto_start_once_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("homes.db");
+        let ws = WorkspaceId::from("ws-1");
+        let completed = setup_finished("h1", 7, SetupState::Completed);
+        {
+            let store = Store::open(&path).await.unwrap();
+            store
+                .insert_workspace(&Workspace {
+                    id: ws.clone(),
+                    title: "ws-1".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            store
+                .set_workspace_home(
+                    &ws,
+                    &WorkspaceHome {
+                        home_id: HomeId::from("h1"),
+                        node_id: Some("node-a".into()),
+                        cloud_machine_id: None,
+                        name: "Machine A".into(),
+                        state: HomeState::Attached,
+                        since: intent_core::now_iso(),
+                        last_backup_at: None,
+                        backup_warning: false,
+                    },
+                )
+                .await
+                .unwrap();
+            let failed = setup_finished("h1", 6, SetupState::Failed);
+            assert!(!auto_start_due(&store, "node-a", "lease-1", &failed).await);
+            assert!(!auto_start_due(&store, "node-b", "lease-9", &completed).await);
+            let stale = setup_finished("h0", 7, SetupState::Completed);
+            assert!(!auto_start_due(&store, "node-a", "lease-1", &stale).await);
+            assert!(auto_start_due(&store, "node-a", "lease-1", &completed).await);
+        }
+        let store = Store::open(&path).await.unwrap();
+        assert!(
+            !auto_start_due(&store, "node-a", "lease-1", &completed).await,
+            "the replay after a restart starts nothing"
+        );
+        let next = setup_finished("h1", 12, SetupState::Skipped);
+        assert!(auto_start_due(&store, "node-a", "lease-1", &next).await);
+        assert!(!auto_start_due(&store, "node-a", "lease-1", &next).await);
     }
 }
