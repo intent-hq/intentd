@@ -767,7 +767,7 @@ async fn light_captures_bound_what_they_copy() {
 
 fn script_start_frame() -> LinkFrame {
     LinkFrame::ScriptStart(crate::node_link::ScriptStartCommand {
-        agent_id: AgentId::from_string("agent-1"),
+        owner: AgentId::from_string("agent-1").into(),
         script_id: "script-1".into(),
         spawn_id: "run-1".into(),
         command: "npm run dev".into(),
@@ -876,7 +876,7 @@ async fn script_frames_are_summarized() {
         ),
         (
             LinkFrame::ScriptStop(crate::node_link::ScriptProcessRef {
-                agent_id: crate::AgentId::from("agent-1"),
+                owner: crate::AgentId::from("agent-1").into(),
                 script_id: script_id.clone(),
                 spawn_id: spawn_id.clone(),
             }),
@@ -884,7 +884,7 @@ async fn script_frames_are_summarized() {
         ),
         (
             LinkFrame::ScriptStarted(crate::node_link::ScriptStarted {
-                agent_id: crate::AgentId::from("agent-1"),
+                owner: crate::AgentId::from("agent-1").into(),
                 script_id: script_id.clone(),
                 spawn_id: spawn_id.clone(),
                 pid: 77,
@@ -893,7 +893,7 @@ async fn script_frames_are_summarized() {
         ),
         (
             LinkFrame::ScriptOutput(crate::node_link::ScriptOutput {
-                agent_id: crate::AgentId::from("agent-1"),
+                owner: crate::AgentId::from("agent-1").into(),
                 script_id: script_id.clone(),
                 spawn_id: spawn_id.clone(),
                 seq: 3,
@@ -903,7 +903,7 @@ async fn script_frames_are_summarized() {
         ),
         (
             LinkFrame::ScriptExited(crate::node_link::ScriptExited {
-                agent_id: crate::AgentId::from("agent-1"),
+                owner: crate::AgentId::from("agent-1").into(),
                 script_id,
                 spawn_id,
                 exit_code: Some(2),

@@ -1,6 +1,8 @@
 //! Machine runs of saved scripts (nodeProtocol 8): the backend keeps a remote
 //! agent's script definitions, runtime state and output log, and only the
-//! process runs here, in the agent's checkout. Each `scriptStart` is one
+//! process runs here, in the agent's checkout. At nodeProtocol 19 a frame may
+//! name a workspace home instead of an agent: that is the workspace's home
+//! run, in its home checkout, otherwise the same. Each `scriptStart` is one
 //! process, spawned through the same shell, process group, PTY capture and
 //! environment as a local saved script (never the agent's provider
 //! credentials), answered with `scriptStarted`, its output as `scriptOutput`
@@ -18,8 +20,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use intent_core::node_link::{
-    LinkFrame, ScriptExited, ScriptOutput, ScriptProcessRef, ScriptStartCommand, ScriptStarted,
-    MAX_SCRIPT_OUTPUT_BYTES,
+    CheckoutOwner, LinkFrame, ScriptExited, ScriptOutput, ScriptProcessRef, ScriptStartCommand,
+    ScriptStarted, MAX_SCRIPT_OUTPUT_BYTES, NODE_HOME_UNKNOWN,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
@@ -66,38 +68,38 @@ pub(super) fn reap_wait() -> std::time::Duration {
 /// Agents whose script reapers never finish (test seam for a process whose
 /// `wait` never returns).
 #[cfg(test)]
-static HELD_REAPS: std::sync::LazyLock<Mutex<std::collections::HashSet<AgentId>>> =
+static HELD_REAPS: std::sync::LazyLock<Mutex<std::collections::HashSet<CheckoutOwner>>> =
     std::sync::LazyLock::new(Mutex::default);
 
 /// Make every reaper of `agent_id`'s scripts hang (test seam).
 #[cfg(test)]
 pub(super) fn hold_reaps_for_test(agent_id: &AgentId) {
-    lock(&HELD_REAPS).insert(agent_id.clone());
+    lock(&HELD_REAPS).insert(agent_id.clone().into());
 }
 
 /// Agents whose next script kill panics, and whose script reapers panic
 /// (test seams).
 #[cfg(test)]
-static PANIC_KILLS: std::sync::LazyLock<Mutex<std::collections::HashSet<AgentId>>> =
+static PANIC_KILLS: std::sync::LazyLock<Mutex<std::collections::HashSet<CheckoutOwner>>> =
     std::sync::LazyLock::new(Mutex::default);
 #[cfg(test)]
-static PANIC_REAPS: std::sync::LazyLock<Mutex<std::collections::HashSet<AgentId>>> =
+static PANIC_REAPS: std::sync::LazyLock<Mutex<std::collections::HashSet<CheckoutOwner>>> =
     std::sync::LazyLock::new(Mutex::default);
 
 /// Make the next kill of one of `agent_id`'s scripts panic (test seam).
 #[cfg(test)]
 pub(super) fn panic_next_kill_for_test(agent_id: &AgentId) {
-    lock(&PANIC_KILLS).insert(agent_id.clone());
+    lock(&PANIC_KILLS).insert(agent_id.clone().into());
 }
 
 /// Make every reaper of `agent_id`'s scripts panic (test seam).
 #[cfg(test)]
 pub(super) fn panic_reaps_for_test(agent_id: &AgentId) {
-    lock(&PANIC_REAPS).insert(agent_id.clone());
+    lock(&PANIC_REAPS).insert(agent_id.clone().into());
 }
 
-/// A process is named by its agent, script and spawn.
-type Key = (AgentId, String, String);
+/// A process is named by its owner (an agent or a home), script and spawn.
+type Key = (CheckoutOwner, String, String);
 
 struct Process {
     pty_id: PtyId,
@@ -108,7 +110,7 @@ struct Process {
     reaped: tokio::sync::watch::Receiver<bool>,
 }
 
-/// The script processes of one backend's agents on this machine.
+/// The script processes of one backend's agents and homes on this machine.
 #[derive(Clone)]
 pub(super) struct ScriptProcesses {
     pty: Arc<PtyHost>,
@@ -120,6 +122,10 @@ pub(super) struct ScriptProcesses {
     /// Set by [`Self::stop_all`]: the machine is shutting down, so no new
     /// process starts.
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Starts waiting for their checkout (a home being reopened), each
+    /// `true` once a `scriptStop` for it came: the start then answers that
+    /// stop instead of spawning.
+    pending: Arc<Mutex<HashMap<Key, bool>>>,
 }
 
 /// Removes a kill's entry from [`ScriptProcesses::kills`] when its task
@@ -154,13 +160,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn key(agent_id: &AgentId, script_id: &str, spawn_id: &str) -> Key {
-    (agent_id.clone(), script_id.to_owned(), spawn_id.to_owned())
+fn key(owner: &CheckoutOwner, script_id: &str, spawn_id: &str) -> Key {
+    (owner.clone(), script_id.to_owned(), spawn_id.to_owned())
 }
 
 fn exited(key: &Key, exit_code: Option<i32>, error: Option<String>) -> LinkFrame {
     LinkFrame::ScriptExited(ScriptExited {
-        agent_id: key.0.clone(),
+        owner: key.0.clone(),
         script_id: key.1.clone(),
         spawn_id: key.2.clone(),
         exit_code,
@@ -188,12 +194,23 @@ impl ScriptProcesses {
             running: Arc::default(),
             kills: Arc::default(),
             shutting_down: Arc::default(),
+            pending: Arc::default(),
         }
     }
 
-    /// Start one process for `command` in `checkout` (the agent's checkout,
-    /// `None` when the agent is unknown or its checkout is gone), started by
-    /// the link binding `generation`. Every outcome is reported on `link`.
+    /// Hold `command`'s start while its checkout is looked up off the
+    /// link's frame gate: a `scriptStop` meanwhile cancels it.
+    pub(super) fn reserve(&self, command: &ScriptStartCommand) {
+        lock(&self.pending).insert(
+            key(&command.owner, &command.script_id, &command.spawn_id),
+            false,
+        );
+    }
+
+    /// Start one process for `command` in `checkout` (its owner's checkout:
+    /// the agent's, or the home checkout; `None` when the owner is unknown
+    /// or its checkout is gone), started by the link binding `generation`.
+    /// Every outcome is reported on `link`.
     pub(super) async fn start(
         &self,
         link: &NodeLink,
@@ -201,9 +218,15 @@ impl ScriptProcesses {
         checkout: Option<&Path>,
         command: ScriptStartCommand,
     ) {
-        let key = key(&command.agent_id, &command.script_id, &command.spawn_id);
+        let key = key(&command.owner, &command.script_id, &command.spawn_id);
         let refuse =
             |code: &str, detail: &str| exited(&key, None, Some(format!("{code}: {detail}")));
+        if lock(&self.pending).remove(&key) == Some(true) {
+            let _ = link
+                .send(&refuse(NOT_RUNNING, "stopped before it started"))
+                .await;
+            return;
+        }
         if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = link
                 .send(&refuse(START_FAILED, "the machine is shutting down"))
@@ -211,29 +234,34 @@ impl ScriptProcesses {
             return;
         }
         let Some(checkout) = checkout else {
-            let _ = link
-                .send(&refuse(
-                    AGENT_UNKNOWN,
-                    "the agent has no checkout on this machine",
-                ))
-                .await;
+            let refusal = match &key.0 {
+                CheckoutOwner::Agent(_) => {
+                    refuse(AGENT_UNKNOWN, "the agent has no checkout on this machine")
+                }
+                CheckoutOwner::Home(home) => refuse(
+                    NODE_HOME_UNKNOWN,
+                    &format!("this machine holds no home {}", home.home_id),
+                ),
+            };
+            let _ = link.send(&refusal).await;
             return;
         };
         let Some(cwd) = resolve_cwd(checkout, command.cwd.as_deref()) else {
             let _ = link
-                .send(&refuse(
-                    INVALID_CWD,
-                    "cwd must stay inside the agent's checkout",
-                ))
+                .send(&refuse(INVALID_CWD, "cwd must stay inside the checkout"))
                 .await;
             return;
         };
         if lock(&self.running).contains_key(&key) {
-            tracing::warn!(agent = %key.0, "node: duplicate scriptStart for a running process; ignored");
+            tracing::warn!(owner = %key.0, "node: duplicate scriptStart for a running process; ignored");
             return;
         }
         let shell = default_shell();
-        let mut spec = SpawnSpec::new(format!("remote-script:{}", key.0), shell.clone());
+        let scope = match &key.0 {
+            CheckoutOwner::Agent(agent) => format!("remote-script:{agent}"),
+            CheckoutOwner::Home(home) => format!("home-script:{}", home.home_id),
+        };
+        let mut spec = SpawnSpec::new(scope, shell.clone());
         spec.args = shell_args(&shell, &command.command);
         spec.env = saved_script_env_overlay(
             Some(&cwd),
@@ -272,7 +300,7 @@ impl ScriptProcesses {
         }
         let _ = link
             .send(&LinkFrame::ScriptStarted(ScriptStarted {
-                agent_id: key.0.clone(),
+                owner: key.0.clone(),
                 script_id: key.1.clone(),
                 spawn_id: key.2.clone(),
                 pid: self.pty.pid(pty_id).unwrap_or_default(),
@@ -339,7 +367,12 @@ impl ScriptProcesses {
     /// naming no running process is answered at once with
     /// `node-script-not-running` and stops nothing.
     pub(super) fn stop(&self, link: &NodeLink, process: &ScriptProcessRef) {
-        let key = key(&process.agent_id, &process.script_id, &process.spawn_id);
+        let key = key(&process.owner, &process.script_id, &process.spawn_id);
+        // A start still waiting for its checkout answers this stop itself.
+        if let Some(cancelled) = lock(&self.pending).get_mut(&key) {
+            *cancelled = true;
+            return;
+        }
         let found = lock(&self.running)
             .get(&key)
             .map(|p| (p.pty_id, p.generation));
@@ -422,7 +455,7 @@ impl ScriptProcesses {
     #[cfg(test)]
     pub(super) fn is_running(&self, process: &ScriptProcessRef) -> bool {
         lock(&self.running).contains_key(&key(
-            &process.agent_id,
+            &process.owner,
             &process.script_id,
             &process.spawn_id,
         ))
@@ -431,7 +464,8 @@ impl ScriptProcesses {
     /// Kill every process of `agent_id`. Returns whether each was reaped
     /// within [`reap_wait`].
     pub(super) async fn stop_agent(&self, agent_id: &AgentId) -> bool {
-        self.kill_where(|key, _| &key.0 == agent_id).await
+        self.kill_where(|key, _| key.0.agent() == Some(agent_id))
+            .await
     }
 
     /// Kill every process and start no more (the machine is shutting
@@ -523,7 +557,7 @@ struct OutputStream {
 impl OutputStream {
     fn try_send(&mut self, data: String) -> bool {
         let sent = self.link.try_send_script_output(ScriptOutput {
-            agent_id: self.key.0.clone(),
+            owner: self.key.0.clone(),
             script_id: self.key.1.clone(),
             spawn_id: self.key.2.clone(),
             seq: self.seq,

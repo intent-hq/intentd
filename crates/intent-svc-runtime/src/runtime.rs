@@ -63,6 +63,9 @@ pub(crate) struct RuntimeFeature {
     /// Remote agents' machine runs, shared by every manager view; set up by
     /// the first view built over the owner's services.
     pub(crate) machine_runs: Arc<std::sync::OnceLock<script_ops::machine_runs::MachineRuns>>,
+    /// The PTYs of home runs on workspace homes, shared by every manager
+    /// view (nodeProtocol 19).
+    pub(crate) home_ptys: script_ops::HomePtys,
 }
 
 /// The runtime feature state and script output store, on [`Services`].
@@ -104,6 +107,7 @@ impl RuntimeStateExt for Services {
         .with_output_store(self.script_output_store())
         .with_tasks(self.feature_store_tasks().clone())
         .with_machine_runs(self.runtime().machine_runs.clone())
+        .with_home_ptys(self.runtime().home_ptys.clone())
         .with_owner_services(self.clone())
     }
 }
@@ -265,6 +269,24 @@ impl RuntimePort for RuntimeFeature {
         Box::pin(async move {
             if let Some(runs) = mgr.machine_runs() {
                 runs.on_frame(node_id, frame).await;
+            }
+        })
+    }
+
+    fn start_home_auto_start<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: intent_core::WorkspaceId,
+    ) -> BoxFuture<'a, ()> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            match mgr.start_auto_start(&workspace_id).await {
+                Ok(started) => {
+                    tracing::info!(workspace = %workspace_id, started, "home autoStart scripts started");
+                }
+                Err(error) => {
+                    tracing::warn!(workspace = %workspace_id, %error, "could not start the home's autoStart scripts");
+                }
             }
         })
     }

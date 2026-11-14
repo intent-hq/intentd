@@ -20,7 +20,7 @@ fn wait() -> Duration {
 
 fn start(agent: &AgentId, spawn: &str, command: &str) -> ScriptStartCommand {
     ScriptStartCommand {
-        agent_id: agent.clone(),
+        owner: agent.clone().into(),
         script_id: "s1".into(),
         spawn_id: spawn.into(),
         command: command.into(),
@@ -32,7 +32,7 @@ fn start(agent: &AgentId, spawn: &str, command: &str) -> ScriptStartCommand {
 
 fn process(agent: &AgentId, spawn: &str) -> ScriptProcessRef {
     ScriptProcessRef {
-        agent_id: agent.clone(),
+        owner: agent.clone().into(),
         script_id: "s1".into(),
         spawn_id: spawn.into(),
     }
@@ -125,7 +125,7 @@ async fn a_start_runs_in_the_agent_checkout_with_the_saved_env_and_reports_its_e
     let exited = seen.exited.unwrap();
     assert_eq!(exited.exit_code, Some(3));
     assert_eq!(exited.error, None);
-    assert_eq!(exited.agent_id, agent);
+    assert_eq!(exited.owner, agent.clone().into());
     assert_eq!(exited.script_id, "s1");
 }
 
@@ -618,4 +618,38 @@ async fn a_link_end_during_shutdown_does_not_wait_again() {
     tokio::time::timeout(bound, f.scripts.stop_binding(GEN))
         .await
         .expect("the link's end waited again for a process stop_all gave up on");
+}
+
+/// A start held while its checkout is looked up (a home being reopened)
+/// is cancelled by a `scriptStop` that comes meanwhile: the one
+/// `scriptExited` answers the stop and nothing is spawned.
+#[tokio::test]
+async fn a_stop_before_a_held_start_cancels_it() {
+    let mut f = fixture().await;
+    let agent = AgentId::new();
+    let cmd = start(&agent, "p1", "echo ran > ran.txt");
+    f.scripts.reserve(&cmd);
+    f.scripts.stop(&f.link, &process(&agent, "p1"));
+    f.scripts.start(&f.link, GEN, Some(checkout(&f)), cmd).await;
+    let seen = until_exited(&mut f.head, "p1").await;
+    assert_eq!(seen.pid, None, "{seen:?}");
+    let exited = seen.exited.unwrap();
+    assert_eq!(exited.exit_code, None);
+    assert!(exited
+        .error
+        .is_some_and(|e| e.starts_with("node-script-not-running")),);
+    assert!(!f.checkout.join("ran.txt").exists());
+
+    // A held start nothing stopped runs as usual.
+    let cmd = start(&agent, "p2", "exit 0");
+    f.scripts.reserve(&cmd);
+    f.scripts.start(&f.link, GEN, Some(checkout(&f)), cmd).await;
+    assert_eq!(
+        until_exited(&mut f.head, "p2")
+            .await
+            .exited
+            .unwrap()
+            .exit_code,
+        Some(0)
+    );
 }

@@ -131,7 +131,7 @@ async fn frame(runs: &MachineRuns, frame: LinkFrame) {
 
 fn started(start: &ScriptStartCommand) -> LinkFrame {
     LinkFrame::ScriptStarted(ScriptStarted {
-        agent_id: start.agent_id.clone(),
+        owner: start.owner.clone(),
         script_id: start.script_id.clone(),
         spawn_id: start.spawn_id.clone(),
         pid: 42,
@@ -140,7 +140,7 @@ fn started(start: &ScriptStartCommand) -> LinkFrame {
 
 fn output(start: &ScriptStartCommand, seq: u64, data: &str) -> LinkFrame {
     LinkFrame::ScriptOutput(ScriptOutput {
-        agent_id: start.agent_id.clone(),
+        owner: start.owner.clone(),
         script_id: start.script_id.clone(),
         spawn_id: start.spawn_id.clone(),
         seq,
@@ -150,7 +150,7 @@ fn output(start: &ScriptStartCommand, seq: u64, data: &str) -> LinkFrame {
 
 fn exited(start: &ScriptStartCommand, code: Option<i32>, error: Option<&str>) -> LinkFrame {
     LinkFrame::ScriptExited(ScriptExited {
-        agent_id: start.agent_id.clone(),
+        owner: start.owner.clone(),
         script_id: start.script_id.clone(),
         spawn_id: start.spawn_id.clone(),
         exit_code: code,
@@ -169,7 +169,7 @@ async fn a_command_run_starts_on_the_machine_and_settles_from_its_frames() {
         .unwrap();
     assert_eq!(state.status, ScriptStatus::Starting);
     let start = last_start(&rec);
-    assert_eq!(start.agent_id, agent);
+    assert_eq!(start.owner, agent.clone().into());
     assert_eq!(start.command, "make");
     assert_eq!(start.cwd.as_deref(), Some("web"));
     assert_eq!(start.env.len(), 1);
@@ -509,14 +509,14 @@ async fn ending_several_agents_waits_once_for_all_their_stops() {
         tokio::spawn(async move {
             loop {
                 let stop = rec.frames.lock().unwrap().iter().find_map(|f| match f {
-                    LinkFrame::ScriptStop(s) if s.agent_id == prompt => Some(s.clone()),
+                    LinkFrame::ScriptStop(s) if s.owner.agent() == Some(&prompt) => Some(s.clone()),
                     _ => None,
                 });
                 if let Some(stop) = stop {
                     runs.on_frame(
                         "mac",
                         LinkFrame::ScriptExited(ScriptExited {
-                            agent_id: stop.agent_id,
+                            owner: stop.owner,
                             script_id: stop.script_id,
                             spawn_id: stop.spawn_id,
                             exit_code: Some(143),
@@ -933,7 +933,7 @@ async fn stop_acked(runs: &MachineRuns, rec: &Arc<Recorded>, here: &RunPlace) {
                     runs.on_frame(
                         "mac",
                         LinkFrame::ScriptExited(ScriptExited {
-                            agent_id: stop.agent_id,
+                            owner: stop.owner,
                             script_id: stop.script_id,
                             spawn_id: stop.spawn_id,
                             exit_code: Some(143),
@@ -987,7 +987,7 @@ async fn stopping_or_restarting_a_monitored_run_wakes_once_cancelled() {
                             runs.on_frame(
                                 "mac",
                                 LinkFrame::ScriptExited(ScriptExited {
-                                    agent_id: stop.agent_id,
+                                    owner: stop.owner,
                                     script_id: stop.script_id,
                                     spawn_id: stop.spawn_id,
                                     exit_code: Some(143),

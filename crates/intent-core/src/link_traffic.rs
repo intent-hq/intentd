@@ -625,6 +625,21 @@ fn masked_copy(frame: &LinkFrame) -> LinkFrame {
     }
 }
 
+/// `light` with the owner a script or setup frame names: `agentId`, or a
+/// home's `workspaceId` and `homeId`.
+fn with_owner(owner: &crate::node_link::CheckoutOwner, mut light: Value) -> Value {
+    match owner {
+        crate::node_link::CheckoutOwner::Agent(id) => {
+            light["agentId"] = json!(clip(id.as_str(), FIELD_BYTES));
+        }
+        crate::node_link::CheckoutOwner::Home(home) => {
+            light["workspaceId"] = json!(clip(home.workspace_id.as_str(), FIELD_BYTES));
+            light["homeId"] = json!(clip(home.home_id.as_str(), FIELD_BYTES));
+        }
+    }
+    light
+}
+
 /// The parts of `frame` a record shows without its payload: the type, the
 /// ids and the fields [`summarize`] reads, never a prompt, params body,
 /// result, journal body or launch configuration.
@@ -729,51 +744,55 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "queryId": reply.query_id,
             "skills": reply.skills.len(),
         }),
-        LinkFrame::ScriptStart(start) => json!({
-            "type": "scriptStart",
-            "agentId": agent(&start.agent_id),
-            "scriptId": field(&start.script_id),
-            "spawnId": field(&start.spawn_id),
-            "mode": start.mode,
-        }),
-        LinkFrame::ScriptStop(stop) => json!({
-            "type": "scriptStop",
-            "agentId": agent(&stop.agent_id),
-            "scriptId": field(&stop.script_id),
-            "spawnId": field(&stop.spawn_id),
-        }),
-        LinkFrame::ScriptStarted(started) => json!({
-            "type": "scriptStarted",
-            "agentId": agent(&started.agent_id),
-            "scriptId": field(&started.script_id),
-            "spawnId": field(&started.spawn_id),
-            "pid": started.pid,
-        }),
-        LinkFrame::ScriptOutput(output) => json!({
-            "type": "scriptOutput",
-            "agentId": agent(&output.agent_id),
-            "scriptId": field(&output.script_id),
-            "spawnId": field(&output.spawn_id),
-            "seq": output.seq,
-        }),
-        LinkFrame::ScriptExited(exited) => json!({
-            "type": "scriptExited",
-            "agentId": agent(&exited.agent_id),
-            "scriptId": field(&exited.script_id),
-            "spawnId": field(&exited.spawn_id),
-            "exitCode": exited.exit_code,
-            "error": exited.error.as_deref().map(field),
-        }),
-        LinkFrame::SetupOutput(output) => {
-            let mut light = json!({ "type": "setupOutput", "seq": output.seq });
-            match &output.owner {
-                crate::node_link::SetupOwner::Agent(id) => light["agentId"] = agent(id),
-                crate::node_link::SetupOwner::Home(home) => {
-                    light["homeId"] = field(home.home_id.as_str());
-                }
-            }
-            light
-        }
+        LinkFrame::ScriptStart(start) => with_owner(
+            &start.owner,
+            json!({
+                "type": "scriptStart",
+                "scriptId": field(&start.script_id),
+                "spawnId": field(&start.spawn_id),
+                "mode": start.mode,
+            }),
+        ),
+        LinkFrame::ScriptStop(stop) => with_owner(
+            &stop.owner,
+            json!({
+                "type": "scriptStop",
+                "scriptId": field(&stop.script_id),
+                "spawnId": field(&stop.spawn_id),
+            }),
+        ),
+        LinkFrame::ScriptStarted(started) => with_owner(
+            &started.owner,
+            json!({
+                "type": "scriptStarted",
+                "scriptId": field(&started.script_id),
+                "spawnId": field(&started.spawn_id),
+                "pid": started.pid,
+            }),
+        ),
+        LinkFrame::ScriptOutput(output) => with_owner(
+            &output.owner,
+            json!({
+                "type": "scriptOutput",
+                "scriptId": field(&output.script_id),
+                "spawnId": field(&output.spawn_id),
+                "seq": output.seq,
+            }),
+        ),
+        LinkFrame::ScriptExited(exited) => with_owner(
+            &exited.owner,
+            json!({
+                "type": "scriptExited",
+                "scriptId": field(&exited.script_id),
+                "spawnId": field(&exited.spawn_id),
+                "exitCode": exited.exit_code,
+                "error": exited.error.as_deref().map(field),
+            }),
+        ),
+        LinkFrame::SetupOutput(output) => with_owner(
+            &output.owner,
+            json!({ "type": "setupOutput", "seq": output.seq }),
+        ),
         LinkFrame::PushWip(request) => json!({
             "type": "pushWip",
             "requestId": request.request_id,

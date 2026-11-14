@@ -218,7 +218,7 @@ impl Runner {
         lock(&self.inner.homes).lease.insert(home.home_id.clone());
         let existed = self.inner.checkouts.existing_home(&home.home_id).is_some();
         let output = SetupOutput::new(
-            intent_core::node_link::SetupOwner::Home(home.clone()),
+            intent_core::node_link::CheckoutOwner::Home(home.clone()),
             self.inner.head.clone(),
         );
         let progress = |text: &str| output.line(text);
@@ -380,6 +380,24 @@ impl Runner {
                 .terminals
                 .start(reserved, &frame, worktree.as_deref());
         });
+    }
+
+    /// Whether [`Self::home_run_checkout`] answers without reopening a
+    /// home (which can wait on another home's open).
+    pub(super) fn home_run_checkout_now(&self, home: &HomeRef) -> bool {
+        !self.leased_unopened(home)
+    }
+
+    /// The home checkout a home run of `home` runs in: the open home (a
+    /// leased one not reopened yet after a restart is reopened first);
+    /// `None` when this machine does not hold it. A run does not wait for
+    /// the checkout's setup, as a terminal does not.
+    pub(super) async fn home_run_checkout(&self, home: &HomeRef) -> Option<PathBuf> {
+        if self.leased_unopened(home) {
+            self.resume_leased_homes(std::slice::from_ref(home)).await;
+        }
+        self.leased_home(&home.workspace_id, &home.home_id)
+            .map(|opened| opened.worktree.clone())
     }
 
     /// Push the home checkout for an agent sharing `home`, after its turn.

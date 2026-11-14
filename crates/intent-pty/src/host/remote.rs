@@ -45,6 +45,8 @@ pub struct RemoteSpec {
     pub cwd: Option<String>,
     pub size: PtySize,
     pub scrollback_bytes: usize,
+    /// Receives every output chunk, as [`super::SpawnSpec::output_sink`].
+    pub output_sink: Option<super::OutputSink>,
 }
 
 impl RemoteSpec {
@@ -57,6 +59,7 @@ impl RemoteSpec {
             cwd: None,
             size: PtySize::default(),
             scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
+            output_sink: None,
         }
     }
 }
@@ -67,6 +70,10 @@ type ExitSlot = Arc<Mutex<Option<ExitStatus>>>;
 pub(super) struct RemoteHandle {
     io: Arc<dyn RemotePty>,
     exit: ExitSlot,
+    sink: Option<super::OutputSink>,
+    /// Why the process ended without an exit status, when the caller knows
+    /// ([`PtyHost::remote_lost`]).
+    lost: Mutex<Option<String>>,
 }
 
 impl RemoteHandle {
@@ -264,7 +271,12 @@ impl PtyHost {
             stop_reader: Arc::default(),
             watcher: Mutex::new(None),
             exit: Mutex::new(None),
-            remote: Some(RemoteHandle { io, exit }),
+            remote: Some(RemoteHandle {
+                io,
+                exit,
+                sink: spec.output_sink,
+                lost: Mutex::default(),
+            }),
         });
         let id = PtyId(
             self.next_id
@@ -285,6 +297,9 @@ impl PtyHost {
     /// `Error::NotFound` for an unknown or released terminal.
     pub fn push_remote_output(&self, id: PtyId, bytes: &[u8]) -> Result<()> {
         let session = self.get(id)?;
+        if let Some(sink) = session.remote.as_ref().and_then(|r| r.sink.as_ref()) {
+            sink.write(bytes);
+        }
         publish_output(&session.fanout, bytes);
         Ok(())
     }
@@ -326,6 +341,37 @@ impl PtyHost {
         fanout.eof = true;
         fanout.eof_notify.notify_waiters();
         Ok(())
+    }
+
+    /// A remote process ended without an exit status for `reason` (its
+    /// machine was lost, or refused to start it): as
+    /// [`Self::remote_exited`] with no code, keeping `reason` for
+    /// [`Self::remote_lost_reason`].
+    ///
+    /// # Errors
+    ///
+    /// `Error::NotFound` for an unknown or released terminal.
+    pub fn remote_lost(&self, id: PtyId, reason: &str) -> Result<()> {
+        let session = self.get(id)?;
+        let Some(remote) = session.remote.as_ref() else {
+            return Err(internal("not a remote terminal"));
+        };
+        remote
+            .lost
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| reason.to_owned());
+        drop(session);
+        self.remote_exited(id, None)
+    }
+
+    /// Why remote process `id` ended without an exit status, if it was
+    /// ended by [`Self::remote_lost`].
+    #[must_use]
+    pub fn remote_lost_reason(&self, id: PtyId) -> Option<String> {
+        let session = self.get(id).ok()?;
+        let reason = session.remote.as_ref()?.lost.lock().ok()?.clone();
+        reason
     }
 
     /// Whether `id` is a remote terminal.
@@ -415,6 +461,48 @@ mod tests {
         assert!(!host.is_alive(id));
         assert!(host.list_scope("ws-1").is_empty());
         assert_eq!(*io.kills.lock().unwrap(), 0);
+    }
+
+    /// A remote PTY's output reaches its output sink, beyond what the
+    /// scrollback keeps, as a local PTY's does.
+    #[tokio::test]
+    async fn a_remote_pty_feeds_its_output_sink() {
+        let host = PtyHost::new();
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut spec = RemoteSpec::new("ws-1");
+        spec.listed = false;
+        spec.scrollback_bytes = 4;
+        let sink = seen.clone();
+        spec.output_sink = Some(crate::OutputSink::new(move |bytes| {
+            sink.lock().unwrap().extend_from_slice(bytes);
+        }));
+        let id = host
+            .spawn_remote(spec, Arc::new(Recorder::default()))
+            .unwrap();
+        assert!(host.list_scope("ws-1").is_empty());
+        host.push_remote_output(id, b"first ").unwrap();
+        host.push_remote_output(id, b"second\n").unwrap();
+        assert_eq!(*seen.lock().unwrap(), b"first second\n");
+    }
+
+    /// A remote process lost without an exit status keeps the reason, and
+    /// ends like one whose status was unobservable.
+    #[tokio::test]
+    async fn a_lost_remote_process_keeps_its_reason() {
+        let host = PtyHost::new();
+        let id = host
+            .spawn_remote(RemoteSpec::new("ws-1"), Arc::new(Recorder::default()))
+            .unwrap();
+        assert_eq!(host.remote_lost_reason(id), None);
+        host.remote_lost(id, "remote-script-lost: the machine disconnected")
+            .unwrap();
+        assert_eq!(
+            host.remote_lost_reason(id).as_deref(),
+            Some("remote-script-lost: the machine disconnected")
+        );
+        let exit = host.try_exit(id).unwrap().unwrap();
+        assert!(!exit.observed);
+        host.wait_output_eof(id).await.unwrap();
     }
 
     /// Killing a remote terminal asks the machine to end it and releases

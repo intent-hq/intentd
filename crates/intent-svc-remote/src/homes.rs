@@ -461,6 +461,45 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
                 }
             }
         }
+        // A new home checkout finished its setup (nodeProtocol 19 journals
+        // it once per checkout): its `autoStart` scripts start now, not when
+        // a later `homeOpen` answers `ready` for the checkout it holds.
+        JournalBody::SetupFinished { state, .. } => {
+            // A failed setup leaves the checkout unfit to run services in;
+            // the user starts them once it is fixed.
+            if *state == intent_core::node_link::SetupState::Failed {
+                tracing::info!(home = %home_id, "remote machine: the home's setup failed; no autoStart");
+                return;
+            }
+            let current = svc
+                .store()
+                .get_workspace_home(&record.workspace_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|home| {
+                    &home.home_id == home_id
+                        && home.node_id.as_deref() == Some(shared.machine_id().as_str())
+                });
+            if !current || !svc.workspace_homes() {
+                tracing::debug!(home = %home_id, "remote machine: setup of a home that is not current; no autoStart");
+                return;
+            }
+            // Once per home in this process: a record replayed before its
+            // ack was saved does not start them again.
+            if !shared.home_scripts.first_auto_start(home_id) {
+                return;
+            }
+            let svc = svc.clone();
+            let workspace_id = record.workspace_id.clone();
+            // Off the link's ingest loop (a start dials this same link), as
+            // the daemon: no client asked for it.
+            intent_core::spawn_daemon(async move {
+                svc.feature_runtime()
+                    .start_home_auto_start(&svc, workspace_id)
+                    .await;
+            });
+        }
         _ => {
             tracing::debug!(home = %home_id, seq = record.seq.0, "remote machine: home record not used yet");
         }

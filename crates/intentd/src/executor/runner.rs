@@ -1270,15 +1270,43 @@ impl Runner {
     }
 
     /// Start one process of a machine run for the link binding
-    /// `generation`, in the agent's checkout when it has one here.
+    /// `generation`, in the agent's checkout when it has one here, or of a
+    /// home run (nodeProtocol 19), in the home checkout when this machine
+    /// holds that home.
     pub(super) async fn script_start(
         &self,
         link: &intent_transport::node_link::NodeLink,
         generation: NodeCounter,
         command: intent_core::node_link::ScriptStartCommand,
     ) {
-        let owner = lock(&self.inner.state).checkout_owner(&command.agent_id);
-        let checkout = self.inner.checkouts.existing(&owner);
+        let checkout = match &command.owner {
+            intent_core::node_link::CheckoutOwner::Agent(agent_id) => {
+                let owner = lock(&self.inner.state).checkout_owner(agent_id);
+                self.inner.checkouts.existing(&owner)
+            }
+            intent_core::node_link::CheckoutOwner::Home(home) => {
+                let home = home.clone();
+                if !self.home_run_checkout_now(&home) {
+                    // A home not reopened since a restart is reopened on
+                    // its own task, so no other frame waits on the link's
+                    // gate meanwhile.
+                    self.inner.scripts.reserve(&command);
+                    let runner = self.clone();
+                    let link = link.clone();
+                    // caller-binding: allow — node-local start of one home run after its home is reopened
+                    tokio::spawn(async move {
+                        let checkout = runner.home_run_checkout(&home).await;
+                        runner
+                            .inner
+                            .scripts
+                            .start(&link, generation, checkout.as_deref(), command)
+                            .await;
+                    });
+                    return;
+                }
+                self.home_run_checkout(&home).await
+            }
+        };
         self.inner
             .scripts
             .start(link, generation, checkout.as_deref(), command)

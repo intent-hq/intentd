@@ -47,6 +47,7 @@ mod connector;
 mod final_stop;
 mod forge_token;
 mod git;
+mod home_scripts;
 mod homes;
 mod ingest;
 mod launch;

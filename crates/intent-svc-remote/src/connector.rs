@@ -376,6 +376,8 @@ pub(crate) struct Shared {
     pub(crate) holds_homes: std::sync::atomic::AtomicBool,
     /// Terminals on this machine's homes (nodeProtocol 19).
     pub(crate) terminals: crate::terminals::HomeTerminals,
+    /// The home runs of saved scripts on this machine (nodeProtocol 19).
+    pub(crate) home_scripts: crate::home_scripts::HomeScripts,
     /// Secret forgets for a machine that was not connected (nodeProtocol
     /// 14): sent after the next bind. Memory only; a backend restart drops
     /// them, and its new `headSession` drops the values on the machine.
@@ -542,6 +544,7 @@ impl Shared {
             || !lock(&self.home_waiters).is_empty()
             || self.holds_homes.load(std::sync::atomic::Ordering::SeqCst)
             || !self.terminals.is_empty()
+            || !self.home_scripts.is_empty()
             || (self
                 .survivors_unclaimed
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -563,6 +566,7 @@ impl Shared {
             || !lock(&self.secret_waiters).is_empty()
             || !lock(&self.home_waiters).is_empty()
             || !self.terminals.is_empty()
+            || !self.home_scripts.is_empty()
     }
 
     /// When the machine last had agent activity (see `last_activity`).
@@ -1624,7 +1628,7 @@ impl Shared {
     /// Keep a `setupOutput` of an agent attached here (seq 0 starts the
     /// output over) and announce it, throttled.
     async fn setup_output(&self, output: intent_core::node_link::SetupOutput) {
-        let intent_core::node_link::SetupOwner::Agent(agent_id) = &output.owner else {
+        let intent_core::node_link::CheckoutOwner::Agent(agent_id) = &output.owner else {
             tracing::debug!(
                 "remote machine: setup output for a home this backend does not hold; dropped"
             );
@@ -1744,6 +1748,7 @@ impl RemoteNode {
             home_waiters: Mutex::new(HashMap::new()),
             holds_homes: std::sync::atomic::AtomicBool::new(false),
             terminals: crate::terminals::HomeTerminals::default(),
+            home_scripts: crate::home_scripts::HomeScripts::default(),
             secret_waiters: Mutex::new(HashMap::new()),
             secret_forgets: Mutex::new(Vec::new()),
             secret_locks: Mutex::new(HashMap::new()),
@@ -2720,7 +2725,10 @@ async fn run(
             .link_lost(shared.weak(), shared.tuning.link_loss_grace);
         // The machine stops this binding's scripts when its link closes.
         shared
-            .machine_runs_lost("remote-script-lost: the machine disconnected")
+            .home_scripts
+            .link_lost(crate::home_scripts::LOST_DISCONNECTED);
+        shared
+            .machine_runs_lost(crate::home_scripts::LOST_DISCONNECTED)
             .await;
         match ended {
             Ended::Shutdown => return,
@@ -2884,6 +2892,13 @@ async fn serve(
                             };
                             tracing::warn!(error, "remote machine: refused the GitHub token");
                         }
+                    }
+                    // A home run's frames feed its PTY here; an agent's go to
+                    // its machine run.
+                    LinkEvent::Frame(frame)
+                        if frame.script_owner().is_some_and(|owner| owner.home().is_some()) =>
+                    {
+                        shared.home_scripts.frame(frame);
                     }
                     LinkEvent::Frame(frame)
                         if frame.channel() == intent_core::node_link::LinkChannel::Script =>
