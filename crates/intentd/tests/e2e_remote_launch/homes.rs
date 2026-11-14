@@ -403,6 +403,7 @@ async fn home_runs_and_autostart_run_in_the_home_checkout() {
         serde_json::to_string_pretty(&json!({
             "scripts": [{
                 "name": "auto",
+                // timing-guard: a long-lived service process for the run to stop, not a wait
                 "command": "echo $$ > auto.pid; echo auto:$(pwd -P) > auto.txt; exec sleep 600",
                 "mode": "service",
                 "autoStart": true,
