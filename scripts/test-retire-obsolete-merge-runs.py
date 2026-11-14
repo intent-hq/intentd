@@ -383,13 +383,16 @@ class Scenarios:
         self.assertEqual(self.api.mutations, self.expected())
 
     def test_incomplete_duplicate_and_truncated_run_pages(self):
-        for pages in ([{'total_count': 2, 'workflow_runs': [self.api.runs[10]]}],
-                      [{'total_count': 1001, 'workflow_runs': []}],
-                      [{'total_count': 2, 'workflow_runs': [self.api.runs[10]]}]*2):
-            self.api.list_pages = pages
+        first = ('GET', self.api.root + '/actions/workflows/123/runs?event=merge_group&status=queued&per_page=100')
+        for pages, reads in (([{'total_count': 2, 'workflow_runs': [self.api.runs[10]]}], P.INVENTORY_READS),
+                             ([{'total_count': 1001, 'workflow_runs': []}], 1),
+                             ([{'total_count': 2, 'workflow_runs': [self.api.runs[10]]}]*2, 1)):
+            self.api.list_pages, self.api.counts = pages, {}
             self.assert_skips()
-        self.api.list_pages = [{'total_count': 2, 'workflow_runs': [self.api.runs[10]]}]*2
+            self.assertEqual(self.api.counts[first], reads)
+        self.api.list_pages, self.api.counts = [{'total_count': 2, 'workflow_runs': [self.api.runs[10]]}]*2, {}
         self.assert_skips(max_pages=1)
+        self.assertEqual(self.api.counts[first], 1)
 
     def test_self_inconsistent_run_snapshot_is_reread_within_a_bound(self):
         # Shape of cloudlands-fe run 43235620671 / intentd run 43364575898: one page, no Link,
