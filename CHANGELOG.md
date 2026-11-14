@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.209] - 2026-11-14
+
+### 🚀 Features
+
+- Answer home calls on the machine (nodeProtocol 19) ([#3360](https://github.com/intent-hq/intentd/pull/3360))
+
+### 📚 Documentation
+
+- *(guide)* Describe Delete for local folders in the Home sidebar ([#3362](https://github.com/intent-hq/intentd/pull/3362))
+
+
 ## [0.11.208] - 2026-11-14
 
 ### 🚀 Features
