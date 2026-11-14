@@ -68,6 +68,19 @@ const HOME_WRITES: &[&str] = &[
     "git.unstageHunk",
 ];
 
+/// Routed searches: `search.cancel` ends them on the home too.
+const HOME_SEARCHES: &[&str] = &["search.inFiles", "search.fileNames", "search.codebase"];
+
+/// What a home search `search.cancel` ended before the home answered
+/// returns: no results, as a local search cancelled before its first match.
+fn cancelled_search(method: &str, request_id: &str) -> Value {
+    match method {
+        "search.fileNames" => json!({ "requestId": request_id, "files": [], "truncated": false }),
+        "search.inFiles" => json!({ "requestId": request_id, "matches": [], "truncated": false }),
+        _ => json!({ "requestId": request_id, "matches": [] }),
+    }
+}
+
 /// How long a routed call may run on the home.
 fn call_timeout(method: &str) -> Duration {
     match method {
@@ -201,6 +214,19 @@ fn names_checkout(worktree: &Path, params: &Map<String, Value>) -> bool {
 }
 
 impl Services {
+    /// On a machine, end the search `request_id` a home call started, also
+    /// when it has not begun yet (the backend sent `homeCallCancel`). Pair
+    /// with [`Services::home_search_ended`] once the call is over.
+    pub fn cancel_home_search(&self, request_id: &str) {
+        self.search_cancels.cancel_early(request_id);
+    }
+
+    /// The home call that ran the search `request_id` is over: a cancel
+    /// that arrived before the search began is forgotten.
+    pub fn home_search_ended(&self, request_id: &str) {
+        self.search_cancels.forget_early(request_id);
+    }
+
     /// The workspace's home when it is on a machine and homes are on.
     pub(crate) async fn machine_home(
         &self,
@@ -296,16 +322,44 @@ impl Services {
                 );
             }
         }
-        let result = port
-            .home_call(
-                self,
-                home,
-                workspace_id,
-                method,
-                params,
-                call_timeout(method),
-            )
-            .await?;
+        // A search runs on the home under the id the client cancels it by
+        // (one minted here when it gave none, as a local search mints one).
+        let search_id = HOME_SEARCHES.contains(&method).then(|| {
+            if let Some(Value::String(id)) = params.get("requestId") {
+                return id.clone();
+            }
+            let id = intent_search::mint_request_id();
+            params.insert("requestId".into(), Value::String(id.clone()));
+            id
+        });
+        let call = port.home_call(
+            self,
+            home,
+            workspace_id,
+            method,
+            params,
+            call_timeout(method),
+        );
+        let result = match search_id {
+            Some(request_id) => {
+                let token = self
+                    .search_cancels
+                    .register_as(&request_id, crate::capability::search_owner()?);
+                // Cancelled: the call is dropped, which sends the machine
+                // `homeCallCancel`, and its late answer is never shown.
+                let answered = tokio::select! {
+                    biased;
+                    answered = call => Some(answered),
+                    () = token.cancelled() => None,
+                };
+                self.search_cancels.unregister(&request_id);
+                match answered {
+                    Some(answered) => answered?,
+                    None => return Ok(Some(Ok(cancelled_search(method, &request_id)))),
+                }
+            }
+            None => call.await?,
+        };
         let result = match result {
             Ok(found) if method == "search.codebase" => {
                 Ok(self.restream_search(workspace_id, found)?)

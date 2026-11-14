@@ -14,31 +14,77 @@
 //! subscriber through the streamed `search:*` events.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Poll, Waker};
 
 /// A shared cancellation flag handed to a running search. Cloning shares the
 /// same underlying flag, so a cancel from another task is observed by the walk.
 #[derive(Clone, Debug, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken(Arc<Flag>);
+
+/// The flag and the tasks waiting for it ([`CancelToken::cancelled`]).
+#[derive(Debug, Default)]
+struct Flag {
+    set: AtomicBool,
+    waiting: Mutex<Vec<Waker>>,
+}
 
 impl CancelToken {
     /// Mint a fresh, un-cancelled token.
     #[must_use]
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self::default()
     }
 
     /// Request cancellation; subsequent [`CancelToken::is_cancelled`] calls
-    /// (including ones already in-flight) observe `true`.
+    /// (including ones already in-flight) observe `true`, and every
+    /// [`CancelToken::cancelled`] future completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the waiter mutex is poisoned (a prior panic while holding the lock).
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.set.store(true, Ordering::SeqCst);
+        let waiting = std::mem::take(&mut *self.0.waiting.lock().expect("cancel token poisoned"));
+        for waker in waiting {
+            waker.wake();
+        }
     }
 
     /// Whether cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.set.load(Ordering::SeqCst)
+    }
+
+    /// Completes once cancellation has been requested, for a search that
+    /// waits on another task (a search on a workspace's home) rather than
+    /// polling the flag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the waiter mutex is poisoned (a prior panic while holding the lock).
+    pub fn cancelled(&self) -> impl Future<Output = ()> + Send + '_ {
+        std::future::poll_fn(move |cx| {
+            if self.is_cancelled() {
+                return Poll::Ready(());
+            }
+            {
+                let mut waiting = self.0.waiting.lock().expect("cancel token poisoned");
+                if !waiting.iter().any(|waker| waker.will_wake(cx.waker())) {
+                    waiting.push(cx.waker().clone());
+                }
+            }
+            // A cancel between the first check and the registration has
+            // already taken the wakers: look again.
+            if self.is_cancelled() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
     }
 }
 
@@ -47,6 +93,9 @@ impl CancelToken {
 struct Entry {
     token: CancelToken,
     owner: Option<String>,
+    /// Cancelled before its search registered ([`CancelRegistry::cancel_early`]):
+    /// the search registering next under this id starts cancelled.
+    early: bool,
 }
 
 /// Maps a search `requestId` to its [`CancelToken`]. Cheap to clone (shares the
@@ -84,13 +133,17 @@ impl CancelRegistry {
     #[must_use]
     pub fn register_as(&self, request_id: &str, owner: Option<String>) -> CancelToken {
         let token = CancelToken::new();
-        self.inner.lock().expect("cancel registry poisoned").insert(
+        let previous = self.inner.lock().expect("cancel registry poisoned").insert(
             request_id.to_string(),
             Entry {
                 token: token.clone(),
                 owner,
+                early: false,
             },
         );
+        if previous.is_some_and(|entry| entry.early) {
+            token.cancel();
+        }
         token
     }
 
@@ -142,6 +195,45 @@ impl CancelRegistry {
             .lock()
             .expect("cancel registry poisoned")
             .remove(request_id);
+    }
+
+    /// Cancel the search `request_id` on behalf of whoever started it, also
+    /// when it has not registered yet: that search then starts cancelled.
+    /// Undo the early mark with [`Self::forget_early`] once that search can
+    /// no longer start.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn cancel_early(&self, request_id: &str) {
+        let mut inner = self.inner.lock().expect("cancel registry poisoned");
+        if let Some(entry) = inner.get(request_id) {
+            entry.token.cancel();
+            return;
+        }
+        let token = CancelToken::new();
+        token.cancel();
+        inner.insert(
+            request_id.to_string(),
+            Entry {
+                token,
+                owner: None,
+                early: true,
+            },
+        );
+    }
+
+    /// Drop an early mark [`Self::cancel_early`] left for `request_id`
+    /// when no search took it; a registered search is left alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn forget_early(&self, request_id: &str) {
+        let mut inner = self.inner.lock().expect("cancel registry poisoned");
+        if inner.get(request_id).is_some_and(|entry| entry.early) {
+            inner.remove(request_id);
+        }
     }
 }
 
@@ -205,5 +297,52 @@ mod tests {
         let b = mint_request_id();
         assert!(a.starts_with("srch-"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn an_early_cancel_cancels_the_search_registering_next_and_is_forgotten() {
+        let reg = CancelRegistry::new();
+        reg.cancel_early("srch-early");
+        let token = reg.register_as("srch-early", Some("alice".into()));
+        assert!(token.is_cancelled(), "registered after the cancel");
+        // The search took the mark: forgetting leaves the search alone.
+        reg.forget_early("srch-early");
+        assert!(reg.cancel_as("srch-early", Some("alice")));
+        reg.unregister("srch-early");
+
+        // A mark no search took is forgotten; a later search runs.
+        reg.cancel_early("srch-late");
+        reg.forget_early("srch-late");
+        assert!(!reg.register("srch-late").is_cancelled());
+
+        // A registered search is cancelled at once.
+        let running = reg.register("srch-running");
+        reg.cancel_early("srch-running");
+        assert!(running.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_completes_when_the_token_is_cancelled() {
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Wake};
+
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let woken = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        let token = CancelToken::new();
+        let mut cancelled = std::pin::pin!(token.cancelled());
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        token.clone().cancel();
+        assert_eq!(woken.0.load(Ordering::SeqCst), 1, "woken once");
+        assert!(cancelled.as_mut().poll(&mut cx).is_ready());
+        // Already cancelled: ready at once.
+        assert!(std::pin::pin!(token.cancelled()).poll(&mut cx).is_ready());
     }
 }
