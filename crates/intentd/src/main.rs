@@ -2462,55 +2462,11 @@ async fn cmd_serve_owned(
     // per-connection `ReverseChannel` here; agent-initiated `browser.exec`
     // routes through the same registry via `Services::with_reverse_dispatch`.
     let reverse_registry = Arc::new(PrimaryReverseRegistry::new());
-    let mut startup_error = async {
-        // One-time carry-over of the renamed `[backgroundAgents]` table into the
-        // `quickActions.*` keys (monorepo#1729), before the legacy import below
-        // discards and strips it. Unset quick-action keys inherit the old value;
-        // already-set ones are left alone.
-        intent_services::migrate_quick_action_settings(&settings_registry)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        // One-time removal of the deprecated `providers.active` from config.toml
-        // (comment-preserving rewrite; runs only when the key exists). Its value
-        // is carried over into `model.defaultProvider` (which superseded it)
-        // first; an already-set target is never clobbered.
-        intent_services::migrate_active_provider_setting(&settings_registry)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        // One-time fold of the deprecated shared quick action model and effort
-        // into each action. Runs after both carry-overs above: the first can
-        // fill the shared key, the second the default provider that decides
-        // whether a legacy compound model is the active provider's own.
-        intent_services::migrate_quick_action_shared_default(&settings_registry)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        // One-time rename of `workspace.autoRetireArchivedAfterDays` to
-        // `workspace.purgeArchivedAfterDays` (comment-preserving rewrite; runs
-        // only when the legacy key exists; an already-set new key wins).
-        intent_services::migrate_auto_retire_setting(&settings_registry)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        // One-time legacy handling: retired keys still present in config.toml
-        // (e.g. the `[ai]` table, `model.workspaceOverrides`) were tolerated +
-        // captured by the load above; import any that still have a catalog entry
-        // into the settings table (currently none), then strip them from the
-        // file with a comment-preserving rewrite. A failed import keeps the file
-        // intact so the next boot retries.
-        intent_services::import_legacy_settings(&settings_registry, &store)
+    let mut startup_error =
+        intent_services::run_boot_settings_migrations(&settings_registry, &store)
             .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        // One-time cleanup of stale SQLite rows for retired settings (e.g. the
-        // per-workspace `model.workspaceOverrides` blob, monorepo#1000).
-        intent_services::cleanup_retired_settings(&store)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        // One-time migration for the trimmed `voice.vocabulary` default: a stored
-        // row that only ever persisted the retired 17-term seed default is
-        // deleted so the new `["Intent"]` default applies; user-modified lists
-        // are never touched.
-        intent_services::migrate_default_vocabulary(&store)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        Ok::<_, anyhow::Error>(())
-    }
-    .await
-    .err();
+            .err()
+            .map(|e| anyhow::anyhow!(e.to_string()));
     // Resolve the concurrent agent cap: positive effective value → explicit
     // override; 0 (the schema default) → auto (RAM-based default_process_cap).
     // The setting applies on daemon restart (§9.8 agents.maxConcurrent).

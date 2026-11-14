@@ -3064,18 +3064,22 @@ pub async fn import_legacy_settings(
 /// member that fails the typed schema is skipped with a warning and the rest
 /// still carry over.
 ///
+/// Returns `false` when a member's write failed (not its validation): the
+/// legacy table must then stay in the file so the next boot retries.
+///
 /// # Errors
 ///
 /// Never errors today: migration failures are logged and skipped. The `Result` keeps parity with the other startup migrations.
-pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> {
+pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<bool> {
     const MEMBERS: [&str; 3] = ["defaultModel", "typeOverrides", "providerSettings"];
     let Some(legacy) = registry.legacy_values().get("backgroundAgents").cloned() else {
-        return Ok(());
+        return Ok(true);
     };
     let Some(table) = legacy.as_object() else {
         tracing::warn!("legacy [backgroundAgents] is not a table; discarding");
-        return Ok(());
+        return Ok(true);
     };
+    let mut complete = true;
     let mut migrated: Vec<String> = Vec::new();
     let unknown: Vec<&str> = table
         .keys()
@@ -3097,11 +3101,16 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
             tracing::debug!(path, "quick-action key already set; keeping current value");
             continue;
         }
-        if let Err(e) = registry.apply(&[(path.clone(), value.clone())]) {
-            tracing::warn!(path, error = %e, "failed to migrate legacy [backgroundAgents] member; discarding");
-            continue;
+        match registry.apply(&[(path.clone(), value.clone())]) {
+            Ok(_) => migrated.push(path),
+            Err(Error::InvalidParams(e)) => {
+                tracing::warn!(path, error = %e, "legacy [backgroundAgents] member is invalid; discarding");
+            }
+            Err(e) => {
+                tracing::warn!(path, error = %e, "failed to migrate legacy [backgroundAgents] member; next boot retries");
+                complete = false;
+            }
         }
-        migrated.push(path);
     }
     if !migrated.is_empty() {
         tracing::info!(
@@ -3109,7 +3118,7 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
             "migrated legacy [backgroundAgents] into quickActions.*"
         );
     }
-    Ok(())
+    Ok(complete)
 }
 
 /// Action types that inherited the shared quick action model and effort.
