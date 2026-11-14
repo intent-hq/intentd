@@ -232,6 +232,52 @@ impl Store {
         .map_err(db)
     }
 
+    /// End the failing backup streak of the workspace's home `home_id`
+    /// without a backup: its machine is linked again, so backups can flow.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn clear_workspace_home_backup_failure(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE workspace_home SET backup_failing_since = NULL \
+             WHERE workspace_id = ? AND home_id = ?",
+        )
+        .bind(&workspace_id.0)
+        .bind(&home_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// When the failing backup streak of the workspace's home `home_id`
+    /// began, if one is on.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn workspace_home_backup_failing_since(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+    ) -> Result<Option<String>> {
+        let since: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT backup_failing_since FROM workspace_home \
+             WHERE workspace_id = ? AND home_id = ?",
+        )
+        .bind(&workspace_id.0)
+        .bind(&home_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(db)?;
+        Ok(since.flatten())
+    }
+
     /// Move the workspace's home `home_id` from `from` to `to`; `false` when
     /// that is not its home (any more) or it is not in `from`.
     ///

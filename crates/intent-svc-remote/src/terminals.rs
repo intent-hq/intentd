@@ -385,9 +385,11 @@ pub(crate) fn home_unavailable(home: &intent_core::WorkspaceHome, detail: &str) 
 }
 
 /// `home-unavailable` while `home` is detached: nothing waits on a dial to
-/// a machine whose link has been down for the link-loss grace.
-pub(crate) fn ensure_attached(home: &intent_core::WorkspaceHome) -> Result<()> {
+/// a machine whose link has been down for the link-loss grace, but its
+/// connector is asked to dial again.
+pub(crate) fn ensure_attached(svc: &Services, home: &intent_core::WorkspaceHome) -> Result<()> {
     if home.state == intent_core::HomeState::Detached {
+        crate::home_state::redial(svc, home);
         return Err(home_unavailable(
             home,
             "its machine's link has been down for the link-loss grace",
@@ -412,7 +414,7 @@ pub(crate) async fn connect_home(svc: &Services, workspace_id: &WorkspaceId) -> 
     let Some(node_id) = home.node_id.clone() else {
         return Ok(());
     };
-    ensure_attached(&home)?;
+    ensure_attached(svc, &home)?;
     let feature = svc
         .remote_feature()
         .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;
@@ -440,7 +442,7 @@ async fn linked_home(
     let Some(node_id) = home.node_id.clone() else {
         return Ok(None);
     };
-    ensure_attached(&home)?;
+    ensure_attached(svc, &home)?;
     let feature = svc
         .remote_feature()
         .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;

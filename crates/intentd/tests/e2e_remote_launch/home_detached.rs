@@ -155,6 +155,8 @@ async fn a_home_whose_link_is_lost_is_detached_and_attached_again_at_the_next_bi
     assert_eq!(again_port, machine_port, "the machine keeps its WSS port");
     let attached = home_update(&mut events, &ws_id, |home| home["state"] == "attached").await;
     assert_ne!(attached["since"], detached["since"], "{attached}");
+    // The streak the loss began ends with the bind.
+    assert_ne!(attached["backupWarning"], true, "{attached}");
     id += 1;
     let read = ok(
         &mut rpc_ws,

@@ -419,7 +419,7 @@ pub(crate) fn after_bind(shared: &Arc<Shared>, link: &NodeLink) {
         if !svc.workspace_homes() {
             return;
         }
-        crate::home_state::attach_homes(&svc, &homes).await;
+        crate::home_state::attach_homes(&svc, &shared, &homes).await;
         for (workspace_id, _) in homes {
             if let Err(error) = open_home(&svc, &workspace_id).await {
                 tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not open the workspace's home");

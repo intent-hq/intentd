@@ -263,6 +263,26 @@ async fn failures_answer_their_streak_and_state_moves_name_their_start() {
             .unwrap(),
         None
     );
+    assert_eq!(
+        store
+            .workspace_home_backup_failing_since(&ws, &h1)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(first)
+    );
+    store
+        .clear_workspace_home_backup_failure(&ws, &h1)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .workspace_home_backup_failing_since(&ws, &h1)
+            .await
+            .unwrap(),
+        None,
+        "a home linked again has no failing streak"
+    );
 
     let since = "2026-11-12T10:00:00Z";
     assert!(store

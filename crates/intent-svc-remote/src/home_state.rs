@@ -45,6 +45,12 @@ impl HomeLink {
     /// The machine's link is down (or not up yet at start): its homes are
     /// detached once `grace` passes without a bind.
     pub(crate) fn link_lost(&self, shared: Weak<Shared>, grace: Duration) {
+        let holds = shared
+            .upgrade()
+            .is_some_and(|shared| shared.holds_homes.load(std::sync::atomic::Ordering::SeqCst));
+        if !holds {
+            return;
+        }
         let lost_at = intent_core::now_iso();
         let mut slot = lock(&self.grace);
         if let Some(previous) = slot.take() {
@@ -79,7 +85,7 @@ impl HomeLink {
 
     /// Announce the home once its failing streak, begun at
     /// `failing_since`, raises `backupWarning`. One wait per home.
-    fn watch_warning(
+    pub(crate) fn watch_warning(
         &self,
         svc: &Services,
         workspace_id: &WorkspaceId,
@@ -87,6 +93,7 @@ impl HomeLink {
         failing_since: String,
     ) {
         let mut warnings = lock(&self.warnings);
+        warnings.retain(|_, waiting| !waiting.is_finished());
         if warnings
             .get(home_id)
             .is_some_and(|waiting| !waiting.is_finished())
@@ -164,6 +171,11 @@ async fn detach_homes(shared: &std::sync::Arc<Shared>, lost_at: &str) {
             )
             .await;
         match detached {
+            Ok(true) if shared.current_link().is_some() => {
+                // The machine bound while this ran: its bind's attach may
+                // have passed already, so undo the detach here.
+                attach_homes(svc, shared, &[(workspace_id, home)]).await;
+            }
             Ok(true) => {
                 tracing::info!(workspace = %workspace_id, %machine, "remote machine: the workspace's home is detached");
                 record_failure(svc, shared, &workspace_id, &home.home_id, lost_at).await;
@@ -177,9 +189,25 @@ async fn detach_homes(shared: &std::sync::Arc<Shared>, lost_at: &str) {
     }
 }
 
-/// After a bind: each detached home of the machine is attached again.
-pub(crate) async fn attach_homes(svc: &Services, homes: &[(WorkspaceId, WorkspaceHome)]) {
+/// After a bind: each detached home of the machine is attached again, and
+/// the failing backup streak its loss began ends (the machine pushes again
+/// on its next change).
+pub(crate) async fn attach_homes(
+    svc: &Services,
+    shared: &Shared,
+    homes: &[(WorkspaceId, WorkspaceHome)],
+) {
     for (workspace_id, home) in homes {
+        if home.state == HomeState::Detached {
+            shared.home_link.backed_up(&home.home_id);
+            if let Err(error) = svc
+                .store()
+                .clear_workspace_home_backup_failure(workspace_id, &home.home_id)
+                .await
+            {
+                tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not end the home's failing backup streak");
+            }
+        }
         match svc
             .store()
             .move_workspace_home_state(
@@ -227,27 +255,73 @@ async fn record_failure(
     }
 }
 
-/// A backup the orchestrator asked `home` for failed.
+/// A backup the orchestrator asked `home` for failed. No connector is
+/// started for it: without one the streak is recorded and its warning
+/// waits for the machine's next connector (see [`resume_warnings`]).
 pub(crate) async fn backup_failed(
     svc: &Services,
     workspace_id: &WorkspaceId,
     home: &WorkspaceHome,
 ) {
-    let Some(node_id) = home.node_id.as_deref() else {
+    let node = home
+        .node_id
+        .as_deref()
+        .and_then(|node_id| svc.remote_feature()?.running_node(node_id));
+    let at = intent_core::now_iso();
+    match node {
+        Some(node) => {
+            record_failure(svc, node.shared_ref(), workspace_id, &home.home_id, &at).await;
+        }
+        None => {
+            if let Err(error) = svc
+                .store()
+                .record_workspace_home_backup_failure(workspace_id, &home.home_id, &at)
+                .await
+            {
+                tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not record a failed home backup");
+            }
+        }
+    }
+}
+
+/// At start: wait for the warning of each failing streak `homes` already
+/// have, so it is announced when it shows.
+pub(crate) async fn resume_warnings(
+    svc: &Services,
+    shared: &Shared,
+    homes: &[(WorkspaceId, WorkspaceHome)],
+) {
+    for (workspace_id, home) in homes {
+        if let Ok(Some(since)) = svc
+            .store()
+            .workspace_home_backup_failing_since(workspace_id, &home.home_id)
+            .await
+        {
+            shared
+                .home_link
+                .watch_warning(svc, workspace_id, &home.home_id, since);
+        }
+    }
+}
+
+/// A call found `home` detached: ask its machine's connector to dial now
+/// (the app's **Wait**), without waiting for it.
+pub(crate) fn redial(svc: &Services, home: &WorkspaceHome) {
+    let Some(node_id) = home.node_id.clone() else {
         return;
     };
-    let Some(feature) = svc.remote_feature() else {
-        return;
-    };
-    let Ok(node) = feature.node(svc, node_id).await else {
-        return;
-    };
-    record_failure(
-        svc,
-        node.shared_ref(),
-        workspace_id,
-        &home.home_id,
-        &intent_core::now_iso(),
-    )
-    .await;
+    let svc = svc.clone();
+    // caller-binding: allow — dials a detached home's machine for a call that failed at once
+    tokio::spawn(async move {
+        let Some(feature) = svc.remote_feature() else {
+            return;
+        };
+        let Ok(node) = feature.node(&svc, &node_id).await else {
+            return;
+        };
+        node.shared_ref().set_holds_homes(true);
+        if let Err(error) = node.connect().await {
+            tracing::debug!(%error, "remote machine: a detached home's machine is still not reachable");
+        }
+    });
 }

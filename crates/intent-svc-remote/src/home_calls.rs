@@ -45,7 +45,7 @@ fn call_unavailable(home: &WorkspaceHome, method: &str, detail: &str) -> Error {
 /// The home's machine, connected and speaking nodeProtocol 19.
 async fn home_node(svc: &Services, home: &WorkspaceHome, method: &str) -> Result<RemoteNode> {
     // Detached: the call never reached the home, so it may be retried.
-    crate::terminals::ensure_attached(home)?;
+    crate::terminals::ensure_attached(svc, home)?;
     let node_id = home
         .node_id
         .as_deref()
