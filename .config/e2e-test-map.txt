@@ -140,3 +140,5 @@ crates/intent-services/src/note_write.rs             intentd::suite_e2e        e
 crates/intent-services/src/note_write.rs             intentd::suite_e2e        e2e_services_note_ops
 crates/intent-services/src/note_write.rs             intentd::suite_wss_g_r    e2e_wss_note_truncated_read
 crates/intent-services/src/note_write.rs             intentd::suite_wss_g_r    e2e_wss_note_set_content_merge
+crates/intent-services/src/codex_diagnostics/process/linux_fallback.rs intentd::suite_e2e e2e_linux_probe_owner
+crates/intent-services/src/codex_diagnostics/process/linux.rs intentd::suite_e2e e2e_linux_probe_owner

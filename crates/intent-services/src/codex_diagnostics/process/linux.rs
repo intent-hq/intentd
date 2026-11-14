@@ -9,6 +9,9 @@ use tokio::io::AsyncReadExt;
 use tokio::net::unix::pipe;
 use tokio::process::{Child, Command};
 
+#[path = "linux_fallback.rs"]
+pub(crate) mod fallback;
+
 pub(super) struct Ownership {
     child: Child,
     pid: u32,
@@ -20,6 +23,7 @@ pub(super) struct Ownership {
     control: Option<pipe::Sender>,
     descendants: Vec<i32>,
     finished: bool,
+    fallback: bool,
     #[cfg(test)]
     snapshot_barrier: Option<(
         tokio::sync::oneshot::Sender<Vec<i32>>,
@@ -33,7 +37,17 @@ pub(super) async fn spawn(command: Command) -> io::Result<super::Started> {
     let (control, control_reader) = pipe::pipe()?;
     let status_writer = above_stdio(status_writer.into_blocking_fd()?)?;
     let control_reader = above_stdio(control_reader.into_blocking_fd()?)?;
-    let mut owner = supervisor(&command, &control_reader, &status_writer);
+    let fallback =
+        match std::fs::metadata(format!("/proc/self/task/{}/children", std::process::id())) {
+            Ok(_) => false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error),
+        };
+    let mut owner = if fallback {
+        fallback_supervisor(&command, &control_reader, &status_writer)?
+    } else {
+        supervisor(&command, &control_reader, &status_writer)
+    };
     drop(command);
     // SAFETY: child-only prctl/fcntl are syscalls with no allocation or locks.
     // Owned descriptors remain alive in this closure through the fork/exec.
@@ -65,10 +79,43 @@ pub(super) async fn spawn(command: Command) -> io::Result<super::Started> {
             control: Some(control),
             descendants: Vec::new(),
             finished: false,
+            fallback,
             #[cfg(test)]
             snapshot_barrier: None,
         },
     })
+}
+
+fn fallback_supervisor(
+    command: &Command,
+    control: &OwnedFd,
+    status: &OwnedFd,
+) -> io::Result<Command> {
+    let command = command.as_std();
+    let mut owner = Command::new(std::env::current_exe()?);
+    owner
+        .arg(fallback::OWNER_ARGUMENT)
+        .arg(control.as_raw_fd().to_string())
+        .arg(status.as_raw_fd().to_string())
+        .arg(command.get_program())
+        .args(command.get_args())
+        .env_clear()
+        .envs(
+            command
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // EOF on the private control pipe requests cleanup even if our runtime
+        // disappears. Killing this subreaper first would orphan escaped children.
+        .kill_on_drop(false)
+        .process_group(0);
+    if let Some(directory) = command.get_current_dir() {
+        owner.current_dir(directory);
+    }
+    Ok(owner)
 }
 
 fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
@@ -139,7 +186,9 @@ impl Ownership {
     }
 
     pub(super) async fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.control_pid().await?;
+        if !self.fallback {
+            self.control_pid().await?;
+        }
         // Keep partial data in the owner so cancelling a wait never discards
         // part of the private status frame. Provider stdio remains untouched.
         read_frame(
@@ -157,6 +206,16 @@ impl Ownership {
     }
 
     pub(super) async fn cleanup(mut self) -> io::Result<()> {
+        if self.fallback {
+            drop(self.control.take());
+            let status = self.child.wait().await?;
+            self.finished = true;
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(io::ErrorKind::InvalidData.into())
+            };
+        }
         let control_pid = self.control_pid().await?;
         // The first child is our non-forking control reader. It stays alive
         // until we close its pipe, while the supervisor reaps adopted children.
@@ -279,6 +338,10 @@ fn read_proc(path: &str) -> io::Result<String> {
 impl Drop for Ownership {
     fn drop(&mut self) {
         if self.finished {
+            return;
+        }
+        if self.fallback {
+            drop(self.control.take());
             return;
         }
         // Runtime teardown can drop the cleanup future. Kill all identities it

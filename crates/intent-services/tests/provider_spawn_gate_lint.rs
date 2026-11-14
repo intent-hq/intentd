@@ -87,6 +87,10 @@ const SITES: &[(&str, Spawn)] = &[
         Spawn::Provider(&[MODELS]),
     ),
     (
+        "codex_diagnostics/process/linux_fallback.rs",
+        Spawn::Provider(&[MODELS]),
+    ),
+    (
         "cursor_cli.rs",
         Spawn::Provider(&[DISCOVERY, REPORT, STATUSES]),
     ),

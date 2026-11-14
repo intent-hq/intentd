@@ -357,6 +357,10 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Some(code) = intent_services::dispatch_diagnostic_owner() {
+        return code;
+    }
     #[cfg(unix)]
     if let Some(code) = git_remote_intent::dispatch_argv0() {
         return code;
