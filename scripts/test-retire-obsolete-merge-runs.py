@@ -409,6 +409,16 @@ class Scenarios:
                 if not mutations:
                     self.assertEqual(result['error'], 'incomplete run pages')
 
+    def test_rows_from_a_discarded_inconsistent_read_never_reach_the_inventory(self):
+        path = self.api.root + '/actions/workflows/123/runs?event=merge_group&status=queued&per_page=100'
+        self.api.runs[30] = self.api.make_run(30)
+        phantom = self.api.runs[30]
+        self.api.override = lambda method, p, body, n: self.api.response(
+            {'total_count': 1, 'workflow_runs': [self.api.runs[10]] + ([phantom] if n == 1 else [])}) if p == path else None
+        result = self.scan()
+        self.assertEqual(self.api.mutations, self.expected(), result)
+        self.assertEqual([d['id'] for d in result['decisions']], [10])
+
     def test_run_count_change_between_pages_is_reread(self):
         self.api.runs[20] = self.api.make_run(20)
         self.api.list_pages = [{'total_count': 2, 'workflow_runs': [self.api.runs[10]]},
