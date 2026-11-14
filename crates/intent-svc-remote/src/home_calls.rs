@@ -44,6 +44,8 @@ fn call_unavailable(home: &WorkspaceHome, method: &str, detail: &str) -> Error {
 
 /// The home's machine, connected and speaking nodeProtocol 19.
 async fn home_node(svc: &Services, home: &WorkspaceHome, method: &str) -> Result<RemoteNode> {
+    // Detached: the call never reached the home, so it may be retried.
+    crate::terminals::ensure_attached(home)?;
     let node_id = home
         .node_id
         .as_deref()
@@ -110,11 +112,21 @@ pub(crate) async fn home_call(
 }
 
 /// See [`intent_services::feature_api::feature_ports::RemoteLaunchPort::push_home`].
+/// A failure counts toward the home's `backupWarning`.
 pub(crate) async fn push_home(
     svc: &Services,
     home: &WorkspaceHome,
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
+    let pushed = push_once(svc, home, workspace_id).await;
+    if pushed.is_err() {
+        crate::home_state::backup_failed(svc, workspace_id, home).await;
+    }
+    pushed
+}
+
+/// Ask the home for one synchronous push.
+async fn push_once(svc: &Services, home: &WorkspaceHome, workspace_id: &WorkspaceId) -> Result<()> {
     let node = home_node(svc, home, "homePush").await?;
     let request_id = LinkId::new_v4();
     let frame = LinkFrame::HomePush(HomePush {

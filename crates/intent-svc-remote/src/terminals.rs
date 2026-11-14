@@ -356,22 +356,44 @@ impl RemotePty for LinkPty {
     }
 }
 
+/// `home-unavailable` for `home` (nodes.md "Detached workspaces"): the
+/// documented message and data; `detail` is logged.
 pub(crate) fn home_unavailable(home: &intent_core::WorkspaceHome, detail: &str) -> Error {
+    tracing::info!(home = %home.home_id, %detail, "the workspace's home is unavailable");
+    let mut data = serde_json::json!({
+        "code": HOME_UNAVAILABLE,
+        "name": home.name,
+        "retryable": true,
+    });
+    for (key, value) in [
+        ("nodeId", &home.node_id),
+        ("cloudMachineId", &home.cloud_machine_id),
+        ("lastBackupAt", &home.last_backup_at),
+    ] {
+        if let Some(value) = value {
+            data[key] = serde_json::Value::String(value.clone());
+        }
+    }
     Error::remote_machine(
         true,
         format!(
-            "{HOME_UNAVAILABLE}: the workspace's home {} is not reachable: {detail}",
+            "Home {} is unavailable. Chats and notes still work; files, terminals and scripts don't.",
             home.name
         ),
-        serde_json::json!({
-            "code": HOME_UNAVAILABLE,
-            "nodeId": home.node_id,
-            "cloudMachineId": home.cloud_machine_id,
-            "name": home.name,
-            "lastBackupAt": home.last_backup_at,
-            "retryable": true,
-        }),
+        data,
     )
+}
+
+/// `home-unavailable` while `home` is detached: nothing waits on a dial to
+/// a machine whose link has been down for the link-loss grace.
+pub(crate) fn ensure_attached(home: &intent_core::WorkspaceHome) -> Result<()> {
+    if home.state == intent_core::HomeState::Detached {
+        return Err(home_unavailable(
+            home,
+            "its machine's link has been down for the link-loss grace",
+        ));
+    }
+    Ok(())
 }
 
 /// Dial `workspace_id`'s home machine ahead of a terminal start, outside
@@ -390,6 +412,7 @@ pub(crate) async fn connect_home(svc: &Services, workspace_id: &WorkspaceId) -> 
     let Some(node_id) = home.node_id.clone() else {
         return Ok(());
     };
+    ensure_attached(&home)?;
     let feature = svc
         .remote_feature()
         .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;
@@ -417,6 +440,7 @@ async fn linked_home(
     let Some(node_id) = home.node_id.clone() else {
         return Ok(None);
     };
+    ensure_attached(&home)?;
     let feature = svc
         .remote_feature()
         .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;

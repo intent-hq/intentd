@@ -28,10 +28,19 @@ fn state_from_db(text: &str) -> Result<HomeState> {
     }
 }
 
+/// How long after `now` a failing streak that began at `failing_since`
+/// raises `backupWarning`: zero once it shows; `None` for an unreadable
+/// time.
+#[must_use]
+pub fn backup_warning_in(failing_since: &str, now: time::OffsetDateTime) -> Option<time::Duration> {
+    let since = parse_iso(failing_since)?;
+    Some((since + BACKUP_WARNING_AFTER - now).max(time::Duration::ZERO))
+}
+
 fn warning(failing_since: Option<&str>, now: time::OffsetDateTime) -> bool {
     failing_since
-        .and_then(parse_iso)
-        .is_some_and(|since| now - since >= BACKUP_WARNING_AFTER)
+        .and_then(|since| backup_warning_in(since, now))
+        .is_some_and(time::Duration::is_zero)
 }
 
 fn map_row(row: &SqliteRow, now: time::OffsetDateTime) -> Result<(WorkspaceId, WorkspaceHome)> {
@@ -199,7 +208,8 @@ impl Store {
     }
 
     /// Record that backing up the workspace's home `home_id` failed at `at`;
-    /// a streak keeps its first failure.
+    /// a streak keeps its first failure. The streak's start, or `None` when
+    /// `home_id` is not the workspace's home.
     ///
     /// # Errors
     ///
@@ -209,18 +219,46 @@ impl Store {
         workspace_id: &WorkspaceId,
         home_id: &HomeId,
         at: &str,
-    ) -> Result<()> {
-        sqlx::query(
+    ) -> Result<Option<String>> {
+        sqlx::query_scalar(
             "UPDATE workspace_home SET backup_failing_since = COALESCE(backup_failing_since, ?) \
-             WHERE workspace_id = ? AND home_id = ?",
+             WHERE workspace_id = ? AND home_id = ? RETURNING backup_failing_since",
         )
         .bind(at)
         .bind(&workspace_id.0)
         .bind(&home_id.0)
+        .fetch_optional(self.write_pool())
+        .await
+        .map_err(db)
+    }
+
+    /// Move the workspace's home `home_id` from `from` to `to`; `false` when
+    /// that is not its home (any more) or it is not in `from`.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn move_workspace_home_state(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        from: HomeState,
+        to: HomeState,
+        since: &str,
+    ) -> Result<bool> {
+        let done = sqlx::query(
+            "UPDATE workspace_home SET state = ?, since = ? \
+             WHERE workspace_id = ? AND home_id = ? AND state = ?",
+        )
+        .bind(to.as_str())
+        .bind(since)
+        .bind(&workspace_id.0)
+        .bind(&home_id.0)
+        .bind(from.as_str())
         .execute(self.write_pool())
         .await
         .map_err(db)?;
-        Ok(())
+        Ok(done.rows_affected() > 0)
     }
 }
 

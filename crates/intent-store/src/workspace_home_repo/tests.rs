@@ -196,3 +196,104 @@ async fn a_deleted_workspace_has_no_home() {
     store.delete_workspace(&ws).await.unwrap();
     assert!(store.list_workspace_homes().await.unwrap().is_empty());
 }
+
+/// `backupWarning` shows exactly 15 minutes into a failing streak: the
+/// time left counts down from the streak's start, is zero from then on,
+/// and an unreadable start never warns.
+#[test]
+fn backup_warning_shows_fifteen_minutes_into_a_streak() {
+    let since = "2026-11-12T09:00:00Z";
+    let at = |text: &str| parse_iso(text).unwrap();
+    assert_eq!(
+        backup_warning_in(since, at("2026-11-12T09:00:00Z")),
+        Some(time::Duration::minutes(15))
+    );
+    assert_eq!(
+        backup_warning_in(since, at("2026-11-12T09:14:59Z")),
+        Some(time::Duration::seconds(1))
+    );
+    assert_eq!(
+        backup_warning_in(since, at("2026-11-12T09:15:00Z")),
+        Some(time::Duration::ZERO)
+    );
+    assert_eq!(
+        backup_warning_in(since, at("2026-11-13T09:00:00Z")),
+        Some(time::Duration::ZERO)
+    );
+    assert!(!warning(Some(since), at("2026-11-12T09:14:59Z")));
+    assert!(warning(Some(since), at("2026-11-12T09:15:00Z")));
+    assert!(!warning(None, at("2026-11-13T09:00:00Z")));
+    assert_eq!(backup_warning_in("not a time", at(since)), None);
+    assert!(!warning(Some("not a time"), at(since)));
+}
+
+/// A failure answers the streak's first failure, and nothing for a home
+/// that is not the workspace's; a state move happens only from the state
+/// named, so a detach never ends a move.
+#[tokio::test]
+async fn failures_answer_their_streak_and_state_moves_name_their_start() {
+    let (_dir, store) = open().await;
+    let ws = WorkspaceId::from("ws-1");
+    let h1 = HomeId::from("h1");
+    store
+        .set_workspace_home(&ws, &home("h1", "node-a"))
+        .await
+        .unwrap();
+    let first = "2026-11-12T09:00:00Z";
+    assert_eq!(
+        store
+            .record_workspace_home_backup_failure(&ws, &h1, first)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(first)
+    );
+    assert_eq!(
+        store
+            .record_workspace_home_backup_failure(&ws, &h1, "2026-11-12T09:05:00Z")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(first)
+    );
+    assert_eq!(
+        store
+            .record_workspace_home_backup_failure(&ws, &HomeId::from("h0"), first)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let since = "2026-11-12T10:00:00Z";
+    assert!(store
+        .move_workspace_home_state(&ws, &h1, HomeState::Attached, HomeState::Detached, since)
+        .await
+        .unwrap());
+    assert!(!store
+        .move_workspace_home_state(&ws, &h1, HomeState::Attached, HomeState::Detached, since)
+        .await
+        .unwrap());
+    let got = store.get_workspace_home(&ws).await.unwrap().unwrap();
+    assert_eq!(
+        (got.state, got.since.as_str()),
+        (HomeState::Detached, since)
+    );
+    store
+        .set_workspace_home_state(&ws, &h1, HomeState::Moving, since)
+        .await
+        .unwrap();
+    assert!(!store
+        .move_workspace_home_state(&ws, &h1, HomeState::Attached, HomeState::Detached, since)
+        .await
+        .unwrap());
+    assert!(!store
+        .move_workspace_home_state(
+            &ws,
+            &HomeId::from("h0"),
+            HomeState::Moving,
+            HomeState::Attached,
+            since
+        )
+        .await
+        .unwrap());
+}

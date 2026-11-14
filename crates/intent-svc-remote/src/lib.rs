@@ -49,6 +49,7 @@ mod forge_token;
 mod git;
 mod home_calls;
 mod home_scripts;
+mod home_state;
 mod homes;
 mod ingest;
 mod launch;
@@ -285,7 +286,13 @@ async fn resume_exposed_machines(svc: &Services) -> Vec<String> {
                     .await
                     .is_ok_and(|homes| !homes.is_empty());
                 if holds_homes {
-                    node.shared_ref().set_holds_homes(true);
+                    let shared = node.shared_ref();
+                    shared.set_holds_homes(true);
+                    // Its homes are detached if no link comes up within
+                    // the link-loss grace.
+                    shared
+                        .home_link
+                        .link_lost(shared.weak(), shared.tuning.link_loss_grace);
                     // caller-binding: allow — dials a home's machine at start; the connector retries with backoff
                     tokio::spawn(async move {
                         if let Err(error) = node.connect().await {

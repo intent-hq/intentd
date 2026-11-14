@@ -89,6 +89,7 @@ mod usage_stats_repo;
 mod workspace_context_repo;
 mod workspace_git_root_repo;
 mod workspace_home_repo;
+pub use workspace_home_repo::{backup_warning_in, BACKUP_WARNING_AFTER};
 mod workspace_mcp_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
