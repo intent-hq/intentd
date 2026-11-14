@@ -515,7 +515,20 @@ orchestrator (`intentd serve --orchestrator`, experimental) runs every agent on 
 machines: its list has no **This computer** row, and **Settings → Providers** shows only
 the enable switches and profiles, with no **Test** button and no sign-in status. On an
 orchestrator, **Start on** offers **First available machine** instead of the backend, plus
-each machine. Agents see each machine's name and
+each machine. On an orchestrator each workspace also has a **home** (experimental): the
+machine that holds its files, terminals and scripts, shown as **Home: <machine>** under the
+workspace title (hover it for the last backup). When the home has been offline for a
+minute, a banner in the workspace and a **Home unavailable** marker on its Home card say
+so: chats and notes keep working, and file, diff and terminal panels show the reason
+instead. **Wait** tries to reconnect it. **Move home…** (owner and managers; also in the
+workspace header's menu) moves the home to an agent's machine or to a machine or cloud
+entry from the list, starting from the last backup; when the old home is unavailable the
+dialog first warns that its changes after that backup are not on the new home. While the
+home moves, files, terminals and scripts pause. A banner also warns when a home's backups
+keep failing.
+<!-- Sources: packages/cloudlands-fe/src/features/workspace-home/ (components/, workspace-home.ts,
+workspace-home-saga.ts); docs/protocol/methods/nodes.md "Workspace homes". -->
+Agents see each machine's name and
 platform, and look up its providers, sign-in status and models when they need them.
 A Default with **Use on remote machines** turned on in **Settings → Providers** is
 always sent when it has saved settings, even to a machine signed in to that provider. Otherwise a machine uses its
