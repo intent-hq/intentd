@@ -331,10 +331,12 @@ impl Runner {
     }
 
     /// The home's hidden record, made now when its open could not.
+    /// Whichever path makes the record (the open's task or, after a failed
+    /// make, the first call) also starts the checkout's event watch.
     async fn home_record(
         &self,
         records: &Arc<dyn super::HomeRecords>,
-        home: &Home,
+        home: &Arc<Home>,
     ) -> anyhow::Result<intent_core::WorkspaceId> {
         let mut record = home.record.lock().await;
         if let Some(record) = record.as_ref() {
@@ -344,6 +346,11 @@ impl Runner {
         anyhow::ensure!(!*home.closed.borrow(), "the home is closed");
         let made = records.register(&home.of, &home.worktree).await?;
         *record = Some(made.clone());
+        let runner = self.clone();
+        let watched = home.clone();
+        let of = made.clone();
+        // caller-binding: allow — node-local event watch of one home checkout
+        tokio::spawn(async move { runner.watch_home_events(&watched, of).await });
         Ok(made)
     }
 
@@ -356,11 +363,8 @@ impl Runner {
         let runner = self.clone();
         // caller-binding: allow — node-local record of one home checkout
         tokio::spawn(async move {
-            match runner.home_record(&records, &home).await {
-                Ok(record) => runner.watch_home_events(&home, record).await,
-                Err(error) => {
-                    tracing::warn!(home = %home.of.home_id, %error, "node: could not record a home checkout; the first call retries");
-                }
+            if let Err(error) = runner.home_record(&records, &home).await {
+                tracing::warn!(home = %home.of.home_id, %error, "node: could not record a home checkout; the first call retries");
             }
         });
     }
