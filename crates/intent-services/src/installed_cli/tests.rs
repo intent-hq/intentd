@@ -1712,7 +1712,7 @@ async fn installed_cli_version_survives_unconfirmed_cleanup() {
         .env("HOME", root.path())
         .env("CODEX_HOME", root.path())
         .current_dir(root.path());
-    let (control, _events) = Control::new(Stage::AdapterVersion, true);
+    let (control, mut events) = Control::new(Stage::AdapterVersion, true);
     control.release();
     let bytes = control
         .scope(version_output(command, None))
@@ -1722,6 +1722,17 @@ async fn installed_cli_version_survives_unconfirmed_cleanup() {
         std::str::from_utf8(&bytes).unwrap().trim(),
         current(InstalledCli::Codex)
     );
+    let injected = crate::codex_diagnostics::process::test_control::next(
+        &mut events,
+        Stage::AdapterVersion,
+        true,
+    )
+    .await;
+    assert!(
+        injected.home.is_dir(),
+        "unconfirmed cleanup still retains the probe directory"
+    );
+    std::fs::remove_dir_all(&injected.home).unwrap();
 }
 
 #[cfg(target_os = "linux")]
