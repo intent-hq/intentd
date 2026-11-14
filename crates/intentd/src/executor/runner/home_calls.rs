@@ -97,6 +97,7 @@ const REPO_PATH_METHODS: &[&str] = &["git.pull", "git.getBranches", "git.branchS
 const WRITING_METHODS: &[&str] = &[
     "file-tracking.stage",
     "file-tracking.unstage",
+    "file.attachmentUpload.commit",
     "file.delete",
     "file.mkdir",
     "file.placeAttachment",
@@ -275,7 +276,14 @@ impl Runner {
         hidden.record = Some(record.as_str().to_owned());
         let method = frame.method;
         let frame_timeout_ms = frame.timeout_ms.min(MAX_TIMEOUT_MS);
-        let params = match checkout_params(&method, frame.params, &home.worktree, &record) {
+        let mut params = frame.params;
+        let identity = params.remove(GIT_IDENTITY_PARAM);
+        if method == "git.agentCommit" {
+            // The backend's identity for the workspace, as a launch's
+            // `gitIdentity`; without one the checkout's git config decides.
+            intent_git::identity::set_checkout_identity(&home.worktree, commit_identity(identity));
+        }
+        let params = match checkout_params(&method, params, &home.worktree, &record) {
             Ok(params) => params,
             Err(error) => return (Err(error), hidden),
         };
@@ -420,6 +428,24 @@ pub(super) fn checkout_path(checkout: &Path, rel: &str) -> Option<PathBuf> {
         .strip_prefix(&root)
         .is_ok_and(|rest| !rest.components().any(|part| is_git(part.as_os_str())));
     inside.then_some(joined)
+}
+
+/// The `git.agentCommit` param in which a backend sends the workspace's
+/// commit identity (`{ name, email }`, as `launch.gitIdentity`); it never
+/// reaches the wire method.
+const GIT_IDENTITY_PARAM: &str = "gitIdentity";
+
+/// The `{ name, email }` of a [`GIT_IDENTITY_PARAM`], when both are set.
+fn commit_identity(value: Option<Value>) -> Option<(String, String)> {
+    let value = value?;
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    Some((text("name")?, text("email")?))
 }
 
 /// The call's params as the wire method takes them on this machine: its

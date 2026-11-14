@@ -37,7 +37,6 @@ const CONNECT_WAIT: Duration = Duration::from_secs(15);
 #[derive(Debug)]
 pub(crate) enum HomeReply {
     Open(HomeOpenReply),
-    #[expect(dead_code, reason = "read once hub operations push the home first")]
     Push(HomePushReply),
 }
 

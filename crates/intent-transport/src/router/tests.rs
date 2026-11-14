@@ -8996,3 +8996,75 @@ fn script_create_refuses_a_remote_author_param() {
     assert!(text.contains("remote-script-author-readonly"), "{text}");
     assert!(text.contains("-32602"), "{text}");
 }
+
+/// Files and git on the home: a routed call answers with the machine's
+/// result or error unchanged; an unrouted one dispatches here.
+mod home_route {
+    use intent_core::node_link::{HomeCallError, HomeCallFailure};
+    use intent_core::{BoxFuture, Error, WorkspaceApi};
+    use serde_json::{json, Map, Value};
+
+    use super::super::handle_message;
+
+    struct Api;
+
+    impl WorkspaceApi for Api {
+        fn home_route<'a>(
+            &'a self,
+            method: &'a str,
+            params: &'a Map<String, Value>,
+        ) -> BoxFuture<'a, Option<std::result::Result<Value, HomeCallFailure>>> {
+            Box::pin(async move {
+                let path = params.get("path").and_then(Value::as_str)?;
+                match (method, path) {
+                    ("file.read", "ok") => Some(Ok(json!("from the home"))),
+                    ("file.read", "home-error") => {
+                        Some(Err(HomeCallFailure::Home(HomeCallError {
+                            code: -32001,
+                            message: "home said no".into(),
+                            data: Some(json!({ "code": "custom" })),
+                        })))
+                    }
+                    ("file.read", "local-error") => Some(Err(HomeCallFailure::Local(
+                        Error::InvalidParams("path is outside".into()),
+                    ))),
+                    _ => None,
+                }
+            })
+        }
+    }
+
+    async fn call(path: &str) -> Value {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "file.read",
+            "params": { "workspaceId": "ws", "path": path },
+        });
+        serde_json::from_str(&handle_message(&Api, &request.to_string()).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_homes_answer_passes_through_unchanged() {
+        assert_eq!(call("ok").await["result"], "from the home");
+        let error = &call("home-error").await["error"];
+        assert_eq!(error["code"], -32001);
+        assert_eq!(error["message"], "home said no");
+        assert_eq!(error["data"], json!({ "code": "custom" }));
+        let error = &call("local-error").await["error"];
+        assert_eq!(error["code"], -32602, "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unrouted_call_runs_here() {
+        // The fake's own `file_read` is the default: not implemented here.
+        let reply = call("here").await;
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.contains("home")),
+            "{reply}"
+        );
+        assert_eq!(reply["error"]["code"], -32603, "{reply}");
+    }
+}

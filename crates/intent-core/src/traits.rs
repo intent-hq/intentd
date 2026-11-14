@@ -55,6 +55,24 @@ pub struct GitDiffPage {
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
+    /// Files and git on the home (monorepo `docs/protocol/node-link.md`,
+    /// "Files and git on the home"): run `method` on the home machine of the
+    /// workspace its params name, and answer with the machine's own result
+    /// or error. `None` when the call runs here: no home on a machine, a
+    /// method that is not routed, or homes switched off. Never routed by
+    /// default.
+    fn home_route<'a>(
+        &'a self,
+        method: &'a str,
+        params: &'a serde_json::Map<String, serde_json::Value>,
+    ) -> BoxFuture<
+        'a,
+        Option<std::result::Result<serde_json::Value, crate::node_link::HomeCallFailure>>,
+    > {
+        let _ = (method, params);
+        Box::pin(async { None })
+    }
+
     /// Whether this daemon runs in node mode (`intentd serve --node` or
     /// `daemon.mode = "node"`): the transport then serves only
     /// `NODE_MODE_METHODS` and refuses everything else with `node-mode`.

@@ -14,10 +14,10 @@
 use super::*;
 use base64::Engine as _;
 
-const HOMES: (&str, &str) = ("INTENTD_UNSTABLE_HOMES", "1");
+pub(super) const HOMES: (&str, &str) = ("INTENTD_UNSTABLE_HOMES", "1");
 
 /// The home checkout `home_id` on the machine whose data dir is `node_dir`.
-fn home_checkout(node_dir: &Path, home_id: &str) -> Option<PathBuf> {
+pub(super) fn home_checkout(node_dir: &Path, home_id: &str) -> Option<PathBuf> {
     std::fs::read_dir(node_dir.join("w"))
         .ok()?
         .filter_map(Result::ok)
@@ -26,7 +26,7 @@ fn home_checkout(node_dir: &Path, home_id: &str) -> Option<PathBuf> {
 }
 
 /// Poll `check` until it gives a value; `what` names the wait.
-async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+pub(super) async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
     let deadline = tokio::time::Instant::now() + wait();
     loop {
         if let Some(found) = check() {
@@ -38,7 +38,7 @@ async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-fn commit_on(work: &Path, file: &str, text: &str, message: &str) -> String {
+pub(super) fn commit_on(work: &Path, file: &str, text: &str, message: &str) -> String {
     std::fs::write(work.join(file), text).unwrap();
     git(work, &["add", file]);
     git(

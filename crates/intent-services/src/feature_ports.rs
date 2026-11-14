@@ -1568,6 +1568,49 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
 
+    /// Run the wire method `method` on `home`, the workspace's home on a
+    /// machine (`homeCall`, nodeProtocol 19), waiting up to `timeout`: the
+    /// machine's result, or its error unchanged.
+    ///
+    /// # Errors
+    ///
+    /// `home-unavailable` when the machine cannot be reached, its link is
+    /// lost or it does not answer in time (`retryable: false` for
+    /// `git.agentCommit`, whose commit may have landed); by default, as no
+    /// machine can be reached.
+    fn home_call<'a>(
+        &'a self,
+        svc: &'a Services,
+        home: &'a intent_core::WorkspaceHome,
+        workspace_id: &'a WorkspaceId,
+        method: &'a str,
+        params: serde_json::Map<String, serde_json::Value>,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<
+        'a,
+        Result<std::result::Result<serde_json::Value, intent_core::node_link::HomeCallError>>,
+    > {
+        let _ = (svc, home, workspace_id, method, params, timeout);
+        Box::pin(async { Err(no_execution_node()) })
+    }
+
+    /// Push `home`'s `home/head` and `home/wip` to the hub now (`homePush`)
+    /// and wait until the hub's copy has them.
+    ///
+    /// # Errors
+    ///
+    /// `home-unavailable` when the machine cannot be reached or the push
+    /// failed; by default, as no machine can be reached.
+    fn push_home<'a>(
+        &'a self,
+        svc: &'a Services,
+        home: &'a intent_core::WorkspaceHome,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Result<()>> {
+        let _ = (svc, home, workspace_id);
+        Box::pin(async { Err(no_execution_node()) })
+    }
+
     /// Open the workspace's recorded home on its machine (`homeOpen`): its
     /// `home/head` is written first when the hub has none. Answers once the
     /// machine replied; a no-op by default.

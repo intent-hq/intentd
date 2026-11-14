@@ -371,6 +371,9 @@ pub(crate) struct Shared {
     /// `homeOpen`s and `homePush`es waiting for their reply (nodeProtocol
     /// 19).
     pub(crate) home_waiters: Mutex<HashMap<LinkId, oneshot::Sender<crate::homes::HomeReply>>>,
+    /// `homeCall`s waiting for their reply (nodeProtocol 19).
+    home_call_waiters:
+        Mutex<HashMap<LinkId, oneshot::Sender<intent_core::node_link::HomeCallReply>>>,
     /// The machine holds a home of this backend's workspaces: its link stays
     /// up, so the home is backed up and reachable.
     pub(crate) holds_homes: std::sync::atomic::AtomicBool,
@@ -542,6 +545,7 @@ impl Shared {
             || !lock(&self.one_shot_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
             || !lock(&self.home_waiters).is_empty()
+            || !lock(&self.home_call_waiters).is_empty()
             || self.holds_homes.load(std::sync::atomic::Ordering::SeqCst)
             || !self.terminals.is_empty()
             || !self.home_scripts.is_empty()
@@ -565,6 +569,7 @@ impl Shared {
             || !lock(&self.one_shot_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
             || !lock(&self.home_waiters).is_empty()
+            || !lock(&self.home_call_waiters).is_empty()
             || !self.terminals.is_empty()
             || !self.home_scripts.is_empty()
     }
@@ -1746,6 +1751,7 @@ impl RemoteNode {
             checkout_waiters: Mutex::new(HashMap::new()),
             one_shot_waiters: Mutex::new(HashMap::new()),
             home_waiters: Mutex::new(HashMap::new()),
+            home_call_waiters: Mutex::new(HashMap::new()),
             holds_homes: std::sync::atomic::AtomicBool::new(false),
             terminals: crate::terminals::HomeTerminals::default(),
             home_scripts: crate::home_scripts::HomeScripts::default(),
@@ -2160,6 +2166,64 @@ impl RemoteNode {
         Ok(reply)
     }
 
+    /// Run one wire method on a home (`homeCall`, nodeProtocol 19), waiting
+    /// up to `wait` for its reply. When this future is dropped, or `wait`
+    /// runs out, the machine is told to end the call (`homeCallCancel`).
+    /// The link must already be up.
+    ///
+    /// # Errors
+    ///
+    /// The send error; `node-link-timeout` when the machine does not answer
+    /// in time; `node-link-closed` when the link drops first.
+    pub(crate) async fn home_call(
+        &self,
+        frame: intent_core::node_link::HomeCall,
+        wait: Duration,
+    ) -> Result<intent_core::node_link::HomeCallReply> {
+        /// Forgets the waiter, and cancels the call unless it answered.
+        struct Pending {
+            shared: Arc<Shared>,
+            request_id: LinkId,
+            answered: bool,
+        }
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                lock(&self.shared.home_call_waiters).remove(&self.request_id);
+                if self.answered {
+                    return;
+                }
+                let shared = self.shared.clone();
+                let cancel = LinkFrame::HomeCallCancel(intent_core::node_link::HomeCallCancel {
+                    request_id: self.request_id,
+                });
+                // caller-binding: allow — best-effort cancel of an abandoned home call on its link
+                tokio::spawn(async move {
+                    let _ = shared.send(&cancel).await;
+                });
+            }
+        }
+        let request_id = frame.request_id;
+        let (tx, rx) = oneshot::channel();
+        lock(&self.shared.home_call_waiters).insert(request_id, tx);
+        let mut pending = Pending {
+            shared: self.shared.clone(),
+            request_id,
+            answered: false,
+        };
+        self.shared.send(&LinkFrame::HomeCall(frame)).await?;
+        let reply = tokio::time::timeout(wait, rx)
+            .await
+            .map_err(|_| {
+                Error::Internal(format!(
+                    "{}: the machine did not answer the home call",
+                    link::codes::TIMEOUT
+                ))
+            })?
+            .map_err(|_| Error::Internal(link::codes::CLOSED.into()))?;
+        pending.answered = true;
+        Ok(reply)
+    }
+
     /// Send a home frame (`homeOpen` or `homePush`, nodeProtocol 19) whose
     /// request id is `request_id`, connecting first, and wait up to `wait`
     /// for its reply.
@@ -2515,6 +2579,7 @@ async fn run(
                 lock(&shared.checkout_waiters).clear();
                 lock(&shared.one_shot_waiters).clear();
                 lock(&shared.home_waiters).clear();
+                lock(&shared.home_call_waiters).clear();
                 lock(&shared.secret_waiters).clear();
                 retry = shared.wants_link();
                 if retry {
@@ -2591,6 +2656,7 @@ async fn run(
             lock(&shared.checkout_waiters).clear();
             lock(&shared.one_shot_waiters).clear();
             lock(&shared.home_waiters).clear();
+            lock(&shared.home_call_waiters).clear();
             lock(&shared.secret_waiters).clear();
             shared.announce().await;
             retry = shared.wants_link();
@@ -2718,6 +2784,7 @@ async fn run(
         lock(&shared.checkout_waiters).clear();
         lock(&shared.one_shot_waiters).clear();
         lock(&shared.home_waiters).clear();
+        lock(&shared.home_call_waiters).clear();
         lock(&shared.secret_waiters).clear();
         // Home terminals wait out the link-loss grace for the next bind.
         shared
@@ -2854,6 +2921,13 @@ async fn serve(
                     }
                     LinkEvent::Frame(LinkFrame::PtyExited(exited)) => {
                         shared.terminals.exited(&exited);
+                    }
+                    LinkEvent::Frame(LinkFrame::HomeCallReply(reply)) => {
+                        if let Some(waiter) =
+                            lock(&shared.home_call_waiters).remove(&reply.request_id)
+                        {
+                            let _ = waiter.send(reply);
+                        }
                     }
                     LinkEvent::Frame(LinkFrame::HomePushReply(reply)) => {
                         if let Some(waiter) = lock(&shared.home_waiters).remove(&reply.request_id) {

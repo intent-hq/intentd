@@ -823,7 +823,10 @@ pub(crate) async fn prepare_message(
             Err(e) => Err(e),
         };
         let result = match gate {
-            Ok(()) => dispatch(api, method, &params).await,
+            Ok(()) => match api.home_route(method, &params).await {
+                None => dispatch(api, method, &params).await,
+                Some(routed) => routed.map_err(home_call_to_rpc),
+            },
             Err(e) => Err(domain_to_rpc(e)),
         };
         let kind = if result.is_ok() {
@@ -864,6 +867,19 @@ pub(crate) async fn prepare_message(
     }
     .instrument(span)
     .await
+}
+
+/// A home call's failure as this daemon answers it: the machine's error
+/// unchanged, a local refusal as any domain error.
+fn home_call_to_rpc(failure: intent_core::node_link::HomeCallFailure) -> RpcErr {
+    match failure {
+        intent_core::node_link::HomeCallFailure::Local(error) => domain_to_rpc(error),
+        intent_core::node_link::HomeCallFailure::Home(error) => RpcErr {
+            code: i32::try_from(error.code).unwrap_or(-32603),
+            message: error.message,
+            data: error.data,
+        },
+    }
 }
 
 fn millis_u64(millis: u128) -> u64 {

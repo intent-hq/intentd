@@ -858,7 +858,7 @@ fn home_call_wire_shapes() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted, HOME_METHODS, "sorted and unique");
-    assert_eq!(HOME_METHODS.len(), 44);
+    assert_eq!(HOME_METHODS.len(), 48);
 }
 
 fn home_open() -> HomeOpen {

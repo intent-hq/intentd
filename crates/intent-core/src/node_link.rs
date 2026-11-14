@@ -411,13 +411,18 @@ pub const PTY_UNACKED_BYTES: usize = 4 * 1024 * 1024;
 
 /// The wire methods a [`HomeCall`] may name (nodeProtocol 19): the machine
 /// answers each as the method of that name does on a regular daemon,
-/// against the home checkout. Sorted.
+/// against the home checkout. The `file.attachmentUpload.*` methods carry
+/// an attachment too large for one `file.placeAttachment` in pieces. Sorted.
 pub const HOME_METHODS: &[&str] = &[
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.loadCommits",
     "file-tracking.stage",
     "file-tracking.unstage",
+    "file.attachmentUpload.abort",
+    "file.attachmentUpload.begin",
+    "file.attachmentUpload.chunk",
+    "file.attachmentUpload.commit",
     "file.delete",
     "file.exists",
     "file.getAttachmentInfo",
@@ -526,6 +531,21 @@ pub struct HomeCallError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+/// Why a call routed to the home did not succeed: refused or failed here
+/// (the home unreachable, a path outside the checkout), or the wire
+/// method's own error from the machine, passed on unchanged.
+#[derive(Debug)]
+pub enum HomeCallFailure {
+    Local(crate::Error),
+    Home(HomeCallError),
+}
+
+impl From<crate::Error> for HomeCallFailure {
+    fn from(error: crate::Error) -> Self {
+        Self::Local(error)
+    }
 }
 
 /// Machine to backend (nodeProtocol 19, rpc lane): the answer to a

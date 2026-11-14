@@ -736,6 +736,37 @@ impl RemoteLaunchPort for RemoteLaunch {
         Box::pin(crate::homes::open_home(svc, workspace_id))
     }
 
+    fn home_call<'a>(
+        &'a self,
+        svc: &'a Services,
+        home: &'a intent_core::WorkspaceHome,
+        workspace_id: &'a intent_core::WorkspaceId,
+        method: &'a str,
+        params: serde_json::Map<String, serde_json::Value>,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<
+        'a,
+        Result<std::result::Result<serde_json::Value, intent_core::node_link::HomeCallError>>,
+    > {
+        Box::pin(crate::home_calls::home_call(
+            svc,
+            home,
+            workspace_id,
+            method,
+            params,
+            timeout,
+        ))
+    }
+
+    fn push_home<'a>(
+        &'a self,
+        svc: &'a Services,
+        home: &'a intent_core::WorkspaceHome,
+        workspace_id: &'a intent_core::WorkspaceId,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(crate::home_calls::push_home(svc, home, workspace_id))
+    }
+
     fn connect_home<'a>(
         &'a self,
         svc: &'a Services,

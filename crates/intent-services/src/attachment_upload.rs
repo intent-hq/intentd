@@ -328,6 +328,20 @@ impl Services {
         mime_type: Option<String>,
         idempotency: Option<KeyedPlacement>,
     ) -> Result<serde_json::Value> {
+        // A workspace whose home is on a machine keeps its attachments
+        // there: the home places it and its registry answers for it.
+        if let Some(placed) = self
+            .place_on_home(
+                &workspace_id,
+                file_name,
+                source,
+                mime_type.as_deref(),
+                idempotency.as_ref().map(|keyed| keyed.key.as_str()),
+            )
+            .await
+        {
+            return placed;
+        }
         let Some(keyed) = idempotency else {
             return self
                 .place_attachment_registered_inner(workspace_id, file_name, source, mime_type, None)
@@ -729,6 +743,20 @@ impl Services {
             "attachment upload {upload_id} expired after {}s of inactivity — begin a new upload",
             attachment_upload_idle_ttl().as_secs()
         )))
+    }
+
+    /// The workspace whose upload session `upload_id` is, while it is open.
+    ///
+    /// # Panics
+    ///
+    /// When the upload registry's lock is poisoned.
+    #[must_use]
+    pub fn attachment_upload_workspace(&self, upload_id: &str) -> Option<WorkspaceId> {
+        self.attachment_uploads
+            .lock()
+            .expect("attachment upload registry poisoned")
+            .get(upload_id)
+            .map(|session| session.workspace_id.clone())
     }
 
     /// Multiplayer w3 membership recheck for an upload continuation

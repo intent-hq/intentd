@@ -125,7 +125,7 @@ pub fn commit_observed(
     // Calculate the receipt from the immutable trees before advancing HEAD.
     // A metadata error must not hide the SHA of an already-created commit.
     let files = changed_files(&repo, parent.as_ref(), &tree)?;
-    let sig = repo.signature().map_err(map_git_err)?;
+    let sig = crate::identity::commit_signature(&repo).map_err(map_git_err)?;
     let parents: Vec<&Commit> = parent.iter().chain(merge_parents.iter()).collect();
     let oid = repo
         .commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
@@ -252,7 +252,7 @@ pub fn commit_paths_with_trailers(
 
     // Resolve fallible receipt metadata before creating the commit.
     let files = changed_files(&repo, parent.as_ref(), &tree)?;
-    let sig = repo.signature().map_err(map_git_err)?;
+    let sig = crate::identity::commit_signature(&repo).map_err(map_git_err)?;
     let parents: Vec<&Commit> = parent.iter().collect();
     let oid = repo
         .commit(Some("HEAD"), &sig, &sig, &body, &tree, &parents)
