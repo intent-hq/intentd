@@ -3282,12 +3282,15 @@ mod home_stops {
             .unwrap();
         assert_eq!(hold.orphaned, moved.orphaned_at);
         assert!(hold.token.is_none(), "nothing of home/head is pinned");
+        // The push ends: its workspace's push slot is free again.
+        drop(hold);
 
         let hold = access
             .before_receive(binding, &remote("h-retired"), &pushed)
             .await
             .unwrap();
         assert_eq!(hold.orphaned, None);
+        drop(hold);
         assert!(access
             .repository(binding, &remote("h-retired"), GitService::ReceivePack)
             .await
