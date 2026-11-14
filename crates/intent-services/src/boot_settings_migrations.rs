@@ -34,7 +34,8 @@ pub(crate) enum BootSettingsMigration {
 /// Dependencies:
 /// - `QuickActionCarryOver` reads `[backgroundAgents]`, which `ImportLegacy`
 ///   strips, and can fill the shared key `QuickActionSharedDefault` folds.
-///   While a carry-over write is pending, `ImportLegacy` is skipped.
+///   While a carry-over write is pending, both are skipped: a fold would
+///   make a member that is not yet carried over look already set.
 /// - `QuickActionSharedDefault` reads the default provider; it also reads a
 ///   still-pending `providers.active`, so it survives a failed
 ///   `ActiveProvider` write.
@@ -75,6 +76,12 @@ async fn run_steps(
                 legacy_carried = migrate_quick_action_settings(registry);
             }
             BootSettingsMigration::ActiveProvider => migrate_active_provider_setting(registry),
+            BootSettingsMigration::QuickActionSharedDefault if !legacy_carried => {
+                tracing::warn!(
+                    "keeping the shared quick action default until [backgroundAgents] is \
+                     carried over (next boot retries)"
+                );
+            }
             BootSettingsMigration::QuickActionSharedDefault => {
                 migrate_quick_action_shared_default(registry);
             }
@@ -172,6 +179,11 @@ mod tests {
         }
     }
 
+    /// Root ignores the read-only directory, so no write can be made to fail.
+    fn running_as_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
     fn set_writable(dir: &Path, writable: bool) {
         let mode = if writable { 0o755 } else { 0o555 };
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
@@ -265,6 +277,9 @@ mod tests {
     /// shared model of that provider is still kept.
     #[tokio::test]
     async fn boot_settings_migrations_keep_the_shared_model_when_the_provider_write_fails() {
+        if running_as_root() {
+            return;
+        }
         let fx = Fixture::new(OLD_CONFIG).await;
         let registry = fx.boot(Some(BootSettingsMigration::ActiveProvider)).await;
         assert_eq!(
@@ -280,11 +295,38 @@ mod tests {
         assert_upgraded("next boot", &fx, &fx.boot(None).await).await;
     }
 
-    /// A step whose write fails loses nothing: the next boot reaches the same
-    /// final settings as a boot where every step succeeded.
+    /// intentd#3372 review: a boot whose carry-over wrote the shared model but
+    /// not `typeOverrides` must not fold the shared model into the overrides,
+    /// or the next boot keeps the folded map and strips `commit = "o3"`.
+    #[tokio::test]
+    async fn boot_settings_migrations_keep_overrides_after_a_partial_carry_over() {
+        if running_as_root() {
+            return;
+        }
+        let partial = OLD_CONFIG.replace(
+            "[quickActions]\n",
+            "[quickActions]\ndefaultModel = \"codex:gpt-5\"\n",
+        );
+        let fx = Fixture::new(&partial).await;
+        fx.boot(Some(BootSettingsMigration::QuickActionCarryOver))
+            .await;
+        assert_upgraded("next boot", &fx, &fx.boot(None).await).await;
+    }
+
+    /// A step whose `config.toml` write fails loses nothing: the next boot
+    /// reaches the same final settings as a boot where every step succeeded.
     #[tokio::test]
     async fn boot_settings_migrations_recover_from_any_failed_step() {
-        for step in BOOT_SETTINGS_MIGRATIONS {
+        if running_as_root() {
+            return;
+        }
+        let config_steps = BOOT_SETTINGS_MIGRATIONS.into_iter().filter(|step| {
+            !matches!(
+                step,
+                BootSettingsMigration::CleanupRetired | BootSettingsMigration::DefaultVocabulary
+            )
+        });
+        for step in config_steps {
             let fx = Fixture::new(OLD_CONFIG).await;
             fx.boot(Some(step)).await;
             let registry = fx.boot(None).await;

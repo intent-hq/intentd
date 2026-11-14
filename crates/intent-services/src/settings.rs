@@ -3059,7 +3059,8 @@ pub async fn import_legacy_settings(
 /// still carry over.
 ///
 /// Returns `false` when a member's write failed (not its validation): the
-/// legacy table must then stay in the file so the next boot retries.
+/// legacy table must then stay in the file so the next boot retries. A write
+/// that keeps failing keeps the legacy keys, with a warning at each boot.
 #[must_use]
 pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> bool {
     const MEMBERS: [&str; 3] = ["defaultModel", "typeOverrides", "providerSettings"];
