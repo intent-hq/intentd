@@ -37,6 +37,38 @@ const INTERNAL_ERROR: i64 = -32603;
 /// answers with `backupPending`.
 const COMMIT_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The least time a commit's push leaves before the call's deadline, so
+/// its `backupPending` reply still reaches the backend in time.
+const REPLY_MARGIN: Duration = Duration::from_secs(2);
+
+/// The longest a home call may run (one hour); a larger `timeoutMs` is
+/// clamped.
+const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+
+/// Result members that carry file or command contents, never paths: they
+/// are passed on unchanged.
+const CONTENT_KEYS: &[&str] = &[
+    "content",
+    "data",
+    "patch",
+    "diff",
+    "hunk",
+    "hunkPatch",
+    "line",
+    "lineText",
+    "text",
+    "preview",
+    "match",
+    "stdout",
+    "stderr",
+    "output",
+    "before",
+    "after",
+    "oldContent",
+    "newContent",
+    "body",
+];
+
 /// Params that name one checkout path, passed on as given.
 const PATH_PARAMS: &[&str] = &["path", "oldPath", "newPath", "filePath", "cwd"];
 
@@ -80,10 +112,27 @@ impl Runner {
         &self,
         id: LinkId,
         generation: NodeCounter,
-    ) -> tokio::sync::oneshot::Receiver<()> {
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
-        lock(&self.inner.home_calls).insert(id, (generation, cancel));
-        cancelled
+        match lock(&self.inner.home_calls).entry(id) {
+            // A second call with a running call's id is refused; the
+            // first keeps running and can still be cancelled.
+            std::collections::hash_map::Entry::Occupied(_) => None,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert((generation, cancel));
+                Some(cancelled)
+            }
+        }
+    }
+
+    /// The reply to a call reusing a running call's `requestId`.
+    pub(in crate::executor) fn duplicate_home_call(id: LinkId) -> HomeCallReply {
+        HomeCallReply::err(
+            id,
+            INVALID_PARAMS,
+            "Invalid params: a home call with this requestId is running".to_owned(),
+            Some(json!({ "code": "invalid-params" })),
+        )
     }
 
     /// How many home calls are running (test seam).
@@ -124,24 +173,26 @@ impl Runner {
         cancelled: tokio::sync::oneshot::Receiver<()>,
     ) -> Option<HomeCallReply> {
         let id = frame.request_id;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(frame.timeout_ms);
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(frame.timeout_ms.min(MAX_TIMEOUT_MS));
+        let shown_as = frame.workspace_id.clone();
         let answer = tokio::select! {
             answer = tokio::time::timeout_at(deadline, self.answer_home_call(frame, deadline)) => {
                 answer.ok()
             }
-            _ = cancelled => None,
+            Ok(()) = cancelled => None,
         };
         lock(&self.inner.home_calls).remove(&id);
-        let (result, roots) = answer?;
-        Some(fit_reply(id, result, &roots))
+        let (result, shown) = answer?;
+        Some(fit_reply(id, result, &shown.with_workspace(shown_as)))
     }
 
-    /// The call's result and the checkout roots its reply must not show.
+    /// The call's result and what its reply must not show.
     async fn answer_home_call(
         &self,
         frame: HomeCall,
         deadline: tokio::time::Instant,
-    ) -> (Result<Value, HomeCallError>, Vec<String>) {
+    ) -> (Result<Value, HomeCallError>, Hidden) {
         if !HOME_METHODS.contains(&frame.method.as_str()) {
             return (
                 Err(rpc_error(
@@ -149,7 +200,7 @@ impl Runner {
                     format!("Method not found: {} is not a home method", frame.method),
                     None,
                 )),
-                Vec::new(),
+                Hidden::default(),
             );
         }
         let Some(records) = self.inner.home_records.clone() else {
@@ -159,7 +210,7 @@ impl Runner {
                     format!("{NODE_HOME_UNSUPPORTED}: this machine answers no home calls"),
                     Some(json!({ "code": NODE_HOME_UNSUPPORTED })),
                 )),
-                Vec::new(),
+                Hidden::default(),
             );
         };
         let home_ref = frame.home();
@@ -173,10 +224,13 @@ impl Runner {
                     ),
                     Some(json!({ "code": NODE_HOME_UNKNOWN })),
                 )),
-                Vec::new(),
+                Hidden::default(),
             );
         };
-        let roots = shown_roots(&home.worktree);
+        let mut hidden = Hidden {
+            roots: shown_roots(&home.worktree),
+            ..Hidden::default()
+        };
         let record = match self.home_record(&records, &home).await {
             Ok(record) => record,
             Err(error) => {
@@ -188,14 +242,16 @@ impl Runner {
                         ),
                         Some(json!({ "code": NODE_HOME_UNKNOWN })),
                     )),
-                    roots,
+                    hidden,
                 );
             }
         };
+        hidden.record = Some(record.as_str().to_owned());
         let method = frame.method;
+        let frame_timeout_ms = frame.timeout_ms.min(MAX_TIMEOUT_MS);
         let params = match checkout_params(&method, frame.params, &home.worktree, &record) {
             Ok(params) => params,
-            Err(error) => return (Err(error), roots),
+            Err(error) => return (Err(error), hidden),
         };
         let result = records.dispatch(method.clone(), params).await;
         if WRITING_METHODS.contains(&method.as_str()) {
@@ -205,8 +261,17 @@ impl Runner {
             ("git.agentCommit", Ok(mut committed)) => {
                 // The commit landed: a failed push still answers success, so
                 // a client never retries a commit that exists.
-                let push_by = deadline.min(tokio::time::Instant::now() + COMMIT_PUSH_TIMEOUT);
-                if let Err(error) = self.push_home_now(&home, push_by).await {
+                // The push leaves the reply time to arrive before the
+                // backend's own timeout.
+                let margin = REPLY_MARGIN.max(Duration::from_millis(frame_timeout_ms / 10));
+                let push_by =
+                    (deadline - margin).min(tokio::time::Instant::now() + COMMIT_PUSH_TIMEOUT);
+                let pushed = if push_by > tokio::time::Instant::now() {
+                    self.push_home_now(&home, push_by).await
+                } else {
+                    Err(anyhow::anyhow!("no time was left for the push"))
+                };
+                if let Err(error) = pushed {
                     tracing::info!(home = %home.of.home_id, %error, "node: home head push after a commit failed");
                     if let Some(object) = committed.as_object_mut() {
                         object.insert("backupPending".into(), json!(true));
@@ -216,7 +281,7 @@ impl Runner {
             }
             (_, result) => result,
         };
-        (result, roots)
+        (result, hidden)
     }
 
     /// The open home a call names, reopening a leased home after a restart.
@@ -237,6 +302,8 @@ impl Runner {
         if let Some(record) = record.as_ref() {
             return Ok(record.clone());
         }
+        // A closed home makes no new record; its removal already ran.
+        anyhow::ensure!(!*home.closed.borrow(), "the home is closed");
         let made = records.register(&home.of, &home.worktree).await?;
         *record = Some(made.clone());
         Ok(made)
@@ -340,14 +407,29 @@ fn checkout_params(
     };
     for param in PATH_PARAMS {
         if let Some(value) = params.get(*param) {
-            check(param, value)?;
+            check(param, &trimmed(value))?;
         }
     }
     for param in PATH_LIST_PARAMS {
-        if let Some(Value::Array(paths)) = params.get(*param) {
-            for path in paths {
-                check(param, path)?;
-            }
+        // As `file-tracking` reads them: an array of strings or one
+        // comma-separated string, each entry trimmed.
+        let entries: Vec<String> = match params.get(*param) {
+            Some(Value::Array(paths)) => paths
+                .iter()
+                .map(|path| {
+                    path.as_str()
+                        .map(|path| path.trim().to_owned())
+                        .ok_or_else(|| outside(param, &path.to_string()))
+                })
+                .collect::<Result<_, _>>()?,
+            Some(Value::String(paths)) => paths
+                .split(',')
+                .map(|path| path.trim().to_owned())
+                .collect(),
+            _ => Vec::new(),
+        };
+        for path in entries.iter().filter(|path| !path.is_empty()) {
+            checkout_path(checkout, path).ok_or_else(|| outside(param, path))?;
         }
     }
     for param in HOST_PATH_PARAMS {
@@ -370,8 +452,119 @@ fn checkout_params(
             json!(checkout.to_string_lossy().into_owned()),
         );
     }
+    if method == "git.agentCommit" {
+        // The backend applies the workspace's commit policy before it asks;
+        // the machine's own `git.autoCommit` setting never decides.
+        params.insert("userRequested".into(), json!(true));
+    }
     params.insert("workspaceId".into(), json!(record.as_str()));
     Ok(params)
+}
+
+/// `value` with whitespace trimmed when it is a string, as handlers read
+/// single paths.
+fn trimmed(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(text.trim().to_owned()),
+        other => other.clone(),
+    }
+}
+
+/// What a reply must not show: the checkout's absolute paths (made
+/// relative) and the hidden record's id (shown as the backend's workspace).
+#[derive(Default)]
+struct Hidden {
+    /// The checkout as given and canonical, longest first.
+    roots: Vec<String>,
+    record: Option<String>,
+    workspace: Option<String>,
+}
+
+impl Hidden {
+    fn with_workspace(mut self, workspace: intent_core::WorkspaceId) -> Self {
+        self.workspace = Some(workspace.0);
+        self
+    }
+
+    /// A whole value: the checkout itself is `""`, a path in it is made
+    /// relative, the record is the backend's workspace; anything else
+    /// (another path, a sibling such as `<root>2/x`) is unchanged.
+    fn whole(&self, text: &str) -> Option<String> {
+        if let (Some(record), Some(workspace)) = (&self.record, &self.workspace) {
+            if text == record {
+                return Some(workspace.clone());
+            }
+        }
+        for root in &self.roots {
+            if text == root {
+                return Some(String::new());
+            }
+            if let Some(rest) = text
+                .strip_prefix(root.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+            {
+                return Some(rest.to_owned());
+            }
+        }
+        None
+    }
+
+    /// An error message: each checkout path in it made relative (the
+    /// checkout itself `.`), only where the root ends a path component,
+    /// and the record shown as the backend's workspace.
+    fn message(&self, text: &str) -> String {
+        let mut text = text.to_owned();
+        if let (Some(record), Some(workspace)) = (&self.record, &self.workspace) {
+            text = text.replace(record.as_str(), workspace);
+        }
+        for root in &self.roots {
+            let mut out = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find(root.as_str()) {
+                out.push_str(&rest[..at]);
+                let after = &rest[at + root.len()..];
+                match after.chars().next() {
+                    Some('/') => rest = &after[1..],
+                    Some(next) if next.is_alphanumeric() || "-_.".contains(next) => {
+                        out.push_str(root);
+                        rest = after;
+                    }
+                    _ => {
+                        out.push('.');
+                        rest = after;
+                    }
+                }
+            }
+            out.push_str(rest);
+            text = out;
+        }
+        text
+    }
+
+    /// `value` with every path-shaped string and key made relative, never
+    /// touching the members of [`CONTENT_KEYS`].
+    fn value(&self, value: Value) -> Value {
+        match value {
+            Value::String(text) => Value::String(self.whole(&text).unwrap_or(text)),
+            Value::Array(items) => {
+                Value::Array(items.into_iter().map(|item| self.value(item)).collect())
+            }
+            Value::Object(object) => Value::Object(
+                object
+                    .into_iter()
+                    .map(|(key, item)| {
+                        let item = if CONTENT_KEYS.contains(&key.as_str()) {
+                            item
+                        } else {
+                            self.value(item)
+                        };
+                        (self.whole(&key).unwrap_or(key), item)
+                    })
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
 }
 
 /// The checkout's absolute path as given and canonical, longest first: no
@@ -387,55 +580,11 @@ fn shown_roots(checkout: &Path) -> Vec<String> {
     roots
 }
 
-/// `text` with the checkout's absolute paths made relative to it: the
-/// checkout itself is `""` as a whole value and `.` inside a text.
-fn relative_text(text: &str, roots: &[String]) -> String {
-    for root in roots {
-        if text == root {
-            return String::new();
-        }
-        if let Some(rest) = text.strip_prefix(root.as_str()) {
-            if let Some(rest) = rest.strip_prefix('/') {
-                return relative_text(rest, roots);
-            }
-        }
-    }
-    let mut text = text.to_owned();
-    for root in roots {
-        if text.contains(root.as_str()) {
-            text = text
-                .replace(&format!("{root}/"), "")
-                .replace(root.as_str(), ".");
-        }
-    }
-    text
-}
-
-/// `value` with every string (and key) made relative by [`relative_text`].
-fn relative_value(value: Value, roots: &[String]) -> Value {
-    match value {
-        Value::String(text) => Value::String(relative_text(&text, roots)),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(|item| relative_value(item, roots))
-                .collect(),
-        ),
-        Value::Object(object) => Value::Object(
-            object
-                .into_iter()
-                .map(|(key, item)| (relative_text(&key, roots), relative_value(item, roots)))
-                .collect(),
-        ),
-        other => other,
-    }
-}
-
 /// The reply for `result`, without the checkout's absolute paths, and
 /// [`HOME_REPLY_TOO_LARGE`] when it would not fit one frame.
-fn fit_reply(id: LinkId, result: Result<Value, HomeCallError>, roots: &[String]) -> HomeCallReply {
+fn fit_reply(id: LinkId, result: Result<Value, HomeCallError>, hidden: &Hidden) -> HomeCallReply {
     let reply = match result {
-        Ok(result) => HomeCallReply::ok(id, relative_value(result, roots)),
+        Ok(result) => HomeCallReply::ok(id, hidden.value(result)),
         Err(error) => {
             let oversized = error
                 .data
@@ -449,8 +598,8 @@ fn fit_reply(id: LinkId, result: Result<Value, HomeCallError>, roots: &[String])
             HomeCallReply::err(
                 id,
                 error.code,
-                relative_text(&error.message, roots),
-                error.data.map(|data| relative_value(data, roots)),
+                hidden.message(&error.message),
+                error.data.map(|data| hidden.value(data)),
             )
         }
     };
@@ -539,6 +688,26 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(refused.code, INVALID_PARAMS);
+        for paths in [json!("a.txt, ../x"), json!([" ../x"]), json!([1])] {
+            assert!(
+                checkout_params(
+                    "file-tracking.stage",
+                    params(json!({ "paths": paths })),
+                    &root,
+                    &record,
+                )
+                .is_err(),
+                "{paths}"
+            );
+        }
+        let committed = checkout_params(
+            "git.agentCommit",
+            params(json!({ "message": "m", "userRequested": false })),
+            &root,
+            &record,
+        )
+        .unwrap();
+        assert_eq!(committed["userRequested"], true);
         assert!(checkout_params(
             "git.getBranches",
             params(json!({ "repoPath": root.to_string_lossy() })),
@@ -549,25 +718,36 @@ mod tests {
     }
 
     #[test]
-    fn replies_never_show_the_checkout_path() {
-        let roots = vec!["/srv/homes/h1/work".to_owned()];
-        let shown = relative_value(
-            json!({
-                "repoPath": "/srv/homes/h1/work",
-                "files": ["/srv/homes/h1/work/src/a.rs", "b.rs"],
-                "/srv/homes/h1/work/c.rs": 1,
-                "message": "fatal: /srv/homes/h1/work/d is outside /srv/homes/h1/work",
-            }),
-            &roots,
-        );
+    fn replies_never_show_the_checkout_path_or_the_record() {
+        let hidden = Hidden {
+            roots: vec!["/srv/homes/h1/work".to_owned()],
+            record: Some("__home__:r1".to_owned()),
+            workspace: Some("ws-1".to_owned()),
+        };
+        let shown = hidden.value(json!({
+            "repoPath": "/srv/homes/h1/work",
+            "files": ["/srv/homes/h1/work/src/a.rs", "b.rs", "/srv/homes/h1/work2/x"],
+            "/srv/homes/h1/work/c.rs": 1,
+            "workspaceId": "__home__:r1",
+            "content": "built in /srv/homes/h1/work/build/out",
+            "hunks": [{ "patch": "+/srv/homes/h1/work/x", "path": "/srv/homes/h1/work/x" }],
+        }));
         assert_eq!(
             shown,
             json!({
                 "repoPath": "",
-                "files": ["src/a.rs", "b.rs"],
+                "files": ["src/a.rs", "b.rs", "/srv/homes/h1/work2/x"],
                 "c.rs": 1,
-                "message": "fatal: d is outside .",
+                "workspaceId": "ws-1",
+                "content": "built in /srv/homes/h1/work/build/out",
+                "hunks": [{ "patch": "+/srv/homes/h1/work/x", "path": "x" }],
             })
+        );
+        assert_eq!(
+            hidden.message(
+                "fatal: /srv/homes/h1/work/d is outside /srv/homes/h1/work; see /srv/homes/h1/work2 for __home__:r1"
+            ),
+            "fatal: d is outside .; see /srv/homes/h1/work2 for ws-1"
         );
     }
 
@@ -575,7 +755,7 @@ mod tests {
     fn an_oversized_reply_is_refused_as_too_large() {
         let id = LinkId::nil();
         let big = "x".repeat(MAX_FRAME_BYTES);
-        let reply = fit_reply(id, Ok(json!({ "content": big })), &[]);
+        let reply = fit_reply(id, Ok(json!({ "content": big })), &Hidden::default());
         let error = reply.error.unwrap();
         assert_eq!(error.code, INTERNAL_ERROR);
         assert!(error.message.starts_with(HOME_REPLY_TOO_LARGE));
@@ -587,7 +767,7 @@ mod tests {
                 "response too large".into(),
                 Some(json!({ "code": "oversized-response" })),
             )),
-            &[],
+            &Hidden::default(),
         );
         assert_eq!(
             capped.error.unwrap().data,

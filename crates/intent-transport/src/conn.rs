@@ -1365,14 +1365,18 @@ async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &Outbound
     }
 }
 
-/// Whether a request's `params.workspaceId` names a machine's hidden home
-/// record ([`intent_core::HOME_RECORD_PREFIX`]).
+/// Whether a request's `params.workspaceId` (or any `…WorkspaceId` param)
+/// names a machine's hidden home record ([`intent_core::HOME_RECORD_PREFIX`]).
 pub(crate) fn names_home_record(value: &Value) -> bool {
     value
         .get("params")
-        .and_then(|params| params.get("workspaceId"))
-        .and_then(Value::as_str)
-        .is_some_and(intent_core::is_home_record_id)
+        .and_then(Value::as_object)
+        .is_some_and(|params| {
+            params.iter().any(|(key, value)| {
+                (key == "workspaceId" || key.ends_with("WorkspaceId"))
+                    && value.as_str().is_some_and(intent_core::is_home_record_id)
+            })
+        })
 }
 
 /// Answer a request naming a hidden home record as one naming a workspace
@@ -3362,6 +3366,9 @@ mod tests {
             &json!({ "params": { "workspaceId": "ws-1" } })
         ));
         assert!(!names_home_record(&json!({ "params": {} })));
+        assert!(names_home_record(
+            &json!({ "params": { "targetWorkspaceId": hidden.as_str() } })
+        ));
         bus.shutdown().await.unwrap();
         store.close().await;
     }

@@ -11943,6 +11943,13 @@ async fn home_records_are_never_listed() {
         store.home_record_ids().await.unwrap(),
         std::slice::from_ref(&hidden)
     );
-    store.delete_workspace(&hidden).await.unwrap();
+    assert!(store.delete_home_record(&shown).await.is_err());
+    store.delete_home_record(&hidden).await.unwrap();
     assert!(store.home_record_ids().await.unwrap().is_empty());
+    let marked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deleted_workspace_id WHERE id = ?")
+        .bind(hidden.as_str())
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(marked, 0, "no deletion marker");
 }

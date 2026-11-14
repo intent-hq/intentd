@@ -1855,6 +1855,25 @@ impl Store {
         Ok(ids.into_iter().map(WorkspaceId).collect())
     }
 
+    /// Remove a machine's hidden home record and (by cascade) its rows,
+    /// leaving no deletion marker: a record is made per home open, and its
+    /// id is never reused or transferred. Any other id is refused.
+    ///
+    /// # Errors
+    /// `InvalidParams` for an id that is not a home record; `Internal` on a
+    /// database failure.
+    pub async fn delete_home_record(&self, id: &WorkspaceId) -> Result<()> {
+        if !id.is_home_record() {
+            return Err(Error::InvalidParams(format!("{id} is not a home record")));
+        }
+        sqlx::query("DELETE FROM workspace WHERE id = ?")
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("delete home record failed: {e}")))?;
+        Ok(())
+    }
+
     /// Ordinary workspace keys for inherited host access, without hydrating
     /// rows or issuing a role lookup per workspace. Includes archived rows.
     ///

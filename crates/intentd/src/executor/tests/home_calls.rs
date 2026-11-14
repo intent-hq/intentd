@@ -174,6 +174,24 @@ async fn home_files_and_git_answer_as_the_wire_methods() {
     .await);
     assert!(shown(&read).contains("from the app"), "{read}");
 
+    // Contents are never rewritten, even when they name the checkout.
+    std::fs::write(
+        work.join("paths.txt"),
+        format!("built in {}/out", work.display()),
+    )
+    .unwrap();
+    let raw = ok(call(
+        &mut dialed,
+        &h1,
+        "file.read",
+        json!({ "path": "paths.txt" }),
+    )
+    .await);
+    assert!(
+        raw.to_string().contains(&format!("{}/out", work.display())),
+        "{raw}"
+    );
+
     let listed = ok(call(
         &mut dialed,
         &h1,
@@ -339,11 +357,23 @@ async fn a_cancelled_or_timed_out_home_call_ends_without_a_reply() {
         60_000,
     );
     let cancelled = sleeping.request_id;
+    let mut again = sleeping.clone();
     dialed
         .link
         .send(&LinkFrame::HomeCall(sleeping))
         .await
         .unwrap();
+    // A second call with the running call's id is refused at once.
+    again.method = "file.exists".into();
+    again.params = json!({ "path": "README.md" }).as_object().cloned().unwrap();
+    dialed.link.send(&LinkFrame::HomeCall(again)).await.unwrap();
+    let refused = next_of(&mut dialed, |frame| match frame {
+        LinkFrame::HomeCallReply(reply) => Some(reply),
+        _ => None,
+    })
+    .await;
+    assert_eq!(refused.request_id, cancelled);
+    assert_eq!(err(&refused).0, -32602, "{refused:?}");
     let late = call_frame(
         &h1,
         "host.exec",

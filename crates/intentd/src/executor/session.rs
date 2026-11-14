@@ -454,7 +454,15 @@ pub(super) async fn serve_link(
                 let runner = runner.clone();
                 // Registered before the task runs, under this link's
                 // generation, so this link's end always ends it.
-                let cancelled = runner.begin_home_call(frame.request_id, binding.generation);
+                let Some(cancelled) = runner.begin_home_call(frame.request_id, binding.generation)
+                else {
+                    let reply = Runner::duplicate_home_call(frame.request_id);
+                    // caller-binding: allow — answers one refused home call on its link
+                    tokio::spawn(async move {
+                        let _ = link.send(&LinkFrame::HomeCallReply(reply)).await;
+                    });
+                    continue;
+                };
                 // caller-binding: allow — answers one home call on its link
                 tokio::spawn(async move {
                     if let Some(reply) = runner.home_call(frame, cancelled).await {

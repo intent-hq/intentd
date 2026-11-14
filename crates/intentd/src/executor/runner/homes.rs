@@ -79,7 +79,7 @@ pub(super) struct Home {
     /// Taken (dropped) to stop a running setup.
     setup_stop: Mutex<Option<oneshot::Sender<()>>>,
     /// Set when the home is closed: its backup watcher ends.
-    closed: watch::Sender<bool>,
+    pub(super) closed: watch::Sender<bool>,
 }
 
 impl Home {
@@ -728,6 +728,11 @@ impl Runner {
                 let deadline = tokio::time::Instant::now() + PUSH_TIMEOUT;
                 if let Err(error) = runner.push_home_now(&home, deadline).await {
                     tracing::info!(home = %home.of.home_id, %error, "node: home backup push failed; retrying");
+                    // A write's push is tried again on the next tick, not
+                    // only at the next WIP_INTERVAL.
+                    if written {
+                        lock(&home.wip_due).get_or_insert_with(Instant::now);
+                    }
                 }
             }
         });

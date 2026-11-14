@@ -952,7 +952,7 @@ impl ServicesHomeRecords {
             return;
         };
         for record in records {
-            if let Err(error) = store.delete_workspace(&record).await {
+            if let Err(error) = store.delete_home_record(&record).await {
                 tracing::warn!(%error, "executor: could not remove a stale home record");
             }
         }
@@ -990,7 +990,7 @@ impl runner::HomeRecords for ServicesHomeRecords {
     fn remove(&self, record: intent_core::WorkspaceId) -> intent_core::BoxFuture<'static, ()> {
         let store = self.0.store().clone();
         Box::pin(async move {
-            if let Err(error) = store.delete_workspace(&record).await {
+            if let Err(error) = store.delete_home_record(&record).await {
                 tracing::warn!(%error, "executor: could not remove a home record");
             }
         })
@@ -1010,6 +1010,36 @@ impl runner::HomeRecords for ServicesHomeRecords {
             async move { dispatch_home_call(&services, &method, params).await },
         ))
     }
+}
+
+/// Attachments are keyed across the whole daemon: a home call may read only
+/// one stored for its own record, and any other reads as unknown.
+async fn refuse_foreign_attachment(
+    services: &intent_services::Services,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), intent_core::node_link::HomeCallError> {
+    let Some(id) = params
+        .get("attachmentId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    let record = params
+        .get("workspaceId")
+        .and_then(serde_json::Value::as_str);
+    let own = services
+        .store()
+        .get_attachment(id)
+        .await
+        .is_ok_and(|attachment| Some(attachment.workspace_id.as_str()) == record);
+    if own {
+        return Ok(());
+    }
+    Err(intent_core::node_link::HomeCallError {
+        code: -32602,
+        message: format!("unknown attachment id: {id}"),
+        data: Some(serde_json::json!({ "code": "not-found" })),
+    })
 }
 
 /// The branch `worktree` has checked out, or `""` when detached.
@@ -1052,6 +1082,9 @@ async fn dispatch_home_call(
                 message: error.message,
                 data: None,
             });
+    }
+    if method == "file.getAttachmentInfo" {
+        refuse_foreign_attachment(services, &params).await?;
     }
     let request = serde_json::json!({
         "jsonrpc": "2.0",
