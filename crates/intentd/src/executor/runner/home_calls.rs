@@ -331,10 +331,12 @@ impl Runner {
     }
 
     /// The home's hidden record, made now when its open could not.
+    /// Whichever path makes the record (the open's task or, after a failed
+    /// make, the first call) also starts the checkout's event watch.
     async fn home_record(
         &self,
         records: &Arc<dyn super::HomeRecords>,
-        home: &Home,
+        home: &Arc<Home>,
     ) -> anyhow::Result<intent_core::WorkspaceId> {
         let mut record = home.record.lock().await;
         if let Some(record) = record.as_ref() {
@@ -344,6 +346,11 @@ impl Runner {
         anyhow::ensure!(!*home.closed.borrow(), "the home is closed");
         let made = records.register(&home.of, &home.worktree).await?;
         *record = Some(made.clone());
+        let runner = self.clone();
+        let watched = home.clone();
+        let of = made.clone();
+        // caller-binding: allow — node-local event watch of one home checkout
+        tokio::spawn(async move { runner.watch_home_events(&watched, of).await });
         Ok(made)
     }
 
@@ -533,7 +540,7 @@ fn trimmed(value: &Value) -> Value {
 /// relative), its git directory's (shown as `.git`), and the hidden
 /// record's id (shown as the backend's workspace).
 #[derive(Default)]
-struct Hidden {
+pub(super) struct Hidden {
     /// The paths not shown, longest first.
     roots: Vec<Root>,
     record: Option<String>,
@@ -543,7 +550,7 @@ struct Hidden {
 /// One absolute path a reply does not show, and what it shows instead
 /// (`""` for the checkout itself: paths in it become relative).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Root {
+pub(super) struct Root {
     path: String,
     shown: &'static str,
 }
@@ -571,6 +578,20 @@ impl Root {
 }
 
 impl Hidden {
+    /// What a home's events must not show: its checkout's `roots`, and its
+    /// `record` (shown as the backend's `workspace`).
+    pub(super) fn of_home(
+        roots: Vec<Root>,
+        record: &intent_core::WorkspaceId,
+        workspace: &intent_core::WorkspaceId,
+    ) -> Self {
+        Self {
+            roots,
+            record: Some(record.as_str().to_owned()),
+            workspace: Some(workspace.as_str().to_owned()),
+        }
+    }
+
     fn with_workspace(mut self, workspace: intent_core::WorkspaceId) -> Self {
         self.workspace = Some(workspace.0);
         self
@@ -649,7 +670,7 @@ impl Hidden {
     /// object member (a git error in an ok result) as [`Self::message`].
     /// A bare string result (`file.read`'s contents) and the members of
     /// [`CONTENT_KEYS`] are never rewritten inside.
-    fn value(&self, value: Value) -> Value {
+    pub(super) fn value(&self, value: Value) -> Value {
         self.scrub(value, false)
     }
 
@@ -688,7 +709,7 @@ impl Hidden {
 /// The paths no reply shows, longest first: the checkout as given and
 /// canonical, and, for a linked worktree (a `.git` file), its git
 /// directory and the repository's common one.
-fn shown_roots(checkout: &Path) -> Vec<Root> {
+pub(super) fn shown_roots(checkout: &Path) -> Vec<Root> {
     let mut roots = Vec::new();
     let mut add = |path: &Path, make: fn(String) -> Root| {
         roots.push(make(path.to_string_lossy().into_owned()));

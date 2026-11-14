@@ -47,6 +47,7 @@ use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
 mod home_calls;
+mod home_events;
 mod homes;
 pub(crate) use homes::homes_ready;
 
@@ -192,7 +193,27 @@ pub(crate) trait HomeRecords: Send + Sync {
         'static,
         Result<serde_json::Value, intent_core::node_link::HomeCallError>,
     >;
+    /// Watch the home checkout `worktree` under its `record` (node-link.md
+    /// "File and git events of a home") until the returned guard is
+    /// dropped; `None` when this machine relays no home events.
+    fn watch(
+        &self,
+        _record: &intent_core::WorkspaceId,
+        _worktree: &std::path::Path,
+    ) -> Option<HomeWatchGuard> {
+        None
+    }
+    /// The events published for every hidden record, which the relay
+    /// sends on to the backend; `None` when there are none to relay.
+    fn events(&self) -> Option<tokio::sync::broadcast::Receiver<Arc<intent_core::Event>>> {
+        None
+    }
+    /// Publish `record`'s git status again soon.
+    fn refresh(&self, _record: &intent_core::WorkspaceId) {}
 }
+
+/// What keeps a home checkout's watches running ([`HomeRecords::watch`]).
+pub(crate) type HomeWatchGuard = Box<dyn std::any::Any + Send>;
 
 /// What the runner needs.
 pub(super) struct RunnerConfig {
@@ -313,6 +334,8 @@ struct Inner {
     homes: Mutex<homes::Homes>,
     /// Home opens run one at a time.
     home_opens: Arc<tokio::sync::Mutex<()>>,
+    /// Set once the relay of the homes' file and git events runs.
+    home_relay: std::sync::atomic::AtomicBool,
     /// Terminals on the bound backend's homes (nodeProtocol 19).
     terminals: crate::executor::terminals::HomeTerminals,
 }
@@ -1077,6 +1100,7 @@ impl Runner {
                 start_timeouts: Mutex::new(StartTimeouts::default()),
                 homes: Mutex::new(homes::Homes::default()),
                 home_opens: Arc::new(tokio::sync::Mutex::new(())),
+                home_relay: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }

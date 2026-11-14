@@ -1665,6 +1665,7 @@ async fn persisted_event_is_broadcast_before_its_publisher_wakes() {
 async fn home_record_events_are_never_published() {
     let (_tmp, bus) = bus().await;
     let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut tap = bus.subscribe_home_records();
     let hidden = WorkspaceId::new_home_record();
     let mut persisted = new_event("file:changed", None, ActorType::System);
     persisted.workspace_id = hidden.clone();
@@ -1685,6 +1686,15 @@ async fn home_record_events_are_never_published() {
     .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].id, shown.id);
+    // Only the machine's home relay sees them, in order, and nothing else.
+    let tapped: Vec<String> = (0..2)
+        .map(|_| tap.try_recv().expect("tapped").event_type.clone())
+        .collect();
+    assert_eq!(tapped, ["file:changed", "chat:stream:delta"]);
+    assert!(
+        tap.try_recv().is_err(),
+        "another workspace's event was tapped"
+    );
     let stored = bus
         .store()
         .query_events(&EventQuery {

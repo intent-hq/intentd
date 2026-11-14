@@ -51,6 +51,11 @@ pub(crate) const LAG_WARN_INTERVAL: Duration = Duration::from_secs(1);
 /// Capacity of each subscriber's outbound batch queue.
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
 
+/// Capacity of the home-record tap ([`EventBus::subscribe_home_records`]).
+/// A machine's relay reads it; a reader that lags past it loses the oldest
+/// events and resyncs from a fresh git status.
+const HOME_TAP_CAPACITY: usize = 1024;
+
 /// Capacity of the writer task's inbound channel. Controls backpressure when
 /// publishers send events faster than the writer task can batch-persist them.
 /// At 512 slots, the channel can buffer ~8 full batches (64 events each) before
@@ -132,6 +137,9 @@ pub struct EventBus {
     /// older than [`ATTRIBUTION_NAME_TTL`] are reloaded on next use.
     attribution_names: Arc<Mutex<HashMap<PrincipalId, (Instant, String)>>>,
     task_event_baselines: Arc<intent_store::TaskEventBaselines>,
+    /// Events of a machine's hidden home records, for the machine's relay
+    /// to its backend only: never stored, never broadcast to subscribers.
+    home_tap: broadcast::Sender<Arc<Event>>,
 }
 
 impl EventBus {
@@ -162,7 +170,27 @@ impl EventBus {
             writer: Arc::new(tokio::sync::Mutex::new(Some(writer))),
             attribution_names: Arc::default(),
             task_event_baselines,
+            home_tap: broadcast::channel(HOME_TAP_CAPACITY).0,
         }
+    }
+
+    /// The events published for a machine's hidden home records
+    /// ([`intent_core::WorkspaceId::is_home_record`]), which no subscriber
+    /// and no store ever sees: the machine relays a home's file and git
+    /// events to its backend from here (monorepo
+    /// `docs/protocol/node-link.md`, "File and git events of a home").
+    #[must_use]
+    pub fn subscribe_home_records(&self) -> broadcast::Receiver<Arc<Event>> {
+        self.home_tap.subscribe()
+    }
+
+    /// Hand a home record's event to the tap only.
+    fn tap_home_record(&self, ev: &NewEvent) -> Event {
+        let event = unpublished(ev);
+        if self.home_tap.receiver_count() > 0 {
+            let _ = self.home_tap.send(Arc::new(event.clone()));
+        }
+        event
     }
 
     /// Borrow the underlying store.
@@ -235,9 +263,9 @@ impl EventBus {
     /// Panics if the writer admission mutex is poisoned.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
         // A machine's hidden home record is never seen: its events are
-        // neither stored nor broadcast.
+        // neither stored nor broadcast, only handed to the home relay.
         if ev.workspace_id.is_home_record() {
-            return Ok(unpublished(ev));
+            return Ok(self.tap_home_record(ev));
         }
         if matches!(
             ev.event_type.as_str(),
@@ -354,10 +382,10 @@ impl EventBus {
     /// B's persisted event commits, even if B's call started first.
     #[must_use]
     pub fn publish_transient(&self, ev: &NewEvent) -> Event {
-        let event = unpublished(ev);
         if ev.workspace_id.is_home_record() {
-            return event;
+            return self.tap_home_record(ev);
         }
+        let event = unpublished(ev);
         // Broadcast on the same channel so transient/persisted events interleave
         // correctly for subscribers (ordering preserved from a single publisher).
         self.tx

@@ -108,7 +108,7 @@ impl GitStatusRefresher {
         status_cache: Arc<GitStatusCache>,
         presence: WorktreePresence,
     ) -> Self {
-        let mut sub = bus.subscribe(SubscriptionFilter {
+        let sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![
                 FILE_CREATED.to_string(),
                 FILE_CHANGED.to_string(),
@@ -116,9 +116,35 @@ impl GitStatusRefresher {
             ],
             ..SubscriptionFilter::default()
         });
+        Self::start_inner(bus, services, status_cache, presence, Some(sub))
+    }
+
+    /// A refresher fed by [`Self::trigger`] only, with no `file:*`
+    /// subscription of its own: the machine's home watches
+    /// ([`super::home_watch::HomeWatches`]) trigger it for their hidden
+    /// records, whose events no subscription sees.
+    pub(crate) fn start_triggered(
+        bus: EventBus,
+        services: Arc<dyn WorkspaceApi>,
+        status_cache: Arc<GitStatusCache>,
+        presence: WorktreePresence,
+    ) -> Self {
+        Self::start_inner(bus, services, status_cache, presence, None)
+    }
+
+    fn start_inner(
+        bus: EventBus,
+        services: Arc<dyn WorkspaceApi>,
+        status_cache: Arc<GitStatusCache>,
+        presence: WorktreePresence,
+        sub: Option<super::bus::Subscription>,
+    ) -> Self {
         let (trigger_tx, trigger_rx) = mpsc::unbounded_channel::<WorkspaceId>();
         let forward_tx = trigger_tx.clone();
         let forward_task = intent_core::spawn_daemon(async move {
+            let Some(mut sub) = sub else {
+                return;
+            };
             while let Some(batch) = sub.recv().await {
                 for ev in batch {
                     let _ = forward_tx.send(ev.workspace_id.clone());

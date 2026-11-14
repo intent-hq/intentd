@@ -889,6 +889,11 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "outcome": reply.outcome,
             "code": reply.error.as_ref().map(|error| error.code),
         }),
+        LinkFrame::HomeEvents(events) => json!({
+            "type": "homeEvents",
+            "homeId": field(events.home_id.as_str()),
+            "events": events.events.len(),
+        }),
         LinkFrame::HomeOpen(open) => json!({
             "type": "homeOpen",
             "requestId": open.request_id,
