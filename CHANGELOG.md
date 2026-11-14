@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.208] - 2026-11-14
+
+### 🚀 Features
+
+- Run home runs of saved scripts and autoStart on the workspace home ([#3361](https://github.com/intent-hq/intentd/pull/3361))
+
+
 ## [0.11.207] - 2026-11-14
 
 ### 🔧 Refactor
