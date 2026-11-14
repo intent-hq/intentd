@@ -235,15 +235,26 @@ class Scenarios:
         result = self.scan()
         self.assertEqual(self.api.mutations, self.expected(), result)
 
+    def test_stacked_entry_in_main_queue_is_main_activity(self):
+        # A stacked PR queued into main keeps its parent branch as base (cloudlands-fe#4582).
+        for heads, expected in (([H, S], []), ([H, H], self.expected())):
+            with self.subTest(heads=heads):
+                self.api = FakeGitHub(self.REPO)
+                page = self.api.queue_body(heads)
+                page['data']['repository']['mergeQueue']['entries']['nodes'][1]['pullRequest']['baseRefName'] = 'fix/parent'
+                self.api.queue_pages = [page]
+                self.scan()
+                self.assertEqual(self.api.mutations, expected)
+
     def test_partial_graphql_and_incomplete_cursor_fail_closed(self):
-        for change in ('error', 'cursor', 'unknown-state', 'wrong-repo', 'other-base'):
+        for change in ('error', 'cursor', 'unknown-state', 'wrong-repo', 'missing-base'):
             page = self.api.queue_body([H])
             entries = page['data']['repository']['mergeQueue']['entries']
             if change == 'error': page['errors'] = [{'message': 'rate limit'}]
             if change == 'cursor': entries['pageInfo'] = {'hasNextPage': True, 'endCursor': None}
             if change == 'unknown-state': entries['nodes'][0]['state'] = 'NEW_STATE'
             if change == 'wrong-repo': page['data']['repository']['databaseId'] = 88
-            if change == 'other-base': entries['nodes'][0]['pullRequest']['baseRefName'] = 'release'
+            if change == 'missing-base': entries['nodes'][0]['pullRequest'] = None
             self.api.queue_pages = [page]
             self.assert_skips()
 

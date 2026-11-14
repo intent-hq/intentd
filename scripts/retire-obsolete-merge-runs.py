@@ -313,7 +313,9 @@ def activity(client, ctx, candidate):
         for node in entries['nodes']:
             require(isinstance(node['id'], str) and node['id'] not in node_ids, 'invalid/duplicate queue entry')
             node_ids.add(node['id'])
-            require(node['state'] in QUEUE_STATES and node['pullRequest']['baseRefName'] == 'main', 'unknown queue state/target')
+            # mergeQueue(branch: main) scopes entries; a stacked PR keeps its parent branch as base.
+            require(node['state'] in QUEUE_STATES and isinstance(node['pullRequest']['baseRefName'], str),
+                    'unknown queue state/entry')
             if node['headCommit'] is None and node['state'] == 'QUEUED':
                 continue  # not yet built: no merge-group commit exists, so no run SHA to protect
             require(node['headCommit'] is not None and sha(node['headCommit']['oid']), 'unknown candidate activity')
