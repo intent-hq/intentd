@@ -179,12 +179,26 @@ impl std::fmt::Debug for BeforePublish {
     }
 }
 
+/// How long a machine's link may stay down before a running turn fails
+/// `node-link-unavailable` and its homes are detached: 60 s, or
+/// `INTENTD_LINK_LOSS_GRACE_MS` (a test seam, so an e2e need not wait the
+/// production grace).
+fn link_loss_grace() -> Duration {
+    std::env::var("INTENTD_LINK_LOSS_GRACE_MS")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .map_or(LINK_LOSS_GRACE, Duration::from_millis)
+}
+
+/// The production [`Tuning::link_loss_grace`].
+const LINK_LOSS_GRACE: Duration = Duration::from_secs(60);
+
 impl Default for Tuning {
     fn default() -> Self {
         Self {
             ack_interval: Duration::from_millis(100),
             ack_batch: 256,
-            link_loss_grace: Duration::from_secs(60),
+            link_loss_grace: link_loss_grace(),
             turn_poll: Duration::from_secs(1),
             permanent_retry: Duration::from_secs(60),
             backoff: Backoff::default(),
@@ -377,6 +391,9 @@ pub(crate) struct Shared {
     /// The machine holds a home of this backend's workspaces: its link stays
     /// up, so the home is backed up and reachable.
     pub(crate) holds_homes: std::sync::atomic::AtomicBool,
+    /// Detaching this machine's homes after a link loss, and their
+    /// backup warnings (nodes.md "Detached workspaces").
+    pub(crate) home_link: crate::home_state::HomeLink,
     /// Terminals on this machine's homes (nodeProtocol 19).
     pub(crate) terminals: crate::terminals::HomeTerminals,
     /// The home runs of saved scripts on this machine (nodeProtocol 19).
@@ -1753,6 +1770,7 @@ impl RemoteNode {
             home_waiters: Mutex::new(HashMap::new()),
             home_call_waiters: Mutex::new(HashMap::new()),
             holds_homes: std::sync::atomic::AtomicBool::new(false),
+            home_link: crate::home_state::HomeLink::default(),
             terminals: crate::terminals::HomeTerminals::default(),
             home_scripts: crate::home_scripts::HomeScripts::default(),
             secret_waiters: Mutex::new(HashMap::new()),
@@ -2731,6 +2749,9 @@ async fn run(
                 shared
                     .terminals
                     .link_lost(shared.weak(), shared.tuning.link_loss_grace);
+                shared
+                    .home_link
+                    .link_lost(shared.weak(), shared.tuning.link_loss_grace);
                 demanded = asked;
                 retry = shared.wants_link();
                 continue;
@@ -2740,6 +2761,7 @@ async fn run(
         for waiter in waiters.drain(..) {
             let _ = waiter.send(Ok(()));
         }
+        shared.home_link.bound();
         crate::homes::after_bind(&shared, &link);
         shared.terminals.after_bind(&link);
         tracing::info!(
@@ -2789,6 +2811,10 @@ async fn run(
         // Home terminals wait out the link-loss grace for the next bind.
         shared
             .terminals
+            .link_lost(shared.weak(), shared.tuning.link_loss_grace);
+        // Its homes are detached once the same grace passes without a bind.
+        shared
+            .home_link
             .link_lost(shared.weak(), shared.tuning.link_loss_grace);
         // The machine stops this binding's scripts when its link closes.
         shared

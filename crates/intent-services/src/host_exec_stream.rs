@@ -102,6 +102,7 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecStreamArgs, Hos
             Value::String(s) => Some(s.as_bytes().to_vec()),
             _ => {
                 return Err(HostExecError {
+                    data: None,
                     code: INVALID_PARAMS,
                     message: "Invalid parameter: stdin must be a string".to_string(),
                 });
@@ -111,6 +112,7 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecStreamArgs, Hos
             Value::String(s) => Some(decode_base64_field(s, "stdinBase64")?),
             _ => {
                 return Err(HostExecError {
+                    data: None,
                     code: INVALID_PARAMS,
                     message: "Invalid parameter: stdinBase64 must be a string".to_string(),
                 });
@@ -118,6 +120,7 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecStreamArgs, Hos
         },
         (Some(_), Some(_)) => {
             return Err(HostExecError {
+                data: None,
                 code: INVALID_PARAMS,
                 message: "Invalid parameter: pass either stdin or stdinBase64, not both"
                     .to_string(),
@@ -137,6 +140,7 @@ fn decode_base64_field(s: &str, field: &str) -> Result<Vec<u8>, HostExecError> {
     base64::engine::general_purpose::STANDARD
         .decode(s.as_bytes())
         .map_err(|_| HostExecError {
+            data: None,
             code: INVALID_PARAMS,
             message: format!("Invalid parameter: {field} is not valid base64"),
         })
@@ -220,6 +224,7 @@ impl HostExecStreamRegistry {
             let result = task.await;
             tasks.pop();
             result.map_err(|error| HostExecError {
+                data: None,
                 code: -32603,
                 message: format!("host.execStream terminal writer failed: {error}"),
             })?;
@@ -273,6 +278,7 @@ impl HostExecStreamRegistry {
             let map = self.inner.lock().expect("registry poisoned");
             if map.closed {
                 return Err(HostExecError {
+                    data: None,
                     code: -32603,
                     message: "daemon is shutting down".into(),
                 });
@@ -280,6 +286,7 @@ impl HostExecStreamRegistry {
             map.streams.get(request_id).map(|h| h.stdin.clone())
         };
         let sender = match sender.ok_or_else(|| HostExecError {
+            data: None,
             code: -32603,
             message: format!("unknown host.execStream requestId: {request_id}"),
         })? {
@@ -306,6 +313,7 @@ impl HostExecStreamRegistry {
                     })
                 };
                 send.await.map_err(|_| HostExecError {
+                    data: None,
                     code: -32603,
                     message: format!("host.execStream {request_id} stdin closed"),
                 })?;
@@ -391,6 +399,7 @@ pub async fn start_stream(
 ) -> Result<String, HostExecError> {
     if registry().inner.lock().expect("registry poisoned").closed {
         return Err(HostExecError {
+            data: None,
             code: -32603,
             message: "daemon is shutting down".into(),
         });
@@ -427,6 +436,7 @@ pub async fn start_stream(
     let mut admission = registry().inner.lock().expect("registry poisoned");
     if admission.closed {
         return Err(HostExecError {
+            data: None,
             code: -32603,
             message: "daemon is shutting down".into(),
         });
@@ -435,6 +445,7 @@ pub async fn start_stream(
     // displace it: shutdown must be able to cancel every admitted child.
     if admission.streams.contains_key(&request_id) {
         return Err(HostExecError {
+            data: None,
             code: INVALID_PARAMS,
             message: "host.execStream requestId is already active".into(),
         });
@@ -443,6 +454,7 @@ pub async fn start_stream(
     let mut cmd = build_command(&common, cwd_resolved.as_deref());
     cmd.stdin(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| HostExecError {
+        data: None,
         code: -32603,
         message: format!("spawn failed: {}: {e}", common.command),
     })?;
@@ -808,6 +820,7 @@ fn write_home(
 ) -> Result<(), HostExecError> {
     if eof {
         return Err(HostExecError {
+            data: None,
             code: INVALID_PARAMS,
             message: format!(
                 "{HOME_EXEC_EOF_UNSUPPORTED}: the stdin of a process on the workspace's home cannot be closed; nothing was written"
@@ -815,11 +828,31 @@ fn write_home(
         });
     }
     match data {
-        Some(bytes) if !bytes.is_empty() => control.write(&bytes).map_err(|error| HostExecError {
-            code: -32603,
-            message: error.to_string(),
-        }),
+        Some(bytes) if !bytes.is_empty() => control
+            .write(&bytes)
+            .map_err(|error| home_write_error(&error)),
         _ => Ok(()),
+    }
+}
+
+/// A failed write to a process on the home: a `home-unavailable` keeps its
+/// documented `data` (nodes.md "Workspace homes": every home call fails with
+/// `data.code: "home-unavailable"`).
+fn home_write_error(error: &std::io::Error) -> HostExecError {
+    let failure = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<intent_core::Error>());
+    if let Some(intent_core::Error::RemoteMachine(failure)) = failure {
+        return HostExecError {
+            code: -32603,
+            message: failure.message.clone(),
+            data: Some(failure.data.clone()),
+        };
+    }
+    HostExecError {
+        data: None,
+        code: -32603,
+        message: error.to_string(),
     }
 }
 
@@ -945,6 +978,28 @@ fn chunk_event(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A write to a home process whose machine is away keeps the
+    /// documented `home-unavailable` data; any other failure has none.
+    #[test]
+    fn a_home_write_failure_keeps_its_error_data() {
+        let data = json!({ "code": "home-unavailable", "name": "Machine A", "retryable": true });
+        let failure = std::io::Error::other(intent_core::Error::remote_machine(
+            true,
+            "Home Machine A is unavailable.",
+            data.clone(),
+        ));
+        let error = home_write_error(&failure);
+        assert_eq!(
+            (error.code, error.message.as_str(), error.data),
+            (-32603, "Home Machine A is unavailable.", Some(data))
+        );
+        let error = home_write_error(&std::io::Error::other("the terminal is closed"));
+        assert_eq!(
+            (error.code, error.message.as_str(), error.data),
+            (-32603, "the terminal is closed", None)
+        );
+    }
 
     /// A shell runs the quoted line as the argv it came from, whatever the
     /// words hold.

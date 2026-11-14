@@ -96,6 +96,8 @@ pub(crate) const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 pub struct HostExecError {
     pub code: i32,
     pub message: String,
+    /// The JSON-RPC `error.data`, when the failure documents one.
+    pub data: Option<serde_json::Value>,
 }
 
 impl HostExecError {
@@ -103,12 +105,14 @@ impl HostExecError {
         Self {
             code: INVALID_PARAMS,
             message: msg.into(),
+            data: None,
         }
     }
     fn internal(msg: impl Into<String>) -> Self {
         Self {
             code: INTERNAL_ERROR,
             message: msg.into(),
+            data: None,
         }
     }
 }

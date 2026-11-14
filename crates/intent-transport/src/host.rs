@@ -16,7 +16,7 @@ use intent_core::WorkspaceApi;
 use intent_services::EventBus;
 use serde_json::{json, Map, Value};
 
-use crate::events::{error_frame, success_frame};
+use crate::events::{error_frame, error_frame_with_data, success_frame};
 use crate::host_env::{
     detect_display_server, detect_has_display, local_hostname, pretty_hostname, HostEnvironment,
 };
@@ -871,7 +871,10 @@ pub(crate) async fn handle_with_host_environment(
                 .await
             {
                 Ok(()) => success_frame(&id_echo, &json!({ "ok": true })),
-                Err(e) => error_frame(&id_echo, e.code, &e.message),
+                Err(e) => match &e.data {
+                    Some(data) => error_frame_with_data(&id_echo, e.code, &e.message, data),
+                    None => error_frame(&id_echo, e.code, &e.message),
+                },
             }
         }
         HostMethod::ExecStreamCancel => {
