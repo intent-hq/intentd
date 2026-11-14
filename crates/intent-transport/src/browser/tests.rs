@@ -254,6 +254,7 @@ impl MemTabs {
         api.tabs.lock().unwrap().insert(
             tab_id.to_string(),
             BrowserTab {
+                navigation_only: false,
                 tab_id: tab_id.to_string(),
                 workspace_id: WorkspaceId("ws-1".to_string()),
                 host_client_id: ClientId(host.to_string()),
@@ -316,6 +317,7 @@ impl WorkspaceApi for MemTabs {
             }
             None => {
                 let tab = BrowserTab {
+                    navigation_only: false,
                     tab_id: input.tab_id.clone(),
                     workspace_id: input.workspace_id.clone(),
                     host_client_id: host,
@@ -603,6 +605,7 @@ async fn list_tabs_decorates_host_presence() {
     api.tabs.lock().unwrap().insert(
         "tab-2".to_string(),
         BrowserTab {
+            navigation_only: false,
             tab_id: "tab-2".to_string(),
             host_client_id: client("client-offline"),
             displayed: None,

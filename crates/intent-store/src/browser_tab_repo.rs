@@ -44,7 +44,7 @@ type WriteTxn<'a> = Transaction<'a, sqlx::Sqlite>;
 
 const COLUMNS: &str = "tab_id, workspace_id, host_client_id, url, requested_url, title, \
      owner_agent_id, owner_agent_name, visibility, emulated_width, emulated_height, \
-     created_at, updated_at, closed_at";
+     created_at, updated_at, closed_at, navigation_only";
 
 /// Process-local `tab_id → displayed` overlay (see the module docs). Shared
 /// by every clone of the [`Store`]; an id with no entry reads as `None`.
@@ -346,6 +346,11 @@ impl Store {
                 };
                 let mut changes = serde_json::Map::new();
                 let host_changes = tab.host_client_id != *new_host;
+                if tab.navigation_only && host_changes {
+                    return Err(Error::InvalidParams(
+                        "native browser tabs cannot move between clients".into(),
+                    ));
+                }
                 if host_changes {
                     changes.insert(
                         "hostClientId".to_string(),
@@ -410,7 +415,7 @@ impl Store {
                 let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "SELECT {COLUMNS} FROM browser_tab \
                      WHERE workspace_id = ? AND closed_at IS NULL \
-                     AND owner_agent_id IS NOT NULL AND host_client_id <> ? \
+                     AND owner_agent_id IS NOT NULL AND navigation_only = 0 AND host_client_id <> ? \
                      ORDER BY created_at, tab_id"
                 )))
                 .bind(&id.0)
@@ -469,7 +474,7 @@ impl Store {
                 let placeholders = vec!["?"; old_hosts.len()].join(", ");
                 let sql = format!(
                     "SELECT {COLUMNS} FROM browser_tab \
-                     WHERE closed_at IS NULL AND host_client_id IN ({placeholders}) \
+                     WHERE closed_at IS NULL AND navigation_only = 0 AND host_client_id IN ({placeholders}) \
                      ORDER BY created_at, tab_id"
                 );
                 let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
@@ -619,15 +624,16 @@ async fn write_tab(conn: &mut SqliteConnection, tab: &BrowserTab) -> Result<()> 
     sqlx::query(
         "INSERT INTO browser_tab (tab_id, workspace_id, host_client_id, url, requested_url, \
          title, owner_agent_id, owner_agent_name, visibility, emulated_width, \
-         emulated_height, created_at, updated_at, closed_at) \
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL) \
+         emulated_height, created_at, updated_at, navigation_only, closed_at) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL) \
          ON CONFLICT(tab_id) DO UPDATE SET \
          workspace_id = excluded.workspace_id, \
          url = excluded.url, requested_url = excluded.requested_url, title = excluded.title, \
          owner_agent_id = excluded.owner_agent_id, \
          owner_agent_name = excluded.owner_agent_name, visibility = excluded.visibility, \
          emulated_width = excluded.emulated_width, \
-         emulated_height = excluded.emulated_height, updated_at = excluded.updated_at",
+         emulated_height = excluded.emulated_height, updated_at = excluded.updated_at, \
+         navigation_only = MAX(browser_tab.navigation_only, excluded.navigation_only)",
     )
     .bind(&tab.tab_id)
     .bind(&tab.workspace_id.0)
@@ -642,6 +648,7 @@ async fn write_tab(conn: &mut SqliteConnection, tab: &BrowserTab) -> Result<()> 
     .bind(tab.emulated_size.map(|s| i64::from(s.height)))
     .bind(&tab.created_at)
     .bind(&tab.updated_at)
+    .bind(tab.navigation_only)
     .execute(conn)
     .await
     .map_err(|e| Error::Internal(format!("write browser tab failed: {e}")))?;
@@ -745,6 +752,7 @@ fn reject_tombstone(stored: &StoredTab) -> Result<()> {
 fn new_tab(host: &ClientId, input: BrowserTabInput) -> BrowserTab {
     let now = now_iso();
     let BrowserTabInput {
+        navigation_only,
         tab_id,
         workspace_id,
         url,
@@ -757,6 +765,7 @@ fn new_tab(host: &ClientId, input: BrowserTabInput) -> BrowserTab {
         displayed,
     } = input;
     BrowserTab {
+        navigation_only,
         tab_id,
         workspace_id,
         host_client_id: host.clone(),
@@ -791,6 +800,7 @@ fn map_row(r: &SqliteRow, displayed: &DisplayedOverlay) -> Result<StoredTab> {
     let tab_id: String = r.get("tab_id");
     Ok(StoredTab {
         tab: BrowserTab {
+            navigation_only: r.get("navigation_only"),
             displayed: displayed.get(&tab_id),
             tab_id,
             workspace_id: WorkspaceId(r.get("workspace_id")),

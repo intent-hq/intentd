@@ -34,6 +34,7 @@ pub(crate) const LIST_TABS_ACTION: &str = "listTabs";
 
 /// Browser-tab routing and agent-side tab operations, on [`Services`].
 pub(crate) trait BrowserTabRoutingExt {
+    async fn browser_client_navigation_only(&self, client: &ClientId) -> Result<bool>;
     async fn browser_tab_route_target(&self, tab: &BrowserTab) -> Result<ReverseTarget>;
     async fn browser_tab_required(&self, method: &str, tab_id: &str) -> Result<BrowserTab>;
     async fn require_browser_workspace(&self, workspace: &WorkspaceId) -> Result<()>;
@@ -75,15 +76,43 @@ pub(crate) trait BrowserTabRoutingExt {
 }
 
 impl BrowserTabRoutingExt for Services {
-    /// Where a request about one registered tab goes (REV-2 Model 3 & 5): a
-    /// claimed tab lives on its workspace's driving client, an unclaimed one
-    /// on its physical host.
-    async fn browser_tab_route_target(&self, tab: &BrowserTab) -> Result<ReverseTarget> {
-        if tab.owner_agent_id.is_some() {
-            self.browser_client_target(&tab.workspace_id).await
-        } else {
-            Ok(ReverseTarget::Client(tab.host_client_id.clone()))
+    async fn browser_client_navigation_only(&self, client: &ClientId) -> Result<bool> {
+        if self
+            .store()
+            .list_browser_tabs_by_host(client)
+            .await?
+            .iter()
+            .any(|tab| tab.navigation_only)
+        {
+            return Ok(true);
         }
+        let capabilities = if let Some(live) = self.feature_reverse_dispatch().and_then(|d| {
+            d.live_clients()
+                .into_iter()
+                .find(|c| &c.client_id == client)
+        }) {
+            live.capabilities
+        } else {
+            self.store()
+                .get_client(client)
+                .await?
+                .map(|c| c.capabilities)
+                .unwrap_or_default()
+        };
+        Ok(capabilities["browserNavigation"] == true && capabilities["browserExec"] != true)
+    }
+
+    /// Existing-tab navigation stays on its physical host. Preserve pin
+    /// diagnostics when the desktop assignment agrees with that host.
+    async fn browser_tab_route_target(&self, tab: &BrowserTab) -> Result<ReverseTarget> {
+        if tab.owner_agent_id.is_some() && !tab.navigation_only {
+            let target = self.driving_client_target(&tab.workspace_id).await?;
+            if matches!(&target, ReverseTarget::Client(id) | ReverseTarget::Pinned(id) if id == &tab.host_client_id)
+            {
+                return Ok(target);
+            }
+        }
+        Ok(ReverseTarget::Client(tab.host_client_id.clone()))
     }
 
     /// The open registry row for `tab_id`, or the `-32602` the tab-addressed
@@ -245,9 +274,19 @@ impl BrowserTabRoutingExt for Services {
         let Some(current) = self.store().get_browser_tab(tab_id).await? else {
             return Ok(());
         };
+        if current.navigation_only {
+            return Err(Error::InvalidParams(
+                "native browser tabs cannot be claimed for automation".into(),
+            ));
+        }
         let new_host = self
             .claim_commit_host(&current.workspace_id, executed_on)
             .await?;
+        if self.browser_client_navigation_only(&new_host).await? {
+            return Err(Error::InvalidParams(
+                "native browser clients cannot host automation tabs".into(),
+            ));
+        }
         if let Some((tab, changes)) = self
             .store()
             .reassign_browser_tab_host(tab_id, &new_host, agent_id)
@@ -297,6 +336,9 @@ impl BrowserTabRoutingExt for Services {
         new_host: &ClientId,
     ) -> Result<()> {
         let _gate = self.feature_browser_tab_gate().lock().await;
+        if self.browser_client_navigation_only(new_host).await? {
+            return Ok(());
+        }
         let moved = self
             .store()
             .reassign_claimed_browser_tabs(workspace_id, new_host)
@@ -455,6 +497,9 @@ impl BrowserTabRoutingExt for Services {
 fn registry_tab_entry(tab: &BrowserTab, presence: &HashMap<ClientId, Option<String>>) -> Value {
     let mut entry = serde_json::Map::new();
     entry.insert("tabId".into(), tab.tab_id.clone().into());
+    if tab.navigation_only {
+        entry.insert("navigationOnly".into(), true.into());
+    }
     entry.insert("workspaceId".into(), tab.workspace_id.0.clone().into());
     entry.insert("url".into(), tab.url.clone().into());
     if let Some(requested) = &tab.requested_url {
@@ -513,7 +558,12 @@ impl BrowserTabOpsExt for Services {
     /// the field-wise `changes` when something differed, nothing otherwise.
     /// A report naming another `workspaceId` for a known tab is rejected by
     /// the store (`-32602`): tabs do not move between workspaces.
-    async fn browser_tab_upsert(&self, host: ClientId, tab: BrowserTabInput) -> Result<BrowserTab> {
+    async fn browser_tab_upsert(
+        &self,
+        host: ClientId,
+        mut tab: BrowserTabInput,
+    ) -> Result<BrowserTab> {
+        tab.navigation_only |= self.browser_client_navigation_only(&host).await?;
         self.require_browser_workspace(&tab.workspace_id).await?;
         let _mutation = self
             .feature_workspace_mutations()
@@ -578,8 +628,13 @@ impl BrowserTabOpsExt for Services {
     async fn browser_tabs_sync(
         &self,
         host: ClientId,
-        tabs: Vec<BrowserTabInput>,
+        mut tabs: Vec<BrowserTabInput>,
     ) -> Result<Vec<String>> {
+        if self.browser_client_navigation_only(&host).await? {
+            for tab in &mut tabs {
+                tab.navigation_only = true;
+            }
+        }
         for tab in &tabs {
             self.require_browser_workspace(&tab.workspace_id).await?;
         }
@@ -671,3 +726,16 @@ mod browser_routing_fixture_tests;
 
 #[cfg(test)]
 mod browser_clients_tests;
+
+/// Refuse an entire batch before any client sees it, preserving request arity.
+pub(crate) fn navigation_failure(actions: &[Value], code: &str, message: &str) -> Value {
+    let failure = json!({"action": actions[0]["action"], "success": false, "errorCode": code, "error": message});
+    if actions.len() == 1 {
+        failure
+    } else {
+        json!({"success": false, "results": [failure], "error": message})
+    }
+}
+
+#[cfg(test)]
+mod native_navigation_tests;

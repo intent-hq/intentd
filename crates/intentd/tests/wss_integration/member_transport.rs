@@ -1133,6 +1133,7 @@ async fn member_transport_browser_reports_keep_bound_identity_and_chief_private(
     let mut owner = connect_ws(srv.port, srv.cfg.clone()).await;
     hello_browser_host(&mut owner, owner_host.as_str()).await;
     let private_tab = intent_core::BrowserTabInput {
+        navigation_only: false,
         tab_id: "chief-tab".into(),
         workspace_id: WorkspaceId::chief(),
         url: "https://private.invalid".into(),

@@ -83,6 +83,7 @@ async fn fixture() -> Fixture {
 
 fn input(ws: &WorkspaceId, tab_id: &str, url: &str) -> BrowserTabInput {
     BrowserTabInput {
+        navigation_only: false,
         tab_id: tab_id.to_string(),
         workspace_id: ws.clone(),
         url: url.to_string(),
@@ -988,4 +989,51 @@ async fn reassign_browser_tabs_from_hosts_decides_while_holding_the_write_connec
         b.host_client_id, f.host_b,
         "a rejected host is never written"
     );
+}
+
+#[tokio::test]
+async fn native_navigation_marker_survives_reports_reopen_and_migrations() {
+    let f = fixture().await;
+    let mut native = input(&f.ws, "native", "https://native.test");
+    native.navigation_only = true;
+    native.owner_agent_id = Some(AgentId::from("agent"));
+    f.store
+        .upsert_browser_tab(&f.host_a, native.clone())
+        .await
+        .unwrap();
+    native.navigation_only = false;
+    native.url = "https://updated.test".into();
+    assert!(
+        f.store
+            .upsert_browser_tab(&f.host_a, native.clone())
+            .await
+            .unwrap()
+            .tab()
+            .navigation_only
+    );
+    f.store
+        .sync_browser_tabs(&f.host_a, vec![native])
+        .await
+        .unwrap();
+    let reopened = Store::open(&f.tmp.path).await.unwrap();
+    let saved = reopened.get_browser_tab("native").await.unwrap().unwrap();
+    assert!(saved.navigation_only);
+    assert_eq!(saved.host_client_id, f.host_a);
+    assert!(reopened
+        .reassign_claimed_browser_tabs(&f.ws, &f.host_b)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(reopened
+        .reassign_browser_tab_host("native", &f.host_b, None)
+        .await
+        .is_err());
+    assert!(reopened
+        .reassign_browser_tabs_from_hosts(&f.host_b, std::slice::from_ref(&f.host_a), &|_| true)
+        .await
+        .unwrap()
+        .is_empty());
+    let saved = reopened.get_browser_tab("native").await.unwrap().unwrap();
+    assert_eq!(saved.host_client_id, f.host_a);
+    assert_eq!(saved.owner_agent_id, Some(AgentId::from("agent")));
 }

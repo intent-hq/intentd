@@ -7029,6 +7029,9 @@ pub struct BrowserTabSize {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserTab {
+    /// Native navigation only; once set, this tab never migrates or gains automation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub navigation_only: bool,
     pub tab_id: String,
     pub workspace_id: WorkspaceId,
     pub host_client_id: ClientId,
@@ -7062,6 +7065,9 @@ impl BrowserTab {
         input: &BrowserTabInput,
     ) -> serde_json::Map<String, serde_json::Value> {
         let mut changes = serde_json::Map::new();
+        if input.navigation_only && !self.navigation_only {
+            changes.insert("navigationOnly".into(), true.into());
+        }
         if self.workspace_id != input.workspace_id {
             changes.insert(
                 "workspaceId".to_string(),
@@ -7117,6 +7123,7 @@ impl BrowserTab {
     /// daemon-owned host / timestamps untouched.
     pub fn apply_input(&mut self, input: BrowserTabInput) {
         let BrowserTabInput {
+            navigation_only,
             tab_id: _,
             workspace_id,
             url,
@@ -7128,6 +7135,7 @@ impl BrowserTab {
             emulated_size,
             displayed,
         } = input;
+        self.navigation_only |= navigation_only;
         self.workspace_id = workspace_id;
         self.url = url;
         self.requested_url = requested_url;
@@ -7147,6 +7155,9 @@ impl BrowserTab {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserTabInput {
+    /// Native navigation only; once set, this tab never migrates or gains automation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub navigation_only: bool,
     pub tab_id: String,
     pub workspace_id: WorkspaceId,
     pub url: String,
