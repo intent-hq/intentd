@@ -55,7 +55,7 @@ intent-pty = { path = "../intent-pty", version = "0.11.211" }
 intent-js = { path = "../intent-js", version = "0.11.211", optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
-sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.40.1", default-features = false, features = ["system", "disk"] }
 # The executor names a deep data dir's git socket by a hash.
 sha2 = "0.11"
 
