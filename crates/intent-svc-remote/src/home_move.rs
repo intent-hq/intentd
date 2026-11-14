@@ -85,7 +85,11 @@ fn parse_target(params: &Value) -> Result<Target> {
 }
 
 /// The new home `target` names, with a fresh `homeId`.
-async fn resolve(svc: &Services, workspace_id: &WorkspaceId, target: Target) -> Result<WorkspaceHome> {
+async fn resolve(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    target: Target,
+) -> Result<WorkspaceHome> {
     let node_id = match target {
         Target::Machine(node_id) => node_id,
         Target::Agent(agent_id) => {
@@ -94,7 +98,9 @@ async fn resolve(svc: &Services, workspace_id: &WorkspaceId, target: Target) -> 
                 .get_remote_agent(&agent_id)
                 .await?
                 .filter(|record| &record.workspace_id == workspace_id)
-                .ok_or_else(|| target_unavailable("that agent is not on a machine of this workspace"))?;
+                .ok_or_else(|| {
+                    target_unavailable("that agent is not on a machine of this workspace")
+                })?;
             record.node_id
         }
         // Cloud homes do not open yet: a sandbox cannot hold one.
@@ -128,8 +134,7 @@ pub(crate) async fn set_home(
         .get_workspace_home(workspace_id)
         .await?
         .ok_or_else(|| Error::InvalidParams("the workspace has no home".into()))?;
-    if home.state == HomeState::Moving || svc.store().get_home_move(workspace_id).await?.is_some()
-    {
+    if home.state == HomeState::Moving || svc.store().get_home_move(workspace_id).await?.is_some() {
         return Err(home_moving());
     }
     let target = resolve(svc, workspace_id, target).await?;

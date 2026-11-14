@@ -13,9 +13,8 @@ use intent_core::machines::{
 };
 use intent_core::node_link::{
     HomeOpen, HomeOpenOutcome, HomeOpenReply, HomePushReply, HomeRestore, HomeStopAck,
-    HomeStopOutcome,
-    HomeStopReason, HomeStopRecord, JournalBody, JournalRecord, LinkFrame, PreparedCheckout,
-    RecordOwner, HOMES_PROTOCOL,
+    HomeStopOutcome, HomeStopReason, HomeStopRecord, JournalBody, JournalRecord, LinkFrame,
+    PreparedCheckout, RecordOwner, HOMES_PROTOCOL,
 };
 use intent_core::placement::{AgentPlacement, PlacementUnavailable, PlacementUnavailableReason};
 use intent_core::remote_launch::RemotePlacementView;

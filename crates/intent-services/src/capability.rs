@@ -1080,7 +1080,10 @@ mod tests {
         let to = serde_json::json!({ "to": { "kind": "machine", "nodeId": "n-1" } });
         for role in ROLES {
             let result = f
-                .run(role, f.services.set_workspace_home_op(f.ws.clone(), to.clone()))
+                .run(
+                    role,
+                    f.services.set_workspace_home_op(f.ws.clone(), to.clone()),
+                )
                 .await;
             match role {
                 Role::Collaborator => {

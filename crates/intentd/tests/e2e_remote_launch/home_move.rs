@@ -37,7 +37,10 @@ fn refusal(response: &Value) -> (i64, String) {
     assert!(error.is_object(), "expected an error: {response}");
     (
         error["code"].as_i64().unwrap(),
-        error["data"]["code"].as_str().unwrap_or_default().to_owned(),
+        error["data"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
     )
 }
 
@@ -78,7 +81,13 @@ async fn two_machines(prefix: &str) -> Option<TwoMachines> {
     let a_dir = scratch.path().join("node-a");
     std::fs::create_dir_all(&a_dir).unwrap();
     let a = start_machine_with(&a_dir, &backend_id, &[HOMES]).await;
-    ok(&mut rpc_ws, 3, "remoteMachines.add", add_params(&a, "Machine A")).await;
+    ok(
+        &mut rpc_ws,
+        3,
+        "remoteMachines.add",
+        add_params(&a, "Machine A"),
+    )
+    .await;
     let deadline = tokio::time::Instant::now() + wait();
     let mut id = 10;
     let created = loop {
@@ -114,7 +123,13 @@ async fn two_machines(prefix: &str) -> Option<TwoMachines> {
     std::fs::create_dir_all(&b_dir).unwrap();
     let b = start_machine_with(&b_dir, &backend_id, &[HOMES]).await;
     id += 1;
-    ok(&mut rpc_ws, id, "remoteMachines.add", add_params(&b, "Machine B")).await;
+    ok(
+        &mut rpc_ws,
+        id,
+        "remoteMachines.add",
+        add_params(&b, "Machine B"),
+    )
+    .await;
     Some(TwoMachines {
         scratch,
         head_dir,
@@ -224,12 +239,16 @@ async fn moving_the_home_carries_its_work_to_another_machine_and_stops_the_old_o
     // A is frozen: the move waits on its last backup.
     s.a.daemon.child_mut().signal(Signal::SIGSTOP).unwrap();
     let b_id = s.b.daemon_id.clone();
-    let started = s.set_home(json!({ "kind": "machine", "nodeId": b_id })).await;
+    let started = s
+        .set_home(json!({ "kind": "machine", "nodeId": b_id }))
+        .await;
     assert!(started.get("error").is_none(), "{started}");
     let moving = &started["result"]["home"];
     assert_eq!(moving["state"], "moving", "{started}");
     assert_eq!(moving["homeId"], json!(s.home_id));
-    let again = s.set_home(json!({ "kind": "machine", "nodeId": b_id })).await;
+    let again = s
+        .set_home(json!({ "kind": "machine", "nodeId": b_id }))
+        .await;
     assert_eq!(refusal(&again), (-32602, "home-moving".into()));
     let id = s.id();
     let ws_id = s.ws_id.clone();
@@ -241,7 +260,11 @@ async fn moving_the_home_carries_its_work_to_another_machine_and_stops_the_old_o
     )
     .await;
     assert_eq!(refusal(&terminal), (-32603, "home-unavailable".into()));
-    assert_eq!(terminal["error"]["data"]["moving"], json!(true), "{terminal}");
+    assert_eq!(
+        terminal["error"]["data"]["moving"],
+        json!(true),
+        "{terminal}"
+    );
     s.a.daemon.child_mut().signal(Signal::SIGCONT).unwrap();
 
     let old_home = s.home_id.clone();
@@ -338,7 +361,9 @@ async fn a_move_whose_new_home_cannot_open_rolls_back() {
     std::fs::set_permissions(&homes, std::fs::Permissions::from_mode(0o500)).unwrap();
     let before = s.home().await;
     let b_id = s.b.daemon_id.clone();
-    let started = s.set_home(json!({ "kind": "machine", "nodeId": b_id })).await;
+    let started = s
+        .set_home(json!({ "kind": "machine", "nodeId": b_id }))
+        .await;
     assert!(started.get("error").is_none(), "{started}");
     let home = s
         .home_until("the move rolls back", |home| home["state"] != "moving")
@@ -381,7 +406,9 @@ async fn an_orchestrator_restart_mid_move_completes_the_move() {
     // The move stops at its first step: A is frozen.
     s.a.daemon.child_mut().signal(Signal::SIGSTOP).unwrap();
     let b_id = s.b.daemon_id.clone();
-    let started = s.set_home(json!({ "kind": "machine", "nodeId": b_id })).await;
+    let started = s
+        .set_home(json!({ "kind": "machine", "nodeId": b_id }))
+        .await;
     assert_eq!(started["result"]["home"]["state"], "moving", "{started}");
     let TwoMachines {
         scratch,
