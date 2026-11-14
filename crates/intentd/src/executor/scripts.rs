@@ -122,6 +122,10 @@ pub(super) struct ScriptProcesses {
     /// Set by [`Self::stop_all`]: the machine is shutting down, so no new
     /// process starts.
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Starts waiting for their checkout (a home being reopened), each
+    /// `true` once a `scriptStop` for it came: the start then answers that
+    /// stop instead of spawning.
+    pending: Arc<Mutex<HashMap<Key, bool>>>,
 }
 
 /// Removes a kill's entry from [`ScriptProcesses::kills`] when its task
@@ -190,7 +194,17 @@ impl ScriptProcesses {
             running: Arc::default(),
             kills: Arc::default(),
             shutting_down: Arc::default(),
+            pending: Arc::default(),
         }
+    }
+
+    /// Hold `command`'s start while its checkout is looked up off the
+    /// link's frame gate: a `scriptStop` meanwhile cancels it.
+    pub(super) fn reserve(&self, command: &ScriptStartCommand) {
+        lock(&self.pending).insert(
+            key(&command.owner, &command.script_id, &command.spawn_id),
+            false,
+        );
     }
 
     /// Start one process for `command` in `checkout` (its owner's checkout:
@@ -207,6 +221,12 @@ impl ScriptProcesses {
         let key = key(&command.owner, &command.script_id, &command.spawn_id);
         let refuse =
             |code: &str, detail: &str| exited(&key, None, Some(format!("{code}: {detail}")));
+        if lock(&self.pending).remove(&key) == Some(true) {
+            let _ = link
+                .send(&refuse(NOT_RUNNING, "stopped before it started"))
+                .await;
+            return;
+        }
         if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = link
                 .send(&refuse(START_FAILED, "the machine is shutting down"))
@@ -348,6 +368,11 @@ impl ScriptProcesses {
     /// `node-script-not-running` and stops nothing.
     pub(super) fn stop(&self, link: &NodeLink, process: &ScriptProcessRef) {
         let key = key(&process.owner, &process.script_id, &process.spawn_id);
+        // A start still waiting for its checkout answers this stop itself.
+        if let Some(cancelled) = lock(&self.pending).get_mut(&key) {
+            *cancelled = true;
+            return;
+        }
         let found = lock(&self.running)
             .get(&key)
             .map(|p| (p.pty_id, p.generation));

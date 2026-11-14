@@ -382,6 +382,12 @@ impl Runner {
         });
     }
 
+    /// Whether [`Self::home_run_checkout`] answers without reopening a
+    /// home (which can wait on another home's open).
+    pub(super) fn home_run_checkout_now(&self, home: &HomeRef) -> bool {
+        !self.leased_unopened(home)
+    }
+
     /// The home checkout a home run of `home` runs in: the open home (a
     /// leased one not reopened yet after a restart is reopened first);
     /// `None` when this machine does not hold it. A run does not wait for

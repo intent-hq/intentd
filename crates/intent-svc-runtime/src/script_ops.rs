@@ -2196,6 +2196,7 @@ impl ScriptManager {
             )
         };
         if let Some(pty_id) = pty_id {
+            self.stop_home_run(workspace_id, pty_id).await;
             self.pty.kill(pty_id).await;
         }
         if let Some(handle) = handle {
@@ -2719,20 +2720,22 @@ impl ScriptManager {
         generation: u64,
         mut restoring: bool,
     ) {
-        let target = match self.resolve_target(&ws, &def).await {
-            Ok(target) => target,
-            Err(e) => {
-                self.fail(&ws, &script_id, generation, &e.to_string(), restoring)
-                    .await;
-                return;
-            }
-        };
         let detect = def.mode == ScriptMode::Service;
         let mut prev: Option<PtyId> = None;
         loop {
             if let Some(old) = prev.take() {
                 self.pty.kill(old).await;
             }
+            // Per attempt: the workspace's home may have come or gone since
+            // the last process (nodeProtocol 19).
+            let target = match self.resolve_target(&ws, &def).await {
+                Ok(target) => target,
+                Err(e) => {
+                    self.fail(&ws, &script_id, generation, &e.to_string(), restoring)
+                        .await;
+                    return;
+                }
+            };
             let pty_id = match self
                 .spawn_monitored(
                     &ws,

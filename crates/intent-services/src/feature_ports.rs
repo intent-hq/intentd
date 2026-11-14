@@ -1547,6 +1547,21 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         Box::pin(async { Ok(None) })
     }
 
+    /// Stop the home run of PTY `id` (from [`Self::open_home_script`]) and
+    /// wait up to `wait` for its machine to report the end. `false` when it
+    /// did not end in time or is not a home run; the default.
+    fn stop_home_script<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        pty: &'a Arc<intent_pty::PtyHost>,
+        id: intent_pty::PtyId,
+        wait: std::time::Duration,
+    ) -> BoxFuture<'a, bool> {
+        let _ = (svc, workspace_id, pty, id, wait);
+        Box::pin(async { false })
+    }
+
     /// Open the workspace's recorded home on its machine (`homeOpen`): its
     /// `home/head` is written first when the hub has none. Answers once the
     /// machine replied; a no-op by default.

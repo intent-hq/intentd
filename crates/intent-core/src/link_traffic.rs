@@ -625,8 +625,6 @@ fn masked_copy(frame: &LinkFrame) -> LinkFrame {
     }
 }
 
-/// The parts of `frame` a record shows without its payload: the type, the
-/// ids and the fields [`summarize`] reads, never a prompt, params body,
 /// `light` with the owner a script or setup frame names: `agentId`, or a
 /// home's `workspaceId` and `homeId`.
 fn with_owner(owner: &crate::node_link::CheckoutOwner, mut light: Value) -> Value {
@@ -642,6 +640,8 @@ fn with_owner(owner: &crate::node_link::CheckoutOwner, mut light: Value) -> Valu
     light
 }
 
+/// The parts of `frame` a record shows without its payload: the type, the
+/// ids and the fields [`summarize`] reads, never a prompt, params body,
 /// result, journal body or launch configuration.
 fn light_frame(frame: &LinkFrame) -> Value {
     let agent = |id: &crate::AgentId| json!(clip(id.as_str(), FIELD_BYTES));

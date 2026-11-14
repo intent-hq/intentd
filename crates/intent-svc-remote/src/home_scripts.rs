@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use intent_core::node_link::{
     CheckoutOwner, HomeRef, LinkFrame, ScriptEnvVar, ScriptExited, ScriptOutput, ScriptProcessRef,
@@ -39,6 +40,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Default)]
 pub(crate) struct HomeScripts {
     runs: Mutex<HashMap<String, Run>>,
+    /// The homes whose `autoStart` scripts were started by this process.
+    auto_started: Mutex<std::collections::HashSet<intent_core::HomeId>>,
 }
 
 struct Run {
@@ -50,12 +53,29 @@ struct Run {
     next_seq: u64,
     /// The home's name, for a start failure or loss shown in the output.
     home_name: String,
+    /// The run's `scriptStop`, and the queue it goes out on (after its
+    /// `scriptStart`).
+    stop: ScriptProcessRef,
+    frames: mpsc::UnboundedSender<LinkFrame>,
+    /// Set once its `scriptStop` was sent: no second one goes out.
+    stopping: bool,
+    /// Turns `true` when the run ended (its `scriptExited`, or a loss).
+    done: tokio::sync::watch::Sender<bool>,
 }
 
 impl Run {
+    /// Send the run's `scriptStop`, once.
+    fn send_stop(&mut self) {
+        if !self.stopping {
+            self.stopping = true;
+            let _ = self.frames.send(LinkFrame::ScriptStop(self.stop.clone()));
+        }
+    }
+
     /// End the PTY: `exit_code`; or, with `error`, without one, `error`
     /// shown as the run's last output line and kept as why it ended.
     fn end(&self, exit_code: Option<i32>, error: Option<&str>) {
+        self.done.send_replace(true);
         let Some(error) = error else {
             let _ = self.pty.remote_exited(self.id, exit_code);
             return;
@@ -86,6 +106,12 @@ impl Drop for HomeScripts {
 }
 
 impl HomeScripts {
+    /// Whether `home_id`'s `autoStart` scripts are due: `true` the first
+    /// time only.
+    pub(crate) fn first_auto_start(&self, home_id: &intent_core::HomeId) -> bool {
+        lock(&self.auto_started).insert(home_id.clone())
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         lock(&self.runs).is_empty()
     }
@@ -145,6 +171,28 @@ impl HomeScripts {
         run.end(frame.exit_code, error);
     }
 
+    /// Stop the run of PTY `id` in `pty` and wait, up to `wait`, for the
+    /// machine to report its end, as a machine run's stop does: a restart
+    /// then never starts the next process while the last one still holds
+    /// its resources. `false` when it did not end in time (or is not a home
+    /// run of this machine); the caller's release of the PTY then drops it.
+    pub(crate) async fn stop(&self, pty: &Arc<PtyHost>, id: PtyId, wait: Duration) -> bool {
+        let mut done = {
+            let mut runs = lock(&self.runs);
+            let Some(run) = runs
+                .values_mut()
+                .find(|run| run.id == id && Arc::ptr_eq(&run.pty, pty))
+            else {
+                return false;
+            };
+            run.send_stop();
+            run.done.subscribe()
+        };
+        tokio::time::timeout(wait, done.wait_for(|done| *done))
+            .await
+            .is_ok_and(|ended| ended.is_ok())
+    }
+
     /// The link closed: every home run on it is lost (the machine ends the
     /// binding's processes as its link closes).
     pub(crate) fn link_lost(&self, reason: &str) {
@@ -162,8 +210,7 @@ fn owns(run: &Run, owner: &CheckoutOwner, script_id: &str) -> bool {
 /// Stops one home run: the PTY's kill. A home run takes no input.
 struct LinkRun {
     shared: Weak<Shared>,
-    stop: ScriptProcessRef,
-    frames: mpsc::UnboundedSender<LinkFrame>,
+    spawn_id: String,
 }
 
 impl RemotePty for LinkRun {
@@ -177,11 +224,16 @@ impl RemotePty for LinkRun {
 
     fn kill(&self) {
         // The run ends here at once (its PTY is released); the machine's
-        // `scriptExited` for it is dropped.
-        if let Some(shared) = self.shared.upgrade() {
-            lock(&shared.home_scripts.runs).remove(&self.stop.spawn_id);
+        // `scriptExited` for it is dropped. A run that already ended, or
+        // whose stop already went out, sends none.
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let held = lock(&shared.home_scripts.runs).remove(&self.spawn_id);
+        if let Some(mut run) = held {
+            run.send_stop();
+            run.done.send_replace(true);
         }
-        let _ = self.frames.send(LinkFrame::ScriptStop(self.stop.clone()));
     }
 }
 
@@ -191,8 +243,9 @@ impl RemotePty for LinkRun {
 ///
 /// # Errors
 ///
-/// `home-unavailable` when the home's machine cannot be reached or does
-/// not speak nodeProtocol 19.
+/// `home-unavailable` when the home's machine is not linked now (the
+/// caller dials it first, outside its locks) or does not speak
+/// nodeProtocol 19.
 pub(crate) async fn open(
     svc: &Services,
     workspace_id: &WorkspaceId,
@@ -215,9 +268,7 @@ pub(crate) async fn open(
         .node(svc, &node_id)
         .await
         .map_err(|error| home_unavailable(&home, &error.to_string()))?;
-    node.connect()
-        .await
-        .map_err(|error| home_unavailable(&home, &error.to_string()))?;
+    // No dial here: the caller may hold a lock other scripts wait on.
     let shared = node.shared_ref();
     if shared.protocol() < HOMES_PROTOCOL {
         return Err(home_unavailable(
@@ -237,12 +288,7 @@ pub(crate) async fn open(
     let (frames, mut queued) = mpsc::unbounded_channel::<LinkFrame>();
     let io = Arc::new(LinkRun {
         shared: shared.weak(),
-        stop: ScriptProcessRef {
-            owner: owner.clone(),
-            script_id: open.script_id.clone(),
-            spawn_id: spawn_id.clone(),
-        },
-        frames: frames.clone(),
+        spawn_id: spawn_id.clone(),
     });
     let mut spec = RemoteSpec::new(workspace_id.as_str());
     spec.listed = false;
@@ -258,6 +304,14 @@ pub(crate) async fn open(
             script_id: open.script_id.clone(),
             next_seq: 0,
             home_name: home.name.clone(),
+            stop: ScriptProcessRef {
+                owner: owner.clone(),
+                script_id: open.script_id.clone(),
+                spawn_id: spawn_id.clone(),
+            },
+            frames: frames.clone(),
+            stopping: false,
+            done: tokio::sync::watch::channel(false).0,
         },
     );
     // `scriptStart` goes first on the run's own queue, so its stop never
@@ -276,6 +330,8 @@ pub(crate) async fn open(
             .collect(),
     }));
     let forwarder = shared.weak();
+    let binding = link.binding().clone();
+    drop(link);
     // caller-binding: allow — sends one home run's start and stop in order on the link it started on
     tokio::spawn(async move {
         while let Some(frame) = queued.recv().await {
@@ -285,8 +341,7 @@ pub(crate) async fn open(
             // Only on the binding the run started on: the machine ended the
             // run with that link, so a later link has nothing to stop.
             match shared.current_link() {
-                Some(current) if current.binding() == link.binding() => {
-                    let link = current;
+                Some(link) if link.binding() == &binding => {
                     if link.send(&frame).await.is_err() {
                         lose(&shared, &spawn_id);
                         return;
@@ -301,6 +356,31 @@ pub(crate) async fn open(
     });
     shared.wake();
     Ok(Some(id))
+}
+
+/// See [`intent_services::feature_api::feature_ports::RemoteLaunchPort::stop_home_script`].
+pub(crate) async fn stop(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    pty: &Arc<PtyHost>,
+    id: PtyId,
+    wait: Duration,
+) -> bool {
+    let Ok(Some(node_id)) = svc
+        .store()
+        .get_workspace_home(workspace_id)
+        .await
+        .map(|home| home.and_then(|home| home.node_id))
+    else {
+        return false;
+    };
+    let Some(feature) = svc.remote_feature() else {
+        return false;
+    };
+    let Ok(node) = feature.node(svc, &node_id).await else {
+        return false;
+    };
+    node.shared_ref().home_scripts.stop(pty, id, wait).await
 }
 
 /// The run's frame could not reach the machine: it is lost.
@@ -336,6 +416,13 @@ mod tests {
 
     /// One held run of script `s1`, spawn `p1`, on [`home`].
     fn held(pty: &Arc<PtyHost>) -> (HomeScripts, PtyId) {
+        held_with(pty, mpsc::unbounded_channel().0)
+    }
+
+    fn held_with(
+        pty: &Arc<PtyHost>,
+        frames: mpsc::UnboundedSender<LinkFrame>,
+    ) -> (HomeScripts, PtyId) {
         let mut spec = RemoteSpec::new("ws-1");
         spec.listed = false;
         let id = pty.spawn_remote(spec, Arc::new(Quiet)).unwrap();
@@ -349,6 +436,14 @@ mod tests {
                 script_id: "s1".into(),
                 next_seq: 0,
                 home_name: "Machine A".into(),
+                stop: ScriptProcessRef {
+                    owner: CheckoutOwner::Home(home()),
+                    script_id: "s1".into(),
+                    spawn_id: "p1".into(),
+                },
+                frames,
+                stopping: false,
+                done: tokio::sync::watch::channel(false).0,
             },
         );
         (scripts, id)
@@ -439,5 +534,36 @@ mod tests {
             Some(LOST_DISCONNECTED)
         );
         assert!(text(&pty, id).contains("Machine A"));
+    }
+
+    /// A stop sends one `scriptStop` and waits for the run's own exit; a
+    /// second stop sends nothing more.
+    #[tokio::test]
+    async fn a_stop_waits_for_the_machine_and_is_sent_once() {
+        let pty = Arc::new(PtyHost::new());
+        let (frames, mut sent) = mpsc::unbounded_channel();
+        let (scripts, id) = held_with(&pty, frames);
+        let scripts = Arc::new(scripts);
+        let stopping = {
+            let scripts = scripts.clone();
+            let pty = pty.clone();
+            tokio::spawn(async move { scripts.stop(&pty, id, Duration::from_secs(30)).await })
+        };
+        let frame = sent.recv().await.unwrap();
+        assert!(matches!(&frame, LinkFrame::ScriptStop(stop) if stop.spawn_id == "p1"));
+        assert!(!stopping.is_finished(), "the stop waits for the machine");
+        scripts.frame(exited(Some(143), None));
+        assert!(stopping.await.unwrap());
+        assert_eq!(pty.try_exit(id).unwrap().unwrap().exit_code, 143);
+        assert!(!scripts.stop(&pty, id, Duration::from_millis(10)).await);
+        assert!(sent.try_recv().is_err());
+    }
+
+    /// A stop the machine never confirms gives up after its wait.
+    #[tokio::test]
+    async fn an_unconfirmed_stop_gives_up() {
+        let pty = Arc::new(PtyHost::new());
+        let (scripts, id) = held(&pty);
+        assert!(!scripts.stop(&pty, id, Duration::from_millis(20)).await);
     }
 }

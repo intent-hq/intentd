@@ -464,7 +464,13 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
         // A new home checkout finished its setup (nodeProtocol 19 journals
         // it once per checkout): its `autoStart` scripts start now, not when
         // a later `homeOpen` answers `ready` for the checkout it holds.
-        JournalBody::SetupFinished { .. } => {
+        JournalBody::SetupFinished { state, .. } => {
+            // A failed setup leaves the checkout unfit to run services in;
+            // the user starts them once it is fixed.
+            if *state == intent_core::node_link::SetupState::Failed {
+                tracing::info!(home = %home_id, "remote machine: the home's setup failed; no autoStart");
+                return;
+            }
             let current = svc
                 .store()
                 .get_workspace_home(&record.workspace_id)
@@ -477,6 +483,11 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
                 });
             if !current || !svc.workspace_homes() {
                 tracing::debug!(home = %home_id, "remote machine: setup of a home that is not current; no autoStart");
+                return;
+            }
+            // Once per home in this process: a record replayed before its
+            // ack was saved does not start them again.
+            if !shared.home_scripts.first_auto_start(home_id) {
                 return;
             }
             let svc = svc.clone();

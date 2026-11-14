@@ -15,6 +15,10 @@ use intent_services::feature_api::feature_ports::HomeScriptOpen;
 
 use super::{is_safe_relative, ScriptManager, SCRIPT_SCROLLBACK_BYTES};
 
+/// How long a home run's stop waits for its machine to report the end,
+/// as a machine run's (`machine_runs::Hooks::stop_wait`).
+const HOME_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Where a run's processes run.
 #[derive(Debug, Clone)]
 pub(super) enum RunTarget {
@@ -121,6 +125,25 @@ impl ScriptManager {
                 self.home_ptys.lock().unwrap().insert(id);
                 Ok(id)
             }
+        }
+    }
+
+    /// Before `pty_id` is killed: when it is a home run, stop it on the
+    /// machine and wait (bounded) for the end, as a machine run's stop
+    /// does, so a restart never overlaps the last process.
+    pub(super) async fn stop_home_run(&self, ws: &WorkspaceId, pty_id: PtyId) {
+        if !self.home_ptys.lock().unwrap().contains(&pty_id) {
+            return;
+        }
+        let Some(svc) = &self.owner_services else {
+            return;
+        };
+        let ended = svc
+            .feature_remote_launch_port()
+            .stop_home_script(svc, ws, &self.pty, pty_id, HOME_STOP_WAIT)
+            .await;
+        if !ended {
+            tracing::warn!(workspace = %ws, "a home run's stop was not confirmed in time; releasing it");
         }
     }
 

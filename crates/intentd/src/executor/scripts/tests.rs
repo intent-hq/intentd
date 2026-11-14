@@ -619,3 +619,37 @@ async fn a_link_end_during_shutdown_does_not_wait_again() {
         .await
         .expect("the link's end waited again for a process stop_all gave up on");
 }
+
+/// A start held while its checkout is looked up (a home being reopened)
+/// is cancelled by a `scriptStop` that comes meanwhile: the one
+/// `scriptExited` answers the stop and nothing is spawned.
+#[tokio::test]
+async fn a_stop_before_a_held_start_cancels_it() {
+    let mut f = fixture().await;
+    let agent = AgentId::new();
+    let cmd = start(&agent, "p1", "echo ran > ran.txt");
+    f.scripts.reserve(&cmd);
+    f.scripts.stop(&f.link, &process(&agent, "p1"));
+    f.scripts.start(&f.link, GEN, Some(checkout(&f)), cmd).await;
+    let seen = until_exited(&mut f.head, "p1").await;
+    assert_eq!(seen.pid, None, "{seen:?}");
+    let exited = seen.exited.unwrap();
+    assert_eq!(exited.exit_code, None);
+    assert!(exited
+        .error
+        .is_some_and(|e| e.starts_with("node-script-not-running")),);
+    assert!(!f.checkout.join("ran.txt").exists());
+
+    // A held start nothing stopped runs as usual.
+    let cmd = start(&agent, "p2", "exit 0");
+    f.scripts.reserve(&cmd);
+    f.scripts.start(&f.link, GEN, Some(checkout(&f)), cmd).await;
+    assert_eq!(
+        until_exited(&mut f.head, "p2")
+            .await
+            .exited
+            .unwrap()
+            .exit_code,
+        Some(0)
+    );
+}

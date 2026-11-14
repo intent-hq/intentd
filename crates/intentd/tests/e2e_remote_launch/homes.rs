@@ -372,8 +372,18 @@ fn script_row<'a>(list: &'a Value, name: &str) -> Option<&'a Value> {
         .find(|row| row["name"] == name)
 }
 
-/// Whether process `pid` is gone.
+/// Whether process `pid` is gone, or a zombie its parent has yet to reap
+/// (it holds nothing then: no ports, no files).
 fn process_gone(pid: &str) -> bool {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The state follows the parenthesised command name.
+        return stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
+    }
+    if std::path::Path::new("/proc/self/stat").exists() {
+        return true;
+    }
     !std::process::Command::new("kill")
         .args(["-0", pid])
         .status()
@@ -545,12 +555,35 @@ async fn home_runs_and_autostart_run_in_the_home_checkout() {
     assert_eq!(status["status"], "exited", "{status}");
     assert_eq!(status["exitCode"], 3, "{status}");
 
-    // Stopping the service from the app ends its process on the machine.
-    let pid = std::fs::read_to_string(work.join("auto.pid"))
+    // A restart from the app waits for the machine to end the old process
+    // before it starts the next one.
+    let old = std::fs::read_to_string(work.join("auto.pid"))
         .unwrap()
         .trim()
         .to_owned();
-    assert!(!process_gone(&pid), "the autoStart service runs");
+    assert!(!process_gone(&old), "the autoStart service runs");
+    id += 1;
+    ok(
+        &mut rpc_ws,
+        id,
+        "script.restart",
+        json!({ "workspaceId": ws_id, "scriptId": auto_id }),
+    )
+    .await;
+    assert!(
+        process_gone(&old),
+        "the old process ended before the restart replied"
+    );
+    let pid = until("the restarted service runs", || {
+        std::fs::read_to_string(work.join("auto.pid"))
+            .ok()
+            .map(|pid| pid.trim().to_owned())
+            .filter(|pid| !pid.is_empty() && pid != &old)
+    })
+    .await;
+
+    // Stopping the service from the app ends its process on the machine.
+    assert!(!process_gone(&pid), "the restarted service runs");
     id += 1;
     ok(
         &mut rpc_ws,
