@@ -1596,6 +1596,8 @@ that renders Mermaid diagrams. For files in the main workspace checkout, relativ
 outside the workspace; files from other registered repositories do not resolve them.
 Use the diagram's **View source** action to inspect
 its code, or turn off **Markdown preview** in the panel menu to edit the file's source.
+Mermaid flowcharts keep the authored direction and reserve space for connector
+labels and return arrows. Wide diagrams scroll horizontally to keep text readable.
 Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
 to save the original file on your computer, including from a remote workspace.
