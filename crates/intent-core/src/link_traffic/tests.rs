@@ -1086,3 +1086,30 @@ async fn home_call_payloads_stay_out_of_light_captures_and_exec_secrets_are_mask
         }
     }
 }
+
+/// A home's events (nodeProtocol 19) enter the light capture as a count,
+/// never with their paths.
+#[tokio::test]
+async fn home_events_stay_out_of_light_captures() {
+    use crate::node_link::{HomeEvent, HomeEvents};
+    let (traffic, _) = traffic(limits(10, 1 << 16, 1 << 16));
+    traffic.start(false);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    tap.observe(
+        TrafficDirection::In,
+        &LinkFrame::HomeEvents(HomeEvents {
+            workspace_id: crate::WorkspaceId::from("ws-1"),
+            home_id: crate::HomeId::from("h1"),
+            events: vec![HomeEvent {
+                event_type: "file:created".into(),
+                data: json!({ "path": "canary-path.txt" }),
+            }],
+        }),
+        10,
+    );
+    settle(&traffic, 1).await;
+    let records = traffic.snapshot(None, None)["records"].clone();
+    let text = records.to_string();
+    assert!(!text.contains("canary"), "{text}");
+    assert_eq!(records[0]["frameType"], "homeEvents", "{text}");
+}

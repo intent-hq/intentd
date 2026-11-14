@@ -7,6 +7,7 @@ pub mod bus;
 pub mod filter;
 pub(crate) mod git_metadata_watcher;
 pub mod git_status_refresher;
+pub mod home_watch;
 pub(crate) mod linked_watch;
 pub mod monitor_delivery;
 pub mod registry;
@@ -23,6 +24,7 @@ pub(crate) use filter::{
     DEFAULT_BATCH_WINDOW,
 };
 pub use git_status_refresher::GitStatusRefresher;
+pub use home_watch::{HomeWatch, HomeWatches};
 pub use registry::WatcherRegistry;
 pub use shared_watch::{SharedWatchHub, WatchHealth, WatchHealthSnapshot};
 
