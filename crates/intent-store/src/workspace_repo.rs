@@ -1318,6 +1318,9 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("read plain folder path failed: {e}")))?
             .flatten();
+            // The workspace's home ends with it (node-link.md "Home final
+            // stop"): its stop outlives the row, which cascades the home's.
+            crate::home_stop_repo::retire_workspace_home(&mut tx, id, &now_iso(), true).await?;
             let res = sqlx::query(DELETE_WORKSPACE_SQL)
                 .bind(&id.0)
                 .execute(&mut *tx)

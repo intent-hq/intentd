@@ -6,9 +6,10 @@
 
 use base64::Engine as _;
 use intent_core::node_link::{
-    HomeOpen, HomeOpenOutcome, HomePush, HomePushOutcome, HomeRef, PreparedCheckout, PtyAck,
-    PtyExited, PtyInput, PtyKill, PtyMode, PtyOpen, PtyOutput, PtyResize, PtyStream, RecordOwner,
-    SetupState, HOMES_PROTOCOL, MAX_PTY_OUTPUT_BYTES, NODE_HOME_UNKNOWN, NODE_HOME_UNSUPPORTED,
+    HomeOpen, HomeOpenOutcome, HomeOrphaned, HomePush, HomePushOutcome, HomeRef, HomeStop,
+    HomeStopAck, HomeStopOutcome, HomeStopReason, PreparedCheckout, PtyAck, PtyExited, PtyInput,
+    PtyKill, PtyMode, PtyOpen, PtyOutput, PtyResize, PtyStream, RecordOwner, SetupState,
+    HOMES_PROTOCOL, MAX_PTY_OUTPUT_BYTES, NODE_HOME_UNKNOWN, NODE_HOME_UNSUPPORTED,
     PTY_UNACKED_BYTES,
 };
 use intent_core::HomeId;
@@ -1320,6 +1321,294 @@ async fn stopping_a_home_run_ends_it_and_an_agent_stop_does_not() {
     let exited = run.exited.unwrap();
     assert_eq!(exited.error, None, "{exited:?}");
     assert_ne!(exited.exit_code, Some(0), "killed: {exited:?}");
+    node.stop().await;
+}
+
+fn home_stop(home: &HomeRef, stop_id: &str, orphaned_at: Option<&str>) -> LinkFrame {
+    LinkFrame::HomeStop(HomeStop {
+        stop_id: stop_id.into(),
+        workspace_id: home.workspace_id.clone(),
+        home_id: home.home_id.clone(),
+        reason: if orphaned_at.is_some() {
+            HomeStopReason::Moved
+        } else {
+            HomeStopReason::Retired
+        },
+        orphaned_at: orphaned_at.map(str::to_owned),
+    })
+}
+
+async fn stop_acked(dialed: &mut DialedLink, stop_id: &str) -> HomeStopAck {
+    next_of(dialed, |frame| match frame {
+        LinkFrame::HomeStopAck(ack) if ack.stop_id == stop_id => Some(ack),
+        _ => None,
+    })
+    .await
+}
+
+/// The pushes of every home logged beside the home directories:
+/// `(homeId, target, head)`.
+fn home_pushes(dir: &std::path::Path) -> Vec<(String, String, String)> {
+    let Some(log) = dir
+        .join("executor")
+        .read_dir()
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| {
+            entry
+                .path()
+                .join("homes")
+                .join(checkout::TEST_HOME_PUSH_LOG)
+        })
+        .find(|path| path.is_file())
+    else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut parts = line.splitn(3, ' ').map(str::to_owned);
+            (
+                parts.next().unwrap(),
+                parts.next().unwrap(),
+                parts.next().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// A retired home's stop ends its terminals, pushes `home/head` and
+/// `home/wip` one last time (the commit made just before), removes the
+/// checkout and acks `removed`; the home answers no frame after.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_retired_home_is_pushed_once_more_then_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    let checkout = worktree(dir.path(), &h1);
+    dialed
+        .link
+        .send(&pty_open(
+            &h1,
+            "t1",
+            PtyMode::Exec,
+            Some("echo up; sleep 600"),
+        ))
+        .await
+        .unwrap();
+    watch_terminal(&mut dialed, "t1", true, |text, _| text.contains("up")).await;
+    let last = "2".repeat(40);
+    std::fs::write(checkout.join(checkout::TEST_HOME_HEAD), &last).unwrap();
+
+    dialed
+        .link
+        .send(&home_stop(&h1, "stop-1", None))
+        .await
+        .unwrap();
+    let seen = watch_terminal(&mut dialed, "t1", true, |_, exited| exited).await;
+    assert_ne!(
+        seen.exited.unwrap().exit_code,
+        Some(0),
+        "the terminal was ended"
+    );
+    let ack = stop_acked(&mut dialed, "stop-1").await;
+    assert_eq!(ack.outcome, HomeStopOutcome::Removed, "{ack:?}");
+    assert_eq!(ack.orphaned, None);
+    assert!(!checkout.exists(), "the checkout is removed");
+    let pushes = home_pushes(dir.path());
+    assert_eq!(
+        pushes.last(),
+        Some(&("h1".to_owned(), "home".to_owned(), last)),
+        "{pushes:?}"
+    );
+    assert!(pushes.iter().all(|(_, target, _)| target == "home"));
+    dialed.link.send(&push(&h1)).await.unwrap();
+    let refused = next_of(&mut dialed, |frame| match frame {
+        LinkFrame::HomePushReply(reply) => Some(reply),
+        _ => None,
+    })
+    .await;
+    assert_eq!(refused.outcome, HomePushOutcome::Failed);
+    node.stop().await;
+}
+
+/// A moved home's stop pushes the leftover checkout once, to its orphaned
+/// refs only, before removing it, and acks with what it pushed. A resend
+/// after a lost ack finds nothing and acks `removed` again, pushing
+/// nothing more.
+#[tokio::test]
+async fn a_moved_home_pushes_only_its_orphaned_refs_and_a_resend_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, leasing(1, Some(Vec::new())))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    let checkout = worktree(dir.path(), &h1);
+    let left = "3".repeat(40);
+    std::fs::write(checkout.join(checkout::TEST_HOME_HEAD), &left).unwrap();
+    let before = home_pushes(dir.path()).len();
+    let at = "20261114T140107Z";
+    dialed
+        .link
+        .send(&home_stop(&h1, "stop-1", Some(at)))
+        .await
+        .unwrap();
+    let ack = stop_acked(&mut dialed, "stop-1").await;
+    assert_eq!(ack.outcome, HomeStopOutcome::Removed, "{ack:?}");
+    assert_eq!(
+        ack.orphaned,
+        Some(HomeOrphaned {
+            head: left.clone(),
+            wip: None
+        })
+    );
+    assert!(!checkout.exists());
+    let pushes = home_pushes(dir.path());
+    assert!(pushes.len() > before);
+    assert_eq!(
+        pushes.last(),
+        Some(&("h1".to_owned(), format!("orphaned/{at}"), left)),
+        "{pushes:?}"
+    );
+    let orphaned = |pushes: &[(String, String, String)]| {
+        pushes
+            .iter()
+            .filter(|(_, target, _)| target.starts_with("orphaned/"))
+            .count()
+    };
+    assert_eq!(orphaned(&pushes), 1);
+
+    // The ack was lost: the backend sends the same stop after its bind.
+    dialed
+        .link
+        .send(&home_stop(&h1, "stop-1", Some(at)))
+        .await
+        .unwrap();
+    let again = stop_acked(&mut dialed, "stop-1").await;
+    assert_eq!(again.outcome, HomeStopOutcome::Removed);
+    assert_eq!(again.orphaned, None);
+    let after = home_pushes(dir.path());
+    assert_eq!(orphaned(&after), 1, "nothing is pushed again: {after:?}");
+    assert!(
+        after[pushes.len()..].is_empty(),
+        "no push of the stopped home: {after:?}"
+    );
+    node.stop().await;
+}
+
+/// A moved home whose last push fails keeps its checkout (and the work in
+/// it) and acks `failed`; the stop sent again after the next bind, with
+/// the home still leased, pushes and removes it, also on a machine that
+/// restarted meanwhile and never reopened the home.
+#[tokio::test]
+async fn a_moved_home_keeps_its_checkout_until_its_push_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, leasing(1, Some(Vec::new())))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    let checkout = worktree(dir.path(), &h1);
+    let fails = checkout.with_file_name(checkout::TEST_HOME_PUSH_FAILS);
+    std::fs::write(&fails, "").unwrap();
+    let at = "20261114T140107Z";
+    dialed
+        .link
+        .send(&home_stop(&h1, "stop-1", Some(at)))
+        .await
+        .unwrap();
+    let ack = stop_acked(&mut dialed, "stop-1").await;
+    assert_eq!(ack.outcome, HomeStopOutcome::Failed, "{ack:?}");
+    assert!(checkout.is_dir(), "the checkout stays");
+    drop(dialed);
+
+    let node_api = node.stop().await;
+    let node = Running::start_with_launch(
+        dir.path(),
+        node_api,
+        CountAdmission::new(4),
+        Arc::new(HomesLaunch(true)),
+        |storage, _cache| checkout::PlainCheckouts::new(storage),
+    )
+    .await;
+    std::fs::remove_file(&fails).unwrap();
+    // The pending stop leases the home: the bind sweep keeps it.
+    let mut dialed = dial_link(&node.endpoint, leasing(2, Some(vec![h1.clone()])))
+        .await
+        .unwrap();
+    replayed(&mut dialed).await;
+    assert!(checkout.is_dir());
+    dialed
+        .link
+        .send(&home_stop(&h1, "stop-1", Some(at)))
+        .await
+        .unwrap();
+    let ack = stop_acked(&mut dialed, "stop-1").await;
+    assert_eq!(ack.outcome, HomeStopOutcome::Removed, "{ack:?}");
+    assert!(ack.orphaned.is_some());
+    assert!(!checkout.exists());
+    node.stop().await;
+}
+
+/// A moved stop without a usable `orphanedAt`, or for a checkout of
+/// another workspace, changes nothing and acks `failed`.
+#[tokio::test]
+async fn a_malformed_home_stop_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, leasing(1, Some(Vec::new())))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    let checkout = worktree(dir.path(), &h1);
+    dialed
+        .link
+        .send(&home_stop(&h1, "bad-at", Some("2026-11-14T14:01:07Z")))
+        .await
+        .unwrap();
+    assert_eq!(
+        stop_acked(&mut dialed, "bad-at").await.outcome,
+        HomeStopOutcome::Failed
+    );
+    let elsewhere = HomeRef {
+        workspace_id: WorkspaceId::from("ws-2"),
+        home_id: h1.home_id.clone(),
+    };
+    dialed
+        .link
+        .send(&home_stop(&elsewhere, "other-ws", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        stop_acked(&mut dialed, "other-ws").await.outcome,
+        HomeStopOutcome::Failed
+    );
+    assert!(checkout.is_dir());
+    dialed.link.send(&push(&h1)).await.unwrap();
+    let reply = next_of(&mut dialed, |frame| match frame {
+        LinkFrame::HomePushReply(reply) => Some(reply),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        reply.outcome,
+        HomePushOutcome::Pushed,
+        "the home stays open"
+    );
     node.stop().await;
 }
 

@@ -49,6 +49,11 @@ const MODULE_CACHES: &str = ".modules";
 /// `orphaned/*` are never a node push's. An `unapplied/` ref is create-only
 /// and named by the commit it holds; pinning the same commit again is a
 /// no-op success, so a pin whose answer was lost can be retried.
+///
+/// With [`ORPHANED_ENV`] set (a moved home's one last push, authorized by
+/// its home stop) it allows exactly `orphaned/<that value>/{head,wip}`,
+/// create-only; pushing the commit a ref already holds succeeds, so a push
+/// whose answer was lost can be retried.
 const UPDATE_HOOK: &str = r#"#!/bin/sh
 ref="$1"
 old="$2"
@@ -66,6 +71,19 @@ case "$ref" in
 "$prefix"*) name="${ref#"$prefix"}" ;;
 *) refuse "not this session's ref" ;;
 esac
+orphaned="$INTENT_NODE_GIT_ORPHANED"
+if [ -n "$orphaned" ]; then
+  case "$name" in
+  "orphaned/$orphaned/head"|"orphaned/$orphaned/wip") ;;
+  *) refuse "only the home's orphaned refs may be pushed" ;;
+  esac
+  if [ "$old" != "$new" ]; then
+    case "$old" in
+    *[!0]*) refuse "is create-only" ;;
+    esac
+  fi
+  exit 0
+fi
 case "$name" in
 head|wip) exit 0 ;;
 unapplied/*)
@@ -92,6 +110,11 @@ esac
 /// ([`AgentRemote::ref_prefix`]) to [`UPDATE_HOOK`].
 pub const PREFIX_ENV: &str = "INTENT_NODE_GIT_PREFIX";
 
+/// The environment variable naming a moved home's `orphanedAt`
+/// ([`AgentRemote::orphaned`]) to [`UPDATE_HOOK`]: set, the session may
+/// create only that home's `orphaned/<orphanedAt>/{head,wip}`.
+pub const ORPHANED_ENV: &str = "INTENT_NODE_GIT_ORPHANED";
+
 /// Where head keeps its receive hooks (see [`configure_receive_hooks`]).
 static HOOKS_DIR: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
@@ -109,6 +132,10 @@ pub struct AgentRemote {
     /// A workspace home's checkout (nodeProtocol 19): `agent_id` holds the
     /// `homeId`, and the refs are the workspace's `home/*`.
     home: bool,
+    /// A moved home's last push (node-link.md "Home final stop"): `head`
+    /// and `wip` name `home/orphaned/<this>/{head,wip}`. Never on the wire:
+    /// the backend sets it from the home's stop.
+    orphaned: Option<String>,
 }
 
 const MODULES: &str = "/modules/";
@@ -137,6 +164,7 @@ impl AgentRemote {
             module_key: None,
             forge: false,
             home: false,
+            orphaned: None,
         })
     }
 
@@ -160,6 +188,29 @@ impl AgentRemote {
         self.home
     }
 
+    /// This home's remote for its moved checkout's one last push: `head`
+    /// and `wip` name `home/orphaned/<orphaned_at>/{head,wip}`.
+    ///
+    /// # Errors
+    ///
+    /// `node-git-invalid-remote` for an agent's remote or an `orphaned_at`
+    /// that is not a safe ref component.
+    pub fn orphaned(&self, orphaned_at: &str) -> Result<Self> {
+        if !self.home || !intent_core::node_link::valid_orphaned_at(orphaned_at) {
+            return Err(invalid_remote());
+        }
+        Ok(Self {
+            orphaned: Some(orphaned_at.to_owned()),
+            ..self.clone()
+        })
+    }
+
+    /// The `orphanedAt` of a moved home's last push.
+    #[must_use]
+    pub fn orphaned_at(&self) -> Option<&str> {
+        self.orphaned.as_deref()
+    }
+
     /// The same agent's forge remote (nodeProtocol 17): the workspace's
     /// GitHub repository, fetched through head.
     #[must_use]
@@ -168,6 +219,7 @@ impl AgentRemote {
             module_key: None,
             forge: true,
             home: false,
+            orphaned: None,
             ..self.clone()
         }
     }
@@ -269,6 +321,13 @@ impl AgentRemote {
 
     #[must_use]
     pub fn ref_name(&self, kind: AgentRef) -> String {
+        if let Some(at) = &self.orphaned {
+            let name = match kind {
+                AgentRef::Wip => "wip",
+                AgentRef::Base | AgentRef::Head => "head",
+            };
+            return format!("{}orphaned/{at}/{name}", self.ref_prefix());
+        }
         let suffix = match kind {
             AgentRef::Base if self.home => "head",
             AgentRef::Base => "base",
@@ -395,9 +454,13 @@ pub fn service_command(
 ) -> Result<Command> {
     let mut command = sanitized_git();
     command.args(scope_args(remote));
+    command.env_remove(ORPHANED_ENV);
     if service == GitService::ReceivePack {
         command.args(receive_hook_args()?);
         command.env(PREFIX_ENV, remote.ref_prefix());
+        if let Some(at) = remote.orphaned_at() {
+            command.env(ORPHANED_ENV, at);
+        }
     }
     command
         .arg(service.subcommand())
@@ -1007,8 +1070,12 @@ impl NodeGit {
     fn remote_url(&self, remote: &AgentRemote) -> String {
         #[cfg(test)]
         if let Some(head) = &self.test_head {
+            let orphaned = remote
+                .orphaned_at()
+                .map(|at| format!("{ORPHANED_ENV}={at} "))
+                .unwrap_or_default();
             return format!(
-                "ext::env {PREFIX_ENV}={} git {} {} %s {}",
+                "ext::env {orphaned}{PREFIX_ENV}={} git {} {} %s {}",
                 remote.ref_prefix(),
                 scope_args(remote).join(" "),
                 receive_hook_args().unwrap_or_default().join(" "),
@@ -1137,6 +1204,13 @@ impl NodeGit {
             head.clone()
         } else {
             let mut commit = self.command(worktree);
+            // A moved home's last push is create-only: its `wip` commit is
+            // the same for the same tree, so a retried push lands again.
+            if let Some(date) = remote.orphaned_at().map(orphaned_date) {
+                commit
+                    .env("GIT_AUTHOR_DATE", &date)
+                    .env("GIT_COMMITTER_DATE", &date);
+            }
             commit
                 .env("GIT_AUTHOR_NAME", WIP_NAME)
                 .env("GIT_AUTHOR_EMAIL", WIP_EMAIL)
@@ -1161,6 +1235,26 @@ impl NodeGit {
         let mut command = self.command(dir);
         command.args(args);
         run(command).await
+    }
+}
+
+/// The commit date of a moved home's `wip` (see [`AgentRemote::orphaned`]):
+/// its `orphanedAt` (`YYYYMMDDTHHMMSSZ`) as an ISO 8601 date, else the epoch.
+fn orphaned_date(at: &str) -> String {
+    let b = at.as_bytes();
+    let digits = |range: std::ops::Range<usize>| b[range].iter().all(u8::is_ascii_digit);
+    if b.len() == 16 && digits(0..8) && b[8] == b'T' && digits(9..15) && b[15] == b'Z' {
+        format!(
+            "{}-{}-{}T{}:{}:{}Z",
+            &at[0..4],
+            &at[4..6],
+            &at[6..8],
+            &at[9..11],
+            &at[11..13],
+            &at[13..15]
+        )
+    } else {
+        "1970-01-01T00:00:00Z".to_owned()
     }
 }
 

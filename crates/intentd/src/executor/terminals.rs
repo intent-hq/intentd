@@ -73,6 +73,8 @@ struct State {
 
 struct Term {
     id: String,
+    /// The home this terminal runs in.
+    home: intent_core::HomeId,
     out: Mutex<Outbox>,
     /// The PTY reader waits here while the unacknowledged output is full.
     room: Condvar,
@@ -166,10 +168,11 @@ fn login_args(shell: &str) -> Vec<String> {
 }
 
 impl Term {
-    fn new(id: String) -> (Arc<Self>, mpsc::UnboundedReceiver<Vec<u8>>) {
+    fn new(id: String, home: intent_core::HomeId) -> (Arc<Self>, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (input, rx) = mpsc::unbounded_channel();
         let term = Arc::new(Self {
             id,
+            home,
             out: Mutex::default(),
             room: Condvar::new(),
             room_async: tokio::sync::Notify::new(),
@@ -467,7 +470,7 @@ impl HomeTerminals {
         if state.closed || state.terms.contains_key(&frame.terminal_id) {
             return None;
         }
-        let (term, input) = Term::new(frame.terminal_id.clone());
+        let (term, input) = Term::new(frame.terminal_id.clone(), frame.home_id.clone());
         state.terms.insert(frame.terminal_id.clone(), term.clone());
         drop(state);
         let this = self.clone();
@@ -842,6 +845,30 @@ impl HomeTerminals {
         };
         if let Some(pty_id) = pty_id {
             let _ = self.shared.pty.resize(pty_id, size);
+        }
+    }
+
+    /// End every terminal of `home` (its home stop) and wait up to `wait`
+    /// for their processes to end; their `ptyExited` follow.
+    pub(super) async fn kill_home(&self, home: &intent_core::HomeId, wait: Duration) {
+        let terms: Vec<Arc<Term>> = lock(&self.shared.state)
+            .terms
+            .values()
+            .filter(|term| &term.home == home)
+            .cloned()
+            .collect();
+        for term in &terms {
+            self.kill_process(term);
+        }
+        let gone = || {
+            terms
+                .iter()
+                .all(|term| matches!(*lock(&term.process), Process::Gone))
+        };
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        while !gone() && tokio::time::Instant::now() < deadline {
+            tick.tick().await;
         }
     }
 

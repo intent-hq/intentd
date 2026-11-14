@@ -17951,6 +17951,13 @@ impl Services {
             match store_outcome.result {
                 Ok(()) => {
                     publish_event(bus.as_ref(), workspace_deleted_event(&id)).await;
+                    // The delete retired the workspace's home: its machine
+                    // gets the stop now (or after its next bind).
+                    services
+                        .ports
+                        .remote_launch()
+                        .send_home_stops(&services, &id)
+                        .await;
                 }
                 Err(Error::NotFound(_)) => {
                     tracing::debug!(
@@ -39052,6 +39059,9 @@ impl Services {
             } else {
                 store.archive_workspace_detaching_guests(&id, &now).await?
             };
+            // The archive retired the workspace's home: its machine gets
+            // the stop now (or after its next bind).
+            this.ports.remote_launch().send_home_stops(&this, &id).await;
             if automatic {
                 if let Err(error) = this
                     .ports

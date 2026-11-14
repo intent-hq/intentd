@@ -2969,6 +2969,14 @@ async fn serve(
                                 .await;
                         }
                     }
+                    LinkEvent::Frame(LinkFrame::HomeStopAck(ack)) => {
+                        let shared = shared.clone();
+                        // Off the ingest loop: it writes the store and may
+                        // post a notice.
+                        intent_core::spawn_daemon(async move {
+                            crate::homes::stop_acked(&shared, ack).await;
+                        });
+                    }
                     LinkEvent::Frame(LinkFrame::HomePushReply(reply)) => {
                         if let Some(waiter) = lock(&shared.home_waiters).remove(&reply.request_id) {
                             let _ = waiter.send(crate::homes::HomeReply::Push(reply));

@@ -12,11 +12,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use intent_core::node_link::{
-    ForgeFetchLaunch, LeaseBinding, FORGE_FETCH_PROTOCOL, HOMES_PROTOCOL,
-    PREPARED_CHECKOUT_PROTOCOL,
+    ForgeFetchLaunch, HomeStopReason, HomeStopRecord, LeaseBinding, FORGE_FETCH_PROTOCOL,
+    HOMES_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::remote_launch::RemotePlacementView;
-use intent_core::{AgentId, BoxFuture, Error, Result, WorkspaceId};
+use intent_core::{AgentId, BoxFuture, Error, HomeId, Result, WorkspaceId};
 use intent_git::node_git::{self, forge, AgentRemote, GitService, ModuleRefusal};
 use intent_transport::node_link::{
     git_codes, ForgeServe, NodeGitAccess, ReceiveHold, FORGE_REFRESH_FAILED,
@@ -230,36 +230,98 @@ impl HeadGitAccess {
         Ok((checkout, workspace_id))
     }
 
+    /// The pending stop of `remote`'s home on this machine, if it has one
+    /// (node-link.md "Home final stop"): only on the current binding.
+    async fn home_stop(
+        &self,
+        binding: &LeaseBinding,
+        remote: &AgentRemote,
+    ) -> Result<Option<HomeStopRecord>> {
+        let current = self
+            .shared
+            .current_link()
+            .ok_or_else(|| Error::InvalidParams("node-link-stale".into()))?;
+        binding.ensure_current(current.binding())?;
+        let stop = self
+            .shared
+            .store
+            .get_home_stop(&HomeId::from(remote.agent_id()))
+            .await?;
+        Ok(stop.filter(|stop| {
+            stop.node_id == self.shared.machine_id()
+                && stop.workspace_id.as_str() == remote.workspace_id()
+        }))
+    }
+
+    /// The repository a stopped home's last push lands in: receive-pack
+    /// only, into the workspace's repository (its refs outlive an archived
+    /// workspace's removed worktree), or a submodule of its checkout. A
+    /// deleted workspace's home pushes nothing.
+    async fn stopped_home_repository(
+        &self,
+        remote: &AgentRemote,
+        service: GitService,
+    ) -> Result<PathBuf> {
+        if service != GitService::ReceivePack {
+            return Err(denied());
+        }
+        let workspace = self
+            .shared
+            .store
+            .get_workspace(&WorkspaceId::from(remote.workspace_id()))
+            .await
+            .map_err(|_| denied())?;
+        if let Some(key) = remote.module_key() {
+            let checkout = crate::launch::checkout_path(&workspace).ok_or_else(denied)?;
+            return module_of(checkout, key).await;
+        }
+        let repo = PathBuf::from(crate::final_stop::repo_path(&workspace));
+        if !repo.is_dir() {
+            return Err(unavailable("the workspace's repository is gone"));
+        }
+        Ok(repo)
+    }
+
     /// The repository a home session reaches (nodes.md "Workspace homes" →
     /// "Refs"): the workspace checkout, or one of its submodules. Before a
     /// push of the superproject, the current `home/head` is pinned as
     /// `home/rewritten/<sha>`, so a rewrite keeps the old commits; a push
-    /// that cannot be pinned is refused.
+    /// that cannot be pinned is refused. A home with a pending stop gets
+    /// only its last push.
     async fn home_repository(
         &self,
         binding: &LeaseBinding,
         remote: &AgentRemote,
         service: GitService,
     ) -> Result<PathBuf> {
+        if self.home_stop(binding, remote).await?.is_some() {
+            return self.stopped_home_repository(remote, service).await;
+        }
         let (checkout, workspace_id) = self.home_checkout(binding, remote).await?;
         if let Some(key) = remote.module_key() {
-            let key = key.to_owned();
-            let module = tokio::task::spawn_blocking(move || {
-                let pin = node_git::submodule_pins(&checkout)
-                    .ok()
-                    .and_then(|pins| pins.into_iter().find(|pin| pin.module_key == key));
-                pin.map(|pin| node_git::module_repository(&checkout, &pin.path, &key))
-            })
-            .await
-            .map_err(|e| Error::Internal(format!("node git: resolve the submodule: {e}")))?;
-            return match module {
-                Some(Ok(module)) => Ok(module.worktree),
-                Some(Err(ModuleRefusal::Unavailable(what))) => Err(unavailable(&what)),
-                Some(Err(ModuleRefusal::Denied)) | None => Err(denied()),
-            };
+            return module_of(checkout, key).await;
         }
         let _ = (service, workspace_id);
         Ok(checkout)
+    }
+}
+
+/// The repository of the submodule `key` of the home checkout's
+/// workspace `checkout`: one its gitlinks pin.
+async fn module_of(checkout: PathBuf, key: &str) -> Result<PathBuf> {
+    let key = key.to_owned();
+    let module = tokio::task::spawn_blocking(move || {
+        let pin = node_git::submodule_pins(&checkout)
+            .ok()
+            .and_then(|pins| pins.into_iter().find(|pin| pin.module_key == key));
+        pin.map(|pin| node_git::module_repository(&checkout, &pin.path, &key))
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("node git: resolve the submodule: {e}")))?;
+    match module {
+        Some(Ok(module)) => Ok(module.worktree),
+        Some(Err(ModuleRefusal::Unavailable(what))) => Err(unavailable(&what)),
+        Some(Err(ModuleRefusal::Denied)) | None => Err(denied()),
     }
 }
 
@@ -282,12 +344,30 @@ impl NodeGitAccess for HeadGitAccess {
     /// made, if any.
     fn before_receive<'a>(
         &'a self,
-        _binding: &'a LeaseBinding,
+        binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
         repository: &'a Path,
     ) -> BoxFuture<'a, Result<ReceiveHold>> {
         Box::pin(async move {
-            if !remote.is_home() || remote.module_key().is_some() {
+            if !remote.is_home() {
+                return Ok(ReceiveHold::default());
+            }
+            // A moved home's last push creates only its orphaned refs, in
+            // each repository; nothing of `home/head` is pinned for it.
+            if let Some(stop) = self.home_stop(binding, remote).await? {
+                if stop.reason == HomeStopReason::Moved {
+                    let at = stop
+                        .frame()
+                        .orphaned()
+                        .map(str::to_owned)
+                        .ok_or_else(denied)?;
+                    return Ok(ReceiveHold {
+                        orphaned: Some(at),
+                        ..ReceiveHold::default()
+                    });
+                }
+            }
+            if remote.module_key().is_some() {
                 return Ok(ReceiveHold::default());
             }
             let slot = HOME_PUSHES
@@ -318,6 +398,7 @@ impl NodeGitAccess for HeadGitAccess {
             Ok(ReceiveHold {
                 token,
                 guard: Some(Box::new(guard)),
+                orphaned: None,
             })
         })
     }

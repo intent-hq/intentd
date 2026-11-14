@@ -108,7 +108,8 @@ pub const FORGE_FETCH_PROTOCOL: u32 = 17;
 pub const ONE_SHOT_PROTOCOL: u32 = 18;
 
 /// The first protocol with workspace homes: the workspace checkout owner
-/// ([`LinkFrame::HomeOpen`], [`LinkFrame::HomePush`] and their replies),
+/// ([`LinkFrame::HomeOpen`], [`LinkFrame::HomePush`], [`LinkFrame::HomeStop`]
+/// and their replies),
 /// [`LinkHello::lease_homes`], journal records owned by a home
 /// ([`RecordOwner::Home`], [`JournalBody::HomePushed`]),
 /// [`CheckoutOf::Home`] and [`MachineCapabilities::homes`]. The backend
@@ -213,6 +214,188 @@ pub struct HomePush {
     pub request_id: LinkId,
     pub workspace_id: WorkspaceId,
     pub home_id: HomeId,
+}
+
+/// Why a home ends on its machine (nodeProtocol 19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HomeStopReason {
+    /// The workspace was archived or deleted.
+    Retired,
+    /// The workspace's home moved to a new `homeId`.
+    Moved,
+}
+
+impl HomeStopReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retired => "retired",
+            Self::Moved => "moved",
+        }
+    }
+
+    /// The reason a stored row names.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "retired" => Some(Self::Retired),
+            "moved" => Some(Self::Moved),
+            _ => None,
+        }
+    }
+}
+
+/// Backend to machine (nodeProtocol 19): the home's final stop, durable
+/// like an agent's: sent after every bind until its [`HomeStopAck`]. A
+/// `moved` stop names the `orphanedAt` of the refs its leftover checkout is
+/// pushed to once. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeStop {
+    pub stop_id: String,
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+    pub reason: HomeStopReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned_at: Option<String>,
+}
+
+impl HomeStop {
+    #[must_use]
+    pub fn home(&self) -> HomeRef {
+        HomeRef {
+            workspace_id: self.workspace_id.clone(),
+            home_id: self.home_id.clone(),
+        }
+    }
+
+    /// The `orphanedAt` a `moved` stop must carry: a safe ref component.
+    /// `None` for a `retired` stop, or a `moved` one without a valid one.
+    #[must_use]
+    pub fn orphaned(&self) -> Option<&str> {
+        match self.reason {
+            HomeStopReason::Moved => self
+                .orphaned_at
+                .as_deref()
+                .filter(|at| valid_orphaned_at(at)),
+            HomeStopReason::Retired => None,
+        }
+    }
+}
+
+/// Whether `at` may name a `home/orphaned/<at>/` ref directory: 1 to 64
+/// ASCII letters, digits, `-` or `_` (always a valid ref component).
+#[must_use]
+pub fn valid_orphaned_at(at: &str) -> bool {
+    !at.is_empty()
+        && at.len() <= 64
+        && at
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// The backend's durable record of a pending [`HomeStop`] (node-link.md
+/// "Home final stop"): written in the same transaction that archives or
+/// deletes the workspace or switches its home, resent after every bind of
+/// `node_id` until acknowledged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeStopRecord {
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+    pub node_id: String,
+    pub stop_id: String,
+    pub reason: HomeStopReason,
+    /// `moved`: the `home/orphaned/<orphanedAt>/` directory.
+    pub orphaned_at: Option<String>,
+    pub recorded_at: String,
+}
+
+impl HomeStopRecord {
+    /// A new stop of `home_id` on `node_id` recorded at `now` (RFC 3339):
+    /// a `moved` one gets its `orphanedAt` from `now`.
+    #[must_use]
+    pub fn new(
+        workspace_id: WorkspaceId,
+        home_id: HomeId,
+        node_id: String,
+        reason: HomeStopReason,
+        now: &str,
+    ) -> Self {
+        Self {
+            workspace_id,
+            home_id,
+            node_id,
+            stop_id: uuid::Uuid::new_v4().to_string(),
+            reason,
+            orphaned_at: (reason == HomeStopReason::Moved).then(|| orphaned_at_of(now)),
+            recorded_at: now.to_owned(),
+        }
+    }
+
+    /// The frame that sends this stop.
+    #[must_use]
+    pub fn frame(&self) -> HomeStop {
+        HomeStop {
+            stop_id: self.stop_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            home_id: self.home_id.clone(),
+            reason: self.reason,
+            orphaned_at: self.orphaned_at.clone(),
+        }
+    }
+}
+
+/// The `orphanedAt` of a move recorded at `now` (RFC 3339): its UTC time
+/// to the second in the ISO 8601 basic form `YYYYMMDDTHHMMSSZ`, a valid
+/// ref component. An unreadable `now` falls back to the current time.
+#[must_use]
+pub fn orphaned_at_of(now: &str) -> String {
+    let at = crate::clock::parse_iso(now).unwrap_or_else(time::OffsetDateTime::now_utc);
+    let at = at.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )
+}
+
+/// How a [`HomeStop`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HomeStopOutcome {
+    /// The checkout is gone (or was never here).
+    Removed,
+    /// The checkout stays: its push or removal failed; the next resend
+    /// tries again.
+    Failed,
+}
+
+/// What a `moved` home's last push sent to `home/orphaned/<orphanedAt>/`.
+/// The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeOrphaned {
+    pub head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wip: Option<String>,
+}
+
+/// Machine to backend (nodeProtocol 19): the answer to a [`HomeStop`].
+/// The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HomeStopAck {
+    pub stop_id: String,
+    pub workspace_id: WorkspaceId,
+    pub home_id: HomeId,
+    pub outcome: HomeStopOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned: Option<HomeOrphaned>,
 }
 
 /// How a [`HomePush`] ended.
@@ -1030,7 +1213,7 @@ impl std::fmt::Display for ProtocolRange {
 /// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
 /// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`, `secretReply`,
 /// `forgeTokenReply`, `checkoutReadReply`, `oneShotReply`, `homeOpenReply`,
-/// `homePushReply`, `ptyOutput`, `ptyExited`, `homeCallReply`) and
+/// `homePushReply`, `homeStopAck`, `ptyOutput`, `ptyExited`, `homeCallReply`) and
 /// `cancelRequest` are
 /// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
@@ -1048,6 +1231,7 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "homeCallCancel",
     "homeOpen",
     "homePush",
+    "homeStop",
     "launch",
     "oneShot",
     "oneShotCancel",
@@ -2252,6 +2436,10 @@ pub enum LinkFrame {
     HomePush(HomePush),
     /// Machine to backend (nodeProtocol 19): the answer to a `homePush`.
     HomePushReply(HomePushReply),
+    /// Backend to machine (nodeProtocol 19): end a home for good.
+    HomeStop(HomeStop),
+    /// Machine to backend (nodeProtocol 19): the answer to a `homeStop`.
+    HomeStopAck(HomeStopAck),
     /// Backend to machine (nodeProtocol 19): start a home terminal.
     PtyOpen(PtyOpen),
     /// Backend to machine (nodeProtocol 19): a home terminal's input.
@@ -2443,6 +2631,8 @@ impl LinkFrame {
             | Self::HomeOpenReply(_)
             | Self::HomePush(_)
             | Self::HomePushReply(_)
+            | Self::HomeStop(_)
+            | Self::HomeStopAck(_)
             // Input first: typing works while output floods.
             | Self::PtyOpen(_)
             | Self::PtyInput(_)
@@ -2497,6 +2687,8 @@ impl LinkFrame {
             | Self::HomeOpenReply(_)
             | Self::HomePush(_)
             | Self::HomePushReply(_)
+            | Self::HomeStop(_)
+            | Self::HomeStopAck(_)
             | Self::PtyOpen(_)
             | Self::PtyInput(_)
             | Self::PtyResize(_)
@@ -2590,6 +2782,7 @@ impl LinkFrame {
             | Self::OneShotCancel(_)
             | Self::HomeOpen(_)
             | Self::HomePush(_)
+            | Self::HomeStop(_)
             | Self::PtyOpen(_)
             | Self::PtyInput(_)
             | Self::PtyResize(_)
@@ -2616,6 +2809,7 @@ impl LinkFrame {
             | Self::OneShotReply(_)
             | Self::HomeOpenReply(_)
             | Self::HomePushReply(_)
+            | Self::HomeStopAck(_)
             | Self::PtyOutput(_)
             | Self::PtyExited(_)
             | Self::HomeCallReply(_)

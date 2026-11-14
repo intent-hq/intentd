@@ -3057,3 +3057,186 @@ async fn a_queued_secret_forget_never_lands_after_a_newer_put() {
     );
     node.shutdown();
 }
+
+mod home_stops {
+    use super::*;
+    use intent_core::node_link::{HomeStopAck, HomeStopOutcome, HomeStopReason, HomeStopRecord};
+    use intent_core::HomeId;
+    use intent_git::node_git::{AgentRemote, GitService};
+    use intent_transport::node_link::NodeGitAccess as _;
+
+    fn stop_of(machine: &Machine, home: &str, reason: HomeStopReason) -> HomeStopRecord {
+        HomeStopRecord::new(
+            workspace(),
+            HomeId::from(home),
+            machine.id(),
+            reason,
+            &intent_core::now_iso(),
+        )
+    }
+
+    async fn ack(link: &NodeEnd, stop: &HomeStopRecord, stop_id: &str, outcome: HomeStopOutcome) {
+        link.link
+            .send(&LinkFrame::HomeStopAck(HomeStopAck {
+                stop_id: stop_id.into(),
+                workspace_id: stop.workspace_id.clone(),
+                home_id: stop.home_id.clone(),
+                outcome,
+                orphaned: None,
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn sent_stop(link: &mut NodeEnd) -> intent_core::node_link::HomeStop {
+        link.expect(|frame| match frame {
+            LinkFrame::HomeStop(stop) => Some(stop),
+            _ => None,
+        })
+        .await
+    }
+
+    async fn workspace_at(backend: &Backend, repository: &std::path::Path) {
+        let now = intent_core::now_iso();
+        backend
+            .store()
+            .insert_workspace(&intent_core::Workspace {
+                id: workspace(),
+                title: "Remote".into(),
+                branch: "main".into(),
+                repository_path: Some(repository.to_string_lossy().into_owned()),
+                created_at: now.clone(),
+                updated_at: now,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A pending home stop is in `leaseHomes` (the machine's sweep keeps
+    /// that checkout) and is sent after every bind, keeping the link
+    /// wanted, until its own `removed` ack: an ack for another stop id or
+    /// a `failed` one keeps it.
+    #[tokio::test]
+    async fn a_home_stop_is_leased_and_resent_at_each_bind_until_its_ack() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        let node = backend.expose(&mut machine).await;
+        let stop = backend
+            .store()
+            .record_home_stop(&stop_of(&machine, "h-old", HomeStopReason::Moved))
+            .await
+            .unwrap();
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        let leased = link.hello.lease_homes.clone().unwrap_or_default();
+        assert_eq!(leased, vec![stop.frame().home()]);
+        link.replay_complete(0).await;
+        assert_eq!(sent_stop(&mut link).await, stop.frame());
+
+        ack(&link, &stop, "another-stop", HomeStopOutcome::Removed).await;
+        ack(&link, &stop, &stop.stop_id, HomeStopOutcome::Failed).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(backend
+            .store()
+            .get_home_stop(&stop.home_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        // The ack was lost with the link: the next bind sends it again.
+        machine.stop().await;
+        machine.restart().await;
+        let mut link = machine.accept().await;
+        link.replay_complete(0).await;
+        assert_eq!(sent_stop(&mut link).await, stop.frame());
+        ack(&link, &stop, &stop.stop_id, HomeStopOutcome::Removed).await;
+        let store = backend.store().clone();
+        let home = stop.home_id.clone();
+        tokio::time::timeout(wait(), async {
+            while store.get_home_stop(&home).await.unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the ack ends the stop");
+        node.shutdown();
+    }
+
+    /// A moved home's session may only push (its orphaned refs, which the
+    /// hook is told); a retired one pushes into the workspace's repository;
+    /// a deleted workspace's home pushes nothing; a home of another machine
+    /// or with no stop and no current home is refused.
+    #[tokio::test]
+    async fn a_stopped_home_gets_only_its_last_push() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        let node = backend.expose(&mut machine).await;
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        workspace_at(&backend, repo.path()).await;
+        let moved = backend
+            .store()
+            .record_home_stop(&stop_of(&machine, "h-moved", HomeStopReason::Moved))
+            .await
+            .unwrap();
+        let retired = backend
+            .store()
+            .record_home_stop(&stop_of(&machine, "h-retired", HomeStopReason::Retired))
+            .await
+            .unwrap();
+        let mut elsewhere = stop_of(&machine, "h-elsewhere", HomeStopReason::Retired);
+        elsewhere.node_id = "another-machine".into();
+        backend.store().record_home_stop(&elsewhere).await.unwrap();
+        node.connect().await.unwrap();
+        let link = machine.accept().await;
+        link.replay_complete(0).await;
+        bound(&node).await;
+        let access = crate::git::HeadGitAccess::new(node.shared());
+        let binding = &link.hello.binding;
+        let remote = |home: &str| AgentRemote::home(workspace().as_str(), home).unwrap();
+
+        let pushed = access
+            .repository(binding, &remote("h-moved"), GitService::ReceivePack)
+            .await
+            .unwrap();
+        assert_eq!(pushed, repo.path());
+        assert!(access
+            .repository(binding, &remote("h-moved"), GitService::UploadPack)
+            .await
+            .is_err());
+        let hold = access
+            .before_receive(binding, &remote("h-moved"), &pushed)
+            .await
+            .unwrap();
+        assert_eq!(hold.orphaned, moved.orphaned_at);
+        assert!(hold.token.is_none(), "nothing of home/head is pinned");
+
+        let hold = access
+            .before_receive(binding, &remote("h-retired"), &pushed)
+            .await
+            .unwrap();
+        assert_eq!(hold.orphaned, None);
+        assert!(access
+            .repository(binding, &remote("h-retired"), GitService::ReceivePack)
+            .await
+            .is_ok());
+        for refused in ["h-elsewhere", "h-unknown"] {
+            assert!(access
+                .repository(binding, &remote(refused), GitService::ReceivePack)
+                .await
+                .is_err());
+        }
+        backend
+            .store()
+            .delete_workspace(&workspace())
+            .await
+            .unwrap();
+        assert!(access
+            .repository(binding, &remote("h-retired"), GitService::ReceivePack)
+            .await
+            .is_err());
+        let _ = retired;
+        node.shutdown();
+    }
+}

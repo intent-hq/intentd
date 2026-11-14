@@ -155,6 +155,18 @@ pub(super) trait Checkouts: Send + Sync {
         timeout: Duration,
     ) -> BoxFuture<'a, anyhow::Result<HomePush>>;
 
+    /// A moved home's one last push (node-link.md "Home final stop"): the
+    /// checkout's `HEAD` and a commit of its dirty tree to
+    /// `home/orphaned/<orphaned_at>/{head,wip}`, within `timeout`. The same
+    /// checkout pushes the same commits again, so a retry lands.
+    fn push_home_orphaned<'a>(
+        &'a self,
+        home: &'a HomeRef,
+        worktree: &'a Path,
+        orphaned_at: &'a str,
+        timeout: Duration,
+    ) -> BoxFuture<'a, anyhow::Result<HomePush>>;
+
     /// The commit `worktree`'s `HEAD` is at, for the backup watcher.
     fn head_commit<'a>(&'a self, worktree: &'a Path) -> BoxFuture<'a, Option<String>>;
 
@@ -457,6 +469,36 @@ impl Checkouts for GitCheckouts {
         })
     }
 
+    fn push_home_orphaned<'a>(
+        &'a self,
+        home: &'a HomeRef,
+        worktree: &'a Path,
+        orphaned_at: &'a str,
+        timeout: Duration,
+    ) -> BoxFuture<'a, anyhow::Result<HomePush>> {
+        Box::pin(async move {
+            let remote =
+                AgentRemote::home(&home.workspace_id.0, &home.home_id.0)?.orphaned(orphaned_at)?;
+            let pins = read_pins(&pins_file(worktree));
+            let pushed = tokio::time::timeout(
+                timeout,
+                self.cache.git().push_work_excluding(
+                    worktree,
+                    &remote,
+                    &pins,
+                    Some(&super::setup::excludes_dir(worktree)),
+                ),
+            )
+            .await
+            .context("the orphaned home push timed out")??;
+            Ok(HomePush {
+                head: pushed.head,
+                wip: pushed.wip,
+                rewritten: None,
+            })
+        })
+    }
+
     fn head_commit<'a>(&'a self, worktree: &'a Path) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move {
             let output = tokio::process::Command::new("git")
@@ -667,6 +709,27 @@ pub(super) struct PlainCheckouts {
     >,
     /// The home checkouts prepared, in order.
     pub(super) prepared_homes: std::sync::Mutex<Vec<HomeId>>,
+}
+
+/// Beside the test home directories (so it outlives a removed checkout):
+/// one line `<homeId> <target> <head>` per push of a home, `target` being
+/// `home` or a moved home's `orphaned/<orphanedAt>`.
+#[cfg(test)]
+pub(super) const TEST_HOME_PUSH_LOG: &str = "home-pushes";
+
+#[cfg(test)]
+fn log_test_push(worktree: &Path, home: &HomeRef, target: &str, head: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let homes = worktree
+        .parent()
+        .and_then(Path::parent)
+        .context("a home checkout has a homes directory")?;
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(homes.join(TEST_HOME_PUSH_LOG))?;
+    writeln!(log, "{} {target} {head}", home.home_id)?;
+    Ok(())
 }
 
 /// In a test home checkout: the commit its `HEAD` is at, which a test
@@ -884,7 +947,7 @@ impl Checkouts for PlainCheckouts {
 
     fn push_home<'a>(
         &'a self,
-        _home: &'a HomeRef,
+        home: &'a HomeRef,
         worktree: &'a Path,
         _previous: Option<&'a str>,
         _timeout: Duration,
@@ -900,9 +963,37 @@ impl Checkouts for PlainCheckouts {
                 "head refused the push"
             );
             let head = std::fs::read_to_string(worktree.join(TEST_HOME_HEAD))?;
+            log_test_push(worktree, home, "home", &head)?;
             let pushed = beside.join(TEST_HOME_PUSHED);
             let count = std::fs::read_to_string(&pushed).unwrap_or_default();
             std::fs::write(pushed, format!("{count}+"))?;
+            Ok(HomePush {
+                rewritten: None,
+                wip: head.clone(),
+                head,
+            })
+        })
+    }
+
+    fn push_home_orphaned<'a>(
+        &'a self,
+        home: &'a HomeRef,
+        worktree: &'a Path,
+        orphaned_at: &'a str,
+        _timeout: Duration,
+    ) -> BoxFuture<'a, anyhow::Result<HomePush>> {
+        Box::pin(async move {
+            anyhow::ensure!(
+                !self.fail_pushes.load(std::sync::atomic::Ordering::SeqCst),
+                "head refused the push"
+            );
+            let beside = worktree.parent().unwrap_or(worktree);
+            anyhow::ensure!(
+                !beside.join(TEST_HOME_PUSH_FAILS).exists(),
+                "head refused the push"
+            );
+            let head = std::fs::read_to_string(worktree.join(TEST_HOME_HEAD))?;
+            log_test_push(worktree, home, &format!("orphaned/{orphaned_at}"), &head)?;
             Ok(HomePush {
                 rewritten: None,
                 wip: head.clone(),

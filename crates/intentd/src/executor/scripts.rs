@@ -468,6 +468,13 @@ impl ScriptProcesses {
             .await
     }
 
+    /// Kill every home run of `home_id` (its home stop). Returns whether
+    /// each was reaped within [`reap_wait`].
+    pub(super) async fn stop_home(&self, home_id: &intent_core::HomeId) -> bool {
+        self.kill_where(|key, _| key.0.home().is_some_and(|home| &home.home_id == home_id))
+            .await
+    }
+
     /// Kill every process and start no more (the machine is shutting
     /// down).
     pub(super) async fn stop_all(&self) {

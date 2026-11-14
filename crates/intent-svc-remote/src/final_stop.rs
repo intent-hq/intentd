@@ -73,7 +73,7 @@ pub(crate) fn expired(
 /// Where a final push for `workspace`'s agents lands: the workspace's
 /// repository, whose refs its worktrees share, so the push still lands once
 /// the worktree is removed. Empty when the workspace has neither.
-fn repo_path(workspace: &Workspace) -> String {
+pub(crate) fn repo_path(workspace: &Workspace) -> String {
     workspace
         .repository_path
         .as_ref()
