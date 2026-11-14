@@ -198,7 +198,7 @@ fn new_id() -> String {
 
 fn start_frame(place: &RunPlace, def: &Script, spawn_id: &str) -> LinkFrame {
     LinkFrame::ScriptStart(ScriptStartCommand {
-        agent_id: place.agent_id.clone(),
+        owner: place.agent_id.clone().into(),
         script_id: place.script_id.clone(),
         spawn_id: spawn_id.to_owned(),
         command: def.command.clone(),
@@ -218,7 +218,7 @@ fn start_frame(place: &RunPlace, def: &Script, spawn_id: &str) -> LinkFrame {
 
 fn stop_frame(place: &RunPlace, spawn_id: &str) -> LinkFrame {
     LinkFrame::ScriptStop(ScriptProcessRef {
-        agent_id: place.agent_id.clone(),
+        owner: place.agent_id.clone().into(),
         script_id: place.script_id.clone(),
         spawn_id: spawn_id.to_owned(),
     })
@@ -637,13 +637,17 @@ impl MachineRuns {
             .any(|run| run.node_id == node_id && is_live(&run.state))
     }
 
-    /// Handle a script frame from machine `node_id`.
+    /// Handle a script frame from machine `node_id`. A home run's frames
+    /// are not machine runs: they go to the home runs on the connector.
     pub(crate) async fn on_frame(&self, node_id: &str, frame: LinkFrame) {
-        let (agent, script, spawn) = match &frame {
-            LinkFrame::ScriptStarted(f) => (&f.agent_id, &f.script_id, &f.spawn_id),
-            LinkFrame::ScriptOutput(f) => (&f.agent_id, &f.script_id, &f.spawn_id),
-            LinkFrame::ScriptExited(f) => (&f.agent_id, &f.script_id, &f.spawn_id),
+        let (owner, script, spawn) = match &frame {
+            LinkFrame::ScriptStarted(f) => (&f.owner, &f.script_id, &f.spawn_id),
+            LinkFrame::ScriptOutput(f) => (&f.owner, &f.script_id, &f.spawn_id),
+            LinkFrame::ScriptExited(f) => (&f.owner, &f.script_id, &f.spawn_id),
             _ => return,
+        };
+        let Some(agent) = owner.agent() else {
+            return;
         };
         let place = lock(&self.inner.runs)
             .iter()

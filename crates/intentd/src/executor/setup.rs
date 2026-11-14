@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use intent_core::node_link::{
-    SetupCommand, SetupOwner, SetupState, SubmodulePin, HOMES_PROTOCOL, MAX_SCRIPT_OUTPUT_BYTES,
+    CheckoutOwner, SetupCommand, SetupState, SubmodulePin, HOMES_PROTOCOL, MAX_SCRIPT_OUTPUT_BYTES,
     PREPARED_CHECKOUT_PROTOCOL,
 };
 use intent_pty::{OutputSink, PtyHost, SpawnSpec};
@@ -201,7 +201,7 @@ pub(super) fn write_status(worktree: &Path, status: &SetupStatus) {
 /// room; the last [`OUTPUT_TAIL_BYTES`] are kept and resent once after a
 /// reconnect.
 pub(super) struct SetupOutput {
-    owner: SetupOwner,
+    owner: CheckoutOwner,
     head: HeadLink,
     state: Mutex<OutputState>,
     /// The log in the agent's storage directory, appended as output
@@ -219,7 +219,7 @@ struct OutputState {
 }
 
 impl SetupOutput {
-    pub(super) fn new(owner: impl Into<SetupOwner>, head: HeadLink) -> Arc<Self> {
+    pub(super) fn new(owner: impl Into<CheckoutOwner>, head: HeadLink) -> Arc<Self> {
         Arc::new(Self {
             owner: owner.into(),
             head,
@@ -353,8 +353,8 @@ impl SetupOutput {
 
     fn link(&self) -> Option<NodeLink> {
         let needs = match self.owner {
-            SetupOwner::Agent(_) => PREPARED_CHECKOUT_PROTOCOL,
-            SetupOwner::Home(_) => HOMES_PROTOCOL,
+            CheckoutOwner::Agent(_) => PREPARED_CHECKOUT_PROTOCOL,
+            CheckoutOwner::Home(_) => HOMES_PROTOCOL,
         };
         self.head.get().filter(|link| link.protocol() >= needs)
     }

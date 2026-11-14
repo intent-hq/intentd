@@ -754,6 +754,16 @@ impl RemoteLaunchPort for RemoteLaunch {
         Box::pin(crate::terminals::open(svc, workspace_id, pty, open))
     }
 
+    fn open_home_script<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        pty: &'a std::sync::Arc<intent_pty::PtyHost>,
+        open: intent_services::feature_api::feature_ports::HomeScriptOpen,
+    ) -> BoxFuture<'a, Result<Option<intent_pty::PtyId>>> {
+        Box::pin(crate::home_scripts::open(svc, workspace_id, pty, open))
+    }
+
     fn placement_help<'a>(
         &'a self,
         svc: &'a Services,

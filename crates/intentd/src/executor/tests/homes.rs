@@ -1083,3 +1083,211 @@ async fn a_kill_ends_a_terminal_whose_output_is_paused() {
     }
     node.stop().await;
 }
+
+fn home_script(home: &HomeRef, spawn: &str, command: &str, cwd: Option<&str>) -> LinkFrame {
+    LinkFrame::ScriptStart(intent_core::node_link::ScriptStartCommand {
+        owner: intent_core::node_link::CheckoutOwner::Home(home.clone()),
+        script_id: "s1".into(),
+        spawn_id: spawn.into(),
+        command: command.into(),
+        mode: intent_core::ScriptMode::Command,
+        cwd: cwd.map(str::to_owned),
+        env: vec![intent_core::node_link::ScriptEnvVar {
+            key: "HOME_RUN_VAR".into(),
+            value: "from-the-script".into(),
+        }],
+    })
+}
+
+/// What one home run reported: whether it started, its output in `seq`
+/// order and its exit.
+#[derive(Default)]
+struct HomeRun {
+    started: bool,
+    seqs: Vec<u64>,
+    output: String,
+    exited: Option<intent_core::node_link::ScriptExited>,
+}
+
+/// Collect `spawn`'s script frames until its `scriptExited`, checking that
+/// each names `home`.
+async fn watch_home_run(dialed: &mut DialedLink, home: &HomeRef, spawn: &str) -> HomeRun {
+    let owner = intent_core::node_link::CheckoutOwner::Home(home.clone());
+    let mut run = HomeRun::default();
+    while run.exited.is_none() {
+        let frame = next_frame(dialed).await.expect("the link closed");
+        if frame.script_owner().is_none() {
+            continue;
+        }
+        assert_eq!(frame.script_owner(), Some(&owner), "{frame:?}");
+        match frame {
+            LinkFrame::ScriptStarted(started) if started.spawn_id == spawn => run.started = true,
+            LinkFrame::ScriptOutput(output) if output.spawn_id == spawn => {
+                run.seqs.push(output.seq);
+                run.output.push_str(&output.data);
+            }
+            LinkFrame::ScriptExited(exited) if exited.spawn_id == spawn => {
+                run.exited = Some(exited);
+            }
+            _ => {}
+        }
+    }
+    run
+}
+
+/// A home run (nodeProtocol 19) runs in the home checkout with its saved
+/// environment, streams its output numbered from 0 and reports its exit
+/// code, every frame naming the home.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_home_run_runs_in_the_home_checkout_and_reports_its_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(dialed.link.protocol(), HOMES_PROTOCOL);
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    let checkout = std::fs::canonicalize(worktree(dir.path(), &h1)).unwrap();
+    std::fs::create_dir_all(checkout.join("web")).unwrap();
+
+    dialed
+        .link
+        .send(&home_script(
+            &h1,
+            "p1",
+            "echo at:$(pwd -P):$HOME_RUN_VAR; exit 4",
+            Some("web"),
+        ))
+        .await
+        .unwrap();
+    let run = watch_home_run(&mut dialed, &h1, "p1").await;
+    assert!(run.started);
+    assert!(
+        run.output.contains(&format!(
+            "at:{}:from-the-script",
+            checkout.join("web").display()
+        )),
+        "{}",
+        run.output
+    );
+    assert_eq!(run.seqs, (0..run.seqs.len() as u64).collect::<Vec<_>>());
+    let exited = run.exited.unwrap();
+    assert_eq!(exited.exit_code, Some(4), "{exited:?}");
+    assert_eq!(exited.error, None);
+    node.stop().await;
+}
+
+/// A home run for a home this machine does not hold, or with a `cwd` that
+/// leaves the home checkout, is refused with a typed `scriptExited` and
+/// runs nothing.
+#[tokio::test]
+async fn a_home_run_on_an_unknown_home_or_outside_the_checkout_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+
+    let unknown = home("h9");
+    dialed
+        .link
+        .send(&home_script(&unknown, "p1", "echo ran", None))
+        .await
+        .unwrap();
+    let run = watch_home_run(&mut dialed, &unknown, "p1").await;
+    assert!(!run.started);
+    let exited = run.exited.unwrap();
+    assert_eq!(exited.exit_code, None);
+    assert!(
+        exited
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(NODE_HOME_UNKNOWN)),
+        "{exited:?}"
+    );
+
+    let h1 = home("h1");
+    opened_home(&mut dialed, &h1).await;
+    dialed
+        .link
+        .send(&home_script(&h1, "p2", "echo ran", Some("../outside")))
+        .await
+        .unwrap();
+    let run = watch_home_run(&mut dialed, &h1, "p2").await;
+    assert!(!run.started);
+    assert!(run
+        .exited
+        .unwrap()
+        .error
+        .is_some_and(|e| e.starts_with("node-script-invalid-cwd")),);
+    node.stop().await;
+}
+
+/// `scriptStop` naming the home ends its run, answered by the run's own
+/// `scriptExited`; a stop naming an agent with the same script and spawn
+/// does not touch it.
+#[cfg(unix)]
+#[tokio::test]
+async fn stopping_a_home_run_ends_it_and_an_agent_stop_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), true).await;
+    let h1 = home("h1");
+    let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    opened_home(&mut dialed, &h1).await;
+    dialed
+        .link
+        .send(&home_script(&h1, "p1", "echo up; sleep 600", None))
+        .await
+        .unwrap();
+    next_of(&mut dialed, |frame| match frame {
+        LinkFrame::ScriptOutput(output) if output.data.contains("up") => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // Same script and spawn, but an agent's: no such process.
+    dialed
+        .link
+        .send(&LinkFrame::ScriptStop(
+            intent_core::node_link::ScriptProcessRef {
+                owner: AgentId::from("a1").into(),
+                script_id: "s1".into(),
+                spawn_id: "p1".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    let refused = next_of(&mut dialed, |frame| match frame {
+        LinkFrame::ScriptExited(exited) => Some(exited),
+        _ => None,
+    })
+    .await;
+    assert_eq!(refused.owner, AgentId::from("a1").into());
+    assert!(refused
+        .error
+        .is_some_and(|e| e.starts_with("node-script-not-running")));
+
+    dialed
+        .link
+        .send(&LinkFrame::ScriptStop(
+            intent_core::node_link::ScriptProcessRef {
+                owner: intent_core::node_link::CheckoutOwner::Home(h1.clone()),
+                script_id: "s1".into(),
+                spawn_id: "p1".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    let run = watch_home_run(&mut dialed, &h1, "p1").await;
+    let exited = run.exited.unwrap();
+    assert_eq!(exited.error, None, "{exited:?}");
+    assert_ne!(exited.exit_code, Some(0), "killed: {exited:?}");
+    node.stop().await;
+}

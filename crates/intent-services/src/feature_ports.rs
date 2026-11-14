@@ -54,6 +54,22 @@ pub struct HomeTerminalOpen {
     pub env: Vec<(String, String)>,
 }
 
+/// What [`RemoteLaunchPort::open_home_script`] starts on the home: one
+/// process of a saved script's home run.
+#[derive(Debug, Clone)]
+pub struct HomeScriptOpen {
+    pub script_id: String,
+    pub command: String,
+    pub mode: intent_core::ScriptMode,
+    /// Relative to the home checkout.
+    pub cwd: Option<String>,
+    /// The saved environment, in saved order.
+    pub env: Vec<(String, String)>,
+    pub scrollback_bytes: usize,
+    /// Receives the run's output, for its log.
+    pub output_sink: Option<intent_pty::OutputSink>,
+}
+
 /// Maximum DECODED bytes per transfer chunk (`workspace.import.chunk`, and
 /// `workspace.export.read`). Base64 inflates this by 4/3 on the wire
 /// (~21.4 MiB), keeping the full JSON-RPC frame comfortably under the
@@ -865,6 +881,18 @@ pub trait RuntimePort: Send + Sync + 'static {
         Box::pin(async {})
     }
 
+    /// `workspace_id`'s home made a new checkout and finished its setup:
+    /// start the home run of each saved `autoStart` script. A no-op by
+    /// default.
+    fn start_home_auto_start<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (svc, workspace_id);
+        Box::pin(async {})
+    }
+
     /// Machine `node_id`'s link ended: every live machine run on it is lost
     /// with `reason` (`remote-script-lost: …`).
     fn machine_link_lost<'a>(
@@ -1496,6 +1524,24 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         workspace_id: &'a WorkspaceId,
         pty: &'a Arc<intent_pty::PtyHost>,
         open: HomeTerminalOpen,
+    ) -> BoxFuture<'a, Result<Option<intent_pty::PtyId>>> {
+        let _ = (svc, workspace_id, pty, open);
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Start one process of a saved script's home run on the workspace's
+    /// home (nodeProtocol 19) as a remote PTY in `pty`. `None` when the
+    /// workspace has no home on a machine, so the caller runs it here.
+    ///
+    /// # Errors
+    ///
+    /// `home-unavailable` when the home's machine cannot run it now.
+    fn open_home_script<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        pty: &'a Arc<intent_pty::PtyHost>,
+        open: HomeScriptOpen,
     ) -> BoxFuture<'a, Result<Option<intent_pty::PtyId>>> {
         let _ = (svc, workspace_id, pty, open);
         Box::pin(async { Ok(None) })

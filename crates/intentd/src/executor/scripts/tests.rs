@@ -20,7 +20,7 @@ fn wait() -> Duration {
 
 fn start(agent: &AgentId, spawn: &str, command: &str) -> ScriptStartCommand {
     ScriptStartCommand {
-        agent_id: agent.clone(),
+        owner: agent.clone().into(),
         script_id: "s1".into(),
         spawn_id: spawn.into(),
         command: command.into(),
@@ -32,7 +32,7 @@ fn start(agent: &AgentId, spawn: &str, command: &str) -> ScriptStartCommand {
 
 fn process(agent: &AgentId, spawn: &str) -> ScriptProcessRef {
     ScriptProcessRef {
-        agent_id: agent.clone(),
+        owner: agent.clone().into(),
         script_id: "s1".into(),
         spawn_id: spawn.into(),
     }
@@ -125,7 +125,7 @@ async fn a_start_runs_in_the_agent_checkout_with_the_saved_env_and_reports_its_e
     let exited = seen.exited.unwrap();
     assert_eq!(exited.exit_code, Some(3));
     assert_eq!(exited.error, None);
-    assert_eq!(exited.agent_id, agent);
+    assert_eq!(exited.owner, agent.clone().into());
     assert_eq!(exited.script_id, "s1");
 }
 

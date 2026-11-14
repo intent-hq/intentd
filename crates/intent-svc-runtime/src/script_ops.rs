@@ -34,6 +34,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::MissedTickBehavior;
 
+mod home_runs;
 mod lifecycle;
 pub(crate) mod machine_runs;
 mod monitors;
@@ -357,6 +358,9 @@ pub struct ScriptManager {
     /// Remote agents' machine runs (`remoteScripts: 1`), set up once the
     /// owner's services are attached.
     machine_runs: Arc<std::sync::OnceLock<machine_runs::MachineRuns>>,
+    /// The PTYs of home runs on a workspace home (nodeProtocol 19), until
+    /// released: a stopped one ends with no status from the machine.
+    home_ptys: Arc<std::sync::Mutex<HashSet<PtyId>>>,
 }
 
 /// Holds a workspace's closing mark (see [`ScriptManager::close_workspace`]);
@@ -525,6 +529,7 @@ impl ScriptManager {
                 intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
             ),
             machine_runs: Arc::default(),
+            home_ptys: Arc::default(),
         }
     }
 
@@ -556,6 +561,7 @@ impl ScriptManager {
     /// lives on in the run's on-disk log.
     async fn release_pty(&self, pty_id: PtyId) {
         self.pty.kill(pty_id).await;
+        self.home_ptys.lock().unwrap().remove(&pty_id);
     }
 
     pub(crate) fn with_owner_services(
@@ -2020,6 +2026,9 @@ impl ScriptManager {
         if self.is_live(workspace_id, script_id)? {
             return Ok(self.start_reply(workspace_id, script_id));
         }
+        // A home run's machine is dialed first: an unreachable home fails
+        // the start with `home-unavailable`, and no lock waits on a dial.
+        self.connect_home(workspace_id).await?;
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
@@ -2402,6 +2411,7 @@ impl ScriptManager {
         workspace_id: &WorkspaceId,
         script_id: &str,
     ) -> Result<Value> {
+        self.connect_home(workspace_id).await?;
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
@@ -2461,6 +2471,7 @@ impl ScriptManager {
                 json!({"output": "", "warning": "Script is already running; wait for it to finish or use script.stop."}),
             );
         }
+        self.connect_home(workspace_id).await?;
         self.signal_admission_wait();
         let lock = self.locks.definition_lock(script_id);
         let admission = lock.lock_owned().await;
@@ -2587,8 +2598,8 @@ impl ScriptManager {
             .get(&(workspace_id.clone(), script_id.to_string()))
             .and_then(|m| m.state.run_id.clone());
         let ws = workspace_id.clone();
-        let cwd = match self.resolve_cwd(&ws, &def).await {
-            Ok(cwd) => cwd,
+        let target = match self.resolve_target(&ws, &def).await {
+            Ok(target) => target,
             Err(e) => {
                 let _ = self.fail_run(reservation, e.to_string()).await;
                 return Err(e);
@@ -2599,7 +2610,7 @@ impl ScriptManager {
                 &ws,
                 script_id,
                 generation,
-                self.build_spec(&ws, &def, cwd.as_ref()),
+                self.launch_for(&ws, &def, &target),
             )
             .await
         {
@@ -2708,8 +2719,8 @@ impl ScriptManager {
         generation: u64,
         mut restoring: bool,
     ) {
-        let cwd = match self.resolve_cwd(&ws, &def).await {
-            Ok(c) => c,
+        let target = match self.resolve_target(&ws, &def).await {
+            Ok(target) => target,
             Err(e) => {
                 self.fail(&ws, &script_id, generation, &e.to_string(), restoring)
                     .await;
@@ -2727,7 +2738,7 @@ impl ScriptManager {
                     &ws,
                     &script_id,
                     generation,
-                    self.build_spec(&ws, &def, cwd.as_ref()),
+                    self.launch_for(&ws, &def, &target),
                 )
                 .await
             {
@@ -2778,7 +2789,14 @@ impl ScriptManager {
                 self.release_pty(pty_id).await;
                 return;
             };
-            if stopped_by_user || def.mode != ScriptMode::Service || self.locks.is_closing(&ws) {
+            // A home run lost with its machine (or refused there) is not
+            // restarted, as a machine run is not (nodeProtocol 19).
+            let lost = self.pty.remote_lost_reason(pty_id).is_some();
+            if stopped_by_user
+                || lost
+                || def.mode != ScriptMode::Service
+                || self.locks.is_closing(&ws)
+            {
                 self.queue_settlement(&ws, &script_id, generation);
                 break;
             }
@@ -3126,7 +3144,18 @@ impl ScriptManager {
             let code = terminal_exit_code(exit.as_ref());
             m.state.exit_code = Some(code);
             if code == EXIT_CODE_UNOBSERVABLE {
-                m.state.error = Some(EXIT_UNOBSERVABLE_ERROR.to_string());
+                // A home run (nodeProtocol 19) lost with its machine says
+                // why; one the user stopped ends on the machine, which
+                // reports no status for a released run, so it has no error.
+                let remote = m
+                    .pty_id
+                    .filter(|id| self.home_ptys.lock().unwrap().contains(id));
+                let lost = remote.and_then(|id| self.pty.remote_lost_reason(id));
+                m.state.error = match lost {
+                    Some(lost) => Some(lost),
+                    None if remote.is_some() && m.stopped_by_user => None,
+                    None => Some(EXIT_UNOBSERVABLE_ERROR.to_string()),
+                };
             }
             m.state.stopped_at = Some(now_iso());
             if m.def.mode == ScriptMode::Command || m.stopped_by_user {

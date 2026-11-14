@@ -1626,33 +1626,91 @@ impl std::fmt::Debug for LaunchProfileEnv {
     }
 }
 
-/// Backend asks the machine to run one process of a remote agent's machine
-/// run of a saved script, in that agent's checkout. `spawn_id` is a UUID the
-/// backend picks for every process it starts, automatic restarts included,
-/// unique within the binding; it is not the run's §5.8a `runId`. A process is
-/// identified by (`agent_id`, `script_id`, `spawn_id`). The body is closed.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ScriptStartCommand {
-    /// The remote agent whose machine run this is: it runs in its checkout.
-    pub agent_id: AgentId,
-    pub script_id: String,
-    pub spawn_id: String,
-    pub command: String,
-    pub mode: crate::ScriptMode,
-    /// Relative to the agent's checkout.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    /// The saved environment, in saved order. Values may be secrets:
-    /// `Debug` renders only the keys.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub env: Vec<ScriptEnvVar>,
+/// Declares a script frame whose body names its run's owner on the wire as
+/// exactly one of `agentId` or (nodeProtocol 19) `workspaceId` with
+/// `homeId`, through a closed raw body.
+macro_rules! owned_script_frame {
+    (
+        $(#[$meta:meta])*
+        $name:ident via $raw:ident = $raw_lit:literal, $what:literal {
+            $($(#[$fmeta:meta])* $field:ident : $ty:ty,)*
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(try_from = $raw_lit, into = $raw_lit)]
+        pub struct $name {
+            /// Whose run: a remote agent's machine run, or a workspace's
+            /// home run.
+            pub owner: CheckoutOwner,
+            $($(#[$fmeta])* pub $field: $ty,)*
+        }
+
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct $raw {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            agent_id: Option<AgentId>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            workspace_id: Option<WorkspaceId>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            home_id: Option<HomeId>,
+            $($(#[$fmeta])* $field: $ty,)*
+        }
+
+        impl TryFrom<$raw> for $name {
+            type Error = &'static str;
+
+            fn try_from(raw: $raw) -> std::result::Result<Self, Self::Error> {
+                Ok(Self {
+                    owner: CheckoutOwner::from_wire(raw.agent_id, raw.workspace_id, raw.home_id)
+                        .ok_or(concat!($what, " names an agentId, or a workspaceId with a homeId"))?,
+                    $($field: raw.$field,)*
+                })
+            }
+        }
+
+        impl From<$name> for $raw {
+            fn from(frame: $name) -> Self {
+                let (agent_id, workspace_id, home_id) = frame.owner.into_wire();
+                Self {
+                    agent_id,
+                    workspace_id,
+                    home_id,
+                    $($field: frame.$field,)*
+                }
+            }
+        }
+    };
+}
+
+owned_script_frame! {
+    /// Backend asks the machine to run one process of a saved script: a
+    /// remote agent's machine run, in that agent's checkout, or
+    /// (nodeProtocol 19) a workspace's home run, in its home checkout.
+    /// `spawn_id` is a UUID the backend picks for every process it starts,
+    /// automatic restarts included, unique within the binding; it is not the
+    /// run's §5.8a `runId`. A process is identified by (owner, `script_id`,
+    /// `spawn_id`). The body is closed.
+    ScriptStartCommand via RawScriptStart = "RawScriptStart", "scriptStart" {
+        script_id: String,
+        spawn_id: String,
+        command: String,
+        mode: crate::ScriptMode,
+        /// Relative to the owner's checkout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// The saved environment, in saved order. Values may be secrets:
+        /// `Debug` renders only the keys.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<ScriptEnvVar>,
+    }
 }
 
 impl std::fmt::Debug for ScriptStartCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScriptStartCommand")
-            .field("agent_id", &self.agent_id)
+            .field("owner", &self.owner)
             .field("script_id", &self.script_id)
             .field("spawn_id", &self.spawn_id)
             .field("mode", &self.mode)
@@ -1676,51 +1734,52 @@ impl std::fmt::Debug for ScriptEnvVar {
     }
 }
 
-/// Names one script process: the body of `scriptStop`. The machine answers
-/// every stop with that process's `scriptExited`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ScriptProcessRef {
-    pub agent_id: AgentId,
-    pub script_id: String,
-    pub spawn_id: String,
+owned_script_frame! {
+    /// Names one script process: the body of `scriptStop`. The machine
+    /// answers every stop with that process's `scriptExited`.
+    #[derive(Debug)]
+    ScriptProcessRef via RawScriptProcessRef = "RawScriptProcessRef", "scriptStop" {
+        script_id: String,
+        spawn_id: String,
+    }
 }
 
-/// Machine to backend: the run's process is spawned.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ScriptStarted {
-    pub agent_id: AgentId,
-    pub script_id: String,
-    pub spawn_id: String,
-    pub pid: u32,
+owned_script_frame! {
+    /// Machine to backend: the run's process is spawned.
+    #[derive(Debug)]
+    ScriptStarted via RawScriptStarted = "RawScriptStarted", "scriptStarted" {
+        script_id: String,
+        spawn_id: String,
+        pid: u32,
+    }
 }
 
-/// Machine to backend: the next piece of the run's combined output, as
-/// UTF-8 text (invalid bytes replaced), `seq` counting from 0 per `spawn_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ScriptOutput {
-    pub agent_id: AgentId,
-    pub script_id: String,
-    pub spawn_id: String,
-    pub seq: u64,
-    pub data: String,
+owned_script_frame! {
+    /// Machine to backend: the next piece of the run's combined output, as
+    /// UTF-8 text (invalid bytes replaced), `seq` counting from 0 per
+    /// `spawn_id`.
+    #[derive(Debug)]
+    ScriptOutput via RawScriptOutput = "RawScriptOutput", "scriptOutput" {
+        script_id: String,
+        spawn_id: String,
+        seq: u64,
+        data: String,
+    }
 }
 
-/// Machine to backend: the run ended. `exit_code` is absent only together
-/// with `error` (`"<code>: <detail>"`), for a refused start or a stop of a
-/// process that is not running (`node-script-not-running`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ScriptExited {
-    pub agent_id: AgentId,
-    pub script_id: String,
-    pub spawn_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+owned_script_frame! {
+    /// Machine to backend: the run ended. `exit_code` is absent only
+    /// together with `error` (`"<code>: <detail>"`), for a refused start or
+    /// a stop of a process that is not running (`node-script-not-running`).
+    #[derive(Debug)]
+    ScriptExited via RawScriptExited = "RawScriptExited", "scriptExited" {
+        script_id: String,
+        spawn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    }
 }
 
 /// The largest `data` one [`ScriptOutput`] carries, in bytes.
@@ -1957,19 +2016,78 @@ pub enum LinkFrame {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawSetupOutput", into = "RawSetupOutput")]
 pub struct SetupOutput {
-    pub owner: SetupOwner,
+    pub owner: CheckoutOwner,
     pub seq: u64,
     pub data: String,
 }
 
-/// Whose checkout a [`SetupOutput`] is about.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SetupOwner {
+/// Whose checkout a frame is about: a remote agent's, or (nodeProtocol 19)
+/// a workspace's home checkout. On the wire it is exactly one of `agentId`
+/// or `workspaceId` with `homeId`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CheckoutOwner {
     Agent(AgentId),
     Home(HomeRef),
 }
 
-impl From<AgentId> for SetupOwner {
+impl CheckoutOwner {
+    /// The owner the wire members name, when they name exactly one.
+    #[must_use]
+    pub fn from_wire(
+        agent_id: Option<AgentId>,
+        workspace_id: Option<WorkspaceId>,
+        home_id: Option<HomeId>,
+    ) -> Option<Self> {
+        match (agent_id, workspace_id, home_id) {
+            (Some(agent), None, None) => Some(Self::Agent(agent)),
+            (None, Some(workspace_id), Some(home_id)) => Some(Self::Home(HomeRef {
+                workspace_id,
+                home_id,
+            })),
+            _ => None,
+        }
+    }
+
+    /// The wire members `agentId`, `workspaceId` and `homeId`.
+    #[must_use]
+    pub fn into_wire(self) -> (Option<AgentId>, Option<WorkspaceId>, Option<HomeId>) {
+        match self {
+            Self::Agent(agent) => (Some(agent), None, None),
+            Self::Home(home) => (None, Some(home.workspace_id), Some(home.home_id)),
+        }
+    }
+
+    #[must_use]
+    pub fn agent(&self) -> Option<&AgentId> {
+        match self {
+            Self::Agent(agent) => Some(agent),
+            Self::Home(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn home(&self) -> Option<&HomeRef> {
+        match self {
+            Self::Agent(_) => None,
+            Self::Home(home) => Some(home),
+        }
+    }
+}
+
+impl std::fmt::Display for CheckoutOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Agent(agent) => write!(f, "agent {agent}"),
+            Self::Home(home) => write!(
+                f,
+                "home {} of workspace {}",
+                home.home_id, home.workspace_id
+            ),
+        }
+    }
+}
+
+impl From<AgentId> for CheckoutOwner {
     fn from(agent: AgentId) -> Self {
         Self::Agent(agent)
     }
@@ -1992,14 +2110,8 @@ impl TryFrom<RawSetupOutput> for SetupOutput {
     type Error = &'static str;
 
     fn try_from(raw: RawSetupOutput) -> std::result::Result<Self, Self::Error> {
-        let owner = match (raw.agent_id, raw.workspace_id, raw.home_id) {
-            (Some(agent), None, None) => SetupOwner::Agent(agent),
-            (None, Some(workspace_id), Some(home_id)) => SetupOwner::Home(HomeRef {
-                workspace_id,
-                home_id,
-            }),
-            _ => return Err("setupOutput names an agentId, or a workspaceId with a homeId"),
-        };
+        let owner = CheckoutOwner::from_wire(raw.agent_id, raw.workspace_id, raw.home_id)
+            .ok_or("setupOutput names an agentId, or a workspaceId with a homeId")?;
         Ok(Self {
             owner,
             seq: raw.seq,
@@ -2010,10 +2122,7 @@ impl TryFrom<RawSetupOutput> for SetupOutput {
 
 impl From<SetupOutput> for RawSetupOutput {
     fn from(output: SetupOutput) -> Self {
-        let (agent_id, workspace_id, home_id) = match output.owner {
-            SetupOwner::Agent(agent) => (Some(agent), None, None),
-            SetupOwner::Home(home) => (None, Some(home.workspace_id), Some(home.home_id)),
-        };
+        let (agent_id, workspace_id, home_id) = output.owner.into_wire();
         Self {
             agent_id,
             workspace_id,
@@ -2097,6 +2206,19 @@ impl LinkFrame {
         }
     }
 
+    /// The run owner a script frame names; `None` for any other frame.
+    #[must_use]
+    pub fn script_owner(&self) -> Option<&CheckoutOwner> {
+        match self {
+            Self::ScriptStart(frame) => Some(&frame.owner),
+            Self::ScriptStop(frame) => Some(&frame.owner),
+            Self::ScriptStarted(frame) => Some(&frame.owner),
+            Self::ScriptOutput(frame) => Some(&frame.owner),
+            Self::ScriptExited(frame) => Some(&frame.owner),
+            _ => None,
+        }
+    }
+
     /// The lowest negotiated protocol this frame may travel on.
     #[must_use]
     pub fn min_protocol(&self) -> u32 {
@@ -2112,6 +2234,12 @@ impl LinkFrame {
             | Self::PtyAck(_)
             | Self::PtyOutput(_)
             | Self::PtyExited(_) => HOMES_PROTOCOL,
+            _ if self
+                .script_owner()
+                .is_some_and(|owner| owner.home().is_some()) =>
+            {
+                HOMES_PROTOCOL
+            }
             Self::Launch(command)
                 if command
                     .checkout_of
@@ -2139,7 +2267,7 @@ impl LinkFrame {
             Self::Launch(command) if command.forge.is_some() => FORGE_TOKEN_PROTOCOL,
             Self::Launch(command) if !command.mcp_proxies.is_empty() => MCP_PROXY_PROTOCOL,
             Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,
-            Self::SetupOutput(output) if matches!(output.owner, SetupOwner::Home(_)) => {
+            Self::SetupOutput(output) if matches!(output.owner, CheckoutOwner::Home(_)) => {
                 HOMES_PROTOCOL
             }
             Self::SetupOutput(_) => PREPARED_CHECKOUT_PROTOCOL,

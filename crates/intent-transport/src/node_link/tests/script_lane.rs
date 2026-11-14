@@ -14,7 +14,7 @@ use super::*;
 
 fn start_frame(agent_id: &AgentId) -> LinkFrame {
     LinkFrame::ScriptStart(ScriptStartCommand {
-        agent_id: agent_id.clone(),
+        owner: agent_id.clone().into(),
         script_id: "s1".into(),
         spawn_id: "spawn-1".into(),
         command: "echo hi".into(),
@@ -26,7 +26,7 @@ fn start_frame(agent_id: &AgentId) -> LinkFrame {
 
 fn output(agent_id: &AgentId, seq: u64, data: String) -> ScriptOutput {
     ScriptOutput {
-        agent_id: agent_id.clone(),
+        owner: agent_id.clone().into(),
         script_id: "s1".into(),
         spawn_id: "spawn-1".into(),
         seq,
@@ -71,7 +71,7 @@ async fn script_frames_travel_both_ways(
         .unwrap()
     {
         Some(LinkEvent::Frame(LinkFrame::ScriptStart(start))) => {
-            assert_eq!(start.agent_id, agent_id);
+            assert_eq!(start.owner, agent_id.clone().into());
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -80,7 +80,7 @@ async fn script_frames_travel_both_ways(
         .unwrap());
     machine
         .send(&LinkFrame::ScriptExited(ScriptExited {
-            agent_id: agent_id.clone(),
+            owner: agent_id.clone().into(),
             script_id: "s1".into(),
             spawn_id: "spawn-1".into(),
             exit_code: Some(0),
@@ -197,7 +197,7 @@ async fn queued_script_output_is_bounded_but_lifecycle_frames_are_never_dropped(
     tokio::time::timeout(
         wait(),
         link.send(&LinkFrame::ScriptStop(ScriptProcessRef {
-            agent_id: agent_id.clone(),
+            owner: agent_id.clone().into(),
             script_id: "s1".into(),
             spawn_id: "spawn-1".into(),
         })),

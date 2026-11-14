@@ -1,9 +1,10 @@
 //! Script monitors share the definition admission lock with start/restart/stop.
 //! The shorter monitor lane orders output, TTL and terminal decisions; teardown
 //! reserves its outcome then releases that lane before joining a supervisor.
+use super::home_runs::Launch;
 use super::{
     json, now_iso, publish_event, script_event, Error, Ordering, PtyId, Result, ScriptManager,
-    SpawnSpec, Value, WorkspaceId, LOST_AT_DAEMON_STOP_ERROR,
+    Value, WorkspaceId, LOST_AT_DAEMON_STOP_ERROR,
 };
 use crate::script_monitor::ScriptMonitorExt;
 use intent_core::script_output::LineDecoder;
@@ -793,11 +794,16 @@ impl ScriptManager {
         ws: &WorkspaceId,
         id: &str,
         generation: u64,
-        spec: SpawnSpec,
+        launch: Launch,
     ) -> Result<PtyId> {
         if let Some(park) = &self.parks.before_spawn {
             park.entered.notify_one();
             park.release.notified().await;
+        }
+        // Dialed before the monitor lane: a home's spawn below then finds
+        // its link up and holds the lane only for the open.
+        if matches!(launch, Launch::Home(_)) {
+            self.connect_home(ws).await?;
         }
         let _lane = self.locks.monitor_lane.lock().await;
         if self
@@ -809,7 +815,7 @@ impl ScriptManager {
         {
             return Err(Error::InvalidParams("script launch was cancelled".into()));
         }
-        let mut spec = spec;
+        let mut launch = launch;
         let run = self
             .scripts
             .lock()
@@ -817,9 +823,9 @@ impl ScriptManager {
             .get(&(ws.clone(), id.into()))
             .and_then(|m| m.state.run_id.clone());
         if let Some(run) = run {
-            spec.output_sink = self.open_output_sink(ws, id, &run).await;
+            launch.set_output_sink(self.open_output_sink(ws, id, &run).await);
         }
-        let pty = self.pty.spawn(spec)?;
+        let pty = self.spawn_launch(ws, launch).await?;
         if let Some(m) = self
             .scripts
             .lock()

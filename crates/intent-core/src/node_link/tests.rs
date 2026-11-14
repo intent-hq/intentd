@@ -572,25 +572,25 @@ fn every_frame() -> Vec<LinkFrame> {
         },
         LinkFrame::ScriptStart(script_start()),
         LinkFrame::ScriptStop(ScriptProcessRef {
-            agent_id: AgentId::from("a1"),
+            owner: AgentId::from("a1").into(),
             script_id: "s1".into(),
             spawn_id: "r1".into(),
         }),
         LinkFrame::ScriptStarted(ScriptStarted {
-            agent_id: AgentId::from("a1"),
+            owner: AgentId::from("a1").into(),
             script_id: "s1".into(),
             spawn_id: "r1".into(),
             pid: 4242,
         }),
         LinkFrame::ScriptOutput(ScriptOutput {
-            agent_id: AgentId::from("a1"),
+            owner: AgentId::from("a1").into(),
             script_id: "s1".into(),
             spawn_id: "r1".into(),
             seq: 0,
             data: "hello\n".into(),
         }),
         LinkFrame::ScriptExited(ScriptExited {
-            agent_id: AgentId::from("a1"),
+            owner: AgentId::from("a1").into(),
             script_id: "s1".into(),
             spawn_id: "r1".into(),
             exit_code: Some(0),
@@ -829,7 +829,7 @@ fn home_owners_round_trip_and_need_protocol_19() {
     assert_eq!(LinkFrame::Journal(record).min_protocol(), HOMES_PROTOCOL);
 
     let output = SetupOutput {
-        owner: SetupOwner::Home(home.clone()),
+        owner: CheckoutOwner::Home(home.clone()),
         seq: 0,
         data: "x".into(),
     };
@@ -927,7 +927,7 @@ fn pty_frame_wire_shapes() {
 
 fn script_start() -> ScriptStartCommand {
     ScriptStartCommand {
-        agent_id: AgentId::from("a1"),
+        owner: AgentId::from("a1").into(),
         script_id: "s1".into(),
         spawn_id: "r1".into(),
         command: "npm test".into(),
@@ -1369,7 +1369,7 @@ fn script_frames_match_the_documented_wire_shapes() {
     assert_eq!(wire["mode"], "service");
     assert_eq!(
         serde_json::to_value(LinkFrame::ScriptStop(ScriptProcessRef {
-            agent_id: AgentId::from("a1"),
+            owner: AgentId::from("a1").into(),
             script_id: "s1".into(),
             spawn_id: "r1".into(),
         }))
@@ -1389,7 +1389,7 @@ fn script_frames_match_the_documented_wire_shapes() {
         json!({ "type": "scriptExited", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "exitCode": 0 })
     );
     let refused = LinkFrame::ScriptExited(ScriptExited {
-        agent_id: AgentId::from("a1"),
+        owner: AgentId::from("a1").into(),
         script_id: "s1".into(),
         spawn_id: "r1".into(),
         exit_code: None,
@@ -2257,4 +2257,98 @@ fn one_shot_input_must_match_its_operation() {
         json!({ "providerId": "codex", "prompt": "p", "extra": 1 })
     ))
     .is_err());
+}
+
+#[test]
+fn script_frames_name_an_agent_or_a_home_and_a_home_needs_protocol_19() {
+    let home = HomeRef {
+        workspace_id: WorkspaceId::from("ws-1"),
+        home_id: HomeId::from("home-1"),
+    };
+    let start = ScriptStartCommand {
+        owner: CheckoutOwner::Home(home.clone()),
+        script_id: "s1".into(),
+        spawn_id: "p1".into(),
+        command: "echo hi".into(),
+        mode: crate::ScriptMode::Command,
+        cwd: Some("web".into()),
+        env: Vec::new(),
+    };
+    let wire = serde_json::to_value(LinkFrame::ScriptStart(start.clone())).unwrap();
+    assert_eq!(wire["workspaceId"], "ws-1");
+    assert_eq!(wire["homeId"], "home-1");
+    assert!(wire.get("agentId").is_none());
+    assert_eq!(
+        serde_json::from_value::<LinkFrame>(wire.clone()).unwrap(),
+        LinkFrame::ScriptStart(start.clone())
+    );
+    assert_eq!(
+        LinkFrame::ScriptStart(start.clone()).min_protocol(),
+        HOMES_PROTOCOL
+    );
+
+    // Exactly one owner: both, neither, or half a home are refused.
+    let mut both = wire.clone();
+    both["agentId"] = json!("a1");
+    assert!(serde_json::from_value::<LinkFrame>(both).is_err());
+    let mut neither = wire.clone();
+    let body = neither.as_object_mut().unwrap();
+    body.remove("workspaceId");
+    body.remove("homeId");
+    assert!(serde_json::from_value::<LinkFrame>(neither).is_err());
+    let mut half = wire.clone();
+    half.as_object_mut().unwrap().remove("homeId");
+    assert!(serde_json::from_value::<LinkFrame>(half).is_err());
+    // The body stays closed.
+    let mut extra = wire;
+    extra["extra"] = json!(1);
+    assert!(serde_json::from_value::<LinkFrame>(extra).is_err());
+
+    let owner = CheckoutOwner::Home(home);
+    let frames = [
+        LinkFrame::ScriptStop(ScriptProcessRef {
+            owner: owner.clone(),
+            script_id: "s1".into(),
+            spawn_id: "p1".into(),
+        }),
+        LinkFrame::ScriptStarted(ScriptStarted {
+            owner: owner.clone(),
+            script_id: "s1".into(),
+            spawn_id: "p1".into(),
+            pid: 7,
+        }),
+        LinkFrame::ScriptOutput(ScriptOutput {
+            owner: owner.clone(),
+            script_id: "s1".into(),
+            spawn_id: "p1".into(),
+            seq: 0,
+            data: "hi\n".into(),
+        }),
+        LinkFrame::ScriptExited(ScriptExited {
+            owner: owner.clone(),
+            script_id: "s1".into(),
+            spawn_id: "p1".into(),
+            exit_code: Some(0),
+            error: None,
+        }),
+    ];
+    for frame in frames {
+        assert_eq!(frame.script_owner(), Some(&owner));
+        assert_eq!(frame.min_protocol(), HOMES_PROTOCOL);
+        let wire = serde_json::to_value(&frame).unwrap();
+        assert_eq!(serde_json::from_value::<LinkFrame>(wire).unwrap(), frame);
+    }
+
+    // An agent's run keeps its wire shape and protocol.
+    let agent_start = ScriptStartCommand {
+        owner: AgentId::from("a1").into(),
+        ..start
+    };
+    let wire = serde_json::to_value(LinkFrame::ScriptStart(agent_start.clone())).unwrap();
+    assert_eq!(wire["agentId"], "a1");
+    assert!(wire.get("homeId").is_none());
+    assert_eq!(
+        LinkFrame::ScriptStart(agent_start).min_protocol(),
+        SCRIPT_PROTOCOL
+    );
 }

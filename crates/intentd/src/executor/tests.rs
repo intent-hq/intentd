@@ -1808,7 +1808,7 @@ async fn a_final_stop_ends_the_agents_scripts_before_it_is_acknowledged() {
     dialed
         .link
         .send(&LinkFrame::ScriptStart(ScriptStartCommand {
-            agent_id: agent.clone(),
+            owner: agent.clone().into(),
             script_id: "s1".into(),
             spawn_id: "spawn-1".into(),
             // Ignores the polite signals, so only a kill that is waited for
@@ -1924,7 +1924,7 @@ async fn a_final_stop_over_a_stuck_script_answers_without_an_ack() {
     dialed
         .link
         .send(&LinkFrame::ScriptStart(ScriptStartCommand {
-            agent_id: agent.clone(),
+            owner: agent.clone().into(),
             script_id: "s1".into(),
             spawn_id: "spawn-1".into(),
             command: "sleep 60".into(),
@@ -1984,7 +1984,7 @@ async fn a_final_stop_over_a_panicked_script_teardown_gives_no_ack() {
         dialed
             .link
             .send(&LinkFrame::ScriptStart(ScriptStartCommand {
-                agent_id: agent.clone(),
+                owner: agent.clone().into(),
                 script_id: "s1".into(),
                 spawn_id: format!("spawn-{}", agent.0),
                 command: "sleep 60".into(),
@@ -2076,7 +2076,7 @@ async fn shutdown_over_a_stuck_script_stays_within_one_reap_wait() {
     dialed
         .link
         .send(&LinkFrame::ScriptStart(ScriptStartCommand {
-            agent_id: agent.clone(),
+            owner: agent.clone().into(),
             script_id: "s1".into(),
             spawn_id: "spawn-1".into(),
             command: "sleep 60".into(),

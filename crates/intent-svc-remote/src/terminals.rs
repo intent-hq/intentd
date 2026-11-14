@@ -294,7 +294,7 @@ impl RemotePty for LinkPty {
     }
 }
 
-fn home_unavailable(home: &intent_core::WorkspaceHome, detail: &str) -> Error {
+pub(crate) fn home_unavailable(home: &intent_core::WorkspaceHome, detail: &str) -> Error {
     Error::remote_machine(
         true,
         format!(
