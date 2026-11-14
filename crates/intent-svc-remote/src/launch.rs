@@ -94,7 +94,10 @@ fn no_node() -> Error {
     )
 }
 
-pub(crate) async fn workspace_checkout(svc: &Services, workspace_id: &WorkspaceId) -> Result<PathBuf> {
+pub(crate) async fn workspace_checkout(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+) -> Result<PathBuf> {
     let workspace = svc.store().get_workspace(workspace_id).await?;
     checkout_path(&workspace).ok_or_else(|| {
         Error::InvalidParams(
@@ -359,8 +362,9 @@ pub(crate) fn copy_work(
             node_git::read_agent_ref(&module.worktree, &from_module, AgentRef::Head)?
         {
             pin.commit = module_head.to_string();
-            if let Some(wip) = node_git::read_agent_ref(&module.worktree, &from_module, AgentRef::Wip)?
-                .filter(|wip| *wip != module_head)
+            if let Some(wip) =
+                node_git::read_agent_ref(&module.worktree, &from_module, AgentRef::Wip)?
+                    .filter(|wip| *wip != module_head)
             {
                 let to_module = to.with_module(&pin.module_key)?;
                 node_git::write_agent_ref(&module.worktree, &to_module, AgentRef::Wip, wip)?;
@@ -399,8 +403,7 @@ async fn copy_parent_work(
     let child = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
     let pins = view.pins().to_vec();
     let checkout = checkout.to_path_buf();
-    let copied = blocking(move || copy_work(&checkout, &parent, &child, pins))
-    .await?;
+    let copied = blocking(move || copy_work(&checkout, &parent, &child, pins)).await?;
     let Some((head, pins)) = copied else {
         return Ok(());
     };
@@ -475,7 +478,9 @@ async fn record_refused_start(
     }
 }
 
-pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| Error::Internal(format!("remote launch task failed: {e}")))?
@@ -1356,8 +1361,8 @@ impl RemoteLaunchPort for RemoteLaunch {
                 )));
             }
             let session = svc.store().get_agent_session_summary(agent_id).await?;
-            let mut view =
-                RemotePlacementView::from_metadata(session.metadata.as_ref()).ok_or_else(|| {
+            let mut view = RemotePlacementView::from_metadata(session.metadata.as_ref())
+                .ok_or_else(|| {
                     Error::InvalidParams(format!(
                         "node-agent-unplaced: agent {agent_id} has no remote placement"
                     ))

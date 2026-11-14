@@ -294,19 +294,16 @@ pub(crate) async fn current_home_checkout(
     let Some(placed) = view.home_checkout.as_ref() else {
         return Ok(None);
     };
-    let Some(home) = svc
-        .store()
-        .get_workspace_home(&record.workspace_id)
-        .await?
-    else {
+    let Some(home) = svc.store().get_workspace_home(&record.workspace_id).await? else {
         return Ok(None);
     };
     Ok(
-        (&home.home_id == placed && home.node_id.as_deref() == Some(record.node_id.as_str()))
-            .then(|| intent_core::node_link::HomeRef {
+        (&home.home_id == placed && home.node_id.as_deref() == Some(record.node_id.as_str())).then(
+            || intent_core::node_link::HomeRef {
                 workspace_id: record.workspace_id.clone(),
                 home_id: home.home_id,
-            }),
+            },
+        ),
     )
 }
 

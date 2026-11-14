@@ -527,7 +527,9 @@ async fn a_sharing_agent_relaunches_isolated_after_the_home_moves() {
     std::fs::write(work.join("dirty.txt"), "left uncommitted\n").unwrap();
 
     let b_id = s.b.daemon_id.clone();
-    let started = s.set_home(json!({ "kind": "machine", "nodeId": b_id })).await;
+    let started = s
+        .set_home(json!({ "kind": "machine", "nodeId": b_id }))
+        .await;
     assert!(started.get("error").is_none(), "{started}");
     s.home_until("the home is on B", |home| {
         home["nodeId"] == json!(b_id) && home["state"] == "attached"
@@ -573,14 +575,23 @@ async fn a_sharing_agent_relaunches_isolated_after_the_home_moves() {
     let reply = reply_containing(&mut s.rpc_ws, (&ws_id, &agent_id), "sh-out t1 ", id + 1).await;
     s.next_id += 1000;
     assert!(reply.contains("\\\"code\\\":0"), "{reply}");
-    assert!(reply.contains(&kept), "it starts at the home's head: {reply}");
+    assert!(
+        reply.contains(&kept),
+        "it starts at the home's head: {reply}"
+    );
     assert!(reply.contains("kept\\\\n"), "{reply}");
-    assert!(reply.contains("left uncommitted"), "it has the home's wip: {reply}");
+    assert!(
+        reply.contains("left uncommitted"),
+        "it has the home's wip: {reply}"
+    );
     assert!(
         reply.contains(&a_dir.to_string_lossy().into_owned()),
         "it stays on A: {reply}"
     );
-    assert!(!reply.contains("/homes/"), "not in a home checkout: {reply}");
+    assert!(
+        !reply.contains("/homes/"),
+        "not in a home checkout: {reply}"
+    );
 
     // The user sees the notice once in the transcript.
     let id = s.id();
