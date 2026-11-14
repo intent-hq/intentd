@@ -695,3 +695,59 @@ async fn an_attachment_arrives_in_pieces_and_foreign_uploads_are_unknown() {
         assert_eq!(data, Some(json!({ "code": "not-found" })), "{method}");
     }
 }
+
+/// A cancelled home call stops the search it started (`homeCallCancel`
+/// reaches the search, also one that has not begun), and a later search
+/// under the same id runs in full.
+#[tokio::test]
+async fn a_cancelled_home_call_stops_its_search() {
+    use runner::HomeRecords as _;
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = intent_store::Store::open(&store_dir.path().join("machine.db"))
+        .await
+        .unwrap();
+    let services = intent_services::Services::new(store)
+        .with_workspaces_root(store_dir.path().join("workspaces"));
+    let records = crate::executor::ServicesHomeRecords(services);
+    let checkout = store_dir.path().join("home").join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    for n in 0..40 {
+        std::fs::write(checkout.join(format!("n{n}.txt")), "zqxneedle\n").unwrap();
+    }
+    let record = records.register(&home("h1"), &checkout).await.unwrap();
+    let search = |method: &str, request_id: &str| {
+        let query = if method == "search.fileNames" {
+            "pattern"
+        } else {
+            "query"
+        };
+        let needle = if method == "search.fileNames" {
+            "n"
+        } else {
+            "zqxneedle"
+        };
+        json!({ "workspaceId": record.as_str(), query: needle, "requestId": request_id })
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    for (method, results) in [("search.inFiles", "matches"), ("search.fileNames", "files")] {
+        // The call is already cancelled when its search begins.
+        let (_stopped, stop) = tokio::sync::watch::channel(true);
+        let ended = records
+            .dispatch(method.into(), search(method, "srch-machine"), stop)
+            .await
+            .unwrap();
+        assert_eq!(ended[results], json!([]), "{method}: {ended}");
+        let (_running, stop) = tokio::sync::watch::channel(false);
+        let full = records
+            .dispatch(method.into(), search(method, "srch-machine"), stop)
+            .await
+            .unwrap();
+        assert_eq!(
+            full[results].as_array().map(Vec::len),
+            Some(40),
+            "{method}: {full}"
+        );
+    }
+}

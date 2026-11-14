@@ -14,31 +14,104 @@
 //! subscriber through the streamed `search:*` events.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Poll, Waker};
 
 /// A shared cancellation flag handed to a running search. Cloning shares the
 /// same underlying flag, so a cancel from another task is observed by the walk.
+/// A token made [within](CancelToken::within) another is also cancelled with it.
 #[derive(Clone, Debug, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken {
+    own: Arc<Flag>,
+    /// The token this one was made within, if any.
+    within: Option<Arc<Flag>>,
+}
+
+/// The flag and the tasks waiting for it ([`CancelToken::cancelled`]).
+#[derive(Debug, Default)]
+struct Flag {
+    set: AtomicBool,
+    waiting: Mutex<Vec<Waker>>,
+}
+
+impl Flag {
+    fn is_set(&self) -> bool {
+        self.set.load(Ordering::SeqCst)
+    }
+
+    fn wait(&self, waker: &Waker) {
+        let mut waiting = self.waiting.lock().expect("cancel token poisoned");
+        if !waiting.iter().any(|waiter| waiter.will_wake(waker)) {
+            waiting.push(waker.clone());
+        }
+    }
+}
 
 impl CancelToken {
     /// Mint a fresh, un-cancelled token.
     #[must_use]
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self::default()
+    }
+
+    /// A fresh token that is also cancelled when this one is (a search a
+    /// cancelled home call started). Cancelling it leaves this one alone.
+    #[must_use]
+    pub fn within(&self) -> Self {
+        Self {
+            own: Arc::default(),
+            within: Some(self.own.clone()),
+        }
     }
 
     /// Request cancellation; subsequent [`CancelToken::is_cancelled`] calls
-    /// (including ones already in-flight) observe `true`.
+    /// (including ones already in-flight) observe `true`, and every
+    /// [`CancelToken::cancelled`] future completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the waiter mutex is poisoned (a prior panic while holding the lock).
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.own.set.store(true, Ordering::SeqCst);
+        let waiting = std::mem::take(&mut *self.own.waiting.lock().expect("cancel token poisoned"));
+        for waker in waiting {
+            waker.wake();
+        }
     }
 
-    /// Whether cancellation has been requested.
+    /// Whether cancellation has been requested, of this token or of the one
+    /// it was made within.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.own.is_set() || self.within.as_ref().is_some_and(|within| within.is_set())
+    }
+
+    /// Completes once cancellation has been requested, for a search that
+    /// waits on another task (a search on a workspace's home) rather than
+    /// polling the flag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the waiter mutex is poisoned (a prior panic while holding the lock).
+    pub fn cancelled(&self) -> impl Future<Output = ()> + Send + '_ {
+        std::future::poll_fn(move |cx| {
+            if self.is_cancelled() {
+                return Poll::Ready(());
+            }
+            self.own.wait(cx.waker());
+            if let Some(within) = &self.within {
+                within.wait(cx.waker());
+            }
+            // A cancel between the first check and the registration has
+            // already taken the wakers: look again.
+            if self.is_cancelled() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
     }
 }
 
@@ -83,7 +156,23 @@ impl CancelRegistry {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     #[must_use]
     pub fn register_as(&self, request_id: &str, owner: Option<String>) -> CancelToken {
-        let token = CancelToken::new();
+        self.register_within(request_id, owner, None)
+    }
+
+    /// [`Self::register_as`], with a token also cancelled when `within` is
+    /// ([`CancelToken::within`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn register_within(
+        &self,
+        request_id: &str,
+        owner: Option<String>,
+        within: Option<&CancelToken>,
+    ) -> CancelToken {
+        let token = within.map_or_else(CancelToken::new, CancelToken::within);
         self.inner.lock().expect("cancel registry poisoned").insert(
             request_id.to_string(),
             Entry {
@@ -205,5 +294,58 @@ mod tests {
         let b = mint_request_id();
         assert!(a.starts_with("srch-"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_token_within_another_is_cancelled_with_it_only() {
+        let reg = CancelRegistry::new();
+        let call = CancelToken::new();
+        let search = reg.register_within("srch-in", Some("alice".into()), Some(&call));
+        let other = reg.register("srch-other");
+        assert!(!search.is_cancelled());
+        call.cancel();
+        assert!(search.is_cancelled(), "the call's search ends with it");
+        assert!(!other.is_cancelled(), "another search runs on");
+
+        // Cancelling the search leaves the call alone.
+        let call = CancelToken::new();
+        let search = reg.register_within("srch-in", None, Some(&call));
+        assert!(reg.cancel("srch-in"));
+        assert!(search.is_cancelled());
+        assert!(!call.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_completes_when_the_token_is_cancelled() {
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Wake};
+
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let woken = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        let token = CancelToken::new();
+        let mut cancelled = std::pin::pin!(token.cancelled());
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        token.clone().cancel();
+        assert_eq!(woken.0.load(Ordering::SeqCst), 1, "woken once");
+        assert!(cancelled.as_mut().poll(&mut cx).is_ready());
+        // Already cancelled: ready at once.
+        assert!(std::pin::pin!(token.cancelled()).poll(&mut cx).is_ready());
+
+        // A token within another completes when that one is cancelled.
+        let call = CancelToken::new();
+        let search = call.within();
+        let mut cancelled = std::pin::pin!(search.cancelled());
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        call.cancel();
+        assert_eq!(woken.0.load(Ordering::SeqCst), 2);
+        assert!(cancelled.as_mut().poll(&mut cx).is_ready());
     }
 }

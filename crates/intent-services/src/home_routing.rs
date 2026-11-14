@@ -68,6 +68,30 @@ const HOME_WRITES: &[&str] = &[
     "git.unstageHunk",
 ];
 
+tokio::task_local! {
+    /// On a machine, the home call this task runs: a search it starts ends
+    /// with it ([`Services::run_home_call`]).
+    static HOME_CALL: intent_search::CancelToken;
+}
+
+/// The cancel of the home call this task runs, if any.
+pub(crate) fn home_call_cancel() -> Option<intent_search::CancelToken> {
+    HOME_CALL.try_with(Clone::clone).ok()
+}
+
+/// Routed searches: `search.cancel` ends them on the home too.
+const HOME_SEARCHES: &[&str] = &["search.inFiles", "search.fileNames", "search.codebase"];
+
+/// What a home search `search.cancel` ended before the home answered
+/// returns: no results, as a local search cancelled before its first match.
+fn cancelled_search(method: &str, request_id: &str) -> Value {
+    match method {
+        "search.fileNames" => json!({ "requestId": request_id, "files": [], "truncated": false }),
+        "search.inFiles" => json!({ "requestId": request_id, "matches": [], "truncated": false }),
+        _ => json!({ "requestId": request_id, "matches": [] }),
+    }
+}
+
 /// How long a routed call may run on the home.
 fn call_timeout(method: &str) -> Duration {
     match method {
@@ -201,6 +225,31 @@ fn names_checkout(worktree: &Path, params: &Map<String, Value>) -> bool {
 }
 
 impl Services {
+    /// On a machine, run the home call `call` until it ends, or until
+    /// `stop` turns `true` (the backend sent `homeCallCancel`): a search the
+    /// call runs then stops at its next file and answers with what it found.
+    pub async fn run_home_call<F: std::future::Future>(
+        mut stop: tokio::sync::watch::Receiver<bool>,
+        call: F,
+    ) -> F::Output {
+        let cancel = intent_search::CancelToken::new();
+        if *stop.borrow() {
+            cancel.cancel();
+        }
+        let running = HOME_CALL.scope(cancel.clone(), call);
+        tokio::pin!(running);
+        // `false` when the call's end can no longer be observed.
+        let stopped = async move { stop.wait_for(|stop| *stop).await.is_ok() };
+        tokio::select! {
+            biased;
+            output = &mut running => output,
+            true = stopped => {
+                cancel.cancel();
+                running.await
+            }
+        }
+    }
+
     /// The workspace's home when it is on a machine and homes are on.
     pub(crate) async fn machine_home(
         &self,
@@ -296,16 +345,44 @@ impl Services {
                 );
             }
         }
-        let result = port
-            .home_call(
-                self,
-                home,
-                workspace_id,
-                method,
-                params,
-                call_timeout(method),
-            )
-            .await?;
+        // A search runs on the home under the id the client cancels it by
+        // (one minted here when it gave none, as a local search mints one).
+        let search_id = HOME_SEARCHES.contains(&method).then(|| {
+            if let Some(Value::String(id)) = params.get("requestId") {
+                return id.clone();
+            }
+            let id = intent_search::mint_request_id();
+            params.insert("requestId".into(), Value::String(id.clone()));
+            id
+        });
+        let call = port.home_call(
+            self,
+            home,
+            workspace_id,
+            method,
+            params,
+            call_timeout(method),
+        );
+        let result = match search_id {
+            Some(request_id) => {
+                let token = self
+                    .search_cancels
+                    .register_as(&request_id, crate::capability::search_owner()?);
+                // Cancelled: the call is dropped, which sends the machine
+                // `homeCallCancel`, and its late answer is never shown.
+                let answered = tokio::select! {
+                    biased;
+                    answered = call => Some(answered),
+                    () = token.cancelled() => None,
+                };
+                self.search_cancels.unregister(&request_id);
+                match answered {
+                    Some(answered) => answered?,
+                    None => return Ok(Some(Ok(cancelled_search(method, &request_id)))),
+                }
+            }
+            None => call.await?,
+        };
         let result = match result {
             Ok(found) if method == "search.codebase" => {
                 Ok(self.restream_search(workspace_id, found)?)

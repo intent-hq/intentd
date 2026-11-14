@@ -19684,7 +19684,11 @@ impl WorkspaceApi for Services {
             };
             // Validate opts (incl. regex) before registering, so a bad regex is
             // surfaced as InvalidParams without leaving a stale cancel token.
-            let token = registry.register_as(&request_id, capability::search_owner()?);
+            let token = registry.register_within(
+                &request_id,
+                capability::search_owner()?,
+                home_routing::home_call_cancel().as_ref(),
+            );
             let outcome = {
                 let token = token.clone();
                 tokio::task::spawn_blocking(move || {
@@ -19723,7 +19727,11 @@ impl WorkspaceApi for Services {
                     "truncated": false,
                 }));
             };
-            let token = registry.register_as(&request_id, capability::search_owner()?);
+            let token = registry.register_within(
+                &request_id,
+                capability::search_owner()?,
+                home_routing::home_call_cancel().as_ref(),
+            );
             let outcome = {
                 let token = token.clone();
                 tokio::task::spawn_blocking(move || {
@@ -19788,7 +19796,11 @@ impl WorkspaceApi for Services {
             // negative SQL LIMIT would otherwise mean no limit).
             let limit =
                 Some(i64::try_from(search_ops::match_limit(limit)).expect("limit fits in i64"));
-            let token = registry.register_as(&request_id, capability::search_owner()?);
+            let token = registry.register_within(
+                &request_id,
+                capability::search_owner()?,
+                home_routing::home_call_cancel().as_ref(),
+            );
             // User-typed queries are never handed to the FTS5 parser verbatim
             // (as-you-type input would surface `fts5: syntax error`); a query
             // with no searchable tokens yields empty matches, not an error.
@@ -19840,7 +19852,11 @@ impl WorkspaceApi for Services {
                 self.require_member(ws).await?;
             }
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let token = registry.register_as(&request_id, capability::search_owner()?);
+            let token = registry.register_within(
+                &request_id,
+                capability::search_owner()?,
+                home_routing::home_call_cancel().as_ref(),
+            );
             let limit = search_ops::match_limit(limit);
             let mut q = EventQuery {
                 workspace_id: workspace_id.clone(),
@@ -19982,7 +19998,11 @@ impl WorkspaceApi for Services {
             let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
                 return Ok(serde_json::json!({ "requestId": request_id, "matches": [] }));
             };
-            let token = registry.register_as(&request_id, capability::search_owner()?);
+            let token = registry.register_within(
+                &request_id,
+                capability::search_owner()?,
+                home_routing::home_call_cancel().as_ref(),
+            );
 
             // Prefer the context engine when it is available, mapping its hits
             // to `CodebaseMatch` (§5.15 parity). When the engine is `Unavailable`

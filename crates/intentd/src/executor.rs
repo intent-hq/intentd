@@ -1207,9 +1207,14 @@ async fn dispatch_home_call(
         message: message.to_owned(),
         data: None,
     };
-    let reply = intent_transport::router::handle_message(services, &request)
-        .await
-        .ok_or_else(|| internal("the method gave no reply"))?;
+    // A search the call runs ends when the call does: it stops at its
+    // next file and answers with what it found.
+    let reply = intent_services::Services::run_home_call(
+        stop,
+        intent_transport::router::handle_message(services, &request),
+    )
+    .await
+    .ok_or_else(|| internal("the method gave no reply"))?;
     let mut reply: serde_json::Value =
         serde_json::from_str(&reply).map_err(|_| internal("the method's reply is not JSON"))?;
     if let Some(error) = reply.get_mut("error").map(serde_json::Value::take) {
