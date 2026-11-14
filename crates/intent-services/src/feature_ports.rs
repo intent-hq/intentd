@@ -1700,6 +1700,23 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         Box::pin(async {})
     }
 
+    /// `workspace.setHome` (nodes.md "Moving the home"), after the services
+    /// checked the caller manages the workspace: start the move and answer
+    /// with the home, now `moving`.
+    ///
+    /// # Errors
+    ///
+    /// As documented for the method; `homes-unsupported` by default.
+    fn set_home<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        let _ = (svc, workspace_id, params);
+        Box::pin(async { Err(crate::homes_unsupported()) })
+    }
+
     /// What a remote agent of `workspace_id` starts from: its checkout's
     /// `HEAD` and the commits of its populated submodules.
     ///

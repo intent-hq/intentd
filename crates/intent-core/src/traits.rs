@@ -6424,6 +6424,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.setHome` (monorepo `docs/protocol/methods/nodes.md`,
+    /// "Moving the home"): `params` is the request's params object; the
+    /// result is `{ home }`.
+    fn set_workspace_home(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async move {
+            Err(Error::Internal(
+                "WorkspaceApi::set_workspace_home not implemented".into(),
+            ))
+        })
+    }
+
     /// `remoteMachines.*` (daemon-to-daemon remote agents, backend side,
     /// owner-only): `method` is the part after `remoteMachines.`
     /// (`backendInfo`, `add`, `list`, `remove`, `refresh`) and `params` the

@@ -31,7 +31,7 @@ fn map_row(row: &SqliteRow) -> Result<HomeStopRecord> {
 }
 
 /// Insert `record` unless its home has a stop already.
-async fn insert(conn: &mut SqliteConnection, record: &HomeStopRecord) -> Result<()> {
+pub(crate) async fn insert(conn: &mut SqliteConnection, record: &HomeStopRecord) -> Result<()> {
     sqlx::query(
         "INSERT INTO home_stop (home_id, workspace_id, node_id, stop_id, reason, orphaned_at, \
          recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(home_id) DO NOTHING",
@@ -50,7 +50,7 @@ async fn insert(conn: &mut SqliteConnection, record: &HomeStopRecord) -> Result<
 }
 
 /// The workspace's current home on an exposed machine, as `(homeId, nodeId)`.
-async fn machine_home(
+pub(crate) async fn machine_home(
     conn: &mut SqliteConnection,
     workspace_id: &WorkspaceId,
 ) -> Result<Option<(String, String)>> {
@@ -92,6 +92,12 @@ pub(crate) async fn retire_workspace_home(
         insert(conn, &record).await?;
     }
     sqlx::query("DELETE FROM workspace_home WHERE workspace_id = ?")
+        .bind(&workspace_id.0)
+        .execute(&mut *conn)
+        .await
+        .map_err(db)?;
+    // A move in progress ends with the home: it never switches now.
+    sqlx::query("DELETE FROM home_move WHERE workspace_id = ?")
         .bind(&workspace_id.0)
         .execute(&mut *conn)
         .await

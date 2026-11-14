@@ -191,6 +191,11 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          gets a home of its own there",
     ),
     (
+        "home_move",
+        "a move in progress of the workspace's home between this daemon's own machines; the \
+         target head has neither the machines nor the home",
+    ),
+    (
         "home_stop",
         "pending home stops this head owes one of its own machines (stop ids, orphan ref \
          names); the target head has neither the machine nor the home, so it could neither \

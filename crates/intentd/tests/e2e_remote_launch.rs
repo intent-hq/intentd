@@ -43,6 +43,7 @@ mod home_calls;
 mod home_detached;
 mod home_events;
 mod home_exec;
+mod home_move;
 mod home_stops;
 mod homes;
 mod machine_order;

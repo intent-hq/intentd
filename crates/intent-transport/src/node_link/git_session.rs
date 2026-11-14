@@ -183,6 +183,9 @@ pub struct ReceiveHold {
     /// A moved home's last push (node-link.md "Home final stop"): the
     /// session may create only `home/orphaned/<this>/{head,wip}`.
     pub orphaned: Option<String>,
+    /// The new home of a move before its switch: the session may only pin
+    /// `home/unapplied/<sha>`.
+    pub pins_only: bool,
 }
 
 pub trait NodeGitAccess: Send + Sync {
@@ -416,6 +419,9 @@ async fn run_service(
             if let Some(at) = hold.orphaned.as_deref() {
                 remote = remote.orphaned(at).map_err(|_| codes::FAILED)?;
             }
+            if hold.pins_only {
+                remote = remote.pins_only();
+            }
         }
         (
             service_command(service, &repository, &remote).map_err(|_| codes::FAILED)?,
@@ -492,6 +498,7 @@ async fn run_service(
                     token: hold.token.take(),
                     guard: service.hold.take(),
                     orphaned: hold.orphaned.take(),
+                    pins_only: hold.pins_only,
                 },
             )
             .await;

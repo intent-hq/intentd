@@ -79,6 +79,7 @@ mod link_traffic_ops;
 mod node_invite_ops;
 mod plain_folder;
 mod remote_machine_ops;
+pub use remote_machine_ops::homes_unsupported;
 mod remote_skills;
 mod retire;
 pub mod session_import;
@@ -34189,6 +34190,14 @@ impl WorkspaceApi for Services {
         params: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(self.remote_machines_op(method, params))
+    }
+
+    fn set_workspace_home(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.set_workspace_home_op(workspace_id, params))
     }
 
     fn cloud_machines(

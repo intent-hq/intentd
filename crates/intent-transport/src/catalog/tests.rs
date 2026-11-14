@@ -1104,6 +1104,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",
+    "workspace.setHome",
     "workspace.transfer.plan",
     "workspace.unarchive",
     "workspace.update",
@@ -1626,6 +1627,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",
+    "workspace.setHome",
     "workspace.transfer.plan",
     "workspace.unarchive",
 ];

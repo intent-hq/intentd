@@ -568,6 +568,10 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             "workspace.setBrowserClient",
             json!({ "workspaceId": ws, "clientId": null }),
         ),
+        (
+            "workspace.setHome",
+            json!({ "workspaceId": ws, "to": { "kind": "machine", "nodeId": "n-1" } }),
+        ),
         ("workspace.transfer.plan", json!({ "workspaceId": ws })),
         ("workspace.unarchive", json!({ "workspaceId": ws })),
     ]

@@ -477,6 +477,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",
+    "workspace.setHome",
     "workspace.transfer.plan",
     "workspace.unarchive",
     "workspace.update",
@@ -1034,6 +1035,7 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",
+    "workspace.setHome",
     "workspace.transfer.plan",
     "workspace.unarchive",
 ];
@@ -1780,6 +1782,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     mutation("workspace.saveSetupScript", "Saves the setup script."),
     mutation("workspace.setAutoCommit", "Sets auto-commit."),
     mutation("workspace.setBrowserClient", "Pins the browser client."),
+    mutation("workspace.setHome", "Starts a move of the workspace's home."),
     bounded("workspace.transfer.plan", "Transfer plan preview."),
     mutation("workspace.unarchive", "Unarchives a workspace."),
     mutation("workspace.update", "Updates a workspace."),

@@ -3442,13 +3442,24 @@ mod home_stops {
             .set_workspace_home(&workspace(), &home("h1"))
             .await
             .unwrap();
+        assert!(backend
+            .store()
+            .begin_home_move(&intent_store::HomeMove {
+                workspace_id: workspace(),
+                target: home("h2"),
+                from_home_id: HomeId::from("h1"),
+                from_state: intent_core::HomeState::Attached,
+                from_since: now.clone(),
+                pushed: true,
+                started_at: now.clone(),
+            })
+            .await
+            .unwrap());
         let pushing = crate::git::home_push_slot(&workspace()).await.unwrap();
         let services = backend.services.clone();
-        let next = home("h2");
-        let switch =
-            tokio::spawn(
-                async move { crate::homes::switch_home(&services, &workspace(), &next).await },
-            );
+        let switch = tokio::spawn(async move {
+            crate::homes::switch_home(&services, &workspace(), &HomeId::from("h2")).await
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!switch.is_finished(), "the switch waits for the push");
         assert_eq!(
@@ -3462,7 +3473,7 @@ mod home_stops {
             HomeId::from("h1")
         );
         drop(pushing);
-        let stop = switch.await.unwrap().unwrap().unwrap();
+        let stop = switch.await.unwrap().unwrap().unwrap().stop.unwrap();
         assert_eq!(stop.home_id, HomeId::from("h1"));
         assert_eq!(stop.reason, HomeStopReason::Moved);
     }

@@ -744,6 +744,15 @@ impl RemoteLaunchPort for RemoteLaunch {
         Box::pin(crate::homes::send_workspace_stops(svc, workspace_id))
     }
 
+    fn set_home<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move { crate::home_move::set_home(svc, workspace_id, &params).await })
+    }
+
     fn home_call<'a>(
         &'a self,
         svc: &'a Services,

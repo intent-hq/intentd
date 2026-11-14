@@ -252,33 +252,45 @@ impl HeadGitAccess {
 
 impl HeadGitAccess {
     /// The workspace checkout of `remote`'s home and its workspace: only on
-    /// the current binding, for the workspace's current home, on this
-    /// machine.
+    /// the current binding, for the workspace's current home on this
+    /// machine, or the new home on this machine of a move in progress
+    /// (`true`: before its switch it may only read and pin `unapplied/`).
     async fn home_checkout(
         &self,
         binding: &LeaseBinding,
         remote: &AgentRemote,
-    ) -> Result<(PathBuf, WorkspaceId)> {
+    ) -> Result<(PathBuf, WorkspaceId, bool)> {
         let current = self
             .shared
             .current_link()
             .ok_or_else(|| Error::InvalidParams("node-link-stale".into()))?;
         binding.ensure_current(current.binding())?;
         let workspace_id = WorkspaceId::from(remote.workspace_id());
+        let machine = self.shared.machine_id();
         let home = self
             .shared
             .store
             .get_workspace_home(&workspace_id)
             .await?
             .ok_or_else(denied)?;
-        if home.home_id.as_str() != remote.agent_id()
-            || home.node_id.as_deref() != Some(self.shared.machine_id().as_str())
-        {
+        let current_home = home.home_id.as_str() == remote.agent_id()
+            && home.node_id.as_deref() == Some(machine.as_str());
+        let target = !current_home
+            && self
+                .shared
+                .store
+                .get_home_move(&workspace_id)
+                .await?
+                .is_some_and(|home_move| {
+                    home_move.target.home_id.as_str() == remote.agent_id()
+                        && home_move.target.node_id.as_deref() == Some(machine.as_str())
+                });
+        if !current_home && !target {
             return Err(denied());
         }
         let workspace = self.shared.store.get_workspace(&workspace_id).await?;
         let checkout = crate::launch::checkout_path(&workspace).ok_or_else(denied)?;
-        Ok((checkout, workspace_id))
+        Ok((checkout, workspace_id, target))
     }
 
     /// The pending stop of `remote`'s home on this machine, if it has one
@@ -363,11 +375,11 @@ impl HeadGitAccess {
         if self.home_stop(binding, remote).await?.is_some() {
             return self.stopped_home_repository(remote, service).await;
         }
-        let (checkout, workspace_id) = self.home_checkout(binding, remote).await?;
+        let (checkout, _, _) = self.home_checkout(binding, remote).await?;
         if let Some(key) = remote.module_key() {
             return module_of(checkout, key).await;
         }
-        let _ = (service, workspace_id);
+        let _ = service;
         Ok(checkout)
     }
 }
@@ -428,6 +440,7 @@ impl NodeGitAccess for HeadGitAccess {
                 token,
                 guard: Some(Box::new((guard, sink))),
                 orphaned,
+                pins_only: false,
             };
             match self.home_stop(binding, remote).await? {
                 Some(stop) if stop.reason == HomeStopReason::Moved => {
@@ -442,7 +455,13 @@ impl NodeGitAccess for HeadGitAccess {
                 Some(_) => {}
                 None => {
                     // Switched away meanwhile: not this home's to write.
-                    self.home_checkout(binding, remote).await?;
+                    let (_, _, target) = self.home_checkout(binding, remote).await?;
+                    if target {
+                        return Ok(ReceiveHold {
+                            pins_only: true,
+                            ..hold(None, None)
+                        });
+                    }
                 }
             }
             if remote.module_key().is_some() {
@@ -467,11 +486,11 @@ impl NodeGitAccess for HeadGitAccess {
         hold: ReceiveHold,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if !remote.is_home() || remote.module_key().is_some() {
+            if !remote.is_home() || remote.module_key().is_some() || hold.pins_only {
                 return;
             }
             let workspace_id = WorkspaceId::from(remote.workspace_id());
-            let Ok((checkout, _)) = self.home_checkout(binding, remote).await else {
+            let Ok((checkout, _, false)) = self.home_checkout(binding, remote).await else {
                 return;
             };
             let pins: Vec<String> = hold.token.into_iter().collect();

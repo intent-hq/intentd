@@ -1589,6 +1589,12 @@ async fn dispatch(
                 .map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
+        "workspace.setHome" => {
+            let id = require_workspace_id(params)?;
+            api.set_workspace_home(id, Value::Object(params.clone()))
+                .await
+                .map_err(workspace_err)
+        }
         "workspace.retire" => {
             let id = require_workspace_id(params)?;
             let ws = api

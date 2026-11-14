@@ -1070,6 +1070,36 @@ mod tests {
         );
     }
 
+    /// `workspace.setHome` is the owner's and managers': a collaborator is
+    /// `-32003` before anything else; an allowed caller on a daemon without
+    /// workspace homes gets `homes-unsupported`.
+    #[tokio::test]
+    async fn set_home_by_role() {
+        let tmp = TempDb::new();
+        let f = fixture(&tmp).await;
+        let to = serde_json::json!({ "to": { "kind": "machine", "nodeId": "n-1" } });
+        for role in ROLES {
+            let result = f
+                .run(role, f.services.set_workspace_home_op(f.ws.clone(), to.clone()))
+                .await;
+            match role {
+                Role::Collaborator => {
+                    let refused = result.unwrap_err();
+                    assert_eq!(refused.code(), -32003, "{refused}");
+                }
+                Role::NonMember => assert_eq!(cell(&result), "not-found"),
+                _ => {
+                    let refused = result.unwrap_err();
+                    assert_eq!(refused.code(), -32602, "{role:?}: {refused}");
+                    let Error::RemoteMachine(failure) = refused else {
+                        panic!("{role:?}: {refused}");
+                    };
+                    assert_eq!(failure.data["code"], "homes-unsupported", "{role:?}");
+                }
+            }
+        }
+    }
+
     /// Administrator-only: every per-principal (collaborator) wire caller is
     /// `Forbidden` regardless of workspace role; the administrator, agents
     /// and the daemon pass.

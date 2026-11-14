@@ -17,6 +17,16 @@ use crate::Services;
 
 /// The secret-store account of an exposed machine's executor token.
 #[must_use]
+/// `-32602` `homes-unsupported`: a backend without `workspaceHomes`
+/// (nodes.md "Moving the home").
+pub fn homes_unsupported() -> intent_core::Error {
+    intent_core::Error::remote_machine(
+        false,
+        "This backend doesn't keep workspace homes.",
+        serde_json::json!({ "code": "homes-unsupported" }),
+    )
+}
+
 pub fn remote_machine_token_account(machine_id: &str) -> String {
     format!("remoteMachines.{machine_id}.token")
 }
@@ -264,6 +274,29 @@ impl Services {
             serde_json::json!({ "agentId": agent_id.0 }),
         )
         .await;
+    }
+
+    /// `workspace.setHome` (nodes.md "Moving the home"): the workspace's
+    /// owner and managers only.
+    ///
+    /// # Errors
+    ///
+    /// `-32003` for any other caller, `homes-unsupported` on a backend
+    /// without workspace homes, and the move's own refusals.
+    pub async fn set_workspace_home_op(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.require_workspace_manager(&workspace_id, "workspace.setHome")
+            .await?;
+        if !self.workspace_homes() {
+            return Err(crate::homes_unsupported());
+        }
+        self.ports
+            .remote_launch()
+            .set_home(self, &workspace_id, params)
+            .await
     }
 
     /// The home of a workspace being created (nodes.md "Workspace homes" →
