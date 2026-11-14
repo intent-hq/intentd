@@ -50,7 +50,7 @@ pub(crate) fn homes_ready() -> bool {
 #[derive(Default)]
 pub(super) struct Homes {
     /// The open home checkouts.
-    open: HashMap<HomeId, Arc<Home>>,
+    pub(super) open: HashMap<HomeId, Arc<Home>>,
     /// The bound hello's `leaseHomes`, plus each home a `homeOpen` opened
     /// since: a home frame for any other `homeId` is refused.
     lease: HashSet<HomeId>,
@@ -73,13 +73,16 @@ pub(super) struct Home {
     /// When `home/wip` was last pushed.
     wip_pushed_at: Mutex<Instant>,
     /// `true` once the checkout's setup has finished (or was skipped).
-    setup_done: watch::Sender<bool>,
+    pub(super) setup_done: watch::Sender<bool>,
     /// The setup's output while it runs, resent after a reconnect.
     output: Mutex<Option<Arc<SetupOutput>>>,
     /// Taken (dropped) to stop a running setup.
     setup_stop: Mutex<Option<oneshot::Sender<()>>>,
     /// Set when the home is closed: its backup watcher ends.
     pub(super) closed: watch::Sender<bool>,
+    /// The checkout's file and git watches, once its setup is done; taken
+    /// (ending them) when the home closes.
+    pub(super) events_watch: Mutex<Option<super::HomeWatchGuard>>,
 }
 
 impl Home {
@@ -457,6 +460,7 @@ impl Runner {
             lock(&home.setup_stop).take();
             // Its record stays: the home reopens with it after a restart.
             home.closed.send_replace(true);
+            lock(&home.events_watch).take();
         }
     }
 
@@ -517,6 +521,7 @@ impl Runner {
             output: Mutex::new(None),
             setup_stop: Mutex::new(Some(stop)),
             closed: watch::channel(false).0,
+            events_watch: Mutex::new(None),
         });
         // Callers hold `home_opens`; an entry already there is never
         // replaced, so a home never has two watchers.
