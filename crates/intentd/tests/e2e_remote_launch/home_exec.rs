@@ -351,8 +351,63 @@ async fn host_exec_and_exec_stream_of_a_workspace_with_a_home_run_on_the_home() 
     })
     .await;
 
+    // A stream whose machine goes away: each write fails as itself with
+    // home-unavailable, and does not close the stream's stdin for later
+    // writes.
+    id += 1;
+    ok(
+        &mut rpc_ws,
+        id,
+        "host.execStream",
+        json!({
+            "workspaceId": ws_id,
+            "command": "sh",
+            // timing-guard: the process only waits while its machine goes away
+            "args": ["-c", "exec sleep 60"],
+            "requestId": "home-stream-4",
+        }),
+    )
+    .await;
+
     // A home whose machine is gone answers home-unavailable.
     drop(machine);
+    let deadline = tokio::time::Instant::now() + wait();
+    let refused = loop {
+        id += 1;
+        let written = rpc(
+            &mut rpc_ws,
+            id,
+            "host.execStream.write",
+            json!({ "requestId": "home-stream-4", "stdin": "x\n" }),
+        )
+        .await;
+        if written.get("error").is_some() {
+            break written;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "writes kept succeeding with the machine gone: {written}"
+        );
+        // timing-guard: poll until the orchestrator sees the link close
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    for written in [refused, {
+        id += 1;
+        rpc(
+            &mut rpc_ws,
+            id,
+            "host.execStream.write",
+            json!({ "requestId": "home-stream-4", "stdin": "y\n" }),
+        )
+        .await
+    }] {
+        assert!(
+            written["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("home-unavailable")),
+            "{written}"
+        );
+    }
     id += 1;
     let lost = rpc(
         &mut rpc_ws,

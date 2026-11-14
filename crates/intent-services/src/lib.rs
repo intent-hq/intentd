@@ -35354,7 +35354,7 @@ impl WorkspaceApi for Services {
                     return result.map_err(|failure| match failure {
                         intent_core::node_link::HomeCallFailure::Local(error) => error,
                         intent_core::node_link::HomeCallFailure::Home(error) => {
-                            home_routing::home_error(&error)
+                            home_routing::home_error_with_data(error)
                         }
                     });
                 }

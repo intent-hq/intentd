@@ -829,6 +829,17 @@ pub(crate) fn home_error(error: &intent_core::node_link::HomeCallError) -> Error
     }
 }
 
+/// The home's error as this daemon's, keeping its `data` (`data.code`,
+/// such as `node-home-unknown`) when it carries one.
+pub(crate) fn home_error_with_data(error: intent_core::node_link::HomeCallError) -> Error {
+    match error.data {
+        Some(data) if data.get("code").is_some_and(Value::is_string) => {
+            Error::remote_machine(error.code != -32602, error.message, data)
+        }
+        _ => home_error(&error),
+    }
+}
+
 /// An attachment's bytes, read a piece at a time.
 struct Payload<'a> {
     source: &'a crate::file_ops::AttachmentSource<'a>,

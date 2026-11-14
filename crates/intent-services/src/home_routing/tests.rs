@@ -533,3 +533,32 @@ fn a_routed_exec_waits_past_its_own_timeout() {
         Duration::from_secs(60)
     );
 }
+
+#[test]
+fn a_home_error_keeps_its_data_code() {
+    use intent_core::node_link::HomeCallError;
+    let unknown = home_error_with_data(HomeCallError {
+        code: -32603,
+        message: "node-home-unknown: gone".into(),
+        data: Some(json!({ "code": "node-home-unknown" })),
+    });
+    assert_eq!(unknown.code(), -32603);
+    match unknown {
+        Error::RemoteMachine(failure) => assert_eq!(failure.data["code"], "node-home-unknown"),
+        other => panic!("{other:?}"),
+    }
+    let invalid = home_error_with_data(HomeCallError {
+        code: -32602,
+        message: "bad".into(),
+        data: Some(json!({ "code": "invalid-params" })),
+    });
+    assert_eq!(invalid.code(), -32602);
+    assert!(matches!(
+        home_error_with_data(HomeCallError {
+            code: -32603,
+            message: "plain".into(),
+            data: None,
+        }),
+        Error::Internal(_)
+    ));
+}

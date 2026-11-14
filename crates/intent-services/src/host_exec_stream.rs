@@ -53,6 +53,18 @@ pub const HOME_EXEC_EOF_UNSUPPORTED: &str = "home-exec-eof-unsupported";
 /// machine to report the process's end before it ends here anyway.
 const HOME_KILL_WAIT: Duration = Duration::from_secs(30);
 
+/// [`HOME_KILL_WAIT`] at shutdown, which must not wait on a machine that
+/// is away.
+const HOME_KILL_WAIT_AT_SHUTDOWN: Duration = Duration::from_millis(500);
+
+fn kill_wait() -> Duration {
+    if registry().inner.lock().expect("registry poisoned").closed {
+        HOME_KILL_WAIT_AT_SHUTDOWN
+    } else {
+        HOME_KILL_WAIT
+    }
+}
+
 /// Parsed `host.execStream` params: the shared exec fields (validated by
 /// [`host_exec::parse_args`]) plus the streaming-only `requestId` / initial
 /// `stdin` payload.
@@ -130,15 +142,23 @@ fn decode_base64_field(s: &str, field: &str) -> Result<Vec<u8>, HostExecError> {
         })
 }
 
-/// Per-stream handle held by [`HostExecStreamRegistry`]. The stdin sender is
-/// consumed by the forwarder task; the cancel token is polled by the wait task
-/// so `host.execStream.cancel` reaps the whole process group.
+/// Per-stream handle held by [`HostExecStreamRegistry`]. The cancel token is
+/// polled by the wait task so `host.execStream.cancel` reaps the whole
+/// process group.
 struct StreamHandle {
-    stdin_tx: mpsc::Sender<StdinMsg>,
+    stdin: StreamStdin,
     cancel_token: Arc<AtomicBool>,
-    /// Whether `eof` can close the process's stdin: not for a process on
-    /// the workspace's home, whose link carries no stdin end.
-    closable: bool,
+}
+
+/// Where a stream's stdin goes.
+#[derive(Clone)]
+enum StreamStdin {
+    /// A local child: the forwarder task drains this sender into its pipe.
+    Local(mpsc::Sender<StdinMsg>),
+    /// A process on the workspace's home: each write goes to its machine
+    /// at once (so a write while the machine is away fails as itself, and
+    /// later ones still go), and its stdin cannot be closed.
+    Home(Arc<dyn crate::feature_api::feature_ports::HomeExecControl>),
 }
 
 /// Stdin control channel messages. `Data` is written verbatim to the child;
@@ -257,22 +277,15 @@ impl HostExecStreamRegistry {
                     message: "daemon is shutting down".into(),
                 });
             }
-            map.streams
-                .get(request_id)
-                .map(|h| (h.stdin_tx.clone(), h.closable))
+            map.streams.get(request_id).map(|h| h.stdin.clone())
         };
-        let (sender, closable) = sender.ok_or_else(|| HostExecError {
+        let sender = match sender.ok_or_else(|| HostExecError {
             code: -32603,
             message: format!("unknown host.execStream requestId: {request_id}"),
-        })?;
-        if eof && !closable {
-            return Err(HostExecError {
-                code: INVALID_PARAMS,
-                message: format!(
-                    "{HOME_EXEC_EOF_UNSUPPORTED}: the stdin of a process on the workspace's home cannot be closed; nothing was written"
-                ),
-            });
-        }
+        })? {
+            StreamStdin::Local(sender) => sender,
+            StreamStdin::Home(control) => return write_home(&control, data, eof),
+        };
         if let Some(bytes) = data {
             if !bytes.is_empty() {
                 let send = sender.send(StdinMsg::Data(bytes));
@@ -453,9 +466,8 @@ pub async fn start_stream(
     admission.streams.insert(
         request_id.clone(),
         StreamHandle {
-            stdin_tx,
+            stdin: StreamStdin::Local(stdin_tx),
             cancel_token: cancel_token.clone(),
-            closable: true,
         },
     );
 
@@ -718,10 +730,8 @@ pub(crate) async fn start_home_stream(
         stdin,
     } = args;
     let request_id = request_id.unwrap_or_else(mint_request_id);
-    let (stdin_tx, mut stdin_rx) = mpsc::channel::<StdinMsg>(STDIN_QUEUE_CAP);
-    let cancel_token = Arc::new(AtomicBool::new(false));
-    {
-        let mut admission = registry().inner.lock().expect("registry poisoned");
+    let admit = || -> intent_core::Result<()> {
+        let admission = registry().inner.lock().expect("registry poisoned");
         if admission.closed {
             return Err(intent_core::Error::Internal(
                 "daemon is shutting down".into(),
@@ -732,63 +742,51 @@ pub(crate) async fn start_home_stream(
                 "host.execStream requestId is already active".into(),
             ));
         }
-        admission.streams.insert(
-            request_id.clone(),
-            StreamHandle {
-                stdin_tx: stdin_tx.clone(),
-                cancel_token: cancel_token.clone(),
-                closable: false,
-            },
-        );
-    }
+        Ok(())
+    };
+    admit()?;
     let open = HomeExecOpen {
         cwd,
         command: shell_command(&common.command, &common.args),
         env: common.env.into_iter().collect(),
     };
-    let opened = svc
+    let exec = svc
         .feature_remote_launch_port()
         .open_home_exec(svc, workspace_id, open)
-        .await;
-    let exec = match opened {
-        Ok(Some(exec)) => exec,
-        Ok(None) => {
-            registry().remove(&request_id);
-            return Err(intent_core::Error::Internal(
-                "the workspace's home is not on a machine".into(),
-            ));
+        .await?
+        .ok_or_else(|| {
+            intent_core::Error::Internal("the workspace's home is not on a machine".into())
+        })?;
+    // The initial stdin goes out right behind the `ptyOpen`, ahead of any
+    // write a client sends once the stream is registered.
+    if let Some(seed) = stdin.filter(|seed| !seed.is_empty()) {
+        if let Err(error) = exec.control.write(&seed) {
+            exec.control.kill();
+            return Err(intent_core::Error::Internal(error.to_string()));
         }
-        Err(error) => {
-            registry().remove(&request_id);
+    }
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    let mut tasks = registry().terminal_tasks.lock().await;
+    {
+        // Checked again: the open awaited, and shutdown or another stream
+        // with this id may have come meanwhile.
+        if let Err(error) = admit() {
+            exec.control.kill();
             return Err(error);
         }
-    };
-    let mut tasks = registry().terminal_tasks.lock().await;
-    if registry().inner.lock().expect("registry poisoned").closed {
-        exec.control.kill();
-        registry().remove(&request_id);
-        return Err(intent_core::Error::Internal(
-            "daemon is shutting down".into(),
-        ));
+        registry()
+            .inner
+            .lock()
+            .expect("registry poisoned")
+            .streams
+            .insert(
+                request_id.clone(),
+                StreamHandle {
+                    stdin: StreamStdin::Home(exec.control.clone()),
+                    cancel_token: cancel_token.clone(),
+                },
+            );
     }
-    if let Some(seed) = stdin.filter(|seed| !seed.is_empty()) {
-        let _ = stdin_tx.try_send(StdinMsg::Data(seed));
-    }
-    drop(stdin_tx);
-    let control = exec.control.clone();
-    // Stdin forwarder: each write goes to the machine in order.
-    intent_core::spawn_daemon(async move {
-        while let Some(msg) = stdin_rx.recv().await {
-            match msg {
-                StdinMsg::Data(bytes) => {
-                    if control.write(&bytes).is_err() {
-                        break;
-                    }
-                }
-                StdinMsg::Close => break,
-            }
-        }
-    });
     let terminal = intent_core::spawn_daemon(run_home_wait(
         bus,
         workspace_id.clone(),
@@ -800,6 +798,29 @@ pub(crate) async fn start_home_stream(
     tasks.retain(|task| !task.is_finished());
     tasks.push(terminal);
     Ok(request_id)
+}
+
+/// A `host.execStream.write` to a process on the workspace's home.
+fn write_home(
+    control: &Arc<dyn crate::feature_api::feature_ports::HomeExecControl>,
+    data: Option<Vec<u8>>,
+    eof: bool,
+) -> Result<(), HostExecError> {
+    if eof {
+        return Err(HostExecError {
+            code: INVALID_PARAMS,
+            message: format!(
+                "{HOME_EXEC_EOF_UNSUPPORTED}: the stdin of a process on the workspace's home cannot be closed; nothing was written"
+            ),
+        });
+    }
+    match data {
+        Some(bytes) if !bytes.is_empty() => control.write(&bytes).map_err(|error| HostExecError {
+            code: -32603,
+            message: error.to_string(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Publish a home stream's output until its end, ending it on the machine
@@ -848,8 +869,8 @@ async fn run_home_wait(
                         killed_at = Some(now);
                     }
                     // The machine ends it after its next bind; this
-                    // stream ends here now.
-                    Some(at) if now.duration_since(at) >= HOME_KILL_WAIT => break (None, None),
+                    // stream ends here now, at once when shutting down.
+                    Some(at) if now.duration_since(at) >= kill_wait() => break (None, None),
                     _ => {}
                 }
             }

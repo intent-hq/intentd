@@ -585,3 +585,78 @@ pub(crate) async fn open_exec(
         control: io,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exec_term() -> (Term, mpsc::UnboundedReceiver<HomeExecEvent>) {
+        let (events, received) = mpsc::unbounded_channel();
+        let term = Term {
+            sink: Sink::Exec(events),
+            received: None,
+            size: Arc::new(Mutex::new(PtySize::default())),
+            killed: false,
+            home_name: "Machine A".into(),
+        };
+        (term, received)
+    }
+
+    /// An exec process's output keeps its stream, and its end follows.
+    #[test]
+    fn an_exec_sink_takes_output_by_stream_then_its_end() {
+        let (term, mut received) = exec_term();
+        assert!(term.push(b"out", Some(PtyStream::Stdout)));
+        assert!(term.push(b"err", Some(PtyStream::Stderr)));
+        term.end(Some(3), None);
+        assert_eq!(
+            received.try_recv().unwrap(),
+            HomeExecEvent::Output {
+                stderr: false,
+                bytes: b"out".to_vec()
+            }
+        );
+        assert_eq!(
+            received.try_recv().unwrap(),
+            HomeExecEvent::Output {
+                stderr: true,
+                bytes: b"err".to_vec()
+            }
+        );
+        assert_eq!(
+            received.try_recv().unwrap(),
+            HomeExecEvent::Exited {
+                exit_code: Some(3),
+                error: None
+            }
+        );
+    }
+
+    /// A lost home ends an exec process with home-unavailable, also when
+    /// the machine's terminals are dropped with its connector.
+    #[test]
+    fn a_lost_home_ends_an_exec_process_with_home_unavailable() {
+        let (term, mut received) = exec_term();
+        let terminals = HomeTerminals::default();
+        lock(&terminals.state).terms.insert("hexec-1".into(), term);
+        drop(terminals);
+        match received.try_recv().unwrap() {
+            HomeExecEvent::Exited {
+                exit_code: None,
+                error: Some(error),
+            } => {
+                assert!(error.starts_with(HOME_UNAVAILABLE), "{error}");
+                assert!(error.contains("Machine A"), "{error}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Output nobody takes any more reports so, and the process is ended.
+    #[test]
+    fn an_exec_sink_whose_stream_ended_refuses_output() {
+        let (term, received) = exec_term();
+        drop(received);
+        assert!(!term.push(b"late", None));
+    }
+}

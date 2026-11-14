@@ -624,7 +624,14 @@ impl HomeTerminals {
         frame: &PtyOpen,
         cwd: &Path,
     ) -> Result<(), String> {
-        let shell = default_shell();
+        // `host.execStream`: a plain `/bin/sh`, not the user's login shell,
+        // so no profile prints into the output or reorders PATH, as with
+        // `host.exec`. Windows has no `/bin/sh`.
+        let shell = if cfg!(windows) {
+            default_shell()
+        } else {
+            "/bin/sh".to_owned()
+        };
         let command = frame.command.as_deref().unwrap_or_default();
         let mut cmd = tokio::process::Command::new(&shell);
         cmd.args(shell_args(&shell, command))
