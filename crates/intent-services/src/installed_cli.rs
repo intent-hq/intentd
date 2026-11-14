@@ -882,10 +882,12 @@ async fn version_output(
     })
     .await
     .unwrap_or(Err("installed CLI version check timed out"));
-    guard
-        .cleanup()
-        .await
-        .map_err(|_| "installed CLI version cleanup failed")?;
+    // An unconfirmed teardown keeps the private directories (the guard retains
+    // them) but must not hide a version the CLI already reported. Kernels
+    // without /proc/<pid>/task/<tid>/children (e.g. Jetson L4T) never confirm.
+    if guard.cleanup().await.is_err() {
+        tracing::warn!("installed CLI version cleanup unconfirmed; probe directories retained");
+    }
     result.map_err(str::to_owned)
 }
 
