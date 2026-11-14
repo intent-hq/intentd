@@ -3165,6 +3165,75 @@ mod home_stops {
         node.shutdown();
     }
 
+    /// An archive after a clean bind (no stop pending then) sends its stop
+    /// on the link that is up, and a `failed` ack is retried on that same
+    /// link, without a reconnect, until a `removed` ack ends it.
+    #[tokio::test]
+    async fn an_archive_on_a_live_link_retries_a_failed_stop_without_a_reconnect() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        let node = backend.expose(&mut machine).await;
+        let repo = tempfile::tempdir().unwrap();
+        workspace_at(&backend, repo.path()).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        assert!(link
+            .hello
+            .lease_homes
+            .clone()
+            .unwrap_or_default()
+            .is_empty());
+        link.replay_complete(0).await;
+        bound(&node).await;
+        backend
+            .store()
+            .set_workspace_home(
+                &workspace(),
+                &intent_core::WorkspaceHome {
+                    home_id: HomeId::from("h1"),
+                    node_id: Some(machine.id()),
+                    cloud_machine_id: None,
+                    name: "Machine".into(),
+                    state: intent_core::HomeState::Attached,
+                    since: intent_core::now_iso(),
+                    last_backup_at: None,
+                    backup_warning: false,
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .store()
+            .archive_workspace_detaching_guests(&workspace(), &intent_core::now_iso())
+            .await
+            .unwrap();
+        crate::homes::send_workspace_stops(&backend.services, &workspace()).await;
+        let stop = backend
+            .store()
+            .get_home_stop(&HomeId::from("h1"))
+            .await
+            .unwrap()
+            .expect("the archive recorded a stop");
+        assert_eq!(stop.reason, HomeStopReason::Retired);
+        assert_eq!(sent_stop(&mut link).await, stop.frame());
+        ack(&link, &stop, &stop.stop_id, HomeStopOutcome::Failed).await;
+        assert_eq!(
+            sent_stop(&mut link).await,
+            stop.frame(),
+            "resent on the same link"
+        );
+        ack(&link, &stop, &stop.stop_id, HomeStopOutcome::Removed).await;
+        let store = backend.store().clone();
+        tokio::time::timeout(wait(), async {
+            while store.get_home_stop(&stop.home_id).await.unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the ack ends the stop");
+        node.shutdown();
+    }
+
     /// A moved home's session may only push (its orphaned refs, which the
     /// hook is told); a retired one pushes into the workspace's repository;
     /// a deleted workspace's home pushes nothing; a home of another machine

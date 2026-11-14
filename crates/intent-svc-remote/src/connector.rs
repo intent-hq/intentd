@@ -398,6 +398,9 @@ pub(crate) struct Shared {
     /// Detaching this machine's homes after a link loss, and their
     /// backup warnings (nodes.md "Detached workspaces").
     pub(crate) home_link: crate::home_state::HomeLink,
+    /// A worker resends this machine's pending home stops on a timer
+    /// ([`crate::homes::ensure_stop_resends`]).
+    pub(crate) home_stop_resends: std::sync::atomic::AtomicBool,
     /// Terminals on this machine's homes (nodeProtocol 19).
     pub(crate) terminals: crate::terminals::HomeTerminals,
     /// The home runs of saved scripts on this machine (nodeProtocol 19).
@@ -1781,6 +1784,7 @@ impl RemoteNode {
             home_call_waiters: Mutex::new(HashMap::new()),
             holds_homes: std::sync::atomic::AtomicBool::new(false),
             home_link: crate::home_state::HomeLink::default(),
+            home_stop_resends: std::sync::atomic::AtomicBool::new(false),
             terminals: crate::terminals::HomeTerminals::default(),
             home_scripts: crate::home_scripts::HomeScripts::default(),
             secret_waiters: Mutex::new(HashMap::new()),

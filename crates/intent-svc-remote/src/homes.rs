@@ -406,7 +406,6 @@ pub(crate) fn after_bind(shared: &Arc<Shared>, link: &NodeLink) {
         return;
     };
     let shared = shared.clone();
-    let link_generation = link.binding().generation;
     // caller-binding: allow — opens one machine's homes after its bind
     tokio::spawn(async move {
         let machine = shared.machine_id();
@@ -433,7 +432,7 @@ pub(crate) fn after_bind(shared: &Arc<Shared>, link: &NodeLink) {
             send_stop(&shared, &stop).await;
         }
         if pending {
-            resend_while_linked(shared.clone(), link_generation);
+            ensure_stop_resends(&shared);
         }
         if !svc.workspace_homes() {
             return;
@@ -595,28 +594,30 @@ async fn send_stop(shared: &Shared, stop: &HomeStopRecord) {
     }
 }
 
-/// Send the machine's pending home stops again every
-/// `tuning.home_stop_resend` while the link of `generation` is current,
-/// until none is left.
-fn resend_while_linked(shared: Arc<Shared>, generation: intent_core::nodes::NodeCounter) {
-    // caller-binding: allow — resends one machine's pending home stops while its link lasts
+/// Make sure one worker resends the machine's pending home stops every
+/// `tuning.home_stop_resend` while it has a link, until none is left: a
+/// `failed` ack (a push that did not land) or one that never came is
+/// retried without a reconnect. Called whenever a stop is sent or fails;
+/// a worker that ended (no stop left, or no link) is started again.
+pub(crate) fn ensure_stop_resends(shared: &Arc<Shared>) {
+    use std::sync::atomic::Ordering;
+    if shared.home_stop_resends.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let shared = shared.clone();
+    // caller-binding: allow — resends one machine's pending home stops while it is linked
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(shared.tuning.home_stop_resend).await;
-            let current = shared
-                .current_link()
-                .is_some_and(|link| link.binding().generation == generation);
-            if !current {
-                return;
-            }
-            let stops = match shared.store.list_home_stops(&shared.machine_id()).await {
-                Ok(stops) => stops,
-                Err(error) => {
-                    tracing::warn!(%error, "remote machine: could not read its home stops");
+            let stops = pending_while_linked(&shared).await;
+            if stops.is_empty() {
+                shared.home_stop_resends.store(false, Ordering::SeqCst);
+                // A stop sent meanwhile found this worker still running:
+                // keep going for it, unless another worker took over.
+                let again = !pending_while_linked(&shared).await.is_empty();
+                if again && !shared.home_stop_resends.swap(true, Ordering::SeqCst) {
                     continue;
                 }
-            };
-            if stops.is_empty() {
                 return;
             }
             for stop in stops {
@@ -624,6 +625,22 @@ fn resend_while_linked(shared: Arc<Shared>, generation: intent_core::nodes::Node
             }
         }
     });
+}
+
+/// The machine's pending home stops while it has a link; none without
+/// one (the next bind sends them and starts a worker again).
+async fn pending_while_linked(shared: &Shared) -> Vec<HomeStopRecord> {
+    if shared.current_link().is_none() {
+        return Vec::new();
+    }
+    shared
+        .store
+        .list_home_stops(&shared.machine_id())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "remote machine: could not read its home stops");
+            Vec::new()
+        })
 }
 
 /// Make `home` the workspace's home and record a `moved` stop of the
@@ -674,6 +691,7 @@ pub(crate) async fn send_workspace_stops(svc: &Services, workspace_id: &Workspac
         node.shared_ref().set_holds_homes(true);
         if node.shared_ref().current_link().is_some() {
             send_stop(node.shared_ref(), &stop).await;
+            ensure_stop_resends(&node.shared());
             continue;
         }
         // The bind sends it.
@@ -705,14 +723,15 @@ fn orphaned_refs(
 
 /// Take in a `homeStopAck`: a `removed` ack ends its stop (an ack for
 /// another `stopId` changes nothing), and a moved home's notice names the
-/// orphaned refs its last push left. A `failed` one keeps the stop for the
-/// next bind.
-pub(crate) async fn stop_acked(shared: &Shared, ack: HomeStopAck) {
+/// orphaned refs its last push left. A `failed` one keeps the stop, which
+/// is sent again on a timer.
+pub(crate) async fn stop_acked(shared: &Arc<Shared>, ack: HomeStopAck) {
     let Some(svc) = shared.services() else {
         return;
     };
     if ack.outcome == HomeStopOutcome::Failed {
-        tracing::warn!(home = %ack.home_id, "remote machine: a home stop failed on the machine; it is sent again after the next bind");
+        tracing::warn!(home = %ack.home_id, "remote machine: a home stop failed on the machine; it is sent again");
+        ensure_stop_resends(shared);
         return;
     }
     let finished = match svc
