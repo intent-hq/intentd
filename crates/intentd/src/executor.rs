@@ -1152,9 +1152,6 @@ async fn home_branch(worktree: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Home methods that search the checkout: a cancelled call stops them.
-const HOME_SEARCHES: &[&str] = &["search.inFiles", "search.fileNames", "search.codebase"];
-
 /// Run one home method in-process: `host.exec` with the daemon's exec
 /// runtime, every other one through the JSON-RPC router, past the
 /// connection's node-mode gate, exactly as a client's request runs.
@@ -1198,11 +1195,6 @@ async fn dispatch_home_call(
     ) {
         refuse_foreign_upload(services, &params)?;
     }
-    let search_id = HOME_SEARCHES
-        .contains(&method)
-        .then(|| params.get("requestId").and_then(serde_json::Value::as_str))
-        .flatten()
-        .map(str::to_owned);
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1215,27 +1207,13 @@ async fn dispatch_home_call(
         message: message.to_owned(),
         data: None,
     };
-    let reply = match search_id {
-        // A search ends early when the call does: it stops at its next
-        // file and answers with what it found.
-        Some(request_id) => {
-            let replied = intent_transport::router::handle_message(services, &request);
-            tokio::pin!(replied);
-            // `false` when the call's end can no longer be observed.
-            let stopped = async move { stop.wait_for(|stop| *stop).await.is_ok() };
-            let reply = tokio::select! {
-                biased;
-                reply = &mut replied => reply,
-                true = stopped => {
-                    services.cancel_home_search(&request_id);
-                    replied.await
-                }
-            };
-            services.home_search_ended(&request_id);
-            reply
-        }
-        None => intent_transport::router::handle_message(services, &request).await,
-    }
+    // A search the call runs ends when the call does: it stops at its
+    // next file and answers with what it found.
+    let reply = intent_services::Services::run_home_call(
+        stop,
+        intent_transport::router::handle_message(services, &request),
+    )
+    .await
     .ok_or_else(|| internal("the method gave no reply"))?;
     let mut reply: serde_json::Value =
         serde_json::from_str(&reply).map_err(|_| internal("the method's reply is not JSON"))?;

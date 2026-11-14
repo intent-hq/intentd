@@ -68,6 +68,17 @@ const HOME_WRITES: &[&str] = &[
     "git.unstageHunk",
 ];
 
+tokio::task_local! {
+    /// On a machine, the home call this task runs: a search it starts ends
+    /// with it ([`Services::run_home_call`]).
+    static HOME_CALL: intent_search::CancelToken;
+}
+
+/// The cancel of the home call this task runs, if any.
+pub(crate) fn home_call_cancel() -> Option<intent_search::CancelToken> {
+    HOME_CALL.try_with(Clone::clone).ok()
+}
+
 /// Routed searches: `search.cancel` ends them on the home too.
 const HOME_SEARCHES: &[&str] = &["search.inFiles", "search.fileNames", "search.codebase"];
 
@@ -214,17 +225,29 @@ fn names_checkout(worktree: &Path, params: &Map<String, Value>) -> bool {
 }
 
 impl Services {
-    /// On a machine, end the search `request_id` a home call started, also
-    /// when it has not begun yet (the backend sent `homeCallCancel`). Pair
-    /// with [`Services::home_search_ended`] once the call is over.
-    pub fn cancel_home_search(&self, request_id: &str) {
-        self.search_cancels.cancel_early(request_id);
-    }
-
-    /// The home call that ran the search `request_id` is over: a cancel
-    /// that arrived before the search began is forgotten.
-    pub fn home_search_ended(&self, request_id: &str) {
-        self.search_cancels.forget_early(request_id);
+    /// On a machine, run the home call `call` until it ends, or until
+    /// `stop` turns `true` (the backend sent `homeCallCancel`): a search the
+    /// call runs then stops at its next file and answers with what it found.
+    pub async fn run_home_call<F: std::future::Future>(
+        mut stop: tokio::sync::watch::Receiver<bool>,
+        call: F,
+    ) -> F::Output {
+        let cancel = intent_search::CancelToken::new();
+        if *stop.borrow() {
+            cancel.cancel();
+        }
+        let running = HOME_CALL.scope(cancel.clone(), call);
+        tokio::pin!(running);
+        // `false` when the call's end can no longer be observed.
+        let stopped = async move { stop.wait_for(|stop| *stop).await.is_ok() };
+        tokio::select! {
+            biased;
+            output = &mut running => output,
+            true = stopped => {
+                cancel.cancel();
+                running.await
+            }
+        }
     }
 
     /// The workspace's home when it is on a machine and homes are on.

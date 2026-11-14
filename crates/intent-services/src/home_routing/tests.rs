@@ -438,7 +438,9 @@ async fn a_home_search_without_an_id_gets_one() {
 #[intent_test_macros::daemon_test]
 async fn search_cancel_stops_a_home_search_streaming_from_here() {
     use intent_core::WorkspaceApi as _;
-    let matches: Vec<Value> = (0..60)
+    // Enough matches that the stream (a batch every 20 ms) outlasts the
+    // cancel by seconds, also on a slow runner.
+    let matches: Vec<Value> = (0..3000)
         .map(|i| json!({ "file": format!("n{i}.txt"), "line": 1, "preview": "needle" }))
         .collect();
     let h = home_harness(Some(
@@ -474,7 +476,7 @@ async fn search_cancel_stops_a_home_search_streaming_from_here() {
         }
     };
     assert_eq!(done["data"]["truncated"], true, "{done}");
-    assert!(done["data"]["total"].as_u64().unwrap() < 60, "{done}");
+    assert!(done["data"]["total"].as_u64().unwrap() < 3000, "{done}");
 }
 
 async fn next_event(sub: &mut crate::Subscription) -> Value {
