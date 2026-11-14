@@ -10,6 +10,11 @@ import time
 import unittest
 
 OWNER = str(pathlib.Path(sys.argv.pop(1)).resolve())
+NON_UTF8_NAME = (
+    "import ctypes,os,time; "
+    "assert ctypes.CDLL(None).prctl(15,b'probe-\\xff',0,0,0)==0; "
+    "print(os.getpid(),flush=True); time.sleep(60)"
+)
 
 
 class Probe:
@@ -112,6 +117,31 @@ class OwnerTests(unittest.TestCase):
     def test_invalid_owner_start_cannot_confirm_cleanup(self):
         result = subprocess.run([OWNER, '--intent-internal-probe-owner', '1', '1', '/bin/true'])
         self.assertNotEqual(result.returncode, 0)
+
+    def test_unrelated_non_utf8_name_does_not_abort_cleanup(self):
+        with subprocess.Popen(['/usr/bin/python3', '-c', NON_UTF8_NAME],
+                              stdout=subprocess.PIPE) as unrelated:
+            try:
+                self.assertTrue(select.select([unrelated.stdout], [], [], 5)[0])
+                self.assertEqual(int(unrelated.stdout.readline()), unrelated.pid)
+                probe = Probe('/bin/sh', '-c', 'exit 0')
+                self.assertEqual(probe.exit_status(), b'000\n')
+                self.assertEqual(probe.cleanup(), 0)
+                self.assertIsNone(unrelated.poll())
+            finally:
+                unrelated.terminate()
+                unrelated.wait(timeout=5)
+
+    def test_owned_non_utf8_name_is_killed_and_reaped(self):
+        probe = Probe('/usr/bin/python3', '-c', NON_UTF8_NAME)
+        self.assertTrue(select.select([probe.process.stdout], [], [], 5)[0])
+        pid = int(probe.process.stdout.readline())
+        try:
+            self.assertEqual(probe.cleanup(cancel=True), 0)
+            self.assertTrue(gone(pid))
+        finally:
+            if not gone(pid):
+                os.kill(pid, signal.SIGKILL)
 
 
 unittest.main()

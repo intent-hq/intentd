@@ -132,13 +132,15 @@ fn reap(leader: u32, reported: &mut bool, status_pipe: &mut impl Write) -> io::R
     }
 }
 
-fn parent_pid(stat: &str) -> Option<u32> {
-    stat.rsplit_once(") ")?
-        .1
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+fn parent_pid(stat: &[u8]) -> Option<u32> {
+    // comm is raw kernel bytes and may contain spaces, parentheses, or a
+    // truncated UTF-8 sequence. Decode only the numeric PPID after its end.
+    let end = stat.windows(2).rposition(|bytes| bytes == b") ")?;
+    let parent = stat[end + 2..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(1)?;
+    std::str::from_utf8(parent).ok()?.parse().ok()
 }
 
 fn signal_children(owner: u32) -> io::Result<()> {
@@ -154,7 +156,7 @@ fn signal_children(owner: u32) -> io::Result<()> {
         if pid <= 1 {
             continue;
         }
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+        let stat = match std::fs::read(entry.path().join("stat")) {
             Ok(stat) => stat,
             Err(error)
                 if matches!(
@@ -189,10 +191,17 @@ mod tests {
 
     #[test]
     fn parses_parent_with_spaces_and_parentheses_in_name() {
-        assert_eq!(parent_pid("20 (name ) with spaces) S 12 4 5"), Some(12));
-        assert_eq!(parent_pid("20 (name) Z 12 4 5"), Some(12));
-        assert_eq!(parent_pid("malformed"), None);
-        assert_eq!(parent_pid("20 (name) S nope"), None);
+        assert_eq!(parent_pid(b"20 (name ) with spaces) S 12 4 5"), Some(12));
+        assert_eq!(parent_pid(b"20 (name) Z 12 4 5"), Some(12));
+        assert_eq!(parent_pid(b"malformed"), None);
+        assert_eq!(parent_pid(b"20 (name) S nope"), None);
+    }
+
+    #[test]
+    fn parses_parent_without_decoding_process_name() {
+        assert_eq!(parent_pid(b"20 (raw \xff ) name) S 12 4 5"), Some(12));
+        assert_eq!(parent_pid(b"20 (truncated \xe2\x82) Z 12 4 5"), Some(12));
+        assert_eq!(parent_pid(b"20 (name) S \xff 4 5"), None);
     }
 
     #[test]
