@@ -112,8 +112,7 @@ async fn a_home_whose_link_is_lost_is_detached_and_attached_again_at_the_next_bi
     // A backup, so the error names when the last one was.
     let work = until("the home checkout", || home_checkout(&node_dir, &home_id)).await;
     commit_on(&work, "a.txt", "a\n", "a");
-    let backed_up = home_update(&mut events, &ws_id, |home| home["lastBackupAt"].is_string()).await;
-    let last_backup = backed_up["lastBackupAt"].as_str().unwrap().to_owned();
+    home_update(&mut events, &ws_id, |home| home["lastBackupAt"].is_string()).await;
 
     // The machine goes away: past the grace the home is detached.
     let machine_port = machine.port;
@@ -133,6 +132,12 @@ async fn a_home_whose_link_is_lost_is_detached_and_attached_again_at_the_next_bi
     )
     .await;
     assert_eq!(row["workspace"]["home"]["state"], "detached", "{row}");
+    // The home may have backed up more than once before the loss (at open
+    // and for the commit); the error names the last one the row holds.
+    let last_backup = row["workspace"]["home"]["lastBackupAt"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     id += 1;
     let lost = rpc(
