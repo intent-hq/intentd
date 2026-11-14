@@ -1112,6 +1112,31 @@ async fn refuse_foreign_attachment(
     })
 }
 
+/// Upload sessions are keyed across the whole daemon: a home call may
+/// touch only one its own record began, and any other reads as unknown.
+fn refuse_foreign_upload(
+    services: &intent_services::Services,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), intent_core::node_link::HomeCallError> {
+    let Some(id) = params.get("uploadId").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    let record = params
+        .get("workspaceId")
+        .and_then(serde_json::Value::as_str);
+    let own = services
+        .attachment_upload_workspace(id)
+        .is_some_and(|workspace| Some(workspace.as_str()) == record);
+    if own {
+        return Ok(());
+    }
+    Err(intent_core::node_link::HomeCallError {
+        code: -32602,
+        message: format!("no attachment upload in progress: {id}"),
+        data: Some(serde_json::json!({ "code": "not-found" })),
+    })
+}
+
 /// The branch `worktree` has checked out, or `""` when detached.
 async fn home_branch(worktree: &str) -> String {
     let output = tokio::process::Command::new("git")
@@ -1161,6 +1186,14 @@ async fn dispatch_home_call(
     }
     if method == "file.getAttachmentInfo" {
         refuse_foreign_attachment(services, &params).await?;
+    }
+    if matches!(
+        method,
+        "file.attachmentUpload.chunk"
+            | "file.attachmentUpload.commit"
+            | "file.attachmentUpload.abort"
+    ) {
+        refuse_foreign_upload(services, &params)?;
     }
     let request = serde_json::json!({
         "jsonrpc": "2.0",

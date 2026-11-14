@@ -23,7 +23,8 @@ async fn machine(dir: &std::path::Path) -> Machine {
     let store = intent_store::Store::open(&store_dir.path().join("machine.db"))
         .await
         .unwrap();
-    let services = intent_services::Services::new(store);
+    let services = intent_services::Services::new(store)
+        .with_workspaces_root(store_dir.path().join("workspaces"));
     let records: Arc<dyn runner::HomeRecords> =
         Arc::new(crate::executor::ServicesHomeRecords(services.clone()));
     let node = Running::start_with_records(
@@ -626,4 +627,71 @@ async fn a_cancelled_call_stays_running_until_its_cleanup_ends() {
     .await;
     assert_eq!(answered.request_id, probe_id, "{answered:?}");
     node.stop().await;
+}
+
+/// An attachment too large for one call arrives in pieces through the
+/// home's upload session and is placed in the checkout; an upload the
+/// home's record did not begin reads as unknown.
+#[tokio::test]
+async fn an_attachment_arrives_in_pieces_and_foreign_uploads_are_unknown() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let dir = tempfile::tempdir().unwrap();
+    let m = machine(dir.path()).await;
+    let (mut dialed, h1, work) = opened(&m, dir.path()).await;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let payload: Vec<u8> = (0..3000_u32)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    let sha = sha2::Sha256::digest(&payload)
+        .iter()
+        .fold(String::new(), |mut hex, b| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+            hex
+        });
+    let begun = ok(call(
+        &mut dialed,
+        &h1,
+        "file.attachmentUpload.begin",
+        json!({ "fileName": "big.bin", "sizeBytes": payload.len(), "sha256": sha }),
+    )
+    .await);
+    let upload = begun["uploadId"].as_str().unwrap().to_owned();
+    for (seq, piece) in payload.chunks(1024).enumerate() {
+        ok(call(
+            &mut dialed,
+            &h1,
+            "file.attachmentUpload.chunk",
+            json!({ "uploadId": upload, "seq": seq, "data": b64.encode(piece) }),
+        )
+        .await);
+    }
+    let placed = ok(call(
+        &mut dialed,
+        &h1,
+        "file.attachmentUpload.commit",
+        json!({ "uploadId": upload }),
+    )
+    .await);
+    let path = placed["path"].as_str().unwrap();
+    assert!(!path.starts_with('/'), "{placed}");
+    assert_eq!(std::fs::read(work.join(path)).unwrap(), payload);
+
+    for method in [
+        "file.attachmentUpload.chunk",
+        "file.attachmentUpload.commit",
+        "file.attachmentUpload.abort",
+    ] {
+        let reply = call(
+            &mut dialed,
+            &h1,
+            method,
+            json!({ "uploadId": "not-ours", "seq": 0, "data": "" }),
+        )
+        .await;
+        let (code, data) = err(&reply);
+        assert_eq!(code, -32602, "{method}: {reply:?}");
+        assert_eq!(data, Some(json!({ "code": "not-found" })), "{method}");
+    }
 }

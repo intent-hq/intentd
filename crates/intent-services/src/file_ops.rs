@@ -406,6 +406,37 @@ pub(crate) enum AttachmentSource<'a> {
     CopyFrom(&'a std::path::Path),
 }
 
+/// Refuse a `sourcePath` that cannot be attached with an actionable
+/// `-32602`: a directory, not a regular file, missing or unreadable
+/// (intent-hq/monorepo#2144). Other stat outcomes pass; the copy reports
+/// them.
+pub(crate) fn check_attachment_source(src: &std::path::Path) -> Result<()> {
+    let refused = |what: &str| {
+        Err(Error::InvalidParams(format!(
+            "sourcePath {what}: {}",
+            src.display()
+        )))
+    };
+    match std::fs::metadata(src) {
+        Ok(md) if md.is_dir() => refused("is a directory — only individual files can be attached"),
+        Ok(md) if !md.is_file() => refused("is not a regular file"),
+        // `NotADirectory`: an intermediate path component is a file
+        // (e.g. `/tmp/file/child`) — client-invalid, same as NotFound.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::NotADirectory =>
+        {
+            refused("does not exist")
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            refused("is not readable by the daemon (permission denied)")
+        }
+        // Any other stat outcome falls through to the copy, whose error
+        // carries the I/O detail.
+        _ => Ok(()),
+    }
+}
+
 /// `file.placeAttachment` → `{ ok, path, fileName, size }` (PROTOCOL §5.9;
 /// intent-hq/monorepo#1948). Places the payload into `.intent/attachments/`
 /// under a collision-safe name: the sanitized basename as-is when free, else
@@ -429,40 +460,7 @@ pub(crate) fn place_attachment(
     // dragged FOLDER is the common real-world case, alongside a vanished or
     // unreadable file (intent-hq/monorepo#2144).
     if let AttachmentSource::CopyFrom(src) = &source {
-        match std::fs::metadata(src) {
-            Ok(md) if md.is_dir() => {
-                return Err(Error::InvalidParams(format!(
-                    "sourcePath is a directory — only individual files can be attached: {}",
-                    src.display()
-                )));
-            }
-            Ok(md) if !md.is_file() => {
-                return Err(Error::InvalidParams(format!(
-                    "sourcePath is not a regular file: {}",
-                    src.display()
-                )));
-            }
-            // `NotADirectory`: an intermediate path component is a file
-            // (e.g. `/tmp/file/child`) — client-invalid, same as NotFound.
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    || e.kind() == std::io::ErrorKind::NotADirectory =>
-            {
-                return Err(Error::InvalidParams(format!(
-                    "sourcePath does not exist: {}",
-                    src.display()
-                )));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err(Error::InvalidParams(format!(
-                    "sourcePath is not readable by the daemon (permission denied): {}",
-                    src.display()
-                )));
-            }
-            // Any other stat outcome falls through to the copy below, whose
-            // error carries the I/O detail.
-            _ => {}
-        }
+        check_attachment_source(src)?;
     }
     let dir = resolve_within(root, ATTACHMENTS_DIR)?;
     std::fs::create_dir_all(&dir).map_err(|e: std::io::Error| io_err(&e))?;

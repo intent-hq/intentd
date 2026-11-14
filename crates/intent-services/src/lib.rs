@@ -120,6 +120,7 @@ mod git_diff_singleflight;
 mod git_ops;
 mod git_status_cache;
 mod git_status_singleflight;
+mod home_routing;
 pub mod host_exec;
 pub mod host_exec_stream;
 mod installed_cli;
@@ -16755,7 +16756,11 @@ impl Services {
     ) -> serde_json::Value {
         let registry = self.search_cancels.clone();
         let stream_target = match (&self.event_bus, workspace_id) {
-            (Some(bus), Some(ws)) if matches.len() > search_ops::INLINE_THRESHOLD => {
+            // A machine's hidden home record answers inline: its backend
+            // streams the matches to its own clients.
+            (Some(bus), Some(ws))
+                if matches.len() > search_ops::INLINE_THRESHOLD && !ws.is_home_record() =>
+            {
                 Some((bus.clone(), ws.clone()))
             }
             _ => None,
@@ -18356,6 +18361,17 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn home_route<'a>(
+        &'a self,
+        method: &'a str,
+        params: &'a serde_json::Map<String, serde_json::Value>,
+    ) -> BoxFuture<
+        'a,
+        Option<std::result::Result<serde_json::Value, intent_core::node_link::HomeCallFailure>>,
+    > {
+        Box::pin(Services::home_route(self, method, params))
+    }
+
     fn node_mode(&self) -> bool {
         self.node_mode
     }

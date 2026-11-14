@@ -97,6 +97,7 @@ const REPO_PATH_METHODS: &[&str] = &["git.pull", "git.getBranches", "git.branchS
 const WRITING_METHODS: &[&str] = &[
     "file-tracking.stage",
     "file-tracking.unstage",
+    "file.attachmentUpload.commit",
     "file.delete",
     "file.mkdir",
     "file.placeAttachment",
