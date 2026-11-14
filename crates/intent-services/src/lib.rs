@@ -64,6 +64,7 @@ mod agent_workers;
 mod archive_script;
 mod auto_archive;
 mod auto_retire;
+mod boot_settings_migrations;
 mod executor_capabilities;
 mod executor_ops;
 mod link_traffic_ops;
@@ -335,6 +336,7 @@ mod v3_10_goldens;
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use auto_archive::AutoArchiveReport;
 pub use auto_retire::AutoRetireReport;
+pub use boot_settings_migrations::run_boot_settings_migrations;
 pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
 pub use provider_profiles::{
@@ -342,12 +344,9 @@ pub use provider_profiles::{
     REMOTE_INCOMPATIBLE_NOT_MARKED,
 };
 pub use settings::{
-    agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
-    host_total_memory_bytes, import_legacy_settings, max_concurrent_adapters,
-    max_concurrent_agents, migrate_active_provider_setting, migrate_auto_retire_setting,
-    migrate_default_vocabulary, migrate_quick_action_settings, migrate_quick_action_shared_default,
-    report_to_parent_debounce_seconds, tool_payload_retention_days, InMemorySecretStore,
-    SecretStore,
+    agent_memory_budget_bytes, history_replay_tool_content_chars, host_total_memory_bytes,
+    max_concurrent_adapters, max_concurrent_agents, report_to_parent_debounce_seconds,
+    tool_payload_retention_days, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry, SettingsSnapshot, WsApiPortPolicy};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};

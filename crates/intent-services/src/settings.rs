@@ -2933,19 +2933,14 @@ pub fn purge_archived_after_days(settings: &SettingsFile) -> Option<u32> {
 /// carried over; when both are set the new key wins. Either way the legacy
 /// key is removed from config.toml in the same atomic, comment-preserving
 /// [`SettingsRegistry::apply`] batch. A file without the legacy key is never
-/// rewritten.
-///
-/// # Errors
-///
-/// Never errors today: a failed rewrite is logged and skipped (the file
-/// stays intact and the purge sweep keeps honoring the legacy key, so the
-/// next boot retries). The `Result` keeps parity with the other startup
-/// migrations.
-pub fn migrate_auto_retire_setting(registry: &SettingsRegistry) -> Result<()> {
+/// rewritten. A failed rewrite is logged and skipped: the file stays intact
+/// and the purge sweep keeps honoring the legacy key, so the next boot
+/// retries.
+pub fn migrate_auto_retire_setting(registry: &SettingsRegistry) {
     let snapshot = registry.snapshot();
     let workspace = &snapshot.effective.workspace;
     let Some(legacy) = workspace.auto_retire_archived_after_days else {
-        return Ok(());
+        return;
     };
     let carried = workspace.purge_archived_after_days.is_none() && legacy > 0;
     let mut changes: Vec<(String, Value)> = Vec::with_capacity(2);
@@ -2959,7 +2954,7 @@ pub fn migrate_auto_retire_setting(registry: &SettingsRegistry) -> Result<()> {
             "failed to migrate workspace.autoRetireArchivedAfterDays to \
              workspace.purgeArchivedAfterDays; continuing (next boot retries)"
         );
-        return Ok(());
+        return;
     }
     if carried {
         tracing::info!(
@@ -2972,7 +2967,6 @@ pub fn migrate_auto_retire_setting(registry: &SettingsRegistry) -> Result<()> {
              the already-set workspace.purgeArchivedAfterDays wins"
         );
     }
-    Ok(())
 }
 
 /// The effective `agents.toolPayloadRetentionDays` setting: `Some(days)` when
@@ -3064,18 +3058,20 @@ pub async fn import_legacy_settings(
 /// member that fails the typed schema is skipped with a warning and the rest
 /// still carry over.
 ///
-/// # Errors
-///
-/// Never errors today: migration failures are logged and skipped. The `Result` keeps parity with the other startup migrations.
-pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> {
+/// Returns `false` when a member's write failed (not its validation): the
+/// legacy table must then stay in the file so the next boot retries. A write
+/// that keeps failing keeps the legacy keys, with a warning at each boot.
+#[must_use]
+pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> bool {
     const MEMBERS: [&str; 3] = ["defaultModel", "typeOverrides", "providerSettings"];
     let Some(legacy) = registry.legacy_values().get("backgroundAgents").cloned() else {
-        return Ok(());
+        return true;
     };
     let Some(table) = legacy.as_object() else {
         tracing::warn!("legacy [backgroundAgents] is not a table; discarding");
-        return Ok(());
+        return true;
     };
+    let mut complete = true;
     let mut migrated: Vec<String> = Vec::new();
     let unknown: Vec<&str> = table
         .keys()
@@ -3097,11 +3093,16 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
             tracing::debug!(path, "quick-action key already set; keeping current value");
             continue;
         }
-        if let Err(e) = registry.apply(&[(path.clone(), value.clone())]) {
-            tracing::warn!(path, error = %e, "failed to migrate legacy [backgroundAgents] member; discarding");
-            continue;
+        match registry.apply(&[(path.clone(), value.clone())]) {
+            Ok(_) => migrated.push(path),
+            Err(Error::InvalidParams(e)) => {
+                tracing::warn!(path, error = %e, "legacy [backgroundAgents] member is invalid; discarding");
+            }
+            Err(e) => {
+                tracing::warn!(path, error = %e, "failed to migrate legacy [backgroundAgents] member; next boot retries");
+                complete = false;
+            }
         }
-        migrated.push(path);
     }
     if !migrated.is_empty() {
         tracing::info!(
@@ -3109,7 +3110,7 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
             "migrated legacy [backgroundAgents] into quickActions.*"
         );
     }
-    Ok(())
+    complete
 }
 
 /// Action types that inherited the shared quick action model and effort.
@@ -3219,14 +3220,9 @@ fn fold_quick_action_snapshot(bag: &mut serde_json::Map<String, Value>, provider
 /// per-action values too. A compound shared model keeps only a bare id of its
 /// own provider. Runs after [`migrate_quick_action_settings`], which can
 /// carry a legacy `[backgroundAgents]` default into the shared key. A file
-/// without a shared value or snapshot default is never rewritten.
-///
-/// # Errors
-///
-/// Never errors today: migration failures are logged and skipped (the file
-/// stays intact, so the next boot retries). The `Result` keeps parity with
-/// the other startup migrations.
-pub fn migrate_quick_action_shared_default(registry: &SettingsRegistry) -> Result<()> {
+/// without a shared value or snapshot default is never rewritten. A failed
+/// rewrite is logged and skipped; the next boot retries.
+pub fn migrate_quick_action_shared_default(registry: &SettingsRegistry) {
     let model = nonblank_str(registry.get("quickActions.defaultModel").as_ref());
     let effort = nonblank_str(registry.get("quickActions.defaultReasoningEffort").as_ref());
     // `providers.active` is still set when its carry-over into
@@ -3287,7 +3283,7 @@ pub fn migrate_quick_action_shared_default(registry: &SettingsRegistry) -> Resul
         }
     }
     if changes.is_empty() {
-        return Ok(());
+        return;
     }
     if let Err(e) = registry.apply(&changes) {
         tracing::warn!(
@@ -3295,7 +3291,7 @@ pub fn migrate_quick_action_shared_default(registry: &SettingsRegistry) -> Resul
             "failed to fold the shared quick action default into each action; \
              continuing (next boot retries)"
         );
-        return Ok(());
+        return;
     }
     tracing::info!(
         model = model.as_deref(),
@@ -3303,7 +3299,6 @@ pub fn migrate_quick_action_shared_default(registry: &SettingsRegistry) -> Resul
         "copied the shared quick action default into each action and removed it \
          from config.toml"
     );
-    Ok(())
 }
 
 /// One-time boot migration of the deprecated `providers.active` OUT of
@@ -3324,19 +3319,14 @@ pub fn migrate_quick_action_shared_default(registry: &SettingsRegistry) -> Resul
 /// key is never rewritten (the read path stays rewrite-free). Both writes go
 /// through [`SettingsRegistry::apply`] in one atomic batch, so the raw
 /// document, typed file, and effective snapshot stay in sync — origin
-/// tracking and `settings.reset` behave as if the key was never set.
-///
-/// # Errors
-///
-/// Never errors today: migration failures are logged and skipped (the file
-/// stays intact, so the next boot retries). The `Result` keeps parity with
-/// the other startup migrations.
-pub fn migrate_active_provider_setting(registry: &SettingsRegistry) -> Result<()> {
+/// tracking and `settings.reset` behave as if the key was never set. A failed
+/// rewrite is logged and skipped; the next boot retries.
+pub fn migrate_active_provider_setting(registry: &SettingsRegistry) {
     let Some(active) = registry
         .get("providers.active")
         .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
     else {
-        return Ok(());
+        return;
     };
     let target_set = registry
         .get("model.defaultProvider")
@@ -3362,7 +3352,7 @@ pub fn migrate_active_provider_setting(registry: &SettingsRegistry) -> Result<()
             "failed to migrate deprecated providers.active out of config.toml; \
              continuing (next boot retries)"
         );
-        return Ok(());
+        return;
     }
     if let Some(canonical) = carried {
         tracing::info!(
@@ -3389,7 +3379,6 @@ pub fn migrate_active_provider_setting(registry: &SettingsRegistry) -> Result<()
              model.defaultProvider"
         );
     }
-    Ok(())
 }
 
 /// One-time boot cleanup of stale `SQLite` rows for retired settings. The
@@ -7747,7 +7736,7 @@ mod tests {
                 .and_then(|m| m.modified())
                 .ok();
             let registry = SettingsRegistry::load(&config_path).expect("load registry");
-            migrate_auto_retire_setting(&registry).expect("migrate");
+            migrate_auto_retire_setting(&registry);
             let after = std::fs::read_to_string(&config_path).expect("read config");
             assert!(!after.contains("autoRetireArchivedAfterDays"), "{after}");
             assert_eq!(
@@ -7775,7 +7764,7 @@ mod tests {
                 assert_eq!(before, unchanged);
             }
             // Idempotent: a second boot does nothing.
-            migrate_auto_retire_setting(&registry).expect("migrate again");
+            migrate_auto_retire_setting(&registry);
             assert_eq!(std::fs::read_to_string(&config_path).unwrap(), after);
             let _ = std::fs::remove_file(&config_path);
         }
@@ -9183,7 +9172,7 @@ mod tests {
         .expect("seed legacy config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
 
-        migrate_quick_action_settings(&registry).expect("migrate");
+        assert!(migrate_quick_action_settings(&registry));
         assert_eq!(
             registry.get("quickActions.defaultModel"),
             Some(json!("auggie:haiku"))
@@ -9208,7 +9197,7 @@ mod tests {
         // Second boot: the stripped file reloads, the migration is a no-op and
         // the carried-over values stay put.
         let registry2 = SettingsRegistry::load(&config_path).expect("reload registry");
-        migrate_quick_action_settings(&registry2).expect("migrate again");
+        assert!(migrate_quick_action_settings(&registry2));
         assert_eq!(
             registry2.get("quickActions.defaultModel"),
             Some(json!("auggie:haiku"))
@@ -9243,7 +9232,7 @@ mod tests {
         .expect("seed config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
 
-        migrate_quick_action_settings(&registry).expect("migrate");
+        assert!(migrate_quick_action_settings(&registry));
         assert_eq!(
             registry.get("quickActions.typeOverrides"),
             Some(json!({ "commit": "auggie:fast" })),
@@ -9271,7 +9260,7 @@ mod tests {
         .expect("seed config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
 
-        migrate_quick_action_settings(&registry).expect("migrate");
+        assert!(migrate_quick_action_settings(&registry));
         assert_eq!(
             registry.get("quickActions.defaultModel"),
             Some(json!("auggie:opus")),
@@ -9316,7 +9305,7 @@ mod tests {
         .expect("seed config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
 
-        migrate_quick_action_shared_default(&registry).expect("migrate");
+        migrate_quick_action_shared_default(&registry);
         assert_eq!(
             registry.origin("quickActions.defaultModel"),
             Some(SettingOrigin::Default)
@@ -9361,7 +9350,7 @@ mod tests {
         assert!(text.contains("# keep me"), "{text}");
 
         let registry2 = SettingsRegistry::load(&config_path).expect("reload registry");
-        migrate_quick_action_shared_default(&registry2).expect("migrate again");
+        migrate_quick_action_shared_default(&registry2);
         assert_eq!(
             std::fs::read_to_string(&config_path).expect("re-read config"),
             text,
@@ -9385,7 +9374,7 @@ mod tests {
         )
         .expect("seed config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
-        migrate_quick_action_shared_default(&registry).expect("migrate");
+        migrate_quick_action_shared_default(&registry);
         assert_eq!(
             registry.get("quickActions.typeOverrides"),
             Some(json!({
@@ -9463,7 +9452,7 @@ mod tests {
         .expect("seed legacy config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
 
-        migrate_active_provider_setting(&registry).expect("migrate");
+        migrate_active_provider_setting(&registry);
         assert_eq!(
             registry.get("model.defaultProvider"),
             Some(json!("codex")),
@@ -9494,7 +9483,7 @@ mod tests {
 
         // Next boot from the migrated file: no key → no rewrite, byte-identical.
         let registry2 = SettingsRegistry::load(&config_path).expect("reload registry");
-        migrate_active_provider_setting(&registry2).expect("migrate again");
+        migrate_active_provider_setting(&registry2);
         assert_eq!(
             std::fs::read_to_string(&config_path).expect("re-read config"),
             text,
@@ -9522,7 +9511,7 @@ mod tests {
         )
         .expect("seed config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
-        migrate_active_provider_setting(&registry).expect("migrate");
+        migrate_active_provider_setting(&registry);
         assert_eq!(
             registry.get("model.defaultProvider"),
             Some(json!("claude-code")),
@@ -9557,7 +9546,7 @@ mod tests {
         std::fs::write(&config_path2, "[providers]\nactive = \"not-a-provider\"\n")
             .expect("seed config");
         let registry2 = SettingsRegistry::load(&config_path2).expect("load registry");
-        migrate_active_provider_setting(&registry2).expect("migrate");
+        migrate_active_provider_setting(&registry2);
         assert_eq!(
             registry2.origin("model.defaultProvider"),
             Some(SettingOrigin::Default),
@@ -9576,7 +9565,7 @@ mod tests {
         let seed = "# comment only\n[git]\nautoCommit = true\n";
         std::fs::write(&config_path3, seed).expect("seed config");
         let registry3 = SettingsRegistry::load(&config_path3).expect("load registry");
-        migrate_active_provider_setting(&registry3).expect("migrate");
+        migrate_active_provider_setting(&registry3);
         assert_eq!(
             registry3.origin("model.defaultProvider"),
             Some(SettingOrigin::Default)
