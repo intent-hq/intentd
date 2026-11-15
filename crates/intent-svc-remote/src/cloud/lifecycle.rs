@@ -480,17 +480,30 @@ pub(crate) async fn pause(
     client: &dyn CloudProvider,
     machine_id: &str,
 ) -> Result<ExposedMachine> {
-    pause_when(svc, feature, client, machine_id, false).await
+    pause_when(svc, feature, client, machine_id, Admit::Any).await
 }
 
-/// [`pause`]; with `idle`, only while nothing keeps the sandbox busy, as
-/// checked under its locks.
+/// Which pauses [`pause_when`] admits.
+#[derive(Debug, Clone, Copy)]
+enum Admit {
+    /// Any pause without a turn in flight (`cloudMachines.pause`, the run
+    /// cap, a restart's cut pause).
+    Any,
+    /// An idle pause: nothing busy, and no activity since the time read
+    /// before its home pushes.
+    IdleSince(Option<Instant>),
+}
+
+/// [`pause`], admitted as `admit` says. An idle pause is admitted under
+/// the machine's locks, and checked again once the machine is parked: a
+/// call that began before the park is seen there and undoes it, and one
+/// that begins after it waits for the pause, then resumes the sandbox.
 async fn pause_when(
     svc: &Services,
     feature: &RemoteFeature,
     client: &dyn CloudProvider,
     machine_id: &str,
-    idle: bool,
+    admit: Admit,
 ) -> Result<ExposedMachine> {
     let _lifecycle = feature.lifecycle(machine_id).await;
     let _transition = feature.cloud.transition(machine_id).await;
@@ -515,14 +528,25 @@ async fn pause_when(
         if turns > 0 {
             return Err(crate::methods::in_use(&row.name, turns));
         }
-        if idle && node.shared_ref().busy() {
-            feature.cloud.touch(machine_id);
-            return Err(crate::methods::in_use(&row.name, 0));
-        }
+    }
+    let used = |node: Option<&crate::RemoteNode>| match admit {
+        Admit::Any => false,
+        Admit::IdleSince(before) => node.is_some_and(|node| {
+            node.shared_ref().busy() || Some(node.shared_ref().last_activity()) != before
+        }),
+    };
+    if used(node.as_ref()) {
+        feature.cloud.touch(machine_id);
+        return Err(crate::methods::in_use(&row.name, 0));
     }
     // No dial from now until a demand; the link drops with the pause anyway,
     // and a dial in flight is dropped when it binds.
     feature.cloud.park(machine_id);
+    if used(node.as_ref()) {
+        feature.cloud.unpark(machine_id);
+        feature.cloud.touch(machine_id);
+        return Err(crate::methods::in_use(&row.name, 0));
+    }
     feature.cloud.count_pause(machine_id);
     if let Some(node) = &node {
         node.shared_ref().close_link();
@@ -928,7 +952,7 @@ async fn idle_pause(
             "the sandbox was used while its homes pushed".into(),
         ));
     }
-    pause_when(svc, feature, client, machine_id, true)
+    pause_when(svc, feature, client, machine_id, Admit::IdleSince(before))
         .await
         .map(drop)
 }
