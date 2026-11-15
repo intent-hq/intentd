@@ -1,6 +1,6 @@
 [package]
 name = "intent-svc-remote"
-version = "0.11.214"
+version = "0.11.215"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,15 +8,15 @@ license.workspace = true
 description = "Remote agent runtime for intentd: the backend connector to exposed machines and journal ingestion"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.214" }
-intent-core = { path = "../intent-core", version = "0.11.214" }
-intent-store = { path = "../intent-store", version = "0.11.214" }
-intent-transport = { path = "../intent-transport", version = "0.11.214" }
-intent-acp = { path = "../intent-acp", version = "0.11.214" }
-intent-git = { path = "../intent-git", version = "0.11.214" }
-intent-providers = { path = "../intent-providers", version = "0.11.214" }
-intent-nodes = { path = "../intent-nodes", version = "0.11.214" }
-intent-pty = { path = "../intent-pty", version = "0.11.214" }
+intent-services = { path = "../intent-services", version = "0.11.215" }
+intent-core = { path = "../intent-core", version = "0.11.215" }
+intent-store = { path = "../intent-store", version = "0.11.215" }
+intent-transport = { path = "../intent-transport", version = "0.11.215" }
+intent-acp = { path = "../intent-acp", version = "0.11.215" }
+intent-git = { path = "../intent-git", version = "0.11.215" }
+intent-providers = { path = "../intent-providers", version = "0.11.215" }
+intent-nodes = { path = "../intent-nodes", version = "0.11.215" }
+intent-pty = { path = "../intent-pty", version = "0.11.215" }
 base64 = { workspace = true }
 serde = { workspace = true }
 git2 = { workspace = true }
@@ -33,7 +33,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.11.214", features = ["test-hooks"] }
+intent-services = { path = "../intent-services", version = "0.11.215", features = ["test-hooks"] }
 intentd-test-support = { path = "../intentd-test-support" }
 socket2 = "0.6"
 sqlx = { workspace = true }
