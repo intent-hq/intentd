@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.217] - 2026-11-15
+
+### 🚀 Features
+
+- Move a workspace's home with workspace.setHome ([#3385](https://github.com/intent-hq/intentd/pull/3385))
+- Relaunch a home's sharing agents isolated after a move ([#3386](https://github.com/intent-hq/intentd/pull/3386))
+
+### 🐛 Bug Fixes
+
+- Remove agent temp folders on retire and workspace archive ([#3384](https://github.com/intent-hq/intentd/pull/3384))
+
+
 ## [0.11.216] - 2026-11-15
 
 ### 🚀 Features
