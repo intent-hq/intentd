@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.215] - 2026-11-15
+
+### 🐛 Bug Fixes
+
+- A home's autoStart runs once per checkout across restarts ([#3368](https://github.com/intent-hq/intentd/pull/3368))
+- *(linux)* Confirm probe cleanup without proc children ([#3382](https://github.com/intent-hq/intentd/pull/3382))
+
+
 ## [0.11.214] - 2026-11-14
 
 ### 🚀 Features
