@@ -932,8 +932,7 @@ async fn own_machine(svc: &Services, params: &Value, what: &str) -> Result<Expos
         .as_ref()
         .map(|cloud| cloud.started_by.principal_id.as_str())
         .unwrap_or_default();
-    let Some(intent_core::Caller::Wire { principal_id, .. }) = intent_core::current_caller()
-    else {
+    let Some(intent_core::Caller::Wire { principal_id, .. }) = intent_core::current_caller() else {
         return Err(refused(what));
     };
     if !starter.is_empty() && principal_id.to_string() == starter {

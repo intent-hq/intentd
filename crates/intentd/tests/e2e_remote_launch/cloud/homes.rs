@@ -444,10 +444,13 @@ async fn seed_people(head_dir: &Path) -> String {
         .await
         .unwrap();
     let hash = |token: &str| {
+        use std::fmt::Write as _;
         Sha256::digest(token.as_bytes())
             .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
+            .fold(String::with_capacity(64), |mut text, byte| {
+                let _ = write!(text, "{byte:02x}");
+                text
+            })
     };
     let mut guest_id = String::new();
     for (login, token) in [("member", MEMBER_TOKEN), ("guest", GUEST_TOKEN)] {
@@ -610,8 +613,7 @@ impl CloudHomes {
             .metadata
             .iter()
             .find(|(_, metadata)| metadata["agentId"] == owner)
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| panic!("no sandbox for {owner}"))
+            .map_or_else(|| panic!("no sandbox for {owner}"), |(id, _)| id.clone())
     }
 
     /// The data dir of sandbox `sandbox`'s daemon.
@@ -806,7 +808,10 @@ async fn a_cloud_home_sandbox_is_co_owned_by_its_workspace() {
     let machine = cloud_of(&mut homes.rpc_ws, id, &home_only)
         .await
         .expect("the home-only machine");
-    assert_eq!(machine["cloud"]["startedBy"]["principalId"], owner, "{machine}");
+    assert_eq!(
+        machine["cloud"]["startedBy"]["principalId"], owner,
+        "{machine}"
+    );
     let machine_id = machine["id"].as_str().unwrap().to_owned();
     let guest_id = homes.guest_id.clone();
     homes
@@ -831,7 +836,10 @@ async fn a_cloud_home_sandbox_is_co_owned_by_its_workspace() {
     homes
         .ok("cloudMachines.kill", json!({ "machineId": machine_id }))
         .await;
-    assert!(homes.deleted(&home_only), "the owner's kill left the sandbox");
+    assert!(
+        homes.deleted(&home_only),
+        "the owner's kill left the sandbox"
+    );
 }
 
 /// A cloud home's idle pause (nodes.md "Cloud homes" 3-4, "Continuous
@@ -898,7 +906,11 @@ async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing(
     // Four idle periods with the terminal open: no pause.
     // timing-guard: the open terminal must keep the sandbox running across several idle periods
     tokio::time::sleep(Duration::from_secs(12)).await;
-    assert_eq!(homes.pause_calls(&sandbox), 0, "paused with a terminal open");
+    assert_eq!(
+        homes.pause_calls(&sandbox),
+        0,
+        "paused with a terminal open"
+    );
     let id = homes.next();
     let machine = cloud_of(&mut homes.rpc_ws, id, &sandbox)
         .await
@@ -927,5 +939,8 @@ async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing(
     )
     .await;
     homes.id = id;
-    assert!(home.get("backupWarning").is_none_or(|w| w == false), "{home}");
+    assert!(
+        home.get("backupWarning").is_none_or(|w| w == false),
+        "{home}"
+    );
 }
