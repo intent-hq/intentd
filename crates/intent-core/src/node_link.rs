@@ -1790,7 +1790,7 @@ fn safe_ref_component(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with(['.', '-'])
         && !value.contains("..")
-        && !value.ends_with(".lock")
+        && !value.as_bytes().ends_with(b".lock")
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
