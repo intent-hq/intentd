@@ -559,10 +559,10 @@ impl NodeGitAccess for HeadGitAccess {
                     let pins = crate::launch::checkout_pins(&self.shared.store, &agent_id).await?;
                     let module =
                         tokio::task::spawn_blocking(move || forge::module(&checkout, &pins, &key))
-                        .await
-                        .map_err(|e| {
-                            Error::Internal(format!("node git: resolve the submodule: {e}"))
-                        })?;
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!("node git: resolve the submodule: {e}"))
+                            })?;
                     match module {
                         Ok(module) => module,
                         Err(ModuleRefusal::Denied) => return Err(denied()),

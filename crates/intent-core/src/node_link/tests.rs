@@ -2127,8 +2127,8 @@ fn launch_forge_fetch_modules_are_optional_closed_and_ignorable() {
     command.forge_fetch = Some(Box::new(
         ForgeFetchLaunch::for_github("https://github.com/o/root.git").unwrap(),
     ));
-    let module = ForgeFetchModule::for_github("packages/ios", "k1", "git@github.com:o/ios.git")
-        .unwrap();
+    let module =
+        ForgeFetchModule::for_github("packages/ios", "k1", "git@github.com:o/ios.git").unwrap();
     assert_eq!(module.remote_url, "https://github.com/o/ios.git");
     command.forge_fetch_modules = vec![module];
     assert!(command.forge_fetch_modules_valid());
@@ -2191,9 +2191,11 @@ fn launch_forge_fetch_modules_are_optional_closed_and_ignorable() {
             "{bad:?}"
         );
     }
-    assert!(!invalid(&|c| c
-        .forge_fetch_modules
-        .push(entry("a/b", "k2", "https://github.com/o/b.git"))));
+    assert!(!invalid(&|c| c.forge_fetch_modules.push(entry(
+        "a/b",
+        "k2",
+        "https://github.com/o/b.git"
+    ))));
 }
 
 #[test]

@@ -188,7 +188,14 @@ async fn sub_agents_fetch_github_through_the_backend_and_cannot_push() {
 
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let mut events = connect(port, cfg.clone()).await;
-    let family = family(&mut rpc_ws, &mut events, scratch.path(), &ws_id, &backend_id).await;
+    let family = family(
+        &mut rpc_ws,
+        &mut events,
+        scratch.path(),
+        &ws_id,
+        &backend_id,
+    )
+    .await;
     let machines = family.machines;
     let parent = (ws_id.as_str(), family.parent.as_str());
     let sharer = (ws_id.as_str(), family.sharer.as_str());
@@ -320,7 +327,10 @@ async fn sub_agents_fetch_a_github_submodule_through_the_backend_and_cannot_push
     let gadget = forge_root.join("acme").join("gadget.git");
     for bare in [&github, &gadget] {
         std::fs::create_dir_all(bare).unwrap();
-        git(bare, &["init", "--quiet", "--bare", "--initial-branch=main"]);
+        git(
+            bare,
+            &["init", "--quiet", "--bare", "--initial-branch=main"],
+        );
     }
     push_to_github(&gadget, scratch.path(), "gadget-base");
     let base = format!("file://{}/", forge_root.display());
@@ -344,9 +354,18 @@ async fn sub_agents_fetch_a_github_submodule_through_the_backend_and_cannot_push
             // The submodule's own `origin` names its GitHub repository.
             git(
                 repo,
-                &["config", "-f", ".gitmodules", "submodule.gadget.url", GADGET],
+                &[
+                    "config",
+                    "-f",
+                    ".gitmodules",
+                    "submodule.gadget.url",
+                    GADGET,
+                ],
             );
-            git(&repo.join("gadget"), &["remote", "set-url", "origin", GADGET]);
+            git(
+                &repo.join("gadget"),
+                &["remote", "set-url", "origin", GADGET],
+            );
             git(repo, &["add", ".gitmodules"]);
             git(repo, &["commit", "--quiet", "-m", "gadget"]);
         },
@@ -360,7 +379,14 @@ async fn sub_agents_fetch_a_github_submodule_through_the_backend_and_cannot_push
 
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let mut events = connect(port, cfg.clone()).await;
-    let family = family(&mut rpc_ws, &mut events, scratch.path(), &ws_id, &backend_id).await;
+    let family = family(
+        &mut rpc_ws,
+        &mut events,
+        scratch.path(),
+        &ws_id,
+        &backend_id,
+    )
+    .await;
     let sharer = (ws_id.as_str(), family.sharer.as_str());
     let far_agent = (ws_id.as_str(), family.far.as_str());
 
