@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.216] - 2026-11-15
+
+### 🚀 Features
+
+- Durable home final stop on archive, delete and move ([#3379](https://github.com/intent-hq/intentd/pull/3379))
+
+
 ## [0.11.215] - 2026-11-15
 
 ### 🐛 Bug Fixes
