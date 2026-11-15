@@ -17979,7 +17979,9 @@ impl Services {
             // The rows are gone and the agents' trees are killed: remove
             // their temp folders.
             if let Some(manager) = manager.as_ref() {
-                manager.remove_agent_tmp_dirs(&session_ids).await;
+                manager
+                    .remove_agent_tmp_dirs(&session_ids, intent_core::AgentTmpRemoval::Deleted)
+                    .await;
             }
             // The row is gone and its scripts are stopped: delete its on-disk
             // script output (best-effort; the startup orphan sweep retries).
@@ -35759,7 +35761,7 @@ impl Services {
                 None => self.archive_fence_after_archive_script(&id).await,
             };
             let current = store.get_workspace(&id).await?;
-            if current.is_retired() {
+            let (flipped, revived) = if current.is_retired() {
                 // The agent whose turn triggered the revive gets its notice in
                 // that turn; every other agent's notice is written with the
                 // flip (see `revive_retired_checkout`).
@@ -35777,7 +35779,14 @@ impl Services {
                     .unarchive_workspace_if_archived(&id, &now_iso())
                     .await?;
                 (flipped, None)
+            };
+            // Under the fence with the flip, so a later archive's removal is
+            // never cancelled: keep the temp folders the archive left to
+            // running processes.
+            if flipped {
+                self.keep_workspace_agent_tmp_dirs(&id).await;
             }
+            (flipped, revived)
         };
         let mut ws = store.get_workspace(&id).await?;
         if ws.is_retired() {
@@ -38998,6 +39007,48 @@ impl Services {
         self.archive_workspace_inner(id, caller_agent_id, automatic, true)
     }
 
+    /// Detach the temp folders of every agent in `id` (archive) for
+    /// [`AgentManager::discard_agent_tmp_dirs`]. A folder a running process
+    /// holds goes when it ends, unless unarchive keeps it.
+    async fn detach_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) -> Vec<PathBuf> {
+        let Some(manager) = self.agent_manager() else {
+            return Vec::new();
+        };
+        match self.store.list_agent_session_summaries(id).await {
+            Ok(sessions) => {
+                let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
+                manager.detach_agent_tmp_dirs(&ids, intent_core::AgentTmpRemoval::Archived)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %id.as_str(),
+                    error = %e,
+                    "workspace.archive: agent listing failed; temp folders left to the idle sweep"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Cancel the archive's deferred temp-folder removal for `id`'s agents
+    /// (unarchive; call under the archive fence). A retire's removal stands.
+    async fn keep_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) {
+        let Some(manager) = self.agent_manager() else {
+            return;
+        };
+        match self.store.list_agent_session_summaries(id).await {
+            Ok(sessions) => {
+                let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
+                manager.keep_agent_tmp_dirs(&ids, intent_core::AgentTmpRemoval::Archived);
+            }
+            Err(e) => tracing::warn!(
+                workspace = %id.as_str(),
+                error = %e,
+                "unarchive: agent listing failed; running agents' temp folders go when they stop"
+            ),
+        }
+    }
+
     /// [`Self::archive_workspace_with_mode`]; with `run_archive_script` the
     /// committed archive starts the workspace's `archiveScript` in the
     /// background. Retire passes `false`: it runs the script itself, and
@@ -39236,7 +39287,7 @@ impl Services {
                 // row still carries this call's `archivedAt`; the flip and
                 // its delta happen under the same fence, so the two
                 // announcements can never cross.
-                let _fence = this.archive_fence.acquire(&ws.id).await;
+                let fence = this.archive_fence.acquire(&ws.id).await;
                 let still_archived = match store.get_workspace(&ws.id).await {
                     Ok(row) => row.archived && row.archived_at == ws.archived_at,
                     Err(e) => {
@@ -39247,6 +39298,13 @@ impl Services {
                         );
                         true
                     }
+                };
+                // Detach under the fence, so an unarchive's keep runs after
+                // it; the slow delete runs once the fence is released.
+                let detached_tmp_dirs = if still_archived {
+                    this.detach_workspace_agent_tmp_dirs(&ws.id).await
+                } else {
+                    Vec::new()
                 };
                 if still_archived {
                     publish_event(
@@ -39279,6 +39337,8 @@ impl Services {
                         runner.run_claimed_archive_script(claimed, true).await;
                     });
                 }
+                drop(fence);
+                AgentManager::discard_agent_tmp_dirs(detached_tmp_dirs).await;
                 ws
             });
             // Awaiting the handle keeps the caller-visible contract intact

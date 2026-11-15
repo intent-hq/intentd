@@ -7954,7 +7954,10 @@ impl Services {
             // The runtime is stopped above; its temp folder goes with it.
             if let Some(manager) = self.agent_manager() {
                 manager
-                    .remove_agent_tmp_dirs(std::slice::from_ref(&agent_id))
+                    .remove_agent_tmp_dirs(
+                        std::slice::from_ref(&agent_id),
+                        intent_core::AgentTmpRemoval::Deleted,
+                    )
                     .await;
             }
         }
@@ -8417,6 +8420,15 @@ impl Services {
                 manager.retire(&session.id).await;
             }
         }
+        // Its temp folder goes now, or when a still-running process ends.
+        if let Some(manager) = self.agent_manager() {
+            manager
+                .remove_agent_tmp_dirs(
+                    std::slice::from_ref(&session.id),
+                    intent_core::AgentTmpRemoval::Retired,
+                )
+                .await;
+        }
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Drop the retired agent's event subscriptions: the wake target is
         // inert, so matching/batching for it is pure leak (same rationale
@@ -8532,6 +8544,12 @@ impl Services {
         }
         if let Some(manager) = self.agent_manager() {
             manager.restore_retired(&agent_id);
+            // Under the retirement gate, like the retire's removal. An
+            // archive's removal stands.
+            manager.keep_agent_tmp_dirs(
+                std::slice::from_ref(&agent_id),
+                intent_core::AgentTmpRemoval::Retired,
+            );
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         crate::publish_event(

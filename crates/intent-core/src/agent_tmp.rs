@@ -12,9 +12,11 @@
 //! by its process: the idle reaper, memory pressure, a model switch and a
 //! daemon restart all relaunch the provider between turns, and the agent must
 //! find the files it left in `$TMPDIR` on the previous turn. The folder
-//! therefore outlives each process and is reclaimed by
-//! [`sweep_agent_tmp_root`] once no launch holds it and it has sat unused for
-//! [`AGENT_TMP_MAX_IDLE`].
+//! therefore outlives each process. It is removed when the agent is deleted,
+//! retired or its workspace archived ([`remove_agent_tmp_dir`],
+//! [`AgentTmpRemoval`]), and
+//! otherwise reclaimed by [`sweep_agent_tmp_root`] once no launch holds it
+//! and it has sat unused for [`AGENT_TMP_MAX_IDLE`].
 //!
 //! The folders live under a per-daemon root in the OS temp dir
 //! ([`agent_tmp_root`]), not under the data dir: tools put Unix sockets in
@@ -47,15 +49,39 @@ pub const AGENT_TMP_MAX_IDLE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// tools that consult them first.
 pub const AGENT_TMP_ENV_KEYS: [&str; 3] = ["TMPDIR", "TMP", "TEMP"];
 
+/// Why an agent's temp folder is removed. A removal deferred to the last
+/// release is cancelled only for its own reason ([`keep_agent_tmp_dir`]),
+/// so an unarchive never cancels a retire's removal, nor a restore an
+/// archive's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTmpRemoval {
+    /// The agent was deleted (never cancelled).
+    Deleted,
+    /// The agent was retired; restore cancels it.
+    Retired,
+    /// The agent's workspace was archived; unarchive cancels it.
+    Archived,
+}
+
+impl AgentTmpRemoval {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Deleted => 1,
+            Self::Retired => 2,
+            Self::Archived => 4,
+        }
+    }
+}
+
 /// Live holders of one agent folder.
 #[derive(Debug, Default)]
 struct Holders {
     /// Live [`AgentTempDir`]s (a relaunch can overlap the previous
     /// process's teardown).
     count: usize,
-    /// The agent was deleted while a holder was live: remove the folder when
-    /// the last one is dropped.
-    remove_on_release: bool,
+    /// [`AgentTmpRemoval`] bits requested while a holder was live: remove
+    /// the folder when the last one is dropped if any is still set.
+    remove_on_release: u8,
 }
 
 /// Folders held by a live [`AgentTempDir`]. The sweep skips them; it checks
@@ -250,20 +276,46 @@ fn agent_dir_path(root: &Path, agent_key: &str) -> PathBuf {
     root.join(format!("{AGENT_TMP_DIR_PREFIX}{hash:012x}"))
 }
 
-/// Remove `agent_key`'s folder under `root` because the agent was deleted.
-/// A folder a live launch still holds is removed when the last holder drops.
-pub fn remove_agent_tmp_dir(root: &Path, agent_key: &str) {
+/// Remove `agent_key`'s folder under `root` for `reason`. A folder a live
+/// launch still holds is removed when the last holder drops, unless
+/// [`keep_agent_tmp_dir`] cancels every reason first.
+pub fn remove_agent_tmp_dir(root: &Path, agent_key: &str, reason: AgentTmpRemoval) {
+    if let Some(aside) = detach_agent_tmp_dir(root, agent_key, reason) {
+        discard_agent_tmp_dir(&aside);
+    }
+}
+
+/// The fast half of [`remove_agent_tmp_dir`]: move `agent_key`'s unheld
+/// folder aside (a held one is marked for removal on release) and return
+/// the moved path for [`discard_agent_tmp_dir`]. A moved-aside folder is no
+/// longer the agent's; the sweep removes it if it is never discarded.
+#[must_use]
+pub fn detach_agent_tmp_dir(
+    root: &Path,
+    agent_key: &str,
+    reason: AgentTmpRemoval,
+) -> Option<PathBuf> {
     let path = agent_dir_path(root, agent_key);
-    let aside = {
-        let mut held = in_use();
-        if let Some(holders) = held.get_mut(&path) {
-            holders.remove_on_release = true;
-            return;
-        }
-        move_aside(root, &path)
-    };
-    if let Some(aside) = aside {
-        remove_entry(&aside);
+    let mut held = in_use();
+    if let Some(holders) = held.get_mut(&path) {
+        holders.remove_on_release |= reason.bit();
+        return None;
+    }
+    move_aside(root, &path)
+}
+
+/// Delete a folder [`detach_agent_tmp_dir`] moved aside, with its contents.
+pub fn discard_agent_tmp_dir(aside: &Path) {
+    remove_entry(aside);
+}
+
+/// Cancel the `reason` removal [`remove_agent_tmp_dir`] deferred to the
+/// last release of `agent_key`'s folder (restore cancels
+/// [`AgentTmpRemoval::Retired`], unarchive [`AgentTmpRemoval::Archived`]).
+/// Other reasons stand; an already removed folder stays removed.
+pub fn keep_agent_tmp_dir(root: &Path, agent_key: &str, reason: AgentTmpRemoval) {
+    if let Some(holders) = in_use().get_mut(&agent_dir_path(root, agent_key)) {
+        holders.remove_on_release &= !reason.bit();
     }
 }
 
@@ -366,7 +418,7 @@ impl Drop for AgentTempDir {
                 if holders.count > 0 {
                     return;
                 }
-                let remove = holders.remove_on_release;
+                let remove = holders.remove_on_release != 0;
                 held.remove(&self.path);
                 let root = self.path.parent();
                 match root {
@@ -539,19 +591,67 @@ mod tests {
         let idle = AgentTempDir::for_agent(&root, "idle").unwrap();
         let idle_path = idle.path().to_path_buf();
         drop(idle);
-        remove_agent_tmp_dir(&root, "idle");
+        remove_agent_tmp_dir(&root, "idle", AgentTmpRemoval::Deleted);
         assert!(!idle_path.exists(), "an unheld folder goes at once");
 
         let a = AgentTempDir::for_agent(&root, "busy").unwrap();
         let b = AgentTempDir::for_agent(&root, "busy").unwrap();
         let path = a.path().to_path_buf();
-        remove_agent_tmp_dir(&root, "busy");
+        remove_agent_tmp_dir(&root, "busy", AgentTmpRemoval::Deleted);
         assert!(path.is_dir(), "a held folder stays while held");
         drop(a);
         assert!(path.is_dir(), "one holder remains");
         drop(b);
         assert!(!path.exists(), "the last release removes it");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn keep_cancels_only_its_own_deferred_removal() {
+        let base = base();
+        let root = base.path().join("root");
+        prepare_agent_tmp_root(&root).unwrap();
+        let held = AgentTempDir::for_agent(&root, "back").unwrap();
+        let path = held.path().to_path_buf();
+        std::fs::write(path.join("kept"), "x").unwrap();
+        remove_agent_tmp_dir(&root, "back", AgentTmpRemoval::Retired);
+        keep_agent_tmp_dir(&root, "back", AgentTmpRemoval::Retired);
+        drop(held);
+        assert!(
+            path.join("kept").is_file(),
+            "a kept folder survives the last release"
+        );
+
+        let held = AgentTempDir::for_agent(&root, "back").unwrap();
+        remove_agent_tmp_dir(&root, "back", AgentTmpRemoval::Retired);
+        remove_agent_tmp_dir(&root, "back", AgentTmpRemoval::Archived);
+        keep_agent_tmp_dir(&root, "back", AgentTmpRemoval::Archived);
+        drop(held);
+        assert!(
+            !path.exists(),
+            "unarchive does not cancel a retire's removal"
+        );
+
+        let held = AgentTempDir::for_agent(&root, "back").unwrap();
+        std::fs::write(held.path().join("kept"), "x").unwrap();
+        keep_agent_tmp_dir(&root, "never-launched", AgentTmpRemoval::Archived);
+        drop(held);
+        let aside = detach_agent_tmp_dir(&root, "back", AgentTmpRemoval::Archived)
+            .expect("an unheld folder moves aside");
+        assert!(!path.exists(), "a detached folder is no longer the agent's");
+        keep_agent_tmp_dir(&root, "back", AgentTmpRemoval::Archived);
+        let fresh = AgentTempDir::for_agent(&root, "back").unwrap();
+        assert!(
+            !fresh.path().join("kept").exists(),
+            "a relaunch after detach starts empty"
+        );
+        drop(fresh);
+        assert!(
+            aside.join("kept").is_file(),
+            "detach moves the contents aside"
+        );
+        discard_agent_tmp_dir(&aside);
+        assert!(!aside.exists(), "discard deletes the moved folder");
     }
 
     #[test]

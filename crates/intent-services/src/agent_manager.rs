@@ -3458,22 +3458,70 @@ impl AgentManager {
         Some(root.clone())
     }
 
-    /// Remove the private temp folders of deleted agents. Call after their
-    /// runtimes are stopped; a folder a late teardown still holds goes when
-    /// that holder drops.
-    pub async fn remove_agent_tmp_dirs(&self, agent_ids: &[AgentId]) {
+    /// Remove the private temp folders of deleted, retired or archived
+    /// agents. Call after their runtimes are stopped; a folder a live process
+    /// still holds goes when that holder drops.
+    pub async fn remove_agent_tmp_dirs(
+        &self,
+        agent_ids: &[AgentId],
+        reason: intent_core::AgentTmpRemoval,
+    ) {
         let Some(root) = self.agent_tmp_root.clone() else {
             return;
         };
         let keys: Vec<String> = agent_ids.iter().map(|id| id.0.clone()).collect();
         let removed = tokio::task::spawn_blocking(move || {
             for key in &keys {
-                intent_core::remove_agent_tmp_dir(&root, key);
+                intent_core::remove_agent_tmp_dir(&root, key, reason);
             }
         })
         .await;
         if let Err(e) = removed {
             tracing::warn!(error = %e, "agent temp folder removal task failed");
+        }
+    }
+
+    /// Move the agents' unheld temp folders aside (a held one goes when its
+    /// process ends) and return them for [`Self::discard_agent_tmp_dirs`]:
+    /// renames only, cheap enough to run under a lock.
+    pub fn detach_agent_tmp_dirs(
+        &self,
+        agent_ids: &[AgentId],
+        reason: intent_core::AgentTmpRemoval,
+    ) -> Vec<PathBuf> {
+        let Some(root) = self.agent_tmp_root.as_deref() else {
+            return Vec::new();
+        };
+        agent_ids
+            .iter()
+            .filter_map(|id| intent_core::detach_agent_tmp_dir(root, &id.0, reason))
+            .collect()
+    }
+
+    /// Delete folders [`Self::detach_agent_tmp_dirs`] moved aside.
+    pub async fn discard_agent_tmp_dirs(paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let removed = tokio::task::spawn_blocking(move || {
+            for path in &paths {
+                intent_core::discard_agent_tmp_dir(path);
+            }
+        })
+        .await;
+        if let Err(e) = removed {
+            tracing::warn!(error = %e, "agent temp folder removal task failed");
+        }
+    }
+
+    /// Cancel the `reason` removal deferred for restored or unarchived
+    /// agents' temp folders (see [`Self::remove_agent_tmp_dirs`]).
+    pub fn keep_agent_tmp_dirs(&self, agent_ids: &[AgentId], reason: intent_core::AgentTmpRemoval) {
+        let Some(root) = self.agent_tmp_root.as_deref() else {
+            return;
+        };
+        for id in agent_ids {
+            intent_core::keep_agent_tmp_dir(root, &id.0, reason);
         }
     }
 
