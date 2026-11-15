@@ -1166,6 +1166,8 @@ pub(crate) async fn remove_machine(
                 }
             }
         }
+        // The homes it held are rebuilt at their next use, never detached.
+        let rebuilds = super::home::sandbox_removed(svc, &row.id).await?;
         store.remove_exposed_machine(&row.id).await?;
         svc.delete_remote_machine_token(&row.id).await?;
         store.end_machine_leases(&row.id, &head_id).await?;
@@ -1185,11 +1187,14 @@ pub(crate) async fn remove_machine(
             svc.publish_agent_placement_changed(&agent.workspace_id, &agent.agent_id)
                 .await;
         }
-        Ok::<(), Error>(())
+        Ok::<_, Error>(rebuilds)
     }
     .await;
-    if let Err(error) = unlinked {
-        tracing::warn!(machine = %row.id, %error, "cloud machine: could not remove its records");
+    match unlinked {
+        Ok(rebuilds) => super::home::announce_rebuilds(svc, &rebuilds).await,
+        Err(error) => {
+            tracing::warn!(machine = %row.id, %error, "cloud machine: could not remove its records");
+        }
     }
     if let (None, Some(client), Some(cloud)) = (lost, client, &row.cloud) {
         if let Err(error) = client.delete(&cloud.sandbox_id).await {

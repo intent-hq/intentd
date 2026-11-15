@@ -202,6 +202,11 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          send nor receive them",
     ),
     (
+        "home_rebuild",
+        "a rebuild pending for a cloud home this daemon deleted (its own home ids); the \
+         target head has neither the cloud entry's sandbox nor the home",
+    ),
+    (
         "remote_final_stop",
         "pending final stops this head owes a machine under its own lease (stop ids, a local \
          repository path); the target head has no such lease, so it could neither send nor \

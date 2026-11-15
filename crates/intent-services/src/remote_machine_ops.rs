@@ -420,9 +420,6 @@ impl Services {
         home_name: Option<&str>,
         refs: &[String],
     ) -> Result<intent_core::NoteId> {
-        use intent_core::{
-            ContentType, Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility,
-        };
         let from = home_name.map_or_else(
             || "the old home".to_owned(),
             |name| format!("the old home on {name}"),
@@ -438,11 +435,49 @@ impl Services {
         content.push_str(
             "\nNothing was merged. To bring it back, fetch the ref and merge or cherry-pick it in the home checkout.\n",
         );
+        self.post_home_notice(workspace_id, "Work left on the old home", content)
+            .await
+    }
+
+    /// The workspace's notice that its cloud home was rebuilt (nodes.md
+    /// "Cloud homes" 5): the sandbox that held it on `home_name` was
+    /// deleted, and a new one holds it from the backup of `last_backup_at`.
+    ///
+    /// # Errors
+    ///
+    /// The store's error.
+    pub async fn post_home_rebuilt_notice(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_name: &str,
+        last_backup_at: Option<&str>,
+    ) -> Result<intent_core::NoteId> {
+        let backup = last_backup_at.map_or_else(
+            || "the workspace's last saved work".to_owned(),
+            |at| format!("its last backup ({at})"),
+        );
+        let content = format!(
+            "The cloud sandbox that held this workspace's home on {home_name} was deleted (for example, after it stayed paused too long). A new sandbox now holds the home, restored from {backup}.\n\nChanges made after that backup are not on the new home.\n"
+        );
+        self.post_home_notice(workspace_id, "The home was rebuilt", content)
+            .await
+    }
+
+    /// A workspace note from Intent about its home.
+    async fn post_home_notice(
+        &self,
+        workspace_id: &WorkspaceId,
+        title: &str,
+        content: String,
+    ) -> Result<intent_core::NoteId> {
+        use intent_core::{
+            ContentType, Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility,
+        };
         let now = now_iso();
         let note = Note {
             id: NoteId::new(),
             workspace_id: workspace_id.clone(),
-            title: "Work left on the old home".to_owned(),
+            title: title.to_owned(),
             content,
             content_type: ContentType::Markdown,
             tags: vec!["home".to_owned()],

@@ -450,8 +450,37 @@ pub(crate) async fn open_home(svc: &Services, workspace_id: &WorkspaceId) -> Res
     settle_open(svc, workspace_id, &home.home_id, reply).await
 }
 
+/// The hub's `home/head` and `home/wip`, which a new home restores (a
+/// move's target, or a rebuilt cloud home); `None` without a `home/head`.
+pub(crate) async fn home_restore(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+) -> Option<HomeRestore> {
+    let workspace = svc.store().get_workspace(workspace_id).await.ok()?;
+    let checkout = crate::launch::checkout_path(&workspace)?;
+    let remote = AgentRemote::home(workspace_id.as_str(), &HomeId::new().0).ok()?;
+    tokio::task::spawn_blocking(move || {
+        let repo = git2::Repository::open(&checkout).ok()?;
+        let read = |kind| {
+            repo.find_reference(&remote.ref_name(kind))
+                .ok()
+                .and_then(|reference| reference.target())
+                .map(|oid| oid.to_string())
+        };
+        Some(HomeRestore {
+            head: read(AgentRef::Head)?,
+            wip: read(AgentRef::Wip),
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Send the `homeOpen` of `home_id` to the exposed machine `node_id` and
-/// wait for its answer.
+/// wait for its answer. A cloud home rebuilt after its sandbox was deleted
+/// (nodes.md "Cloud homes" 5) restores the hub's home refs unless
+/// `restore` says what to restore.
 pub(crate) async fn send_open(
     svc: &Services,
     workspace_id: &WorkspaceId,
@@ -462,6 +491,18 @@ pub(crate) async fn send_open(
     let feature = svc
         .remote_feature()
         .ok_or_else(|| Error::Internal("no remote machine feature".into()))?;
+    let restore = match restore {
+        Some(restore) => Some(restore),
+        None if svc
+            .store()
+            .home_rebuild_of(workspace_id, home_id)
+            .await?
+            .is_some() =>
+        {
+            home_restore(svc, workspace_id).await
+        }
+        None => None,
+    };
     let node = feature.node(svc, node_id).await?;
     node.shared_ref().set_holds_homes(true);
     let mut frame = home_open_frame(svc, workspace_id, home_id).await?;
@@ -542,6 +583,7 @@ pub(crate) async fn settle_open(
                     break;
                 }
             }
+            crate::cloud::home::rebuilt(svc, workspace_id, home_id).await;
             Ok(())
         }
         HomeOpenOutcome::Failed => Err(Error::Internal(format!(

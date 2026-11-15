@@ -283,9 +283,9 @@ pub(crate) async fn open(
     let shared = node.shared_ref();
     let _use = shared.begin_use().await;
     if shared.current_link().is_none() && feature.cloud.is_parked(&node_id) {
-        node.connect()
-            .await
-            .map_err(|error| home_unavailable(&home, &error.to_string()))?;
+        if let Err(error) = node.connect().await {
+            return Err(crate::cloud::home::unreachable(svc, workspace_id, &home, &error).await);
+        }
     }
     if shared.protocol() < HOMES_PROTOCOL {
         return Err(home_unavailable(
