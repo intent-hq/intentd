@@ -119,6 +119,11 @@ pub(crate) async fn push_home(
     home: &WorkspaceHome,
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
+    // A cloud home no sandbox holds has no work beyond the hub's refs:
+    // nothing to push, and no reason to start one.
+    if home.cloud_machine_id.is_some() && home.node_id.is_none() {
+        return Ok(());
+    }
     let pushed = push_once(svc, home, workspace_id).await;
     match &pushed {
         Ok(()) => crate::home_state::backup_succeeded(svc, workspace_id, home).await,

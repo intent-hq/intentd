@@ -763,8 +763,12 @@ async fn start(
         &mut made,
     )
     .await;
+    // A home-only start in flight still may become the home: it settles
+    // the home itself.
     if let (Err(_), Some(home)) = (&started, &home) {
-        super::home::start_failed(svc, workspace_id, &home.home_id, made.as_deref()).await;
+        if !super::home::home_start_in_flight(svc, workspace_id) {
+            super::home::start_failed(svc, workspace_id, &home.home_id, made.as_deref()).await;
+        }
     }
     started
 }
@@ -869,13 +873,27 @@ pub(crate) async fn start_home(
     home_id: &intent_core::HomeId,
     cloud_machine_id: &str,
 ) -> Result<()> {
+    let mut made = None;
+    let started = start_home_sandbox(svc, workspace_id, home_id, cloud_machine_id, &mut made).await;
+    if started.is_err() {
+        super::home::start_failed(svc, workspace_id, home_id, made.as_deref()).await;
+    }
+    started
+}
+
+async fn start_home_sandbox(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home_id: &intent_core::HomeId,
+    cloud_machine_id: &str,
+    made: &mut Option<String>,
+) -> Result<()> {
     let feature = super::feature(svc)?;
     let owner = super::home::start_key(workspace_id);
     let started_by = super::owner_started_by(svc, workspace_id).await;
     let prepared = prepare(svc, cloud_machine_id).await?;
     let created = create(svc, &prepared, workspace_id, &owner, cloud_machine_id).await?;
     let sandbox_id = created.id.clone();
-    let mut made = None;
     let linked = async {
         let minted = mint(svc, &prepared, &created).await?;
         let machine_id = add_row(
@@ -893,7 +911,7 @@ pub(crate) async fn start_home(
             },
         )
         .await?;
-        made = Some(machine_id.clone());
+        *made = Some(machine_id.clone());
         if config::load(svc, cloud_machine_id).await?.is_none() {
             return Err(config::not_configured());
         }
@@ -906,7 +924,7 @@ pub(crate) async fn start_home(
     }
     .await;
     if linked.is_err() {
-        if let Some(machine_id) = &made {
+        if let Some(machine_id) = made.as_deref() {
             if let Ok(Some(row)) = svc.store().get_exposed_machine(machine_id).await {
                 delete_machine(feature, svc, &row, None).await;
             }
@@ -914,9 +932,6 @@ pub(crate) async fn start_home(
         if let Err(error) = prepared.client.delete(&sandbox_id).await {
             tracing::warn!(%error, sandbox = %sandbox_id, "cloud machine: could not delete the sandbox of a failed home start");
         }
-    }
-    if linked.is_err() {
-        super::home::start_failed(svc, workspace_id, home_id, made.as_deref()).await;
     }
     linked
 }

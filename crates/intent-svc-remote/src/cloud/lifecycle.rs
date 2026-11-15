@@ -645,6 +645,9 @@ pub(crate) fn spawn_supervisor(svc: &Services) {
         if let Err(error) = config::migrate(&svc).await {
             tracing::warn!(%error, "cloud machines: could not migrate the saved E2B provider");
         }
+        if svc.workspace_homes() {
+            super::home::reset_after_restart(&svc).await;
+        }
         let mut last_reap: Option<Instant> = None;
         loop {
             let clock = Clock::current();

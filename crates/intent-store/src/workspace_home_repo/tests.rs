@@ -379,3 +379,111 @@ async fn auto_start_is_claimed_once_per_setup_record_across_a_restart() {
         .await
         .unwrap());
 }
+
+fn cloud_home(id: &str) -> WorkspaceHome {
+    WorkspaceHome {
+        node_id: None,
+        cloud_machine_id: Some("e2b".into()),
+        ..home(id, "unused")
+    }
+}
+
+async fn state_of(store: &Store, workspace: &WorkspaceId) -> (HomeState, Option<String>) {
+    let home = store.get_workspace_home(workspace).await.unwrap().unwrap();
+    (home.state, home.node_id)
+}
+
+/// A cloud home is claimed by one sandbox only; a start marks it starting
+/// only while no sandbox holds it (a start that lost the race never marks
+/// a running home starting); a failed start detaches it unless another
+/// sandbox holds it; a restart resets a home left starting with no sandbox,
+/// and leaves one a sandbox holds for its reopen.
+#[tokio::test]
+async fn a_cloud_home_is_claimed_once_and_only_an_unheld_one_starts() {
+    let (_dir, store) = open().await;
+    let ws1 = WorkspaceId::from("ws-1");
+    let ws2 = WorkspaceId::from("ws-2");
+    let h1 = HomeId::from("h1");
+    let h2 = HomeId::from("h2");
+    store
+        .set_workspace_home(&ws1, &cloud_home("h1"))
+        .await
+        .unwrap();
+    store
+        .set_workspace_home(&ws2, &cloud_home("h2"))
+        .await
+        .unwrap();
+
+    assert!(store
+        .mark_cloud_home_starting(&ws1, &h1, &now_iso())
+        .await
+        .unwrap());
+    assert!(!store
+        .claim_cloud_home(&ws1, &h1, "other-entry", "m1")
+        .await
+        .unwrap());
+    assert!(store
+        .claim_cloud_home(&ws1, &h1, "e2b", "m1")
+        .await
+        .unwrap());
+    assert!(!store
+        .claim_cloud_home(&ws1, &h1, "e2b", "m2")
+        .await
+        .unwrap());
+    // The losing start fails: the home keeps the winner's sandbox.
+    assert!(!store
+        .detach_cloud_home(&ws1, &h1, Some("m2"), &now_iso())
+        .await
+        .unwrap());
+    assert!(!store
+        .detach_cloud_home(&ws1, &h1, None, &now_iso())
+        .await
+        .unwrap());
+    assert!(store
+        .move_workspace_home_state(
+            &ws1,
+            &h1,
+            HomeState::Starting,
+            HomeState::Attached,
+            &now_iso()
+        )
+        .await
+        .unwrap());
+    assert!(!store
+        .mark_cloud_home_starting(&ws1, &h1, &now_iso())
+        .await
+        .unwrap());
+    assert_eq!(
+        state_of(&store, &ws1).await,
+        (HomeState::Attached, Some("m1".into()))
+    );
+
+    // The winner's own failure detaches the home and frees it.
+    assert!(store
+        .detach_cloud_home(&ws1, &h1, Some("m1"), &now_iso())
+        .await
+        .unwrap());
+    assert_eq!(state_of(&store, &ws1).await, (HomeState::Detached, None));
+    assert!(store
+        .mark_cloud_home_starting(&ws1, &h1, &now_iso())
+        .await
+        .unwrap());
+    assert!(store
+        .claim_cloud_home(&ws1, &h1, "e2b", "m3")
+        .await
+        .unwrap());
+
+    // ws-1 is starting on m3, ws-2 starting with no sandbox: a restart
+    // resets only ws-2.
+    assert!(store
+        .mark_cloud_home_starting(&ws2, &h2, &now_iso())
+        .await
+        .unwrap());
+    let reset = store.reset_unstarted_cloud_homes(&now_iso()).await.unwrap();
+    assert_eq!(reset, vec![ws2.clone()]);
+    assert_eq!(state_of(&store, &ws2).await, (HomeState::Attached, None));
+    assert_eq!(
+        state_of(&store, &ws1).await,
+        (HomeState::Starting, Some("m3".into()))
+    );
+}

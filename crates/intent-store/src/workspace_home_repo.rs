@@ -372,6 +372,56 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
+    /// Cloud home `home_id` starts: `starting` from `detached`, or from
+    /// `attached` while no sandbox holds it (a running one is never marked
+    /// starting by a start that will lose its claim). `false` when nothing
+    /// changed.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn mark_cloud_home_starting(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        since: &str,
+    ) -> Result<bool> {
+        let done = sqlx::query(
+            "UPDATE workspace_home SET state = 'starting', since = ? \
+             WHERE workspace_id = ? AND home_id = ? AND cloud_machine_id IS NOT NULL \
+             AND (state = 'detached' OR (state = 'attached' AND node_id IS NULL))",
+        )
+        .bind(since)
+        .bind(&workspace_id.0)
+        .bind(&home_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(db)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// At start: every cloud home left `starting` with no sandbox (a start
+    /// the restart cut) is `attached` and unstarted again, so it starts at
+    /// its next use. The workspaces changed.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn reset_unstarted_cloud_homes(&self, since: &str) -> Result<Vec<WorkspaceId>> {
+        let rows = sqlx::query(
+            "UPDATE workspace_home SET state = 'attached', since = ? \
+             WHERE state = 'starting' AND node_id IS NULL AND cloud_machine_id IS NOT NULL \
+             RETURNING workspace_id",
+        )
+        .bind(since)
+        .fetch_all(self.write_pool())
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|row| row.try_get("workspace_id").map(WorkspaceId).map_err(db))
+            .collect()
+    }
+
     /// A start of cloud home `home_id` failed: the home is detached at
     /// once, with no machine, unless another start holds it (its machine
     /// is neither none nor `node_id`) or it is moving. `false` when nothing

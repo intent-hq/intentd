@@ -74,38 +74,60 @@ pub(crate) async fn claimable(
     if !svc.workspace_homes() {
         return None;
     }
-    let home = svc
-        .store()
-        .get_workspace_home(workspace_id)
-        .await
-        .ok()??;
+    let home = svc.store().get_workspace_home(workspace_id).await.ok()??;
     (home.cloud_machine_id.as_deref() == Some(cloud_machine_id)
         && home.node_id.is_none()
         && home.state != HomeState::Moving)
         .then_some(home)
 }
 
-/// `home` is starting: announce it unless it already was.
-pub(crate) async fn mark_starting(svc: &Services, workspace_id: &WorkspaceId, home: &WorkspaceHome) {
-    let now = intent_core::now_iso();
-    for from in [HomeState::Attached, HomeState::Detached] {
-        match svc
-            .store()
-            .move_workspace_home_state(workspace_id, &home.home_id, from, HomeState::Starting, &now)
-            .await
-        {
-            Ok(true) => {
-                tracing::info!(workspace = %workspace_id, "cloud home: starting");
-                announce(svc, workspace_id).await;
-                return;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(workspace = %workspace_id, %error, "cloud home: could not record the start");
-                return;
-            }
+/// `home` is starting: announce it unless it already was, or a sandbox
+/// already holds it.
+pub(crate) async fn mark_starting(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home: &WorkspaceHome,
+) {
+    match svc
+        .store()
+        .mark_cloud_home_starting(workspace_id, &home.home_id, &intent_core::now_iso())
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(workspace = %workspace_id, "cloud home: starting");
+            announce(svc, workspace_id).await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(workspace = %workspace_id, %error, "cloud home: could not record the start");
         }
     }
+}
+
+/// At start: cloud homes a restart left `starting` with no sandbox are
+/// unstarted again (they start at their next use), and announced.
+pub(crate) async fn reset_after_restart(svc: &Services) {
+    match svc
+        .store()
+        .reset_unstarted_cloud_homes(&intent_core::now_iso())
+        .await
+    {
+        Ok(workspaces) => {
+            for workspace_id in workspaces {
+                svc.publish_workspace_home_changed(&workspace_id).await;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cloud home: could not reset the homes a restart left starting");
+        }
+    }
+}
+
+/// Whether a home-only start of `workspace_id` is in flight.
+pub(crate) fn home_start_in_flight(svc: &Services, workspace_id: &WorkspaceId) -> bool {
+    svc.remote_feature().is_some_and(|feature| {
+        crate::lock(&feature.cloud.starts).contains_key(&start_key(workspace_id))
+    })
 }
 
 /// Record machine `machine_id` as cloud home `home_id`'s sandbox; `false`
@@ -164,7 +186,15 @@ pub(crate) async fn take(
     cloud_machine_id: &str,
     machine_id: &str,
 ) -> Result<()> {
-    if !claim(svc, workspace_id, &home.home_id, cloud_machine_id, machine_id).await? {
+    if !claim(
+        svc,
+        workspace_id,
+        &home.home_id,
+        cloud_machine_id,
+        machine_id,
+    )
+    .await?
+    {
         return Ok(());
     }
     if let Err(error) = open(svc, workspace_id, &home.home_id, machine_id).await {

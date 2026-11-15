@@ -221,9 +221,13 @@ async fn a_cloud_entry_is_a_home_that_starts_lazily() {
     )
     .await;
     assert_eq!(read, "lazy home\n", "{read}");
-    let home = home_until(&mut rpc_ws, &mut id, &lazy, "the lazy home attached", |home| {
-        home["state"] == "attached" && home["nodeId"].is_string()
-    })
+    let home = home_until(
+        &mut rpc_ws,
+        &mut id,
+        &lazy,
+        "the lazy home attached",
+        |home| home["state"] == "attached" && home["nodeId"].is_string(),
+    )
     .await;
     assert_eq!(home["homeId"], lazy_home.as_str(), "{home}");
     let lazy_node = home["nodeId"].as_str().unwrap().to_owned();
@@ -394,7 +398,10 @@ async fn a_cloud_entry_is_a_home_that_starts_lazily() {
         json!({ "workspaceId": failing, "path": "README.md" }),
     )
     .await;
-    assert_eq!(reply["error"]["data"]["code"], "home-unavailable", "{reply}");
+    assert_eq!(
+        reply["error"]["data"]["code"], "home-unavailable",
+        "{reply}"
+    );
     let home = home_until(
         &mut rpc_ws,
         &mut id,
@@ -413,7 +420,10 @@ async fn a_cloud_entry_is_a_home_that_starts_lazily() {
     )
     .await;
     assert_eq!(reply["error"]["code"], -32603, "{reply}");
-    assert_eq!(reply["error"]["data"]["code"], "home-unavailable", "{reply}");
+    assert_eq!(
+        reply["error"]["data"]["code"], "home-unavailable",
+        "{reply}"
+    );
     assert!(
         reply["error"]["data"].get("starting").is_none(),
         "a detached home is not starting: {reply}"
