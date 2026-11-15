@@ -14,8 +14,9 @@
 //!
 //! Test code is exempt as `source_lint::test_code_files` classifies it: whole
 //! test files (`tests.rs`, `*_tests.rs`, `tests/` dirs, out-of-line test
-//! modules such as `source_tests/` and `test_support`) and every
-//! `#[cfg(test)]` / `#[cfg(all(test, …))]` item. A hand-rolled check that knew
+//! modules such as `source_tests/`) and every `#[cfg(test)]`,
+//! `#[cfg(all(test, …))]` and `#[cfg(any(test, feature = "test-hooks"))]`
+//! item, which makes `test_support` test code too. A hand-rolled check that knew
 //! only an exact `#[cfg(test)]` line ejected intentd#3391 from the merge
 //! queue over a `#[cfg(all(test, debug_assertions))]` module (merge-group run
 //! 43704464258).
