@@ -82,7 +82,7 @@ mod task_agent_link_repo;
 mod task_event_repo;
 pub use task_event_repo::TaskEventBaselines;
 mod home_move_repo;
-pub use home_move_repo::{HomeMove, HomeMoveSwitch};
+pub use home_move_repo::{HomeAutoStart, HomeMove, HomeMoveSwitch};
 mod home_stop_repo;
 mod tracked_changes_repo;
 mod transfer_authorship;

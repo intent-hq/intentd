@@ -12,7 +12,7 @@
 //! A failure before the switch rolls back: the old home gets its old state
 //! and nothing else has changed.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use intent_core::node_link::{HomeOpenOutcome, HomeRestore};
@@ -26,8 +26,10 @@ use serde_json::{json, Value};
 use crate::homes::{Candidate, HomeReply};
 use crate::RemoteServicesExt as _;
 
-/// The workspaces whose move runs in this process: one runner each.
-static RUNNING: LazyLock<Mutex<HashSet<WorkspaceId>>> = LazyLock::new(Mutex::default);
+/// The workspaces whose move runs in this process: one runner each. `true`
+/// asks the runner to look again before it ends: a move was started while
+/// it was finishing the previous one.
+static RUNNING: LazyLock<Mutex<HashMap<WorkspaceId, bool>>> = LazyLock::new(Mutex::default);
 
 /// What `to` names.
 #[derive(Debug, PartialEq, Eq)]
@@ -152,9 +154,14 @@ pub(crate) async fn set_home(
     }
     tracing::info!(workspace = %workspace_id, from = %home.home_id, to = %home_move.target.home_id, "the workspace's home is moving");
     end_old_terminals(svc, &home).await;
+    // The reply is the moving home, also when the move ends before it is sent.
+    let home = WorkspaceHome {
+        state: HomeState::Moving,
+        since: home_move.started_at.clone(),
+        ..home
+    };
     svc.publish_workspace_home_changed(workspace_id).await;
     spawn(svc, workspace_id);
-    let home = svc.store().get_workspace_home(workspace_id).await?;
     Ok(json!({ "home": home }))
 }
 
@@ -187,15 +194,28 @@ pub(crate) async fn resume(svc: &Services) {
 }
 
 fn spawn(svc: &Services, workspace_id: &WorkspaceId) {
-    if !crate::lock(&RUNNING).insert(workspace_id.clone()) {
-        return;
+    {
+        let mut running = crate::lock(&RUNNING);
+        if let Some(again) = running.get_mut(workspace_id) {
+            *again = true;
+            return;
+        }
+        running.insert(workspace_id.clone(), false);
     }
     let svc = svc.clone();
     let workspace_id = workspace_id.clone();
     // Its own task, as the daemon: the move outlives the request.
     intent_core::spawn_daemon(async move {
-        run(&svc, &workspace_id).await;
-        crate::lock(&RUNNING).remove(&workspace_id);
+        loop {
+            run(&svc, &workspace_id).await;
+            let mut running = crate::lock(&RUNNING);
+            if running.get(&workspace_id) == Some(&true) {
+                running.insert(workspace_id.clone(), false);
+                continue;
+            }
+            running.remove(&workspace_id);
+            return;
+        }
     });
 }
 
@@ -334,6 +354,12 @@ async fn rollback(svc: &Services, home_move: &HomeMove) {
                     shared
                         .home_link
                         .link_lost(shared.weak(), shared.tuning.link_loss_grace);
+                } else if home_move.from_state == HomeState::Detached {
+                    // Its machine bound during the move, when a moving home
+                    // is not opened: open it now, as that bind would have.
+                    if let Err(error) = crate::homes::open_home(svc, workspace_id).await {
+                        tracing::info!(workspace = %workspace_id, %error, "the old home did not open again after the rollback");
+                    }
                 }
             }
             if let Some(node) = home_move

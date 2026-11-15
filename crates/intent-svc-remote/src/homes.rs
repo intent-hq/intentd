@@ -568,8 +568,10 @@ async fn auto_start_due(
         tracing::info!(home = %home_id, "remote machine: the home's setup failed; no autoStart");
         return false;
     }
+    // One transaction: the new home of a move may finish its setup before
+    // the switch, which then claims its autoStart from the move.
     match store
-        .claim_workspace_home_auto_start(
+        .claim_home_auto_start_or_record_move(
             &record.workspace_id,
             home_id,
             machine_id,
@@ -578,30 +580,13 @@ async fn auto_start_due(
         )
         .await
     {
-        Ok(true) => true,
-        Ok(false) => {
-            // The new home of a move may finish its setup before the
-            // switch: the switch claims its autoStart then.
-            match store
-                .record_home_move_setup(
-                    &record.workspace_id,
-                    home_id,
-                    machine_id,
-                    lease_id,
-                    record.seq.0,
-                )
-                .await
-            {
-                Ok(true) => {
-                    tracing::debug!(home = %home_id, "remote machine: a moving home's new home finished its setup; autoStart waits for the switch");
-                }
-                Ok(false) => {
-                    tracing::debug!(home = %home_id, seq = record.seq.0, "remote machine: setup of a home that is not current, or autoStart already claimed; no autoStart");
-                }
-                Err(error) => {
-                    tracing::warn!(home = %home_id, %error, "remote machine: could not record a new home's setup");
-                }
-            }
+        Ok(intent_store::HomeAutoStart::Claimed) => true,
+        Ok(intent_store::HomeAutoStart::AtSwitch) => {
+            tracing::debug!(home = %home_id, "remote machine: a move's new home finished its setup; autoStart waits for the switch");
+            false
+        }
+        Ok(intent_store::HomeAutoStart::No) => {
+            tracing::debug!(home = %home_id, seq = record.seq.0, "remote machine: setup of a home that is not current, or autoStart already claimed; no autoStart");
             false
         }
         Err(error) => {

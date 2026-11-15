@@ -25,6 +25,17 @@ pub struct HomeMoveSwitch {
     pub auto_start: bool,
 }
 
+/// What [`Store::claim_home_auto_start_or_record_move`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeAutoStart {
+    /// The home is the workspace's: start its `autoStart` scripts now.
+    Claimed,
+    /// The home is a move's new home: the switch claims them.
+    AtSwitch,
+    /// Neither, or claimed already.
+    No,
+}
+
 /// A workspace's home move in progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HomeMove {
@@ -194,35 +205,65 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Record that the new home `home_id` of a move, on `node_id`, finished
-    /// its setup in the `setupFinished` record `seq` of lease `lease_id`'s
-    /// journal, before the switch. `false` when no such move is recorded.
+    /// A `setupFinished` record of the home `home_id` on `node_id`, seq
+    /// `seq` of lease `lease_id`'s journal, in one transaction: it claims
+    /// the home's `autoStart` (as
+    /// [`Store::claim_workspace_home_auto_start`]) when the home is the
+    /// workspace's; else, when it is the new home of a move, it is recorded
+    /// on the move and the switch claims it.
     ///
     /// # Errors
     ///
     /// `Error::Internal` on a database failure.
-    pub async fn record_home_move_setup(
+    pub async fn claim_home_auto_start_or_record_move(
         &self,
         workspace_id: &WorkspaceId,
         home_id: &HomeId,
         node_id: &str,
         lease_id: &str,
         seq: u64,
-    ) -> Result<bool> {
+    ) -> Result<HomeAutoStart> {
         let seq = i64::try_from(seq).map_err(db)?;
-        let done = sqlx::query(
-            "UPDATE home_move SET setup_lease_id = ?, setup_seq = ? \
-             WHERE workspace_id = ? AND home_id = ? AND node_id = ?",
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let claimed = sqlx::query(
+            "UPDATE workspace_home SET auto_start_lease_id = ?, auto_start_seq = ? \
+             WHERE workspace_id = ? AND home_id = ? AND node_id = ? \
+             AND (auto_start_lease_id IS NULL OR auto_start_lease_id != ? \
+             OR auto_start_seq IS NULL OR auto_start_seq < ?)",
         )
         .bind(lease_id)
         .bind(seq)
         .bind(&workspace_id.0)
         .bind(&home_id.0)
         .bind(node_id)
-        .execute(self.write_pool())
+        .bind(lease_id)
+        .bind(seq)
+        .execute(&mut *tx)
         .await
         .map_err(db)?;
-        Ok(done.rows_affected() > 0)
+        let outcome = if claimed.rows_affected() > 0 {
+            HomeAutoStart::Claimed
+        } else {
+            let recorded = sqlx::query(
+                "UPDATE home_move SET setup_lease_id = ?, setup_seq = ? \
+                 WHERE workspace_id = ? AND home_id = ? AND node_id = ?",
+            )
+            .bind(lease_id)
+            .bind(seq)
+            .bind(&workspace_id.0)
+            .bind(&home_id.0)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+            if recorded.rows_affected() > 0 {
+                HomeAutoStart::AtSwitch
+            } else {
+                HomeAutoStart::No
+            }
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(outcome)
     }
 
     /// Roll back the move to `home_id`: in one transaction the move goes and
