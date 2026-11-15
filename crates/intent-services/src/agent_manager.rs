@@ -3477,6 +3477,35 @@ impl AgentManager {
         }
     }
 
+    /// Move the agents' unheld temp folders aside (a held one goes when its
+    /// process ends) and return them for [`Self::discard_agent_tmp_dirs`]:
+    /// renames only, cheap enough to run under a lock.
+    pub fn detach_agent_tmp_dirs(&self, agent_ids: &[AgentId]) -> Vec<PathBuf> {
+        let Some(root) = self.agent_tmp_root.as_deref() else {
+            return Vec::new();
+        };
+        agent_ids
+            .iter()
+            .filter_map(|id| intent_core::detach_agent_tmp_dir(root, &id.0))
+            .collect()
+    }
+
+    /// Delete folders [`Self::detach_agent_tmp_dirs`] moved aside.
+    pub async fn discard_agent_tmp_dirs(paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let removed = tokio::task::spawn_blocking(move || {
+            for path in &paths {
+                intent_core::discard_agent_tmp_dir(path);
+            }
+        })
+        .await;
+        if let Err(e) = removed {
+            tracing::warn!(error = %e, "agent temp folder removal task failed");
+        }
+    }
+
     /// Cancel the deferred removal of restored or unarchived agents' temp
     /// folders (see [`Self::remove_agent_tmp_dirs`]).
     pub fn keep_agent_tmp_dirs(&self, agent_ids: &[AgentId]) {

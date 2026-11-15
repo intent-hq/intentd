@@ -262,6 +262,7 @@ async fn agent_tmpdir_is_private_and_survives_relaunch() {
 }
 
 struct Harness {
+    store: Store,
     services: Services,
     manager: Arc<AgentManager>,
     provider: ProviderConfig,
@@ -318,6 +319,7 @@ impl Harness {
         services.attach_agent_manager(&manager);
         let cwd_dir = common::test_tempdir("itd-agent-cwd-");
         Some(Self {
+            store,
             services,
             manager,
             provider,
@@ -368,20 +370,26 @@ async fn retire_and_archive_remove_agent_tmpdirs() {
     };
     let ws = Some(h.ws.clone());
 
-    // Retire after the process ended: the folder goes at once.
-    let (stopped, stopped_file) = h.agent("retire-stopped").await;
-    assert!(h.manager.stop(&stopped).await);
-    h.services
-        .agent_retire(stopped.clone(), ws.clone(), None)
-        .await
-        .expect("retire stopped agent");
+    // A retire from the app stops the process: the folder goes at once.
+    let principal = h.store.get_primary_principal().await.expect("principal");
+    let app = intent_core::Caller::Wire {
+        principal_id: principal.id.clone(),
+        host_role: intent_core::HostRole::Owner,
+    };
+    let (by_app, by_app_file) = h.agent("retire-app").await;
+    intent_core::with_caller(
+        app,
+        h.services.agent_retire(by_app.clone(), ws.clone(), None),
+    )
+    .await
+    .expect("retire from the app");
     assert!(
-        !stopped_file.parent().unwrap().exists(),
-        "retiring an agent removes its folder"
+        !by_app_file.parent().unwrap().exists(),
+        "retiring an agent from the app removes its folder"
     );
 
-    // Retire while the process runs (self-retire keeps it alive): the
-    // folder goes when the process ends.
+    // Other retires leave the process running (as an agent retiring itself
+    // does): the folder goes when the process ends.
     let (running, running_file) = h.agent("retire-running").await;
     h.services
         .agent_retire(running.clone(), ws.clone(), None)
@@ -415,6 +423,14 @@ async fn retire_and_archive_remove_agent_tmpdirs() {
     let (idle, idle_file) = h.agent("archive-idle").await;
     assert!(h.manager.stop(&idle).await);
     let (live, live_file) = h.agent("archive-live").await;
+    let (retired_live, retired_live_file) = h.agent("archive-retired").await;
+    let (parked, parked_file) = h.agent("archive-restored").await;
+    for id in [&retired_live, &parked] {
+        h.services
+            .agent_retire(id.clone(), ws.clone(), None)
+            .await
+            .expect("retire before archive");
+    }
     h.services
         .archive_workspace(h.ws.clone(), None)
         .await
@@ -428,6 +444,19 @@ async fn retire_and_archive_remove_agent_tmpdirs() {
         !restored_file.parent().unwrap().exists(),
         "archiving removes every agent's folder"
     );
+
+    // Restoring an agent in an archived workspace keeps the removal.
+    h.services
+        .agent_restore(parked.clone(), ws.clone())
+        .await
+        .expect("restore in archived workspace");
+    assert!(h.manager.stop(&parked).await);
+    assert!(
+        !parked_file.parent().unwrap().exists(),
+        "a restore in an archived workspace does not keep the folder"
+    );
+
+    // Unarchive keeps an active agent's folder, not a retired one's.
     h.services
         .unarchive_workspace(h.ws.clone())
         .await
@@ -436,6 +465,11 @@ async fn retire_and_archive_remove_agent_tmpdirs() {
     assert!(
         live_file.is_file(),
         "an agent unarchived before its process ended keeps its files"
+    );
+    assert!(h.manager.stop(&retired_live).await);
+    assert!(
+        !retired_live_file.parent().unwrap().exists(),
+        "unarchive does not keep a retired agent's folder"
     );
 
     h.services

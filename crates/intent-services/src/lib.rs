@@ -35735,7 +35735,7 @@ impl Services {
                 None => self.archive_fence_after_archive_script(&id).await,
             };
             let current = store.get_workspace(&id).await?;
-            if current.is_retired() {
+            let (flipped, revived) = if current.is_retired() {
                 // The agent whose turn triggered the revive gets its notice in
                 // that turn; every other agent's notice is written with the
                 // flip (see `revive_retired_checkout`).
@@ -35753,7 +35753,14 @@ impl Services {
                     .unarchive_workspace_if_archived(&id, &now_iso())
                     .await?;
                 (flipped, None)
+            };
+            // Under the fence with the flip, so a later archive's removal is
+            // never cancelled: keep the temp folders the archive left to
+            // running processes (a retired agent's still go).
+            if flipped {
+                self.keep_workspace_agent_tmp_dirs(&id).await;
             }
+            (flipped, revived)
         };
         let mut ws = store.get_workspace(&id).await?;
         if ws.is_retired() {
@@ -35791,16 +35798,6 @@ impl Services {
         if let Some(manager) = manager {
             match store.list_agent_session_summaries(&id).await {
                 Ok(sessions) => {
-                    // Keep the temp folders the archive left to running
-                    // processes; a retired agent's still go.
-                    if flipped {
-                        let active: Vec<AgentId> = sessions
-                            .iter()
-                            .filter(|s| s.retired_at.is_none())
-                            .map(|s| s.id.clone())
-                            .collect();
-                        manager.keep_agent_tmp_dirs(&active);
-                    }
                     for session in sessions {
                         if self.has_ready_to_send(&session.id) {
                             manager
@@ -38984,21 +38981,48 @@ impl Services {
         self.archive_workspace_inner(id, caller_agent_id, automatic, true)
     }
 
-    /// Remove the temp folders of every agent in `id` (archive). A folder a
-    /// running process holds goes when it ends, unless unarchive keeps it.
-    async fn remove_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) {
+    /// Detach the temp folders of every agent in `id` (archive) for
+    /// [`AgentManager::discard_agent_tmp_dirs`]. A folder a running process
+    /// holds goes when it ends, unless unarchive keeps it.
+    async fn detach_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) -> Vec<PathBuf> {
+        let Some(manager) = self.agent_manager() else {
+            return Vec::new();
+        };
+        match self.store.list_agent_session_summaries(id).await {
+            Ok(sessions) => {
+                let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
+                manager.detach_agent_tmp_dirs(&ids)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %id.as_str(),
+                    error = %e,
+                    "workspace.archive: agent listing failed; temp folders left to the idle sweep"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Cancel the deferred temp-folder removal of `id`'s non-retired agents
+    /// (unarchive; call under the archive fence).
+    async fn keep_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) {
         let Some(manager) = self.agent_manager() else {
             return;
         };
         match self.store.list_agent_session_summaries(id).await {
             Ok(sessions) => {
-                let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
-                manager.remove_agent_tmp_dirs(&ids).await;
+                let active: Vec<AgentId> = sessions
+                    .iter()
+                    .filter(|s| s.retired_at.is_none())
+                    .map(|s| s.id.clone())
+                    .collect();
+                manager.keep_agent_tmp_dirs(&active);
             }
             Err(e) => tracing::warn!(
                 workspace = %id.as_str(),
                 error = %e,
-                "workspace.archive: agent listing failed; temp folders left to the idle sweep"
+                "unarchive: agent listing failed; running agents' temp folders go when they stop"
             ),
         }
     }
@@ -39238,7 +39262,7 @@ impl Services {
                 // row still carries this call's `archivedAt`; the flip and
                 // its delta happen under the same fence, so the two
                 // announcements can never cross.
-                let _fence = this.archive_fence.acquire(&ws.id).await;
+                let fence = this.archive_fence.acquire(&ws.id).await;
                 let still_archived = match store.get_workspace(&ws.id).await {
                     Ok(row) => row.archived && row.archived_at == ws.archived_at,
                     Err(e) => {
@@ -39250,9 +39274,14 @@ impl Services {
                         true
                     }
                 };
+                // Detach under the fence, so an unarchive's keep runs after
+                // it; the slow delete runs once the fence is released.
+                let detached_tmp_dirs = if still_archived {
+                    this.detach_workspace_agent_tmp_dirs(&ws.id).await
+                } else {
+                    Vec::new()
+                };
                 if still_archived {
-                    // Under the fence, so an unarchive's keep runs after it.
-                    this.remove_workspace_agent_tmp_dirs(&ws.id).await;
                     publish_event(
                         bus.as_ref(),
                         workspace_updated_event(
@@ -39283,6 +39312,8 @@ impl Services {
                         runner.run_claimed_archive_script(claimed, true).await;
                     });
                 }
+                drop(fence);
+                AgentManager::discard_agent_tmp_dirs(detached_tmp_dirs).await;
                 ws
             });
             // Awaiting the handle keeps the caller-visible contract intact

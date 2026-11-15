@@ -255,18 +255,29 @@ fn agent_dir_path(root: &Path, agent_key: &str) -> PathBuf {
 /// retired or archived. A folder a live launch still holds is removed when
 /// the last holder drops, unless [`keep_agent_tmp_dir`] cancels it first.
 pub fn remove_agent_tmp_dir(root: &Path, agent_key: &str) {
-    let path = agent_dir_path(root, agent_key);
-    let aside = {
-        let mut held = in_use();
-        if let Some(holders) = held.get_mut(&path) {
-            holders.remove_on_release = true;
-            return;
-        }
-        move_aside(root, &path)
-    };
-    if let Some(aside) = aside {
-        remove_entry(&aside);
+    if let Some(aside) = detach_agent_tmp_dir(root, agent_key) {
+        discard_agent_tmp_dir(&aside);
     }
+}
+
+/// The fast half of [`remove_agent_tmp_dir`]: move `agent_key`'s unheld
+/// folder aside (a held one is marked for removal on release) and return
+/// the moved path for [`discard_agent_tmp_dir`]. A moved-aside folder is no
+/// longer the agent's; the sweep removes it if it is never discarded.
+#[must_use]
+pub fn detach_agent_tmp_dir(root: &Path, agent_key: &str) -> Option<PathBuf> {
+    let path = agent_dir_path(root, agent_key);
+    let mut held = in_use();
+    if let Some(holders) = held.get_mut(&path) {
+        holders.remove_on_release = true;
+        return None;
+    }
+    move_aside(root, &path)
+}
+
+/// Delete a folder [`detach_agent_tmp_dir`] moved aside, with its contents.
+pub fn discard_agent_tmp_dir(aside: &Path) {
+    remove_entry(aside);
 }
 
 /// Cancel a removal [`remove_agent_tmp_dir`] deferred to the last release
@@ -572,15 +583,31 @@ mod tests {
         prepare_agent_tmp_root(&root).unwrap();
         let held = AgentTempDir::for_agent(&root, "back").unwrap();
         let path = held.path().to_path_buf();
+        std::fs::write(path.join("kept"), "x").unwrap();
         remove_agent_tmp_dir(&root, "back");
         keep_agent_tmp_dir(&root, "back");
         drop(held);
-        assert!(path.is_dir(), "a kept folder survives the last release");
+        assert!(
+            path.join("kept").is_file(),
+            "a kept folder survives the last release"
+        );
 
         keep_agent_tmp_dir(&root, "never-launched");
-        remove_agent_tmp_dir(&root, "back");
+        let aside = detach_agent_tmp_dir(&root, "back").expect("an unheld folder moves aside");
+        assert!(!path.exists(), "a detached folder is no longer the agent's");
         keep_agent_tmp_dir(&root, "back");
-        assert!(!path.exists(), "keep cannot undo a removal already done");
+        let fresh = AgentTempDir::for_agent(&root, "back").unwrap();
+        assert!(
+            !fresh.path().join("kept").exists(),
+            "a relaunch after detach starts empty"
+        );
+        drop(fresh);
+        assert!(
+            aside.join("kept").is_file(),
+            "detach moves the contents aside"
+        );
+        discard_agent_tmp_dir(&aside);
+        assert!(!aside.exists(), "discard deletes the moved folder");
     }
 
     #[test]

@@ -8538,7 +8538,17 @@ impl Services {
         }
         if let Some(manager) = self.agent_manager() {
             manager.restore_retired(&agent_id);
-            manager.keep_agent_tmp_dirs(std::slice::from_ref(&agent_id));
+            // An archived workspace's removal stands; unarchive keeps it.
+            // The fence orders this check against the archive's detach.
+            let _fence = self.archive_fence.acquire(&session.workspace_id).await;
+            let archived = self
+                .store
+                .get_workspace(&session.workspace_id)
+                .await
+                .map_or(true, |ws| ws.archived);
+            if !archived {
+                manager.keep_agent_tmp_dirs(std::slice::from_ref(&agent_id));
+            }
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         crate::publish_event(
