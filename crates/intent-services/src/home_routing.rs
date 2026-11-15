@@ -350,7 +350,8 @@ impl Services {
         }
     }
 
-    /// The workspace's home when it is on a machine and homes are on.
+    /// The workspace's home when it is on a machine, or is a cloud home
+    /// (started for the call when it runs nowhere), and homes are on.
     pub(crate) async fn machine_home(
         &self,
         workspace_id: &WorkspaceId,
@@ -362,7 +363,7 @@ impl Services {
             .store
             .get_workspace_home(workspace_id)
             .await?
-            .filter(|home| home.node_id.is_some()))
+            .filter(|home| home.node_id.is_some() || home.cloud_machine_id.is_some()))
     }
 
     /// See [`intent_core::WorkspaceApi::home_route`].

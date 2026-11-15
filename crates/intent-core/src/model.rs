@@ -608,6 +608,8 @@ pub enum HomeState {
     Attached,
     Detached,
     Moving,
+    /// A cloud home whose sandbox is starting, resuming or being rebuilt.
+    Starting,
 }
 
 impl HomeState {
@@ -617,6 +619,7 @@ impl HomeState {
             Self::Attached => "attached",
             Self::Detached => "detached",
             Self::Moving => "moving",
+            Self::Starting => "starting",
         }
     }
 }

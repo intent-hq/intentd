@@ -79,6 +79,7 @@ pub(crate) async fn home_call(
     params: Map<String, Value>,
     timeout: Duration,
 ) -> Result<std::result::Result<Value, HomeCallError>> {
+    let home = &crate::cloud::home::ready(svc, workspace_id, home.clone()).await?;
     let node = home_node(svc, home, method).await?;
     let frame = HomeCall {
         request_id: LinkId::new_v4(),
@@ -118,6 +119,11 @@ pub(crate) async fn push_home(
     home: &WorkspaceHome,
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
+    // A cloud home no sandbox holds has no work beyond the hub's refs:
+    // nothing to push, and no reason to start one.
+    if home.cloud_machine_id.is_some() && home.node_id.is_none() {
+        return Ok(());
+    }
     let pushed = push_once(svc, home, workspace_id).await;
     match &pushed {
         Ok(()) => crate::home_state::backup_succeeded(svc, workspace_id, home).await,
@@ -128,6 +134,7 @@ pub(crate) async fn push_home(
 
 /// Ask the home for one synchronous push.
 async fn push_once(svc: &Services, home: &WorkspaceHome, workspace_id: &WorkspaceId) -> Result<()> {
+    let home = &crate::cloud::home::ready(svc, workspace_id, home.clone()).await?;
     let node = home_node(svc, home, "homePush").await?;
     let request_id = LinkId::new_v4();
     let frame = LinkFrame::HomePush(HomePush {

@@ -25,6 +25,7 @@ use tokio::net::TcpListener;
 use super::*;
 
 mod entries;
+mod homes;
 mod northflank;
 mod sub_agents;
 mod teardown;
@@ -99,6 +100,8 @@ struct FakeState {
     /// The process group of every sandbox ever created, deleted ones too,
     /// for the teardown.
     groups: Vec<Arc<ProcessGroup>>,
+    /// More environment for every new sandbox's processes.
+    sandbox_env: Vec<(String, String)>,
 }
 
 /// The release manifest listing `sizes` for this build's version.
@@ -401,6 +404,7 @@ impl FakeE2b {
                 }
                 let mut env = self.sandbox_env(&dir);
                 env.retain(|(key, _)| key != "INTENTD_DATA_DIR");
+                env.extend(self.state().sandbox_env.iter().cloned());
                 env.push(("HOME".into(), home.to_string_lossy().into_owned()));
                 self.state()
                     .metadata

@@ -430,6 +430,20 @@ pub(crate) fn home_moving(home: &intent_core::WorkspaceHome) -> Error {
     }
 }
 
+/// `home-unavailable` with `starting: true` while cloud home `home` still
+/// starts after a call's wait (nodes.md "Cloud homes" 6).
+pub(crate) fn home_starting(home: &intent_core::WorkspaceHome) -> Error {
+    match home_unavailable(home, "it is still starting") {
+        Error::RemoteMachine(mut failure) => {
+            if let Some(data) = failure.data.as_object_mut() {
+                data.insert("starting".into(), serde_json::Value::Bool(true));
+            }
+            Error::RemoteMachine(failure)
+        }
+        other => other,
+    }
+}
+
 /// `home-unavailable` while `home` is detached: nothing waits on a dial to
 /// a machine whose link has been down for the link-loss grace, but its
 /// connector is asked to dial again.
@@ -460,10 +474,11 @@ pub(crate) async fn connect_home(svc: &Services, workspace_id: &WorkspaceId) -> 
     let Some(home) = svc.store().get_workspace_home(workspace_id).await? else {
         return Ok(());
     };
+    let home = crate::cloud::home::ready(svc, workspace_id, home).await?;
+    ensure_attached(svc, &home)?;
     let Some(node_id) = home.node_id.clone() else {
         return Ok(());
     };
-    ensure_attached(svc, &home)?;
     let feature = svc
         .remote_feature()
         .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;
@@ -488,10 +503,11 @@ async fn linked_home(
     let Some(home) = svc.store().get_workspace_home(workspace_id).await? else {
         return Ok(None);
     };
+    let home = crate::cloud::home::ready(svc, workspace_id, home).await?;
+    ensure_attached(svc, &home)?;
     let Some(node_id) = home.node_id.clone() else {
         return Ok(None);
     };
-    ensure_attached(svc, &home)?;
     let feature = svc
         .remote_feature()
         .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;
