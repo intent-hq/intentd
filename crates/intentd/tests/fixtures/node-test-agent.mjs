@@ -91,6 +91,8 @@ const readHistory = (id) => {
   }
 };
 let currentSession;
+// The working directory session/new named.
+let sessionCwd;
 const AUTH_REQUIRED = { code: -32000, message: 'Authentication required' };
 if (argv.includes('--dump-env')) fs.writeFileSync('agent.env.json', JSON.stringify(process.env));
 
@@ -231,6 +233,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       return send({ id: msg.id, result: {} });
     case 'session/new':
       if (hangSetup) return;
+      sessionCwd = msg.params?.cwd;
       mcpServers = msg.params?.mcpServers ?? [];
       fs.writeFileSync('session-mcp.json', JSON.stringify(mcpServers));
       if (authRequiredSetup) return send({ id: msg.id, error: AUTH_REQUIRED });
@@ -297,7 +300,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
             sessionId: SESSION,
             update: {
               sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `raw: ${JSON.stringify({ cwd: process.cwd(), raw })}` },
+              content: { type: 'text', text: `raw: ${JSON.stringify({ cwd: process.cwd(), sessionCwd, raw })}` },
             },
           },
         });

@@ -36,7 +36,7 @@ pub(crate) use lifecycle::{spawn_supervisor, CloudGate};
 pub(crate) use methods::call;
 #[cfg(test)]
 pub(crate) use start::chain_entry;
-pub(crate) use start::{admit, begin_start, delete_machine, wait_linked};
+pub(crate) use start::{admit, begin_start, wait_linked};
 
 /// A finished start that failed: the error's message and data (with its
 /// `code`), so every waiter can rebuild the same error.
@@ -103,6 +103,11 @@ pub(crate) struct CloudState {
     /// Agents whose machine started again from its disk since they last
     /// ran there; their next launch says so.
     disk_resumed: Mutex<HashSet<String>>,
+    /// Machines in an idle pause now, from their homes' pushes to its end.
+    pushing: Mutex<HashSet<String>>,
+    /// Idle pauses skipped in a row per machine because a home's push
+    /// before it failed.
+    skipped_pauses: Mutex<HashMap<String, u32>>,
 }
 
 impl CloudState {
@@ -125,6 +130,32 @@ impl CloudState {
             .get(machine_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Begin an idle pause (its pushes, then the pause); `false` when one
+    /// already runs.
+    fn begin_push(&self, machine_id: &str) -> bool {
+        crate::lock(&self.pushing).insert(machine_id.to_owned())
+    }
+
+    fn is_pushing(&self, machine_id: &str) -> bool {
+        crate::lock(&self.pushing).contains(machine_id)
+    }
+
+    fn end_push(&self, machine_id: &str) {
+        crate::lock(&self.pushing).remove(machine_id);
+    }
+
+    /// One more idle pause skipped for a failed push; how many in a row.
+    fn skip_pause(&self, machine_id: &str) -> u32 {
+        let mut skipped = crate::lock(&self.skipped_pauses);
+        let count = skipped.entry(machine_id.to_owned()).or_default();
+        *count += 1;
+        *count
+    }
+
+    fn reset_skipped_pauses(&self, machine_id: &str) {
+        crate::lock(&self.skipped_pauses).remove(machine_id);
     }
 
     fn mark_disk_resumed(&self, agent_id: &str) {
@@ -227,6 +258,7 @@ impl CloudState {
         crate::lock(&self.lost).remove(machine_id);
         crate::lock(&self.transitions).remove(machine_id);
         crate::lock(&self.pauses).remove(machine_id);
+        self.reset_skipped_pauses(machine_id);
         self.forget_activity(machine_id);
     }
 
@@ -271,6 +303,23 @@ impl CloudState {
             .filter(|start| start.entry == entry)
             .map(|start| start.outcome.clone())
             .collect()
+    }
+}
+
+/// Test seam: register a start of `entry` in `workspace` under `key` that
+/// never finishes, as a start in flight.
+#[cfg(test)]
+pub(crate) fn test_hold_start(svc: &Services, key: &str, entry: &str, workspace: &str) {
+    let (_, outcome) = watch::channel::<StartOutcome>(None);
+    if let Ok(feature) = feature(svc) {
+        crate::lock(&feature.cloud.starts).insert(
+            key.to_owned(),
+            Start {
+                entry: entry.to_owned(),
+                workspace: workspace.to_owned(),
+                outcome,
+            },
+        );
     }
 }
 

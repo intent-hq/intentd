@@ -1042,7 +1042,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             // child on the home's machine works in the home checkout too
             // (when it was placed there), one elsewhere starts from the
             // workspace's base, the home's last backup.
-            if parent_view.home_checkout.is_some() {
+            if parent_view.home_checkout.is_some() && !parent_view.is_unlinked() {
                 if child.node_id != parent_view.node_id {
                     child.home_checkout = None;
                 }
@@ -1083,7 +1083,7 @@ impl RemoteLaunchPort for RemoteLaunch {
         Box::pin(async move {
             // A parent in the home checkout has no refs of its own: the
             // sub-agent starts from the workspace, which follows the home.
-            if parent_view.home_checkout.is_some() {
+            if parent_view.home_checkout.is_some() && !parent_view.is_unlinked() {
                 return Ok(None);
             }
             let owner = parent_view
@@ -1564,7 +1564,8 @@ impl RemoteLaunchPort for RemoteLaunch {
 const SELF_RETIRE_TURN_BOUND: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Send placed agent `agent_id` its final stop on `node`; the agent a cloud
-/// sandbox was started for also takes the sandbox with it.
+/// sandbox was started for also takes the sandbox with it, unless the
+/// sandbox holds a workspace's home.
 async fn final_stop_placed(
     svc: &Services,
     node: &RemoteNode,
@@ -1574,21 +1575,7 @@ async fn final_stop_placed(
 ) {
     node.final_stop(agent_id, reason).await;
     // The agent a sandbox was started for ends for good: its sub-agents
-    // there get final stops too, then the sandbox goes.
-    if let Ok(Some(row)) = svc.store().get_exposed_machine(node_id).await {
-        if row
-            .cloud
-            .as_ref()
-            .is_some_and(|cloud| cloud.agent_id == agent_id.as_str())
-        {
-            let svc = svc.clone();
-            tokio::spawn(async move {
-                let Some(feature) = svc.remote_feature() else {
-                    return;
-                };
-                let client = crate::cloud::saved_client(&svc, &row).await;
-                crate::cloud::delete_machine(feature, &svc, &row, client.as_deref()).await;
-            });
-        }
-    }
+    // there get final stops too, then the sandbox goes, unless it holds a
+    // workspace's home (nodes.md "Cloud homes" 1).
+    crate::cloud::home::release(svc, node_id, Some(agent_id)).await;
 }

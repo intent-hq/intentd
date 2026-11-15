@@ -40,6 +40,10 @@ const RENEW_MINUTES: u32 = 10;
 /// Pause and resume a sandbox at a turn boundary once it ran this long
 /// without a pause: before E2B's shortest continuous-run cap (1 h, Hobby).
 const RUN_CAP_MINUTES: u32 = 50;
+/// Idle pauses of a sandbox holding a home skipped in a row because a
+/// push before them failed; the next one pauses anyway, and the failed
+/// pushes count toward the home's `backupWarning`.
+const MAX_SKIPPED_PAUSES: u32 = 2;
 /// How often the reaper lists this backend's sandboxes.
 const REAP_MINUTES: u32 = 10;
 /// A sandbox no row knows is reaped only once it is this old, so a start in
@@ -50,6 +54,9 @@ const REAP_GRACE_MINUTES: u32 = 15;
 /// settings and timers, in milliseconds.
 const MINUTE_MS_ENV: &str = "INTENTD_E2B_MINUTE_MS";
 const DAY_MS_ENV: &str = "INTENTD_E2B_DAY_MS";
+/// Test seam: a wait between an idle pause's home pushes and the pause, in
+/// milliseconds, so a test can try to use the sandbox in between.
+const AFTER_PUSH_MS_ENV: &str = "INTENTD_E2B_AFTER_PUSH_MS";
 
 /// The turn error of an agent whose sandbox E2B removed.
 pub(crate) const SANDBOX_LOST_MESSAGE: &str = "The cloud provider removed this agent's sandbox, so its turn was interrupted. Work it pushed is kept; work it did not push is lost. The next message starts a new sandbox.";
@@ -500,10 +507,10 @@ pub(crate) async fn pause(
     // No dial from now until a demand; the link drops with the pause anyway,
     // and a dial in flight is dropped when it binds.
     feature.cloud.park(machine_id);
-    feature.cloud.count_pause(machine_id);
     if let Some(node) = &node {
         node.shared_ref().close_link();
     }
+    feature.cloud.count_pause(machine_id);
     set_state(svc, feature, machine_id, CloudSandboxState::Pausing).await;
     let paused = match client.pause(&cloud.sandbox_id).await {
         Ok(()) => Ok(()),
@@ -751,6 +758,11 @@ async fn check(
             {
                 renew(svc, feature, &**client, row, cloud).await;
             }
+            if busy && !feature.cloud.is_pushing(&row.id) {
+                // Failed pushes before idle pauses count in a row only; the
+                // pushes themselves keep the sandbox busy.
+                feature.cloud.reset_skipped_pauses(&row.id);
+            }
             if busy || !settled {
                 return;
             }
@@ -758,7 +770,12 @@ async fn check(
             let capped =
                 lease && since(cloud.running_since.as_deref()) >= clock.minutes(RUN_CAP_MINUTES);
             if idle || capped {
-                spawn_pause(svc, client, &row.id, !idle);
+                spawn_pause(
+                    svc,
+                    client,
+                    &row.id,
+                    if idle { PauseFor::Idle } else { PauseFor::Cap },
+                );
             }
         }
         CloudSandboxState::Paused => {
@@ -768,7 +785,9 @@ async fn check(
             }
         }
         // A transition a backend restart cut: finish it.
-        CloudSandboxState::Pausing if settled => spawn_pause(svc, client, &row.id, false),
+        CloudSandboxState::Pausing if settled => {
+            spawn_pause(svc, client, &row.id, PauseFor::Restart);
+        }
         CloudSandboxState::Resuming if settled => {
             feature.cloud.park(&row.id);
             set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
@@ -809,9 +828,25 @@ async fn renew(
     }
 }
 
-/// Pause in the background; `planned` (the run cap) resumes at once when
-/// the link is still wanted, so the cap resets without a visible pause.
-fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, planned: bool) {
+/// Why the supervisor pauses a sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PauseFor {
+    /// It was idle: its homes push first, and it pauses only while still
+    /// idle.
+    Idle,
+    /// The run cap: it resumes at once when the link is still wanted, so
+    /// the cap resets without a visible pause.
+    Cap,
+    /// A pause a backend restart cut: finish it.
+    Restart,
+}
+
+/// Pause in the background, as `why` says.
+fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, why: PauseFor) {
+    let idle_since = super::feature(svc)
+        .ok()
+        .and_then(|feature| feature.running_node(machine_id))
+        .map(|node| node.shared_ref().last_activity());
     let svc = svc.clone();
     let client = client.clone();
     let machine_id = machine_id.to_owned();
@@ -819,11 +854,23 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, planned: boo
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
-        if let Err(error) = pause(&svc, feature, &*client, &machine_id).await {
+        let paused = if why == PauseFor::Idle {
+            // One idle pause at a time, from its pushes to its end: a later
+            // check must not push (and so resume) a sandbox it paused.
+            if !feature.cloud.begin_push(&machine_id) {
+                return;
+            }
+            let paused = idle_pause(&svc, feature, &*client, &machine_id, idle_since).await;
+            feature.cloud.end_push(&machine_id);
+            paused
+        } else {
+            pause(&svc, feature, &*client, &machine_id).await.map(drop)
+        };
+        if let Err(error) = paused {
             tracing::debug!(machine = %machine_id, %error, "cloud machine: not paused");
             return;
         }
-        if planned {
+        if why == PauseFor::Cap {
             if let Some(node) = feature.running_node(&machine_id) {
                 if node.shared_ref().link_wanted() {
                     tracing::info!(machine = %machine_id, "cloud machine: planned pause before the run cap; resuming");
@@ -834,6 +881,92 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, planned: boo
             }
         }
     });
+}
+
+/// How long an idle pause waits for the uses of its machine in flight to
+/// end before it gives up (the idle time starts again).
+const USE_WAIT: Duration = Duration::from_secs(5);
+
+/// An idle pause. It holds its machine's use gate exclusively
+/// ([`crate::connector::Shared::quiesce`]): the uses in flight (home calls,
+/// terminal and script opens, turns) end first, and new ones wait until the
+/// link is closed, then dial, which resumes the sandbox. Under the gate it
+/// checks the sandbox is still idle (nothing busy, no activity since the
+/// check that found it idle), the homes push ([`pushed_before_pause`]), and
+/// the sandbox pauses.
+async fn idle_pause(
+    svc: &Services,
+    feature: &RemoteFeature,
+    client: &dyn CloudProvider,
+    machine_id: &str,
+    idle_since: Option<Instant>,
+) -> Result<()> {
+    let node = feature.running_node(machine_id);
+    // Held until the pause ends: new uses wait for it.
+    let mut quiet = None;
+    if let Some(node) = &node {
+        quiet = node.shared_ref().quiesce(USE_WAIT).await;
+        if quiet.is_none() {
+            feature.cloud.touch(machine_id);
+            return Err(Error::Internal("the sandbox kept being used".into()));
+        }
+    }
+    let used = node.as_ref().is_some_and(|node| {
+        node.shared_ref().busy() || Some(node.shared_ref().last_activity()) != idle_since
+    });
+    if used {
+        feature.cloud.touch(machine_id);
+        return Err(Error::Internal("the sandbox is in use".into()));
+    }
+    if !pushed_before_pause(svc, feature, machine_id).await {
+        return Err(Error::Internal(
+            "a home did not push before the idle pause".into(),
+        ));
+    }
+    if let Some(wait) = std::env::var(AFTER_PUSH_MS_ENV)
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+    {
+        // timing-guard: test seam only; holds the gap a slow push leaves open
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+    }
+    let paused = pause(svc, feature, client, machine_id).await.map(drop);
+    drop(quiet);
+    paused
+}
+
+/// Before an idle pause (nodes.md "Cloud homes" 4): each home the machine
+/// holds pushes `home/head` and `home/wip`. Whether to pause now: a failed
+/// push skips this pause and the idle time starts again, up to
+/// [`MAX_SKIPPED_PAUSES`] in a row; then the sandbox pauses anyway. Only a
+/// running sandbox pushes: a push dials it, and a dial resumes a paused one.
+async fn pushed_before_pause(svc: &Services, feature: &RemoteFeature, machine_id: &str) -> bool {
+    let running = matches!(
+        svc.store().get_exposed_machine(machine_id).await,
+        Ok(Some(row)) if row.cloud.as_ref().is_some_and(|cloud| cloud.state == CloudSandboxState::Running)
+    );
+    if !running || feature.cloud.is_parked(machine_id) {
+        return false;
+    }
+    let homes = svc.store().homes_on_machine(machine_id).await;
+    let mut failed = homes.is_err();
+    for (workspace_id, home) in homes.unwrap_or_default() {
+        if let Err(error) = crate::home_calls::push_home(svc, &home, &workspace_id).await {
+            tracing::warn!(machine = %machine_id, workspace = %workspace_id, %error, "cloud machine: the home did not push before the idle pause");
+            failed = true;
+        }
+    }
+    if !failed {
+        feature.cloud.reset_skipped_pauses(machine_id);
+        return true;
+    }
+    if feature.cloud.skip_pause(machine_id) > MAX_SKIPPED_PAUSES {
+        tracing::warn!(machine = %machine_id, "cloud machine: its homes keep failing to push; pausing anyway");
+        feature.cloud.reset_skipped_pauses(machine_id);
+        return true;
+    }
+    feature.cloud.touch(machine_id);
+    false
 }
 
 /// Delete a machine in the background (resume, final stops, delete).

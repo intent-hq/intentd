@@ -276,8 +276,17 @@ pub(crate) async fn open(
         .node(svc, &node_id)
         .await
         .map_err(|error| home_unavailable(&home, &error.to_string()))?;
-    // No dial here: the caller may hold a lock other scripts wait on.
+    // The caller dialed before taking its script locks, so no lock waits on
+    // a dial here. The start is a use of the machine: it waits out an idle
+    // pause, and when that pause closed the link meanwhile, it dials once
+    // more (bounded), which resumes the sandbox.
     let shared = node.shared_ref();
+    let _use = shared.begin_use().await;
+    if shared.current_link().is_none() && feature.cloud.is_parked(&node_id) {
+        node.connect()
+            .await
+            .map_err(|error| home_unavailable(&home, &error.to_string()))?;
+    }
     if shared.protocol() < HOMES_PROTOCOL {
         return Err(home_unavailable(
             &home,

@@ -162,6 +162,12 @@ impl RemoteAgentRuntime {
                 data: None,
             }));
         }
+        // The turn is a use of the machine: it waits out an idle pause,
+        // then asks for the link, which resumes a sandbox that paused.
+        let _use = self.shared.begin_use().await;
+        if self.shared.current_link().is_none() {
+            self.shared.ask_link();
+        }
         let Some(mut ended) = self.sink.expect_turn(&turn_id) else {
             return Err(self
                 .not_running()

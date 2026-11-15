@@ -38,6 +38,32 @@ pub fn cloud_machine_key_account(provider: &str) -> String {
     format!("cloudMachines.{provider}.apiKey")
 }
 
+/// A new workspace's initial agent that waits for a new sandbox of its
+/// cloud home's entry, placed with no checkout, asks to work in the home
+/// checkout (nodes.md "The home checkout" 1): its start keeps that only
+/// when its sandbox becomes the home.
+pub(crate) fn share_new_cloud_home(
+    home: &intent_core::WorkspaceHome,
+    plan: &mut crate::agent_ops::AgentCreatePlan,
+) {
+    let explicit = plan
+        .placement
+        .as_ref()
+        .is_some_and(|placement| placement.checkout.is_some());
+    let Some(view) = plan.remote.as_mut() else {
+        return;
+    };
+    if !explicit
+        && home.node_id.is_none()
+        && view.is_cloud()
+        && view.is_unlinked()
+        && home.cloud_machine_id.is_some()
+        && view.placement.cloud_machine_id == home.cloud_machine_id
+    {
+        view.home_checkout = Some(home.home_id.clone());
+    }
+}
+
 impl Services {
     /// `remoteMachines.<method>`: see
     /// [`intent_core::WorkspaceApi::remote_machines`].

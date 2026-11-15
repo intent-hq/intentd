@@ -148,7 +148,7 @@ fn machine_unknown(placement: &AgentPlacement, node_id: &str) -> Error {
 }
 
 /// Whether `agent` is `top` or one of its sub-agents.
-async fn descends_from(svc: &Services, agent: &AgentId, top: &str) -> Result<bool> {
+pub(super) async fn descends_from(svc: &Services, agent: &AgentId, top: &str) -> Result<bool> {
     let mut current = Some(agent.clone());
     for _ in 0..64 {
         let Some(id) = current else { return Ok(false) };
@@ -734,7 +734,10 @@ async fn add_row(
 /// When the workspace's home is a cloud home of this entry that runs
 /// nowhere yet, the sandbox becomes the home (nodes.md "Choosing the
 /// home"): its `startedBy` is the workspace owner, and the home checkout is
-/// opened (and its setup run) before the agent launches.
+/// opened (and its setup run) before the agent launches. An agent placed
+/// with no checkout then works in the home checkout. A sandbox that does
+/// not become the home is the agent's alone: `startedBy` is the agent's
+/// starter again.
 async fn start(
     svc: &Services,
     workspace_id: &WorkspaceId,
@@ -744,9 +747,9 @@ async fn start(
 ) -> Result<()> {
     let feature = super::feature(svc)?;
     let home = super::home::claimable(svc, workspace_id, cloud_machine_id).await;
-    let started_by = match &home {
+    let row_started_by = match &home {
         Some(_) => super::owner_started_by(svc, workspace_id).await,
-        None => started_by,
+        None => started_by.clone(),
     };
     if let Some(home) = &home {
         super::home::mark_starting(svc, workspace_id, home).await;
@@ -755,47 +758,51 @@ async fn start(
     let started = start_for_agent(
         feature,
         svc,
-        workspace_id,
-        agent_id,
-        cloud_machine_id,
-        started_by,
-        home.as_ref(),
+        AgentStart {
+            workspace_id,
+            agent_id,
+            cloud_machine_id,
+            row_started_by,
+            agent_started_by: started_by,
+            home: home.as_ref(),
+        },
         &mut made,
     )
     .await;
-    // A home this start holds is detached. An unheld one is left to a
-    // home-only start in flight, which still may become the home and
-    // settles it itself.
     if let (Err(_), Some(home)) = (&started, &home) {
-        let held = made.is_some()
-            && svc
-                .store()
-                .get_workspace_home(workspace_id)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|current| current.node_id == made);
-        if held || !super::home::home_start_in_flight(svc, workspace_id) {
-            super::home::start_failed(svc, workspace_id, &home.home_id, made.as_deref()).await;
-        }
+        super::home::agent_start_failed(svc, workspace_id, home, made.as_deref()).await;
     }
     started
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one start's inputs, read once by the caller"
-)]
+/// One agent's sandbox start, as [`start`] read it.
+struct AgentStart<'a> {
+    workspace_id: &'a WorkspaceId,
+    agent_id: &'a AgentId,
+    cloud_machine_id: &'a str,
+    /// The new row's `startedBy`: the workspace owner while the sandbox
+    /// may become the home.
+    row_started_by: intent_core::machines::CloudStartedBy,
+    /// The agent's starter, the row's `startedBy` when it is not the home.
+    agent_started_by: intent_core::machines::CloudStartedBy,
+    /// The cloud home the sandbox may become.
+    home: Option<&'a intent_core::WorkspaceHome>,
+}
+
 async fn start_for_agent(
     feature: &RemoteFeature,
     svc: &Services,
-    workspace_id: &WorkspaceId,
-    agent_id: &AgentId,
-    cloud_machine_id: &str,
-    started_by: intent_core::machines::CloudStartedBy,
-    home: Option<&intent_core::WorkspaceHome>,
+    start: AgentStart<'_>,
     made: &mut Option<String>,
 ) -> Result<()> {
+    let AgentStart {
+        workspace_id,
+        agent_id,
+        cloud_machine_id,
+        row_started_by,
+        agent_started_by,
+        home,
+    } = start;
     step(svc, workspace_id, agent_id, CloudStartStep::CreatingSandbox).await;
     let prepared = prepare(svc, cloud_machine_id).await?;
     // A rename may have run since admission wrote the entry's name.
@@ -808,6 +815,9 @@ async fn start_for_agent(
             .await;
     }
     let session = svc.store().get_agent_session_summary(agent_id).await?;
+    // The home the agent asked to share at placement (no checkout named).
+    let wants_home = RemotePlacementView::from_metadata(session.metadata.as_ref())
+        .and_then(|view| view.home_checkout);
     let created = create(
         svc,
         &prepared,
@@ -831,28 +841,34 @@ async fn start_for_agent(
                 owner: agent_id.as_str(),
                 workspace_id,
                 cloud_machine_id,
-                started_by,
+                started_by: row_started_by,
                 name: machine_name(&prepared.saved.name, &session.name),
             },
         )
         .await?;
         *made = Some(machine_id.clone());
-        // `cloudMachines.remove` may have run meanwhile: nothing would be
-        // left to delete this sandbox.
-        let launched = if config::load(svc, cloud_machine_id).await?.is_none() {
-            Err(config::not_configured())
-        } else {
-            match home {
-                Some(home) => {
-                    super::home::take(svc, workspace_id, home, cloud_machine_id, &machine_id).await
-                }
-                None => Ok(()),
+        let launched = async {
+            // `cloudMachines.remove` may have run meanwhile: nothing would
+            // be left to delete this sandbox.
+            if config::load(svc, cloud_machine_id).await?.is_none() {
+                return Err(config::not_configured());
             }
-        };
-        let launched = match launched {
-            Ok(()) => link(feature, svc, workspace_id, agent_id, &machine_id).await,
-            Err(error) => Err(error),
-        };
+            let shares = match home {
+                Some(home) => {
+                    let is_home =
+                        super::home::take(svc, workspace_id, home, cloud_machine_id, &machine_id)
+                            .await?;
+                    if !is_home {
+                        set_started_by(svc, &machine_id, agent_started_by).await;
+                    }
+                    (is_home && wants_home.as_ref() == Some(&home.home_id))
+                        .then(|| home.home_id.clone())
+                }
+                None => None,
+            };
+            link(feature, svc, workspace_id, agent_id, &machine_id, shares).await
+        }
+        .await;
         if let Err(error) = launched {
             // The sandbox itself is deleted once, below.
             if let Ok(Some(row)) = svc.store().get_exposed_machine(&machine_id).await {
@@ -869,6 +885,25 @@ async fn start_for_agent(
         }
     }
     linked
+}
+
+/// Record `started_by` as machine `machine_id`'s `cloud.startedBy`.
+async fn set_started_by(
+    svc: &Services,
+    machine_id: &str,
+    started_by: intent_core::machines::CloudStartedBy,
+) {
+    let Ok(Some(row)) = svc.store().get_exposed_machine(machine_id).await else {
+        return;
+    };
+    let Some(mut cloud) = row.cloud else { return };
+    if cloud.started_by == started_by {
+        return;
+    }
+    cloud.started_by = started_by;
+    if let Err(error) = svc.store().update_cloud_machine(machine_id, &cloud).await {
+        tracing::warn!(machine = %machine_id, %error, "cloud machine: could not record who started it");
+    }
 }
 
 /// A home-only sandbox start (nodes.md "Cloud homes"): no agent; the
@@ -946,13 +981,15 @@ async fn start_home_sandbox(
 }
 
 /// Bind the agent to its new machine: its view gets the machine and lease,
-/// loses `cloudStart`, and the remote launch places it there.
+/// loses `cloudStart`, works in home checkout `shares` when given, and the
+/// remote launch places it there.
 async fn link(
     feature: &RemoteFeature,
     svc: &Services,
     workspace_id: &WorkspaceId,
     agent_id: &AgentId,
     machine_id: &str,
+    shares: Option<intent_core::HomeId>,
 ) -> Result<()> {
     let node = feature.node(svc, machine_id).await?;
     let lease_id = node.status().lease_id;
@@ -967,6 +1004,12 @@ async fn link(
     view.lease_id = lease_id;
     view.cloud_start = None;
     view.placement_error = None;
+    // A home the agent only asked for at placement is dropped when its
+    // sandbox did not become it; one it worked in before stays, for its
+    // launch to leave ([`crate::homes::leave_moved_home`]).
+    if shares.is_some() || view.launched_on.is_none() {
+        view.home_checkout = shares;
+    }
     if view.base_commit.is_empty() {
         let base = crate::launch::checkout_base(svc, workspace_id).await?;
         view.base_commit = base.commit;
@@ -1016,6 +1059,24 @@ pub(crate) enum Removal<'a> {
     /// The sandbox cannot link to this backend: no stops, then the E2B
     /// delete.
     Unlinkable,
+    /// As [`Removal::Stop`], only while nothing needs the machine
+    /// ([`super::home::needed`], with the agent ending now), checked under
+    /// its lifecycle lock.
+    Unneeded(Option<&'a AgentId>),
+}
+
+/// [`delete_machine`] of a machine nothing needed (see
+/// [`super::home::needed`], `ending` the agent ending now): checked again
+/// under the machine's lifecycle lock, so a home move or an agent placed
+/// there meanwhile keeps it.
+pub(crate) async fn delete_unneeded_machine(
+    feature: &RemoteFeature,
+    svc: &Services,
+    row: &ExposedMachine,
+    client: Option<&dyn CloudProvider>,
+    ending: Option<&AgentId>,
+) -> Vec<String> {
+    remove_machine(feature, svc, row, client, Removal::Unneeded(ending)).await
 }
 
 /// [`delete_machine`], ending the sandbox as `removal` says.
@@ -1028,7 +1089,7 @@ pub(crate) async fn remove_machine(
 ) -> Vec<String> {
     let lost = match removal {
         Removal::Lost(error) => Some(error),
-        Removal::Stop | Removal::Unlinkable => None,
+        Removal::Stop | Removal::Unlinkable | Removal::Unneeded(_) => None,
     };
     let mut unconfirmed = Vec::new();
     let _lifecycle = feature.lifecycle(&row.id).await;
@@ -1042,11 +1103,17 @@ pub(crate) async fn remove_machine(
         }
         Err(_) => row.clone(),
     };
+    if let Removal::Unneeded(ending) = removal {
+        if super::home::needed(svc, &row, ending).await {
+            return unconfirmed;
+        }
+        tracing::info!(machine = %row.id, "cloud machine: nothing needs it any more; deleting it");
+    }
     let row = &row;
     // The agents placed here, read before their final stops end their
     // records, so each one is left without a machine afterwards.
     let placed = placed_agents(store, &row.id).await.unwrap_or_default();
-    let mut stops = matches!(removal, Removal::Stop);
+    let mut stops = matches!(removal, Removal::Stop | Removal::Unneeded(_));
     if let (true, Some(client), Some(cloud)) = (stops, client, &row.cloud) {
         let paused = cloud.state != CloudSandboxState::Running;
         super::lifecycle::set_state(svc, feature, &row.id, CloudSandboxState::Stopping).await;
@@ -1061,7 +1128,7 @@ pub(crate) async fn remove_machine(
             node.shared_ref().drop_stops();
             let turn_error = match removal {
                 Removal::Unlinkable => super::lifecycle::outdated_turn_error(),
-                Removal::Stop | Removal::Lost(_) => "cloud-machine-unavailable: the agent's E2B sandbox was deleted without a final stop; work it pushed is kept".to_owned(),
+                Removal::Stop | Removal::Unneeded(_) | Removal::Lost(_) => "cloud-machine-unavailable: the agent's E2B sandbox was deleted without a final stop; work it pushed is kept".to_owned(),
             };
             node.shared_ref().agents.end_all(&turn_error);
         }
