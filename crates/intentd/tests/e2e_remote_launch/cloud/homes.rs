@@ -854,7 +854,8 @@ const AFTER_PUSH_MS: u64 = 2000;
 /// several idle periods; once it closes, the home pushes the uncommitted
 /// file the terminal wrote to `home/wip`. An app edit while that pause runs
 /// waits for it, then resumes the sandbox and lands; the next idle pause
-/// pushes the edit too, then pauses.
+/// pushes the edit too, then pauses. A saved script started while a later
+/// pause runs waits for it too, then resumes the sandbox and runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing() {
     let Some(mut homes) = CloudHomes::start(
@@ -1006,5 +1007,53 @@ async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing(
     assert!(
         home.get("backupWarning").is_none_or(|w| w == false),
         "{home}"
+    );
+
+    // A saved script started while the next pause runs waits for it too,
+    // then resumes the sandbox and runs.
+    let script = homes
+        .ok(
+            "script.create",
+            json!({
+                "workspaceId": ws_id, "name": "late", "command": "echo ran:$(cat late.txt)",
+                "mode": "command", "purpose": "saved",
+            }),
+        )
+        .await;
+    let script_id = script["id"].as_str().unwrap().to_owned();
+    homes
+        .ok(
+            "file.read",
+            json!({ "workspaceId": ws_id, "path": "late.txt" }),
+        )
+        .await;
+    let pushed = home["lastBackupAt"].clone();
+    let mut id = homes.id;
+    home_until(
+        &mut homes.rpc_ws,
+        &mut id,
+        &ws_id,
+        "the third pause's push",
+        |home| home["lastBackupAt"].is_string() && home["lastBackupAt"] != pushed,
+    )
+    .await;
+    homes.id = id;
+    let ran = homes
+        .ok(
+            "script.run",
+            json!({ "workspaceId": ws_id, "scriptId": script_id, "timeoutSeconds": 60 }),
+        )
+        .await;
+    assert!(
+        ran["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ran:late"),
+        "{ran}"
+    );
+    assert_eq!(
+        homes.pause_calls(&sandbox),
+        3,
+        "the start did not wait for the pause"
     );
 }
