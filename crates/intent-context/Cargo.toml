@@ -1,6 +1,6 @@
 [package]
 name = "intent-context"
-version = "0.11.220"
+version = "0.11.221"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 description = "ContextEngine implementation (AuggieContextEngine) + discovery"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.220" }
+intent-core = { path = "../intent-core", version = "0.11.221" }
 async-trait = "0.1"
 tokio = { workspace = true }
 directories = { workspace = true }
