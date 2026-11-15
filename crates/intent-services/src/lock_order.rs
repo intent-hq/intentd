@@ -240,8 +240,10 @@ mod held {
     }
 }
 
-#[cfg(all(test, debug_assertions))]
+#[cfg(test)]
 mod tests {
+    #![cfg(debug_assertions)]
+
     use std::sync::Arc;
 
     use intent_core::WorkspaceId;
