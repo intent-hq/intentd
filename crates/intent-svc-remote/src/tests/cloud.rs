@@ -190,12 +190,26 @@ async fn workspace_owned_by(backend: &Backend, id: &str, owner: &PrincipalId) {
         })
         .await
         .unwrap();
-    sqlx::query("UPDATE workspace SET owner_principal_id = ? WHERE id = ?")
-        .bind(owner.as_str())
-        .bind(id)
-        .execute(backend.store().write_pool())
-        .await
-        .unwrap();
+    for sql in [
+        "UPDATE workspace_member SET principal_id = ? WHERE workspace_id = ? AND role = 'owner'",
+        "UPDATE workspace SET owner_principal_id = ? WHERE id = ?",
+    ] {
+        sqlx::query(sql)
+            .bind(owner.as_str())
+            .bind(id)
+            .execute(backend.store().write_pool())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        backend
+            .store()
+            .get_workspace_owner_principal_id(&intent_core::WorkspaceId::from(id))
+            .await
+            .unwrap()
+            .as_ref(),
+        Some(owner)
+    );
 }
 
 /// A sandbox that holds a workspace's home: its workspace's current owner

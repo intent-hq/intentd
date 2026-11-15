@@ -431,7 +431,8 @@ async fn a_cloud_entry_is_a_home_that_starts_lazily() {
     assert_no_secret_logged(&head_dir, &fake);
 }
 
-/// A host member's token: a person who may create workspaces here.
+/// A host member's token: a person who neither owns nor started the
+/// sandboxes here.
 const MEMBER_TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 /// A credentialed guest's token: a collaborator once added to a workspace.
 const GUEST_TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -656,6 +657,20 @@ impl CloudHomes {
     }
 }
 
+/// The directory of agent `agent_id` on the machine whose data dir is
+/// `node_dir`, while the machine keeps one.
+fn agent_dir(node_dir: &Path, agent_id: &str) -> Option<PathBuf> {
+    std::fs::read_dir(node_dir.join("w"))
+        .ok()?
+        .filter_map(Result::ok)
+        .flat_map(|workspace| std::fs::read_dir(workspace.path()).into_iter().flatten())
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|dir| {
+            std::fs::read_to_string(dir.join(".agent")).is_ok_and(|id| id.trim() == agent_id)
+        })
+}
+
 /// A cloud home's sandbox is co-owned by the workspace (nodes.md "Cloud
 /// homes" 1-2, "The home checkout" 1):
 ///
@@ -663,9 +678,9 @@ impl CloudHomes {
 ///    home checkout on its sandbox, which became the home.
 /// 2. Deleting that agent keeps the sandbox: the home still answers.
 /// 3. Archiving the workspace deletes the sandbox and its machine row.
-/// 4. A home-only sandbox of a workspace a host member owns: a
-///    collaborator can neither pause nor kill it; the workspace owner
-///    pauses it, then kills it.
+/// 4. A home-only sandbox: a collaborator of its workspace and another host
+///    member can neither pause nor kill it; the workspace owner pauses it,
+///    then kills it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cloud_home_sandbox_is_co_owned_by_its_workspace() {
     let Some(mut homes) = CloudHomes::start("itd-e2b-coown-", &[], 1440).await else {
@@ -712,29 +727,29 @@ async fn a_cloud_home_sandbox_is_co_owned_by_its_workspace() {
     homes
         .ok(
             "agent.sendMessage",
-            json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello" }),
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "echo-raw" }),
         )
         .await;
+    let id = homes.next();
+    let raw = reply_containing(&mut homes.rpc_ws, (&ws_id, &agent_id), "raw: ", id).await;
+    homes.id += 1000;
+    assert!(
+        raw.contains(&format!("/homes/{home_id}/work")),
+        "the agent's session is not in the home checkout: {raw}"
+    );
     let sandbox_dir = homes.sandbox_dir(&sandbox);
-    let pid_file = super::super::homes::until("the agent started in the home checkout", || {
-        super::super::homes::home_checkout(&sandbox_dir, &home_id)
-            .map(|work| work.join("agent.pid"))
-            .filter(|pid| pid.is_file())
-    })
-    .await;
-    let pids: Value = serde_json::from_str(&std::fs::read_to_string(&pid_file).unwrap()).unwrap();
-    let agent_pid = pids["agent"].to_string();
+    assert!(agent_dir(&sandbox_dir, &agent_id).is_some());
 
-    // 2. Deleting the agent stops it but keeps its sandbox: the home still
-    // answers there.
+    // 2. Deleting the agent stops it (its machine drops its directory) but
+    // keeps its sandbox: the home still answers there.
     homes
         .ok(
             "agent.delete",
             json!({ "workspaceId": ws_id, "agentId": agent_id }),
         )
         .await;
-    super::super::homes::until("the deleted agent's process ended", || {
-        super::super::homes::process_gone(&agent_pid).then_some(())
+    super::super::homes::until("the deleted agent's final stop", || {
+        agent_dir(&sandbox_dir, &agent_id).is_none().then_some(())
     })
     .await;
     homes
@@ -772,58 +787,50 @@ async fn a_cloud_home_sandbox_is_co_owned_by_its_workspace() {
         "the row stays: {listed}"
     );
 
-    // 4. A member's workspace with a home-only sandbox.
-    let mut member = homes.connect_as(MEMBER_TOKEN).await;
-    let created = ok(
-        &mut member,
-        1,
-        "workspace.create",
-        json!({ "repositoryPath": repo.to_string_lossy(), "baseRef": branch }),
-    )
-    .await;
-    let member_ws = created["workspace"]["id"].as_str().unwrap().to_owned();
-    let write = json!({ "workspaceId": member_ws, "path": "m.txt", "content": "m\n" });
-    let mut mid = 10;
-    call_while_starting(&mut member, &mut mid, "file.write", &write).await;
-    let home_only = homes.sandbox_of(&format!("home-{member_ws}"));
+    // 4. A home-only sandbox: a collaborator of its workspace and another
+    // host member can neither pause nor kill it; the workspace owner can.
+    let created = homes
+        .ok(
+            "workspace.create",
+            json!({ "repositoryPath": repo.to_string_lossy(), "baseRef": branch }),
+        )
+        .await;
+    let only_ws = created["workspace"]["id"].as_str().unwrap().to_owned();
+    let owner = created["workspace"]["ownerPrincipalId"].clone();
+    let write = json!({ "workspaceId": only_ws, "path": "o.txt", "content": "o\n" });
+    let mut id = homes.id;
+    call_while_starting(&mut homes.rpc_ws, &mut id, "file.write", &write).await;
+    homes.id = id;
+    let home_only = homes.sandbox_of(&format!("home-{only_ws}"));
     let id = homes.next();
     let machine = cloud_of(&mut homes.rpc_ws, id, &home_only)
         .await
         .expect("the home-only machine");
+    assert_eq!(machine["cloud"]["startedBy"]["principalId"], owner, "{machine}");
     let machine_id = machine["id"].as_str().unwrap().to_owned();
     let guest_id = homes.guest_id.clone();
-    mid += 1;
-    ok(
-        &mut member,
-        mid,
-        "workspace.members.add",
-        json!({ "workspaceId": member_ws, "principalId": guest_id }),
-    )
-    .await;
-    let mut guest = homes.connect_as(GUEST_TOKEN).await;
-    for (gid, method) in [(1, "cloudMachines.pause"), (2, "cloudMachines.kill")] {
-        let refused = rpc(&mut guest, gid, method, json!({ "machineId": machine_id })).await;
-        assert_eq!(refused["error"]["code"], -32003, "{method}: {refused}");
+    homes
+        .ok(
+            "workspace.members.add",
+            json!({ "workspaceId": only_ws, "principalId": guest_id }),
+        )
+        .await;
+    for token in [GUEST_TOKEN, MEMBER_TOKEN] {
+        let mut other = homes.connect_as(token).await;
+        for (oid, method) in [(1, "cloudMachines.pause"), (2, "cloudMachines.kill")] {
+            let refused = rpc(&mut other, oid, method, json!({ "machineId": machine_id })).await;
+            assert_eq!(refused["error"]["code"], -32003, "{method}: {refused}");
+        }
     }
-    assert_eq!(homes.pause_calls(&home_only), 0, "a collaborator paused it");
-    assert!(!homes.deleted(&home_only), "a collaborator killed it");
-    mid += 1;
-    let paused = ok(
-        &mut member,
-        mid,
-        "cloudMachines.pause",
-        json!({ "machineId": machine_id }),
-    )
-    .await;
+    assert_eq!(homes.pause_calls(&home_only), 0, "another person paused it");
+    assert!(!homes.deleted(&home_only), "another person killed it");
+    let paused = homes
+        .ok("cloudMachines.pause", json!({ "machineId": machine_id }))
+        .await;
     assert_eq!(paused["machine"]["cloud"]["state"], "paused", "{paused}");
-    mid += 1;
-    ok(
-        &mut member,
-        mid,
-        "cloudMachines.kill",
-        json!({ "machineId": machine_id }),
-    )
-    .await;
+    homes
+        .ok("cloudMachines.kill", json!({ "machineId": machine_id }))
+        .await;
     assert!(homes.deleted(&home_only), "the owner's kill left the sandbox");
 }
 
@@ -860,6 +867,17 @@ async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing(
     homes.id = id;
     let terminal_id = terminal["terminalId"].as_str().unwrap().to_owned();
     let sandbox = homes.sandbox_of(&format!("home-{ws_id}"));
+    // The new home's first backup, so the file below is not in it.
+    let mut id = homes.id;
+    home_until(
+        &mut homes.rpc_ws,
+        &mut id,
+        &ws_id,
+        "the new home's first backup",
+        |home| home["lastBackupAt"].is_string(),
+    )
+    .await;
+    homes.id = id;
     let b64 = base64::engine::general_purpose::STANDARD;
     homes
         .ok(
