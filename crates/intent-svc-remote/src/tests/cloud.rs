@@ -253,55 +253,56 @@ async fn pause_and_kill_of_a_home_sandbox_follow_the_workspace_owner() {
 async fn a_failed_agent_start_settles_the_cloud_home_it_raced_for() {
     use intent_core::{HomeState, WorkspaceId};
 
-    let backend = Backend::new().await;
-    let svc = &backend.services;
-    let owner = backend.store().get_primary_principal().await.unwrap().id;
-    let home_of = |ws: &str| {
+    async fn home_of(backend: &Backend, ws: &str) -> intent_core::WorkspaceHome {
         let ws = WorkspaceId::from(ws);
-        async move { backend.store().get_workspace_home(&ws).await.unwrap().unwrap() }
-    };
-    let starting = |ws: &'static str| async move {
-        workspace_owned_by(&backend, ws, &owner).await;
+        backend.store().get_workspace_home(&ws).await.unwrap().unwrap()
+    }
+    async fn starting_home(backend: &Backend, ws: &str) -> intent_core::WorkspaceHome {
+        let owner = backend.store().get_primary_principal().await.unwrap().id;
+        workspace_owned_by(backend, ws, &owner).await;
         let home = crate::cloud::home::new_home("e2b", "E2B");
         let ws = WorkspaceId::from(ws);
         backend.store().set_workspace_home(&ws, &home).await.unwrap();
-        crate::cloud::home::mark_starting(svc, &ws, &home).await;
+        crate::cloud::home::mark_starting(&backend.services, &ws, &home).await;
         home
-    };
+    }
+
+    let backend = Backend::new().await;
+    let svc = &backend.services;
 
     // Held by the failed agent start, a home-only start in flight.
-    let home = starting("ws-held").await;
+    let home = starting_home(&backend, "ws-held").await;
     let ws = WorkspaceId::from("ws-held");
     crate::cloud::test_hold_start(svc, &crate::cloud::home::start_key(&ws), "e2b", "ws-held");
     assert!(crate::cloud::home::claim(svc, &ws, &home.home_id, "e2b", "m-agent")
         .await
         .unwrap());
     crate::cloud::home::agent_start_failed(svc, &ws, &home, Some("m-agent")).await;
-    let after = home_of("ws-held").await;
+    let after = home_of(&backend, "ws-held").await;
     assert_eq!(after.state, HomeState::Detached, "{after:?}");
     assert_eq!(after.node_id, None);
 
     // Unheld, a home-only start in flight: left to it.
-    let home = starting("ws-left").await;
+    let home = starting_home(&backend, "ws-left").await;
     let ws = WorkspaceId::from("ws-left");
     crate::cloud::test_hold_start(svc, &crate::cloud::home::start_key(&ws), "e2b", "ws-left");
     crate::cloud::home::agent_start_failed(svc, &ws, &home, Some("m-agent")).await;
-    assert_eq!(home_of("ws-left").await.state, HomeState::Starting);
+    assert_eq!(home_of(&backend, "ws-left").await.state, HomeState::Starting);
 
     // Unheld, no other start: detached.
-    let home = starting("ws-alone").await;
+    let home = starting_home(&backend, "ws-alone").await;
     let ws = WorkspaceId::from("ws-alone");
     crate::cloud::home::agent_start_failed(svc, &ws, &home, None).await;
-    assert_eq!(home_of("ws-alone").await.state, HomeState::Detached);
+    assert_eq!(home_of(&backend, "ws-alone").await.state, HomeState::Detached);
 
     // Held by the home-only sandbox, which won: untouched.
-    let home = starting("ws-won").await;
+    let home = starting_home(&backend, "ws-won").await;
     let ws = WorkspaceId::from("ws-won");
     assert!(crate::cloud::home::claim(svc, &ws, &home.home_id, "e2b", "m-home")
         .await
         .unwrap());
     crate::cloud::home::agent_start_failed(svc, &ws, &home, Some("m-agent")).await;
-    let after = home_of("ws-won").await;
+    let after = home_of(&backend, "ws-won").await;
     assert_eq!(after.node_id.as_deref(), Some("m-home"));
     assert_ne!(after.state, HomeState::Detached);
 }

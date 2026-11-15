@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use intent_core::{HomeId, HomeState, Result, WorkspaceHome, WorkspaceId};
+use intent_core::{AgentId, HomeId, HomeState, Result, WorkspaceHome, WorkspaceId};
 use intent_services::feature_api::Services;
 use tokio::sync::watch;
 
@@ -172,9 +172,9 @@ pub(crate) async fn open(
 
 /// The new sandbox `machine_id` of an agent becomes the workspace's cloud
 /// home `home`, whose checkout opens (with its setup) before the agent
-/// launches. Nothing changes when another start took the home first. A
-/// failed open detaches the home; the agent still launches, in its own
-/// checkout.
+/// launches. Whether it did: nothing changes when another start took the
+/// home first, and a failed open detaches the home; the agent still
+/// launches either way, in its own checkout.
 ///
 /// # Errors
 ///
@@ -185,7 +185,7 @@ pub(crate) async fn take(
     home: &WorkspaceHome,
     cloud_machine_id: &str,
     machine_id: &str,
-) -> Result<()> {
+) -> Result<bool> {
     if !claim(
         svc,
         workspace_id,
@@ -195,13 +195,14 @@ pub(crate) async fn take(
     )
     .await?
     {
-        return Ok(());
+        return Ok(false);
     }
     if let Err(error) = open(svc, workspace_id, &home.home_id, machine_id).await {
         tracing::warn!(workspace = %workspace_id, %error, "cloud home: the home did not open on the agent's sandbox");
         start_failed(svc, workspace_id, &home.home_id, Some(machine_id)).await;
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A start of cloud home `home_id` failed (its sandbox `machine_id`, when
@@ -225,6 +226,114 @@ pub(crate) async fn start_failed(
         Err(error) => {
             tracing::warn!(workspace = %workspace_id, %error, "cloud home: could not detach the home after a failed start");
         }
+    }
+}
+
+/// An agent start that raced for cloud home `home` failed (`made`: its
+/// sandbox's machine, when it got that far). A home the start holds is
+/// detached. An unheld one is left to a home-only start in flight, which
+/// may still become the home and settles it itself; with none, it is
+/// detached too. A home another sandbox holds is untouched.
+pub(crate) async fn agent_start_failed(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home: &WorkspaceHome,
+    made: Option<&str>,
+) {
+    let held = made.is_some()
+        && svc
+            .store()
+            .get_workspace_home(workspace_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|current| current.node_id.as_deref() == made);
+    if held || !home_start_in_flight(svc, workspace_id) {
+        start_failed(svc, workspace_id, &home.home_id, made).await;
+    }
+}
+
+/// Delete cloud machine `machine_id` in the background once nothing needs
+/// it (nodes.md "Cloud homes" 1): it holds no home, owes no home stop and
+/// is no move's target, and no agent uses it. `ending` is an agent ending
+/// for good now; when it is the one the sandbox was started for, its
+/// sub-agents there are stopped with it, as for any agent sandbox.
+///
+/// Boxed: the delete's final stops lead back here.
+pub(crate) fn release<'a>(
+    svc: &'a Services,
+    machine_id: &'a str,
+    ending: Option<&'a AgentId>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(release_inner(svc, machine_id, ending))
+}
+
+async fn release_inner(svc: &Services, machine_id: &str, ending: Option<&AgentId>) {
+    let store = svc.store();
+    let Ok(Some(row)) = store.get_exposed_machine(machine_id).await else {
+        return;
+    };
+    let Some(cloud) = &row.cloud else { return };
+    match crate::homes::machine_holds_homes(store, machine_id).await {
+        Ok(false) => {}
+        Ok(true) => {
+            tracing::info!(machine = %machine_id, "cloud machine: kept, it holds a workspace's home");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(machine = %machine_id, %error, "cloud machine: could not read its homes; kept");
+            return;
+        }
+    }
+    let starter_ends = ending.is_some_and(|agent| agent.as_str() == cloud.agent_id);
+    if !starter_ends {
+        if uses(svc, &AgentId::from(cloud.agent_id.as_str())).await {
+            return;
+        }
+        let placed = match super::start::placed_agents(store, machine_id).await {
+            Ok(placed) => placed,
+            Err(error) => {
+                tracing::warn!(machine = %machine_id, %error, "cloud machine: could not read its agents; kept");
+                return;
+            }
+        };
+        for agent in placed {
+            if Some(&agent.agent_id) != ending && uses(svc, &agent.agent_id).await {
+                return;
+            }
+        }
+    }
+    let svc = svc.clone();
+    // caller-binding: allow — deletes one cloud machine nothing needs any more
+    tokio::spawn(async move {
+        let Some(feature) = svc.remote_feature() else {
+            return;
+        };
+        tracing::info!(machine = %row.id, "cloud machine: nothing needs it any more; deleting it");
+        let client = super::saved_client(&svc, &row).await;
+        super::start::delete_machine(feature, &svc, &row, client.as_deref()).await;
+    });
+}
+
+/// Whether agent `agent_id` still uses its machine: it has not ended, and
+/// its workspace is neither archived nor deleted. `true` when that cannot
+/// be read, so a sandbox is never deleted on a guess.
+async fn uses(svc: &Services, agent_id: &AgentId) -> bool {
+    let session = match svc.store().get_agent_session_summary(agent_id).await {
+        Ok(session) => session,
+        Err(intent_core::Error::NotFound(_)) => return false,
+        Err(_) => return true,
+    };
+    if crate::final_stop::session_ended(&session) {
+        return false;
+    }
+    match svc.store().get_workspace(&session.workspace_id).await {
+        Ok(workspace) => matches!(
+            workspace.status,
+            intent_core::WorkspaceStatus::Active | intent_core::WorkspaceStatus::Inactive
+        ),
+        Err(intent_core::Error::NotFound(_)) => false,
+        Err(_) => true,
     }
 }
 

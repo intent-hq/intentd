@@ -344,9 +344,9 @@ pub(crate) struct Shared {
     /// disk: a `not-running` stop answer for one is final, no exit record
     /// is coming.
     lost_processes: Mutex<HashSet<AgentId>>,
-    /// When the machine last had agent activity: a prompt sent, or a
-    /// journal record of an agent ingested. A cloud machine's idle pause
-    /// counts from it (intent-hq/intent#9237).
+    /// When the machine last had agent activity: a prompt sent, a journal
+    /// record of an agent ingested, or a home call. A cloud machine's idle
+    /// pause counts from it (intent-hq/intent#9237).
     last_activity: Mutex<Instant>,
     /// Agents whose machine runs an acknowledged final stop settled.
     #[cfg(test)]
@@ -2235,6 +2235,9 @@ impl RemoteNode {
             }
         }
         let request_id = frame.request_id;
+        // App file and git use of a cloud home counts as activity for its
+        // idle pause (nodes.md "Cloud homes" 3).
+        self.shared.note_activity();
         let (tx, rx) = oneshot::channel();
         lock(&self.shared.home_call_waiters).insert(request_id, tx);
         let mut pending = Pending {

@@ -265,15 +265,23 @@ pub(crate) fn settle_home_push(
 /// The home an agent placed on `view`'s machine works in (nodes.md
 /// "Workspace homes" → "Sharing"): the workspace's home when it is on that
 /// machine, the placement names no checkout, and the link speaks
-/// nodeProtocol 19.
+/// nodeProtocol 19. A cloud agent waiting for its new sandbox gets the
+/// cloud home that sandbox may become; its start keeps it only when the
+/// sandbox does ([`crate::cloud::home::take`]).
 pub(crate) async fn home_checkout_for(
     svc: &Services,
     workspace_id: &WorkspaceId,
     placement: &AgentPlacement,
     view: &RemotePlacementView,
 ) -> Option<HomeId> {
-    if !svc.workspace_homes() || placement.checkout.is_some() || view.is_cloud() {
+    if !svc.workspace_homes() || placement.checkout.is_some() {
         return None;
+    }
+    if view.is_cloud() && view.is_unlinked() {
+        let entry = view.placement.cloud_machine_id.as_deref()?;
+        return crate::cloud::home::claimable(svc, workspace_id, entry)
+            .await
+            .map(|home| home.home_id);
     }
     let home = svc.store().get_workspace_home(workspace_id).await.ok()??;
     // A moving home is about to stop: the agent gets its own checkout.
@@ -902,6 +910,9 @@ pub(crate) async fn stop_acked(shared: &Arc<Shared>, ack: HomeStopAck) {
     if let Ok(holds) = machine_holds_homes(svc.store(), &shared.machine_id()).await {
         shared.set_holds_homes(holds);
     }
+    // A cloud home's sandbox goes with its last home, once no agent uses
+    // it (nodes.md "Cloud homes" 1).
+    crate::cloud::home::release(svc, &shared.machine_id(), None).await;
     let Some(at) = stop
         .orphaned_at
         .clone()

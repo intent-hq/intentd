@@ -762,7 +762,7 @@ async fn a_cloud_home_sandbox_is_co_owned_by_its_workspace() {
         .ok("workspace.archive", json!({ "workspaceId": ws_id }))
         .await;
     let id = homes.next();
-    machine_until(&mut homes.rpc_ws, id, &sandbox, Option::is_none).await;
+    machine_until(&mut homes.rpc_ws, id, &sandbox, |machine| machine.is_none()).await;
     homes.id += 1000;
     assert!(homes.deleted(&sandbox), "the archived home's sandbox stays");
     let id = homes.next();

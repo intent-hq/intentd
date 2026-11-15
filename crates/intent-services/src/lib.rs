@@ -21440,7 +21440,7 @@ impl WorkspaceApi for Services {
                     // carries no workspace identity — the planner never reads
                     // it — so the id derived below goes straight to the
                     // persist half as an argument.
-                    let planned_initial_agent = match input.initial_agent.take() {
+                    let mut planned_initial_agent = match input.initial_agent.take() {
                         Some(agent) => {
                             let prompt = agent
                                 .prompt
@@ -21596,6 +21596,11 @@ impl WorkspaceApi for Services {
                         )
                     })
                     .await?;
+                    if let (Some(home), Some((plan, _, _))) =
+                        (home.as_deref(), planned_initial_agent.as_mut())
+                    {
+                        crate::remote_machine_ops::share_new_cloud_home(home, plan);
+                    }
                     // Kept alongside the resolved parent below: the known-repo
                     // registration hook checks BOTH roots (a configured
                     // `worktreesLocation` may differ from the boot root, and a

@@ -40,6 +40,10 @@ const RENEW_MINUTES: u32 = 10;
 /// Pause and resume a sandbox at a turn boundary once it ran this long
 /// without a pause: before E2B's shortest continuous-run cap (1 h, Hobby).
 const RUN_CAP_MINUTES: u32 = 50;
+/// Idle pauses of a sandbox holding a home skipped in a row because a
+/// push before them failed; the next one pauses anyway, and the failed
+/// pushes count toward the home's `backupWarning`.
+const MAX_SKIPPED_PAUSES: u32 = 2;
 /// How often the reaper lists this backend's sandboxes.
 const REAP_MINUTES: u32 = 10;
 /// A sandbox no row knows is reaped only once it is this old, so a start in
@@ -810,7 +814,8 @@ async fn renew(
 }
 
 /// Pause in the background; `planned` (the run cap) resumes at once when
-/// the link is still wanted, so the cap resets without a visible pause.
+/// the link is still wanted, so the cap resets without a visible pause. An
+/// idle pause of a sandbox that holds homes pushes them first.
 fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, planned: bool) {
     let svc = svc.clone();
     let client = client.clone();
@@ -819,6 +824,18 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, planned: boo
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
+        if !planned && !pushed_before_pause(&svc, feature, &machine_id).await {
+            return;
+        }
+        // Something began while the homes pushed (a terminal, a call): not
+        // idle any more.
+        if !planned
+            && feature
+                .running_node(&machine_id)
+                .is_some_and(|node| node.shared_ref().busy())
+        {
+            return;
+        }
         if let Err(error) = pause(&svc, feature, &*client, &machine_id).await {
             tracing::debug!(machine = %machine_id, %error, "cloud machine: not paused");
             return;
@@ -834,6 +851,36 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, planned: boo
             }
         }
     });
+}
+
+/// Before an idle pause (nodes.md "Cloud homes" 4): each home the machine
+/// holds pushes `home/head` and `home/wip`. Whether to pause now: a failed
+/// push skips this pause and the idle time starts again, up to
+/// [`MAX_SKIPPED_PAUSES`] in a row; then the sandbox pauses anyway.
+async fn pushed_before_pause(svc: &Services, feature: &RemoteFeature, machine_id: &str) -> bool {
+    if !feature.cloud.begin_push(machine_id) {
+        return false;
+    }
+    let homes = svc.store().homes_on_machine(machine_id).await;
+    let mut failed = homes.is_err();
+    for (workspace_id, home) in homes.unwrap_or_default() {
+        if let Err(error) = crate::home_calls::push_home(svc, &home, &workspace_id).await {
+            tracing::warn!(machine = %machine_id, workspace = %workspace_id, %error, "cloud machine: the home did not push before the idle pause");
+            failed = true;
+        }
+    }
+    feature.cloud.end_push(machine_id);
+    if !failed {
+        feature.cloud.reset_skipped_pauses(machine_id);
+        return true;
+    }
+    if feature.cloud.skip_pause(machine_id) > MAX_SKIPPED_PAUSES {
+        tracing::warn!(machine = %machine_id, "cloud machine: its homes keep failing to push; pausing anyway");
+        feature.cloud.reset_skipped_pauses(machine_id);
+        return true;
+    }
+    feature.cloud.touch(machine_id);
+    false
 }
 
 /// Delete a machine in the background (resume, final stops, delete).
