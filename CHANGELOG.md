@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.220] - 2026-11-15
+
+### 🚀 Features
+
+- *(remote)* A cloud entry can be a workspace home that starts lazily ([#3393](https://github.com/intent-hq/intentd/pull/3393))
+
+### 🐛 Bug Fixes
+
+- *(services)* Order retirement gate, turn-start gate, archive fence ([#3391](https://github.com/intent-hq/intentd/pull/3391))
+
+
 ## [0.11.219] - 2026-11-15
 
 ### 🔧 Refactor
