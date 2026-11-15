@@ -272,10 +272,12 @@ pub(crate) async fn open(
     let feature = svc
         .remote_feature()
         .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;
-    let node = feature
-        .node(svc, &node_id)
-        .await
-        .map_err(|error| home_unavailable(&home, &error.to_string()))?;
+    let node = match feature.node(svc, &node_id).await {
+        Ok(node) => node,
+        Err(error) => {
+            return Err(crate::cloud::home::unreachable(svc, workspace_id, &home, &error).await)
+        }
+    };
     // The caller dialed before taking its script locks, so no lock waits on
     // a dial here. The start is a use of the machine: it waits out an idle
     // pause, and when that pause closed the link meanwhile, it dials once

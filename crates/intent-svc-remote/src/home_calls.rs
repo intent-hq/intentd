@@ -42,6 +42,22 @@ fn call_unavailable(home: &WorkspaceHome, method: &str, detail: &str) -> Error {
     }
 }
 
+/// The error of a call that could not reach `home`'s machine: `starting`
+/// when its cloud sandbox is gone and the home is rebuilt
+/// ([`crate::cloud::home::sandbox_gone`]).
+async fn unreached(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home: &WorkspaceHome,
+    method: &str,
+    error: &Error,
+) -> Error {
+    if crate::cloud::home::sandbox_gone(svc, workspace_id, home).await {
+        return crate::terminals::home_starting(home);
+    }
+    call_unavailable(home, method, &error.to_string())
+}
+
 /// A use of the home's machine, held while a call runs ([`Shared::begin_use`]).
 type Use = tokio::sync::OwnedRwLockReadGuard<()>;
 
@@ -66,20 +82,17 @@ async fn home_node(
     let feature = svc
         .remote_feature()
         .ok_or_else(|| call_unavailable(home, method, "no remote machine feature"))?;
-    let node = feature
-        .node(svc, node_id)
-        .await
-        .map_err(|error| call_unavailable(home, method, &error.to_string()))?;
+    let node = match feature.node(svc, node_id).await {
+        Ok(node) => node,
+        Err(error) => return Err(unreached(svc, workspace_id, home, method, &error).await),
+    };
     let gate = if gated {
         Some(node.shared_ref().begin_use().await)
     } else {
         None
     };
     if let Err(error) = node.connect().await {
-        if crate::cloud::home::sandbox_gone(svc, workspace_id, home).await {
-            return Err(crate::terminals::home_starting(home));
-        }
-        return Err(call_unavailable(home, method, &error.to_string()));
+        return Err(unreached(svc, workspace_id, home, method, &error).await);
     }
     if node.shared_ref().protocol() < HOMES_PROTOCOL {
         return Err(call_unavailable(
