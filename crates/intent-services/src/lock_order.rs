@@ -8,9 +8,12 @@
 //! can deadlock against it (intentd 62ed1acd, `agent_restore_op`, removed in
 //! 112e980e).
 //!
-//! Debug builds record which task holds a retirement gate and panic when that
-//! task then acquires an archive fence, so a reversed order fails in tests
-//! instead of hanging a daemon. Release builds record nothing.
+//! Debug builds record which task holds each fence and gate, and panic when a
+//! task acquires an archive fence while it holds a retirement gate it took
+//! with no fence held, so a reversed order fails in tests instead of hanging
+//! a daemon. A gate taken under a fence is in order: it is skipped, so two
+//! in-order paths joined in one task (`tokio::join!`) do not trip the check.
+//! Release builds record nothing.
 
 use std::future::Future;
 use std::panic::Location;
@@ -36,7 +39,7 @@ impl RetirementGate {
             let guard = Arc::clone(&self.0).lock_owned().await;
             RetirementGuard {
                 _guard: guard,
-                _hold: held::Hold::register(at),
+                _hold: held::Hold::gate(at),
             }
         }
     }
@@ -52,7 +55,7 @@ impl RetirementGate {
         let guard = Arc::clone(&self.0).try_lock_owned()?;
         Ok(RetirementGuard {
             _guard: guard,
-            _hold: held::Hold::register(at),
+            _hold: held::Hold::gate(at),
         })
     }
 
@@ -74,19 +77,26 @@ pub struct RetirementGuard {
     _hold: held::Hold,
 }
 
-/// Panic (debug builds) when the current task holds a retirement gate:
-/// `fence_at` is about to wait on an archive fence, which reverses the order.
-pub(crate) fn check_archive_fence_order(fence_at: &Location<'_>) {
+/// Debug-build record of one held archive fence; see the module docs.
+pub(crate) struct FenceHold {
+    _hold: held::Hold,
+}
+
+/// Check the order, then record the fence hold the caller is about to take.
+/// Panics (debug builds) when the current task holds a retirement gate it
+/// took with no fence held: `fence_at` reverses the order.
+pub(crate) fn enter_archive_fence(fence_at: &'static Location<'static>) -> FenceHold {
     #[cfg(debug_assertions)]
-    if let Some(gate_at) = held::by_current_task() {
+    if let Some(gate_at) = held::unordered_gate() {
         panic!(
             "lock order violation: archive fence acquired at {fence_at} while this task holds \
              the retirement gate taken at {gate_at}; take the archive fence first \
              (see intent_services::lock_order)"
         );
     }
-    #[cfg(not(debug_assertions))]
-    let _ = fence_at;
+    FenceHold {
+        _hold: held::Hold::fence(fence_at),
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -108,7 +118,21 @@ mod held {
             .map_or_else(|| Holder::Thread(std::thread::current().id()), Holder::Task)
     }
 
-    type Entry = (u64, Holder, &'static Location<'static>);
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Fence,
+        /// `under_fence`: the task held a fence when it took the gate.
+        Gate {
+            under_fence: bool,
+        },
+    }
+
+    struct Entry {
+        id: u64,
+        holder: Holder,
+        kind: Kind,
+        at: &'static Location<'static>,
+    }
 
     static HOLDS: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -119,28 +143,55 @@ mod held {
 
     /// Records the acquiring task, so a guard moved to another task still
     /// counts for the task that took it.
-    pub(super) struct Hold(u64);
+    pub(crate) struct Hold(u64);
 
     impl Hold {
-        pub(super) fn register(at: &'static Location<'static>) -> Self {
+        fn register(
+            kind: impl FnOnce(&[Entry], Holder) -> Kind,
+            at: &'static Location<'static>,
+        ) -> Self {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            holds().push((id, current(), at));
+            let holder = current();
+            let mut holds = holds();
+            let kind = kind(&holds, holder);
+            holds.push(Entry {
+                id,
+                holder,
+                kind,
+                at,
+            });
             Self(id)
+        }
+
+        pub(super) fn fence(at: &'static Location<'static>) -> Self {
+            Self::register(|_, _| Kind::Fence, at)
+        }
+
+        pub(super) fn gate(at: &'static Location<'static>) -> Self {
+            Self::register(
+                |holds, holder| Kind::Gate {
+                    under_fence: holds
+                        .iter()
+                        .any(|e| e.holder == holder && e.kind == Kind::Fence),
+                },
+                at,
+            )
         }
     }
 
     impl Drop for Hold {
         fn drop(&mut self) {
-            holds().retain(|(id, _, _)| *id != self.0);
+            holds().retain(|e| e.id != self.0);
         }
     }
 
-    pub(super) fn by_current_task() -> Option<&'static Location<'static>> {
+    /// A gate the current task holds and took with no fence held.
+    pub(super) fn unordered_gate() -> Option<&'static Location<'static>> {
         let me = current();
         holds()
             .iter()
-            .find(|(_, holder, _)| *holder == me)
-            .map(|(_, _, at)| *at)
+            .find(|e| e.holder == me && e.kind == Kind::Gate { under_fence: false })
+            .map(|e| e.at)
     }
 }
 
@@ -148,10 +199,14 @@ mod held {
 mod held {
     use std::panic::Location;
 
-    pub(super) struct Hold;
+    pub(crate) struct Hold;
 
     impl Hold {
-        pub(super) fn register(_at: &'static Location<'static>) -> Self {
+        pub(super) fn fence(_at: &'static Location<'static>) -> Self {
+            Self
+        }
+
+        pub(super) fn gate(_at: &'static Location<'static>) -> Self {
             Self
         }
     }
@@ -183,10 +238,16 @@ mod tests {
     #[should_panic(expected = "lock order violation")]
     async fn the_check_fires_before_waiting_on_a_held_fence() {
         let fence = Arc::new(ArchiveFence::default());
-        let _held = fence.acquire(&ws()).await;
+        let other = {
+            let fence = Arc::clone(&fence);
+            tokio::spawn(async move { fence.acquire(&ws()).await })
+                .await
+                .unwrap()
+        };
         let gate = RetirementGate::default();
         let _retirement = gate.try_lock().unwrap();
         let _archive = fence.acquire(&ws()).await;
+        drop(other);
     }
 
     #[tokio::test]
@@ -195,6 +256,18 @@ mod tests {
         let gate = RetirementGate::default();
         let _archive = fence.acquire(&ws()).await;
         let _retirement = gate.lock().await;
+    }
+
+    #[tokio::test]
+    async fn in_order_paths_joined_in_one_task_are_allowed() {
+        let fence = Arc::new(ArchiveFence::default());
+        let gate = RetirementGate::default();
+        let in_order = || async {
+            let _archive = fence.acquire(&ws()).await;
+            let _retirement = gate.lock().await;
+            tokio::task::yield_now().await;
+        };
+        tokio::join!(in_order(), in_order());
     }
 
     #[tokio::test]

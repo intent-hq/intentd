@@ -15519,7 +15519,8 @@ impl ArchiveFence {
     /// Take `workspace_id`'s fence (FIFO among waiters: tokio's mutex is
     /// fair, so an unarchive queued behind an archive tail acquires before
     /// the tail's own re-acquire). Debug builds panic when the calling task
-    /// holds a [`RetirementGate`] (see [`lock_order`]).
+    /// holds a [`RetirementGate`] it took with no fence held (see
+    /// [`lock_order`]).
     #[expect(
         clippy::missing_panics_doc,
         reason = "internal doc-hidden feature API, not a public library API"
@@ -15531,7 +15532,7 @@ impl ArchiveFence {
     ) -> impl std::future::Future<Output = ArchiveFenceGuard> + Send + 'a {
         let at = std::panic::Location::caller();
         async move {
-            lock_order::check_archive_fence_order(at);
+            let order = lock_order::enter_archive_fence(at);
             let lock = self
                 .locks
                 .lock()
@@ -15544,6 +15545,7 @@ impl ArchiveFence {
                 fence: Arc::clone(self),
                 key: workspace_id.clone(),
                 guard: Some(guard),
+                _order: order,
             }
         }
     }
@@ -15555,6 +15557,7 @@ pub struct ArchiveFenceGuard {
     fence: Arc<ArchiveFence>,
     key: WorkspaceId,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    _order: lock_order::FenceHold,
 }
 
 impl Drop for ArchiveFenceGuard {
