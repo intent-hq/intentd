@@ -254,7 +254,10 @@ async fn steps(svc: &Services, home_move: &HomeMove) -> Result<()> {
         .node_id
         .as_deref()
         .ok_or_else(|| Error::Internal("the new home is not on a machine".into()))?;
-    let restore = crate::homes::home_restore(svc, workspace_id).await;
+    let restore = crate::homes::home_restore(svc, workspace_id)
+        .await
+        .ok()
+        .flatten();
     let reply =
         crate::homes::send_open(svc, workspace_id, &target.home_id, node_id, restore).await?;
     let HomeReply::Open(reply) = reply else {
@@ -320,6 +323,9 @@ async fn rollback(svc: &Services, home_move: &HomeMove) {
         .await
     {
         Ok(true) => {
+            // An old cloud home whose sandbox went meanwhile was renewed
+            // for a rebuild: a call waiting for it starts it.
+            crate::cloud::home::changed(svc);
             svc.publish_workspace_home_changed(workspace_id).await;
             // The target may have opened although its reply was lost: its
             // stop ends its setup and backups and removes the checkout.

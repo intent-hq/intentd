@@ -452,29 +452,35 @@ pub(crate) async fn open_home(svc: &Services, workspace_id: &WorkspaceId) -> Res
 
 /// The hub's `home/head` and `home/wip`, which a new home restores (a
 /// move's target, or a rebuilt cloud home); `None` without a `home/head`.
+///
+/// # Errors
+///
+/// When the workspace or its repository cannot be read.
 pub(crate) async fn home_restore(
     svc: &Services,
     workspace_id: &WorkspaceId,
-) -> Option<HomeRestore> {
-    let workspace = svc.store().get_workspace(workspace_id).await.ok()?;
-    let checkout = crate::launch::checkout_path(&workspace)?;
-    let remote = AgentRemote::home(workspace_id.as_str(), &HomeId::new().0).ok()?;
+) -> Result<Option<HomeRestore>> {
+    let workspace = svc.store().get_workspace(workspace_id).await?;
+    let checkout = crate::launch::checkout_path(&workspace).ok_or_else(|| {
+        Error::InvalidParams("a workspace home needs a workspace with a git repository".into())
+    })?;
+    let remote = AgentRemote::home(workspace_id.as_str(), &HomeId::new().0)?;
     tokio::task::spawn_blocking(move || {
-        let repo = git2::Repository::open(&checkout).ok()?;
+        let repo = git2::Repository::open(&checkout)
+            .map_err(git_error("open the workspace repository"))?;
         let read = |kind| {
             repo.find_reference(&remote.ref_name(kind))
                 .ok()
                 .and_then(|reference| reference.target())
                 .map(|oid| oid.to_string())
         };
-        Some(HomeRestore {
-            head: read(AgentRef::Head)?,
+        Ok(read(AgentRef::Head).map(|head| HomeRestore {
+            head,
             wip: read(AgentRef::Wip),
-        })
+        }))
     })
     .await
-    .ok()
-    .flatten()
+    .map_err(|e| Error::Internal(format!("read the home refs: {e}")))?
 }
 
 /// Send the `homeOpen` of `home_id` to the exposed machine `node_id` and
@@ -499,7 +505,9 @@ pub(crate) async fn send_open(
             .await?
             .is_some() =>
         {
-            home_restore(svc, workspace_id).await
+            // A rebuild whose backup cannot be read fails, as a failed
+            // start: it is never opened as new.
+            home_restore(svc, workspace_id).await?
         }
         None => None,
     };

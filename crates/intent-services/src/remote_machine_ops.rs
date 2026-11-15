@@ -435,13 +435,20 @@ impl Services {
         content.push_str(
             "\nNothing was merged. To bring it back, fetch the ref and merge or cherry-pick it in the home checkout.\n",
         );
-        self.post_home_notice(workspace_id, "Work left on the old home", content)
-            .await
+        self.post_home_notice(
+            workspace_id,
+            intent_core::NoteId::new(),
+            "Work left on the old home",
+            content,
+        )
+        .await
     }
 
     /// The workspace's notice that its cloud home was rebuilt (nodes.md
     /// "Cloud homes" 5): the sandbox that held it on `home_name` was
     /// deleted, and a new one holds it from the backup of `last_backup_at`.
+    /// The note's id is the rebuilt home's `home_id` (a fresh UUID), so a
+    /// retry after a failure or a restart finds it instead of posting again.
     ///
     /// # Errors
     ///
@@ -449,6 +456,7 @@ impl Services {
     pub async fn post_home_rebuilt_notice(
         &self,
         workspace_id: &WorkspaceId,
+        home_id: &intent_core::HomeId,
         home_name: &str,
         last_backup_at: Option<&str>,
     ) -> Result<intent_core::NoteId> {
@@ -457,9 +465,13 @@ impl Services {
             |at| format!("its last backup ({at})"),
         );
         let content = format!(
-            "The cloud sandbox that held this workspace's home on {home_name} was deleted (for example, after it stayed paused too long). A new sandbox now holds the home, restored from {backup}.\n\nChanges made after that backup are not on the new home.\n"
+            "The cloud sandbox that held this workspace's home on {home_name} was deleted. A new sandbox now holds the home, restored from {backup}.\n\nChanges made after that backup are not on the new home.\n"
         );
-        self.post_home_notice(workspace_id, "The home was rebuilt", content)
+        let id = intent_core::NoteId::from_string(home_id.as_str());
+        if self.store.get_note(workspace_id, &id).await.is_ok() {
+            return Ok(id);
+        }
+        self.post_home_notice(workspace_id, id, "The home was rebuilt", content)
             .await
     }
 
@@ -467,15 +479,14 @@ impl Services {
     async fn post_home_notice(
         &self,
         workspace_id: &WorkspaceId,
+        id: intent_core::NoteId,
         title: &str,
         content: String,
     ) -> Result<intent_core::NoteId> {
-        use intent_core::{
-            ContentType, Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility,
-        };
+        use intent_core::{ContentType, Note, NoteMetadata, NoteVersionAuthor, NoteVisibility};
         let now = now_iso();
         let note = Note {
-            id: NoteId::new(),
+            id,
             workspace_id: workspace_id.clone(),
             title: title.to_owned(),
             content,

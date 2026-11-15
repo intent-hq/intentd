@@ -270,8 +270,9 @@ impl Store {
     /// Roll back the move to `home_id`: in one transaction the move goes,
     /// the old home gets back its state and `since`, and a target on a
     /// machine gets a `retired` stop whose last push is discarded (its
-    /// machine may have opened it although the reply never came). `false`
-    /// when that move is gone.
+    /// machine may have opened it although the reply never came). An old
+    /// cloud home whose sandbox was removed meanwhile is renewed for a
+    /// rebuild in the same transaction. `false` when that move is gone.
     ///
     /// # Errors
     ///
@@ -306,6 +307,7 @@ impl Store {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+        crate::home_rebuild_repo::renew_if_sandbox_gone(&mut tx, workspace_id, now).await?;
         tx.commit().await.map_err(db)?;
         Ok(true)
     }

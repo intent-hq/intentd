@@ -261,10 +261,10 @@ pub(crate) async fn agent_start_failed(
 }
 
 /// Cloud machine `machine_id`'s sandbox is gone (deleted, or the provider
-/// lost it), before its row goes: each attached home it held becomes a new
-/// home to rebuild at its next use (nodes.md "Cloud homes" 5), and the
-/// home stops it owed are dropped. The workspaces whose home changed, to
-/// announce with [`announce_rebuilds`] once the row is gone.
+/// lost it): its row goes, with the home stops it owed, and with `rebuild`
+/// each attached home it held becomes a new home to rebuild at its next
+/// use (nodes.md "Cloud homes" 5), all in one store transaction. The homes
+/// renewed, to announce with [`announce_rebuilds`].
 ///
 /// # Errors
 ///
@@ -272,10 +272,11 @@ pub(crate) async fn agent_start_failed(
 pub(crate) async fn sandbox_removed(
     svc: &Services,
     machine_id: &str,
+    rebuild: bool,
 ) -> Result<Vec<intent_store::HomeRebuild>> {
     let rebuilds = svc
         .store()
-        .rebuild_cloud_homes_on_machine(machine_id, &intent_core::now_iso())
+        .remove_cloud_machine(machine_id, rebuild, &intent_core::now_iso())
         .await?;
     for rebuild in &rebuilds {
         tracing::info!(workspace = %rebuild.workspace_id, machine = %machine_id, from = %rebuild.from_home_id, home = %rebuild.home_id, "cloud home: its sandbox is gone; the home is rebuilt at its next use");
@@ -295,33 +296,64 @@ pub(crate) async fn announce_rebuilds(svc: &Services, rebuilds: &[intent_store::
     }
 }
 
+/// The rebuilt homes whose notice is being posted, so two opens that end
+/// together post it once.
+static POSTING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<HomeId>>> =
+    std::sync::LazyLock::new(std::sync::Mutex::default);
+
 /// Home `home_id` opened: when it rebuilt a cloud home whose sandbox was
-/// deleted, the workspace gets its notice, once.
+/// deleted, the workspace gets its notice, once. The rebuild is recorded as
+/// done only after the notice is posted, so a failure or a restart in
+/// between posts it at the next open; the note's id is the home's, so that
+/// open finds a note already posted instead of posting another.
 pub(crate) async fn rebuilt(svc: &Services, workspace_id: &WorkspaceId, home_id: &HomeId) {
-    match svc.store().finish_home_rebuild(workspace_id, home_id).await {
-        Ok(true) => {}
-        Ok(false) => return,
+    if !crate::lock(&POSTING).insert(home_id.clone()) {
+        return;
+    }
+    post_rebuilt(svc, workspace_id, home_id).await;
+    crate::lock(&POSTING).remove(home_id);
+}
+
+async fn post_rebuilt(svc: &Services, workspace_id: &WorkspaceId, home_id: &HomeId) {
+    match svc.store().home_rebuild_of(workspace_id, home_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
         Err(error) => {
-            tracing::warn!(workspace = %workspace_id, %error, "cloud home: could not record the rebuild");
+            tracing::warn!(workspace = %workspace_id, %error, "cloud home: could not read the rebuild");
             return;
         }
     }
-    tracing::info!(workspace = %workspace_id, home = %home_id, "cloud home: rebuilt from its backup");
-    let Ok(Some(home)) = svc.store().get_workspace_home(workspace_id).await else {
-        return;
+    let home = match svc.store().get_workspace_home(workspace_id).await {
+        Ok(Some(home)) if &home.home_id == home_id => home,
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(workspace = %workspace_id, %error, "cloud home: could not read the rebuilt home");
+            return;
+        }
     };
     if let Err(error) = svc
-        .post_home_rebuilt_notice(workspace_id, &home.name, home.last_backup_at.as_deref())
+        .post_home_rebuilt_notice(
+            workspace_id,
+            home_id,
+            &home.name,
+            home.last_backup_at.as_deref(),
+        )
         .await
     {
         tracing::warn!(workspace = %workspace_id, %error, "cloud home: could not post the rebuilt home's notice");
+        return;
+    }
+    tracing::info!(workspace = %workspace_id, home = %home_id, "cloud home: rebuilt from its backup");
+    if let Err(error) = svc.store().finish_home_rebuild(workspace_id, home_id).await {
+        tracing::warn!(workspace = %workspace_id, %error, "cloud home: could not record the rebuild");
     }
 }
 
 /// Whether a call that could not reach cloud home `home`'s sandbox should
 /// be told the home starts: the sandbox is gone (its loss is being
-/// recorded, or the home was renewed for a rebuild meanwhile), so the next
-/// call starts a new one.
+/// recorded, or the home was renewed for a rebuild meanwhile). The renewed
+/// home's start is begun here, so the app sees it start and retries once
+/// it is attached.
 pub(crate) async fn sandbox_gone(
     svc: &Services,
     workspace_id: &WorkspaceId,
@@ -342,10 +374,16 @@ pub(crate) async fn sandbox_gone(
     let Ok(Some(current)) = svc.store().get_workspace_home(workspace_id).await else {
         return false;
     };
-    matches!(
+    let renewed = matches!(
         svc.store().home_rebuild_of(workspace_id, &current.home_id).await,
         Ok(Some(from)) if from == home.home_id
-    )
+    );
+    if renewed && needs_start(&current) {
+        if let Ok(feature) = super::feature(svc) {
+            ensure_started(svc, feature, workspace_id, &current).await;
+        }
+    }
+    renewed
 }
 
 /// The error of a call that could not reach `home`'s machine: `starting`
