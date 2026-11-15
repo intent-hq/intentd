@@ -586,15 +586,15 @@ pub(super) fn machine_name(entry_name: &str, agent_name: &str) -> String {
         .collect()
 }
 
-/// An idempotency key for one start for `owner` (an agent id, or a
+/// An idempotency key for one start for `start_for` (an agent id, or a
 /// home-only start's key): E2B keys must match `[a-z0-9-]{1,255}`.
-fn idempotency_key(owner: &str) -> String {
-    let owner: String = owner
+fn idempotency_key(start_for: &str) -> String {
+    let starter: String = start_for
         .to_ascii_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    format!("intent-{owner}-{}", uuid::Uuid::new_v4().simple())
+    format!("intent-{starter}-{}", uuid::Uuid::new_v4().simple())
 }
 
 /// A sandbox's entry settings and the client of its saved key.
