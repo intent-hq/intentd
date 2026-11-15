@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.219] - 2026-11-15
+
+### 🔧 Refactor
+
+- *(services)* One per-agent resource registry for lifecycle cleanup ([#3390](https://github.com/intent-hq/intentd/pull/3390))
+
+
 ## [0.11.218] - 2026-11-15
 
 ### 📚 Documentation
