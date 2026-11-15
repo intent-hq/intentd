@@ -57,6 +57,7 @@ fn map_row(row: &SqliteRow) -> Result<HomeMove> {
     let from_state = match row.try_get::<String, _>("from_state").map_err(db)?.as_str() {
         "attached" => HomeState::Attached,
         "detached" => HomeState::Detached,
+        "starting" => HomeState::Starting,
         other => return Err(db(format!("unknown state {other}"))),
     };
     let started_at: String = row.try_get("started_at").map_err(db)?;

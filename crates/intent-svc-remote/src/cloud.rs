@@ -18,6 +18,7 @@
 
 mod bootstrap;
 pub(crate) mod config;
+pub(crate) mod home;
 pub(crate) mod lifecycle;
 mod methods;
 mod start;
@@ -66,17 +67,22 @@ impl StartFailure {
 
 type StartOutcome = Option<std::result::Result<(), StartFailure>>;
 
-/// A sandbox start in flight: the E2B entry it starts with and its outcome.
+/// A sandbox start in flight: the E2B entry it starts with, its workspace
+/// and its outcome.
 struct Start {
     entry: String,
+    workspace: String,
     outcome: watch::Receiver<StartOutcome>,
 }
 
 /// The cloud machines' share of the remote feature's state.
 #[derive(Default)]
 pub(crate) struct CloudState {
-    /// Sandbox starts in flight, by agent id.
+    /// Sandbox starts in flight, by agent id (a home-only start by
+    /// [`home::start_key`]).
     starts: Mutex<HashMap<String, Start>>,
+    /// Woken at each change of a cloud home's state or machine.
+    pub(crate) home_changed: tokio::sync::Notify,
     /// `configure` and `remove` take turns.
     settings: tokio::sync::Mutex<()>,
     /// Paused machines: dialed only on a demand, which resumes them.
@@ -246,7 +252,8 @@ impl CloudState {
         self.supervisor.swap(true, Ordering::SeqCst)
     }
 
-    /// The agents whose sandbox start is in flight.
+    /// The agents whose sandbox start is in flight (and the keys of
+    /// home-only starts).
     fn starting_agents(&self) -> HashSet<String> {
         crate::lock(&self.starts).keys().cloned().collect()
     }
@@ -277,6 +284,30 @@ async fn started_by(svc: &Services) -> intent_core::machines::CloudStartedBy {
         Some(Caller::Agent { agent_id }) => agent_person(svc, &agent_id).await,
         _ => None,
     };
+    person_started_by(svc, person).await
+}
+
+/// `cloud.startedBy` of a sandbox that holds `workspace_id`'s home: the
+/// workspace's owner (nodes.md "Cloud homes" 2), else this backend's
+/// primary principal.
+pub(crate) async fn owner_started_by(
+    svc: &Services,
+    workspace_id: &intent_core::WorkspaceId,
+) -> intent_core::machines::CloudStartedBy {
+    let owner = svc
+        .store()
+        .get_workspace_owner_principal_id(workspace_id)
+        .await
+        .ok()
+        .flatten();
+    person_started_by(svc, owner).await
+}
+
+/// `cloud.startedBy` for `person`, or this backend's primary principal.
+async fn person_started_by(
+    svc: &Services,
+    person: Option<intent_core::PrincipalId>,
+) -> intent_core::machines::CloudStartedBy {
     let principal = match person {
         Some(principal_id) => match svc.store().get_principal(&principal_id).await {
             Ok(principal) => Ok(principal),

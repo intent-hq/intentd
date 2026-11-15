@@ -79,6 +79,7 @@ pub(crate) async fn home_call(
     params: Map<String, Value>,
     timeout: Duration,
 ) -> Result<std::result::Result<Value, HomeCallError>> {
+    let home = &crate::cloud::home::ready(svc, workspace_id, home.clone()).await?;
     let node = home_node(svc, home, method).await?;
     let frame = HomeCall {
         request_id: LinkId::new_v4(),
@@ -128,6 +129,7 @@ pub(crate) async fn push_home(
 
 /// Ask the home for one synchronous push.
 async fn push_once(svc: &Services, home: &WorkspaceHome, workspace_id: &WorkspaceId) -> Result<()> {
+    let home = &crate::cloud::home::ready(svc, workspace_id, home.clone()).await?;
     let node = home_node(svc, home, "homePush").await?;
     let request_id = LinkId::new_v4();
     let frame = LinkFrame::HomePush(HomePush {

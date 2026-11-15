@@ -401,6 +401,7 @@ pub(crate) async fn begin_start(
             agent_id.to_string(),
             super::Start {
                 entry: entry.id.clone(),
+                workspace: workspace_id.to_string(),
                 outcome: receiver,
             },
         );
@@ -585,20 +586,155 @@ pub(super) fn machine_name(entry_name: &str, agent_name: &str) -> String {
         .collect()
 }
 
-/// An idempotency key for one start of `agent_id`: E2B keys must match
-/// `[a-z0-9-]{1,255}`.
-fn idempotency_key(agent_id: &AgentId) -> String {
-    let agent: String = agent_id
-        .as_str()
+/// An idempotency key for one start for `owner` (an agent id, or a
+/// home-only start's key): E2B keys must match `[a-z0-9-]{1,255}`.
+fn idempotency_key(owner: &str) -> String {
+    let owner: String = owner
         .to_ascii_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    format!("intent-{agent}-{}", uuid::Uuid::new_v4().simple())
+    format!("intent-{owner}-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// A sandbox's entry settings and the client of its saved key.
+struct Prepared {
+    saved: config::ProviderConfig,
+    key: intent_nodes::cloud::SecretString,
+    client: config::Provider,
+}
+
+async fn prepare(svc: &Services, cloud_machine_id: &str) -> Result<Prepared> {
+    let saved = config::load(svc, cloud_machine_id)
+        .await?
+        .ok_or_else(config::not_configured)?;
+    let key = config::saved_key(svc, cloud_machine_id)
+        .await?
+        .ok_or_else(config::not_configured)?;
+    let client = config::client(&saved, key.clone())?;
+    Ok(Prepared { saved, key, client })
+}
+
+/// Create the sandbox of a start for `owner` (the agent id the sandbox is
+/// tagged with; a home-only start's key) in `workspace_id`.
+async fn create(
+    svc: &Services,
+    prepared: &Prepared,
+    workspace_id: &WorkspaceId,
+    owner: &str,
+    cloud_machine_id: &str,
+) -> Result<intent_nodes::cloud::CloudInstance> {
+    let saved = &prepared.saved;
+    let backend_id = svc.store().daemon_id().await?;
+    let mut metadata = BTreeMap::new();
+    metadata.insert("intentBackendId".to_owned(), backend_id);
+    metadata.insert("workspaceId".to_owned(), workspace_id.to_string());
+    metadata.insert("agentId".to_owned(), owner.to_owned());
+    metadata.insert("intentEntryId".to_owned(), cloud_machine_id.to_owned());
+    metadata.insert(
+        "intentdVersion".to_owned(),
+        config::intentd_version().to_owned(),
+    );
+    let created = prepared
+        .client
+        .create(&CreateInstance {
+            image: saved.template(saved.size),
+            timeout_secs: Some(super::lifecycle::SANDBOX_TIMEOUT_SECS),
+            pause_on_timeout: Some(true),
+            tags: metadata,
+            idempotency_key: Some(idempotency_key(owner)),
+            plan: saved.plan(saved.size),
+            disk_gib: saved.northflank.as_ref().map(|nf| nf.disk_gib),
+        })
+        .await
+        .map_err(|error| config::to_error(&error, config::Phase::Create, prepared.client.kind()));
+    if let Err(error) = &created {
+        if is_key_rejected(error) {
+            config::note_key_rejected(svc, cloud_machine_id, &prepared.key).await;
+        }
+    }
+    created
+}
+
+/// Start `intentd` in the sandbox and mint its executor credential.
+async fn mint(
+    svc: &Services,
+    prepared: &Prepared,
+    created: &intent_nodes::cloud::CloudInstance,
+) -> Result<bootstrap::Minted> {
+    let backend_id = svc.store().daemon_id().await?;
+    let backend_name = crate::methods::backend_name(svc).await;
+    let fingerprint = svc
+        .own_machine_routes()
+        .await
+        .map(|routes| routes.fingerprint);
+    let params = bootstrap::mint_params(&backend_id, &backend_name, fingerprint.as_deref());
+    bootstrap::run(&*prepared.client, created, &params).await
+}
+
+/// Who a new sandbox's machine row is for: the agent it starts for (or a
+/// home-only start's key) and its workspace.
+struct RowOwner<'a> {
+    owner: &'a str,
+    workspace_id: &'a WorkspaceId,
+    cloud_machine_id: &'a str,
+    started_by: intent_core::machines::CloudStartedBy,
+    name: String,
+}
+
+/// Add the hidden machine row of a minted sandbox. Returns its id.
+async fn add_row(
+    feature: &RemoteFeature,
+    svc: &Services,
+    prepared: &Prepared,
+    created: &intent_nodes::cloud::CloudInstance,
+    minted: bootstrap::Minted,
+    row: RowOwner<'_>,
+) -> Result<String> {
+    let saved = &prepared.saved;
+    let cloud = CloudMachine {
+        provider: prepared.client.kind().to_owned(),
+        cloud_machine_id: row.cloud_machine_id.to_owned(),
+        sandbox_id: created.id.clone(),
+        volume_id: created.volume_id.clone(),
+        state: CloudSandboxState::Running,
+        template: saved.template(saved.size),
+        size: saved.size,
+        started_by: row.started_by,
+        agent_id: row.owner.to_owned(),
+        workspace_id: row.workspace_id.to_string(),
+        started_at: now_iso(),
+        running_seconds: 0,
+        running_since: Some(now_iso()),
+        paused_at: None,
+    };
+    let machine_id = minted.machine_id.clone();
+    crate::methods::add_machine(
+        feature,
+        svc,
+        AddParams {
+            machine_id: minted.machine_id,
+            name: row.name,
+            hosts: minted.hosts,
+            port: minted.port,
+            tc_address: minted.tc_address,
+            fingerprint: minted.fingerprint,
+            credential_id: minted.credential_id,
+            token: minted.token,
+        },
+        Some(cloud),
+    )
+    .await?;
+    Ok(machine_id)
 }
 
 /// One sandbox start: create, bootstrap, add the machine row and launch.
 /// The sandbox is deleted when a later step fails.
+///
+/// When the workspace's home is a cloud home of this entry that runs
+/// nowhere yet, the sandbox becomes the home (nodes.md "Choosing the
+/// home"): its `startedBy` is the workspace owner, and the home checkout is
+/// opened (and its setup run) before the agent launches.
 async fn start(
     svc: &Services,
     workspace_id: &WorkspaceId,
@@ -607,17 +743,51 @@ async fn start(
     started_by: intent_core::machines::CloudStartedBy,
 ) -> Result<()> {
     let feature = super::feature(svc)?;
+    let home = super::home::claimable(svc, workspace_id, cloud_machine_id).await;
+    let started_by = match &home {
+        Some(_) => super::owner_started_by(svc, workspace_id).await,
+        None => started_by,
+    };
+    if let Some(home) = &home {
+        super::home::mark_starting(svc, workspace_id, home).await;
+    }
+    let mut made = None;
+    let started = start_for_agent(
+        feature,
+        svc,
+        workspace_id,
+        agent_id,
+        cloud_machine_id,
+        started_by,
+        home.as_ref(),
+        &mut made,
+    )
+    .await;
+    if let (Err(_), Some(home)) = (&started, &home) {
+        super::home::start_failed(svc, workspace_id, &home.home_id, made.as_deref()).await;
+    }
+    started
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one start's inputs, read once by the caller"
+)]
+async fn start_for_agent(
+    feature: &RemoteFeature,
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+    cloud_machine_id: &str,
+    started_by: intent_core::machines::CloudStartedBy,
+    home: Option<&intent_core::WorkspaceHome>,
+    made: &mut Option<String>,
+) -> Result<()> {
     step(svc, workspace_id, agent_id, CloudStartStep::CreatingSandbox).await;
-    let saved = config::load(svc, cloud_machine_id)
-        .await?
-        .ok_or_else(config::not_configured)?;
-    let key = config::saved_key(svc, cloud_machine_id)
-        .await?
-        .ok_or_else(config::not_configured)?;
-    let client = config::client(&saved, key.clone())?;
+    let prepared = prepare(svc, cloud_machine_id).await?;
     // A rename may have run since admission wrote the entry's name.
     let renamed = crate::view::update(svc.store(), workspace_id, agent_id, |view| {
-        view.node_name.clone_from(&saved.name);
+        view.node_name.clone_from(&prepared.saved.name);
     })
     .await;
     if matches!(renamed, Ok(true)) {
@@ -625,88 +795,50 @@ async fn start(
             .await;
     }
     let session = svc.store().get_agent_session_summary(agent_id).await?;
-    let backend_id = svc.store().daemon_id().await?;
-    let template = saved.template(saved.size);
-    let mut metadata = BTreeMap::new();
-    metadata.insert("intentBackendId".to_owned(), backend_id.clone());
-    metadata.insert("workspaceId".to_owned(), workspace_id.to_string());
-    metadata.insert("agentId".to_owned(), agent_id.to_string());
-    metadata.insert("intentEntryId".to_owned(), cloud_machine_id.to_owned());
-    metadata.insert(
-        "intentdVersion".to_owned(),
-        config::intentd_version().to_owned(),
-    );
-    let created = client
-        .create(&CreateInstance {
-            image: template.clone(),
-            timeout_secs: Some(super::lifecycle::SANDBOX_TIMEOUT_SECS),
-            pause_on_timeout: Some(true),
-            tags: metadata,
-            idempotency_key: Some(idempotency_key(agent_id)),
-            plan: saved.plan(saved.size),
-            disk_gib: saved.northflank.as_ref().map(|nf| nf.disk_gib),
-        })
-        .await
-        .map_err(|error| config::to_error(&error, config::Phase::Create, client.kind()));
-    let created = match created {
-        Ok(created) => created,
-        Err(error) => {
-            if is_key_rejected(&error) {
-                config::note_key_rejected(svc, cloud_machine_id, &key).await;
-            }
-            return Err(error);
-        }
-    };
+    let created = create(
+        svc,
+        &prepared,
+        workspace_id,
+        agent_id.as_str(),
+        cloud_machine_id,
+    )
+    .await?;
     let sandbox_id = created.id.clone();
     let linked = async {
-        let backend_name = crate::methods::backend_name(svc).await;
-        let fingerprint = svc
-            .own_machine_routes()
-            .await
-            .map(|routes| routes.fingerprint);
-        let params = bootstrap::mint_params(&backend_id, &backend_name, fingerprint.as_deref());
         step(svc, workspace_id, agent_id, CloudStartStep::StartingDaemon).await;
-        let minted = bootstrap::run(&*client, &created, &params).await?;
+        let minted = mint(svc, &prepared, &created).await?;
         step(svc, workspace_id, agent_id, CloudStartStep::Connecting).await;
-        let cloud = CloudMachine {
-            provider: client.kind().to_owned(),
-            cloud_machine_id: cloud_machine_id.to_owned(),
-            sandbox_id: sandbox_id.clone(),
-            volume_id: created.volume_id.clone(),
-            state: CloudSandboxState::Running,
-            template: template.clone(),
-            size: saved.size,
-            started_by,
-            agent_id: agent_id.to_string(),
-            workspace_id: workspace_id.to_string(),
-            started_at: now_iso(),
-            running_seconds: 0,
-            running_since: Some(now_iso()),
-            paused_at: None,
-        };
-        let machine_id = minted.machine_id.clone();
-        crate::methods::add_machine(
+        let machine_id = add_row(
             feature,
             svc,
-            AddParams {
-                machine_id: minted.machine_id,
-                name: machine_name(&saved.name, &session.name),
-                hosts: minted.hosts,
-                port: minted.port,
-                tc_address: minted.tc_address,
-                fingerprint: minted.fingerprint,
-                credential_id: minted.credential_id,
-                token: minted.token,
+            &prepared,
+            &created,
+            minted,
+            RowOwner {
+                owner: agent_id.as_str(),
+                workspace_id,
+                cloud_machine_id,
+                started_by,
+                name: machine_name(&prepared.saved.name, &session.name),
             },
-            Some(cloud),
         )
         .await?;
+        *made = Some(machine_id.clone());
         // `cloudMachines.remove` may have run meanwhile: nothing would be
         // left to delete this sandbox.
         let launched = if config::load(svc, cloud_machine_id).await?.is_none() {
             Err(config::not_configured())
         } else {
-            link(feature, svc, workspace_id, agent_id, &machine_id).await
+            match home {
+                Some(home) => {
+                    super::home::take(svc, workspace_id, home, cloud_machine_id, &machine_id).await
+                }
+                None => Ok(()),
+            }
+        };
+        let launched = match launched {
+            Ok(()) => link(feature, svc, workspace_id, agent_id, &machine_id).await,
+            Err(error) => Err(error),
         };
         if let Err(error) = launched {
             // The sandbox itself is deleted once, below.
@@ -719,9 +851,72 @@ async fn start(
     }
     .await;
     if linked.is_err() {
-        if let Err(error) = client.delete(&sandbox_id).await {
+        if let Err(error) = prepared.client.delete(&sandbox_id).await {
             tracing::warn!(%error, sandbox = %sandbox_id, "cloud machine: could not delete the sandbox of a failed start");
         }
+    }
+    linked
+}
+
+/// A home-only sandbox start (nodes.md "Cloud homes"): no agent; the
+/// sandbox becomes `workspace_id`'s home `home_id` and its home checkout is
+/// opened, with its setup. `startedBy` is the workspace owner. The sandbox
+/// is deleted when a later step fails, also when another start became the
+/// home first.
+pub(crate) async fn start_home(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home_id: &intent_core::HomeId,
+    cloud_machine_id: &str,
+) -> Result<()> {
+    let feature = super::feature(svc)?;
+    let owner = super::home::start_key(workspace_id);
+    let started_by = super::owner_started_by(svc, workspace_id).await;
+    let prepared = prepare(svc, cloud_machine_id).await?;
+    let created = create(svc, &prepared, workspace_id, &owner, cloud_machine_id).await?;
+    let sandbox_id = created.id.clone();
+    let mut made = None;
+    let linked = async {
+        let minted = mint(svc, &prepared, &created).await?;
+        let machine_id = add_row(
+            feature,
+            svc,
+            &prepared,
+            &created,
+            minted,
+            RowOwner {
+                owner: &owner,
+                workspace_id,
+                cloud_machine_id,
+                started_by,
+                name: machine_name(&prepared.saved.name, "Home"),
+            },
+        )
+        .await?;
+        made = Some(machine_id.clone());
+        if config::load(svc, cloud_machine_id).await?.is_none() {
+            return Err(config::not_configured());
+        }
+        if !super::home::claim(svc, workspace_id, home_id, cloud_machine_id, &machine_id).await? {
+            return Err(Error::Internal(
+                "another sandbox became the workspace's home first".into(),
+            ));
+        }
+        super::home::open(svc, workspace_id, home_id, &machine_id).await
+    }
+    .await;
+    if linked.is_err() {
+        if let Some(machine_id) = &made {
+            if let Ok(Some(row)) = svc.store().get_exposed_machine(machine_id).await {
+                delete_machine(feature, svc, &row, None).await;
+            }
+        }
+        if let Err(error) = prepared.client.delete(&sandbox_id).await {
+            tracing::warn!(%error, sandbox = %sandbox_id, "cloud machine: could not delete the sandbox of a failed home start");
+        }
+    }
+    if linked.is_err() {
+        super::home::start_failed(svc, workspace_id, home_id, made.as_deref()).await;
     }
     linked
 }

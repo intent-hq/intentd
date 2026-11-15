@@ -123,20 +123,31 @@ pub(crate) async fn machine_candidate(svc: &Services, node_id: &str) -> Candidat
 }
 
 /// See [`intent_services::feature_api::feature_ports::RemoteLaunchPort::choose_home`].
-/// Cloud entries are not homes yet: they come with cloud homes.
+/// A cloud entry (the initial agent's, or a row of the list) is recorded
+/// with no machine: its sandbox starts lazily ([`crate::cloud::home`]).
 pub(crate) async fn choose_home(
     svc: &Services,
     initial: Option<&RemotePlacementView>,
 ) -> Result<WorkspaceHome> {
-    if let Some(view) = initial.filter(|view| !view.is_cloud() && !view.node_id.is_empty()) {
-        if let Candidate::Home(home) = machine_candidate(svc, &view.node_id).await {
-            return Ok(home);
+    if let Some(view) = initial {
+        if view.is_cloud() {
+            if let Some(entry) = view.placement.cloud_machine_id.as_deref() {
+                return Ok(crate::cloud::home::new_home(entry, &view.node_name));
+            }
+        } else if !view.node_id.is_empty() {
+            if let Candidate::Home(home) = machine_candidate(svc, &view.node_id).await {
+                return Ok(home);
+            }
         }
     }
     let mut too_old_only = None;
     for row in crate::order::current(svc).await? {
-        let MachineOrderKey::Machine { node_id } = row.key else {
-            continue;
+        let node_id = match row.key {
+            MachineOrderKey::Machine { node_id } => node_id,
+            MachineOrderKey::Cloud { cloud_machine_id } => {
+                return Ok(crate::cloud::home::new_home(&cloud_machine_id, &row.name));
+            }
+            MachineOrderKey::Local => continue,
         };
         match machine_candidate(svc, &node_id).await {
             Candidate::Home(home) => return Ok(home),
@@ -491,7 +502,7 @@ async fn home_open_frame(
 }
 
 /// Record how a `homeOpen` ended.
-async fn settle_open(
+pub(crate) async fn settle_open(
     svc: &Services,
     workspace_id: &WorkspaceId,
     home_id: &HomeId,
@@ -504,20 +515,24 @@ async fn settle_open(
     };
     match reply.outcome {
         HomeOpenOutcome::Ready => {
-            // Only a detached home is attached here: a moving one keeps its
-            // state until the move ends.
-            if svc
-                .store()
-                .move_workspace_home_state(
-                    workspace_id,
-                    home_id,
-                    HomeState::Detached,
-                    HomeState::Attached,
-                    &intent_core::now_iso(),
-                )
-                .await?
-            {
-                svc.publish_workspace_home_changed(workspace_id).await;
+            // Only a detached or starting home is attached here: a moving
+            // one keeps its state until the move ends.
+            for from in [HomeState::Starting, HomeState::Detached] {
+                if svc
+                    .store()
+                    .move_workspace_home_state(
+                        workspace_id,
+                        home_id,
+                        from,
+                        HomeState::Attached,
+                        &intent_core::now_iso(),
+                    )
+                    .await?
+                {
+                    crate::cloud::home::changed(svc);
+                    svc.publish_workspace_home_changed(workspace_id).await;
+                    break;
+                }
             }
             Ok(())
         }

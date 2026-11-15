@@ -36,6 +36,7 @@ fn state_from_db(text: &str) -> Result<HomeState> {
         "attached" => Ok(HomeState::Attached),
         "detached" => Ok(HomeState::Detached),
         "moving" => Ok(HomeState::Moving),
+        "starting" => Ok(HomeState::Starting),
         other => Err(db(format!("unknown state {other}"))),
     }
 }
@@ -335,6 +336,66 @@ impl Store {
         .bind(&workspace_id.0)
         .bind(&home_id.0)
         .bind(from.as_str())
+        .execute(self.write_pool())
+        .await
+        .map_err(db)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Record machine `node_id` as the running sandbox of cloud home
+    /// `home_id` (entry `cloud_machine_id`), when no sandbox holds it yet.
+    /// `false` when it is not the workspace's home, is on another entry, or
+    /// another sandbox took it first.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn claim_cloud_home(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        cloud_machine_id: &str,
+        node_id: &str,
+    ) -> Result<bool> {
+        let done = sqlx::query(
+            "UPDATE workspace_home SET node_id = ? \
+             WHERE workspace_id = ? AND home_id = ? AND cloud_machine_id = ? \
+             AND node_id IS NULL AND state != 'moving'",
+        )
+        .bind(node_id)
+        .bind(&workspace_id.0)
+        .bind(&home_id.0)
+        .bind(cloud_machine_id)
+        .execute(self.write_pool())
+        .await
+        .map_err(db)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// A start of cloud home `home_id` failed: the home is detached at
+    /// once, with no machine, unless another start holds it (its machine
+    /// is neither none nor `node_id`) or it is moving. `false` when nothing
+    /// changed.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn detach_cloud_home(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        node_id: Option<&str>,
+        since: &str,
+    ) -> Result<bool> {
+        let done = sqlx::query(
+            "UPDATE workspace_home SET node_id = NULL, state = 'detached', since = ? \
+             WHERE workspace_id = ? AND home_id = ? AND cloud_machine_id IS NOT NULL \
+             AND state IN ('attached', 'starting') AND (node_id IS NULL OR node_id = ?)",
+        )
+        .bind(since)
+        .bind(&workspace_id.0)
+        .bind(&home_id.0)
+        .bind(node_id)
         .execute(self.write_pool())
         .await
         .map_err(db)?;

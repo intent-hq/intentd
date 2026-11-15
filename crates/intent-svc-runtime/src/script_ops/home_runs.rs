@@ -45,7 +45,7 @@ impl Launch {
 
 impl ScriptManager {
     /// Whether `ws`'s home runs run on its home: an orchestrator serving
-    /// homes, with the workspace's home on a machine.
+    /// homes, with the workspace's home on a machine or a cloud entry.
     async fn runs_on_home(&self, ws: &WorkspaceId) -> Result<bool> {
         let Some(svc) = &self.owner_services else {
             return Ok(false);
@@ -57,7 +57,7 @@ impl ScriptManager {
             .store()
             .get_workspace_home(ws)
             .await?
-            .is_some_and(|home| home.node_id.is_some()))
+            .is_some_and(|home| home.node_id.is_some() || home.cloud_machine_id.is_some()))
     }
 
     /// Where `def`'s run in `ws` runs.

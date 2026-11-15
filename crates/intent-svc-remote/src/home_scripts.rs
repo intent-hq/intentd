@@ -264,10 +264,11 @@ pub(crate) async fn open(
     let Some(home) = svc.store().get_workspace_home(workspace_id).await? else {
         return Ok(None);
     };
+    let home = crate::cloud::home::ready(svc, workspace_id, home).await?;
+    crate::terminals::ensure_attached(svc, &home)?;
     let Some(node_id) = home.node_id.clone() else {
         return Ok(None);
     };
-    crate::terminals::ensure_attached(svc, &home)?;
     let feature = svc
         .remote_feature()
         .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;
