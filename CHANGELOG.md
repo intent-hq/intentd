@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.218] - 2026-11-15
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe workspace homes on an orchestrator ([#3376](https://github.com/intent-hq/intentd/pull/3376))
+
+
 ## [0.11.217] - 2026-11-15
 
 ### 🚀 Features
