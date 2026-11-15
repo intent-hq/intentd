@@ -13,6 +13,8 @@
 //! 3. Both sandboxes' `cloud.startedBy` is the workspace owner.
 //! 4. A home whose sandbox fails to start is detached at once, and calls
 //!    fail `home-unavailable` without `starting`.
+//! 5. A home whose sandbox was deleted while paused is rebuilt at its next
+//!    use, under a new `homeId`, from its backup.
 
 use base64::Engine as _;
 
@@ -1055,5 +1057,293 @@ async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing(
         homes.pause_calls(&sandbox),
         3,
         "the start did not wait for the pause"
+    );
+}
+
+/// The titles of workspace `ws_id`'s notes.
+async fn note_titles(homes: &mut CloudHomes, ws_id: &str) -> Vec<String> {
+    let notes = homes.ok("note.list", json!({ "workspaceId": ws_id })).await;
+    notes["notes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|note| note["title"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The `home.state` values announced for workspace `ws_id` in `seen`.
+fn announced_states(seen: &[String], ws_id: &str) -> Vec<String> {
+    seen.iter()
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .map(|frame| frame["params"]["event"].clone())
+        .filter(|event| event["data"]["workspaceId"] == ws_id)
+        .filter_map(|event| {
+            event["data"]["changes"]["home"]["state"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// A cloud home whose sandbox was deleted while paused is rebuilt at its
+/// next use (nodes.md "Cloud homes" 5-6), with one settings minute scaled
+/// to 3 s, one day to 300 ms (so `pausedDeleteDays` 30 is 9 s) and an idle
+/// pause of one minute:
+///
+/// 1. A workspace whose initial agent's sandbox is the home: an app edit is
+///    pushed by the idle pause; the paused sandbox is then deleted for
+///    staying paused. The home gets a new `homeId` with no sandbox, and is
+///    never detached. The next file call starts a new sandbox from the same
+///    entry, whose home has the edit; the workspace gets a notice.
+/// 2. The agent that shared the old home starts in a checkout of its own,
+///    with the moved-home notice.
+/// 3. A home-only sandbox E2B removes while paused: a call that finds it
+///    gone is told the home is starting; its rebuild fails, which detaches
+///    the home at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cloud_home_deleted_while_paused_is_rebuilt_from_its_backup() {
+    let Some(mut homes) = CloudHomes::start(
+        "itd-e2b-rebuild-",
+        &[
+            ("INTENTD_E2B_MINUTE_MS", "3000"),
+            ("INTENTD_E2B_DAY_MS", "300"),
+        ],
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    let (repo, branch) = (homes.repo.clone(), homes.branch.clone());
+    let mut events = connect(homes.port, homes.cfg.clone()).await;
+    ok(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:updated"] }),
+    )
+    .await;
+    let mut seen = Vec::new();
+
+    // 1. The initial agent's sandbox is the home; an app edit lands there.
+    let created = homes
+        .ok(
+            "workspace.create",
+            json!({
+                "repositoryPath": repo.to_string_lossy(),
+                "baseRef": branch,
+                "initialAgent": {
+                    "model": "default", "provider": homes.keyed_ref, "placement": { "target": "e2b" },
+                },
+            }),
+        )
+        .await;
+    let ws_id = created["workspace"]["id"].as_str().unwrap().to_owned();
+    let old_home = created["workspace"]["home"]["homeId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let agent_id = created["initialAgent"]["id"]
+        .as_str()
+        .or_else(|| created["initialAgent"]["agentId"].as_str())
+        .unwrap()
+        .to_owned();
+    let mut id = homes.id;
+    home_until(
+        &mut homes.rpc_ws,
+        &mut id,
+        &ws_id,
+        "the agent's sandbox became the home",
+        |home| home["state"] == "attached" && home["nodeId"].is_string(),
+    )
+    .await;
+    homes.id = id;
+    let old_sandbox = homes.sandbox_of(&agent_id);
+    // The agent runs a turn in the home checkout there.
+    homes
+        .ok(
+            "agent.sendMessage",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "echo-raw" }),
+        )
+        .await;
+    let id = homes.next();
+    let raw = reply_containing(&mut homes.rpc_ws, (&ws_id, &agent_id), "raw: ", id).await;
+    homes.id += 1000;
+    assert!(
+        raw.contains(&format!("/homes/{old_home}/work")),
+        "the agent's session is not in the home checkout: {raw}"
+    );
+    homes
+        .ok(
+            "file.write",
+            json!({ "workspaceId": ws_id, "path": "saved.txt", "content": "saved before the pause\n" }),
+        )
+        .await;
+
+    // 3 (set up). A home-only workspace, started by a file call.
+    let created = homes
+        .ok(
+            "workspace.create",
+            json!({ "repositoryPath": repo.to_string_lossy(), "baseRef": branch }),
+        )
+        .await;
+    let lost_ws = created["workspace"]["id"].as_str().unwrap().to_owned();
+    let lost_home = created["workspace"]["home"]["homeId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let write = json!({ "workspaceId": lost_ws, "path": "l.txt", "content": "l\n" });
+    let mut id = homes.id;
+    call_while_starting(&mut homes.rpc_ws, &mut id, "file.write", &write).await;
+    homes.id = id;
+    let lost_sandbox = homes.sandbox_of(&format!("home-{lost_ws}"));
+
+    // 3. Once paused, E2B removes it. A call finds it gone and is told the
+    // home starts; the rebuild fails (the mint does), and the home is
+    // detached at once.
+    let id = homes.next();
+    machine_until(&mut homes.rpc_ws, id, &lost_sandbox, |machine| {
+        machine.is_some_and(|machine| machine["cloud"]["state"] == "paused")
+    })
+    .await;
+    homes.id += 1000;
+    let template = homes.fake.state().sandboxes[&lost_sandbox].template.clone();
+    homes.fake.vanish(&lost_sandbox);
+    homes.fake.state().failed_mint_templates.push(template);
+    let deadline = tokio::time::Instant::now() + wait();
+    let reply = loop {
+        let id = homes.next();
+        let reply = rpc(
+            &mut homes.rpc_ws,
+            id,
+            "file.read",
+            json!({ "workspaceId": lost_ws, "path": "l.txt" }),
+        )
+        .await;
+        assert_eq!(
+            reply["error"]["data"]["code"], "home-unavailable",
+            "{reply}"
+        );
+        if reply["error"]["data"]["starting"] != true {
+            break reply;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the rebuild never ended: {reply}"
+        );
+    };
+    let id = homes.next();
+    let home = home_of(&mut homes.rpc_ws, id, &lost_ws).await;
+    assert_eq!(home["state"], "detached", "{home} after {reply}");
+    assert_ne!(home["homeId"], lost_home.as_str(), "{home}");
+    assert!(home.get("nodeId").is_none(), "{home}");
+    homes.fake.state().failed_mint_templates.clear();
+
+    // 1. The agent's sandbox: the idle pause pushes the edit, and once it
+    // stays paused past pausedDeleteDays it is deleted.
+    let wip_ref = format!("refs/intent/ws/{ws_id}/home/wip");
+    super::super::homes::until("the idle pause pushed the edit", || {
+        try_rev(&repo, &wip_ref)
+            .map(|wip| git(&repo, &["ls-tree", "--name-only", &wip]))
+            .filter(|files| files.contains("saved.txt"))
+    })
+    .await;
+    let id = homes.next();
+    machine_until(&mut homes.rpc_ws, id, &old_sandbox, |machine| {
+        machine.is_none()
+    })
+    .await;
+    homes.id += 1000;
+    super::super::homes::until("E2B deletes the paused sandbox", || {
+        homes.deleted(&old_sandbox).then_some(())
+    })
+    .await;
+    let mut id = homes.id;
+    let home = home_until(
+        &mut homes.rpc_ws,
+        &mut id,
+        &ws_id,
+        "a new home with no sandbox",
+        |home| home["homeId"] != old_home.as_str(),
+    )
+    .await;
+    homes.id = id;
+    assert_eq!(home["state"], "attached", "{home}");
+    assert!(home.get("nodeId").is_none(), "{home}");
+    let new_home = home["homeId"].as_str().unwrap().to_owned();
+    let made = homes.fake.state().creates.len();
+
+    // The next use starts a new sandbox of the same entry, from the backup.
+    let read = json!({ "workspaceId": ws_id, "path": "saved.txt" });
+    let mut id = homes.id;
+    let (content, _) = call_while_starting(&mut homes.rpc_ws, &mut id, "file.read", &read).await;
+    homes.id = id;
+    assert_eq!(content, "saved before the pause\n", "{content}");
+    assert_eq!(homes.fake.state().creates.len(), made + 1);
+    let rebuilt = homes.sandbox_of(&format!("home-{ws_id}"));
+    let mut id = homes.id;
+    let home = home_until(
+        &mut homes.rpc_ws,
+        &mut id,
+        &ws_id,
+        "the rebuilt home attached",
+        |home| home["state"] == "attached" && home["nodeId"].is_string(),
+    )
+    .await;
+    homes.id = id;
+    assert_eq!(home["homeId"], new_home.as_str(), "{home}");
+    let id = homes.next();
+    let machine = machine_of(&mut homes.rpc_ws, id, home["nodeId"].as_str().unwrap()).await;
+    assert_eq!(machine["cloud"]["sandboxId"], rebuilt.as_str(), "{machine}");
+    let deadline = tokio::time::Instant::now() + wait();
+    loop {
+        let titles = note_titles(&mut homes, &ws_id).await;
+        if titles.iter().any(|title| title == "The home was rebuilt") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no notice: {titles:?}"
+        );
+        // timing-guard: poll until the rebuilt home's notice is written
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    drain_events(&mut events, &mut seen).await;
+    let states = announced_states(&seen, &ws_id);
+    assert!(
+        !states.iter().any(|state| state == "detached"),
+        "the rebuilt home was detached: {states:?}"
+    );
+    assert!(
+        states.iter().any(|state| state == "starting"),
+        "the rebuild was not announced as starting: {states:?}"
+    );
+
+    // 2. The agent that shared the old home starts in its own checkout.
+    let made = homes.fake.state().creates.len();
+    homes
+        .ok(
+            "agent.sendMessage",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "echo-raw" }),
+        )
+        .await;
+    let id = homes.next();
+    let raw = reply_containing(
+        &mut homes.rpc_ws,
+        (&ws_id, &agent_id),
+        "The workspace's home moved.",
+        id,
+    )
+    .await;
+    homes.id += 1000;
+    assert!(
+        raw.contains("The workspace's home moved."),
+        "the turn carries the moved-home notice: {raw}"
+    );
+    assert!(!raw.contains("/homes/"), "still in a home checkout: {raw}");
+    assert_eq!(
+        homes.fake.state().creates.len(),
+        made + 1,
+        "the agent starts on a sandbox of its own"
     );
 }
