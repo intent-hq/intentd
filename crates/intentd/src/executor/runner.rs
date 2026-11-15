@@ -1942,14 +1942,16 @@ impl Runner {
                             .forge_origin(&ready.worktree, &fetch.remote_url)
                             .await?;
                     }
-                    // Only a submodule populated in this checkout.
+                    // A submodule's `origin` is a convenience: a failure
+                    // there leaves only that submodule without one.
                     for module in &agent.forge_fetch_modules {
-                        let dir = ready.worktree.join(&module.path);
-                        if dir.join(".git").exists() {
-                            self.inner
-                                .checkouts
-                                .forge_origin(&dir, &module.remote_url)
-                                .await?;
+                        if let Err(error) = self
+                            .inner
+                            .checkouts
+                            .forge_module_origin(&ready.worktree, &agent.repo_key, module)
+                            .await
+                        {
+                            tracing::warn!(agent = %agent.id, path = %module.path, %error, "node: no origin for the submodule");
                         }
                     }
                     Ok::<(), anyhow::Error>(())

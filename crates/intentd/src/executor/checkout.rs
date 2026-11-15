@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 
-use intent_core::node_link::{forge_agent_branch, ForgeLaunch, HomeRef, SubmodulePin};
+use intent_core::node_link::{
+    forge_agent_branch, ForgeFetchModule, ForgeLaunch, HomeRef, SubmodulePin,
+};
 use intent_core::{AgentId, BoxFuture, HomeId, WorkspaceId};
 use intent_git::node_git::{self, AgentRemote, CheckoutCache, ModuleCheckout};
 
@@ -123,6 +125,18 @@ pub(super) trait Checkouts: Send + Sync {
         remote_url: &'a str,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         let _ = (worktree, remote_url);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Give the submodule `module` of `checkout` its `origin` when it is
+    /// populated there, is no symlink, and is that module's repository.
+    fn forge_module_origin<'a>(
+        &'a self,
+        checkout: &'a Path,
+        repo_key: &'a str,
+        module: &'a ForgeFetchModule,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        let _ = (checkout, repo_key, module);
         Box::pin(async { Ok(()) })
     }
 
@@ -369,6 +383,27 @@ impl Checkouts for GitCheckouts {
                 .ensure_origin(worktree, remote_url)
                 .await
                 .map_err(|e| anyhow::anyhow!("set up the sub-agent's origin: {e}"))
+        })
+    }
+
+    fn forge_module_origin<'a>(
+        &'a self,
+        checkout: &'a Path,
+        repo_key: &'a str,
+        module: &'a ForgeFetchModule,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.cache
+                .ensure_module_origin(
+                    checkout,
+                    repo_key,
+                    &module.path,
+                    &module.module_key,
+                    &module.remote_url,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("set up the submodule's origin: {e}"))
         })
     }
 

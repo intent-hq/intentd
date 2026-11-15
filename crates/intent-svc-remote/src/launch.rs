@@ -1507,15 +1507,24 @@ impl RemoteLaunchPort for RemoteLaunch {
             node.shared_ref().launching(agent_id);
             // A sub-agent reaches GitHub through this backend (nodeProtocol
             // 17); the connector drops it on an older link.
-            let (forge_fetch, forge_fetch_modules) =
-                if is_sub_agent || checkout_of.is_some() || home.is_some() {
-                    let pins = checkout_pins(svc.store(), agent_id).await?;
-                    forge_fetch_launch(svc, &record.workspace_id, pins)
+            let (forge_fetch, forge_fetch_modules) = if is_sub_agent
+                || checkout_of.is_some()
+                || home.is_some()
+            {
+                // Submodule entries never fail a launch: without pins
+                // the sub-agent gets none.
+                let pins = checkout_pins(svc.store(), agent_id)
                         .await
-                        .map_or((None, Vec::new()), |(root, modules)| (Some(root), modules))
-                } else {
-                    (None, Vec::new())
-                };
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(agent = %agent_id, %error, "no submodule forge fetch: the checkout's pins are unreadable");
+                            Vec::new()
+                        });
+                forge_fetch_launch(svc, &record.workspace_id, pins)
+                    .await
+                    .map_or((None, Vec::new()), |(root, modules)| (Some(root), modules))
+            } else {
+                (None, Vec::new())
+            };
             let workspace_title = svc
                 .store()
                 .get_workspace(&record.workspace_id)

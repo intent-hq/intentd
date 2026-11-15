@@ -75,10 +75,11 @@ pub mod codes {
 pub const PUSH_REFUSED_MESSAGE: &str =
     "sub-agents hand work back through intent1; ask your parent to push";
 
-/// What the helper prints when head has no GitHub refs to serve a forge
-/// remote from: its refresh failed and none succeeded before.
-pub const FORGE_UNAVAILABLE_MESSAGE: &str =
-    "could not fetch from GitHub through intent1: the backend has nothing to serve for this repository";
+/// What the helper prints when a forge session fails with
+/// [`codes::UNAVAILABLE`]: the link or the backend is not reachable, or the
+/// backend has no GitHub refs to serve for the repository.
+#[cfg(unix)]
+pub const FORGE_UNAVAILABLE_MESSAGE: &str = "could not fetch from GitHub through intent1: the backend is not reachable or has nothing to serve for this repository";
 
 /// The warning a forge ACCEPT carries when head served the last fetched
 /// refs because the GitHub refresh failed.

@@ -1689,6 +1689,50 @@ impl CheckoutCache {
         Ok(())
     }
 
+    /// Node side: [`Self::ensure_origin`] for the submodule at `path` of
+    /// `checkout`, only when no step of `path` is a symlink, it is populated
+    /// there, and its repository is the module cache of `module_key`. `false`
+    /// when it is not populated.
+    ///
+    /// # Errors
+    ///
+    /// When a step is a symlink, the submodule is another repository, or a
+    /// git step fails.
+    pub async fn ensure_module_origin(
+        &self,
+        checkout: &Path,
+        repo_key: &str,
+        path: &str,
+        module_key: &str,
+        remote_url: &str,
+    ) -> Result<bool> {
+        if module_components(path).is_none() {
+            return Err(invalid_pin(path, "not a safe relative path"));
+        }
+        ensure_no_symlink(checkout, path)?;
+        let dir = checkout.join(path);
+        if !populated_here(&dir) {
+            return Ok(false);
+        }
+        let common = self
+            .git
+            .git(
+                &dir,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .await?;
+        let cache = self.module_cache(repo_key, module_key)?;
+        let same = match (Path::new(&common).canonicalize(), cache.canonicalize()) {
+            (Ok(common), Ok(cache)) => common == cache,
+            _ => false,
+        };
+        if !same {
+            return Err(invalid_pin(path, "not the pinned module's repository"));
+        }
+        self.ensure_origin(&dir, remote_url).await?;
+        Ok(true)
+    }
+
     /// Undo [`Self::set_forge`]'s config in `worktree` (a relaunch without
     /// `forge`): it then has no `origin`. Missing entries are fine.
     pub async fn clear_forge(&self, worktree: &Path, local: &str) {
