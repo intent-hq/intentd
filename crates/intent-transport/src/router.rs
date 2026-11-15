@@ -1304,7 +1304,126 @@ async fn guarded_note_set_content(
     to_result_value(&result)
 }
 
+/// Route `method` to its namespace's `*_methods` function (the text before
+/// the first `.`).
+///
+/// In a debug build a poll frame reserves room for the locals of every
+/// `match` arm, so one match over all methods reserved ~900 KiB per call.
+/// Each namespace function is built off-frame by `boxed_await`, so a call
+/// reserves only its own namespace's frame. Add a method's arm to its
+/// namespace function; a new namespace needs a function and a route here.
+/// `router::dispatch_stack_tests` guards the frame sizes.
 async fn dispatch(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let namespace = method
+        .split_once('.')
+        .map_or(method, |(namespace, _)| namespace);
+    match namespace {
+        "workspace" => {
+            crate::stack_frame::boxed_await(|| workspace_methods(api, method, params)).await
+        }
+        "sourceControl" => {
+            crate::stack_frame::boxed_await(|| source_control_methods(api, method, params)).await
+        }
+        "discussion" => {
+            crate::stack_frame::boxed_await(|| discussion_methods(api, method, params)).await
+        }
+        "host" => crate::stack_frame::boxed_await(|| host_methods(api, method, params)).await,
+        "executor" => {
+            crate::stack_frame::boxed_await(|| executor_methods(api, method, params)).await
+        }
+        "remoteMachines" => {
+            crate::stack_frame::boxed_await(|| remote_machines_methods(api, method, params)).await
+        }
+        "cloudMachines" => {
+            crate::stack_frame::boxed_await(|| cloud_machines_methods(api, method, params)).await
+        }
+        "remoteLinkTraffic" => {
+            crate::stack_frame::boxed_await(|| remote_link_traffic_methods(api, method, params))
+                .await
+        }
+        "client" => crate::stack_frame::boxed_await(|| client_methods(api, method, params)).await,
+        "desktop" => crate::stack_frame::boxed_await(|| desktop_methods(api, method, params)).await,
+        "repoConfig" => {
+            crate::stack_frame::boxed_await(|| repo_config_methods(api, method, params)).await
+        }
+        "note" => crate::stack_frame::boxed_await(|| note_methods(api, method, params)).await,
+        "task" => crate::stack_frame::boxed_await(|| task_methods(api, method, params)).await,
+        "comment" => crate::stack_frame::boxed_await(|| comment_methods(api, method, params)).await,
+        "event" => crate::stack_frame::boxed_await(|| event_methods(api, method, params)).await,
+        "agent" => crate::stack_frame::boxed_await(|| agent_methods(api, method, params)).await,
+        "secret" => crate::stack_frame::boxed_await(|| secret_methods(api, method, params)).await,
+        "models" => crate::stack_frame::boxed_await(|| models_methods(api, method, params)).await,
+        "stats" => crate::stack_frame::boxed_await(|| stats_methods(api, method, params)).await,
+        "git" => crate::stack_frame::boxed_await(|| git_methods(api, method, params)).await,
+        "gitRoot" => {
+            crate::stack_frame::boxed_await(|| git_root_methods(api, method, params)).await
+        }
+        "repo" => crate::stack_frame::boxed_await(|| repo_methods(api, method, params)).await,
+        "pr" => crate::stack_frame::boxed_await(|| pr_methods(api, method, params)).await,
+        "github" => crate::stack_frame::boxed_await(|| github_methods(api, method, params)).await,
+        "identity" => {
+            crate::stack_frame::boxed_await(|| identity_methods(api, method, params)).await
+        }
+        "principal" => {
+            crate::stack_frame::boxed_await(|| principal_methods(api, method, params)).await
+        }
+        "presence" => {
+            crate::stack_frame::boxed_await(|| presence_methods(api, method, params)).await
+        }
+        "linear" => crate::stack_frame::boxed_await(|| linear_methods(api, method, params)).await,
+        "sentry" => crate::stack_frame::boxed_await(|| sentry_methods(api, method, params)).await,
+        "file-tracking" => {
+            crate::stack_frame::boxed_await(|| file_tracking_methods(api, method, params)).await
+        }
+        "metrics" => crate::stack_frame::boxed_await(|| metrics_methods(api, method, params)).await,
+        "settings" => {
+            crate::stack_frame::boxed_await(|| settings_methods(api, method, params)).await
+        }
+        "system" => crate::stack_frame::boxed_await(|| system_methods(api, method, params)).await,
+        "debug" => crate::stack_frame::boxed_await(|| debug_methods(api, method, params)).await,
+        "providers" => {
+            crate::stack_frame::boxed_await(|| providers_methods(api, method, params)).await
+        }
+        "unsloth" => crate::stack_frame::boxed_await(|| unsloth_methods(api, method, params)).await,
+        "voice" => crate::stack_frame::boxed_await(|| voice_methods(api, method, params)).await,
+        "accept-changes" => {
+            crate::stack_frame::boxed_await(|| accept_changes_methods(api, method, params)).await
+        }
+        "search" => crate::stack_frame::boxed_await(|| search_methods(api, method, params)).await,
+        "terminal" => {
+            crate::stack_frame::boxed_await(|| terminal_methods(api, method, params)).await
+        }
+        "file" => crate::stack_frame::boxed_await(|| file_methods(api, method, params)).await,
+        "primitive" => {
+            crate::stack_frame::boxed_await(|| primitive_methods(api, method, params)).await
+        }
+        "crossWorkspace" => {
+            crate::stack_frame::boxed_await(|| cross_workspace_methods(api, method, params)).await
+        }
+        "script" => crate::stack_frame::boxed_await(|| script_methods(api, method, params)).await,
+        "scriptMonitor" => {
+            crate::stack_frame::boxed_await(|| script_monitor_methods(api, method, params)).await
+        }
+        "hook" => crate::stack_frame::boxed_await(|| hook_methods(api, method, params)).await,
+        "prMonitor" => {
+            crate::stack_frame::boxed_await(|| pr_monitor_methods(api, method, params)).await
+        }
+        "rules" => crate::stack_frame::boxed_await(|| rules_methods(api, method, params)).await,
+        "specialist" => {
+            crate::stack_frame::boxed_await(|| specialist_methods(api, method, params)).await
+        }
+        "skill" => crate::stack_frame::boxed_await(|| skill_methods(api, method, params)).await,
+        "mcp" => crate::stack_frame::boxed_await(|| mcp_methods(api, method, params)).await,
+        "plugin" => crate::stack_frame::boxed_await(|| plugin_methods(api, method, params)).await,
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn workspace_methods(
     api: &dyn WorkspaceApi,
     method: &str,
     params: &Map<String, Value>,
@@ -1359,94 +1478,6 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!(r))
-        }
-        "sourceControl.gitlab.childGit.get" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .gitlab_child_git_policy_get(input)
-                .await
-                .map_err(domain_to_rpc)?))
-        }
-        "sourceControl.gitlab.childGit.set" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .gitlab_child_git_policy_set(input)
-                .await
-                .map_err(domain_to_rpc)?))
-        }
-        "sourceControl.read.resolveKnownRepository" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .repository_resource_resolve_known(input)
-                .await
-                .map_err(domain_to_rpc)?))
-        }
-        "sourceControl.read.captureScoped" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .repository_resource_capture_scoped(input)
-                .await
-                .map_err(domain_to_rpc)?))
-        }
-        "sourceControl.read.detailScoped" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .repository_resource_detail_scoped(input)
-                .await
-                .map_err(domain_to_rpc)?))
-        }
-        "sourceControl.read.releaseScoped" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .repository_resource_release_scoped(input)
-                .await
-                .map_err(domain_to_rpc)?))
-        }
-        "sourceControl.read.list" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .repository_resource_list(input)
-                .await
-                .map_err(domain_to_rpc)?))
-        }
-        "sourceControl.read.discussions" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .repository_resource_discussions(input)
-                .await
-                .map_err(domain_to_rpc)?))
-        }
-        "sourceControl.read.capture" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .repository_resource_capture(input)
-                .await
-                .map_err(domain_to_rpc)?))
-        }
-        "sourceControl.read.detail" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .repository_resource_detail(input)
-                .await
-                .map_err(domain_to_rpc)?))
-        }
-        "sourceControl.read.release" => {
-            let input = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            Ok(json!(api
-                .repository_resource_release(input)
-                .await
-                .map_err(domain_to_rpc)?))
         }
         "workspace.repositoryContext.capture" => {
             let input = serde_json::from_value(Value::Object(params.clone()))
@@ -1695,6 +1726,500 @@ async fn dispatch(
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
+        // `workspace.members.*` (multiplayer w3): membership roster of one
+        // workspace. Member+ may list; add / removal are Owner-only in the
+        // service layer (`-32003` for a collaborator, `-32602` for a
+        // non-member).
+        "workspace.members.list" => {
+            let id = require_workspace_id(params)?;
+            let r = api
+                .workspace_members_list(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.members.add` (direct member add): attach a credentialed
+        // guest as a collaborator; `-32602` for an unknown / primary /
+        // uncredentialed principal or a spent guest cap.
+        "workspace.members.add" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let r = api
+                .workspace_members_add(id, intent_core::PrincipalId::from(principal_id))
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.members.setRole" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let role = match require_str_param(params, "role")?.as_str() {
+                "collaborator" => intent_core::WorkspaceRole::Collaborator,
+                "manager" => intent_core::WorkspaceRole::Manager,
+                _ => return Err(invalid_params("role must be collaborator or manager")),
+            };
+            api.workspace_members_set_role(id, intent_core::PrincipalId::from(principal_id), role)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.members.remove" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let r = api
+                .workspace_members_remove(id, intent_core::PrincipalId::from(principal_id))
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.members.leave` (multiplayer w4): the bound collaborator
+        // drops its own membership; an owner is `-32602`.
+        "workspace.members.leave" => {
+            let id = require_workspace_id(params)?;
+            let r = api
+                .workspace_members_leave(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.invite.list" => {
+            let id = require_workspace_id(params)?;
+            let r = api.workspace_invite_list(id).await.map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.invite.revoke" => {
+            let id = require_workspace_id(params)?;
+            let invite_id = require_str_param(params, "inviteId")?;
+            let r = api
+                .workspace_invite_revoke(id, invite_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "workspace.getTokenUsage" => {
+            let id = require_workspace_id(params)?;
+            let token_usage = api.get_token_usage(id).await.map_err(workspace_err)?;
+            Ok(json!({ "tokenUsage": token_usage }))
+        }
+        "workspace.getAutoCommit" => {
+            let id = require_workspace_id(params)?;
+            let auto_commit = api
+                .get_workspace_auto_commit(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "autoCommit": auto_commit }))
+        }
+        "workspace.setAutoCommit" => {
+            let id = require_workspace_id(params)?;
+            let enabled = match params.get("enabled") {
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err(invalid_params(
+                        "Invalid parameter: enabled must be a boolean",
+                    ))
+                }
+                None => {
+                    return Err(invalid_params(
+                        "Missing required parameter: enabled (boolean)",
+                    ))
+                }
+            };
+            let auto_commit = api
+                .set_workspace_auto_commit(id, enabled)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "autoCommit": auto_commit }))
+        }
+        "workspace.getBrowserClient" => {
+            let id = require_workspace_id(params)?;
+            let browser_client = api
+                .get_workspace_browser_client(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "browserClient": browser_client }))
+        }
+        "workspace.setBrowserClient" => {
+            let id = require_workspace_id(params)?;
+            let client_id = match params.get("clientId") {
+                Some(Value::String(s)) if !s.trim().is_empty() => {
+                    Some(ClientId::from_string(s.clone()))
+                }
+                Some(Value::Null) => None,
+                Some(_) => {
+                    return Err(invalid_params(
+                        "Invalid parameter: clientId must be a non-empty string or null",
+                    ))
+                }
+                None => {
+                    return Err(invalid_params(
+                        "Missing required parameter: clientId (string | null)",
+                    ))
+                }
+            };
+            let browser_client = api
+                .set_workspace_browser_client(id, client_id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "browserClient": browser_client }))
+        }
+        "workspace.getSetupScript" => {
+            let id = require_workspace_id(params)?;
+            let setup_script = api.get_setup_script(id).await.map_err(workspace_err)?;
+            Ok(json!({ "setupScript": setup_script }))
+        }
+        "workspace.saveSetupScript" => {
+            let id = require_workspace_id(params)?;
+            let script = require_str_param(params, "script")?;
+            let setup_script = api
+                .save_setup_script(id, script)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "setupScript": setup_script }))
+        }
+        "workspace.detectProjectType" => {
+            let id = require_workspace_id(params)?;
+            let project_type = api.detect_project_type(id).await.map_err(workspace_err)?;
+            Ok(json!({ "projectType": project_type }))
+        }
+        "workspace.generateSetupScript" => {
+            let id = require_workspace_id(params)?;
+            let setup_script = api.generate_setup_script(id).await.map_err(workspace_err)?;
+            Ok(json!({ "setupScript": setup_script }))
+        }
+        "workspace.getContext" => {
+            let id = require_workspace_id(params)?;
+            let items = api.get_workspace_context(id).await.map_err(workspace_err)?;
+            Ok(json!({ "items": items }))
+        }
+        "workspace.updateContext" => {
+            let id = require_workspace_id(params)?;
+            let items = require_context_items(params)?;
+            let items = api
+                .update_workspace_context(id, items)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "items": items }))
+        }
+        "workspace.getUiContext" => {
+            let id = require_workspace_id(params)?;
+            let ui_context = api
+                .get_workspace_ui_context(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "uiContext": ui_context }))
+        }
+        "workspace.updateUiContext" => {
+            let id = require_workspace_id(params)?;
+            let ui_context = params
+                .get("uiContext")
+                .ok_or_else(|| invalid_params("uiContext required"))?
+                .clone();
+            let persisted = api
+                .update_workspace_ui_context(id, ui_context)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "uiContext": persisted }))
+        }
+        "workspace.restore" => {
+            let id = require_workspace_id(params)?;
+            let ws = api.restore_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
+        "workspace.cleanup" => {
+            let id = require_workspace_id(params)?;
+            api.cleanup_workspace(id).await.map_err(workspace_err)?;
+            Ok(json!({ "success": true }))
+        }
+        "workspace.findRepositories" => {
+            let directory = require_str_param(params, "directory")?;
+            let repositories = api
+                .find_repositories(directory)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "repositories": repositories }))
+        }
+        "workspace.initializeRepository" => {
+            let path = require_str_param(params, "path")?;
+            api.initialize_repository(path)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "success": true }))
+        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn source_control_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
+        "sourceControl.gitlab.childGit.get" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .gitlab_child_git_policy_get(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.gitlab.childGit.set" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .gitlab_child_git_policy_set(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.resolveKnownRepository" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_resolve_known(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.captureScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_capture_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.detailScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_detail_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.releaseScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_release_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.list" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_list(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.discussions" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_discussions(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.capture" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_capture(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.detail" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_detail(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.release" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_release(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        // `sourceControl.identityProof.*` (protocol 10.8): the
+        // provider-generic form of the pair above — `provider` required
+        // (`github` | `gitlab`), `host` optional and gitlab-only, parsed
+        // strictly like the `sourceControl.*` auth methods; `proofId` is the
+        // gist id / snippet id `create` answered.
+        "sourceControl.identityProof.create" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let nonce = require_str_param(params, "nonce")?;
+            let host_label = require_str_param(params, "hostLabel")?;
+            let r = api
+                .source_control_identity_proof_create(
+                    provider,
+                    host,
+                    nonce,
+                    host_label,
+                    opt_str_strict(params, "purpose")?,
+                    params
+                        .get("expectedIdentity")
+                        .filter(|v| !v.is_null())
+                        .map(|v| {
+                            serde_json::from_value(v.clone())
+                                .map_err(|_| invalid_params("invalid expectedIdentity"))
+                        })
+                        .transpose()?,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.identityProof.delete" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let proof_id = require_str_param(params, "proofId")?;
+            let r = api
+                .source_control_identity_proof_delete(
+                    provider,
+                    host,
+                    proof_id,
+                    opt_str_strict(params, "purpose")?,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `host` names the forge, never an intentd routing destination.
+        // Optional `workspaceId` leaves provider/host credential selection intact.
+        "sourceControl.checkout.capture" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_capture(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.projects" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_projects(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.project" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_project(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.branches" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_branches(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.repoConfig" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_repo_config(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.warm" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_warm(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.release" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_release(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.authStatus" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
+            let r = api
+                .source_control_auth_status_for_instance(provider, host, instance_base_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.connect" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
+            let method = opt_str_strict(params, "method")?;
+            let token = opt_str_strict(params, "token")?;
+            let r = api
+                .source_control_connect_for_instance(
+                    provider,
+                    host,
+                    method,
+                    token,
+                    instance_base_url,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.cancelAuth" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
+            let r = api
+                .source_control_cancel_auth_for_instance(provider, host, instance_base_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.revoke" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
+            let r = api
+                .source_control_revoke_for_instance(provider, host, instance_base_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.getUser" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
+            let r = api
+                .source_control_get_user_for_instance(provider, host, instance_base_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn discussion_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "discussion.rename" | "discussion.delete" => {
             let ws = require_workspace_id(params)?;
             let id = require_non_empty_str(params, "conversationId")?;
@@ -1887,61 +2412,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
-        // `workspace.members.*` (multiplayer w3): membership roster of one
-        // workspace. Member+ may list; add / removal are Owner-only in the
-        // service layer (`-32003` for a collaborator, `-32602` for a
-        // non-member).
-        "workspace.members.list" => {
-            let id = require_workspace_id(params)?;
-            let r = api
-                .workspace_members_list(id)
-                .await
-                .map_err(workspace_err)?;
-            Ok(r)
-        }
-        // `workspace.members.add` (direct member add): attach a credentialed
-        // guest as a collaborator; `-32602` for an unknown / primary /
-        // uncredentialed principal or a spent guest cap.
-        "workspace.members.add" => {
-            let id = require_workspace_id(params)?;
-            let principal_id = require_str_param(params, "principalId")?;
-            let r = api
-                .workspace_members_add(id, intent_core::PrincipalId::from(principal_id))
-                .await
-                .map_err(workspace_err)?;
-            Ok(r)
-        }
-        "workspace.members.setRole" => {
-            let id = require_workspace_id(params)?;
-            let principal_id = require_str_param(params, "principalId")?;
-            let role = match require_str_param(params, "role")?.as_str() {
-                "collaborator" => intent_core::WorkspaceRole::Collaborator,
-                "manager" => intent_core::WorkspaceRole::Manager,
-                _ => return Err(invalid_params("role must be collaborator or manager")),
-            };
-            api.workspace_members_set_role(id, intent_core::PrincipalId::from(principal_id), role)
-                .await
-                .map_err(workspace_err)
-        }
-        "workspace.members.remove" => {
-            let id = require_workspace_id(params)?;
-            let principal_id = require_str_param(params, "principalId")?;
-            let r = api
-                .workspace_members_remove(id, intent_core::PrincipalId::from(principal_id))
-                .await
-                .map_err(workspace_err)?;
-            Ok(r)
-        }
-        // `workspace.members.leave` (multiplayer w4): the bound collaborator
-        // drops its own membership; an owner is `-32602`.
-        "workspace.members.leave" => {
-            let id = require_workspace_id(params)?;
-            let r = api
-                .workspace_members_leave(id)
-                .await
-                .map_err(workspace_err)?;
-            Ok(r)
-        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn host_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // `workspace.invite.*` (multiplayer w4): owner-only invite links.
         // `workspace.invite.create` is handled on the connection fast-path
         // (it wraps the secret into the `intent://invite` link with the
@@ -1973,6 +2453,21 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
+        "host.invite.revoke" => api
+            .host_invite_revoke(require_str_param(params, "inviteId")?)
+            .await
+            .map_err(domain_to_rpc),
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn executor_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // Daemon-to-daemon executor credentials (nodes.md "Machine methods:
         // executor credentials"): owner-only, daemon-global. The services
         // recheck the owner role; the minted token is in the result only.
@@ -2002,6 +2497,16 @@ async fn dispatch(
             .executor_invite_create(Value::Object(params.clone()))
             .await
             .map_err(domain_to_rpc),
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn remote_machines_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // Daemon-to-daemon exposed machines (nodes.md "Backend methods:
         // exposed machines"): owner-only, daemon-global. The services
         // recheck the owner role; `add` carries the executor token, which no
@@ -2015,135 +2520,76 @@ async fn dispatch(
         "remoteMachines.refresh" => remote_machines(api, "refresh", params).await,
         "remoteMachines.order" => remote_machines(api, "order", params).await,
         "remoteMachines.setOrder" => remote_machines(api, "setOrder", params).await,
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn cloud_machines_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "cloudMachines.configure" => cloud_machines(api, "configure", params).await,
         "cloudMachines.list" => cloud_machines(api, "list", params).await,
         "cloudMachines.remove" => cloud_machines(api, "remove", params).await,
         "cloudMachines.pause" => cloud_machines(api, "pause", params).await,
         "cloudMachines.kill" => cloud_machines(api, "kill", params).await,
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn remote_link_traffic_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // Executor-link traffic capture (nodes.md "Link traffic capture"):
         // owner-only, daemon-global; the services recheck the owner role.
         "remoteLinkTraffic.start" => remote_link_traffic(api, "start", params).await,
         "remoteLinkTraffic.stop" => remote_link_traffic(api, "stop", params).await,
         "remoteLinkTraffic.snapshot" => remote_link_traffic(api, "snapshot", params).await,
-        "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
-        "host.invite.revoke" => api
-            .host_invite_revoke(require_str_param(params, "inviteId")?)
-            .await
-            .map_err(domain_to_rpc),
-        "workspace.invite.list" => {
-            let id = require_workspace_id(params)?;
-            let r = api.workspace_invite_list(id).await.map_err(workspace_err)?;
-            Ok(r)
-        }
-        "workspace.invite.revoke" => {
-            let id = require_workspace_id(params)?;
-            let invite_id = require_str_param(params, "inviteId")?;
-            let r = api
-                .workspace_invite_revoke(id, invite_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "workspace.getTokenUsage" => {
-            let id = require_workspace_id(params)?;
-            let token_usage = api.get_token_usage(id).await.map_err(workspace_err)?;
-            Ok(json!({ "tokenUsage": token_usage }))
-        }
-        "workspace.getAutoCommit" => {
-            let id = require_workspace_id(params)?;
-            let auto_commit = api
-                .get_workspace_auto_commit(id)
-                .await
-                .map_err(workspace_err)?;
-            Ok(json!({ "autoCommit": auto_commit }))
-        }
-        "workspace.setAutoCommit" => {
-            let id = require_workspace_id(params)?;
-            let enabled = match params.get("enabled") {
-                Some(Value::Bool(b)) => *b,
-                Some(_) => {
-                    return Err(invalid_params(
-                        "Invalid parameter: enabled must be a boolean",
-                    ))
-                }
-                None => {
-                    return Err(invalid_params(
-                        "Missing required parameter: enabled (boolean)",
-                    ))
-                }
-            };
-            let auto_commit = api
-                .set_workspace_auto_commit(id, enabled)
-                .await
-                .map_err(workspace_err)?;
-            Ok(json!({ "autoCommit": auto_commit }))
-        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn client_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    _params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "client.list" => {
             let clients = api.client_list().await.map_err(workspace_err)?;
             Ok(json!({ "clients": clients }))
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn desktop_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "desktop.getState" => dispatch_desktop(api, "desktop.getState", params).await,
         "desktop.respondPermission" => {
             dispatch_desktop(api, "desktop.respondPermission", params).await
         }
         "desktop.revoke" => dispatch_desktop(api, "desktop.revoke", params).await,
         "desktop.setPermission" => dispatch_desktop(api, "desktop.setPermission", params).await,
-        "workspace.getBrowserClient" => {
-            let id = require_workspace_id(params)?;
-            let browser_client = api
-                .get_workspace_browser_client(id)
-                .await
-                .map_err(workspace_err)?;
-            Ok(json!({ "browserClient": browser_client }))
-        }
-        "workspace.setBrowserClient" => {
-            let id = require_workspace_id(params)?;
-            let client_id = match params.get("clientId") {
-                Some(Value::String(s)) if !s.trim().is_empty() => {
-                    Some(ClientId::from_string(s.clone()))
-                }
-                Some(Value::Null) => None,
-                Some(_) => {
-                    return Err(invalid_params(
-                        "Invalid parameter: clientId must be a non-empty string or null",
-                    ))
-                }
-                None => {
-                    return Err(invalid_params(
-                        "Missing required parameter: clientId (string | null)",
-                    ))
-                }
-            };
-            let browser_client = api
-                .set_workspace_browser_client(id, client_id)
-                .await
-                .map_err(workspace_err)?;
-            Ok(json!({ "browserClient": browser_client }))
-        }
-        "workspace.getSetupScript" => {
-            let id = require_workspace_id(params)?;
-            let setup_script = api.get_setup_script(id).await.map_err(workspace_err)?;
-            Ok(json!({ "setupScript": setup_script }))
-        }
-        "workspace.saveSetupScript" => {
-            let id = require_workspace_id(params)?;
-            let script = require_str_param(params, "script")?;
-            let setup_script = api
-                .save_setup_script(id, script)
-                .await
-                .map_err(workspace_err)?;
-            Ok(json!({ "setupScript": setup_script }))
-        }
-        "workspace.detectProjectType" => {
-            let id = require_workspace_id(params)?;
-            let project_type = api.detect_project_type(id).await.map_err(workspace_err)?;
-            Ok(json!({ "projectType": project_type }))
-        }
-        "workspace.generateSetupScript" => {
-            let id = require_workspace_id(params)?;
-            let setup_script = api.generate_setup_script(id).await.map_err(workspace_err)?;
-            Ok(json!({ "setupScript": setup_script }))
-        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn repo_config_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "repoConfig.get" => {
             let id = require_workspace_id(params)?;
             let config = api.get_repo_config(id).await.map_err(workspace_err)?;
@@ -2181,65 +2627,16 @@ async fn dispatch(
                 .map_err(workspace_err)?;
             Ok(json!({ "ok": true }))
         }
-        "workspace.getContext" => {
-            let id = require_workspace_id(params)?;
-            let items = api.get_workspace_context(id).await.map_err(workspace_err)?;
-            Ok(json!({ "items": items }))
-        }
-        "workspace.updateContext" => {
-            let id = require_workspace_id(params)?;
-            let items = require_context_items(params)?;
-            let items = api
-                .update_workspace_context(id, items)
-                .await
-                .map_err(workspace_err)?;
-            Ok(json!({ "items": items }))
-        }
-        "workspace.getUiContext" => {
-            let id = require_workspace_id(params)?;
-            let ui_context = api
-                .get_workspace_ui_context(id)
-                .await
-                .map_err(workspace_err)?;
-            Ok(json!({ "uiContext": ui_context }))
-        }
-        "workspace.updateUiContext" => {
-            let id = require_workspace_id(params)?;
-            let ui_context = params
-                .get("uiContext")
-                .ok_or_else(|| invalid_params("uiContext required"))?
-                .clone();
-            let persisted = api
-                .update_workspace_ui_context(id, ui_context)
-                .await
-                .map_err(workspace_err)?;
-            Ok(json!({ "uiContext": persisted }))
-        }
-        "workspace.restore" => {
-            let id = require_workspace_id(params)?;
-            let ws = api.restore_workspace(id).await.map_err(workspace_err)?;
-            Ok(json!({ "workspace": ws }))
-        }
-        "workspace.cleanup" => {
-            let id = require_workspace_id(params)?;
-            api.cleanup_workspace(id).await.map_err(workspace_err)?;
-            Ok(json!({ "success": true }))
-        }
-        "workspace.findRepositories" => {
-            let directory = require_str_param(params, "directory")?;
-            let repositories = api
-                .find_repositories(directory)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!({ "repositories": repositories }))
-        }
-        "workspace.initializeRepository" => {
-            let path = require_str_param(params, "path")?;
-            api.initialize_repository(path)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!({ "success": true }))
-        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn note_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
         "note.list" => crate::stack_frame::boxed_await(|| bounded_note_list(api, params)).await,
         // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
@@ -2417,6 +2814,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn task_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "task.updateStatus" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
@@ -2589,6 +2996,16 @@ async fn dispatch(
                 "linksByNoteId": links_by_note_id(&links),
             }))
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn comment_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "comment.add" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
@@ -2682,6 +3099,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn event_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "event.agentActivity" => {
             let ws = require_ws_note(params)?;
             let agent_id = opt_str(params, "agentId");
@@ -2714,6 +3141,16 @@ async fn dispatch(
             };
             api.event_query(ws, query).await.map_err(domain_to_rpc)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn agent_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "agent.list" => {
             let ws = require_ws_note(params)?;
             // Soft retire (§5.5): retired rows are excluded by default;
@@ -3165,40 +3602,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
-        // Secret requests (PROTOCOL §5.56). `secret.provide` carries a secret
-        // value: it is handed to the service call and never logged, echoed or
-        // copied into an error (the request params own the original string).
-        "secret.provide" => {
-            let ws = require_ws_note(params)?;
-            let request_id = require_str_param(params, "requestId")?;
-            let value = match params.get("value") {
-                Some(Value::String(value)) => value.clone(),
-                _ => return Err(invalid_params("Missing required parameter: value")),
-            };
-            api.secret_provide(ws, request_id, value)
-                .await
-                .map_err(domain_to_rpc)
-        }
-        "secret.dismiss" => {
-            let ws = require_ws_note(params)?;
-            let request_id = require_str_param(params, "requestId")?;
-            api.secret_dismiss(ws, request_id)
-                .await
-                .map_err(domain_to_rpc)
-        }
-        "secret.list" => {
-            let ws = require_ws_note(params)?;
-            let agent_id = require_agent_id(params)?;
-            api.secret_list(ws, agent_id).await.map_err(domain_to_rpc)
-        }
-        "secret.forget" => {
-            let ws = require_ws_note(params)?;
-            let agent_id = require_agent_id(params)?;
-            let name = require_str_param(params, "name")?;
-            api.secret_forget(ws, agent_id, name)
-                .await
-                .map_err(domain_to_rpc)
-        }
         "agent.resolveProposal" => {
             let agent_id = require_agent_id(params)?;
             let proposal_id = require_str_param(params, "proposalId")?;
@@ -3354,56 +3757,6 @@ async fn dispatch(
         }
         "agent.getModels" => {
             let result = api.agent_get_models().await.map_err(domain_to_rpc)?;
-            Ok(result)
-        }
-        "models.list" => {
-            // Additive rich model catalog (PROTOCOL §5.30); optional
-            // `providerId` (omitted or empty/whitespace → backward-compatible
-            // auggie path) and `forceRefresh` (skip the cache read, await a
-            // fresh probe).
-            let provider_id = opt_nonempty_str(params, "providerId");
-            let force_refresh = opt_bool(params, "forceRefresh").unwrap_or(false);
-            let result = api
-                .models_list(provider_id, force_refresh)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(result)
-        }
-        "stats.getUsage" => {
-            // Global usage-stats read behind the agentic usage-stats cards;
-            // no workspaceId. `period` is "24h" / "month" / "year"; `key`
-            // ("YYYY-MM" / "YYYY") is required for month/year and ignored for
-            // 24h; `tzOffsetMinutes` (minutes east of UTC, default 0) shifts
-            // buckets into the client's local time before grouping.
-            let period = require_str_param(params, "period")?;
-            let key = opt_str(params, "key");
-            let tz_offset_minutes = match params.get("tzOffsetMinutes") {
-                None | Some(Value::Null) => 0,
-                Some(v) => v
-                    .as_i64()
-                    .ok_or_else(|| invalid_params("tzOffsetMinutes must be an integer"))?,
-            };
-            let result = api
-                .stats_get_usage(period, key, tz_offset_minutes)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(result)
-        }
-        "stats.getRateHistory" => {
-            // Global per-minute token-rate history behind the HUD TOK/MIN
-            // chart (§5.39); no workspaceId. `limit` (default 60, max 1440)
-            // is the number of trailing minute samples returned.
-            let limit = match params.get("limit") {
-                None | Some(Value::Null) => None,
-                Some(v) => Some(
-                    v.as_i64()
-                        .ok_or_else(|| invalid_params("limit must be an integer"))?,
-                ),
-            };
-            let result = api
-                .stats_get_rate_history(limit)
-                .await
-                .map_err(domain_to_rpc)?;
             Ok(result)
         }
         "agent.enhancePrompt" => {
@@ -3807,6 +4160,130 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn secret_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
+        // Secret requests (PROTOCOL §5.56). `secret.provide` carries a secret
+        // value: it is handed to the service call and never logged, echoed or
+        // copied into an error (the request params own the original string).
+        "secret.provide" => {
+            let ws = require_ws_note(params)?;
+            let request_id = require_str_param(params, "requestId")?;
+            let value = match params.get("value") {
+                Some(Value::String(value)) => value.clone(),
+                _ => return Err(invalid_params("Missing required parameter: value")),
+            };
+            api.secret_provide(ws, request_id, value)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "secret.dismiss" => {
+            let ws = require_ws_note(params)?;
+            let request_id = require_str_param(params, "requestId")?;
+            api.secret_dismiss(ws, request_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "secret.list" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = require_agent_id(params)?;
+            api.secret_list(ws, agent_id).await.map_err(domain_to_rpc)
+        }
+        "secret.forget" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = require_agent_id(params)?;
+            let name = require_str_param(params, "name")?;
+            api.secret_forget(ws, agent_id, name)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn models_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
+        "models.list" => {
+            // Additive rich model catalog (PROTOCOL §5.30); optional
+            // `providerId` (omitted or empty/whitespace → backward-compatible
+            // auggie path) and `forceRefresh` (skip the cache read, await a
+            // fresh probe).
+            let provider_id = opt_nonempty_str(params, "providerId");
+            let force_refresh = opt_bool(params, "forceRefresh").unwrap_or(false);
+            let result = api
+                .models_list(provider_id, force_refresh)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn stats_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
+        "stats.getUsage" => {
+            // Global usage-stats read behind the agentic usage-stats cards;
+            // no workspaceId. `period` is "24h" / "month" / "year"; `key`
+            // ("YYYY-MM" / "YYYY") is required for month/year and ignored for
+            // 24h; `tzOffsetMinutes` (minutes east of UTC, default 0) shifts
+            // buckets into the client's local time before grouping.
+            let period = require_str_param(params, "period")?;
+            let key = opt_str(params, "key");
+            let tz_offset_minutes = match params.get("tzOffsetMinutes") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v
+                    .as_i64()
+                    .ok_or_else(|| invalid_params("tzOffsetMinutes must be an integer"))?,
+            };
+            let result = api
+                .stats_get_usage(period, key, tz_offset_minutes)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "stats.getRateHistory" => {
+            // Global per-minute token-rate history behind the HUD TOK/MIN
+            // chart (§5.39); no workspaceId. `limit` (default 60, max 1440)
+            // is the number of trailing minute samples returned.
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_i64()
+                        .ok_or_else(|| invalid_params("limit must be an integer"))?,
+                ),
+            };
+            let result = api
+                .stats_get_rate_history(limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn git_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "git.status" => {
             let ws = require_ws_note(params)?;
             // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
@@ -3818,14 +4295,6 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&status)
-        }
-        "gitRoot.list" => {
-            // Every registered git root for a workspace (agent-registered and
-            // auto-detected) as `{ gitRoots: [...] }`, each row carrying a
-            // live-read `branch` (monorepo#2053). Missing workspace → -32602.
-            let ws = require_ws_note(params)?;
-            let r = api.git_root_list(ws).await.map_err(domain_to_rpc)?;
-            Ok(r)
         }
         "git.getConfig" => {
             let ws = require_ws_note(params)?;
@@ -3999,30 +4468,6 @@ async fn dispatch(
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
-        }
-        "repo.list" => {
-            // No params; returns `{ repos: KnownRepo[] }` with camelCase keys.
-            let r = api.repo_list().await.map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "repo.remove" => {
-            // Delete one known-repo registry entry by path; returns
-            // `{ removed: bool }` (false when the path was not registered).
-            let path = require_str_param(params, "path")?;
-            let r = api.repo_remove(path).await.map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "repo.warmCache" => {
-            // Opportunistic background refresh of the repo cache for one
-            // GitHub repo; returns `{ started: true, owner, repo }`
-            // immediately. A warm already in flight is rejected with the
-            // `warm-in-flight` busy error (PROTOCOL §5.6).
-            let github_url = require_str_param(params, "githubUrl")?;
-            let r = api
-                .repo_warm_cache(github_url)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
         }
         "git.clone" => {
             let url = require_str_param(params, "url")?;
@@ -4247,6 +4692,68 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn git_root_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
+        "gitRoot.list" => {
+            // Every registered git root for a workspace (agent-registered and
+            // auto-detected) as `{ gitRoots: [...] }`, each row carrying a
+            // live-read `branch` (monorepo#2053). Missing workspace → -32602.
+            let ws = require_ws_note(params)?;
+            let r = api.git_root_list(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn repo_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
+        "repo.list" => {
+            // No params; returns `{ repos: KnownRepo[] }` with camelCase keys.
+            let r = api.repo_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "repo.remove" => {
+            // Delete one known-repo registry entry by path; returns
+            // `{ removed: bool }` (false when the path was not registered).
+            let path = require_str_param(params, "path")?;
+            let r = api.repo_remove(path).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "repo.warmCache" => {
+            // Opportunistic background refresh of the repo cache for one
+            // GitHub repo; returns `{ started: true, owner, repo }`
+            // immediately. A warm already in flight is rejected with the
+            // `warm-in-flight` busy error (PROTOCOL §5.6).
+            let github_url = require_str_param(params, "githubUrl")?;
+            let r = api
+                .repo_warm_cache(github_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn pr_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "pr.refresh" => {
             let ws = require_ws_note(params)?;
             let automatic = opt_bool_strict(params, "automatic")?.unwrap_or(false);
@@ -4258,6 +4765,16 @@ async fn dispatch(
             .map_err(workspace_err)?;
             Ok(r)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn github_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // `github.*` explicit-addressing surface (PROTOCOL §5.27): every data
         // method takes `(owner, repo[, number])` rather than resolving from the
         // workspace. Optional `workspaceId` is routing metadata and must not
@@ -4618,51 +5135,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `sourceControl.identityProof.*` (protocol 10.8): the
-        // provider-generic form of the pair above — `provider` required
-        // (`github` | `gitlab`), `host` optional and gitlab-only, parsed
-        // strictly like the `sourceControl.*` auth methods; `proofId` is the
-        // gist id / snippet id `create` answered.
-        "sourceControl.identityProof.create" => {
-            let provider = require_str_param(params, "provider")?;
-            let host = opt_str_strict(params, "host")?;
-            let nonce = require_str_param(params, "nonce")?;
-            let host_label = require_str_param(params, "hostLabel")?;
-            let r = api
-                .source_control_identity_proof_create(
-                    provider,
-                    host,
-                    nonce,
-                    host_label,
-                    opt_str_strict(params, "purpose")?,
-                    params
-                        .get("expectedIdentity")
-                        .filter(|v| !v.is_null())
-                        .map(|v| {
-                            serde_json::from_value(v.clone())
-                                .map_err(|_| invalid_params("invalid expectedIdentity"))
-                        })
-                        .transpose()?,
-                )
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "sourceControl.identityProof.delete" => {
-            let provider = require_str_param(params, "provider")?;
-            let host = opt_str_strict(params, "host")?;
-            let proof_id = require_str_param(params, "proofId")?;
-            let r = api
-                .source_control_identity_proof_delete(
-                    provider,
-                    host,
-                    proof_id,
-                    opt_str_strict(params, "purpose")?,
-                )
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn identity_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // Provider-generic auth (§5.27 "Provider-generic auth —
         // `sourceControl.*`", v10.5): `provider` is required on every method
         // (`github` | `gitlab`), `host` is optional and gitlab-only; both are
@@ -4717,129 +5199,16 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
-        // `host` names the forge, never an intentd routing destination.
-        // Optional `workspaceId` leaves provider/host credential selection intact.
-        "sourceControl.checkout.capture" => {
-            let query = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(e.to_string()))?;
-            let result = api
-                .repository_checkout_capture(query)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!(result))
-        }
-        "sourceControl.checkout.projects" => {
-            let query = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(e.to_string()))?;
-            let result = api
-                .repository_checkout_projects(query)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!(result))
-        }
-        "sourceControl.checkout.project" => {
-            let query = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(e.to_string()))?;
-            let result = api
-                .repository_checkout_project(query)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!(result))
-        }
-        "sourceControl.checkout.branches" => {
-            let query = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(e.to_string()))?;
-            let result = api
-                .repository_checkout_branches(query)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!(result))
-        }
-        "sourceControl.checkout.repoConfig" => {
-            let query = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(e.to_string()))?;
-            let result = api
-                .repository_checkout_repo_config(query)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!(result))
-        }
-        "sourceControl.checkout.warm" => {
-            let query = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(e.to_string()))?;
-            let result = api
-                .repository_checkout_warm(query)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!(result))
-        }
-        "sourceControl.checkout.release" => {
-            let query = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(e.to_string()))?;
-            let result = api
-                .repository_checkout_release(query)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!(result))
-        }
-        "sourceControl.authStatus" => {
-            let provider = require_str_param(params, "provider")?;
-            let host = opt_str_strict(params, "host")?;
-            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
-            let r = api
-                .source_control_auth_status_for_instance(provider, host, instance_base_url)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "sourceControl.connect" => {
-            let provider = require_str_param(params, "provider")?;
-            let host = opt_str_strict(params, "host")?;
-            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
-            let method = opt_str_strict(params, "method")?;
-            let token = opt_str_strict(params, "token")?;
-            let r = api
-                .source_control_connect_for_instance(
-                    provider,
-                    host,
-                    method,
-                    token,
-                    instance_base_url,
-                )
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "sourceControl.cancelAuth" => {
-            let provider = require_str_param(params, "provider")?;
-            let host = opt_str_strict(params, "host")?;
-            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
-            let r = api
-                .source_control_cancel_auth_for_instance(provider, host, instance_base_url)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "sourceControl.revoke" => {
-            let provider = require_str_param(params, "provider")?;
-            let host = opt_str_strict(params, "host")?;
-            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
-            let r = api
-                .source_control_revoke_for_instance(provider, host, instance_base_url)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "sourceControl.getUser" => {
-            let provider = require_str_param(params, "provider")?;
-            let host = opt_str_strict(params, "host")?;
-            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
-            let r = api
-                .source_control_get_user_for_instance(provider, host, instance_base_url)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn principal_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    _params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // `principal.me` (multiplayer w1): the principal this connection was
         // bound to at admission; no params. Fails when no caller is bound.
         "principal.me" => {
@@ -4860,6 +5229,16 @@ async fn dispatch(
             let r = api.principal_revoke_self().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn presence_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // `presence.snapshot` (multiplayer w5): the current `presence:changed`
         // roster of a member workspace, on demand. Member+; a non-member is
         // `-32602 not-found` like any other membership-narrowed read.
@@ -4868,6 +5247,16 @@ async fn dispatch(
             let r = api.presence_snapshot(id).await.map_err(workspace_err)?;
             Ok(r)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn linear_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // `linear.*` (§5.28) uses leaf-configured credentials. Optional
         // `workspaceId` is routing metadata only; it never selects credentials. A key
         // that is absent or fails the `viewer` probe ("not configured") and any
@@ -4966,6 +5355,16 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn sentry_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // `sentry.*` (§5.29) accepts optional routing-only `workspaceId`;
         // explicit issue/project selectors and leaf credentials are unchanged. A
         // credential pair that is absent or fails the org probe ("not
@@ -5038,6 +5437,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn file_tracking_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "file-tracking.getChanges" => {
             let ws = require_ws_note(params)?;
             let filter = opt_value(params, "filter");
@@ -5086,6 +5495,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn metrics_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "metrics.getAgentStats" => {
             let agent_id = require_str_param(params, "agentId")?;
             let r = api
@@ -5094,6 +5513,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn settings_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "settings.list" => {
             // Daemon-wide storage; optional routing context does not scope settings.
             // Sensitive values are redacted.
@@ -5127,6 +5556,16 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn system_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    _params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "system.capabilities" => {
             // Machine-level capabilities; optional workspaceId is routing-only (§5.7).
             // Router method (unlike the system.* control fast-path): the
@@ -5134,6 +5573,16 @@ async fn dispatch(
             let r = api.system_capabilities().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn debug_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "debug.sampleStacks" => {
             // Point-in-time sample of the daemon's own thread stacks
             // (PROTOCOL §5.43, monorepo#1755); no workspaceId — the daemon
@@ -5158,6 +5607,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn providers_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "providers.catalog" => {
             // The static provider registry (monorepo#928); no params, no
             // workspaceId — the registry is compiled-in daemon data.
@@ -5195,6 +5654,16 @@ async fn dispatch(
             .provider_profiles_update_default(Value::Object(params.clone()))
             .await
             .map_err(domain_to_rpc),
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn unsloth_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    _params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "unsloth.status" => {
             // Observe the daemon-managed singleton Unsloth server
             // (monorepo#878); no workspaceId — the server is daemon-global.
@@ -5207,6 +5676,16 @@ async fn dispatch(
             let r = api.unsloth_stop().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn voice_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "voice.transcribe" => {
             // Daemon-owned and global: no required `workspaceId`. `audio`
             // (base64) is required; the service layer validates shape/size,
@@ -5235,6 +5714,16 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn accept_changes_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "accept-changes.getStatus" => {
             let ws = require_ws_note(params)?;
             let r = api
@@ -5320,6 +5809,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn search_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "search.inFiles" => {
             let ws = require_ws_note(params)?;
             let query = require_str_param(params, "query")?;
@@ -5423,6 +5922,16 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn terminal_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "terminal.create" => {
             let ws = require_ws_note(params)?;
             let cols = opt_dim(params, "cols", 80);
@@ -5474,6 +5983,16 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn file_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "file.read" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
@@ -5627,6 +6146,16 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn primitive_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "primitive.addReference" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
@@ -5667,6 +6196,16 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn cross_workspace_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "crossWorkspace.listSiblings" => {
             let ws = require_ws_note(params)?;
             let include_retired = opt_bool_if_present(params, "includeRetired")?.unwrap_or(false);
@@ -5685,6 +6224,16 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn script_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "script.list" => {
             let ws = require_ws_note(params)?;
             api.script_list_view(ws, Value::Object(params.clone()))
@@ -5717,29 +6266,6 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_remove(ws, script_id)
-                .await
-                .map_err(domain_to_rpc)
-        }
-        "scriptMonitor.list" => {
-            let ws = require_ws_note(params)?;
-            let agent = params
-                .get("agentId")
-                .map(|_| require_str_param(params, "agentId").map(intent_core::AgentId::from))
-                .transpose()?;
-            api.script_monitor_list_view(ws, agent, Value::Object(params.clone()))
-                .await
-                .map_err(domain_to_rpc)
-        }
-        "scriptMonitor.get" => {
-            let ws = require_ws_note(params)?;
-            api.script_monitor_get(ws, require_str_param(params, "monitorId")?, None)
-                .await
-                .map_err(domain_to_rpc)
-        }
-        "scriptMonitor.cancel" | "scriptMonitor.cancelRun" => {
-            let ws = require_ws_note(params)?;
-            let id = require_str_param(params, "monitorId")?;
-            api.script_monitor_cancel(ws, id, None, method == "scriptMonitor.cancelRun")
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -5880,6 +6406,49 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn script_monitor_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
+        "scriptMonitor.list" => {
+            let ws = require_ws_note(params)?;
+            let agent = params
+                .get("agentId")
+                .map(|_| require_str_param(params, "agentId").map(intent_core::AgentId::from))
+                .transpose()?;
+            api.script_monitor_list_view(ws, agent, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.get" => {
+            let ws = require_ws_note(params)?;
+            api.script_monitor_get(ws, require_str_param(params, "monitorId")?, None)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.cancel" | "scriptMonitor.cancelRun" => {
+            let ws = require_ws_note(params)?;
+            let id = require_str_param(params, "monitorId")?;
+            api.script_monitor_cancel(ws, id, None, method == "scriptMonitor.cancelRun")
+                .await
+                .map_err(domain_to_rpc)
+        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn hook_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // Background hooks (§6.8): the FE reads and manages hooks; there is
         // NO wire `hook.schedule` — hooks are agent-authored via the
         // `ws.hook.schedule` MCP binding only. An unknown/foreign `hookId`
@@ -5910,6 +6479,16 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn pr_monitor_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         // Centralized PR monitors (§6.9): the FE reads, cancels and flushes
         // monitors; there is NO wire registration method — monitors are
         // agent-owned via the `ws.pr.monitor` MCP binding only.
@@ -5938,6 +6517,16 @@ async fn dispatch(
             .await
             .map_err(domain_to_rpc)
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn rules_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "rules.list" => {
             // Optional workspaceId: present → include the workspace's read-only
             // rule files; omitted → global user-override set only.
@@ -5962,6 +6551,16 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn specialist_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "specialist.list" => {
             let workspace_path = if opt_bool_strict(params, "includeProject")?.unwrap_or(false) {
                 let workspace = api
@@ -6029,6 +6628,16 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn skill_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "skill.list" if params.get("agentId").is_some_and(|v| !v.is_null()) => {
             let ws_id = require_workspace_id(params)?;
             let agent_id = require_agent_id(params)?;
@@ -6050,6 +6659,16 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn mcp_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
         "mcp.servers.list" => {
             // Global (no required scope); optional workspaceId per PROTOCOL §5.22.
             let workspace_id = opt_workspace_id(params);
@@ -6115,31 +6734,6 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
-        "plugin.list" => api.plugin_list().await.map_err(domain_to_rpc),
-        "plugin.install" => {
-            let source = require_str_param(params, "source")?;
-            plugin_result(api.plugin_install(source).await)
-        }
-        "plugin.update" => {
-            let name = require_str_param(params, "name")?;
-            plugin_result(api.plugin_update(name).await)
-        }
-        "plugin.uninstall" => {
-            let name = require_str_param(params, "name")?;
-            let keep_data = params
-                .get("keepData")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            plugin_result(api.plugin_uninstall(name, keep_data).await)
-        }
-        "plugin.toggle" => {
-            let name = require_str_param(params, "name")?;
-            let enabled = params
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| invalid_params("enabled is required"))?;
-            plugin_result(api.plugin_toggle(name, enabled).await)
-        }
         "mcp.servers.restart" => {
             let server_id = require_str_param(params, "serverId")?;
             match api.mcp_servers_restart(server_id).await {
@@ -6198,6 +6792,41 @@ async fn dispatch(
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
+        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn plugin_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
+        "plugin.list" => api.plugin_list().await.map_err(domain_to_rpc),
+        "plugin.install" => {
+            let source = require_str_param(params, "source")?;
+            plugin_result(api.plugin_install(source).await)
+        }
+        "plugin.update" => {
+            let name = require_str_param(params, "name")?;
+            plugin_result(api.plugin_update(name).await)
+        }
+        "plugin.uninstall" => {
+            let name = require_str_param(params, "name")?;
+            let keep_data = params
+                .get("keepData")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            plugin_result(api.plugin_uninstall(name, keep_data).await)
+        }
+        "plugin.toggle" => {
+            let name = require_str_param(params, "name")?;
+            let enabled = params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid_params("enabled is required"))?;
+            plugin_result(api.plugin_toggle(name, enabled).await)
         }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
@@ -7189,6 +7818,9 @@ mod tests;
 
 #[cfg(test)]
 mod blank_model_tests;
+
+#[cfg(test)]
+mod dispatch_stack_tests;
 
 mod bounded_read;
 pub use bounded_read::REFUSE_OVER_CAP_WITHOUT_MAX_BYTES;

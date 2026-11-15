@@ -5,9 +5,8 @@
 //! CALLER's poll frame (about twice its size). [`boxed_await`] builds the
 //! future in its own never-inlined frame and returns it boxed, so the caller
 //! holds only a pointer. `conn::process_captured_frame` and `router::dispatch`
-//! already sit close to the 2 MiB default test stack (the repository-resource
-//! WSS tests need just under it), so their large or growing callees are
-//! awaited through this helper.
+//! sit on every RPC's stack, so their large or growing callees (including
+//! each per-namespace dispatch function) are awaited through this helper.
 
 use std::future::Future;
 use std::pin::Pin;

@@ -173,14 +173,25 @@ fn arm_body(dispatch: &str, method: &str) -> Option<String> {
     Some(body.join("\n"))
 }
 
-/// The body of the router's top-level `async fn dispatch(`.
+/// The router's top-level `async fn dispatch(` and the per-namespace
+/// `async fn *_methods(` functions that follow it, which hold the arms.
 fn dispatch_body(src: &str) -> &str {
     let start = src
         .find("\nasync fn dispatch(")
-        .expect("router dispatch fn");
-    let rest = &src[start + 1..];
-    let end = rest.find("\n}\n").expect("end of dispatch fn");
-    &rest[..end]
+        .expect("router dispatch fn")
+        + 1;
+    let mut end = start;
+    loop {
+        end += src[end..].find("\n}\n").expect("end of dispatch fn") + 3;
+        let next = src[end..].trim_start_matches('\n');
+        let namespace_fn = next
+            .strip_prefix("async fn ")
+            .and_then(|rest| rest.split('(').next())
+            .is_some_and(|name| name.ends_with("_methods"));
+        if !namespace_fn {
+            return &src[start..end];
+        }
+    }
 }
 
 /// Params each of `methods` reads in `router.rs`; methods without a router

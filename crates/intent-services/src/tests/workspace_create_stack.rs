@@ -2,8 +2,8 @@
 //!
 //! In debug builds every inline `.await` puts about twice the awaited future
 //! in the caller's poll frame (see `crate::stack_frame`). The create path sits
-//! under the transport's own deep poll frames (`router::dispatch` alone is
-//! ~900 KB in debug), so growth here showed up only as an unrelated-looking
+//! under the transport's own deep poll frames (`router::dispatch` alone was
+//! ~900 KB in debug until it was split per namespace), so growth here showed up only as an unrelated-looking
 //! "has overflowed its stack" abort of
 //! `wss_workspace_create_context_links_round_trip_and_validation`
 //! (intent-hq/intent#6741, intent-hq/intentd#2819), and only in some builds:
