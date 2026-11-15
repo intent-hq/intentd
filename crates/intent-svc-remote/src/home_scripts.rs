@@ -276,8 +276,10 @@ pub(crate) async fn open(
         .node(svc, &node_id)
         .await
         .map_err(|error| home_unavailable(&home, &error.to_string()))?;
-    // No dial here: the caller may hold a lock other scripts wait on.
+    // No dial here: the caller may hold a lock other scripts wait on. The
+    // start is a use of the machine: it waits out an idle pause.
     let shared = node.shared_ref();
+    let _use = shared.begin_use().await;
     if shared.protocol() < HOMES_PROTOCOL {
         return Err(home_unavailable(
             &home,

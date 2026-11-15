@@ -55,7 +55,7 @@ const REAP_GRACE_MINUTES: u32 = 15;
 const MINUTE_MS_ENV: &str = "INTENTD_E2B_MINUTE_MS";
 const DAY_MS_ENV: &str = "INTENTD_E2B_DAY_MS";
 /// Test seam: a wait between an idle pause's home pushes and the pause, in
-/// milliseconds, so a test can use the sandbox in between.
+/// milliseconds, so a test can try to use the sandbox in between.
 const AFTER_PUSH_MS_ENV: &str = "INTENTD_E2B_AFTER_PUSH_MS";
 
 /// The turn error of an agent whose sandbox E2B removed.
@@ -480,31 +480,6 @@ pub(crate) async fn pause(
     client: &dyn CloudProvider,
     machine_id: &str,
 ) -> Result<ExposedMachine> {
-    pause_when(svc, feature, client, machine_id, Admit::Any).await
-}
-
-/// Which pauses [`pause_when`] admits.
-#[derive(Debug, Clone, Copy)]
-enum Admit {
-    /// Any pause without a turn in flight (`cloudMachines.pause`, the run
-    /// cap, a restart's cut pause).
-    Any,
-    /// An idle pause: nothing busy, and no activity since the time read
-    /// before its home pushes.
-    IdleSince(Option<Instant>),
-}
-
-/// [`pause`], admitted as `admit` says. An idle pause is admitted under
-/// the machine's locks, and checked again once the machine is parked: a
-/// call that began before the park is seen there and undoes it, and one
-/// that begins after it waits for the pause, then resumes the sandbox.
-async fn pause_when(
-    svc: &Services,
-    feature: &RemoteFeature,
-    client: &dyn CloudProvider,
-    machine_id: &str,
-    admit: Admit,
-) -> Result<ExposedMachine> {
     let _lifecycle = feature.lifecycle(machine_id).await;
     let _transition = feature.cloud.transition(machine_id).await;
     let row = svc
@@ -529,28 +504,13 @@ async fn pause_when(
             return Err(crate::methods::in_use(&row.name, turns));
         }
     }
-    let used = |node: Option<&crate::RemoteNode>| match admit {
-        Admit::Any => false,
-        Admit::IdleSince(before) => node.is_some_and(|node| {
-            node.shared_ref().busy() || Some(node.shared_ref().last_activity()) != before
-        }),
-    };
-    if used(node.as_ref()) {
-        feature.cloud.touch(machine_id);
-        return Err(crate::methods::in_use(&row.name, 0));
-    }
     // No dial from now until a demand; the link drops with the pause anyway,
     // and a dial in flight is dropped when it binds.
     feature.cloud.park(machine_id);
-    if used(node.as_ref()) {
-        feature.cloud.unpark(machine_id);
-        feature.cloud.touch(machine_id);
-        return Err(crate::methods::in_use(&row.name, 0));
-    }
-    feature.cloud.count_pause(machine_id);
     if let Some(node) = &node {
         node.shared_ref().close_link();
     }
+    feature.cloud.count_pause(machine_id);
     set_state(svc, feature, machine_id, CloudSandboxState::Pausing).await;
     let paused = match client.pause(&cloud.sandbox_id).await {
         Ok(()) => Ok(()),
@@ -883,6 +843,10 @@ enum PauseFor {
 
 /// Pause in the background, as `why` says.
 fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, why: PauseFor) {
+    let idle_since = super::feature(svc)
+        .ok()
+        .and_then(|feature| feature.running_node(machine_id))
+        .map(|node| node.shared_ref().last_activity());
     let svc = svc.clone();
     let client = client.clone();
     let machine_id = machine_id.to_owned();
@@ -896,7 +860,7 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, why: PauseFo
             if !feature.cloud.begin_push(&machine_id) {
                 return;
             }
-            let paused = idle_pause(&svc, feature, &*client, &machine_id).await;
+            let paused = idle_pause(&svc, feature, &*client, &machine_id, idle_since).await;
             feature.cloud.end_push(&machine_id);
             paused
         } else {
@@ -919,21 +883,41 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, why: PauseFo
     });
 }
 
-/// An idle pause: the homes push first ([`pushed_before_pause`]); anything
-/// that ran meanwhile (a terminal, a call, a turn, even one already over)
-/// means the sandbox is not idle any more, and its idle time starts again.
+/// How long an idle pause waits for the uses of its machine in flight to
+/// end before it gives up (the idle time starts again).
+const USE_WAIT: Duration = Duration::from_secs(5);
+
+/// An idle pause. It holds its machine's use gate exclusively
+/// ([`crate::connector::Shared::quiesce`]): the uses in flight (home calls,
+/// terminal and script opens, turns) end first, and new ones wait until the
+/// link is closed, then dial, which resumes the sandbox. Under the gate it
+/// checks the sandbox is still idle (nothing busy, no activity since the
+/// check that found it idle), the homes push ([`pushed_before_pause`]), and
+/// the sandbox pauses.
 async fn idle_pause(
     svc: &Services,
     feature: &RemoteFeature,
     client: &dyn CloudProvider,
     machine_id: &str,
+    idle_since: Option<Instant>,
 ) -> Result<()> {
-    let activity = || {
-        feature
-            .running_node(machine_id)
-            .map(|node| node.shared_ref().last_activity())
-    };
-    let before = activity();
+    let node = feature.running_node(machine_id);
+    // Held until the pause ends: new uses wait for it.
+    let mut quiet = None;
+    if let Some(node) = &node {
+        quiet = node.shared_ref().quiesce(USE_WAIT).await;
+        if quiet.is_none() {
+            feature.cloud.touch(machine_id);
+            return Err(Error::Internal("the sandbox kept being used".into()));
+        }
+    }
+    let used = node.as_ref().is_some_and(|node| {
+        node.shared_ref().busy() || Some(node.shared_ref().last_activity()) != idle_since
+    });
+    if used {
+        feature.cloud.touch(machine_id);
+        return Err(Error::Internal("the sandbox is in use".into()));
+    }
     if !pushed_before_pause(svc, feature, machine_id).await {
         return Err(Error::Internal(
             "a home did not push before the idle pause".into(),
@@ -943,18 +927,12 @@ async fn idle_pause(
         .ok()
         .and_then(|ms| ms.parse::<u64>().ok())
     {
-        // timing-guard: test seam only; holds the gap a real slow push leaves open
+        // timing-guard: test seam only; holds the gap a slow push leaves open
         tokio::time::sleep(Duration::from_millis(wait)).await;
     }
-    if activity() != before {
-        feature.cloud.touch(machine_id);
-        return Err(Error::Internal(
-            "the sandbox was used while its homes pushed".into(),
-        ));
-    }
-    pause_when(svc, feature, client, machine_id, Admit::IdleSince(before))
-        .await
-        .map(drop)
+    let paused = pause(svc, feature, client, machine_id).await.map(drop);
+    drop(quiet);
+    paused
 }
 
 /// Before an idle pause (nodes.md "Cloud homes" 4): each home the machine

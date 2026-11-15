@@ -493,10 +493,21 @@ pub(crate) async fn connect_home(svc: &Services, workspace_id: &WorkspaceId) -> 
 
 /// The connected machine of `workspace_id`'s home, speaking nodeProtocol
 /// 19; `None` when the workspace has no home on a machine.
+/// The workspace's home and its connected machine, with the use of the
+/// machine the caller holds while it opens its terminal
+/// ([`Shared::begin_use`]).
+///
+/// [`Shared::begin_use`]: crate::connector::Shared::begin_use
 async fn linked_home(
     svc: &Services,
     workspace_id: &WorkspaceId,
-) -> Result<Option<(intent_core::WorkspaceHome, crate::connector::RemoteNode)>> {
+) -> Result<
+    Option<(
+        intent_core::WorkspaceHome,
+        crate::connector::RemoteNode,
+        tokio::sync::OwnedRwLockReadGuard<()>,
+    )>,
+> {
     if !svc.workspace_homes() {
         return Ok(None);
     }
@@ -515,6 +526,7 @@ async fn linked_home(
         .node(svc, &node_id)
         .await
         .map_err(|error| home_unavailable(&home, &error.to_string()))?;
+    let gate = node.shared_ref().begin_use().await;
     node.connect()
         .await
         .map_err(|error| home_unavailable(&home, &error.to_string()))?;
@@ -524,7 +536,7 @@ async fn linked_home(
             "its machine needs an intentd update for workspace homes",
         ));
     }
-    Ok(Some((home, node)))
+    Ok(Some((home, node, gate)))
 }
 
 /// Hold `term` as `terminal_id` and send its `ptyOpen` on the terminal's
@@ -574,7 +586,7 @@ pub(crate) async fn open(
     pty: &Arc<PtyHost>,
     open: HomeTerminalOpen,
 ) -> Result<Option<PtyId>> {
-    let Some((home, node)) = linked_home(svc, workspace_id).await? else {
+    let Some((home, node, _use)) = linked_home(svc, workspace_id).await? else {
         return Ok(None);
     };
     let shared = node.shared_ref();
@@ -637,7 +649,7 @@ pub(crate) async fn open_exec(
     workspace_id: &WorkspaceId,
     open: HomeExecOpen,
 ) -> Result<Option<HomeExec>> {
-    let Some((home, node)) = linked_home(svc, workspace_id).await? else {
+    let Some((home, node, _use)) = linked_home(svc, workspace_id).await? else {
         return Ok(None);
     };
     let shared = node.shared_ref();

@@ -852,9 +852,9 @@ const AFTER_PUSH_MS: u64 = 2000;
 /// backup" 2), with one settings minute scaled to 3 s and an idle pause of
 /// one minute: an open terminal keeps the home-only sandbox running past
 /// several idle periods; once it closes, the home pushes the uncommitted
-/// file the terminal wrote to `home/wip`. An app edit between that push and
-/// the pause skips the pause; the next idle pause pushes the edit too, then
-/// pauses.
+/// file the terminal wrote to `home/wip`. An app edit while that pause runs
+/// waits for it, then resumes the sandbox and lands; the next idle pause
+/// pushes the edit too, then pauses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing() {
     let Some(mut homes) = CloudHomes::start(
@@ -953,21 +953,27 @@ async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing(
         "home/wip lacks the terminal's file after the push"
     );
 
-    // An app edit between that push and the pause (the seam holds the gap
-    // open): this pause is skipped, as the sandbox was used.
+    // An app edit while the pause runs (the seam holds the gap between its
+    // push and the pause open): it waits for the pause, then resumes the
+    // sandbox and lands. Nothing slips through before the pause.
     homes
         .ok(
             "file.write",
             json!({ "workspaceId": ws_id, "path": "late.txt", "content": "late\n" }),
         )
         .await;
-    // timing-guard: past the seam's gap, when a pause that ignored the edit would have run
-    tokio::time::sleep(Duration::from_millis(AFTER_PUSH_MS + 1500)).await;
     assert_eq!(
         homes.pause_calls(&sandbox),
-        0,
-        "paused right after the sandbox was used"
+        1,
+        "the edit did not wait for the pause"
     );
+    let read = homes
+        .ok(
+            "file.read",
+            json!({ "workspaceId": ws_id, "path": "late.txt" }),
+        )
+        .await;
+    assert_eq!(read, "late\n", "{read}");
 
     // Idle again: it pushes once more, with the late edit, then pauses.
     let id = homes.next();
@@ -976,6 +982,12 @@ async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing(
     })
     .await;
     homes.id += 1000;
+    assert_eq!(
+        homes.pause_calls(&sandbox),
+        2,
+        "{:?}",
+        homes.fake.state().calls
+    );
     let files = wip_files(&repo).expect("home/wip was pushed before the pause");
     assert!(
         files.contains("wip.txt") && files.contains("late.txt"),

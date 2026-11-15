@@ -348,6 +348,11 @@ pub(crate) struct Shared {
     /// record of an agent ingested, or a home call. A cloud machine's idle
     /// pause counts from it (intent-hq/intent#9237).
     last_activity: Mutex<Instant>,
+    /// Uses of the machine over its link (home calls, terminal and home
+    /// script opens, agent turns) hold the shared side for their whole
+    /// time; an idle pause of a cloud machine holds the exclusive side
+    /// from its home pushes until the link is closed.
+    use_gate: Arc<tokio::sync::RwLock<()>>,
     /// Agents whose machine runs an acknowledged final stop settled.
     #[cfg(test)]
     final_settles: Mutex<Vec<AgentId>>,
@@ -601,6 +606,30 @@ impl Shared {
     /// When the machine last had agent activity (see `last_activity`).
     pub(crate) fn last_activity(&self) -> Instant {
         *lock(&self.last_activity)
+    }
+
+    /// Begin a use of the machine over its link; it waits while an idle
+    /// pause runs, and the guard ends the use.
+    pub(crate) async fn begin_use(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.use_gate.clone().read_owned().await
+    }
+
+    /// For an idle pause: wait up to `wait` for the uses in flight to end,
+    /// and hold off new ones while the guard lives. `None` when uses kept
+    /// it busy.
+    pub(crate) async fn quiesce(
+        &self,
+        wait: Duration,
+    ) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        tokio::time::timeout(wait, self.use_gate.clone().write_owned())
+            .await
+            .ok()
+    }
+
+    /// Ask for a link: a parked cloud machine resumes for it.
+    pub(crate) fn ask_link(&self) {
+        let (tx, _rx) = oneshot::channel();
+        let _ = self.demand.send(Some(tx));
     }
 
     /// The machine has agent activity now.
@@ -1767,6 +1796,7 @@ impl RemoteNode {
             stop_exits: Mutex::new(HashMap::new()),
             lost_processes: Mutex::default(),
             last_activity: Mutex::new(Instant::now()),
+            use_gate: Arc::default(),
             #[cfg(test)]
             final_settles: Mutex::default(),
             #[cfg(test)]
