@@ -452,7 +452,20 @@ impl NodeGitAccess for HeadGitAccess {
                 orphaned,
                 pins_only: false,
             };
-            match self.home_stop(binding, remote).await? {
+            let stop = self.home_stop(binding, remote).await?;
+            // Rechecked under the slot: a rollback may have discarded this
+            // home's push after its repository was resolved.
+            if stop.is_some()
+                && !is_sink(repository)
+                && self
+                    .shared
+                    .store
+                    .home_stop_discards_push(&HomeId::from(remote.agent_id()))
+                    .await?
+            {
+                return Err(unavailable("this home's last push is discarded"));
+            }
+            match stop {
                 Some(stop) if stop.reason == HomeStopReason::Moved => {
                     let at = stop
                         .frame()

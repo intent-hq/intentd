@@ -3599,6 +3599,78 @@ mod home_stops {
         node.shutdown();
     }
 
+    /// A target's push that resolved the workspace's repository before the
+    /// rollback recorded its discarded stop is refused under the push slot;
+    /// the machine's retry resolves the sink, and the home refs never move.
+    #[tokio::test]
+    async fn a_target_push_resolved_before_its_rollback_is_refused() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        let node = backend.expose(&mut machine).await;
+        let repo = tempfile::tempdir().unwrap();
+        committed_repo(repo.path());
+        workspace_at(&backend, repo.path()).await;
+        moving_to(&backend, &machine).await;
+        node.connect().await.unwrap();
+        let link = machine.accept().await;
+        link.replay_complete(0).await;
+        bound(&node).await;
+        let access = crate::git::HeadGitAccess::new(node.shared());
+        let binding = &link.hello.binding;
+        let remote = AgentRemote::home(workspace().as_str(), "h-new").unwrap();
+        let resolved = access
+            .repository(binding, &remote, GitService::ReceivePack)
+            .await
+            .unwrap();
+        assert_eq!(resolved, repo.path(), "the target reads the workspace's");
+        let refs = |path: &std::path::Path| {
+            let repo = git2::Repository::open(path).unwrap();
+            let mut names: Vec<_> = repo
+                .references()
+                .unwrap()
+                .filter_map(|r| {
+                    let r = r.ok()?;
+                    Some((
+                        String::from_utf8_lossy(r.name_bytes()).into_owned(),
+                        r.target(),
+                    ))
+                })
+                .collect();
+            names.sort();
+            names
+        };
+        let before = refs(repo.path());
+
+        assert!(backend
+            .store()
+            .abort_home_move(
+                &workspace(),
+                &HomeId::from("h-new"),
+                &intent_core::now_iso()
+            )
+            .await
+            .unwrap());
+        assert!(
+            access
+                .before_receive(binding, &remote, &resolved)
+                .await
+                .is_err(),
+            "a discarded stop's push may not land in the workspace's repository"
+        );
+        let sink = access
+            .repository(binding, &remote, GitService::ReceivePack)
+            .await
+            .unwrap();
+        assert_ne!(sink, repo.path());
+        let hold = access
+            .before_receive(binding, &remote, &sink)
+            .await
+            .unwrap();
+        drop(hold);
+        assert_eq!(refs(repo.path()), before, "the home refs never moved");
+        node.shutdown();
+    }
+
     /// An archive during a move also stops the move's target (its push
     /// discarded) besides the old home.
     #[tokio::test]
