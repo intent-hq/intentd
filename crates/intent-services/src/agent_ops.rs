@@ -310,10 +310,10 @@ impl PendingQuestionMutationLocks {
     /// A mutation that starts AFTER removal gets a fresh mutex, but by then
     /// the session row is gone, so it no-ops on the store read — the two
     /// mutexes never guard conflicting writes.
-    fn remove(&self, agent_id: &AgentId) {
+    pub(crate) fn remove(&self, agent_id: &AgentId) {
         self.locks
             .lock()
-            .expect("pending-question lock map poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -7840,6 +7840,9 @@ impl Services {
             .get_agent_session_with_transcript(&agent_id)
             .await;
         let mut known_completion = matches!(&session_observation, Ok(_) | Err(Error::NotFound(_)));
+        // A failed read leaves the agent's state unknown: it may still be
+        // live, so its resources are not released below.
+        let session_read = known_completion;
         let session_meta = session_observation
             .ok()
             .map(|s| (s.workspace_id, s.name, s.parent_agent_id));
@@ -7951,61 +7954,17 @@ impl Services {
                 .await?;
             known_completion &= deleted;
             self.invalidate_agent_list_cache(session_ws);
-            // The runtime is stopped above; its temp folder goes with it.
-            if let Some(manager) = self.agent_manager() {
-                manager
-                    .remove_agent_tmp_dirs(
-                        std::slice::from_ref(&agent_id),
-                        intent_core::AgentTmpRemoval::Deleted,
-                    )
-                    .await;
-            }
         }
-        // Memory-held secrets and pending requests die with their agent
-        // (§5.56). Swept only AFTER the row is gone: a concurrent
-        // `ws.secret.request` either inserted before this sweep (removed
-        // here) or re-reads the session after the DELETE and drops itself.
-        self.secret_vault.clear_agent(&agent_id);
-        self.agent_queues
-            .lock()
-            .expect("agent queue registry poisoned")
-            .remove(&agent_id);
-        // Silent-tail record (intent-hq/monorepo#2669): in-memory, keyed by
-        // agent — drop it with the session so the map never leaks entries
-        // for deleted agents. The truncation-redrive counter and handoff
-        // flag (monorepo#2863) are dropped on the same terms.
-        self.clear_turn_silent_tail(&agent_id);
-        self.clear_truncation_redrives(&agent_id);
-        self.take_truncation_redrive(&agent_id);
-        // A parked mid-turn attention raise dies with the agent — dropped on
-        // the same terms as the other per-agent in-memory registries.
-        self.take_deferred_attention(&agent_id);
-        // Context-occupancy registry (intent-hq/intent#3797): in-memory,
-        // keyed by agent — dropped on the same terms.
-        self.clear_context_usage(&agent_id);
-        // Registry hygiene (monorepo#840): drop the failure streak and any
-        // failure-wake dedup records naming the deleted agent as parent OR
-        // child — delegation churns short-lived agents in both roles, so a
-        // child-only sweep would leak (deleted_parent, child) entries for the
-        // daemon's lifetime. The streaming path's terminal-error stash
-        // (monorepo#2050) is dropped on the same terms.
-        self.clear_failure_streak(&agent_id);
-        self.clear_failure_wake_dedup_all_roles(&agent_id);
-        self.discard_pending_terminal_error(&agent_id);
-        // Pending-question registries (monorepo#3179): the per-agent marker
-        // mutation lock and the dismissal-notice dedup set are both in-memory
-        // and keyed by agent — drop them with the session so neither map
-        // grows unboundedly on a long-lived daemon. In-flight marker
-        // mutations keep their own Arc clone of the mutex, so ordering is
-        // preserved (see `PendingQuestionMutationLocks::remove`).
-        self.pending_question_mutation_locks.remove(&agent_id);
-        self.dismissal_notices_sent
-            .lock()
-            .expect("dismissal notice registry poisoned")
-            .remove(&agent_id);
-        // Drop the deleted agent's event subscriptions (monorepo#937): the
-        // wake target is gone, so matching/batching for it is pure leak.
-        self.remove_event_subscriptions_for_agent(&agent_id).await;
+        // The row is gone (deleted above, or never found) and the runtime
+        // is stopped: release everything the agent owned (see
+        // `agent_resources`).
+        if session_read {
+            self.release_deleted_agent(crate::agent_resources::DeletedAgent {
+                workspace_id: session_workspace_id.as_ref(),
+                agent_id: &agent_id,
+            })
+            .await;
+        }
         if let Some((workspace_id, agent_name, parent_agent_id)) = session_meta {
             // intent-hq/monorepo#3906: the session row is already deleted, so
             // the watch-wake label pass cannot resolve the delegation parent
@@ -8405,8 +8364,6 @@ impl Services {
                 intent_core::remote_launch::FinalStopReason::AgentRetired,
             )
             .await;
-        // A retired agent is inert: drop its secrets and pending requests (§5.56).
-        self.secret_vault.clear_agent(&session.id);
         // The persisted mark closes new requests before teardown. A wire
         // caller retires another agent, whose current worker must be aborted;
         // MCP self-retirement instead lets its own response unwind normally.
@@ -8420,41 +8377,11 @@ impl Services {
                 manager.retire(&session.id).await;
             }
         }
-        // Its temp folder goes now, or when a still-running process ends.
-        if let Some(manager) = self.agent_manager() {
-            manager
-                .remove_agent_tmp_dirs(
-                    std::slice::from_ref(&session.id),
-                    intent_core::AgentTmpRemoval::Retired,
-                )
-                .await;
-        }
         self.invalidate_agent_list_cache(&session.workspace_id);
-        // Drop the retired agent's event subscriptions: the wake target is
-        // inert, so matching/batching for it is pure leak (same rationale
-        // as the delete cascade — monorepo#937). The queue entry is kept:
-        // restore may drain it later.
-        self.remove_event_subscriptions_for_agent(&session.id).await;
-        // Cancel the retiring agent's active hooks and PR monitors (mirrors
-        // the workspace-archive sweeps): the owner is inert and retired
-        // itself, so NO wake notice is queued. `agent.restore` does NOT
-        // resurrect them (unarchive precedent) — the agent re-registers if
-        // the condition still matters.
-        self.ports
-            .runtime()
-            .cancel_agent_hooks(self, &session.id)
-            .await;
-        self.cancel_agent_pr_monitors(&session.id).await;
-        // Drop the retiring agent's OWN outgoing completion watches and
-        // delegation groups (monorepo#4183): a retired watcher can never
-        // consume a wake — every delivery attempt fails on the soft-retire
-        // inertness gate, so a watch left armed feeds the completion
-        // delivery retry loop with permanent failures forever. Mirrors the
-        // delete cascade and `agent.cancelSubscriptions` remove-all sweep.
-        // `agent.restore` does NOT resurrect them (same contract as hooks /
-        // PR monitors above) — the agent re-watches if it still cares.
-        self.remove_all_for_parent(&session.id);
-        self.remove_groups_for_parent(&session.id);
+        // The retired agent is inert: release what it owned (secrets,
+        // subscriptions, hooks, PR monitors, watches, temp folder — see
+        // `agent_resources`). `agent.restore` does not resurrect them.
+        self.release_retired_agent(&session.id).await;
         let mut data = json!({
             "agentId": session.id.0,
             "agentName": session.name,
@@ -8544,13 +8471,8 @@ impl Services {
         }
         if let Some(manager) = self.agent_manager() {
             manager.restore_retired(&agent_id);
-            // Under the retirement gate, like the retire's removal. An
-            // archive's removal stands.
-            manager.keep_agent_tmp_dirs(
-                std::slice::from_ref(&agent_id),
-                intent_core::AgentTmpRemoval::Retired,
-            );
         }
+        self.reclaim_restored_agent(&agent_id).await;
         self.invalidate_agent_list_cache(&session.workspace_id);
         crate::publish_event(
             self.event_bus.as_ref(),

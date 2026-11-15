@@ -753,6 +753,44 @@ async fn original_agent_metadata_error_keeps_legacy_ack_without_confirming_claim
     );
 }
 
+/// A failed session read leaves the agent possibly live (its row stays):
+/// `agent.delete` must not release what it owns, such as its watches.
+#[intent_test_macros::daemon_test]
+async fn session_read_error_does_not_release_agent_resources() {
+    let h = Harness::new().await;
+    h.services
+        .register_completion_watch(
+            &h.ws,
+            &h.ws,
+            h.agent.clone(),
+            "Watcher".into(),
+            intent_core::AgentId::from("target-agent"),
+            None,
+        )
+        .expect("register watch");
+    sqlx::query("ALTER TABLE agent_message RENAME TO missing_original_transcript")
+        .execute(h.services.store.write_pool())
+        .await
+        .unwrap();
+
+    h.services
+        .agent_delete_op(h.agent.clone(), None)
+        .await
+        .unwrap();
+
+    assert!(h
+        .services
+        .store
+        .get_agent_session_summary(&h.agent)
+        .await
+        .is_ok());
+    assert_eq!(
+        h.services.list_watches_for_parent(&h.agent).len(),
+        1,
+        "the possibly live agent keeps its watch"
+    );
+}
+
 #[intent_test_macros::daemon_test]
 async fn unobserved_claimed_cancellation_survives_last_services_store_drop_and_reopen() {
     let db = TempDb::new();

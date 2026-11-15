@@ -65,6 +65,7 @@ mod acp_adapter;
 mod agent_locks;
 mod agent_manager;
 mod agent_ops;
+mod agent_resources;
 mod agent_session;
 mod agent_subscriptions;
 mod agent_wake;
@@ -7775,7 +7776,7 @@ impl Services {
     pub(crate) fn clear_failure_streak(&self, agent_id: &AgentId) {
         self.agent_failure_streaks
             .lock()
-            .expect("agent failure streak registry poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -7816,7 +7817,7 @@ impl Services {
     pub(crate) fn discard_pending_terminal_error(&self, agent_id: &AgentId) {
         self.pending_terminal_error
             .lock()
-            .expect("pending terminal error registry poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -7983,7 +7984,7 @@ impl Services {
     pub(crate) fn clear_failure_wake_dedup_all_roles(&self, agent_id: &AgentId) {
         self.failure_wake_dedup
             .lock()
-            .expect("failure wake dedup registry poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(parent, child), _| parent != agent_id && child != agent_id);
     }
 
@@ -17628,11 +17629,6 @@ impl Services {
         // reference; read-only/test wiring with no manager attached simply
         // skips the runtime stop and still sweeps the in-memory registries.
         let manager = self.agent_manager();
-        let agent_queues = self.agent_queues.clone();
-        let live_turns = self.live_turns.clone();
-        let last_turn_silent_tails = self.last_turn_silent_tails.clone();
-        let truncation_redrives = self.truncation_redrives.clone();
-        let pending_truncation_redrive = self.pending_truncation_redrive.clone();
         let agent_subscriptions = self.agent_subscriptions.clone();
         // Full handle for the direct completion delivery below (Services is
         // Clone — the same capture pattern the spawn helpers use).
@@ -17732,41 +17728,14 @@ impl Services {
                 Some(manager) => Some(manager.stop_many(&session_ids).await),
                 None => None,
             };
-            for session in &sessions {
-                // Live-turn slot + pending message queue live in `Services`'
-                // maps (not touched by `manager.stop_many`); drop them so a
-                // same-slug recreate observes no ghost state. Recover through
-                // a poisoned lock via `into_inner` — the delete path is the
-                // last chance to unlink this state, so best-effort teardown
-                // outweighs propagating a mutex-poison panic.
-                live_turns
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                last_turn_silent_tails
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                truncation_redrives
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                pending_truncation_redrive
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                agent_queues
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-            }
             // Sweep the deleted workspace out of the daemon-global
             // subscription registry: drop watches whose PARENT lives here
             // (their wake destination is gone) and groups anchored here.
             // Watches whose parent lives elsewhere (a chief watching a child
             // in this workspace) are kept — the `agent:deleted` events
             // published just below still wake the cross-workspace parent.
-            // Poison recovery mirrors the per-session sweep above.
+            // Recover a poisoned lock: delete is the last chance to unlink
+            // this state.
             let parent_watch_ids: Vec<String> = {
                 let registry = agent_subscriptions
                     .lock()
@@ -17906,26 +17875,14 @@ impl Services {
                         .await;
                 }
             }
-            // Drop the workspace's event subscriptions (monorepo#947): their
-            // filter is workspace-scoped, so once the workspace is gone they
-            // can never match again — without this sweep their delivery
-            // tasks and persisted rows leak and rehydrate forever. Aborts
-            // the tasks and deletes the rows (chief-anchored subscriptions
-            // scoped to OTHER workspaces are untouched — this removes only
-            // subscriptions whose events came from the deleted workspace).
-            // Producer admission is already closed: no new subscription can
-            // register behind this sweep while the store cleanup yields.
-            services.remove_event_subscriptions_for_workspace(&id).await;
-            // Drop the workspace's memory-held secrets and pending secret
-            // requests (§5.56) before its rows go.
-            services.secret_vault.clear_workspace(&id);
-            // Eagerly abort the workspace's live hook scheduler tasks BEFORE
-            // the store cascade drops their rows — otherwise each task would
-            // linger until its next tick before noticing the row is gone.
+            // Release what the agents owned (see `agent_resources`), before
+            // the rows go. Producer admission is already closed: nothing new
+            // can register behind this sweep while the store cleanup yields.
             services
-                .ports
-                .runtime()
-                .abort_workspace_hook_tasks(&services, &id)
+                .release_deleted_workspace_agents(agent_resources::DeletedWorkspace {
+                    workspace_id: &id,
+                    agent_ids: &session_ids,
+                })
                 .await;
             // Capture workspace state for the async cleanup below (before the
             // row delete). Best-effort: when the workspace is already gone or
@@ -17975,13 +17932,6 @@ impl Services {
                     );
                 }
                 Err(e) => return Err(e),
-            }
-            // The rows are gone and the agents' trees are killed: remove
-            // their temp folders.
-            if let Some(manager) = manager.as_ref() {
-                manager
-                    .remove_agent_tmp_dirs(&session_ids, intent_core::AgentTmpRemoval::Deleted)
-                    .await;
             }
             // The row is gone and its scripts are stopped: delete its on-disk
             // script output (best-effort; the startup orphan sweep retries).
@@ -35781,10 +35731,9 @@ impl Services {
                 (flipped, None)
             };
             // Under the fence with the flip, so a later archive's removal is
-            // never cancelled: keep the temp folders the archive left to
-            // running processes.
+            // never cancelled (see `agent_resources`).
             if flipped {
-                self.keep_workspace_agent_tmp_dirs(&id).await;
+                self.reclaim_unarchived_workspace_agents(&id).await;
             }
             (flipped, revived)
         };
@@ -39010,7 +38959,7 @@ impl Services {
     /// Detach the temp folders of every agent in `id` (archive) for
     /// [`AgentManager::discard_agent_tmp_dirs`]. A folder a running process
     /// holds goes when it ends, unless unarchive keeps it.
-    async fn detach_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) -> Vec<PathBuf> {
+    pub(crate) async fn detach_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) -> Vec<PathBuf> {
         let Some(manager) = self.agent_manager() else {
             return Vec::new();
         };
@@ -39032,7 +38981,7 @@ impl Services {
 
     /// Cancel the archive's deferred temp-folder removal for `id`'s agents
     /// (unarchive; call under the archive fence). A retire's removal stands.
-    async fn keep_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) {
+    pub(crate) async fn keep_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) {
         let Some(manager) = self.agent_manager() else {
             return;
         };
@@ -39231,28 +39180,16 @@ impl Services {
                 // Desktop authority never survives archive, the caller's
                 // included: unarchive must not hand it back without consent.
                 this.desktop_terminate_workspace(&id).await;
-                // Archiving drops every memory-held secret and pending
-                // request in the workspace (§5.56); unarchive starts empty.
-                this.secret_vault.clear_workspace(&id);
-                // Its remote agents' secrets are on their machines.
-                this.forget_remote_secrets_in(&id);
-                // Cancel every active background hook in the workspace: task
-                // aborted, state persisted to `cancelled`, `hook:cancelled`
-                // emitted — silently per hook. Unarchive does NOT resurrect
-                // cancelled hooks; the consolidated notice below tells the
-                // owner to reschedule if the condition still matters.
-                let cancelled_hooks = this.ports.runtime().cancel_workspace_hooks(&this, &id).await;
-                // Cancel every ACTIVE PR monitor the same way
-                // (intent-hq/monorepo#1828): state persisted to `cancelled`,
-                // `prMonitor:cancelled` emitted, silently per monitor.
-                // Unarchive does NOT resurrect cancelled monitors. Without
-                // this sweep an archived workspace's displayStatus rollup
-                // reads `in_progress` indefinitely off the active-monitor
-                // signal.
-                let cancelled_monitors = this.cancel_workspace_pr_monitors(&id).await;
+                // Release what the agents own (secrets, hooks, PR monitors,
+                // temp folders — see `agent_resources`). Hooks and monitors
+                // are cancelled silently per item; unarchive does NOT
+                // resurrect them.
+                let mut sweep =
+                    agent_resources::ArchiveSweep::new(id.clone(), ws.archived_at.clone());
+                this.release_archived_workspace_agents(&mut sweep).await;
                 // ONE consolidated wake per affected owner naming every hook
-                // and monitor the two sweeps cancelled, THEN the owner's
-                // deferral backstop (the per-item cancels above skipped it so
+                // and monitor the sweep cancelled, THEN the owner's
+                // deferral backstop (the per-item cancels skipped it so
                 // a deferred completion watch stays armed behind the queued
                 // notice). Runs AFTER the archived row is persisted so the
                 // wake parks behind the archived gate in
@@ -39260,6 +39197,8 @@ impl Services {
                 // the same reason the interrupt sweep above runs post-persist
                 // — and is only ever read after unarchive, which is the
                 // moment its wording is written for.
+                let cancelled_hooks = std::mem::take(&mut sweep.cancelled_hooks);
+                let cancelled_monitors = std::mem::take(&mut sweep.cancelled_monitors);
                 this.notify_owners_of_archived_watches(&id, cancelled_hooks, cancelled_monitors)
                     .await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
@@ -39299,13 +39238,6 @@ impl Services {
                         true
                     }
                 };
-                // Detach under the fence, so an unarchive's keep runs after
-                // it; the slow delete runs once the fence is released.
-                let detached_tmp_dirs = if still_archived {
-                    this.detach_workspace_agent_tmp_dirs(&ws.id).await
-                } else {
-                    Vec::new()
-                };
                 if still_archived {
                     publish_event(
                         bus.as_ref(),
@@ -39338,7 +39270,8 @@ impl Services {
                     });
                 }
                 drop(fence);
-                AgentManager::discard_agent_tmp_dirs(detached_tmp_dirs).await;
+                // The slow delete of the temp folders the sweep moved aside.
+                AgentManager::discard_agent_tmp_dirs(sweep.detached_tmp_dirs).await;
                 ws
             });
             // Awaiting the handle keeps the caller-visible contract intact
