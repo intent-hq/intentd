@@ -1624,6 +1624,16 @@ impl RuntimePort for RuntimeFeature {
         Box::pin(svc.cancel_script_monitors(workspace_id, agent_id, reason))
     }
 
+    fn cancel_script_monitors_deferring_redelivery<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: Option<&'a AgentId>,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<AgentId>>> {
+        Box::pin(svc.cancel_script_monitors_deferring_redelivery(workspace_id, agent_id, reason))
+    }
+
     fn script_monitor_export_blocked(
         &self,
         svc: &Services,

@@ -811,6 +811,19 @@ pub trait RuntimePort: Send + Sync + 'static {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<()>>;
 
+    /// [`Self::cancel_script_monitors`] without the completion redelivery:
+    /// returns the owners the caller must pass to
+    /// `Services::redeliver_completion_after_queue_mutation`. For a caller
+    /// holding an archive fence: redelivery can start a turn, and a turn-start
+    /// gate ranks before the fence (see [`crate::lock_order`]).
+    fn cancel_script_monitors_deferring_redelivery<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: Option<&'a AgentId>,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<AgentId>>>;
+
     /// Whether `metadata` is a script-monitor wake whose workspace is being
     /// exported (its delivery must wait).
     fn script_monitor_export_blocked(
@@ -2652,6 +2665,16 @@ impl RuntimePort for UnavailableRuntime {
         _reason: &'a str,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn cancel_script_monitors_deferring_redelivery<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _agent_id: Option<&'a AgentId>,
+        _reason: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<AgentId>>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     fn script_monitor_export_blocked(

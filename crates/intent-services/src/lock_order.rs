@@ -23,12 +23,18 @@
 //! wait. Release builds record nothing.
 //!
 //! Limits of the debug check:
-//! - A later-ranked hold taken while the same task held an earlier-ranked
-//!   lock that is still held is in order and skipped. This keeps in-order
-//!   paths joined in one task (`tokio::join!`) from tripping the check, but a
-//!   reversed branch joined with an in-order one can be missed.
+//! - A later-ranked hold H is skipped when the lock held just before it in
+//!   the same task (H's "under" hold) is still held and ranks at or after the
+//!   lock being acquired. This keeps in-order paths joined in one task
+//!   (`tokio::join!`) from tripping the check. Holds are attributed per task,
+//!   not per joined branch, so a reversed branch joined with an in-order one
+//!   can be missed, and a hold recorded under another branch's lock can be
+//!   flagged once that branch releases it.
 //! - Holds belong to the task that acquired them; a guard moved into another
-//!   task still counts for the acquiring task.
+//!   task still counts for the acquiring task, and the receiving task does
+//!   not see it.
+//! - Two locks of the same rank (two agents' gates, two workspaces' fences)
+//!   are not ordered against each other and are not checked.
 
 use std::future::Future;
 use std::panic::Location;
@@ -206,15 +212,15 @@ mod held {
         }
     }
 
-    /// A hold of the current task ranked after `rank` that is not chained
-    /// under a still-held earlier-ranked hold.
+    /// A hold of the current task ranked after `rank` that is not excused by
+    /// a still-held "under" hold ranked at or after `rank`.
     pub(super) fn later_than(rank: Rank) -> Option<(Rank, &'static Location<'static>)> {
         let me = current();
         let holds = holds();
-        let held = |id: u64| holds.iter().any(|e| e.id == id);
+        let excused = |under: u64| holds.iter().any(|e| e.id == under && e.rank >= rank);
         holds
             .iter()
-            .find(|e| e.holder == me && e.rank > rank && !e.under.is_some_and(held))
+            .find(|e| e.holder == me && e.rank > rank && !e.under.is_some_and(excused))
             .map(|e| (e.rank, e.at))
     }
 }
@@ -319,6 +325,15 @@ mod tests {
         let _f = fence.acquire(&ws()).await;
         drop(first);
         let _r = OrderedGate::default().lock().await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "lock order violation: TurnStartGate")]
+    async fn a_turn_start_gate_under_a_fence_taken_under_a_retirement_gate_panics() {
+        let fence = Arc::new(ArchiveFence::default());
+        let _r = OrderedGate::default().lock().await;
+        let _f = fence.acquire(&ws()).await;
+        let _t = turn_start().lock().await;
     }
 
     #[tokio::test]

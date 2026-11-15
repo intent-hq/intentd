@@ -545,13 +545,31 @@ impl RuntimePort for FakeRuntime {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            for owner in self
+                .cancel_script_monitors_deferring_redelivery(svc, workspace_id, agent_id, reason)
+                .await?
+            {
+                svc.redeliver_completion_after_queue_mutation(&owner).await;
+            }
+            Ok(())
+        })
+    }
+
+    fn cancel_script_monitors_deferring_redelivery<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: Option<&'a AgentId>,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<AgentId>>> {
+        Box::pin(async move {
             self.record("cancel_script_monitors");
             let store = svc.store();
             let owners = store
                 .script_notification_owners(workspace_id, agent_id)
                 .await?;
             if owners.is_empty() {
-                return Ok(());
+                return Ok(owners);
             }
             for mut row in store.script_monitors(workspace_id, agent_id).await? {
                 if row.state == "active" {
@@ -581,10 +599,7 @@ impl RuntimePort for FakeRuntime {
                     });
                 }
             }
-            for owner in owners {
-                svc.redeliver_completion_after_queue_mutation(&owner).await;
-            }
-            Ok(())
+            Ok(owners)
         })
     }
 

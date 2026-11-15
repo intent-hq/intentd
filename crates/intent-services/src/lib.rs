@@ -39075,10 +39075,20 @@ impl Services {
             // must have no side effects, so it cancels only after the flip
             // committed (still under the fence; an archived workspace accepts
             // no new monitors and its wakes are already terminal).
+            // The cancel's completion redelivery runs only once the fence is
+            // released: it can start a watcher's turn, and a turn-start gate
+            // ranks before the fence (see `lock_order`).
+            let mut deferred_redelivery = Vec::new();
             if !automatic {
-                this.ports
+                deferred_redelivery = this
+                    .ports
                     .runtime()
-                    .cancel_script_monitors(&this, &id, None, "workspace-archived")
+                    .cancel_script_monitors_deferring_redelivery(
+                        &this,
+                        &id,
+                        None,
+                        "workspace-archived",
+                    )
                     .await?;
             }
             let guest_sweep = if automatic {
@@ -39090,23 +39100,38 @@ impl Services {
                     None => return Ok(None),
                 }
             } else {
-                store.archive_workspace_detaching_guests(&id, &now).await?
+                match store.archive_workspace_detaching_guests(&id, &now).await {
+                    Ok(sweep) => sweep,
+                    Err(error) => {
+                        drop(fence);
+                        for owner in &deferred_redelivery {
+                            this.redeliver_completion_after_queue_mutation(owner).await;
+                        }
+                        return Err(error);
+                    }
+                }
             };
             // The archive retired the workspace's home: its machine gets
             // the stop now (or after its next bind).
             this.ports.remote_launch().send_home_stops(&this, &id).await;
             if automatic {
-                if let Err(error) = this
+                match this
                     .ports
                     .runtime()
-                    .cancel_script_monitors(&this, &id, None, "workspace-archived")
+                    .cancel_script_monitors_deferring_redelivery(
+                        &this,
+                        &id,
+                        None,
+                        "workspace-archived",
+                    )
                     .await
                 {
-                    tracing::warn!(
+                    Ok(owners) => deferred_redelivery = owners,
+                    Err(error) => tracing::warn!(
                         workspace = %id.as_str(),
                         error = %error,
                         "auto-archive: script monitor cleanup failed after archiving"
-                    );
+                    ),
                 }
             }
             ws.status = WorkspaceStatus::Archived;
@@ -39150,6 +39175,12 @@ impl Services {
                     park.release.notified().await;
                 }
                 drop(fence);
+                // The script-monitor cancel's completion redelivery, now
+                // outside the fence. The row is archived, so a watcher in
+                // this workspace parks its wake instead of starting a turn.
+                for owner in &deferred_redelivery {
+                    this.redeliver_completion_after_queue_mutation(owner).await;
+                }
                 // Gracefully interrupt every in-flight turn in the workspace —
                 // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
                 // turn cancelled over the wire, draining worker aborted, terminal
