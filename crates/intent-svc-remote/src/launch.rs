@@ -94,7 +94,10 @@ fn no_node() -> Error {
     )
 }
 
-async fn workspace_checkout(svc: &Services, workspace_id: &WorkspaceId) -> Result<PathBuf> {
+pub(crate) async fn workspace_checkout(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+) -> Result<PathBuf> {
     let workspace = svc.store().get_workspace(workspace_id).await?;
     checkout_path(&workspace).ok_or_else(|| {
         Error::InvalidParams(
@@ -320,6 +323,69 @@ async fn push_parent_now(svc: &Services, owner: &AgentId) -> bool {
     }
 }
 
+/// Copy `from`'s saved work to `to` in head's repositories: `from`'s
+/// `wip` (when it is not its `head`) becomes `to`'s, also in each of
+/// `pins`' submodules. Returns `from`'s `head` and the pins moved to its
+/// module heads, or `None` when `from` has no `head`. `to`'s `base` refs are
+/// left to the caller.
+pub(crate) fn copy_work(
+    checkout: &Path,
+    from: &AgentRemote,
+    to: &AgentRemote,
+    pins: Vec<SubmodulePin>,
+) -> Result<Option<(String, Vec<SubmodulePin>)>> {
+    let Some(head) = node_git::read_agent_ref(checkout, from, AgentRef::Head)? else {
+        return Ok(None);
+    };
+    if let Some(wip) =
+        node_git::read_agent_ref(checkout, from, AgentRef::Wip)?.filter(|wip| *wip != head)
+    {
+        node_git::write_agent_ref(checkout, to, AgentRef::Wip, wip)?;
+    }
+    let mut copied_pins = Vec::with_capacity(pins.len());
+    for mut pin in pins {
+        let module = node_git::module_repository(checkout, &pin.path, &pin.module_key).map_err(
+            |refusal| {
+                Error::Internal(format!(
+                    "remote launch: submodule {} is not the pinned repository: {refusal:?}",
+                    pin.path
+                ))
+            },
+        )?;
+        let from_module = from.with_module(&pin.module_key)?;
+        if let Some(module_head) =
+            node_git::read_agent_ref(&module.worktree, &from_module, AgentRef::Head)?
+        {
+            pin.commit = module_head.to_string();
+            if let Some(wip) =
+                node_git::read_agent_ref(&module.worktree, &from_module, AgentRef::Wip)?
+                    .filter(|wip| *wip != module_head)
+            {
+                let to_module = to.with_module(&pin.module_key)?;
+                node_git::write_agent_ref(&module.worktree, &to_module, AgentRef::Wip, wip)?;
+            }
+        }
+        copied_pins.push(pin);
+    }
+    Ok(Some((head.to_string(), copied_pins)))
+}
+
+/// Point `remote`'s `base` refs at `commit` and at each of `pins`.
+pub(crate) fn write_base_refs(
+    checkout: &Path,
+    remote: &AgentRemote,
+    commit: &str,
+    pins: &[SubmodulePin],
+) -> Result<()> {
+    let commit = git2::Oid::from_str(commit)
+        .map_err(|_| Error::Internal("remote launch: invalid base commit".into()))?;
+    node_git::write_base_ref(checkout, remote, commit)?;
+    for pin in pins {
+        write_module_base_ref(checkout, remote, pin)?;
+    }
+    Ok(())
+}
+
 /// Start sub-agent `agent_id` from its parent `owner`'s pushed work: its
 /// `base` is the parent's `head`, its `wip` the parent's `wip`, in the
 /// superproject and each pinned submodule (nodeProtocol 13). The parent's
@@ -337,42 +403,7 @@ async fn copy_parent_work(
     let child = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
     let pins = view.pins().to_vec();
     let checkout = checkout.to_path_buf();
-    let copied = blocking(move || {
-        let Some(head) = node_git::read_agent_ref(&checkout, &parent, AgentRef::Head)? else {
-            return Ok(None);
-        };
-        if let Some(wip) =
-            node_git::read_agent_ref(&checkout, &parent, AgentRef::Wip)?.filter(|wip| *wip != head)
-        {
-            node_git::write_agent_ref(&checkout, &child, AgentRef::Wip, wip)?;
-        }
-        let mut copied_pins = Vec::with_capacity(pins.len());
-        for mut pin in pins {
-            let module = node_git::module_repository(&checkout, &pin.path, &pin.module_key)
-                .map_err(|refusal| {
-                    Error::Internal(format!(
-                        "remote launch: submodule {} is not the pinned repository: {refusal:?}",
-                        pin.path
-                    ))
-                })?;
-            let parent_module = parent.with_module(&pin.module_key)?;
-            if let Some(module_head) =
-                node_git::read_agent_ref(&module.worktree, &parent_module, AgentRef::Head)?
-            {
-                pin.commit = module_head.to_string();
-                if let Some(wip) =
-                    node_git::read_agent_ref(&module.worktree, &parent_module, AgentRef::Wip)?
-                        .filter(|wip| *wip != module_head)
-                {
-                    let child_module = child.with_module(&pin.module_key)?;
-                    node_git::write_agent_ref(&module.worktree, &child_module, AgentRef::Wip, wip)?;
-                }
-            }
-            copied_pins.push(pin);
-        }
-        Ok(Some((head.to_string(), copied_pins)))
-    })
-    .await?;
+    let copied = blocking(move || copy_work(&checkout, &parent, &child, pins)).await?;
     let Some((head, pins)) = copied else {
         return Ok(());
     };
@@ -447,7 +478,9 @@ async fn record_refused_start(
     }
 }
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| Error::Internal(format!("remote launch task failed: {e}")))?
@@ -693,17 +726,9 @@ pub(crate) async fn launch_linked(svc: &Services, request: RemoteLaunchRequest) 
         copy_parent_work(svc, &workspace_id, (&checkout, &agent_id), owner, &mut view).await?;
     }
     let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
-    let commit = git2::Oid::from_str(&view.base_commit)
-        .map_err(|_| Error::Internal("remote launch: invalid base commit".into()))?;
+    let commit = view.base_commit.clone();
     let submodules = view.pins().to_vec();
-    blocking(move || {
-        node_git::write_base_ref(&checkout, &remote, commit)?;
-        for pin in &submodules {
-            write_module_base_ref(&checkout, &remote, pin)?;
-        }
-        Ok(())
-    })
-    .await?;
+    blocking(move || write_base_refs(&checkout, &remote, &commit, &submodules)).await?;
     svc.store()
         .record_remote_agent(&RemoteAgentRecord {
             agent_id,
@@ -1336,8 +1361,8 @@ impl RemoteLaunchPort for RemoteLaunch {
                 )));
             }
             let session = svc.store().get_agent_session_summary(agent_id).await?;
-            let view =
-                RemotePlacementView::from_metadata(session.metadata.as_ref()).ok_or_else(|| {
+            let mut view = RemotePlacementView::from_metadata(session.metadata.as_ref())
+                .ok_or_else(|| {
                     Error::InvalidParams(format!(
                         "node-agent-unplaced: agent {agent_id} has no remote placement"
                     ))
@@ -1367,7 +1392,10 @@ impl RemoteLaunchPort for RemoteLaunch {
             // build does not offer the prepared checkout, starts as before.
             // A sub-agent sharing its parent's checkout (nodeProtocol 13)
             // gets no checkout of its own.
-            let home = crate::homes::current_home_checkout(svc, &record, &view).await;
+            let home = crate::homes::current_home_checkout(svc, &record, &view).await?;
+            if home.is_none() && view.home_checkout.is_some() {
+                crate::homes::leave_moved_home(svc, &record, &mut view).await?;
+            }
             let checkout_of = view.shared_checkout_of.clone();
             if checkout_of.is_some() {
                 let protocol = link_protocol(&node).await?;

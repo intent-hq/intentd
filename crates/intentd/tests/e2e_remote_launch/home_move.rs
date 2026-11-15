@@ -478,3 +478,139 @@ async fn an_orchestrator_restart_mid_move_completes_the_move() {
     drop(s.head);
     drop(s.scratch);
 }
+
+/// nodes.md "Moving the home" step 4: an agent sharing the home checkout is
+/// stopped by the old home's `moved` stop, stays on its machine, and at its
+/// next start runs in a checkout of its own made from the home's last
+/// committed and uncommitted work, with a notice in its prompt and its
+/// transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sharing_agent_relaunches_isolated_after_the_home_moves() {
+    let Some(mut s) = two_machines("itd-home-sharer-").await else {
+        return;
+    };
+    let (ws_id, a_id) = (s.ws_id.clone(), s.a.daemon_id.clone());
+    let id = s.id();
+    let agent = ok(
+        &mut s.rpc_ws,
+        id,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "Sharer",
+            "model": "default",
+            "provider": "mock",
+            "placement": { "nodeId": a_id },
+        }),
+    )
+    .await;
+    let agent_id = agent["agent"]["id"].as_str().unwrap().to_owned();
+    let id = s.id();
+    ok(
+        &mut s.rpc_ws,
+        id,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello" }),
+    )
+    .await;
+    let work = s.work.clone();
+    let pids = until("the agent started in the home checkout", || {
+        std::fs::read_to_string(work.join("agent.pid"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    })
+    .await;
+    let pid = pids["agent"].to_string();
+    std::fs::remove_file(work.join("agent.pid")).unwrap();
+
+    // The home's last work: a commit and an uncommitted file.
+    let kept = commit_on(&work, "kept.txt", "kept\n", "kept");
+    std::fs::write(work.join("dirty.txt"), "left uncommitted\n").unwrap();
+
+    let b_id = s.b.daemon_id.clone();
+    let started = s
+        .set_home(json!({ "kind": "machine", "nodeId": b_id }))
+        .await;
+    assert!(started.get("error").is_none(), "{started}");
+    s.home_until("the home is on B", |home| {
+        home["nodeId"] == json!(b_id) && home["state"] == "attached"
+    })
+    .await;
+    // The old home's stop ends the sharing agent before its checkout goes.
+    let (a_dir, old_home) = (s.a_dir.clone(), s.home_id.clone());
+    until("the old home checkout is removed", || {
+        home_checkout(&a_dir, &old_home).is_none().then_some(())
+    })
+    .await;
+    until("the sharing agent is stopped", || {
+        super::homes::process_gone(&pid).then_some(())
+    })
+    .await;
+
+    // Its next start: its own checkout on A, from the home's last work.
+    let id = s.id();
+    ok(
+        &mut s.rpc_ws,
+        id,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "echo-raw" }),
+    )
+    .await;
+    let id = s.id();
+    let raw = reply_containing(&mut s.rpc_ws, (&ws_id, &agent_id), "raw: ", id).await;
+    s.next_id += 1000;
+    let notice = "The workspace's home moved. This agent stays on";
+    assert!(raw.contains(notice), "the turn carries the notice: {raw}");
+    let id = s.id();
+    ok(
+        &mut s.rpc_ws,
+        id,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "sh t1 pwd && git rev-parse HEAD && cat kept.txt dirty.txt",
+        }),
+    )
+    .await;
+    let reply = reply_containing(&mut s.rpc_ws, (&ws_id, &agent_id), "sh-out t1 ", id + 1).await;
+    s.next_id += 1000;
+    assert!(reply.contains("\\\"code\\\":0"), "{reply}");
+    assert!(
+        reply.contains(&kept),
+        "it starts at the home's head: {reply}"
+    );
+    assert!(reply.contains("kept\\\\n"), "{reply}");
+    assert!(
+        reply.contains("left uncommitted"),
+        "it has the home's wip: {reply}"
+    );
+    assert!(
+        reply.contains(&a_dir.to_string_lossy().into_owned()),
+        "it stays on A: {reply}"
+    );
+    assert!(
+        !reply.contains("/homes/"),
+        "not in a home checkout: {reply}"
+    );
+
+    // The user sees the notice once in the transcript.
+    let id = s.id();
+    let convo = ok(
+        &mut s.rpc_ws,
+        id,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let notices = convo["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "system" && m.to_string().contains(notice))
+        .count();
+    assert_eq!(notices, 1, "{convo}");
+    drop(s.rpc_ws);
+    drop(s.head);
+    drop(s.scratch);
+}

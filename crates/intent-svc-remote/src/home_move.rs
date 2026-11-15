@@ -9,6 +9,9 @@
 //! 3. the switch: the new home and the old one's `moved` stop in one store
 //!    transaction, then the stop goes out.
 //!
+//! The agents that shared the old home stay on their machine; each gets a
+//! checkout of its own at its next start (`homes::leave_moved_home`).
+//!
 //! A failure before the switch rolls back: the old home gets its old state,
 //! and the new home, which its machine may have opened, gets a stop.
 

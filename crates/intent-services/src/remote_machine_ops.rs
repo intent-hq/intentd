@@ -355,6 +355,32 @@ impl Services {
         Ok(())
     }
 
+    /// Show `notice` (nodes.md "Moving the home" step 4: the agent now works
+    /// in a checkout of its own) in agent `agent_id`'s transcript as a system
+    /// row. Best-effort.
+    pub async fn add_home_moved_transcript_row(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &intent_core::AgentId,
+        notice: &str,
+    ) {
+        let content = serde_json::json!([{ "type": "text", "text": notice }]);
+        match self
+            .store
+            .append_agent_message(agent_id, "system", &content, &now_iso())
+            .await
+        {
+            Ok(message) => {
+                self.invalidate_agent_list_cache(workspace_id);
+                self.publish_agent_message_events(workspace_id, agent_id, &message, None)
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, %error, "could not add the home-moved notice to the transcript");
+            }
+        }
+    }
+
     /// The workspace's notice that a moved home's leftover work was pushed
     /// to `refs` (nodes.md "Moving the home" step 5): a note naming them, so
     /// nothing is merged automatically and the user can pick them up.

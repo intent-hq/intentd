@@ -6448,10 +6448,29 @@ impl AgentManager {
                 None
             }
         };
+        // Home-moved notice: left by the start that gave this agent a
+        // checkout of its own after the home it shared moved away.
+        let home_moved = match self
+            .services
+            .store
+            .take_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_HOME_MOVED_NOTICE_KEY,
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "pending home-moved notice read failed");
+                None
+            }
+        };
         for text in notice
             .into_iter()
             .chain(pending.filter(|_| !revive_now))
             .chain(archive_script)
+            .chain(home_moved)
         {
             blocks.extend(text_prompt(&text));
         }

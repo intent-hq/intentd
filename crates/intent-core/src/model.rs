@@ -4486,6 +4486,12 @@ pub const PENDING_WORKSPACE_PURGE_NOTICE_KEY: &str = "pendingWorkspacePurgeNotic
 /// relies on resources the script removed.
 pub const PENDING_ARCHIVE_SCRIPT_NOTICE_KEY: &str = "pendingArchiveScriptNotice";
 
+/// Metadata key under which a one-time "the home moved" prompt notice waits
+/// on `agent_session.metadata`: written when an agent that shared the
+/// workspace's home checkout starts in a checkout of its own after a home
+/// move (nodes.md "Moving the home" step 4), and taken by that start's turn.
+pub const PENDING_HOME_MOVED_NOTICE_KEY: &str = "pendingHomeMovedNotice";
+
 /// Metadata key under which the initial-agent flag is persisted on the
 /// `agent_session.metadata` JSON (PROTOCOL §5.1/§5.5): stamped `true` by the
 /// daemon's `workspace.create` initial-agent orchestration so clients can
