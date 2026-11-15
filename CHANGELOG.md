@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.222] - 2026-11-15
+
+### 🚀 Features
+
+- *(remote)* Rebuild a cloud home whose sandbox was deleted while paused ([#3397](https://github.com/intent-hq/intentd/pull/3397))
+
+
 ## [0.11.221] - 2026-11-15
 
 ### 🚀 Features
