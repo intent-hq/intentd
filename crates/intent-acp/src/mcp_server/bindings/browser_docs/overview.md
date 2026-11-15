@@ -197,6 +197,8 @@ naming the "action execution" stage instead of a per-action `errorCode`.
 - `{ action: "getAccessibilityTree", tabId? }` - Get page structure as YAML
 - `{ action: "screenshot", tabId? }` - Take a screenshot
 - `{ action: "evaluate", expression, tabId? }` - Run JavaScript in the page
+- `{ action: "listTools", tabId? }` - List the WebMCP tools the page registered (`document.modelContext.registerTool`): `result.tools` is `[{ name, title?, description, inputSchema?, annotations?, origin? }]`. Empty with a `warning` when the page has no WebMCP (it needs https or a localhost URL)
+- `{ action: "callTool", name, input?, tabId? }` - Run a page's WebMCP tool with `input` matching its `inputSchema`; `result` is the tool's JSON result. Prefer a page's tools over `evaluate` when it offers them
 - `{ action: "focusTab", tabId? }` - Focus/remount a visible tab (fails on a hidden tab — use showTab)
 - `{ action: "previewHtml", html, width?, appearance? }` - Check a self-contained `ws-block:html` visual before showing it, in an invisible window with the app sandbox, fonts and themes (no tab, server or focus change). `width` is CSS pixels, 320 to 1600 (default 800; about 390 for phones). `appearance` is `"light"` (default) or `"dark"`. As a single action, `r.result` has `assetUrl`, `width`, `height`, `contentHeight`, `truncated` (full-height PNG capped at 8000px), `appearance` and `consoleMessages` (`[{ level, message }]`); view it with `return await ws.note.readAsset(r.result.assetUrl)`. Without `assetUrl`, the result keeps `base64` and `mimeType`. Frontends without this action report it as unsupported.
 
