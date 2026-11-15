@@ -18,10 +18,8 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-use intent_core::node_link::{HomeOpenOutcome, HomeRestore};
-use intent_core::{AgentId, Error, HomeId, HomeState, Result, WorkspaceHome, WorkspaceId};
-use intent_git::hub::AgentRef;
-use intent_git::node_git::AgentRemote;
+use intent_core::node_link::HomeOpenOutcome;
+use intent_core::{AgentId, Error, HomeState, Result, WorkspaceHome, WorkspaceId};
 use intent_services::feature_api::Services;
 use intent_store::HomeMove;
 use serde_json::{json, Value};
@@ -256,7 +254,10 @@ async fn steps(svc: &Services, home_move: &HomeMove) -> Result<()> {
         .node_id
         .as_deref()
         .ok_or_else(|| Error::Internal("the new home is not on a machine".into()))?;
-    let restore = home_refs(svc, workspace_id).await;
+    let restore = crate::homes::home_restore(svc, workspace_id)
+        .await
+        .ok()
+        .flatten();
     let reply =
         crate::homes::send_open(svc, workspace_id, &target.home_id, node_id, restore).await?;
     let HomeReply::Open(reply) = reply else {
@@ -309,29 +310,6 @@ async fn last_backup(svc: &Services, home_move: &HomeMove) -> Result<()> {
     crate::home_calls::push_home(svc, &old, workspace_id).await
 }
 
-/// The hub's `home/head` and `home/wip`, which the new home restores.
-async fn home_refs(svc: &Services, workspace_id: &WorkspaceId) -> Option<HomeRestore> {
-    let workspace = svc.store().get_workspace(workspace_id).await.ok()?;
-    let checkout = crate::launch::checkout_path(&workspace)?;
-    let remote = AgentRemote::home(workspace_id.as_str(), &HomeId::new().0).ok()?;
-    tokio::task::spawn_blocking(move || {
-        let repo = git2::Repository::open(&checkout).ok()?;
-        let read = |kind| {
-            repo.find_reference(&remote.ref_name(kind))
-                .ok()
-                .and_then(|reference| reference.target())
-                .map(|oid| oid.to_string())
-        };
-        Some(HomeRestore {
-            head: read(AgentRef::Head)?,
-            wip: read(AgentRef::Wip),
-        })
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
 /// The move failed before its switch: the old home gets its old state back.
 async fn rollback(svc: &Services, home_move: &HomeMove) {
     let workspace_id = &home_move.workspace_id;
@@ -345,6 +323,9 @@ async fn rollback(svc: &Services, home_move: &HomeMove) {
         .await
     {
         Ok(true) => {
+            // An old cloud home whose sandbox went meanwhile was renewed
+            // for a rebuild: a call waiting for it starts it.
+            crate::cloud::home::changed(svc);
             svc.publish_workspace_home_changed(workspace_id).await;
             // The target may have opened although its reply was lost: its
             // stop ends its setup and backups and removes the checkout.

@@ -348,6 +348,59 @@ async fn a_failed_agent_start_settles_the_cloud_home_it_raced_for() {
     assert_ne!(after.state, HomeState::Detached);
 }
 
+/// A rebuilt cloud home's notice (nodes.md "Cloud homes" 5) is posted
+/// exactly once: a daemon that stopped after posting it but before
+/// recording the rebuild as done finds the note at the next open instead
+/// of posting another, and the rebuild is then done.
+#[tokio::test]
+async fn a_rebuilt_home_s_notice_is_posted_once_across_a_crash() {
+    use intent_core::WorkspaceId;
+
+    let backend = Backend::new().await;
+    let svc = &backend.services;
+    let owner = backend.store().get_primary_principal().await.unwrap().id;
+    let starter = owner.clone();
+    workspace_owned_by(&backend, "ws-rebuilt", &owner).await;
+    home_row(&backend, "m-gone", "ws-rebuilt", &starter).await;
+    let ws = WorkspaceId::from("ws-rebuilt");
+    let renewed = crate::cloud::home::sandbox_removed(svc, "m-gone", true)
+        .await
+        .unwrap();
+    assert_eq!(renewed.len(), 1);
+    let home_id = renewed[0].home_id.clone();
+    let notices = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM note WHERE workspace_id = ? AND title = 'The home was rebuilt'",
+        )
+        .bind(ws.as_str())
+        .fetch_one(backend.store().read_pool())
+        .await
+        .unwrap()
+    };
+
+    // Posted, then the daemon stopped before the rebuild was done.
+    svc.post_home_rebuilt_notice(&ws, &home_id, "E2B", None)
+        .await
+        .unwrap();
+    assert!(backend
+        .store()
+        .home_rebuild_of(&ws, &home_id)
+        .await
+        .unwrap()
+        .is_some());
+
+    // The next opens: no second note, and the rebuild is done.
+    crate::cloud::home::rebuilt(svc, &ws, &home_id).await;
+    crate::cloud::home::rebuilt(svc, &ws, &home_id).await;
+    assert_eq!(notices().await, 1);
+    assert!(backend
+        .store()
+        .home_rebuild_of(&ws, &home_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
 mod entries {
     //! Named E2B entries: the migration of a single provider, which entry
     //! a placement picks, and the `configure` refusals that come before any

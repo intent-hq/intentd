@@ -482,13 +482,16 @@ pub(crate) async fn connect_home(svc: &Services, workspace_id: &WorkspaceId) -> 
     let feature = svc
         .remote_feature()
         .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;
-    let node = feature
-        .node(svc, &node_id)
-        .await
-        .map_err(|error| home_unavailable(&home, &error.to_string()))?;
-    node.connect()
-        .await
-        .map_err(|error| home_unavailable(&home, &error.to_string()))
+    let node = match feature.node(svc, &node_id).await {
+        Ok(node) => node,
+        Err(error) => {
+            return Err(crate::cloud::home::unreachable(svc, workspace_id, &home, &error).await)
+        }
+    };
+    match node.connect().await {
+        Ok(()) => Ok(()),
+        Err(error) => Err(crate::cloud::home::unreachable(svc, workspace_id, &home, &error).await),
+    }
 }
 
 /// The connected machine of `workspace_id`'s home, speaking nodeProtocol
@@ -522,14 +525,16 @@ async fn linked_home(
     let feature = svc
         .remote_feature()
         .ok_or_else(|| home_unavailable(&home, "no remote machine feature"))?;
-    let node = feature
-        .node(svc, &node_id)
-        .await
-        .map_err(|error| home_unavailable(&home, &error.to_string()))?;
+    let node = match feature.node(svc, &node_id).await {
+        Ok(node) => node,
+        Err(error) => {
+            return Err(crate::cloud::home::unreachable(svc, workspace_id, &home, &error).await)
+        }
+    };
     let gate = node.shared_ref().begin_use().await;
-    node.connect()
-        .await
-        .map_err(|error| home_unavailable(&home, &error.to_string()))?;
+    if let Err(error) = node.connect().await {
+        return Err(crate::cloud::home::unreachable(svc, workspace_id, &home, &error).await);
+    }
     if node.shared_ref().protocol() < HOMES_PROTOCOL {
         return Err(home_unavailable(
             &home,

@@ -42,6 +42,22 @@ fn call_unavailable(home: &WorkspaceHome, method: &str, detail: &str) -> Error {
     }
 }
 
+/// The error of a call that could not reach `home`'s machine: `starting`
+/// when its cloud sandbox is gone and the home is rebuilt
+/// ([`crate::cloud::home::sandbox_gone`]).
+async fn unreached(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home: &WorkspaceHome,
+    method: &str,
+    error: &Error,
+) -> Error {
+    if crate::cloud::home::sandbox_gone(svc, workspace_id, home).await {
+        return crate::terminals::home_starting(home);
+    }
+    call_unavailable(home, method, &error.to_string())
+}
+
 /// A use of the home's machine, held while a call runs ([`Shared::begin_use`]).
 type Use = tokio::sync::OwnedRwLockReadGuard<()>;
 
@@ -52,6 +68,7 @@ type Use = tokio::sync::OwnedRwLockReadGuard<()>;
 /// [`Shared::begin_use`]: crate::connector::Shared::begin_use
 async fn home_node(
     svc: &Services,
+    workspace_id: &WorkspaceId,
     home: &WorkspaceHome,
     method: &str,
     gated: bool,
@@ -65,18 +82,18 @@ async fn home_node(
     let feature = svc
         .remote_feature()
         .ok_or_else(|| call_unavailable(home, method, "no remote machine feature"))?;
-    let node = feature
-        .node(svc, node_id)
-        .await
-        .map_err(|error| call_unavailable(home, method, &error.to_string()))?;
+    let node = match feature.node(svc, node_id).await {
+        Ok(node) => node,
+        Err(error) => return Err(unreached(svc, workspace_id, home, method, &error).await),
+    };
     let gate = if gated {
         Some(node.shared_ref().begin_use().await)
     } else {
         None
     };
-    node.connect()
-        .await
-        .map_err(|error| call_unavailable(home, method, &error.to_string()))?;
+    if let Err(error) = node.connect().await {
+        return Err(unreached(svc, workspace_id, home, method, &error).await);
+    }
     if node.shared_ref().protocol() < HOMES_PROTOCOL {
         return Err(call_unavailable(
             home,
@@ -97,7 +114,7 @@ pub(crate) async fn home_call(
     timeout: Duration,
 ) -> Result<std::result::Result<Value, HomeCallError>> {
     let home = &crate::cloud::home::ready(svc, workspace_id, home.clone()).await?;
-    let (node, _use) = home_node(svc, home, method, true).await?;
+    let (node, _use) = home_node(svc, workspace_id, home, method, true).await?;
     let frame = HomeCall {
         request_id: LinkId::new_v4(),
         workspace_id: workspace_id.clone(),
@@ -152,7 +169,7 @@ pub(crate) async fn push_home(
 /// Ask the home for one synchronous push.
 async fn push_once(svc: &Services, home: &WorkspaceHome, workspace_id: &WorkspaceId) -> Result<()> {
     let home = &crate::cloud::home::ready(svc, workspace_id, home.clone()).await?;
-    let (node, _) = home_node(svc, home, "homePush", false).await?;
+    let (node, _) = home_node(svc, workspace_id, home, "homePush", false).await?;
     let request_id = LinkId::new_v4();
     let frame = LinkFrame::HomePush(HomePush {
         request_id,

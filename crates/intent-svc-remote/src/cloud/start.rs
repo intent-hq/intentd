@@ -872,7 +872,7 @@ async fn start_for_agent(
         if let Err(error) = launched {
             // The sandbox itself is deleted once, below.
             if let Ok(Some(row)) = svc.store().get_exposed_machine(&machine_id).await {
-                delete_machine(feature, svc, &row, None).await;
+                remove_machine(feature, svc, &row, None, Removal::FailedStart).await;
             }
             return Err(error);
         }
@@ -970,7 +970,7 @@ async fn start_home_sandbox(
     if linked.is_err() {
         if let Some(machine_id) = made.as_deref() {
             if let Ok(Some(row)) = svc.store().get_exposed_machine(machine_id).await {
-                delete_machine(feature, svc, &row, None).await;
+                remove_machine(feature, svc, &row, None, Removal::FailedStart).await;
             }
         }
         if let Err(error) = prepared.client.delete(&sandbox_id).await {
@@ -1059,6 +1059,9 @@ pub(crate) enum Removal<'a> {
     /// The sandbox cannot link to this backend: no stops, then the E2B
     /// delete.
     Unlinkable,
+    /// As [`Removal::Stop`], for a sandbox whose start failed: a home it
+    /// took is not rebuilt, the failed start detaches it.
+    FailedStart,
     /// As [`Removal::Stop`], only while nothing needs the machine
     /// ([`super::home::needed`], with the agent ending now), checked under
     /// its lifecycle lock.
@@ -1089,7 +1092,7 @@ pub(crate) async fn remove_machine(
 ) -> Vec<String> {
     let lost = match removal {
         Removal::Lost(error) => Some(error),
-        Removal::Stop | Removal::Unlinkable | Removal::Unneeded(_) => None,
+        Removal::Stop | Removal::FailedStart | Removal::Unlinkable | Removal::Unneeded(_) => None,
     };
     let mut unconfirmed = Vec::new();
     let _lifecycle = feature.lifecycle(&row.id).await;
@@ -1113,7 +1116,10 @@ pub(crate) async fn remove_machine(
     // The agents placed here, read before their final stops end their
     // records, so each one is left without a machine afterwards.
     let placed = placed_agents(store, &row.id).await.unwrap_or_default();
-    let mut stops = matches!(removal, Removal::Stop | Removal::Unneeded(_));
+    let mut stops = matches!(
+        removal,
+        Removal::Stop | Removal::FailedStart | Removal::Unneeded(_)
+    );
     if let (true, Some(client), Some(cloud)) = (stops, client, &row.cloud) {
         let paused = cloud.state != CloudSandboxState::Running;
         super::lifecycle::set_state(svc, feature, &row.id, CloudSandboxState::Stopping).await;
@@ -1128,7 +1134,7 @@ pub(crate) async fn remove_machine(
             node.shared_ref().drop_stops();
             let turn_error = match removal {
                 Removal::Unlinkable => super::lifecycle::outdated_turn_error(),
-                Removal::Stop | Removal::Unneeded(_) | Removal::Lost(_) => "cloud-machine-unavailable: the agent's E2B sandbox was deleted without a final stop; work it pushed is kept".to_owned(),
+                Removal::Stop | Removal::FailedStart | Removal::Unneeded(_) | Removal::Lost(_) => "cloud-machine-unavailable: the agent's E2B sandbox was deleted without a final stop; work it pushed is kept".to_owned(),
             };
             node.shared_ref().agents.end_all(&turn_error);
         }
@@ -1148,6 +1154,10 @@ pub(crate) async fn remove_machine(
         node.shutdown();
     }
     let lost_error = lost.cloned();
+    // The homes it held are rebuilt at their next use, never detached;
+    // announced also when a later step fails.
+    let rebuild = !matches!(removal, Removal::FailedStart);
+    let mut rebuilds = Vec::new();
     let unlinked = async {
         let head_id = store.daemon_id().await?;
         let mut agents = placed;
@@ -1166,7 +1176,7 @@ pub(crate) async fn remove_machine(
                 }
             }
         }
-        store.remove_exposed_machine(&row.id).await?;
+        rebuilds = super::home::sandbox_removed(svc, &row.id, rebuild).await?;
         svc.delete_remote_machine_token(&row.id).await?;
         store.end_machine_leases(&row.id, &head_id).await?;
         for agent in agents {
@@ -1191,6 +1201,7 @@ pub(crate) async fn remove_machine(
     if let Err(error) = unlinked {
         tracing::warn!(machine = %row.id, %error, "cloud machine: could not remove its records");
     }
+    super::home::announce_rebuilds(svc, &rebuilds).await;
     if let (None, Some(client), Some(cloud)) = (lost, client, &row.cloud) {
         if let Err(error) = client.delete(&cloud.sandbox_id).await {
             tracing::warn!(%error, sandbox = %cloud.sandbox_id, "cloud machine: could not delete its sandbox");
