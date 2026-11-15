@@ -582,9 +582,11 @@ impl RuntimePort for RuntimeFeature {
         Box::pin(async move {
             let _admission = svc.feature_workspace_mutations().enter(&workspace_id)?;
             svc.require_member(&workspace_id).await?;
-            let _archive = svc.feature_archive_fence().acquire(&workspace_id).await;
+            // Lock order: retirement gate, then archive fence
+            // (`intent_services::lock_order`).
             let retirement = svc.feature_agent_wake().retirement_gate(svc, &agent_id);
             let _retirement = retirement.lock().await;
+            let _archive = svc.feature_archive_fence().acquire(&workspace_id).await;
             let key = (workspace_id.clone(), script_id.clone());
             let auto = self.auto_start_monitors.lock().unwrap().get(&key).cloned();
             let reply = svc
@@ -1620,6 +1622,16 @@ impl RuntimePort for RuntimeFeature {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(svc.cancel_script_monitors(workspace_id, agent_id, reason))
+    }
+
+    fn cancel_script_monitors_deferring_redelivery<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: Option<&'a AgentId>,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<AgentId>>> {
+        Box::pin(svc.cancel_script_monitors_deferring_redelivery(workspace_id, agent_id, reason))
     }
 
     fn script_monitor_export_blocked(

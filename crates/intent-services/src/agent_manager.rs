@@ -3022,7 +3022,7 @@ pub struct AgentManager {
     turn_admissions: Mutex<HashMap<AgentId, TurnAdmission>>,
     next_admission: AtomicUsize,
     /// Claimed startup side effects must finish before retirement detaches.
-    turn_start_gates: crate::agent_ops::AgentRetirementGates,
+    turn_start_gates: crate::agent_ops::TurnStartGates,
     active_discussion_turns: Mutex<HashMap<AgentId, String>>,
     /// Start of the current stretch with no turn in flight: `Some(boot)`
     /// initially, cleared on the `busy` empty → non-empty edge and re-armed
@@ -3302,7 +3302,7 @@ impl AgentManager {
             shutdown_retirement: Mutex::new(()),
             turn_admissions: Mutex::new(HashMap::new()),
             next_admission: AtomicUsize::new(0),
-            turn_start_gates: crate::agent_ops::AgentRetirementGates::default(),
+            turn_start_gates: crate::agent_ops::TurnStartGates::default(),
             active_discussion_turns: Mutex::default(),
             idle_since: Arc::new(Mutex::new(Some(Instant::now()))),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),

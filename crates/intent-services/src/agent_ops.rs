@@ -214,8 +214,41 @@ pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
     )
 }
 
+/// Per-agent mutexes outside the lifecycle lock order (discussion control).
+/// Weak entries retire with their last user.
+#[derive(Clone, Default)]
+pub(crate) struct AgentGates {
+    gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+impl AgentGates {
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        weak_gate(&self.gates, agent_id)
+    }
+}
+
+/// Per-agent turn-start gates, second in the lifecycle lock order (see
+/// [`crate::lock_order`]): taken under a retirement gate by retire and
+/// restore, and holding one a turn start may take the archive fence.
+#[derive(Clone, Default)]
+pub(crate) struct TurnStartGates(AgentGates);
+
+impl TurnStartGates {
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> crate::OrderedGate {
+        crate::OrderedGate::new(
+            crate::lock_order::Rank::TurnStartGate,
+            self.0.for_agent(agent_id),
+        )
+    }
+}
+
 /// Serialize each retirement transition with restore without blocking other
 /// targets. Weak entries keep completed transitions out of the lock registry.
+///
+/// First in the lifecycle lock order: retirement gate → turn-start gate →
+/// archive fence. Never wait on one of these gates while holding a turn-start
+/// gate or an archive fence; debug builds panic when code does (see
+/// [`crate::lock_order`]).
 #[derive(Clone, Default)]
 pub(crate) struct AgentRetirementGates {
     gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
@@ -231,12 +264,18 @@ pub(crate) struct AgentRetirementGates {
 const REMOTE_SCRIPT_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl AgentRetirementGates {
-    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
-        weak_gate(&self.gates, agent_id)
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> crate::OrderedGate {
+        crate::OrderedGate::new(
+            crate::lock_order::Rank::RetirementGate,
+            weak_gate(&self.gates, agent_id),
+        )
     }
 
-    pub(crate) fn for_workspace(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
-        weak_gate(&self.workspaces, workspace_id)
+    pub(crate) fn for_workspace(&self, workspace_id: &WorkspaceId) -> crate::OrderedGate {
+        crate::OrderedGate::new(
+            crate::lock_order::Rank::RetirementGate,
+            weak_gate(&self.workspaces, workspace_id),
+        )
     }
 }
 
@@ -8189,7 +8228,7 @@ impl Services {
             let gate = self
                 .agent_retirement_gates
                 .for_workspace(&session.workspace_id);
-            let guard = gate.lock_owned().await;
+            let guard = gate.lock().await;
             // A concurrent retire of this same target may have won while
             // this call waited for the workspace gate: report it as an
             // idempotent retry, not as a last-agent refusal.

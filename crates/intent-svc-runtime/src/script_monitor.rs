@@ -51,6 +51,12 @@ pub(crate) trait ScriptMonitorExt {
         agent: Option<&AgentId>,
         reason: &str,
     ) -> Result<()>;
+    async fn cancel_script_monitors_deferring_redelivery(
+        &self,
+        ws: &WorkspaceId,
+        agent: Option<&AgentId>,
+        reason: &str,
+    ) -> Result<Vec<AgentId>>;
 }
 
 impl ScriptMonitorExt for Services {
@@ -406,6 +412,21 @@ impl ScriptMonitorExt for Services {
         agent: Option<&AgentId>,
         reason: &str,
     ) -> Result<()> {
+        for agent in self
+            .cancel_script_monitors_deferring_redelivery(ws, agent, reason)
+            .await?
+        {
+            self.redeliver_completion_after_queue_mutation(&agent).await;
+        }
+        Ok(())
+    }
+
+    async fn cancel_script_monitors_deferring_redelivery(
+        &self,
+        ws: &WorkspaceId,
+        agent: Option<&AgentId>,
+        reason: &str,
+    ) -> Result<Vec<AgentId>> {
         let mut owners = self
             .script_manager()
             .cleanup_monitors(ws, agent, reason)
@@ -441,9 +462,6 @@ impl ScriptMonitorExt for Services {
                 owners.push(id);
             }
         }
-        for agent in owners {
-            self.redeliver_completion_after_queue_mutation(&agent).await;
-        }
-        Ok(())
+        Ok(owners)
     }
 }

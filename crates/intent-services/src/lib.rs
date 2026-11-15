@@ -77,6 +77,8 @@ mod boot_settings_migrations;
 mod executor_capabilities;
 mod executor_ops;
 mod link_traffic_ops;
+pub mod lock_order;
+pub use lock_order::{OrderedGate, OrderedGuard};
 mod node_invite_ops;
 mod plain_folder;
 mod remote_machine_ops;
@@ -1374,7 +1376,7 @@ pub struct Services {
     /// the executor link; unset reads every credential as disconnected.
     executor_liveness: Arc<OnceLock<Arc<dyn intent_core::machines::ExecutorLiveness>>>,
     human_instruction_authority: Arc<tokio::sync::RwLock<()>>,
-    discussion_control_gates: Arc<agent_ops::AgentRetirementGates>,
+    discussion_control_gates: Arc<agent_ops::AgentGates>,
     #[cfg(test)]
     invite_create_commit_pause: Arc<member_removal::MutationBarrier>,
     #[cfg(test)]
@@ -15504,6 +15506,10 @@ impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
 /// removal of a CURRENT member. Owned guards ([`tokio::sync::OwnedMutexGuard`])
 /// so the archive tail — a detached task — can carry the hold across its
 /// spawn; an entry is pruned once nobody holds or awaits it.
+///
+/// Lock order: retirement gate → turn-start gate → archive fence. Nothing
+/// holding this fence may wait on a gate; debug builds panic when one does
+/// (see [`lock_order`]).
 #[derive(Default)]
 pub struct ArchiveFence {
     locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
@@ -15512,24 +15518,33 @@ pub struct ArchiveFence {
 impl ArchiveFence {
     /// Take `workspace_id`'s fence (FIFO among waiters: tokio's mutex is
     /// fair, so an unarchive queued behind an archive tail acquires before
-    /// the tail's own re-acquire).
+    /// the tail's own re-acquire). Debug builds record the hold for the
+    /// lock-order check (see [`lock_order`]).
     #[expect(
         clippy::missing_panics_doc,
         reason = "internal doc-hidden feature API, not a public library API"
     )]
-    pub async fn acquire(self: &Arc<Self>, workspace_id: &WorkspaceId) -> ArchiveFenceGuard {
-        let lock = self
-            .locks
-            .lock()
-            .expect("archive fence registry poisoned")
-            .entry(workspace_id.clone())
-            .or_default()
-            .clone();
-        let guard = lock.lock_owned().await;
-        ArchiveFenceGuard {
-            fence: Arc::clone(self),
-            key: workspace_id.clone(),
-            guard: Some(guard),
+    #[track_caller]
+    pub fn acquire<'a>(
+        self: &'a Arc<Self>,
+        workspace_id: &'a WorkspaceId,
+    ) -> impl std::future::Future<Output = ArchiveFenceGuard> + Send + 'a {
+        let at = std::panic::Location::caller();
+        async move {
+            let lock = self
+                .locks
+                .lock()
+                .expect("archive fence registry poisoned")
+                .entry(workspace_id.clone())
+                .or_default()
+                .clone();
+            let guard = lock.lock_owned().await;
+            ArchiveFenceGuard {
+                fence: Arc::clone(self),
+                key: workspace_id.clone(),
+                guard: Some(guard),
+                _order: lock_order::hold(lock_order::Rank::ArchiveFence, at),
+            }
         }
     }
 }
@@ -15540,6 +15555,7 @@ pub struct ArchiveFenceGuard {
     fence: Arc<ArchiveFence>,
     key: WorkspaceId,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    _order: lock_order::LockHold,
 }
 
 impl Drop for ArchiveFenceGuard {
@@ -35889,7 +35905,7 @@ impl Services {
     /// first orders the claim strictly after any retirement teardown, and
     /// no retirement can start between the claim and the revive. Lock order
     /// is turn-start gate → archive fence; nothing holding the fence takes a
-    /// turn-start gate. `None` for chief, an Active row, or a read failure
+    /// turn-start gate (see [`lock_order`]). `None` for chief, an Active row, or a read failure
     /// (the turn proceeds unfenced exactly as before).
     pub(crate) async fn turn_start_archive_fence(
         &self,
@@ -39059,10 +39075,20 @@ impl Services {
             // must have no side effects, so it cancels only after the flip
             // committed (still under the fence; an archived workspace accepts
             // no new monitors and its wakes are already terminal).
+            // The cancel's completion redelivery runs only once the fence is
+            // released: it can start a watcher's turn, and a turn-start gate
+            // ranks before the fence (see `lock_order`).
+            let mut deferred_redelivery = Vec::new();
             if !automatic {
-                this.ports
+                deferred_redelivery = this
+                    .ports
                     .runtime()
-                    .cancel_script_monitors(&this, &id, None, "workspace-archived")
+                    .cancel_script_monitors_deferring_redelivery(
+                        &this,
+                        &id,
+                        None,
+                        "workspace-archived",
+                    )
                     .await?;
             }
             let guest_sweep = if automatic {
@@ -39074,23 +39100,38 @@ impl Services {
                     None => return Ok(None),
                 }
             } else {
-                store.archive_workspace_detaching_guests(&id, &now).await?
+                match store.archive_workspace_detaching_guests(&id, &now).await {
+                    Ok(sweep) => sweep,
+                    Err(error) => {
+                        drop(fence);
+                        for owner in &deferred_redelivery {
+                            this.redeliver_completion_after_queue_mutation(owner).await;
+                        }
+                        return Err(error);
+                    }
+                }
             };
             // The archive retired the workspace's home: its machine gets
             // the stop now (or after its next bind).
             this.ports.remote_launch().send_home_stops(&this, &id).await;
             if automatic {
-                if let Err(error) = this
+                match this
                     .ports
                     .runtime()
-                    .cancel_script_monitors(&this, &id, None, "workspace-archived")
+                    .cancel_script_monitors_deferring_redelivery(
+                        &this,
+                        &id,
+                        None,
+                        "workspace-archived",
+                    )
                     .await
                 {
-                    tracing::warn!(
+                    Ok(owners) => deferred_redelivery = owners,
+                    Err(error) => tracing::warn!(
                         workspace = %id.as_str(),
                         error = %error,
                         "auto-archive: script monitor cleanup failed after archiving"
-                    );
+                    ),
                 }
             }
             ws.status = WorkspaceStatus::Archived;
@@ -39134,6 +39175,12 @@ impl Services {
                     park.release.notified().await;
                 }
                 drop(fence);
+                // The script-monitor cancel's completion redelivery, now
+                // outside the fence. The row is archived, so a watcher in
+                // this workspace parks its wake instead of starting a turn.
+                for owner in &deferred_redelivery {
+                    this.redeliver_completion_after_queue_mutation(owner).await;
+                }
                 // Gracefully interrupt every in-flight turn in the workspace —
                 // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
                 // turn cancelled over the wire, draining worker aborted, terminal

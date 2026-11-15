@@ -3911,7 +3911,14 @@ async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
         .expect("archive row");
 
     // Retire's flip + teardown hold: fence first, then the Retired flip.
-    let fence = mgr.services.archive_fence.acquire(&ws).await;
+    // Taken on its own task, like the retire it stands in for: the debug
+    // lock-order check attributes holds per task.
+    let fence = {
+        let (fence, ws) = (Arc::clone(&mgr.services.archive_fence), ws.clone());
+        tokio::spawn(async move { fence.acquire(&ws).await })
+            .await
+            .unwrap()
+    };
     assert!(mgr
         .services
         .store

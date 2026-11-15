@@ -78,7 +78,7 @@ impl AgentWakePort for AgentWakeFeature {
             .map(|manager| manager as Arc<dyn AgentQueueDrainer>)
     }
 
-    fn retirement_gate(&self, svc: &Services, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+    fn retirement_gate(&self, svc: &Services, agent_id: &AgentId) -> crate::OrderedGate {
         svc.agent_retirement_gates.for_agent(agent_id)
     }
 

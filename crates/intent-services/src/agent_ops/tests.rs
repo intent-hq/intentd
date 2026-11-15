@@ -1108,7 +1108,7 @@ async fn user_retire_of_top_level_agent_waits_on_the_workspace_gate() {
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(30)),
         async {
-            while Arc::strong_count(&gate) < 2 {
+            while gate.handle_count() < 2 {
                 tokio::task::yield_now().await;
             }
         },
@@ -1186,7 +1186,7 @@ async fn guarded_retire_reports_already_retired_after_waiting_on_the_gate() {
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(30)),
         async {
-            while Arc::strong_count(&gate) < 2 {
+            while gate.handle_count() < 2 {
                 tokio::task::yield_now().await;
             }
         },
@@ -44442,6 +44442,73 @@ async fn retire_settles_hook_deferred_watch_with_retired_notice() {
             .calls()
             .contains(&"cancel_agent_hooks"),
         "retire asks the runtime to cancel the retired agent's hooks"
+    );
+}
+
+/// A manual archive cancels a child's script monitor before its commit. The
+/// cancel redelivers the child's deferred completion, which can start the
+/// watching parent's turn (turn-start gate); that must not run while the
+/// archive holds the workspace's archive fence (lock order: turn-start gate
+/// before archive fence, see `crate::lock_order`).
+#[intent_test_macros::daemon_test]
+async fn manual_archive_redelivers_script_monitor_completions_outside_the_fence() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager_fake_runtime().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    svc.store()
+        .insert_script_monitor(&intent_core::ScriptMonitor {
+            monitor_id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.clone(),
+            agent_id: child.clone(),
+            script_id: uuid::Uuid::new_v4().to_string(),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            script_name: "build".into(),
+            mode: intent_core::ScriptMode::Command,
+            state: "active".into(),
+            created_at: now_iso(),
+            expires_at: now_iso(),
+            output_pattern: None,
+            line_count: None,
+            settled_at: None,
+            reason: None,
+            result: None,
+            trigger: None,
+        })
+        .await
+        .expect("seed active script monitor");
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.store()
+        .record_advisory_wake_delivery(&parent, &child, &now_iso())
+        .await
+        .expect("seed advisory marker");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert!(
+        svc.has_interim_skipped_idle(&child),
+        "the child's idle is deferred behind its script monitor"
+    );
+
+    svc.archive_workspace(ws.clone(), None)
+        .await
+        .expect("archive");
+
+    assert!(svc.store().get_workspace(&ws).await.unwrap().archived);
+    assert!(
+        !manager.list_busy().iter().any(|(id, _)| *id == parent),
+        "the redelivered completion parks behind the archived gate"
     );
 }
 

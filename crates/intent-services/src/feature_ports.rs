@@ -811,6 +811,19 @@ pub trait RuntimePort: Send + Sync + 'static {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<()>>;
 
+    /// [`Self::cancel_script_monitors`] without the completion redelivery:
+    /// returns the owners the caller must pass to
+    /// `Services::redeliver_completion_after_queue_mutation`. For a caller
+    /// holding an archive fence: redelivery can start a turn, and a turn-start
+    /// gate ranks before the fence (see [`crate::lock_order`]).
+    fn cancel_script_monitors_deferring_redelivery<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: Option<&'a AgentId>,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<AgentId>>>;
+
     /// Whether `metadata` is a script-monitor wake whose workspace is being
     /// exported (its delivery must wait).
     fn script_monitor_export_blocked(
@@ -1318,8 +1331,9 @@ pub trait AgentWakePort: Send + Sync + 'static {
     fn queue_drainer(&self, svc: &Services) -> Option<Arc<dyn AgentQueueDrainer>>;
 
     /// The per-agent gate that serializes retirement with restore; hold its
-    /// lock to keep `agent_id` from retiring meanwhile.
-    fn retirement_gate(&self, svc: &Services, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>>;
+    /// lock to keep `agent_id` from retiring meanwhile. Take it before any
+    /// archive fence (see [`crate::lock_order`]).
+    fn retirement_gate(&self, svc: &Services, agent_id: &AgentId) -> crate::OrderedGate;
 
     /// Whether `status` is terminal: the agent can no longer receive wakes.
     fn is_terminal_status(&self, status: AgentStatus) -> bool;
@@ -1387,8 +1401,8 @@ impl AgentWakePort for UnavailableAgentWake {
         None
     }
 
-    fn retirement_gate(&self, _svc: &Services, _agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::new(tokio::sync::Mutex::new(()))
+    fn retirement_gate(&self, _svc: &Services, _agent_id: &AgentId) -> crate::OrderedGate {
+        crate::OrderedGate::default()
     }
 
     fn is_terminal_status(&self, _status: AgentStatus) -> bool {
@@ -2653,6 +2667,16 @@ impl RuntimePort for UnavailableRuntime {
         Box::pin(async { Ok(()) })
     }
 
+    fn cancel_script_monitors_deferring_redelivery<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _agent_id: Option<&'a AgentId>,
+        _reason: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<AgentId>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn script_monitor_export_blocked(
         &self,
         _svc: &Services,
@@ -3284,7 +3308,7 @@ mod tests {
         let agent = intent_core::AgentId::new();
         let gate = port.retirement_gate(&svc, &agent);
         assert!(
-            Arc::ptr_eq(&gate, &svc.agent_retirement_gates.for_agent(&agent)),
+            gate.ptr_eq(&svc.agent_retirement_gates.for_agent(&agent)),
             "the port hands out the agent's own retirement gate"
         );
         assert!(
