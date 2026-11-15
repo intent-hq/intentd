@@ -313,7 +313,7 @@ impl PendingQuestionMutationLocks {
     pub(crate) fn remove(&self, agent_id: &AgentId) {
         self.locks
             .lock()
-            .expect("pending-question lock map poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -7840,6 +7840,9 @@ impl Services {
             .get_agent_session_with_transcript(&agent_id)
             .await;
         let mut known_completion = matches!(&session_observation, Ok(_) | Err(Error::NotFound(_)));
+        // A failed read leaves the agent's state unknown: it may still be
+        // live, so its resources are not released below.
+        let session_read = known_completion;
         let session_meta = session_observation
             .ok()
             .map(|s| (s.workspace_id, s.name, s.parent_agent_id));
@@ -7952,13 +7955,16 @@ impl Services {
             known_completion &= deleted;
             self.invalidate_agent_list_cache(session_ws);
         }
-        // The row is gone and the runtime is stopped: release everything
-        // the agent owned (see `agent_resources`).
-        self.release_deleted_agent(crate::agent_resources::DeletedAgent {
-            workspace_id: session_workspace_id.as_ref(),
-            agent_id: &agent_id,
-        })
-        .await;
+        // The row is gone (deleted above, or never found) and the runtime
+        // is stopped: release everything the agent owned (see
+        // `agent_resources`).
+        if session_read {
+            self.release_deleted_agent(crate::agent_resources::DeletedAgent {
+                workspace_id: session_workspace_id.as_ref(),
+                agent_id: &agent_id,
+            })
+            .await;
+        }
         if let Some((workspace_id, agent_name, parent_agent_id)) = session_meta {
             // intent-hq/monorepo#3906: the session row is already deleted, so
             // the watch-wake label pass cannot resolve the delegation parent

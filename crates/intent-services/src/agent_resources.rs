@@ -8,10 +8,11 @@
 //! after a retire or an archive (intent-hq/intent#9359).
 //!
 //! Each lifecycle path calls the matching [`Services`] method below once,
-//! after its state transition commits and after its agents' runtimes are
-//! stopped. Steps that gate or must precede the transition stay in the
-//! paths: script-monitor cancels (their failure aborts the transition),
-//! desktop control, remote final stops and the runtime stop itself.
+//! after its state transition commits. Each [`AgentResource`] method states
+//! what is already true when it runs (runtime stopped, fences held). Steps
+//! that gate or must precede the transition stay in the paths:
+//! script-monitor cancels (their failure aborts the transition), desktop
+//! control, remote final stops and the runtime stop itself.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,7 +22,7 @@ use intent_core::{AgentId, AgentTmpRemoval, HookId, PrMonitorId, WorkspaceId};
 use crate::Services;
 
 /// A deleted agent. `workspace_id` is `None` when its session row was
-/// already gone: the in-memory state is still released.
+/// already gone (the read found no row): its leftovers are still released.
 #[derive(Clone, Copy)]
 pub(crate) struct DeletedAgent<'a> {
     pub workspace_id: Option<&'a WorkspaceId>,
@@ -64,18 +65,19 @@ impl ArchiveSweep {
 /// Every method is required: write an empty body with the reason when an
 /// event leaves the resource as it is.
 pub(crate) trait AgentResource {
-    /// `agent.delete`: the session row is gone and the runtime is stopped.
+    /// `agent.delete`: the session row is confirmed gone and the runtime is
+    /// stopped. Not called when the session read failed.
     async fn agent_deleted(&self, svc: &Services, agent: DeletedAgent<'_>);
-    /// `agent.retire` (and its child cascade): the retired mark is set and
-    /// the runtime is stopped or stopping. Runs under the agent's
-    /// retirement gate.
+    /// `agent.retire` (and its child cascade): the retired mark is set. A
+    /// wire retire has aborted the worker; a self-retire's turn may still
+    /// run. Runs under the agent's retirement gate.
     async fn agent_retired(&self, svc: &Services, agent_id: &AgentId);
     /// `agent.restore`: the retired mark is cleared. Runs under the agent's
     /// retirement gate.
     async fn agent_restored(&self, svc: &Services, agent_id: &AgentId);
     /// `workspace.archive`: the Archived flip committed and in-flight turns
-    /// are interrupted. Runs on the detached archive tail, outside the
-    /// archive fence.
+    /// are interrupted (provider processes stay alive). Runs on the
+    /// detached archive tail, outside the archive fence.
     async fn workspace_archived(&self, svc: &Services, sweep: &mut ArchiveSweep);
     /// `workspace.unarchive` (and revive): the flip committed. Runs UNDER
     /// the archive fence, so a handler must not take it.
@@ -89,7 +91,14 @@ pub(crate) trait AgentResource {
 }
 
 /// Runs `$method` on every registered resource, in order. The one list of
-/// per-agent resources: add a new resource here.
+/// per-agent resources: add a new resource here (a resource left out is
+/// never constructed, which the `dead_code` lint rejects).
+///
+/// Order matters: the retire path's single `waiting` recompute runs after
+/// the registry, and hooks and PR monitors recompute `waiting` themselves,
+/// so they come before `CompletionWatches`. `TempFolders` comes last: its
+/// archive handler takes the archive fence, and its removals are the slow
+/// part.
 macro_rules! for_each_agent_resource {
     ($svc:expr, $method:ident, $arg:expr) => {{
         MemorySecrets.$method($svc, $arg).await;
@@ -328,13 +337,11 @@ impl AgentResource for CompletionWatches {
         // Kept, as for archive.
     }
 
-    async fn workspace_deleted(&self, svc: &Services, workspace: DeletedWorkspace<'_>) {
-        // The delete path already swept every watch whose parent lives in
-        // the workspace, before its `agent:deleted` deliveries. Backstop.
-        for agent_id in workspace.agent_ids {
-            svc.remove_all_for_parent(agent_id);
-            svc.remove_groups_for_parent(agent_id);
-        }
+    async fn workspace_deleted(&self, _svc: &Services, _workspace: DeletedWorkspace<'_>) {
+        // Swept by `delete_workspace_with_claim` itself: every watch whose
+        // parent lives in the workspace goes BEFORE its `agent:deleted`
+        // deliveries (so no deleted agent is woken), and every watch on its
+        // agents after them. The registry runs later than both.
     }
 }
 
