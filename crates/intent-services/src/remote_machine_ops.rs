@@ -322,6 +322,75 @@ impl Services {
         Ok(())
     }
 
+    /// The workspace's notice that a moved home's leftover work was pushed
+    /// to `refs` (nodes.md "Moving the home" step 5): a note naming them, so
+    /// nothing is merged automatically and the user can pick them up.
+    ///
+    /// # Errors
+    ///
+    /// The store's error.
+    pub async fn post_home_orphaned_notice(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_name: Option<&str>,
+        refs: &[String],
+    ) -> Result<intent_core::NoteId> {
+        use intent_core::{
+            ContentType, Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility,
+        };
+        let from = home_name.map_or_else(
+            || "the old home".to_owned(),
+            |name| format!("the old home on {name}"),
+        );
+        let mut content = format!(
+            "The workspace's home moved. Work left on {from} after its last backup was saved to:\n\n"
+        );
+        for name in refs {
+            content.push_str("- `");
+            content.push_str(name);
+            content.push_str("`\n");
+        }
+        content.push_str(
+            "\nNothing was merged. To bring it back, fetch the ref and merge or cherry-pick it in the home checkout.\n",
+        );
+        let now = now_iso();
+        let note = Note {
+            id: NoteId::new(),
+            workspace_id: workspace_id.clone(),
+            title: "Work left on the old home".to_owned(),
+            content,
+            content_type: ContentType::Markdown,
+            tags: vec!["home".to_owned()],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: now.clone(),
+            rev: 0,
+            updated_at: now,
+        };
+        let author = NoteVersionAuthor {
+            id: "system".to_owned(),
+            name: "Intent".to_owned(),
+            author_type: "system".to_owned(),
+        };
+        crate::note_write::persist_new_note(&self.store, &note, &author).await?;
+        crate::publish_event(
+            self.event_bus.as_ref(),
+            crate::note_change_event(
+                workspace_id,
+                &note.id,
+                &note.title,
+                intent_core::events::NOTE_CREATED,
+                "create",
+            ),
+        )
+        .await;
+        Ok(note.id)
+    }
+
     /// Announce the workspace's home (nodes.md "Workspace homes") as the
     /// existing `workspace:updated` with `changes: { home }`.
     pub async fn publish_workspace_home_changed(&self, workspace_id: &WorkspaceId) {

@@ -1688,6 +1688,18 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
 
+    /// Send the pending home stops of `workspace_id` (node-link.md "Home
+    /// final stop") to their machines now, connecting first; a machine not
+    /// reachable gets them after its next bind. A no-op by default.
+    fn send_home_stops<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (svc, workspace_id);
+        Box::pin(async {})
+    }
+
     /// What a remote agent of `workspace_id` starts from: its checkout's
     /// `HEAD` and the commits of its populated submodules.
     ///

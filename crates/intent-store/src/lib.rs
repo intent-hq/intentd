@@ -81,6 +81,7 @@ mod subscription_agent_repo;
 mod task_agent_link_repo;
 mod task_event_repo;
 pub use task_event_repo::TaskEventBaselines;
+mod home_stop_repo;
 mod tracked_changes_repo;
 mod transfer_authorship;
 mod transfer_repo;

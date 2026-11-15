@@ -1727,6 +1727,9 @@ impl Store {
             if flipped.rows_affected() == 0 {
                 return Err(Error::NotFound(format!("workspace {id}")));
             }
+            // The workspace's home ends with the archive (node-link.md
+            // "Home final stop"): its stop is recorded in this write.
+            crate::home_stop_repo::retire_workspace_home(&mut conn, id, archived_at, false).await?;
             let removed_collaborators: Vec<PrincipalId> = sqlx::query_scalar::<_, String>(
                 "SELECT principal_id FROM workspace_member m \
                  WHERE workspace_id = ? AND role <> 'owner' \

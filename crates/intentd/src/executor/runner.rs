@@ -336,6 +336,9 @@ struct Inner {
     home_opens: Arc<tokio::sync::Mutex<()>>,
     /// Set once the relay of the homes' file and git events runs.
     home_relay: std::sync::atomic::AtomicBool,
+    /// Held for the whole of a home stop (node-link.md "Home final stop"):
+    /// one at a time.
+    home_stops: tokio::sync::Mutex<()>,
     /// Terminals on the bound backend's homes (nodeProtocol 19).
     terminals: crate::executor::terminals::HomeTerminals,
 }
@@ -1101,6 +1104,7 @@ impl Runner {
                 homes: Mutex::new(homes::Homes::default()),
                 home_opens: Arc::new(tokio::sync::Mutex::new(())),
                 home_relay: std::sync::atomic::AtomicBool::new(false),
+                home_stops: tokio::sync::Mutex::new(()),
             }),
         }
     }

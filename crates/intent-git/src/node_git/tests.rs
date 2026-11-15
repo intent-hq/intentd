@@ -1005,3 +1005,111 @@ fn the_hook_stays_inside_the_sessions_prefix() {
         "a prefix outside refs/intent/ws"
     );
 }
+
+/// A moved home's last push lands only in `home/orphaned/<orphanedAt>/`,
+/// create-only: its `wip` commit is the same for the same tree, so a retry
+/// (an ack lost after the push) lands again, while another commit or any
+/// other ref, `home/head` and `home/wip` included, is refused.
+#[tokio::test]
+async fn a_moved_homes_last_push_creates_only_its_orphaned_refs() {
+    let fixture = Fixture::new();
+    let worktree = fixture.checkout("a").await;
+    let head = fixture.head.path();
+    write_file(&worktree, "dirty.txt", "left behind\n");
+    let home = AgentRemote::home(WS, "home-1").unwrap();
+    assert!(remote(AGENT).orphaned("20261114T140107Z").is_err());
+    assert!(home.orphaned("2026-11-14T14:01:07Z").is_err());
+    let orphaned = home.orphaned("20261114T140107Z").unwrap();
+    assert_eq!(
+        orphaned.ref_name(AgentRef::Head),
+        "refs/intent/ws/ws-1/home/orphaned/20261114T140107Z/head"
+    );
+    let first = fixture
+        .cache
+        .git
+        .push_wip(&worktree, &orphaned)
+        .await
+        .unwrap();
+    assert_eq!(
+        try_ref(head, &orphaned.ref_name(AgentRef::Head)),
+        Some(first.head.clone())
+    );
+    assert_eq!(
+        try_ref(head, &orphaned.ref_name(AgentRef::Wip)),
+        Some(first.wip.clone())
+    );
+    assert_ne!(first.head, first.wip);
+    let again = fixture
+        .cache
+        .git
+        .push_wip(&worktree, &orphaned)
+        .await
+        .unwrap();
+    assert_eq!(again, first, "a retried push is the same push");
+    // Another tree is another wip: the refs are create-only.
+    write_file(&worktree, "dirty.txt", "changed since\n");
+    assert!(fixture
+        .cache
+        .git
+        .push_wip(&worktree, &orphaned)
+        .await
+        .is_err());
+    assert_eq!(
+        try_ref(head, &orphaned.ref_name(AgentRef::Wip)),
+        Some(first.wip.clone())
+    );
+    // Only those two refs: not the home's own, nor another move's.
+    let url = fixture.cache.git.remote_url(&orphaned);
+    for target in [
+        home.ref_name(AgentRef::Head),
+        home.ref_name(AgentRef::Wip),
+        format!("{}orphaned/20200101T000000Z/head", home.ref_prefix()),
+        format!("{}orphaned/20261114T140107Z/other", home.ref_prefix()),
+    ] {
+        let pushed = fixture
+            .cache
+            .git
+            .git(
+                &worktree,
+                &["push", "--quiet", &url, &format!("+HEAD:{target}")],
+            )
+            .await;
+        assert!(pushed.is_err(), "{target} accepted");
+        assert_eq!(try_ref(head, &target), None, "{target} written");
+    }
+    // Without the stop's authority the orphaned refs are never a push's.
+    let url = fixture.cache.git.remote_url(&home);
+    let target = format!("{}orphaned/20261114T150000Z/head", home.ref_prefix());
+    let pushed = fixture
+        .cache
+        .git
+        .git(
+            &worktree,
+            &["push", "--quiet", &url, &format!("HEAD:{target}")],
+        )
+        .await;
+    assert!(pushed.is_err());
+    assert_eq!(try_ref(head, &target), None);
+}
+
+#[test]
+fn an_orphaned_receive_session_names_its_refs_to_the_hook() {
+    let data = tempfile::tempdir().unwrap();
+    configure_receive_hooks(data.path()).unwrap();
+    let home = AgentRemote::home(WS, "home-1").unwrap();
+    let env = |remote: &AgentRemote, service| {
+        service_command(service, Path::new("/repo"), remote)
+            .unwrap()
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == ORPHANED_ENV)
+            .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    };
+    let orphaned = home.orphaned("20261114T140107Z").unwrap();
+    assert_eq!(
+        env(&orphaned, GitService::ReceivePack).as_deref(),
+        Some("20261114T140107Z")
+    );
+    assert_eq!(env(&home, GitService::ReceivePack), None);
+    assert_eq!(env(&orphaned, GitService::UploadPack), None);
+}

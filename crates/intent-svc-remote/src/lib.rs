@@ -285,17 +285,26 @@ async fn resume_exposed_machines(svc: &Services) -> Vec<String> {
                     .homes_on_machine(&machine_id)
                     .await
                     .unwrap_or_default();
-                if !homes.is_empty() {
+                // A machine that only owes a home stop is dialed too, so
+                // the stop goes out.
+                let owes_stops = svc
+                    .store()
+                    .list_home_stops(&machine_id)
+                    .await
+                    .is_ok_and(|stops| !stops.is_empty());
+                if !homes.is_empty() || owes_stops {
                     let shared = node.shared_ref();
                     shared.set_holds_homes(true);
-                    // A failing backup streak from before the restart
-                    // still raises its warning on time.
-                    home_state::resume_warnings(svc, shared, &homes).await;
-                    // Its homes are detached if no link comes up within
-                    // the link-loss grace.
-                    shared
-                        .home_link
-                        .link_lost(shared.weak(), shared.tuning.link_loss_grace);
+                    if !homes.is_empty() {
+                        // A failing backup streak from before the restart
+                        // still raises its warning on time.
+                        home_state::resume_warnings(svc, shared, &homes).await;
+                        // Its homes are detached if no link comes up within
+                        // the link-loss grace.
+                        shared
+                            .home_link
+                            .link_lost(shared.weak(), shared.tuning.link_loss_grace);
+                    }
                     // caller-binding: allow — dials a home's machine at start; the connector retries with backoff
                     tokio::spawn(async move {
                         if let Err(error) = node.connect().await {
@@ -338,7 +347,7 @@ async fn machines_with_live_records(svc: &Services) -> Result<Vec<String>> {
             Some(_) => {}
         }
         if connector::has_live_records(store, &lease.owner.lease_id).await?
-            || !store.homes_on_machine(machine_id).await?.is_empty()
+            || homes::machine_holds_homes(store, machine_id).await?
         {
             machines.push(machine_id.clone());
         }

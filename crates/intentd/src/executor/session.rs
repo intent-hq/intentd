@@ -478,9 +478,9 @@ pub(super) async fn serve_link(
             }
             // Workspace homes (nodeProtocol 19): each answers once on its
             // own task; a replaced session starts nothing.
-            LinkEvent::Frame(frame @ (LinkFrame::HomeOpen(_) | LinkFrame::HomePush(_)))
-                if protocol >= HOMES_PROTOCOL =>
-            {
+            LinkEvent::Frame(
+                frame @ (LinkFrame::HomeOpen(_) | LinkFrame::HomePush(_) | LinkFrame::HomeStop(_)),
+            ) if protocol >= HOMES_PROTOCOL => {
                 let replaced = {
                     let gate = runner.link_gate().lock().await;
                     admit(gate.as_ref(), &binding, link.is_closed()) == Admission::Replaced
@@ -500,6 +500,10 @@ pub(super) async fn serve_link(
                         LinkFrame::HomePush(push) => {
                             LinkFrame::HomePushReply(runner.home_push(push).await)
                         }
+                        LinkFrame::HomeStop(stop) => match runner.home_stop(stop).await {
+                            Some(ack) => LinkFrame::HomeStopAck(ack),
+                            None => return,
+                        },
                         _ => return,
                     };
                     let _ = link.send(&reply).await;

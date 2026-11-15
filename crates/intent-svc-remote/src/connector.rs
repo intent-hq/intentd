@@ -113,6 +113,9 @@ pub(crate) struct Tuning {
     pub forge_refresh: Duration,
     /// How often the token's watcher looks for a credential or gate change.
     pub forge_check: Duration,
+    /// How often a linked machine's pending home stops are sent again
+    /// (a `failed` ack, or none): every bind sends them too.
+    pub home_stop_resend: Duration,
     /// Test seam: fail every ack write while set.
     #[cfg(test)]
     pub fail_ack_writes: Arc<std::sync::atomic::AtomicBool>,
@@ -216,6 +219,7 @@ impl Default for Tuning {
             connect: ConnectTuning::default(),
             forge_refresh: Duration::from_secs(5 * 60),
             forge_check: Duration::from_secs(2),
+            home_stop_resend: Duration::from_secs(2 * 60),
             #[cfg(test)]
             fail_ack_writes: Arc::default(),
             #[cfg(test)]
@@ -394,6 +398,9 @@ pub(crate) struct Shared {
     /// Detaching this machine's homes after a link loss, and their
     /// backup warnings (nodes.md "Detached workspaces").
     pub(crate) home_link: crate::home_state::HomeLink,
+    /// A worker resends this machine's pending home stops on a timer
+    /// ([`crate::homes::ensure_stop_resends`]).
+    pub(crate) home_stop_resends: std::sync::atomic::AtomicBool,
     /// Terminals on this machine's homes (nodeProtocol 19).
     pub(crate) terminals: crate::terminals::HomeTerminals,
     /// The home runs of saved scripts on this machine (nodeProtocol 19).
@@ -1777,6 +1784,7 @@ impl RemoteNode {
             home_call_waiters: Mutex::new(HashMap::new()),
             holds_homes: std::sync::atomic::AtomicBool::new(false),
             home_link: crate::home_state::HomeLink::default(),
+            home_stop_resends: std::sync::atomic::AtomicBool::new(false),
             terminals: crate::terminals::HomeTerminals::default(),
             home_scripts: crate::home_scripts::HomeScripts::default(),
             secret_waiters: Mutex::new(HashMap::new()),
@@ -2968,6 +2976,14 @@ async fn serve(
                                 .publish_home_events(&shared.machine_id(), events)
                                 .await;
                         }
+                    }
+                    LinkEvent::Frame(LinkFrame::HomeStopAck(ack)) => {
+                        let shared = shared.clone();
+                        // Off the ingest loop: it writes the store and may
+                        // post a notice.
+                        intent_core::spawn_daemon(async move {
+                            crate::homes::stop_acked(&shared, ack).await;
+                        });
                     }
                     LinkEvent::Frame(LinkFrame::HomePushReply(reply)) => {
                         if let Some(waiter) = lock(&shared.home_waiters).remove(&reply.request_id) {

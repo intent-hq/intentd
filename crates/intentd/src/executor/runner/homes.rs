@@ -4,8 +4,8 @@
 //! backup to the workspace's `home/head` and `home/wip`.
 //!
 //! A home checkout belongs to the workspace, not to an agent: no agent stop
-//! removes it. Only the bind-time sweep (a home missing from the hello's
-//! `leaseHomes`) does here.
+//! removes it. Only its home stop (node-link.md "Home final stop") and the
+//! bind-time sweep (a home missing from the hello's `leaseHomes`) do.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 
 use intent_core::node_link::{
-    HomeOpen, HomeOpenOutcome, HomeOpenReply, HomePush, HomePushOutcome, HomePushReply, HomeRef,
-    JournalBody, RecordOwner, SetupCommand, SubmodulePin, HOMES_PROTOCOL, NODE_HOME_UNKNOWN,
+    HomeOpen, HomeOpenOutcome, HomeOpenReply, HomeOrphaned, HomePush, HomePushOutcome,
+    HomePushReply, HomeRef, HomeStop, HomeStopAck, HomeStopOutcome, HomeStopReason, JournalBody,
+    RecordOwner, SetupCommand, SubmodulePin, HOMES_PROTOCOL, NODE_HOME_UNKNOWN,
     NODE_HOME_UNSUPPORTED,
 };
 use intent_core::HomeId;
@@ -37,6 +38,12 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often a changing checkout's `home/wip` is pushed at least.
 const WIP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// The bound on a home stop's last push.
+const STOP_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a home stop waits for the home's terminals to end.
+const STOP_TERMINALS_WAIT: Duration = Duration::from_secs(10);
 
 /// How long after the last writing home call `home/wip` is pushed.
 pub(super) const WIP_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -348,6 +355,172 @@ impl Runner {
                 Some(format!("node-home-push-failed: {error:#}")),
             ),
         }
+    }
+
+    /// End `frame`'s home for good (node-link.md "Home final stop"): stop
+    /// its terminals, home runs and the agents sharing its checkout, push
+    /// it one last time (a retired home to `home/head` and `home/wip`, a
+    /// moved one to its orphaned refs only), then remove the checkout. A
+    /// stop for a home this machine no longer has answers `removed`, so a
+    /// resend after a lost ack ends the same way. `None` sends no ack (a
+    /// home run or sharing agent that did not stop): the backend resends.
+    pub(in crate::executor) async fn home_stop(&self, frame: HomeStop) -> Option<HomeStopAck> {
+        let home = frame.home();
+        let ack = |outcome, orphaned: Option<HomeOrphaned>| HomeStopAck {
+            stop_id: frame.stop_id.clone(),
+            workspace_id: home.workspace_id.clone(),
+            home_id: home.home_id.clone(),
+            outcome,
+            orphaned,
+        };
+        let orphaned_at = frame.orphaned().map(str::to_owned);
+        if frame.reason == HomeStopReason::Moved && orphaned_at.is_none() {
+            tracing::warn!(home = %home.home_id, "node: a moved home's stop names no valid orphanedAt");
+            return Some(ack(HomeStopOutcome::Failed, None));
+        }
+        // One home stop at a time (a resend joins the queue and then finds
+        // the checkout gone); opens of other homes are not held up.
+        let _stopping = self.inner.home_stops.lock().await;
+        let recorded = self
+            .inner
+            .checkouts
+            .homes()
+            .into_iter()
+            .find(|(id, _)| id == &home.home_id);
+        if recorded
+            .as_ref()
+            .and_then(|(_, workspace)| workspace.as_ref())
+            .is_some_and(|workspace| workspace != &home.workspace_id)
+        {
+            tracing::warn!(home = %home.home_id, "node: a home stop for a checkout of another workspace");
+            return Some(ack(HomeStopOutcome::Failed, None));
+        }
+        // Closed first, under the open lock so no open or reopen of it
+        // races: its watcher ends, no home frame reaches it, and it never
+        // pushes `home/head` or `home/wip` on its own again.
+        let opened = {
+            let _opening = self.inner.home_opens.lock().await;
+            let mut homes = lock(&self.inner.homes);
+            homes.lease.remove(&home.home_id);
+            homes.open.remove(&home.home_id)
+        };
+        if let Some(opened) = &opened {
+            lock(&opened.setup_stop).take();
+            opened.closed.send_replace(true);
+        }
+        self.inner
+            .terminals
+            .kill_home(&home.home_id, STOP_TERMINALS_WAIT)
+            .await;
+        if !self.inner.scripts.stop_home(&home.home_id).await {
+            tracing::warn!(home = %home.home_id, "node: home stop not acknowledged: a home run was not reaped");
+            return None;
+        }
+        if !self.stop_home_sharers(&home).await {
+            tracing::warn!(home = %home.home_id, "node: home stop not acknowledged: an agent sharing the home did not stop");
+            return None;
+        }
+        let Some(worktree) = opened
+            .as_ref()
+            .map(|opened| opened.worktree.clone())
+            .or_else(|| self.inner.checkouts.existing_home(&home.home_id))
+        else {
+            // Nothing here (any more): a resend after the checkout went.
+            if recorded.is_some() {
+                if let Err(error) = self.inner.checkouts.remove_home(&home.home_id).await {
+                    tracing::warn!(home = %home.home_id, %error, "node: could not remove a stopped home's directory");
+                    return Some(ack(HomeStopOutcome::Failed, None));
+                }
+            }
+            return Some(ack(HomeStopOutcome::Removed, None));
+        };
+        let orphaned = if let Some(at) = &orphaned_at {
+            match self
+                .push_orphaned(opened.as_deref(), &home, &worktree, at)
+                .await
+            {
+                Ok(pushed) => Some(HomeOrphaned {
+                    wip: (pushed.wip != pushed.head).then_some(pushed.wip),
+                    head: pushed.head,
+                }),
+                Err(error) => {
+                    // The checkout stays until its leftover work is on the
+                    // backend: the next resend pushes again.
+                    tracing::warn!(home = %home.home_id, error = %format!("{error:#}"), "node: a moved home's last push failed; its checkout stays");
+                    return Some(ack(HomeStopOutcome::Failed, None));
+                }
+            }
+        } else {
+            // A retired home's last backup (the backend takes a deleted
+            // workspace's into a sink). The checkout stays until it lands:
+            // the next resend pushes again.
+            let deadline = tokio::time::Instant::now() + STOP_PUSH_TIMEOUT;
+            let pushed = if let Some(opened) = &opened {
+                self.push_home_now(opened, deadline).await.map(drop)
+            } else {
+                self.inner
+                    .checkouts
+                    .push_home(&home, &worktree, None, STOP_PUSH_TIMEOUT)
+                    .await
+                    .map(drop)
+            };
+            if let Err(error) = pushed {
+                tracing::warn!(home = %home.home_id, error = %format!("{error:#}"), "node: a retired home's last push failed; its checkout stays");
+                return Some(ack(HomeStopOutcome::Failed, None));
+            }
+            None
+        };
+        if let Some(records) = self.inner.home_records.as_ref() {
+            records.forget(&worktree).await;
+        }
+        if let Err(error) = self.inner.checkouts.remove_home(&home.home_id).await {
+            tracing::warn!(home = %home.home_id, %error, "node: could not remove a stopped home's checkout");
+            return Some(ack(HomeStopOutcome::Failed, orphaned));
+        }
+        Some(ack(HomeStopOutcome::Removed, orphaned))
+    }
+
+    /// A moved home's one last push to its orphaned refs, after any push of
+    /// it still under way.
+    async fn push_orphaned(
+        &self,
+        opened: Option<&Home>,
+        home: &HomeRef,
+        worktree: &std::path::Path,
+        orphaned_at: &str,
+    ) -> anyhow::Result<Pushed> {
+        let _pushes = match opened {
+            Some(opened) => Some(opened.pushed.lock().await),
+            None => None,
+        };
+        self.inner
+            .checkouts
+            .push_home_orphaned(home, worktree, orphaned_at, STOP_PUSH_TIMEOUT)
+            .await
+    }
+
+    /// Stop every agent working in `home`'s checkout, with its script runs.
+    /// Whether all of them stopped.
+    async fn stop_home_sharers(&self, home: &HomeRef) -> bool {
+        let sharers: Vec<intent_core::AgentId> = lock(&self.inner.state)
+            .agents
+            .iter()
+            .filter(|(_, agent)| {
+                agent
+                    .home
+                    .as_ref()
+                    .is_some_and(|of| of.home_id == home.home_id)
+            })
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect();
+        let mut stopped = true;
+        for sharer in sharers {
+            if !self.inner.scripts.stop_agent(&sharer).await {
+                stopped = false;
+            }
+            stopped &= self.stop(&sharer).wait().await.is_some();
+        }
+        stopped
     }
 
     /// The home checkout an agent sharing `home` works in (nodeProtocol

@@ -919,6 +919,19 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "outcome": reply.outcome,
             "error": reply.error.as_deref().map(field),
         }),
+        LinkFrame::HomeStop(stop) => json!({
+            "type": "homeStop",
+            "stopId": field(&stop.stop_id),
+            "homeId": field(stop.home_id.as_str()),
+            "reason": stop.reason,
+        }),
+        LinkFrame::HomeStopAck(ack) => json!({
+            "type": "homeStopAck",
+            "stopId": field(&ack.stop_id),
+            "homeId": field(ack.home_id.as_str()),
+            "outcome": ack.outcome,
+            "orphaned": ack.orphaned.is_some(),
+        }),
         LinkFrame::PtyOpen(open) => json!({
             "type": "ptyOpen",
             "terminalId": field(&open.terminal_id),
@@ -1123,6 +1136,16 @@ fn summarize(frame_type: &str, frame: &Value) -> String {
             line
         }
         "homeOpen" | "homePush" => format!("{frame_type} home {}", text(frame, "homeId")),
+        "homeStop" => format!(
+            "homeStop {} home {}",
+            text(frame, "reason"),
+            text(frame, "homeId")
+        ),
+        "homeStopAck" => format!(
+            "homeStopAck {} home {}",
+            text(frame, "outcome"),
+            text(frame, "homeId")
+        ),
         "homeCall" => format!(
             "homeCall {} on home {}",
             text(frame, "method"),

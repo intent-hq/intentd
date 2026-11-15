@@ -234,10 +234,11 @@ impl HeadLease {
     }
 
     /// The homes the machine keeps (nodeProtocol 19): every workspace's
-    /// current home on it. The machine sweeps every other home checkout of
-    /// this backend.
+    /// current home on it, and every home with a pending stop (its stop
+    /// removes it, after its last push). The machine sweeps every other
+    /// home checkout of this backend.
     pub(crate) async fn lease_homes(&self) -> Result<Vec<HomeRef>> {
-        Ok(self
+        let mut homes: Vec<HomeRef> = self
             .store
             .homes_on_machine(&self.owner.node_id)
             .await?
@@ -246,7 +247,13 @@ impl HeadLease {
                 workspace_id,
                 home_id: home.home_id,
             })
-            .collect())
+            .collect();
+        for stop in self.store.list_home_stops(&self.owner.node_id).await? {
+            if !homes.iter().any(|home| home.home_id == stop.home_id) {
+                homes.push(stop.frame().home());
+            }
+        }
+        Ok(homes)
     }
 
     /// Record what the node reported for a new link.

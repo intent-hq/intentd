@@ -710,6 +710,9 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
                 .await?;
         }
     }
+    // Its pending home stops go too: removing the machine is the user's
+    // choice to drop those checkouts (node-link.md "Home final stop").
+    store.delete_home_stops_on_machine(&machine_id).await?;
     let credential = store.remove_exposed_machine(&machine_id).await?;
     svc.delete_remote_machine_token(&machine_id).await?;
     store

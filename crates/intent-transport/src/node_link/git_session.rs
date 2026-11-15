@@ -180,6 +180,9 @@ pub struct ReceiveHold {
     pub token: Option<String>,
     /// Dropped once the receive-pack process has exited.
     pub guard: Option<Box<dyn Send>>,
+    /// A moved home's last push (node-link.md "Home final stop"): the
+    /// session may create only `home/orphaned/<this>/{head,wip}`.
+    pub orphaned: Option<String>,
 }
 
 pub trait NodeGitAccess: Send + Sync {
@@ -374,7 +377,7 @@ async fn run_service(
 ) -> std::result::Result<(), &'static str> {
     let open: OpenRequest = serde_json::from_slice(open).map_err(|_| codes::INVALID)?;
     let service = GitService::parse(&open.service).map_err(|_| codes::INVALID)?;
-    let remote = AgentRemote::parse(&open.url).map_err(|_| codes::INVALID)?;
+    let mut remote = AgentRemote::parse(&open.url).map_err(|_| codes::INVALID)?;
     if remote.is_home() && !access.homes_supported() {
         return Err(codes::INVALID);
     }
@@ -410,6 +413,9 @@ async fn run_service(
                 .before_receive(binding, &remote, &repository)
                 .await
                 .map_err(|error| access_code(&error))?;
+            if let Some(at) = hold.orphaned.as_deref() {
+                remote = remote.orphaned(at).map_err(|_| codes::FAILED)?;
+            }
         }
         (
             service_command(service, &repository, &remote).map_err(|_| codes::FAILED)?,
@@ -485,6 +491,7 @@ async fn run_service(
                 ReceiveHold {
                     token: hold.token.take(),
                     guard: service.hold.take(),
+                    orphaned: hold.orphaned.take(),
                 },
             )
             .await;

@@ -191,6 +191,12 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          gets a home of its own there",
     ),
     (
+        "home_stop",
+        "pending home stops this head owes one of its own machines (stop ids, orphan ref \
+         names); the target head has neither the machine nor the home, so it could neither \
+         send nor receive them",
+    ),
+    (
         "remote_final_stop",
         "pending final stops this head owes a machine under its own lease (stop ids, a local \
          repository path); the target head has no such lease, so it could neither send nor \

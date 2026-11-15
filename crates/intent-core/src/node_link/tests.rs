@@ -358,6 +358,7 @@ fn executor_link_requests_golden() {
             "homeCallCancel",
             "homeOpen",
             "homePush",
+            "homeStop",
             "launch",
             "oneShot",
             "oneShotCancel",
@@ -420,6 +421,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "homeEvents",
             "homeOpenReply",
             "homePushReply",
+            "homeStopAck",
             "journal",
             "oneShotReply",
             "ptyExited",
@@ -735,6 +737,23 @@ fn every_frame() -> Vec<LinkFrame> {
             head: Some("a".repeat(40)),
             wip: Some("b".repeat(40)),
             error: None,
+        }),
+        LinkFrame::HomeStop(HomeStop {
+            stop_id: "stop-1".into(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            home_id: HomeId::from("home-1"),
+            reason: HomeStopReason::Moved,
+            orphaned_at: Some("20261114T140107Z".into()),
+        }),
+        LinkFrame::HomeStopAck(HomeStopAck {
+            stop_id: "stop-1".into(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            home_id: HomeId::from("home-1"),
+            outcome: HomeStopOutcome::Removed,
+            orphaned: Some(HomeOrphaned {
+                head: "a".repeat(40),
+                wip: None,
+            }),
         }),
         LinkFrame::PtyOpen(PtyOpen {
             terminal_id: "t1".into(),
@@ -1098,7 +1117,7 @@ fn frames_are_routed_to_their_lane() {
             Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
             Control, Control, Control, Control, Control, Control, Control, Control, Script, Script,
             Script, Rpc, Rpc, Rpc, Control, Control, Control, Control, Control, Control, Control,
-            Control, Control, Script, Script, Rpc, Rpc, Rpc, Script,
+            Control, Control, Control, Control, Script, Script, Rpc, Rpc, Rpc, Script,
         ]
     );
 }
@@ -1607,6 +1626,8 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
                 | LinkFrame::HomeOpenReply(_)
                 | LinkFrame::HomePush(_)
                 | LinkFrame::HomePushReply(_)
+                | LinkFrame::HomeStop(_)
+                | LinkFrame::HomeStopAck(_)
                 | LinkFrame::PtyOpen(_)
                 | LinkFrame::PtyInput(_)
                 | LinkFrame::PtyResize(_)
@@ -2493,4 +2514,85 @@ fn script_frames_name_an_agent_or_a_home_and_a_home_needs_protocol_19() {
         LinkFrame::ScriptStart(agent_start).min_protocol(),
         SCRIPT_PROTOCOL
     );
+}
+
+#[test]
+fn a_home_stop_round_trips_and_its_body_is_closed() {
+    let stop = json!({
+        "type": "homeStop",
+        "stopId": "s1",
+        "workspaceId": "ws-1",
+        "homeId": "home-1",
+        "reason": "retired",
+    });
+    let frame: LinkFrame = serde_json::from_value(stop.clone()).unwrap();
+    let LinkFrame::HomeStop(decoded) = &frame else {
+        panic!("not a homeStop: {frame:?}");
+    };
+    assert_eq!(decoded.reason, HomeStopReason::Retired);
+    assert_eq!(decoded.orphaned(), None);
+    assert_eq!(serde_json::to_value(&frame).unwrap(), stop);
+    let mut extra = stop;
+    extra["force"] = json!(true);
+    assert!(serde_json::from_value::<LinkFrame>(extra).is_err());
+    let ack = json!({
+        "type": "homeStopAck",
+        "stopId": "s1",
+        "workspaceId": "ws-1",
+        "homeId": "home-1",
+        "outcome": "removed",
+        "orphaned": { "head": "a", "wip": "b" },
+    });
+    let frame: LinkFrame = serde_json::from_value(ack.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&frame).unwrap(), ack);
+    assert!(!frame.admitted_from_executor());
+    assert_eq!(frame.channel(), LinkChannel::Control);
+}
+
+#[test]
+fn a_moved_home_stop_needs_a_safe_orphaned_at() {
+    let stop = |orphaned_at: Option<&str>| HomeStop {
+        stop_id: "s1".into(),
+        workspace_id: WorkspaceId::from("ws-1"),
+        home_id: HomeId::from("home-1"),
+        reason: HomeStopReason::Moved,
+        orphaned_at: orphaned_at.map(str::to_owned),
+    };
+    assert_eq!(
+        stop(Some("20261114T140107Z")).orphaned(),
+        Some("20261114T140107Z")
+    );
+    for bad in [
+        None,
+        Some(""),
+        Some("2026-11-14T14:01:07Z"),
+        Some("../head"),
+        Some("a/b"),
+        Some(".hidden"),
+        Some("x.lock"),
+    ] {
+        assert_eq!(stop(bad).orphaned(), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn a_moved_record_names_its_orphaned_refs_by_its_time() {
+    let record = HomeStopRecord::new(
+        WorkspaceId::from("ws-1"),
+        HomeId::from("home-1"),
+        "node-1".into(),
+        HomeStopReason::Moved,
+        "2026-11-14T14:01:07.123+01:00",
+    );
+    assert_eq!(record.orphaned_at.as_deref(), Some("20261114T130107Z"));
+    assert_eq!(record.frame().orphaned(), Some("20261114T130107Z"));
+    let retired = HomeStopRecord::new(
+        WorkspaceId::from("ws-1"),
+        HomeId::from("home-1"),
+        "node-1".into(),
+        HomeStopReason::Retired,
+        "2026-11-14T14:01:07Z",
+    );
+    assert_eq!(retired.orphaned_at, None);
+    assert_ne!(retired.stop_id, record.stop_id);
 }

@@ -12,8 +12,9 @@ use intent_core::machines::{
     ExposedMachine, MachineUpdateRequired, RemoteMachineState, UpdateSide,
 };
 use intent_core::node_link::{
-    HomeOpen, HomeOpenOutcome, HomeOpenReply, HomePushReply, JournalBody, JournalRecord, LinkFrame,
-    PreparedCheckout, RecordOwner, HOMES_PROTOCOL,
+    HomeOpen, HomeOpenOutcome, HomeOpenReply, HomePushReply, HomeStopAck, HomeStopOutcome,
+    HomeStopReason, HomeStopRecord, JournalBody, JournalRecord, LinkFrame, PreparedCheckout,
+    RecordOwner, HOMES_PROTOCOL,
 };
 use intent_core::placement::{AgentPlacement, PlacementUnavailable, PlacementUnavailableReason};
 use intent_core::remote_launch::RemotePlacementView;
@@ -415,7 +416,24 @@ pub(crate) fn after_bind(shared: &Arc<Shared>, link: &NodeLink) {
                 return;
             }
         };
-        shared.set_holds_homes(!homes.is_empty());
+        let stops = match svc.store().list_home_stops(&machine).await {
+            Ok(stops) => stops,
+            Err(error) => {
+                tracing::warn!(%machine, %error, "remote machine: could not read its home stops");
+                Vec::new()
+            }
+        };
+        shared.set_holds_homes(!homes.is_empty() || !stops.is_empty());
+        // Every pending stop goes again after each bind until its ack, and
+        // on a timer while this link lasts: a `failed` ack (a moved home's
+        // push did not land) or one that never came is retried.
+        let pending = !stops.is_empty();
+        for stop in stops {
+            send_stop(&shared, &stop).await;
+        }
+        if pending {
+            ensure_stop_resends(&shared);
+        }
         if !svc.workspace_homes() {
             return;
         }
@@ -548,6 +566,221 @@ async fn auto_start_due(
             tracing::warn!(home = %home_id, %error, "remote machine: could not claim the home's autoStart; it is not started");
             false
         }
+    }
+}
+
+/// Whether the exposed machine `node_id` holds a home of this backend or
+/// owes one a stop: its link is kept up.
+///
+/// # Errors
+///
+/// The store's error.
+pub(crate) async fn machine_holds_homes(
+    store: &intent_store::Store,
+    node_id: &str,
+) -> Result<bool> {
+    Ok(!store.homes_on_machine(node_id).await?.is_empty()
+        || !store.list_home_stops(node_id).await?.is_empty())
+}
+
+/// Send `stop` on the machine's current link, when it speaks
+/// nodeProtocol 19; otherwise it goes after the next bind.
+async fn send_stop(shared: &Shared, stop: &HomeStopRecord) {
+    if shared.current_link().is_none() || shared.protocol() < HOMES_PROTOCOL {
+        return;
+    }
+    if let Err(error) = shared.send(&LinkFrame::HomeStop(stop.frame())).await {
+        tracing::info!(home = %stop.home_id, %error, "remote machine: could not send a home stop; it goes after the next bind");
+    }
+}
+
+/// Make sure one worker resends the machine's pending home stops every
+/// `tuning.home_stop_resend` while it has a link, until none is left: a
+/// `failed` ack (a push that did not land) or one that never came is
+/// retried without a reconnect. Called whenever a stop is sent or fails;
+/// a worker that ended (no stop left, or no link) is started again.
+pub(crate) fn ensure_stop_resends(shared: &Arc<Shared>) {
+    use std::sync::atomic::Ordering;
+    if shared.home_stop_resends.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let shared = shared.clone();
+    // caller-binding: allow — resends one machine's pending home stops while it is linked
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(shared.tuning.home_stop_resend).await;
+            let stops = pending_while_linked(&shared).await;
+            if stops.is_empty() {
+                shared.home_stop_resends.store(false, Ordering::SeqCst);
+                // A stop sent meanwhile found this worker still running:
+                // keep going for it, unless another worker took over.
+                let again = !pending_while_linked(&shared).await.is_empty();
+                if again && !shared.home_stop_resends.swap(true, Ordering::SeqCst) {
+                    continue;
+                }
+                return;
+            }
+            for stop in stops {
+                send_stop(&shared, &stop).await;
+            }
+        }
+    });
+}
+
+/// The machine's pending home stops while it has a link; none without
+/// one (the next bind sends them and starts a worker again).
+async fn pending_while_linked(shared: &Shared) -> Vec<HomeStopRecord> {
+    if shared.current_link().is_none() {
+        return Vec::new();
+    }
+    shared
+        .store
+        .list_home_stops(&shared.machine_id())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "remote machine: could not read its home stops");
+            Vec::new()
+        })
+}
+
+/// Make `home` the workspace's home and record a `moved` stop of the
+/// machine home it replaces, in one store transaction
+/// ([`intent_store::Store::switch_workspace_home`]), holding the
+/// workspace's home push slot: a push the old home started before the
+/// switch lands first, and none of it lands after. The switch step of a
+/// home move (nodes.md "Moving the home" step 3).
+///
+/// # Errors
+///
+/// The store's error.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "workspace.setHome (homes step 4.4c) calls it")
+)]
+pub(crate) async fn switch_home(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home: &WorkspaceHome,
+) -> Result<Option<HomeStopRecord>> {
+    let _pushes = crate::git::home_push_slot(workspace_id).await?;
+    svc.store()
+        .switch_workspace_home(workspace_id, home, &intent_core::now_iso())
+        .await
+}
+
+/// See [`intent_services::feature_api::feature_ports::RemoteLaunchPort::send_home_stops`].
+pub(crate) async fn send_workspace_stops(svc: &Services, workspace_id: &WorkspaceId) {
+    let stops = match svc.store().list_workspace_home_stops(workspace_id).await {
+        Ok(stops) => stops,
+        Err(error) => {
+            tracing::warn!(workspace = %workspace_id, %error, "could not read the workspace's home stops");
+            return;
+        }
+    };
+    let Some(feature) = svc.remote_feature() else {
+        return;
+    };
+    for stop in stops {
+        let node = match feature.node(svc, &stop.node_id).await {
+            Ok(node) => node,
+            Err(error) => {
+                tracing::info!(home = %stop.home_id, %error, "remote machine: no connector for a home stop yet");
+                continue;
+            }
+        };
+        node.shared_ref().set_holds_homes(true);
+        if node.shared_ref().current_link().is_some() {
+            send_stop(node.shared_ref(), &stop).await;
+            ensure_stop_resends(&node.shared());
+            continue;
+        }
+        // The bind sends it.
+        // caller-binding: allow — dials the machine owing a home stop; the connector retries with backoff
+        tokio::spawn(async move {
+            if let Err(error) = node.connect().await {
+                tracing::info!(%error, "remote machine: a stopped home's machine is not reachable yet");
+            }
+        });
+    }
+}
+
+/// The `home/orphaned/<at>/{head,wip}` refs of `workspace_id` the hub
+/// holds, in `repository`.
+fn orphaned_refs(
+    repository: &std::path::Path,
+    workspace_id: &WorkspaceId,
+    at: &str,
+) -> Vec<String> {
+    let Ok(repo) = git2::Repository::open(repository) else {
+        return Vec::new();
+    };
+    ["head", "wip"]
+        .into_iter()
+        .map(|name| format!("refs/intent/ws/{workspace_id}/home/orphaned/{at}/{name}"))
+        .filter(|name| repo.find_reference(name).is_ok())
+        .collect()
+}
+
+/// Take in a `homeStopAck`: a `removed` ack ends its stop (an ack for
+/// another `stopId` changes nothing), and a moved home's notice names the
+/// orphaned refs its last push left. A `failed` one keeps the stop, which
+/// is sent again on a timer.
+pub(crate) async fn stop_acked(shared: &Arc<Shared>, ack: HomeStopAck) {
+    let Some(svc) = shared.services() else {
+        return;
+    };
+    if ack.outcome == HomeStopOutcome::Failed {
+        tracing::warn!(home = %ack.home_id, "remote machine: a home stop failed on the machine; it is sent again");
+        ensure_stop_resends(shared);
+        return;
+    }
+    let finished = match svc
+        .store()
+        .finish_home_stop(&ack.home_id, &ack.stop_id)
+        .await
+    {
+        Ok(finished) => finished,
+        Err(error) => {
+            tracing::warn!(home = %ack.home_id, %error, "remote machine: could not record a home stop's ack");
+            return;
+        }
+    };
+    let Some(stop) = finished else {
+        return;
+    };
+    if let Ok(holds) = machine_holds_homes(svc.store(), &shared.machine_id()).await {
+        shared.set_holds_homes(holds);
+    }
+    let Some(at) = stop
+        .orphaned_at
+        .clone()
+        .filter(|_| stop.reason == HomeStopReason::Moved)
+    else {
+        return;
+    };
+    let Ok(workspace) = svc.store().get_workspace(&stop.workspace_id).await else {
+        return;
+    };
+    let repository = std::path::PathBuf::from(crate::final_stop::repo_path(&workspace));
+    let workspace_id = stop.workspace_id.clone();
+    let refs = tokio::task::spawn_blocking(move || orphaned_refs(&repository, &workspace_id, &at))
+        .await
+        .unwrap_or_default();
+    if refs.is_empty() {
+        return;
+    }
+    let name = svc
+        .store()
+        .get_exposed_machine(&stop.node_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.name);
+    if let Err(error) = svc
+        .post_home_orphaned_notice(&stop.workspace_id, name.as_deref(), &refs)
+        .await
+    {
+        tracing::warn!(workspace = %stop.workspace_id, %error, "could not post the old home's notice");
     }
 }
 
