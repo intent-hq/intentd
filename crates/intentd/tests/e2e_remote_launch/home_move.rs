@@ -515,10 +515,11 @@ async fn a_sharing_agent_relaunches_isolated_after_the_home_moves() {
     .await;
     let work = s.work.clone();
     let pids = until("the agent started in the home checkout", || {
-        std::fs::read_to_string(work.join("agent.pid")).ok()
+        std::fs::read_to_string(work.join("agent.pid"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
     })
     .await;
-    let pids: Value = serde_json::from_str(&pids).unwrap();
     let pid = pids["agent"].to_string();
     std::fs::remove_file(work.join("agent.pid")).unwrap();
 

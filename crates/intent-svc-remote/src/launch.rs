@@ -323,11 +323,6 @@ async fn push_parent_now(svc: &Services, owner: &AgentId) -> bool {
     }
 }
 
-/// Start sub-agent `agent_id` from its parent `owner`'s pushed work: its
-/// `base` is the parent's `head`, its `wip` the parent's `wip`, in the
-/// superproject and each pinned submodule (nodeProtocol 13). The parent's
-/// machine is asked to push first. Without a parent `head` the view is left
-/// as admitted (the workspace's last commit).
 /// Copy `from`'s saved work to `to` in head's repositories: `from`'s
 /// `wip` (when it is not its `head`) becomes `to`'s, also in each of
 /// `pins`' submodules. Returns `from`'s `head` and the pins moved to its
@@ -391,6 +386,11 @@ pub(crate) fn write_base_refs(
     Ok(())
 }
 
+/// Start sub-agent `agent_id` from its parent `owner`'s pushed work: its
+/// `base` is the parent's `head`, its `wip` the parent's `wip`, in the
+/// superproject and each pinned submodule (nodeProtocol 13). The parent's
+/// machine is asked to push first. Without a parent `head` the view is left
+/// as admitted (the workspace's last commit).
 async fn copy_parent_work(
     svc: &Services,
     workspace_id: &WorkspaceId,

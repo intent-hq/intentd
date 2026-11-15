@@ -310,8 +310,13 @@ pub(crate) async fn current_home_checkout(
 /// nodes.md "Moving the home" step 4: `record`'s agent shared a home that
 /// is no longer the workspace's, so it starts in a checkout of its own on
 /// the same machine. Its `base` and `wip` refs are written from the hub's
-/// `home/head` and `home/wip` (each submodule's too), `view` drops the home
-/// and takes the new base, and the agent and the user get a notice.
+/// `home/head` and `home/wip` (each submodule's too, for the workspace's
+/// current submodules), and `view` drops the home and takes the new base.
+/// When the workspace has a home, the agent and the user get a notice.
+///
+/// A retry after a failure part-way redoes every step: the agent's old
+/// `wip` refs are cleared first, and the transcript row is added only by
+/// the call whose placement update drops the home.
 pub(crate) async fn leave_moved_home(
     svc: &Services,
     record: &intent_core::remote_launch::RemoteAgentRecord,
@@ -319,16 +324,28 @@ pub(crate) async fn leave_moved_home(
 ) -> Result<()> {
     let workspace_id = &record.workspace_id;
     let agent_id = &record.agent_id;
+    let moved = svc
+        .store()
+        .get_workspace_home(workspace_id)
+        .await?
+        .is_some();
     let checkout = crate::launch::workspace_checkout(svc, workspace_id).await?;
+    let current = crate::launch::checkout_base(svc, workspace_id).await?;
     let home = AgentRemote::home(workspace_id.as_str(), &HomeId::new().0)?;
     let agent = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
-    let pins = view.pins().to_vec();
-    let base = view.base_commit.clone();
+    let pins = if view.submodules.is_some() {
+        current.submodules.clone()
+    } else {
+        Vec::new()
+    };
     let (base, pins) = crate::launch::blocking(move || {
+        clear_wip(&checkout, &agent, &pins)?;
         let copied = crate::launch::copy_work(&checkout, &home, &agent, pins.clone())?;
         let (base, pins) = copied.unwrap_or_else(|| {
-            tracing::warn!("the moved home has no saved head; the agent starts from its base");
-            (base, pins)
+            tracing::warn!(
+                "the moved home has no saved head; the agent starts from the workspace's checkout"
+            );
+            (current.commit, pins)
         });
         crate::launch::write_base_refs(&checkout, &agent, &base, &pins)?;
         Ok((base, pins))
@@ -339,17 +356,61 @@ pub(crate) async fn leave_moved_home(
     if view.submodules.is_some() {
         view.submodules = Some(pins);
     }
-    let notice = intent_core::remote_launch::home_moved_notice(&view.node_name);
-    svc.post_home_moved_agent_notice(workspace_id, agent_id, &notice)
-        .await?;
+    let notice = moved.then(|| intent_core::remote_launch::home_moved_notice(&view.node_name));
+    if let Some(notice) = &notice {
+        svc.store()
+            .set_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_HOME_MOVED_NOTICE_KEY,
+                notice,
+                None,
+                None,
+            )
+            .await?;
+    }
     let stored = view.clone();
-    crate::view::update(svc.store(), workspace_id, agent_id, move |current| {
+    let left = crate::view::update(svc.store(), workspace_id, agent_id, move |current| {
         current.home_checkout = None;
         current.base_commit = stored.base_commit;
         current.submodules = stored.submodules;
     })
     .await?;
-    tracing::info!(workspace = %workspace_id, agent = %agent_id, "the agent's home moved; it starts in a checkout of its own");
+    if let Some(notice) = notice.filter(|_| left) {
+        svc.add_home_moved_transcript_row(workspace_id, agent_id, &notice)
+            .await;
+    }
+    tracing::info!(workspace = %workspace_id, agent = %agent_id, "the agent left its home; it starts in a checkout of its own");
+    Ok(())
+}
+
+/// Delete `agent`'s `wip` refs in head's repositories, the superproject's
+/// and each of `pins`' submodules', so a stale one is never restored.
+fn clear_wip(
+    checkout: &std::path::Path,
+    agent: &AgentRemote,
+    pins: &[intent_core::node_link::SubmodulePin],
+) -> Result<()> {
+    let delete = |repository: &std::path::Path, remote: &AgentRemote| -> Result<()> {
+        let repo = git2::Repository::open(repository)
+            .map_err(|e| Error::Internal(format!("open the workspace repository: {e}")))?;
+        let found = repo.find_reference(&remote.ref_name(AgentRef::Wip));
+        match found {
+            Ok(mut reference) => reference
+                .delete()
+                .map_err(|e| Error::Internal(format!("delete the agent's wip ref: {e}"))),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(()),
+            Err(error) => Err(Error::Internal(format!(
+                "read the agent's wip ref: {error}"
+            ))),
+        }
+    };
+    delete(checkout, agent)?;
+    for pin in pins {
+        if let Ok(module) = node_git::module_repository(checkout, &pin.path, &pin.module_key) {
+            delete(&module.worktree, &agent.with_module(&pin.module_key)?)?;
+        }
+    }
     Ok(())
 }
 

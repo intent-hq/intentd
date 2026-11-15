@@ -602,7 +602,7 @@ pub fn launch_notice_with_setup(
 #[must_use]
 pub fn home_moved_notice(node_name: &str) -> String {
     format!(
-        "The workspace's home moved. This agent stays on \"{node_name}\" and now works in its own checkout there, made from the home's last saved work. Its changes no longer show in the home, and the home's later changes don't show here."
+        "The workspace's home moved. This agent stays on \"{node_name}\" with its own copy of the home's last saved work. Changes here and in the home no longer reach each other."
     )
 }
 
