@@ -43945,10 +43945,17 @@ mod context_usage_projection {
     #[tokio::test]
     async fn workspace_delete_drops_registry_entry() {
         let (_tmp, svc, ws) = setup().await;
+        let root = tempfile::tempdir().expect("workspaces root");
+        let svc = svc.with_workspaces_root(root.path().to_path_buf());
         let id = create_agent(&svc, &ws).await;
         svc.record_context_usage(&id, 10_000, 200_000);
 
-        svc.delete_workspace(ws.clone()).await.expect("delete");
+        intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            svc.delete_workspace(ws.clone()),
+        )
+        .await
+        .expect("delete");
         assert_eq!(
             svc.context_usage_for(&id),
             None,
