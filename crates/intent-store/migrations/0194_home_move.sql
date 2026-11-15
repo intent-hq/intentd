@@ -23,3 +23,10 @@ CREATE TABLE home_move (
     started_at TEXT NOT NULL
 );
 CREATE INDEX home_move_node ON home_move(node_id);
+
+-- A stop of a move's target that never became the workspace's home (the
+-- move rolled back, or the workspace was archived or deleted mid-move):
+-- its last push lands in a sink, so the abandoned checkout never writes
+-- `home/head` or `home/wip` over the home's own.
+ALTER TABLE home_stop ADD COLUMN discard_push INTEGER NOT NULL DEFAULT 0
+    CHECK (discard_push IN (0, 1));

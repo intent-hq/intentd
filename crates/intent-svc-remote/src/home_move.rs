@@ -9,8 +9,8 @@
 //! 3. the switch: the new home and the old one's `moved` stop in one store
 //!    transaction, then the stop goes out.
 //!
-//! A failure before the switch rolls back: the old home gets its old state
-//! and nothing else has changed.
+//! A failure before the switch rolls back: the old home gets its old state,
+//! and the new home, which its machine may have opened, gets a stop.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -219,7 +219,7 @@ fn spawn(svc: &Services, workspace_id: &WorkspaceId) {
     });
 }
 
-async fn run(svc: &Services, workspace_id: &WorkspaceId) {
+pub(crate) async fn run(svc: &Services, workspace_id: &WorkspaceId) {
     let home_move = match svc.store().get_home_move(workspace_id).await {
         Ok(Some(home_move)) => home_move,
         Ok(None) => return,
@@ -334,11 +334,18 @@ async fn rollback(svc: &Services, home_move: &HomeMove) {
     let workspace_id = &home_move.workspace_id;
     match svc
         .store()
-        .abort_home_move(workspace_id, &home_move.target.home_id)
+        .abort_home_move(
+            workspace_id,
+            &home_move.target.home_id,
+            &intent_core::now_iso(),
+        )
         .await
     {
         Ok(true) => {
             svc.publish_workspace_home_changed(workspace_id).await;
+            // The target may have opened although its reply was lost: its
+            // stop ends its setup and backups and removes the checkout.
+            crate::homes::send_workspace_stops(svc, workspace_id).await;
             // An old home whose link went down meanwhile is detached after
             // the link-loss grace, as if it had never moved.
             if let Some(old) = svc

@@ -319,8 +319,9 @@ impl HeadGitAccess {
     /// The repository a stopped home's last push lands in: receive-pack
     /// only, into the workspace's repository (its refs outlive an archived
     /// workspace's removed worktree), or a submodule of its checkout (else
-    /// of the repository's). A deleted workspace's home pushes into a sink,
-    /// so its stop goes on with nothing kept.
+    /// of the repository's). A deleted workspace's home, and a move's
+    /// target that never became the home, push into a sink, so the stop
+    /// goes on with nothing kept.
     async fn stopped_home_repository(
         &self,
         remote: &AgentRemote,
@@ -328,6 +329,15 @@ impl HeadGitAccess {
     ) -> Result<PathBuf> {
         if service != GitService::ReceivePack {
             return Err(denied());
+        }
+        // A move's target that never became the home: nothing of it is kept.
+        if self
+            .shared
+            .store
+            .home_stop_discards_push(&HomeId::from(remote.agent_id()))
+            .await?
+        {
+            return new_sink();
         }
         let workspace = match self
             .shared

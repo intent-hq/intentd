@@ -266,9 +266,11 @@ impl Store {
         Ok(outcome)
     }
 
-    /// Roll back the move to `home_id`: in one transaction the move goes and
-    /// the old home gets back its state and `since`. `false` when that move
-    /// is gone.
+    /// Roll back the move to `home_id`: in one transaction the move goes,
+    /// the old home gets back its state and `since`, and a target on a
+    /// machine gets a `retired` stop whose last push is discarded (its
+    /// machine may have opened it although the reply never came). `false`
+    /// when that move is gone.
     ///
     /// # Errors
     ///
@@ -277,6 +279,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         home_id: &HomeId,
+        now: &str,
     ) -> Result<bool> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let Some(home_move) = move_of(&mut tx, workspace_id)
@@ -285,6 +288,7 @@ impl Store {
         else {
             return Ok(false);
         };
+        crate::home_stop_repo::stop_move_target(&mut tx, workspace_id, now).await?;
         sqlx::query("DELETE FROM home_move WHERE workspace_id = ?")
             .bind(&workspace_id.0)
             .execute(&mut *tx)

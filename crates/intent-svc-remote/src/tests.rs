@@ -3062,7 +3062,7 @@ async fn a_queued_secret_forget_never_lands_after_a_newer_put() {
 mod home_stops {
     use super::*;
     use intent_core::node_link::{HomeStopAck, HomeStopOutcome, HomeStopReason, HomeStopRecord};
-    use intent_core::HomeId;
+    use intent_core::{HomeId, WorkspaceHome};
     use intent_git::node_git::{AgentRemote, GitService};
     use intent_transport::node_link::NodeGitAccess as _;
 
@@ -3476,5 +3476,166 @@ mod home_stops {
         let stop = switch.await.unwrap().unwrap().unwrap().stop.unwrap();
         assert_eq!(stop.home_id, HomeId::from("h1"));
         assert_eq!(stop.reason, HomeStopReason::Moved);
+    }
+
+    fn committed_repo(path: &std::path::Path) {
+        let repo = git2::Repository::init(path).unwrap();
+        let signature = git2::Signature::now("T", "t@example.invalid").unwrap();
+        let tree = repo
+            .find_tree(repo.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])
+            .unwrap();
+    }
+
+    fn machine_home(id: &str, node_id: &str, state: intent_core::HomeState) -> WorkspaceHome {
+        WorkspaceHome {
+            home_id: HomeId::from(id),
+            node_id: Some(node_id.into()),
+            cloud_machine_id: None,
+            name: "Machine".into(),
+            state,
+            since: intent_core::now_iso(),
+            last_backup_at: None,
+            backup_warning: false,
+        }
+    }
+
+    /// Start a move of the workspace's home `h-old` (detached, on another
+    /// machine) to `h-new` on `machine`.
+    async fn moving_to(backend: &Backend, machine: &Machine) {
+        let old = machine_home("h-old", "node-gone", intent_core::HomeState::Detached);
+        backend
+            .store()
+            .set_workspace_home(&workspace(), &old)
+            .await
+            .unwrap();
+        assert!(backend
+            .store()
+            .begin_home_move(&intent_store::HomeMove {
+                workspace_id: workspace(),
+                target: machine_home("h-new", &machine.id(), intent_core::HomeState::Attached),
+                from_home_id: old.home_id.clone(),
+                from_state: old.state,
+                from_since: old.since.clone(),
+                pushed: true,
+                started_at: intent_core::now_iso(),
+            })
+            .await
+            .unwrap());
+    }
+
+    /// The machine got the move's `homeOpen` (and may have made the home),
+    /// but its reply was lost with the link: the move rolls back, and in
+    /// the same transaction the target gets a `retired` stop. It is leased
+    /// and sent at the next bind, and its last push lands in a sink, so the
+    /// abandoned checkout never writes `home/head` or `home/wip`.
+    #[tokio::test]
+    async fn a_move_rolled_back_after_a_lost_open_reply_stops_its_target() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        let node = backend.expose(&mut machine).await;
+        let repo = tempfile::tempdir().unwrap();
+        committed_repo(repo.path());
+        workspace_at(&backend, repo.path()).await;
+        moving_to(&backend, &machine).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        link.replay_complete(0).await;
+        bound(&node).await;
+        let services = backend.services.clone();
+        let run = tokio::spawn(async move { crate::home_move::run(&services, &workspace()).await });
+        let open = link
+            .expect(|frame| match frame {
+                LinkFrame::HomeOpen(open) => Some(open),
+                _ => None,
+            })
+            .await;
+        assert_eq!(open.home_id, HomeId::from("h-new"));
+        machine.stop().await;
+        tokio::time::timeout(wait(), run)
+            .await
+            .expect("the move ends with the link")
+            .unwrap();
+
+        let store = backend.store();
+        assert!(store.get_home_move(&workspace()).await.unwrap().is_none());
+        let home = store
+            .get_workspace_home(&workspace())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(home.home_id, HomeId::from("h-old"));
+        assert_eq!(home.state, intent_core::HomeState::Detached);
+        let stop = store
+            .get_home_stop(&HomeId::from("h-new"))
+            .await
+            .unwrap()
+            .expect("the abandoned target has a stop");
+        assert_eq!(stop.reason, HomeStopReason::Retired);
+        assert_eq!(stop.node_id, machine.id());
+
+        machine.restart().await;
+        let mut link = machine.accept().await;
+        let leased = link.hello.lease_homes.clone().unwrap_or_default();
+        assert_eq!(leased, vec![stop.frame().home()]);
+        link.replay_complete(0).await;
+        assert_eq!(sent_stop(&mut link).await, stop.frame());
+        bound(&node).await;
+        let access = crate::git::HeadGitAccess::new(node.shared());
+        let remote = AgentRemote::home(workspace().as_str(), "h-new").unwrap();
+        let sink = access
+            .repository(&link.hello.binding, &remote, GitService::ReceivePack)
+            .await
+            .unwrap();
+        assert_ne!(sink, repo.path(), "nothing of the target is kept");
+        let hold = access
+            .before_receive(&link.hello.binding, &remote, &sink)
+            .await
+            .unwrap();
+        assert!(hold.token.is_none() && hold.orphaned.is_none());
+        drop(hold);
+        assert!(!sink.exists(), "the sink goes with the push");
+        node.shutdown();
+    }
+
+    /// An archive during a move also stops the move's target (its push
+    /// discarded) besides the old home.
+    #[tokio::test]
+    async fn an_archive_mid_move_stops_the_moves_target_too() {
+        let backend = Backend::new().await;
+        let machine = backend.machine().await;
+        let repo = tempfile::tempdir().unwrap();
+        committed_repo(repo.path());
+        workspace_at(&backend, repo.path()).await;
+        moving_to(&backend, &machine).await;
+        backend
+            .store()
+            .archive_workspace_detaching_guests(&workspace(), &intent_core::now_iso())
+            .await
+            .unwrap();
+        let store = backend.store();
+        assert!(store.get_home_move(&workspace()).await.unwrap().is_none());
+        let stops = store.list_workspace_home_stops(&workspace()).await.unwrap();
+        let mut homes: Vec<_> = stops
+            .iter()
+            .map(|stop| (stop.home_id.as_str().to_owned(), stop.reason.as_str()))
+            .collect();
+        homes.sort();
+        assert_eq!(
+            homes,
+            vec![
+                ("h-new".to_owned(), "retired"),
+                ("h-old".to_owned(), "retired"),
+            ]
+        );
+        assert!(store
+            .home_stop_discards_push(&HomeId::from("h-new"))
+            .await
+            .unwrap());
+        assert!(!store
+            .home_stop_discards_push(&HomeId::from("h-old"))
+            .await
+            .unwrap());
     }
 }
