@@ -34,7 +34,8 @@ fn home(id: &str, node: &str, cloud: bool, state: HomeState) -> WorkspaceHome {
 /// A deleted sandbox's attached cloud home gets a new `homeId` with no
 /// machine (still attached, its last backup kept), and the stops the
 /// machine owed go; a starting cloud home is left to its start, and homes
-/// on other machines are untouched. The rebuild names only the new home,
+/// on other machines are untouched. Without `rebuild_homes` nothing is
+/// renewed. The rebuild names only the new home,
 /// and finishes once.
 #[tokio::test]
 async fn a_deleted_sandbox_s_home_is_rebuilt_under_a_new_home_id() {
@@ -69,7 +70,7 @@ async fn a_deleted_sandbox_s_home_is_rebuilt_under_a_new_home_id() {
         .unwrap();
 
     let rebuilt = store
-        .rebuild_cloud_homes_on_machine("m-gone", &now)
+        .remove_cloud_machine("m-gone", true, &now)
         .await
         .unwrap();
     assert_eq!(rebuilt.len(), 1, "{rebuilt:?}");
@@ -92,6 +93,13 @@ async fn a_deleted_sandbox_s_home_is_rebuilt_under_a_new_home_id() {
     assert_eq!(starting.node_id.as_deref(), Some("m-gone"));
     let other = store.get_workspace_home(&ws3).await.unwrap().unwrap();
     assert_eq!(other.node_id.as_deref(), Some("m-other"));
+    assert!(store
+        .remove_cloud_machine("m-other", false, &now)
+        .await
+        .unwrap()
+        .is_empty());
+    let kept = store.get_workspace_home(&ws3).await.unwrap().unwrap();
+    assert_eq!(kept.home_id, HomeId::from("h3"));
 
     assert_eq!(
         store.home_rebuild_of(&ws1, &current.home_id).await.unwrap(),
@@ -119,5 +127,49 @@ async fn a_deleted_sandbox_s_home_is_rebuilt_under_a_new_home_id() {
     assert_eq!(
         store.home_rebuild_of(&ws1, &current.home_id).await.unwrap(),
         None
+    );
+}
+
+/// A cloud home whose sandbox was removed while it was moving (the removal
+/// skips a moving home) is renewed for a rebuild when the move rolls back.
+#[tokio::test]
+async fn a_move_rolled_back_after_its_sandbox_went_renews_the_home() {
+    let (_dir, store) = open().await;
+    let ws1 = WorkspaceId::from("ws-1");
+    store
+        .set_workspace_home(&ws1, &home("h1", "m-gone", true, HomeState::Attached))
+        .await
+        .unwrap();
+    let target = WorkspaceHome {
+        cloud_machine_id: None,
+        ..home("h-target", "m-mac", false, HomeState::Attached)
+    };
+    let now = now_iso();
+    let home_move = crate::HomeMove {
+        workspace_id: ws1.clone(),
+        target: target.clone(),
+        from_home_id: HomeId::from("h1"),
+        from_state: HomeState::Attached,
+        from_since: now.clone(),
+        pushed: false,
+        started_at: now.clone(),
+    };
+    assert!(store.begin_home_move(&home_move).await.unwrap());
+    assert!(store
+        .remove_cloud_machine("m-gone", true, &now)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .abort_home_move(&ws1, &target.home_id, &now)
+        .await
+        .unwrap());
+    let current = store.get_workspace_home(&ws1).await.unwrap().unwrap();
+    assert_ne!(current.home_id, HomeId::from("h1"));
+    assert_eq!(current.node_id, None);
+    assert_eq!(current.state, HomeState::Attached);
+    assert_eq!(
+        store.home_rebuild_of(&ws1, &current.home_id).await.unwrap(),
+        Some(HomeId::from("h1"))
     );
 }
