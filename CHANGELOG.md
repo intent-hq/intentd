@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.221] - 2026-11-15
+
+### 🚀 Features
+
+- *(remote)* A cloud home's sandbox is co-owned by its workspace ([#3395](https://github.com/intent-hq/intentd/pull/3395))
+
+
 ## [0.11.220] - 2026-11-15
 
 ### 🚀 Features
