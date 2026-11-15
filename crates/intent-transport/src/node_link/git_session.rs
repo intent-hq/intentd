@@ -77,7 +77,8 @@ pub const PUSH_REFUSED_MESSAGE: &str =
 
 /// What the helper prints when head has no GitHub refs to serve a forge
 /// remote from: its refresh failed and none succeeded before.
-pub const FORGE_UNAVAILABLE_MESSAGE: &str = "could not fetch from GitHub through intent1; the backend's GitHub access may not reach this repository";
+pub const FORGE_UNAVAILABLE_MESSAGE: &str =
+    "could not fetch from GitHub through intent1: the backend has nothing to serve for this repository";
 
 /// The warning a forge ACCEPT carries when head served the last fetched
 /// refs because the GitHub refresh failed.
