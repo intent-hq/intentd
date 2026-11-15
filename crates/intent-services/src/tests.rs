@@ -43938,6 +43938,23 @@ mod context_usage_projection {
             "other agent's entry survives"
         );
     }
+
+    /// A workspace delete releases the same per-agent memory as
+    /// `agent.delete` (one `agent_resources` list); it used to keep this
+    /// entry for the daemon's lifetime.
+    #[tokio::test]
+    async fn workspace_delete_drops_registry_entry() {
+        let (_tmp, svc, ws) = setup().await;
+        let id = create_agent(&svc, &ws).await;
+        svc.record_context_usage(&id, 10_000, 200_000);
+
+        svc.delete_workspace(ws.clone()).await.expect("delete");
+        assert_eq!(
+            svc.context_usage_for(&id),
+            None,
+            "deleted workspace's agent entry dropped"
+        );
+    }
 }
 
 /// Regression tests for the `agentSummary` soft-delete/soft-retire filter:

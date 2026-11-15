@@ -1446,6 +1446,41 @@ async fn retire_drops_owned_watches_and_delegation_groups() {
     wait_for_persisted_watches(&svc, 0).await;
 }
 
+/// Deleting an agent drops its own outgoing watches and delegation groups,
+/// like retire (one `agent_resources` list). They used to stay armed until
+/// a delivery to the gone parent failed.
+#[tokio::test]
+async fn delete_drops_owned_watches_and_delegation_groups() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        target.clone(),
+        None,
+    )
+    .expect("register watch");
+    let _gid = svc.get_or_create_delegation_group(&ws, &watcher);
+
+    svc.agent_delete_op(watcher.clone(), Some(ws.clone()))
+        .await
+        .expect("delete watcher");
+
+    assert!(
+        svc.list_watches_for_parent(&watcher).is_empty(),
+        "delete must drop the deleted agent's outgoing watches"
+    );
+    assert!(
+        svc.delegation_group_for_parent(&watcher).is_none(),
+        "delete must drop the deleted agent's delegation groups"
+    );
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
 /// monorepo#4183 delivery-path backstop: a monitoring-idle advisory whose
 /// watcher is retired (a watch that raced the retire sweep, or a stale
 /// persisted row from before the retire cleanup existed) is TERMINAL — the
