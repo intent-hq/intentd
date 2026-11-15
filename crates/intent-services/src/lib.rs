@@ -17963,7 +17963,9 @@ impl Services {
             // The rows are gone and the agents' trees are killed: remove
             // their temp folders.
             if let Some(manager) = manager.as_ref() {
-                manager.remove_agent_tmp_dirs(&session_ids).await;
+                manager
+                    .remove_agent_tmp_dirs(&session_ids, intent_core::AgentTmpRemoval::Deleted)
+                    .await;
             }
             // The row is gone and its scripts are stopped: delete its on-disk
             // script output (best-effort; the startup orphan sweep retries).
@@ -35756,7 +35758,7 @@ impl Services {
             };
             // Under the fence with the flip, so a later archive's removal is
             // never cancelled: keep the temp folders the archive left to
-            // running processes (a retired agent's still go).
+            // running processes.
             if flipped {
                 self.keep_workspace_agent_tmp_dirs(&id).await;
             }
@@ -38991,7 +38993,7 @@ impl Services {
         match self.store.list_agent_session_summaries(id).await {
             Ok(sessions) => {
                 let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
-                manager.detach_agent_tmp_dirs(&ids)
+                manager.detach_agent_tmp_dirs(&ids, intent_core::AgentTmpRemoval::Archived)
             }
             Err(e) => {
                 tracing::warn!(
@@ -39004,20 +39006,16 @@ impl Services {
         }
     }
 
-    /// Cancel the deferred temp-folder removal of `id`'s non-retired agents
-    /// (unarchive; call under the archive fence).
+    /// Cancel the archive's deferred temp-folder removal for `id`'s agents
+    /// (unarchive; call under the archive fence). A retire's removal stands.
     async fn keep_workspace_agent_tmp_dirs(&self, id: &WorkspaceId) {
         let Some(manager) = self.agent_manager() else {
             return;
         };
         match self.store.list_agent_session_summaries(id).await {
             Ok(sessions) => {
-                let active: Vec<AgentId> = sessions
-                    .iter()
-                    .filter(|s| s.retired_at.is_none())
-                    .map(|s| s.id.clone())
-                    .collect();
-                manager.keep_agent_tmp_dirs(&active);
+                let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
+                manager.keep_agent_tmp_dirs(&ids, intent_core::AgentTmpRemoval::Archived);
             }
             Err(e) => tracing::warn!(
                 workspace = %id.as_str(),

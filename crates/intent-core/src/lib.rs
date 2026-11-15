@@ -91,7 +91,7 @@ pub use agent_logs::{
 pub use agent_tmp::{
     agent_tmp_root, detach_agent_tmp_dir, discard_agent_tmp_dir, keep_agent_tmp_dir,
     prepare_agent_tmp_root, remove_agent_tmp_dir, sweep_agent_tmp_root, AgentTempDir,
-    AGENT_TMP_ENV_KEYS, AGENT_TMP_MAX_IDLE,
+    AgentTmpRemoval, AGENT_TMP_ENV_KEYS, AGENT_TMP_MAX_IDLE,
 };
 pub use caller::{
     current_caller, is_human_authored_metadata, project_queue_for_caller,

@@ -7954,7 +7954,10 @@ impl Services {
             // The runtime is stopped above; its temp folder goes with it.
             if let Some(manager) = self.agent_manager() {
                 manager
-                    .remove_agent_tmp_dirs(std::slice::from_ref(&agent_id))
+                    .remove_agent_tmp_dirs(
+                        std::slice::from_ref(&agent_id),
+                        intent_core::AgentTmpRemoval::Deleted,
+                    )
                     .await;
             }
         }
@@ -8420,7 +8423,10 @@ impl Services {
         // Its temp folder goes now, or when a still-running process ends.
         if let Some(manager) = self.agent_manager() {
             manager
-                .remove_agent_tmp_dirs(std::slice::from_ref(&session.id))
+                .remove_agent_tmp_dirs(
+                    std::slice::from_ref(&session.id),
+                    intent_core::AgentTmpRemoval::Retired,
+                )
                 .await;
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
@@ -8538,17 +8544,12 @@ impl Services {
         }
         if let Some(manager) = self.agent_manager() {
             manager.restore_retired(&agent_id);
-            // An archived workspace's removal stands; unarchive keeps it.
-            // The fence orders this check against the archive's detach.
-            let _fence = self.archive_fence.acquire(&session.workspace_id).await;
-            let archived = self
-                .store
-                .get_workspace(&session.workspace_id)
-                .await
-                .map_or(true, |ws| ws.archived);
-            if !archived {
-                manager.keep_agent_tmp_dirs(std::slice::from_ref(&agent_id));
-            }
+            // Under the retirement gate, like the retire's removal. An
+            // archive's removal stands.
+            manager.keep_agent_tmp_dirs(
+                std::slice::from_ref(&agent_id),
+                intent_core::AgentTmpRemoval::Retired,
+            );
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         crate::publish_event(
