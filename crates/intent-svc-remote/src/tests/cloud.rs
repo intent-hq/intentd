@@ -157,6 +157,155 @@ async fn pause_and_kill_admit_only_the_owner_and_the_starter() {
     }
 }
 
+/// A cloud row for `workspace`'s home, started by `starter`, that holds
+/// that workspace's home (nodes.md "Cloud homes" 2: pause and kill follow
+/// the workspace owner).
+async fn home_row(backend: &Backend, id: &str, workspace: &str, starter: &PrincipalId) {
+    cloud_row(backend, id, starter).await;
+    let mut row = backend.store().get_exposed_machine(id).await.unwrap().unwrap();
+    let mut cloud = row.cloud.take().unwrap();
+    cloud.agent_id = format!("home-{workspace}");
+    cloud.workspace_id = workspace.to_owned();
+    backend.store().update_cloud_machine(id, &cloud).await.unwrap();
+    backend
+        .store()
+        .set_workspace_home(
+            &intent_core::WorkspaceId::from(workspace),
+            &intent_core::WorkspaceHome {
+                node_id: Some(id.to_owned()),
+                ..crate::cloud::home::new_home("e2b", "E2B")
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn workspace_owned_by(backend: &Backend, id: &str, owner: &PrincipalId) {
+    backend
+        .store()
+        .insert_workspace(&intent_core::Workspace {
+            id: intent_core::WorkspaceId::from(id),
+            title: id.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workspace SET owner_principal_id = ? WHERE id = ?")
+        .bind(owner.as_str())
+        .bind(id)
+        .execute(backend.store().write_pool())
+        .await
+        .unwrap();
+}
+
+/// A sandbox that holds a workspace's home: its workspace's current owner
+/// may pause and kill it even when another person started it (the owner
+/// changed, or the sandbox was an agent's); a collaborator of that
+/// workspace may not.
+#[tokio::test]
+async fn pause_and_kill_of_a_home_sandbox_follow_the_workspace_owner() {
+    let backend = Backend::new().await;
+    let starter = principal(&backend, true).await;
+    let owner = principal(&backend, true).await;
+    let collaborator = principal(&backend, false).await;
+    workspace_owned_by(&backend, "ws-home", &owner).await;
+    backend
+        .store()
+        .add_workspace_member(
+            &intent_core::WorkspaceId::from("ws-home"),
+            &collaborator,
+            intent_core::WorkspaceRole::Collaborator,
+        )
+        .await
+        .unwrap();
+    home_row(&backend, "m-home", "ws-home", &starter).await;
+
+    for method in ["pause", "kill"] {
+        let refused =
+            call_as(&backend, &collaborator, HostRole::Guest, method, "m-home").await;
+        assert!(
+            matches!(refused, Err(Error::Forbidden(_))),
+            "a collaborator may not {method}: {refused:?}"
+        );
+    }
+    match call_as(&backend, &owner, HostRole::Member, "pause", "m-home").await {
+        Err(Error::RemoteMachine(failure)) => {
+            assert_eq!(failure.data["reason"], "not-configured", "{failure:?}");
+        }
+        other => panic!("the workspace owner's pause reaches E2B: {other:?}"),
+    }
+    call_as(&backend, &owner, HostRole::Member, "kill", "m-home")
+        .await
+        .expect("the workspace owner may kill its home's sandbox");
+    assert!(backend
+        .store()
+        .get_exposed_machine("m-home")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// The race of an agent start and a home-only start of the same cloud
+/// home (5a): a failed agent start detaches the home it holds even while a
+/// home-only start runs; a home it does not hold is left to that start, or
+/// detached when none runs; a home another sandbox holds is untouched.
+#[tokio::test]
+async fn a_failed_agent_start_settles_the_cloud_home_it_raced_for() {
+    use intent_core::{HomeState, WorkspaceId};
+
+    let backend = Backend::new().await;
+    let svc = &backend.services;
+    let owner = backend.store().get_primary_principal().await.unwrap().id;
+    let home_of = |ws: &str| {
+        let ws = WorkspaceId::from(ws);
+        async move { backend.store().get_workspace_home(&ws).await.unwrap().unwrap() }
+    };
+    let starting = |ws: &'static str| async move {
+        workspace_owned_by(&backend, ws, &owner).await;
+        let home = crate::cloud::home::new_home("e2b", "E2B");
+        let ws = WorkspaceId::from(ws);
+        backend.store().set_workspace_home(&ws, &home).await.unwrap();
+        crate::cloud::home::mark_starting(svc, &ws, &home).await;
+        home
+    };
+
+    // Held by the failed agent start, a home-only start in flight.
+    let home = starting("ws-held").await;
+    let ws = WorkspaceId::from("ws-held");
+    crate::cloud::test_hold_start(svc, &crate::cloud::home::start_key(&ws), "e2b", "ws-held");
+    assert!(crate::cloud::home::claim(svc, &ws, &home.home_id, "e2b", "m-agent")
+        .await
+        .unwrap());
+    crate::cloud::home::agent_start_failed(svc, &ws, &home, Some("m-agent")).await;
+    let after = home_of("ws-held").await;
+    assert_eq!(after.state, HomeState::Detached, "{after:?}");
+    assert_eq!(after.node_id, None);
+
+    // Unheld, a home-only start in flight: left to it.
+    let home = starting("ws-left").await;
+    let ws = WorkspaceId::from("ws-left");
+    crate::cloud::test_hold_start(svc, &crate::cloud::home::start_key(&ws), "e2b", "ws-left");
+    crate::cloud::home::agent_start_failed(svc, &ws, &home, Some("m-agent")).await;
+    assert_eq!(home_of("ws-left").await.state, HomeState::Starting);
+
+    // Unheld, no other start: detached.
+    let home = starting("ws-alone").await;
+    let ws = WorkspaceId::from("ws-alone");
+    crate::cloud::home::agent_start_failed(svc, &ws, &home, None).await;
+    assert_eq!(home_of("ws-alone").await.state, HomeState::Detached);
+
+    // Held by the home-only sandbox, which won: untouched.
+    let home = starting("ws-won").await;
+    let ws = WorkspaceId::from("ws-won");
+    assert!(crate::cloud::home::claim(svc, &ws, &home.home_id, "e2b", "m-home")
+        .await
+        .unwrap());
+    crate::cloud::home::agent_start_failed(svc, &ws, &home, Some("m-agent")).await;
+    let after = home_of("ws-won").await;
+    assert_eq!(after.node_id.as_deref(), Some("m-home"));
+    assert_ne!(after.state, HomeState::Detached);
+}
+
 mod entries {
     //! Named E2B entries: the migration of a single provider, which entry
     //! a placement picks, and the `configure` refusals that come before any
