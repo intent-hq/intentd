@@ -77,6 +77,8 @@ mod boot_settings_migrations;
 mod executor_capabilities;
 mod executor_ops;
 mod link_traffic_ops;
+pub mod lock_order;
+pub use lock_order::{RetirementGate, RetirementGuard};
 mod node_invite_ops;
 mod plain_folder;
 mod remote_machine_ops;
@@ -1374,7 +1376,7 @@ pub struct Services {
     /// the executor link; unset reads every credential as disconnected.
     executor_liveness: Arc<OnceLock<Arc<dyn intent_core::machines::ExecutorLiveness>>>,
     human_instruction_authority: Arc<tokio::sync::RwLock<()>>,
-    discussion_control_gates: Arc<agent_ops::AgentRetirementGates>,
+    discussion_control_gates: Arc<agent_ops::AgentGates>,
     #[cfg(test)]
     invite_create_commit_pause: Arc<member_removal::MutationBarrier>,
     #[cfg(test)]
@@ -15504,6 +15506,10 @@ impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
 /// removal of a CURRENT member. Owned guards ([`tokio::sync::OwnedMutexGuard`])
 /// so the archive tail — a detached task — can carry the hold across its
 /// spawn; an entry is pruned once nobody holds or awaits it.
+///
+/// Lock order: take this fence BEFORE any [`RetirementGate`], never while
+/// holding one. Debug builds panic on the reversed order (see
+/// [`lock_order`]).
 #[derive(Default)]
 pub struct ArchiveFence {
     locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
@@ -15512,24 +15518,33 @@ pub struct ArchiveFence {
 impl ArchiveFence {
     /// Take `workspace_id`'s fence (FIFO among waiters: tokio's mutex is
     /// fair, so an unarchive queued behind an archive tail acquires before
-    /// the tail's own re-acquire).
+    /// the tail's own re-acquire). Debug builds panic when the calling task
+    /// holds a [`RetirementGate`] (see [`lock_order`]).
     #[expect(
         clippy::missing_panics_doc,
         reason = "internal doc-hidden feature API, not a public library API"
     )]
-    pub async fn acquire(self: &Arc<Self>, workspace_id: &WorkspaceId) -> ArchiveFenceGuard {
-        let lock = self
-            .locks
-            .lock()
-            .expect("archive fence registry poisoned")
-            .entry(workspace_id.clone())
-            .or_default()
-            .clone();
-        let guard = lock.lock_owned().await;
-        ArchiveFenceGuard {
-            fence: Arc::clone(self),
-            key: workspace_id.clone(),
-            guard: Some(guard),
+    #[track_caller]
+    pub fn acquire<'a>(
+        self: &'a Arc<Self>,
+        workspace_id: &'a WorkspaceId,
+    ) -> impl std::future::Future<Output = ArchiveFenceGuard> + Send + 'a {
+        let at = std::panic::Location::caller();
+        async move {
+            lock_order::check_archive_fence_order(at);
+            let lock = self
+                .locks
+                .lock()
+                .expect("archive fence registry poisoned")
+                .entry(workspace_id.clone())
+                .or_default()
+                .clone();
+            let guard = lock.lock_owned().await;
+            ArchiveFenceGuard {
+                fence: Arc::clone(self),
+                key: workspace_id.clone(),
+                guard: Some(guard),
+            }
         }
     }
 }

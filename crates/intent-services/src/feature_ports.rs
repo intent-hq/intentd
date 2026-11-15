@@ -1318,8 +1318,9 @@ pub trait AgentWakePort: Send + Sync + 'static {
     fn queue_drainer(&self, svc: &Services) -> Option<Arc<dyn AgentQueueDrainer>>;
 
     /// The per-agent gate that serializes retirement with restore; hold its
-    /// lock to keep `agent_id` from retiring meanwhile.
-    fn retirement_gate(&self, svc: &Services, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>>;
+    /// lock to keep `agent_id` from retiring meanwhile. Take any archive
+    /// fence first (see [`crate::lock_order`]).
+    fn retirement_gate(&self, svc: &Services, agent_id: &AgentId) -> crate::RetirementGate;
 
     /// Whether `status` is terminal: the agent can no longer receive wakes.
     fn is_terminal_status(&self, status: AgentStatus) -> bool;
@@ -1387,8 +1388,8 @@ impl AgentWakePort for UnavailableAgentWake {
         None
     }
 
-    fn retirement_gate(&self, _svc: &Services, _agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::new(tokio::sync::Mutex::new(()))
+    fn retirement_gate(&self, _svc: &Services, _agent_id: &AgentId) -> crate::RetirementGate {
+        crate::RetirementGate::default()
     }
 
     fn is_terminal_status(&self, _status: AgentStatus) -> bool {
@@ -3284,7 +3285,7 @@ mod tests {
         let agent = intent_core::AgentId::new();
         let gate = port.retirement_gate(&svc, &agent);
         assert!(
-            Arc::ptr_eq(&gate, &svc.agent_retirement_gates.for_agent(&agent)),
+            gate.ptr_eq(&svc.agent_retirement_gates.for_agent(&agent)),
             "the port hands out the agent's own retirement gate"
         );
         assert!(

@@ -214,8 +214,25 @@ pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
     )
 }
 
+/// Per-agent mutexes for gates outside the archive/retirement lock order
+/// (turn start, discussion control). Weak entries retire with their last user.
+#[derive(Clone, Default)]
+pub(crate) struct AgentGates {
+    gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+impl AgentGates {
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        weak_gate(&self.gates, agent_id)
+    }
+}
+
 /// Serialize each retirement transition with restore without blocking other
 /// targets. Weak entries keep completed transitions out of the lock registry.
+///
+/// Lock order: a caller that needs a workspace's [`crate::ArchiveFence`] takes
+/// it BEFORE any of these gates (`script_monitor` does), never while holding
+/// one. Debug builds panic on the reversed order (see [`crate::lock_order`]).
 #[derive(Clone, Default)]
 pub(crate) struct AgentRetirementGates {
     gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
@@ -231,12 +248,12 @@ pub(crate) struct AgentRetirementGates {
 const REMOTE_SCRIPT_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl AgentRetirementGates {
-    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
-        weak_gate(&self.gates, agent_id)
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> crate::RetirementGate {
+        crate::RetirementGate::new(weak_gate(&self.gates, agent_id))
     }
 
-    pub(crate) fn for_workspace(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
-        weak_gate(&self.workspaces, workspace_id)
+    pub(crate) fn for_workspace(&self, workspace_id: &WorkspaceId) -> crate::RetirementGate {
+        crate::RetirementGate::new(weak_gate(&self.workspaces, workspace_id))
     }
 }
 
@@ -8189,7 +8206,7 @@ impl Services {
             let gate = self
                 .agent_retirement_gates
                 .for_workspace(&session.workspace_id);
-            let guard = gate.lock_owned().await;
+            let guard = gate.lock().await;
             // A concurrent retire of this same target may have won while
             // this call waited for the workspace gate: report it as an
             // idempotent retry, not as a last-agent refusal.

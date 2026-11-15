@@ -1108,7 +1108,7 @@ async fn user_retire_of_top_level_agent_waits_on_the_workspace_gate() {
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(30)),
         async {
-            while Arc::strong_count(&gate) < 2 {
+            while gate.handle_count() < 2 {
                 tokio::task::yield_now().await;
             }
         },
@@ -1186,7 +1186,7 @@ async fn guarded_retire_reports_already_retired_after_waiting_on_the_gate() {
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(30)),
         async {
-            while Arc::strong_count(&gate) < 2 {
+            while gate.handle_count() < 2 {
                 tokio::task::yield_now().await;
             }
         },
