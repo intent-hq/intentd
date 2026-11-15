@@ -78,7 +78,7 @@ mod executor_capabilities;
 mod executor_ops;
 mod link_traffic_ops;
 pub mod lock_order;
-pub use lock_order::{RetirementGate, RetirementGuard};
+pub use lock_order::{OrderedGate, OrderedGuard};
 mod node_invite_ops;
 mod plain_folder;
 mod remote_machine_ops;
@@ -15507,9 +15507,9 @@ impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
 /// so the archive tail — a detached task — can carry the hold across its
 /// spawn; an entry is pruned once nobody holds or awaits it.
 ///
-/// Lock order: take this fence BEFORE any [`RetirementGate`], never while
-/// holding one. Debug builds panic on the reversed order (see
-/// [`lock_order`]).
+/// Lock order: retirement gate → turn-start gate → archive fence. Nothing
+/// holding this fence may wait on a gate; debug builds panic when one does
+/// (see [`lock_order`]).
 #[derive(Default)]
 pub struct ArchiveFence {
     locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
@@ -15518,9 +15518,8 @@ pub struct ArchiveFence {
 impl ArchiveFence {
     /// Take `workspace_id`'s fence (FIFO among waiters: tokio's mutex is
     /// fair, so an unarchive queued behind an archive tail acquires before
-    /// the tail's own re-acquire). Debug builds panic when the calling task
-    /// holds a [`RetirementGate`] it took with no fence held (see
-    /// [`lock_order`]).
+    /// the tail's own re-acquire). Debug builds record the hold for the
+    /// lock-order check (see [`lock_order`]).
     #[expect(
         clippy::missing_panics_doc,
         reason = "internal doc-hidden feature API, not a public library API"
@@ -15532,7 +15531,6 @@ impl ArchiveFence {
     ) -> impl std::future::Future<Output = ArchiveFenceGuard> + Send + 'a {
         let at = std::panic::Location::caller();
         async move {
-            let order = lock_order::enter_archive_fence(at);
             let lock = self
                 .locks
                 .lock()
@@ -15545,7 +15543,7 @@ impl ArchiveFence {
                 fence: Arc::clone(self),
                 key: workspace_id.clone(),
                 guard: Some(guard),
-                _order: order,
+                _order: lock_order::hold(lock_order::Rank::ArchiveFence, at),
             }
         }
     }
@@ -15557,7 +15555,7 @@ pub struct ArchiveFenceGuard {
     fence: Arc<ArchiveFence>,
     key: WorkspaceId,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-    _order: lock_order::FenceHold,
+    _order: lock_order::LockHold,
 }
 
 impl Drop for ArchiveFenceGuard {
@@ -35907,7 +35905,7 @@ impl Services {
     /// first orders the claim strictly after any retirement teardown, and
     /// no retirement can start between the claim and the revive. Lock order
     /// is turn-start gate → archive fence; nothing holding the fence takes a
-    /// turn-start gate. `None` for chief, an Active row, or a read failure
+    /// turn-start gate (see [`lock_order`]). `None` for chief, an Active row, or a read failure
     /// (the turn proceeds unfenced exactly as before).
     pub(crate) async fn turn_start_archive_fence(
         &self,

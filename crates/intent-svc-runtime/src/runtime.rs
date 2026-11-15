@@ -582,9 +582,11 @@ impl RuntimePort for RuntimeFeature {
         Box::pin(async move {
             let _admission = svc.feature_workspace_mutations().enter(&workspace_id)?;
             svc.require_member(&workspace_id).await?;
-            let _archive = svc.feature_archive_fence().acquire(&workspace_id).await;
+            // Lock order: retirement gate, then archive fence
+            // (`intent_services::lock_order`).
             let retirement = svc.feature_agent_wake().retirement_gate(svc, &agent_id);
             let _retirement = retirement.lock().await;
+            let _archive = svc.feature_archive_fence().acquire(&workspace_id).await;
             let key = (workspace_id.clone(), script_id.clone());
             let auto = self.auto_start_monitors.lock().unwrap().get(&key).cloned();
             let reply = svc
