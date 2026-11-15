@@ -44,7 +44,7 @@ fn every_router_method_dispatches_on_a_small_stack() {
                 let params = Map::<String, Value>::new();
                 for method in ROUTER_METHODS {
                     let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
+                        intentd_test_support::test_timeout(Duration::from_secs(5)),
                         dispatch(&DefaultApi, method, &params),
                     )
                     .await;
