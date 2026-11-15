@@ -1535,6 +1535,12 @@ pub struct LaunchCommand {
     /// only for a sub-agent, never with [`Self::forge`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge_fetch: Option<Box<ForgeFetchLaunch>>,
+    /// The workspace checkout's submodules a sub-agent also fetches
+    /// through the backend, each on GitHub. Sent only with
+    /// [`Self::forge_fetch`]; needs no protocol of its own: a machine from
+    /// before ignores it and the sub-agent's submodules work as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forge_fetch_modules: Vec<ForgeFetchModule>,
     /// The commit identity the backend resolves for the workspace's
     /// checkout at this start, for every agent; absent when none resolves.
     /// Needs no protocol: a machine from before ignores it.
@@ -1713,6 +1719,81 @@ impl ForgeFetchLaunch {
     pub fn owner_repo(&self) -> Option<(&str, &str)> {
         github_owner_repo(&self.remote_url)
     }
+}
+
+/// One entry of [`LaunchCommand::forge_fetch_modules`]: a submodule of the
+/// workspace checkout whose own `origin` is a GitHub repository. The body is
+/// closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForgeFetchModule {
+    /// From the checkout root, `/`-separated, as [`SubmodulePin::path`].
+    pub path: String,
+    /// The submodule repository's key, as [`SubmodulePin::module_key`].
+    pub module_key: String,
+    /// `https://github.com/<owner>/<repo>.git`.
+    pub remote_url: String,
+}
+
+impl ForgeFetchModule {
+    /// The entry for the submodule at `path` whose repository is
+    /// `module_key` and whose `origin` is `origin`: `None` unless that
+    /// names a GitHub repository.
+    #[must_use]
+    pub fn for_github(path: &str, module_key: &str, origin: &str) -> Option<Self> {
+        let remote = ForgeFetchLaunch::for_github(origin)?;
+        Some(Self {
+            path: path.to_owned(),
+            module_key: module_key.to_owned(),
+            remote_url: remote.remote_url,
+        })
+    }
+}
+
+impl LaunchCommand {
+    /// Whether [`Self::forge_fetch_modules`] may be used: empty, or with
+    /// [`Self::forge_fetch`], each entry with a safe relative path and a
+    /// safe key no other entry has, and a GitHub URL that is neither the root's
+    /// nor another entry's. A launch that fails this ends with
+    /// `node-checkout-failed`.
+    #[must_use]
+    pub fn forge_fetch_modules_valid(&self) -> bool {
+        if self.forge_fetch_modules.is_empty() {
+            return true;
+        }
+        let Some(root) = &self.forge_fetch else {
+            return false;
+        };
+        let mut paths = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
+        let mut urls = std::collections::HashSet::from([root.remote_url.as_str()]);
+        self.forge_fetch_modules.iter().all(|module| {
+            safe_relative_path(&module.path)
+                && safe_ref_component(&module.module_key)
+                && github_owner_repo(&module.remote_url).is_some()
+                && paths.insert(module.path.as_str())
+                && keys.insert(module.module_key.as_str())
+                && urls.insert(module.remote_url.as_str())
+        })
+    }
+}
+
+/// A `/`-separated relative path with no empty, `.` or `..` component.
+fn safe_relative_path(path: &str) -> bool {
+    path.split('/')
+        .all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains('\\'))
+}
+
+/// A single ref name component of `[A-Za-z0-9._-]`, not starting with `.`
+/// or `-`, with no `..` and not ending in `.lock`.
+fn safe_ref_component(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['.', '-'])
+        && !value.contains("..")
+        && !value.ends_with(".lock")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// `(owner, repo)` of `https://github.com/<owner>/<repo>.git`.

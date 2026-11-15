@@ -53,6 +53,7 @@ fn launch_frame() -> LinkFrame {
         checkout_of: None,
         forge: None,
         forge_fetch: None,
+        forge_fetch_modules: Vec::new(),
         git_identity: None,
         new_machine: None,
         resumed_from_disk: false,

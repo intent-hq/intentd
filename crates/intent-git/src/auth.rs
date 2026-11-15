@@ -419,19 +419,23 @@ pub fn node_helper_env(
 }
 
 /// The [`GIT_CONFIG_PARAMETERS_ENV`] pair for a sub-agent that fetches
-/// GitHub through the backend (nodeProtocol 17): `url.<forge>.insteadOf`
-/// for `remote_url` (`https://github.com/<owner>/<repo>.git`) and its
+/// GitHub through the backend (nodeProtocol 17): for each `(forge_url,
+/// remote_url)` of `rewrites`, `url.<forge_url>.insteadOf` for `remote_url`
+/// (`https://github.com/<owner>/<repo>.git`) and its
 /// `git@github.com:<owner>/<repo>.git` form, appended to any
 /// `inherited_config_parameters`. No credential helper.
 #[must_use]
-pub fn forge_fetch_env(
-    forge_url: &str,
-    remote_url: &str,
+pub fn forge_fetch_env<S: AsRef<str>>(
+    rewrites: &[(S, &str)],
     inherited_config_parameters: Option<&str>,
 ) -> Vec<(String, String)> {
-    let mut entries = vec![format!("url.{forge_url}.insteadOf={remote_url}")];
-    if let Some(path) = remote_url.strip_prefix("https://github.com/") {
-        entries.push(format!("url.{forge_url}.insteadOf=git@github.com:{path}"));
+    let mut entries = Vec::new();
+    for (forge_url, remote_url) in rewrites {
+        let forge_url = forge_url.as_ref();
+        entries.push(format!("url.{forge_url}.insteadOf={remote_url}"));
+        if let Some(path) = remote_url.strip_prefix("https://github.com/") {
+            entries.push(format!("url.{forge_url}.insteadOf=git@github.com:{path}"));
+        }
     }
     vec![(
         GIT_CONFIG_PARAMETERS_ENV.to_string(),

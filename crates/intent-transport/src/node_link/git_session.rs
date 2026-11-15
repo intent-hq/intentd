@@ -75,6 +75,10 @@ pub mod codes {
 pub const PUSH_REFUSED_MESSAGE: &str =
     "sub-agents hand work back through intent1; ask your parent to push";
 
+/// What the helper prints when head has no GitHub refs to serve a forge
+/// remote from: its refresh failed and none succeeded before.
+pub const FORGE_UNAVAILABLE_MESSAGE: &str = "could not fetch from GitHub through intent1; the backend's GitHub access may not reach this repository";
+
 /// The warning a forge ACCEPT carries when head served the last fetched
 /// refs because the GitHub refresh failed.
 pub const FORGE_REFRESH_FAILED: &str = "forge-refresh-failed";
@@ -911,21 +915,21 @@ pub async fn serve_helpers_with(
 }
 
 /// One sub-agent's own helper socket (nodeProtocol 17): it opens only
-/// `forge`, that agent's forge remote, and answers no credential request.
-/// Another agent's forge remote is [`codes::DENIED`]; any other request is
-/// [`codes::INVALID`].
+/// `forges`, that agent's forge remote and those of its submodules, and
+/// answers no credential request. Any other forge remote is
+/// [`codes::DENIED`]; any other request is [`codes::INVALID`].
 #[cfg(unix)]
 pub async fn serve_forge_helpers(
     listener: tokio::net::UnixListener,
     sessions: NodeGitSessions,
-    forge: AgentRemote,
+    forges: Vec<AgentRemote>,
 ) {
-    let forge = Arc::new(forge);
+    let forges: Arc<[AgentRemote]> = forges.into();
     while let Ok((stream, _)) = listener.accept().await {
         let sessions = sessions.clone();
-        let forge = forge.clone();
+        let forges = forges.clone();
         tokio::spawn(async move {
-            let _ = serve_helper(stream, &sessions, None, Some(&forge)).await;
+            let _ = serve_helper(stream, &sessions, None, Some(&forges)).await;
         });
     }
 }
@@ -935,7 +939,7 @@ async fn serve_helper(
     stream: tokio::net::UnixStream,
     sessions: &NodeGitSessions,
     credential: Option<&HelperCredential>,
-    only: Option<&AgentRemote>,
+    only: Option<&[AgentRemote]>,
 ) -> Result<()> {
     use tokio::io::AsyncBufReadExt as _;
 
@@ -966,7 +970,7 @@ async fn serve_helper(
             (Ok(_), Ok(remote)) if only.is_some() && !remote.is_forge() => {
                 Err(session_error(codes::INVALID))
             }
-            (Ok(_), Ok(remote)) if only.is_some_and(|only| *only != remote) => {
+            (Ok(_), Ok(remote)) if only.is_some_and(|only| !only.contains(&remote)) => {
                 Err(session_error(codes::DENIED))
             }
             (Ok(service), Ok(remote)) => sessions.open(service, &remote).await,

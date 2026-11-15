@@ -110,6 +110,9 @@ async fn connect(
         if code == super::git_session::codes::PUSH_REFUSED {
             eprintln!("error: {}", super::git_session::PUSH_REFUSED_MESSAGE);
         }
+        if remote.is_forge() && code == super::git_session::codes::UNAVAILABLE {
+            eprintln!("error: {}", super::git_session::FORGE_UNAVAILABLE_MESSAGE);
+        }
         return Err(helper_error(&format!("head refused the session ({code})")));
     }
     output

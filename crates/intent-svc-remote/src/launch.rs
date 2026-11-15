@@ -21,7 +21,7 @@ use intent_core::machine_selection::{
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
-    FinalPush, ForgeFetchLaunch, ForgeLaunch, GitIdentity, LaunchCommand, LaunchLabels,
+    FinalPush, ForgeFetchLaunch, ForgeFetchModule, ForgeLaunch, GitIdentity, LaunchCommand, LaunchLabels,
     LaunchProfileEnv, MachineName, PreparedCheckout, SetupCommand, SubmodulePin,
     MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SHARED_CHECKOUT_PROTOCOL,
 };
@@ -119,19 +119,54 @@ async fn forge_launch(svc: &Services, workspace_id: &WorkspaceId) -> Option<Box<
     ForgeLaunch::for_github(&origin, &workspace.branch).map(Box::new)
 }
 
+/// The pins of the checkout `agent_id` works in on its machine: its own,
+/// or its checkout owner's when it shares one. Empty for an agent without
+/// pins or in a home checkout.
+pub(crate) async fn checkout_pins(
+    store: &intent_store::Store,
+    agent_id: &AgentId,
+) -> Result<Vec<SubmodulePin>> {
+    let view_of = |summary: &intent_store::AgentSessionSummary| {
+        RemotePlacementView::from_metadata(summary.metadata.as_ref())
+    };
+    let Some(view) = view_of(&store.get_agent_session_summary(agent_id).await?) else {
+        return Ok(Vec::new());
+    };
+    if view.home_checkout.is_some() {
+        return Ok(Vec::new());
+    }
+    let view = match &view.shared_checkout_of {
+        Some(owner) => match view_of(&store.get_agent_session_summary(owner).await?) {
+            Some(owner) => owner,
+            None => return Ok(Vec::new()),
+        },
+        None => view,
+    };
+    Ok(view.pins().to_vec())
+}
+
 /// The `forgeFetch` member a sub-agent of `workspace_id` would carry
 /// (nodeProtocol 17): its checkout's `origin`, normalized to HTTPS GitHub;
-/// `None` when that `origin` is not on GitHub.
+/// `None` when that `origin` is not on GitHub. With it, the
+/// `forgeFetchModules`: those of `pins` whose submodule is on GitHub.
 async fn forge_fetch_launch(
     svc: &Services,
     workspace_id: &WorkspaceId,
-) -> Option<Box<ForgeFetchLaunch>> {
+    pins: Vec<SubmodulePin>,
+) -> Option<(Box<ForgeFetchLaunch>, Vec<ForgeFetchModule>)> {
     let workspace = svc.store().get_workspace(workspace_id).await.ok()?;
     let checkout = checkout_path(&workspace)?;
-    let origin = blocking(move || intent_git::remote::origin_url(&checkout))
-        .await
-        .ok()??;
-    ForgeFetchLaunch::for_github(&origin).map(Box::new)
+    blocking(move || {
+        let launch = intent_git::remote::origin_url(&checkout)?
+            .as_deref()
+            .and_then(ForgeFetchLaunch::for_github);
+        Ok(launch.map(|launch| {
+            let modules = node_git::forge::modules(&checkout, &launch.remote_url, &pins);
+            (Box::new(launch), modules)
+        }))
+    })
+    .await
+    .ok()?
 }
 
 /// The `launch.gitIdentity` for a workspace whose checkout is `checkout`:
@@ -1472,11 +1507,15 @@ impl RemoteLaunchPort for RemoteLaunch {
             node.shared_ref().launching(agent_id);
             // A sub-agent reaches GitHub through this backend (nodeProtocol
             // 17); the connector drops it on an older link.
-            let forge_fetch = if is_sub_agent || checkout_of.is_some() || home.is_some() {
-                forge_fetch_launch(svc, &record.workspace_id).await
-            } else {
-                None
-            };
+            let (forge_fetch, forge_fetch_modules) =
+                if is_sub_agent || checkout_of.is_some() || home.is_some() {
+                    let pins = checkout_pins(svc.store(), agent_id).await?;
+                    forge_fetch_launch(svc, &record.workspace_id, pins)
+                        .await
+                        .map_or((None, Vec::new()), |(root, modules)| (Some(root), modules))
+                } else {
+                    (None, Vec::new())
+                };
             let workspace_title = svc
                 .store()
                 .get_workspace(&record.workspace_id)
@@ -1506,6 +1545,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                         .or_else(|| checkout_of.map(Into::into)),
                     forge,
                     forge_fetch,
+                    forge_fetch_modules,
                     git_identity,
                     new_machine,
                     resumed_from_disk,
