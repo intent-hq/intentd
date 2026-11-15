@@ -1042,7 +1042,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             // child on the home's machine works in the home checkout too
             // (when it was placed there), one elsewhere starts from the
             // workspace's base, the home's last backup.
-            if parent_view.home_checkout.is_some() {
+            if parent_view.home_checkout.is_some() && !parent_view.is_unlinked() {
                 if child.node_id != parent_view.node_id {
                     child.home_checkout = None;
                 }
@@ -1083,7 +1083,7 @@ impl RemoteLaunchPort for RemoteLaunch {
         Box::pin(async move {
             // A parent in the home checkout has no refs of its own: the
             // sub-agent starts from the workspace, which follows the home.
-            if parent_view.home_checkout.is_some() {
+            if parent_view.home_checkout.is_some() && !parent_view.is_unlinked() {
                 return Ok(None);
             }
             let owner = parent_view

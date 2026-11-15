@@ -148,7 +148,7 @@ fn machine_unknown(placement: &AgentPlacement, node_id: &str) -> Error {
 }
 
 /// Whether `agent` is `top` or one of its sub-agents.
-async fn descends_from(svc: &Services, agent: &AgentId, top: &str) -> Result<bool> {
+pub(super) async fn descends_from(svc: &Services, agent: &AgentId, top: &str) -> Result<bool> {
     let mut current = Some(agent.clone());
     for _ in 0..64 {
         let Some(id) = current else { return Ok(false) };
@@ -1059,6 +1059,24 @@ pub(crate) enum Removal<'a> {
     /// The sandbox cannot link to this backend: no stops, then the E2B
     /// delete.
     Unlinkable,
+    /// As [`Removal::Stop`], only while nothing needs the machine
+    /// ([`super::home::needed`], with the agent ending now), checked under
+    /// its lifecycle lock.
+    Unneeded(Option<&'a AgentId>),
+}
+
+/// [`delete_machine`] of a machine nothing needed (see
+/// [`super::home::needed`], `ending` the agent ending now): checked again
+/// under the machine's lifecycle lock, so a home move or an agent placed
+/// there meanwhile keeps it.
+pub(crate) async fn delete_unneeded_machine(
+    feature: &RemoteFeature,
+    svc: &Services,
+    row: &ExposedMachine,
+    client: Option<&dyn CloudProvider>,
+    ending: Option<&AgentId>,
+) -> Vec<String> {
+    remove_machine(feature, svc, row, client, Removal::Unneeded(ending)).await
 }
 
 /// [`delete_machine`], ending the sandbox as `removal` says.
@@ -1071,7 +1089,7 @@ pub(crate) async fn remove_machine(
 ) -> Vec<String> {
     let lost = match removal {
         Removal::Lost(error) => Some(error),
-        Removal::Stop | Removal::Unlinkable => None,
+        Removal::Stop | Removal::Unlinkable | Removal::Unneeded(_) => None,
     };
     let mut unconfirmed = Vec::new();
     let _lifecycle = feature.lifecycle(&row.id).await;
@@ -1085,11 +1103,17 @@ pub(crate) async fn remove_machine(
         }
         Err(_) => row.clone(),
     };
+    if let Removal::Unneeded(ending) = removal {
+        if super::home::needed(svc, &row, ending).await {
+            return unconfirmed;
+        }
+        tracing::info!(machine = %row.id, "cloud machine: nothing needs it any more; deleting it");
+    }
     let row = &row;
     // The agents placed here, read before their final stops end their
     // records, so each one is left without a machine afterwards.
     let placed = placed_agents(store, &row.id).await.unwrap_or_default();
-    let mut stops = matches!(removal, Removal::Stop);
+    let mut stops = matches!(removal, Removal::Stop | Removal::Unneeded(_));
     if let (true, Some(client), Some(cloud)) = (stops, client, &row.cloud) {
         let paused = cloud.state != CloudSandboxState::Running;
         super::lifecycle::set_state(svc, feature, &row.id, CloudSandboxState::Stopping).await;
@@ -1104,7 +1128,7 @@ pub(crate) async fn remove_machine(
             node.shared_ref().drop_stops();
             let turn_error = match removal {
                 Removal::Unlinkable => super::lifecycle::outdated_turn_error(),
-                Removal::Stop | Removal::Lost(_) => "cloud-machine-unavailable: the agent's E2B sandbox was deleted without a final stop; work it pushed is kept".to_owned(),
+                Removal::Stop | Removal::Unneeded(_) | Removal::Lost(_) => "cloud-machine-unavailable: the agent's E2B sandbox was deleted without a final stop; work it pushed is kept".to_owned(),
             };
             node.shared_ref().agents.end_all(&turn_error);
         }

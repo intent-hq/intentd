@@ -254,10 +254,7 @@ pub(crate) async fn agent_start_failed(
 }
 
 /// Delete cloud machine `machine_id` in the background once nothing needs
-/// it (nodes.md "Cloud homes" 1): it holds no home, owes no home stop and
-/// is no move's target, and no agent uses it. `ending` is an agent ending
-/// for good now; when it is the one the sandbox was started for, its
-/// sub-agents there are stopped with it, as for any agent sandbox.
+/// it ([`needed`]). `ending` is an agent ending for good now.
 ///
 /// Boxed: the delete's final stops lead back here.
 pub(crate) fn release<'a>(
@@ -269,50 +266,85 @@ pub(crate) fn release<'a>(
 }
 
 async fn release_inner(svc: &Services, machine_id: &str, ending: Option<&AgentId>) {
-    let store = svc.store();
-    let Ok(Some(row)) = store.get_exposed_machine(machine_id).await else {
+    let Ok(Some(row)) = svc.store().get_exposed_machine(machine_id).await else {
         return;
     };
-    let Some(cloud) = &row.cloud else { return };
-    match crate::homes::machine_holds_homes(store, machine_id).await {
-        Ok(false) => {}
-        Ok(true) => {
-            tracing::info!(machine = %machine_id, "cloud machine: kept, it holds a workspace's home");
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(machine = %machine_id, %error, "cloud machine: could not read its homes; kept");
-            return;
-        }
-    }
-    let starter_ends = ending.is_some_and(|agent| agent.as_str() == cloud.agent_id);
-    if !starter_ends {
-        if uses(svc, &AgentId::from(cloud.agent_id.as_str())).await {
-            return;
-        }
-        let placed = match super::start::placed_agents(store, machine_id).await {
-            Ok(placed) => placed,
-            Err(error) => {
-                tracing::warn!(machine = %machine_id, %error, "cloud machine: could not read its agents; kept");
-                return;
-            }
-        };
-        for agent in placed {
-            if Some(&agent.agent_id) != ending && uses(svc, &agent.agent_id).await {
-                return;
-            }
-        }
+    if row.cloud.is_none() || needed(svc, &row, ending).await {
+        return;
     }
     let svc = svc.clone();
+    let ending = ending.cloned();
     // caller-binding: allow — deletes one cloud machine nothing needs any more
     tokio::spawn(async move {
         let Some(feature) = svc.remote_feature() else {
             return;
         };
-        tracing::info!(machine = %row.id, "cloud machine: nothing needs it any more; deleting it");
         let client = super::saved_client(&svc, &row).await;
-        super::start::delete_machine(feature, &svc, &row, client.as_deref()).await;
+        super::start::delete_unneeded_machine(
+            feature,
+            &svc,
+            &row,
+            client.as_deref(),
+            ending.as_ref(),
+        )
+        .await;
     });
+}
+
+/// Whether cloud machine `row` is still needed (nodes.md "Cloud homes" 1):
+/// it holds a home, owes a home stop or is a move's target, or an agent
+/// uses it. `ending` is an agent ending for good now; when it is the one
+/// the sandbox was started for, its own sub-agents there are stopped with
+/// it, as for any agent sandbox, but other agents still count. `true` when
+/// that cannot be read, so a sandbox is never deleted on a guess.
+pub(crate) async fn needed(
+    svc: &Services,
+    row: &intent_core::machines::ExposedMachine,
+    ending: Option<&AgentId>,
+) -> bool {
+    let Some(cloud) = &row.cloud else {
+        return true;
+    };
+    let store = svc.store();
+    match crate::homes::machine_holds_homes(store, &row.id).await {
+        Ok(false) => {}
+        Ok(true) => {
+            tracing::info!(machine = %row.id, "cloud machine: kept, it holds a workspace's home");
+            return true;
+        }
+        Err(error) => {
+            tracing::warn!(machine = %row.id, %error, "cloud machine: could not read its homes; kept");
+            return true;
+        }
+    }
+    let starter = AgentId::from(cloud.agent_id.as_str());
+    let starter_ends = ending == Some(&starter);
+    if !starter_ends && uses(svc, &starter).await {
+        return true;
+    }
+    let placed = match super::start::placed_agents(store, &row.id).await {
+        Ok(placed) => placed,
+        Err(error) => {
+            tracing::warn!(machine = %row.id, %error, "cloud machine: could not read its agents; kept");
+            return true;
+        }
+    };
+    for agent in placed {
+        if Some(&agent.agent_id) == ending || agent.agent_id == starter {
+            continue;
+        }
+        if starter_ends {
+            match super::start::descends_from(svc, &agent.agent_id, starter.as_str()).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => return true,
+            }
+        }
+        if uses(svc, &agent.agent_id).await {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether agent `agent_id` still uses its machine: it has not ended, and

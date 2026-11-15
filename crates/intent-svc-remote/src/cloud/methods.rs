@@ -904,8 +904,8 @@ pub(crate) fn not_found(machine_id: &str) -> Error {
 }
 
 /// The cloud machine `params.machineId` names, once the caller may act on
-/// it: the owner, the principal that started it, or the current owner of a
-/// workspace whose home it holds (nodes.md "Cloud homes" 2).
+/// it: the owner, the principal that started it, or the current owner of
+/// every workspace whose home it holds (nodes.md "Cloud homes" 2).
 async fn own_machine(svc: &Services, params: &Value, what: &str) -> Result<ExposedMachine> {
     let machine_id = match params.get("machineId") {
         Some(Value::String(id)) if !id.trim().is_empty() && id.len() <= 256 => id.clone(),
@@ -938,14 +938,18 @@ async fn own_machine(svc: &Services, params: &Value, what: &str) -> Result<Expos
     if !starter.is_empty() && principal_id.to_string() == starter {
         return Ok(row);
     }
-    for (workspace_id, _) in svc.store().homes_on_machine(&row.id).await? {
+    // The owner of every workspace whose home the machine holds.
+    let homes = svc.store().homes_on_machine(&row.id).await?;
+    let mut owns_all = !homes.is_empty();
+    for (workspace_id, _) in &homes {
         let owner = svc
             .store()
-            .get_workspace_owner_principal_id(&workspace_id)
+            .get_workspace_owner_principal_id(workspace_id)
             .await?;
-        if owner.as_ref() == Some(&principal_id) {
-            return Ok(row);
-        }
+        owns_all &= owner.as_ref() == Some(&principal_id);
+    }
+    if owns_all {
+        return Ok(row);
     }
     Err(refused(what))
 }

@@ -103,7 +103,7 @@ pub(crate) struct CloudState {
     /// Agents whose machine started again from its disk since they last
     /// ran there; their next launch says so.
     disk_resumed: Mutex<HashSet<String>>,
-    /// Machines whose homes push before an idle pause now.
+    /// Machines in an idle pause now, from their homes' pushes to its end.
     pushing: Mutex<HashSet<String>>,
     /// Idle pauses skipped in a row per machine because a home's push
     /// before it failed.
@@ -132,10 +132,14 @@ impl CloudState {
             .unwrap_or_default()
     }
 
-    /// Begin the pushes before an idle pause; `false` when they already
-    /// run.
+    /// Begin an idle pause (its pushes, then the pause); `false` when one
+    /// already runs.
     fn begin_push(&self, machine_id: &str) -> bool {
         crate::lock(&self.pushing).insert(machine_id.to_owned())
+    }
+
+    fn is_pushing(&self, machine_id: &str) -> bool {
+        crate::lock(&self.pushing).contains(machine_id)
     }
 
     fn end_push(&self, machine_id: &str) {

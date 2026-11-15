@@ -767,6 +767,8 @@ async fn a_cloud_home_sandbox_is_co_owned_by_its_workspace() {
         )
         .await;
     assert_eq!(read, "still home\n", "{read}");
+    // timing-guard: a wrong delete is started in the background after the stop; give it time to land
+    tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!homes.deleted(&sandbox), "the home's sandbox was deleted");
     let id = homes.next();
     assert!(
@@ -842,16 +844,28 @@ async fn a_cloud_home_sandbox_is_co_owned_by_its_workspace() {
     );
 }
 
+/// The gap the backend holds open between an idle pause's pushes and the
+/// pause in the idle test.
+const AFTER_PUSH_MS: u64 = 2000;
+
 /// A cloud home's idle pause (nodes.md "Cloud homes" 3-4, "Continuous
 /// backup" 2), with one settings minute scaled to 3 s and an idle pause of
 /// one minute: an open terminal keeps the home-only sandbox running past
-/// several idle periods; once it closes, the sandbox pauses, and the
-/// uncommitted file the terminal wrote is in `home/wip` by then (the home
-/// pushed before the pause).
+/// several idle periods; once it closes, the home pushes the uncommitted
+/// file the terminal wrote to `home/wip`. An app edit between that push and
+/// the pause skips the pause; the next idle pause pushes the edit too, then
+/// pauses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing() {
-    let Some(mut homes) =
-        CloudHomes::start("itd-e2b-idle-", &[("INTENTD_E2B_MINUTE_MS", "3000")], 1).await
+    let Some(mut homes) = CloudHomes::start(
+        "itd-e2b-idle-",
+        &[
+            ("INTENTD_E2B_MINUTE_MS", "3000"),
+            ("INTENTD_E2B_AFTER_PUSH_MS", &AFTER_PUSH_MS.to_string()),
+        ],
+        1,
+    )
+    .await
     else {
         return;
     };
@@ -917,10 +931,45 @@ async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing(
         .expect("the home's machine");
     assert_eq!(machine["cloud"]["state"], "running", "{machine}");
 
-    // Closed: the sandbox pauses once idle, after pushing home/wip.
+    // Closed: once idle, the homes push before the pause.
+    let mut id = homes.id;
+    let backed_up = home_of(&mut homes.rpc_ws, id + 1, &ws_id).await["lastBackupAt"].clone();
+    id += 1;
     homes
         .ok("terminal.kill", json!({ "terminalId": terminal_id }))
         .await;
+    let home = home_until(
+        &mut homes.rpc_ws,
+        &mut id,
+        &ws_id,
+        "the push before the idle pause",
+        |home| home["lastBackupAt"].is_string() && home["lastBackupAt"] != backed_up,
+    )
+    .await;
+    homes.id = id;
+    let pushed = home["lastBackupAt"].clone();
+    assert!(
+        wip_files(&repo).is_some_and(|files| files.contains("wip.txt")),
+        "home/wip lacks the terminal's file after the push"
+    );
+
+    // An app edit between that push and the pause (the seam holds the gap
+    // open): this pause is skipped, as the sandbox was used.
+    homes
+        .ok(
+            "file.write",
+            json!({ "workspaceId": ws_id, "path": "late.txt", "content": "late\n" }),
+        )
+        .await;
+    // timing-guard: past the seam's gap, when a pause that ignored the edit would have run
+    tokio::time::sleep(Duration::from_millis(AFTER_PUSH_MS + 1500)).await;
+    assert_eq!(
+        homes.pause_calls(&sandbox),
+        0,
+        "paused right after the sandbox was used"
+    );
+
+    // Idle again: it pushes once more, with the late edit, then pauses.
     let id = homes.next();
     machine_until(&mut homes.rpc_ws, id, &sandbox, |machine| {
         machine.is_some_and(|machine| machine["cloud"]["state"] == "paused")
@@ -928,14 +977,17 @@ async fn an_open_terminal_keeps_a_cloud_home_awake_and_it_pushes_before_pausing(
     .await;
     homes.id += 1000;
     let files = wip_files(&repo).expect("home/wip was pushed before the pause");
-    assert!(files.contains("wip.txt"), "home/wip: {files}");
+    assert!(
+        files.contains("wip.txt") && files.contains("late.txt"),
+        "home/wip: {files}"
+    );
     let mut id = homes.next();
     let home = home_until(
         &mut homes.rpc_ws,
         &mut id,
         &ws_id,
         "the pause's push is the last backup",
-        |home| home["lastBackupAt"].is_string(),
+        |home| home["lastBackupAt"].is_string() && home["lastBackupAt"] != pushed,
     )
     .await;
     homes.id = id;
