@@ -8,6 +8,8 @@
 //! the move back; an orchestrator restart mid-move completes it. Each
 //! refusal carries its documented code.
 
+use std::os::unix::fs::PermissionsExt as _;
+
 use nix::sys::signal::Signal;
 
 use super::homes::{commit_on, home_checkout, until, HOMES};
@@ -32,6 +34,7 @@ struct TwoMachines {
 }
 
 /// `error.code` and `error.data.code` of a refused call.
+#[track_caller]
 fn refusal(response: &Value) -> (i64, String) {
     let error = &response["error"];
     assert!(error.is_object(), "expected an error: {response}");
@@ -345,7 +348,11 @@ async fn moving_the_home_carries_its_work_to_another_machine_and_stops_the_old_o
 fn work_dir(node_dir: &Path, credential_id: &str) -> PathBuf {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(credential_id.as_bytes());
-    let name: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    let name = digest[..4].iter().fold(String::new(), |mut name, b| {
+        use std::fmt::Write as _;
+        let _ = write!(name, "{b:02x}");
+        name
+    });
     node_dir.join("w").join(name)
 }
 
@@ -355,7 +362,6 @@ async fn a_move_whose_new_home_cannot_open_rolls_back() {
         return;
     };
     // B cannot make a home directory: its homeOpen fails.
-    use std::os::unix::fs::PermissionsExt as _;
     let homes = work_dir(&s.b_dir, &s.b.credential_id).join("homes");
     std::fs::create_dir_all(&homes).unwrap();
     std::fs::set_permissions(&homes, std::fs::Permissions::from_mode(0o500)).unwrap();
