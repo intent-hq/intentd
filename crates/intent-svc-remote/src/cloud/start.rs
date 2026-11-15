@@ -763,10 +763,19 @@ async fn start(
         &mut made,
     )
     .await;
-    // A home-only start in flight still may become the home: it settles
-    // the home itself.
+    // A home this start holds is detached. An unheld one is left to a
+    // home-only start in flight, which still may become the home and
+    // settles it itself.
     if let (Err(_), Some(home)) = (&started, &home) {
-        if !super::home::home_start_in_flight(svc, workspace_id) {
+        let held = made.is_some()
+            && svc
+                .store()
+                .get_workspace_home(workspace_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|current| current.node_id == made);
+        if held || !super::home::home_start_in_flight(svc, workspace_id) {
             super::home::start_failed(svc, workspace_id, &home.home_id, made.as_deref()).await;
         }
     }
