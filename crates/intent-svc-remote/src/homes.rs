@@ -325,13 +325,11 @@ pub(crate) async fn leave_moved_home(
     let pins = view.pins().to_vec();
     let base = view.base_commit.clone();
     let (base, pins) = crate::launch::blocking(move || {
-        let (base, pins) = match crate::launch::copy_work(&checkout, &home, &agent, pins.clone())? {
-            Some(copied) => copied,
-            None => {
-                tracing::warn!("the moved home has no saved head; the agent starts from its base");
-                (base, pins)
-            }
-        };
+        let copied = crate::launch::copy_work(&checkout, &home, &agent, pins.clone())?;
+        let (base, pins) = copied.unwrap_or_else(|| {
+            tracing::warn!("the moved home has no saved head; the agent starts from its base");
+            (base, pins)
+        });
         crate::launch::write_base_refs(&checkout, &agent, &base, &pins)?;
         Ok((base, pins))
     })
