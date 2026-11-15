@@ -482,6 +482,7 @@ workspace.retire
 workspace.saveSetupScript
 workspace.setAutoCommit
 workspace.setBrowserClient
+workspace.setHome
 workspace.subscribe
 workspace.transfer.plan
 workspace.unarchive

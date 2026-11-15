@@ -162,6 +162,7 @@ pub(crate) const RETIRED_GATED_METHODS: &[&str] = &[
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",
+    "workspace.setHome",
     "workspace.update",
     "workspace.updateContext",
     "workspace.updateUiContext",

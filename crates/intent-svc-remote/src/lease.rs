@@ -248,6 +248,21 @@ impl HeadLease {
                 home_id: home.home_id,
             })
             .collect();
+        for home_move in self
+            .store
+            .home_moves_to_machine(&self.owner.node_id)
+            .await?
+        {
+            if !homes
+                .iter()
+                .any(|home| home.home_id == home_move.target.home_id)
+            {
+                homes.push(HomeRef {
+                    workspace_id: home_move.workspace_id,
+                    home_id: home_move.target.home_id,
+                });
+            }
+        }
         for stop in self.store.list_home_stops(&self.owner.node_id).await? {
             if !homes.iter().any(|home| home.home_id == stop.home_id) {
                 homes.push(stop.frame().home());

@@ -500,6 +500,7 @@ router workspace.retire
 router workspace.saveSetupScript
 router workspace.setAutoCommit
 router workspace.setBrowserClient
+router workspace.setHome
 router workspace.transfer.plan
 router workspace.unarchive
 router workspace.update

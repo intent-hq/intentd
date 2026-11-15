@@ -31,7 +31,7 @@ fn map_row(row: &SqliteRow) -> Result<HomeStopRecord> {
 }
 
 /// Insert `record` unless its home has a stop already.
-async fn insert(conn: &mut SqliteConnection, record: &HomeStopRecord) -> Result<()> {
+pub(crate) async fn insert(conn: &mut SqliteConnection, record: &HomeStopRecord) -> Result<()> {
     sqlx::query(
         "INSERT INTO home_stop (home_id, workspace_id, node_id, stop_id, reason, orphaned_at, \
          recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(home_id) DO NOTHING",
@@ -49,8 +49,42 @@ async fn insert(conn: &mut SqliteConnection, record: &HomeStopRecord) -> Result<
     Ok(())
 }
 
+/// Inside a transaction that ends a move without its switch (a rollback,
+/// or the workspace archived or deleted): a `retired` stop of the move's
+/// target when it is on an exposed machine, which may have opened it. Its
+/// last push is discarded (see `discard_push`).
+pub(crate) async fn stop_move_target(
+    conn: &mut SqliteConnection,
+    workspace_id: &WorkspaceId,
+    now: &str,
+) -> Result<()> {
+    let target: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT home_id, node_id FROM home_move WHERE workspace_id = ?")
+            .bind(&workspace_id.0)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(db)?;
+    let Some((home_id, Some(node_id))) = target else {
+        return Ok(());
+    };
+    let record = HomeStopRecord::new(
+        workspace_id.clone(),
+        HomeId(home_id),
+        node_id,
+        HomeStopReason::Retired,
+        now,
+    );
+    insert(&mut *conn, &record).await?;
+    sqlx::query("UPDATE home_stop SET discard_push = 1 WHERE home_id = ?")
+        .bind(&record.home_id.0)
+        .execute(conn)
+        .await
+        .map_err(db)?;
+    Ok(())
+}
+
 /// The workspace's current home on an exposed machine, as `(homeId, nodeId)`.
-async fn machine_home(
+pub(crate) async fn machine_home(
     conn: &mut SqliteConnection,
     workspace_id: &WorkspaceId,
 ) -> Result<Option<(String, String)>> {
@@ -92,6 +126,14 @@ pub(crate) async fn retire_workspace_home(
         insert(conn, &record).await?;
     }
     sqlx::query("DELETE FROM workspace_home WHERE workspace_id = ?")
+        .bind(&workspace_id.0)
+        .execute(&mut *conn)
+        .await
+        .map_err(db)?;
+    // A move in progress ends with the home: it never switches now, and
+    // its target stops too.
+    stop_move_target(conn, workspace_id, now).await?;
+    sqlx::query("DELETE FROM home_move WHERE workspace_id = ?")
         .bind(&workspace_id.0)
         .execute(&mut *conn)
         .await
@@ -191,6 +233,22 @@ impl Store {
             .await
             .map_err(db)?;
         row.as_ref().map(map_row).transpose()
+    }
+
+    /// Whether the pending stop of `home_id` discards its last push: the
+    /// home was a move's target that never became the workspace's.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn home_stop_discards_push(&self, home_id: &HomeId) -> Result<bool> {
+        let discard: Option<i64> =
+            sqlx::query_scalar("SELECT discard_push FROM home_stop WHERE home_id = ?")
+                .bind(&home_id.0)
+                .fetch_optional(self.write_pool())
+                .await
+                .map_err(db)?;
+        Ok(discard.is_some_and(|discard| discard != 0))
     }
 
     /// The pending stops of the exposed machine `node_id`, oldest first.

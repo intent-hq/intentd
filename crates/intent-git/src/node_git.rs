@@ -85,7 +85,10 @@ if [ -n "$orphaned" ]; then
   exit 0
 fi
 case "$name" in
-head|wip) exit 0 ;;
+head|wip)
+  [ -z "$INTENT_NODE_GIT_PINS_ONLY" ] || refuse "only unapplied pins until this home is current"
+  exit 0
+  ;;
 unapplied/*)
   sha="${name#unapplied/}"
   case "$sha" in
@@ -105,6 +108,10 @@ unapplied/*)
 *) refuse "not a ref a node may push" ;;
 esac
 "#;
+
+/// Set (to `1`), [`UPDATE_HOOK`] lets the session only pin
+/// `unapplied/<sha>` ([`AgentRemote::pins_only`]).
+pub const PINS_ONLY_ENV: &str = "INTENT_NODE_GIT_PINS_ONLY";
 
 /// The environment variable naming a receive session's ref prefix
 /// ([`AgentRemote::ref_prefix`]) to [`UPDATE_HOOK`].
@@ -136,6 +143,9 @@ pub struct AgentRemote {
     /// and `wip` name `home/orphaned/<this>/{head,wip}`. Never on the wire:
     /// the backend sets it from the home's stop.
     orphaned: Option<String>,
+    /// The new home of a move before its switch (nodes.md "Moving the
+    /// home"): a push may only pin `unapplied/<sha>`. Never on the wire.
+    pins_only: bool,
 }
 
 const MODULES: &str = "/modules/";
@@ -165,6 +175,7 @@ impl AgentRemote {
             forge: false,
             home: false,
             orphaned: None,
+            pins_only: false,
         })
     }
 
@@ -203,6 +214,22 @@ impl AgentRemote {
             orphaned: Some(orphaned_at.to_owned()),
             ..self.clone()
         })
+    }
+
+    /// This remote for a push that may only pin `unapplied/<sha>`: the new
+    /// home of a move, before the switch makes it the workspace's home.
+    #[must_use]
+    pub fn pins_only(&self) -> Self {
+        Self {
+            pins_only: true,
+            ..self.clone()
+        }
+    }
+
+    /// Whether a push may only pin `unapplied/<sha>`.
+    #[must_use]
+    pub fn is_pins_only(&self) -> bool {
+        self.pins_only
     }
 
     /// The `orphanedAt` of a moved home's last push.
@@ -455,11 +482,15 @@ pub fn service_command(
     let mut command = sanitized_git();
     command.args(scope_args(remote));
     command.env_remove(ORPHANED_ENV);
+    command.env_remove(PINS_ONLY_ENV);
     if service == GitService::ReceivePack {
         command.args(receive_hook_args()?);
         command.env(PREFIX_ENV, remote.ref_prefix());
         if let Some(at) = remote.orphaned_at() {
             command.env(ORPHANED_ENV, at);
+        }
+        if remote.is_pins_only() {
+            command.env(PINS_ONLY_ENV, "1");
         }
     }
     command

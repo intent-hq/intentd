@@ -48,6 +48,7 @@ mod final_stop;
 mod forge_token;
 mod git;
 mod home_calls;
+mod home_move;
 mod home_scripts;
 mod home_state;
 mod homes;
@@ -319,6 +320,7 @@ async fn resume_exposed_machines(svc: &Services) -> Vec<String> {
             }
         }
     }
+    home_move::resume(svc).await;
     started
 }
 

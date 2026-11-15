@@ -12,9 +12,9 @@ use intent_core::machines::{
     ExposedMachine, MachineUpdateRequired, RemoteMachineState, UpdateSide,
 };
 use intent_core::node_link::{
-    HomeOpen, HomeOpenOutcome, HomeOpenReply, HomePushReply, HomeStopAck, HomeStopOutcome,
-    HomeStopReason, HomeStopRecord, JournalBody, JournalRecord, LinkFrame, PreparedCheckout,
-    RecordOwner, HOMES_PROTOCOL,
+    HomeOpen, HomeOpenOutcome, HomeOpenReply, HomePushReply, HomeRestore, HomeStopAck,
+    HomeStopOutcome, HomeStopReason, HomeStopRecord, JournalBody, JournalRecord, LinkFrame,
+    PreparedCheckout, RecordOwner, HOMES_PROTOCOL,
 };
 use intent_core::placement::{AgentPlacement, PlacementUnavailable, PlacementUnavailableReason};
 use intent_core::remote_launch::RemotePlacementView;
@@ -73,7 +73,7 @@ fn too_old(row: &ExposedMachine) -> MachineUpdateRequired {
     }
 }
 
-enum Candidate {
+pub(crate) enum Candidate {
     Home(WorkspaceHome),
     TooOld(MachineUpdateRequired),
     No,
@@ -81,7 +81,7 @@ enum Candidate {
 
 /// Whether the exposed machine `node_id` can be a home now: known, not
 /// revoked, online on nodeProtocol 19 with `homes` not `false`.
-async fn machine_candidate(svc: &Services, node_id: &str) -> Candidate {
+pub(crate) async fn machine_candidate(svc: &Services, node_id: &str) -> Candidate {
     let Ok(Some(row)) = svc.store().get_exposed_machine(node_id).await else {
         return Candidate::No;
     };
@@ -265,7 +265,8 @@ pub(crate) async fn home_checkout_for(
         return None;
     }
     let home = svc.store().get_workspace_home(workspace_id).await.ok()??;
-    if home.node_id.as_deref() != Some(view.node_id.as_str()) {
+    // A moving home is about to stop: the agent gets its own checkout.
+    if home.node_id.as_deref() != Some(view.node_id.as_str()) || home.state == HomeState::Moving {
         return None;
     }
     // The protocol the machine's last bind negotiated, from its row: the
@@ -308,17 +309,34 @@ pub(crate) async fn open_home(svc: &Services, workspace_id: &WorkspaceId) -> Res
     let Some(node_id) = home.node_id.clone() else {
         return Ok(());
     };
+    // A home moving away is not opened again: the move ends it, or gives
+    // it back with its old state.
+    if home.state == HomeState::Moving {
+        return Ok(());
+    }
+    let reply = send_open(svc, workspace_id, &home.home_id, &node_id, None).await?;
+    settle_open(svc, workspace_id, &home.home_id, reply).await
+}
+
+/// Send the `homeOpen` of `home_id` to the exposed machine `node_id` and
+/// wait for its answer.
+pub(crate) async fn send_open(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home_id: &HomeId,
+    node_id: &str,
+    restore: Option<HomeRestore>,
+) -> Result<HomeReply> {
     let feature = svc
         .remote_feature()
         .ok_or_else(|| Error::Internal("no remote machine feature".into()))?;
-    let node = feature.node(svc, &node_id).await?;
+    let node = feature.node(svc, node_id).await?;
     node.shared_ref().set_holds_homes(true);
-    let frame = home_open_frame(svc, workspace_id, &home.home_id).await?;
+    let mut frame = home_open_frame(svc, workspace_id, home_id).await?;
+    frame.restore = restore;
     let request_id = frame.request_id;
-    let reply = node
-        .home_request(request_id, LinkFrame::HomeOpen(frame), OPEN_WAIT)
-        .await?;
-    settle_open(svc, workspace_id, &home.home_id, reply).await
+    node.home_request(request_id, LinkFrame::HomeOpen(frame), OPEN_WAIT)
+        .await
 }
 
 /// The `homeOpen` for `home_id`, after seeding the hub's home refs.
@@ -373,11 +391,14 @@ async fn settle_open(
     };
     match reply.outcome {
         HomeOpenOutcome::Ready => {
+            // Only a detached home is attached here: a moving one keeps its
+            // state until the move ends.
             if svc
                 .store()
-                .set_workspace_home_state(
+                .move_workspace_home_state(
                     workspace_id,
                     home_id,
+                    HomeState::Detached,
                     HomeState::Attached,
                     &intent_core::now_iso(),
                 )
@@ -547,8 +568,10 @@ async fn auto_start_due(
         tracing::info!(home = %home_id, "remote machine: the home's setup failed; no autoStart");
         return false;
     }
+    // One transaction: the new home of a move may finish its setup before
+    // the switch, which then claims its autoStart from the move.
     match store
-        .claim_workspace_home_auto_start(
+        .claim_home_auto_start_or_record_move(
             &record.workspace_id,
             home_id,
             machine_id,
@@ -557,8 +580,12 @@ async fn auto_start_due(
         )
         .await
     {
-        Ok(true) => true,
-        Ok(false) => {
+        Ok(intent_store::HomeAutoStart::Claimed) => true,
+        Ok(intent_store::HomeAutoStart::AtSwitch) => {
+            tracing::debug!(home = %home_id, "remote machine: a move's new home finished its setup; autoStart waits for the switch");
+            false
+        }
+        Ok(intent_store::HomeAutoStart::No) => {
             tracing::debug!(home = %home_id, seq = record.seq.0, "remote machine: setup of a home that is not current, or autoStart already claimed; no autoStart");
             false
         }
@@ -569,8 +596,8 @@ async fn auto_start_due(
     }
 }
 
-/// Whether the exposed machine `node_id` holds a home of this backend or
-/// owes one a stop: its link is kept up.
+/// Whether the exposed machine `node_id` holds a home of this backend, is
+/// the new home of a move, or owes one a stop: its link is kept up.
 ///
 /// # Errors
 ///
@@ -580,7 +607,8 @@ pub(crate) async fn machine_holds_homes(
     node_id: &str,
 ) -> Result<bool> {
     Ok(!store.homes_on_machine(node_id).await?.is_empty()
-        || !store.list_home_stops(node_id).await?.is_empty())
+        || !store.list_home_stops(node_id).await?.is_empty()
+        || !store.home_moves_to_machine(node_id).await?.is_empty())
 }
 
 /// Send `stop` on the machine's current link, when it speaks
@@ -643,28 +671,23 @@ async fn pending_while_linked(shared: &Shared) -> Vec<HomeStopRecord> {
         })
 }
 
-/// Make `home` the workspace's home and record a `moved` stop of the
-/// machine home it replaces, in one store transaction
-/// ([`intent_store::Store::switch_workspace_home`]), holding the
-/// workspace's home push slot: a push the old home started before the
-/// switch lands first, and none of it lands after. The switch step of a
-/// home move (nodes.md "Moving the home" step 3).
+/// The switch of the move to `home_id` ([`intent_store::Store::complete_home_move`]:
+/// the new home and a `moved` stop of the old one in one store
+/// transaction), holding the workspace's home push slot: a push the old
+/// home started before the switch lands first, and none of it lands after.
+/// `None` when the move is gone. nodes.md "Moving the home" step 3.
 ///
 /// # Errors
 ///
 /// The store's error.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "workspace.setHome (homes step 4.4c) calls it")
-)]
 pub(crate) async fn switch_home(
     svc: &Services,
     workspace_id: &WorkspaceId,
-    home: &WorkspaceHome,
-) -> Result<Option<HomeStopRecord>> {
+    home_id: &HomeId,
+) -> Result<Option<intent_store::HomeMoveSwitch>> {
     let _pushes = crate::git::home_push_slot(workspace_id).await?;
     svc.store()
-        .switch_workspace_home(workspace_id, home, &intent_core::now_iso())
+        .complete_home_move(workspace_id, home_id, &intent_core::now_iso())
         .await
 }
 

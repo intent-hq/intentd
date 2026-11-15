@@ -14,7 +14,7 @@ use intent_core::node_link::{
     LinkFrame, PtyAck, PtyEnvVar, PtyExited, PtyInput, PtyKill, PtyMode, PtyOpen, PtyOutput,
     PtyResize, PtyStream, HOMES_PROTOCOL,
 };
-use intent_core::{Error, Result, WorkspaceId};
+use intent_core::{Error, HomeId, Result, WorkspaceId};
 use intent_pty::{PtyHost, PtyId, PtySize, RemotePty, RemoteSpec};
 use intent_services::feature_api::feature_ports::{
     HomeExec, HomeExecControl, HomeExecEvent, HomeExecOpen, HomeTerminalOpen,
@@ -59,6 +59,8 @@ struct Term {
     killed: bool,
     /// The home's name, for a start failure shown in the terminal.
     home_name: String,
+    /// The home generation it runs on: a move ends it.
+    home_id: HomeId,
 }
 
 /// Where a home terminal's output and end go.
@@ -198,6 +200,36 @@ impl HomeTerminals {
     fn killed(&self, terminal_id: &str) {
         if let Some(term) = lock(&self.state).terms.get_mut(terminal_id) {
             term.killed = true;
+        }
+    }
+
+    /// The home `home_id` is moving away: each of its terminals and exec
+    /// processes ends here now, and its process is killed on the machine.
+    pub(crate) async fn end_home(&self, shared: &Shared, home_id: &HomeId) {
+        let ended: Vec<(String, Term)> = {
+            let mut state = lock(&self.state);
+            let ids: Vec<String> = state
+                .terms
+                .iter()
+                .filter(|(_, term)| &term.home_id == home_id)
+                .map(|(terminal_id, _)| terminal_id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|terminal_id| {
+                    let term = state.terms.remove(&terminal_id)?;
+                    Some((terminal_id, term))
+                })
+                .collect()
+        };
+        for (terminal_id, term) in ended {
+            let _ = shared
+                .send(&LinkFrame::PtyKill(PtyKill { terminal_id }))
+                .await;
+            let error = format!(
+                "{HOME_UNAVAILABLE}: the workspace's home is moving away from {}",
+                term.home_name
+            );
+            term.end(None, Some(&error));
         }
     }
 
@@ -384,10 +416,27 @@ pub(crate) fn home_unavailable(home: &intent_core::WorkspaceHome, detail: &str) 
     )
 }
 
+/// `home-unavailable` with `moving: true` while `home` is moving (nodes.md
+/// "Moving the home").
+pub(crate) fn home_moving(home: &intent_core::WorkspaceHome) -> Error {
+    match home_unavailable(home, "it is moving") {
+        Error::RemoteMachine(mut failure) => {
+            if let Some(data) = failure.data.as_object_mut() {
+                data.insert("moving".into(), serde_json::Value::Bool(true));
+            }
+            Error::RemoteMachine(failure)
+        }
+        other => other,
+    }
+}
+
 /// `home-unavailable` while `home` is detached: nothing waits on a dial to
 /// a machine whose link has been down for the link-loss grace, but its
 /// connector is asked to dial again.
 pub(crate) fn ensure_attached(svc: &Services, home: &intent_core::WorkspaceHome) -> Result<()> {
+    if home.state == intent_core::HomeState::Moving {
+        return Err(home_moving(home));
+    }
     if home.state == intent_core::HomeState::Detached {
         crate::home_state::redial(svc, home);
         return Err(home_unavailable(
@@ -542,6 +591,7 @@ pub(crate) async fn open(
         size: size_slot,
         killed: false,
         home_name: home.name.clone(),
+        home_id: home.home_id.clone(),
     };
     let frame = PtyOpen {
         terminal_id,
@@ -593,6 +643,7 @@ pub(crate) async fn open_exec(
         size: size_slot,
         killed: false,
         home_name: home.name.clone(),
+        home_id: home.home_id.clone(),
     };
     let frame = PtyOpen {
         terminal_id,
@@ -624,6 +675,7 @@ mod tests {
             size: Arc::new(Mutex::new(PtySize::default())),
             killed: false,
             home_name: "Machine A".into(),
+            home_id: HomeId::from("home-1"),
         };
         (term, received)
     }
