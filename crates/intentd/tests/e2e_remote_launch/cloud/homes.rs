@@ -206,8 +206,9 @@ async fn a_cloud_entry_is_a_home_that_starts_lazily() {
     let (_, waited) = call_while_starting(&mut rpc_ws, &mut id, "file.write", &write).await;
     eprintln!("calls that failed while the home started: {waited}");
     assert_eq!(fake.state().creates.len(), 1, "one home-only sandbox");
+    let lazy_sandbox = fake.state().metadata.keys().next().unwrap().clone();
     assert_eq!(
-        fake.state().metadata["sbx0"]["agentId"],
+        fake.state().metadata[&lazy_sandbox]["agentId"],
         format!("home-{lazy}"),
         "the sandbox is the home's, not an agent's"
     );
@@ -228,7 +229,11 @@ async fn a_cloud_entry_is_a_home_that_starts_lazily() {
     let lazy_node = home["nodeId"].as_str().unwrap().to_owned();
     id += 1;
     let machine = machine_of(&mut rpc_ws, id, &lazy_node).await;
-    assert_eq!(machine["cloud"]["sandboxId"], "sbx0", "{machine}");
+    assert_eq!(
+        machine["cloud"]["sandboxId"],
+        lazy_sandbox.as_str(),
+        "{machine}"
+    );
     assert_eq!(
         machine["cloud"]["startedBy"]["principalId"],
         owner.as_str(),
