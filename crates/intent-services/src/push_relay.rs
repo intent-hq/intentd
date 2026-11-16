@@ -32,7 +32,7 @@ use tokio::time::Instant;
 use crate::{EventBus, Services, SubscriptionFilter};
 use client::{LinkCounts, RelayClient, RelayError};
 use proof::DaemonKey;
-use state::{Facts, IdleAgent, Notice, Pending, WorkspaceState};
+use state::{Facts, IdleAgent, Notice, NoticeKind, Pending, Settled, WorkspaceState};
 
 const KEY_ACCOUNT: &str = "push.relay.daemonKey";
 const STATE_ACCOUNT: &str = "push.relay.state";
@@ -496,7 +496,14 @@ impl Services {
             } else {
                 Vec::new()
             };
-            states.insert(ws.id.0.clone(), state::build_state(ws, &agents, &now));
+            let mut state = state::build_state(ws, &agents, &now);
+            state.running = publisher.settled.running(
+                &ws.id,
+                state.running,
+                self.agent_turn_in_flight(&ws.id),
+                false,
+            );
+            states.insert(ws.id.0.clone(), state);
             facts.insert(ws.id.clone(), Facts::of(ws));
         }
         let counts = self
@@ -546,6 +553,12 @@ impl Services {
         let transition =
             state::transition_notice(publisher.facts.insert(workspace.clone(), facts), facts);
         let notice = state::choose_notice(transition, idle, &agents);
+        next.running = publisher.settled.running(
+            workspace,
+            next.running,
+            self.agent_turn_in_flight(workspace),
+            matches!(notice, Some((NoticeKind::Done, _))),
+        );
         if notice.is_none() && publisher.sent.get(workspace) == Some(&next) {
             return Ok(());
         }
@@ -612,6 +625,7 @@ struct Publisher {
     facts: HashMap<WorkspaceId, Facts>,
     /// Last published state per workspace, without its notice.
     sent: HashMap<WorkspaceId, WorkspaceState>,
+    settled: Settled,
 }
 
 impl Publisher {

@@ -12,7 +12,7 @@ use tokio::time::Instant;
 
 use super::state::{
     build_state, choose_notice, idle_alert_allowed, transition_notice, Facts, IdleAgent,
-    NoticeKind, Pending, DEBOUNCE,
+    NoticeKind, Pending, Settled, DEBOUNCE,
 };
 use super::{proof::DaemonKey, subject_for, Publisher};
 use crate::test_support::capability_fixtures::host_role::fixture;
@@ -72,6 +72,30 @@ fn pending_coalesces_changes_into_one_flush_per_window() {
     assert!(
         pending.take_due(t0 + DEBOUNCE).is_empty(),
         "offline drops queued work"
+    );
+}
+
+#[test]
+fn a_done_notice_ends_running_during_the_idle_grace_window() {
+    let mut settled = Settled::default();
+    let ws = WorkspaceId::new();
+    assert!(settled.running(&ws, true, true, false), "a turn in flight runs");
+    assert!(
+        settled.running(&ws, true, false, false),
+        "the grace window alone keeps running, so turns back to back do not end the activity"
+    );
+    assert!(!settled.running(&ws, true, false, true), "done ends it at once");
+    assert!(
+        !settled.running(&ws, true, false, false),
+        "later publishes in the same grace window stay ended"
+    );
+    assert!(settled.running(&ws, true, true, false), "a new turn runs again");
+    assert!(settled.running(&ws, true, false, false), "and clears the mark");
+    assert!(!settled.running(&ws, true, false, true));
+    assert!(!settled.running(&ws, false, false, false));
+    assert!(
+        settled.running(&ws, true, false, false),
+        "the window closing clears the mark too"
     );
 }
 

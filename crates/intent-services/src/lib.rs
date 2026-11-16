@@ -3452,6 +3452,15 @@ impl Services {
         self.ports.runtime().stop_all_scripts(self).await
     }
 
+    /// An agent turn is in flight, ignoring the idle grace window.
+    pub(crate) fn agent_turn_in_flight(&self, workspace_id: &WorkspaceId) -> bool {
+        self.agent_activity
+            .lock()
+            .unwrap()
+            .get(workspace_id)
+            .is_some_and(|count| *count > 0)
+    }
+
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
     /// in-flight agent count (§9.9): `AgentRunning` iff any session is in flight
     /// OR if a pending idle debounce is scheduled (grace window). During the grace
