@@ -25,7 +25,8 @@ pub(super) const TAGS_ANNOTATION: &str = "intent.dev/tags";
 const BACKEND_ID_TAG: &str = "intentBackendId";
 /// Prefix of a [`ListedInstance::id`] that names a volume without a service.
 const VOLUME_PREFIX: &str = "volume:";
-/// Polls with only exited containers before the wait gives up.
+/// Polls in a row with only exited containers, over at least
+/// `crash_window`, before the wait gives up.
 const CRASH_POLLS: u32 = 3;
 
 #[derive(Deserialize)]
@@ -276,8 +277,9 @@ impl NorthflankClient {
 
     /// Wait until the deployment is `COMPLETED` with a running container.
     async fn wait_ready(&self, id: &str) -> Result<ServiceView, CloudError> {
-        let deadline = Instant::now() + self.config.ready_timeout;
-        let mut crashed = 0;
+        let started = Instant::now();
+        let deadline = started + self.config.ready_timeout;
+        let mut crashed: Option<(u32, Instant)> = None;
         loop {
             let view = ServiceView::from(&self.service(id).await?);
             match view.deployment_status.as_str() {
@@ -305,8 +307,13 @@ impl NorthflankClient {
                                 "TASK_FAILED" | "TASK_KILLED" | "TASK_FINISHED"
                             )
                         });
-                    crashed = if exited { crashed + 1 } else { 0 };
-                    if crashed >= CRASH_POLLS {
+                    crashed = exited.then(|| match crashed {
+                        Some((polls, since)) => (polls + 1, since),
+                        None => (1, Instant::now()),
+                    });
+                    if crashed.is_some_and(|(polls, since)| {
+                        polls >= CRASH_POLLS && since.elapsed() >= self.config.crash_window
+                    }) {
                         return Err(CloudError::new(
                             CloudErrorKind::Other,
                             "the Northflank container keeps exiting before it runs",
@@ -315,7 +322,8 @@ impl NorthflankClient {
                 }
                 _ => {}
             }
-            if Instant::now() + self.config.poll_interval > deadline {
+            let interval = self.poll_interval(started.elapsed());
+            if Instant::now() + interval > deadline {
                 return Err(CloudError::new(
                     CloudErrorKind::Other,
                     format!(
@@ -324,7 +332,16 @@ impl NorthflankClient {
                     ),
                 ));
             }
-            tokio::time::sleep(self.config.poll_interval).await;
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// The time to the next status read, `waited` into a wait.
+    pub(super) fn poll_interval(&self, waited: std::time::Duration) -> std::time::Duration {
+        if waited < self.config.fast_poll_window {
+            self.config.poll_interval
+        } else {
+            self.config.slow_poll_interval
         }
     }
 

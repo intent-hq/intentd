@@ -23,6 +23,9 @@ fn config(server: &FakeServer) -> NorthflankConfig {
         connect_timeout: Duration::from_secs(5),
         ready_timeout: Duration::from_secs(5),
         poll_interval: Duration::from_millis(10),
+        fast_poll_window: Duration::from_secs(60),
+        slow_poll_interval: Duration::from_millis(10),
+        crash_window: Duration::ZERO,
         max_rate_limit_retries: 2,
         max_retry_wait: Duration::from_secs(1),
         exec_drain_timeout: Duration::from_millis(300),
@@ -131,6 +134,9 @@ fn new_refuses_an_empty_token_and_redacts_it() {
     assert_eq!(defaults.exec_url, "wss://api.northflank.com/v1");
     assert_eq!(defaults.ready_timeout, Duration::from_secs(600));
     assert_eq!(defaults.poll_interval, Duration::from_secs(1));
+    assert_eq!(defaults.fast_poll_window, Duration::from_secs(60));
+    assert_eq!(defaults.slow_poll_interval, Duration::from_secs(5));
+    assert_eq!(defaults.crash_window, Duration::from_secs(6));
 }
 
 #[tokio::test]
@@ -459,6 +465,51 @@ async fn a_failed_deployment_is_an_error_and_removes_the_machine() {
         "DELETE /projects/p1/services/svc-1?delete_child_objects=true"
     );
     assert_eq!(lines[5], "DELETE /projects/p1/volumes/vol-1");
+}
+
+/// Northflank allows a token 1000 requests an hour, shared by every
+/// machine of the entry: a long wait polls every second only at first.
+#[test]
+fn the_readiness_poll_slows_down_after_the_fast_window() {
+    let client =
+        NorthflankClient::new(SecretString::new(TOKEN), NorthflankConfig::default()).unwrap();
+    assert_eq!(client.poll_interval(Duration::ZERO), Duration::from_secs(1));
+    assert_eq!(
+        client.poll_interval(Duration::from_secs(59)),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        client.poll_interval(Duration::from_secs(60)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        client.poll_interval(Duration::from_secs(500)),
+        Duration::from_secs(5)
+    );
+}
+
+#[tokio::test]
+async fn exited_containers_are_a_crash_only_once_the_crash_window_has_passed() {
+    let server = FakeServer::start(vec![Reply::data(&service(
+        "svc-1",
+        "COMPLETED",
+        1,
+        &tags(),
+    ))])
+    .await;
+    for _ in 0..200 {
+        server.push(Reply::data(&service("svc-1", "COMPLETED", 1, &tags())));
+        server.push(containers(&["TASK_FAILED"]));
+    }
+    let mut config = config(&server);
+    config.ready_timeout = Duration::from_millis(300);
+    config.crash_window = Duration::from_secs(3600);
+    let client = NorthflankClient::new(SecretString::new(TOKEN), config).unwrap();
+    let err = client.connect("svc-1", 600).await.unwrap_err();
+    assert!(
+        err.to_string().contains("not ready"),
+        "a container that exited within the crash window may still start: {err}"
+    );
 }
 
 #[tokio::test]
