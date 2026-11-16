@@ -582,10 +582,12 @@ async fn wait_moved(
         if home.state != HomeState::Moving {
             return Ok(home);
         }
-        let shown = match svc.store().get_home_move(workspace_id).await? {
-            Some(home_move) => home_move.shown(&home),
-            None => continue,
+        // The move ended between the two reads: this call fails as
+        // moving, and a retry finds the home the move left.
+        let Some(home_move) = svc.store().get_home_move(workspace_id).await? else {
+            return Ok(home);
         };
+        let shown = home_move.shown(&home);
         if shown.state != HomeState::Starting {
             return Ok(home);
         }
