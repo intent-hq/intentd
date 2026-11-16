@@ -531,8 +531,10 @@ stay on their machine and continue in their own copy, with a notice. A banner al
 when a home's backups keep failing. A cloud home shows **Starting home…** while its
 sandbox starts or resumes, and files and terminals wait for it. A cloud home whose sandbox
 was deleted while paused is rebuilt from its last backup at its next use, with a notice in
-the workspace.
-<!-- Sources: packages/cloudlands-fe/src/features/workspace-home/{workspace-home.ts,workspace-home-saga.ts,components/MoveHomeDialog.svelte,components/WorkspaceHomeBanner.svelte}; packages/intentd/crates/intent-svc-remote/src/{home_move.rs,cloud/home.rs}. -->
+the workspace. While the home is unavailable, moving or starting, **Start** and **Restart**
+for scripts are off (hover one for the reason) and **Stop** still works; a file that could
+not open because of the home shows that reason and opens again once the home is back.
+<!-- Sources: packages/cloudlands-fe/src/features/workspace-home/{workspace-home.ts,workspace-home-copy.ts,workspace-home-saga.ts,components/MoveHomeDialog.svelte,components/WorkspaceHomeBanner.svelte}; packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/intentd/crates/intent-svc-remote/src/{home_move.rs,cloud/home.rs}. -->
 Agents see each machine's name and
 platform, and look up its providers, sign-in status and models when they need them.
 A Default with **Use on remote machines** turned on in **Settings → Providers** is
