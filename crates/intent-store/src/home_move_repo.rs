@@ -3,6 +3,8 @@
 //! progress of each workspace, kept so it goes on after a restart.
 
 use intent_core::node_link::{HomeStopReason, HomeStopRecord};
+use std::collections::HashMap;
+
 use intent_core::{Error, HomeId, HomeState, Result, WorkspaceHome, WorkspaceId};
 use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
 
@@ -52,6 +54,31 @@ pub struct HomeMove {
     pub started_at: String,
 }
 
+impl HomeMove {
+    /// The home clients see while this move runs from `home`, the
+    /// workspace's home: once the old home's last backup landed, a move to
+    /// a cloud home shows its new home `starting` until the switch
+    /// (nodes.md "Cloud homes" 6); else `home` as is. The store keeps the
+    /// old home `moving`, so every call stays refused as for any move.
+    #[must_use]
+    pub fn shown(&self, home: &WorkspaceHome) -> WorkspaceHome {
+        if home.state != HomeState::Moving
+            || home.home_id != self.from_home_id
+            || !self.pushed
+            || self.target.cloud_machine_id.is_none()
+        {
+            return home.clone();
+        }
+        WorkspaceHome {
+            state: HomeState::Starting,
+            since: home.since.clone(),
+            last_backup_at: home.last_backup_at.clone(),
+            backup_warning: home.backup_warning,
+            ..self.target.clone()
+        }
+    }
+}
+
 fn map_row(row: &SqliteRow) -> Result<HomeMove> {
     let get = |name: &str| row.try_get::<Option<String>, _>(name).map_err(db);
     let from_state = match row.try_get::<String, _>("from_state").map_err(db)?.as_str() {
@@ -92,6 +119,37 @@ async fn move_of(
         .await
         .map_err(db)?;
     row.as_ref().map(map_row).transpose()
+}
+
+/// Inside a transaction: `owner` becomes cloud machine `node_id`'s
+/// `cloud.startedBy`. Nothing for a row that is not a cloud machine.
+async fn co_own(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    owner: &intent_core::machines::CloudStartedBy,
+) -> Result<()> {
+    let cloud: Option<Option<String>> =
+        sqlx::query_scalar("SELECT cloud_json FROM exposed_machine WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(db)?;
+    let Some(Some(cloud)) = cloud else {
+        return Ok(());
+    };
+    let mut cloud: intent_core::machines::CloudMachine =
+        serde_json::from_str(&cloud).map_err(db)?;
+    if &cloud.started_by == owner {
+        return Ok(());
+    }
+    cloud.started_by = owner.clone();
+    sqlx::query("UPDATE exposed_machine SET cloud_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(&cloud).map_err(db)?)
+        .bind(node_id)
+        .execute(conn)
+        .await
+        .map_err(db)?;
+    Ok(())
 }
 
 impl Store {
@@ -183,6 +241,103 @@ impl Store {
             .await
             .map_err(db)?;
         rows.iter().map(map_row).collect()
+    }
+
+    /// The workspace's home as clients see it ([`HomeMove::shown`]).
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn get_shown_workspace_home(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<WorkspaceHome>> {
+        let Some(home) = self.get_workspace_home(workspace_id).await? else {
+            return Ok(None);
+        };
+        if home.state != HomeState::Moving {
+            return Ok(Some(home));
+        }
+        Ok(Some(match self.get_home_move(workspace_id).await? {
+            Some(home_move) => home_move.shown(&home),
+            None => home,
+        }))
+    }
+
+    /// Every workspace's home as clients see it ([`HomeMove::shown`]).
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn list_shown_workspace_homes(&self) -> Result<HashMap<WorkspaceId, WorkspaceHome>> {
+        let mut homes = self.list_workspace_homes().await?;
+        if homes.values().any(|home| home.state == HomeState::Moving) {
+            for home_move in self.list_home_moves().await? {
+                if let Some(home) = homes.get_mut(&home_move.workspace_id) {
+                    *home = home_move.shown(home);
+                }
+            }
+        }
+        Ok(homes)
+    }
+
+    /// Record exposed machine `node_id` (a sandbox started for it) as the
+    /// new home of the move to `home_id`; `false` when that move is gone
+    /// or already has a machine.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn set_home_move_machine(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        node_id: &str,
+    ) -> Result<bool> {
+        let done = sqlx::query(
+            "UPDATE home_move SET node_id = ? \
+             WHERE workspace_id = ? AND home_id = ? AND node_id IS NULL",
+        )
+        .bind(node_id)
+        .bind(&workspace_id.0)
+        .bind(&home_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(db)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The cloud machines of entry `cloud_machine_id` in `workspace_id`
+    /// started for `owner` (a home-only start's key) that hold no home, owe
+    /// no stop and are no move's target: sandboxes whose start a restart
+    /// cut before anything recorded them. Oldest first.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn unclaimed_home_sandboxes(
+        &self,
+        workspace_id: &WorkspaceId,
+        cloud_machine_id: &str,
+        owner: &str,
+    ) -> Result<Vec<intent_core::machines::ExposedMachine>> {
+        let mut left = Vec::new();
+        for row in self.list_cloud_machines().await? {
+            let Some(cloud) = &row.cloud else { continue };
+            if cloud.agent_id != owner
+                || cloud.workspace_id != workspace_id.as_str()
+                || cloud.cloud_machine_id != cloud_machine_id
+            {
+                continue;
+            }
+            if self.homes_on_machine(&row.id).await?.is_empty()
+                && self.list_home_stops(&row.id).await?.is_empty()
+                && self.home_moves_to_machine(&row.id).await?.is_empty()
+            {
+                left.push(row);
+            }
+        }
+        Ok(left)
     }
 
     /// Record that the move to `home_id` has the old home's last backup;
@@ -316,8 +471,11 @@ impl Store {
     /// 3): in one transaction the workspace's home becomes the move's new
     /// home, `attached` since `now` (its `lastBackupAt` kept: the new home
     /// starts from that backup), a `moved` stop of the old machine home is
-    /// recorded and the move goes. A setup the new home finished before
-    /// claims its `autoStart` here. `None` when that move is gone (rolled
+    /// recorded and the move goes; an error when the new home's cloud
+    /// sandbox is gone, so the move rolls back. A setup the new home finished before
+    /// claims its `autoStart` here. A new home on a cloud sandbox gets
+    /// `owner` as the sandbox's `cloud.startedBy` in the same transaction
+    /// (nodes.md "Cloud homes" 2). `None` when that move is gone (rolled
     /// back, or the workspace archived or deleted): nothing is written.
     ///
     /// # Errors
@@ -327,6 +485,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         home_id: &HomeId,
+        owner: &intent_core::machines::CloudStartedBy,
         now: &str,
     ) -> Result<Option<HomeMoveSwitch>> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
@@ -336,6 +495,22 @@ impl Store {
         else {
             return Ok(None);
         };
+        if let (Some(node_id), Some(_)) = (
+            &home_move.target.node_id,
+            &home_move.target.cloud_machine_id,
+        ) {
+            let present: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM exposed_machine WHERE id = ?")
+                    .bind(node_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db)?;
+            if present.is_none() {
+                // Its sandbox went (lost, killed, deleted) after it opened:
+                // the move fails and rolls back instead.
+                return Err(Error::Internal("the new home's machine is gone".into()));
+            }
+        }
         let stop = match crate::home_stop_repo::machine_home(&mut tx, workspace_id).await? {
             Some((old, node_id)) if old != home_id.0 => Some(HomeStopRecord::new(
                 workspace_id.clone(),
@@ -377,6 +552,9 @@ impl Store {
         if switched.rows_affected() == 0 {
             return Ok(None);
         }
+        if let (Some(_), Some(node_id)) = (&target.cloud_machine_id, &target.node_id) {
+            co_own(&mut tx, node_id, owner).await?;
+        }
         sqlx::query("DELETE FROM home_move WHERE workspace_id = ?")
             .bind(&workspace_id.0)
             .execute(&mut *tx)
@@ -389,3 +567,6 @@ impl Store {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests;

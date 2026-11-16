@@ -523,13 +523,16 @@ home has been offline for a minute, a banner in the workspace and a **Home unava
 marker on its Home card say so: chats, notes and script logs keep working, and file, diff
 and terminal panels show the reason instead. **Wait** tries to reconnect it. **Move home…**
 (owner and managers; also in the workspace header's menu) moves the home to an agent's
-machine or to a machine from the list, starting from the last backup; cloud entries cannot
-be homes yet. When the old home is unavailable the dialog first warns that its changes
+machine or sandbox, to a machine from the list, or to a cloud entry (a new sandbox),
+starting from the last backup. When the old home is unavailable the dialog first warns that its changes
 after that backup are not on the new home. While the home moves, files, terminals and
 scripts pause; if the move fails, the old home stays. Agents that worked in the old home
 stay on their machine and continue in their own copy, with a notice. A banner also warns
-when a home's backups keep failing.
-<!-- Sources: packages/cloudlands-fe/src/features/workspace-home/{workspace-home.ts,workspace-home-saga.ts,components/MoveHomeDialog.svelte,components/WorkspaceHomeBanner.svelte}; packages/intentd/crates/intent-svc-remote/src/home_move.rs. -->
+when a home's backups keep failing. A cloud home shows **Starting home…** while its
+sandbox starts or resumes, and files and terminals wait for it. A cloud home whose sandbox
+was deleted while paused is rebuilt from its last backup at its next use, with a notice in
+the workspace.
+<!-- Sources: packages/cloudlands-fe/src/features/workspace-home/{workspace-home.ts,workspace-home-saga.ts,components/MoveHomeDialog.svelte,components/WorkspaceHomeBanner.svelte}; packages/intentd/crates/intent-svc-remote/src/{home_move.rs,cloud/home.rs}. -->
 Agents see each machine's name and
 platform, and look up its providers, sign-in status and models when they need them.
 A Default with **Use on remote machines** turned on in **Settings → Providers** is

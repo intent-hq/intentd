@@ -5,7 +5,10 @@
 //! up where it was:
 //!
 //! 1. the old home's last backup, when it is attached;
-//! 2. `homeOpen` of the new home from `home/head` and `home/wip`;
+//! 2. `homeOpen` of the new home from `home/head` and `home/wip`; a move
+//!    to a cloud entry first starts a home-only sandbox and records it on
+//!    the move. Clients see a move to a cloud home `starting` meanwhile
+//!    (`HomeMove::shown`);
 //! 3. the switch: the new home and the old one's `moved` stop in one store
 //!    transaction, then the stop goes out.
 //!
@@ -51,7 +54,7 @@ fn home_moving() -> Error {
     )
 }
 
-fn target_unavailable(detail: &str) -> Error {
+pub(crate) fn target_unavailable(detail: &str) -> Error {
     coded(
         "home-target-unavailable",
         format!("That can't be the workspace's home now: {detail}."),
@@ -87,7 +90,8 @@ fn parse_target(params: &Value) -> Result<Target> {
     }
 }
 
-/// The new home `target` names, with a fresh `homeId`.
+/// The new home `target` names, with a fresh `homeId`: a machine, a
+/// cloud entry (a sandbox starts for it) or an agent's machine or sandbox.
 async fn resolve(
     svc: &Services,
     workspace_id: &WorkspaceId,
@@ -95,6 +99,9 @@ async fn resolve(
 ) -> Result<WorkspaceHome> {
     let node_id = match target {
         Target::Machine(node_id) => node_id,
+        Target::Cloud(cloud_machine_id) => {
+            return crate::cloud::home::entry_target(svc, &cloud_machine_id).await;
+        }
         Target::Agent(agent_id) => {
             let record = svc
                 .store()
@@ -104,11 +111,15 @@ async fn resolve(
                 .ok_or_else(|| {
                     target_unavailable("that agent is not on a machine of this workspace")
                 })?;
+            let on_sandbox = svc
+                .store()
+                .get_exposed_machine(&record.node_id)
+                .await?
+                .is_some_and(|row| row.is_cloud());
+            if on_sandbox {
+                return crate::cloud::home::sandbox_target(svc, &record.node_id).await;
+            }
             record.node_id
-        }
-        // Cloud homes do not open yet: a sandbox cannot hold one.
-        Target::Cloud(_) => {
-            return Err(target_unavailable("cloud machines can't hold a home yet"));
         }
     };
     match crate::homes::machine_candidate(svc, &node_id).await {
@@ -231,7 +242,16 @@ pub(crate) async fn run(svc: &Services, workspace_id: &WorkspaceId) {
     };
     if let Err(error) = steps(svc, &home_move).await {
         tracing::warn!(workspace = %workspace_id, %error, "the home move failed; the old home stays");
-        rollback(svc, &home_move).await;
+        // The steps may have recorded the new home's sandbox meanwhile.
+        let current = svc
+            .store()
+            .get_home_move(workspace_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|current| current.target.home_id == home_move.target.home_id)
+            .unwrap_or(home_move);
+        rollback(svc, &current).await;
     }
 }
 
@@ -249,17 +269,25 @@ async fn steps(svc: &Services, home_move: &HomeMove) -> Result<()> {
         {
             return Ok(());
         }
+        if target.cloud_machine_id.is_some() {
+            // Clients see the new cloud home starting from now on.
+            svc.publish_workspace_home_changed(workspace_id).await;
+        }
     }
-    let node_id = target
-        .node_id
-        .as_deref()
-        .ok_or_else(|| Error::Internal("the new home is not on a machine".into()))?;
+    let node_id = match (&target.node_id, &target.cloud_machine_id) {
+        (Some(node_id), _) => node_id.clone(),
+        (None, Some(cloud_machine_id)) => {
+            crate::cloud::start_move_home(svc, workspace_id, &target.home_id, cloud_machine_id)
+                .await?
+        }
+        (None, None) => return Err(Error::Internal("the new home is not on a machine".into())),
+    };
     let restore = crate::homes::home_restore(svc, workspace_id)
         .await
         .ok()
         .flatten();
     let reply =
-        crate::homes::send_open(svc, workspace_id, &target.home_id, node_id, restore).await?;
+        crate::homes::send_open(svc, workspace_id, &target.home_id, &node_id, restore).await?;
     let HomeReply::Open(reply) = reply else {
         return Err(Error::Internal(
             "the machine answered a homeOpen with another reply".into(),
@@ -277,6 +305,7 @@ async fn steps(svc: &Services, home_move: &HomeMove) -> Result<()> {
         }
         Some(switch) => {
             tracing::info!(workspace = %workspace_id, home = %target.home_id, "the workspace's home moved");
+            crate::cloud::home::changed(svc);
             svc.publish_workspace_home_changed(workspace_id).await;
             if switch.auto_start {
                 // The new home finished its setup before the switch.

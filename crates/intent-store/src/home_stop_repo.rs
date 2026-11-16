@@ -51,22 +51,35 @@ pub(crate) async fn insert(conn: &mut SqliteConnection, record: &HomeStopRecord)
 
 /// Inside a transaction that ends a move without its switch (a rollback,
 /// or the workspace archived or deleted): a `retired` stop of the move's
-/// target when it is on an exposed machine, which may have opened it. Its
+/// target when it is on an exposed machine (a cloud sandbox only while it
+/// still exists), which may have opened it. Its
 /// last push is discarded (see `discard_push`).
 pub(crate) async fn stop_move_target(
     conn: &mut SqliteConnection,
     workspace_id: &WorkspaceId,
     now: &str,
 ) -> Result<()> {
-    let target: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT home_id, node_id FROM home_move WHERE workspace_id = ?")
-            .bind(&workspace_id.0)
+    let target: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT home_id, node_id, cloud_machine_id FROM home_move WHERE workspace_id = ?",
+    )
+    .bind(&workspace_id.0)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db)?;
+    let Some((home_id, Some(node_id), cloud_machine_id)) = target else {
+        return Ok(());
+    };
+    if cloud_machine_id.is_some() {
+        // A cloud sandbox that is gone (removed, lost) is owed nothing.
+        let present: Option<i64> = sqlx::query_scalar("SELECT 1 FROM exposed_machine WHERE id = ?")
+            .bind(&node_id)
             .fetch_optional(&mut *conn)
             .await
             .map_err(db)?;
-    let Some((home_id, Some(node_id))) = target else {
-        return Ok(());
-    };
+        if present.is_none() {
+            return Ok(());
+        }
+    }
     let record = HomeStopRecord::new(
         workspace_id.clone(),
         HomeId(home_id),

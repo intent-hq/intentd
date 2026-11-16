@@ -525,7 +525,7 @@ impl Services {
     /// Announce the workspace's home (nodes.md "Workspace homes") as the
     /// existing `workspace:updated` with `changes: { home }`.
     pub async fn publish_workspace_home_changed(&self, workspace_id: &WorkspaceId) {
-        let home = match self.store.get_workspace_home(workspace_id).await {
+        let home = match self.store.get_shown_workspace_home(workspace_id).await {
             Ok(home) => home,
             Err(error) => {
                 tracing::warn!(workspace = %workspace_id, %error, "could not read the workspace's home to announce it");

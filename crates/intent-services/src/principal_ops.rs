@@ -1564,7 +1564,7 @@ impl Services {
             Err(e) => tracing::debug!(error = %e, "workspace.get: membership summary failed"),
         }
         if self.workspace_homes() {
-            match self.store.get_workspace_home(&ws.id).await {
+            match self.store.get_shown_workspace_home(&ws.id).await {
                 Ok(home) => ws.home = home.map(Box::new),
                 Err(e) => tracing::debug!(error = %e, "workspace.get: home failed"),
             }
@@ -1593,7 +1593,7 @@ impl Services {
             Err(e) => tracing::debug!(error = %e, "workspace.list: membership summary failed"),
         }
         if self.workspace_homes() {
-            match self.store.list_workspace_homes().await {
+            match self.store.list_shown_workspace_homes().await {
                 Ok(mut homes) => {
                     for ws in list.iter_mut() {
                         ws.home = homes.remove(&ws.id).map(Box::new);

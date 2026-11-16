@@ -918,20 +918,132 @@ pub(crate) async fn start_home(
     cloud_machine_id: &str,
 ) -> Result<()> {
     let mut made = None;
-    let started = start_home_sandbox(svc, workspace_id, home_id, cloud_machine_id, &mut made).await;
+    let started = start_home_sandbox(
+        svc,
+        workspace_id,
+        HomeSandbox::Claim(home_id),
+        cloud_machine_id,
+        &mut made,
+    )
+    .await;
     if started.is_err() {
         super::home::start_failed(svc, workspace_id, home_id, made.as_deref()).await;
     }
+    started.map(drop)
+}
+
+/// The new home-only sandbox of a home move to cloud entry
+/// `cloud_machine_id` (nodes.md "Moving the home" step 2): as
+/// [`start_home`], but the sandbox is recorded as the machine of the move
+/// to `home_id`, which opens it, instead of becoming the workspace's home.
+/// Its machine id. The sandbox is deleted when a step fails, also when the
+/// move ended meanwhile. A sandbox an interrupted start left (a restart
+/// between its machine row and its record on the move) is taken instead
+/// of starting another one.
+///
+/// # Errors
+///
+/// The start's error.
+pub(crate) async fn start_move_home(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home_id: &intent_core::HomeId,
+    cloud_machine_id: &str,
+) -> Result<String> {
+    if let Some(machine_id) = left_move_sandbox(svc, workspace_id, cloud_machine_id).await? {
+        if !svc
+            .store()
+            .set_home_move_machine(workspace_id, home_id, &machine_id)
+            .await?
+        {
+            return Err(Error::Internal(
+                "the home move ended before it took its sandbox".into(),
+            ));
+        }
+        tracing::info!(workspace = %workspace_id, machine = %machine_id, "cloud home: the move takes the sandbox an interrupted start left");
+        return Ok(machine_id);
+    }
+    // In flight like any home start, so the reaper leaves the new sandbox
+    // alone while it has no machine row.
+    let feature = super::feature(svc)?;
+    let key = super::home::start_key(workspace_id);
+    let (sender, receiver) = watch::channel::<super::StartOutcome>(None);
+    let registered = {
+        let mut starts = crate::lock(&feature.cloud.starts);
+        let free = !starts.contains_key(&key);
+        if free {
+            starts.insert(
+                key.clone(),
+                super::Start {
+                    entry: cloud_machine_id.to_owned(),
+                    workspace: workspace_id.to_string(),
+                    outcome: receiver,
+                },
+            );
+        }
+        free
+    };
+    let started = start_home_sandbox(
+        svc,
+        workspace_id,
+        HomeSandbox::Move(home_id),
+        cloud_machine_id,
+        &mut None,
+    )
+    .await;
+    if registered {
+        crate::lock(&feature.cloud.starts).remove(&key);
+        let _ = sender.send(Some(
+            started.as_ref().map(drop).map_err(super::StartFailure::of),
+        ));
+    }
     started
+}
+
+/// A home-only sandbox of entry `cloud_machine_id` in `workspace_id` that
+/// holds no home, owes no stop, is no move's target and is not being
+/// started or removed: one whose start a restart cut before the move
+/// recorded it.
+async fn left_move_sandbox(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    cloud_machine_id: &str,
+) -> Result<Option<String>> {
+    let feature = super::feature(svc)?;
+    if super::home::home_start_in_flight(svc, workspace_id) {
+        return Ok(None);
+    }
+    let owner = super::home::start_key(workspace_id);
+    Ok(svc
+        .store()
+        .unclaimed_home_sandboxes(workspace_id, cloud_machine_id, &owner)
+        .await?
+        .into_iter()
+        .find(|row| {
+            row.cloud
+                .as_ref()
+                .is_some_and(|cloud| cloud.state != CloudSandboxState::Stopping)
+                && feature.cloud.loss(&row.id).is_none()
+        })
+        .map(|row| row.id))
+}
+
+/// What a home-only sandbox is started for.
+#[derive(Clone, Copy)]
+enum HomeSandbox<'a> {
+    /// To become the workspace's cloud home `homeId` and open it.
+    Claim(&'a intent_core::HomeId),
+    /// To be the new home `homeId` of the workspace's move.
+    Move(&'a intent_core::HomeId),
 }
 
 async fn start_home_sandbox(
     svc: &Services,
     workspace_id: &WorkspaceId,
-    home_id: &intent_core::HomeId,
+    purpose: HomeSandbox<'_>,
     cloud_machine_id: &str,
     made: &mut Option<String>,
-) -> Result<()> {
+) -> Result<String> {
     let feature = super::feature(svc)?;
     let owner = super::home::start_key(workspace_id);
     let started_by = super::owner_started_by(svc, workspace_id).await;
@@ -959,12 +1071,30 @@ async fn start_home_sandbox(
         if config::load(svc, cloud_machine_id).await?.is_none() {
             return Err(config::not_configured());
         }
-        if !super::home::claim(svc, workspace_id, home_id, cloud_machine_id, &machine_id).await? {
-            return Err(Error::Internal(
-                "another sandbox became the workspace's home first".into(),
-            ));
+        match purpose {
+            HomeSandbox::Claim(home_id) => {
+                if !super::home::claim(svc, workspace_id, home_id, cloud_machine_id, &machine_id)
+                    .await?
+                {
+                    return Err(Error::Internal(
+                        "another sandbox became the workspace's home first".into(),
+                    ));
+                }
+                super::home::open(svc, workspace_id, home_id, &machine_id).await?;
+            }
+            HomeSandbox::Move(home_id) => {
+                if !svc
+                    .store()
+                    .set_home_move_machine(workspace_id, home_id, &machine_id)
+                    .await?
+                {
+                    return Err(Error::Internal(
+                        "the home move ended while its sandbox started".into(),
+                    ));
+                }
+            }
         }
-        super::home::open(svc, workspace_id, home_id, &machine_id).await
+        Ok(machine_id)
     }
     .await;
     if linked.is_err() {

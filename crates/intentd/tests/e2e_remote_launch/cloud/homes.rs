@@ -15,6 +15,9 @@
 //!    fail `home-unavailable` without `starting`.
 //! 5. A home whose sandbox was deleted while paused is rebuilt at its next
 //!    use, under a new `homeId`, from its backup.
+//! 6. A home moves from a machine to the entry (a new home-only sandbox),
+//!    then to an agent's sandbox; a move whose sandbox fails to start
+//!    rolls back.
 
 use base64::Engine as _;
 
@@ -500,6 +503,8 @@ struct CloudHomes {
     branch: String,
     keyed_ref: String,
     guest_id: String,
+    /// The E2B entry's `cloudMachineId`.
+    entry: String,
     id: i64,
     fake: Arc<FakeE2b>,
 }
@@ -564,7 +569,7 @@ impl CloudHomes {
         )
         .await;
         let keyed_ref = format!("codex@{}", keyed["profile"]["id"].as_str().unwrap());
-        ok(
+        let configured = ok(
             &mut rpc_ws,
             3,
             "cloudMachines.configure",
@@ -574,6 +579,7 @@ impl CloudHomes {
             })),
         )
         .await;
+        let entry = configured["provider"]["id"].as_str().unwrap().to_owned();
         Some(Self {
             rpc_ws,
             _head: head,
@@ -583,6 +589,7 @@ impl CloudHomes {
             branch,
             keyed_ref,
             guest_id,
+            entry,
             id: 10,
             fake,
         })
@@ -1346,4 +1353,343 @@ async fn a_cloud_home_deleted_while_paused_is_rebuilt_from_its_backup() {
         made + 1,
         "the agent starts on a sandbox of its own"
     );
+}
+
+/// The sandbox E2B made for `owner`, once it has.
+async fn sandbox_until(homes: &CloudHomes, owner: &str) -> String {
+    super::super::homes::until(&format!("a sandbox for {owner}"), || {
+        homes
+            .fake
+            .state()
+            .metadata
+            .iter()
+            .find(|(_, metadata)| metadata["agentId"] == owner)
+            .map(|(id, _)| id.clone())
+    })
+    .await
+}
+
+/// Whether `states` holds `wanted` in that order (not necessarily next to
+/// each other).
+fn in_order(states: &[String], wanted: &[&str]) -> bool {
+    let mut next = wanted.iter().peekable();
+    for state in states {
+        if next.peek().is_some_and(|want| *want == state) {
+            next.next();
+        }
+    }
+    next.peek().is_none()
+}
+
+/// Moving a home to a cloud entry and to an agent's sandbox (nodes.md
+/// "Moving the home", "Cloud homes"), on an orchestrator with machine A
+/// first on its list and an E2B entry:
+///
+/// 1. A home on machine A, with a commit and uncommitted work, moves to the
+///    entry: the move is announced `moving`, then `starting` while a
+///    home-only sandbox starts, then `attached` on that sandbox, whose home
+///    checkout has the commit and the uncommitted file. A gets the `moved`
+///    stop: its last push lands on orphaned refs and its checkout goes.
+///    The sandbox's `startedBy` is the workspace owner.
+/// 2. The home moves to the sandbox of an agent placed on the entry; the
+///    home-only sandbox, which holds nothing any more, is deleted.
+/// 3. A move to the entry whose sandbox fails to start rolls back: the home
+///    is the agent's sandbox again, with its old state and `since`, and
+///    still answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_home_moves_to_a_cloud_entry_and_to_an_agents_sandbox() {
+    let Some(mut homes) = CloudHomes::start("itd-e2b-move-", &[], 1440).await else {
+        return;
+    };
+    let (repo, branch) = (homes.repo.clone(), homes.branch.clone());
+    let mut events = connect(homes.port, homes.cfg.clone()).await;
+    ok(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:updated"] }),
+    )
+    .await;
+    let mut seen = Vec::new();
+    let entry = homes.entry.clone();
+
+    // Machine A, first on the list: new workspaces get their home there.
+    let backend = homes.ok("remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let a_dir = homes.fake.scratch().join("node-a");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    let a = start_machine_with(&a_dir, &backend_id, &[HOMES]).await;
+    homes
+        .ok("remoteMachines.add", add_params(&a, "Machine A"))
+        .await;
+    let order = homes.ok("remoteMachines.order", json!({})).await;
+    let mut rows: Vec<Value> = order["order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| match row["kind"].as_str() {
+            Some("machine") => json!({ "kind": "machine", "nodeId": row["nodeId"] }),
+            Some("cloud") => json!({ "kind": "cloud", "cloudMachineId": row["cloudMachineId"] }),
+            _ => json!({ "kind": "local" }),
+        })
+        .collect();
+    rows.sort_by_key(|row| row["nodeId"] != a.daemon_id.as_str());
+    homes
+        .ok("remoteMachines.setOrder", json!({ "order": rows }))
+        .await;
+    let deadline = tokio::time::Instant::now() + wait();
+    let created = loop {
+        let id = homes.next();
+        let response = rpc(
+            &mut homes.rpc_ws,
+            id,
+            "workspace.create",
+            json!({ "repositoryPath": repo.to_string_lossy(), "baseRef": branch }),
+        )
+        .await;
+        let workspace = &response["result"]["workspace"];
+        if workspace["home"]["nodeId"] == a.daemon_id.as_str() {
+            break workspace.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "machine A never became a home: {response}"
+        );
+        // timing-guard: retry while the new machine finishes its first bind
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let ws_id = created["id"].as_str().unwrap().to_owned();
+    let owner = created["ownerPrincipalId"].as_str().unwrap().to_owned();
+    let a_home = created["home"]["homeId"].as_str().unwrap().to_owned();
+    let mirror = PathBuf::from(created["worktreePath"].as_str().unwrap());
+    let base = git(&mirror, &["rev-parse", "HEAD"]);
+    let work = super::super::homes::until("the home checkout on A", || {
+        super::super::homes::home_checkout(&a_dir, &a_home)
+            .filter(|work| try_rev(work, "HEAD").as_deref() == Some(base.as_str()))
+    })
+    .await;
+    let kept = super::super::homes::commit_on(&work, "kept.txt", "kept\n", "kept");
+    std::fs::write(work.join("dirty.txt"), "left uncommitted\n").unwrap();
+
+    // 1. To the entry: a new home-only sandbox.
+    let made = homes.fake.state().creates.len();
+    let started = homes
+        .ok(
+            "workspace.setHome",
+            json!({ "workspaceId": ws_id, "to": { "kind": "cloud", "cloudMachineId": entry } }),
+        )
+        .await;
+    assert_eq!(started["home"]["state"], "moving", "{started}");
+    assert_eq!(started["home"]["homeId"], a_home.as_str(), "{started}");
+    let mut id = homes.id;
+    let home = home_until(
+        &mut homes.rpc_ws,
+        &mut id,
+        &ws_id,
+        "the home is on the entry's sandbox",
+        |home| {
+            home["state"] == "attached"
+                && home["cloudMachineId"] == entry.as_str()
+                && home["nodeId"].is_string()
+        },
+    )
+    .await;
+    homes.id = id;
+    let cloud_home = home["homeId"].as_str().unwrap().to_owned();
+    assert_ne!(cloud_home, a_home);
+    let cloud_node = home["nodeId"].as_str().unwrap().to_owned();
+    assert_eq!(homes.fake.state().creates.len(), made + 1, "one sandbox");
+    let home_sandbox = homes.sandbox_of(&format!("home-{ws_id}"));
+    let id = homes.next();
+    let machine = machine_of(&mut homes.rpc_ws, id, &cloud_node).await;
+    assert_eq!(
+        machine["cloud"]["sandboxId"],
+        home_sandbox.as_str(),
+        "{machine}"
+    );
+    assert_eq!(
+        machine["cloud"]["startedBy"]["principalId"],
+        owner.as_str(),
+        "{machine}"
+    );
+    let sandbox_dir = homes.sandbox_dir(&home_sandbox);
+    let moved = super::super::homes::until("the home checkout on the sandbox", || {
+        super::super::homes::home_checkout(&sandbox_dir, &cloud_home)
+            .filter(|work| try_rev(work, "HEAD").as_deref() == Some(kept.as_str()))
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(moved.join("dirty.txt")).unwrap(),
+        "left uncommitted\n"
+    );
+    let read = homes
+        .ok(
+            "file.read",
+            json!({ "workspaceId": ws_id, "path": "dirty.txt" }),
+        )
+        .await;
+    assert_eq!(read, "left uncommitted\n", "{read}");
+    drain_events(&mut events, &mut seen).await;
+    let states = announced_states(&seen, &ws_id);
+    assert!(
+        in_order(&states, &["moving", "starting", "attached"]),
+        "home states announced: {states:?}"
+    );
+    // A got its moved stop: its last push lands on orphaned refs, then its
+    // checkout goes.
+    super::super::homes::until("the old home checkout on A is removed", || {
+        super::super::homes::home_checkout(&a_dir, &a_home)
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    let orphaned = git(
+        &mirror,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/intent/ws/{ws_id}/home/orphaned/"),
+        ],
+    );
+    let orphaned_head = orphaned
+        .lines()
+        .find(|name| name.ends_with("/head"))
+        .unwrap_or_else(|| panic!("no orphaned head: {orphaned:?}"));
+    assert_eq!(git(&mirror, &["rev-parse", orphaned_head]), kept);
+
+    // 2. To an agent's sandbox on the entry.
+    let agent = homes
+        .ok(
+            "agent.create",
+            json!({
+                "workspaceId": ws_id,
+                "name": "Cloud agent",
+                "model": "default",
+                "provider": homes.keyed_ref,
+                "placement": { "target": "e2b", "cloudMachineId": entry, "checkout": "isolated" },
+            }),
+        )
+        .await;
+    let agent_id = agent["agent"]["id"].as_str().unwrap().to_owned();
+    let agent_sandbox = sandbox_until(&homes, &agent_id).await;
+    let id = homes.next();
+    let agent_machine = machine_until(&mut homes.rpc_ws, id, &agent_sandbox, |machine| {
+        machine.is_some_and(|machine| machine["id"].is_string())
+    })
+    .await
+    .unwrap();
+    homes.id += 1000;
+    let agent_node = agent_machine["id"].as_str().unwrap().to_owned();
+    // The agent's placement links once its sandbox runs; the move needs it.
+    let deadline = tokio::time::Instant::now() + wait();
+    let started = loop {
+        let id = homes.next();
+        let response = rpc(
+            &mut homes.rpc_ws,
+            id,
+            "workspace.setHome",
+            json!({ "workspaceId": ws_id, "to": { "agentId": agent_id } }),
+        )
+        .await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert_eq!(
+            response["error"]["data"]["code"], "home-target-unavailable",
+            "{response}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the agent's sandbox never became a home target: {response}"
+        );
+        // timing-guard: retry while the agent's sandbox links
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(started["home"]["state"], "moving", "{started}");
+    let mut id = homes.id;
+    let home = home_until(
+        &mut homes.rpc_ws,
+        &mut id,
+        &ws_id,
+        "the home is on the agent's sandbox",
+        |home| home["state"] == "attached" && home["nodeId"] == agent_node.as_str(),
+    )
+    .await;
+    homes.id = id;
+    assert_eq!(home["cloudMachineId"], entry.as_str(), "{home}");
+    let agent_home = home["homeId"].as_str().unwrap().to_owned();
+    let agent_dir = homes.sandbox_dir(&agent_sandbox);
+    super::super::homes::until("the home checkout on the agent's sandbox", || {
+        super::super::homes::home_checkout(&agent_dir, &agent_home)
+            .filter(|work| work.join("dirty.txt").exists())
+    })
+    .await;
+    let read = homes
+        .ok(
+            "file.read",
+            json!({ "workspaceId": ws_id, "path": "kept.txt" }),
+        )
+        .await;
+    assert_eq!(read, "kept\n", "{read}");
+    // The home-only sandbox held only the old home: it goes.
+    super::super::homes::until("the home-only sandbox is deleted", || {
+        homes.deleted(&home_sandbox).then_some(())
+    })
+    .await;
+
+    // 3. A move to the entry whose sandbox fails to start rolls back.
+    let before = home.clone();
+    let template = homes.fake.state().sandboxes[&agent_sandbox]
+        .template
+        .clone();
+    homes.fake.state().failed_mint_templates.push(template);
+    let made = homes.fake.state().creates.len();
+    let started = homes
+        .ok(
+            "workspace.setHome",
+            json!({ "workspaceId": ws_id, "to": { "kind": "cloud", "cloudMachineId": entry } }),
+        )
+        .await;
+    assert_eq!(started["home"]["state"], "moving", "{started}");
+    let mut id = homes.id;
+    let home = home_until(
+        &mut homes.rpc_ws,
+        &mut id,
+        &ws_id,
+        "the failed move rolls back",
+        |home| home["state"] != "moving" && home["state"] != "starting",
+    )
+    .await;
+    homes.id = id;
+    assert_eq!(home["homeId"], before["homeId"], "{home}");
+    assert_eq!(home["nodeId"], before["nodeId"], "{home}");
+    assert_eq!(home["state"], "attached", "{home}");
+    assert_eq!(home["since"], before["since"], "{home}");
+    assert_eq!(
+        homes.fake.state().creates.len(),
+        made + 1,
+        "one start tried"
+    );
+    homes.fake.state().failed_mint_templates.clear();
+    let failed_sandbox = homes
+        .fake
+        .state()
+        .metadata
+        .iter()
+        .filter(|(_, metadata)| metadata["agentId"] == format!("home-{ws_id}"))
+        .map(|(id, _)| id.clone())
+        .find(|id| *id != home_sandbox)
+        .expect("the failed start's sandbox");
+    super::super::homes::until("the failed start's sandbox is deleted", || {
+        homes.deleted(&failed_sandbox).then_some(())
+    })
+    .await;
+    let read = homes
+        .ok(
+            "file.read",
+            json!({ "workspaceId": ws_id, "path": "kept.txt" }),
+        )
+        .await;
+    assert_eq!(read, "kept\n", "{read}");
+    drop(a);
 }
