@@ -954,3 +954,109 @@ mod entries {
         assert_eq!(config::free_legacy_name(&[], "e2b"), "E2B");
     }
 }
+
+/// A disk-only machine (Northflank) whose row reads `Running` but whose
+/// container restarted: the resume starts its intentd, and that counts as
+/// a resume, so the dial takes the quick-retry path. An intentd that was
+/// already up is a plain dial.
+#[tokio::test]
+async fn a_restarted_disk_only_intentd_dials_as_resumed() {
+    use crate::RemoteServicesExt as _;
+    use intent_nodes::cloud::{
+        CloudFuture, CloudInstance, Connected, CreateInstance, ListInstances, ListedInstance,
+        ProcessExit, ProcessOutput, ProcessSpec,
+    };
+
+    #[derive(Debug)]
+    struct DiskOnly {
+        started: bool,
+    }
+
+    impl intent_nodes::cloud::CloudProvider for DiskOnly {
+        fn kind(&self) -> &'static str {
+            "northflank"
+        }
+        fn keeps_memory(&self) -> bool {
+            false
+        }
+        fn create<'a>(&'a self, _: &'a CreateInstance) -> CloudFuture<'a, CloudInstance> {
+            unimplemented!()
+        }
+        fn connect<'a>(&'a self, id: &'a str, _: u32) -> CloudFuture<'a, Connected> {
+            Box::pin(async move {
+                Ok(Connected {
+                    instance: CloudInstance {
+                        id: id.to_owned(),
+                        image: "intent-node".into(),
+                        access_token: None,
+                        volume_id: None,
+                    },
+                    resumed: false,
+                })
+            })
+        }
+        fn run_command<'a>(
+            &'a self,
+            _: &'a CloudInstance,
+            _: &'a ProcessSpec,
+        ) -> CloudFuture<'a, ProcessOutput> {
+            let stdout = if self.started {
+                b"started\n".to_vec()
+            } else {
+                Vec::new()
+            };
+            Box::pin(async move {
+                Ok(ProcessOutput {
+                    pid: None,
+                    exit: ProcessExit {
+                        exit_code: 0,
+                        exited: true,
+                        status: "exit status 0".into(),
+                        error: None,
+                    },
+                    stdout,
+                    stderr: Vec::new(),
+                    truncated: false,
+                })
+            })
+        }
+        fn pause<'a>(&'a self, _: &'a str) -> CloudFuture<'a, ()> {
+            unimplemented!()
+        }
+        fn keep_alive<'a>(&'a self, _: &'a str, _: u32) -> CloudFuture<'a, ()> {
+            unimplemented!()
+        }
+        fn delete<'a>(&'a self, _: &'a str) -> CloudFuture<'a, bool> {
+            unimplemented!()
+        }
+        fn list<'a>(&'a self, _: &'a ListInstances) -> CloudFuture<'a, Vec<ListedInstance>> {
+            unimplemented!()
+        }
+        fn check_key(&self) -> CloudFuture<'_, ()> {
+            unimplemented!()
+        }
+        fn image_ready<'a>(&'a self, _: &'a str) -> CloudFuture<'a, bool> {
+            unimplemented!()
+        }
+    }
+
+    let backend = Backend::new().await;
+    let starter = backend.store().get_primary_principal().await.unwrap().id;
+    cloud_row(&backend, "nf-1", &starter).await;
+    let row = backend
+        .store()
+        .get_exposed_machine("nf-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let feature = backend.services.remote_feature().unwrap();
+    for (started, resumed) in [(true, true), (false, false)] {
+        let client = DiskOnly { started };
+        let got = crate::cloud::lifecycle::resume(&backend.services, feature, &client, &row).await;
+        assert!(
+            matches!(got, Ok(r) if r == resumed),
+            "started={started}: {:?}",
+            got.map_err(|_| "refused or lost")
+        );
+    }
+}

@@ -913,6 +913,7 @@ async fn a_host_that_stalls_the_bind_does_not_hide_a_valid_one() {
     let budget = crate::connect::ConnectTuning {
         attempt: std::time::Duration::from_secs(2),
         total: std::time::Duration::from_secs(8),
+        ..crate::connect::ConnectTuning::default()
     };
     for generation in 1..5 {
         let connected = crate::connect::connect(&target, &budget, None, || {
