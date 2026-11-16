@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.229] - 2026-11-16
+
+### 🚀 Features
+
+- *(store)* Multi-tenant Postgres baseline schema ([#3424](https://github.com/intent-hq/intentd/pull/3424))
+
+
 ## [0.11.228] - 2026-11-16
 
 ### 🐛 Bug Fixes
