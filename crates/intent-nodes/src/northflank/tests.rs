@@ -711,6 +711,27 @@ async fn delete_removes_the_service_with_child_objects_then_the_volume() {
 }
 
 #[tokio::test]
+async fn a_volume_still_attached_to_the_deleted_service_is_left_to_the_reaper() {
+    // Northflank deletes a service in the background: its volume is still
+    // attached for a while, and the reaper deletes it as an orphan later.
+    let server = FakeServer::start(vec![
+        Reply::data(&json!({})),
+        Reply::error(409, "Volume must be detached before it can be deleted"),
+        Reply::error(404, "service not found"),
+        Reply::error(409, "Volume must be detached before it can be deleted"),
+    ])
+    .await;
+    let client = client(&server);
+    assert!(client.delete("svc-1").await.unwrap());
+    let err = client.delete("svc-1").await.unwrap_err();
+    assert_eq!(
+        err.kind(),
+        CloudErrorKind::Conflict,
+        "without a service delete, a refused volume delete is an error"
+    );
+}
+
+#[tokio::test]
 async fn delete_of_a_volume_id_deletes_only_the_volume() {
     let server = FakeServer::start(vec![Reply::data(&json!({})), Reply::error(404, "gone")]).await;
     let client = client(&server);

@@ -414,7 +414,13 @@ impl NorthflankClient {
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e),
         };
-        let volume = self.delete_volume(volume.unwrap_or(id)).await?;
+        let volume = match self.delete_volume(volume.unwrap_or(id)).await {
+            Ok(volume) => volume,
+            // The service goes in the background and holds its volume
+            // until then: the reaper deletes that volume as an orphan.
+            Err(e) if service && e.kind() == CloudErrorKind::Conflict => false,
+            Err(e) => return Err(e),
+        };
         Ok(service || volume)
     }
 
@@ -458,9 +464,9 @@ impl NorthflankClient {
             let view = ServiceView::from(&value);
             // A service made before the tags moved here has none to read:
             // its team tag still says it is this backend's.
-            let tags = view.tags.unwrap_or_else(|| {
-                BTreeMap::from([(BACKEND_ID_TAG.to_string(), backend.clone())])
-            });
+            let tags = view
+                .tags
+                .unwrap_or_else(|| BTreeMap::from([(BACKEND_ID_TAG.to_string(), backend.clone())]));
             if !filter.tags.iter().all(|(k, v)| tags.get(k) == Some(v)) {
                 continue;
             }

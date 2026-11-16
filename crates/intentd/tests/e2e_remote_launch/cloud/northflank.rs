@@ -1078,9 +1078,7 @@ async fn the_reaper_deletes_this_backends_leftover_northflank_machines() {
         intent_nodes::northflank::NODE_TAG.to_owned(),
         intent_nodes::northflank::backend_tag("another-backend"),
     ];
-    let tags_env = |backend: &str| {
-        json!({ "INTENT_TAGS": json!({ "intentBackendId": backend, "agentId": "gone" }).to_string() })
-    };
+    let tags_env = |backend: &str| json!({ "INTENT_TAGS": json!({ "intentBackendId": backend, "agentId": "gone" }).to_string() });
     let old = "2026-01-01T00:00:00Z";
     fake.seed_service("left-new", &mine, tags_env(&backend_id), old);
     fake.seed_service("left-legacy", &mine, json!({}), old);
