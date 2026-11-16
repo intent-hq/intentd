@@ -156,7 +156,7 @@ parity_test!(workspaces_insert_get_and_list, |store| {
         .unwrap());
 });
 
-parity_test!(workspace_scoped_column_writes, |store| {
+parity_test!(workspace_scoped_column_writes, |store, tenant| {
     let id = wid("ws-s");
     let missing = wid("missing");
     store
@@ -172,22 +172,22 @@ parity_test!(workspace_scoped_column_writes, |store| {
     assert!(store.workspace_branch_auto_generated(&id).await.unwrap());
     store.set_workspace_auto_commit(&id, false).await.unwrap();
     assert_eq!(store.workspace_auto_commit(&id).await.unwrap(), Some(false));
-    store.set_workspace_label(&id, Some("lbl")).await.unwrap();
+    store.set_workspace_label(&id, Some(tenant)).await.unwrap();
     store
         .set_workspace_auto_archive_disabled(&id, true)
         .await
         .unwrap();
     assert_eq!(store.workspace_browser_client(&id).await.unwrap(), None);
     store
-        .set_workspace_browser_client(&id, Some(&ClientId("c1".into())))
+        .set_workspace_browser_client(&id, Some(&ClientId(tenant.into())))
         .await
         .unwrap();
     assert_eq!(
         store.workspace_browser_client(&id).await.unwrap(),
-        Some(ClientId("c1".into()))
+        Some(ClientId(tenant.into()))
     );
     let got = store.get_workspace(&id).await.unwrap();
-    assert_eq!(got.label.as_deref(), Some("lbl"));
+    assert_eq!(got.label.as_deref(), Some(tenant));
     assert!(got.auto_archive_disabled);
     for err in [
         store.set_workspace_label(&missing, None).await,
@@ -260,66 +260,84 @@ parity_test!(workspace_scoped_column_writes, |store| {
         store.bump_workspace_last_activity(&missing, T1).await,
         Err(Error::NotFound(_))
     ));
-});
-
-parity_test!(workspace_full_updates_and_branch_reconcile, |store| {
-    let id = wid("ws-u");
-    let mut ws = workspace("ws-u", T0);
-    ws.last_activity = Some(T2.into());
-    store.insert_workspace(&ws).await.unwrap();
-
-    let mut edit = ws.clone();
-    edit.title = "renamed".into();
-    edit.branch = "ignored".into();
-    edit.last_activity = Some(T1.into());
-    edit.status = WorkspaceStatus::Archived;
-    assert_eq!(store.update_workspace(&edit).await.unwrap(), "main");
-    let got = store.get_workspace(&id).await.unwrap();
-    assert_eq!(got.title, "renamed");
-    assert_eq!(
-        got.last_activity.as_deref(),
-        Some(T2),
-        "older value ignored"
-    );
-    assert_eq!(
-        got.status,
-        WorkspaceStatus::Active,
-        "archive moves elsewhere"
-    );
-    assert_eq!(
+    if tenant == "decoy" {
+        // Same id the subject writes, in a state its guarded writes match.
         store
-            .update_workspace_with_branch(&edit, Some("feat/x"))
+            .insert_workspace(&workspace("missing", T0))
             .await
-            .unwrap(),
-        "feat/x"
-    );
-    assert!(matches!(
-        store.update_workspace(&workspace("missing", T0)).await,
-        Err(Error::NotFound(_))
-    ));
-
-    let current = store.get_workspace(&id).await.unwrap();
-    assert!(!store
-        .reconcile_workspace_branch(&current, "feat/x")
-        .await
-        .unwrap());
-    store
-        .set_workspace_branch_auto_generated(&id, true)
-        .await
-        .unwrap();
-    assert!(store
-        .reconcile_workspace_branch(&current, "feat/y")
-        .await
-        .unwrap());
-    assert!(!store
-        .reconcile_workspace_branch(&current, "feat/z")
-        .await
-        .unwrap());
-    assert_eq!(store.get_workspace(&id).await.unwrap().branch, "feat/y");
-    assert!(!store.workspace_branch_auto_generated(&id).await.unwrap());
+            .unwrap();
+        store
+            .set_workspace_label(&missing, Some("decoy"))
+            .await
+            .unwrap();
+        store
+            .set_workspace_attention(&missing, WorkspaceAttention::Unread, None, None)
+            .await
+            .unwrap();
+    }
 });
 
-parity_test!(workspace_archive_retire_and_revive, |store| {
+parity_test!(
+    workspace_full_updates_and_branch_reconcile,
+    |store, tenant| {
+        let id = wid("ws-u");
+        let mut ws = workspace("ws-u", T0);
+        ws.last_activity = Some(T2.into());
+        store.insert_workspace(&ws).await.unwrap();
+
+        let mut edit = ws.clone();
+        edit.title = format!("renamed {tenant}");
+        edit.branch = "ignored".into();
+        edit.last_activity = Some(T1.into());
+        edit.status = WorkspaceStatus::Archived;
+        assert_eq!(store.update_workspace(&edit).await.unwrap(), "main");
+        let got = store.get_workspace(&id).await.unwrap();
+        assert_eq!(got.title, format!("renamed {tenant}"));
+        assert_eq!(
+            got.last_activity.as_deref(),
+            Some(T2),
+            "older value ignored"
+        );
+        assert_eq!(
+            got.status,
+            WorkspaceStatus::Active,
+            "archive moves elsewhere"
+        );
+        assert_eq!(
+            store
+                .update_workspace_with_branch(&edit, Some("feat/x"))
+                .await
+                .unwrap(),
+            "feat/x"
+        );
+        assert!(matches!(
+            store.update_workspace(&workspace("missing", T0)).await,
+            Err(Error::NotFound(_))
+        ));
+
+        let current = store.get_workspace(&id).await.unwrap();
+        assert!(!store
+            .reconcile_workspace_branch(&current, "feat/x")
+            .await
+            .unwrap());
+        store
+            .set_workspace_branch_auto_generated(&id, true)
+            .await
+            .unwrap();
+        assert!(store
+            .reconcile_workspace_branch(&current, "feat/y")
+            .await
+            .unwrap());
+        assert!(!store
+            .reconcile_workspace_branch(&current, "feat/z")
+            .await
+            .unwrap());
+        assert_eq!(store.get_workspace(&id).await.unwrap().branch, "feat/y");
+        assert!(!store.workspace_branch_auto_generated(&id).await.unwrap());
+    }
+);
+
+parity_test!(workspace_archive_retire_and_revive, |store, tenant| {
     let id = wid("ws-r");
     let missing = wid("missing");
     store
@@ -377,7 +395,7 @@ parity_test!(workspace_archive_retire_and_revive, |store| {
         .revive_workspace_if_retired_with_notice(
             &id2,
             "revived",
-            Some("abc"),
+            Some(tenant),
             T2,
             Some(("notice", "text", None))
         )
@@ -387,7 +405,7 @@ parity_test!(workspace_archive_retire_and_revive, |store| {
     assert_eq!(revived.status, WorkspaceStatus::Active);
     assert!(!revived.archived);
     assert_eq!(revived.branch, "revived");
-    assert_eq!(revived.base_commit_sha.as_deref(), Some("abc"));
+    assert_eq!(revived.base_commit_sha.as_deref(), Some(tenant));
     assert_eq!(revived.status_message, None);
     for err in [
         store.unarchive_workspace_if_archived(&missing, T1).await,
@@ -400,7 +418,7 @@ parity_test!(workspace_archive_retire_and_revive, |store| {
     }
 });
 
-parity_test!(workspace_pull_request_links, |store| {
+parity_test!(workspace_pull_request_links, |store, tenant| {
     let url = "https://github.com/acme/app/pull/7";
     let key = "github.com/acme/app/pull/7";
     let id = wid("ws-p");
@@ -477,7 +495,9 @@ parity_test!(workspace_pull_request_links, |store| {
     let projected = store
         .project_workspace_pr_snapshots(&id, T2, |pool, active| {
             assert_eq!(pool.as_ref().map(Vec::len), Some(1));
-            *active = Some(pr(url, PullRequestStatus::Merged));
+            let mut merged = pr(url, PullRequestStatus::Merged);
+            merged.title = tenant.into();
+            *active = Some(merged);
             true
         })
         .await
@@ -493,6 +513,7 @@ parity_test!(workspace_pull_request_links, |store| {
     let stored = store.get_workspace(&id).await.unwrap();
     assert_eq!(stored.updated_at, T2);
     assert_eq!(stored.pr_status, Some(PullRequestStatus::Merged));
+    assert_eq!(stored.active_pull_request.unwrap().title, tenant);
     let settled = store
         .workspaces_with_settled_pull_requests(&[id.clone(), wid("ws-q")])
         .await
@@ -503,7 +524,7 @@ parity_test!(workspace_pull_request_links, |store| {
     );
 });
 
-parity_test!(workspace_git_roots, |store| {
+parity_test!(workspace_git_roots, |store, tenant| {
     let ws = wid("ws-g");
     let rid = WorkspaceGitRootId("root-1".into());
     store
@@ -527,7 +548,7 @@ parity_test!(workspace_git_roots, |store| {
     assert_eq!(stored.registered_by_agent_ids, [AgentId("a1".into())]);
     let mut again = root("root-other", "ws-g", "/src/a", &["a2"]);
     again.source = WorkspaceGitRootSource::Agent;
-    again.repo_owner = Some("acme".into());
+    again.repo_owner = Some(tenant.into());
     again.updated_at = T1.into();
     let (merged, inserted) = store.upsert_workspace_git_root(&again).await.unwrap();
     assert!(!inserted);
@@ -639,7 +660,7 @@ fn home(home_id: &str, node: Option<&str>, cloud: Option<&str>, state: HomeState
     }
 }
 
-parity_test!(workspace_homes, |store| {
+parity_test!(workspace_homes, |store, tenant| {
     let ws = wid("ws-h");
     let cloud = wid("ws-c");
     let h1 = HomeId("h1".into());
@@ -656,7 +677,8 @@ parity_test!(workspace_homes, |store| {
     assert!(store.homes_on_machine("n1").await.unwrap().is_empty());
     assert_eq!(store.get_workspace_home(&ws).await.unwrap(), None);
 
-    let attached = home("h1", Some("n1"), None, HomeState::Attached);
+    let mut attached = home("h1", Some("n1"), None, HomeState::Attached);
+    attached.name = tenant.into();
     store.set_workspace_home(&ws, &attached).await.unwrap();
     assert_eq!(store.get_workspace_home(&ws).await.unwrap(), Some(attached));
     assert!(store
@@ -789,9 +811,25 @@ parity_test!(workspace_homes, |store| {
     assert_eq!(all.len(), 2);
     assert_eq!(all[&cloud].state, HomeState::Detached);
     assert_eq!(all[&cloud].node_id, None);
+    if tenant == "decoy" {
+        // A starting cloud home the subject's reset must not touch.
+        let other = wid("ws-decoy-only");
+        store
+            .insert_workspace(&workspace("ws-decoy-only", T0))
+            .await
+            .unwrap();
+        store
+            .set_workspace_home(&other, &home("h3", None, Some("m3"), HomeState::Detached))
+            .await
+            .unwrap();
+        assert!(store
+            .mark_cloud_home_starting(&other, &HomeId("h3".into()), T1)
+            .await
+            .unwrap());
+    }
 });
 
-parity_test!(workspace_context_ui_and_mcp, |store| {
+parity_test!(workspace_context_ui_and_mcp, |store, tenant| {
     let ws = wid("ws-x");
     store
         .insert_workspace(&workspace("ws-x", T0))
@@ -829,7 +867,7 @@ parity_test!(workspace_context_ui_and_mcp, |store| {
         store.update_workspace_ui_context(&ws, &ui).await.unwrap(),
         ui
     );
-    let ui2 = serde_json::json!({ "panes": [] });
+    let ui2 = serde_json::json!({ "panes": [], "tenant": tenant });
     store.update_workspace_ui_context(&ws, &ui2).await.unwrap();
     assert_eq!(
         store.get_workspace_ui_context(&ws).await.unwrap(),
@@ -869,4 +907,10 @@ parity_test!(workspace_context_ui_and_mcp, |store| {
             .await,
         Err(Error::NotFound(_))
     ));
+    if tenant == "decoy" {
+        store
+            .set_workspace_mcp_server_disabled(&ws, "zeta", true)
+            .await
+            .unwrap();
+    }
 });
