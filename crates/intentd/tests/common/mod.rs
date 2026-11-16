@@ -12,6 +12,7 @@
 pub mod claude_npx;
 #[cfg(unix)]
 pub mod codex_npx;
+pub mod submodule_repo;
 #[cfg(unix)]
 pub mod uds_exchange;
 

@@ -17,6 +17,7 @@
 #![cfg(unix)]
 
 use crate::common;
+use crate::common::submodule_repo::SubmoduleRepo;
 
 use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
@@ -249,37 +250,6 @@ fn make_source_repo(dir: &Path) -> PathBuf {
     std::fs::write(repo.join("tracked.txt"), "seed\n").unwrap();
     run_git(&["add", "tracked.txt"], &repo);
     run_git(&["commit", "-q", "-m", "seed"], &repo);
-    repo
-}
-
-/// Materialise a source repository that carries a real submodule gitlink at
-/// `sub` (cloned from a second tiny repo in `dir`), returning its path. The
-/// `protocol.file.allow` override is required for `file://`-style submodule
-/// clones on modern git.
-fn make_source_repo_with_submodule(dir: &Path) -> PathBuf {
-    let child = dir.join("child-repo");
-    std::fs::create_dir_all(&child).expect("mkdir child repo");
-    run_git(&["init", "-q", "-b", "main"], &child);
-    run_git(&["config", "user.name", "e2e"], &child);
-    run_git(&["config", "user.email", "e2e@example.com"], &child);
-    std::fs::write(child.join("inner.txt"), "inner\n").unwrap();
-    run_git(&["add", "inner.txt"], &child);
-    run_git(&["commit", "-q", "-m", "inner seed"], &child);
-
-    let repo = make_source_repo(dir);
-    run_git(
-        &[
-            "-c",
-            "protocol.file.allow=always",
-            "submodule",
-            "add",
-            "-q",
-            child.to_str().unwrap(),
-            "sub",
-        ],
-        &repo,
-    );
-    run_git(&["commit", "-q", "-m", "add submodule"], &repo);
     repo
 }
 
@@ -1045,7 +1015,7 @@ async fn git_agent_commit_rejects_submodule_internal_file_over_wss() {
     let root_guard = scratch_dir("root-submodule");
     let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let repo = make_source_repo_with_submodule(&daemon.scratch);
+    let repo = SubmoduleRepo::create(&daemon.scratch).superproject;
 
     let mut ws = connect_ws(port, cfg).await;
     let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Write E2E — submodule guard").await;
@@ -1123,7 +1093,7 @@ async fn git_discard_rejects_submodule_internal_path_over_wss() {
     let root_guard = scratch_dir("root-submodule-discard");
     let root = root_guard.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let repo = make_source_repo_with_submodule(&daemon.scratch);
+    let repo = SubmoduleRepo::create(&daemon.scratch).superproject;
 
     let mut ws = connect_ws(port, cfg).await;
     let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Write E2E — discard guard").await;
