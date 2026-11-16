@@ -46,7 +46,8 @@
 # code and the intent://node link. An unattended node install sets the service up
 # unless told not to. An orchestrator install sets daemon.mode=orchestrator,
 # restarts the daemon and pairs like a full install, on a fresh install only:
-# over an existing install it warns and keeps the current mode. An unattended
+# a re-install never switches to or from orchestrator mode (it warns and keeps
+# the current mode). An unattended
 # orchestrator install sets the service up unless told not to. Force an answer:
 #
 #   INTENTD_DAEMON_MODE=full|node|orchestrator  (or --daemon-mode=<value>, on direct runs)
@@ -494,6 +495,21 @@ current_daemon_mode() {
     | sed -n 's/^[^=]*=[[:space:]]*"\{0,1\}\([a-z]*\).*$/\1/p'
 }
 
+# A re-install never switches to or from orchestrator mode: warn that the
+# current mode <current> stays, for the answer <wanted>.
+warn_mode_kept() {
+  case "$1" in
+    regular) kept_as="a full install" ;;
+    node) kept_as="a node" ;;
+    orchestrator) kept_as="an orchestrator" ;;
+    *) kept_as="${1:-another mode}" ;;
+  esac
+  kept_hint=""
+  [ "$2" != "orchestrator" ] \
+    || kept_hint=" To use orchestrator mode, install on a fresh machine and open your repos there."
+  warn "This computer is already set up as $kept_as; the mode can't be changed by re-installing.$kept_hint"
+}
+
 # Orchestrator: daemon.mode orchestrator and a restart, on a fresh install
 # only. Over an existing install it warns and keeps the current mode, so a
 # re-install never stops the agents a full install or node runs here.
@@ -501,7 +517,7 @@ apply_orchestrator_mode() {
   current_mode=$(current_daemon_mode)
   [ "$current_mode" != "orchestrator" ] || return 0
   if [ "$existing_install" = "yes" ]; then
-    warn "this computer already runs Intent, so it keeps its current mode (daemon.mode = ${current_mode:-unknown}); the installer sets up an orchestrator only on a fresh install"
+    warn_mode_kept "$current_mode" orchestrator
     return 0
   fi
   restart_from=$(data_dir_owner_pid "$(resolve_data_dir)")
@@ -520,12 +536,18 @@ To finish by hand: intentd settings daemon.mode orchestrator && intentd restart"
 # mode applies at the next start), then the normal pairing flow — the
 # interface picker with the tunnel pre-checked on a terminal, a tunnel-only
 # link without one — which prints the QR code and the intent:// link. An
-# explicit full answer switches a node or an orchestrator back to regular; the unasked default
+# explicit full answer switches a node back to regular; an orchestrator stays
+# one (warn_mode_kept). The unasked default
 # writes nothing. Failures are warnings that name the commands to finish by
 # hand: the binary and the service are installed either way.
 apply_daemon_mode() {
   case "$daemon_mode" in
-    node) ;;
+    node)
+      if [ "$(current_daemon_mode)" = "orchestrator" ]; then
+        warn_mode_kept orchestrator node
+        return 0
+      fi
+      ;;
     orchestrator)
       apply_orchestrator_mode
       return 0
@@ -533,7 +555,11 @@ apply_daemon_mode() {
     full)
       [ "$daemon_mode_explicit" = "yes" ] || return 0
       case "$(current_daemon_mode)" in
-        node | orchestrator) ;;
+        node) ;;
+        orchestrator)
+          warn_mode_kept orchestrator full
+          return 0
+          ;;
         *) return 0 ;;
       esac
       restart_from=$(data_dir_owner_pid "$(resolve_data_dir)")
@@ -542,7 +568,7 @@ apply_daemon_mode() {
         && await_restarted_daemon "$restart_from"; then
         info "this computer runs Intent again (daemon.mode = regular)"
       else
-        warn "could not switch this computer back to running Intent here — run: intentd settings daemon.mode regular && intentd restart"
+        warn "could not switch this computer back from node mode — run: intentd settings daemon.mode regular && intentd restart"
       fi
       return 0
       ;;

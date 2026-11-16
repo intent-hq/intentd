@@ -481,7 +481,9 @@ fn an_explicit_full_answer_switches_a_node_back() {
     let run = run_install(
         Terminal::None,
         &["--service", "--daemon-mode=full"],
-        &[], Some("node"));
+        &[],
+        Some("node"),
+    );
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(run.position("settings daemon.mode regular") < run.position("restart"));
     assert!(
@@ -675,8 +677,8 @@ fn the_link_marker_prints_one_link_line_for_a_node_even_on_a_terminal() {
                 ("INTENTD_DAEMON_MODE", "node"),
                 ("INTENTD_LINK_MARKER", "1"),
             ],
-        None,
-    );
+            None,
+        );
         assert!(run.output.status.success(), "{}", run.describe());
         assert!(
             run.called("pair --node --tunnel --yes"),
@@ -793,9 +795,11 @@ fn scripted_orchestrator_install_sets_up_the_service_and_pairs_like_a_full_insta
     );
 }
 
+const KEPT: &str = "the mode can't be changed by re-installing.";
+
 #[test]
 fn a_reinstall_never_switches_an_existing_install_to_orchestrator() {
-    for prior in ["regular", "node"] {
+    for (prior, named) in [("regular", "a full install"), ("node", "a node")] {
         let run = run_install(
             Terminal::None,
             &["--service", "--daemon-mode=orchestrator"],
@@ -808,12 +812,10 @@ fn a_reinstall_never_switches_an_existing_install_to_orchestrator() {
             "the current mode stays\n{}",
             run.describe()
         );
-        assert!(
-            run.stderr()
-                .contains(&format!("keeps its current mode (daemon.mode = {prior})")),
-            "{}",
-            run.describe()
+        let warning = format!(
+            "This computer is already set up as {named}; {KEPT} To use orchestrator mode, install on a fresh machine and open your repos there."
         );
+        assert!(run.stderr().contains(&warning), "{}", run.describe());
     }
 }
 
@@ -831,23 +833,37 @@ fn a_reinstall_of_an_orchestrator_keeps_it_without_a_restart() {
         "{}",
         run.describe()
     );
-    assert!(!run.stderr().contains("keeps its current mode"));
+    assert!(!run.stderr().contains(KEPT), "{}", run.describe());
 }
 
 #[test]
-fn an_explicit_full_answer_switches_an_orchestrator_back() {
-    let run = run_install(
-        Terminal::None,
-        &["--service", "--daemon-mode=full"],
-        &[],
-        Some("orchestrator"),
-    );
-    assert!(run.output.status.success(), "{}", run.describe());
-    assert!(
-        run.position("settings daemon.mode regular") < run.position("restart"),
-        "{}",
-        run.describe()
-    );
+fn a_reinstall_never_switches_an_orchestrator_to_another_mode() {
+    for (args, terminal) in [
+        (&["--service", "--daemon-mode=full"][..], Terminal::None),
+        (&["--service", "--daemon-mode=node"][..], Terminal::None),
+        // A typed 1 on a terminal.
+        (&[][..], Terminal::Answers("1\n\n\n")),
+    ] {
+        let run = run_install(terminal, args, &[], Some("orchestrator"));
+        assert!(run.output.status.success(), "{}", run.describe());
+        assert!(
+            mode_writes(&run).is_empty() && !run.called("restart"),
+            "an orchestrator stays one\n{}",
+            run.describe()
+        );
+        assert!(
+            !run.calls.iter().any(|c| c.starts_with("pair --node")),
+            "{}",
+            run.describe()
+        );
+        assert!(
+            run.stderr().contains(&format!(
+                "This computer is already set up as an orchestrator; {KEPT}"
+            )),
+            "{}",
+            run.describe()
+        );
+    }
 }
 
 #[test]

@@ -175,7 +175,9 @@ fn the_choice_folds_spellings_and_the_parameter_beats_the_env_var() {
     }
     let bad = choice(&pwsh, "", Some("server"));
     assert!(
-        bad.contains("invalid INTENTD_DAEMON_MODE value 'server' (expected full, node or orchestrator)"),
+        bad.contains(
+            "invalid INTENTD_DAEMON_MODE value 'server' (expected full, node or orchestrator)"
+        ),
         "{bad}"
     );
 }
@@ -187,6 +189,7 @@ fn a_node_install_sets_the_mode_and_tunnel_restarts_then_pairs_unattended() {
     assert_eq!(
         outcome.calls,
         [
+            "settings daemon.mode",
             "settings daemon.mode node",
             "settings server.tunnel.enabled true",
             "restart",
@@ -317,7 +320,7 @@ fn a_fresh_orchestrator_install_sets_the_mode_restarts_then_pairs_like_a_full_in
 #[test]
 fn a_reinstall_never_switches_an_existing_install_to_orchestrator() {
     let Some(pwsh) = pwsh() else { return };
-    for saved in ["regular", "node"] {
+    for (saved, named) in [("regular", "a full install"), ("node", "a node")] {
         let outcome = apply(&pwsh, "orchestrator", true, "up", Some(saved));
         assert_eq!(
             outcome.calls,
@@ -326,32 +329,42 @@ fn a_reinstall_never_switches_an_existing_install_to_orchestrator() {
             outcome.output
         );
         assert!(
-            outcome
-                .output
-                .contains(&format!("keeps its current mode (daemon.mode = {saved})")),
+            outcome.output.contains(&format!(
+                "This computer is already set up as {named}; the mode can't be changed by re-installing. To use orchestrator mode, install on a fresh machine and open your repos there."
+            )),
             "{}",
             outcome.output
         );
     }
     let already = apply(&pwsh, "orchestrator", true, "up", Some("orchestrator"));
-    assert_eq!(already.calls, ["settings daemon.mode"], "{}", already.output);
-    assert!(!already.output.contains("keeps its current mode"));
+    assert_eq!(
+        already.calls,
+        ["settings daemon.mode"],
+        "{}",
+        already.output
+    );
+    assert!(!already.output.contains("can't be changed"), "{}", already.output);
 }
 
 #[test]
-fn an_explicit_full_answer_switches_an_orchestrator_back() {
+fn a_reinstall_never_switches_an_orchestrator_to_another_mode() {
     let Some(pwsh) = pwsh() else { return };
-    let outcome = apply(&pwsh, "full", true, "up", Some("orchestrator"));
-    assert_eq!(
-        outcome.calls,
-        [
-            "settings daemon.mode",
-            "settings daemon.mode regular",
-            "restart"
-        ],
-        "{}",
-        outcome.output
-    );
+    for mode in ["full", "node"] {
+        let outcome = apply(&pwsh, mode, true, "up", Some("orchestrator"));
+        assert_eq!(
+            outcome.calls,
+            ["settings daemon.mode"],
+            "{mode}: {}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains(
+                "This computer is already set up as an orchestrator; the mode can't be changed by re-installing."
+            ),
+            "{mode}: {}",
+            outcome.output
+        );
+    }
 }
 
 #[test]

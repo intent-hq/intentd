@@ -41,8 +41,8 @@
 # console, a tunnel-only link without one) and ends with the QR code and the
 # intent:// link. A non-interactive node install sets the task up unless told
 # not to. An orchestrator install sets daemon.mode=orchestrator, restarts the
-# daemon and pairs like a full install, on a fresh install only: over an
-# existing install it warns and keeps the current mode. A non-interactive
+# daemon and pairs like a full install, on a fresh install only: a re-install
+# never switches to or from orchestrator mode (it warns and keeps the mode). A non-interactive
 # orchestrator install sets the task up unless told not to.
 # $env:INTENTD_DAEMON_MODE = 'full'|'node'|'orchestrator' (or -DaemonMode
 # <value>, on direct runs) forces an answer.
@@ -685,13 +685,32 @@ if ($serviceMode -eq 'yes') {
     # the next start; on Windows `intentd restart` waits for the replacement),
     # then the normal pairing flow, which prints the QR code and the link.
     # Orchestrator: daemon.mode orchestrator and a restart, on a fresh install
-    # only; over an existing install it warns and keeps the current mode. An
-    # explicit full answer switches a node or an orchestrator back; the unasked
-    # default writes nothing. Failures are warnings naming the commands to
+    # only. A re-install never switches to or from orchestrator mode: it warns
+    # and keeps the current mode. An explicit full answer switches a node
+    # back; the unasked default writes nothing. Failures are warnings naming the commands to
     # finish by hand.
+    # Read the whole output: Select-Object -First would stop the native
+    # command early and leave $LASTEXITCODE meaningless.
+    function Get-SavedDaemonMode {
+        $text = (& $dest settings daemon.mode 2>$null) -join "`n"
+        if ($LASTEXITCODE -eq 0 -and $text -match '=\s*"?([a-z]+)') { return $Matches[1] }
+        return ''
+    }
+    function Write-ModeKept([string]$Current, [string]$Wanted) {
+        $keptAs = switch ($Current) {
+            'regular' { 'a full install' }
+            'node' { 'a node' }
+            'orchestrator' { 'an orchestrator' }
+            default { if ($Current) { $Current } else { 'another mode' } }
+        }
+        $hint = if ($Wanted -eq 'orchestrator') { ' To use orchestrator mode, install on a fresh machine and open your repos there.' } else { '' }
+        Write-Warning "install.ps1: This computer is already set up as $keptAs; the mode can't be changed by re-installing.$hint"
+    }
     $nodeSetupHint = "`nTo finish setting up this computer as a node, once the daemon is running:`n  intentd settings daemon.mode node`n  intentd settings server.tunnel.enabled true`n  intentd restart`n  intentd pair --node --tunnel"
     if ($installMode -eq 'node' -and $verdict -ne 'up') {
         Write-Warning "install.ps1: node setup did not run because the daemon is not up yet.$nodeSetupHint"
+    } elseif ($installMode -eq 'node' -and (Get-SavedDaemonMode) -eq 'orchestrator') {
+        Write-ModeKept 'orchestrator' 'node'
     } elseif ($installMode -eq 'node') {
         & $dest settings daemon.mode node *> $null
         if ($LASTEXITCODE -ne 0) {
@@ -718,12 +737,9 @@ if ($serviceMode -eq 'yes') {
             Write-Warning 'install.ps1: orchestrator setup did not run because the daemon is not up yet - once it is: intentd settings daemon.mode orchestrator; intentd restart'
         }
     } elseif ($installMode -eq 'orchestrator') {
-        # Read the whole output: Select-Object -First would stop the native
-        # command early and leave $LASTEXITCODE meaningless.
-        $currentMode = (& $dest settings daemon.mode 2>$null) -join "`n"
-        $savedMode = if ($LASTEXITCODE -eq 0 -and $currentMode -match '=\s*"?([a-z]+)') { $Matches[1] } else { 'unknown' }
+        $savedMode = Get-SavedDaemonMode
         if ($savedMode -ne 'orchestrator' -and $existingInstall) {
-            Write-Warning "install.ps1: this computer already runs Intent, so it keeps its current mode (daemon.mode = $savedMode); the installer sets up an orchestrator only on a fresh install"
+            Write-ModeKept $savedMode 'orchestrator'
         } elseif ($savedMode -ne 'orchestrator') {
             & $dest settings daemon.mode orchestrator *> $null
             $switched = $LASTEXITCODE -eq 0
@@ -738,10 +754,10 @@ if ($serviceMode -eq 'yes') {
             }
         }
     } elseif ($installModeExplicit -and $verdict -eq 'up') {
-        # Read the whole output: Select-Object -First would stop the native
-        # command early and leave $LASTEXITCODE meaningless.
-        $currentMode = (& $dest settings daemon.mode 2>$null) -join "`n"
-        if ($LASTEXITCODE -eq 0 -and $currentMode -match '=\s*"?(node|orchestrator)') {
+        $savedMode = Get-SavedDaemonMode
+        if ($savedMode -eq 'orchestrator') {
+            Write-ModeKept 'orchestrator' 'full'
+        } elseif ($savedMode -eq 'node') {
             & $dest settings daemon.mode regular *> $null
             $switched = $LASTEXITCODE -eq 0
             if ($switched) {
@@ -751,7 +767,7 @@ if ($serviceMode -eq 'yes') {
             if ($switched) {
                 Write-Host 'install.ps1: this computer runs Intent again (daemon.mode = regular)'
             } else {
-                Write-Warning 'install.ps1: could not switch this computer back to running Intent here - run: intentd settings daemon.mode regular; intentd restart'
+                Write-Warning 'install.ps1: could not switch this computer back from node mode - run: intentd settings daemon.mode regular; intentd restart'
             }
         }
     }
