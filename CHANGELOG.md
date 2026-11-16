@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.231] - 2026-11-16
+
+### 📚 Documentation
+
+- Explain the Labs tab group color picker ([#3432](https://github.com/intent-hq/intentd/pull/3432))
+
+
 ## [0.11.230] - 2026-11-16
 
 ### 🐛 Bug Fixes
