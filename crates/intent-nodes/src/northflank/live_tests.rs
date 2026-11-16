@@ -86,7 +86,7 @@ async fn live_northflank_round_trip() {
             image,
             tags: tags.clone(),
             plan: Some(plan),
-            disk_gib: Some(5),
+            disk_gib: Some(10),
             ..CreateInstance::default()
         })
         .await

@@ -975,8 +975,12 @@ fn init_ok() -> WsStep {
     WsStep::Send(json!({"type": "init", "data": {"auth": "successful"}}))
 }
 
+/// Output as real Northflank sends it for this command's `init`.
 fn out(kind: &str, text: &str) -> WsStep {
-    WsStep::Send(json!({"type": kind, "data": text}))
+    WsStep::Output {
+        stderr: kind == "stdErr",
+        text: text.into(),
+    }
 }
 
 fn completion(code: i32, status: &str) -> WsStep {
@@ -1068,7 +1072,8 @@ async fn exec_collects_output_and_the_exit_code() {
             "context": {
                 "command": ["env", "HOME=/home/user", "/bin/sh", "-c", "echo out; echo err >&2; exit 3"],
                 "shell": "none",
-                "user": "user"
+                "user": "user",
+                "tty": false
             }
         }})
     );
@@ -1118,7 +1123,8 @@ async fn exec_builds_the_argv_with_cwd_env_home_and_user() {
         json!({
             "command": ["env", "-C", "/home/user/work", "HOME=/root", "SECRET=s3cr3t", "intentd", "executor", "mint"],
             "shell": "none",
-            "user": "user"
+            "user": "user",
+            "tty": false
         })
     );
     assert!(!format!("{spec:?}").contains("s3cr3t"));
@@ -1194,6 +1200,40 @@ async fn the_first_command_after_a_connect_sets_up_the_home_in_the_same_exec() {
     assert!(script.contains("exec setpriv"), "{script}");
     assert_eq!(second_user, "user", "the home is set up once per connect");
     assert_eq!(second, super::exec::argv(&shell("echo mint")));
+}
+
+/// A terminal stream (`"tty": false` ignored) merges the marker into
+/// stdout with a CRLF: the setup still counts as done.
+#[tokio::test]
+async fn the_home_setup_marker_is_found_in_a_terminal_stream() {
+    let ready = format!("{}\r\n", super::provider::HOME_READY);
+    let (server, client) = connected(vec![
+        session(vec![
+            WsStep::Send(json!({"type": "stdOut", "data": format!("{ready}started\r\n")})),
+            completion(0, "Success"),
+        ]),
+        session(vec![completion(0, "Success")]),
+    ])
+    .await;
+    let output = client
+        .run_command(&instance("svc-1"), &shell("echo started"))
+        .await
+        .unwrap();
+    assert!(output.success());
+    assert_eq!(
+        output.stdout, b"started\r\n",
+        "the setup's marker is not output"
+    );
+    client
+        .run_command(&instance("svc-1"), &shell("echo mint"))
+        .await
+        .unwrap();
+    let users: Vec<String> = contexts(&server).into_iter().map(|(u, _)| u).collect();
+    assert_eq!(
+        users,
+        ["root", "user"],
+        "the home is set up once per connect"
+    );
 }
 
 #[tokio::test]

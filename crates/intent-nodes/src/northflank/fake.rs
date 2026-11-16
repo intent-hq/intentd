@@ -93,6 +93,13 @@ pub enum WsStep {
     /// Wait for the client's next text frame and record it.
     Receive,
     Send(serde_json::Value),
+    /// Command output, delivered as real Northflank does: in a terminal
+    /// (stderr merged into `stdOut`, `\n` sent as `\r\n`) unless the
+    /// `init` context sets `"tty": false`.
+    Output {
+        stderr: bool,
+        text: String,
+    },
     SendText(String),
     Sleep(Duration),
     Ping,
@@ -236,11 +243,17 @@ impl FakeServer {
         let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, record).await else {
             return;
         };
+        let mut tty = true;
         for step in steps {
             match step {
                 WsStep::Receive => loop {
                     match ws.next().await {
                         Some(Ok(Message::Text(text))) => {
+                            if let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if frame["type"] == "init" {
+                                    tty = frame["data"]["context"]["tty"] != false;
+                                }
+                            }
                             self.frames.lock().unwrap().push(text.to_string());
                             break;
                         }
@@ -250,6 +263,17 @@ impl FakeServer {
                 },
                 WsStep::Send(value) => {
                     let _ = ws.send(Message::text(value.to_string())).await;
+                }
+                WsStep::Output { stderr, text } => {
+                    let (kind, data) = if tty {
+                        ("stdOut", text.replace('\n', "\r\n"))
+                    } else if stderr {
+                        ("stdErr", text)
+                    } else {
+                        ("stdOut", text)
+                    };
+                    let frame = serde_json::json!({ "type": kind, "data": data });
+                    let _ = ws.send(Message::text(frame.to_string())).await;
                 }
                 WsStep::SendText(text) => {
                     let _ = ws.send(Message::text(text)).await;
