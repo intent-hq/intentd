@@ -50,6 +50,7 @@ mod homes;
 mod machine_order;
 mod node_invite;
 mod orchestrator;
+mod orchestrator_switch;
 mod push_on_commit;
 mod secrets;
 mod sub_agents;

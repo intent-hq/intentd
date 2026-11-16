@@ -254,6 +254,10 @@ pub(super) fn decode_rejection(reason: &str) -> Error {
             "{}: the node cannot read or persist its binding",
             codes::BINDING_STORE
         )),
+        codes::ORCHESTRATOR_MODE => Error::InvalidParams(format!(
+            "{}: the machine runs as an orchestrator",
+            codes::ORCHESTRATOR_MODE
+        )),
         _ => super::protocol("node closed the link during the handshake"),
     }
 }

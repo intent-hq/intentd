@@ -864,6 +864,9 @@ fn rejection_reasons_never_echo_peer_text() {
     let error = decode_rejection(injected);
     assert_eq!(code(&error), codes::STALE);
     assert!(!error.to_string().contains("hunter2"));
+    let error = decode_rejection("node-link-orchestrator-mode: hunter2");
+    assert_eq!(code(&error), codes::ORCHESTRATOR_MODE);
+    assert!(!error.to_string().contains("hunter2"));
     let error = decode_rejection("totally made up hunter2");
     assert_eq!(code(&error), codes::PROTOCOL);
     assert!(!error.to_string().contains("hunter2"));

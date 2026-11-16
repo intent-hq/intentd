@@ -472,6 +472,10 @@ pub(crate) async fn add_machine(
     let _lifecycle = feature.lifecycle(&params.machine_id).await;
     let store = svc.store();
     let previous = store.get_exposed_machine(&params.machine_id).await?;
+    let stored_token = match &previous {
+        Some(row) if !row.is_cloud() => svc.load_remote_machine_token(&row.id).await?,
+        _ => None,
+    };
     // A cloud machine's id is never taken over by the expose flow, nor the
     // other way round.
     if previous
@@ -551,6 +555,13 @@ pub(crate) async fn add_machine(
     .map_err(|failure| match failure {
         // A refused credential at add time is one more route error.
         ConnectFailure::Revoked(attempts) => ConnectFailure::Unreachable(attempts),
+        // A saved machine that is now an orchestrator is removed.
+        ConnectFailure::Orchestrator => {
+            if let Some(token) = &stored_token {
+                forget_orchestrator(Some(svc.clone()), params.machine_id.clone(), token.clone());
+            }
+            ConnectFailure::Orchestrator
+        }
         other => other,
     })
     .map_err(|failure| failure.into_error(&params.name))?;
@@ -697,6 +708,19 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     if let Some(node) = feature.take_node(&machine_id) {
         node.shutdown();
     }
+    let mut result = json!({ "ok": true });
+    if let Some(credential) = forget(svc, &machine_id).await? {
+        result["credentialId"] = json!(credential);
+    }
+    Ok(result)
+}
+
+/// Forget exposed machine `machine_id`: its final stop and home stop
+/// records, token and leases, then its row (last, so a failure leaves a row
+/// to remove again), then announce the removal and drop its order entry. The
+/// removed credential's id, if any.
+async fn forget(svc: &Services, machine_id: &str) -> Result<Option<ExecutorCredentialId>> {
+    let store = svc.store();
     // The machine is forgotten: no connector will resend a final stop it
     // did not acknowledge (it was revoked), so their records go too.
     let head_id = store.daemon_id().await?;
@@ -712,26 +736,89 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     }
     // Its pending home stops go too: removing the machine is the user's
     // choice to drop those checkouts (node-link.md "Home final stop").
-    store.delete_home_stops_on_machine(&machine_id).await?;
-    let credential = store.remove_exposed_machine(&machine_id).await?;
-    svc.delete_remote_machine_token(&machine_id).await?;
-    store
-        .end_machine_leases(&machine_id, &store.daemon_id().await?)
-        .await?;
+    store.delete_home_stops_on_machine(machine_id).await?;
+    svc.delete_remote_machine_token(machine_id).await?;
+    store.end_machine_leases(machine_id, &head_id).await?;
+    let credential = store.remove_exposed_machine(machine_id).await?;
     svc.publish_remote_machine_changed(json!({ "machineId": machine_id, "removed": true }))
         .await;
     crate::order::forget(
         svc,
         &MachineOrderKey::Machine {
-            node_id: machine_id.clone(),
+            node_id: machine_id.to_owned(),
         },
     )
     .await;
-    let mut result = json!({ "ok": true });
-    if let Some(credential) = credential {
-        result["credentialId"] = json!(credential);
+    Ok(credential)
+}
+
+/// Remove exposed machine `machine_id` in the background after it refused a
+/// bind because it now runs as an orchestrator (nodes.md "Orchestrator
+/// mode"). Only while the stored token is still `refused` (or already
+/// deleted by a removal that failed later): a machine paired again meanwhile
+/// is kept. Its agents end; an orchestrator runs none. A store failure is
+/// retried with backoff until the removal succeeds or no longer applies;
+/// the connector stops only then.
+pub(crate) fn forget_orchestrator(svc: Option<Services>, machine_id: String, refused: String) {
+    let Some(svc) = svc else {
+        return;
+    };
+    tokio::spawn(async move {
+        use crate::RemoteServicesExt as _;
+        let Some(feature) = svc.remote_feature() else {
+            return;
+        };
+        // A store failure is retried here, not by the connector: once its
+        // leases ended it can no longer dial.
+        let mut retry = intent_transport::node_link::Backoff::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(60),
+        );
+        loop {
+            match forget_orchestrator_once(feature, &svc, &machine_id, &refused).await {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(%error, machine = %machine_id, "remote machine: could not remove the orchestrator; retrying");
+                    tokio::time::sleep(retry.next_delay()).await;
+                }
+            }
+        }
+    });
+}
+
+async fn forget_orchestrator_once(
+    feature: &RemoteFeature,
+    svc: &Services,
+    machine_id: &str,
+    refused: &str,
+) -> Result<()> {
+    let _lifecycle = feature.lifecycle(machine_id).await;
+    let Some(row) = svc
+        .store()
+        .get_exposed_machine(machine_id)
+        .await?
+        .filter(|row| !row.is_cloud())
+    else {
+        return Ok(());
+    };
+    let stored = svc.load_remote_machine_token(machine_id).await?;
+    if stored.is_some_and(|token| token != refused) {
+        return Ok(());
     }
-    Ok(result)
+    if let Some(node) = feature.running_node(machine_id) {
+        node.shared_ref().drop_stops();
+        node.shared_ref().agents.end_all(&format!(
+            "{}: {} is now an orchestrator and no longer runs agents for other backends",
+            crate::connect::MACHINE_ORCHESTRATOR,
+            row.name
+        ));
+    }
+    forget(svc, machine_id).await?;
+    if let Some(node) = feature.take_node(machine_id) {
+        node.shutdown();
+    }
+    tracing::info!(machine = %machine_id, "remote machine: now an orchestrator; removed");
+    Ok(())
 }
 
 /// The connector to use for removing `row` when no bind in this process has
@@ -776,11 +863,7 @@ pub(crate) async fn recover_survivors(
             "{}: could not tell which of its {recorded} recorded remote agent(s) still run, because this backend's agent records could not be read; nothing was changed. Try again.",
             row.name
         ))),
-        Ok(Err(Error::RemoteMachine(failure)))
-            if failure.data["code"] == crate::connect::MACHINE_REVOKED =>
-        {
-            Ok(Some(node))
-        }
+        Ok(Err(Error::RemoteMachine(failure))) if needs_no_stops(&failure.data) => Ok(Some(node)),
         Ok(Err(Error::RemoteMachine(failure))) => Err(survivors_unknown(
             &row.name,
             recorded,
@@ -789,6 +872,13 @@ pub(crate) async fn recover_survivors(
         Ok(Err(other)) => Err(other),
         Err(_) => Err(survivors_unknown(&row.name, recorded, &json!([]))),
     }
+}
+
+/// A revoked credential, or a machine that is now an orchestrator, runs no
+/// agents for this backend: there is nothing to stop.
+fn needs_no_stops(data: &Value) -> bool {
+    data["code"] == crate::connect::MACHINE_REVOKED
+        || data["code"] == crate::connect::MACHINE_ORCHESTRATOR
 }
 
 fn survivors_unknown(name: &str, recorded: usize, attempts: &Value) -> Error {
@@ -825,11 +915,7 @@ pub(crate) async fn deliver_stops(
     // A connect that does not finish in time leaves the stops unconfirmed.
     if let Ok(Err(error)) = tokio::time::timeout_at(deadline, node.connect()).await {
         match error {
-            Error::RemoteMachine(failure)
-                if failure.data["code"] == crate::connect::MACHINE_REVOKED =>
-            {
-                return Ok(());
-            }
+            Error::RemoteMachine(failure) if needs_no_stops(&failure.data) => return Ok(()),
             Error::RemoteMachine(failure) => attempts = failure.data["attempts"].clone(),
             other => return Err(other),
         }

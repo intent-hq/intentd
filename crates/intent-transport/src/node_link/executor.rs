@@ -352,6 +352,10 @@ impl ExecutorLinks {
                 _ => return Err(super::unavailable()),
             }
         };
+        if api.daemon_mode() == intent_core::settings_file::DaemonMode::Orchestrator {
+            reject(socket, codes::ORCHESTRATOR_MODE).await;
+            return Err(Error::InvalidParams(codes::ORCHESTRATOR_MODE.into()));
+        }
         let ours = spoken_protocols();
         let Some(protocol) = ours.highest_common(hello.protocol) else {
             reject(
