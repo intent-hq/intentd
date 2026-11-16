@@ -1598,7 +1598,7 @@ Use the diagram's **View source** action to inspect
 its code, or turn off **Markdown preview** in the panel menu to edit the file's source.
 Mermaid flowcharts keep their authored direction and curved connector style.
 The renderer can compact connected groups and soften tight bends for shorter, clearer connections.
-Routes account for node outlines, including decisions and databases.
+Routes and arrowheads follow node outlines, including decisions and databases.
 Wide diagrams scroll horizontally to keep text readable.
 Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
