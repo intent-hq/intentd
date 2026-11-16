@@ -46,7 +46,9 @@ fn stop_logs(head_dir: &Path, scratch: &Path) -> String {
     }
     let mut out = String::new();
     for log in logs {
-        out.push_str(&format!("--- {}\n", log.display()));
+        out.push_str("--- ");
+        out.push_str(&log.display().to_string());
+        out.push('\n');
         let text = std::fs::read_to_string(&log).unwrap_or_default();
         for line in text.lines().filter(|line| {
             ["stop", "link", "lease", "WARN", "ERROR"]
