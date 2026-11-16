@@ -40,6 +40,25 @@ older connected daemon shows an update note instead of the GitLab setup.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/deeplink/main/invite-attempt.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts; packages/cloudlands-fe/src/routes/(app)/+layout.svelte; packages/cloudlands-fe/src/lib/components/settings/GitLabAuthConnection.svelte; packages/cloudlands-fe/src/features/onboarding/steps/OnboardingForgeStep.svelte; packages/cloudlands-fe/src/features/collaboration-auth/renderer/CollaborationSignInModal.svelte. -->
 
+On iPhone and iPad, with an Intent Mobile version that has sharing, a workspace owner
+opens the workspace's **⋯** menu → **Share…** to make an invitation link: **Anyone
+with the link** (reusable until it expires) or **One person** (a GitHub username; that
+account can use it once). **Send Invite Link** opens the iOS share sheet and **Copy
+Link** copies it; **Create Another Link** makes the next one, so a few people each get
+their own link. The phone only creates links: it does not add people directly, list
+members, or turn links off. Remove people, revoke links and pin GitLab accounts from
+**Share…** in the desktop app. Links need the host's Tailcat tunnel; the sheet says so
+when it is off.
+
+Opening an invitation link on a phone with Intent Mobile installed shows **Join
+Workspace** with the workspace and host, then **Join as @login** using the GitHub or
+GitLab account of the person's own paired Mac; the workspace opens after joining. With
+no paired Mac, the phone asks them to pair one or open the link on their Mac. Some apps,
+such as Messages and Mail, do not show `intent://` links as tappable yet; links sent
+through apps that do (for example Slack) open directly.
+
+<!-- Sources: packages/ios/Intent/Views/Workspaces/ShareWorkspaceView.swift; packages/ios/Intent/Services/WorkspaceSharingModel.swift; packages/ios/Intent/Views/Onboarding/InviteJoinView.swift; packages/ios/Intent/Services/InviteJoinFlow.swift; packages/ios/Intent/App/AppCoordinatorDeepLinks.swift. -->
+
 Workspace guest roles: the default collaborator role is Participant. The workspace owner
 can change a direct guest between Participant and Manager in Share. Managers can
 create agents, choose models/providers and reasoning effort, and run, start, stop,
