@@ -46,7 +46,7 @@ use intent_transport::node_link::{
 };
 
 use crate::agents::Agents;
-use crate::connect::{connect, ConnectFailure, ConnectTuning, Connected};
+use crate::connect::{connect, connect_after_resume, ConnectFailure, ConnectTuning, Connected};
 use crate::ingest::{Ingest, Step};
 use crate::lease::HeadLease;
 use crate::lock;
@@ -2577,12 +2577,22 @@ async fn run(
         let mut pauses = None;
         let connected = match gated {
             Ok(seen) => {
-                pauses = seen;
+                pauses = seen.map(|seen| seen.pauses);
+                let next_hello = || {
+                    let lease = lease.clone();
+                    async move { lease.next_hello(ingested).await }
+                };
+                let tuning = &shared.tuning.connect;
+                let version = version.as_deref();
+                let dialing = async {
+                    if seen.is_some_and(|seen| seen.resumed) {
+                        connect_after_resume(&target, tuning, version, next_hello).await
+                    } else {
+                        connect(&target, tuning, version, next_hello).await
+                    }
+                };
                 tokio::select! {
-                    connected = connect(&target, &shared.tuning.connect, version.as_deref(), || {
-                        let lease = lease.clone();
-                        async move { lease.next_hello(ingested).await }
-                    }) => connected,
+                    connected = dialing => connected,
                     () = wait_true(&mut shutdown) => return,
                 }
             }

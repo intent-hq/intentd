@@ -45,6 +45,7 @@ mod cloud;
 mod forge_token;
 mod launch;
 mod methods;
+mod resume_dial;
 
 fn wait() -> Duration {
     intentd_test_support::test_timeout(Duration::from_secs(5))
@@ -72,6 +73,7 @@ fn tuning() -> Tuning {
         connect: ConnectTuning {
             attempt: Duration::from_millis(500),
             total: wait(),
+            ..ConnectTuning::default()
         },
         forge_refresh: Duration::from_secs(600),
         forge_check: Duration::from_millis(20),

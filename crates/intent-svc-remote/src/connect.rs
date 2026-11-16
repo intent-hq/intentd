@@ -12,12 +12,14 @@
 use std::future::Future;
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use serde_json::json;
 
 use intent_core::machines::{MachineUpdateRequired, UpdateSide};
 use intent_core::node_link::{LinkHello, ProtocolRange, NODE_LINK_PROTOCOLS};
 use intent_core::{Error, Result};
-use intent_transport::node_link::{self as link, codes, DialedLink, NodeEndpoint};
+use intent_transport::node_link::{self as link, codes, Backoff, DialedLink, NodeEndpoint};
 
 use crate::machine::{MachineTarget, Route};
 
@@ -33,6 +35,12 @@ pub(crate) struct ConnectTuning {
     pub attempt: Duration,
     /// Longest the whole connect may take.
     pub total: Duration,
+    /// Right after a resume: the bound of the first tailcat attempt. Later
+    /// attempts get [`Self::attempt`]. A healthy Northflank resume binds in
+    /// about 1.2 s, so this must stay above that.
+    pub resume_attempt: Duration,
+    /// Right after a resume: the delays between attempts.
+    pub resume_retry: Backoff,
 }
 
 impl Default for ConnectTuning {
@@ -40,6 +48,8 @@ impl Default for ConnectTuning {
         Self {
             attempt: Duration::from_secs(3),
             total: Duration::from_secs(10),
+            resume_attempt: Duration::from_millis(1_500),
+            resume_retry: Backoff::new(Duration::from_millis(250), Duration::from_secs(2)),
         }
     }
 }
@@ -167,62 +177,80 @@ where
     Fut: Future<Output = Result<LinkHello>>,
 {
     let mut attempts = Vec::new();
-    let raced = tokio::time::timeout(tuning.total, async {
-        let mut racing = race_direct(target.direct_routes(), tuning);
-        loop {
-            let route = match racing.join_next().await {
-                None => break,
-                Some(Ok((route, true))) => route,
-                Some(Ok((route, false))) => {
-                    attempts.push(Attempt {
-                        route: route.label,
-                        error: codes::UNAVAILABLE.into(),
-                    });
-                    continue;
-                }
-                Some(Err(_)) => continue,
-            };
-            // A host that accepted TCP gets one attempt's budget for the
-            // handshake, so one that stalls cannot hide the hosts after it.
-            if let Some(connected) = dial(
-                target,
-                machine_version,
-                &mut hello,
-                route,
-                Some(tuning.attempt),
-                &mut attempts,
-            )
-            .await?
-            {
-                racing.abort_all();
-                return Ok(connected);
-            }
-        }
-        if let Some(route) = target.tailcat_route() {
-            if let Some(connected) = dial(
-                target,
-                machine_version,
-                &mut hello,
-                route,
-                None,
-                &mut attempts,
-            )
-            .await?
-            {
-                return Ok(connected);
-            }
-        }
-        Err(ConnectFailure::Unreachable(Vec::new()))
-    })
+    let raced = tokio::time::timeout(
+        tuning.total,
+        connect_once(
+            target,
+            tuning,
+            machine_version,
+            &mut hello,
+            None,
+            &mut attempts,
+        ),
+    )
     .await;
-    let failure = match raced {
-        Ok(Ok(connected)) => return Ok(connected),
-        Ok(Err(ConnectFailure::Unreachable(_))) | Err(_) => None,
-        Ok(Err(other)) => Some(other),
-    };
-    if let Some(failure) = failure {
-        return Err(failure);
+    match raced {
+        Ok(Ok(connected)) => Ok(connected),
+        Ok(Err(ConnectFailure::Unreachable(_))) | Err(_) => Err(unreachable(attempts)),
+        Ok(Err(other)) => Err(other),
     }
+}
+
+/// [`connect`] right after a cloud sandbox resumed. Its tailcat path comes
+/// back a moment after the sandbox: until then a pipe stalls (E2B) or is
+/// refused. Each tailcat attempt is bounded and an unreachable one is
+/// retried quickly, all within [`ConnectTuning::total`], so the first
+/// stalled pipe no longer takes the whole budget.
+pub(crate) async fn connect_after_resume<F, Fut>(
+    target: &MachineTarget,
+    tuning: &ConnectTuning,
+    machine_version: Option<&str>,
+    mut hello: F,
+) -> std::result::Result<Connected, ConnectFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<LinkHello>>,
+{
+    let deadline = Instant::now() + tuning.total;
+    let mut retry = tuning.resume_retry.clone();
+    let mut bound = tuning.resume_attempt;
+    let mut attempts = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(unreachable(attempts));
+        }
+        let mut round = Vec::new();
+        let raced = tokio::time::timeout(
+            left,
+            connect_once(
+                target,
+                tuning,
+                machine_version,
+                &mut hello,
+                Some(bound),
+                &mut round,
+            ),
+        )
+        .await;
+        match raced {
+            Ok(Ok(connected)) => return Ok(connected),
+            Ok(Err(ConnectFailure::Unreachable(_))) | Err(_) => {}
+            Ok(Err(other)) => return Err(other),
+        }
+        if !round.is_empty() {
+            attempts = round;
+        }
+        tracing::debug!(machine = %target.id, ?attempts, "remote machine: not answering yet after the resume; retrying");
+        bound = tuning.attempt;
+        let left = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(retry.next_delay().min(left)).await;
+    }
+}
+
+/// `Unreachable` with `attempts`, or `Revoked` when a route refused the
+/// credential.
+fn unreachable(mut attempts: Vec<Attempt>) -> ConnectFailure {
     if attempts.is_empty() {
         attempts.push(Attempt {
             route: "none".into(),
@@ -230,9 +258,71 @@ where
         });
     }
     if attempts.iter().any(|a| a.error == codes::UNAUTHORIZED) {
-        return Err(ConnectFailure::Revoked(attempts));
+        return ConnectFailure::Revoked(attempts);
     }
-    Err(ConnectFailure::Unreachable(attempts))
+    ConnectFailure::Unreachable(attempts)
+}
+
+/// One pass over `target`'s routes: the direct hosts raced, then the
+/// tailcat route, within `tailcat_bound` when given. `Unreachable` (with
+/// no attempts) when none bound; their failures are in `attempts`.
+async fn connect_once<F, Fut>(
+    target: &MachineTarget,
+    tuning: &ConnectTuning,
+    machine_version: Option<&str>,
+    hello: &mut F,
+    tailcat_bound: Option<Duration>,
+    attempts: &mut Vec<Attempt>,
+) -> std::result::Result<Connected, ConnectFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<LinkHello>>,
+{
+    let mut racing = race_direct(target.direct_routes(), tuning);
+    loop {
+        let route = match racing.join_next().await {
+            None => break,
+            Some(Ok((route, true))) => route,
+            Some(Ok((route, false))) => {
+                attempts.push(Attempt {
+                    route: route.label,
+                    error: codes::UNAVAILABLE.into(),
+                });
+                continue;
+            }
+            Some(Err(_)) => continue,
+        };
+        // A host that accepted TCP gets one attempt's budget for the
+        // handshake, so one that stalls cannot hide the hosts after it.
+        if let Some(connected) = dial(
+            target,
+            machine_version,
+            hello,
+            route,
+            Some(tuning.attempt),
+            attempts,
+        )
+        .await?
+        {
+            racing.abort_all();
+            return Ok(connected);
+        }
+    }
+    if let Some(route) = target.tailcat_route() {
+        if let Some(connected) = dial(
+            target,
+            machine_version,
+            hello,
+            route,
+            tailcat_bound,
+            attempts,
+        )
+        .await?
+        {
+            return Ok(connected);
+        }
+    }
+    Err(ConnectFailure::Unreachable(Vec::new()))
 }
 
 /// Dial and bind on `route`, within `bound` when given: `Ok(None)` records

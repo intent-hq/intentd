@@ -180,14 +180,18 @@ impl CloudGate {
     /// something asked for this dial; a redial that waited here while a
     /// pause finished does not resume the sandbox. Returns the machine's
     /// pause count as seen under its transition lock, for the connector to
-    /// tell whether a pause began after this check.
+    /// tell whether a pause began after this check, and whether the sandbox
+    /// was resumed now.
     pub(crate) async fn before_dial(
         &self,
         shared: &Shared,
         asked: bool,
-    ) -> std::result::Result<u64, ConnectFailure> {
+    ) -> std::result::Result<Dialable, ConnectFailure> {
         let Ok(feature) = super::feature(&self.svc) else {
-            return Ok(0);
+            return Ok(Dialable {
+                pauses: 0,
+                resumed: false,
+            });
         };
         match feature.cloud.loss(&self.machine_id) {
             Some(Loss::Removed) => return Err(lost_failure()),
@@ -196,6 +200,10 @@ impl CloudGate {
         }
         let _transition = feature.cloud.transition(&self.machine_id).await;
         let pauses = feature.cloud.pauses(&self.machine_id);
+        let as_is = Dialable {
+            pauses,
+            resumed: false,
+        };
         if !asked && feature.cloud.is_parked(&self.machine_id) {
             return Err(ConnectFailure::Local(
                 "the sandbox was paused; it resumes when something asks for it".into(),
@@ -203,7 +211,7 @@ impl CloudGate {
         }
         let row = match self.svc.store().get_exposed_machine(&self.machine_id).await {
             Ok(Some(row)) => row,
-            Ok(None) => return Ok(pauses),
+            Ok(None) => return Ok(as_is),
             Err(error) => return Err(ConnectFailure::Local(error.to_string())),
         };
         if row
@@ -211,15 +219,15 @@ impl CloudGate {
             .as_ref()
             .is_none_or(|cloud| cloud.state == CloudSandboxState::Stopping)
         {
-            return Ok(pauses);
+            return Ok(as_is);
         }
         // Without the key (an entry remove in progress), dial as is.
         let Ok(client) = config::saved_client(&self.svc, super::methods::row_entry(&row)).await
         else {
-            return Ok(pauses);
+            return Ok(as_is);
         };
         match resume(&self.svc, feature, &*client, &row).await {
-            Ok(()) => Ok(pauses),
+            Ok(resumed) => Ok(Dialable { pauses, resumed }),
             Err(Resumed::Lost) => {
                 sandbox_lost(&self.svc, feature, Some(shared), &row);
                 Err(lost_failure())
@@ -276,16 +284,26 @@ enum Resumed {
     Refused(Error),
 }
 
+/// What [`CloudGate::before_dial`] saw.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Dialable {
+    /// The machine's pause count under its transition lock.
+    pub pauses: u64,
+    /// The sandbox was resumed (or its intentd started again) just now.
+    pub resumed: bool,
+}
+
 /// Make E2B run `row`'s sandbox: resume it when paused, else check it and
 /// extend its timeout. The caller holds the machine's transition lock.
+/// Returns whether it resumed the sandbox.
 async fn resume(
     svc: &Services,
     feature: &RemoteFeature,
     client: &dyn CloudProvider,
     row: &ExposedMachine,
-) -> std::result::Result<(), Resumed> {
+) -> std::result::Result<bool, Resumed> {
     let Some(cloud) = &row.cloud else {
-        return Ok(());
+        return Ok(false);
     };
     let paused = cloud.state != CloudSandboxState::Running;
     if paused {
@@ -314,13 +332,14 @@ async fn resume(
                     }
                 }
             }
-            if paused || connected.resumed {
+            let resumed = paused || connected.resumed;
+            if resumed {
                 tracing::info!(machine = %row.id, sandbox = %cloud.sandbox_id, "cloud machine: sandbox resumed");
                 set_state(svc, feature, &row.id, CloudSandboxState::Running).await;
             }
             feature.cloud.unpark(&row.id);
             feature.cloud.touch(&row.id);
-            Ok(())
+            Ok(resumed)
         }
         Err(error) if error.is_not_found() => Err(Resumed::Lost),
         Err(error) => {
