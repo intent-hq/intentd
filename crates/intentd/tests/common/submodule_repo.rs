@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A superproject on `main` (`tracked.txt`, content `seed\n`) whose
-/// submodule `sub` holds `inner.txt` (content `inner\n`).
+/// submodule `sub` holds `inner.txt` (content `inner\n`). `.gitmodules`
+/// records the submodule as a `file://` URL, so a recursive clone transfers
+/// it as a pack and streams its object progress like a remote one.
 ///
 /// Two traps this fixture exists for:
 ///
@@ -26,8 +28,8 @@ pub struct SubmoduleRepo {
 }
 
 impl SubmoduleRepo {
-    /// The daemon env entry that lets its child `git` clone `file://`
-    /// submodules. `GIT_CONFIG_PARAMETERS` is command-line-scoped config that
+    /// The daemon env entry that lets its child `git` clone local
+    /// (`file://` or plain-path) submodules. `GIT_CONFIG_PARAMETERS` is command-line-scoped config that
     /// every git the daemon spawns inherits; the clone pipeline appends its
     /// own entries after it, so production behavior is unchanged.
     pub const DAEMON_ENV: (&'static str, &'static str) =
@@ -64,7 +66,7 @@ impl SubmoduleRepo {
                 "submodule",
                 "add",
                 "-q",
-                upstream.to_str().expect("utf-8 path"),
+                &format!("file://{}", upstream.display()),
                 Self::SUBMODULE,
             ],
         );
@@ -90,6 +92,7 @@ impl SubmoduleRepo {
     }
 }
 
+#[track_caller]
 fn init(dir: &Path) {
     std::fs::create_dir_all(dir).expect("mkdir");
     git(dir, &["init", "-q", "-b", "main"]);
@@ -104,6 +107,10 @@ fn git(dir: &Path, args: &[&str]) {
         .arg(dir)
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .expect("run git");
     assert!(
