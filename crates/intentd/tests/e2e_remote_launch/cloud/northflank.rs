@@ -526,8 +526,13 @@ impl FakeNorthflank {
             .outputs
             .push(String::from_utf8_lossy(&output.stdout).into_owned());
         let code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        // As on Northflank: a terminal, with stderr in stdout and CRLF line
+        // ends, unless the command asks for `"tty": false`.
+        if init["data"]["context"]["tty"] != false {
+            stdout = (stdout + &std::mem::take(&mut stderr)).replace('\n', "\r\n");
+        }
         if !stdout.is_empty() {
             let _ = ws
                 .send(send(json!({ "type": "stdOut", "data": stdout })))
