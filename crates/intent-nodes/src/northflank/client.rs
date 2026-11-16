@@ -34,8 +34,15 @@ pub struct NorthflankConfig {
     pub connect_timeout: Duration,
     /// How long a create or resume waits for the deployment to run.
     pub ready_timeout: Duration,
-    /// Time between two status reads while waiting.
+    /// Time between two status reads while waiting, for the first
+    /// `fast_poll_window` of a wait.
     pub poll_interval: Duration,
+    pub fast_poll_window: Duration,
+    /// Time between two status reads after that: Northflank allows a token
+    /// 1000 requests an hour, shared by every machine of the entry.
+    pub slow_poll_interval: Duration,
+    /// How long containers must keep exiting before the wait gives up.
+    pub crash_window: Duration,
     /// Retries after a 429 before giving up.
     pub max_rate_limit_retries: u32,
     /// Longest wait for one retry. A 429 that asks for longer is reported
@@ -59,7 +66,10 @@ impl Default for NorthflankConfig {
             request_timeout: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(10),
             ready_timeout: Duration::from_secs(600),
-            poll_interval: Duration::from_secs(3),
+            poll_interval: Duration::from_secs(1),
+            fast_poll_window: Duration::from_secs(60),
+            slow_poll_interval: Duration::from_secs(5),
+            crash_window: Duration::from_secs(6),
             max_rate_limit_retries: 3,
             max_retry_wait: Duration::from_secs(30),
             exec_drain_timeout: Duration::from_secs(30),
@@ -74,6 +84,9 @@ pub struct NorthflankClient {
     pub(super) http: reqwest::Client,
     pub(super) token: SecretString,
     pub(super) config: NorthflankConfig,
+    /// Services connected or created since their home was last handed to
+    /// [`super::RUN_AS`]: their next command does that first.
+    pub(super) home_pending: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +184,7 @@ impl NorthflankClient {
             http,
             token,
             config,
+            home_pending: std::sync::Mutex::default(),
         })
     }
 

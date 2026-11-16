@@ -39,6 +39,12 @@ const IMAGE_REPO: &str = "ghcr.io/intent-hq/intent-node";
 /// The words of the notice a launch after a disk resume carries.
 const DISK_NOTICE: &str = "stopped and started again from its disk";
 
+/// The test cannot become root or have a `user` account: `id` answers the
+/// test's own ids for `user`, so the home is already owned.
+const ID_SHIM: &str = "#!/bin/sh\nif [ \"$#\" -eq 2 ] && [ \"$2\" = user ]; then exec /usr/bin/id \"$1\"; fi\nexec /usr/bin/id \"$@\"\n";
+/// `setpriv` drops nothing here: it runs the command after `--`.
+const SETPRIV_SHIM: &str = "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in --) shift; break ;; *) shift ;; esac\ndone\nexec \"$@\"\n";
+
 /// One fake service: its volume (the container's home folder), the
 /// environment its commands run with, and the process group of its current
 /// container (replaced at each start, since a stop ends every process).
@@ -98,10 +104,16 @@ impl FakeNorthflank {
         std::fs::create_dir_all(&root).unwrap();
         let shim_dir = scratch.path().join("nf-bin");
         std::fs::create_dir_all(&shim_dir).unwrap();
-        let shim = shim_dir.join("setsid");
-        std::fs::write(&shim, SETSID_SHIM).unwrap();
-        std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        for (name, body) in [
+            ("setsid", SETSID_SHIM),
+            ("id", ID_SHIM),
+            ("setpriv", SETPRIV_SHIM),
+        ] {
+            let shim = shim_dir.join(name);
+            std::fs::write(&shim, body).unwrap();
+            std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
         let rest = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let exec = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let fake = Arc::new(Self {
@@ -474,17 +486,6 @@ impl FakeNorthflank {
                 json!({ "type": "init", "data": { "auth": "successful" } }),
             ))
             .await;
-        // The test cannot become root: the root setup step is recorded and
-        // answered without running.
-        if user == "root" {
-            let _ = ws
-                .send(send(
-                    json!({ "type": "completion", "data": { "exitCode": 0, "status": "Success" } }),
-                ))
-                .await;
-            let _ = ws.close(None).await;
-            return;
-        }
         let Some((home, env, group)) = self
             .state()
             .services
@@ -868,6 +869,15 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
 
     let setups = fake.root_setups();
     assert!(setups >= 1, "the volume is handed to the user at create");
+    {
+        let state = fake.state();
+        let (user, argv) = &state.execs[0];
+        assert_eq!(user, "root", "{argv:?}");
+        assert!(
+            argv.iter().any(|arg| arg.contains("intentd serve")),
+            "the start runs in the same command as the setup: {argv:?}"
+        );
+    }
 
     // Paused (scaled to 0) and resumed: the same machine, one notice.
     let paused = ok(
@@ -941,10 +951,18 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
             !argv.iter().any(|arg| arg.starts_with("IS_SANDBOX")),
             "{argv:?}"
         );
-        let setup = argv
-            .last()
-            .is_some_and(|script| script.contains("chown -R"));
+        let setup = argv.iter().any(|arg| arg.contains("chown -R"));
         assert_eq!(user, if setup { "root" } else { "user" }, "{argv:?}");
+        if setup {
+            assert!(
+                argv.iter().any(|arg| arg.contains("exec setpriv")),
+                "a root command drops to the user before it runs anything: {argv:?}"
+            );
+            assert!(
+                argv.iter().any(|arg| arg.contains("intentd")),
+                "no command runs only the setup: {argv:?}"
+            );
+        }
     }
 
     // Killed: the service and its volume go.
