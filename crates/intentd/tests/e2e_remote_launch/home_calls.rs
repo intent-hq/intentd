@@ -285,7 +285,7 @@ async fn files_and_git_of_a_workspace_with_a_home_run_on_the_home() {
     .await;
     assert_eq!(info["exists"], true, "{info}");
 
-    // A registered git root is not known on the home: refused clearly.
+    // A git root the workspace never registered is refused as locally.
     id += 1;
     let refused = rpc(
         &mut rpc_ws,
@@ -298,7 +298,7 @@ async fn files_and_git_of_a_workspace_with_a_home_run_on_the_home() {
     assert!(
         refused["error"]["message"]
             .as_str()
-            .is_some_and(|m| m.contains("home-root-unsupported")),
+            .is_some_and(|m| m.contains("Unknown git root")),
         "{refused}"
     );
 

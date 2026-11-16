@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use intent_core::node_link::{
-    HomeCallFailure, HomeEvents, HOME_EVENT_TYPES, HOME_METHODS, MAX_HOME_EVENTS,
+    HomeCallError, HomeCallFailure, HomeEvents, GIT_ROOT_PATH_PARAM, HOME_EVENT_TYPES,
+    HOME_METHODS, HOME_ROOT_OUTSIDE_CHECKOUT, HOME_ROOT_UNSUPPORTED, MAX_HOME_EVENTS,
 };
 use intent_core::{Error, Result, WorkspaceHome, WorkspaceId};
 use serde_json::{json, Map, Value};
@@ -255,6 +256,22 @@ pub(crate) fn home_params(
     Ok(params)
 }
 
+/// A home's refusal of a call's git root: a machine that does not read
+/// `gitRootPath` runs the method with the backend's `gitRootId`, which its
+/// own record does not know.
+fn older_machine_root(error: HomeCallError, root_named: bool) -> HomeCallError {
+    if !root_named || error.code != -32602 || !error.message.contains("Unknown git root") {
+        return error;
+    }
+    HomeCallError {
+        code: error.code,
+        message: format!(
+            "{HOME_ROOT_UNSUPPORTED}: the workspace home's machine needs an intentd update for git roots"
+        ),
+        data: Some(json!({ "code": HOME_ROOT_UNSUPPORTED })),
+    }
+}
+
 /// Whether a path-based call's `repoPath` names the workspace's checkout
 /// (or a folder in it); a call for another repository runs here.
 fn names_checkout(worktree: &Path, params: &Map<String, Value>) -> bool {
@@ -428,19 +445,23 @@ impl Services {
             // missing command), before the home is asked.
             crate::host_exec::parse_args(params).map_err(crate::host_exec::domain_err)?;
         }
-        if params.get("gitRootId").is_some_and(|id| !id.is_null()) {
-            // The home's record knows no registered git roots of this
-            // workspace.
-            return Err(Error::InvalidParams(
-                "home-root-unsupported: a workspace whose home is on a machine has no registered git roots yet"
-                    .to_owned(),
-            ));
-        }
+        let root_path = self.home_root_path(&workspace, &worktree, params).await?;
+        let root_named = root_path.is_some();
         if method == "git.agentCommit" {
             self.check_home_commit(workspace_id, params).await?;
         }
         let timeout = call_timeout(method, params);
-        let mut params = home_params(&worktree, params.clone())?;
+        // With a root, the method reads its paths in the root: an absolute
+        // one maps against it, as a local call's does.
+        let mut params = params.clone();
+        params.remove(GIT_ROOT_PATH_PARAM);
+        let base = root_path
+            .as_ref()
+            .map_or(worktree.as_path(), |(root, _)| root);
+        let mut params = home_params(base, params)?;
+        if let Some((_, rel)) = root_path {
+            params.insert(GIT_ROOT_PATH_PARAM.into(), Value::String(rel));
+        }
         if method == "git.agentCommit" {
             // The home commits as a remote agent's launch would: with the
             // identity this backend's git config gives the workspace.
@@ -495,7 +516,45 @@ impl Services {
             }
             other => other,
         };
-        Ok(Some(result.map_err(HomeCallFailure::Home)))
+        Ok(Some(result.map_err(|error| {
+            HomeCallFailure::Home(older_machine_root(error, root_named))
+        })))
+    }
+
+    /// The registered root a call's `gitRootId` names, resolved as a local
+    /// call resolves it, and its path in the checkout; `None` without one.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidParams` for an unknown or foreign id, or
+    /// `home-root-outside-checkout` for a root the home does not have.
+    async fn home_root_path(
+        &self,
+        workspace: &intent_core::Workspace,
+        worktree: &Path,
+        params: &Map<String, Value>,
+    ) -> Result<Option<(PathBuf, String)>> {
+        let Some(id) = params
+            .get("gitRootId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return Ok(None);
+        };
+        let id = intent_core::WorkspaceGitRootId::from(id);
+        let Some(root) = self.resolve_git_read_root(workspace, Some(&id)).await? else {
+            return Ok(None);
+        };
+        let shown = root.to_string_lossy().into_owned();
+        checkout_relative(worktree, &shown)
+            .filter(|rel| !rel.is_empty())
+            .map(|rel| Some((root, rel)))
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "{HOME_ROOT_OUTSIDE_CHECKOUT}: the git root {shown} is outside the workspace's checkout, so its home does not have it"
+                ))
+            })
     }
 
     /// `host.execStream` on the home: the stream's `requestId`.

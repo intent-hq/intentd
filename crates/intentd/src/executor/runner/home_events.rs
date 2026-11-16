@@ -229,7 +229,10 @@ impl Runner {
     /// Queue `event` for its home, when it is a relayed type of an open
     /// home's record.
     fn collect_home_event(&self, waiting: &mut HashMap<HomeId, Waiting>, event: &Event) {
-        if !HOME_EVENT_TYPES.contains(&event.event_type.as_str()) {
+        // The checkout root's only: a git root's id here is the machine's.
+        if !HOME_EVENT_TYPES.contains(&event.event_type.as_str())
+            || event.data.get("gitRootId").is_some()
+        {
             return;
         }
         let home = lock(&self.inner.homes)

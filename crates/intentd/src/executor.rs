@@ -1062,6 +1062,48 @@ impl runner::HomeRecords for ServicesHomeRecords {
         })
     }
 
+    fn root(
+        &self,
+        record: &intent_core::WorkspaceId,
+        path: &std::path::Path,
+    ) -> intent_core::BoxFuture<'static, anyhow::Result<String>> {
+        let store = self.0.store().clone();
+        let record = record.clone();
+        let path = path.to_owned();
+        Box::pin(async move {
+            let path = tokio::fs::canonicalize(&path)
+                .await?
+                .to_string_lossy()
+                .into_owned();
+            if let Some(known) = store
+                .find_workspace_git_root_by_path(&record, &path)
+                .await?
+            {
+                return Ok(known.id.as_str().to_owned());
+            }
+            let now = intent_core::now_iso();
+            let (stored, _) = store
+                .upsert_workspace_git_root(&intent_core::WorkspaceGitRoot {
+                    id: intent_core::WorkspaceGitRootId::new(),
+                    workspace_id: record,
+                    path,
+                    source: intent_core::WorkspaceGitRootSource::Auto,
+                    repo_owner: None,
+                    repo_name: None,
+                    registered_by_agent_ids: vec![],
+                    registered_commit_sha: None,
+                    pr_number: None,
+                    pr_url: None,
+                    pr_status: None,
+                    pull_requests: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                })
+                .await?;
+            Ok(stored.id.as_str().to_owned())
+        })
+    }
+
     fn forget(&self, worktree: &std::path::Path) -> intent_core::BoxFuture<'static, ()> {
         let store = self.0.store().clone();
         let record = read_home_record(worktree);

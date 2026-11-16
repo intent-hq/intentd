@@ -559,3 +559,27 @@ fn a_home_error_keeps_its_data_code() {
         Error::Internal(_)
     ));
 }
+
+#[test]
+fn an_older_machine_refusing_the_root_id_reads_as_home_root_unsupported() {
+    let unknown = || HomeCallError {
+        code: -32602,
+        message: "Invalid params: Unknown git root: root-1".to_owned(),
+        data: None,
+    };
+    let mapped = older_machine_root(unknown(), true);
+    assert_eq!(mapped.code, -32602);
+    assert!(
+        mapped.message.starts_with(HOME_ROOT_UNSUPPORTED),
+        "{mapped:?}"
+    );
+    assert_eq!(mapped.data, Some(json!({ "code": HOME_ROOT_UNSUPPORTED })));
+    // Without a root in the call, or for another error, the home's stands.
+    assert_eq!(older_machine_root(unknown(), false), unknown());
+    let other = HomeCallError {
+        code: -32603,
+        message: "Unknown git root".to_owned(),
+        data: None,
+    };
+    assert_eq!(older_machine_root(other.clone(), true), other);
+}
