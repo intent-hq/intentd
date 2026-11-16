@@ -287,16 +287,31 @@ impl Runner {
                 commit_identity(identity.clone()),
             );
         }
-        let root_path = params.remove(GIT_ROOT_PATH_PARAM);
-        let mut params = match checkout_params(&method, params, &home.worktree, &record) {
+        let root = match params.remove(GIT_ROOT_PATH_PARAM) {
+            None => None,
+            Some(_) if !params.get("gitRootId").is_some_and(Value::is_string) => {
+                return (
+                    Err(rpc_error(
+                        INVALID_PARAMS,
+                        format!("Invalid params: {GIT_ROOT_PATH_PARAM} needs a gitRootId"),
+                        Some(json!({ "code": "invalid-params" })),
+                    )),
+                    hidden,
+                );
+            }
+            Some(root_path) => match home_root(&home.worktree, &root_path) {
+                Ok(root) => Some(root),
+                Err(error) => return (Err(error), hidden),
+            },
+        };
+        // With a root, the method resolves its paths in the root: they are
+        // checked there.
+        let base = root.as_deref().unwrap_or(&home.worktree);
+        let mut params = match checkout_params(&method, params, base, &record) {
             Ok(params) => params,
             Err(error) => return (Err(error), hidden),
         };
-        if let Some(root_path) = root_path {
-            let root = match home_root(&home.worktree, &root_path) {
-                Ok(root) => root,
-                Err(error) => return (Err(error), hidden),
-            };
+        if let Some(root) = root {
             if method == "git.agentCommit" {
                 intent_git::identity::set_checkout_identity(&root, commit_identity(identity));
             }
@@ -474,7 +489,7 @@ pub(super) fn checkout_path(checkout: &Path, rel: &str) -> Option<PathBuf> {
 fn home_root(checkout: &Path, root_path: &Value) -> Result<PathBuf, HomeCallError> {
     let rel = root_path.as_str().map(str::trim).unwrap_or_default();
     let root = checkout_path(checkout, rel)
-        .filter(|_| !matches!(rel, "" | "."))
+        .filter(|root| root.as_path() != checkout)
         .ok_or_else(|| outside(GIT_ROOT_PATH_PARAM, rel))?;
     if !root.join(".git").exists() {
         return Err(rpc_error(
@@ -994,6 +1009,58 @@ mod tests {
             ),
             "fatal: d is outside .; see /srv/homes/h1/work2 for ws-1"
         );
+    }
+
+    #[test]
+    fn a_reply_shows_the_backends_root_id() {
+        let hidden = Hidden {
+            root_id: Some(("own-root".to_owned(), "their-root".to_owned())),
+            ..Hidden::default()
+        };
+        assert_eq!(
+            hidden.value(json!({
+                "gitRootId": "own-root",
+                "error": "no commit in own-root",
+                "content": "own-root",
+            })),
+            json!({
+                "gitRootId": "their-root",
+                "error": "no commit in their-root",
+                "content": "own-root",
+            })
+        );
+    }
+
+    #[test]
+    fn root_paths_are_checked_in_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("work");
+        let lib = checkout.join("lib");
+        std::fs::create_dir_all(lib.join(".git")).unwrap();
+        std::fs::create_dir_all(checkout.join("plain")).unwrap();
+        assert_eq!(home_root(&checkout, &json!("lib")).unwrap(), lib);
+        for refused in [
+            json!(""),
+            json!("."),
+            json!("./"),
+            json!("./."),
+            json!("../x"),
+            json!("lib/.git"),
+        ] {
+            assert!(home_root(&checkout, &refused).is_err(), "{refused}");
+        }
+        let missing = home_root(&checkout, &json!("plain")).unwrap_err();
+        assert_eq!(missing.data, Some(json!({ "code": HOME_ROOT_MISSING })));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(lib.join(".git"), lib.join("meta")).unwrap();
+            let record = intent_core::WorkspaceId::new_home_record();
+            let params = json!({ "path": "meta/config" })
+                .as_object()
+                .cloned()
+                .unwrap();
+            assert!(checkout_params("file.read", params, &lib, &record).is_err());
+        }
     }
 
     #[test]

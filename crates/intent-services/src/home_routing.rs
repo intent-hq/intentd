@@ -451,9 +451,16 @@ impl Services {
             self.check_home_commit(workspace_id, params).await?;
         }
         let timeout = call_timeout(method, params);
-        let mut params = home_params(&worktree, params.clone())?;
-        if let Some(root_path) = root_path {
-            params.insert(GIT_ROOT_PATH_PARAM.into(), Value::String(root_path));
+        // With a root, the method reads its paths in the root: an absolute
+        // one maps against it, as a local call's does.
+        let mut params = params.clone();
+        params.remove(GIT_ROOT_PATH_PARAM);
+        let base = root_path
+            .as_ref()
+            .map_or(worktree.as_path(), |(root, _)| root);
+        let mut params = home_params(base, params)?;
+        if let Some((_, rel)) = root_path {
+            params.insert(GIT_ROOT_PATH_PARAM.into(), Value::String(rel));
         }
         if method == "git.agentCommit" {
             // The home commits as a remote agent's launch would: with the
@@ -514,8 +521,8 @@ impl Services {
         })))
     }
 
-    /// The checkout path of the registered root a call's `gitRootId` names,
-    /// resolved as a local call resolves it; `None` without one.
+    /// The registered root a call's `gitRootId` names, resolved as a local
+    /// call resolves it, and its path in the checkout; `None` without one.
     ///
     /// # Errors
     ///
@@ -526,7 +533,7 @@ impl Services {
         workspace: &intent_core::Workspace,
         worktree: &Path,
         params: &Map<String, Value>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(PathBuf, String)>> {
         let Some(id) = params
             .get("gitRootId")
             .and_then(Value::as_str)
@@ -539,13 +546,13 @@ impl Services {
         let Some(root) = self.resolve_git_read_root(workspace, Some(&id)).await? else {
             return Ok(None);
         };
-        let root = root.to_string_lossy();
-        checkout_relative(worktree, &root)
+        let shown = root.to_string_lossy().into_owned();
+        checkout_relative(worktree, &shown)
             .filter(|rel| !rel.is_empty())
-            .map(Some)
+            .map(|rel| Some((root, rel)))
             .ok_or_else(|| {
                 Error::InvalidParams(format!(
-                    "{HOME_ROOT_OUTSIDE_CHECKOUT}: the git root {root} is outside the workspace's checkout, so its home does not have it"
+                    "{HOME_ROOT_OUTSIDE_CHECKOUT}: the git root {shown} is outside the workspace's checkout, so its home does not have it"
                 ))
             })
     }

@@ -125,6 +125,13 @@ async fn a_submodule_root_of_a_workspace_with_a_home_runs_on_the_home() {
     let ws_id = created["id"].as_str().unwrap().to_owned();
     let home_id = created["home"]["homeId"].as_str().unwrap().to_owned();
     let mirror = PathBuf::from(created["worktreePath"].as_str().unwrap());
+    // The backend's identity for the workspace; the machine has none of its
+    // own when its global config is empty (as on CI).
+    git(&mirror, &["config", "user.name", "Backend User"]);
+    git(
+        &mirror,
+        &["config", "user.email", "backend@example.invalid"],
+    );
     let work = until("the home checkout with its submodule", || {
         home_checkout(&node_dir, &home_id).filter(|work| work.join("lib").join("lib.txt").exists())
     })
@@ -180,6 +187,32 @@ async fn a_submodule_root_of_a_workspace_with_a_home_runs_on_the_home() {
     .await;
     assert_eq!(read, "in lib\n", "{read}");
 
+    // An absolute path names the file in the root, as locally.
+    id += 1;
+    let read = ok(
+        &mut rpc_ws,
+        id,
+        "file.read",
+        json!({
+            "workspaceId": ws_id,
+            "gitRootId": lib_id,
+            "path": lib_path.join("added.txt").to_string_lossy(),
+        }),
+    )
+    .await;
+    assert_eq!(read, "in lib\n", "{read}");
+    // A client cannot name a root path itself: without a gitRootId the call
+    // reads the checkout root.
+    id += 1;
+    let read = ok(
+        &mut rpc_ws,
+        id,
+        "file.read",
+        json!({ "workspaceId": ws_id, "gitRootPath": "lib", "path": "README.md" }),
+    )
+    .await;
+    assert_eq!(read, "base\n", "{read}");
+
     // git.status of the root is the home submodule's status.
     id += 1;
     let status = ok(
@@ -227,6 +260,10 @@ async fn a_submodule_root_of_a_workspace_with_a_home_runs_on_the_home() {
     let hash = committed["hash"].as_str().unwrap().to_owned();
     assert_eq!(git(&lib_work, &["rev-parse", "HEAD"]), hash, "{committed}");
     assert_ne!(hash, lib_before);
+    assert_eq!(
+        git(&lib_work, &["log", "-1", "--format=%an <%ae>"]),
+        "Backend User <backend@example.invalid>"
+    );
     assert_eq!(git(&work, &["rev-parse", "HEAD"]), primary_before);
     id += 1;
     let commits = ok(
