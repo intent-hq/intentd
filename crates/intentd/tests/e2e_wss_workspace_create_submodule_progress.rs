@@ -12,17 +12,16 @@
 //! in-process plain `ws://`): this suite adds the real daemon + TLS path and
 //! the recursive-submodule clone shape. Harness modeled on
 //! `e2e_wss_git_clone.rs`. Gated on `git` being on PATH; skips cleanly
-//! otherwise. The daemon is spawned with
-//! `GIT_CONFIG_PARAMETERS='protocol.file.allow=always'` so its child
-//! `git clone --recurse-submodules` may fetch `file://` submodules (modern
-//! git blocks the file transport for submodules by default).
+//! otherwise. The source repository and the daemon env come from
+//! [`SubmoduleRepo`].
 
 #![cfg(unix)]
 
 use crate::common;
+use crate::common::submodule_repo::SubmoduleRepo;
 
 use intentd_test_support::GuardedChild;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -310,57 +309,12 @@ fn run_git(args: &[&str], cwd: &Path) {
     );
 }
 
-/// Materialise a source repository inside `dir` that carries a real submodule
-/// gitlink at `sub` (cloned from a second tiny repo in `dir`), returning its
-/// path. The `protocol.file.allow` override is required for `file://`-style
-/// submodule clones on modern git.
-fn make_source_repo_with_submodule(dir: &Path) -> PathBuf {
-    let child = dir.join("child-repo");
-    std::fs::create_dir_all(&child).expect("mkdir child repo");
-    run_git(&["init", "-q", "-b", "main"], &child);
-    run_git(&["config", "user.name", "e2e"], &child);
-    run_git(&["config", "user.email", "e2e@example.com"], &child);
-    std::fs::write(child.join("inner.txt"), "inner\n").unwrap();
-    run_git(&["add", "inner.txt"], &child);
-    run_git(&["commit", "-q", "-m", "inner seed"], &child);
-
-    let repo = dir.join("source-repo");
-    std::fs::create_dir_all(&repo).expect("mkdir source repo");
-    run_git(&["init", "-q", "-b", "main"], &repo);
-    run_git(&["config", "user.name", "e2e"], &repo);
-    run_git(&["config", "user.email", "e2e@example.com"], &repo);
-    std::fs::write(repo.join("tracked.txt"), "seed\n").unwrap();
-    run_git(&["add", "tracked.txt"], &repo);
-    run_git(&["commit", "-q", "-m", "seed"], &repo);
-    run_git(
-        &[
-            "-c",
-            "protocol.file.allow=always",
-            "submodule",
-            "add",
-            "-q",
-            &format!("file://{}", child.display()),
-            "sub",
-        ],
-        &repo,
-    );
-    run_git(&["commit", "-q", "-m", "add submodule"], &repo);
-    repo
-}
-
-/// Boot a daemon whose child git processes may fetch `file://` submodules:
-/// `GIT_CONFIG_PARAMETERS` ranks as command-line-scoped git config and is
-/// inherited by every git the daemon spawns (the clone pipeline appends its
-/// credential-helper entries after any inherited value, so this coexists
-/// with production behavior).
+/// Boot a daemon whose child git processes may fetch `file://` submodules.
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir_guard = scratch_dir("data");
     let data_dir = data_dir_guard.path().to_path_buf();
     let scratch = scratch_dir("scratch");
-    let env: [(&str, &str); 2] = [
-        ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("GIT_CONFIG_PARAMETERS", "'protocol.file.allow=always'"),
-    ];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), SubmoduleRepo::DAEMON_ENV];
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
@@ -505,7 +459,7 @@ async fn workspace_create_clone_with_submodule_streams_normalized_progress_over_
         return;
     }
     let (daemon, port, cfg) = boot().await;
-    let src = make_source_repo_with_submodule(daemon.scratch.path());
+    let src = SubmoduleRepo::create(daemon.scratch.path());
     let clone_path = daemon.scratch.path().join("checkout").join("source-repo");
 
     let mut sub = connect_ws(port, cfg.clone()).await;
@@ -519,7 +473,7 @@ async fn workspace_create_clone_with_submodule_streams_normalized_progress_over_
         "workspace.create",
         json!({
             "title": "WSS Submodule Clone Progress",
-            "githubUrl": format!("file://{}", src.display()),
+            "githubUrl": src.url(),
             "clonePath": clone_path.to_string_lossy(),
             "progressId": progress_id,
         }),
@@ -564,11 +518,11 @@ async fn workspace_create_clone_with_submodule_streams_normalized_progress_over_
     // The clone materialised with the submodule populated (the
     // `--recurse-submodules` contract from the streaming-progress batch).
     assert!(
-        clone_path.join("tracked.txt").exists(),
+        clone_path.join(SubmoduleRepo::TRACKED_FILE).exists(),
         "clone target populated"
     );
     assert!(
-        clone_path.join("sub").join("inner.txt").exists(),
+        SubmoduleRepo::is_populated(&clone_path),
         "submodule populated by --recurse-submodules"
     );
 }
