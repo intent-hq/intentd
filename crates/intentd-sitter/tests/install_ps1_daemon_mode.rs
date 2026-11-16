@@ -1,6 +1,7 @@
 //! The "How will you use this computer?" half of `scripts/install.ps1`: the
 //! `daemon-mode-choice` block (flag, env var, validation) and the
-//! `daemon-mode-apply` block (node setup, switching a node back), run
+//! `daemon-mode-apply` block (node and orchestrator setup, switching back,
+//! never switching an existing install to orchestrator), run
 //! verbatim under PowerShell against a fake `intentd` that records its calls
 //! — the Windows counterpart of `install_sh_daemon_mode.rs`. Like
 //! `install_ps1_owner.rs`, the tests skip without `pwsh` and fail instead
@@ -146,8 +147,10 @@ fn apply_with_pair(
     saved: Option<&str>,
     pair: bool,
 ) -> Outcome {
+    // A saved mode means an earlier install left its database behind.
+    let existing = saved.is_some();
     let body = format!(
-        "$installMode = '{mode}'\n$installModeExplicit = ${explicit}\n$verdict = '{verdict}'\n$interactive = $false\n$pair = ${pair}\n{}",
+        "$installMode = '{mode}'\n$installModeExplicit = ${explicit}\n$verdict = '{verdict}'\n$interactive = $false\n$pair = ${pair}\n$existingInstall = ${existing}\n{}",
         ps_region("daemon-mode-apply")
     );
     run(pwsh, &body, &[], saved)
@@ -161,6 +164,8 @@ fn the_choice_folds_spellings_and_the_parameter_beats_the_env_var() {
         ("", Some("regular"), "MODE=full EXPLICIT=True"),
         ("2", Some("full"), "MODE=node EXPLICIT=True"),
         ("", None, "MODE= EXPLICIT=False"),
+        ("3", None, "MODE=orchestrator EXPLICIT=True"),
+        ("", Some("ORCHESTRATOR"), "MODE=orchestrator EXPLICIT=True"),
     ] {
         let out = choice(&pwsh, param, env);
         assert!(
@@ -170,7 +175,9 @@ fn the_choice_folds_spellings_and_the_parameter_beats_the_env_var() {
     }
     let bad = choice(&pwsh, "", Some("server"));
     assert!(
-        bad.contains("invalid INTENTD_DAEMON_MODE value 'server' (expected full or node)"),
+        bad.contains(
+            "invalid INTENTD_DAEMON_MODE value 'server' (expected full, node or orchestrator)"
+        ),
         "{bad}"
     );
 }
@@ -182,6 +189,7 @@ fn a_node_install_sets_the_mode_and_tunnel_restarts_then_pairs_unattended() {
     assert_eq!(
         outcome.calls,
         [
+            "settings daemon.mode",
             "settings daemon.mode node",
             "settings server.tunnel.enabled true",
             "restart",
@@ -284,4 +292,133 @@ fn the_pair_option_pairs_a_full_install_once_the_daemon_is_up() {
     );
     let off = apply(&pwsh, "", false, "up", None);
     assert!(off.calls.is_empty(), "{:?}", off.calls);
+}
+
+#[test]
+fn a_fresh_orchestrator_install_sets_the_mode_restarts_then_pairs_like_a_full_install() {
+    let Some(pwsh) = pwsh() else { return };
+    let outcome = apply_with_pair(&pwsh, "orchestrator", true, "up", None, true);
+    assert_eq!(
+        outcome.calls,
+        [
+            "settings daemon.mode",
+            "settings daemon.mode orchestrator",
+            "restart",
+            "pair --yes --tunnel",
+        ],
+        "{}",
+        outcome.output
+    );
+    assert!(
+        outcome.output.contains("orchestrator mode on")
+            && outcome.output.contains("intent://pair?"),
+        "{}",
+        outcome.output
+    );
+}
+
+#[test]
+fn a_reinstall_never_switches_an_existing_install_to_orchestrator() {
+    let Some(pwsh) = pwsh() else { return };
+    for (saved, named) in [("regular", "a full install"), ("node", "a node")] {
+        let outcome = apply(&pwsh, "orchestrator", true, "up", Some(saved));
+        assert_eq!(
+            outcome.calls,
+            ["settings daemon.mode"],
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains(&format!(
+                "This computer is already set up as {named}; the mode can't be changed by re-installing. To use orchestrator mode, install on a fresh machine and open your repos there."
+            )),
+            "{}",
+            outcome.output
+        );
+    }
+    let already = apply(&pwsh, "orchestrator", true, "up", Some("orchestrator"));
+    assert_eq!(
+        already.calls,
+        ["settings daemon.mode"],
+        "{}",
+        already.output
+    );
+    assert!(
+        !already.output.contains("can't be changed"),
+        "{}",
+        already.output
+    );
+}
+
+#[test]
+fn a_reinstall_never_switches_an_orchestrator_to_another_mode() {
+    let Some(pwsh) = pwsh() else { return };
+    for mode in ["full", "node"] {
+        let outcome = apply(&pwsh, mode, true, "up", Some("orchestrator"));
+        assert_eq!(
+            outcome.calls,
+            ["settings daemon.mode"],
+            "{mode}: {}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains(
+                "This computer is already set up as an orchestrator; the mode can't be changed by re-installing."
+            ),
+            "{mode}: {}",
+            outcome.output
+        );
+    }
+}
+
+#[test]
+fn orchestrator_setup_waits_for_a_daemon_that_is_up() {
+    let Some(pwsh) = pwsh() else { return };
+    let outcome = apply(&pwsh, "orchestrator", true, "undecided", None);
+    assert!(outcome.calls.is_empty(), "{:?}", outcome.calls);
+    assert!(
+        outcome.output.contains("orchestrator setup did not run"),
+        "{}",
+        outcome.output
+    );
+}
+
+#[test]
+fn an_install_is_existing_when_its_data_dir_holds_the_database() {
+    let Some(pwsh) = pwsh() else { return };
+    for existing in [false, true] {
+        let data = tempfile::tempdir().unwrap();
+        if existing {
+            fs::write(data.path().join("intentd.db"), "").unwrap();
+        }
+        let body = format!(
+            "{}\n\"EXISTING=$existingInstall\"",
+            ps_region("existing-install")
+        );
+        let data_dir = data.path().display().to_string();
+        let outcome = run(
+            &pwsh,
+            &body,
+            &[("INTENTD_DATA_DIR", data_dir.as_str())],
+            None,
+        );
+        let want = if existing {
+            "EXISTING=True"
+        } else {
+            "EXISTING=False"
+        };
+        assert!(outcome.output.contains(want), "{}", outcome.output);
+    }
+}
+
+/// The existing-install check runs before anything can start a daemon that
+/// would create the database: before the task is registered.
+#[test]
+fn the_existing_install_check_runs_before_the_task_is_registered() {
+    let script =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1"))
+            .unwrap();
+    let check = script.find(">>> BEGIN existing-install").unwrap();
+    let register = script.find(">>> BEGIN service-task-register").unwrap();
+    assert!(check < register);
 }

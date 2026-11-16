@@ -1,7 +1,8 @@
 //! Whole runs of `scripts/install.sh` for the "How will you use this computer?"
-//! question: interactive full, interactive node, scripted node, and the
-//! scripted edge cases (no service, a bad value, switching a node back, the
-//! unasked default).
+//! question: interactive full, interactive node, scripted node, a fresh
+//! orchestrator, and the scripted edge cases (no service, a bad value,
+//! switching a node back, the unasked default, a re-install that would switch
+//! an existing install to orchestrator).
 //!
 //! Each test runs the shipped script end to end on the Linux path. Only the
 //! outside world is faked: `curl` serves a local release archive whose
@@ -208,26 +209,26 @@ enum Terminal<'a> {
 }
 
 /// Run the shipped install.sh with `args` and `envs`, answering the terminal
-/// as `terminal` says. `node_already` seeds a daemon whose saved
-/// `daemon.mode` is `node`.
+/// as `terminal` says. `prior` seeds an existing install (its database in the
+/// data dir) whose saved `daemon.mode` is that value.
 fn run_install(
     terminal: Terminal,
     args: &[&str],
     envs: &[(&str, &str)],
-    node_already: bool,
+    prior: Option<&str>,
 ) -> Run {
     let envs: Vec<(&str, &str)> = [("FAKE_LINGER", "yes")]
         .into_iter()
         .chain(envs.iter().copied())
         .collect();
-    run_install_on(terminal, args, &envs, node_already)
+    run_install_on(terminal, args, &envs, prior)
 }
 
 fn run_install_on(
     terminal: Terminal,
     args: &[&str],
     envs: &[(&str, &str)],
-    node_already: bool,
+    prior: Option<&str>,
 ) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -238,8 +239,9 @@ fn run_install_on(
     for d in [&state, &home, &data] {
         fs::create_dir_all(d).unwrap();
     }
-    if node_already {
-        fs::write(state.join("setting.daemon.mode"), "node").unwrap();
+    if let Some(mode) = prior {
+        fs::write(data.join("intentd.db"), "").unwrap();
+        fs::write(state.join("setting.daemon.mode"), mode).unwrap();
     }
     let release = build_release(root);
     let stubs = build_stubs(root);
@@ -304,11 +306,12 @@ fn run_install_on(
     }
 }
 
-const QUESTION: [&str; 4] = [
+const QUESTION: [&str; 5] = [
     "How will you use this computer?",
     "1) Run Intent here (recommended if you're just getting started): workspaces, agents and the app connect to it.",
     "2) Node only: lets another Intent run agents on this computer; nothing else runs here.",
-    "Choose 1 or 2 [1]: ",
+    "3) Orchestrator: holds your workspaces and sends agents to your other machines; no agents run here.",
+    "Choose 1, 2 or 3 [1]: ",
 ];
 
 fn mode_writes(run: &Run) -> Vec<&String> {
@@ -323,7 +326,7 @@ fn mode_writes(run: &Run) -> Vec<&String> {
 #[test]
 fn interactive_full_install_asks_first_and_changes_nothing() {
     // Enter at the mode question, the service question and auto-resume.
-    let run = run_install(Terminal::Answers("\n\n\n"), &[], &[], false);
+    let run = run_install(Terminal::Answers("\n\n\n"), &[], &[], None);
     assert!(run.output.status.success(), "{}", run.describe());
     for line in QUESTION {
         assert!(
@@ -350,7 +353,7 @@ fn interactive_full_install_asks_first_and_changes_nothing() {
 fn interactive_node_install_restarts_then_pairs_through_the_picker() {
     // 2 at the mode question, Enter at service and auto-resume, then the
     // listen-target picker inside `intentd pair` takes "1".
-    let run = run_install(Terminal::Answers("2\n\n\n1\n"), &[], &[], false);
+    let run = run_install(Terminal::Answers("2\n\n\n1\n"), &[], &[], None);
     assert!(run.output.status.success(), "{}", run.describe());
     let node = run.position("settings daemon.mode node");
     let tunnel = run.position("settings server.tunnel.enabled true");
@@ -385,7 +388,7 @@ fn interactive_node_install_restarts_then_pairs_through_the_picker() {
 
 #[test]
 fn interactive_answer_is_asked_again_when_unrecognized() {
-    let run = run_install(Terminal::Answers("maybe\nnode\n\n\n\n"), &[], &[], false);
+    let run = run_install(Terminal::Answers("maybe\nnode\n\n\n\n"), &[], &[], None);
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(
         run.stderr().contains("unrecognized answer 'maybe'"),
@@ -393,7 +396,7 @@ fn interactive_answer_is_asked_again_when_unrecognized() {
         run.describe()
     );
     assert_eq!(
-        run.tty.matches(QUESTION[3]).count(),
+        run.tty.matches(QUESTION[4]).count(),
         2,
         "{}",
         run.describe()
@@ -411,7 +414,7 @@ fn scripted_node_install_sets_up_the_service_and_pairs_unattended() {
         Terminal::None,
         &[],
         &[("INTENTD_DAEMON_MODE", "Node")],
-        false,
+        None,
     );
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(run.tty.is_empty(), "nothing is asked\n{}", run.describe());
@@ -436,7 +439,7 @@ fn scripted_node_flag_beats_the_env_var() {
         Terminal::None,
         &["--daemon-mode=node", "--no-service"],
         &[("INTENTD_DAEMON_MODE", "full")],
-        false,
+        None,
     );
     assert!(run.output.status.success(), "{}", run.describe());
     let stdout = run.stdout();
@@ -461,12 +464,12 @@ fn a_bad_daemon_mode_fails_before_downloading() {
         Terminal::None,
         &[],
         &[("INTENTD_DAEMON_MODE", "server")],
-        false,
+        None,
     );
     assert!(!run.output.status.success(), "{}", run.describe());
     assert!(
         run.stderr()
-            .contains("invalid daemon mode 'server' (expected full or node)"),
+            .contains("invalid daemon mode 'server' (expected full, node or orchestrator)"),
         "{}",
         run.describe()
     );
@@ -479,7 +482,7 @@ fn an_explicit_full_answer_switches_a_node_back() {
         Terminal::None,
         &["--service", "--daemon-mode=full"],
         &[],
-        true,
+        Some("node"),
     );
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(run.position("settings daemon.mode regular") < run.position("restart"));
@@ -497,7 +500,7 @@ fn an_explicit_full_answer_switches_a_node_back() {
 
 #[test]
 fn enter_on_a_node_keeps_it_and_a_typed_1_switches_it_back() {
-    let enter = run_install(Terminal::Answers("\n\n\n"), &[], &[], true);
+    let enter = run_install(Terminal::Answers("\n\n\n"), &[], &[], Some("node"));
     assert!(enter.output.status.success(), "{}", enter.describe());
     assert!(
         !enter
@@ -508,7 +511,7 @@ fn enter_on_a_node_keeps_it_and_a_typed_1_switches_it_back() {
         "{}",
         enter.describe()
     );
-    let typed = run_install(Terminal::Answers("1\n\n\n"), &[], &[], true);
+    let typed = run_install(Terminal::Answers("1\n\n\n"), &[], &[], Some("node"));
     assert!(typed.output.status.success(), "{}", typed.describe());
     assert!(
         typed.position("settings daemon.mode regular") < typed.position("restart"),
@@ -519,7 +522,7 @@ fn enter_on_a_node_keeps_it_and_a_typed_1_switches_it_back() {
 
 #[test]
 fn the_unasked_default_leaves_a_node_alone() {
-    let run = run_install(Terminal::None, &["--service"], &[], true);
+    let run = run_install(Terminal::None, &["--service"], &[], Some("node"));
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(
         !run.calls
@@ -558,7 +561,7 @@ fn the_pair_option_pairs_a_full_install_and_shows_the_link_without_a_terminal() 
             &[("INTENTD_INSTALL_SERVICE", "1"), ("INTENTD_PAIR", "1")][..],
         ),
     ] {
-        let run = run_install(Terminal::None, args, envs, false);
+        let run = run_install(Terminal::None, args, envs, None);
         assert!(run.output.status.success(), "{}", run.describe());
         assert!(
             run.position("status") < run.position("pair --yes --tunnel"),
@@ -583,7 +586,7 @@ fn without_the_pair_option_a_full_install_pairs_nothing() {
         Terminal::None,
         &[],
         &[("INTENTD_INSTALL_SERVICE", "1")],
-        false,
+        None,
     );
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(run.called("status"), "{}", run.describe());
@@ -605,7 +608,7 @@ fn the_pair_option_without_a_service_says_how_to_pair_later() {
         Terminal::None,
         &["--pair"],
         &[("INTENTD_INSTALL_SERVICE", "0")],
-        false,
+        None,
     );
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(
@@ -656,7 +659,7 @@ fn the_link_marker_prints_one_link_line_and_no_credentials_for_a_full_install() 
             ("INTENTD_INSTALL_SERVICE", "1"),
             ("INTENTD_LINK_MARKER", "1"),
         ],
-        false,
+        None,
     );
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(run.called("pair --yes --tunnel"), "{}", run.describe());
@@ -674,7 +677,7 @@ fn the_link_marker_prints_one_link_line_for_a_node_even_on_a_terminal() {
                 ("INTENTD_DAEMON_MODE", "node"),
                 ("INTENTD_LINK_MARKER", "1"),
             ],
-            false,
+            None,
         );
         assert!(run.output.status.success(), "{}", run.describe());
         assert!(
@@ -692,7 +695,7 @@ fn linux_service_setup_turns_lingering_on_without_sudo_when_allowed() {
         Terminal::None,
         &["--service"],
         &[("FAKE_LINGER_ALLOWED", "1")],
-        false,
+        None,
     );
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(
@@ -709,7 +712,7 @@ fn linux_service_setup_turns_lingering_on_without_sudo_when_allowed() {
 
 #[test]
 fn linux_service_setup_prints_the_sudo_step_when_lingering_is_refused() {
-    let run = run_install_on(Terminal::None, &["--service"], &[], false);
+    let run = run_install_on(Terminal::None, &["--service"], &[], None);
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(
         recorded(&run, "loginctl").contains(&format!("--no-ask-password enable-linger {}", user())),
@@ -726,7 +729,7 @@ fn linux_service_setup_prints_the_sudo_step_when_lingering_is_refused() {
 
 #[test]
 fn linux_service_setup_leaves_lingering_alone_when_it_is_on() {
-    let run = run_install(Terminal::None, &["--service"], &[], false);
+    let run = run_install(Terminal::None, &["--service"], &[], None);
     assert!(run.output.status.success(), "{}", run.describe());
     assert!(
         !recorded(&run, "loginctl")
@@ -735,4 +738,196 @@ fn linux_service_setup_leaves_lingering_alone_when_it_is_on() {
         "{}",
         run.describe()
     );
+}
+
+#[test]
+fn interactive_orchestrator_install_sets_the_mode_and_restarts() {
+    // 3 at the mode question, Enter at service and auto-resume.
+    let run = run_install(Terminal::Answers("3\n\n\n"), &[], &[], None);
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert_eq!(
+        mode_writes(&run),
+        ["settings daemon.mode orchestrator"],
+        "no tunnel: an orchestrator pairs like a full install\n{}",
+        run.describe()
+    );
+    assert!(
+        run.position("settings daemon.mode orchestrator") < run.position("restart"),
+        "{}",
+        run.describe()
+    );
+    assert!(
+        !run.calls.iter().any(|c| c.starts_with("pair")),
+        "{}",
+        run.describe()
+    );
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("orchestrator mode on"),
+        "{}",
+        run.describe()
+    );
+    assert!(stdout.contains("Run: intentd pair"), "{}", run.describe());
+}
+
+#[test]
+fn scripted_orchestrator_install_sets_up_the_service_and_pairs_like_a_full_install() {
+    let run = run_install(
+        Terminal::None,
+        &["--pair"],
+        &[("INTENTD_DAEMON_MODE", "Orchestrator")],
+        None,
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(run.tty.is_empty(), "nothing is asked\n{}", run.describe());
+    let mode = run.position("settings daemon.mode orchestrator");
+    let restart = run.position("restart");
+    let pair = run.position("pair --yes --tunnel");
+    assert!(
+        run.position("status") < mode && mode < restart && restart < pair,
+        "{}",
+        run.describe()
+    );
+    assert!(
+        run.stdout().contains(&format!("URL:         {PAIR_URI}")),
+        "{}",
+        run.describe()
+    );
+}
+
+const KEPT: &str = "the mode can't be changed by re-installing.";
+
+#[test]
+fn a_reinstall_never_switches_an_existing_install_to_orchestrator() {
+    for (prior, named) in [("regular", "a full install"), ("node", "a node")] {
+        let run = run_install(
+            Terminal::None,
+            &["--service", "--daemon-mode=orchestrator"],
+            &[],
+            Some(prior),
+        );
+        assert!(run.output.status.success(), "{}", run.describe());
+        assert!(
+            mode_writes(&run).is_empty() && !run.called("restart"),
+            "the current mode stays\n{}",
+            run.describe()
+        );
+        let warning = format!(
+            "This computer is already set up as {named}; {KEPT} To use orchestrator mode, install on a fresh machine and open your repos there."
+        );
+        assert!(run.stderr().contains(&warning), "{}", run.describe());
+    }
+}
+
+#[test]
+fn a_reinstall_of_an_orchestrator_keeps_it_without_a_restart() {
+    let run = run_install(
+        Terminal::None,
+        &["--service", "--daemon-mode=orchestrator"],
+        &[],
+        Some("orchestrator"),
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(
+        mode_writes(&run).is_empty() && !run.called("restart"),
+        "{}",
+        run.describe()
+    );
+    assert!(!run.stderr().contains(KEPT), "{}", run.describe());
+}
+
+#[test]
+fn a_reinstall_never_switches_an_orchestrator_to_another_mode() {
+    for (args, terminal) in [
+        (&["--service", "--daemon-mode=full"][..], Terminal::None),
+        (&["--service", "--daemon-mode=node"][..], Terminal::None),
+        // A typed 1 on a terminal.
+        (&[][..], Terminal::Answers("1\n\n\n")),
+    ] {
+        let run = run_install(terminal, args, &[], Some("orchestrator"));
+        assert!(run.output.status.success(), "{}", run.describe());
+        assert!(
+            mode_writes(&run).is_empty() && !run.called("restart"),
+            "an orchestrator stays one\n{}",
+            run.describe()
+        );
+        assert!(
+            !run.calls.iter().any(|c| c.starts_with("pair --node")),
+            "{}",
+            run.describe()
+        );
+        assert!(
+            run.stderr().contains(&format!(
+                "This computer is already set up as an orchestrator; {KEPT}"
+            )),
+            "{}",
+            run.describe()
+        );
+    }
+}
+
+#[test]
+fn an_orchestrator_without_a_service_names_its_next_steps() {
+    let run = run_install(
+        Terminal::None,
+        &["--daemon-mode=orchestrator", "--no-service"],
+        &[],
+        None,
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("Next steps for an orchestrator:")
+            && stdout.contains("intentd serve --orchestrator")
+            && stdout.contains("intentd settings daemon.mode orchestrator"),
+        "{}",
+        run.describe()
+    );
+    assert!(
+        !run.called("status") && mode_writes(&run).is_empty(),
+        "{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn an_orchestrator_reinstall_without_a_service_keeps_the_mode() {
+    let run = run_install(
+        Terminal::None,
+        &["--daemon-mode=orchestrator", "--no-service"],
+        &[],
+        Some("regular"),
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(
+        run.stderr().contains(&format!(
+            "This computer already has Intent installed; {KEPT} To use orchestrator mode, install on a fresh machine and open your repos there."
+        )),
+        "{}",
+        run.describe()
+    );
+    let stdout = run.stdout();
+    assert!(
+        !stdout.contains("Next steps for an orchestrator:")
+            && !stdout.contains("daemon.mode orchestrator"),
+        "no orchestrator steps for an existing install\n{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn an_unattended_orchestrator_reinstall_sets_no_service_up() {
+    let run = run_install(
+        Terminal::None,
+        &[],
+        &[("INTENTD_DAEMON_MODE", "orchestrator")],
+        Some("regular"),
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(
+        !run.called("status") && mode_writes(&run).is_empty(),
+        "{}",
+        run.describe()
+    );
+    assert!(run.stderr().contains(KEPT), "{}", run.describe());
 }
