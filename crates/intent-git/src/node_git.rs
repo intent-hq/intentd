@@ -1775,12 +1775,32 @@ impl CheckoutCache {
         let name = format!("refs/heads/{local}");
         for entry in entries.flatten() {
             let cache = entry.path();
-            if cache.extension().is_some_and(|ext| ext == "git") && cache.join("HEAD").is_file() {
+            if cache.extension().is_some_and(|ext| ext == "git") && is_cache(&cache) {
                 if let Err(error) = self.git.git(&cache, &["update-ref", "-d", &name]).await {
                     tracing::warn!(%error, "node git: could not delete an agent branch");
                 }
             }
         }
+    }
+
+    /// Create the bare `cache`, replacing a half-made one. It is built
+    /// aside and renamed into place: a launch cancelled by a stop kills its
+    /// `git init`, which must not leave a directory git refuses.
+    async fn init_cache(&self, cache: &Path) -> Result<()> {
+        let parent = cache.parent().unwrap_or(&self.root);
+        std::fs::create_dir_all(parent).map_err(io)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".init-")
+            .tempdir_in(parent)
+            .map_err(io)?;
+        let built = staging.path().join("cache");
+        let mut init = self.git.command(parent);
+        init.args(["init", "--quiet", "--bare"]).arg(&built);
+        run(init).await?;
+        if cache.exists() {
+            std::fs::remove_dir_all(cache).map_err(io)?;
+        }
+        std::fs::rename(&built, cache).map_err(io)
     }
 
     /// Fetch `remote`'s refs into the bare `cache` (created on first use)
@@ -1795,12 +1815,8 @@ impl CheckoutCache {
         expect_base: Option<&str>,
     ) -> Result<Checkout> {
         let cache = cache.to_path_buf();
-        if !cache.join("HEAD").is_file() {
-            let parent = cache.parent().unwrap_or(&self.root).to_path_buf();
-            std::fs::create_dir_all(&parent).map_err(io)?;
-            let mut init = self.git.command(&parent);
-            init.args(["init", "--quiet", "--bare"]).arg(&cache);
-            run(init).await?;
+        if !is_cache(&cache) {
+            self.init_cache(&cache).await?;
         }
         // Head advertises only this agent's refs; the glob takes whichever
         // of base, head and wip exist, and prunes local copies it dropped.
@@ -1967,7 +1983,7 @@ impl CheckoutCache {
     }
 
     async fn prune_cache(&self, cache: &Path) -> Result<()> {
-        if cache.extension().is_some_and(|ext| ext == "git") && cache.join("HEAD").is_file() {
+        if cache.extension().is_some_and(|ext| ext == "git") && is_cache(cache) {
             let mut prune = self.git.command(cache);
             prune.args(["worktree", "prune"]);
             run(prune).await?;
@@ -2000,6 +2016,12 @@ impl CheckoutCache {
 #[expect(clippy::needless_pass_by_value)]
 fn io(error: std::io::Error) -> Error {
     Error::Internal(format!("node git I/O: {error}"))
+}
+
+/// Whether `dir` is a bare cache git accepts: a killed `git init` can leave
+/// `HEAD` without `objects`.
+fn is_cache(dir: &Path) -> bool {
+    dir.join("HEAD").is_file() && dir.join("objects").is_dir()
 }
 
 /// Run a git command to completion, returning its trimmed stdout.

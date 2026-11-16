@@ -29,6 +29,39 @@ async fn machine_of(rpc_ws: &mut common::TlsWs, id: i64, agent_id: &str) -> Opti
         .cloned()
 }
 
+/// The backend's and every sandbox's log lines about links and stops, for a
+/// remove that left a stop unacknowledged.
+fn stop_logs(head_dir: &Path, scratch: &Path) -> String {
+    let mut logs = vec![head_dir.join("head.log")];
+    let mut dirs = vec![scratch.join("e2b")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.file_name().is_some_and(|name| name == "serve.log") {
+                logs.push(path);
+            }
+        }
+    }
+    let mut out = String::new();
+    for log in logs {
+        out.push_str("--- ");
+        out.push_str(&log.display().to_string());
+        out.push('\n');
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        for line in text.lines().filter(|line| {
+            ["stop", "link", "lease", "WARN", "ERROR"]
+                .iter()
+                .any(|word| line.contains(word))
+        }) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_named_entries_start_and_remove_their_own_sandboxes() {
     if intent_providers::resolve_on_path("node").is_none()
@@ -62,6 +95,8 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
     .await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let mut transcript = Vec::new();
+    let began = std::time::Instant::now();
+    let step = |name: &str| eprintln!("[entries {:>6.1}s] {name}", began.elapsed().as_secs_f64());
     let hello = ok(
         &mut rpc_ws,
         1,
@@ -244,6 +279,7 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
     assert_eq!(ant_machine["name"], "Alpha · Ant", "{ant_machine}");
     assert_eq!(ant_machine["cloud"]["cloudMachineId"], "e2b");
 
+    step("both agents linked");
     // A sub-agent placed on E2B without an entry, while several exist,
     // starts with its parent's entry.
     let mut events = connect(port, cfg.clone()).await;
@@ -310,6 +346,17 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
         "the sub-agent's sandbox is in Beta's project"
     );
 
+    // Bee watches the sub-agent it created: Bee's wake turn ends before
+    // the remove, or the wake would start Bee again on the entry left.
+    // The reply is streamed while the turn runs, hence also idle.
+    agent_until(&mut rpc_ws, (&ws_id, &bee), 300, |a| {
+        a["status"] == "idle"
+            && a["lastAgentResponse"]
+                .as_str()
+                .is_some_and(|reply| reply.contains("Child agent Kid"))
+    })
+    .await;
+    step("sub-agent linked");
     // A rename reaches the machine row and the agent.
     let renamed = ok(
         &mut rpc_ws,
@@ -327,6 +374,7 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
     .await;
     assert_eq!(bee_now["placement"]["cloudMachineId"], beta_id.as_str());
 
+    step("renamed");
     // Removing one entry: its live sandbox needs stopAgents; then only its
     // sandbox goes, and its agent no longer names it.
     let busy = rpc(
@@ -344,8 +392,14 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
         json!({ "cloudMachineId": beta_id, "stopAgents": true }),
     )
     .await;
+    step("entry removed");
     transcript.push(removed.to_string());
-    assert_eq!(removed["ok"], true, "{removed}");
+    assert_eq!(
+        removed,
+        json!({ "ok": true, "unconfirmedStops": [] }),
+        "every stop is acknowledged\n{}",
+        stop_logs(&head_dir, fake.scratch())
+    );
     {
         let state = fake.state();
         assert!(
