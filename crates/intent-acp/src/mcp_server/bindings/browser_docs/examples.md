@@ -371,17 +371,32 @@ default `tabId`.
   ]
 }
 
-// Find button by accessible name and click it
+// Click the button with trusted input, then check the result
 {
   "actions": [
-    {
-      "action": "evaluate",
-      "expression": "const buttons = document.querySelectorAll('button'); for (const btn of buttons) { if (btn.textContent.includes('Submit')) { btn.click(); break; } }"
-    },
+    { "action": "click", "selector": "button[type=submit]" },
     { "action": "getAccessibilityTree" }
   ]
 }
 ```
+
+## Filling a Form
+
+```json
+{
+  "actions": [
+    { "action": "type", "selector": "#email", "text": "ada@example.com", "clear": true },
+    { "action": "type", "selector": "#birthday", "text": "03141990" },
+    { "action": "selectOption", "selector": "#country", "value": "Canada" },
+    { "action": "press", "key": "Enter" },
+    { "action": "screenshot" }
+  ]
+}
+```
+
+Use `type` in the default `keys` mode for date pickers and masked inputs: they read
+each key press. If a click fails with `element-obscured`, close the dialog or banner the
+error names first.
 
 ## Capturing a Login Flow
 

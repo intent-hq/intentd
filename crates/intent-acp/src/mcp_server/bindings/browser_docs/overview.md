@@ -131,7 +131,7 @@ steal focus.
 **Frame rate during agent use.** While you act on a tab you own, it draws at full
 frame rate (requestAnimationFrame, CSS animations, timers) even when it is hidden or
 the app window is minimized or covered. Content actions on it (`evaluate`,
-`screenshot`, `snapshot`, `getAccessibilityTree`, `navigate`, `focusTab`,
+`screenshot`, `snapshot`, `getAccessibilityTree`, the input actions, `navigate`, `focusTab`,
 `startSession`, and the `startCapture` / `captureStep` / `startTrace` session steps)
 keep it at full rate for as long as they run and for 30 s
 after your last action; after that an idle hidden tab drops back to a throttled,
@@ -152,7 +152,7 @@ succeed, skip the UI focus attempt, and the action result carries an additive
 `warning` string stating that the workspace is not visible so no UI focus was
 attempted (the field is absent when the workspace is visible).
 
-Capture ops (`screenshot`, `getAccessibilityTree`, `evaluate`) and `navigate` (which
+Capture ops (`screenshot`, `getAccessibilityTree`, `evaluate`, and the input actions) and `navigate` (which
 runs through `evaluate`) need a mounted webview. A tab whose webview is not mounted —
 typically a **visible** tab whose workspace is not in view or that sits behind another
 tab in its panel, but also a tab opened while its workspace was not in view, whatever
@@ -199,6 +199,27 @@ naming the "action execution" stage instead of a per-action `errorCode`.
 - `{ action: "evaluate", expression, tabId? }` - Run JavaScript in the page
 - `{ action: "focusTab", tabId? }` - Focus/remount a visible tab (fails on a hidden tab — use showTab)
 - `{ action: "previewHtml", html, width?, appearance? }` - Check a self-contained `ws-block:html` visual before showing it, in an invisible window with the app sandbox, fonts and themes (no tab, server or focus change). `width` is CSS pixels, 320 to 1600 (default 800; about 390 for phones). `appearance` is `"light"` (default) or `"dark"`. As a single action, `r.result` has `assetUrl`, `width`, `height`, `contentHeight`, `truncated` (full-height PNG capped at 8000px), `appearance` and `consoleMessages` (`[{ level, message }]`); view it with `return await ws.note.readAsset(r.result.assetUrl)`. Without `assetUrl`, the result keeps `base64` and `mimeType`. Frontends without this action report it as unsupported.
+
+## Input Actions
+Real mouse and keyboard input through the DevTools Input domain. The page gets
+`isTrusted: true` events with native editing and selection, so these work on controls
+that ignore events made in `evaluate`: sectioned date pickers, masked inputs, rich-text
+editors and `isTrusted` checks. Input goes only to the tab's page. It never moves the
+user's focus and works on hidden tabs. `selector` is a CSS selector in the top document
+(not inside iframes); `x`/`y` are CSS pixels in the tab's viewport.
+- `{ action: "click", selector | x+y, button?, clickCount?, tabId? }` - Scroll the element into view and click its center. `button` is `left` (default), `right` or `middle`; `clickCount` is 1–3
+- `{ action: "hover", selector | x+y, tabId? }` - Move the mouse over the element
+- `{ action: "type", text, selector?, clear?, mode?, tabId? }` - Type into the focused element, or focus `selector` first. Types at the caret; `clear: true` selects all and deletes first. `mode: "keys"` (default) sends one key press per character (`\n` is Enter); `"insert"` inserts the text in one step (faster, no key events)
+- `{ action: "press", key, modifiers?, tabId? }` - Press one key: a single character or a named key (`Enter`, `Tab`, `Backspace`, `Delete`, `Escape`, `ArrowUp`/`Down`/`Left`/`Right`, `Home`, `End`, `PageUp`, `PageDown`, `F1`–`F12`). `modifiers` is a list of `Shift`, `Control`, `Alt`, `Meta`, `ControlOrMeta` (Meta on macOS, else Control), e.g. `{ key: "a", modifiers: ["ControlOrMeta"] }` selects all
+- `{ action: "selectOption", selector, value, tabId? }` - Choose options of a native `<select>` by value or label (`value` is a string or a list for `multiple`), then fire `input` and `change`. For custom dropdowns, use `click`
+
+Input failures carry an `errorCode`: `element-not-found`, `invalid-selector`,
+`element-not-visible` (zero size or `visibility: hidden`), `element-obscured` (another
+element covers the center; the error names it — close it, or click by `x`/`y`),
+`not-focusable`, `not-a-select`, `option-not-found` or `unknown-key`. These checks
+run before any input is sent. Take a `screenshot` or `getAccessibilityTree` after input to see
+the result. The user can still use a tab you drive, and their input is not blocked:
+work in your own hidden tabs when you can.
 
 ## Capture Actions (for debugging)
 - `{ action: "snapshot", workspaceId, name?, reload?, waitFor? }` - Quick point-in-time capture
