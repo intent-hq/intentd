@@ -17,10 +17,18 @@
 // This module has no npm dependencies so scripts/test-e2b-template.mjs can run it
 // offline; build.mjs and smoke.mjs pass in the e2b SDK.
 
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 
 export const TEMPLATE_PREFIX = 'intent-node';
-export const BASE_IMAGE = 'node:24-bookworm';
+// Pinned by digest in base.Dockerfile, where Dependabot keeps it current.
+export const BASE_IMAGE = baseImage(readFileSync(new URL('./base.Dockerfile', import.meta.url), 'utf8'));
+
+export function baseImage(text) {
+  const from = String(text).split('\n').filter(line => /^FROM\s/i.test(line));
+  const match = from.length === 1 && /^FROM\s+(\S+@sha256:[0-9a-f]{64})\s*$/i.exec(from[0]);
+  if (!match) throw new Error('base.Dockerfile must hold one FROM line with an image pinned by digest');
+  return match[1];
+}
 export const ARCHIVE_TARGET = 'x86_64-unknown-linux-musl';
 export const RELEASES_REPO = 'intent-hq/intentd-releases';
 export const INSTALL_DIR = '/opt/intentd';
@@ -275,10 +283,18 @@ export const IMAGE_REPO = 'ghcr.io/intent-hq/intent-node';
 export const IMAGE_SOURCE = 'https://github.com/intent-hq/intentd';
 
 // plan() with full image references; PR images are built and smoke-tested only.
+// A PR also builds the release before the newest one (`baseline`), to measure
+// the layers a release adds when the previous image is its build cache.
 export function imagePlan(env) {
   const target = plan(env);
   if (target.skip) return target;
-  return { version: target.version, tags: target.tags.map(tag => `${IMAGE_REPO}:${tag}`), push: target.publish };
+  const image = { version: target.version, tags: target.tags.map(tag => `${IMAGE_REPO}:${tag}`), push: target.publish };
+  if (env.EVENT_NAME === 'pull_request') {
+    const baseline = parseVersion(env.PREVIOUS_RELEASE_TAG);
+    if (baseline === image.version) throw new Error(`the baseline release ${baseline} is the newest release`);
+    image.baseline = baseline;
+  }
+  return image;
 }
 
 // The base image's `node` account (uid 1000) renamed to `user`, with its home
@@ -292,13 +308,16 @@ export function addUserCommand() {
 // Every template step runs as root, like the template's; the container then
 // runs as the unprivileged `user`. It idles: the backend starts intentd
 // itself, as in an E2B sandbox.
+// Layers go from least to most often changed, so a release built with the
+// previous image as its cache only adds the intentd layer: the user step
+// comes before the template steps, and the version label after them.
 export function dockerfile({ version, sha256 }) {
   const v = parseVersion(version);
   parseSha256(sha256);
   const lines = [];
   const builder = {
     fromImage(image) {
-      lines.push(`FROM ${image}`, `LABEL org.opencontainers.image.source="${IMAGE_SOURCE}"`, `LABEL org.opencontainers.image.version="${v}"`);
+      lines.push(`FROM ${image}`, `LABEL org.opencontainers.image.source="${IMAGE_SOURCE}"`, `RUN ${addUserCommand()}`);
       return builder;
     },
     aptInstall(packages) {
@@ -312,7 +331,7 @@ export function dockerfile({ version, sha256 }) {
     },
   };
   defineTemplate(() => builder, { version: v, sha256 });
-  lines.push(`RUN ${addUserCommand()}`, 'USER user', 'WORKDIR /home/user', 'CMD ["sleep", "infinity"]');
+  lines.push('USER user', 'WORKDIR /home/user', `LABEL org.opencontainers.image.version="${v}"`, 'CMD ["sleep", "infinity"]');
   return `${lines.join('\n')}\n`;
 }
 

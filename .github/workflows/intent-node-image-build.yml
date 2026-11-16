@@ -15,10 +15,27 @@ on:
         required: false
         type: boolean
 
+# Layer cache: every build reads the previous image's inline build cache
+# (--cache-from) and pushes its own (--cache-to type=inline), so a release
+# reuses the base, apt, gh and CLI layers byte for byte and only adds intentd.
+# A PR proves it: it builds the release before the newest one into a local
+# registry, empties the builder's cache, builds the newest one with that image
+# as its only cache, and fails when the new compressed blobs are over
+# LAYER_BUDGET_MB.
+env:
+  LAYER_BUDGET_MB: 120
+  LOCAL_IMAGE: localhost:5000/intent-node
+
 jobs:
   image:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    services:
+      # An empty image skips the service: only PR runs need the local registry.
+      registry:
+        image: ${{ github.event_name == 'pull_request' && 'registry:2' || '' }}
+        ports:
+          - 5000:5000
     steps:
       - uses: actions/checkout@v7
         with:
@@ -34,10 +51,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # The mirror also carries sitter-v* releases; take the newest daemon tag.
-          tag=$(gh release list --repo intent-hq/intentd-releases --limit 50 --json tagName \
-            --jq '[.[] | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].tagName')
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # The mirror also carries sitter-v* releases; take the two newest daemon tags.
+          tags=$(gh release list --repo intent-hq/intentd-releases --limit 50 --json tagName \
+            --jq '[.[] | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0:2][].tagName')
+          echo "tag=$(sed -n 1p <<<"$tags")" >> "$GITHUB_OUTPUT"
+          echo "previous=$(sed -n 2p <<<"$tags")" >> "$GITHUB_OUTPUT"
 
       - name: Write the Dockerfile
         id: plan
@@ -50,17 +68,48 @@ jobs:
           INPUT_LATEST: ${{ inputs.latest }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           LATEST_RELEASE_TAG: ${{ steps.latest.outputs.tag }}
+          PREVIOUS_RELEASE_TAG: ${{ steps.latest.outputs.previous }}
         run: node image.mjs
+
+      # The docker-container driver keeps imported cache layers as the same
+      # compressed blobs, so a push reuses them instead of uploading new ones.
+      # Host networking lets it reach the PR's local registry.
+      - uses: docker/setup-buildx-action@v4
+        if: steps.plan.outputs.skip == 'false'
+        with:
+          driver-opts: network=host
+
+      - name: Build the previous release as the cache
+        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.baseline != ''
+        working-directory: packaging/e2b
+        run: |
+          docker buildx build --platform linux/amd64 --pull --file Dockerfile.baseline \
+            --cache-to type=inline \
+            --output "type=image,name=$LOCAL_IMAGE:baseline,push=true,registry.insecure=true" .
+          # Drop the builder's local cache, so the next build can only reuse
+          # layers through the registry cache import, as a release does.
+          docker buildx prune --all --force
 
       - name: Build the image
         if: steps.plan.outputs.skip == 'false'
         working-directory: packaging/e2b
         env:
           TAGS: ${{ steps.plan.outputs.tags }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REF: ${{ steps.plan.outputs.ref }}
         run: |
           args=()
-          for tag in $TAGS; do args+=(--tag "$tag"); done
-          docker build --platform linux/amd64 --pull "${args[@]}" .
+          if [ -n "$PR_NUMBER" ]; then
+            # Only the baseline as cache, like a release with the previous image.
+            # No --tag: buildx would put it on the local registry export too.
+            args+=(--cache-from "type=registry,ref=$LOCAL_IMAGE:baseline,registry.insecure=true")
+            args+=(--output "type=docker,name=$REF")
+            args+=(--output "type=image,name=$LOCAL_IMAGE:pr-$PR_NUMBER,push=true,registry.insecure=true")
+          else
+            args+=(--cache-from "type=registry,ref=ghcr.io/intent-hq/intent-node:latest" --load)
+            for tag in $TAGS; do args+=(--tag "$tag"); done
+          fi
+          docker buildx build --platform linux/amd64 --pull --cache-to type=inline "${args[@]}" .
 
       - name: Smoke-test the image
         if: steps.plan.outputs.skip == 'false'
@@ -70,12 +119,21 @@ jobs:
           VERSION: ${{ steps.plan.outputs.version }}
         run: node smoke-image.mjs "$REF" "$VERSION"
 
+      - name: Measure the layers a release adds
+        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.baseline != ''
+        working-directory: packaging/e2b
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node layers.mjs "$LOCAL_IMAGE:baseline" "$LOCAL_IMAGE:pr-$PR_NUMBER" --budget-mb "$LAYER_BUDGET_MB"
+
       - name: Push the image
         if: steps.plan.outputs.push == 'true'
+        working-directory: packaging/e2b
         env:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
           TAGS: ${{ steps.plan.outputs.tags }}
+          REF: ${{ steps.plan.outputs.ref }}
         run: |
           log=$(mktemp)
           refuse() {
@@ -86,12 +144,20 @@ jobs:
             grep -qiE 'denied|unauthorized|403' "$log" && refuse
             cat "$log"; exit 1
           fi
+          previous=$(node layers.mjs --digest ghcr.io/intent-hq/intent-node:latest) || previous=
+          # Rebuilds from the build cache: the same layers that were smoke-tested.
+          args=(--cache-from "type=registry,ref=ghcr.io/intent-hq/intent-node:latest")
+          for tag in $TAGS; do args+=(--tag "$tag"); done
+          if ! docker buildx build --platform linux/amd64 --cache-to type=inline --push "${args[@]}" . >"$log" 2>&1; then
+            # Only a refused push is fail-soft, not any 403 in the build log.
+            grep -qiE '(push|ghcr\.io).*(denied|unauthorized|403)' "$log" && refuse
+            cat "$log"; exit 1
+          fi
           echo "### intent-node image (built, smoke-tested, pushed)" >> "$GITHUB_STEP_SUMMARY"
           for tag in $TAGS; do
-            if ! docker push "$tag" >"$log" 2>&1; then
-              grep -qiE 'denied|unauthorized|403' "$log" && refuse
-              cat "$log"; exit 1
-            fi
             echo "Pushed $tag"
             echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
           done
+          if [ -n "$previous" ]; then
+            node layers.mjs "$previous" "$REF" || echo "::warning::Could not compare the layers with the previous latest image."
+          fi
