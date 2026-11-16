@@ -487,8 +487,8 @@ computer (macOS / Linux, or Windows); it installs intentd as a service and ends 
 an intent:// link to paste back. Run by hand in a terminal, the installer first asks how the
 computer will be used: **Run Intent here**, **Node only**, or **Orchestrator** (holds the
 workspaces and sends agents to other machines; no agents run here). Orchestrator is set
-only on a fresh install: over an existing install the installer keeps its current role and
-says so. A
+only on a fresh install: re-installing never switches a computer to or from Orchestrator
+(it keeps its current role and says so). A
 remote machine's actions include **Edit** and **Connect**, with **Test connection** inside
 its editing panel.
 <!-- Labs (SSH machine setup, desktop app only): describe only when the user asks about
