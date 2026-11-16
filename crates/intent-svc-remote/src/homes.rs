@@ -871,9 +871,10 @@ pub(crate) async fn switch_home(
     workspace_id: &WorkspaceId,
     home_id: &HomeId,
 ) -> Result<Option<intent_store::HomeMoveSwitch>> {
+    let owner = crate::cloud::owner_started_by(svc, workspace_id).await;
     let _pushes = crate::git::home_push_slot(workspace_id).await?;
     svc.store()
-        .complete_home_move(workspace_id, home_id, &intent_core::now_iso())
+        .complete_home_move(workspace_id, home_id, &owner, &intent_core::now_iso())
         .await
 }
 

@@ -888,7 +888,7 @@ async fn start_for_agent(
 }
 
 /// Record `started_by` as machine `machine_id`'s `cloud.startedBy`.
-pub(super) async fn set_started_by(
+async fn set_started_by(
     svc: &Services,
     machine_id: &str,
     started_by: intent_core::machines::CloudStartedBy,
@@ -937,7 +937,9 @@ pub(crate) async fn start_home(
 /// [`start_home`], but the sandbox is recorded as the machine of the move
 /// to `home_id`, which opens it, instead of becoming the workspace's home.
 /// Its machine id. The sandbox is deleted when a step fails, also when the
-/// move ended meanwhile.
+/// move ended meanwhile. A sandbox an interrupted start left (a restart
+/// between its machine row and its record on the move) is taken instead
+/// of starting another one.
 ///
 /// # Errors
 ///
@@ -948,6 +950,19 @@ pub(crate) async fn start_move_home(
     home_id: &intent_core::HomeId,
     cloud_machine_id: &str,
 ) -> Result<String> {
+    if let Some(machine_id) = left_move_sandbox(svc, workspace_id, cloud_machine_id).await? {
+        if !svc
+            .store()
+            .set_home_move_machine(workspace_id, home_id, &machine_id)
+            .await?
+        {
+            return Err(Error::Internal(
+                "the home move ended before it took its sandbox".into(),
+            ));
+        }
+        tracing::info!(workspace = %workspace_id, machine = %machine_id, "cloud home: the move takes the sandbox an interrupted start left");
+        return Ok(machine_id);
+    }
     start_home_sandbox(
         svc,
         workspace_id,
@@ -956,6 +971,37 @@ pub(crate) async fn start_move_home(
         &mut None,
     )
     .await
+}
+
+/// A home-only sandbox of entry `cloud_machine_id` in `workspace_id` that
+/// holds no home, owes no stop, is no move's target and is not being
+/// started or removed: one whose start a restart cut before the move
+/// recorded it.
+async fn left_move_sandbox(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    cloud_machine_id: &str,
+) -> Result<Option<String>> {
+    let feature = super::feature(svc)?;
+    if super::home::home_start_in_flight(svc, workspace_id) {
+        return Ok(None);
+    }
+    let owner = super::home::start_key(workspace_id);
+    for row in svc.store().list_cloud_machines().await? {
+        let Some(cloud) = &row.cloud else { continue };
+        if cloud.agent_id != owner
+            || cloud.workspace_id != workspace_id.as_str()
+            || cloud.cloud_machine_id != cloud_machine_id
+            || cloud.state == CloudSandboxState::Stopping
+            || feature.cloud.loss(&row.id).is_some()
+        {
+            continue;
+        }
+        if !crate::homes::machine_holds_homes(svc.store(), &row.id).await? {
+            return Ok(Some(row.id));
+        }
+    }
+    Ok(None)
 }
 
 /// What a home-only sandbox is started for.

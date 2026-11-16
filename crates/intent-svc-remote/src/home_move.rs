@@ -296,9 +296,6 @@ async fn steps(svc: &Services, home_move: &HomeMove) -> Result<()> {
         }
         Some(switch) => {
             tracing::info!(workspace = %workspace_id, home = %target.home_id, "the workspace's home moved");
-            if target.cloud_machine_id.is_some() {
-                crate::cloud::home::co_own(svc, workspace_id, &node_id).await;
-            }
             crate::cloud::home::changed(svc);
             svc.publish_workspace_home_changed(workspace_id).await;
             if switch.auto_start {

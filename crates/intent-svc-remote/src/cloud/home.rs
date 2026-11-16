@@ -687,13 +687,6 @@ async fn usable_entry(
     Ok(saved)
 }
 
-/// Sandbox `machine_id` now holds `workspace_id`'s home: its `startedBy`
-/// is the workspace owner (nodes.md "Cloud homes" 2).
-pub(crate) async fn co_own(svc: &Services, workspace_id: &WorkspaceId, machine_id: &str) {
-    let owner = super::owner_started_by(svc, workspace_id).await;
-    super::start::set_started_by(svc, machine_id, owner).await;
-}
-
 async fn wait_started(
     svc: &Services,
     feature: &crate::RemoteFeature,

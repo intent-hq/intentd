@@ -121,6 +121,37 @@ async fn move_of(
     row.as_ref().map(map_row).transpose()
 }
 
+/// Inside a transaction: `owner` becomes cloud machine `node_id`'s
+/// `cloud.startedBy`. Nothing for a row that is not a cloud machine.
+async fn co_own(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    owner: &intent_core::machines::CloudStartedBy,
+) -> Result<()> {
+    let cloud: Option<Option<String>> =
+        sqlx::query_scalar("SELECT cloud_json FROM exposed_machine WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(db)?;
+    let Some(Some(cloud)) = cloud else {
+        return Ok(());
+    };
+    let mut cloud: intent_core::machines::CloudMachine =
+        serde_json::from_str(&cloud).map_err(db)?;
+    if &cloud.started_by == owner {
+        return Ok(());
+    }
+    cloud.started_by = owner.clone();
+    sqlx::query("UPDATE exposed_machine SET cloud_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(&cloud).map_err(db)?)
+        .bind(node_id)
+        .execute(conn)
+        .await
+        .map_err(db)?;
+    Ok(())
+}
+
 impl Store {
     /// Start `home_move`: in one transaction the workspace's home
     /// `from_home_id` goes from `from_state` to `moving` (since
@@ -408,7 +439,9 @@ impl Store {
     /// home, `attached` since `now` (its `lastBackupAt` kept: the new home
     /// starts from that backup), a `moved` stop of the old machine home is
     /// recorded and the move goes. A setup the new home finished before
-    /// claims its `autoStart` here. `None` when that move is gone (rolled
+    /// claims its `autoStart` here. A new home on a cloud sandbox gets
+    /// `owner` as the sandbox's `cloud.startedBy` in the same transaction
+    /// (nodes.md "Cloud homes" 2). `None` when that move is gone (rolled
     /// back, or the workspace archived or deleted): nothing is written.
     ///
     /// # Errors
@@ -418,6 +451,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         home_id: &HomeId,
+        owner: &intent_core::machines::CloudStartedBy,
         now: &str,
     ) -> Result<Option<HomeMoveSwitch>> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
@@ -468,6 +502,9 @@ impl Store {
         if switched.rows_affected() == 0 {
             return Ok(None);
         }
+        if let (Some(_), Some(node_id)) = (&target.cloud_machine_id, &target.node_id) {
+            co_own(&mut tx, node_id, owner).await?;
+        }
         sqlx::query("DELETE FROM home_move WHERE workspace_id = ?")
             .bind(&workspace_id.0)
             .execute(&mut *tx)
@@ -480,3 +517,6 @@ impl Store {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests;
