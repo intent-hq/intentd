@@ -23,7 +23,6 @@ enum Early {
 /// A tailcat stand-in that pipes to `127.0.0.1:<port>` only once `ready`
 /// exists; before that it behaves as `early`. Each run adds a line to
 /// `dir/pipes`.
-#[cfg(unix)]
 fn sandbox_tailcat(dir: &std::path::Path, ready: &std::path::Path, early: Early) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = dir.join("tailcat");
@@ -96,7 +95,6 @@ async fn dial_after_resume(
 /// the test's hang guard, a sandbox that answers 1 s after the resume still
 /// binds: the connect gave up on the stalled (or refused) pipe and opened a
 /// fresh one, instead of waiting out the budget.
-#[cfg(unix)]
 #[tokio::test]
 async fn a_sandbox_that_answers_soon_after_a_resume_binds_on_a_fresh_pipe() {
     for early in [Early::Stalls, Early::Refused] {
@@ -141,7 +139,6 @@ async fn a_sandbox_that_answers_soon_after_a_resume_binds_on_a_fresh_pipe() {
 
 /// A sandbox that never answers after the resume still fails as before:
 /// `Unreachable`, once the whole connect budget is spent, not sooner.
-#[cfg(unix)]
 #[tokio::test]
 async fn a_sandbox_that_never_answers_after_a_resume_fails_after_the_whole_budget() {
     let backend = Backend::new().await;
@@ -164,7 +161,6 @@ async fn a_sandbox_that_never_answers_after_a_resume_fails_after_the_whole_budge
 
 /// A sandbox that refuses this backend's credential after the resume is
 /// `Revoked` on the first pipe: a retry cannot change the answer.
-#[cfg(unix)]
 #[tokio::test]
 async fn a_refused_credential_after_a_resume_is_revoked_without_a_retry() {
     let backend = Backend::new().await;

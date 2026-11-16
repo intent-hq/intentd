@@ -45,6 +45,7 @@ mod cloud;
 mod forge_token;
 mod launch;
 mod methods;
+#[cfg(unix)]
 mod resume_dial;
 
 fn wait() -> Duration {
