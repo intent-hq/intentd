@@ -1597,7 +1597,7 @@ outside the workspace; files from other registered repositories do not resolve t
 Use the diagram's **View source** action to inspect
 its code, or turn off **Markdown preview** in the panel menu to edit the file's source.
 Mermaid flowcharts keep their authored direction and curved connector style.
-The renderer can reflow shared branches and simple sibling groups for shorter connections with fewer bends.
+The renderer can reflow shared branches and simple sibling groups to reduce crossings and unnecessary bends.
 Routes and arrowheads follow node outlines, including decisions and databases.
 Wide diagrams scroll horizontally to keep text readable.
 Excel workbooks and other binary files
