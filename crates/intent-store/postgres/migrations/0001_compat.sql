@@ -1,7 +1,7 @@
 -- SQLite compatibility functions for the multi-tenant Postgres backend. Store
 -- SQL keeps SQLite's JSON1 semantics on Postgres by calling these instead of
--- the SQLite built-ins. All are IMMUTABLE
--- (except intent_now_iso) so expression and partial indexes can use them. Each
+-- the SQLite built-ins. All are IMMUTABLE (except intent_now_iso and
+-- sqlite_julianday, which read the clock) so expression and partial indexes can use them. Each
 -- pins its search_path: Postgres 17+ builds indexes with a restricted one.
 
 -- Parse JSON text; NULL when malformed (SQLite json_valid is false).
@@ -108,11 +108,15 @@ SET search_path FROM CURRENT AS $$
     SELECT (intent_json(t) #> intent_json_path(p))::text
 $$;
 
--- SQLite julianday() over the ISO-8601 forms the store writes; NULL otherwise.
+-- SQLite julianday() over 'now' and the ISO-8601 forms the store writes;
+-- NULL otherwise. STABLE because of 'now'.
 CREATE FUNCTION sqlite_julianday(t text) RETURNS double precision
-LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
+LANGUAGE plpgsql STABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
 BEGIN
+    IF t = 'now' THEN
+        RETURN extract(epoch FROM clock_timestamp()) / 86400.0 + 2440587.5;
+    END IF;
     IF t IS NULL OR t !~ '^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?(Z|[+-]\d{2}:\d{2})?$' THEN
         RETURN NULL;
     END IF;
@@ -123,21 +127,63 @@ EXCEPTION WHEN others THEN
 END
 $$;
 
--- SQLite json_set(t, path, json(value), ...) where every value is JSON text.
-CREATE FUNCTION sqlite_json_set(t text, VARIADIC kv text[]) RETURNS text
+-- SQLite json(): the value as JSON (an error when malformed). Pass it to
+-- sqlite_json_set to store JSON rather than a string.
+CREATE FUNCTION sqlite_json(t text) RETURNS jsonb
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+SET search_path FROM CURRENT AS $$
+    SELECT t::jsonb
+$$;
+
+-- One json_set step: like SQLite, create missing parent objects, then set
+-- the leaf (SQL NULL becomes JSON null).
+CREATE FUNCTION intent_json_set_step(doc jsonb, p text, v jsonb) RETURNS jsonb
 LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
 DECLARE
-    doc jsonb := intent_json(t);
-    i int := 1;
+    path text[] := intent_json_path(p);
+    i int;
 BEGIN
-    IF doc IS NULL THEN
-        RETURN NULL;
-    END IF;
-    WHILE i < array_length(kv, 1) LOOP
-        doc := jsonb_set(doc, intent_json_path(kv[i]), kv[i + 1]::jsonb, true);
-        i := i + 2;
+    FOR i IN 1 .. coalesce(array_length(path, 1), 0) - 1 LOOP
+        IF doc #> path[1:i] IS NULL THEN
+            doc := jsonb_set(doc, path[1:i], '{}'::jsonb, true);
+        END IF;
     END LOOP;
-    RETURN doc::text;
+    RETURN jsonb_set(doc, path, coalesce(v, 'null'::jsonb), true);
 END
+$$;
+
+-- SQLite json_set(t, path, value[, path, value]). The overload picks how the
+-- value is stored: text as a JSON string, numbers as numbers, and
+-- sqlite_json(...) (SQLite json(...)) as JSON. A NULL document stays NULL;
+-- a malformed one is an error, as in SQLite.
+CREATE FUNCTION sqlite_json_set(t text, p text, v jsonb) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+SET search_path FROM CURRENT AS $$
+    SELECT intent_json_set_step(t::jsonb, p, v)::text
+$$;
+CREATE FUNCTION sqlite_json_set(t text, p text, v text) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+SET search_path FROM CURRENT AS $$
+    SELECT intent_json_set_step(t::jsonb, p, to_jsonb(v))::text
+$$;
+CREATE FUNCTION sqlite_json_set(t text, p text, v bigint) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+SET search_path FROM CURRENT AS $$
+    SELECT intent_json_set_step(t::jsonb, p, to_jsonb(v))::text
+$$;
+CREATE FUNCTION sqlite_json_set(t text, p text, v double precision) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+SET search_path FROM CURRENT AS $$
+    SELECT intent_json_set_step(t::jsonb, p, to_jsonb(v))::text
+$$;
+CREATE FUNCTION sqlite_json_set(t text, p1 text, v1 jsonb, p2 text, v2 jsonb) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+SET search_path FROM CURRENT AS $$
+    SELECT intent_json_set_step(intent_json_set_step(t::jsonb, p1, v1), p2, v2)::text
+$$;
+CREATE FUNCTION sqlite_json_set(t text, p1 text, v1 text, p2 text, v2 text) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+SET search_path FROM CURRENT AS $$
+    SELECT intent_json_set_step(intent_json_set_step(t::jsonb, p1, to_jsonb(v1)), p2, to_jsonb(v2))::text
 $$;

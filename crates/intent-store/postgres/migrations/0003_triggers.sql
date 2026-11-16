@@ -139,7 +139,7 @@ CREATE TRIGGER host_member_removed_ad AFTER DELETE ON host_member
 
 CREATE FUNCTION trg_node_assignment_agent_deleted() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    UPDATE node_assignment SET record_json = SQLITE_JSON_SET(record_json, '$.active', 'false', '$.tombstoned', 'true') WHERE agent_id = OLD.id AND node_assignment.tenant_id = old.tenant_id;
+    UPDATE node_assignment SET record_json = SQLITE_JSON_SET(record_json, '$.active', SQLITE_JSON('false'), '$.tombstoned', SQLITE_JSON('true')) WHERE agent_id = OLD.id AND node_assignment.tenant_id = old.tenant_id;
     RETURN NULL;
 END
 $$;

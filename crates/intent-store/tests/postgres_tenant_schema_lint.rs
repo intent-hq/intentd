@@ -9,7 +9,9 @@
 //! - every foreign key pairs `tenant_id` on both sides, so cascades stay
 //!   inside one tenant;
 //! - every trigger statement filters each table it reads or writes by the
-//!   triggering row's tenant, and every trigger INSERT sets `tenant_id`.
+//!   triggering row's tenant in the same query (not only in a subquery), and
+//!   every trigger INSERT sets `tenant_id`; tenant provisioning functions do
+//!   the same with their `p_tenant` parameter.
 //!
 //! It also pairs migrations: each `SQLite` migration after the baseline needs
 //! a Postgres migration whose header names it (`-- sqlite: <file>`), or an
@@ -181,74 +183,167 @@ fn check_foreign_keys(file: &str, sql: &str, out: &mut Findings) -> usize {
     count
 }
 
-/// Table references in one statement: (keyword, table, alias).
-fn table_refs(stmt: &str) -> Vec<(String, String, String)> {
-    let words: Vec<&str> = stmt
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|w| !w.is_empty())
-        .collect();
+/// One table reference: the keyword, its byte offset, the table and its alias.
+struct TableRef {
+    keyword: String,
+    at: usize,
+    table: String,
+    alias: String,
+}
+
+/// Words of `stmt` with their byte offsets (split on whitespace and commas).
+fn words_with_offsets(stmt: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, c) in stmt.char_indices() {
+        let sep = c.is_whitespace() || c == ',';
+        match (sep, start) {
+            (true, Some(s)) => {
+                out.push((s, &stmt[s..i]));
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, &stmt[s..]));
+    }
+    out
+}
+
+fn ident(w: &str) -> String {
+    w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .to_lowercase()
+}
+
+fn table_refs(stmt: &str) -> Vec<TableRef> {
+    const NOT_ALIAS: &[&str] = &[
+        "where",
+        "set",
+        "on",
+        "join",
+        "left",
+        "inner",
+        "group",
+        "order",
+        "limit",
+        "union",
+        "values",
+        "select",
+        "returning",
+        "default",
+    ];
+    let words = words_with_offsets(stmt);
     let mut refs = Vec::new();
-    for (i, w) in words.iter().enumerate() {
-        let kw = w.to_uppercase();
-        let target = match kw.as_str() {
-            "FROM" | "JOIN" | "UPDATE" | "INTO" => words.get(i + 1),
-            _ => None,
+    for (i, (at, w)) in words.iter().enumerate() {
+        let keyword = w.to_uppercase();
+        if !matches!(keyword.as_str(), "FROM" | "JOIN" | "UPDATE" | "INTO") {
+            continue;
+        }
+        let Some((_, raw)) = words.get(i + 1) else {
+            continue;
         };
-        let Some(raw) = target else { continue };
-        if kw == "UPDATE" && i > 0 && words[i - 1].eq_ignore_ascii_case("DO") {
+        if keyword == "UPDATE" && i > 0 && words[i - 1].1.eq_ignore_ascii_case("DO") {
             continue; // ON CONFLICT DO UPDATE SET
         }
         if raw.contains(['(', ')', '.']) || raw.starts_with(|c: char| c.is_ascii_digit()) {
             // subquery, table function, `IS DISTINCT FROM old.x`, SUBSTRING(x FROM n)
             continue;
         }
-        let table = raw
-            .trim_matches(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .to_lowercase();
-        if table.is_empty() || matches!(table.as_str(), "new" | "old") {
+        let table = ident(raw);
+        if table.is_empty() {
             continue;
         }
-        let mut alias = table.clone();
-        let next = words.get(i + 2).map(|w| w.to_lowercase());
-        if next.as_deref() == Some("as") {
-            if let Some(a) = words.get(i + 3) {
-                alias = a
-                    .trim_matches(|c: char| !(c.is_alphanumeric() || c == '_'))
-                    .to_lowercase();
-            }
-        } else if let Some(n) = next {
-            let reserved = [
-                "where",
-                "set",
-                "on",
-                "join",
-                "left",
-                "inner",
-                "group",
-                "order",
-                "limit",
-                "union",
-                "values",
-                "select",
-                "returning",
-                "default",
-            ];
-            if !n.starts_with('(')
-                && !reserved.contains(&n.as_str())
-                && n.chars().all(|c| c.is_alphanumeric() || c == '_')
+        let next = words.get(i + 2).map(|(_, w)| w.to_lowercase());
+        let alias = match next.as_deref() {
+            Some("as") => words.get(i + 3).map_or(table.clone(), |(_, a)| ident(a)),
+            Some(n)
+                if !NOT_ALIAS.contains(&n)
+                    && n.chars().all(|c| c.is_alphanumeric() || c == '_') =>
             {
-                alias = n;
+                n.to_owned()
             }
-        }
-        refs.push((kw, table, alias));
+            _ => table.clone(),
+        };
+        refs.push(TableRef {
+            keyword,
+            at: *at,
+            table,
+            alias,
+        });
     }
     refs
 }
 
-fn check_trigger_functions(file: &str, sql: &str, out: &mut Findings) -> usize {
+/// Text of the query that holds byte `at`: the parenthesized group around it
+/// (the whole statement at depth 0) with nested subqueries — groups that open
+/// with `select` — removed. Plain grouping parentheses stay, so a filter must
+/// sit in the same query as the table it scopes, not only in a subquery.
+fn same_level(s: &str, at: usize) -> String {
+    let bytes = s.as_bytes();
+    let mut depth = Vec::with_capacity(bytes.len());
+    let mut d = 0usize;
+    for &b in bytes {
+        match b {
+            b'(' => {
+                depth.push(d);
+                d += 1;
+            }
+            b')' => {
+                d = d.saturating_sub(1);
+                depth.push(d);
+            }
+            _ => depth.push(d),
+        }
+    }
+    let level = depth[at];
+    let mut lo = at;
+    while lo > 0 && depth[lo - 1] >= level {
+        lo -= 1;
+    }
+    let mut hi = at;
+    while hi < bytes.len() && depth[hi] >= level {
+        hi += 1;
+    }
+    let mut out = String::new();
+    let mut i = lo;
+    while i < hi {
+        let opens_subquery =
+            bytes[i] == b'(' && depth[i] >= level && s[i + 1..].trim_start().starts_with("select");
+        if opens_subquery {
+            let inner = depth[i];
+            i += 1;
+            while i < hi && !(bytes[i] == b')' && depth[i] == inner) {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(char::from(bytes[i]));
+        i += 1;
+    }
+    out
+}
+
+/// The expression a function's statements must compare `tenant_id` with:
+/// the triggering row for `trg_*`, the `p_tenant` parameter otherwise.
+fn tenant_of(name: &str, body: &str) -> String {
+    let lower = body.to_lowercase();
+    if !name.starts_with("trg_") {
+        return "p_tenant".to_owned();
+    }
+    if lower.contains("old.tenant_id") && !lower.contains("new.tenant_id") {
+        "old.tenant_id".to_owned()
+    } else {
+        "new.tenant_id".to_owned()
+    }
+}
+
+fn check_functions(file: &str, sql: &str, out: &mut Findings) -> usize {
     let mut count = 0;
     let mut rest = sql;
-    while let Some(pos) = rest.find("CREATE FUNCTION trg_") {
+    while let Some(pos) = rest.find("CREATE FUNCTION ") {
         let after = &rest[pos..];
         let name = word_after(after, "CREATE FUNCTION")
             .unwrap_or("?")
@@ -256,35 +351,35 @@ fn check_trigger_functions(file: &str, sql: &str, out: &mut Findings) -> usize {
         let body_start = after.find("$$").expect("function body") + 2;
         let body_len = after[body_start..].find("$$").expect("function body end");
         let body = &after[body_start..body_start + body_len];
+        rest = &after[body_start + body_len + 2..];
+        if !name.starts_with("trg_") && !body.contains("p_tenant") {
+            continue; // compat helpers touch no tenant table
+        }
         count += 1;
-        let tenant = if body.to_lowercase().contains("old.tenant_id")
-            && !body.to_lowercase().contains("new.tenant_id")
-        {
-            "old"
-        } else {
-            "new"
-        };
+        let tenant = tenant_of(&name, body);
         for stmt in body.split(';') {
             let lower = stmt.to_lowercase();
-            for (kw, table, alias) in table_refs(stmt) {
-                let ok = if kw == "INTO" {
-                    let cols = lower.find(&format!("into {table} (")).map(|i| &lower[i..]);
-                    cols.is_some_and(|c| c.contains("(tenant_id,"))
-                } else if kw == "UPDATE" || lower.trim_start().starts_with("delete") && kw == "FROM"
-                {
-                    lower.contains(&format!("tenant_id = {tenant}.tenant_id"))
+            for r in table_refs(&lower) {
+                let ok = if r.keyword == "INTO" {
+                    let after_insert = lower[..r.at].trim_end().ends_with("insert");
+                    !after_insert
+                        || lower
+                            .find(&format!("into {} (", r.table))
+                            .is_some_and(|i| lower[i..].contains("(tenant_id,"))
                 } else {
-                    lower.contains(&format!("{alias}.tenant_id = {tenant}.tenant_id"))
+                    same_level(&lower, r.at).contains(&format!("{}.tenant_id = {tenant}", r.alias))
                 };
                 if !ok {
                     out.fail(
                         file,
-                        &format!("{name}: {kw} {table} is not scoped to {tenant}.tenant_id"),
+                        &format!(
+                            "{name}: {} {} is not filtered by {tenant} in the same query",
+                            r.keyword, r.table
+                        ),
                     );
                 }
             }
         }
-        rest = &after[body_start + body_len..];
     }
     count
 }
@@ -298,7 +393,7 @@ fn every_postgres_object_is_tenant_scoped() {
         tables += check_tables(&file, &sql, &mut out);
         indexes += check_indexes(&file, &sql, &mut out);
         fks += check_foreign_keys(&file, &sql, &mut out);
-        triggers += check_trigger_functions(&file, &sql, &mut out);
+        triggers += check_functions(&file, &sql, &mut out);
     }
     assert!(tables > 50 && indexes > 50 && fks > 50 && triggers > 50, "scanned too little: {tables} tables, {indexes} indexes, {fks} foreign keys, {triggers} trigger functions");
     assert!(
