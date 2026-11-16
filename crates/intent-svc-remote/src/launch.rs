@@ -766,7 +766,11 @@ impl RemoteLaunchPort for RemoteLaunch {
         svc: &'a Services,
         workspace_id: &'a WorkspaceId,
     ) -> BoxFuture<'a, ()> {
-        Box::pin(crate::homes::send_workspace_stops(svc, workspace_id))
+        Box::pin(async move {
+            // An archive or delete may have ended a move calls wait on.
+            crate::cloud::home::changed(svc);
+            crate::homes::send_workspace_stops(svc, workspace_id).await;
+        })
     }
 
     fn set_home<'a>(
