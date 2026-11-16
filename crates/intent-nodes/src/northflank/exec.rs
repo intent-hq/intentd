@@ -1,8 +1,8 @@
 //! Northflank command execution: one command per WebSocket, as
 //! `@northflank/js-client` 0.12 speaks it.
 //!
-//! The first frame authenticates with the API token (never the URL). Then
-//! `stdOut` / `stdErr` frames carry output and one `completion` frame the
+//! The first frame authenticates with the API token (never the URL) and
+//! asks for no terminal. Then `stdOut` / `stdErr` frames carry output and one `completion` frame the
 //! exit. Output may still follow `completion`; the stream is read until
 //! Northflank closes it, or until it has been silent for the drain time.
 //!
@@ -128,14 +128,8 @@ impl NorthflankClient {
             let mut output = self
                 .run(&instance.id, "root", command, spec.timeout, &secrets)
                 .await?;
-            let marker = format!("{HOME_READY}\n");
-            if let Some(at) = output
-                .stderr
-                .windows(marker.len())
-                .position(|w| w == marker.as_bytes())
-            {
+            if take_home_ready(&mut output) {
                 self.pending().remove(&instance.id);
-                output.stderr.drain(..at + marker.len());
                 return Ok(output);
             }
             if output.exit.exit_code != NO_DROP_EXIT {
@@ -199,8 +193,10 @@ impl NorthflankClient {
             })??;
         // Only the home setup names root, and it drops to RUN_AS before the
         // command: an agent run as root would need IS_SANDBOX for Claude
-        // Code's bypass-permissions mode.
-        let context = json!({ "command": command, "shell": "none", "user": user });
+        // Code's bypass-permissions mode. Without `"tty": false` Northflank
+        // runs the command in a terminal: stderr arrives in stdout, with
+        // CRLF line ends.
+        let context = json!({ "command": command, "shell": "none", "user": user, "tty": false });
         let init = json!({
             "type": "init",
             "data": {
@@ -472,6 +468,26 @@ fn init_refused(data: &Value, secrets: &[&str]) -> CloudError {
             format!("Northflank rejected the API token for command execution: {message}"),
         )
     }
+}
+
+/// Remove the setup's [`HOME_READY`] line, if it printed one: on stderr, or
+/// first on stdout when Northflank ran the command in a terminal anyway.
+fn take_home_ready(output: &mut ProcessOutput) -> bool {
+    let marker = format!("{HOME_READY}\n");
+    if let Some(at) = output
+        .stderr
+        .windows(marker.len())
+        .position(|w| w == marker.as_bytes())
+    {
+        output.stderr.drain(..at + marker.len());
+        return true;
+    }
+    let terminal = format!("{HOME_READY}\r\n");
+    if output.stdout.starts_with(terminal.as_bytes()) {
+        output.stdout.drain(..terminal.len());
+        return true;
+    }
+    false
 }
 
 /// The setup before a command failed, so the command did not run.

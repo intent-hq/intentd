@@ -96,7 +96,10 @@ pub enum WsStep {
     /// Command output, delivered as real Northflank does: in a terminal
     /// (stderr merged into `stdOut`, `\n` sent as `\r\n`) unless the
     /// `init` context sets `"tty": false`.
-    Output { stderr: bool, text: String },
+    Output {
+        stderr: bool,
+        text: String,
+    },
     SendText(String),
     Sleep(Duration),
     Ping,

@@ -1220,13 +1220,20 @@ async fn the_home_setup_marker_is_found_in_a_terminal_stream() {
         .await
         .unwrap();
     assert!(output.success());
-    assert_eq!(output.stdout, b"started\r\n", "the setup's marker is not output");
+    assert_eq!(
+        output.stdout, b"started\r\n",
+        "the setup's marker is not output"
+    );
     client
         .run_command(&instance("svc-1"), &shell("echo mint"))
         .await
         .unwrap();
     let users: Vec<String> = contexts(&server).into_iter().map(|(u, _)| u).collect();
-    assert_eq!(users, ["root", "user"], "the home is set up once per connect");
+    assert_eq!(
+        users,
+        ["root", "user"],
+        "the home is set up once per connect"
+    );
 }
 
 #[tokio::test]
