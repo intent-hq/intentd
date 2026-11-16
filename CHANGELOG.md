@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.226] - 2026-11-16
+
+### 🚀 Features
+
+- *(remote)* Run gitRootId calls on a workspace home ([#3409](https://github.com/intent-hq/intentd/pull/3409))
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Keep workspaces with an active monitor off the settled tier ([#3415](https://github.com/intent-hq/intentd/pull/3415))
+
+### 🧪 Testing
+
+- *(e2e)* Share one submodule source-repo fixture ([#3412](https://github.com/intent-hq/intentd/pull/3412))
+
+
 ## [0.11.225] - 2026-11-16
 
 ### 🚀 Features
