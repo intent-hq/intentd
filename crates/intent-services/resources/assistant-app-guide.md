@@ -1597,8 +1597,8 @@ outside the workspace; files from other registered repositories do not resolve t
 Use the diagram's **View source** action to inspect
 its code, or turn off **Markdown preview** in the panel menu to edit the file's source.
 Mermaid flowcharts keep their authored direction and curved connector style.
-The renderer reduces connector crossings without moving nodes. Wide diagrams
-scroll horizontally to keep text readable.
+The renderer can reflow connected nodes to keep curved connections short and clear.
+Wide diagrams scroll horizontally to keep text readable.
 Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
 to save the original file on your computer, including from a remote workspace.
