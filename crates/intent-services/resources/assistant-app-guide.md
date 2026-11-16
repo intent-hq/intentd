@@ -515,9 +515,8 @@ orchestrator (`intentd serve --orchestrator`, experimental) runs every agent on 
 machines: its list has no **This computer** row, and **Settings → Providers** shows only
 the enable switches and profiles, with no **Test** button and no sign-in status. On an
 orchestrator, **Start on** offers **First available machine** instead of the backend, plus
-each machine. On an orchestrator each workspace may also have a **home** (experimental:
-only when the daemon runs with `INTENTD_UNSTABLE_HOMES=1`; do not offer it as a normal
-option): the machine that holds its files, terminals and scripts, shown as
+each machine. Homes are part of orchestrator mode: on an orchestrator a git workspace
+gets a **home**, a machine that holds its files, terminals and scripts, shown as
 **Home: <machine>** under the workspace title (hover it for the last backup). When the
 home has been offline for a minute, a banner in the workspace and a **Home unavailable**
 marker on its Home card say so: chats, notes and script logs keep working, and file, diff

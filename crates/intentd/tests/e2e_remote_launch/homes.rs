@@ -1,7 +1,7 @@
 //! Workspace homes on an orchestrator (monorepo
 //! `docs/protocol/methods/nodes.md`, "Workspace homes"; `node-link.md`,
 //! "Workspace homes (nodeProtocol 19)") against a real orchestrator and a
-//! real machine, both with homes enabled: `workspace.create` chooses the
+//! real machine: `workspace.create` chooses the
 //! machine as the workspace's home and the row carries `home`; the machine
 //! makes the home checkout from `home/head`; a commit there reaches the
 //! hub's `home/head`, moves `lastBackupAt` and the orchestrator's mirror
@@ -13,8 +13,6 @@
 
 use super::*;
 use base64::Engine as _;
-
-pub(super) const HOMES: (&str, &str) = ("INTENTD_UNSTABLE_HOMES", "1");
 
 /// The home checkout `home_id` on the machine whose data dir is `node_dir`.
 pub(super) fn home_checkout(node_dir: &Path, home_id: &str) -> Option<PathBuf> {
@@ -77,14 +75,14 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
     let (head, _, _, _) = start_backend(&head_dir, &repo).await;
     drop(head);
     super::orchestrator::orchestrator_config(&head_dir);
-    let (head, port, cfg) = serve_backend(&head_dir, &[HOMES]).await;
+    let (head, port, cfg) = serve_backend(&head_dir, &[]).await;
     let mut rpc_ws = connect(port, cfg).await;
 
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
     let node_dir = scratch.path().join("node-0");
     std::fs::create_dir_all(&node_dir).unwrap();
-    let machine = start_machine_with(&node_dir, &backend_id, &[HOMES]).await;
+    let machine = start_machine_with(&node_dir, &backend_id, &[]).await;
     ok(
         &mut rpc_ws,
         2,
@@ -356,7 +354,7 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
     // its own: a commit there still reaches home/head.
     drop(rpc_ws);
     drop(head);
-    let (_head, _, _) = serve_backend(&head_dir, &[HOMES]).await;
+    let (_head, _, _) = serve_backend(&head_dir, &[]).await;
     let third = commit_on(&work, "notes.txt", "three\n", "third");
     until("home/head at the third commit after a restart", || {
         (try_rev(&mirror, &home_ref("head")).as_deref() == Some(third.as_str())).then_some(())
@@ -431,14 +429,14 @@ async fn home_runs_and_autostart_run_in_the_home_checkout() {
     let (head, _, _, _) = start_backend(&head_dir, &repo).await;
     drop(head);
     super::orchestrator::orchestrator_config(&head_dir);
-    let (_head, port, cfg) = serve_backend(&head_dir, &[HOMES]).await;
+    let (_head, port, cfg) = serve_backend(&head_dir, &[]).await;
     let mut rpc_ws = connect(port, cfg).await;
 
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
     let node_dir = scratch.path().join("node-0");
     std::fs::create_dir_all(&node_dir).unwrap();
-    let machine = start_machine_with(&node_dir, &backend_id, &[HOMES]).await;
+    let machine = start_machine_with(&node_dir, &backend_id, &[]).await;
     ok(
         &mut rpc_ws,
         2,

@@ -7,7 +7,7 @@
 //! pushed to `home/orphaned/<orphanedAt>/{head,wip}` only, then removed,
 //! and the workspace gets a notice naming those refs.
 
-use super::homes::{commit_on, home_checkout, until, HOMES};
+use super::homes::{commit_on, home_checkout, until};
 use super::*;
 
 /// A workspace whose home is a fresh machine: the orchestrator, its
@@ -46,13 +46,13 @@ async fn homed(prefix: &str) -> Option<Homed> {
     let (head, _, _, _) = start_backend(&head_dir, &repo).await;
     drop(head);
     super::orchestrator::orchestrator_config(&head_dir);
-    let (head, port, cfg) = serve_backend(&head_dir, &[HOMES]).await;
+    let (head, port, cfg) = serve_backend(&head_dir, &[]).await;
     let mut rpc_ws = connect(port, cfg).await;
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
     let node_dir = scratch.path().join("node-0");
     std::fs::create_dir_all(&node_dir).unwrap();
-    let machine = start_machine_with(&node_dir, &backend_id, &[HOMES]).await;
+    let machine = start_machine_with(&node_dir, &backend_id, &[]).await;
     ok(
         &mut rpc_ws,
         2,
@@ -241,7 +241,7 @@ async fn a_moved_home_pushes_its_leftover_work_to_orphaned_refs_when_its_machine
     let at = stop.orphaned_at.clone().unwrap();
 
     // The machine binds again when the orchestrator is back.
-    let (head, port, cfg) = serve_backend(&head_dir, &[HOMES]).await;
+    let (head, port, cfg) = serve_backend(&head_dir, &[]).await;
     let orphaned_head = format!("{}orphaned/{at}/head", home_ref(""));
     let orphaned_wip = format!("{}orphaned/{at}/wip", home_ref(""));
     let wip = until("the orphaned refs", || {

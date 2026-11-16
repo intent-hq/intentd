@@ -1035,6 +1035,19 @@ fn runtime_capabilities_are_added_only_when_on() {
             "startupStatus": 1,
         })
     );
+    let homes = |mode: DaemonMode, remote: bool| {
+        caps(with_runtime_capabilities(
+            Some(ok.clone()),
+            mode,
+            false,
+            remote,
+        ))
+        .get("workspaceHomes")
+        .cloned()
+    };
+    assert_eq!(homes(DaemonMode::Orchestrator, true), Some(json!(1)));
+    assert_eq!(homes(DaemonMode::Regular, true), None);
+    assert_eq!(homes(DaemonMode::Node, false), None);
     let error = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32602 } }).to_string();
     let patched =
         with_runtime_capabilities(Some(error.clone()), DaemonMode::Node, true, true).unwrap();

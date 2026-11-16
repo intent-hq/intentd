@@ -292,9 +292,6 @@ struct HomeHarness {
 
 /// An orchestrator with one workspace whose home is on a machine.
 async fn home_harness(reply: Option<Value>) -> HomeHarness {
-    // Homes are on for this test process only (nextest runs each test in
-    // its own process).
-    std::env::set_var("INTENTD_UNSTABLE_HOMES", "1");
     let dir = crate::test_support::test_tempdir("home-search-cancel");
     let worktree = dir.path().join("work");
     std::fs::create_dir_all(&worktree).unwrap();

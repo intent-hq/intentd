@@ -2238,11 +2238,10 @@ impl Services {
     }
 
     /// Whether this daemon keeps its workspaces' files, terminals and
-    /// scripts on homes (nodes.md "Workspace homes"): an orchestrator, once
-    /// this build serves homes ([`intent_core::node_link::homes_ready`]).
+    /// scripts on homes (nodes.md "Workspace homes"): every orchestrator.
     #[must_use]
     pub fn workspace_homes(&self) -> bool {
-        self.orchestrator_mode() && intent_core::node_link::homes_ready()
+        self.orchestrator_mode()
     }
 
     /// Whether this daemon may run agents on its own host: the "This

@@ -21,7 +21,6 @@
 
 use base64::Engine as _;
 
-use super::super::homes::HOMES;
 use super::*;
 
 /// The workspace's home, from `workspace.get`.
@@ -121,9 +120,6 @@ async fn a_cloud_entry_is_a_home_that_starts_lazily() {
     git(&repo, &["commit", "--quiet", "-m", "base"]);
     let branch = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
     let fake = FakeE2b::start(scratch, &fixture).await;
-    fake.state()
-        .sandbox_env
-        .push((HOMES.0.to_owned(), HOMES.1.to_owned()));
 
     let head_dir = fake.scratch().join("head");
     let (head, _, _, _) = start_backend(&head_dir, &repo).await;
@@ -138,7 +134,6 @@ async fn a_cloud_entry_is_a_home_that_starts_lazily() {
             ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
             ("INTENTD_E2B_DAEMON_WAIT_SECS", "30"),
             ("INTENTD_E2B_MANIFEST_BASE_URL", &manifest_base),
-            HOMES,
         ],
     )
     .await;
@@ -532,9 +527,6 @@ impl CloudHomes {
         git(&repo, &["commit", "--quiet", "-m", "base"]);
         let branch = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
         let fake = FakeE2b::start(scratch, &fixture).await;
-        fake.state()
-            .sandbox_env
-            .push((HOMES.0.to_owned(), HOMES.1.to_owned()));
         let head_dir = fake.scratch().join("head");
         let (head, _, _, _) = start_backend(&head_dir, &repo).await;
         drop(head);
@@ -547,7 +539,6 @@ impl CloudHomes {
             ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
             ("INTENTD_E2B_DAEMON_WAIT_SECS", "30"),
             ("INTENTD_E2B_MANIFEST_BASE_URL", manifest_base.as_str()),
-            HOMES,
         ];
         backend_env.extend_from_slice(env);
         let (head, port, cfg) = serve_backend(&head_dir, &backend_env).await;
@@ -1418,7 +1409,7 @@ async fn a_home_moves_to_a_cloud_entry_and_to_an_agents_sandbox() {
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
     let a_dir = homes.fake.scratch().join("node-a");
     std::fs::create_dir_all(&a_dir).unwrap();
-    let a = start_machine_with(&a_dir, &backend_id, &[HOMES]).await;
+    let a = start_machine_with(&a_dir, &backend_id, &[]).await;
     homes
         .ok("remoteMachines.add", add_params(&a, "Machine A"))
         .await;
