@@ -1,12 +1,12 @@
 //! Git roots on the home (monorepo `docs/protocol/node-link.md`, "Files
 //! and git on the home", point 7) against a real orchestrator and a real
-//! machine, both with homes enabled: a call with the `gitRootId` of a
+//! machine (the orchestrator serves homes): a call with the `gitRootId` of a
 //! submodule reads, shows git status and commits in that submodule of the
 //! home checkout; a root outside
 //! the checkout, a root the home checkout lacks and an unknown id each fail
 //! with a clear `-32602`.
 
-use super::homes::{home_checkout, until, HOMES};
+use super::homes::{home_checkout, until};
 use super::*;
 
 fn seeded_root(workspace_id: &str, path: &Path) -> intent_core::WorkspaceGitRoot {
@@ -86,13 +86,13 @@ async fn a_submodule_root_of_a_workspace_with_a_home_runs_on_the_home() {
     // from a local path is a plain worktree, which leaves it empty on any
     // daemon); `file://` submodules need this on modern git.
     let file_submodules = ("GIT_CONFIG_PARAMETERS", "'protocol.file.allow=always'");
-    let (_head, port, cfg) = serve_backend(&head_dir, &[HOMES, file_submodules]).await;
+    let (_head, port, cfg) = serve_backend(&head_dir, &[file_submodules]).await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
     let node_dir = scratch.path().join("node-0");
     std::fs::create_dir_all(&node_dir).unwrap();
-    let machine = start_machine_with(&node_dir, &backend_id, &[HOMES]).await;
+    let machine = start_machine_with(&node_dir, &backend_id, &[]).await;
     ok(
         &mut rpc_ws,
         2,
