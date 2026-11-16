@@ -396,8 +396,30 @@ fn an_install_is_existing_when_its_data_dir_holds_the_database() {
             ps_region("existing-install")
         );
         let data_dir = data.path().display().to_string();
-        let outcome = run(&pwsh, &body, &[("INTENTD_DATA_DIR", data_dir.as_str())], None);
-        let want = if existing { "EXISTING=True" } else { "EXISTING=False" };
+        let outcome = run(
+            &pwsh,
+            &body,
+            &[("INTENTD_DATA_DIR", data_dir.as_str())],
+            None,
+        );
+        let want = if existing {
+            "EXISTING=True"
+        } else {
+            "EXISTING=False"
+        };
         assert!(outcome.output.contains(want), "{}", outcome.output);
     }
+}
+
+/// The existing-install check runs before anything can start a daemon that
+/// would create the database: before the task is registered.
+#[test]
+fn the_existing_install_check_runs_before_the_task_is_registered() {
+    let script = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1"),
+    )
+    .unwrap();
+    let check = script.find(">>> BEGIN existing-install").unwrap();
+    let register = script.find(">>> BEGIN service-task-register").unwrap();
+    assert!(check < register);
 }
