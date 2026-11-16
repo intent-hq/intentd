@@ -551,6 +551,13 @@ pub(crate) async fn add_machine(
     .map_err(|failure| match failure {
         // A refused credential at add time is one more route error.
         ConnectFailure::Revoked(attempts) => ConnectFailure::Unreachable(attempts),
+        // A saved machine that is now an orchestrator is removed.
+        ConnectFailure::Orchestrator => {
+            if previous.as_ref().is_some_and(|row| !row.is_cloud()) {
+                forget_orchestrator(Some(svc.clone()), params.machine_id.clone());
+            }
+            ConnectFailure::Orchestrator
+        }
         other => other,
     })
     .map_err(|failure| failure.into_error(&params.name))?;
@@ -831,7 +838,7 @@ pub(crate) async fn recover_survivors(
 /// agents for this backend: there is nothing to stop.
 fn needs_no_stops(data: &Value) -> bool {
     data["code"] == crate::connect::MACHINE_REVOKED
-        || data["code"] == crate::connect::ORCHESTRATOR_MODE
+        || data["code"] == crate::connect::MACHINE_ORCHESTRATOR
 }
 
 fn survivors_unknown(name: &str, recorded: usize, attempts: &Value) -> Error {

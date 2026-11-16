@@ -28,7 +28,7 @@ pub(crate) const MACHINE_UNREACHABLE: &str = "machine-unreachable";
 /// `error.data.code` of a machine that refused this backend's credential.
 pub(crate) const MACHINE_REVOKED: &str = "machine-revoked";
 /// `error.data.code` of a machine that now runs as an orchestrator.
-pub(crate) const ORCHESTRATOR_MODE: &str = "orchestrator-mode";
+pub(crate) const MACHINE_ORCHESTRATOR: &str = "machine-orchestrator";
 
 /// Connect timing; tests shorten it.
 #[derive(Debug, Clone)]
@@ -110,9 +110,9 @@ impl ConnectFailure {
             Self::Orchestrator => Error::remote_machine(
                 false,
                 format!(
-                    "{name} is now an orchestrator and no longer runs agents for other backends, so it was removed. Pair it again to use it as a backend."
+                    "{name} is now an orchestrator and no longer runs agents for other backends. Pair with it to use it as a backend."
                 ),
-                json!({ "code": ORCHESTRATOR_MODE }),
+                json!({ "code": MACHINE_ORCHESTRATOR }),
             ),
             Self::Local(message) => Error::Internal(format!("remote machine {name}: {message}")),
             Self::Cloud { message, data, .. } => Error::remote_machine(true, message, data),

@@ -2648,11 +2648,12 @@ async fn run(
                         tracing::info!(machine = %target.id, ended, "remote machine: revoked; its agents ended");
                     }
                 }
-                if matches!(failure, ConnectFailure::Orchestrator) {
+                // Only an exposed machine can become an orchestrator.
+                if matches!(failure, ConnectFailure::Orchestrator) && target.gate.is_none() {
                     shared.drop_stops();
                     shared.agents.end_all(&format!(
                         "{}: {} is now an orchestrator and no longer runs agents for other backends",
-                        crate::connect::ORCHESTRATOR_MODE,
+                        crate::connect::MACHINE_ORCHESTRATOR,
                         target.name
                     ));
                     crate::methods::forget_orchestrator(

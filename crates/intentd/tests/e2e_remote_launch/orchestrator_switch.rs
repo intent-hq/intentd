@@ -1,7 +1,7 @@
 //! A machine that becomes an orchestrator leaves the backends that used it
 //! (monorepo `docs/protocol/methods/nodes.md`, "Orchestrator mode"): a real
 //! backend adds a real machine; the machine restarts as an orchestrator; the
-//! backend's next dial is refused with `orchestrator-mode`, and the backend
+//! backend's next dial fails with `machine-orchestrator`, and the backend
 //! removes the machine row, its order entry and its stored token, and
 //! announces the removal. Switched back to a full daemon, the machine pairs
 //! again with a new credential.
@@ -86,6 +86,7 @@ async fn a_machine_that_becomes_an_orchestrator_leaves_its_backends() {
 
     // The machine restarts as an orchestrator, on the port its row names.
     let machine_port = machine.port;
+    let (credential_id, token) = (machine.credential_id.clone(), machine.token.clone());
     drop(machine);
     orchestrator_config(&node_dir);
     let pinned = machine_port.to_string();
@@ -101,8 +102,9 @@ async fn a_machine_that_becomes_an_orchestrator_leaves_its_backends() {
         json!({ "machineId": machine_id }),
     )
     .await;
+    assert_eq!(refreshed["error"]["code"], -32602, "{refreshed}");
     assert_eq!(
-        refreshed["error"]["data"]["code"], "orchestrator-mode",
+        refreshed["error"]["data"]["code"], "machine-orchestrator",
         "{refreshed}"
     );
     loop {
@@ -120,6 +122,31 @@ async fn a_machine_that_becomes_an_orchestrator_leaves_its_backends() {
         !holds_token(&head_dir, &machine_id),
         "the stored token is gone"
     );
+
+    // Adding it while it is an orchestrator fails and saves nothing.
+    let orchestrator = Machine {
+        daemon: orchestrator,
+        port: machine_port,
+        fingerprint: fingerprint.clone(),
+        daemon_id: machine_id.clone(),
+        credential_id,
+        token,
+    };
+    let refused = rpc(
+        &mut rpc_ws,
+        10,
+        "remoteMachines.add",
+        add_params(&orchestrator, "Machine A"),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["code"], "machine-orchestrator",
+        "{refused}"
+    );
+    let listed = ok(&mut rpc_ws, 11, "remoteMachines.list", json!({})).await;
+    assert_eq!(listed["machines"], json!([]), "{listed}");
+    assert!(!holds_token(&head_dir, &machine_id));
 
     // Switched back to a full daemon, it pairs again.
     drop(orchestrator);
