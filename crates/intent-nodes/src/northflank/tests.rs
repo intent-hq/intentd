@@ -69,8 +69,18 @@ fn tag_list(names: &[&str]) -> Reply {
     )
 }
 
-/// A deployment service as `GET /projects/p1/services/{id}` returns it.
+/// A deployment service as `GET /projects/p1/services/{id}` returns it:
+/// Northflank keeps no annotation, and returns the runtime environment.
 fn service(id: &str, status: &str, instances: u32, tags: &BTreeMap<String, String>) -> Value {
+    let mut value = legacy_service(id, status, instances);
+    value["runtimeEnvironment"] =
+        json!({"INTENT_TAGS": serde_json::to_string(tags).unwrap(), "OTHER": "x"});
+    value
+}
+
+/// A service made before the tags moved to the runtime environment: they
+/// went to an annotation, which Northflank drops, so none can be read.
+fn legacy_service(id: &str, status: &str, instances: u32) -> Value {
     json!({
         "id": id,
         "name": id,
@@ -81,7 +91,7 @@ fn service(id: &str, status: &str, instances: u32, tags: &BTreeMap<String, Strin
         "deployment": {
             "instances": instances,
             "external": {"imagePath": "ghcr.io/intent-hq/intent-node:0.11.184"},
-            "metadata": {"annotations": {"intent.dev/tags": serde_json::to_string(tags).unwrap()}}
+            "metadata": {"labels": {}, "annotations": {}}
         },
         "status": {"deployment": {"status": status, "reason": "DEPLOYING"}}
     })
@@ -328,13 +338,14 @@ async fn create_makes_tags_volume_then_service_and_waits_until_ready() {
         svc["deployment"]["external"],
         json!({"imagePath": "ghcr.io/intent-hq/intent-node:0.11.184"})
     );
-    let stored: BTreeMap<String, String> = serde_json::from_str(
-        svc["deployment"]["metadata"]["annotations"]["intent.dev/tags"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
+    let stored: BTreeMap<String, String> =
+        serde_json::from_str(svc["runtimeEnvironment"]["INTENT_TAGS"].as_str().unwrap()).unwrap();
     assert_eq!(stored, tags());
+    assert_eq!(
+        svc["deployment"].get("metadata"),
+        None,
+        "Northflank drops annotations"
+    );
     assert_eq!(svc["ports"], json!([]));
     assert_eq!(svc["createOptions"], json!({"volumesToAttach": ["vol-1"]}));
 }
@@ -745,10 +756,12 @@ async fn list_filters_by_backend_tag_and_stored_tags_and_finds_orphan_volumes() 
         Reply::json(200, &json!({"data": {"services": [
             listed_service("svc-2", &[NODE_TAG, BACKEND_TAG]),
             listed_service("svc-3", &[NODE_TAG, BACKEND_TAG]),
-        ]}, "pagination": {"hasNextPage": false, "count": 2}})),
+            listed_service("svc-old", &[NODE_TAG, BACKEND_TAG]),
+        ]}, "pagination": {"hasNextPage": false, "count": 3}})),
         Reply::data(&service("svc-1", "COMPLETED", 1, &mine)),
         Reply::data(&service("svc-2", "COMPLETED", 0, &other_agent)),
         Reply::error(404, "deleted meanwhile"),
+        Reply::data(&legacy_service("svc-old", "COMPLETED", 0)),
         // Volumes.
         Reply::json(200, &json!({"data": [
             {"id": "svc-1", "name": "svc-1", "tags": [NODE_TAG, BACKEND_TAG],
@@ -775,17 +788,21 @@ async fn list_filters_by_backend_tag_and_stored_tags_and_finds_orphan_volumes() 
         [
             ("svc-1".to_string(), InstanceState::Running),
             ("svc-2".to_string(), InstanceState::Paused),
+            ("svc-old".to_string(), InstanceState::Paused),
             ("volume:vol-orphan".to_string(), InstanceState::Paused),
         ]
     );
+    let only_backend = BTreeMap::from([("intentBackendId".to_string(), BACKEND.to_string())]);
     assert_eq!(found[0].tags, mine);
     assert_eq!(found[0].started_at, "2026-11-11T10:00:00.000Z");
     assert_eq!(found[1].tags, other_agent);
     assert_eq!(
-        found[2].tags,
-        BTreeMap::from([("intentBackendId".to_string(), BACKEND.to_string())])
+        found[2].tags, only_backend,
+        "a service with no readable tags is the backend's by its team tag"
     );
-    assert_eq!(found[2].started_at, "2026-11-11T08:00:00Z");
+    assert_eq!(found[2].started_at, "2026-11-11T10:00:00.000Z");
+    assert_eq!(found[3].tags, only_backend);
+    assert_eq!(found[3].started_at, "2026-11-11T08:00:00Z");
     let lines = server.lines();
     assert!(
         lines[0].starts_with("GET /projects/p1/services?"),
@@ -797,7 +814,7 @@ async fn list_filters_by_backend_tag_and_stored_tags_and_finds_orphan_volumes() 
     );
     assert_eq!(lines[2], "GET /projects/p1/services/svc-1");
     assert!(
-        lines[5].starts_with("GET /projects/p1/volumes"),
+        lines[6].starts_with("GET /projects/p1/volumes"),
         "{lines:?}"
     );
 }
@@ -810,7 +827,8 @@ async fn list_by_more_tags_matches_every_pair_and_skips_volumes() {
             &json!({"data": {"services": [
             listed_service("svc-1", &[BACKEND_TAG]),
             listed_service("svc-2", &[BACKEND_TAG]),
-        ]}, "pagination": {"hasNextPage": false, "count": 2}}),
+            listed_service("svc-old", &[BACKEND_TAG]),
+        ]}, "pagination": {"hasNextPage": false, "count": 3}}),
         ),
         Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
         Reply::data(&service(
@@ -819,6 +837,7 @@ async fn list_by_more_tags_matches_every_pair_and_skips_volumes() {
             1,
             &BTreeMap::from([("intentBackendId".to_string(), BACKEND.to_string())]),
         )),
+        Reply::data(&legacy_service("svc-old", "COMPLETED", 1)),
     ])
     .await;
     let found = client(&server)
@@ -830,9 +849,10 @@ async fn list_by_more_tags_matches_every_pair_and_skips_volumes() {
         .unwrap();
     assert_eq!(
         found.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
-        ["svc-1"]
+        ["svc-1"],
+        "only the backend is known of a service with no readable tags"
     );
-    assert_eq!(server.requests().len(), 3);
+    assert_eq!(server.requests().len(), 4);
 }
 
 #[tokio::test]

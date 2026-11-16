@@ -54,7 +54,9 @@ struct FakeService {
     group: Arc<ProcessGroup>,
     paused: bool,
     image: String,
-    annotations: Value,
+    /// Northflank keeps the runtime environment, and drops annotations.
+    runtime_env: Value,
+    created_at: String,
     tags: Vec<String>,
 }
 
@@ -162,6 +164,30 @@ impl FakeNorthflank {
             .filter(|(_, path)| path.split('/').any(|part| part == id))
             .cloned()
             .collect()
+    }
+
+    /// A service with its volume, as an earlier run left it: created
+    /// `created_at`, with `tags` as team tags and `runtime_env`.
+    fn seed_service(&self, id: &str, tags: &[String], runtime_env: Value, created_at: &str) {
+        let home = self.root.join(id);
+        std::fs::create_dir_all(&home).unwrap();
+        let group = Arc::new(ProcessGroup::new().unwrap());
+        let mut state = self.state();
+        state.groups.push(group.clone());
+        state.volumes.insert(id.to_owned(), tags.to_vec());
+        state.services.insert(
+            id.to_owned(),
+            FakeService {
+                env: self.container_env(&home),
+                home,
+                group,
+                paused: true,
+                image: format!("{IMAGE_REPO}:{}", env!("CARGO_PKG_VERSION")),
+                runtime_env,
+                created_at: created_at.to_owned(),
+                tags: tags.to_vec(),
+            },
+        );
     }
 
     /// Northflank restarts the container on its own: every process ends,
@@ -360,7 +386,11 @@ impl FakeNorthflank {
                             .as_str()
                             .unwrap_or_default()
                             .to_owned(),
-                        annotations: request["deployment"]["metadata"]["annotations"].clone(),
+                        runtime_env: request
+                            .get("runtimeEnvironment")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                        created_at: "2026-01-01T00:00:00Z".to_owned(),
                         tags: serde_json::from_value(request["tags"].clone()).unwrap(),
                     },
                 );
@@ -374,12 +404,13 @@ impl FakeNorthflank {
                 data(json!({
                     "id": id,
                     "servicePaused": service.paused,
-                    "createdAt": "2026-01-01T00:00:00Z",
+                    "createdAt": service.created_at,
                     "deployment": {
                         "instances": u8::from(!service.paused),
                         "external": { "imagePath": service.image },
-                        "metadata": { "annotations": service.annotations },
+                        "metadata": { "labels": {}, "annotations": {} },
                     },
+                    "runtimeEnvironment": service.runtime_env,
                     "status": { "deployment": { "status": "COMPLETED" } },
                 }))
             }
@@ -1007,4 +1038,87 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     for secret in &secrets {
         assert!(!log.contains(secret.as_str()), "a secret reached the log");
     }
+}
+
+/// The reaper, with one settings minute of 100 ms, deletes the leftovers of
+/// this backend: a service whose tags are in its runtime environment, one
+/// made before that (Northflank kept none of its tags: only its team tag
+/// says whose it is) and a volume without a service. Another backend's
+/// service stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reaper_deletes_this_backends_leftover_northflank_machines() {
+    let scratch = common::test_tempdir_in("/tmp", "itd-nf-reap-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let fake = FakeNorthflank::start(scratch, "unused").await;
+    let head_dir = fake.scratch().join("head");
+    let (_head, port, cfg, _ws_id) = start_backend_with(
+        &head_dir,
+        &repo,
+        &[
+            ("INTENTD_NORTHFLANK_API_URL", &fake.url),
+            ("INTENTD_NORTHFLANK_EXEC_URL", &fake.exec_url),
+            ("INTENTD_NORTHFLANK_REGISTRY_URL", &fake.url),
+            ("INTENTD_E2B_MINUTE_MS", "100"),
+        ],
+    )
+    .await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let mine = vec![
+        intent_nodes::northflank::NODE_TAG.to_owned(),
+        intent_nodes::northflank::backend_tag(&backend_id),
+    ];
+    let theirs = vec![
+        intent_nodes::northflank::NODE_TAG.to_owned(),
+        intent_nodes::northflank::backend_tag("another-backend"),
+    ];
+    let tags_env = |backend: &str| {
+        json!({ "INTENT_TAGS": json!({ "intentBackendId": backend, "agentId": "gone" }).to_string() })
+    };
+    let old = "2026-01-01T00:00:00Z";
+    fake.seed_service("left-new", &mine, tags_env(&backend_id), old);
+    fake.seed_service("left-legacy", &mine, json!({}), old);
+    fake.seed_service("foreign", &theirs, tags_env("another-backend"), old);
+    fake.state()
+        .volumes
+        .insert("left-volume".to_owned(), mine.clone());
+
+    ok(
+        &mut rpc_ws,
+        2,
+        "cloudMachines.configure",
+        northflank_params(&json!({ "size": "2x4", "diskGiB": 5 })),
+    )
+    .await;
+    timeout(common::test_timeout(Duration::from_secs(60)), async {
+        loop {
+            {
+                let state = fake.state();
+                if !state.services.contains_key("left-new")
+                    && !state.services.contains_key("left-legacy")
+                    && !state.volumes.contains_key("left-volume")
+                {
+                    break;
+                }
+            }
+            keep_alive(&mut rpc_ws).await;
+            // timing-guard: poll interval for the reaper (every 10 minutes = 1 s)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("this backend's leftovers are reaped");
+    let state = fake.state();
+    assert!(state.services.contains_key("foreign"));
+    assert!(state.volumes.contains_key("foreign"));
+    assert!(
+        !state.volumes.contains_key("left-new") && !state.volumes.contains_key("left-legacy"),
+        "a reaped service's volume goes with it"
+    );
 }
