@@ -143,6 +143,7 @@ const COMPARED_SURFACES: &[&str] = &[
     "stale_redrive_note",
     "dequeue_wait_note",
     "a2a_sender_note",
+    "preemption_attribution_note",
     "collaborator_sender_preamble",
     "host_member_sender_preamble",
     "wait_duration",
@@ -321,6 +322,7 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(dequeue_wait_note("2026-01-02T03:04:05Z", "5 minutes"));
     same!(a2a_sender_note(Some("Coordinator"), "agent-1"));
     same!(a2a_sender_note(None, "agent-1"));
+    same!(preemption_attribution_note());
     same!(collaborator_sender_preamble(
         Some("octocat"),
         Some("The Octocat"),

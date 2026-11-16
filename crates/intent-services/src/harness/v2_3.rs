@@ -134,6 +134,10 @@ impl Harness for V2_3 {
         V1.a2a_sender_note(name, agent_id)
     }
 
+    fn preemption_attribution_note(&self) -> String {
+        V1.preemption_attribution_note()
+    }
+
     fn collaborator_sender_preamble(
         &self,
         login: Option<&str>,

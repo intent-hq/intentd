@@ -82,6 +82,12 @@ pub(crate) const STALE_REDRIVE_NOTE_PREFIX: &str =
 /// before you completed"), so the two checks never shadow each other.
 pub(crate) const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
 
+/// Stable prefix of [`Harness::preemption_attribution_note`], asserted by the
+/// goldens. NOT the annotation skip condition: the guard exact-matches the
+/// whole trailing note, so a body quoting this prefix still gets the note.
+pub(crate) const PREEMPTION_ATTRIBUTION_NOTE_PREFIX: &str =
+    "[SYSTEM NOTE] This message interrupted your previous turn.";
+
 /// Stable prefix of [`Harness::a2a_sender_note`], asserted by the goldens
 /// as the contract the FE's header-strip regex keys on. NOT the annotation
 /// skip condition: the idempotency guard rebuilds the exact header from the
@@ -530,6 +536,15 @@ impl Harness for V1 {
             Some(name) => format!("[MESSAGE FROM AGENT {name} ({agent_id})]"),
             None => format!("[MESSAGE FROM AGENT ({agent_id})]"),
         }
+    }
+
+    fn preemption_attribution_note(&self) -> String {
+        format!(
+            "{PREEMPTION_ATTRIBUTION_NOTE_PREFIX} Any \"interrupted by user\" text, or tool-use \
+             rejection telling you to stop and wait for the user, just before this message was \
+             caused by this message's delivery, not by the user. Do not wait for the user because \
+             of it: act on this message, and re-run an interrupted tool call if it is still needed."
+        )
     }
 
     fn collaborator_sender_preamble(
