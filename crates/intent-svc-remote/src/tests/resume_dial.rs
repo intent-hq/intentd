@@ -105,9 +105,14 @@ async fn a_sandbox_that_answers_soon_after_a_resume_binds_on_a_fresh_pipe() {
         let dir = tempfile::tempdir().unwrap();
         let ready = dir.path().join("ready");
         let target = target(&machine, sandbox_tailcat(dir.path(), &ready, early));
+        // Ready 1 s after the first pipe, so that pipe is always early.
         let opening = {
             let ready = ready.clone();
+            let dir = dir.path().to_owned();
             tokio::spawn(async move {
+                while pipes_opened(&dir) == 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 std::fs::write(ready, b"").unwrap();
             })
@@ -145,7 +150,7 @@ async fn a_sandbox_that_never_answers_after_a_resume_fails_after_the_whole_budge
     let never = dir.path().join("never");
     let target = target(&machine, sandbox_tailcat(dir.path(), &never, Early::Stalls));
     let tuning = ConnectTuning {
-        total: Duration::from_secs(4),
+        total: Duration::from_secs(8),
         ..ConnectTuning::default()
     };
     let (connected, took) = dial_after_resume(&backend, &target, &tuning).await;
@@ -155,4 +160,33 @@ async fn a_sandbox_that_never_answers_after_a_resume_fails_after_the_whole_budge
     assert!(!attempts.is_empty());
     assert!(took >= tuning.total, "gave up after {took:?}");
     assert!(pipes_opened(dir.path()) >= 2, "no retry within the budget");
+}
+
+/// A sandbox that refuses this backend's credential after the resume is
+/// `Revoked` on the first pipe: a retry cannot change the answer.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_credential_after_a_resume_is_revoked_without_a_retry() {
+    let backend = Backend::new().await;
+    let machine = backend.machine().await;
+    let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    std::fs::write(&ready, b"").unwrap();
+    machine.revoke().await;
+    let target = target(&machine, sandbox_tailcat(dir.path(), &ready, Early::Stalls));
+    let tuning = ConnectTuning {
+        total: Duration::from_secs(300),
+        ..ConnectTuning::default()
+    };
+    let (connected, _) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        dial_after_resume(&backend, &target, &tuning),
+    )
+    .await
+    .expect("the refused credential was retried");
+    let Err(ConnectFailure::Revoked(attempts)) = connected else {
+        panic!("expected revoked, got {:?}", connected.map(|c| c.route));
+    };
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(pipes_opened(dir.path()), 1);
 }

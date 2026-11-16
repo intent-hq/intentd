@@ -37,7 +37,7 @@ pub(crate) struct ConnectTuning {
     pub total: Duration,
     /// Right after a resume: the bound of the first tailcat attempt. Later
     /// attempts get [`Self::attempt`]. A healthy Northflank resume binds in
-    /// about 1.2 s, so this must stay above that.
+    /// about 1.2 s; this leaves headroom for a slow path.
     pub resume_attempt: Duration,
     /// Right after a resume: the delays between attempts.
     pub resume_retry: Backoff,
@@ -48,7 +48,7 @@ impl Default for ConnectTuning {
         Self {
             attempt: Duration::from_secs(3),
             total: Duration::from_secs(10),
-            resume_attempt: Duration::from_millis(1_500),
+            resume_attempt: Duration::from_secs(2),
             resume_retry: Backoff::new(Duration::from_millis(250), Duration::from_secs(2)),
         }
     }
@@ -237,6 +237,10 @@ where
             Ok(Ok(connected)) => return Ok(connected),
             Ok(Err(ConnectFailure::Unreachable(_))) | Err(_) => {}
             Ok(Err(other)) => return Err(other),
+        }
+        // A refused credential will not change on a retry.
+        if round.iter().any(|a| a.error == codes::UNAUTHORIZED) {
+            return Err(ConnectFailure::Revoked(round));
         }
         if !round.is_empty() {
             attempts = round;

@@ -277,7 +277,7 @@ fn lost_failure() -> ConnectFailure {
 }
 
 /// Why a resume did not happen.
-enum Resumed {
+pub(crate) enum Resumed {
     /// E2B no longer has the sandbox.
     Lost,
     /// E2B refused (the documented error).
@@ -295,8 +295,8 @@ pub(crate) struct Dialable {
 
 /// Make E2B run `row`'s sandbox: resume it when paused, else check it and
 /// extend its timeout. The caller holds the machine's transition lock.
-/// Returns whether it resumed the sandbox.
-async fn resume(
+/// Returns whether it resumed the sandbox or started its intentd again.
+pub(crate) async fn resume(
     svc: &Services,
     feature: &RemoteFeature,
     client: &dyn CloudProvider,
@@ -317,11 +317,13 @@ async fn resume(
             // A machine that keeps only its disk runs no intentd after a
             // resume or a container restart: start it, and tell each agent
             // that ran there what it lost at its next launch.
+            let mut restarted = false;
             if !client.keeps_memory() {
                 match super::bootstrap::start_daemon(client, &connected.instance).await {
                     Ok(true) => {
                         tracing::info!(machine = %row.id, "cloud machine: intentd started again from the machine's disk");
                         disk_resumed(svc, feature, &row.id).await;
+                        restarted = true;
                     }
                     Ok(false) => {}
                     Err(error) => {
@@ -339,7 +341,7 @@ async fn resume(
             }
             feature.cloud.unpark(&row.id);
             feature.cloud.touch(&row.id);
-            Ok(resumed)
+            Ok(resumed || restarted)
         }
         Err(error) if error.is_not_found() => Err(Resumed::Lost),
         Err(error) => {
