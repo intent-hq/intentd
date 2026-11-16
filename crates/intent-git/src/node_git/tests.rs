@@ -153,6 +153,30 @@ async fn node_fetches_base_and_creates_a_worktree() {
     assert!(!second.exists());
 }
 
+/// A stop that cancels a launch kills its `git init --bare` (the commands
+/// are `kill_on_drop`), which can leave `HEAD` without `objects`: git then
+/// calls the directory no repository. Removing a stopped agent's checkout
+/// must not fail on it (the machine would never acknowledge the stop), and
+/// the next checkout rebuilds it.
+#[tokio::test]
+async fn a_cache_left_by_a_killed_init_is_skipped_then_rebuilt() {
+    let fixture = Fixture::new();
+    let cache = fixture.node.path().join("cache").join("repo-1.git");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    git(
+        cache.parent().unwrap(),
+        &["init", "--quiet", "--bare", "repo-1.git"],
+    );
+    std::fs::remove_dir_all(cache.join("objects")).unwrap();
+
+    fixture.cache.prune().await.unwrap();
+    fixture.cache.delete_branch("intent/a").await;
+
+    let worktree = fixture.checkout("a").await;
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), fixture.base);
+    fixture.cache.prune().await.unwrap();
+}
+
 #[tokio::test]
 async fn upload_pack_advertises_only_the_agents_refs() {
     let fixture = Fixture::new();
