@@ -59,7 +59,7 @@ impl Default for NorthflankConfig {
             request_timeout: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(10),
             ready_timeout: Duration::from_secs(600),
-            poll_interval: Duration::from_secs(3),
+            poll_interval: Duration::from_secs(1),
             max_rate_limit_retries: 3,
             max_retry_wait: Duration::from_secs(30),
             exec_drain_timeout: Duration::from_secs(30),
@@ -74,6 +74,9 @@ pub struct NorthflankClient {
     pub(super) http: reqwest::Client,
     pub(super) token: SecretString,
     pub(super) config: NorthflankConfig,
+    /// Services connected or created since their home was last handed to
+    /// [`super::RUN_AS`]: their next command does that first.
+    pub(super) home_pending: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +174,7 @@ impl NorthflankClient {
             http,
             token,
             config,
+            home_pending: std::sync::Mutex::default(),
         })
     }
 

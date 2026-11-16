@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::WebSocketStream;
 
 use super::client::{error_message, scrub, validate_id};
+use super::provider::{setup_then_run_script, HOME_READY, NO_DROP_EXIT, NO_USER_EXIT};
 use super::{NorthflankClient, HOME, RUN_AS};
 use crate::cloud::{
     CloudError, CloudErrorKind, CloudInstance, ProcessExit, ProcessOutput, ProcessSpec,
@@ -95,7 +96,9 @@ impl Collected {
 }
 
 impl NorthflankClient {
-    /// Run `spec` in service `instance.id` and collect its output.
+    /// Run `spec` in service `instance.id` and collect its output. The
+    /// first command as [`RUN_AS`] after a create or connect starts as
+    /// root to hand the home over, then drops to [`RUN_AS`] to run.
     pub(super) async fn exec(
         &self,
         instance: &CloudInstance,
@@ -111,8 +114,55 @@ impl NorthflankClient {
         let secrets: Vec<&str> = std::iter::once(self.token.expose())
             .chain(spec.envs.values().map(SecretString::expose))
             .collect();
-        let run = self.exec_inner(&instance.id, spec, &secrets);
-        let result = match spec.timeout {
+        let user = spec.user.as_deref().unwrap_or(RUN_AS);
+        if spec.user.is_none() && self.pending().contains(&instance.id) {
+            let mut command = vec![
+                "env".to_string(),
+                format!("HOME={HOME}"),
+                "/bin/sh".into(),
+                "-c".into(),
+                setup_then_run_script(RUN_AS),
+                "intent-setup".into(),
+            ];
+            command.extend(argv(spec));
+            let mut output = self
+                .run(&instance.id, "root", command, spec.timeout, &secrets)
+                .await?;
+            let marker = format!("{HOME_READY}\n");
+            if let Some(at) = output
+                .stderr
+                .windows(marker.len())
+                .position(|w| w == marker.as_bytes())
+            {
+                self.pending().remove(&instance.id);
+                output.stderr.drain(..at + marker.len());
+                return Ok(output);
+            }
+            if output.exit.exit_code != NO_DROP_EXIT {
+                return Err(setup_failed(&output, &secrets));
+            }
+            self.pending().remove(&instance.id);
+        }
+        self.run(&instance.id, user, argv(spec), spec.timeout, &secrets)
+            .await
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        self.home_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    async fn run(
+        &self,
+        service_id: &str,
+        user: &str,
+        command: Vec<String>,
+        timeout: Option<std::time::Duration>,
+        secrets: &[&str],
+    ) -> Result<ProcessOutput, CloudError> {
+        let run = self.exec_inner(service_id, user, command, secrets);
+        let result = match timeout {
             Some(limit) => tokio::time::timeout(limit, run).await.unwrap_or_else(|_| {
                 Err(CloudError::new(
                     CloudErrorKind::Other,
@@ -124,13 +174,14 @@ impl NorthflankClient {
             }),
             None => run.await,
         };
-        result.map_err(|e| rescrub(e, &secrets))
+        result.map_err(|e| rescrub(e, secrets))
     }
 
     async fn exec_inner(
         &self,
         service_id: &str,
-        spec: &ProcessSpec,
+        user: &str,
+        command: Vec<String>,
         secrets: &[&str],
     ) -> Result<ProcessOutput, CloudError> {
         let url = format!(
@@ -146,10 +197,10 @@ impl NorthflankClient {
                     "the Northflank command stream did not open in time",
                 )
             })??;
-        // Only the root setup step names root; an agent run as root would
-        // need IS_SANDBOX for Claude Code's bypass-permissions mode.
-        let user = spec.user.as_deref().unwrap_or(RUN_AS);
-        let context = json!({ "command": argv(spec), "shell": "none", "user": user });
+        // Only the home setup names root, and it drops to RUN_AS before the
+        // command: an agent run as root would need IS_SANDBOX for Claude
+        // Code's bypass-permissions mode.
+        let context = json!({ "command": command, "shell": "none", "user": user });
         let init = json!({
             "type": "init",
             "data": {
@@ -421,6 +472,27 @@ fn init_refused(data: &Value, secrets: &[&str]) -> CloudError {
             format!("Northflank rejected the API token for command execution: {message}"),
         )
     }
+}
+
+/// The setup before a command failed, so the command did not run.
+fn setup_failed(output: &ProcessOutput, secrets: &[&str]) -> CloudError {
+    if output.exit.exit_code == NO_USER_EXIT {
+        return CloudError::new(
+            CloudErrorKind::Other,
+            format!(
+                "this Northflank machine's image predates the unprivileged {RUN_AS:?} account: remove the machine and start a new one"
+            ),
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    CloudError::new(
+        CloudErrorKind::Other,
+        format!(
+            "the Northflank machine's home folder could not be handed to {RUN_AS:?} (exit {}): {}",
+            output.exit.exit_code,
+            scrub(stderr.trim(), secrets)
+        ),
+    )
 }
 
 /// Scrub an error once more with the command's own secrets.

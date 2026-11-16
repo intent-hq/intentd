@@ -130,7 +130,7 @@ fn new_refuses_an_empty_token_and_redacts_it() {
     assert_eq!(defaults.api_url, "https://api.northflank.com/v1");
     assert_eq!(defaults.exec_url, "wss://api.northflank.com/v1");
     assert_eq!(defaults.ready_timeout, Duration::from_secs(600));
-    assert_eq!(defaults.poll_interval, Duration::from_secs(3));
+    assert_eq!(defaults.poll_interval, Duration::from_secs(1));
 }
 
 #[tokio::test]
@@ -252,7 +252,7 @@ async fn create_makes_tags_volume_then_service_and_waits_until_ready() {
             Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
             containers(&["TASK_RUNNING"]),
         ],
-        vec![setup_ok()],
+        vec![],
     )
     .await;
     let client = client(&server);
@@ -277,10 +277,12 @@ async fn create_makes_tags_volume_then_service_and_waits_until_ready() {
             "GET /projects/p1/services/svc-1/containers",
             "GET /projects/p1/services/svc-1",
             "GET /projects/p1/services/svc-1/containers",
-            "GET /command-exec/projects/p1/services/svc-1",
         ]
     );
-    assert_setup_ran(&server);
+    assert!(
+        server.frames().is_empty(),
+        "the home is set up by the first command, not a command of its own"
+    );
     for req in requests
         .iter()
         .filter(|r| !r.target.starts_with("/command-exec"))
@@ -341,7 +343,7 @@ async fn create_reuses_existing_tags_and_defaults_the_disk() {
             Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
             containers(&["TASK_RUNNING"]),
         ],
-        vec![setup_ok()],
+        vec![],
     )
     .await;
     let mut request = create_request();
@@ -367,7 +369,7 @@ async fn create_follows_tag_pages() {
             Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
             containers(&["TASK_RUNNING"]),
         ],
-        vec![setup_ok()],
+        vec![],
     )
     .await;
     client(&server).create(&create_request()).await.unwrap();
@@ -519,7 +521,7 @@ async fn connect_to_a_running_service_waits_and_does_not_resume() {
             Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
             containers(&["TASK_RUNNING"]),
         ],
-        vec![setup_ok()],
+        vec![],
     )
     .await;
     let connected = client(&server).connect("svc-1", 600).await.unwrap();
@@ -530,7 +532,7 @@ async fn connect_to_a_running_service_waits_and_does_not_resume() {
         "ghcr.io/intent-hq/intent-node:0.11.184"
     );
     assert!(!server.lines().iter().any(|l| l.contains("resume")));
-    assert_setup_ran(&server);
+    assert!(server.frames().is_empty(), "connect runs no command");
 }
 
 #[tokio::test]
@@ -545,7 +547,7 @@ async fn connect_resumes_a_paused_service() {
             Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
             containers(&["TASK_RUNNING"]),
         ],
-        vec![setup_ok()],
+        vec![],
     )
     .await;
     let connected = client(&server).connect("svc-1", 600).await.unwrap();
@@ -556,8 +558,7 @@ async fn connect_resumes_a_paused_service() {
         "POST /projects/p1/services/svc-1/resume"
     );
     assert_eq!(requests[1].json(), json!({"instances": 1}));
-    // After a resume the volume may come back root-owned: set up again.
-    assert_setup_ran(&server);
+    assert!(server.frames().is_empty(), "connect runs no command");
 }
 
 #[tokio::test]
@@ -935,31 +936,42 @@ async fn exec_server(steps: Vec<WsStep>) -> FakeServer {
     FakeServer::start_with(vec![], vec![WsSession::Steps(steps)]).await
 }
 
-/// The root setup step: it answers success.
-fn setup_ok() -> WsSession {
-    WsSession::Steps(vec![
-        WsStep::Receive,
-        init_ok(),
-        completion(0, "Success"),
-        WsStep::Close,
-    ])
+/// A connected client: `svc-1` runs, and its first command sets up its home.
+async fn connected(sessions: Vec<WsSession>) -> (FakeServer, NorthflankClient) {
+    let server = FakeServer::start_with(
+        vec![
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            containers(&["TASK_RUNNING"]),
+        ],
+        sessions,
+    )
+    .await;
+    let client = client(&server);
+    client.connect("svc-1", 600).await.unwrap();
+    (server, client)
 }
 
-/// The last command was the root setup step that hands the volume to `user`.
-fn assert_setup_ran(server: &FakeServer) {
-    let frames = server.frames();
-    let init: Value = serde_json::from_str(frames.last().unwrap()).unwrap();
-    let context = &init["data"]["context"];
-    assert_eq!(context["user"], json!("root"), "{context}");
-    let argv: Vec<String> = serde_json::from_value(context["command"].clone()).unwrap();
-    assert!(argv.contains(&"HOME=/home/user".to_string()), "{argv:?}");
-    let script = argv.last().unwrap();
-    assert!(script.contains("chown -R"), "{script}");
-    assert!(script.contains("id -u 'user'"), "{script}");
-    assert!(
-        !argv.iter().any(|a| a.starts_with("IS_SANDBOX")),
-        "{argv:?}"
-    );
+fn session(steps: Vec<WsStep>) -> WsSession {
+    let mut all = vec![WsStep::Receive, init_ok()];
+    all.extend(steps);
+    all.push(WsStep::Close);
+    WsSession::Steps(all)
+}
+
+/// The user and argv of each command, in order.
+fn contexts(server: &FakeServer) -> Vec<(String, Vec<String>)> {
+    server
+        .frames()
+        .iter()
+        .map(|f| {
+            let context = serde_json::from_str::<Value>(f).unwrap()["data"]["context"].clone();
+            (
+                context["user"].as_str().unwrap().to_string(),
+                serde_json::from_value(context["command"].clone()).unwrap(),
+            )
+        })
+        .collect()
 }
 
 fn shell(script: &str) -> ProcessSpec {
@@ -1089,69 +1101,213 @@ async fn exec_runs_as_the_unprivileged_user_unless_the_spec_names_one() {
 }
 
 #[tokio::test]
-async fn a_failed_setup_is_an_error_and_removes_the_machine() {
-    let server = FakeServer::start_with(
-        vec![
-            tag_list(&[NODE_TAG, BACKEND_TAG]),
-            Reply::data(&json!({"id": "vol-1"})),
-            Reply::data(&json!({"id": "svc-1"})),
-            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
-            containers(&["TASK_RUNNING"]),
-            Reply::data(&json!({})),
-            Reply::data(&json!({})),
-        ],
-        vec![WsSession::Steps(vec![
-            WsStep::Receive,
-            init_ok(),
-            out("stdErr", "id: 'user': no such user\n"),
-            completion(1, "Failure"),
-            WsStep::Close,
-        ])],
-    )
+async fn the_first_command_after_a_connect_sets_up_the_home_in_the_same_exec() {
+    let ready = format!("{}\n", super::provider::HOME_READY);
+    let (server, client) = connected(vec![
+        session(vec![
+            out("stdErr", &ready),
+            out("stdOut", "started\n"),
+            out("stdErr", "warn\n"),
+            completion(0, "Success"),
+        ]),
+        session(vec![completion(0, "Success")]),
+    ])
     .await;
-    let err = client(&server).create(&create_request()).await.unwrap_err();
-    assert_eq!(err.kind(), CloudErrorKind::Other);
-    assert!(err.to_string().contains("no such user"), "{err}");
-    let lines = server.lines();
+    let output = client
+        .run_command(&instance("svc-1"), &shell("echo started"))
+        .await
+        .unwrap();
+    assert!(output.success());
+    assert_eq!(output.stdout, b"started\n");
+    assert_eq!(output.stderr, b"warn\n", "the setup's marker is not output");
+    client
+        .run_command(&instance("svc-1"), &shell("echo mint"))
+        .await
+        .unwrap();
+
+    let [(first_user, first), (second_user, second)] = contexts(&server).try_into().unwrap();
+    assert_eq!(first_user, "root");
+    let script = super::provider::setup_then_run_script(RUN_AS);
+    let mut wrapped: Vec<String> = [
+        "env",
+        "HOME=/home/user",
+        "/bin/sh",
+        "-c",
+        &script,
+        "intent-setup",
+    ]
+    .map(String::from)
+    .to_vec();
+    wrapped.extend(super::exec::argv(&shell("echo started")));
+    assert_eq!(first, wrapped);
+    assert!(script.contains("exec setpriv"), "{script}");
+    assert_eq!(second_user, "user", "the home is set up once per connect");
+    assert_eq!(second, super::exec::argv(&shell("echo mint")));
+}
+
+#[tokio::test]
+async fn a_root_command_after_a_connect_leaves_the_setup_to_the_next_user_command() {
+    let ready = format!("{}\n", super::provider::HOME_READY);
+    let (server, client) = connected(vec![
+        session(vec![completion(0, "Success")]),
+        session(vec![out("stdErr", &ready), completion(0, "Success")]),
+    ])
+    .await;
+    let mut root = ProcessSpec::new("id");
+    root.user = Some("root".into());
+    client.run_command(&instance("svc-1"), &root).await.unwrap();
+    client
+        .run_command(&instance("svc-1"), &ProcessSpec::new("id"))
+        .await
+        .unwrap();
+    let ran = contexts(&server);
+    assert_eq!(ran[0].1, super::exec::argv(&root));
+    assert_eq!(ran[1].0, "root");
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "DELETE /projects/p1/services/svc-1?delete_child_objects=true"),
-        "{lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l == "DELETE /projects/p1/volumes/vol-1"),
-        "{lines:?}"
+        ran[1].1.iter().any(|a| a.contains("exec setpriv")),
+        "{:?}",
+        ran[1]
     );
 }
 
-/// Run the setup script against `home` with fake `id` (answering `uid:gid`,
-/// or failing when `None`) and a `chown` that only logs its arguments.
+#[tokio::test]
+async fn a_failed_setup_is_an_error_and_the_next_command_sets_up_again() {
+    let ready = format!("{}\n", super::provider::HOME_READY);
+    let (server, client) = connected(vec![
+        session(vec![
+            out("stdErr", "chown: Operation not permitted\n"),
+            completion(1, "Failure"),
+        ]),
+        session(vec![out("stdErr", &ready), completion(0, "Success")]),
+    ])
+    .await;
+    let err = client
+        .run_command(&instance("svc-1"), &shell("echo started"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), CloudErrorKind::Other);
+    assert!(
+        err.to_string().contains("home folder")
+            && err.to_string().contains("Operation not permitted"),
+        "{err}"
+    );
+    client
+        .run_command(&instance("svc-1"), &shell("echo started"))
+        .await
+        .unwrap();
+    let ran = contexts(&server);
+    assert!(ran.iter().all(|(user, _)| user == "root"), "{ran:?}");
+    assert!(
+        !server.lines().iter().any(|l| l.starts_with("DELETE")),
+        "a command never deletes the machine"
+    );
+}
+
+#[tokio::test]
+async fn an_image_without_setpriv_sets_up_then_runs_the_command_as_the_user() {
+    let (server, client) = connected(vec![
+        session(vec![completion(super::provider::NO_DROP_EXIT, "Failure")]),
+        session(vec![out("stdOut", "hi\n"), completion(0, "Success")]),
+        session(vec![completion(0, "Success")]),
+    ])
+    .await;
+    let output = client
+        .run_command(&instance("svc-1"), &shell("echo hi"))
+        .await
+        .unwrap();
+    assert!(output.success());
+    assert_eq!(output.stdout, b"hi\n");
+    client
+        .run_command(&instance("svc-1"), &shell("echo again"))
+        .await
+        .unwrap();
+    let ran = contexts(&server);
+    assert_eq!(ran[0].0, "root");
+    assert_eq!(
+        ran[1],
+        ("user".to_string(), super::exec::argv(&shell("echo hi")))
+    );
+    assert_eq!(ran[2].0, "user", "the home was set up");
+}
+
+#[tokio::test]
+async fn readiness_is_seen_within_a_second_of_running() {
+    let server = FakeServer::start(vec![
+        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+        containers(&["TASK_STARTING"]),
+        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+        containers(&["TASK_RUNNING"]),
+    ])
+    .await;
+    let mut config = config(&server);
+    config.poll_interval = NorthflankConfig::default().poll_interval;
+    let client = NorthflankClient::new(SecretString::new(TOKEN), config).unwrap();
+    let started = std::time::Instant::now();
+    client.connect("svc-1", 600).await.unwrap();
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_millis(1500),
+        "a container that runs is seen at the next poll: {waited:?}"
+    );
+}
+
+/// Run the setup-then-run script as root would, against `home`, with fake
+/// `id` (answering `uid:gid`, or failing when `None`), a `chown` that only
+/// logs its arguments and, when `setpriv`, a `setpriv` that logs its
+/// options and runs the command after `--`. The command prints `ran` and
+/// the uid it was given.
 #[cfg(unix)]
-fn run_prepare_home(
+fn run_setup(
     home: &std::path::Path,
     owner: Option<(u32, u32)>,
+    setpriv: bool,
 ) -> (std::process::Output, String) {
     use std::os::unix::fs::PermissionsExt as _;
     let shims = tempfile::tempdir().unwrap();
-    let log = shims.path().join("chown.log");
+    let log = shims.path().join("calls.log");
     let id = match owner {
         Some((u, g)) => format!("#!/bin/sh\n[ \"$2\" = user ] || exit 1\ncase \"$1\" in -u) echo {u};; -g) echo {g};; esac\n"),
         None => "#!/bin/sh\necho \"id: 'user': no such user\" >&2\nexit 1\n".into(),
     };
-    let chown = format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display());
-    for (name, body) in [("id", id), ("chown", chown)] {
+    let chown = format!("#!/bin/sh\necho chown \"$@\" >> '{}'\n", log.display());
+    let drop = format!(
+        "#!/bin/sh\nopts=\"\"\nwhile [ \"$1\" != -- ]; do opts=\"$opts $1\"; shift; done\nshift\necho \"setpriv$opts\" >> '{}'\nexec \"$@\"\n",
+        log.display()
+    );
+    let mut shimmed = vec![("id", id), ("chown", chown)];
+    if setpriv {
+        shimmed.push(("setpriv", drop));
+    }
+    for (name, body) in shimmed {
         let path = shims.path().join(name);
         std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
     }
-    let script = super::provider::prepare_home_script(home.to_str().unwrap(), "user");
+    // Only the shims and the tools the script needs: no real setpriv.
+    for tool in ["stat", "env", "echo"] {
+        let found = ["/usr/bin", "/bin"]
+            .iter()
+            .map(|dir| std::path::Path::new(dir).join(tool))
+            .find(|path| path.exists())
+            .unwrap();
+        std::os::unix::fs::symlink(found, shims.path().join(tool)).unwrap();
+    }
+    let script = super::provider::setup_then_run_script("user");
     let output = std::process::Command::new("/bin/sh")
-        .args(["-c", &script])
+        .args([
+            "-c",
+            &script,
+            "intent-setup",
+            "env",
+            "/bin/sh",
+            "-c",
+            "echo ran",
+        ])
         .env_clear()
-        .env("PATH", format!("{}:/usr/bin:/bin", shims.path().display()))
+        .env("PATH", shims.path())
+        .env("HOME", home)
         .output()
         .unwrap();
     (output, std::fs::read_to_string(&log).unwrap_or_default())
@@ -1159,46 +1315,56 @@ fn run_prepare_home(
 
 #[cfg(unix)]
 #[test]
-fn prepare_home_hands_the_home_over_only_when_the_owner_differs() {
+fn the_setup_hands_the_home_over_only_when_the_owner_differs_then_drops_to_the_user() {
     use std::os::unix::fs::MetadataExt as _;
     let home = tempfile::tempdir().unwrap();
     let meta = std::fs::metadata(home.path()).unwrap();
     let (uid, gid) = (meta.uid(), meta.gid());
+    let ready = format!("{}\n", super::provider::HOME_READY);
+    let drop = |u: u32, g: u32| format!("setpriv --reuid={u} --regid={g} --init-groups\n");
 
-    let (owned, log) = run_prepare_home(home.path(), Some((uid, gid)));
+    let (owned, log) = run_setup(home.path(), Some((uid, gid)), true);
     assert!(owned.status.success(), "{owned:?}");
-    assert_eq!(log, "", "an owned home is left alone");
+    assert_eq!(log, drop(uid, gid), "an owned home is left alone");
+    assert_eq!(String::from_utf8_lossy(&owned.stderr), ready);
+    assert_eq!(String::from_utf8_lossy(&owned.stdout), "ran\n");
 
-    let (other, log) = run_prepare_home(home.path(), Some((uid + 1, gid)));
+    let (other, log) = run_setup(home.path(), Some((uid + 1, gid)), true);
     assert!(other.status.success(), "{other:?}");
     assert_eq!(
         log,
-        format!("-R {}:{gid} {}\n", uid + 1, home.path().display())
+        format!(
+            "chown -R {}:{gid} {}\n{}",
+            uid + 1,
+            home.path().display(),
+            drop(uid + 1, gid)
+        )
     );
+    assert_eq!(String::from_utf8_lossy(&other.stdout), "ran\n");
 
-    let (missing, log) = run_prepare_home(home.path(), None);
+    let (missing, log) = run_setup(home.path(), None, true);
     assert_eq!(missing.status.code(), Some(super::provider::NO_USER_EXIT));
     assert_eq!(log, "");
+    assert!(missing.stdout.is_empty(), "nothing runs as root");
+
+    let (no_drop, log) = run_setup(home.path(), Some((uid + 1, gid)), false);
+    assert_eq!(no_drop.status.code(), Some(super::provider::NO_DROP_EXIT));
+    assert!(log.starts_with("chown -R"), "{log}");
+    assert!(no_drop.stdout.is_empty(), "nothing runs as root");
+    assert!(!String::from_utf8_lossy(&no_drop.stderr).contains(super::provider::HOME_READY));
 }
 
 #[tokio::test]
-async fn a_failed_setup_on_connect_is_an_error_and_keeps_the_machine() {
-    let server = FakeServer::start_with(
-        vec![
-            Reply::data(&service("svc-1", "COMPLETED", 0, &tags())),
-            Reply::data(&json!({})),
-            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
-            containers(&["TASK_RUNNING"]),
-        ],
-        vec![WsSession::Steps(vec![
-            WsStep::Receive,
-            init_ok(),
-            completion(super::provider::NO_USER_EXIT, "Failure"),
-            WsStep::Close,
-        ])],
-    )
+async fn an_image_without_the_user_account_is_refused_at_the_first_command() {
+    let (server, client) = connected(vec![session(vec![completion(
+        super::provider::NO_USER_EXIT,
+        "Failure",
+    )])])
     .await;
-    let err = client(&server).connect("svc-1", 600).await.unwrap_err();
+    let err = client
+        .run_command(&instance("svc-1"), &shell("echo started"))
+        .await
+        .unwrap_err();
     assert_eq!(err.kind(), CloudErrorKind::Other);
     assert!(
         err.to_string().contains("predates") && err.to_string().contains("start a new one"),
@@ -1206,7 +1372,7 @@ async fn a_failed_setup_on_connect_is_an_error_and_keeps_the_machine() {
     );
     assert!(
         !server.lines().iter().any(|l| l.starts_with("DELETE")),
-        "connect never deletes the machine"
+        "a command never deletes the machine"
     );
 }
 
