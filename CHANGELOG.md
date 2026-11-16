@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.230] - 2026-11-16
+
+### 🐛 Bug Fixes
+
+- *(remote)* An orchestrator leaves the backends that used it ([#3429](https://github.com/intent-hq/intentd/pull/3429))
+
+
 ## [0.11.229] - 2026-11-16
 
 ### 🚀 Features
