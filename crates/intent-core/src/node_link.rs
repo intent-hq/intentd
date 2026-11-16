@@ -642,6 +642,19 @@ pub const HOME_METHODS: &[&str] = &[
 /// frame (`-32603`).
 pub const HOME_REPLY_TOO_LARGE: &str = "home-reply-too-large";
 
+/// The [`HomeCall`] param the backend adds to a call with a `gitRootId`:
+/// the registered root's path in the home checkout.
+pub const GIT_ROOT_PATH_PARAM: &str = "gitRootPath";
+
+/// A call's git root is outside the workspace checkout (`-32602`).
+pub const HOME_ROOT_OUTSIDE_CHECKOUT: &str = "home-root-outside-checkout";
+
+/// The home checkout has no git repository at `gitRootPath` (`-32602`).
+pub const HOME_ROOT_MISSING: &str = "home-root-missing";
+
+/// The home's machine does not read `gitRootPath` (`-32602`).
+pub const HOME_ROOT_UNSUPPORTED: &str = "home-root-unsupported";
+
 /// Backend to machine (nodeProtocol 19, rpc lane): run one wire method of
 /// [`HOME_METHODS`] against a home checkout. The body is closed. `Debug`
 /// leaves out `params`, which can hold file contents and commands.

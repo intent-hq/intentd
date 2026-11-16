@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 use intent_core::node_link::{
-    HomeCall, HomeCallError, HomeCallReply, HomeRef, LinkFrame, LinkId, HOME_METHODS,
-    HOME_REPLY_TOO_LARGE, MAX_FRAME_BYTES, NODE_HOME_UNKNOWN, NODE_HOME_UNSUPPORTED,
+    HomeCall, HomeCallError, HomeCallReply, HomeRef, LinkFrame, LinkId, GIT_ROOT_PATH_PARAM,
+    HOME_METHODS, HOME_REPLY_TOO_LARGE, HOME_ROOT_MISSING, MAX_FRAME_BYTES, NODE_HOME_UNKNOWN,
+    NODE_HOME_UNSUPPORTED,
 };
 use intent_core::nodes::NodeCounter;
 
@@ -281,12 +282,42 @@ impl Runner {
         if method == "git.agentCommit" {
             // The backend's identity for the workspace, as a launch's
             // `gitIdentity`; without one the checkout's git config decides.
-            intent_git::identity::set_checkout_identity(&home.worktree, commit_identity(identity));
+            intent_git::identity::set_checkout_identity(
+                &home.worktree,
+                commit_identity(identity.clone()),
+            );
         }
-        let params = match checkout_params(&method, params, &home.worktree, &record) {
+        let root_path = params.remove(GIT_ROOT_PATH_PARAM);
+        let mut params = match checkout_params(&method, params, &home.worktree, &record) {
             Ok(params) => params,
             Err(error) => return (Err(error), hidden),
         };
+        if let Some(root_path) = root_path {
+            let root = match home_root(&home.worktree, &root_path) {
+                Ok(root) => root,
+                Err(error) => return (Err(error), hidden),
+            };
+            if method == "git.agentCommit" {
+                intent_git::identity::set_checkout_identity(&root, commit_identity(identity));
+            }
+            let own = match records.root(&record, &root).await {
+                Ok(own) => own,
+                Err(error) => {
+                    return (
+                        Err(rpc_error(
+                            INTERNAL_ERROR,
+                            format!("the home could not record its git root: {error:#}"),
+                            None,
+                        )),
+                        hidden,
+                    );
+                }
+            };
+            // The reply shows the backend's id for the root, never this one.
+            if let Some(Value::String(theirs)) = params.insert("gitRootId".into(), json!(own)) {
+                hidden.root_id = Some((own, theirs));
+            }
+        }
         // A write counts once tried and again whenever it ends, even
         // cancelled, timed out or dropped with its link: it may already
         // have changed the checkout, and the push follows the last change.
@@ -437,6 +468,24 @@ pub(super) fn checkout_path(checkout: &Path, rel: &str) -> Option<PathBuf> {
     inside.then_some(joined)
 }
 
+/// The git root a call's `gitRootPath` names: a checkout path (as
+/// [`checkout_path`] resolves one, not the checkout itself) at a git
+/// repository's root.
+fn home_root(checkout: &Path, root_path: &Value) -> Result<PathBuf, HomeCallError> {
+    let rel = root_path.as_str().map(str::trim).unwrap_or_default();
+    let root = checkout_path(checkout, rel)
+        .filter(|_| !matches!(rel, "" | "."))
+        .ok_or_else(|| outside(GIT_ROOT_PATH_PARAM, rel))?;
+    if !root.join(".git").exists() {
+        return Err(rpc_error(
+            INVALID_PARAMS,
+            format!("{HOME_ROOT_MISSING}: the home checkout has no git repository at {rel}"),
+            Some(json!({ "code": HOME_ROOT_MISSING })),
+        ));
+    }
+    Ok(root)
+}
+
 /// The `git.agentCommit` param in which a backend sends the workspace's
 /// commit identity (`{ name, email }`, as `launch.gitIdentity`); it never
 /// reaches the wire method.
@@ -545,6 +594,8 @@ pub(super) struct Hidden {
     roots: Vec<Root>,
     record: Option<String>,
     workspace: Option<String>,
+    /// The call's git root: this machine's id, and the backend's it shows.
+    root_id: Option<(String, String)>,
 }
 
 /// One absolute path a reply does not show, and what it shows instead
@@ -589,6 +640,7 @@ impl Hidden {
             roots,
             record: Some(record.as_str().to_owned()),
             workspace: Some(workspace.as_str().to_owned()),
+            root_id: None,
         }
     }
 
@@ -604,6 +656,11 @@ impl Hidden {
         if let (Some(record), Some(workspace)) = (&self.record, &self.workspace) {
             if text == record {
                 return Some(workspace.clone());
+            }
+        }
+        if let Some((own, theirs)) = &self.root_id {
+            if text == own {
+                return Some(theirs.clone());
             }
         }
         for root in &self.roots {
@@ -627,6 +684,9 @@ impl Hidden {
         let mut text = text.to_owned();
         if let (Some(record), Some(workspace)) = (&self.record, &self.workspace) {
             text = text.replace(record.as_str(), workspace);
+        }
+        if let Some((own, theirs)) = &self.root_id {
+            text = text.replace(own.as_str(), theirs);
         }
         for root in &self.roots {
             if !text.contains(root.path.as_str()) {
@@ -892,6 +952,7 @@ mod tests {
             ],
             record: Some("__home__:r1".to_owned()),
             workspace: Some("ws-1".to_owned()),
+            root_id: None,
         };
         let shown = hidden.value(json!({
             "repoPath": "/srv/homes/h1/work",

@@ -191,6 +191,15 @@ pub(crate) trait HomeRecords: Send + Sync {
         'static,
         Result<serde_json::Value, intent_core::node_link::HomeCallError>,
     >;
+    /// The id of `record`'s git root at `path` (a repository root in its
+    /// checkout), registered now when it has none.
+    fn root(
+        &self,
+        _record: &intent_core::WorkspaceId,
+        _path: &std::path::Path,
+    ) -> intent_core::BoxFuture<'static, anyhow::Result<String>> {
+        Box::pin(async { Err(anyhow::anyhow!("this machine records no git roots")) })
+    }
     /// Watch the home checkout `worktree` under its `record` (node-link.md
     /// "File and git events of a home") until the returned guard is
     /// dropped; `None` when this machine relays no home events.
