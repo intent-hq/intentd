@@ -1233,7 +1233,6 @@ jobs:
           INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_TUNNEL_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
           INTENTD_TUNNEL_TARGET: ${{ matrix.target }}
-          CARGO_BUILD_JOBS: "2"
         run: |
           python3 -I -B -S - <<'PYTHON'
           import json, os, signal, subprocess
@@ -1350,7 +1349,6 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_FIXTURE_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
-          CARGO_BUILD_JOBS: "2"
         run: |
           set -euo pipefail
           # The capability probe removes the guard only in its exact child.
