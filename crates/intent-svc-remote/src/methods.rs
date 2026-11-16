@@ -472,6 +472,10 @@ pub(crate) async fn add_machine(
     let _lifecycle = feature.lifecycle(&params.machine_id).await;
     let store = svc.store();
     let previous = store.get_exposed_machine(&params.machine_id).await?;
+    let stored_token = match &previous {
+        Some(row) if !row.is_cloud() => svc.load_remote_machine_token(&row.id).await?,
+        _ => None,
+    };
     // A cloud machine's id is never taken over by the expose flow, nor the
     // other way round.
     if previous
@@ -553,8 +557,8 @@ pub(crate) async fn add_machine(
         ConnectFailure::Revoked(attempts) => ConnectFailure::Unreachable(attempts),
         // A saved machine that is now an orchestrator is removed.
         ConnectFailure::Orchestrator => {
-            if previous.as_ref().is_some_and(|row| !row.is_cloud()) {
-                forget_orchestrator(Some(svc.clone()), params.machine_id.clone());
+            if let Some(token) = &stored_token {
+                forget_orchestrator(Some(svc.clone()), params.machine_id.clone(), token.clone());
             }
             ConnectFailure::Orchestrator
         }
@@ -749,8 +753,9 @@ async fn forget(svc: &Services, machine_id: &str) -> Result<Option<ExecutorCrede
 
 /// Remove exposed machine `machine_id` in the background after it refused a
 /// bind because it now runs as an orchestrator (nodes.md "Orchestrator
-/// mode"). Its agents were already ended; an orchestrator runs none.
-pub(crate) fn forget_orchestrator(svc: Option<Services>, machine_id: String) {
+/// mode"). Only while the stored token is still `refused`: a machine paired
+/// again meanwhile is kept. Its agents end; an orchestrator runs none.
+pub(crate) fn forget_orchestrator(svc: Option<Services>, machine_id: String, refused: String) {
     let Some(svc) = svc else {
         return;
     };
@@ -761,15 +766,26 @@ pub(crate) fn forget_orchestrator(svc: Option<Services>, machine_id: String) {
         };
         let _lifecycle = feature.lifecycle(&machine_id).await;
         let forgotten = async {
-            let exposed = svc
+            let Some(row) = svc
                 .store()
                 .get_exposed_machine(&machine_id)
                 .await?
-                .is_some_and(|row| !row.is_cloud());
-            if !exposed {
+                .filter(|row| !row.is_cloud())
+            else {
+                return Ok(());
+            };
+            if svc.load_remote_machine_token(&machine_id).await?.as_deref()
+                != Some(refused.as_str())
+            {
                 return Ok(());
             }
             if let Some(node) = feature.take_node(&machine_id) {
+                node.shared_ref().drop_stops();
+                node.shared_ref().agents.end_all(&format!(
+                    "{}: {} is now an orchestrator and no longer runs agents for other backends",
+                    crate::connect::MACHINE_ORCHESTRATOR,
+                    row.name
+                ));
                 node.shutdown();
             }
             tracing::info!(machine = %machine_id, "remote machine: now an orchestrator; removed");

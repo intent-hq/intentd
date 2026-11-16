@@ -2659,6 +2659,7 @@ async fn run(
                     crate::methods::forget_orchestrator(
                         shared.services().cloned(),
                         target.id.clone(),
+                        target.token.expose().to_owned(),
                     );
                 } else {
                     shared.announce().await;
