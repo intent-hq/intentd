@@ -471,8 +471,8 @@ impl Store {
     /// 3): in one transaction the workspace's home becomes the move's new
     /// home, `attached` since `now` (its `lastBackupAt` kept: the new home
     /// starts from that backup), a `moved` stop of the old machine home is
-    /// recorded and the move goes; an error when the new home's machine is
-    /// gone, so the move rolls back. A setup the new home finished before
+    /// recorded and the move goes; an error when the new home's cloud
+    /// sandbox is gone, so the move rolls back. A setup the new home finished before
     /// claims its `autoStart` here. A new home on a cloud sandbox gets
     /// `owner` as the sandbox's `cloud.startedBy` in the same transaction
     /// (nodes.md "Cloud homes" 2). `None` when that move is gone (rolled
@@ -495,7 +495,10 @@ impl Store {
         else {
             return Ok(None);
         };
-        if let Some(node_id) = &home_move.target.node_id {
+        if let (Some(node_id), Some(_)) = (
+            &home_move.target.node_id,
+            &home_move.target.cloud_machine_id,
+        ) {
             let present: Option<i64> =
                 sqlx::query_scalar("SELECT 1 FROM exposed_machine WHERE id = ?")
                     .bind(node_id)
