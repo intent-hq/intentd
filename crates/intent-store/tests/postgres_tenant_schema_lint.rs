@@ -58,6 +58,7 @@ fn without_comments(sql: &str) -> String {
 }
 
 /// Text from `open` (an index of `(`) to its matching `)`, exclusive.
+#[track_caller]
 fn paren_body(s: &str, open: usize) -> &str {
     let mut depth = 0usize;
     for (i, c) in s[open..].char_indices() {
