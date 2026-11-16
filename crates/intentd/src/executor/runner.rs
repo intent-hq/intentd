@@ -143,9 +143,9 @@ pub(crate) trait MachineLaunch: Send + Sync {
     /// answered.
     fn policy(&self) -> PermissionPolicy;
     /// Whether this machine may hold workspace homes now: its
-    /// `remoteAgents.allowHomes`.
+    /// `remoteAgents.allowHomes`. A launch that does not say holds none.
     fn allows_homes(&self) -> bool {
-        true
+        false
     }
 }
 

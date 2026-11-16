@@ -2260,6 +2260,21 @@ fn the_machine_refuses_a_provider_disabled_in_its_own_settings() {
     );
 }
 
+/// A machine holds homes while `remoteAgents.allowHomes` is on, with no other
+/// switch; an orchestrator, which starts no provider, never holds one.
+#[test]
+fn a_machine_holds_homes_by_its_own_setting_and_never_on_an_orchestrator() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings =
+        Arc::new(intent_services::SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+    assert!(SettingsLaunch(settings.clone(), true).allows_homes());
+    assert!(!SettingsLaunch(settings.clone(), false).allows_homes());
+    settings
+        .apply(&[("remoteAgents.allowHomes".into(), serde_json::json!(false))])
+        .unwrap();
+    assert!(!SettingsLaunch(settings, true).allows_homes());
+}
+
 /// Disabling a provider changes only the report: an agent already running
 /// on it keeps its process; only its next start is refused.
 #[tokio::test]

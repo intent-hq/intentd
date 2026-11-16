@@ -1046,6 +1046,7 @@ fn runtime_capabilities_are_added_only_when_on() {
         .cloned()
     };
     assert_eq!(homes(DaemonMode::Orchestrator, true), Some(json!(1)));
+    assert_eq!(homes(DaemonMode::Orchestrator, false), Some(json!(1)));
     assert_eq!(homes(DaemonMode::Regular, true), None);
     assert_eq!(homes(DaemonMode::Node, false), None);
     let error = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32602 } }).to_string();
