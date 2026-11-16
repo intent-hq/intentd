@@ -12951,6 +12951,43 @@ mod tests {
         );
     }
 
+    /// A workspace whose own PRs all merged is not settled while it monitors
+    /// an open PR: the monitor keeps the plain idle tier (5 min after an idle
+    /// hour), not the 15-minute settled floor that delayed a reviewer reply.
+    #[tokio::test]
+    async fn active_monitor_keeps_a_merged_workspace_off_the_settled_tier() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let mut monitor = register(&svc, &ws, &owner).await;
+        let now = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let ago = |seconds| intent_core::iso_from_unix_secs(now.unix_timestamp() - seconds);
+        sqlx::query(
+            "UPDATE workspace SET last_content_activity = ?, pr_status = 'Merged', \
+             pr_url = 'https://github.com/o/r/pull/7' WHERE id = ?",
+        )
+        .bind(ago(3700))
+        .bind(&ws.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+        monitor.last_polled_at = Some(ago(300));
+        assert_eq!(
+            svc.select_due_pr_monitors(vec![monitor.clone()], None, now)
+                .await
+                .len(),
+            1
+        );
+        svc.store()
+            .update_pr_monitor_state(&monitor.monitor_id, PrMonitorState::Cancelled, &now_iso())
+            .await
+            .unwrap();
+        assert!(svc
+            .store()
+            .workspaces_with_settled_pull_requests(std::slice::from_ref(&ws))
+            .await
+            .unwrap()
+            .contains(&ws));
+    }
+
     /// An `agent:idle` nudge polls the workspace's monitors whose last poll
     /// is at least 60 s old even when the idle tier would wait, skips
     /// fresher ones, other workspaces' PRs, and a rate-limit pause.

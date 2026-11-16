@@ -141,7 +141,9 @@ impl Store {
     /// snapshot exists on the workspace or its git roots, and every one of
     /// them (link status, active PR, discovered pools) is `Merged` or
     /// `Closed`. A link without a status or a malformed snapshot counts as
-    /// unknown, so the workspace is not settled. Read in bounded batches.
+    /// unknown, so the workspace is not settled. An active PR monitor watches
+    /// an open PR, so it also keeps the workspace unsettled. Read in bounded
+    /// batches.
     ///
     /// # Errors
     /// Returns an internal error if the metadata query fails.
@@ -163,6 +165,9 @@ impl Store {
                SELECT r.workspace_id, r.pr_status FROM workspace_git_root r \
                  JOIN ids ON ids.id = r.workspace_id \
                  WHERE r.pr_status IS NOT NULL OR r.pr_url IS NOT NULL \
+               UNION ALL \
+               SELECT m.workspace_id, NULL FROM pr_monitor m \
+                 JOIN ids ON ids.id = m.workspace_id WHERE m.state = 'active' \
                UNION ALL \
                SELECT w.id, CASE WHEN json_valid(w.active_pull_request) \
                  THEN json_extract(w.active_pull_request, '$.status') END \
