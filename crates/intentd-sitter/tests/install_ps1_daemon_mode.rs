@@ -415,10 +415,9 @@ fn an_install_is_existing_when_its_data_dir_holds_the_database() {
 /// would create the database: before the task is registered.
 #[test]
 fn the_existing_install_check_runs_before_the_task_is_registered() {
-    let script = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1"),
-    )
-    .unwrap();
+    let script =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1"))
+            .unwrap();
     let check = script.find(">>> BEGIN existing-install").unwrap();
     let register = script.find(">>> BEGIN service-task-register").unwrap();
     assert!(check < register);
