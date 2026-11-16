@@ -382,3 +382,22 @@ fn orchestrator_setup_waits_for_a_daemon_that_is_up() {
         outcome.output
     );
 }
+
+#[test]
+fn an_install_is_existing_when_its_data_dir_holds_the_database() {
+    let Some(pwsh) = pwsh() else { return };
+    for existing in [false, true] {
+        let data = tempfile::tempdir().unwrap();
+        if existing {
+            fs::write(data.path().join("intentd.db"), "").unwrap();
+        }
+        let body = format!(
+            "{}\n\"EXISTING=$existingInstall\"",
+            ps_region("existing-install")
+        );
+        let data_dir = data.path().display().to_string();
+        let outcome = run(&pwsh, &body, &[("INTENTD_DATA_DIR", data_dir.as_str())], None);
+        let want = if existing { "EXISTING=True" } else { "EXISTING=False" };
+        assert!(outcome.output.contains(want), "{}", outcome.output);
+    }
+}

@@ -146,6 +146,17 @@ if ($env:INTENTD_DATA_DIR) {
 }
 # <<< END resolve-data-dir
 
+# >>> BEGIN existing-install (extracted verbatim and executed by
+# crates/intentd-sitter/tests/install_ps1_daemon_mode.rs; its only input is
+# the environment)
+#
+# Before anything can start a daemon that creates it: a database already in
+# the data dir means an earlier install, which never becomes an orchestrator.
+# The default data dir is the one data-dir-owner-check uses.
+$existingDataDir = if ($env:INTENTD_DATA_DIR) { $env:INTENTD_DATA_DIR } else { Join-Path $env:APPDATA 'intentd\data' }
+$existingInstall = Test-Path -LiteralPath (Join-Path $existingDataDir 'intentd.db')
+# <<< END existing-install
+
 $installDir = if ($env:INTENTD_INSTALL_DIR) {
     $env:INTENTD_INSTALL_DIR
 } else {
@@ -245,7 +256,7 @@ if (-not $installMode) {
 
 # Service setup decision: switches beat the env var beat the prompt. Never
 # hang in non-interactive runs — skip with a hint instead, except for a node
-# or an orchestrator, which are only useful while their daemon runs.
+# or a fresh orchestrator, which are only useful while their daemon runs.
 $serviceMode = ''
 if ($Service) { $serviceMode = 'yes' }
 elseif ($NoService) { $serviceMode = 'no' }
@@ -256,7 +267,7 @@ if (-not $serviceMode) {
     if ($interactive) {
         $reply = Read-Host 'Set up intentd to start at logon and start it now? [Y/n]'
         $serviceMode = if ($reply -match '^[nN]') { 'no' } else { 'yes' }
-    } elseif (@('node', 'orchestrator') -contains $installMode) {
+    } elseif ($installMode -eq 'node' -or ($installMode -eq 'orchestrator' -and -not $existingInstall)) {
         $serviceMode = 'yes'
     } else {
         $serviceMode = 'skip'
@@ -448,9 +459,6 @@ if ($serviceMode -eq 'yes') {
         }
     }
     # <<< END data-dir-owner-check
-    # Before the task's first start creates it: a database already in the
-    # data dir means an earlier install, which never becomes an orchestrator.
-    $existingInstall = Test-Path -LiteralPath (Join-Path $dataDir 'intentd.db')
     # Auto-resume choice: parameter beats the env var beats the prompt (both
     # validated up front); 'auto' — or a non-interactive run — is the daemon
     # default and writes nothing. Applied via `intentd settings` after the
@@ -793,14 +801,18 @@ if ($serviceMode -eq 'yes') {
         Write-Host 'install.ps1: skipping service setup (non-interactive session). To set it up, re-run with $env:INTENTD_INSTALL_SERVICE = ''1'''
     }
     Write-Host ''
-    if ($installMode -eq 'orchestrator') {
+    if ($installMode -eq 'orchestrator' -and $existingInstall) {
+        Write-Warning "install.ps1: This computer already has Intent installed; the mode can't be changed by re-installing. To use orchestrator mode, install on a fresh machine and open your repos there."
+        Write-Host 'Next steps:'
+        Write-Host '  intentd serve   # start the daemon (downloads the real daemon on first run)'
+        Write-Host '  intentd pair    # once the daemon is running (another terminal): pairing info for remote clients (desktop/mobile app)'
+    } elseif ($installMode -eq 'orchestrator') {
         Write-Host 'Next steps for an orchestrator:'
         Write-Host '  intentd serve --orchestrator   # start the daemon in orchestrator mode in the foreground'
         Write-Host '  intentd pair    # once the daemon is running (another terminal): pairing info for the desktop app'
         Write-Host ''
         Write-Host 'To keep orchestrator mode across restarts, set it once the daemon runs:'
         Write-Host '  intentd settings daemon.mode orchestrator'
-        Write-Host 'Or re-run this installer with $env:INTENTD_INSTALL_SERVICE = ''1'' and $env:INTENTD_DAEMON_MODE = ''orchestrator''.'
     } elseif ($installMode -eq 'node') {
         Write-Host 'Next steps for a node:'
         Write-Host '  intentd serve --node    # start the daemon in node mode in the foreground'

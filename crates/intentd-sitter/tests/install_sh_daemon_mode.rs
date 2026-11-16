@@ -889,3 +889,45 @@ fn an_orchestrator_without_a_service_names_its_next_steps() {
         run.describe()
     );
 }
+
+#[test]
+fn an_orchestrator_reinstall_without_a_service_keeps_the_mode() {
+    let run = run_install(
+        Terminal::None,
+        &["--daemon-mode=orchestrator", "--no-service"],
+        &[],
+        Some("regular"),
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(
+        run.stderr().contains(&format!(
+            "This computer already has Intent installed; {KEPT} To use orchestrator mode, install on a fresh machine and open your repos there."
+        )),
+        "{}",
+        run.describe()
+    );
+    let stdout = run.stdout();
+    assert!(
+        !stdout.contains("Next steps for an orchestrator:")
+            && !stdout.contains("daemon.mode orchestrator"),
+        "no orchestrator steps for an existing install\n{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn an_unattended_orchestrator_reinstall_sets_no_service_up() {
+    let run = run_install(
+        Terminal::None,
+        &[],
+        &[("INTENTD_DAEMON_MODE", "orchestrator")],
+        Some("regular"),
+    );
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(
+        !run.called("status") && mode_writes(&run).is_empty(),
+        "{}",
+        run.describe()
+    );
+    assert!(run.stderr().contains(KEPT), "{}", run.describe());
+}

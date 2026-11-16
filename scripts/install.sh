@@ -1272,6 +1272,11 @@ main() {
     pin_channel
   fi
 
+  # Before anything can start a daemon that creates it: a database already in
+  # the data dir means an earlier install, which never becomes an orchestrator.
+  existing_install="no"
+  [ ! -e "$(resolve_data_dir)/intentd.db" ] || existing_install="yes"
+
   # How this computer is used: asked first, on a terminal only; no terminal
   # and no flag or env var means the recommended full install.
   if [ -z "$daemon_mode" ]; then
@@ -1286,7 +1291,7 @@ main() {
   # prompt talks to /dev/tty because `curl | sh` occupies stdin; when no
   # terminal is available (CI, provisioning) it must never hang, so the
   # default there is to skip with a hint — except for a node or an
-  # orchestrator, which are only useful while their daemon runs, so an
+  # fresh orchestrator, which are only useful while their daemon runs, so an
   # unattended install of either sets the service up unless told not to.
   service_mode="$service_arg"
   if [ -z "$service_mode" ]; then
@@ -1306,7 +1311,9 @@ main() {
         [nN]*) service_mode="no" ;;
         *) service_mode="yes" ;;
       esac
-    elif [ "$daemon_mode" = "node" ] || [ "$daemon_mode" = "orchestrator" ]; then
+    elif [ "$daemon_mode" = "node" ]; then
+      service_mode="yes"
+    elif [ "$daemon_mode" = "orchestrator" ] && [ "$existing_install" != "yes" ]; then
       service_mode="yes"
     else
       service_mode="skip"
@@ -1318,10 +1325,6 @@ main() {
     # owns cannot host a second service, so refuse now rather than register a
     # service that can only crash-loop.
     check_data_dir_not_owned
-    # Before the service's first start creates it: a database already in the
-    # data dir means an earlier install, which never becomes an orchestrator.
-    existing_install="no"
-    [ ! -e "$(resolve_data_dir)/intentd.db" ] || existing_install="yes"
     # Auto-resume choice: flag beats the env var beats the prompt (both were
     # lowercased + validated above). Same /dev/tty pattern as the service
     # prompt; `auto` — or no terminal — is the daemon default and writes
@@ -1386,15 +1389,16 @@ To keep node mode across restarts, set it once the daemon runs:
 Or re-run this installer with INTENTD_INSTALL_SERVICE=1 INTENTD_DAEMON_MODE=node."
     return 0
   fi
-  if [ "$daemon_mode" = "orchestrator" ]; then
+  if [ "$daemon_mode" = "orchestrator" ] && [ "$existing_install" = "yes" ]; then
+    warn "This computer already has Intent installed; the mode can't be changed by re-installing. To use orchestrator mode, install on a fresh machine and open your repos there."
+  elif [ "$daemon_mode" = "orchestrator" ]; then
     printf '%s\n' "
 Next steps for an orchestrator:
   intentd serve --orchestrator   # start the daemon in orchestrator mode in the foreground
   intentd pair    # once the daemon is running (another terminal): pairing info for the desktop app
 
 To keep orchestrator mode across restarts, set it once the daemon runs:
-  intentd settings daemon.mode orchestrator
-Or re-run this installer with INTENTD_INSTALL_SERVICE=1 INTENTD_DAEMON_MODE=orchestrator."
+  intentd settings daemon.mode orchestrator"
     return 0
   fi
   printf '%s\n' "
