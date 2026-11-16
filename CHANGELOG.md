@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.225] - 2026-11-16
+
+### 🚀 Features
+
+- Installer orchestrator choice ([#3408](https://github.com/intent-hq/intentd/pull/3408))
+- Homes follow orchestrator mode ([#3407](https://github.com/intent-hq/intentd/pull/3407))
+
+### 📚 Documentation
+
+- *(guide)* Note Run and file errors while a workspace home is away ([#3406](https://github.com/intent-hq/intentd/pull/3406))
+
+
 ## [0.11.224] - 2026-11-16
 
 ### 🚀 Features
