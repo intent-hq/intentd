@@ -1222,6 +1222,7 @@ async fn open_invite_list_preserves_nanosecond_expiry_and_orders_equal_creation_
     }
     assert_eq!(
         store
+            .sqlite()
             .list_open_host_invites_at("2026-01-08T00:00:00Z")
             .await
             .unwrap()
@@ -1231,11 +1232,13 @@ async fn open_invite_list_preserves_nanosecond_expiry_and_orders_equal_creation_
         vec!["a", "b"]
     );
     assert!(store
+        .sqlite()
         .list_open_host_invites_at("2026-01-08T00:00:00.000000001Z")
         .await
         .unwrap()
         .is_empty());
     assert!(store
+        .sqlite()
         .list_open_host_invites_at("2026-01-08T00:00:00.000000002Z")
         .await
         .unwrap()

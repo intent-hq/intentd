@@ -483,7 +483,7 @@ async fn snapshot_reads_source_and_counter_from_same_sqlite_snapshot() {
         .execute(f.store.write_pool())
         .await
         .unwrap();
-    let captured = read_at(&f.store, &f.root, &mut read).await.unwrap();
+    let captured = read_at(f.store.sqlite(), &f.root, &mut read).await.unwrap();
     assert!(initial.matches(&captured));
     read.commit().await.unwrap();
     assert!(!initial.matches(&f.read().await));

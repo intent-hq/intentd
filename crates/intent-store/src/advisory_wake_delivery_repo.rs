@@ -23,6 +23,79 @@ impl Store {
         child_agent_id: &AgentId,
         delivered_at: &str,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.record_advisory_wake_delivery(parent_agent_id, child_agent_id, delivered_at).await)
+    }
+
+    /// Whether an advisory-delivered marker stands for the pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn has_advisory_wake_delivery(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.has_advisory_wake_delivery(parent_agent_id, child_agent_id).await)
+    }
+
+    /// Clear the advisory-delivered marker for the pair (the child's genuine
+    /// completion/failure/deletion wake delivered — the waiting period is
+    /// over).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_advisory_wake_delivery(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.clear_advisory_wake_delivery(parent_agent_id, child_agent_id).await)
+    }
+
+    /// Clear every advisory-delivered marker naming `child_agent_id` as the
+    /// child: its genuine settlement — or a real turn start (the child left
+    /// monitoring-idle, so the current waiting period is over) — ends the
+    /// waiting period for EVERY advised parent, whether or not any still
+    /// holds an armed watch (a parent that never re-armed after the advisory
+    /// has no watch to clear through).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_advisory_wake_deliveries_for_child(
+        &self,
+        child_agent_id: &AgentId,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.clear_advisory_wake_deliveries_for_child(child_agent_id).await)
+    }
+
+    /// Batched [`Store::clear_advisory_wake_deliveries_for_child`]: clear the
+    /// markers naming ANY of `child_agent_ids` as the child in ONE `IN`-list
+    /// statement per 32 000 ids (the workspace-delete sweep —
+    /// intent-hq/monorepo#4130 — settles every session at once, so the
+    /// per-child clear would otherwise cost one statement per agent). No-op
+    /// on an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_advisory_wake_deliveries_for_children(
+        &self,
+        child_agent_ids: &[AgentId],
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.clear_advisory_wake_deliveries_for_children(child_agent_ids).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn record_advisory_wake_delivery(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+        delivered_at: &str,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO advisory_wake_delivery (
                 parent_agent_id, child_agent_id, delivered_at
@@ -39,11 +112,6 @@ impl Store {
         Ok(())
     }
 
-    /// Whether an advisory-delivered marker stands for the pair.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn has_advisory_wake_delivery(
         &self,
         parent_agent_id: &AgentId,
@@ -61,13 +129,6 @@ impl Store {
         Ok(row.is_some())
     }
 
-    /// Clear the advisory-delivered marker for the pair (the child's genuine
-    /// completion/failure/deletion wake delivered — the waiting period is
-    /// over).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_advisory_wake_delivery(
         &self,
         parent_agent_id: &AgentId,
@@ -85,16 +146,6 @@ impl Store {
         Ok(())
     }
 
-    /// Clear every advisory-delivered marker naming `child_agent_id` as the
-    /// child: its genuine settlement — or a real turn start (the child left
-    /// monitoring-idle, so the current waiting period is over) — ends the
-    /// waiting period for EVERY advised parent, whether or not any still
-    /// holds an armed watch (a parent that never re-armed after the advisory
-    /// has no watch to clear through).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_advisory_wake_deliveries_for_child(
         &self,
         child_agent_id: &AgentId,
@@ -109,16 +160,6 @@ impl Store {
         Ok(())
     }
 
-    /// Batched [`Store::clear_advisory_wake_deliveries_for_child`]: clear the
-    /// markers naming ANY of `child_agent_ids` as the child in ONE `IN`-list
-    /// statement per 32 000 ids (the workspace-delete sweep —
-    /// intent-hq/monorepo#4130 — settles every session at once, so the
-    /// per-child clear would otherwise cost one statement per agent). No-op
-    /// on an empty list.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_advisory_wake_deliveries_for_children(
         &self,
         child_agent_ids: &[AgentId],

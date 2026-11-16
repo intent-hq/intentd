@@ -12,6 +12,16 @@ use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
 
+/// Run `$call` against the backend of `$self`, bound to `$s`. Every backend
+/// must provide each `Store` method under the same name and signature.
+macro_rules! dispatch {
+    ($self:ident, $s:ident => $call:expr) => {
+        match &$self.backend {
+            $crate::Backend::Sqlite($s) => $call,
+        }
+    };
+}
+
 mod advisory_wake_delivery_repo;
 mod agent_flipped_completion_repo;
 mod agent_queue_repo;
@@ -405,6 +415,48 @@ mod tests;
 /// target.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
+/// Persistence handle: the one storage API the rest of the daemon uses.
+/// Cheaply cloneable. Every method dispatches to the backend the handle was
+/// opened with; today that is always [`SqliteStore`].
+#[derive(Clone)]
+pub struct Store {
+    backend: Backend,
+}
+
+#[derive(Clone)]
+enum Backend {
+    Sqlite(SqliteStore),
+}
+
+impl Store {
+    fn from_sqlite(store: SqliteStore) -> Self {
+        Self {
+            backend: Backend::Sqlite(store),
+        }
+    }
+}
+
+impl Store {
+    /// The `SQLite` backend behind this handle, for crate-internal code that
+    /// compares two handles' process-local state.
+    pub(crate) fn sqlite(&self) -> &SqliteStore {
+        match &self.backend {
+            Backend::Sqlite(store) => store,
+        }
+    }
+}
+
+/// In-crate tests reach `SQLite` internals (pools, fields, private helpers)
+/// through the handle they opened.
+#[cfg(test)]
+impl Store {
+    pub(crate) fn sqlite_mut(&mut self) -> &mut SqliteStore {
+        match &mut self.backend {
+            Backend::Sqlite(store) => store,
+        }
+    }
+}
+
 /// SQLite-backed persistence handle. Cheaply cloneable (the pools are `Arc`-ed).
 ///
 /// Holds two pools over the same DB file: a single-connection **write pool**
@@ -413,7 +465,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// for concurrent read (SELECT) queries, enforced with `PRAGMA query_only`.
 /// See `connect_write` / `connect_read` for the pool configurations.
 #[derive(Clone)]
-pub struct Store {
+pub(crate) struct SqliteStore {
     // Also retained by connection options and SQLite handles; see retain_owner.
     _daemon_owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
     write_pool: StorePool,
@@ -451,11 +503,13 @@ impl PreparedDaemonStore {
     pub async fn open(self) -> Result<Store> {
         // SQLite initialization callbacks retain ownership even if this caller
         // disappears, matching open_for_daemon's existing cancellation guarantee.
-        tokio::spawn(Store::finish_owned_startup(self.physical, self.owner))
-            .await
-            .map_err(|e| {
-                Error::Internal(format!("daemon database initialization task failed: {e}"))
-            })?
+        tokio::spawn(crate::SqliteStore::finish_owned_startup(
+            self.physical,
+            self.owner,
+        ))
+        .await
+        .map_err(|e| Error::Internal(format!("daemon database initialization task failed: {e}")))?
+        .map(Store::from_sqlite)
     }
 }
 
@@ -466,6 +520,169 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database cannot be opened or created, a migration fails, or the migration ledger records a version newer than this build (downgrade).
+    pub async fn open(db_path: &Path) -> Result<Self> {
+        crate::SqliteStore::open(db_path)
+            .await
+            .map(Self::from_sqlite)
+    }
+
+    /// Open for exclusive daemon startup, sweeping dead-turn payloads before
+    /// returning a usable Store. Ownership survives every Store/pool clone and
+    /// checked-out or detached connection, including pending `SQLite` worker work.
+    /// Close and drop all handles to release it; closed pool options still retain it.
+    /// Ordinary opens never perform this sweep. The lock file must not be removed.
+    ///
+    /// # Errors
+    /// Returns an error if another daemon owns this database, locking is unsupported,
+    /// or opening/migrating/sweeping the database fails.
+    pub async fn open_for_daemon(db_path: &Path) -> Result<Self> {
+        Self::prepare_for_daemon(db_path)?.open().await
+    }
+
+    /// Acquire database ownership before exposing startup listeners.
+    ///
+    /// # Errors
+    /// Refuses aliases, unsupported locking, and a competing daemon owner.
+    pub fn prepare_for_daemon(db_path: &Path) -> Result<PreparedDaemonStore> {
+        crate::SqliteStore::prepare_for_daemon(db_path)
+    }
+
+    /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
+    ///
+    /// Acquisition and queries retain ownership throughout initialization.
+    /// The facade exposes read-only settings, not a raw pool or mutable options.
+    #[must_use]
+    pub fn write_pool(&self) -> &StorePool {
+        dispatch!(self, backend => backend.write_pool())
+    }
+
+    /// Borrow the read pool (32 connections, intended for read/SELECT queries).
+    /// The ownership and exported-options boundary is the same as [`Self::write_pool`].
+    #[must_use]
+    pub fn read_pool(&self) -> &StorePool {
+        dispatch!(self, backend => backend.read_pool())
+    }
+
+    /// Deprecated alias for `read_pool()`. External callers should migrate to
+    /// explicit `read_pool()` / `write_pool()` usage.
+    #[deprecated(since = "0.1.0", note = "use read_pool() or write_pool() explicitly")]
+    #[must_use]
+    pub fn pool(&self) -> &StorePool {
+        dispatch!(self, backend => backend.pool())
+    }
+
+    /// Spawn a background task that periodically runs PRAGMA `wal_checkpoint(PASSIVE)`
+    /// to prevent unbounded WAL growth when continuous readers hold long-lived
+    /// transactions. Returns a handle that can be aborted to stop the task.
+    ///
+    /// Call this after `open()` in the daemon composition root; the task will run
+    /// every ~60s until the returned handle is dropped or aborted.
+    #[must_use]
+    pub fn spawn_periodic_wal_checkpoint(&self) -> tokio::task::JoinHandle<()> {
+        dispatch!(self, backend => backend.spawn_periodic_wal_checkpoint())
+    }
+
+    /// Number of pages on the database freelist (`PRAGMA freelist_count`):
+    /// pages emptied by deletes that have not yet been reclaimed. On an
+    /// incremental-auto-vacuum database these are the pages
+    /// [`Self::incremental_vacuum_chunk`] can release back to the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn freelist_count(&self) -> Result<i64> {
+        dispatch!(self, backend => backend.freelist_count().await)
+    }
+
+    /// One-time activation of incremental auto-vacuum on a legacy database
+    /// (monorepo#720 finding 1). New databases are created with
+    /// `auto_vacuum = INCREMENTAL` (see [`connect_write`]), but on a database
+    /// created before that pragma existed the mode stays NONE until a full
+    /// `VACUUM` rebuilds the file. This method checks `PRAGMA auto_vacuum`;
+    /// when it reports NONE it sets `auto_vacuum = INCREMENTAL` and runs
+    /// `VACUUM` on one write connection so the incremental mode takes effect and
+    /// [`Self::incremental_vacuum_chunk`] can release freelist pages from then on.
+    ///
+    /// Intended to run once during daemon startup, after [`Store::open`] and
+    /// before any listener serves: at that point the single write connection
+    /// has no open transaction (a `VACUUM` requirement) and no client is
+    /// blocked by the rebuild. Callers should treat a failure as non-fatal —
+    /// the daemon runs exactly as before, it just cannot return freelist
+    /// pages to the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn activate_incremental_vacuum(&self) -> Result<AutoVacuumActivation> {
+        dispatch!(self, backend => backend.activate_incremental_vacuum().await)
+    }
+
+    /// Database page size in bytes (`PRAGMA page_size`), read on the read
+    /// pool so it never queues behind the writer. Used to express freelist
+    /// backlogs in bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn page_size(&self) -> Result<i64> {
+        dispatch!(self, backend => backend.page_size().await)
+    }
+
+    /// One bounded `PRAGMA incremental_vacuum(N)` step, run with the
+    /// freelist reads on a single acquired write connection (one pool
+    /// acquisition per chunk), which is returned to the pool before this
+    /// method returns so queued writers can run between chunks. Only
+    /// effective when the database has `auto_vacuum = INCREMENTAL` (a no-op
+    /// otherwise — see [`connect_write`] for the activation story).
+    ///
+    /// `max_pages` is clamped to `1..=i32::MAX`: `SQLite` reads `N <= 0` (and
+    /// an `N` that does not fit an `i32`) as "release the whole freelist",
+    /// which on a large database holds the single-connection write pool for
+    /// hours. Even a bounded `N` does not bound the hold — the per-page cost
+    /// grows with the database (4–7 ms/page on a 33 GB file,
+    /// intent-hq/intent#7448) — so periodic callers size `N` from the
+    /// measured `elapsed` (see `intent_services::retention`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the acquisition or any statement fails.
+    pub async fn incremental_vacuum_chunk(&self, max_pages: u32) -> Result<VacuumChunk> {
+        dispatch!(self, backend => backend.incremental_vacuum_chunk(max_pages).await)
+    }
+
+    /// Run `PRAGMA optimize` on the write connection. Cheap when called
+    /// repeatedly (`SQLite` only re-analyzes tables whose content changed
+    /// enough to matter); intended to run periodically after retention
+    /// sweeps so the query planner statistics track the shrinking event
+    /// table. See <https://sqlite.org/pragma.html#pragma_optimize>.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn optimize(&self) -> Result<()> {
+        dispatch!(self, backend => backend.optimize().await)
+    }
+
+    /// Close both pools gracefully, checkpointing the WAL and freeing resources.
+    /// Call this during daemon shutdown to checkpoint the WAL and close the pools.
+    /// This ensures WAL changes are visible to subsequent daemon instances
+    /// (regression: persisted settings must survive app relaunches in sidecar mode).
+    pub async fn close(&self) {
+        dispatch!(self, backend => backend.close().await);
+    }
+
+    /// Compare the migrations embedded in the binary against the versions
+    /// recorded as applied in `_sqlx_migrations`, for `intentd doctor` (§5.7).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn migration_status(&self) -> Result<MigrationStatus> {
+        dispatch!(self, backend => backend.migration_status().await)
+    }
+}
+
+impl crate::SqliteStore {
     pub async fn open(db_path: &Path) -> Result<Self> {
         Self::open_with_owner(db_path, None).await
     }
@@ -512,23 +729,6 @@ impl Store {
         })
     }
 
-    /// Open for exclusive daemon startup, sweeping dead-turn payloads before
-    /// returning a usable Store. Ownership survives every Store/pool clone and
-    /// checked-out or detached connection, including pending `SQLite` worker work.
-    /// Close and drop all handles to release it; closed pool options still retain it.
-    /// Ordinary opens never perform this sweep. The lock file must not be removed.
-    ///
-    /// # Errors
-    /// Returns an error if another daemon owns this database, locking is unsupported,
-    /// or opening/migrating/sweeping the database fails.
-    pub async fn open_for_daemon(db_path: &Path) -> Result<Self> {
-        Self::prepare_for_daemon(db_path)?.open().await
-    }
-
-    /// Acquire database ownership before exposing startup listeners.
-    ///
-    /// # Errors
-    /// Refuses aliases, unsupported locking, and a competing daemon owner.
     pub fn prepare_for_daemon(db_path: &Path) -> Result<PreparedDaemonStore> {
         // Resolve symlinks (including parent aliases for a new DB) before deriving
         // the lock path, so different config paths cannot acquire different locks.
@@ -585,37 +785,18 @@ impl Store {
         Ok(store)
     }
 
-    /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
-    ///
-    /// Acquisition and queries retain ownership throughout initialization.
-    /// The facade exposes read-only settings, not a raw pool or mutable options.
-    #[must_use]
     pub fn write_pool(&self) -> &StorePool {
         &self.write_pool
     }
 
-    /// Borrow the read pool (32 connections, intended for read/SELECT queries).
-    /// The ownership and exported-options boundary is the same as [`Self::write_pool`].
-    #[must_use]
     pub fn read_pool(&self) -> &StorePool {
         &self.read_pool
     }
 
-    /// Deprecated alias for `read_pool()`. External callers should migrate to
-    /// explicit `read_pool()` / `write_pool()` usage.
-    #[deprecated(since = "0.1.0", note = "use read_pool() or write_pool() explicitly")]
-    #[must_use]
     pub fn pool(&self) -> &StorePool {
         &self.read_pool
     }
 
-    /// Spawn a background task that periodically runs PRAGMA `wal_checkpoint(PASSIVE)`
-    /// to prevent unbounded WAL growth when continuous readers hold long-lived
-    /// transactions. Returns a handle that can be aborted to stop the task.
-    ///
-    /// Call this after `open()` in the daemon composition root; the task will run
-    /// every ~60s until the returned handle is dropped or aborted.
-    #[must_use]
     pub fn spawn_periodic_wal_checkpoint(&self) -> tokio::task::JoinHandle<()> {
         let write_pool = self.write_pool.clone();
         tokio::spawn(async move {
@@ -631,14 +812,6 @@ impl Store {
         })
     }
 
-    /// Number of pages on the database freelist (`PRAGMA freelist_count`):
-    /// pages emptied by deletes that have not yet been reclaimed. On an
-    /// incremental-auto-vacuum database these are the pages
-    /// [`Self::incremental_vacuum_chunk`] can release back to the filesystem.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn freelist_count(&self) -> Result<i64> {
         freelist_count_on(&self.write_pool).await
     }
@@ -652,25 +825,6 @@ impl Store {
             .map_err(|e| Error::Internal(format!("page_count failed: {e}")))
     }
 
-    /// One-time activation of incremental auto-vacuum on a legacy database
-    /// (monorepo#720 finding 1). New databases are created with
-    /// `auto_vacuum = INCREMENTAL` (see [`connect_write`]), but on a database
-    /// created before that pragma existed the mode stays NONE until a full
-    /// `VACUUM` rebuilds the file. This method checks `PRAGMA auto_vacuum`;
-    /// when it reports NONE it sets `auto_vacuum = INCREMENTAL` and runs
-    /// `VACUUM` on one write connection so the incremental mode takes effect and
-    /// [`Self::incremental_vacuum_chunk`] can release freelist pages from then on.
-    ///
-    /// Intended to run once during daemon startup, after [`Store::open`] and
-    /// before any listener serves: at that point the single write connection
-    /// has no open transaction (a `VACUUM` requirement) and no client is
-    /// blocked by the rebuild. Callers should treat a failure as non-fatal —
-    /// the daemon runs exactly as before, it just cannot return freelist
-    /// pages to the filesystem.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn activate_incremental_vacuum(&self) -> Result<AutoVacuumActivation> {
         let mode = sqlx::query("PRAGMA auto_vacuum")
             .fetch_one(&self.write_pool)
@@ -716,13 +870,6 @@ impl Store {
         })
     }
 
-    /// Database page size in bytes (`PRAGMA page_size`), read on the read
-    /// pool so it never queues behind the writer. Used to express freelist
-    /// backlogs in bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn page_size(&self) -> Result<i64> {
         sqlx::query("PRAGMA page_size")
             .fetch_one(&self.read_pool)
@@ -731,24 +878,6 @@ impl Store {
             .map_err(|e| Error::Internal(format!("page_size failed: {e}")))
     }
 
-    /// One bounded `PRAGMA incremental_vacuum(N)` step, run with the
-    /// freelist reads on a single acquired write connection (one pool
-    /// acquisition per chunk), which is returned to the pool before this
-    /// method returns so queued writers can run between chunks. Only
-    /// effective when the database has `auto_vacuum = INCREMENTAL` (a no-op
-    /// otherwise — see [`connect_write`] for the activation story).
-    ///
-    /// `max_pages` is clamped to `1..=i32::MAX`: `SQLite` reads `N <= 0` (and
-    /// an `N` that does not fit an `i32`) as "release the whole freelist",
-    /// which on a large database holds the single-connection write pool for
-    /// hours. Even a bounded `N` does not bound the hold — the per-page cost
-    /// grows with the database (4–7 ms/page on a 33 GB file,
-    /// intent-hq/intent#7448) — so periodic callers size `N` from the
-    /// measured `elapsed` (see `intent_services::retention`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the acquisition or any statement fails.
     pub async fn incremental_vacuum_chunk(&self, max_pages: u32) -> Result<VacuumChunk> {
         let pages = max_pages.clamp(1, i32::MAX.cast_unsigned());
         let mut conn = self
@@ -774,15 +903,6 @@ impl Store {
         })
     }
 
-    /// Run `PRAGMA optimize` on the write connection. Cheap when called
-    /// repeatedly (`SQLite` only re-analyzes tables whose content changed
-    /// enough to matter); intended to run periodically after retention
-    /// sweeps so the query planner statistics track the shrinking event
-    /// table. See <https://sqlite.org/pragma.html#pragma_optimize>.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn optimize(&self) -> Result<()> {
         sqlx::query("PRAGMA optimize")
             .execute(&self.write_pool)
@@ -791,10 +911,6 @@ impl Store {
             .map_err(|e| Error::Internal(format!("PRAGMA optimize failed: {e}")))
     }
 
-    /// Close both pools gracefully, checkpointing the WAL and freeing resources.
-    /// Call this during daemon shutdown to checkpoint the WAL and close the pools.
-    /// This ensures WAL changes are visible to subsequent daemon instances
-    /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
         let started = std::time::Instant::now();
         self.log_close_phase("wal_checkpoint", "started", 0);
@@ -831,12 +947,6 @@ impl Store {
             "store close phase");
     }
 
-    /// Compare the migrations embedded in the binary against the versions
-    /// recorded as applied in `_sqlx_migrations`, for `intentd doctor` (§5.7).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn migration_status(&self) -> Result<MigrationStatus> {
         let expected: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
         let applied: Vec<i64> =

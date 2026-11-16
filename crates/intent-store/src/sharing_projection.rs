@@ -11,8 +11,6 @@
 use intent_core::{now_iso, Error, Result, WorkspaceId};
 use sqlx::{Sqlite, SqliteConnection, Transaction};
 
-use crate::Store;
-
 pub(crate) async fn reconcile_invite_expiry(
     conn: &mut SqliteConnection,
     workspace_ids: &[WorkspaceId],
@@ -35,7 +33,7 @@ pub(crate) async fn reconcile_invite_expiry(
     Ok(())
 }
 
-impl Store {
+impl crate::SqliteStore {
     pub(crate) async fn sharing_snapshot(
         &self,
         ids: &[WorkspaceId],

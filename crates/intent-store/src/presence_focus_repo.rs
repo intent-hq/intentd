@@ -18,6 +18,18 @@ impl Store {
         person: &PrincipalId,
         candidates: &[Value],
     ) -> Result<Value> {
+        dispatch!(self, backend => backend.authorized_presence_focus(source, viewer, person, candidates).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn authorized_presence_focus(
+        &self,
+        source: &WorkspaceId,
+        viewer: &PrincipalId,
+        person: &PrincipalId,
+        candidates: &[Value],
+    ) -> Result<Value> {
         let row = sqlx::query(
             "WITH candidates AS (SELECT value AS target, json_extract(value, '$.workspaceId') AS workspace_id, \
                  json_extract(value, '$.agentId') AS agent_id, json_extract(value, '$.noteId') AS note_id FROM json_each(?1)), \

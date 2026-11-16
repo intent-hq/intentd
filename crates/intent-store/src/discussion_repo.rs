@@ -63,6 +63,63 @@ impl Store {
         body: &str,
         author: &DiscussionAuthor,
     ) -> Result<(DiscussionMessage, bool)> {
+        dispatch!(self, backend => backend.insert_discussion_message(workspace_id, client_message_id, body, author).await)
+    }
+
+    /// Read a bounded page, oldest first. After a cursor, take the first newer
+    /// rows; otherwise take the newest rows before the optional cursor.
+    ///
+    /// # Errors
+    /// Returns `InvalidParams` for invalid bounds or a storage error on failure.
+    pub async fn list_discussion_messages(
+        &self,
+        workspace_id: &WorkspaceId,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> Result<DiscussionPage> {
+        dispatch!(self, backend => backend.list_discussion_messages(workspace_id, before_sequence, after_sequence, limit).await)
+    }
+
+    /// Read one conversation's bounded history.
+    /// # Errors
+    /// Returns invalid bounds or database errors.
+    pub async fn list_discussion_messages_in(
+        &self,
+        workspace_id: &WorkspaceId,
+        conversation_id: &str,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> Result<DiscussionPage> {
+        dispatch!(self, backend => backend.list_discussion_messages_in(workspace_id, conversation_id, before_sequence, after_sequence, limit).await)
+    }
+
+    /// Read a bounded page and viewer reaction selection in a single snapshot.
+    /// Aggregate counts are persisted on write; the indexed selection is at most six rows per message.
+    /// # Errors
+    /// Returns invalid bounds or database errors.
+    pub async fn list_discussion_messages_for(
+        &self,
+        workspace_id: &WorkspaceId,
+        conversation_id: &str,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+        viewer: Option<&DiscussionActor>,
+    ) -> Result<DiscussionPage> {
+        dispatch!(self, backend => backend.list_discussion_messages_for(workspace_id, conversation_id, before_sequence, after_sequence, limit, viewer).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn insert_discussion_message(
+        &self,
+        workspace_id: &WorkspaceId,
+        client_message_id: &str,
+        body: &str,
+        author: &DiscussionAuthor,
+    ) -> Result<(DiscussionMessage, bool)> {
         let (result, inserted) = self
             .send_discussion_message(
                 workspace_id,
@@ -75,11 +132,6 @@ impl Store {
         Ok((result.message, inserted))
     }
 
-    /// Read a bounded page, oldest first. After a cursor, take the first newer
-    /// rows; otherwise take the newest rows before the optional cursor.
-    ///
-    /// # Errors
-    /// Returns `InvalidParams` for invalid bounds or a storage error on failure.
     pub async fn list_discussion_messages(
         &self,
         workspace_id: &WorkspaceId,
@@ -97,9 +149,6 @@ impl Store {
         .await
     }
 
-    /// Read one conversation's bounded history.
-    /// # Errors
-    /// Returns invalid bounds or database errors.
     pub async fn list_discussion_messages_in(
         &self,
         workspace_id: &WorkspaceId,
@@ -119,10 +168,6 @@ impl Store {
         .await
     }
 
-    /// Read a bounded page and viewer reaction selection in a single snapshot.
-    /// Aggregate counts are persisted on write; the indexed selection is at most six rows per message.
-    /// # Errors
-    /// Returns invalid bounds or database errors.
     pub async fn list_discussion_messages_for(
         &self,
         workspace_id: &WorkspaceId,

@@ -26,6 +26,43 @@ impl Store {
         server_id: &str,
         disabled: bool,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.set_workspace_mcp_server_disabled(id, server_id, disabled).await)
+    }
+
+    /// Every server id disabled in workspace `id`, sorted ascending for a
+    /// stable wire order. Empty for unknown workspaces — reads are lenient so
+    /// list paths never fail on a stale id; writes go through the strict
+    /// [`Store::set_workspace_mcp_server_disabled`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn workspace_mcp_disabled_servers(&self, id: &WorkspaceId) -> Result<Vec<String>> {
+        dispatch!(self, backend => backend.workspace_mcp_disabled_servers(id).await)
+    }
+
+    /// Whether `server_id` is disabled in workspace `id`. Lenient like the
+    /// list read: `false` for unknown workspaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn workspace_mcp_server_disabled(
+        &self,
+        id: &WorkspaceId,
+        server_id: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.workspace_mcp_server_disabled(id, server_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn set_workspace_mcp_server_disabled(
+        &self,
+        id: &WorkspaceId,
+        server_id: &str,
+        disabled: bool,
+    ) -> Result<()> {
         // Explicit existence check: an INSERT FK violation would surface as
         // an opaque `Error::Internal`, and the DELETE arm has no FK to trip.
         let exists = sqlx::query("SELECT 1 FROM workspace WHERE id = ?")
@@ -61,14 +98,6 @@ impl Store {
         Ok(())
     }
 
-    /// Every server id disabled in workspace `id`, sorted ascending for a
-    /// stable wire order. Empty for unknown workspaces — reads are lenient so
-    /// list paths never fail on a stale id; writes go through the strict
-    /// [`Store::set_workspace_mcp_server_disabled`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn workspace_mcp_disabled_servers(&self, id: &WorkspaceId) -> Result<Vec<String>> {
         let rows = sqlx::query(
             "SELECT server_id FROM workspace_mcp_disabled_server \
@@ -84,12 +113,6 @@ impl Store {
             .collect())
     }
 
-    /// Whether `server_id` is disabled in workspace `id`. Lenient like the
-    /// list read: `false` for unknown workspaces.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn workspace_mcp_server_disabled(
         &self,
         id: &WorkspaceId,

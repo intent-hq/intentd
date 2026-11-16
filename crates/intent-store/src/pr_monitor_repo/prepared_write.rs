@@ -56,6 +56,41 @@ impl PreparedMonitorWrite {
 }
 
 impl Store {
+    /// Prepare a canonical insert without executing it or granting authority.
+    /// # Errors
+    /// Returns invalid target or database acquisition errors.
+    pub async fn prepare_monitor_insert(
+        &self,
+        m: &PrMonitor,
+        target: &ReviewTarget,
+    ) -> Result<PreparedMonitorWrite> {
+        dispatch!(self, backend => backend.prepare_monitor_insert(m, target).await)
+    }
+
+    /// Prepare a refresh, lifecycle change or ownership transfer of the exact captured row.
+    /// # Errors
+    /// Returns inconsistent identity or database acquisition errors.
+    pub async fn prepare_monitor_replace(
+        &self,
+        expected: &QualifiedPrMonitor,
+        replacement: &PrMonitor,
+    ) -> Result<PreparedMonitorWrite> {
+        dispatch!(self, backend => backend.prepare_monitor_replace(expected, replacement).await)
+    }
+
+    /// Prepare cancellation without losing the complete captured-row CAS.
+    /// # Errors
+    /// Returns database acquisition errors.
+    pub async fn prepare_monitor_cancel(
+        &self,
+        expected: &QualifiedPrMonitor,
+        now: &str,
+    ) -> Result<PreparedMonitorWrite> {
+        dispatch!(self, backend => backend.prepare_monitor_cancel(expected, now).await)
+    }
+}
+
+impl crate::SqliteStore {
     async fn prepare_monitor_write(
         &self,
         query: QueryBuilder<Sqlite>,
@@ -78,9 +113,6 @@ impl Store {
         })
     }
 
-    /// Prepare a canonical insert without executing it or granting authority.
-    /// # Errors
-    /// Returns invalid target or database acquisition errors.
     pub async fn prepare_monitor_insert(
         &self,
         m: &PrMonitor,
@@ -118,9 +150,6 @@ impl Store {
         self.prepare_monitor_write(query, true).await
     }
 
-    /// Prepare a refresh, lifecycle change or ownership transfer of the exact captured row.
-    /// # Errors
-    /// Returns inconsistent identity or database acquisition errors.
     pub async fn prepare_monitor_replace(
         &self,
         expected: &QualifiedPrMonitor,
@@ -163,9 +192,6 @@ impl Store {
         self.prepare_monitor_write(query, false).await
     }
 
-    /// Prepare cancellation without losing the complete captured-row CAS.
-    /// # Errors
-    /// Returns database acquisition errors.
     pub async fn prepare_monitor_cancel(
         &self,
         expected: &QualifiedPrMonitor,

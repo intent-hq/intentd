@@ -123,6 +123,62 @@ impl Store {
         message: &str,
         principal: &PrincipalId,
     ) -> Result<DiscussionReactionState> {
+        dispatch!(self, backend => backend.discussion_reaction_state(ws, conversation, message, principal).await)
+    }
+
+    /// Set a human viewer's selection; identity snapshots come from the store.
+    /// # Errors
+    /// Returns invalid reaction, inaccessible target or database errors.
+    pub async fn set_discussion_reaction(
+        &self,
+        ws: &WorkspaceId,
+        conversation: &str,
+        message: &str,
+        principal: &PrincipalId,
+        reaction: &str,
+        active: bool,
+    ) -> Result<(DiscussionReactionState, bool)> {
+        dispatch!(self, backend => backend.set_discussion_reaction(ws, conversation, message, principal, reaction, active).await)
+    }
+
+    /// Read counts, version and this viewer's choices from one snapshot.
+    /// # Errors
+    /// Returns not-found for inaccessible targets or database errors.
+    pub async fn discussion_actor_reaction_state(
+        &self,
+        ws: &WorkspaceId,
+        conversation: &str,
+        message: &str,
+        actor: &DiscussionActor,
+    ) -> Result<DiscussionReactionState> {
+        dispatch!(self, backend => backend.discussion_actor_reaction_state(ws, conversation, message, actor).await)
+    }
+
+    /// Set one authenticated caller's desired reaction state atomically.
+    /// No-op retries do not advance the version or require a notification.
+    /// # Errors
+    /// Returns invalid reaction, inaccessible target or database errors.
+    pub async fn set_discussion_actor_reaction(
+        &self,
+        ws: &WorkspaceId,
+        conversation: &str,
+        message: &str,
+        actor: &DiscussionActor,
+        reaction: &str,
+        active: bool,
+    ) -> Result<(DiscussionReactionState, bool)> {
+        dispatch!(self, backend => backend.set_discussion_actor_reaction(ws, conversation, message, actor, reaction, active).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn discussion_reaction_state(
+        &self,
+        ws: &WorkspaceId,
+        conversation: &str,
+        message: &str,
+        principal: &PrincipalId,
+    ) -> Result<DiscussionReactionState> {
         self.discussion_actor_reaction_state(
             ws,
             conversation,
@@ -132,9 +188,6 @@ impl Store {
         .await
     }
 
-    /// Set a human viewer's selection; identity snapshots come from the store.
-    /// # Errors
-    /// Returns invalid reaction, inaccessible target or database errors.
     pub async fn set_discussion_reaction(
         &self,
         ws: &WorkspaceId,
@@ -154,9 +207,6 @@ impl Store {
         )
         .await
     }
-    /// Read counts, version and this viewer's choices from one snapshot.
-    /// # Errors
-    /// Returns not-found for inaccessible targets or database errors.
     pub async fn discussion_actor_reaction_state(
         &self,
         ws: &WorkspaceId,
@@ -171,10 +221,6 @@ impl Store {
         Ok(result)
     }
 
-    /// Set one authenticated caller's desired reaction state atomically.
-    /// No-op retries do not advance the version or require a notification.
-    /// # Errors
-    /// Returns invalid reaction, inaccessible target or database errors.
     pub async fn set_discussion_actor_reaction(
         &self,
         ws: &WorkspaceId,

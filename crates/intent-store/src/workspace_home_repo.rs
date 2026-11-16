@@ -87,6 +87,217 @@ impl Store {
         workspace_id: &WorkspaceId,
         home: &WorkspaceHome,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.set_workspace_home(workspace_id, home).await)
+    }
+
+    /// The workspace's home, if it has one.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn get_workspace_home(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<WorkspaceHome>> {
+        dispatch!(self, backend => backend.get_workspace_home(workspace_id).await)
+    }
+
+    /// Every workspace's home, for overlaying list rows in one query.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn list_workspace_homes(&self) -> Result<HashMap<WorkspaceId, WorkspaceHome>> {
+        dispatch!(self, backend => backend.list_workspace_homes().await)
+    }
+
+    /// The homes the exposed machine `node_id` holds.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn homes_on_machine(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<(WorkspaceId, WorkspaceHome)>> {
+        dispatch!(self, backend => backend.homes_on_machine(node_id).await)
+    }
+
+    /// Set the state of the workspace's home `home_id`; `false` when that is
+    /// not its home (any more) or the state is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn set_workspace_home_state(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        state: HomeState,
+        since: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.set_workspace_home_state(workspace_id, home_id, state, since).await)
+    }
+
+    /// Record a backup of the workspace's home `home_id` at `at`, reported
+    /// by the machine `node_id`: it ends a failing streak. `false` when that
+    /// is not its home, or not on that machine.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn record_workspace_home_backup(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        node_id: &str,
+        at: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.record_workspace_home_backup(workspace_id, home_id, node_id, at).await)
+    }
+
+    /// Claim the `autoStart` of the workspace's home `home_id` on machine
+    /// `node_id` for the `setupFinished` record `seq` of lease `lease_id`'s
+    /// journal: `true` once per new checkout, so the caller starts the
+    /// home's `autoStart` scripts. A record at or below the one that
+    /// claimed it on the same lease (a replay, also after a restart) claims
+    /// nothing; a later record, or one of another lease (a fresh journal),
+    /// claims again. `false` too when `home_id` is not the workspace's home
+    /// (any more) or is not on `node_id`. The claim is made before the
+    /// scripts start: a crash between the two leaves them for the user.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn claim_workspace_home_auto_start(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        node_id: &str,
+        lease_id: &str,
+        seq: u64,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.claim_workspace_home_auto_start(workspace_id, home_id, node_id, lease_id, seq).await)
+    }
+
+    /// Record that backing up the workspace's home `home_id` failed at `at`;
+    /// a streak keeps its first failure. The streak's start, or `None` when
+    /// `home_id` is not the workspace's home.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn record_workspace_home_backup_failure(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        at: &str,
+    ) -> Result<Option<String>> {
+        dispatch!(self, backend => backend.record_workspace_home_backup_failure(workspace_id, home_id, at).await)
+    }
+
+    /// When the failing backup streak of the workspace's home `home_id`
+    /// began, if one is on.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn workspace_home_backup_failing_since(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+    ) -> Result<Option<String>> {
+        dispatch!(self, backend => backend.workspace_home_backup_failing_since(workspace_id, home_id).await)
+    }
+
+    /// Move the workspace's home `home_id` from `from` to `to`; `false` when
+    /// that is not its home (any more) or it is not in `from`.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn move_workspace_home_state(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        from: HomeState,
+        to: HomeState,
+        since: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.move_workspace_home_state(workspace_id, home_id, from, to, since).await)
+    }
+
+    /// Record machine `node_id` as the running sandbox of cloud home
+    /// `home_id` (entry `cloud_machine_id`), when no sandbox holds it yet.
+    /// `false` when it is not the workspace's home, is on another entry, or
+    /// another sandbox took it first.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn claim_cloud_home(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        cloud_machine_id: &str,
+        node_id: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.claim_cloud_home(workspace_id, home_id, cloud_machine_id, node_id).await)
+    }
+
+    /// Cloud home `home_id` starts: `starting` from `detached`, or from
+    /// `attached` while no sandbox holds it (a running one is never marked
+    /// starting by a start that will lose its claim). `false` when nothing
+    /// changed.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn mark_cloud_home_starting(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        since: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.mark_cloud_home_starting(workspace_id, home_id, since).await)
+    }
+
+    /// At start: every cloud home left `starting` with no sandbox (a start
+    /// the restart cut) is `attached` and unstarted again, so it starts at
+    /// its next use. The workspaces changed.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn reset_unstarted_cloud_homes(&self, since: &str) -> Result<Vec<WorkspaceId>> {
+        dispatch!(self, backend => backend.reset_unstarted_cloud_homes(since).await)
+    }
+
+    /// A start of cloud home `home_id` failed: the home is detached at
+    /// once, with no machine, unless another start holds it (its machine
+    /// is neither none nor `node_id`) or it is moving. `false` when nothing
+    /// changed.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn detach_cloud_home(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        node_id: Option<&str>,
+        since: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.detach_cloud_home(workspace_id, home_id, node_id, since).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn set_workspace_home(
+        &self,
+        workspace_id: &WorkspaceId,
+        home: &WorkspaceHome,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO workspace_home (workspace_id, home_id, node_id, cloud_machine_id, name, \
              state, since, last_backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
@@ -115,11 +326,6 @@ impl Store {
         Ok(())
     }
 
-    /// The workspace's home, if it has one.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn get_workspace_home(
         &self,
         workspace_id: &WorkspaceId,
@@ -135,11 +341,6 @@ impl Store {
             .transpose()
     }
 
-    /// Every workspace's home, for overlaying list rows in one query.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn list_workspace_homes(&self) -> Result<HashMap<WorkspaceId, WorkspaceHome>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(SELECT))
             .fetch_all(self.read_pool())
@@ -149,11 +350,6 @@ impl Store {
         rows.iter().map(|row| map_row(row, now)).collect()
     }
 
-    /// The homes the exposed machine `node_id` holds.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn homes_on_machine(
         &self,
         node_id: &str,
@@ -168,12 +364,6 @@ impl Store {
         rows.iter().map(|row| map_row(row, now)).collect()
     }
 
-    /// Set the state of the workspace's home `home_id`; `false` when that is
-    /// not its home (any more) or the state is unchanged.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn set_workspace_home_state(
         &self,
         workspace_id: &WorkspaceId,
@@ -196,13 +386,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Record a backup of the workspace's home `home_id` at `at`, reported
-    /// by the machine `node_id`: it ends a failing streak. `false` when that
-    /// is not its home, or not on that machine.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn record_workspace_home_backup(
         &self,
         workspace_id: &WorkspaceId,
@@ -224,19 +407,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Claim the `autoStart` of the workspace's home `home_id` on machine
-    /// `node_id` for the `setupFinished` record `seq` of lease `lease_id`'s
-    /// journal: `true` once per new checkout, so the caller starts the
-    /// home's `autoStart` scripts. A record at or below the one that
-    /// claimed it on the same lease (a replay, also after a restart) claims
-    /// nothing; a later record, or one of another lease (a fresh journal),
-    /// claims again. `false` too when `home_id` is not the workspace's home
-    /// (any more) or is not on `node_id`. The claim is made before the
-    /// scripts start: a crash between the two leaves them for the user.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn claim_workspace_home_auto_start(
         &self,
         workspace_id: &WorkspaceId,
@@ -265,13 +435,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Record that backing up the workspace's home `home_id` failed at `at`;
-    /// a streak keeps its first failure. The streak's start, or `None` when
-    /// `home_id` is not the workspace's home.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn record_workspace_home_backup_failure(
         &self,
         workspace_id: &WorkspaceId,
@@ -290,12 +453,6 @@ impl Store {
         .map_err(db)
     }
 
-    /// When the failing backup streak of the workspace's home `home_id`
-    /// began, if one is on.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn workspace_home_backup_failing_since(
         &self,
         workspace_id: &WorkspaceId,
@@ -313,12 +470,6 @@ impl Store {
         Ok(since.flatten())
     }
 
-    /// Move the workspace's home `home_id` from `from` to `to`; `false` when
-    /// that is not its home (any more) or it is not in `from`.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn move_workspace_home_state(
         &self,
         workspace_id: &WorkspaceId,
@@ -342,14 +493,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Record machine `node_id` as the running sandbox of cloud home
-    /// `home_id` (entry `cloud_machine_id`), when no sandbox holds it yet.
-    /// `false` when it is not the workspace's home, is on another entry, or
-    /// another sandbox took it first.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn claim_cloud_home(
         &self,
         workspace_id: &WorkspaceId,
@@ -372,14 +515,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Cloud home `home_id` starts: `starting` from `detached`, or from
-    /// `attached` while no sandbox holds it (a running one is never marked
-    /// starting by a start that will lose its claim). `false` when nothing
-    /// changed.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn mark_cloud_home_starting(
         &self,
         workspace_id: &WorkspaceId,
@@ -400,13 +535,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// At start: every cloud home left `starting` with no sandbox (a start
-    /// the restart cut) is `attached` and unstarted again, so it starts at
-    /// its next use. The workspaces changed.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn reset_unstarted_cloud_homes(&self, since: &str) -> Result<Vec<WorkspaceId>> {
         let rows = sqlx::query(
             "UPDATE workspace_home SET state = 'attached', since = ? \
@@ -422,14 +550,6 @@ impl Store {
             .collect()
     }
 
-    /// A start of cloud home `home_id` failed: the home is detached at
-    /// once, with no machine, unless another start holds it (its machine
-    /// is neither none nor `node_id`) or it is moving. `false` when nothing
-    /// changed.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn detach_cloud_home(
         &self,
         workspace_id: &WorkspaceId,

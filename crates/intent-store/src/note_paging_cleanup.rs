@@ -119,6 +119,29 @@ impl Store {
     /// # Errors
     /// Returns `Error::Internal` if the schema read or the write fails.
     pub async fn retired_note_paging_step(&self, batch_rows: u32) -> Result<RetiredNotePagingStep> {
+        dispatch!(self, backend => backend.retired_note_paging_step(batch_rows).await)
+    }
+
+    /// Remove the retired note paging tables in short, paced batches until
+    /// both are gone. Between batches the write connection goes back to the
+    /// (FIFO-fair) pool and the cleanup pauses, so queued writes run first. A
+    /// batch slower than `policy.hold_budget` halves the next one. Logs start,
+    /// periodic progress and completion at info. A failed step is logged at
+    /// warn with its attempt count and retried after a capped exponential
+    /// backoff (`policy.initial_backoff` doubling to `policy.max_backoff`), so
+    /// a transient failure such as a write-pool acquire timeout does not leave
+    /// the tables until the next restart. Every wait is a cancellable sleep:
+    /// aborting the task at shutdown stops it between statements.
+    pub async fn run_retired_note_paging_cleanup(
+        &self,
+        policy: NotePagingCleanupPolicy,
+    ) -> NotePagingCleanupOutcome {
+        dispatch!(self, backend => backend.run_retired_note_paging_cleanup(policy).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn retired_note_paging_step(&self, batch_rows: u32) -> Result<RetiredNotePagingStep> {
         for table in RETIRED_NOTE_PAGING_TABLES {
             let present: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
@@ -154,16 +177,6 @@ impl Store {
         Ok(RetiredNotePagingStep::Done)
     }
 
-    /// Remove the retired note paging tables in short, paced batches until
-    /// both are gone. Between batches the write connection goes back to the
-    /// (FIFO-fair) pool and the cleanup pauses, so queued writes run first. A
-    /// batch slower than `policy.hold_budget` halves the next one. Logs start,
-    /// periodic progress and completion at info. A failed step is logged at
-    /// warn with its attempt count and retried after a capped exponential
-    /// backoff (`policy.initial_backoff` doubling to `policy.max_backoff`), so
-    /// a transient failure such as a write-pool acquire timeout does not leave
-    /// the tables until the next restart. Every wait is a cancellable sleep:
-    /// aborting the task at shutdown stops it between statements.
     pub async fn run_retired_note_paging_cleanup(
         &self,
         policy: NotePagingCleanupPolicy,
@@ -261,7 +274,7 @@ fn is_missing_table(error: &sqlx::Error) -> bool {
     error.to_string().contains("no such table")
 }
 
-impl Store {
+impl crate::SqliteStore {
     /// Delete one workspace's retired page-index rows in bounded batches
     /// before its notes are deleted, so a note batch never cascades
     /// note → `note_page_head` → `note_page_entry` over millions of rows in one

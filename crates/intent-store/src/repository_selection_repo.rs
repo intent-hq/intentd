@@ -275,7 +275,7 @@ fn project(row: &SelectionRow, root: &RepositoryRootId) -> Result<RepositoryStor
 }
 
 async fn read_at(
-    store: &Store,
+    store: &crate::SqliteStore,
     root: &RepositoryRootId,
     conn: &mut SqliteConnection,
 ) -> Result<RepositorySelectionSnapshot> {
@@ -425,6 +425,50 @@ impl Store {
         &self,
         root: &RepositoryRootId,
     ) -> Result<RepositorySelectionSnapshot> {
+        dispatch!(self, backend => backend.repository_selection_snapshot(root).await)
+    }
+
+    /// Compare against the original domain/root/choice facts. Unknown attempts
+    /// are never retried; an old snapshot cannot borrow a replacement incarnation.
+    pub async fn write_repository_selection(
+        &self,
+        original: &RepositorySelectionSnapshot,
+        change: RepositorySelectionChange,
+    ) -> RepositorySelectionWriteOutcome {
+        dispatch!(self, backend => backend.write_repository_selection(original, change).await)
+    }
+
+    /// Native selection CAS under the caller's already validated original authority.
+    ///
+    /// The service must own the original Wire/root/credential and manager permission.
+    /// Authority is compared under both serialized snapshots. The one-shot, no-I/O
+    /// callback marks effect admission immediately before the original UPDATE starts.
+    /// No synchronous service fence spans SQL or selection-consumer retirement.
+    pub async fn write_repository_selection_admitted(
+        &self,
+        original: &RepositorySelectionSnapshot,
+        change: RepositorySelectionChange,
+        expected_authority: &crate::RepositoryAuthoritySnapshot,
+        original_token_hash: Option<&str>,
+        admit: impl FnOnce() -> Result<()> + Send,
+    ) -> RepositorySelectionWriteOutcome {
+        dispatch!(self, backend => backend.write_repository_selection_admitted(original, change, expected_authority, original_token_hash, admit).await)
+    }
+
+    /// Persist an explicit reset through the same comparison/transaction path.
+    pub async fn reset_repository_selection(
+        &self,
+        original: &RepositorySelectionSnapshot,
+    ) -> RepositorySelectionWriteOutcome {
+        dispatch!(self, backend => backend.reset_repository_selection(original).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn repository_selection_snapshot(
+        &self,
+        root: &RepositoryRootId,
+    ) -> Result<RepositorySelectionSnapshot> {
         let _serial = self.repository_lifecycle_write().await?;
         let mut tx = self.read_pool().begin().await.map_err(sql_error)?;
         let snapshot = read_at(self, root, &mut tx).await?;
@@ -432,8 +476,6 @@ impl Store {
         Ok(snapshot)
     }
 
-    /// Compare against the original domain/root/choice facts. Unknown attempts
-    /// are never retried; an old snapshot cannot borrow a replacement incarnation.
     pub async fn write_repository_selection(
         &self,
         original: &RepositorySelectionSnapshot,
@@ -452,12 +494,6 @@ impl Store {
         }
     }
 
-    /// Native selection CAS under the caller's already validated original authority.
-    ///
-    /// The service must own the original Wire/root/credential and manager permission.
-    /// Authority is compared under both serialized snapshots. The one-shot, no-I/O
-    /// callback marks effect admission immediately before the original UPDATE starts.
-    /// No synchronous service fence spans SQL or selection-consumer retirement.
     pub async fn write_repository_selection_admitted(
         &self,
         original: &RepositorySelectionSnapshot,
@@ -484,7 +520,6 @@ impl Store {
         }
     }
 
-    /// Persist an explicit reset through the same comparison/transaction path.
     pub async fn reset_repository_selection(
         &self,
         original: &RepositorySelectionSnapshot,

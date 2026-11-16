@@ -51,6 +51,124 @@ impl Store {
         completion_identity: Option<&str>,
         delivered_at: &str,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.retire_completion_watch_after_delivery(watch_id, parent_agent_id, child_agent_id, completion_identity, delivered_at).await)
+    }
+
+    /// Atomically settle a delivered delegation group: failed children that
+    /// can still complete become ungrouped watches, all other group watches are
+    /// retired, and the group row is deleted. A failure leaves the complete
+    /// group and all watches restart-recoverable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if any settlement statement or the final
+    /// transaction commit fails.
+    pub async fn settle_delegation_group_after_delivery(
+        &self,
+        group_id: &str,
+        retain_children: &[AgentId],
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.settle_delegation_group_after_delivery(group_id, retain_children).await)
+    }
+
+    /// Insert a `completion_watch` row, or update its mutable columns on id
+    /// conflict (parent anchor/name, `group_id`, `report_delivered`). The
+    /// identity columns — child ids/workspace and `created_at` — are fixed at
+    /// registration and intentionally not overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {
+        dispatch!(self, backend => backend.upsert_completion_watch(w).await)
+    }
+
+    /// Load every persisted `completion_watch` row (the registry is
+    /// daemon-global, so startup rehydration loads all rows in one pass).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_completion_watches(&self) -> Result<Vec<PersistedCompletionWatch>> {
+        dispatch!(self, backend => backend.list_completion_watches().await)
+    }
+
+    /// Delete a `completion_watch` row (fired watch, cancellation).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_completion_watch(&self, id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.delete_completion_watch(id).await)
+    }
+
+    /// Delete every `completion_watch` row registered by `parent_agent_id`
+    /// (`agent.cancelSubscriptions`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_completion_watches_for_parent(
+        &self,
+        parent_agent_id: &AgentId,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.delete_completion_watches_for_parent(parent_agent_id).await)
+    }
+
+    /// Set `report_delivered = 1` (report-time wake already delivered).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn mark_completion_watch_report_delivered(&self, id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.mark_completion_watch_report_delivered(id).await)
+    }
+
+    /// Reset `report_delivered = 0` (fresh-interest re-arm on watch reuse,
+    /// monorepo#2532).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_completion_watch_report_delivered(&self, id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.clear_completion_watch_report_delivered(id).await)
+    }
+
+    /// Convert a grouped watch into an ungrouped watch (group settlement
+    /// retaining a failed-not-deleted member, STAB-129).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn ungroup_completion_watch(&self, id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.ungroup_completion_watch(id).await)
+    }
+
+    /// Refresh a watch's stored parent display name and home-workspace anchor
+    /// (the `find_and_refresh_ungrouped_watch` reuse path).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn update_completion_watch_parent(
+        &self,
+        id: &str,
+        parent_agent_name: &str,
+        parent_workspace_id: &WorkspaceId,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.update_completion_watch_parent(id, parent_agent_name, parent_workspace_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn retire_completion_watch_after_delivery(
+        &self,
+        watch_id: &str,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+        completion_identity: Option<&str>,
+        delivered_at: &str,
+    ) -> Result<()> {
         let pool = self.write_pool().clone();
         crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
@@ -92,15 +210,6 @@ impl Store {
         .await
     }
 
-    /// Atomically settle a delivered delegation group: failed children that
-    /// can still complete become ungrouped watches, all other group watches are
-    /// retired, and the group row is deleted. A failure leaves the complete
-    /// group and all watches restart-recoverable.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Internal`] if any settlement statement or the final
-    /// transaction commit fails.
     pub async fn settle_delegation_group_after_delivery(
         &self,
         group_id: &str,
@@ -168,14 +277,6 @@ impl Store {
         .await
     }
 
-    /// Insert a `completion_watch` row, or update its mutable columns on id
-    /// conflict (parent anchor/name, `group_id`, `report_delivered`). The
-    /// identity columns — child ids/workspace and `created_at` — are fixed at
-    /// registration and intentionally not overwritten.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {
         sqlx::query(
             "INSERT INTO completion_watch (
@@ -208,12 +309,6 @@ impl Store {
         Ok(())
     }
 
-    /// Load every persisted `completion_watch` row (the registry is
-    /// daemon-global, so startup rehydration loads all rows in one pass).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_completion_watches(&self) -> Result<Vec<PersistedCompletionWatch>> {
         let rows = sqlx::query(
             "SELECT id, parent_workspace_id, child_workspace_id, parent_agent_id,
@@ -229,11 +324,6 @@ impl Store {
         rows.iter().map(decode_watch_row).collect()
     }
 
-    /// Delete a `completion_watch` row (fired watch, cancellation).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_completion_watch(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM completion_watch WHERE id = ?")
             .bind(id)
@@ -243,12 +333,6 @@ impl Store {
         Ok(())
     }
 
-    /// Delete every `completion_watch` row registered by `parent_agent_id`
-    /// (`agent.cancelSubscriptions`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_completion_watches_for_parent(
         &self,
         parent_agent_id: &AgentId,
@@ -263,11 +347,6 @@ impl Store {
         Ok(())
     }
 
-    /// Set `report_delivered = 1` (report-time wake already delivered).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn mark_completion_watch_report_delivered(&self, id: &str) -> Result<()> {
         sqlx::query("UPDATE completion_watch SET report_delivered = 1 WHERE id = ?")
             .bind(id)
@@ -281,12 +360,6 @@ impl Store {
         Ok(())
     }
 
-    /// Reset `report_delivered = 0` (fresh-interest re-arm on watch reuse,
-    /// monorepo#2532).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_completion_watch_report_delivered(&self, id: &str) -> Result<()> {
         sqlx::query("UPDATE completion_watch SET report_delivered = 0 WHERE id = ?")
             .bind(id)
@@ -300,12 +373,6 @@ impl Store {
         Ok(())
     }
 
-    /// Convert a grouped watch into an ungrouped watch (group settlement
-    /// retaining a failed-not-deleted member, STAB-129).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn ungroup_completion_watch(&self, id: &str) -> Result<()> {
         sqlx::query("UPDATE completion_watch SET group_id = NULL WHERE id = ?")
             .bind(id)
@@ -315,12 +382,6 @@ impl Store {
         Ok(())
     }
 
-    /// Refresh a watch's stored parent display name and home-workspace anchor
-    /// (the `find_and_refresh_ungrouped_watch` reuse path).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn update_completion_watch_parent(
         &self,
         id: &str,

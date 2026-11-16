@@ -44,6 +44,109 @@ impl Store {
         deletions: i64,
         files_changed: i64,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.upsert_workspace_metrics(workspace_id, additions, deletions, files_changed).await)
+    }
+
+    /// Read one workspace's metrics row (absent → `None`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_workspace_metrics(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<WorkspaceMetricsRow>> {
+        dispatch!(self, backend => backend.get_workspace_metrics(workspace_id).await)
+    }
+
+    /// List every workspace's metrics row (for `metrics.getAllWorkspaceStats`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspace_metrics(&self) -> Result<Vec<WorkspaceMetricsRow>> {
+        dispatch!(self, backend => backend.list_workspace_metrics().await)
+    }
+
+    /// Delete one workspace's metrics row (used when it has no tracked changes).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_workspace_metrics(&self, workspace_id: &WorkspaceId) -> Result<()> {
+        dispatch!(self, backend => backend.delete_workspace_metrics(workspace_id).await)
+    }
+
+    /// Upsert one per-agent, per-workspace metrics row, stamping `updated_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn upsert_agent_metrics(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &str,
+        additions: i64,
+        deletions: i64,
+        files_changed: i64,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.upsert_agent_metrics(workspace_id, agent_id, additions, deletions, files_changed).await)
+    }
+
+    /// List the per-agent metrics rows for one workspace (powers `byAgent`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_agent_metrics_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AgentMetricsRow>> {
+        dispatch!(self, backend => backend.list_agent_metrics_for_workspace(workspace_id).await)
+    }
+
+    /// List one agent's metrics rows across every workspace (for
+    /// `metrics.getAgentStats`, whose totals are summed across workspaces).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_agent_metrics(&self, agent_id: &str) -> Result<Vec<AgentMetricsRow>> {
+        dispatch!(self, backend => backend.list_agent_metrics(agent_id).await)
+    }
+
+    /// Delete one workspace's per-agent metrics rows (cleared before a recompute
+    /// rewrites the live per-agent breakdown).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_agent_metrics_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.delete_agent_metrics_for_workspace(workspace_id).await)
+    }
+
+    /// Delete one agent's metrics rows across every workspace, returning the
+    /// number of rows removed (backs `metrics.clearAgentStats`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_agent_metrics(&self, agent_id: &str) -> Result<u64> {
+        dispatch!(self, backend => backend.delete_agent_metrics(agent_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn upsert_workspace_metrics(
+        &self,
+        workspace_id: &WorkspaceId,
+        additions: i64,
+        deletions: i64,
+        files_changed: i64,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO workspace_metrics \
              (workspace_id, additions, deletions, files_changed, updated_at) \
@@ -63,11 +166,6 @@ impl Store {
         Ok(())
     }
 
-    /// Read one workspace's metrics row (absent → `None`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_metrics(
         &self,
         workspace_id: &WorkspaceId,
@@ -83,11 +181,6 @@ impl Store {
         row.as_ref().map(map_workspace_metrics_row).transpose()
     }
 
-    /// List every workspace's metrics row (for `metrics.getAllWorkspaceStats`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_metrics(&self) -> Result<Vec<WorkspaceMetricsRow>> {
         let rows = sqlx::query(
             "SELECT workspace_id, additions, deletions, files_changed, updated_at \
@@ -99,11 +192,6 @@ impl Store {
         rows.iter().map(map_workspace_metrics_row).collect()
     }
 
-    /// Delete one workspace's metrics row (used when it has no tracked changes).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_workspace_metrics(&self, workspace_id: &WorkspaceId) -> Result<()> {
         sqlx::query("DELETE FROM workspace_metrics WHERE workspace_id = ?")
             .bind(&workspace_id.0)
@@ -113,11 +201,6 @@ impl Store {
         Ok(())
     }
 
-    /// Upsert one per-agent, per-workspace metrics row, stamping `updated_at`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_agent_metrics(
         &self,
         workspace_id: &WorkspaceId,
@@ -146,11 +229,6 @@ impl Store {
         Ok(())
     }
 
-    /// List the per-agent metrics rows for one workspace (powers `byAgent`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_agent_metrics_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -166,12 +244,6 @@ impl Store {
         rows.iter().map(map_agent_metrics_row).collect()
     }
 
-    /// List one agent's metrics rows across every workspace (for
-    /// `metrics.getAgentStats`, whose totals are summed across workspaces).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_agent_metrics(&self, agent_id: &str) -> Result<Vec<AgentMetricsRow>> {
         let rows = sqlx::query(
             "SELECT agent_id, workspace_id, additions, deletions, files_changed, updated_at \
@@ -184,12 +256,6 @@ impl Store {
         rows.iter().map(map_agent_metrics_row).collect()
     }
 
-    /// Delete one workspace's per-agent metrics rows (cleared before a recompute
-    /// rewrites the live per-agent breakdown).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_agent_metrics_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -202,12 +268,6 @@ impl Store {
         Ok(())
     }
 
-    /// Delete one agent's metrics rows across every workspace, returning the
-    /// number of rows removed (backs `metrics.clearAgentStats`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_agent_metrics(&self, agent_id: &str) -> Result<u64> {
         let result = sqlx::query("DELETE FROM agent_metrics WHERE agent_id = ?")
             .bind(agent_id)

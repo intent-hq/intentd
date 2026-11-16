@@ -18,12 +18,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_known_repos(&self) -> Result<Vec<KnownRepo>> {
-        let sql = format!("SELECT {KNOWN_REPO_COLUMNS} FROM known_repo ORDER BY last_used_at DESC");
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-            .fetch_all(self.read_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("list known repos failed: {e}")))?;
-        rows.iter().map(map_known_repo_row).collect()
+        dispatch!(self, backend => backend.list_known_repos().await)
     }
 
     /// Check one explicitly supplied registry path without loading every row.
@@ -32,11 +27,7 @@ impl Store {
     /// # Errors
     /// Returns an error if the registry query fails.
     pub async fn known_repo_exists(&self, path: &str) -> Result<bool> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM known_repo WHERE path = ?)")
-            .bind(path)
-            .fetch_one(self.read_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("known repo lookup failed: {e}")))
+        dispatch!(self, backend => backend.known_repo_exists(path).await)
     }
 
     /// Insert or update a known repo, keyed on `path` (TS `addRepo`). A new row
@@ -48,6 +39,44 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
+    pub async fn upsert_known_repo(
+        &self,
+        path: &str,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.upsert_known_repo(path, name, owner).await)
+    }
+
+    /// Delete a known repo by `path` (TS `removeRepo`). Returns whether a row
+    /// was actually removed; removing an unregistered path is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn remove_known_repo(&self, path: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.remove_known_repo(path).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn list_known_repos(&self) -> Result<Vec<KnownRepo>> {
+        let sql = format!("SELECT {KNOWN_REPO_COLUMNS} FROM known_repo ORDER BY last_used_at DESC");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list known repos failed: {e}")))?;
+        rows.iter().map(map_known_repo_row).collect()
+    }
+
+    pub async fn known_repo_exists(&self, path: &str) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM known_repo WHERE path = ?)")
+            .bind(path)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("known repo lookup failed: {e}")))
+    }
+
     pub async fn upsert_known_repo(
         &self,
         path: &str,
@@ -74,12 +103,6 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a known repo by `path` (TS `removeRepo`). Returns whether a row
-    /// was actually removed; removing an unregistered path is not an error.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn remove_known_repo(&self, path: &str) -> Result<bool> {
         let res = sqlx::query("DELETE FROM known_repo WHERE path = ?")
             .bind(path)

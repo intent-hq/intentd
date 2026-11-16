@@ -265,6 +265,7 @@ async fn sharing_expiry_reconciles_at_exact_observation_boundary() {
         ("2032-01-01T00:00:00Z", 0),
     ] {
         let mut tx = store
+            .sqlite()
             .sharing_snapshot(std::slice::from_ref(&ws), Some(time))
             .await
             .unwrap();
@@ -463,10 +464,10 @@ async fn sharing_summary_work_is_bounded_by_returned_workspaces_not_grants_or_in
     let store = Store::open(&tmp.path).await.unwrap();
     // A single instrumented connection measures the actual public projection,
     // including its expiry probe/transaction, rather than a copied SQL fragment.
-    let measured = Store {
-        read_pool: store.write_pool.clone(),
-        ..store.clone()
-    };
+    let measured = Store::from_sqlite(crate::SqliteStore {
+        read_pool: store.sqlite().write_pool.clone(),
+        ..store.sqlite().clone()
+    });
     let ids = [WorkspaceId::new(), WorkspaceId::new(), WorkspaceId::new()];
     for id in &ids {
         store

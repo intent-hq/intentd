@@ -108,6 +108,45 @@ impl Store {
         rebuild_homes: bool,
         now: &str,
     ) -> Result<Vec<HomeRebuild>> {
+        dispatch!(self, backend => backend.remove_cloud_machine(node_id, rebuild_homes, now).await)
+    }
+
+    /// The home that `home_id`, the workspace's home, rebuilds (its
+    /// deleted sandbox held it), while that home has not opened yet.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn home_rebuild_of(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+    ) -> Result<Option<HomeId>> {
+        dispatch!(self, backend => backend.home_rebuild_of(workspace_id, home_id).await)
+    }
+
+    /// Rebuilt home `home_id` opened: `true` once, for the call that
+    /// posts its notice.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn finish_home_rebuild(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.finish_home_rebuild(workspace_id, home_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn remove_cloud_machine(
+        &self,
+        node_id: &str,
+        rebuild_homes: bool,
+        now: &str,
+    ) -> Result<Vec<HomeRebuild>> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let held = if rebuild_homes {
             sqlx::query(
@@ -141,12 +180,6 @@ impl Store {
         Ok(rebuilt)
     }
 
-    /// The home that `home_id`, the workspace's home, rebuilds (its
-    /// deleted sandbox held it), while that home has not opened yet.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn home_rebuild_of(
         &self,
         workspace_id: &WorkspaceId,
@@ -163,12 +196,6 @@ impl Store {
         Ok(from.map(HomeId))
     }
 
-    /// Rebuilt home `home_id` opened: `true` once, for the call that
-    /// posts its notice.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn finish_home_rebuild(
         &self,
         workspace_id: &WorkspaceId,

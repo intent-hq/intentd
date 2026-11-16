@@ -21,6 +21,40 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_task_agent_link(&self, link: &TaskAgentLink) -> Result<TaskAgentLink> {
+        dispatch!(self, backend => backend.upsert_task_agent_link(link).await)
+    }
+
+    /// Delete a single link by its full key. Returns whether a row was
+    /// actually removed; deleting an unknown key is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_task_agent_link(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        task_key: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.delete_task_agent_link(workspace_id, note_id, task_key).await)
+    }
+
+    /// List every link for a workspace, oldest first — hydration read for
+    /// `task.listAgentLinks`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_task_agent_links(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<TaskAgentLink>> {
+        dispatch!(self, backend => backend.list_task_agent_links(workspace_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn upsert_task_agent_link(&self, link: &TaskAgentLink) -> Result<TaskAgentLink> {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT OR REPLACE INTO task_agent_link ({TASK_AGENT_LINK_COLUMNS}) \
              VALUES (?, ?, ?, ?, ?, ?)"
@@ -37,12 +71,6 @@ impl Store {
         Ok(link.clone())
     }
 
-    /// Delete a single link by its full key. Returns whether a row was
-    /// actually removed; deleting an unknown key is not an error.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_task_agent_link(
         &self,
         workspace_id: &WorkspaceId,
@@ -62,12 +90,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// List every link for a workspace, oldest first — hydration read for
-    /// `task.listAgentLinks`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_task_agent_links(
         &self,
         workspace_id: &WorkspaceId,

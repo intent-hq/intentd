@@ -76,6 +76,100 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_event(&self, ev: &NewEvent) -> Result<Event> {
+        dispatch!(self, backend => backend.insert_event(ev).await)
+    }
+
+    /// Batch-insert multiple events in a single transaction, preserving order.
+    /// Each event gets a freshly minted `UUIDv7` id. Returns the persisted events
+    /// in insertion order. Empty input returns an empty vec.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {
+        dispatch!(self, backend => backend.insert_events(events).await)
+    }
+
+    /// Run a filtered event query (newest-first). See [`EventQuery`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<Event>> {
+        dispatch!(self, backend => backend.query_events(q).await)
+    }
+
+    /// Retention/compaction sweep (§10.2 / finding F4): delete high-volume
+    /// ephemeral event families (`agent:stream:*`, `file:*`, `terminal:data`,
+    /// `host:exec:*`, `script:output`, plus the high-churn state-notification
+    /// families listed in the body — including `workspace:updated` and
+    /// `workspace:tokenUsage-changed`) whose `timestamp` is strictly older
+    /// than `cutoff` (an RFC-3339 string), and return the number of rows
+    /// removed. Lifecycle/audit events (`workspace:created`/`deleted`/
+    /// `archived`, `agent:created`/`deleted`/`completed`/`failed`, note/task/
+    /// comment/git families, ...) are preserved regardless of age
+    /// (`agent:tool:call` has its own TTL via
+    /// [`Store::delete_tool_call_events_before`]). This is deliberately scoped
+    /// to high-volume families that can be safely trimmed so the log stays the
+    /// source of truth for everything else. Each family is deleted separately
+    /// in index-driven chunks (see
+    /// [`Store::delete_events_by_type_range_before`]) so no single write
+    /// transaction holds the pool for long. Idempotent — a re-run with the same
+    /// cutoff removes nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if a chunked delete fails.
+    pub async fn delete_ephemeral_events_before(&self, cutoff: &str) -> Result<u64> {
+        dispatch!(self, backend => backend.delete_ephemeral_events_before(cutoff).await)
+    }
+
+    /// Retention sweep for `agent:tool:call` events (87% of live data on the
+    /// dev seat): delete rows whose `timestamp` is strictly older than `cutoff`
+    /// and return the number removed. Kept separate from
+    /// [`Store::delete_ephemeral_events_before`] because tool calls carry a
+    /// longer TTL (24h) than the ephemeral stream families. No consumer reads
+    /// persisted `agent:tool:call` rows beyond bounded recent windows —
+    /// conversation replay uses `agent_message`, and live streaming synthesizes
+    /// tool blocks from the in-memory bus.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if a chunked delete fails.
+    pub async fn delete_tool_call_events_before(&self, cutoff: &str) -> Result<u64> {
+        dispatch!(self, backend => backend.delete_tool_call_events_before(cutoff).await)
+    }
+
+    /// Most-recent events for a workspace regardless of type (newest first).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query fails.
+    pub async fn events_by_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
+        dispatch!(self, backend => backend.events_by_workspace(workspace_id, limit).await)
+    }
+
+    /// Most-recent events of a single `event_type` for a workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query fails.
+    pub async fn events_by_type(
+        &self,
+        workspace_id: &WorkspaceId,
+        event_type: &str,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
+        dispatch!(self, backend => backend.events_by_type(workspace_id, event_type, limit).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn insert_event(&self, ev: &NewEvent) -> Result<Event> {
         let id = Uuid::now_v7().to_string();
         let actor_json = serde_json::to_string(&ev.actor)
             .map_err(|e| Error::Internal(format!("encode actor failed: {e}")))?;
@@ -116,13 +210,6 @@ impl Store {
         })
     }
 
-    /// Batch-insert multiple events in a single transaction, preserving order.
-    /// Each event gets a freshly minted `UUIDv7` id. Returns the persisted events
-    /// in insertion order. Empty input returns an empty vec.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {
         if events.is_empty() {
             return Ok(Vec::new());
@@ -214,11 +301,6 @@ impl Store {
         Ok(result)
     }
 
-    /// Run a filtered event query (newest-first). See [`EventQuery`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<Event>> {
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {EVENT_COLUMNS} FROM event WHERE 1=1"));
@@ -345,27 +427,6 @@ impl Store {
         rows.iter().map(map_event_row).collect()
     }
 
-    /// Retention/compaction sweep (§10.2 / finding F4): delete high-volume
-    /// ephemeral event families (`agent:stream:*`, `file:*`, `terminal:data`,
-    /// `host:exec:*`, `script:output`, plus the high-churn state-notification
-    /// families listed in the body — including `workspace:updated` and
-    /// `workspace:tokenUsage-changed`) whose `timestamp` is strictly older
-    /// than `cutoff` (an RFC-3339 string), and return the number of rows
-    /// removed. Lifecycle/audit events (`workspace:created`/`deleted`/
-    /// `archived`, `agent:created`/`deleted`/`completed`/`failed`, note/task/
-    /// comment/git families, ...) are preserved regardless of age
-    /// (`agent:tool:call` has its own TTL via
-    /// [`Store::delete_tool_call_events_before`]). This is deliberately scoped
-    /// to high-volume families that can be safely trimmed so the log stays the
-    /// source of truth for everything else. Each family is deleted separately
-    /// in index-driven chunks (see
-    /// [`Store::delete_events_by_type_range_before`]) so no single write
-    /// transaction holds the pool for long. Idempotent — a re-run with the same
-    /// cutoff removes nothing more.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if a chunked delete fails.
     pub async fn delete_ephemeral_events_before(&self, cutoff: &str) -> Result<u64> {
         // High-volume event families eligible for retention sweep:
         // - agent:stream:* — streaming chunks
@@ -419,18 +480,6 @@ impl Store {
         Ok(removed)
     }
 
-    /// Retention sweep for `agent:tool:call` events (87% of live data on the
-    /// dev seat): delete rows whose `timestamp` is strictly older than `cutoff`
-    /// and return the number removed. Kept separate from
-    /// [`Store::delete_ephemeral_events_before`] because tool calls carry a
-    /// longer TTL (24h) than the ephemeral stream families. No consumer reads
-    /// persisted `agent:tool:call` rows beyond bounded recent windows —
-    /// conversation replay uses `agent_message`, and live streaming synthesizes
-    /// tool blocks from the in-memory bus.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if a chunked delete fails.
     pub async fn delete_tool_call_events_before(&self, cutoff: &str) -> Result<u64> {
         self.delete_exact_type_before(intent_core::events::AGENT_TOOL_CALL, cutoff)
             .await
@@ -518,11 +567,6 @@ impl Store {
         self.delete_ephemeral_events_before(cutoff).await
     }
 
-    /// Most-recent events for a workspace regardless of type (newest first).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the query fails.
     pub async fn events_by_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -536,11 +580,6 @@ impl Store {
         .await
     }
 
-    /// Most-recent events of a single `event_type` for a workspace.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the query fails.
     pub async fn events_by_type(
         &self,
         workspace_id: &WorkspaceId,

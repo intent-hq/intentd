@@ -36,6 +36,43 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_delegation_group(&self, g: &PersistedDelegationGroup) -> Result<()> {
+        dispatch!(self, backend => backend.upsert_delegation_group(g).await)
+    }
+
+    /// Load all undelivered `delegation_group` rows for a workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_undelivered_groups(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<PersistedDelegationGroup>> {
+        dispatch!(self, backend => backend.list_undelivered_groups(workspace_id).await)
+    }
+
+    /// Delete a `delegation_group` row (called on delivery).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_delegation_group(&self, group_id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.delete_delegation_group(group_id).await)
+    }
+
+    /// STAB-108: Get distinct workspace IDs that have undelivered delegation groups.
+    /// Used for startup rehydration sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspaces_with_undelivered_groups(&self) -> Result<Vec<WorkspaceId>> {
+        dispatch!(self, backend => backend.list_workspaces_with_undelivered_groups().await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn upsert_delegation_group(&self, g: &PersistedDelegationGroup) -> Result<()> {
         let expected_json = serde_json::to_string(&g.expected_agent_ids)
             .map_err(|e| Error::Internal(format!("encode expected_agent_ids: {e}")))?;
         let completed_json = serde_json::to_string(&g.completed_agent_ids)
@@ -83,11 +120,6 @@ impl Store {
         Ok(())
     }
 
-    /// Load all undelivered `delegation_group` rows for a workspace.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_undelivered_groups(
         &self,
         workspace_id: &WorkspaceId,
@@ -109,11 +141,6 @@ impl Store {
         rows.iter().map(decode_group_row).collect()
     }
 
-    /// Delete a `delegation_group` row (called on delivery).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_delegation_group(&self, group_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM delegation_group WHERE group_id = ?")
             .bind(group_id)
@@ -123,12 +150,6 @@ impl Store {
         Ok(())
     }
 
-    /// STAB-108: Get distinct workspace IDs that have undelivered delegation groups.
-    /// Used for startup rehydration sweep.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces_with_undelivered_groups(&self) -> Result<Vec<WorkspaceId>> {
         let rows =
             sqlx::query("SELECT DISTINCT workspace_id FROM delegation_group WHERE delivered = 0")

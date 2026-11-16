@@ -23,6 +23,34 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<Value>> {
+        dispatch!(self, backend => backend.get_workspace_ui_context(workspace_id).await)
+    }
+
+    /// Update the UI context blob for a workspace. Upserts the row (replaces
+    /// if it exists, inserts otherwise). Returns the persisted blob read back
+    /// from the store so callers can verify round-trip fidelity.
+    ///
+    /// The payload is stored verbatim as JSON text. No shape validation, no
+    /// coercion (e.g., no `null` → `[]`, no missing-field defaults). The FE
+    /// owns the schema; the daemon is a dumb pipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn update_workspace_ui_context(
+        &self,
+        workspace_id: &WorkspaceId,
+        ui_context: &Value,
+    ) -> Result<Value> {
+        dispatch!(self, backend => backend.update_workspace_ui_context(workspace_id, ui_context).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn get_workspace_ui_context(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<Value>> {
         let row = sqlx::query("SELECT payload FROM workspace_ui_context WHERE workspace_id = ?")
             .bind(&workspace_id.0)
             .fetch_optional(self.read_pool())
@@ -40,17 +68,6 @@ impl Store {
         }
     }
 
-    /// Update the UI context blob for a workspace. Upserts the row (replaces
-    /// if it exists, inserts otherwise). Returns the persisted blob read back
-    /// from the store so callers can verify round-trip fidelity.
-    ///
-    /// The payload is stored verbatim as JSON text. No shape validation, no
-    /// coercion (e.g., no `null` → `[]`, no missing-field defaults). The FE
-    /// owns the schema; the daemon is a dumb pipe.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn update_workspace_ui_context(
         &self,
         workspace_id: &WorkspaceId,

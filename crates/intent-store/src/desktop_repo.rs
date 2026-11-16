@@ -131,6 +131,137 @@ impl Store {
         generation: &str,
         remember: bool,
     ) -> Result<bool> {
+        dispatch!(self, backend => backend.desktop_claim_primary(request, binding, generation, remember).await)
+    }
+
+    /// Read remembered consent for exactly one principal/workspace/agent/computer.
+    /// # Errors
+    /// Returns a storage error if the journal read fails.
+    pub async fn desktop_permission(
+        &self,
+        principal: &PrincipalId,
+        workspace: &WorkspaceId,
+        agent: &AgentId,
+        computer: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.desktop_permission(principal, workspace, agent, computer).await)
+    }
+
+    /// Persist or remove consent without changing an active session.
+    /// # Errors
+    /// Returns a storage error or not-found if the target was deleted.
+    pub async fn desktop_set_permission(
+        &self,
+        principal: &PrincipalId,
+        workspace: &WorkspaceId,
+        agent: &AgentId,
+        computer: &str,
+        allowed: bool,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.desktop_set_permission(principal, workspace, agent, computer, allowed).await)
+    }
+
+    /// Journal a request before publishing its consent prompt.
+    /// # Errors
+    /// Returns a storage error or not-found if the target was deleted.
+    pub async fn desktop_insert_request(
+        &self,
+        id: &str,
+        workspace: &WorkspaceId,
+        agent: &AgentId,
+        binding: &Value,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.desktop_insert_request(id, workspace, agent, binding).await)
+    }
+
+    /// Retain only the hash of the executor's notification credential.
+    /// # Errors
+    /// Returns a storage error or not-found if the target was deleted.
+    pub async fn desktop_insert_terminal(
+        &self,
+        id: &str,
+        workspace: &WorkspaceId,
+        agent: &AgentId,
+        binding: &Value,
+        token_hash: &str,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.desktop_insert_terminal(id, workspace, agent, binding, token_hash).await)
+    }
+
+    /// Read a retained credential only while its target still exists.
+    /// # Errors
+    /// Returns a storage error if the journal read or JSON decoding fails.
+    pub async fn desktop_terminal(&self, id: &str) -> Result<Option<Value>> {
+        dispatch!(self, backend => backend.desktop_terminal(id).await)
+    }
+
+    /// Commit the terminal request outcome and deduplication identity together.
+    /// # Errors
+    /// Returns a storage error if either write fails; neither is committed alone.
+    pub async fn desktop_resolve_request(
+        &self,
+        request: &str,
+        workspace: &WorkspaceId,
+        agent: &AgentId,
+        outcome: &str,
+        payload: &Value,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.desktop_resolve_request(request, workspace, agent, outcome, payload).await)
+    }
+
+    /// User Stop supersedes an undelivered outcome for this session only.
+    /// # Errors
+    /// Returns a storage error or not-found; all state/outbox writes roll back together.
+    pub async fn desktop_record_end(
+        &self,
+        session: &str,
+        reason: &str,
+        report: Option<&str>,
+        payload: Option<&Value>,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.desktop_record_end(session, reason, report, payload).await)
+    }
+
+    /// Read a bounded batch of undelivered outcomes.
+    /// # Errors
+    /// Returns a storage error if the journal read or JSON decoding fails.
+    pub async fn desktop_outbox(&self) -> Result<Vec<(String, WorkspaceId, AgentId, Value)>> {
+        dispatch!(self, backend => backend.desktop_outbox().await)
+    }
+
+    /// Record a successful durable handoff.
+    /// # Errors
+    /// Returns a storage error if the journal write fails.
+    pub async fn desktop_outbox_delivered(&self, id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.desktop_outbox_delivered(id).await)
+    }
+
+    /// Probe durable transcript/queue handoff before retrying an outcome.
+    /// # Errors
+    /// Returns a storage error if the probe fails.
+    pub async fn desktop_wake_exists(&self, agent: &AgentId, id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.desktop_wake_exists(agent, id).await)
+    }
+
+    /// Restart invalidates unfinished execution and retains one correlated wake.
+    /// # Errors
+    /// Returns a storage error if reconciliation fails; the transaction rolls back.
+    ///
+    /// # Panics
+    /// The internal namespace assertion only fails if the fixed SQL prefix changes.
+    pub async fn desktop_invalidate_restart(&self) -> Result<()> {
+        dispatch!(self, backend => backend.desktop_invalidate_restart().await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn desktop_claim_primary(
+        &self,
+        request: &str,
+        binding: &Value,
+        generation: &str,
+        remember: bool,
+    ) -> Result<bool> {
         let field = |name: &str| {
             binding[name]
                 .as_str()
@@ -166,9 +297,6 @@ impl Store {
         tx.commit().await.map_err(db)?;
         Ok(true)
     }
-    /// Read remembered consent for exactly one principal/workspace/agent/computer.
-    /// # Errors
-    /// Returns a storage error if the journal read fails.
     pub async fn desktop_permission(
         &self,
         principal: &PrincipalId,
@@ -181,9 +309,6 @@ impl Store {
             .await?
             .is_some())
     }
-    /// Persist or remove consent without changing an active session.
-    /// # Errors
-    /// Returns a storage error or not-found if the target was deleted.
     pub async fn desktop_set_permission(
         &self,
         principal: &PrincipalId,
@@ -205,9 +330,6 @@ impl Store {
         }
         tx.commit().await.map_err(db)
     }
-    /// Journal a request before publishing its consent prompt.
-    /// # Errors
-    /// Returns a storage error or not-found if the target was deleted.
     pub async fn desktop_insert_request(
         &self,
         id: &str,
@@ -224,9 +346,6 @@ impl Store {
         insert(&mut tx, &key("request", id), &record).await?;
         tx.commit().await.map_err(db)
     }
-    /// Retain only the hash of the executor's notification credential.
-    /// # Errors
-    /// Returns a storage error or not-found if the target was deleted.
     pub async fn desktop_insert_terminal(
         &self,
         id: &str,
@@ -246,16 +365,10 @@ impl Store {
         insert(&mut tx, &key("terminal", id), &record).await?;
         tx.commit().await.map_err(db)
     }
-    /// Read a retained credential only while its target still exists.
-    /// # Errors
-    /// Returns a storage error if the journal read or JSON decoding fails.
     pub async fn desktop_terminal(&self, id: &str) -> Result<Option<Value>> {
         let raw:Option<String>=sqlx::query_scalar("SELECT value FROM settings WHERE key=? AND EXISTS(SELECT 1 FROM agent_session a JOIN workspace w ON w.id=a.workspace_id WHERE a.id=json_extract(value,'$.agentId') AND w.id=json_extract(value,'$.workspaceId')) AND EXISTS(SELECT 1 FROM principal WHERE id=json_extract(value,'$.principalId'))").bind(key("terminal",id)).fetch_optional(self.read_pool()).await.map_err(db)?;
         raw.map(|raw| decode(&raw)).transpose()
     }
-    /// Commit the terminal request outcome and deduplication identity together.
-    /// # Errors
-    /// Returns a storage error if either write fails; neither is committed alone.
     pub async fn desktop_resolve_request(
         &self,
         request: &str,
@@ -281,9 +394,6 @@ impl Store {
         tx.commit().await.map_err(db)?;
         Ok(changed)
     }
-    /// User Stop supersedes an undelivered outcome for this session only.
-    /// # Errors
-    /// Returns a storage error or not-found; all state/outbox writes roll back together.
     pub async fn desktop_record_end(
         &self,
         session: &str,
@@ -356,9 +466,6 @@ impl Store {
         tx.commit().await.map_err(db)?;
         Ok(true)
     }
-    /// Read a bounded batch of undelivered outcomes.
-    /// # Errors
-    /// Returns a storage error if the journal read or JSON decoding fails.
     pub async fn desktop_outbox(&self) -> Result<Vec<(String, WorkspaceId, AgentId, Value)>> {
         sqlx::query("SELECT key,value FROM settings WHERE key GLOB 'desktop.v1/outbox/*' AND json_extract(value,'$.delivered')=0 ORDER BY rowid LIMIT 64").fetch_all(self.read_pool()).await.map_err(db)?.into_iter().map(|row| {
             let record=decode(row.get("value"))?;
@@ -367,26 +474,14 @@ impl Store {
             Ok((row.get("key"),WorkspaceId::from(workspace),AgentId::from(agent),record["payload"].clone()))
         }).collect()
     }
-    /// Record a successful durable handoff.
-    /// # Errors
-    /// Returns a storage error if the journal write fails.
     pub async fn desktop_outbox_delivered(&self, id: &str) -> Result<()> {
         // This can only update an existing row, never recreate a swept record.
         sqlx::query("UPDATE settings SET value=json_set(value,'$.delivered',json('true')) WHERE key=? AND key GLOB 'desktop.v1/outbox/*'").bind(id).execute(self.write_pool()).await.map_err(db)?;
         Ok(())
     }
-    /// Probe durable transcript/queue handoff before retrying an outcome.
-    /// # Errors
-    /// Returns a storage error if the probe fails.
     pub async fn desktop_wake_exists(&self, agent: &AgentId, id: &str) -> Result<bool> {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_message WHERE agent_id=? AND json_extract(metadata,'$.desktopWakeId')=? UNION ALL SELECT 1 FROM agent_queue WHERE agent_id=? AND json_extract(payload,'$.messageMetadata.desktopWakeId')=?)").bind(agent.as_str()).bind(id).bind(agent.as_str()).bind(id).fetch_one(self.read_pool()).await.map_err(db)
     }
-    /// Restart invalidates unfinished execution and retains one correlated wake.
-    /// # Errors
-    /// Returns a storage error if reconciliation fails; the transaction rolls back.
-    ///
-    /// # Panics
-    /// The internal namespace assertion only fails if the fixed SQL prefix changes.
     pub async fn desktop_invalidate_restart(&self) -> Result<()> {
         let _maintenance = self.desktop_writes.maintenance.write().await;
         let mut tx = self.write_pool().begin().await.map_err(db)?;

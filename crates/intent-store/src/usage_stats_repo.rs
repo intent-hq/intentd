@@ -103,6 +103,30 @@ impl Store {
         local: Option<&LocalStamp>,
         delta: &UsageStatsDelta,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.add_usage_stats(bucket_utc, model, provider, local, delta).await)
+    }
+
+    /// List every `usage_stats_hourly` row ordered by `(bucket_utc, model,
+    /// provider)` — the read surface the `stats.getUsage` aggregation (and
+    /// tests) build on; period filtering/grouping happens in the service layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_usage_stats_hourly(&self) -> Result<Vec<UsageStatsRow>> {
+        dispatch!(self, backend => backend.list_usage_stats_hourly().await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn add_usage_stats(
+        &self,
+        bucket_utc: &str,
+        model: &str,
+        provider: &str,
+        local: Option<&LocalStamp>,
+        delta: &UsageStatsDelta,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage_stats_hourly (
                 bucket_utc, model, provider, local_date, local_hour, input_tokens, output_tokens,
@@ -142,13 +166,6 @@ impl Store {
         Ok(())
     }
 
-    /// List every `usage_stats_hourly` row ordered by `(bucket_utc, model,
-    /// provider)` — the read surface the `stats.getUsage` aggregation (and
-    /// tests) build on; period filtering/grouping happens in the service layer.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_usage_stats_hourly(&self) -> Result<Vec<UsageStatsRow>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT bucket_utc, model, provider, local_date, local_hour, {COUNTER_COLUMNS}

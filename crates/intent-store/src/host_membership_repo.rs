@@ -112,22 +112,137 @@ impl Store {
     /// # Errors
     /// Returns `Internal` on a database failure.
     pub async fn principal_instructions_revoked(&self, principal: &PrincipalId) -> Result<bool> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_revocation WHERE principal_id = ?) AND NOT EXISTS(SELECT 1 FROM principal_credential WHERE principal_id = ? AND revoked_at IS NULL)")
-            .bind(&principal.0).bind(&principal.0).fetch_one(self.read_pool()).await.map_err(db_error)
+        dispatch!(self, backend => backend.principal_instructions_revoked(principal).await)
     }
+
     /// Read durable counters, also suitable for taking a proof challenge's
     /// authorization-generation snapshot before its identity is known.
     ///
     /// # Errors
     /// Returns `Internal` for a database failure.
     pub async fn host_membership_state(&self) -> Result<HostMembershipState> {
-        state_in_tx(&mut *self.read_pool().acquire().await.map_err(db_error)?).await
+        dispatch!(self, backend => backend.host_membership_state().await)
     }
 
     /// Resolve host authority without inspecting any workspace membership.
     ///
     /// # Errors
     /// Returns `NotFound` for an unknown principal, `Internal` on DB failure.
+    pub async fn get_host_role(&self, principal_id: &PrincipalId) -> Result<HostRole> {
+        dispatch!(self, backend => backend.get_host_role(principal_id).await)
+    }
+
+    /// Owner first, then members by grant time and ID. Profiles and revision
+    /// are read in the same statement, including on a no-repository host.
+    ///
+    /// # Errors
+    /// Returns `Internal` for a database failure.
+    pub async fn list_host_members(&self) -> Result<HostMembersSnapshot> {
+        dispatch!(self, backend => backend.list_host_members().await)
+    }
+
+    /// Insert a new pinned invite; the creator must still be the primary.
+    /// No linked owner profile or repository credential is consulted.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for an invalid invite/non-owner issuer, or
+    /// `Internal` on database failure (including a duplicate invitation).
+    pub async fn insert_host_invite(&self, invite: &HostInvite) -> Result<()> {
+        dispatch!(self, backend => backend.insert_host_invite(invite).await)
+    }
+
+    /// Read only the host scope, retaining closed history.
+    ///
+    /// # Errors
+    /// Returns `Internal` for a database failure.
+    pub async fn get_host_invite(&self, id: &str) -> Result<Option<HostInvite>> {
+        dispatch!(self, backend => backend.get_host_invite(id).await)
+    }
+
+    /// List open host invitations by creation time, then ID.
+    ///
+    /// # Errors
+    /// Returns `Internal` for a database failure.
+    pub async fn list_open_host_invites(&self) -> Result<Vec<HostInvite>> {
+        dispatch!(self, backend => backend.list_open_host_invites().await)
+    }
+
+    /// Revoke only a usable host invitation. Unknown/wrong-scope IDs are
+    /// `NotFound`; already closed invitations are an unchanged `false`.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an unknown host invite, `Internal` on DB failure.
+    pub async fn revoke_host_invite(&self, id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.revoke_host_invite(id).await)
+    }
+
+    /// Redeem one verified host invite, resolving the full stable identity
+    /// and atomically stamping the invite, granting membership, and minting
+    /// (proof) or rechecking/reusing (accept) a credential. All refusals write
+    /// nothing, even profile fields. Concurrent single-use losers are Redeemed.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a missing identity/empty hash, `Internal`
+    /// on database failure. A failed mint rolls back the entire join.
+    pub async fn join_host_by_invite(
+        &self,
+        invite_id: &str,
+        identity: &Principal,
+        credential: HostJoinCredential<'_>,
+    ) -> Result<HostInviteJoinOutcome> {
+        dispatch!(self, backend => backend.join_host_by_invite(invite_id, identity, credential).await)
+    }
+
+    /// Remove an active host member and their direct collaborator grants,
+    /// revoke all their bearer credentials and every usable workspace invite
+    /// they issued (including previously used reusable links). Closed history,
+    /// other people and workspace ownership remain intact. A no-op neither
+    /// revokes a workspace guest nor advances any clock.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for the primary, `Internal` for a DB failure.
+    pub async fn remove_host_member(
+        &self,
+        principal_id: &PrincipalId,
+    ) -> Result<HostMemberRemoval> {
+        dispatch!(self, backend => backend.remove_host_member(principal_id).await)
+    }
+
+    /// Owner removal, with authority checked under the same write transaction.
+    ///
+    /// # Errors
+    /// Returns `Forbidden` for a non-primary actor, `InvalidInput` for the
+    /// primary target, or `Internal` for a database failure.
+    pub async fn remove_host_member_by_owner(
+        &self,
+        actor: &PrincipalId,
+        principal_id: &PrincipalId,
+    ) -> Result<HostMemberRemoval> {
+        dispatch!(self, backend => backend.remove_host_member_by_owner(actor, principal_id).await)
+    }
+
+    /// Revoke the caller's own access, whether a guest or an active member.
+    /// The membership decision and credentials share one transaction.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for the primary or `Internal` on a DB failure.
+    pub async fn revoke_principal_access(
+        &self,
+        principal_id: &PrincipalId,
+    ) -> Result<HostMemberRemoval> {
+        dispatch!(self, backend => backend.revoke_principal_access(principal_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn principal_instructions_revoked(&self, principal: &PrincipalId) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_revocation WHERE principal_id = ?) AND NOT EXISTS(SELECT 1 FROM principal_credential WHERE principal_id = ? AND revoked_at IS NULL)")
+            .bind(&principal.0).bind(&principal.0).fetch_one(self.read_pool()).await.map_err(db_error)
+    }
+    pub async fn host_membership_state(&self) -> Result<HostMembershipState> {
+        state_in_tx(&mut *self.read_pool().acquire().await.map_err(db_error)?).await
+    }
+
     pub async fn get_host_role(&self, principal_id: &PrincipalId) -> Result<HostRole> {
         let row = sqlx::query(
             "SELECT p.is_primary, h.principal_id IS NOT NULL AS is_member \
@@ -147,11 +262,6 @@ impl Store {
         })
     }
 
-    /// Owner first, then members by grant time and ID. Profiles and revision
-    /// are read in the same statement, including on a no-repository host.
-    ///
-    /// # Errors
-    /// Returns `Internal` for a database failure.
     pub async fn list_host_members(&self) -> Result<HostMembersSnapshot> {
         let rows = sqlx::query(
             "SELECT p.id, p.is_primary, p.login, p.display_name, p.avatar_url, \
@@ -192,12 +302,6 @@ impl Store {
         Ok(HostMembersSnapshot { members, revision })
     }
 
-    /// Insert a new pinned invite; the creator must still be the primary.
-    /// No linked owner profile or repository credential is consulted.
-    ///
-    /// # Errors
-    /// Returns `InvalidInput` for an invalid invite/non-owner issuer, or
-    /// `Internal` on database failure (including a duplicate invitation).
     pub async fn insert_host_invite(&self, invite: &HostInvite) -> Result<()> {
         invite.validate_new()?;
         let mut tx = self
@@ -235,10 +339,6 @@ impl Store {
         tx.commit().await.map_err(db_error)
     }
 
-    /// Read only the host scope, retaining closed history.
-    ///
-    /// # Errors
-    /// Returns `Internal` for a database failure.
     pub async fn get_host_invite(&self, id: &str) -> Result<Option<HostInvite>> {
         let sql = format!("SELECT {HOST_INVITE_COLUMNS} FROM host_invite WHERE id = ?");
         Ok(sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -250,10 +350,6 @@ impl Store {
             .map(map_invite))
     }
 
-    /// List open host invitations by creation time, then ID.
-    ///
-    /// # Errors
-    /// Returns `Internal` for a database failure.
     pub async fn list_open_host_invites(&self) -> Result<Vec<HostInvite>> {
         self.list_open_host_invites_at(&now_iso()).await
     }
@@ -271,11 +367,6 @@ impl Store {
             .collect())
     }
 
-    /// Revoke only a usable host invitation. Unknown/wrong-scope IDs are
-    /// `NotFound`; already closed invitations are an unchanged `false`.
-    ///
-    /// # Errors
-    /// Returns `NotFound` for an unknown host invite, `Internal` on DB failure.
     pub async fn revoke_host_invite(&self, id: &str) -> Result<bool> {
         let mut tx = self
             .write_pool()
@@ -305,14 +396,6 @@ impl Store {
         Ok(true)
     }
 
-    /// Redeem one verified host invite, resolving the full stable identity
-    /// and atomically stamping the invite, granting membership, and minting
-    /// (proof) or rechecking/reusing (accept) a credential. All refusals write
-    /// nothing, even profile fields. Concurrent single-use losers are Redeemed.
-    ///
-    /// # Errors
-    /// Returns `InvalidInput` for a missing identity/empty hash, `Internal`
-    /// on database failure. A failed mint rolls back the entire join.
     pub async fn join_host_by_invite(
         &self,
         invite_id: &str,
@@ -457,14 +540,6 @@ impl Store {
         })
     }
 
-    /// Remove an active host member and their direct collaborator grants,
-    /// revoke all their bearer credentials and every usable workspace invite
-    /// they issued (including previously used reusable links). Closed history,
-    /// other people and workspace ownership remain intact. A no-op neither
-    /// revokes a workspace guest nor advances any clock.
-    ///
-    /// # Errors
-    /// Returns `InvalidInput` for the primary, `Internal` for a DB failure.
     pub async fn remove_host_member(
         &self,
         principal_id: &PrincipalId,
@@ -473,11 +548,6 @@ impl Store {
             .await
     }
 
-    /// Owner removal, with authority checked under the same write transaction.
-    ///
-    /// # Errors
-    /// Returns `Forbidden` for a non-primary actor, `InvalidInput` for the
-    /// primary target, or `Internal` for a database failure.
     pub async fn remove_host_member_by_owner(
         &self,
         actor: &PrincipalId,
@@ -487,11 +557,6 @@ impl Store {
             .await
     }
 
-    /// Revoke the caller's own access, whether a guest or an active member.
-    /// The membership decision and credentials share one transaction.
-    ///
-    /// # Errors
-    /// Returns `InvalidInput` for the primary or `Internal` on a DB failure.
     pub async fn revoke_principal_access(
         &self,
         principal_id: &PrincipalId,
@@ -640,6 +705,16 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` when acquiring or querying the database fails.
+    pub async fn owner_queue_permit(
+        &self,
+        principal_id: &PrincipalId,
+        token_hash: Option<&str>,
+    ) -> Result<Option<OwnerQueuePermit>> {
+        dispatch!(self, backend => backend.owner_queue_permit(principal_id, token_hash).await)
+    }
+}
+
+impl crate::SqliteStore {
     pub async fn owner_queue_permit(
         &self,
         principal_id: &PrincipalId,

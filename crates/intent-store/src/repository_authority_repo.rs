@@ -199,6 +199,50 @@ impl Store {
         principal_id: &PrincipalId,
         original_token_hash: Option<&str>,
     ) -> Result<RepositoryHostAuthoritySnapshot> {
+        dispatch!(self, backend => backend.repository_host_authority_snapshot(principal_id, original_token_hash).await)
+    }
+
+    /// Read common workspace/host facts without supplying or looking up a human
+    /// principal or credential. One consistent transaction is closed before
+    /// return. Missing workspace remains explicit absence; missing/invalid
+    /// provenance of a present workspace fails closed. This is evidence only:
+    /// services must still validate the original caller and operation policy,
+    /// including internal Agent/Daemon lifecycle, wire and root lifetimes.
+    ///
+    /// # Errors
+    /// Returns `Internal` on storage failure or missing/invalid provenance.
+    pub async fn repository_workspace_authority_snapshot(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<RepositoryWorkspaceAuthoritySnapshot> {
+        dispatch!(self, backend => backend.repository_workspace_authority_snapshot(workspace_id).await)
+    }
+
+    /// Read exact original workspace/principal/optional personal credential facts
+    /// and independent ABA-resistant revisions in one read transaction, closed
+    /// before returning. No tokens/hashes are copied into the result. `None` for
+    /// the hash does not authorize a local/legacy caller. Root, wire credential,
+    /// process, settings and forge-directory facts are deliberately outside this
+    /// snapshot and require their own revalidation by the operation owner.
+    ///
+    /// # Errors
+    /// Returns `Internal` on storage failure or missing/invalid provenance.
+    pub async fn repository_authority_snapshot(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        original_token_hash: Option<&str>,
+    ) -> Result<RepositoryAuthoritySnapshot> {
+        dispatch!(self, backend => backend.repository_authority_snapshot(workspace_id, principal_id, original_token_hash).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn repository_host_authority_snapshot(
+        &self,
+        principal_id: &PrincipalId,
+        original_token_hash: Option<&str>,
+    ) -> Result<RepositoryHostAuthoritySnapshot> {
         let mut tx = self.read_pool().begin().await.map_err(db_error)?;
         let conn = &mut *tx;
         let person = principal(conn, principal_id).await?;
@@ -264,15 +308,6 @@ impl Store {
         tx.commit().await.map_err(db_error)?;
         Ok(result)
     }
-    /// Read common workspace/host facts without supplying or looking up a human
-    /// principal or credential. One consistent transaction is closed before
-    /// return. Missing workspace remains explicit absence; missing/invalid
-    /// provenance of a present workspace fails closed. This is evidence only:
-    /// services must still validate the original caller and operation policy,
-    /// including internal Agent/Daemon lifecycle, wire and root lifetimes.
-    ///
-    /// # Errors
-    /// Returns `Internal` on storage failure or missing/invalid provenance.
     pub async fn repository_workspace_authority_snapshot(
         &self,
         workspace_id: &WorkspaceId,
@@ -283,15 +318,6 @@ impl Store {
         Ok(snapshot)
     }
 
-    /// Read exact original workspace/principal/optional personal credential facts
-    /// and independent ABA-resistant revisions in one read transaction, closed
-    /// before returning. No tokens/hashes are copied into the result. `None` for
-    /// the hash does not authorize a local/legacy caller. Root, wire credential,
-    /// process, settings and forge-directory facts are deliberately outside this
-    /// snapshot and require their own revalidation by the operation owner.
-    ///
-    /// # Errors
-    /// Returns `Internal` on storage failure or missing/invalid provenance.
     pub async fn repository_authority_snapshot(
         &self,
         workspace_id: &WorkspaceId,

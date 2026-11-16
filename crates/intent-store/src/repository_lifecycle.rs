@@ -451,7 +451,7 @@ impl Store {
     /// settlement, permission or current usability; those checks remain separate.
     #[must_use]
     pub fn shares_repository_lifecycle_domain(&self, other: &Store) -> bool {
-        Arc::ptr_eq(&self.repository_lifecycle, &other.repository_lifecycle)
+        dispatch!(self, backend => backend.shares_repository_lifecycle_domain(other))
     }
 
     /// Retain original ownership before publishing or claiming pending deletion.
@@ -465,6 +465,44 @@ impl Store {
     /// # Errors
     /// Rejects empty keys, a retired/invalid domain, exhausted ownership, or an
     /// unavailable observer. An observer error never confirms an uncertain begin.
+    pub async fn begin_repository_pending_delete(
+        &self,
+        keys: &[RepositoryLifecycleKey],
+    ) -> Result<RepositoryPendingDeleteGuard> {
+        dispatch!(self, backend => backend.begin_repository_pending_delete(keys).await)
+    }
+
+    /// Install the sole invalidation owner for this managed database lifetime.
+    /// Clones and independent managed opens observe the SAME installed Arc.
+    /// Installation is not a permission grant or proof of complete writer coverage.
+    ///
+    /// # Errors
+    /// Refuses replacement, uncertain earlier writes or an unsupported file identity.
+    pub async fn install_repository_lifecycle_observer(
+        &self,
+        observer: Arc<dyn RepositoryLifecycleObserver>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.install_repository_lifecycle_observer(observer).await)
+    }
+
+    /// Match the actual installed owner; this is evidence, never permission.
+    #[must_use]
+    pub fn has_repository_lifecycle_observer(
+        &self,
+        observer: &Arc<dyn RepositoryLifecycleObserver>,
+    ) -> bool {
+        dispatch!(self, backend => backend.has_repository_lifecycle_observer(observer))
+    }
+}
+
+impl crate::SqliteStore {
+    pub fn shares_repository_lifecycle_domain(&self, other: &Store) -> bool {
+        Arc::ptr_eq(
+            &self.repository_lifecycle,
+            &other.sqlite().repository_lifecycle,
+        )
+    }
+
     pub async fn begin_repository_pending_delete(
         &self,
         keys: &[RepositoryLifecycleKey],
@@ -495,12 +533,6 @@ impl Store {
         Ok(RepositoryPendingDeleteGuard { lifecycle })
     }
 
-    /// Install the sole invalidation owner for this managed database lifetime.
-    /// Clones and independent managed opens observe the SAME installed Arc.
-    /// Installation is not a permission grant or proof of complete writer coverage.
-    ///
-    /// # Errors
-    /// Refuses replacement, uncertain earlier writes or an unsupported file identity.
     pub async fn install_repository_lifecycle_observer(
         &self,
         observer: Arc<dyn RepositoryLifecycleObserver>,
@@ -538,8 +570,6 @@ impl Store {
         Ok(())
     }
 
-    /// Match the actual installed owner; this is evidence, never permission.
-    #[must_use]
     pub fn has_repository_lifecycle_observer(
         &self,
         observer: &Arc<dyn RepositoryLifecycleObserver>,

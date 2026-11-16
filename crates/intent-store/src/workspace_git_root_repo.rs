@@ -123,6 +123,179 @@ impl Store {
         &self,
         root: &WorkspaceGitRoot,
     ) -> Result<(WorkspaceGitRoot, bool)> {
+        dispatch!(self, backend => backend.upsert_workspace_git_root(root).await)
+    }
+
+    /// Fetch a single git root by id, or `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_workspace_git_root(
+        &self,
+        id: &WorkspaceGitRootId,
+    ) -> Result<WorkspaceGitRoot> {
+        dispatch!(self, backend => backend.get_workspace_git_root(id).await)
+    }
+
+    /// The git root registered for `(workspace_id, path)`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn find_workspace_git_root_by_path(
+        &self,
+        workspace_id: &WorkspaceId,
+        path: &str,
+    ) -> Result<Option<WorkspaceGitRoot>> {
+        dispatch!(self, backend => backend.find_workspace_git_root_by_path(workspace_id, path).await)
+    }
+
+    /// Every git root registered for a workspace, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspace_git_roots(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<WorkspaceGitRoot>> {
+        dispatch!(self, backend => backend.list_workspace_git_roots(workspace_id).await)
+    }
+
+    /// Every git root across ALL workspaces that carries a discovered
+    /// `pull_requests` list, oldest first — the single bulk read backing the
+    /// `workspace.list` / `workspace.subscribe` seq-0 PR merge (one query per
+    /// list call instead of one per workspace). SQL-filtered on
+    /// `pull_requests IS NOT NULL`, and — unless `include_archived` — on the
+    /// owning workspace being live, so cost is O(PR-bearing roots of returned
+    /// workspaces) and a large archive never inflates the hot list paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspace_git_roots_with_prs(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<WorkspaceGitRoot>> {
+        dispatch!(self, backend => backend.list_workspace_git_roots_with_prs(include_archived).await)
+    }
+
+    /// Git roots of live (non-archived, non-remote) workspaces referencing a
+    /// PR by URL — linked via `pr_url` or carrying a `pull_requests` pool
+    /// entry with that URL — oldest first. Backs the passive
+    /// `github.pulls.get` fold (mirrors
+    /// [`Store::list_workspaces_referencing_pr_url`]): the match runs in
+    /// SQL (`json_each` over the pool column) so only referencing rows are
+    /// decoded, and compares `COLLATE NOCASE` (forge slugs are
+    /// case-insensitive).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspace_git_roots_referencing_pr_url(
+        &self,
+        url: &str,
+    ) -> Result<Vec<WorkspaceGitRoot>> {
+        dispatch!(self, backend => backend.list_workspace_git_roots_referencing_pr_url(url).await)
+    }
+
+    /// Delete a git root by id; `NotFound` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
+    pub async fn delete_workspace_git_root(&self, id: &WorkspaceGitRootId) -> Result<()> {
+        dispatch!(self, backend => backend.delete_workspace_git_root(id).await)
+    }
+
+    /// Update only the PR-linkage fields of a git root (`pr_number`,
+    /// `pr_url`, `pr_status`, `pull_requests`) plus `updated_at`, from the
+    /// in-memory entity — the scoped write the background PR-discovery sweep
+    /// uses (mirrors [`Store::update_workspace_pr_linkage`]). `NotFound` when
+    /// the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_workspace_git_root_pr(&self, root: &WorkspaceGitRoot) -> Result<()> {
+        dispatch!(self, backend => backend.update_workspace_git_root_pr(root).await)
+    }
+
+    /// [`Self::update_workspace_git_root_pr`] rebased on the row at write
+    /// time — the git-root sibling of
+    /// [`Store::update_workspace_pr_linkage_rebased`]
+    /// (intent-hq/intent#5654): inside ONE `BEGIN IMMEDIATE` write-pool
+    /// transaction, read the stored `pull_requests`, hand it to the caller's
+    /// synchronous `rebase` closure with the entity about to be written,
+    /// then perform the same scoped `UPDATE` from the (possibly amended)
+    /// entity. A malformed stored list decodes to `None`. `NotFound` when
+    /// the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_workspace_git_root_pr_rebased<F>(
+        &self,
+        root: &mut WorkspaceGitRoot,
+        rebase: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut WorkspaceGitRoot, Option<Vec<PullRequestInfo>>),
+    {
+        dispatch!(self, backend => backend.update_workspace_git_root_pr_rebased(root, rebase).await)
+    }
+
+    /// Project onto a git root's persisted `pull_requests` atomically — the
+    /// git-root sibling of [`Store::project_workspace_pr_snapshots`]
+    /// (intent-hq/intent#5654, the cache-hit fold): inside ONE
+    /// `BEGIN IMMEDIATE` write-pool transaction, read the stored pool, hand
+    /// it to the caller's synchronous `project` closure, and — when it
+    /// returns `true` — write back ONLY `pull_requests` plus `updated_at`;
+    /// the linked scalars are untouched and no pre-read entity is ever
+    /// reserialized. Returns the written pool on a committed write, `None`
+    /// when the closure declined. `NotFound` when the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails or the stored pool is malformed.
+    pub async fn project_workspace_git_root_pull_requests<F>(
+        &self,
+        id: &WorkspaceGitRootId,
+        updated_at: &str,
+        project: F,
+    ) -> Result<Option<Option<Vec<PullRequestInfo>>>>
+    where
+        F: FnOnce(&mut Option<Vec<PullRequestInfo>>) -> bool,
+    {
+        dispatch!(self, backend => backend.project_workspace_git_root_pull_requests(id, updated_at, project).await)
+    }
+
+    /// Stamp a git root's `registered_commit_sha` ONLY when it is currently
+    /// NULL — the best-effort backfill the background sweep runs on rows that
+    /// predate the column (or whose HEAD was unreadable at registration). The
+    /// `IS NULL` guard enforces the never-overwrite contract at the SQL
+    /// level; a row that already carries a value returns `false` untouched.
+    /// `NotFound` when the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
+    pub async fn backfill_workspace_git_root_commit_sha(
+        &self,
+        id: &WorkspaceGitRootId,
+        sha: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.backfill_workspace_git_root_commit_sha(id, sha, updated_at).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn upsert_workspace_git_root(
+        &self,
+        root: &WorkspaceGitRoot,
+    ) -> Result<(WorkspaceGitRoot, bool)> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let existing: Option<String> =
             sqlx::query_scalar("SELECT id FROM workspace_git_root WHERE workspace_id=? AND path=?")
@@ -234,11 +407,6 @@ impl Store {
         lifecycle.finish(result).await
     }
 
-    /// Fetch a single git root by id, or `NotFound`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_workspace_git_root(
         &self,
         id: &WorkspaceGitRootId,
@@ -255,11 +423,6 @@ impl Store {
         }
     }
 
-    /// The git root registered for `(workspace_id, path)`, if any.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn find_workspace_git_root_by_path(
         &self,
         workspace_id: &WorkspaceId,
@@ -276,11 +439,6 @@ impl Store {
         row.as_ref().map(root_from_row).transpose()
     }
 
-    /// Every git root registered for a workspace, oldest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_git_roots(
         &self,
         workspace_id: &WorkspaceId,
@@ -296,17 +454,6 @@ impl Store {
         rows.iter().map(root_from_row).collect()
     }
 
-    /// Every git root across ALL workspaces that carries a discovered
-    /// `pull_requests` list, oldest first — the single bulk read backing the
-    /// `workspace.list` / `workspace.subscribe` seq-0 PR merge (one query per
-    /// list call instead of one per workspace). SQL-filtered on
-    /// `pull_requests IS NOT NULL`, and — unless `include_archived` — on the
-    /// owning workspace being live, so cost is O(PR-bearing roots of returned
-    /// workspaces) and a large archive never inflates the hot list paths.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_git_roots_with_prs(
         &self,
         include_archived: bool,
@@ -329,18 +476,6 @@ impl Store {
         rows.iter().map(root_from_row).collect()
     }
 
-    /// Git roots of live (non-archived, non-remote) workspaces referencing a
-    /// PR by URL — linked via `pr_url` or carrying a `pull_requests` pool
-    /// entry with that URL — oldest first. Backs the passive
-    /// `github.pulls.get` fold (mirrors
-    /// [`Store::list_workspaces_referencing_pr_url`]): the match runs in
-    /// SQL (`json_each` over the pool column) so only referencing rows are
-    /// decoded, and compares `COLLATE NOCASE` (forge slugs are
-    /// case-insensitive).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_git_roots_referencing_pr_url(
         &self,
         url: &str,
@@ -366,11 +501,6 @@ impl Store {
         rows.iter().map(root_from_row).collect()
     }
 
-    /// Delete a git root by id; `NotFound` when absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace_git_root(&self, id: &WorkspaceGitRootId) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let root = self.get_workspace_git_root(id).await?;
@@ -394,15 +524,6 @@ impl Store {
         Ok(())
     }
 
-    /// Update only the PR-linkage fields of a git root (`pr_number`,
-    /// `pr_url`, `pr_status`, `pull_requests`) plus `updated_at`, from the
-    /// in-memory entity — the scoped write the background PR-discovery sweep
-    /// uses (mirrors [`Store::update_workspace_pr_linkage`]). `NotFound` when
-    /// the row is absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_git_root_pr(&self, root: &WorkspaceGitRoot) -> Result<()> {
         let res = root_pr_update(root)?
             .execute(self.write_pool())
@@ -414,19 +535,6 @@ impl Store {
         Ok(())
     }
 
-    /// [`Self::update_workspace_git_root_pr`] rebased on the row at write
-    /// time — the git-root sibling of
-    /// [`Store::update_workspace_pr_linkage_rebased`]
-    /// (intent-hq/intent#5654): inside ONE `BEGIN IMMEDIATE` write-pool
-    /// transaction, read the stored `pull_requests`, hand it to the caller's
-    /// synchronous `rebase` closure with the entity about to be written,
-    /// then perform the same scoped `UPDATE` from the (possibly amended)
-    /// entity. A malformed stored list decodes to `None`. `NotFound` when
-    /// the row is absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_git_root_pr_rebased<F>(
         &self,
         root: &mut WorkspaceGitRoot,
@@ -481,19 +589,6 @@ impl Store {
         .await
     }
 
-    /// Project onto a git root's persisted `pull_requests` atomically — the
-    /// git-root sibling of [`Store::project_workspace_pr_snapshots`]
-    /// (intent-hq/intent#5654, the cache-hit fold): inside ONE
-    /// `BEGIN IMMEDIATE` write-pool transaction, read the stored pool, hand
-    /// it to the caller's synchronous `project` closure, and — when it
-    /// returns `true` — write back ONLY `pull_requests` plus `updated_at`;
-    /// the linked scalars are untouched and no pre-read entity is ever
-    /// reserialized. Returns the written pool on a committed write, `None`
-    /// when the closure declined. `NotFound` when the row is absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails or the stored pool is malformed.
     pub async fn project_workspace_git_root_pull_requests<F>(
         &self,
         id: &WorkspaceGitRootId,
@@ -554,16 +649,6 @@ impl Store {
         .await
     }
 
-    /// Stamp a git root's `registered_commit_sha` ONLY when it is currently
-    /// NULL — the best-effort backfill the background sweep runs on rows that
-    /// predate the column (or whose HEAD was unreadable at registration). The
-    /// `IS NULL` guard enforces the never-overwrite contract at the SQL
-    /// level; a row that already carries a value returns `false` untouched.
-    /// `NotFound` when the row is absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn backfill_workspace_git_root_commit_sha(
         &self,
         id: &WorkspaceGitRootId,

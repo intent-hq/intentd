@@ -416,6 +416,7 @@ async fn unpolled_and_cancelled_queued_begins_do_not_invent_ownership() {
     drop(f.store.begin_repository_pending_delete(&keys));
     let serial = f
         .store
+        .sqlite()
         .repository_lifecycle
         .writers
         .clone()
@@ -440,6 +441,7 @@ async fn begin_and_first_install_have_both_serialized_orders() {
         let observer: Arc<dyn RepositoryLifecycleObserver> = probe.clone();
         let serial = f
             .store
+            .sqlite()
             .repository_lifecycle
             .writers
             .clone()
@@ -573,6 +575,7 @@ async fn empty_keys_and_exhausted_domain_reject_without_an_observer_callback() {
     assert!(f.store.begin_repository_pending_delete(&[]).await.is_err());
     // Exhaustion control only: this is not supplied authority or a generation.
     f.store
+        .sqlite()
         .repository_lifecycle
         .state
         .lock()
@@ -584,6 +587,7 @@ async fn empty_keys_and_exhausted_domain_reject_without_an_observer_callback() {
         .await
         .is_err());
     f.store
+        .sqlite()
         .repository_lifecycle
         .state
         .lock()
@@ -644,7 +648,7 @@ async fn factual_commit_removes_rows_tombstones_id_and_evicts_display_cache() {
         .begin_repository_pending_delete(&[f.key()])
         .await
         .unwrap();
-    assert_eq!(f.store.browser_tab_displayed.len(), 1);
+    assert_eq!(f.store.sqlite().browser_tab_displayed.len(), 1);
     let outcome = f.store.delete_workspace_with_outcome(&f.workspace.id).await;
     assert_eq!(outcome.disposition, Committed);
     outcome.result.unwrap();
@@ -654,7 +658,7 @@ async fn factual_commit_removes_rows_tombstones_id_and_evicts_display_cache() {
     ));
     assert_eq!(f.drafts().await, 0);
     assert_eq!(f.tombstones().await, 1);
-    assert_eq!(f.store.browser_tab_displayed.len(), 0);
+    assert_eq!(f.store.sqlite().browser_tab_displayed.len(), 0);
     assert!(f.store.get_browser_tab("tab").await.unwrap().is_none());
     assert!(
         probe.blocked(&f.key()),
@@ -769,7 +773,7 @@ async fn acknowledged_commit_survives_later_ticket_settlement_panic() {
         matches!(outcome.result, Err(Error::Internal(message)) if message.contains("final task failed"))
     );
     assert_eq!(f.tombstones().await, 1);
-    assert_eq!(f.store.browser_tab_displayed.len(), 0);
+    assert_eq!(f.store.sqlite().browser_tab_displayed.len(), 0);
     assert!(
         probe.blocked(&f.key()),
         "a real commit does not fabricate ticket settlement"
@@ -1003,7 +1007,7 @@ async fn domain_identity_distinguishes_equal_rows_and_shared_observer_on_other_d
 #[tokio::test]
 async fn domain_identity_preserves_unobserved_uncertainty_after_last_store_reopen() {
     let f = Fixture::new(true).await;
-    let original_domain = Arc::downgrade(&f.store.repository_lifecycle);
+    let original_domain = Arc::downgrade(&f.store.sqlite().repository_lifecycle);
     let guard = f
         .store
         .begin_repository_pending_delete(&[f.key()])
@@ -1016,7 +1020,7 @@ async fn domain_identity_preserves_unobserved_uncertainty_after_last_store_reope
     let independent = Store::open(&f.dir.path().join("pending.db")).await.unwrap();
     assert!(Arc::ptr_eq(
         &original_domain.upgrade().unwrap(),
-        &reopened.repository_lifecycle
+        &reopened.sqlite().repository_lifecycle
     ));
     assert!(reopened.shares_repository_lifecycle_domain(&independent));
     let observer: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Probe::default());
@@ -1031,7 +1035,7 @@ async fn domain_identity_preserves_unobserved_uncertainty_after_last_store_reope
 #[tokio::test]
 async fn domain_identity_preserves_installed_unknown_ticket_after_last_store_reopen() {
     let f = Fixture::new(true).await;
-    let original_domain = Arc::downgrade(&f.store.repository_lifecycle);
+    let original_domain = Arc::downgrade(&f.store.sqlite().repository_lifecycle);
     let key = f.key();
     let probe = Arc::new(Probe::default());
     let observer = probe.install(&f.store).await;
@@ -1047,7 +1051,7 @@ async fn domain_identity_preserves_installed_unknown_ticket_after_last_store_reo
     let independent = Store::open(&f.dir.path().join("pending.db")).await.unwrap();
     assert!(Arc::ptr_eq(
         &original_domain.upgrade().unwrap(),
-        &reopened.repository_lifecycle
+        &reopened.sqlite().repository_lifecycle
     ));
     assert!(reopened.shares_repository_lifecycle_domain(&independent));
     assert!(independent.has_repository_lifecycle_observer(&observer));

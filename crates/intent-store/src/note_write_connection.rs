@@ -4,7 +4,7 @@ use std::ops::{Deref, DerefMut};
 use intent_core::{Error, Result};
 use sqlx::{pool::PoolConnection, Connection, Sqlite, SqliteConnection};
 
-use crate::Store;
+use crate::SqliteStore;
 
 /// A cancelled writer closes its connection instead of returning an open raw
 /// transaction to the pool. Normal completion preserves explicit rollback and
@@ -12,7 +12,7 @@ use crate::Store;
 pub(crate) struct NoteWriteConnection(Option<PoolConnection<Sqlite>>);
 
 impl NoteWriteConnection {
-    pub(crate) async fn begin(store: &Store) -> Result<Self> {
+    pub(crate) async fn begin(store: &SqliteStore) -> Result<Self> {
         Self::begin_pool(store.write_pool()).await
     }
 

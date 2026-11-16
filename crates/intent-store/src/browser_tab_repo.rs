@@ -125,6 +125,173 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_browser_tabs(&self, id: &WorkspaceId) -> Result<Vec<BrowserTab>> {
+        dispatch!(self, backend => backend.list_browser_tabs(id).await)
+    }
+
+    /// Every open tab hosted by `host`, across workspaces, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_browser_tabs_by_host(&self, host: &ClientId) -> Result<Vec<BrowserTab>> {
+        dispatch!(self, backend => backend.list_browser_tabs_by_host(host).await)
+    }
+
+    /// One open tab by id, or `None` (tombstoned rows count as absent).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_browser_tab(&self, tab_id: &str) -> Result<Option<BrowserTab>> {
+        dispatch!(self, backend => backend.get_browser_tab(tab_id).await)
+    }
+
+    /// Host-reported upsert (`browser.upsertTab`): insert a new row hosted by
+    /// `host`, or update the host-reported fields of an existing open row of
+    /// the same host. Returns how the row changed so the caller can emit the
+    /// matching event — `Unchanged` when the report matched the stored state
+    /// (no write, no event). Read, ownership check and write share one write
+    /// transaction, so two hosts racing on a fresh id cannot both win.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` if the tab exists (open or tombstoned)
+    /// with a different host, or is tombstoned — a daemon-side close the host
+    /// has not acknowledged yet; the tombstone is kept so the next
+    /// [`Store::sync_browser_tabs`] still tells the host to drop it.
+    /// `Error::Internal` if the database operation fails.
+    pub async fn upsert_browser_tab(
+        &self,
+        host: &ClientId,
+        input: BrowserTabInput,
+    ) -> Result<BrowserTabUpsertOutcome> {
+        dispatch!(self, backend => backend.upsert_browser_tab(host, input).await)
+    }
+
+    /// Host-reported close (`browser.removeTab`): delete the row outright and
+    /// return it (for the `browser:tab-closed` payload). Unknown or already
+    /// tombstoned ids are an idempotent `None` (the tombstone is purged since
+    /// the host has now dropped the tab).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` if the tab is hosted by another client;
+    /// `Error::Internal` if the database operation fails.
+    pub async fn remove_browser_tab(
+        &self,
+        host: &ClientId,
+        tab_id: &str,
+    ) -> Result<Option<BrowserTab>> {
+        dispatch!(self, backend => backend.remove_browser_tab(host, tab_id).await)
+    }
+
+    /// Daemon-side close of a tab whose host may be offline (a viewer / agent
+    /// `browser.closeTab { force }`, REV-2 Model 6): the row is tombstoned so
+    /// it disappears from every list now and the host is told to drop it on
+    /// its next [`Store::sync_browser_tabs`]. Returns the closed row, or
+    /// `None` when there was no open row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn close_browser_tab(&self, tab_id: &str) -> Result<Option<BrowserTab>> {
+        dispatch!(self, backend => backend.close_browser_tab(tab_id).await)
+    }
+
+    /// Claim migration (REV-2 Model 3 & 5): an agent `claimTab` on a tab
+    /// hosted elsewhere was dispatched to the workspace's driving client, so
+    /// the row moves there — `host_client_id` becomes `new_host` and
+    /// `owner_agent_id` the claiming agent. Returns the updated row with the
+    /// field-wise `changes` (`hostClientId` / `ownerAgentId`), or `None` when
+    /// there is no open row or nothing differs (the host already matches and
+    /// the owner is unchanged — the host's own report covers that case).
+    /// An actual host change also clears `displayed` (the previous host's
+    /// layout fact; `changes.displayed: null` when it was set) until the new
+    /// host reports; a same-host owner-only claim keeps it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn reassign_browser_tab_host(
+        &self,
+        tab_id: &str,
+        new_host: &ClientId,
+        owner_agent_id: Option<&AgentId>,
+    ) -> Result<Option<(BrowserTab, serde_json::Value)>> {
+        dispatch!(self, backend => backend.reassign_browser_tab_host(tab_id, new_host, owner_agent_id).await)
+    }
+
+    /// Driving-client switch (REV-2 Model 10, `workspace.setBrowserClient`):
+    /// every open **claimed** tab (`owner_agent_id` set) of workspace `id`
+    /// not already hosted by `new_host` moves there. Returns each moved row
+    /// with its `changes` (`{ hostClientId }`, plus `displayed: null` when the
+    /// previous host had reported the layout fact — the move clears it),
+    /// oldest first; unclaimed tabs stay on their physical host.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; nothing is
+    /// persisted in that case.
+    pub async fn reassign_claimed_browser_tabs(
+        &self,
+        id: &WorkspaceId,
+        new_host: &ClientId,
+    ) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
+        dispatch!(self, backend => backend.reassign_claimed_browser_tabs(id, new_host).await)
+    }
+
+    /// Superseded-host rehome (intent-hq/intent#8045): every **open** row
+    /// hosted by one of `old_hosts` moves to `new_host`, claimed or not.
+    /// Returns each moved row with its `changes` (`{ hostClientId }`, plus
+    /// `displayed: null` when the old host had reported the layout fact),
+    /// oldest first. Tombstones stay with their old host, which still owes the
+    /// drop acknowledgement. An empty `old_hosts` is a no-op.
+    ///
+    /// `still_movable` is the caller's final decision per old host, evaluated
+    /// inside the write transaction right before the rows are read and moved:
+    /// a host it rejects is left untouched (no write, its `displayed` fact
+    /// kept), so the move is never committed speculatively.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; nothing is
+    /// persisted in that case.
+    pub async fn reassign_browser_tabs_from_hosts(
+        &self,
+        new_host: &ClientId,
+        old_hosts: &[ClientId],
+        still_movable: &(dyn Fn(&ClientId) -> bool + Send + Sync),
+    ) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
+        dispatch!(self, backend => backend.reassign_browser_tabs_from_hosts(new_host, old_hosts, still_movable).await)
+    }
+
+    /// Host snapshot reconciliation (`browser.syncTabs`, REV-2 Model 6), one
+    /// transaction for the whole reconcile. `snapshot` is the host's full tab
+    /// set across workspaces (duplicate ids after the first are ignored). Per
+    /// snapshot tab: unknown ⇒ created (`opened`); open and hosted by `host`
+    /// ⇒ host fields refreshed (`updated` when anything differs); tombstoned
+    /// ⇒ the host must `drop` it (the tombstone is retained, so a repeated
+    /// stale snapshot keeps answering `drop` instead of reviving the tab);
+    /// hosted elsewhere ⇒ `drop` (a tab has exactly one host; the row is
+    /// untouched). Every row of `host` absent from the snapshot is deleted —
+    /// open rows are reported in `closed`, tombstones are purged silently
+    /// (the host has acknowledged the drop by omitting the id).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; nothing is
+    /// persisted in that case.
+    pub async fn sync_browser_tabs(
+        &self,
+        host: &ClientId,
+        snapshot: Vec<BrowserTabInput>,
+    ) -> Result<BrowserTabSyncResult> {
+        dispatch!(self, backend => backend.sync_browser_tabs(host, snapshot).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn list_browser_tabs(&self, id: &WorkspaceId) -> Result<Vec<BrowserTab>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM browser_tab \
              WHERE workspace_id = ? AND closed_at IS NULL ORDER BY created_at, tab_id"
@@ -138,11 +305,6 @@ impl Store {
             .collect()
     }
 
-    /// Every open tab hosted by `host`, across workspaces, oldest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_browser_tabs_by_host(&self, host: &ClientId) -> Result<Vec<BrowserTab>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM browser_tab \
@@ -157,11 +319,6 @@ impl Store {
             .collect()
     }
 
-    /// One open tab by id, or `None` (tombstoned rows count as absent).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_browser_tab(&self, tab_id: &str) -> Result<Option<BrowserTab>> {
         Ok(self
             .get_stored_tab(tab_id)
@@ -179,20 +336,6 @@ impl Store {
         fetch_stored(&mut conn, tab_id, &self.browser_tab_displayed).await
     }
 
-    /// Host-reported upsert (`browser.upsertTab`): insert a new row hosted by
-    /// `host`, or update the host-reported fields of an existing open row of
-    /// the same host. Returns how the row changed so the caller can emit the
-    /// matching event — `Unchanged` when the report matched the stored state
-    /// (no write, no event). Read, ownership check and write share one write
-    /// transaction, so two hosts racing on a fresh id cannot both win.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::InvalidParams` if the tab exists (open or tombstoned)
-    /// with a different host, or is tombstoned — a daemon-side close the host
-    /// has not acknowledged yet; the tombstone is kept so the next
-    /// [`Store::sync_browser_tabs`] still tells the host to drop it.
-    /// `Error::Internal` if the database operation fails.
     pub async fn upsert_browser_tab(
         &self,
         host: &ClientId,
@@ -241,15 +384,6 @@ impl Store {
         .await
     }
 
-    /// Host-reported close (`browser.removeTab`): delete the row outright and
-    /// return it (for the `browser:tab-closed` payload). Unknown or already
-    /// tombstoned ids are an idempotent `None` (the tombstone is purged since
-    /// the host has now dropped the tab).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::InvalidParams` if the tab is hosted by another client;
-    /// `Error::Internal` if the database operation fails.
     pub async fn remove_browser_tab(
         &self,
         host: &ClientId,
@@ -275,15 +409,6 @@ impl Store {
         .await
     }
 
-    /// Daemon-side close of a tab whose host may be offline (a viewer / agent
-    /// `browser.closeTab { force }`, REV-2 Model 6): the row is tombstoned so
-    /// it disappears from every list now and the host is told to drop it on
-    /// its next [`Store::sync_browser_tabs`]. Returns the closed row, or
-    /// `None` when there was no open row.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn close_browser_tab(&self, tab_id: &str) -> Result<Option<BrowserTab>> {
         let pool = self.write_pool().clone();
         let displayed = self.browser_tab_displayed.clone();
@@ -311,20 +436,6 @@ impl Store {
         .await
     }
 
-    /// Claim migration (REV-2 Model 3 & 5): an agent `claimTab` on a tab
-    /// hosted elsewhere was dispatched to the workspace's driving client, so
-    /// the row moves there — `host_client_id` becomes `new_host` and
-    /// `owner_agent_id` the claiming agent. Returns the updated row with the
-    /// field-wise `changes` (`hostClientId` / `ownerAgentId`), or `None` when
-    /// there is no open row or nothing differs (the host already matches and
-    /// the owner is unchanged — the host's own report covers that case).
-    /// An actual host change also clears `displayed` (the previous host's
-    /// layout fact; `changes.displayed: null` when it was set) until the new
-    /// host reports; a same-host owner-only claim keeps it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn reassign_browser_tab_host(
         &self,
         tab_id: &str,
@@ -384,17 +495,6 @@ impl Store {
         .await
     }
 
-    /// Driving-client switch (REV-2 Model 10, `workspace.setBrowserClient`):
-    /// every open **claimed** tab (`owner_agent_id` set) of workspace `id`
-    /// not already hosted by `new_host` moves there. Returns each moved row
-    /// with its `changes` (`{ hostClientId }`, plus `displayed: null` when the
-    /// previous host had reported the layout fact — the move clears it),
-    /// oldest first; unclaimed tabs stay on their physical host.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails; nothing is
-    /// persisted in that case.
     pub async fn reassign_claimed_browser_tabs(
         &self,
         id: &WorkspaceId,
@@ -427,22 +527,6 @@ impl Store {
         .await
     }
 
-    /// Superseded-host rehome (intent-hq/intent#8045): every **open** row
-    /// hosted by one of `old_hosts` moves to `new_host`, claimed or not.
-    /// Returns each moved row with its `changes` (`{ hostClientId }`, plus
-    /// `displayed: null` when the old host had reported the layout fact),
-    /// oldest first. Tombstones stay with their old host, which still owes the
-    /// drop acknowledgement. An empty `old_hosts` is a no-op.
-    ///
-    /// `still_movable` is the caller's final decision per old host, evaluated
-    /// inside the write transaction right before the rows are read and moved:
-    /// a host it rejects is left untouched (no write, its `displayed` fact
-    /// kept), so the move is never committed speculatively.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails; nothing is
-    /// persisted in that case.
     pub async fn reassign_browser_tabs_from_hosts(
         &self,
         new_host: &ClientId,
@@ -488,22 +572,6 @@ impl Store {
         .await
     }
 
-    /// Host snapshot reconciliation (`browser.syncTabs`, REV-2 Model 6), one
-    /// transaction for the whole reconcile. `snapshot` is the host's full tab
-    /// set across workspaces (duplicate ids after the first are ignored). Per
-    /// snapshot tab: unknown ⇒ created (`opened`); open and hosted by `host`
-    /// ⇒ host fields refreshed (`updated` when anything differs); tombstoned
-    /// ⇒ the host must `drop` it (the tombstone is retained, so a repeated
-    /// stale snapshot keeps answering `drop` instead of reviving the tab);
-    /// hosted elsewhere ⇒ `drop` (a tab has exactly one host; the row is
-    /// untouched). Every row of `host` absent from the snapshot is deleted —
-    /// open rows are reported in `closed`, tombstones are purged silently
-    /// (the host has acknowledged the drop by omitting the id).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails; nothing is
-    /// persisted in that case.
     pub async fn sync_browser_tabs(
         &self,
         host: &ClientId,

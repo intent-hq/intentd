@@ -29,6 +29,43 @@ impl Store {
         capabilities: Option<&serde_json::Value>,
         host: &ClientHostInfo,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.upsert_client(id, name, capabilities, host).await)
+    }
+
+    /// Ensure a `client` row exists for `id` without recording a hello: the
+    /// placeholder an anonymous connection's first draft write mints to
+    /// satisfy the `draft` FK (§5.16). Inserts with `last_hello_at` NULL and
+    /// is a no-op on an existing row, so it never clobbers a hello'd client's
+    /// identity or hello timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn ensure_client(&self, id: &ClientId) -> Result<()> {
+        dispatch!(self, backend => backend.ensure_client(id).await)
+    }
+
+    /// Fetch a logical client by id — `None` when the id was never seen. A
+    /// present row with `last_hello_at == None` is a draft-only placeholder
+    /// that never completed `client.hello` (the `workspace.setBrowserClient`
+    /// guard checks both; the offline-pin display name lookup uses `name`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_client(&self, id: &ClientId) -> Result<Option<Client>> {
+        dispatch!(self, backend => backend.get_client(id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn upsert_client(
+        &self,
+        id: &ClientId,
+        name: Option<&str>,
+        capabilities: Option<&serde_json::Value>,
+        host: &ClientHostInfo,
+    ) -> Result<()> {
         let now = now_iso();
         let caps = match capabilities {
             Some(v) => serde_json::to_string(v)
@@ -69,15 +106,6 @@ impl Store {
         Ok(())
     }
 
-    /// Ensure a `client` row exists for `id` without recording a hello: the
-    /// placeholder an anonymous connection's first draft write mints to
-    /// satisfy the `draft` FK (§5.16). Inserts with `last_hello_at` NULL and
-    /// is a no-op on an existing row, so it never clobbers a hello'd client's
-    /// identity or hello timestamp.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn ensure_client(&self, id: &ClientId) -> Result<()> {
         let now = now_iso();
         sqlx::query(
@@ -93,14 +121,6 @@ impl Store {
         Ok(())
     }
 
-    /// Fetch a logical client by id — `None` when the id was never seen. A
-    /// present row with `last_hello_at == None` is a draft-only placeholder
-    /// that never completed `client.hello` (the `workspace.setBrowserClient`
-    /// guard checks both; the offline-pin display name lookup uses `name`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_client(&self, id: &ClientId) -> Result<Option<Client>> {
         let row = sqlx::query(
             "SELECT id, name, capabilities, hostname, pretty_hostname, device_kind, \

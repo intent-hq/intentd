@@ -40,11 +40,12 @@ async fn attribution_recovers_after_write_pool_timeout() {
     };
     let other = snapshot(other_ws.clone(), 100);
     store.upsert_note_line_attribution(&other).await.unwrap();
-    store.write_pool.close().await;
-    store.write_pool = crate::connect_write_with_acquire_timeout(&tmp.path, Duration::from_secs(1))
-        .await
-        .unwrap()
-        .into();
+    store.sqlite().write_pool.close().await;
+    store.sqlite_mut().write_pool =
+        crate::connect_write_with_acquire_timeout(&tmp.path, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .into();
     let held = store.write_pool().acquire().await.unwrap();
     let observed = Arc::new(AtomicUsize::new(0));
     let latest = snapshot(ws.clone(), 200);
@@ -85,7 +86,7 @@ async fn attribution_recovers_after_write_pool_timeout() {
 async fn attribution_does_not_retry_a_closed_pool() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.unwrap();
-    store.write_pool.close().await;
+    store.sqlite().write_pool.close().await;
     let data = LineAttributionData {
         note_id: NoteId::from("note"),
         workspace_id: WorkspaceId::new(),

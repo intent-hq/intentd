@@ -126,6 +126,12 @@ impl Store {
     ///
     /// `Internal` on database failure or a corrupt stored value.
     pub async fn daemon_id(&self) -> Result<String> {
+        dispatch!(self, backend => backend.daemon_id().await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn daemon_id(&self) -> Result<String> {
         let candidate = serde_json::Value::String(uuid::Uuid::new_v4().to_string()).to_string();
         sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING")
             .bind(DAEMON_ID_KEY)
@@ -160,6 +166,283 @@ impl Store {
         credential: &ExecutorCredential,
         token_hash: &str,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.insert_executor_credential(credential, token_hash).await)
+    }
+
+    /// Resolve an **active** credential by token hash and bump its
+    /// `last_used_at` in one statement, so a concurrent revoke can never
+    /// still admit it. `None` for an unknown or revoked hash.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn resolve_active_executor_credential(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<ExecutorCredential>> {
+        dispatch!(self, backend => backend.resolve_active_executor_credential(token_hash).await)
+    }
+
+    /// One credential by id, revoked or not.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn get_executor_credential(
+        &self,
+        id: &ExecutorCredentialId,
+    ) -> Result<Option<ExecutorCredential>> {
+        dispatch!(self, backend => backend.get_executor_credential(id).await)
+    }
+
+    /// The unrevoked credentials, oldest first (`executor.list`).
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn list_active_executor_credentials(&self) -> Result<Vec<ExecutorCredential>> {
+        dispatch!(self, backend => backend.list_active_executor_credentials().await)
+    }
+
+    /// Revoke a credential. Idempotent; its binding stays so the revoked
+    /// backend can never bind again with an older generation.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn revoke_executor_credential(
+        &self,
+        id: &ExecutorCredentialId,
+    ) -> Result<ExecutorRevocation> {
+        dispatch!(self, backend => backend.revoke_executor_credential(id).await)
+    }
+
+    /// The current link binding of a credential, `None` before its first
+    /// accepted bind.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure or a corrupt row.
+    pub async fn executor_binding(
+        &self,
+        credential_id: &ExecutorCredentialId,
+    ) -> Result<Option<LeaseBinding>> {
+        dispatch!(self, backend => backend.executor_binding(credential_id).await)
+    }
+
+    /// Decide a bind offer on the machine `node_id` for one credential and,
+    /// when accepted, durably replace that credential's binding before
+    /// returning. The offer's `headId` must be the backend the credential was
+    /// minted for ([`BindDecision::OtherHead`] otherwise), then the
+    /// single-node rule applies per credential: only a strictly higher
+    /// generation replaces the current binding.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when the credential is unknown or revoked (the caller
+    /// refuses the link as unauthenticated); `Internal` on database failure.
+    pub async fn bind_executor(
+        &self,
+        credential_id: &ExecutorCredentialId,
+        node_id: &str,
+        offered: &LeaseBinding,
+    ) -> Result<BindDecision> {
+        dispatch!(self, backend => backend.bind_executor(credential_id, node_id, offered).await)
+    }
+
+    /// Save an exposed machine after a successful probe, replacing any row
+    /// with the same id. Returns the replaced row's credential when it
+    /// differs from the new one, for the caller to revoke on the machine.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidParams` for an empty id, name, fingerprint or credential, no
+    /// route (neither a host nor a tailcat address), port 0 or a `connected`
+    /// state; `Internal` on database failure.
+    pub async fn save_exposed_machine(
+        &self,
+        machine: &ExposedMachine,
+    ) -> Result<Option<ExecutorCredentialId>> {
+        dispatch!(self, backend => backend.save_exposed_machine(machine).await)
+    }
+
+    /// One exposed machine by id.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure or a corrupt row.
+    pub async fn get_exposed_machine(&self, id: &str) -> Result<Option<ExposedMachine>> {
+        dispatch!(self, backend => backend.get_exposed_machine(id).await)
+    }
+
+    /// Every machine the owner exposed, oldest first. Cloud machine rows
+    /// are left out: see [`Self::list_cloud_machines`].
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure or a corrupt row.
+    pub async fn list_exposed_machines(&self) -> Result<Vec<ExposedMachine>> {
+        dispatch!(self, backend => backend.list_exposed_machines().await)
+    }
+
+    /// Every cloud machine row (a machine the backend started in a cloud
+    /// sandbox), oldest first.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure or a corrupt row.
+    pub async fn list_cloud_machines(&self) -> Result<Vec<ExposedMachine>> {
+        dispatch!(self, backend => backend.list_cloud_machines().await)
+    }
+
+    /// Remove an exposed machine. Returns its credential for the caller to
+    /// revoke on the machine; `None` for an unknown id (a no-op).
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn remove_exposed_machine(&self, id: &str) -> Result<Option<ExecutorCredentialId>> {
+        dispatch!(self, backend => backend.remove_exposed_machine(id).await)
+    }
+
+    /// Replace a cloud machine row's sandbox state. Returns whether the row
+    /// exists and is a cloud machine.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn update_cloud_machine(
+        &self,
+        id: &str,
+        cloud: &intent_core::machines::CloudMachine,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.update_cloud_machine(id, cloud).await)
+    }
+
+    /// The saved settings of cloud machine provider `id` (a JSON document),
+    /// `None` when it is not configured.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn get_cloud_machine_provider(&self, id: &str) -> Result<Option<String>> {
+        dispatch!(self, backend => backend.get_cloud_machine_provider(id).await)
+    }
+
+    /// Every saved cloud machine provider entry as `(id, config_json)`, in
+    /// the order they were first saved.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn list_cloud_machine_providers(&self) -> Result<Vec<(String, String)>> {
+        dispatch!(self, backend => backend.list_cloud_machine_providers().await)
+    }
+
+    /// Rename cloud machine `id`. Returns whether it exists.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidParams` for an empty name; `Internal` on database failure.
+    pub async fn rename_cloud_machine(&self, id: &str, name: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.rename_cloud_machine(id, name).await)
+    }
+
+    /// The agents placed on E2B (`remotePlacement.placement.target` is
+    /// `"e2b"`) as `(workspace id, agent id)`, deleted ones included.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn list_cloud_placed_agents(
+        &self,
+    ) -> Result<Vec<(intent_core::WorkspaceId, intent_core::AgentId)>> {
+        dispatch!(self, backend => backend.list_cloud_placed_agents().await)
+    }
+
+    /// Save the settings of cloud machine provider `id`.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn save_cloud_machine_provider(&self, id: &str, config_json: &str) -> Result<()> {
+        dispatch!(self, backend => backend.save_cloud_machine_provider(id, config_json).await)
+    }
+
+    /// Forget cloud machine provider `id`. Returns whether it was saved.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn delete_cloud_machine_provider(&self, id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.delete_cloud_machine_provider(id).await)
+    }
+
+    /// Persist a machine's resting state. Returns whether the machine exists.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidParams` for `connected`; `Internal` on database failure.
+    pub async fn set_exposed_machine_state(
+        &self,
+        id: &str,
+        state: RemoteMachineState,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.set_exposed_machine_state(id, state).await)
+    }
+
+    /// After an accepted bind: replace the stored routes with the ones the
+    /// machine reported, and stamp `last_connected_at`. The state is not
+    /// touched; `connected` is a live overlay. Returns whether the machine
+    /// exists.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidParams` for no route (neither a host nor a tailcat address);
+    /// `Internal` on database failure.
+    pub async fn record_exposed_machine_connection(
+        &self,
+        id: &str,
+        hosts: &[String],
+        tc_address: Option<&str>,
+        connected_at: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.record_exposed_machine_connection(id, hosts, tc_address, connected_at).await)
+    }
+
+    /// Record the node-link protocol a bind negotiated with the machine; it
+    /// is kept while the machine is disconnected. Returns whether the
+    /// machine exists.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn record_exposed_machine_protocol(&self, id: &str, protocol: u32) -> Result<bool> {
+        dispatch!(self, backend => backend.record_exposed_machine_protocol(id, protocol).await)
+    }
+
+    /// Cache a machine's capabilities report, its platform and `observedAt`,
+    /// so a disconnected machine still shows what it had. Returns whether the
+    /// machine exists.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn record_exposed_machine_capabilities(
+        &self,
+        id: &str,
+        capabilities: &MachineCapabilities,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.record_exposed_machine_capabilities(id, capabilities).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn insert_executor_credential(
+        &self,
+        credential: &ExecutorCredential,
+        token_hash: &str,
+    ) -> Result<()> {
         if credential.id.as_str().is_empty()
             || token_hash.is_empty()
             || credential.backend_id.is_empty()
@@ -186,13 +469,6 @@ impl Store {
         Ok(())
     }
 
-    /// Resolve an **active** credential by token hash and bump its
-    /// `last_used_at` in one statement, so a concurrent revoke can never
-    /// still admit it. `None` for an unknown or revoked hash.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn resolve_active_executor_credential(
         &self,
         token_hash: &str,
@@ -210,11 +486,6 @@ impl Store {
         Ok(row.as_ref().map(credential_row))
     }
 
-    /// One credential by id, revoked or not.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn get_executor_credential(
         &self,
         id: &ExecutorCredentialId,
@@ -228,11 +499,6 @@ impl Store {
         Ok(row.as_ref().map(credential_row))
     }
 
-    /// The unrevoked credentials, oldest first (`executor.list`).
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn list_active_executor_credentials(&self) -> Result<Vec<ExecutorCredential>> {
         let sql = format!(
             "SELECT {CREDENTIAL_COLUMNS} FROM executor_credential WHERE revoked_at IS NULL \
@@ -245,12 +511,6 @@ impl Store {
         Ok(rows.iter().map(credential_row).collect())
     }
 
-    /// Revoke a credential. Idempotent; its binding stays so the revoked
-    /// backend can never bind again with an older generation.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn revoke_executor_credential(
         &self,
         id: &ExecutorCredentialId,
@@ -283,12 +543,6 @@ impl Store {
         Ok(outcome)
     }
 
-    /// The current link binding of a credential, `None` before its first
-    /// accepted bind.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure or a corrupt row.
     pub async fn executor_binding(
         &self,
         credential_id: &ExecutorCredentialId,
@@ -312,17 +566,6 @@ impl Store {
         .transpose()
     }
 
-    /// Decide a bind offer on the machine `node_id` for one credential and,
-    /// when accepted, durably replace that credential's binding before
-    /// returning. The offer's `headId` must be the backend the credential was
-    /// minted for ([`BindDecision::OtherHead`] otherwise), then the
-    /// single-node rule applies per credential: only a strictly higher
-    /// generation replaces the current binding.
-    ///
-    /// # Errors
-    ///
-    /// `NotFound` when the credential is unknown or revoked (the caller
-    /// refuses the link as unauthenticated); `Internal` on database failure.
     pub async fn bind_executor(
         &self,
         credential_id: &ExecutorCredentialId,
@@ -385,15 +628,6 @@ impl Store {
         Ok(decision)
     }
 
-    /// Save an exposed machine after a successful probe, replacing any row
-    /// with the same id. Returns the replaced row's credential when it
-    /// differs from the new one, for the caller to revoke on the machine.
-    ///
-    /// # Errors
-    ///
-    /// `InvalidParams` for an empty id, name, fingerprint or credential, no
-    /// route (neither a host nor a tailcat address), port 0 or a `connected`
-    /// state; `Internal` on database failure.
     pub async fn save_exposed_machine(
         &self,
         machine: &ExposedMachine,
@@ -449,11 +683,6 @@ impl Store {
             .map(ExecutorCredentialId::from))
     }
 
-    /// One exposed machine by id.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure or a corrupt row.
     pub async fn get_exposed_machine(&self, id: &str) -> Result<Option<ExposedMachine>> {
         let sql = format!("SELECT {MACHINE_COLUMNS} FROM exposed_machine WHERE id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -464,12 +693,6 @@ impl Store {
         row.as_ref().map(machine_row).transpose()
     }
 
-    /// Every machine the owner exposed, oldest first. Cloud machine rows
-    /// are left out: see [`Self::list_cloud_machines`].
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure or a corrupt row.
     pub async fn list_exposed_machines(&self) -> Result<Vec<ExposedMachine>> {
         let sql = format!(
             "SELECT {MACHINE_COLUMNS} FROM exposed_machine WHERE cloud_json IS NULL \
@@ -482,12 +705,6 @@ impl Store {
         rows.iter().map(machine_row).collect()
     }
 
-    /// Every cloud machine row (a machine the backend started in a cloud
-    /// sandbox), oldest first.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure or a corrupt row.
     pub async fn list_cloud_machines(&self) -> Result<Vec<ExposedMachine>> {
         let sql = format!(
             "SELECT {MACHINE_COLUMNS} FROM exposed_machine WHERE cloud_json IS NOT NULL \
@@ -500,12 +717,6 @@ impl Store {
         rows.iter().map(machine_row).collect()
     }
 
-    /// Remove an exposed machine. Returns its credential for the caller to
-    /// revoke on the machine; `None` for an unknown id (a no-op).
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn remove_exposed_machine(&self, id: &str) -> Result<Option<ExecutorCredentialId>> {
         let credential: Option<String> =
             sqlx::query_scalar("DELETE FROM exposed_machine WHERE id = ? RETURNING credential_id")
@@ -516,12 +727,6 @@ impl Store {
         Ok(credential.map(ExecutorCredentialId::from))
     }
 
-    /// Replace a cloud machine row's sandbox state. Returns whether the row
-    /// exists and is a cloud machine.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn update_cloud_machine(
         &self,
         id: &str,
@@ -538,12 +743,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// The saved settings of cloud machine provider `id` (a JSON document),
-    /// `None` when it is not configured.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn get_cloud_machine_provider(&self, id: &str) -> Result<Option<String>> {
         sqlx::query_scalar("SELECT config_json FROM cloud_machine_provider WHERE id = ?")
             .bind(id)
@@ -552,12 +751,6 @@ impl Store {
             .map_err(db)
     }
 
-    /// Every saved cloud machine provider entry as `(id, config_json)`, in
-    /// the order they were first saved.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn list_cloud_machine_providers(&self) -> Result<Vec<(String, String)>> {
         sqlx::query_as("SELECT id, config_json FROM cloud_machine_provider ORDER BY rowid")
             .fetch_all(self.read_pool())
@@ -565,11 +758,6 @@ impl Store {
             .map_err(db)
     }
 
-    /// Rename cloud machine `id`. Returns whether it exists.
-    ///
-    /// # Errors
-    ///
-    /// `InvalidParams` for an empty name; `Internal` on database failure.
     pub async fn rename_cloud_machine(&self, id: &str, name: &str) -> Result<bool> {
         if name.is_empty() {
             return Err(invalid("invalid exposed machine"));
@@ -585,12 +773,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// The agents placed on E2B (`remotePlacement.placement.target` is
-    /// `"e2b"`) as `(workspace id, agent id)`, deleted ones included.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn list_cloud_placed_agents(
         &self,
     ) -> Result<Vec<(intent_core::WorkspaceId, intent_core::AgentId)>> {
@@ -612,11 +794,6 @@ impl Store {
             .collect())
     }
 
-    /// Save the settings of cloud machine provider `id`.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn save_cloud_machine_provider(&self, id: &str, config_json: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO cloud_machine_provider (id, config_json, updated_at) VALUES (?, ?, ?) \
@@ -632,11 +809,6 @@ impl Store {
         Ok(())
     }
 
-    /// Forget cloud machine provider `id`. Returns whether it was saved.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn delete_cloud_machine_provider(&self, id: &str) -> Result<bool> {
         let done = sqlx::query("DELETE FROM cloud_machine_provider WHERE id = ?")
             .bind(id)
@@ -646,11 +818,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Persist a machine's resting state. Returns whether the machine exists.
-    ///
-    /// # Errors
-    ///
-    /// `InvalidParams` for `connected`; `Internal` on database failure.
     pub async fn set_exposed_machine_state(
         &self,
         id: &str,
@@ -666,15 +833,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// After an accepted bind: replace the stored routes with the ones the
-    /// machine reported, and stamp `last_connected_at`. The state is not
-    /// touched; `connected` is a live overlay. Returns whether the machine
-    /// exists.
-    ///
-    /// # Errors
-    ///
-    /// `InvalidParams` for no route (neither a host nor a tailcat address);
-    /// `Internal` on database failure.
     pub async fn record_exposed_machine_connection(
         &self,
         id: &str,
@@ -701,13 +859,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Record the node-link protocol a bind negotiated with the machine; it
-    /// is kept while the machine is disconnected. Returns whether the
-    /// machine exists.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn record_exposed_machine_protocol(&self, id: &str, protocol: u32) -> Result<bool> {
         let done = sqlx::query("UPDATE exposed_machine SET node_protocol = ? WHERE id = ?")
             .bind(i64::from(protocol))
@@ -718,13 +869,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Cache a machine's capabilities report, its platform and `observedAt`,
-    /// so a disconnected machine still shows what it had. Returns whether the
-    /// machine exists.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn record_exposed_machine_capabilities(
         &self,
         id: &str,

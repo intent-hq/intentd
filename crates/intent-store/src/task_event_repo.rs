@@ -51,6 +51,12 @@ impl Store {
     /// Enable task projection events and obtain their shared publication baselines.
     #[must_use]
     pub fn task_event_baselines(&self) -> Arc<TaskEventBaselines> {
+        dispatch!(self, backend => backend.task_event_baselines())
+    }
+}
+
+impl crate::SqliteStore {
+    pub fn task_event_baselines(&self) -> Arc<TaskEventBaselines> {
         self.task_events_enabled.store(true, Ordering::Release);
         self.task_event_baselines.clone()
     }

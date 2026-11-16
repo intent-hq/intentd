@@ -135,6 +135,16 @@ impl Store {
         expected: &QualifiedPrMonitor,
         now: &str,
     ) -> Result<bool> {
+        dispatch!(self, backend => backend.cancel_qualified_pr_monitor(expected, now).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn cancel_qualified_pr_monitor(
+        &self,
+        expected: &QualifiedPrMonitor,
+        now: &str,
+    ) -> Result<bool> {
         let mut query =
             QueryBuilder::<Sqlite>::new("UPDATE pr_monitor SET state = 'cancelled', updated_at = ");
         query.push_bind(now.to_owned());
@@ -395,15 +405,7 @@ impl Store {
     /// # Errors
     /// Returns `NotFound` for an absent ID, or `Internal` for a database failure.
     pub async fn get_qualified_pr_monitor(&self, id: &PrMonitorId) -> Result<QualifiedPrMonitor> {
-        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE monitor_id = ?"
-        )))
-        .bind(&id.0)
-        .fetch_optional(self.read_pool())
-        .await
-        .map_err(|e| intent_core::Error::Internal(format!("get qualified monitor: {e}")))?
-        .ok_or_else(|| intent_core::Error::NotFound(format!("pr monitor {} not found", id.0)))?;
-        qualified_from_row(&row)
+        dispatch!(self, backend => backend.get_qualified_pr_monitor(id).await)
     }
 
     /// Load active resolved AND unresolved records for recovery/inspection.
@@ -412,10 +414,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` for a database failure.
     pub async fn load_active_qualified_pr_monitors(&self) -> Result<Vec<QualifiedPrMonitor>> {
-        sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE state = 'active' ORDER BY created_at, monitor_id")))
-            .fetch_all(self.read_pool()).await
-            .map_err(|e| intent_core::Error::Internal(format!("load qualified monitors: {e}")))?
-            .iter().map(qualified_from_row).collect()
+        dispatch!(self, backend => backend.load_active_qualified_pr_monitors().await)
     }
 
     /// List an agent's rows with their original target evidence, including history.
@@ -427,13 +426,106 @@ impl Store {
         &self,
         agent: &AgentId,
     ) -> Result<Vec<QualifiedPrMonitor>> {
-        self.list_qualified_monitors("agent_id", &agent.0).await
+        dispatch!(self, backend => backend.list_qualified_pr_monitors_by_agent(agent).await)
     }
 
     /// List a workspace's rows with target evidence for destination-aware projection.
     ///
     /// # Errors
     /// Returns `Internal` for a database failure or malformed stored row.
+    pub async fn list_qualified_pr_monitors_by_workspace(
+        &self,
+        workspace: &WorkspaceId,
+    ) -> Result<Vec<QualifiedPrMonitor>> {
+        dispatch!(self, backend => backend.list_qualified_pr_monitors_by_workspace(workspace).await)
+    }
+
+    /// Find the active, qualified target owned by this agent. Never uses an
+    /// unresolved legacy slot as a match for a caller's qualified target.
+    ///
+    /// # Errors
+    /// Returns `InvalidParams` for an invalid target or `Internal` on database failure.
+    pub async fn find_active_qualified_pr_monitor(
+        &self,
+        agent: &AgentId,
+        target: &ReviewTarget,
+    ) -> Result<Option<QualifiedPrMonitor>> {
+        dispatch!(self, backend => backend.find_active_qualified_pr_monitor(agent, target).await)
+    }
+
+    /// Owner-agnostic lookup for the existing workspace refusal/adoption boundary.
+    ///
+    /// # Errors
+    /// Returns `InvalidParams` for an invalid target or `Internal` on database failure.
+    pub async fn find_active_qualified_pr_monitor_in_workspace(
+        &self,
+        workspace: &WorkspaceId,
+        target: &ReviewTarget,
+    ) -> Result<Option<QualifiedPrMonitor>> {
+        dispatch!(self, backend => backend.find_active_qualified_pr_monitor_in_workspace(workspace, target).await)
+    }
+
+    /// Insert a canonical target established by trusted application code.
+    /// The caller supplies provenance from actual evidence, never an archive's
+    /// self-asserted label. URL/path canonicalization and admission stay external.
+    ///
+    /// # Errors
+    /// Returns `InvalidParams` for inconsistent data and `Internal` on database failure.
+    /// A uniqueness conflict returns `Ok(false)` without changing the existing owner.
+    pub async fn insert_qualified_pr_monitor(
+        &self,
+        m: &PrMonitor,
+        target: &ReviewTarget,
+        provenance: MonitorTargetProvenance,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.insert_qualified_pr_monitor(m, target, provenance).await)
+    }
+
+    /// Qualify an unresolved row using separately established target evidence.
+    /// Compares all raw old fields plus all prior target fields in one UPDATE;
+    /// changes ONLY target columns. A competing owner/state/poll/qualification
+    /// write cannot be hidden by an unchanged `updated_at`. Resolved rows are not
+    /// retargeted. Repeating the same applied qualification is idempotent.
+    ///
+    /// # Errors
+    /// Returns `InvalidParams` for inconsistent target data and `Internal` on database failure.
+    pub async fn qualify_legacy_pr_monitor_target(
+        &self,
+        expected: &QualifiedPrMonitor,
+        target: &ReviewTarget,
+        provenance: MonitorTargetProvenance,
+    ) -> Result<MonitorQualificationOutcome> {
+        dispatch!(self, backend => backend.qualify_legacy_pr_monitor_target(expected, target, provenance).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn get_qualified_pr_monitor(&self, id: &PrMonitorId) -> Result<QualifiedPrMonitor> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE monitor_id = ?"
+        )))
+        .bind(&id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| intent_core::Error::Internal(format!("get qualified monitor: {e}")))?
+        .ok_or_else(|| intent_core::Error::NotFound(format!("pr monitor {} not found", id.0)))?;
+        qualified_from_row(&row)
+    }
+
+    pub async fn load_active_qualified_pr_monitors(&self) -> Result<Vec<QualifiedPrMonitor>> {
+        sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE state = 'active' ORDER BY created_at, monitor_id")))
+            .fetch_all(self.read_pool()).await
+            .map_err(|e| intent_core::Error::Internal(format!("load qualified monitors: {e}")))?
+            .iter().map(qualified_from_row).collect()
+    }
+
+    pub async fn list_qualified_pr_monitors_by_agent(
+        &self,
+        agent: &AgentId,
+    ) -> Result<Vec<QualifiedPrMonitor>> {
+        self.list_qualified_monitors("agent_id", &agent.0).await
+    }
+
     pub async fn list_qualified_pr_monitors_by_workspace(
         &self,
         workspace: &WorkspaceId,
@@ -453,11 +545,6 @@ impl Store {
             .iter().map(qualified_from_row).collect()
     }
 
-    /// Find the active, qualified target owned by this agent. Never uses an
-    /// unresolved legacy slot as a match for a caller's qualified target.
-    ///
-    /// # Errors
-    /// Returns `InvalidParams` for an invalid target or `Internal` on database failure.
     pub async fn find_active_qualified_pr_monitor(
         &self,
         agent: &AgentId,
@@ -467,10 +554,6 @@ impl Store {
             .await
     }
 
-    /// Owner-agnostic lookup for the existing workspace refusal/adoption boundary.
-    ///
-    /// # Errors
-    /// Returns `InvalidParams` for an invalid target or `Internal` on database failure.
     pub async fn find_active_qualified_pr_monitor_in_workspace(
         &self,
         workspace: &WorkspaceId,
@@ -508,13 +591,6 @@ impl Store {
         Ok(found.filter(|m| matches!(m.target, PersistedMonitorTarget::Resolved { .. })))
     }
 
-    /// Insert a canonical target established by trusted application code.
-    /// The caller supplies provenance from actual evidence, never an archive's
-    /// self-asserted label. URL/path canonicalization and admission stay external.
-    ///
-    /// # Errors
-    /// Returns `InvalidParams` for inconsistent data and `Internal` on database failure.
-    /// A uniqueness conflict returns `Ok(false)` without changing the existing owner.
     pub async fn insert_qualified_pr_monitor(
         &self,
         m: &PrMonitor,
@@ -565,14 +641,6 @@ impl Store {
         }
     }
 
-    /// Qualify an unresolved row using separately established target evidence.
-    /// Compares all raw old fields plus all prior target fields in one UPDATE;
-    /// changes ONLY target columns. A competing owner/state/poll/qualification
-    /// write cannot be hidden by an unchanged `updated_at`. Resolved rows are not
-    /// retargeted. Repeating the same applied qualification is idempotent.
-    ///
-    /// # Errors
-    /// Returns `InvalidParams` for inconsistent target data and `Internal` on database failure.
     pub async fn qualify_legacy_pr_monitor_target(
         &self,
         expected: &QualifiedPrMonitor,
@@ -1072,6 +1140,361 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the insert fails for any reason other than a unique-index rejection (which returns `Ok(false)`).
     pub async fn insert_pr_monitor(&self, m: &PrMonitor) -> Result<bool> {
+        dispatch!(self, backend => backend.insert_pr_monitor(m).await)
+    }
+
+    /// Get a PR monitor by id; `NotFound` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the PR monitor does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_pr_monitor(&self, monitor_id: &PrMonitorId) -> Result<PrMonitor> {
+        dispatch!(self, backend => backend.get_pr_monitor(monitor_id).await)
+    }
+
+    /// The ACTIVE monitor an agent already owns for `(owner, name, number)`,
+    /// if any — the idempotent re-register lookup. `owner` / `name` match
+    /// case-insensitively (forge slugs are case-insensitive; migration `0119`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn find_active_pr_monitor(
+        &self,
+        agent_id: &AgentId,
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: i64,
+    ) -> Result<Option<PrMonitor>> {
+        dispatch!(self, backend => backend.find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number).await)
+    }
+
+    /// The ACTIVE monitor any agent in `workspace_id` holds for
+    /// `(owner, name, number)`, if any — the workspace-scoped "who already
+    /// monitors this PR" lookup (`idx_pr_monitor_workspace_identity` makes
+    /// it at most one row). Owner-agnostic: compare `agent_id` to tell an
+    /// idempotent re-register from another agent's duplicate. `owner` /
+    /// `name` match case-insensitively.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn find_active_pr_monitor_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: i64,
+    ) -> Result<Option<PrMonitor>> {
+        dispatch!(self, backend => backend.find_active_pr_monitor_in_workspace(workspace_id, repo_owner, repo_name, pr_number).await)
+    }
+
+    /// List every monitor owned by an agent, oldest first (all states — the
+    /// caller filters).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_pr_monitors_by_agent(&self, agent_id: &AgentId) -> Result<Vec<PrMonitor>> {
+        dispatch!(self, backend => backend.list_pr_monitors_by_agent(agent_id).await)
+    }
+
+    /// List every monitor in a workspace, oldest first (all states).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_pr_monitors_by_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<PrMonitor>> {
+        dispatch!(self, backend => backend.list_pr_monitors_by_workspace(workspace_id).await)
+    }
+
+    /// List an agent's ACTIVE monitors only, oldest first — the SQL-filtered
+    /// counterpart to [`Store::list_pr_monitors_by_agent`] for read paths
+    /// that only care about active rows (idle-visibility's
+    /// `waitingOnPrMonitors`), so cost is O(active monitors) rather than
+    /// O(all monitor history for the agent).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_active_pr_monitors_by_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Vec<PrMonitor>> {
+        dispatch!(self, backend => backend.list_active_pr_monitors_by_agent(agent_id).await)
+    }
+
+    /// List a workspace's ACTIVE monitors only, oldest first — the
+    /// SQL-filtered counterpart to [`Store::list_pr_monitors_by_workspace`]
+    /// for `agent.list`/`agent.diagnostics`, so cost is O(active monitors in
+    /// the workspace) rather than O(all monitor history in the workspace).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_active_pr_monitors_by_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<PrMonitor>> {
+        dispatch!(self, backend => backend.list_active_pr_monitors_by_workspace(workspace_id).await)
+    }
+
+    /// List a workspace's ACTIVE monitors plus only its most recently updated
+    /// COMPLETED monitor (`LIMIT 1`), oldest first — the displayStatus
+    /// derivation read (active rows feed the open-PR signals, the latest
+    /// completed row the merged signal, matching linked-PR "latest" step-6
+    /// semantics). Completed rows are retained indefinitely, so the bound
+    /// keeps this hot-path read O(active monitors) instead of O(all monitor
+    /// history in the workspace); cancelled rows are excluded entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_display_status_pr_monitors_by_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<PrMonitor>> {
+        dispatch!(self, backend => backend.list_display_status_pr_monitors_by_workspace(workspace_id).await)
+    }
+
+    /// Display-status monitor rows for every requested workspace in one
+    /// statement: all active rows plus the latest completed row per workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the query or row projection fails.
+    pub async fn list_display_status_pr_monitors_by_workspaces(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<Vec<PrMonitor>> {
+        dispatch!(self, backend => backend.list_display_status_pr_monitors_by_workspaces(workspace_ids).await)
+    }
+
+    /// Every `active` monitor across all workspaces, oldest first — the poll
+    /// loop's per-tick read and the boot rehydration read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
+        dispatch!(self, backend => backend.load_active_pr_monitors().await)
+    }
+
+    /// Every non-cancelled (active or completed) monitor across all
+    /// workspaces, oldest first, as narrow [`PrMonitorListEntry`] projections
+    /// — the single bulk read backing the `workspace.list` /
+    /// `workspace.subscribe` seq-0 PR merge. Completed rows are retained so
+    /// merged PRs stay visible; cancelled rows are excluded (they are removed
+    /// from the UI), matching the services-level per-workspace view
+    /// ([`Services::pr_monitors_for_workspace`]). Unless `include_archived`,
+    /// rows owned by archived workspaces are filtered in SQL so cost tracks
+    /// the workspaces the list call actually returns.
+    ///
+    /// The blob columns are never selected: the few `last_snapshot` scalars
+    /// the merge consumes are `json_extract`ed in SQL (guarded by
+    /// `json_valid` so a malformed blob degrades to NULL scalars instead of
+    /// failing the query), and `baseline_snapshot` / `pending_changes` are
+    /// not touched at all — this read grows with monitor history, and
+    /// hydrating full snapshot JSON per row put it at 1.26s for 440 rows on
+    /// one of the hottest RPCs (intent-hq/monorepo#3878).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn load_non_cancelled_pr_monitor_list_entries(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<PrMonitorListEntry>> {
+        dispatch!(self, backend => backend.load_non_cancelled_pr_monitor_list_entries(include_archived).await)
+    }
+
+    /// One workspace's PR-monitor inputs for `workspace.get` in ONE
+    /// statement: every non-cancelled row as the narrow
+    /// [`PrMonitorListEntry`] projection (the PR merge, same shape as
+    /// [`Store::load_non_cancelled_pr_monitor_list_entries`]) plus the
+    /// displayStatus rows — the ACTIVE rows and the single most recently
+    /// updated COMPLETED row, exactly the set
+    /// [`Store::list_display_status_pr_monitors_by_workspace`] returns. The
+    /// `last_snapshot` blob reaches the result only for those displayStatus
+    /// rows (`display_snapshot`, NULL elsewhere) and is read only after the
+    /// per-state ranking — the ranking runs over the narrow monitor identity
+    /// and joins back on the primary key ([`workspace_pr_monitor_reads_sql`]),
+    /// so the window sorter never carries snapshot bytes for the completed
+    /// history. Each non-cancelled row still costs one `last_snapshot` read
+    /// for its `json_extract`ed scalars (the projection covers the whole
+    /// non-cancelled history), so the statement is O(non-cancelled monitors)
+    /// in blob reads but O(displayStatus rows) in blob bytes materialized
+    /// into the result; `baseline_snapshot` / `pending_changes` are never
+    /// selected (`idx_pr_monitor_workspace` SEARCH, then a primary-key
+    /// SEARCH per ranked row). No archived filter: `workspace.get` serves
+    /// archived workspaces too.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn load_workspace_pr_monitor_reads(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspacePrMonitorReads> {
+        dispatch!(self, backend => backend.load_workspace_pr_monitor_reads(workspace_id).await)
+    }
+
+    /// Set a monitor's lifecycle state. Every legal transition starts from
+    /// `active`, so the update is guarded on it; returns `false` when the row
+    /// is absent or already terminal (a concurrent cancel/complete won) so
+    /// the caller can skip its side effects instead of resurrecting the row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn update_pr_monitor_state(
+        &self,
+        monitor_id: &PrMonitorId,
+        state: PrMonitorState,
+        updated_at: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.update_pr_monitor_state(monitor_id, state, updated_at).await)
+    }
+
+    /// Terminalize an ACTIVE monitor: `completed` plus the cleared pending
+    /// state in ONE statement, guarded like [`Store::update_pr_monitor_poll`]
+    /// on `expected_updated_at`. A single write means no window in which a
+    /// concurrent re-parent (adoption, intent-hq/intent#5079) can land
+    /// between the poll write-back and the state flip and have its row
+    /// completed under it while the final wake goes to the previous owner.
+    /// Returns `false` when the guard fails (the row moved or is already
+    /// terminal) so the caller skips the wake.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn complete_pr_monitor(
+        &self,
+        monitor_id: &PrMonitorId,
+        updated_at: &str,
+        expected_updated_at: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.complete_pr_monitor(monitor_id, updated_at, expected_updated_at).await)
+    }
+
+    /// Write back everything one poll can change: the last-poll snapshot, the
+    /// emit-baseline snapshot, the pending changes and their debounce anchors,
+    /// the poll timestamp, and the last forge error. One statement so a reader
+    /// never observes a baseline that moved without its pending changes.
+    ///
+    /// Optimistic-concurrency guarded: the write only lands when the row is
+    /// still `active` AND its `updated_at` still equals
+    /// [`PrMonitorPollUpdate::expected_updated_at`] (the value the caller
+    /// read). Returns `false` when the guard fails — a concurrent
+    /// flush/cancel/re-register/poll moved the row, and the caller must
+    /// discard its stale image (skip emits) rather than clobber.
+    ///
+    /// `last_error` is composed in the statement against the row's current
+    /// value ([`pause_preserving_last_error_sql`]): a rate-limit pause
+    /// annotation the row already carries, with a deadline not before this
+    /// write's `updated_at`, survives the write — the bulk stamp does not
+    /// move `updated_at`, so the guard alone cannot protect it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn update_pr_monitor_poll(
+        &self,
+        monitor_id: &PrMonitorId,
+        update: PrMonitorPollUpdate<'_>,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.update_pr_monitor_poll(monitor_id, update).await)
+    }
+
+    /// Annotate `last_error` on EVERY active monitor across all workspaces
+    /// with the global forge rate-limit `pause` (monorepo#2961,
+    /// [`pr_monitor_pause_error`]): the monitors the paused sweeps will not
+    /// reach must not sit under a stale checklist with an empty `lastError`.
+    /// An earlier annotation — bare, or appended to a genuine error as
+    /// `"<error>; <pause>"` — is replaced by `pause`, so re-stamping on a
+    /// deadline extension names the new deadline without stacking; a genuine
+    /// fetch error already on the row is kept and `pause` appended to it; an
+    /// empty `last_error` becomes `pause`. Monotonic: a row already naming a
+    /// deadline LATER than `pause`'s keeps it and is not counted — stamps
+    /// from concurrent sweeps can land out of order, and a delayed earlier
+    /// stamp must not roll an extension back while the gate still holds the
+    /// later deadline.
+    ///
+    /// Deliberately leaves `updated_at` (the optimistic-concurrency token)
+    /// and `last_polled_at` alone: the stamp is an annotation, not a poll, so
+    /// an in-flight poll's guarded write-back still lands — and, composing
+    /// against the row in SQL, lands WITH this annotation whether the stamp
+    /// ran before or after the poll read the row. Returns the number of rows
+    /// touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn annotate_active_pr_monitors_pause(&self, pause: &str) -> Result<u64> {
+        dispatch!(self, backend => backend.annotate_active_pr_monitors_pause(pause).await)
+    }
+
+    /// Strip the rate-limit pause annotation ([`pr_monitor_pause_error`])
+    /// from `last_error` on EVERY active monitor across all workspaces — the
+    /// inverse of [`Store::annotate_active_pr_monitors_pause`], for when the
+    /// pause is no longer in force BEFORE the deadline the annotations name:
+    /// the gate lifted early because the quota recovered, or the daemon
+    /// restarted with an open gate while the rows still name a deadline
+    /// persisted by the previous process. The guarded write-backs keep an
+    /// unexpired annotation on purpose, so without this clear the surfaces
+    /// would report a pause until the stale deadline aged out.
+    ///
+    /// `lifted` is the pause annotation the lift observed on the gate: only
+    /// annotations naming a deadline not LATER than its are stripped, so a
+    /// clear delayed past a NEWER pause's stamp (a lift and a fresh trigger
+    /// from concurrent sweeps) cannot erase that pause while the gate holds
+    /// it. `None` (the gate was found open with no lift of its own — boot)
+    /// strips every annotation. A bare annotation leaves `NULL`, one
+    /// appended to a genuine error leaves the error; rows without an
+    /// annotation, and terminal rows, are untouched. Like the stamp, leaves
+    /// `updated_at` and `last_polled_at` alone — an in-flight write-back
+    /// still lands, and lands WITHOUT the cleared annotation even if it
+    /// captured it (see [`pause_preserving_last_error_sql`]). Returns the
+    /// number of rows cleared.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_active_pr_monitors_pause(&self, lifted: Option<&str>) -> Result<u64> {
+        dispatch!(self, backend => backend.clear_active_pr_monitors_pause(lifted).await)
+    }
+
+    /// Re-parent an ACTIVE monitor from `from_agent_id` to `to_agent_id` and
+    /// re-arm it in the same statement (the [`Store::update_pr_monitor_poll`]
+    /// write-back), so a reader never observes the new owner with the old
+    /// owner's pending changes. Backs orphaned-monitor adoption
+    /// (intent-hq/intent#5079).
+    ///
+    /// Guarded like the poll write-back — the row must still be `active`
+    /// with the caller's `expected_updated_at` — AND still owned by
+    /// `from_agent_id`, so two siblings adopting concurrently cannot both
+    /// win. Returns `false` when the guard fails. `last_error` composes
+    /// against the row like the poll write-back.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn adopt_pr_monitor(
+        &self,
+        monitor_id: &PrMonitorId,
+        from_agent_id: &AgentId,
+        to_agent_id: &AgentId,
+        update: PrMonitorPollUpdate<'_>,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.adopt_pr_monitor(monitor_id, from_agent_id, to_agent_id, update).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn insert_pr_monitor(&self, m: &PrMonitor) -> Result<bool> {
         let sql = format!(
             "INSERT INTO pr_monitor ({COLUMNS}) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -1109,11 +1532,6 @@ impl Store {
         }
     }
 
-    /// Get a PR monitor by id; `NotFound` when absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the PR monitor does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_pr_monitor(&self, monitor_id: &PrMonitorId) -> Result<PrMonitor> {
         let sql = format!("SELECT {COLUMNS} FROM pr_monitor WHERE monitor_id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -1130,13 +1548,6 @@ impl Store {
         }
     }
 
-    /// The ACTIVE monitor an agent already owns for `(owner, name, number)`,
-    /// if any — the idempotent re-register lookup. `owner` / `name` match
-    /// case-insensitively (forge slugs are case-insensitive; migration `0119`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn find_active_pr_monitor(
         &self,
         agent_id: &AgentId,
@@ -1160,16 +1571,6 @@ impl Store {
         row.as_ref().map(monitor_from_row).transpose()
     }
 
-    /// The ACTIVE monitor any agent in `workspace_id` holds for
-    /// `(owner, name, number)`, if any — the workspace-scoped "who already
-    /// monitors this PR" lookup (`idx_pr_monitor_workspace_identity` makes
-    /// it at most one row). Owner-agnostic: compare `agent_id` to tell an
-    /// idempotent re-register from another agent's duplicate. `owner` /
-    /// `name` match case-insensitively.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn find_active_pr_monitor_in_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -1195,12 +1596,6 @@ impl Store {
         row.as_ref().map(monitor_from_row).transpose()
     }
 
-    /// List every monitor owned by an agent, oldest first (all states — the
-    /// caller filters).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_pr_monitors_by_agent(&self, agent_id: &AgentId) -> Result<Vec<PrMonitor>> {
         let sql =
             format!("SELECT {COLUMNS} FROM pr_monitor WHERE agent_id = ? ORDER BY created_at");
@@ -1214,11 +1609,6 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
-    /// List every monitor in a workspace, oldest first (all states).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_pr_monitors_by_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -1235,15 +1625,6 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
-    /// List an agent's ACTIVE monitors only, oldest first — the SQL-filtered
-    /// counterpart to [`Store::list_pr_monitors_by_agent`] for read paths
-    /// that only care about active rows (idle-visibility's
-    /// `waitingOnPrMonitors`), so cost is O(active monitors) rather than
-    /// O(all monitor history for the agent).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_active_pr_monitors_by_agent(
         &self,
         agent_id: &AgentId,
@@ -1264,14 +1645,6 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
-    /// List a workspace's ACTIVE monitors only, oldest first — the
-    /// SQL-filtered counterpart to [`Store::list_pr_monitors_by_workspace`]
-    /// for `agent.list`/`agent.diagnostics`, so cost is O(active monitors in
-    /// the workspace) rather than O(all monitor history in the workspace).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_active_pr_monitors_by_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -1292,17 +1665,6 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
-    /// List a workspace's ACTIVE monitors plus only its most recently updated
-    /// COMPLETED monitor (`LIMIT 1`), oldest first — the displayStatus
-    /// derivation read (active rows feed the open-PR signals, the latest
-    /// completed row the merged signal, matching linked-PR "latest" step-6
-    /// semantics). Completed rows are retained indefinitely, so the bound
-    /// keeps this hot-path read O(active monitors) instead of O(all monitor
-    /// history in the workspace); cancelled rows are excluded entirely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_display_status_pr_monitors_by_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -1327,12 +1689,6 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
-    /// Display-status monitor rows for every requested workspace in one
-    /// statement: all active rows plus the latest completed row per workspace.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` when the query or row projection fails.
     pub async fn list_display_status_pr_monitors_by_workspaces(
         &self,
         workspace_ids: &[WorkspaceId],
@@ -1362,12 +1718,6 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
-    /// Every `active` monitor across all workspaces, oldest first — the poll
-    /// loop's per-tick read and the boot rehydration read.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
         let sql =
             format!("SELECT {COLUMNS} FROM pr_monitor WHERE state = 'active' ORDER BY created_at");
@@ -1380,27 +1730,6 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
-    /// Every non-cancelled (active or completed) monitor across all
-    /// workspaces, oldest first, as narrow [`PrMonitorListEntry`] projections
-    /// — the single bulk read backing the `workspace.list` /
-    /// `workspace.subscribe` seq-0 PR merge. Completed rows are retained so
-    /// merged PRs stay visible; cancelled rows are excluded (they are removed
-    /// from the UI), matching the services-level per-workspace view
-    /// ([`Services::pr_monitors_for_workspace`]). Unless `include_archived`,
-    /// rows owned by archived workspaces are filtered in SQL so cost tracks
-    /// the workspaces the list call actually returns.
-    ///
-    /// The blob columns are never selected: the few `last_snapshot` scalars
-    /// the merge consumes are `json_extract`ed in SQL (guarded by
-    /// `json_valid` so a malformed blob degrades to NULL scalars instead of
-    /// failing the query), and `baseline_snapshot` / `pending_changes` are
-    /// not touched at all — this read grows with monitor history, and
-    /// hydrating full snapshot JSON per row put it at 1.26s for 440 rows on
-    /// one of the hottest RPCs (intent-hq/monorepo#3878).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_non_cancelled_pr_monitor_list_entries(
         &self,
         include_archived: bool,
@@ -1421,30 +1750,6 @@ impl Store {
         rows.iter().map(list_entry_from_row).collect()
     }
 
-    /// One workspace's PR-monitor inputs for `workspace.get` in ONE
-    /// statement: every non-cancelled row as the narrow
-    /// [`PrMonitorListEntry`] projection (the PR merge, same shape as
-    /// [`Store::load_non_cancelled_pr_monitor_list_entries`]) plus the
-    /// displayStatus rows — the ACTIVE rows and the single most recently
-    /// updated COMPLETED row, exactly the set
-    /// [`Store::list_display_status_pr_monitors_by_workspace`] returns. The
-    /// `last_snapshot` blob reaches the result only for those displayStatus
-    /// rows (`display_snapshot`, NULL elsewhere) and is read only after the
-    /// per-state ranking — the ranking runs over the narrow monitor identity
-    /// and joins back on the primary key ([`workspace_pr_monitor_reads_sql`]),
-    /// so the window sorter never carries snapshot bytes for the completed
-    /// history. Each non-cancelled row still costs one `last_snapshot` read
-    /// for its `json_extract`ed scalars (the projection covers the whole
-    /// non-cancelled history), so the statement is O(non-cancelled monitors)
-    /// in blob reads but O(displayStatus rows) in blob bytes materialized
-    /// into the result; `baseline_snapshot` / `pending_changes` are never
-    /// selected (`idx_pr_monitor_workspace` SEARCH, then a primary-key
-    /// SEARCH per ranked row). No archived filter: `workspace.get` serves
-    /// archived workspaces too.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_workspace_pr_monitor_reads(
         &self,
         workspace_id: &WorkspaceId,
@@ -1490,14 +1795,6 @@ impl Store {
         Ok(reads)
     }
 
-    /// Set a monitor's lifecycle state. Every legal transition starts from
-    /// `active`, so the update is guarded on it; returns `false` when the row
-    /// is absent or already terminal (a concurrent cancel/complete won) so
-    /// the caller can skip its side effects instead of resurrecting the row.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn update_pr_monitor_state(
         &self,
         monitor_id: &PrMonitorId,
@@ -1519,18 +1816,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Terminalize an ACTIVE monitor: `completed` plus the cleared pending
-    /// state in ONE statement, guarded like [`Store::update_pr_monitor_poll`]
-    /// on `expected_updated_at`. A single write means no window in which a
-    /// concurrent re-parent (adoption, intent-hq/intent#5079) can land
-    /// between the poll write-back and the state flip and have its row
-    /// completed under it while the final wake goes to the previous owner.
-    /// Returns `false` when the guard fails (the row moved or is already
-    /// terminal) so the caller skips the wake.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn complete_pr_monitor(
         &self,
         monitor_id: &PrMonitorId,
@@ -1551,27 +1836,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Write back everything one poll can change: the last-poll snapshot, the
-    /// emit-baseline snapshot, the pending changes and their debounce anchors,
-    /// the poll timestamp, and the last forge error. One statement so a reader
-    /// never observes a baseline that moved without its pending changes.
-    ///
-    /// Optimistic-concurrency guarded: the write only lands when the row is
-    /// still `active` AND its `updated_at` still equals
-    /// [`PrMonitorPollUpdate::expected_updated_at`] (the value the caller
-    /// read). Returns `false` when the guard fails — a concurrent
-    /// flush/cancel/re-register/poll moved the row, and the caller must
-    /// discard its stale image (skip emits) rather than clobber.
-    ///
-    /// `last_error` is composed in the statement against the row's current
-    /// value ([`pause_preserving_last_error_sql`]): a rate-limit pause
-    /// annotation the row already carries, with a deadline not before this
-    /// write's `updated_at`, survives the write — the bulk stamp does not
-    /// move `updated_at`, so the guard alone cannot protect it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn update_pr_monitor_poll(
         &self,
         monitor_id: &PrMonitorId,
@@ -1597,30 +1861,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Annotate `last_error` on EVERY active monitor across all workspaces
-    /// with the global forge rate-limit `pause` (monorepo#2961,
-    /// [`pr_monitor_pause_error`]): the monitors the paused sweeps will not
-    /// reach must not sit under a stale checklist with an empty `lastError`.
-    /// An earlier annotation — bare, or appended to a genuine error as
-    /// `"<error>; <pause>"` — is replaced by `pause`, so re-stamping on a
-    /// deadline extension names the new deadline without stacking; a genuine
-    /// fetch error already on the row is kept and `pause` appended to it; an
-    /// empty `last_error` becomes `pause`. Monotonic: a row already naming a
-    /// deadline LATER than `pause`'s keeps it and is not counted — stamps
-    /// from concurrent sweeps can land out of order, and a delayed earlier
-    /// stamp must not roll an extension back while the gate still holds the
-    /// later deadline.
-    ///
-    /// Deliberately leaves `updated_at` (the optimistic-concurrency token)
-    /// and `last_polled_at` alone: the stamp is an annotation, not a poll, so
-    /// an in-flight poll's guarded write-back still lands — and, composing
-    /// against the row in SQL, lands WITH this annotation whether the stamp
-    /// ran before or after the poll read the row. Returns the number of rows
-    /// touched.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn annotate_active_pr_monitors_pause(&self, pause: &str) -> Result<u64> {
         let res = sqlx::query(sqlx::AssertSqlSafe(
             ANNOTATE_ACTIVE_PR_MONITORS_PAUSE_SQL.as_str(),
@@ -1635,32 +1875,6 @@ impl Store {
         Ok(res.rows_affected())
     }
 
-    /// Strip the rate-limit pause annotation ([`pr_monitor_pause_error`])
-    /// from `last_error` on EVERY active monitor across all workspaces — the
-    /// inverse of [`Store::annotate_active_pr_monitors_pause`], for when the
-    /// pause is no longer in force BEFORE the deadline the annotations name:
-    /// the gate lifted early because the quota recovered, or the daemon
-    /// restarted with an open gate while the rows still name a deadline
-    /// persisted by the previous process. The guarded write-backs keep an
-    /// unexpired annotation on purpose, so without this clear the surfaces
-    /// would report a pause until the stale deadline aged out.
-    ///
-    /// `lifted` is the pause annotation the lift observed on the gate: only
-    /// annotations naming a deadline not LATER than its are stripped, so a
-    /// clear delayed past a NEWER pause's stamp (a lift and a fresh trigger
-    /// from concurrent sweeps) cannot erase that pause while the gate holds
-    /// it. `None` (the gate was found open with no lift of its own — boot)
-    /// strips every annotation. A bare annotation leaves `NULL`, one
-    /// appended to a genuine error leaves the error; rows without an
-    /// annotation, and terminal rows, are untouched. Like the stamp, leaves
-    /// `updated_at` and `last_polled_at` alone — an in-flight write-back
-    /// still lands, and lands WITHOUT the cleared annotation even if it
-    /// captured it (see [`pause_preserving_last_error_sql`]). Returns the
-    /// number of rows cleared.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_active_pr_monitors_pause(&self, lifted: Option<&str>) -> Result<u64> {
         let res = sqlx::query(sqlx::AssertSqlSafe(
             CLEAR_ACTIVE_PR_MONITORS_PAUSE_SQL.as_str(),
@@ -1675,21 +1889,6 @@ impl Store {
         Ok(res.rows_affected())
     }
 
-    /// Re-parent an ACTIVE monitor from `from_agent_id` to `to_agent_id` and
-    /// re-arm it in the same statement (the [`Store::update_pr_monitor_poll`]
-    /// write-back), so a reader never observes the new owner with the old
-    /// owner's pending changes. Backs orphaned-monitor adoption
-    /// (intent-hq/intent#5079).
-    ///
-    /// Guarded like the poll write-back — the row must still be `active`
-    /// with the caller's `expected_updated_at` — AND still owned by
-    /// `from_agent_id`, so two siblings adopting concurrently cannot both
-    /// win. Returns `false` when the guard fails. `last_error` composes
-    /// against the row like the poll write-back.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn adopt_pr_monitor(
         &self,
         monitor_id: &PrMonitorId,

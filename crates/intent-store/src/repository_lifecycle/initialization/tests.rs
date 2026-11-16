@@ -919,7 +919,7 @@ async fn shared_legacy_body_keeps_canonical_and_missing_row_fallback_without_cla
             .execute(&mut *conn)
             .await
             .unwrap();
-        let outcome = Store::write_acp_session_id_in_transaction(
+        let outcome = crate::SqliteStore::write_acp_session_id_in_transaction(
             &mut conn,
             &f.workspace.id,
             &agent,

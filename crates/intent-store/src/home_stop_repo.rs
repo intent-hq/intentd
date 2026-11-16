@@ -180,6 +180,90 @@ impl Store {
         home: &WorkspaceHome,
         now: &str,
     ) -> Result<Option<HomeStopRecord>> {
+        dispatch!(self, backend => backend.switch_workspace_home(workspace_id, home, now).await)
+    }
+
+    /// Record `record` unless its home has a stop already; the stop kept.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn record_home_stop(&self, record: &HomeStopRecord) -> Result<HomeStopRecord> {
+        dispatch!(self, backend => backend.record_home_stop(record).await)
+    }
+
+    /// The pending stop of `home_id`.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn get_home_stop(&self, home_id: &HomeId) -> Result<Option<HomeStopRecord>> {
+        dispatch!(self, backend => backend.get_home_stop(home_id).await)
+    }
+
+    /// Whether the pending stop of `home_id` discards its last push: the
+    /// home was a move's target that never became the workspace's.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn home_stop_discards_push(&self, home_id: &HomeId) -> Result<bool> {
+        dispatch!(self, backend => backend.home_stop_discards_push(home_id).await)
+    }
+
+    /// The pending stops of the exposed machine `node_id`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn list_home_stops(&self, node_id: &str) -> Result<Vec<HomeStopRecord>> {
+        dispatch!(self, backend => backend.list_home_stops(node_id).await)
+    }
+
+    /// The pending stops of `workspace_id`'s homes.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn list_workspace_home_stops(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<HomeStopRecord>> {
+        dispatch!(self, backend => backend.list_workspace_home_stops(workspace_id).await)
+    }
+
+    /// Delete the stop of `home_id` its ack `stop_id` answers; the deleted
+    /// stop, `None` when it is gone or has another id.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn finish_home_stop(
+        &self,
+        home_id: &HomeId,
+        stop_id: &str,
+    ) -> Result<Option<HomeStopRecord>> {
+        dispatch!(self, backend => backend.finish_home_stop(home_id, stop_id).await)
+    }
+
+    /// Delete every stop of the exposed machine `node_id` (it was removed);
+    /// how many went.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn delete_home_stops_on_machine(&self, node_id: &str) -> Result<u64> {
+        dispatch!(self, backend => backend.delete_home_stops_on_machine(node_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn switch_workspace_home(
+        &self,
+        workspace_id: &WorkspaceId,
+        home: &WorkspaceHome,
+        now: &str,
+    ) -> Result<Option<HomeStopRecord>> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let stop = match machine_home(&mut tx, workspace_id).await? {
             Some((old, node_id)) if old != home.home_id.0 => Some(HomeStopRecord::new(
@@ -219,11 +303,6 @@ impl Store {
         Ok(stop)
     }
 
-    /// Record `record` unless its home has a stop already; the stop kept.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn record_home_stop(&self, record: &HomeStopRecord) -> Result<HomeStopRecord> {
         let mut conn = self.write_pool().acquire().await.map_err(db)?;
         insert(&mut conn, record).await?;
@@ -233,11 +312,6 @@ impl Store {
             .ok_or_else(|| db("the recorded stop is gone"))
     }
 
-    /// The pending stop of `home_id`.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn get_home_stop(&self, home_id: &HomeId) -> Result<Option<HomeStopRecord>> {
         let sql = format!("{SELECT} WHERE home_id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -248,12 +322,6 @@ impl Store {
         row.as_ref().map(map_row).transpose()
     }
 
-    /// Whether the pending stop of `home_id` discards its last push: the
-    /// home was a move's target that never became the workspace's.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn home_stop_discards_push(&self, home_id: &HomeId) -> Result<bool> {
         let discard: Option<i64> =
             sqlx::query_scalar("SELECT discard_push FROM home_stop WHERE home_id = ?")
@@ -264,11 +332,6 @@ impl Store {
         Ok(discard.is_some_and(|discard| discard != 0))
     }
 
-    /// The pending stops of the exposed machine `node_id`, oldest first.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn list_home_stops(&self, node_id: &str) -> Result<Vec<HomeStopRecord>> {
         let sql = format!("{SELECT} WHERE node_id = ? ORDER BY recorded_at, home_id");
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -279,11 +342,6 @@ impl Store {
         rows.iter().map(map_row).collect()
     }
 
-    /// The pending stops of `workspace_id`'s homes.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn list_workspace_home_stops(
         &self,
         workspace_id: &WorkspaceId,
@@ -297,12 +355,6 @@ impl Store {
         rows.iter().map(map_row).collect()
     }
 
-    /// Delete the stop of `home_id` its ack `stop_id` answers; the deleted
-    /// stop, `None` when it is gone or has another id.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn finish_home_stop(
         &self,
         home_id: &HomeId,
@@ -323,12 +375,6 @@ impl Store {
         row.as_ref().map(map_row).transpose()
     }
 
-    /// Delete every stop of the exposed machine `node_id` (it was removed);
-    /// how many went.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn delete_home_stops_on_machine(&self, node_id: &str) -> Result<u64> {
         let done = sqlx::query("DELETE FROM home_stop WHERE node_id = ?")
             .bind(node_id)

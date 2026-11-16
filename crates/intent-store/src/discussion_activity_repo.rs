@@ -65,15 +65,66 @@ impl Store {
         message: &str,
         agent: &AgentId,
     ) -> Result<DiscussionActivityReceipt> {
+        dispatch!(self, backend => backend.discussion_activity(ws, conversation, message, agent).await)
+    }
+
+    /// Transition only this live invocation; stale worker completions cannot rewrite retries.
+    /// # Errors
+    /// Returns storage errors.
+    pub async fn transition_discussion_activity(
+        &self,
+        turn: &str,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<Option<DiscussionActivityReceipt>> {
+        dispatch!(self, backend => backend.transition_discussion_activity(turn, state, error).await)
+    }
+
+    /// Gate an exact invocation immediately before its provider work.
+    /// # Errors
+    /// Returns storage errors.
+    pub async fn discussion_invocation_allowed(&self, turn: &str, agent: &AgentId) -> Result<bool> {
+        dispatch!(self, backend => backend.discussion_invocation_allowed(turn, agent).await)
+    }
+
+    /// Stop or retry exactly the observed attempt, atomically with its outbox/queue.
+    /// # Errors
+    /// Returns stale/future request, eligibility, and storage errors.
+    pub async fn control_discussion_activity(
+        &self,
+        ws: &WorkspaceId,
+        conversation: &str,
+        message: &str,
+        agent: &AgentId,
+        attempt: u32,
+        retry: bool,
+    ) -> Result<(DiscussionActivityReceipt, bool)> {
+        dispatch!(self, backend => backend.control_discussion_activity(ws, conversation, message, agent, attempt, retry).await)
+    }
+
+    /// Interrupted processes cannot report success. Keep their receipts stopped,
+    /// and require an explicit retry instead of replaying old invocation queues.
+    /// # Errors
+    /// Returns storage errors.
+    pub async fn recover_discussion_activity(&self) -> Result<()> {
+        dispatch!(self, backend => backend.recover_discussion_activity().await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn discussion_activity(
+        &self,
+        ws: &WorkspaceId,
+        conversation: &str,
+        message: &str,
+        agent: &AgentId,
+    ) -> Result<DiscussionActivityReceipt> {
         let row=sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE m.workspace_id=? AND m.conversation_id=? AND a.message_id=? AND a.agent_id=?")))
             .bind(ws.as_str()).bind(conversation).bind(message).bind(agent.as_str()).fetch_optional(self.read_pool()).await.map_err(|e| db(&e))?
             .ok_or_else(|| Error::NotFound("Discussion invocation not found".into()))?;
         receipt(&row)
     }
 
-    /// Transition only this live invocation; stale worker completions cannot rewrite retries.
-    /// # Errors
-    /// Returns storage errors.
     pub async fn transition_discussion_activity(
         &self,
         turn: &str,
@@ -97,17 +148,11 @@ impl Store {
         Ok(Some(value))
     }
 
-    /// Gate an exact invocation immediately before its provider work.
-    /// # Errors
-    /// Returns storage errors.
     pub async fn discussion_invocation_allowed(&self, turn: &str, agent: &AgentId) -> Result<bool> {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_agent_activity WHERE turn_id=? AND agent_id=? AND state IN ('queued','working'))")
             .bind(turn).bind(agent.as_str()).fetch_one(self.read_pool()).await.map_err(|e| db(&e))
     }
 
-    /// Stop or retry exactly the observed attempt, atomically with its outbox/queue.
-    /// # Errors
-    /// Returns stale/future request, eligibility, and storage errors.
     pub async fn control_discussion_activity(
         &self,
         ws: &WorkspaceId,
@@ -181,10 +226,6 @@ impl Store {
         Ok((result, true))
     }
 
-    /// Interrupted processes cannot report success. Keep their receipts stopped,
-    /// and require an explicit retry instead of replaying old invocation queues.
-    /// # Errors
-    /// Returns storage errors.
     pub async fn recover_discussion_activity(&self) -> Result<()> {
         let mut tx = self.write_pool().begin().await.map_err(|e| db(&e))?;
         // Startup healing runs first. Do not let its generic continuation replay a

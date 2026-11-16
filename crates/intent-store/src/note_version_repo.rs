@@ -45,6 +45,154 @@ impl Store {
         date: &str,
         rev: i64,
     ) -> Result<i64> {
+        dispatch!(self, backend => backend.append_note_version(note, author, date, rev).await)
+    }
+
+    /// Persist a note content write and its version snapshot in ONE
+    /// transaction: the same conditional UPDATE as
+    /// [`Store::update_note_versioned`] (gated on `expected_version` when
+    /// `Some`) followed by the snapshot [`Store::append_note_version`] would
+    /// record for the bumped rev. Committing them together means no reader can
+    /// observe the new `rev` on the note row while
+    /// [`Store::get_note_version_content_by_rev`] still resolves that rev to
+    /// the previous content, and a snapshot can never land after a later
+    /// write's, out of rev order. Returns `(rev, v)`: the post-write rev and
+    /// the new version number.
+    ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or a statement fails.
+    pub async fn update_note_with_version(
+        &self,
+        lock: &crate::NoteWriteLock,
+        note: &Note,
+        expected_version: Option<i64>,
+        author: &NoteVersionAuthor,
+        date: &str,
+    ) -> Result<(i64, i64)> {
+        dispatch!(self, backend => backend.update_note_with_version(lock, note, expected_version, author, date).await)
+    }
+
+    /// Persist a parent-note content write together with the child-note
+    /// inserts the new content refers to, in ONE transaction: the gated
+    /// UPDATE + snapshot of [`Store::update_note_with_version`] for `note`
+    /// (gated on `expected_version` when `Some`), then for each of `children`
+    /// the row insert + initial snapshot of [`Store::insert_note_with_version`]
+    /// (at each child's `rev`, stamped with its `updated_at`). Children exist
+    /// only if the parent write lands: a CAS miss commits nothing, so a
+    /// caller that re-derives its work from the fresh parent never leaves
+    /// orphaned or duplicate children behind (`task.convertBlocks` racing a
+    /// save that already converted the same block). Returns `(rev, v)` for
+    /// the parent.
+    ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the parent does not exist in the workspace; `Error::Internal` if encoding fields or a statement fails (including a duplicate child `(id, workspace_id)`).
+    pub async fn update_note_with_version_and_children(
+        &self,
+        lock: &crate::NoteWriteLock,
+        note: &Note,
+        expected_version: Option<i64>,
+        children: &[Note],
+        author: &NoteVersionAuthor,
+        date: &str,
+    ) -> Result<(i64, i64)> {
+        dispatch!(self, backend => backend.update_note_with_version_and_children(lock, note, expected_version, children, author, date).await)
+    }
+
+    /// Insert a note row and its initial version snapshot (at `note.rev`) in
+    /// ONE transaction, the insert-side counterpart of
+    /// [`Store::update_note_with_version`]: the row is never visible while
+    /// [`Store::get_note_version_content_by_rev`] cannot yet resolve its rev,
+    /// so a writer that reads the fresh note and later sends that rev as a
+    /// stale base always merges instead of degrading to last-writer-wins, and
+    /// the initial snapshot can never land after a later write's. Returns the
+    /// new version number.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if encoding fields or a statement fails (including a duplicate `(id, workspace_id)`).
+    pub async fn insert_note_with_version(
+        &self,
+        note: &Note,
+        author: &NoteVersionAuthor,
+        date: &str,
+    ) -> Result<i64> {
+        dispatch!(self, backend => backend.insert_note_with_version(note, author, date).await)
+    }
+
+    /// List a note's stored versions ascending by `v`, without content blobs
+    /// (`content_length` is computed in SQL). Scoped by
+    /// `(workspace_id, note_id)` (migration 0030 composite FK) so a same-id
+    /// note in another workspace cannot leak its version history.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_note_versions(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+    ) -> Result<Vec<NoteVersionSummary>> {
+        dispatch!(self, backend => backend.list_note_versions(workspace_id, note_id).await)
+    }
+
+    /// Fetch one stored version (with content), or `NotFound`. Scoped by
+    /// `(workspace_id, note_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note version does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn get_note_version(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        v: i64,
+    ) -> Result<NoteVersion> {
+        dispatch!(self, backend => backend.get_note_version(workspace_id, note_id, v).await)
+    }
+
+    /// The note's content *as of* `rev`: the content of the newest snapshot
+    /// whose recorded `rev` is `<= rev` (one range scan on
+    /// `idx_note_version_rev`). Every content write snapshots at its
+    /// post-write rev, while metadata-only writes bump `rev` without a
+    /// snapshot, so the content at rev N is the last content-write snapshot
+    /// at or below N — an exact hit for a content rev, the preceding content
+    /// for a metadata-only rev. `None` when no such snapshot exists: a rev
+    /// older than the oldest retained snapshot (pruned past
+    /// [`MAX_NOTE_VERSIONS`] or predating the note) — pre-migration rows
+    /// (`rev IS NULL`) never match. This is the writer's base for a
+    /// three-way merge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_note_version_content_by_rev(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        rev: i64,
+    ) -> Result<Option<String>> {
+        dispatch!(self, backend => backend.get_note_version_content_by_rev(workspace_id, note_id, rev).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn append_note_version(
+        &self,
+        note: &Note,
+        author: &NoteVersionAuthor,
+        date: &str,
+        rev: i64,
+    ) -> Result<i64> {
         // IMMEDIATE mode: acquires write lock upfront, avoiding the
         // DEFERRED-mode transaction-upgrade race that surfaces SQLITE_BUSY
         // when concurrent connections hold read locks (STAB-1). The upgrade
@@ -70,24 +218,6 @@ impl Store {
         crate::commit_with_rollback_guard(conn, result, "commit note_version tx failed").await
     }
 
-    /// Persist a note content write and its version snapshot in ONE
-    /// transaction: the same conditional UPDATE as
-    /// [`Store::update_note_versioned`] (gated on `expected_version` when
-    /// `Some`) followed by the snapshot [`Store::append_note_version`] would
-    /// record for the bumped rev. Committing them together means no reader can
-    /// observe the new `rev` on the note row while
-    /// [`Store::get_note_version_content_by_rev`] still resolves that rev to
-    /// the previous content, and a snapshot can never land after a later
-    /// write's, out of rev order. Returns `(rev, v)`: the post-write rev and
-    /// the new version number.
-    ///
-    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
-    /// any other lock is refused with `Error::Internal` before anything is
-    /// written.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or a statement fails.
     pub async fn update_note_with_version(
         &self,
         lock: &crate::NoteWriteLock,
@@ -122,25 +252,6 @@ impl Store {
         }
     }
 
-    /// Persist a parent-note content write together with the child-note
-    /// inserts the new content refers to, in ONE transaction: the gated
-    /// UPDATE + snapshot of [`Store::update_note_with_version`] for `note`
-    /// (gated on `expected_version` when `Some`), then for each of `children`
-    /// the row insert + initial snapshot of [`Store::insert_note_with_version`]
-    /// (at each child's `rev`, stamped with its `updated_at`). Children exist
-    /// only if the parent write lands: a CAS miss commits nothing, so a
-    /// caller that re-derives its work from the fresh parent never leaves
-    /// orphaned or duplicate children behind (`task.convertBlocks` racing a
-    /// save that already converted the same block). Returns `(rev, v)` for
-    /// the parent.
-    ///
-    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
-    /// any other lock is refused with `Error::Internal` before anything is
-    /// written.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the parent does not exist in the workspace; `Error::Internal` if encoding fields or a statement fails (including a duplicate child `(id, workspace_id)`).
     pub async fn update_note_with_version_and_children(
         &self,
         lock: &crate::NoteWriteLock,
@@ -185,18 +296,6 @@ impl Store {
         }
     }
 
-    /// Insert a note row and its initial version snapshot (at `note.rev`) in
-    /// ONE transaction, the insert-side counterpart of
-    /// [`Store::update_note_with_version`]: the row is never visible while
-    /// [`Store::get_note_version_content_by_rev`] cannot yet resolve its rev,
-    /// so a writer that reads the fresh note and later sends that rev as a
-    /// stale base always merges instead of degrading to last-writer-wins, and
-    /// the initial snapshot can never land after a later write's. Returns the
-    /// new version number.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if encoding fields or a statement fails (including a duplicate `(id, workspace_id)`).
     pub async fn insert_note_with_version(
         &self,
         note: &Note,
@@ -215,14 +314,6 @@ impl Store {
         conn.finish(result, "commit note insert tx failed").await
     }
 
-    /// List a note's stored versions ascending by `v`, without content blobs
-    /// (`content_length` is computed in SQL). Scoped by
-    /// `(workspace_id, note_id)` (migration 0030 composite FK) so a same-id
-    /// note in another workspace cannot leak its version history.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_note_versions(
         &self,
         workspace_id: &WorkspaceId,
@@ -241,12 +332,6 @@ impl Store {
         rows.iter().map(map_summary_row).collect()
     }
 
-    /// Fetch one stored version (with content), or `NotFound`. Scoped by
-    /// `(workspace_id, note_id)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the note version does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn get_note_version(
         &self,
         workspace_id: &WorkspaceId,
@@ -269,21 +354,6 @@ impl Store {
         }
     }
 
-    /// The note's content *as of* `rev`: the content of the newest snapshot
-    /// whose recorded `rev` is `<= rev` (one range scan on
-    /// `idx_note_version_rev`). Every content write snapshots at its
-    /// post-write rev, while metadata-only writes bump `rev` without a
-    /// snapshot, so the content at rev N is the last content-write snapshot
-    /// at or below N — an exact hit for a content rev, the preceding content
-    /// for a metadata-only rev. `None` when no such snapshot exists: a rev
-    /// older than the oldest retained snapshot (pruned past
-    /// [`MAX_NOTE_VERSIONS`] or predating the note) — pre-migration rows
-    /// (`rev IS NULL`) never match. This is the writer's base for a
-    /// three-way merge.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_note_version_content_by_rev(
         &self,
         workspace_id: &WorkspaceId,

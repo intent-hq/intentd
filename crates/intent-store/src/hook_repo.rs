@@ -161,6 +161,264 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_hook(&self, h: &Hook) -> Result<()> {
+        dispatch!(self, backend => backend.insert_hook(h).await)
+    }
+
+    /// Get a hook by id; `NotFound` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_hook(&self, hook_id: &HookId) -> Result<Hook> {
+        dispatch!(self, backend => backend.get_hook(hook_id).await)
+    }
+
+    /// List all hooks in a workspace, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<Vec<Hook>> {
+        dispatch!(self, backend => backend.list_hooks_by_workspace(workspace_id).await)
+    }
+
+    /// Active hook metadata for one agent, oldest first. Filtering and payload
+    /// projection happen in SQL, using the partial active-agent index.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database read or row decoding fails.
+    pub async fn active_hook_metadata_by_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Vec<ActiveHookMetadata>> {
+        dispatch!(self, backend => backend.active_hook_metadata_by_agent(agent_id).await)
+    }
+
+    /// Active hook metadata for a workspace, oldest first, for batched agent
+    /// decoration. The partial active-workspace index excludes retired history.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database read or row decoding fails.
+    pub async fn active_hook_metadata_by_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<ActiveHookMetadata>> {
+        dispatch!(self, backend => backend.active_hook_metadata_by_workspace(workspace_id).await)
+    }
+
+    /// The `hook.list` read for a workspace (optionally one agent's rows),
+    /// oldest first, in ONE statement whose cost is O(rows returned): the
+    /// state filter is applied in SQL (`include_retired = false` selects
+    /// only `scheduled`/`running` rows), and the heavy `code` / `last_logs`
+    /// / `last_state` columns are hydrated only for active rows, so the
+    /// retired history a long-lived workspace accumulates is never read in
+    /// full (intent-hq/intent#5307).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_hook_rows(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: Option<&AgentId>,
+        include_retired: bool,
+    ) -> Result<Vec<HookListRow>> {
+        dispatch!(self, backend => backend.list_hook_rows(workspace_id, agent_id, include_retired).await)
+    }
+
+    /// One `hook.list` page: [`Self::list_hook_rows`]' rows (whole workspace)
+    /// in ascending `(created_at, hook_id)` order, strictly after `after`,
+    /// at most `limit` rows. Callers read `limit + 1` to learn whether
+    /// another page follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_hook_rows_page(
+        &self,
+        workspace_id: &WorkspaceId,
+        include_retired: bool,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(String, HookListRow)>> {
+        dispatch!(self, backend => backend.list_hook_rows_page(workspace_id, include_retired, after, limit).await)
+    }
+
+    /// Number of ACTIVE (`scheduled`/`running`) hooks owned by an agent —
+    /// a count-only aggregate for per-turn surfaces (the agent state
+    /// snapshot): no `code`/`last_state` blob hydration and no dependence on
+    /// how many terminal rows the agent has accumulated, unlike
+    /// [`Store::list_hooks_by_agent`] + in-memory filtering.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_active_hooks_by_agent(&self, agent_id: &AgentId) -> Result<u64> {
+        dispatch!(self, backend => backend.count_active_hooks_by_agent(agent_id).await)
+    }
+
+    /// Number of ACTIVE (`scheduled`/`running`) hooks in a workspace — the
+    /// count-only aggregate behind the `Workspace.waiting` hook probe: no
+    /// `code`/`last_state` blob hydration and no dependence on how many
+    /// terminal rows the workspace has accumulated over the daemon's
+    /// lifetime, unlike [`Store::list_hooks_by_workspace`] + in-memory
+    /// filtering (mirrors [`Store::count_active_hooks_by_agent`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_active_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<u64> {
+        dispatch!(self, backend => backend.count_active_hooks_by_workspace(workspace_id).await)
+    }
+
+    /// Requested workspaces that own at least one active hook, in one
+    /// aggregate statement. No hook bodies are hydrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the aggregate query fails.
+    pub async fn workspaces_with_active_hooks(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<std::collections::HashSet<WorkspaceId>> {
+        dispatch!(self, backend => backend.workspaces_with_active_hooks(workspace_ids).await)
+    }
+
+    /// List all hooks owned by an agent, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_hooks_by_agent(&self, agent_id: &AgentId) -> Result<Vec<Hook>> {
+        dispatch!(self, backend => backend.list_hooks_by_agent(agent_id).await)
+    }
+
+    /// Set a hook's lifecycle state; `NotFound` when the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_hook_state(&self, hook_id: &HookId, state: HookState) -> Result<()> {
+        dispatch!(self, backend => backend.update_hook_state(hook_id, state).await)
+    }
+
+    /// Atomically persist a hook's TTL expiry: a single UPDATE sets
+    /// `state = 'expired'` AND clears `next_run_at`, so no reader can ever
+    /// observe an expired hook with a stale `next_run_at`; `NotFound` when
+    /// the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
+    pub async fn expire_hook(&self, hook_id: &HookId) -> Result<()> {
+        dispatch!(self, backend => backend.expire_hook(hook_id).await)
+    }
+
+    /// Record a completed run: bump `run_count`, set `last_run_at`, and set
+    /// (or clear) `next_run_at`; `NotFound` when the row is absent.
+    ///
+    /// Idempotent per run: the `run_count` bump is keyed on `last_run_at`, so
+    /// repeating the call with the same `last_run_at` (a retry after a store
+    /// error reported on an already-committed write) does not count the run
+    /// twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_hook_run(
+        &self,
+        hook_id: &HookId,
+        last_run_at: &str,
+        next_run_at: Option<&str>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.update_hook_run(hook_id, last_run_at, next_run_at).await)
+    }
+
+    /// Record a hook dispatch by raising `dispatch_count` to at least
+    /// `dispatch_count` (the caller's count including this fire); `NotFound`
+    /// when the row is absent.
+    ///
+    /// Idempotent: the write is a floor, not an increment, so repeating the
+    /// call for the same fire (a retry after a store error reported on an
+    /// already-committed write) leaves the count unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
+    pub async fn record_hook_dispatch(&self, hook_id: &HookId, dispatch_count: i64) -> Result<()> {
+        dispatch!(self, backend => backend.record_hook_dispatch(hook_id, dispatch_count).await)
+    }
+
+    /// Set (or clear) a hook's `next_run_at`; `NotFound` when the row is
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_hook_next_run(
+        &self,
+        hook_id: &HookId,
+        next_run_at: Option<&str>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.update_hook_next_run(hook_id, next_run_at).await)
+    }
+
+    /// Set (or clear) a hook's `last_error`; `NotFound` when the row is
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_hook_last_error(
+        &self,
+        hook_id: &HookId,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.update_hook_last_error(hook_id, last_error).await)
+    }
+
+    /// Set (or clear) a hook's `last_logs`; `NotFound` when the row is
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_hook_last_logs(
+        &self,
+        hook_id: &HookId,
+        last_logs: Option<&str>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.update_hook_last_logs(hook_id, last_logs).await)
+    }
+
+    /// Set (or clear) a hook's `last_state`; `NotFound` when the row is
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_hook_last_state(
+        &self,
+        hook_id: &HookId,
+        last_state: Option<&str>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.update_hook_last_state(hook_id, last_state).await)
+    }
+
+    /// Load every active (`scheduled` or `running`) hook across all
+    /// workspaces, oldest first — the boot rehydration read for the hook
+    /// scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn load_active_hooks(&self) -> Result<Vec<Hook>> {
+        dispatch!(self, backend => backend.load_active_hooks().await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn insert_hook(&self, h: &Hook) -> Result<()> {
         let sql = format!(
             "INSERT INTO hook ({COLUMNS}) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -191,11 +449,6 @@ impl Store {
         Ok(())
     }
 
-    /// Get a hook by id; `NotFound` when absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_hook(&self, hook_id: &HookId) -> Result<Hook> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE hook_id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -212,11 +465,6 @@ impl Store {
         }
     }
 
-    /// List all hooks in a workspace, oldest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<Vec<Hook>> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE workspace_id = ? ORDER BY created_at");
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -229,11 +477,6 @@ impl Store {
         rows.iter().map(hook_from_row).collect()
     }
 
-    /// Active hook metadata for one agent, oldest first. Filtering and payload
-    /// projection happen in SQL, using the partial active-agent index.
-    ///
-    /// # Errors
-    /// Returns `Error::Internal` if the database read or row decoding fails.
     pub async fn active_hook_metadata_by_agent(
         &self,
         agent_id: &AgentId,
@@ -242,11 +485,6 @@ impl Store {
             .await
     }
 
-    /// Active hook metadata for a workspace, oldest first, for batched agent
-    /// decoration. The partial active-workspace index excludes retired history.
-    ///
-    /// # Errors
-    /// Returns `Error::Internal` if the database read or row decoding fails.
     pub async fn active_hook_metadata_by_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -282,17 +520,6 @@ impl Store {
         })
     }
 
-    /// The `hook.list` read for a workspace (optionally one agent's rows),
-    /// oldest first, in ONE statement whose cost is O(rows returned): the
-    /// state filter is applied in SQL (`include_retired = false` selects
-    /// only `scheduled`/`running` rows), and the heavy `code` / `last_logs`
-    /// / `last_state` columns are hydrated only for active rows, so the
-    /// retired history a long-lived workspace accumulates is never read in
-    /// full (intent-hq/intent#5307).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_hook_rows(
         &self,
         workspace_id: &WorkspaceId,
@@ -324,14 +551,6 @@ impl Store {
         rows.iter().map(hook_list_row_from_row).collect()
     }
 
-    /// One `hook.list` page: [`Self::list_hook_rows`]' rows (whole workspace)
-    /// in ascending `(created_at, hook_id)` order, strictly after `after`,
-    /// at most `limit` rows. Callers read `limit + 1` to learn whether
-    /// another page follows.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_hook_rows_page(
         &self,
         workspace_id: &WorkspaceId,
@@ -372,15 +591,6 @@ impl Store {
             .collect()
     }
 
-    /// Number of ACTIVE (`scheduled`/`running`) hooks owned by an agent —
-    /// a count-only aggregate for per-turn surfaces (the agent state
-    /// snapshot): no `code`/`last_state` blob hydration and no dependence on
-    /// how many terminal rows the agent has accumulated, unlike
-    /// [`Store::list_hooks_by_agent`] + in-memory filtering.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_active_hooks_by_agent(&self, agent_id: &AgentId) -> Result<u64> {
         let n: i64 = sqlx::query(
             "SELECT COUNT(*) AS n FROM hook \
@@ -394,16 +604,6 @@ impl Store {
         Ok(n.cast_unsigned())
     }
 
-    /// Number of ACTIVE (`scheduled`/`running`) hooks in a workspace — the
-    /// count-only aggregate behind the `Workspace.waiting` hook probe: no
-    /// `code`/`last_state` blob hydration and no dependence on how many
-    /// terminal rows the workspace has accumulated over the daemon's
-    /// lifetime, unlike [`Store::list_hooks_by_workspace`] + in-memory
-    /// filtering (mirrors [`Store::count_active_hooks_by_agent`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_active_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<u64> {
         let n: i64 = sqlx::query(
             "SELECT COUNT(*) AS n FROM hook \
@@ -419,12 +619,6 @@ impl Store {
         Ok(n.cast_unsigned())
     }
 
-    /// Requested workspaces that own at least one active hook, in one
-    /// aggregate statement. No hook bodies are hydrated.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` when the aggregate query fails.
     pub async fn workspaces_with_active_hooks(
         &self,
         workspace_ids: &[WorkspaceId],
@@ -450,11 +644,6 @@ impl Store {
             .collect())
     }
 
-    /// List all hooks owned by an agent, oldest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_hooks_by_agent(&self, agent_id: &AgentId) -> Result<Vec<Hook>> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE agent_id = ? ORDER BY created_at");
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -467,11 +656,6 @@ impl Store {
         rows.iter().map(hook_from_row).collect()
     }
 
-    /// Set a hook's lifecycle state; `NotFound` when the row is absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_state(&self, hook_id: &HookId, state: HookState) -> Result<()> {
         let res = sqlx::query("UPDATE hook SET state = ? WHERE hook_id = ?")
             .bind(state_to_db(state))
@@ -488,14 +672,6 @@ impl Store {
         Ok(())
     }
 
-    /// Atomically persist a hook's TTL expiry: a single UPDATE sets
-    /// `state = 'expired'` AND clears `next_run_at`, so no reader can ever
-    /// observe an expired hook with a stale `next_run_at`; `NotFound` when
-    /// the row is absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn expire_hook(&self, hook_id: &HookId) -> Result<()> {
         let res = sqlx::query("UPDATE hook SET state = ?, next_run_at = NULL WHERE hook_id = ?")
             .bind(state_to_db(HookState::Expired))
@@ -512,17 +688,6 @@ impl Store {
         Ok(())
     }
 
-    /// Record a completed run: bump `run_count`, set `last_run_at`, and set
-    /// (or clear) `next_run_at`; `NotFound` when the row is absent.
-    ///
-    /// Idempotent per run: the `run_count` bump is keyed on `last_run_at`, so
-    /// repeating the call with the same `last_run_at` (a retry after a store
-    /// error reported on an already-committed write) does not count the run
-    /// twice.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_run(
         &self,
         hook_id: &HookId,
@@ -551,17 +716,6 @@ impl Store {
         Ok(())
     }
 
-    /// Record a hook dispatch by raising `dispatch_count` to at least
-    /// `dispatch_count` (the caller's count including this fire); `NotFound`
-    /// when the row is absent.
-    ///
-    /// Idempotent: the write is a floor, not an increment, so repeating the
-    /// call for the same fire (a retry after a store error reported on an
-    /// already-committed write) leaves the count unchanged.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn record_hook_dispatch(&self, hook_id: &HookId, dispatch_count: i64) -> Result<()> {
         let res = sqlx::query(
             "UPDATE hook SET dispatch_count = MAX(dispatch_count, ?) WHERE hook_id = ?",
@@ -582,12 +736,6 @@ impl Store {
         Ok(())
     }
 
-    /// Set (or clear) a hook's `next_run_at`; `NotFound` when the row is
-    /// absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_next_run(
         &self,
         hook_id: &HookId,
@@ -610,12 +758,6 @@ impl Store {
         Ok(())
     }
 
-    /// Set (or clear) a hook's `last_error`; `NotFound` when the row is
-    /// absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_last_error(
         &self,
         hook_id: &HookId,
@@ -638,12 +780,6 @@ impl Store {
         Ok(())
     }
 
-    /// Set (or clear) a hook's `last_logs`; `NotFound` when the row is
-    /// absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_last_logs(
         &self,
         hook_id: &HookId,
@@ -666,12 +802,6 @@ impl Store {
         Ok(())
     }
 
-    /// Set (or clear) a hook's `last_state`; `NotFound` when the row is
-    /// absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_last_state(
         &self,
         hook_id: &HookId,
@@ -711,13 +841,6 @@ impl Store {
         Ok(())
     }
 
-    /// Load every active (`scheduled` or `running`) hook across all
-    /// workspaces, oldest first — the boot rehydration read for the hook
-    /// scheduler.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_active_hooks(&self) -> Result<Vec<Hook>> {
         let sql = format!(
             "SELECT {COLUMNS} FROM hook WHERE state IN ('scheduled', 'running') \

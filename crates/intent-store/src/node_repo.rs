@@ -118,6 +118,38 @@ impl Store {
     /// # Errors
     /// Rejects malformed/mismatched records, reused identity or database errors.
     pub async fn enroll_node(&self, record: &NodeRecord, initial: &NodeLease) -> Result<()> {
+        dispatch!(self, backend => backend.enroll_node(record, initial).await)
+    }
+
+    /// Daemon-to-daemon: start `initial`, a fresh lease on exposed machine
+    /// `record.id` for a newly added executor credential. Registers the
+    /// machine on first use and otherwise refreshes its record (same head
+    /// only), ends every live lease the head holds on it (`lost`, fenced:
+    /// the caller has stopped or refused their agents), then inserts the new
+    /// lease at link generation `generation`, the one its probe bound with.
+    /// # Errors
+    /// Rejects a malformed binding, a machine registered by another head or
+    /// database errors.
+    pub async fn renew_machine_lease(
+        &self,
+        record: &NodeRecord,
+        initial: &NodeLease,
+        generation: NodeCounter,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.renew_machine_lease(record, initial, generation).await)
+    }
+
+    /// Daemon-to-daemon: end every live lease on exposed machine `node_id`
+    /// owned by `head_id` (the machine was removed). Returns how many ended.
+    /// # Errors
+    /// Returns database or decoding errors.
+    pub async fn end_machine_leases(&self, node_id: &str, head_id: &str) -> Result<usize> {
+        dispatch!(self, backend => backend.end_machine_leases(node_id, head_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn enroll_node(&self, record: &NodeRecord, initial: &NodeLease) -> Result<()> {
         validate_enrollment(record, initial)?;
         let owner = &initial.owner;
         let mut tx = self.write_pool().begin().await.map_err(db)?;
@@ -134,15 +166,6 @@ impl Store {
         tx.commit().await.map_err(db)
     }
 
-    /// Daemon-to-daemon: start `initial`, a fresh lease on exposed machine
-    /// `record.id` for a newly added executor credential. Registers the
-    /// machine on first use and otherwise refreshes its record (same head
-    /// only), ends every live lease the head holds on it (`lost`, fenced:
-    /// the caller has stopped or refused their agents), then inserts the new
-    /// lease at link generation `generation`, the one its probe bound with.
-    /// # Errors
-    /// Rejects a malformed binding, a machine registered by another head or
-    /// database errors.
     pub async fn renew_machine_lease(
         &self,
         record: &NodeRecord,
@@ -190,10 +213,6 @@ impl Store {
         tx.commit().await.map_err(db)
     }
 
-    /// Daemon-to-daemon: end every live lease on exposed machine `node_id`
-    /// owned by `head_id` (the machine was removed). Returns how many ended.
-    /// # Errors
-    /// Returns database or decoding errors.
     pub async fn end_machine_leases(&self, node_id: &str, head_id: &str) -> Result<usize> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let owned: Option<String> =
@@ -289,6 +308,151 @@ impl Store {
     /// # Errors
     /// Returns database or decoding errors.
     pub async fn list_owned_nodes(&self, head_id: &str) -> Result<Vec<NodeRecord>> {
+        dispatch!(self, backend => backend.list_owned_nodes(head_id).await)
+    }
+
+    /// Enumerate all leases, including terminal history, for the bound head.
+    /// # Errors
+    /// Returns database or decoding errors.
+    pub async fn list_owned_node_leases(&self, head_id: &str) -> Result<Vec<NodeLease>> {
+        dispatch!(self, backend => backend.list_owned_node_leases(head_id).await)
+    }
+
+    /// Read private inventory for the bound head installation.
+    /// # Errors
+    /// Returns not-found for a different owner or a database failure.
+    pub async fn get_node(&self, id: &str, head_id: &str) -> Result<NodeRecord> {
+        dispatch!(self, backend => backend.get_node(id, head_id).await)
+    }
+
+    /// Read a lease only for its exact durable ownership tuple.
+    /// # Errors
+    /// Returns not-found for stale ownership or a database failure.
+    pub async fn get_node_lease(&self, owner: &LeaseOwner) -> Result<NodeLease> {
+        dispatch!(self, backend => backend.get_node_lease(owner).await)
+    }
+
+    /// Apply a reconciled nonterminal state. Terminal states require a fence.
+    /// # Errors
+    /// Rejects invalid transitions, released leases or stale ownership.
+    pub async fn transition_node_lease(
+        &self,
+        owner: &LeaseOwner,
+        next: LeaseState,
+    ) -> Result<NodeLease> {
+        dispatch!(self, backend => backend.transition_node_lease(owner, next).await)
+    }
+
+    /// Persist a greater generation before dialing. Releasing leases can still
+    /// reconnect to confirm stops, but cannot dispatch new work.
+    /// # Errors
+    /// Rejects terminal/stale leases, exhausted counters or database errors.
+    pub async fn next_node_link_generation(&self, owner: &LeaseOwner) -> Result<NodeCounter> {
+        dispatch!(self, backend => backend.next_node_link_generation(owner).await)
+    }
+
+    /// Drain the static registration and revoke new dispatch, retaining every
+    /// assignment/reservation until confirmed stop or offline-budget fencing.
+    /// # Errors
+    /// Rejects local/stale ownership or database errors.
+    pub async fn request_node_lease_release(&self, owner: &LeaseOwner) -> Result<NodeLease> {
+        dispatch!(self, backend => backend.request_node_lease_release(owner).await)
+    }
+
+    /// Commit externally verified stop/fence evidence, then relinquish managed
+    /// assignment authority. Never invokes a host shutdown or deletes files.
+    /// # Errors
+    /// Rejects local/stale leases, invalid terminal transitions or DB errors.
+    pub async fn finish_node_lease(
+        &self,
+        owner: &LeaseOwner,
+        terminal: LeaseState,
+        fence: LeaseFence,
+    ) -> Result<NodeLease> {
+        dispatch!(self, backend => backend.finish_node_lease(owner, terminal, fence).await)
+    }
+
+    /// Admit a new run with a store-allocated epoch. The template's epoch is
+    /// ignored. Repeating the same run is a no-op only for an identical binding.
+    /// Admission/capacity and public caller authorization belong to services.
+    /// # Errors
+    /// Rejects stale/unfenced ownership, changed workspace, deleted agents and DB errors.
+    pub async fn assign_node_run(&self, template: &NodeAssignment) -> Result<NodeAssignment> {
+        dispatch!(self, backend => backend.assign_node_run(template).await)
+    }
+
+    /// Resolve only the persisted workspace/agent scope, including tombstones.
+    /// # Errors
+    /// Returns not-found for scope mismatch or a database failure.
+    pub async fn get_node_assignment(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<NodeAssignment> {
+        dispatch!(self, backend => backend.get_node_assignment(agent_id, workspace_id).await)
+    }
+
+    /// Revoke one run after confirmed termination, or permanently tombstone its
+    /// ref ownership on discard/deletion. The epoch and checkpoint stay durable.
+    /// # Errors
+    /// Rejects stale run identity or DB errors.
+    pub async fn stop_node_assignment(
+        &self,
+        expected: &NodeAssignment,
+        tombstone: bool,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.stop_node_assignment(expected, tombstone).await)
+    }
+
+    /// Check a repository grant without upgrading the caller to daemon authority.
+    /// # Errors
+    /// Rejects stale/stopped/tombstoned execution or out-of-scope repositories.
+    pub async fn authorize_node_repo(
+        &self,
+        expected: &NodeAssignment,
+        repo_key: &str,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.authorize_node_repo(expected, repo_key).await)
+    }
+
+    /// Allocate a revision before capture on a store-owning local node. Remote
+    /// node persistence must provide the same operation in its private store.
+    /// # Errors
+    /// Rejects stale/stopped ownership, counter exhaustion or DB errors.
+    pub async fn next_node_capture_revision(
+        &self,
+        expected: &NodeAssignment,
+    ) -> Result<NodeCounter> {
+        dispatch!(self, backend => backend.next_node_capture_revision(expected).await)
+    }
+
+    /// Persist metadata ONLY after the caller validates and fsyncs all immutable
+    /// objects/manifest anchors. The transaction revalidates current ownership,
+    /// ack cut and numeric freshness. It emits no event and updates no Git ref.
+    /// # Errors
+    /// Rejects stale owners, unacked cuts, reused revision/UUID and DB errors.
+    pub async fn commit_node_checkpoint(
+        &self,
+        checkpoint: &NodeCheckpoint,
+    ) -> Result<CheckpointReceipt> {
+        dispatch!(self, backend => backend.commit_node_checkpoint(checkpoint).await)
+    }
+
+    /// Read the last successful checkpoint; it may belong to the previous run
+    /// until the new epoch successfully captures its state.
+    /// # Errors
+    /// Returns not-found on workspace mismatch or a database failure.
+    pub async fn current_node_checkpoint(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<NodeCheckpoint>> {
+        dispatch!(self, backend => backend.current_node_checkpoint(agent_id, workspace_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn list_owned_nodes(&self, head_id: &str) -> Result<Vec<NodeRecord>> {
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT record_json FROM execution_node WHERE head_id = ? ORDER BY id",
         )
@@ -299,9 +463,6 @@ impl Store {
         rows.iter().map(|json| decode(json)).collect()
     }
 
-    /// Enumerate all leases, including terminal history, for the bound head.
-    /// # Errors
-    /// Returns database or decoding errors.
     pub async fn list_owned_node_leases(&self, head_id: &str) -> Result<Vec<NodeLease>> {
         let rows = sqlx::query("SELECT l.record_json, l.ack_seq FROM node_lease l JOIN execution_node n ON n.id = l.node_id WHERE n.head_id = ? ORDER BY l.id")
             .bind(head_id).fetch_all(self.read_pool()).await.map_err(db)?;
@@ -314,9 +475,6 @@ impl Store {
             .collect()
     }
 
-    /// Read private inventory for the bound head installation.
-    /// # Errors
-    /// Returns not-found for a different owner or a database failure.
     pub async fn get_node(&self, id: &str, head_id: &str) -> Result<NodeRecord> {
         node(
             &mut *self.read_pool().acquire().await.map_err(db)?,
@@ -326,16 +484,10 @@ impl Store {
         .await
     }
 
-    /// Read a lease only for its exact durable ownership tuple.
-    /// # Errors
-    /// Returns not-found for stale ownership or a database failure.
     pub async fn get_node_lease(&self, owner: &LeaseOwner) -> Result<NodeLease> {
         lease(&mut *self.read_pool().acquire().await.map_err(db)?, owner).await
     }
 
-    /// Apply a reconciled nonterminal state. Terminal states require a fence.
-    /// # Errors
-    /// Rejects invalid transitions, released leases or stale ownership.
     pub async fn transition_node_lease(
         &self,
         owner: &LeaseOwner,
@@ -352,10 +504,6 @@ impl Store {
         Ok(record)
     }
 
-    /// Persist a greater generation before dialing. Releasing leases can still
-    /// reconnect to confirm stops, but cannot dispatch new work.
-    /// # Errors
-    /// Rejects terminal/stale leases, exhausted counters or database errors.
     pub async fn next_node_link_generation(&self, owner: &LeaseOwner) -> Result<NodeCounter> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let mut record = lease(&mut tx, owner).await?;
@@ -368,10 +516,6 @@ impl Store {
         Ok(record.link_generation)
     }
 
-    /// Drain the static registration and revoke new dispatch, retaining every
-    /// assignment/reservation until confirmed stop or offline-budget fencing.
-    /// # Errors
-    /// Rejects local/stale ownership or database errors.
     pub async fn request_node_lease_release(&self, owner: &LeaseOwner) -> Result<NodeLease> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let mut record = lease(&mut tx, owner).await?;
@@ -387,10 +531,6 @@ impl Store {
         Ok(record)
     }
 
-    /// Commit externally verified stop/fence evidence, then relinquish managed
-    /// assignment authority. Never invokes a host shutdown or deletes files.
-    /// # Errors
-    /// Rejects local/stale leases, invalid terminal transitions or DB errors.
     pub async fn finish_node_lease(
         &self,
         owner: &LeaseOwner,
@@ -438,11 +578,6 @@ impl Store {
         Ok(record)
     }
 
-    /// Admit a new run with a store-allocated epoch. The template's epoch is
-    /// ignored. Repeating the same run is a no-op only for an identical binding.
-    /// Admission/capacity and public caller authorization belong to services.
-    /// # Errors
-    /// Rejects stale/unfenced ownership, changed workspace, deleted agents and DB errors.
     pub async fn assign_node_run(&self, template: &NodeAssignment) -> Result<NodeAssignment> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let current_lease = lease(&mut tx, &template.owner).await?;
@@ -516,9 +651,6 @@ impl Store {
         Ok(admitted)
     }
 
-    /// Resolve only the persisted workspace/agent scope, including tombstones.
-    /// # Errors
-    /// Returns not-found for scope mismatch or a database failure.
     pub async fn get_node_assignment(
         &self,
         agent_id: &AgentId,
@@ -536,10 +668,6 @@ impl Store {
         Ok(record)
     }
 
-    /// Revoke one run after confirmed termination, or permanently tombstone its
-    /// ref ownership on discard/deletion. The epoch and checkpoint stay durable.
-    /// # Errors
-    /// Rejects stale run identity or DB errors.
     pub async fn stop_node_assignment(
         &self,
         expected: &NodeAssignment,
@@ -562,9 +690,6 @@ impl Store {
         tx.commit().await.map_err(db)
     }
 
-    /// Check a repository grant without upgrading the caller to daemon authority.
-    /// # Errors
-    /// Rejects stale/stopped/tombstoned execution or out-of-scope repositories.
     pub async fn authorize_node_repo(
         &self,
         expected: &NodeAssignment,
@@ -586,10 +711,6 @@ impl Store {
         Ok(())
     }
 
-    /// Allocate a revision before capture on a store-owning local node. Remote
-    /// node persistence must provide the same operation in its private store.
-    /// # Errors
-    /// Rejects stale/stopped ownership, counter exhaustion or DB errors.
     pub async fn next_node_capture_revision(
         &self,
         expected: &NodeAssignment,
@@ -620,11 +741,6 @@ impl Store {
         Ok(next)
     }
 
-    /// Persist metadata ONLY after the caller validates and fsyncs all immutable
-    /// objects/manifest anchors. The transaction revalidates current ownership,
-    /// ack cut and numeric freshness. It emits no event and updates no Git ref.
-    /// # Errors
-    /// Rejects stale owners, unacked cuts, reused revision/UUID and DB errors.
     pub async fn commit_node_checkpoint(
         &self,
         checkpoint: &NodeCheckpoint,
@@ -715,10 +831,6 @@ impl Store {
         Ok(receipt)
     }
 
-    /// Read the last successful checkpoint; it may belong to the previous run
-    /// until the new epoch successfully captures its state.
-    /// # Errors
-    /// Returns not-found on workspace mismatch or a database failure.
     pub async fn current_node_checkpoint(
         &self,
         agent_id: &AgentId,
@@ -737,6 +849,138 @@ impl Store {
     /// # Errors
     /// Returns database or decoding errors.
     pub async fn find_execution_node(&self, id: &str) -> Result<Option<NodeRecord>> {
+        dispatch!(self, backend => backend.find_execution_node(id).await)
+    }
+
+    /// The head id this installation registered its nodes under, if it has
+    /// registered any.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn node_head_id(&self) -> Result<Option<String>> {
+        dispatch!(self, backend => backend.node_head_id().await)
+    }
+
+    /// Record what the node reported when a link was bound: its platform,
+    /// capacity and version. The node becomes ready and an acquiring lease
+    /// becomes ready.
+    /// # Errors
+    /// Rejects terminal/stale leases, invalid transitions or database errors.
+    pub async fn record_node_welcome(
+        &self,
+        owner: &LeaseOwner,
+        os: NodeOs,
+        arch: NodeArch,
+        max_agents: u32,
+        version: &str,
+    ) -> Result<NodeLease> {
+        dispatch!(self, backend => backend.record_node_welcome(owner, os, arch, max_agents, version).await)
+    }
+
+    /// Persist that head has ingested every journal record up to `seq`. The
+    /// ack never moves backwards; the persisted value is returned.
+    /// # Errors
+    /// Rejects terminal/stale leases or database errors.
+    pub async fn advance_node_lease_ack(
+        &self,
+        owner: &LeaseOwner,
+        seq: NodeCounter,
+    ) -> Result<NodeCounter> {
+        dispatch!(self, backend => backend.advance_node_lease_ack(owner, seq).await)
+    }
+
+    /// Record that `agent.agent_id` runs on `agent.node_id` under
+    /// `agent.lease_id`. Recording the same agent again is a no-op only for
+    /// an identical node and lease.
+    /// # Errors
+    /// Rejects an unknown or terminal lease, an agent already placed
+    /// elsewhere, a missing agent or database errors.
+    pub async fn record_remote_agent(&self, agent: &RemoteAgentRecord) -> Result<()> {
+        dispatch!(self, backend => backend.record_remote_agent(agent).await)
+    }
+
+    /// The agents recorded on `lease_id`, oldest first.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn list_remote_agents(&self, lease_id: &str) -> Result<Vec<RemoteAgentRecord>> {
+        dispatch!(self, backend => backend.list_remote_agents(lease_id).await)
+    }
+
+    /// Where `agent_id` runs remotely, if it does.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn get_remote_agent(&self, agent_id: &AgentId) -> Result<Option<RemoteAgentRecord>> {
+        dispatch!(self, backend => backend.get_remote_agent(agent_id).await)
+    }
+
+    /// The remote placements among `agent_ids`, in one statement (agents
+    /// placed locally have none).
+    /// # Errors
+    /// Returns database errors.
+    pub async fn get_remote_agents(&self, agent_ids: &[AgentId]) -> Result<Vec<RemoteAgentRecord>> {
+        dispatch!(self, backend => backend.get_remote_agents(agent_ids).await)
+    }
+
+    /// Forget that `agent_id` runs remotely. Returns whether it was recorded.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn remove_remote_agent(&self, agent_id: &AgentId) -> Result<bool> {
+        dispatch!(self, backend => backend.remove_remote_agent(agent_id).await)
+    }
+
+    /// Record a final stop for `stop.agent_id`, unless one is already
+    /// recorded; returns the recorded one (whose `stop_id` every resend
+    /// reuses).
+    /// # Errors
+    /// Returns database errors.
+    pub async fn record_final_stop(
+        &self,
+        stop: &RemoteFinalStopRecord,
+    ) -> Result<RemoteFinalStopRecord> {
+        dispatch!(self, backend => backend.record_final_stop(stop).await)
+    }
+
+    /// Whether `workspace_id` has a remote agent or a final stop still
+    /// pending (kept after the agent and its `remote_agent` row are gone,
+    /// until the machine's last push lands in the workspace's repository).
+    /// # Errors
+    /// Returns database errors.
+    pub async fn workspace_has_remote_agent_work(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.workspace_has_remote_agent_work(workspace_id).await)
+    }
+
+    /// The final stops recorded on `lease_id`, oldest first.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn list_final_stops(&self, lease_id: &str) -> Result<Vec<RemoteFinalStopRecord>> {
+        dispatch!(self, backend => backend.list_final_stops(lease_id).await)
+    }
+
+    /// `agent_id`'s recorded final stop, if any.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn get_final_stop(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<RemoteFinalStopRecord>> {
+        dispatch!(self, backend => backend.get_final_stop(agent_id).await)
+    }
+
+    /// The final stop `stop_id` of `agent_id` is done (acknowledged, or past
+    /// its bound): drop its record and, unless its session can come back
+    /// ([`FinalStopReason::keeps_placement`]), the agent's placement record,
+    /// in one transaction. Returns whether that final stop was recorded.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn finish_final_stop(&self, agent_id: &AgentId, stop_id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.finish_final_stop(agent_id, stop_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn find_execution_node(&self, id: &str) -> Result<Option<NodeRecord>> {
         let json: Option<String> =
             sqlx::query_scalar("SELECT record_json FROM execution_node WHERE id = ?")
                 .bind(id)
@@ -746,10 +990,6 @@ impl Store {
         json.as_deref().map(decode).transpose()
     }
 
-    /// The head id this installation registered its nodes under, if it has
-    /// registered any.
-    /// # Errors
-    /// Returns database errors.
     pub async fn node_head_id(&self) -> Result<Option<String>> {
         sqlx::query_scalar("SELECT head_id FROM execution_node ORDER BY rowid LIMIT 1")
             .fetch_optional(self.read_pool())
@@ -757,11 +997,6 @@ impl Store {
             .map_err(db)
     }
 
-    /// Record what the node reported when a link was bound: its platform,
-    /// capacity and version. The node becomes ready and an acquiring lease
-    /// becomes ready.
-    /// # Errors
-    /// Rejects terminal/stale leases, invalid transitions or database errors.
     pub async fn record_node_welcome(
         &self,
         owner: &LeaseOwner,
@@ -793,10 +1028,6 @@ impl Store {
         Ok(record)
     }
 
-    /// Persist that head has ingested every journal record up to `seq`. The
-    /// ack never moves backwards; the persisted value is returned.
-    /// # Errors
-    /// Rejects terminal/stale leases or database errors.
     pub async fn advance_node_lease_ack(
         &self,
         owner: &LeaseOwner,
@@ -820,12 +1051,6 @@ impl Store {
         Ok(seq)
     }
 
-    /// Record that `agent.agent_id` runs on `agent.node_id` under
-    /// `agent.lease_id`. Recording the same agent again is a no-op only for
-    /// an identical node and lease.
-    /// # Errors
-    /// Rejects an unknown or terminal lease, an agent already placed
-    /// elsewhere, a missing agent or database errors.
     pub async fn record_remote_agent(&self, agent: &RemoteAgentRecord) -> Result<()> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let row = sqlx::query("SELECT node_id, terminal FROM node_lease WHERE id = ?")
@@ -864,9 +1089,6 @@ impl Store {
         tx.commit().await.map_err(db)
     }
 
-    /// The agents recorded on `lease_id`, oldest first.
-    /// # Errors
-    /// Returns database errors.
     pub async fn list_remote_agents(&self, lease_id: &str) -> Result<Vec<RemoteAgentRecord>> {
         let rows = sqlx::query(
             "SELECT agent_id, workspace_id, node_id, lease_id, created_at FROM remote_agent WHERE lease_id = ? ORDER BY created_at, agent_id",
@@ -887,9 +1109,6 @@ impl Store {
             .collect())
     }
 
-    /// Where `agent_id` runs remotely, if it does.
-    /// # Errors
-    /// Returns database errors.
     pub async fn get_remote_agent(&self, agent_id: &AgentId) -> Result<Option<RemoteAgentRecord>> {
         let row = sqlx::query(
             "SELECT agent_id, workspace_id, node_id, lease_id, created_at FROM remote_agent WHERE agent_id = ?",
@@ -907,10 +1126,6 @@ impl Store {
         }))
     }
 
-    /// The remote placements among `agent_ids`, in one statement (agents
-    /// placed locally have none).
-    /// # Errors
-    /// Returns database errors.
     pub async fn get_remote_agents(&self, agent_ids: &[AgentId]) -> Result<Vec<RemoteAgentRecord>> {
         if agent_ids.is_empty() {
             return Ok(Vec::new());
@@ -937,9 +1152,6 @@ impl Store {
             .collect())
     }
 
-    /// Forget that `agent_id` runs remotely. Returns whether it was recorded.
-    /// # Errors
-    /// Returns database errors.
     pub async fn remove_remote_agent(&self, agent_id: &AgentId) -> Result<bool> {
         let done = sqlx::query("DELETE FROM remote_agent WHERE agent_id = ?")
             .bind(agent_id.as_str())
@@ -949,11 +1161,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Record a final stop for `stop.agent_id`, unless one is already
-    /// recorded; returns the recorded one (whose `stop_id` every resend
-    /// reuses).
-    /// # Errors
-    /// Returns database errors.
     pub async fn record_final_stop(
         &self,
         stop: &RemoteFinalStopRecord,
@@ -987,11 +1194,6 @@ impl Store {
         Ok(recorded)
     }
 
-    /// Whether `workspace_id` has a remote agent or a final stop still
-    /// pending (kept after the agent and its `remote_agent` row are gone,
-    /// until the machine's last push lands in the workspace's repository).
-    /// # Errors
-    /// Returns database errors.
     pub async fn workspace_has_remote_agent_work(
         &self,
         workspace_id: &WorkspaceId,
@@ -1008,9 +1210,6 @@ impl Store {
         Ok(row.get::<i64, _>("pending") != 0)
     }
 
-    /// The final stops recorded on `lease_id`, oldest first.
-    /// # Errors
-    /// Returns database errors.
     pub async fn list_final_stops(&self, lease_id: &str) -> Result<Vec<RemoteFinalStopRecord>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "{FINAL_STOP_SELECT} WHERE lease_id = ? ORDER BY requested_at, agent_id"
@@ -1022,9 +1221,6 @@ impl Store {
         rows.iter().map(final_stop_row).collect()
     }
 
-    /// `agent_id`'s recorded final stop, if any.
-    /// # Errors
-    /// Returns database errors.
     pub async fn get_final_stop(
         &self,
         agent_id: &AgentId,
@@ -1039,12 +1235,6 @@ impl Store {
         row.as_ref().map(final_stop_row).transpose()
     }
 
-    /// The final stop `stop_id` of `agent_id` is done (acknowledged, or past
-    /// its bound): drop its record and, unless its session can come back
-    /// ([`FinalStopReason::keeps_placement`]), the agent's placement record,
-    /// in one transaction. Returns whether that final stop was recorded.
-    /// # Errors
-    /// Returns database errors.
     pub async fn finish_final_stop(&self, agent_id: &AgentId, stop_id: &str) -> Result<bool> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let reason = sqlx::query(
