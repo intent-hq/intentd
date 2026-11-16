@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.224] - 2026-11-16
+
+### 🚀 Features
+
+- *(remote)* Move a workspace's home to a cloud entry or an agent's sandbox ([#3403](https://github.com/intent-hq/intentd/pull/3403))
+- *(nodes)* Remote sub-agents fetch submodule repositories through the backend ([#3399](https://github.com/intent-hq/intentd/pull/3399))
+
+### 🐛 Bug Fixes
+
+- Split router dispatch into per-namespace functions ([#3401](https://github.com/intent-hq/intentd/pull/3401))
+
+### ⚙️ Miscellaneous Tasks
+
+- Drop caller-binding markers on test-only spawns ([#3404](https://github.com/intent-hq/intentd/pull/3404))
+
+
 ## [0.11.223] - 2026-11-16
 
 ### 🧪 Testing
