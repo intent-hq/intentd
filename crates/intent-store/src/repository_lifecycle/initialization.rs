@@ -278,7 +278,7 @@ impl Store {
         observer: Arc<dyn RepositoryLifecycleObserver>,
         original_owner: Box<dyn Any + Send>,
     ) -> Result<RepositoryInitializationClaim> {
-        dispatch!(self, backend => backend.bind_repository_initialization_claim(observer, original_owner))
+        pending_postgres!("bind_repository_initialization_claim", self, backend => backend.bind_repository_initialization_claim(observer, original_owner))
     }
 
     /// Confirm only the original physical owner's real winning write or load.
@@ -294,7 +294,7 @@ impl Store {
         claim: RepositoryInitializationClaim,
         binding: RepositoryInitializationBinding,
     ) -> Result<RepositoryInitializationConfirmation> {
-        dispatch!(self, backend => backend.initialize_repository_acp_session(claim, binding).await)
+        pending_postgres!("initialize_repository_acp_session", self, backend => backend.initialize_repository_acp_session(claim, binding).await)
     }
 
     /// Preserve original persistence facts even when owner confirmation fails.
@@ -306,7 +306,7 @@ impl Store {
         claim: RepositoryInitializationClaim,
         binding: RepositoryInitializationBinding,
     ) -> RepositoryInitializationOutcome {
-        dispatch!(self, backend => backend.initialize_repository_acp_session_outcome(claim, binding).await)
+        pending_postgres!(panic "initialize_repository_acp_session_outcome", self, backend => backend.initialize_repository_acp_session_outcome(claim, binding).await)
     }
 
     /// Atomically bind an original private native family to the winning session
@@ -318,7 +318,7 @@ impl Store {
         binding: RepositoryInitializationBinding,
         enrollment: crate::ReviewContextEnrollmentIntent,
     ) -> RepositoryInitializationOutcome {
-        dispatch!(self, backend => backend.initialize_repository_review_session_outcome(claim, binding, enrollment).await)
+        pending_postgres!(panic "initialize_repository_review_session_outcome", self, backend => backend.initialize_repository_review_session_outcome(claim, binding, enrollment).await)
     }
 
     /// Preserve ordinary ACP result/accounting behavior in one transaction.
@@ -330,7 +330,7 @@ impl Store {
         claim: Option<RepositoryInitializationClaim>,
         binding: RepositoryInitializationBinding,
     ) -> RepositoryAcpCompatibilityOutcome {
-        dispatch!(self, backend => backend.initialize_repository_acp_session_compatible(claim, binding).await)
+        pending_postgres!(panic "initialize_repository_acp_session_compatible", self, backend => backend.initialize_repository_acp_session_compatible(claim, binding).await)
     }
 
     /// Consume a receipt only in its original managed domain/observer.
@@ -344,7 +344,7 @@ impl Store {
         observer: &Arc<dyn RepositoryLifecycleObserver>,
         confirmation: RepositoryInitializationConfirmation,
     ) -> Result<(RepositoryInitializationBinding, Box<dyn Any + Send>)> {
-        dispatch!(self, backend => backend.consume_repository_initialization_confirmation(observer, confirmation))
+        pending_postgres!("consume_repository_initialization_confirmation", self, backend => backend.consume_repository_initialization_confirmation(observer, confirmation))
     }
 }
 

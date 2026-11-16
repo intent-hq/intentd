@@ -16,7 +16,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_mcp_oauth_token(&self, server_id: &str) -> Result<Option<String>> {
-        dispatch!(self, backend => backend.get_mcp_oauth_token(server_id).await)
+        pending_postgres!("get_mcp_oauth_token", self, backend => backend.get_mcp_oauth_token(server_id).await)
     }
 
     /// Upsert the raw JSON `token_bag` for `server_id`, replacing any prior bag
@@ -31,7 +31,7 @@ impl Store {
         token_bag: &str,
         updated_at: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_mcp_oauth_token(server_id, token_bag, updated_at).await)
+        pending_postgres!("set_mcp_oauth_token", self, backend => backend.set_mcp_oauth_token(server_id, token_bag, updated_at).await)
     }
 
     /// Delete the persisted bag for `server_id`. Returns `true` when a row was
@@ -41,7 +41,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_mcp_oauth_token(&self, server_id: &str) -> Result<bool> {
-        dispatch!(self, backend => backend.delete_mcp_oauth_token(server_id).await)
+        pending_postgres!("delete_mcp_oauth_token", self, backend => backend.delete_mcp_oauth_token(server_id).await)
     }
 
     /// List every `server_id` with a stored bag, sorted ascending for a stable
@@ -52,7 +52,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_mcp_oauth_server_ids(&self) -> Result<Vec<String>> {
-        dispatch!(self, backend => backend.list_mcp_oauth_server_ids().await)
+        pending_postgres!("list_mcp_oauth_server_ids", self, backend => backend.list_mcp_oauth_server_ids().await)
     }
 }
 

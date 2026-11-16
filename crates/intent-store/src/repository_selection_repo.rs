@@ -425,7 +425,7 @@ impl Store {
         &self,
         root: &RepositoryRootId,
     ) -> Result<RepositorySelectionSnapshot> {
-        dispatch!(self, backend => backend.repository_selection_snapshot(root).await)
+        pending_postgres!("repository_selection_snapshot", self, backend => backend.repository_selection_snapshot(root).await)
     }
 
     /// Compare against the original domain/root/choice facts. Unknown attempts
@@ -435,7 +435,7 @@ impl Store {
         original: &RepositorySelectionSnapshot,
         change: RepositorySelectionChange,
     ) -> RepositorySelectionWriteOutcome {
-        dispatch!(self, backend => backend.write_repository_selection(original, change).await)
+        pending_postgres!(panic "write_repository_selection", self, backend => backend.write_repository_selection(original, change).await)
     }
 
     /// Native selection CAS under the caller's already validated original authority.
@@ -452,7 +452,7 @@ impl Store {
         original_token_hash: Option<&str>,
         admit: impl FnOnce() -> Result<()> + Send,
     ) -> RepositorySelectionWriteOutcome {
-        dispatch!(self, backend => backend.write_repository_selection_admitted(original, change, expected_authority, original_token_hash, admit).await)
+        pending_postgres!(panic "write_repository_selection_admitted", self, backend => backend.write_repository_selection_admitted(original, change, expected_authority, original_token_hash, admit).await)
     }
 
     /// Persist an explicit reset through the same comparison/transaction path.
@@ -460,7 +460,7 @@ impl Store {
         &self,
         original: &RepositorySelectionSnapshot,
     ) -> RepositorySelectionWriteOutcome {
-        dispatch!(self, backend => backend.reset_repository_selection(original).await)
+        pending_postgres!(panic "reset_repository_selection", self, backend => backend.reset_repository_selection(original).await)
     }
 }
 

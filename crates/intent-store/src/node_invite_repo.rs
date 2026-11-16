@@ -84,7 +84,7 @@ impl Store {
     /// `InvalidParams` for an empty id or hash or a closed invite;
     /// `Internal` on database failure.
     pub async fn insert_node_invite(&self, invite: &NodeInvite, secret_hash: &str) -> Result<()> {
-        dispatch!(self, backend => backend.insert_node_invite(invite, secret_hash).await)
+        pending_postgres!("insert_node_invite", self, backend => backend.insert_node_invite(invite, secret_hash).await)
     }
 
     /// The open invites (unused, unrevoked, unexpired), oldest first.
@@ -93,7 +93,7 @@ impl Store {
     ///
     /// `Internal` on database failure.
     pub async fn list_open_node_invites(&self) -> Result<Vec<NodeInvite>> {
-        dispatch!(self, backend => backend.list_open_node_invites().await)
+        pending_postgres!("list_open_node_invites", self, backend => backend.list_open_node_invites().await)
     }
 
     /// The invite each claimed credential came from: `(credential id,
@@ -103,7 +103,7 @@ impl Store {
     ///
     /// `Internal` on database failure.
     pub async fn claimed_node_invites(&self) -> Result<Vec<(String, String)>> {
-        dispatch!(self, backend => backend.claimed_node_invites().await)
+        pending_postgres!("claimed_node_invites", self, backend => backend.claimed_node_invites().await)
     }
 
     /// Revoke an open invite. A used or already revoked invite is left as
@@ -113,7 +113,7 @@ impl Store {
     ///
     /// `Internal` on database failure.
     pub async fn revoke_node_invite(&self, id: &str) -> Result<NodeInviteRevocation> {
-        dispatch!(self, backend => backend.revoke_node_invite(id).await)
+        pending_postgres!("revoke_node_invite", self, backend => backend.revoke_node_invite(id).await)
     }
 
     /// Check invite `id` against `secret_hash`, then refuse with `late` if
@@ -134,7 +134,7 @@ impl Store {
         token_hash: &str,
         late: Option<&'static str>,
     ) -> Result<std::result::Result<(), NodeInviteRefusal>> {
-        dispatch!(self, backend => backend.claim_node_invite(id, secret_hash, backend_id, credential, token_hash, late).await)
+        pending_postgres!("claim_node_invite", self, backend => backend.claim_node_invite(id, secret_hash, backend_id, credential, token_hash, late).await)
     }
 }
 

@@ -123,7 +123,7 @@ impl Store {
         message: &str,
         principal: &PrincipalId,
     ) -> Result<DiscussionReactionState> {
-        dispatch!(self, backend => backend.discussion_reaction_state(ws, conversation, message, principal).await)
+        pending_postgres!("discussion_reaction_state", self, backend => backend.discussion_reaction_state(ws, conversation, message, principal).await)
     }
 
     /// Set a human viewer's selection; identity snapshots come from the store.
@@ -138,7 +138,7 @@ impl Store {
         reaction: &str,
         active: bool,
     ) -> Result<(DiscussionReactionState, bool)> {
-        dispatch!(self, backend => backend.set_discussion_reaction(ws, conversation, message, principal, reaction, active).await)
+        pending_postgres!("set_discussion_reaction", self, backend => backend.set_discussion_reaction(ws, conversation, message, principal, reaction, active).await)
     }
 
     /// Read counts, version and this viewer's choices from one snapshot.
@@ -151,7 +151,7 @@ impl Store {
         message: &str,
         actor: &DiscussionActor,
     ) -> Result<DiscussionReactionState> {
-        dispatch!(self, backend => backend.discussion_actor_reaction_state(ws, conversation, message, actor).await)
+        pending_postgres!("discussion_actor_reaction_state", self, backend => backend.discussion_actor_reaction_state(ws, conversation, message, actor).await)
     }
 
     /// Set one authenticated caller's desired reaction state atomically.
@@ -167,7 +167,7 @@ impl Store {
         reaction: &str,
         active: bool,
     ) -> Result<(DiscussionReactionState, bool)> {
-        dispatch!(self, backend => backend.set_discussion_actor_reaction(ws, conversation, message, actor, reaction, active).await)
+        pending_postgres!("set_discussion_actor_reaction", self, backend => backend.set_discussion_actor_reaction(ws, conversation, message, actor, reaction, active).await)
     }
 }
 

@@ -51,7 +51,7 @@ impl Store {
     /// Enable task projection events and obtain their shared publication baselines.
     #[must_use]
     pub fn task_event_baselines(&self) -> Arc<TaskEventBaselines> {
-        dispatch!(self, backend => backend.task_event_baselines())
+        pending_postgres!(panic "task_event_baselines", self, backend => backend.task_event_baselines())
     }
 }
 

@@ -139,7 +139,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if encoding the comment JSON or the insert fails.
     pub async fn insert_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
-        dispatch!(self, backend => backend.insert_comment(workspace_id, c).await)
+        pending_postgres!("insert_comment", self, backend => backend.insert_comment(workspace_id, c).await)
     }
 
     /// [`Store::insert_comment`], additionally merging `legacy_extra` — legacy
@@ -157,7 +157,7 @@ impl Store {
         c: &Comment,
         legacy_extra: &Map<String, Value>,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.insert_comment_with_extras(workspace_id, c, legacy_extra).await)
+        pending_postgres!("insert_comment_with_extras", self, backend => backend.insert_comment_with_extras(workspace_id, c, legacy_extra).await)
     }
 
     /// Atomically persist a `comment.add`: the anchor-marker note rewrite
@@ -188,7 +188,7 @@ impl Store {
         c: &Comment,
         author: &NoteVersionAuthor,
     ) -> Result<i64> {
-        dispatch!(self, backend => backend.update_note_with_comment(lock, note, expected_version, c, author).await)
+        pending_postgres!("update_note_with_comment", self, backend => backend.update_note_with_comment(lock, note, expected_version, c, author).await)
     }
 
     /// Fetch a single comment by id, or `NotFound`.
@@ -197,7 +197,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the comment does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_comment(&self, id: &str) -> Result<Comment> {
-        dispatch!(self, backend => backend.get_comment(id).await)
+        pending_postgres!("get_comment", self, backend => backend.get_comment(id).await)
     }
 
     /// Update an existing comment (full row replace). Scoped to `workspace_id`
@@ -214,7 +214,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn update_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
-        dispatch!(self, backend => backend.update_comment(workspace_id, c).await)
+        pending_postgres!("update_comment", self, backend => backend.update_comment(workspace_id, c).await)
     }
 
     /// Flag one root comment of `note_id` orphaned, touching only its
@@ -234,7 +234,7 @@ impl Store {
         comment_id: &str,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.mark_comment_orphaned(workspace_id, note_id, comment_id, updated_at).await)
+        pending_postgres!("mark_comment_orphaned", self, backend => backend.mark_comment_orphaned(workspace_id, note_id, comment_id, updated_at).await)
     }
 
     /// Delete a comment by id, scoped to `workspace_id` (defense-in-depth).
@@ -244,7 +244,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn delete_comment(&self, workspace_id: &WorkspaceId, id: &str) -> Result<()> {
-        dispatch!(self, backend => backend.delete_comment(workspace_id, id).await)
+        pending_postgres!("delete_comment", self, backend => backend.delete_comment(workspace_id, id).await)
     }
 
     /// Delete a comment within a note and return its authoritative thread ID.
@@ -262,7 +262,7 @@ impl Store {
         note_id: &NoteId,
         id: &str,
     ) -> Result<String> {
-        dispatch!(self, backend => backend.delete_comment_in_note(workspace_id, note_id, id).await)
+        pending_postgres!("delete_comment_in_note", self, backend => backend.delete_comment_in_note(workspace_id, note_id, id).await)
     }
 
     /// List a note's comments, ordered by creation time.
@@ -271,7 +271,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_comments(&self, note_id: &NoteId) -> Result<Vec<Comment>> {
-        dispatch!(self, backend => backend.list_comments(note_id).await)
+        pending_postgres!("list_comments", self, backend => backend.list_comments(note_id).await)
     }
 
     /// List a note's comments scoped to `workspace_id`, ordered by creation
@@ -288,7 +288,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> Result<Vec<Comment>> {
-        dispatch!(self, backend => backend.list_comments_in_workspace(workspace_id, note_id).await)
+        pending_postgres!("list_comments_in_workspace", self, backend => backend.list_comments_in_workspace(workspace_id, note_id).await)
     }
 
     /// Set the `status` of every comment in a thread, refreshing `updated_at`.
@@ -307,7 +307,7 @@ impl Store {
         status: CommentStatus,
         updated_at: &str,
     ) -> Result<u64> {
-        dispatch!(self, backend => backend.set_thread_status(workspace_id, thread_id, status, updated_at).await)
+        pending_postgres!("set_thread_status", self, backend => backend.set_thread_status(workspace_id, thread_id, status, updated_at).await)
     }
 
     /// Assemble a [`CommentThread`] (the comments sharing `thread_id`).
@@ -316,7 +316,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if no comments share `thread_id`; `Error::Internal` if the database query fails.
     pub async fn get_thread(&self, thread_id: &str) -> Result<CommentThread> {
-        dispatch!(self, backend => backend.get_thread(thread_id).await)
+        pending_postgres!("get_thread", self, backend => backend.get_thread(thread_id).await)
     }
 }
 

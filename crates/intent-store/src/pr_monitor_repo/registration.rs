@@ -29,7 +29,7 @@ impl Store {
         now: &str,
         pause: Option<&str>,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.rearm_legacy_pr_monitor(expected, owner, target, baseline, now, pause).await)
+        pending_postgres!("rearm_legacy_pr_monitor", self, backend => backend.rearm_legacy_pr_monitor(expected, owner, target, baseline, now, pause).await)
     }
 }
 

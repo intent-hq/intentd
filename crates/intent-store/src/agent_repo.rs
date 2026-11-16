@@ -1169,7 +1169,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if encoding session fields or the insert fails, including when a server-minted agent id collides with an existing session.
     pub async fn insert_agent_session(&self, s: &impl FullAgentSessionRow) -> Result<()> {
-        dispatch!(self, backend => backend.insert_agent_session(s).await)
+        pending_postgres!("insert_agent_session", self, backend => backend.insert_agent_session(s).await)
     }
 
     /// Insert a session with the daemon-owned task-graph feature snapshot that
@@ -1183,7 +1183,7 @@ impl Store {
         s: &impl FullAgentSessionRow,
         task_graph_enabled: bool,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.insert_agent_session_with_task_graph(s, task_graph_enabled).await)
+        pending_postgres!("insert_agent_session_with_task_graph", self, backend => backend.insert_agent_session_with_task_graph(s, task_graph_enabled).await)
     }
 
     /// Atomically insert a session and optionally remember its manual specialist.
@@ -1196,7 +1196,7 @@ impl Store {
         task_graph_enabled: bool,
         remember_specialist: bool,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.insert_agent_session_with_preferences(s, task_graph_enabled, remember_specialist).await)
+        pending_postgres!("insert_agent_session_with_preferences", self, backend => backend.insert_agent_session_with_preferences(s, task_graph_enabled, remember_specialist).await)
     }
 
     /// Insert an agent-session row together with its full message log in ONE
@@ -1219,7 +1219,7 @@ impl Store {
         s: &impl FullAgentSessionRow,
         messages: &[ReplaceMessage<'_>],
     ) -> Result<()> {
-        dispatch!(self, backend => backend.insert_agent_session_with_messages(s, messages).await)
+        pending_postgres!("insert_agent_session_with_messages", self, backend => backend.insert_agent_session_with_messages(s, messages).await)
     }
 
     /// Fetch a session by id (with its message log), or `NotFound`.
@@ -1234,7 +1234,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_with_transcript(&self, id: &AgentId) -> Result<AgentSession> {
-        dispatch!(self, backend => backend.get_agent_session_with_transcript(id).await)
+        pending_postgres!("get_agent_session_with_transcript", self, backend => backend.get_agent_session_with_transcript(id).await)
     }
 
     /// Every persisted session column (the heavy `system_prompt`,
@@ -1249,7 +1249,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_without_messages(&self, id: &AgentId) -> Result<AgentSession> {
-        dispatch!(self, backend => backend.get_agent_session_without_messages(id).await)
+        pending_postgres!("get_agent_session_without_messages", self, backend => backend.get_agent_session_without_messages(id).await)
     }
 
     /// Metadata-only session lookup: the session row WITHOUT its message log
@@ -1263,7 +1263,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_summary(&self, id: &AgentId) -> Result<AgentSessionSummary> {
-        dispatch!(self, backend => backend.get_agent_session_summary(id).await)
+        pending_postgres!("get_agent_session_summary", self, backend => backend.get_agent_session_summary(id).await)
     }
 
     /// Batched status projection: the persisted [`AgentStatus`] of every id
@@ -1284,7 +1284,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_statuses(&self, ids: &[AgentId]) -> Result<Vec<(AgentId, AgentStatus)>> {
-        dispatch!(self, backend => backend.get_agent_statuses(ids).await)
+        pending_postgres!("get_agent_statuses", self, backend => backend.get_agent_statuses(ids).await)
     }
 
     /// Read the daemon-owned task-graph snapshot captured when this agent was
@@ -1297,7 +1297,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_task_graph_enabled(&self, id: &AgentId) -> Result<bool> {
-        dispatch!(self, backend => backend.get_agent_session_task_graph_enabled(id).await)
+        pending_postgres!("get_agent_session_task_graph_enabled", self, backend => backend.get_agent_session_task_graph_enabled(id).await)
     }
 
     /// Lazy legacy freeze (intent-hq/monorepo#2459): persist `snapshot` as the
@@ -1318,7 +1318,7 @@ impl Store {
         id: &AgentId,
         snapshot: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>> {
-        dispatch!(self, backend => backend.materialize_agent_session_harness_features(id, snapshot).await)
+        pending_postgres!("materialize_agent_session_harness_features", self, backend => backend.materialize_agent_session_harness_features(id, snapshot).await)
     }
 
     /// Lightweight status-only lookup used by hot paths that just need the
@@ -1331,7 +1331,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_status(&self, id: &AgentId) -> Result<AgentStatus> {
-        dispatch!(self, backend => backend.get_agent_session_status(id).await)
+        pending_postgres!("get_agent_session_status", self, backend => backend.get_agent_session_status(id).await)
     }
 
     /// Lightweight timestamp-only lookup for daemon-global active-agent probes.
@@ -1341,7 +1341,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_updated_at(&self, id: &AgentId) -> Result<String> {
-        dispatch!(self, backend => backend.get_agent_session_updated_at(id).await)
+        pending_postgres!("get_agent_session_updated_at", self, backend => backend.get_agent_session_updated_at(id).await)
     }
 
     /// Batched `updated_at` projection: the timestamp of every id in `ids`
@@ -1361,7 +1361,7 @@ impl Store {
         &self,
         ids: &[AgentId],
     ) -> Result<std::collections::HashMap<AgentId, String>> {
-        dispatch!(self, backend => backend.get_agent_session_updated_at_batch(ids).await)
+        pending_postgres!("get_agent_session_updated_at_batch", self, backend => backend.get_agent_session_updated_at_batch(ids).await)
     }
 
     /// Lightweight name-only lookup used by hot paths that just need the
@@ -1372,7 +1372,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_name(&self, id: &AgentId) -> Result<Option<String>> {
-        dispatch!(self, backend => backend.get_agent_session_name(id).await)
+        pending_postgres!("get_agent_session_name", self, backend => backend.get_agent_session_name(id).await)
     }
 
     /// List a workspace's sessions (each with its message log), oldest first.
@@ -1384,7 +1384,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentSession>> {
-        dispatch!(self, backend => backend.list_agent_sessions_with_transcripts(workspace_id).await)
+        pending_postgres!("list_agent_sessions_with_transcripts", self, backend => backend.list_agent_sessions_with_transcripts(workspace_id).await)
     }
 
     /// List a workspace's sessions WITHOUT message logs, oldest first. Used by hot
@@ -1401,7 +1401,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentSessionSummary>> {
-        dispatch!(self, backend => backend.list_agent_session_summaries(workspace_id).await)
+        pending_postgres!("list_agent_session_summaries", self, backend => backend.list_agent_session_summaries(workspace_id).await)
     }
 
     /// Message-free session summaries for all requested workspaces in one
@@ -1415,7 +1415,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<std::collections::HashMap<WorkspaceId, Vec<AgentSessionSummary>>> {
-        dispatch!(self, backend => backend.list_agent_session_summaries_by_workspace(workspace_ids).await)
+        pending_postgres!("list_agent_session_summaries_by_workspace", self, backend => backend.list_agent_session_summaries_by_workspace(workspace_ids).await)
     }
 
     /// [`Store::list_agent_session_summaries`] restricted to ACTIVE (not
@@ -1430,7 +1430,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentSessionSummary>> {
-        dispatch!(self, backend => backend.list_active_agent_session_summaries(workspace_id).await)
+        pending_postgres!("list_active_agent_session_summaries", self, backend => backend.list_active_agent_session_summaries(workspace_id).await)
     }
 
     /// [`Store::list_agent_session_summaries`] restricted to soft-RETIRED
@@ -1445,7 +1445,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentSessionSummary>> {
-        dispatch!(self, backend => backend.list_retired_agent_session_summaries(workspace_id).await)
+        pending_postgres!("list_retired_agent_session_summaries", self, backend => backend.list_retired_agent_session_summaries(workspace_id).await)
     }
 
     /// Number of soft-retired sessions in a workspace — the `retiredCount`
@@ -1461,7 +1461,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_retired_agent_sessions(&self, workspace_id: &WorkspaceId) -> Result<u64> {
-        dispatch!(self, backend => backend.count_retired_agent_sessions(workspace_id).await)
+        pending_postgres!("count_retired_agent_sessions", self, backend => backend.count_retired_agent_sessions(workspace_id).await)
     }
 
     /// [`Store::list_agent_session_summaries`] restricted to ONE
@@ -1480,7 +1480,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         scope: &AgentListRowScope,
     ) -> Result<Vec<AgentSessionSummary>> {
-        dispatch!(self, backend => backend.list_scoped_agent_session_summaries(workspace_id, scope).await)
+        pending_postgres!("list_scoped_agent_session_summaries", self, backend => backend.list_scoped_agent_session_summaries(workspace_id, scope).await)
     }
 
     /// Per-bin counts of the workspace's non-retired sessions — the
@@ -1497,7 +1497,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<AgentScopeCounts> {
-        dispatch!(self, backend => backend.count_agent_sessions_by_scope(workspace_id).await)
+        pending_postgres!("count_agent_sessions_by_scope", self, backend => backend.count_agent_sessions_by_scope(workspace_id).await)
     }
 
     /// Per-parent counts of the workspace's non-retired delegated sessions —
@@ -1518,7 +1518,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<AgentDelegatedCounts> {
-        dispatch!(self, backend => backend.count_delegated_agent_sessions_by_parent(workspace_id).await)
+        pending_postgres!("count_delegated_agent_sessions_by_parent", self, backend => backend.count_delegated_agent_sessions_by_parent(workspace_id).await)
     }
 
     /// Get message count, whether any assistant message exists, and the total
@@ -1543,7 +1543,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, (u64, bool, u64)>> {
-        dispatch!(self, backend => backend.get_agent_session_message_stats(workspace_id).await)
+        pending_postgres!("get_agent_session_message_stats", self, backend => backend.get_agent_session_message_stats(workspace_id).await)
     }
 
     /// Per-session `AgentLite` projection inputs for every session in a
@@ -1565,7 +1565,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        dispatch!(self, backend => backend.get_agent_session_message_projections(workspace_id).await)
+        pending_postgres!("get_agent_session_message_projections", self, backend => backend.get_agent_session_message_projections(workspace_id).await)
     }
 
     /// [`Store::get_agent_session_message_projections`] restricted to ACTIVE
@@ -1581,7 +1581,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        dispatch!(self, backend => backend.get_active_agent_session_message_projections(workspace_id).await)
+        pending_postgres!("get_active_agent_session_message_projections", self, backend => backend.get_active_agent_session_message_projections(workspace_id).await)
     }
 
     /// [`Store::get_agent_session_message_projections`] restricted to
@@ -1599,7 +1599,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        dispatch!(self, backend => backend.get_retired_agent_session_message_projections(workspace_id).await)
+        pending_postgres!("get_retired_agent_session_message_projections", self, backend => backend.get_retired_agent_session_message_projections(workspace_id).await)
     }
 
     /// [`Store::get_agent_session_message_projections`] restricted to ONE
@@ -1616,7 +1616,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         scope: &AgentListRowScope,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        dispatch!(self, backend => backend.get_scoped_agent_session_message_projections(workspace_id, scope).await)
+        pending_postgres!("get_scoped_agent_session_message_projections", self, backend => backend.get_scoped_agent_session_message_projections(workspace_id, scope).await)
     }
 
     /// Bounded `AgentLite` projection inputs for a single session
@@ -1633,7 +1633,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<SessionMessageProjection> {
-        dispatch!(self, backend => backend.get_agent_session_message_projection(agent_id).await)
+        pending_postgres!("get_agent_session_message_projection", self, backend => backend.get_agent_session_message_projection(agent_id).await)
     }
 
     /// Get the `agent_message` watermark for a workspace: the count of messages
@@ -1645,7 +1645,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_message_watermark(&self, workspace_id: &WorkspaceId) -> Result<u64> {
-        dispatch!(self, backend => backend.get_workspace_message_watermark(workspace_id).await)
+        pending_postgres!("get_workspace_message_watermark", self, backend => backend.get_workspace_message_watermark(workspace_id).await)
     }
 
     /// Whether the workspace has any **unread top-level session**: a
@@ -1664,7 +1664,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.workspace_has_unread_top_level_session(workspace_id).await)
+        pending_postgres!("workspace_has_unread_top_level_session", self, backend => backend.workspace_has_unread_top_level_session(workspace_id).await)
     }
 
     /// The set of workspace ids that currently have an unread top-level
@@ -1682,7 +1682,7 @@ impl Store {
     pub async fn workspaces_with_unread_top_level_sessions(
         &self,
     ) -> Result<std::collections::HashSet<String>> {
-        dispatch!(self, backend => backend.workspaces_with_unread_top_level_sessions().await)
+        pending_postgres!("workspaces_with_unread_top_level_sessions", self, backend => backend.workspaces_with_unread_top_level_sessions().await)
     }
 
     /// The requested workspace ids that currently have an unread top-level
@@ -1696,7 +1696,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<std::collections::HashSet<WorkspaceId>> {
-        dispatch!(self, backend => backend.workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids).await)
+        pending_postgres!("workspaces_with_unread_top_level_sessions_by_workspace", self, backend => backend.workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids).await)
     }
 
     /// Legacy top-level sessions whose pending-question marker was never
@@ -1714,7 +1714,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<Vec<(AgentId, String, String, serde_json::Value)>> {
-        dispatch!(self, backend => backend.list_legacy_question_tail_candidates_by_workspace(workspace_ids).await)
+        pending_postgres!("list_legacy_question_tail_candidates_by_workspace", self, backend => backend.list_legacy_question_tail_candidates_by_workspace(workspace_ids).await)
     }
 
     /// The workspace's top-level (no parent, non-background, non-deleted)
@@ -1732,7 +1732,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, String)>> {
-        dispatch!(self, backend => backend.list_top_level_sessions_with_unseen_last_message(workspace_id).await)
+        pending_postgres!("list_top_level_sessions_with_unseen_last_message", self, backend => backend.list_top_level_sessions_with_unseen_last_message(workspace_id).await)
     }
 
     /// Upsert one session's cumulative end-of-turn token-usage snapshot
@@ -1751,7 +1751,7 @@ impl Store {
         id: &AgentId,
         snapshot: &TokenUsageTotals,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_agent_session_token_usage(workspace_id, id, snapshot).await)
+        pending_postgres!("set_agent_session_token_usage", self, backend => backend.set_agent_session_token_usage(workspace_id, id, snapshot).await)
     }
 
     /// Guarded write of a session's *resolved* display model (D13/D14): the
@@ -1780,7 +1780,7 @@ impl Store {
         expected_model: Option<&str>,
         resolved: Option<&str>,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_agent_session_resolved_model(workspace_id, id, expected_model, resolved).await)
+        pending_postgres!("set_agent_session_resolved_model", self, backend => backend.set_agent_session_resolved_model(workspace_id, id, expected_model, resolved).await)
     }
 
     /// Clear a session's resolved display model (D14). Called by
@@ -1798,7 +1798,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.clear_agent_session_resolved_model(workspace_id, id).await)
+        pending_postgres!("clear_agent_session_resolved_model", self, backend => backend.clear_agent_session_resolved_model(workspace_id, id).await)
     }
 
     /// Read the model/provider identity of the agent's last committed turn
@@ -1816,7 +1816,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
     ) -> Result<(Option<String>, Option<String>)> {
-        dispatch!(self, backend => backend.get_agent_session_last_turn_model(workspace_id, id).await)
+        pending_postgres!("get_agent_session_last_turn_model", self, backend => backend.get_agent_session_last_turn_model(workspace_id, id).await)
     }
 
     /// Persist the model/provider identity the CURRENT turn runs under
@@ -1837,7 +1837,7 @@ impl Store {
         model: Option<&str>,
         provider: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_agent_session_last_turn_model(workspace_id, id, model, provider).await)
+        pending_postgres!("set_agent_session_last_turn_model", self, backend => backend.set_agent_session_last_turn_model(workspace_id, id, model, provider).await)
     }
 
     /// Read the last confirmed effort and known provider default. SQL NULL
@@ -1850,7 +1850,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
     ) -> Result<Option<AgentTurnEffort>> {
-        dispatch!(self, backend => backend.get_agent_session_last_turn_effort(workspace_id, id).await)
+        pending_postgres!("get_agent_session_last_turn_effort", self, backend => backend.get_agent_session_last_turn_effort(workspace_id, id).await)
     }
 
     /// Commit only effort known to have been applied at the turn boundary.
@@ -1863,7 +1863,7 @@ impl Store {
         id: &AgentId,
         effort: &AgentTurnEffort,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_agent_session_last_turn_effort(workspace_id, id, effort).await)
+        pending_postgres!("set_agent_session_last_turn_effort", self, backend => backend.set_agent_session_last_turn_effort(workspace_id, id, effort).await)
     }
 
     /// Metadata of the agent's newest `limit` identity-change system rows
@@ -1880,7 +1880,7 @@ impl Store {
         agent_id: &AgentId,
         limit: u32,
     ) -> Result<Vec<serde_json::Value>> {
-        dispatch!(self, backend => backend.recent_agent_identity_notices(agent_id, limit).await)
+        pending_postgres!("recent_agent_identity_notices", self, backend => backend.recent_agent_identity_notices(agent_id, limit).await)
     }
 
     /// Metadata of the agent's newest `role: "system"` transcript row that
@@ -1901,7 +1901,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<Option<serde_json::Value>> {
-        dispatch!(self, backend => backend.latest_agent_identity_notice(agent_id).await)
+        pending_postgres!("latest_agent_identity_notice", self, backend => backend.latest_agent_identity_notice(agent_id).await)
     }
 
     /// Read one session's `model`, `resolved_model` (D14 display identity of
@@ -1931,7 +1931,7 @@ impl Store {
         Option<String>,
         Option<TokenUsageTotals>,
     )> {
-        dispatch!(self, backend => backend.get_agent_session_token_usage(workspace_id, id).await)
+        pending_postgres!("get_agent_session_token_usage", self, backend => backend.get_agent_session_token_usage(workspace_id, id).await)
     }
 
     /// Get lightweight usage data for all agents in a workspace: for each agent,
@@ -1954,7 +1954,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentUsageRow>> {
-        dispatch!(self, backend => backend.get_workspace_agent_usage_data(workspace_id).await)
+        pending_postgres!("get_workspace_agent_usage_data", self, backend => backend.get_workspace_agent_usage_data(workspace_id).await)
     }
 
     /// List every persisted session across workspaces, oldest first. Backs the
@@ -1967,7 +1967,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_agent_sessions(&self) -> Result<Vec<AgentSession>> {
-        dispatch!(self, backend => backend.list_all_agent_sessions().await)
+        pending_postgres!("list_all_agent_sessions", self, backend => backend.list_all_agent_sessions().await)
     }
 
     /// Update mutable session state, enforcing the `acp_session_id` write-once
@@ -1991,7 +1991,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &impl FullAgentSessionRow,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.update_agent_session(workspace_id, s).await)
+        pending_postgres!("update_agent_session", self, backend => backend.update_agent_session(workspace_id, s).await)
     }
 
     /// Atomically update a session, optional manual specialist memory, and
@@ -2016,7 +2016,7 @@ impl Store {
         pinned: Option<bool>,
         explicit_effort: bool,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.update_agent_session_with_preferences(workspace_id, s, remember_specialist, notifications_muted, pinned, explicit_effort).await)
+        pending_postgres!("update_agent_session_with_preferences", self, backend => backend.update_agent_session_with_preferences(workspace_id, s, remember_specialist, notifications_muted, pinned, explicit_effort).await)
     }
 
     /// Set the session's `notifications_muted` flag (0123) — the store side
@@ -2040,7 +2040,7 @@ impl Store {
         id: &AgentId,
         muted: bool,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_agent_notifications_muted(workspace_id, id, muted).await)
+        pending_postgres!("set_agent_notifications_muted", self, backend => backend.set_agent_notifications_muted(workspace_id, id, muted).await)
     }
 
     /// Set the session's sidebar `pinned` flag (0180) — the store side of
@@ -2058,7 +2058,7 @@ impl Store {
         id: &AgentId,
         pinned: bool,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_agent_pinned(workspace_id, id, pinned).await)
+        pending_postgres!("set_agent_pinned", self, backend => backend.set_agent_pinned(workspace_id, id, pinned).await)
     }
 
     /// Set the session's permission policy override (0190) — the store side
@@ -2076,7 +2076,7 @@ impl Store {
         id: &AgentId,
         policy: Option<&str>,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_agent_permission_policy(workspace_id, id, policy).await)
+        pending_postgres!("set_agent_permission_policy", self, backend => backend.set_agent_permission_policy(workspace_id, id, policy).await)
     }
 
     /// Persist a model switch (`agent.setModel`): a narrow write of `model`,
@@ -2100,7 +2100,7 @@ impl Store {
         provider: Option<&str>,
         updated_at: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_agent_session_model(workspace_id, id, model, provider, updated_at).await)
+        pending_postgres!("set_agent_session_model", self, backend => backend.set_agent_session_model(workspace_id, id, model, provider, updated_at).await)
     }
 
     /// [`Store::set_agent_session_model`] that also records whether the
@@ -2122,7 +2122,7 @@ impl Store {
         manual_choice: Option<&str>,
         updated_at: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_agent_session_model_choice(workspace_id, id, model, provider, manual_choice, updated_at).await)
+        pending_postgres!("set_agent_session_model_choice", self, backend => backend.set_agent_session_model_choice(workspace_id, id, model, provider, manual_choice, updated_at).await)
     }
 
     /// Re-home a session onto another provider at turn start
@@ -2155,7 +2155,7 @@ impl Store {
         model: Option<&str>,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.rehome_agent_session_provider(workspace_id, id, expected_provider, provider, model, updated_at).await)
+        pending_postgres!("rehome_agent_session_provider", self, backend => backend.rehome_agent_session_provider(workspace_id, id, expected_provider, provider, model, updated_at).await)
     }
 
     /// Move a session onto a backup provider profile after a quota failure
@@ -2191,7 +2191,7 @@ impl Store {
         yield_to_manual_choice: bool,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.failover_agent_session_provider(workspace_id, id, expected_provider, expected_model, provider, metadata_key, yield_to_manual_choice, updated_at).await)
+        pending_postgres!("failover_agent_session_provider", self, backend => backend.failover_agent_session_provider(workspace_id, id, expected_provider, expected_model, provider, metadata_key, yield_to_manual_choice, updated_at).await)
     }
 
     /// Remove the pending manual choice token ([`MANUAL_CHOICE_METADATA_KEY`])
@@ -2209,7 +2209,7 @@ impl Store {
         id: &AgentId,
         token: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.take_agent_session_manual_choice(workspace_id, id, token).await)
+        pending_postgres!("take_agent_session_manual_choice", self, backend => backend.take_agent_session_manual_choice(workspace_id, id, token).await)
     }
 
     /// Set one JSON `metadata` key only while the session still carries
@@ -2237,7 +2237,7 @@ impl Store {
         yield_to_manual_choice: bool,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_agent_session_metadata_key_json_if_identity(workspace_id, id, expected_provider, expected_model, key, value, yield_to_manual_choice, updated_at).await)
+        pending_postgres!("set_agent_session_metadata_key_json_if_identity", self, backend => backend.set_agent_session_metadata_key_json_if_identity(workspace_id, id, expected_provider, expected_model, key, value, yield_to_manual_choice, updated_at).await)
     }
 
     /// Pin the provider of a legacy session — one whose `provider` column is
@@ -2260,7 +2260,7 @@ impl Store {
         provider: &str,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.pin_agent_session_provider_if_null(workspace_id, id, provider, updated_at).await)
+        pending_postgres!("pin_agent_session_provider_if_null", self, backend => backend.pin_agent_session_provider_if_null(workspace_id, id, provider, updated_at).await)
     }
 
     /// Fill a session's `model` / `reasoning_effort` from the identity a turn
@@ -2285,7 +2285,7 @@ impl Store {
         reasoning_effort: Option<&str>,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.fill_agent_session_identity_if_null(workspace_id, id, model, reasoning_effort, updated_at).await)
+        pending_postgres!("fill_agent_session_identity_if_null", self, backend => backend.fill_agent_session_identity_if_null(workspace_id, id, model, reasoning_effort, updated_at).await)
     }
 
     /// Fill a NULL/blank `reasoning_effort` with the level the provider
@@ -2307,7 +2307,7 @@ impl Store {
         expected_model: Option<&str>,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.fill_agent_session_effort_if_identity(workspace_id, id, effort, expected_provider, expected_model, updated_at).await)
+        pending_postgres!("fill_agent_session_effort_if_identity", self, backend => backend.fill_agent_session_effort_if_identity(workspace_id, id, effort, expected_provider, expected_model, updated_at).await)
     }
 
     /// Persist the assembled system prompt (the spawn path): a narrow write
@@ -2331,7 +2331,7 @@ impl Store {
         id: &AgentId,
         system_prompt: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_agent_session_system_prompt(workspace_id, id, system_prompt).await)
+        pending_postgres!("set_agent_session_system_prompt", self, backend => backend.set_agent_session_system_prompt(workspace_id, id, system_prompt).await)
     }
 
     /// [`Store::set_agent_session_system_prompt`] that stores the prompt's
@@ -2348,7 +2348,7 @@ impl Store {
         system_prompt: &str,
         breakdown: Option<&intent_core::prompt_breakdown::PromptBreakdown>,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_agent_session_system_prompt_with_breakdown(workspace_id, id, system_prompt, breakdown).await)
+        pending_postgres!("set_agent_session_system_prompt_with_breakdown", self, backend => backend.set_agent_session_system_prompt_with_breakdown(workspace_id, id, system_prompt, breakdown).await)
     }
 
     /// The stored prompt breakdown of a session, provided the stored
@@ -2367,7 +2367,7 @@ impl Store {
         id: &AgentId,
         system_prompt: Option<&str>,
     ) -> Result<Option<intent_core::prompt_breakdown::PromptBreakdown>> {
-        dispatch!(self, backend => backend.get_agent_session_prompt_breakdown(id, system_prompt).await)
+        pending_postgres!("get_agent_session_prompt_breakdown", self, backend => backend.get_agent_session_prompt_breakdown(id, system_prompt).await)
     }
 
     /// Persist a metadata change: a narrow write of `metadata` and
@@ -2389,7 +2389,7 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         updated_at: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.update_agent_session_metadata(workspace_id, id, metadata, updated_at).await)
+        pending_postgres!("update_agent_session_metadata", self, backend => backend.update_agent_session_metadata(workspace_id, id, metadata, updated_at).await)
     }
 
     /// Atomically set ONE key in `agent_session.metadata` in SQL (`json_set`),
@@ -2425,7 +2425,7 @@ impl Store {
         expected: Option<Option<&str>>,
         updated_at: Option<&str>,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_agent_session_metadata_key(workspace_id, id, key, value, expected, updated_at).await)
+        pending_postgres!("set_agent_session_metadata_key", self, backend => backend.set_agent_session_metadata_key(workspace_id, id, key, value, expected, updated_at).await)
     }
 
     /// Atomically read and remove one string-valued session metadata key:
@@ -2445,7 +2445,7 @@ impl Store {
         id: &AgentId,
         key: &str,
     ) -> Result<Option<String>> {
-        dispatch!(self, backend => backend.take_agent_session_metadata_key(workspace_id, id, key).await)
+        pending_postgres!("take_agent_session_metadata_key", self, backend => backend.take_agent_session_metadata_key(workspace_id, id, key).await)
     }
 
     /// [`Store::set_agent_session_metadata_key`] for a JSON-typed value:
@@ -2469,7 +2469,7 @@ impl Store {
         value: &str,
         updated_at: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_agent_session_metadata_key_json(workspace_id, id, key, value, updated_at).await)
+        pending_postgres!("set_agent_session_metadata_key_json", self, backend => backend.set_agent_session_metadata_key_json(workspace_id, id, key, value, updated_at).await)
     }
 
     /// CAS-set one session metadata key unless a later user row already
@@ -2489,7 +2489,7 @@ impl Store {
         question: &AgentMessage,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_pending_questions_marker_if_unanswered(workspace_id, id, expected, question, updated_at).await)
+        pending_postgres!("set_pending_questions_marker_if_unanswered", self, backend => backend.set_pending_questions_marker_if_unanswered(workspace_id, id, expected, question, updated_at).await)
     }
 
     /// Persist the runtime `status` + `is_active` transition for `agent_session`
@@ -2520,7 +2520,7 @@ impl Store {
         updated_at: &str,
         stop_reason: Option<Option<String>>,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_agent_session_status(workspace_id, id, status, is_active, updated_at, stop_reason).await)
+        pending_postgres!("set_agent_session_status", self, backend => backend.set_agent_session_status(workspace_id, id, status, is_active, updated_at, stop_reason).await)
     }
 
     /// Refresh `updated_at` to the current timestamp whenever a message is
@@ -2541,7 +2541,7 @@ impl Store {
         id: &AgentId,
         updated_at: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.refresh_agent_session_timestamp(workspace_id, id, updated_at).await)
+        pending_postgres!("refresh_agent_session_timestamp", self, backend => backend.refresh_agent_session_timestamp(workspace_id, id, updated_at).await)
     }
 
     /// Read `agent_session.retired_at` alone — the cheap inertness probe for
@@ -2552,7 +2552,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_retired_at(&self, id: &AgentId) -> Result<Option<String>> {
-        dispatch!(self, backend => backend.get_agent_session_retired_at(id).await)
+        pending_postgres!("get_agent_session_retired_at", self, backend => backend.get_agent_session_retired_at(id).await)
     }
 
     /// Set or clear `agent_session.retired_at` (soft retire / restore).
@@ -2572,7 +2572,7 @@ impl Store {
         retired_at: Option<&str>,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_agent_session_retired_at(workspace_id, id, retired_at, updated_at).await)
+        pending_postgres!("set_agent_session_retired_at", self, backend => backend.set_agent_session_retired_at(workspace_id, id, retired_at, updated_at).await)
     }
 
     /// Clear `completion_report` + `completion_report_timestamp` when a new turn
@@ -2591,7 +2591,7 @@ impl Store {
         id: &AgentId,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.clear_completion_report(workspace_id, id, updated_at).await)
+        pending_postgres!("clear_completion_report", self, backend => backend.clear_completion_report(workspace_id, id, updated_at).await)
     }
 
     /// Persist a pending attention request (`attention_request_kind` /
@@ -2616,7 +2616,7 @@ impl Store {
         reason: &str,
         timestamp: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_attention_request(workspace_id, id, kind, reason, timestamp).await)
+        pending_postgres!("set_attention_request", self, backend => backend.set_attention_request(workspace_id, id, kind, reason, timestamp).await)
     }
 
     /// Clear the pending attention request (`attention_request_kind` /
@@ -2636,7 +2636,7 @@ impl Store {
         id: &AgentId,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.clear_attention_request(workspace_id, id, updated_at).await)
+        pending_postgres!("clear_attention_request", self, backend => backend.clear_attention_request(workspace_id, id, updated_at).await)
     }
 
     /// Clear only the blocker observed by the resolver. A replacement request
@@ -2652,7 +2652,7 @@ impl Store {
         timestamp: Option<&str>,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.clear_blocker_request_if_matches(workspace_id, id, reason, timestamp, updated_at).await)
+        pending_postgres!("clear_blocker_request_if_matches", self, backend => backend.clear_blocker_request_if_matches(workspace_id, id, reason, timestamp, updated_at).await)
     }
 
     /// Replace the session's `effort_levels` wholesale (PROTOCOL §5.5,
@@ -2675,7 +2675,7 @@ impl Store {
         levels: Option<&[String]>,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_agent_effort_levels(workspace_id, id, levels, updated_at).await)
+        pending_postgres!("set_agent_effort_levels", self, backend => backend.set_agent_effort_levels(workspace_id, id, levels, updated_at).await)
     }
 
     /// Reset all `is_active=1` rows to `is_active=0` unconditionally (Wave B
@@ -2688,7 +2688,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn reset_all_active_flags(&self) -> Result<usize> {
-        dispatch!(self, backend => backend.reset_all_active_flags().await)
+        pending_postgres!("reset_all_active_flags", self, backend => backend.reset_all_active_flags().await)
     }
 
     /// Set `acp_session_id` write-once (the provider `session:created` path).
@@ -2705,7 +2705,7 @@ impl Store {
         id: &AgentId,
         acp_session_id: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_acp_session_id(workspace_id, id, acp_session_id).await)
+        pending_postgres!("set_acp_session_id", self, backend => backend.set_acp_session_id(workspace_id, id, acp_session_id).await)
     }
 
     /// Compare-and-swap `acp_session_id` on the resume-impossible fallback: swap
@@ -2738,7 +2738,7 @@ impl Store {
         expected_old: &str,
         new_acp_session_id: &str,
     ) -> Result<String> {
-        dispatch!(self, backend => backend.replace_acp_session_id(workspace_id, id, expected_old, new_acp_session_id).await)
+        pending_postgres!("replace_acp_session_id", self, backend => backend.replace_acp_session_id(workspace_id, id, expected_old, new_acp_session_id).await)
     }
 
     /// Delete an agent session and its message log (the `agent_message` rows
@@ -2763,7 +2763,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.delete_agent_session(workspace_id, id).await)
+        pending_postgres!("delete_agent_session", self, backend => backend.delete_agent_session(workspace_id, id).await)
     }
 }
 
@@ -6390,7 +6390,7 @@ impl Store {
         prefer_workspace_id: Option<&WorkspaceId>,
         limit: Option<i64>,
     ) -> Result<Vec<MessageFtsMatch>> {
-        dispatch!(self, backend => backend.search_agent_messages_fts(match_expr, workspace_id, agent_id, role, prefer_workspace_id, limit).await)
+        pending_postgres!("search_agent_messages_fts", self, backend => backend.search_agent_messages_fts(match_expr, workspace_id, agent_id, role, prefer_workspace_id, limit).await)
     }
 
     /// Append a message to an agent's insert-only log, minting a `UUIDv7` id and
@@ -6406,7 +6406,7 @@ impl Store {
         content: &serde_json::Value,
         created_at: &str,
     ) -> Result<AgentMessage> {
-        dispatch!(self, backend => backend.append_agent_message(agent_id, role, content, created_at).await)
+        pending_postgres!("append_agent_message", self, backend => backend.append_agent_message(agent_id, role, content, created_at).await)
     }
 
     /// Append a message with a caller-supplied `metadata` payload
@@ -6426,7 +6426,7 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         created_at: &str,
     ) -> Result<AgentMessage> {
-        dispatch!(self, backend => backend.append_agent_message_with_metadata(agent_id, role, content, metadata, created_at).await)
+        pending_postgres!("append_agent_message_with_metadata", self, backend => backend.append_agent_message_with_metadata(agent_id, role, content, metadata, created_at).await)
     }
 
     /// Append a message with a caller-supplied id (the assistant turn mints its
@@ -6472,7 +6472,7 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         created_at: &str,
     ) -> Result<AgentMessage> {
-        dispatch!(self, backend => backend.append_agent_message_with_id(agent_id, id, role, content, metadata, created_at).await)
+        pending_postgres!("append_agent_message_with_id", self, backend => backend.append_agent_message_with_id(agent_id, id, role, content, metadata, created_at).await)
     }
 
     /// Append with daemon-trusted origin provenance. Opaque metadata never
@@ -6493,7 +6493,7 @@ impl Store {
         created_at: &str,
         origin: UsageMessageOrigin,
     ) -> Result<AgentMessage> {
-        dispatch!(self, backend => backend.append_agent_message_with_provenance(agent_id, id, role, content, metadata, created_at, origin).await)
+        pending_postgres!("append_agent_message_with_provenance", self, backend => backend.append_agent_message_with_provenance(agent_id, id, role, content, metadata, created_at, origin).await)
     }
 
     /// Stage one completed content block's heavy payload into
@@ -6528,7 +6528,7 @@ impl Store {
         block_ordinal: usize,
         block: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>> {
-        dispatch!(self, backend => backend.prestage_agent_message_payload(agent_id, message_id, block_ordinal, block).await)
+        pending_postgres!("prestage_agent_message_payload", self, backend => backend.prestage_agent_message_payload(agent_id, message_id, block_ordinal, block).await)
     }
 
     /// [`Store::append_agent_message_with_id`] for a turn that pre-staged its
@@ -6564,7 +6564,7 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         created_at: &str,
     ) -> Result<AgentMessage> {
-        dispatch!(self, backend => backend.append_agent_message_prestaged(agent_id, id, role, content, metadata, created_at).await)
+        pending_postgres!("append_agent_message_prestaged", self, backend => backend.append_agent_message_prestaged(agent_id, id, role, content, metadata, created_at).await)
     }
 
     /// Delete `message_id`'s pre-staged `agent_message_payload` rows after an
@@ -6579,7 +6579,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_prestaged_agent_message_payloads(&self, message_id: &str) -> Result<u64> {
-        dispatch!(self, backend => backend.delete_prestaged_agent_message_payloads(message_id).await)
+        pending_postgres!("delete_prestaged_agent_message_payloads", self, backend => backend.delete_prestaged_agent_message_payloads(message_id).await)
     }
 
     /// Whether `agent_id` has at least one persisted `assistant` message —
@@ -6592,7 +6592,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn agent_has_assistant_message(&self, agent_id: &AgentId) -> Result<bool> {
-        dispatch!(self, backend => backend.agent_has_assistant_message(agent_id).await)
+        pending_postgres!("agent_has_assistant_message", self, backend => backend.agent_has_assistant_message(agent_id).await)
     }
 
     /// Whether an `assistant` message follows `agent_id`'s latest `user`
@@ -6606,7 +6606,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn agent_has_assistant_after_last_user(&self, agent_id: &AgentId) -> Result<bool> {
-        dispatch!(self, backend => backend.agent_has_assistant_after_last_user(agent_id).await)
+        pending_postgres!("agent_has_assistant_after_last_user", self, backend => backend.agent_has_assistant_after_last_user(agent_id).await)
     }
 
     /// Read an agent's messages in chronological (`seq` ascending) order. When
@@ -6621,7 +6621,7 @@ impl Store {
         agent_id: &AgentId,
         limit: Option<i64>,
     ) -> Result<Vec<AgentMessage>> {
-        dispatch!(self, backend => backend.get_agent_messages(agent_id, limit).await)
+        pending_postgres!("get_agent_messages", self, backend => backend.get_agent_messages(agent_id, limit).await)
     }
 
     /// Read an agent's whole log shaped for recovery replay (`history_xml`):
@@ -6648,7 +6648,7 @@ impl Store {
         agent_id: &AgentId,
         replay_chars: usize,
     ) -> Result<Vec<AgentMessage>> {
-        dispatch!(self, backend => backend.get_agent_messages_for_replay(agent_id, replay_chars).await)
+        pending_postgres!("get_agent_messages_for_replay", self, backend => backend.get_agent_messages_for_replay(agent_id, replay_chars).await)
     }
 
     /// Tool-payload retention sweep (`agents.toolPayloadRetentionDays`):
@@ -6683,7 +6683,7 @@ impl Store {
         cutoff_iso: &str,
         replay_chars: usize,
     ) -> Result<u64> {
-        dispatch!(self, backend => backend.compact_tool_payloads_before(cutoff_iso, replay_chars).await)
+        pending_postgres!("compact_tool_payloads_before", self, backend => backend.compact_tool_payloads_before(cutoff_iso, replay_chars).await)
     }
 
     /// The newest non-`system` message of an agent's log, hydrated as a
@@ -6702,7 +6702,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<Option<AgentMessage>> {
-        dispatch!(self, backend => backend.get_last_non_system_message(agent_id).await)
+        pending_postgres!("get_last_non_system_message", self, backend => backend.get_last_non_system_message(agent_id).await)
     }
 
     /// Queue IDs whose user transcript rows already committed. Shutdown
@@ -6715,7 +6715,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<std::collections::HashSet<String>> {
-        dispatch!(self, backend => backend.persisted_queue_message_ids(agent_id).await)
+        pending_postgres!("persisted_queue_message_ids", self, backend => backend.persisted_queue_message_ids(agent_id).await)
     }
 
     /// One message of an agent's log by row id, hydrated as a single row —
@@ -6732,7 +6732,7 @@ impl Store {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Result<Option<AgentMessage>> {
-        dispatch!(self, backend => backend.get_agent_message_by_id(agent_id, message_id).await)
+        pending_postgres!("get_agent_message_by_id", self, backend => backend.get_agent_message_by_id(agent_id, message_id).await)
     }
 
     /// [`Store::get_agent_message_by_id`] plus the message's retention-pruned
@@ -6755,7 +6755,7 @@ impl Store {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Result<Option<(AgentMessage, Vec<PrunedToolPayload>)>> {
-        dispatch!(self, backend => backend.get_agent_message_by_id_with_pruned(agent_id, message_id).await)
+        pending_postgres!("get_agent_message_by_id_with_pruned", self, backend => backend.get_agent_message_by_id_with_pruned(agent_id, message_id).await)
     }
 
     /// Count active, unsettled, and legacy-running delegated children.
@@ -6769,7 +6769,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_child_agents(&self, parent_agent_id: &AgentId) -> Result<ChildAgentCounts> {
-        dispatch!(self, backend => backend.count_child_agents(parent_agent_id).await)
+        pending_postgres!("count_child_agents", self, backend => backend.count_child_agents(parent_agent_id).await)
     }
 
     /// List the summary rows (no message logs, no prompt/image payloads) of
@@ -6787,7 +6787,7 @@ impl Store {
         &self,
         parent_agent_id: &AgentId,
     ) -> Result<Vec<AgentSessionSummary>> {
-        dispatch!(self, backend => backend.list_child_agent_summaries(parent_agent_id).await)
+        pending_postgres!("list_child_agent_summaries", self, backend => backend.list_child_agent_summaries(parent_agent_id).await)
     }
 
     /// Compatibility helper for callers that only need the legacy unsettled
@@ -6798,7 +6798,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_unsettled_child_agents(&self, parent_agent_id: &AgentId) -> Result<u64> {
-        dispatch!(self, backend => backend.count_unsettled_child_agents(parent_agent_id).await)
+        pending_postgres!("count_unsettled_child_agents", self, backend => backend.count_unsettled_child_agents(parent_agent_id).await)
     }
 
     /// Total number of messages logged for an agent (`agent.getConversation`
@@ -6808,7 +6808,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_agent_messages(&self, agent_id: &AgentId) -> Result<i64> {
-        dispatch!(self, backend => backend.count_agent_messages(agent_id).await)
+        pending_postgres!("count_agent_messages", self, backend => backend.count_agent_messages(agent_id).await)
     }
 
     /// 0-based chronological (`seq` ascending) position of one message within
@@ -6826,7 +6826,7 @@ impl Store {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Result<Option<i64>> {
-        dispatch!(self, backend => backend.get_agent_message_index(agent_id, message_id).await)
+        pending_postgres!("get_agent_message_index", self, backend => backend.get_agent_message_index(agent_id, message_id).await)
     }
 
     /// Read one offset window of an agent's messages in chronological (`seq`
@@ -6853,7 +6853,7 @@ impl Store {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<AgentMessage>> {
-        dispatch!(self, backend => backend.get_agent_messages_page(agent_id, offset, limit).await)
+        pending_postgres!("get_agent_messages_page", self, backend => backend.get_agent_messages_page(agent_id, offset, limit).await)
     }
 
     /// [`Store::get_agent_messages_page`] without 0108 payload hydration:
@@ -6877,7 +6877,7 @@ impl Store {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<AgentMessage>> {
-        dispatch!(self, backend => backend.get_agent_messages_page_as_stored(agent_id, offset, limit).await)
+        pending_postgres!("get_agent_messages_page_as_stored", self, backend => backend.get_agent_messages_page_as_stored(agent_id, offset, limit).await)
     }
 
     /// Bounded keyset read for progressive history. Admission includes the row
@@ -6896,7 +6896,7 @@ impl Store {
         before_seq: Option<i64>,
         limit: usize,
     ) -> Result<(Vec<AgentMessage>, u64)> {
-        dispatch!(self, backend => backend.get_agent_history_batch(agent_id, before_seq, limit).await)
+        pending_postgres!("get_agent_history_batch", self, backend => backend.get_agent_history_batch(agent_id, before_seq, limit).await)
     }
 
     /// Read an agent's user-role messages as lightweight index items in
@@ -6913,7 +6913,7 @@ impl Store {
         agent_id: &AgentId,
         preview_chars: usize,
     ) -> Result<Vec<UserMessageIndexItem>> {
-        dispatch!(self, backend => backend.get_agent_user_message_index(agent_id, preview_chars).await)
+        pending_postgres!("get_agent_user_message_index", self, backend => backend.get_agent_user_message_index(agent_id, preview_chars).await)
     }
 
     /// Read an agent's user-role messages as lightweight index items in
@@ -6944,7 +6944,7 @@ impl Store {
         preview_chars: usize,
         page: Option<UserMessageIndexPageRequest>,
     ) -> Result<UserMessageIndexPage> {
-        dispatch!(self, backend => backend.get_agent_user_message_index_page(agent_id, preview_chars, page).await)
+        pending_postgres!("get_agent_user_message_index_page", self, backend => backend.get_agent_user_message_index_page(agent_id, preview_chars, page).await)
     }
 
     /// Read the persisted image-thumbnail maps (0097) for the message ids in
@@ -6968,7 +6968,7 @@ impl Store {
         agent_id: &AgentId,
         message_ids: &[String],
     ) -> Result<std::collections::HashMap<String, serde_json::Value>> {
-        dispatch!(self, backend => backend.get_agent_message_thumbnails(agent_id, message_ids).await)
+        pending_postgres!("get_agent_message_thumbnails", self, backend => backend.get_agent_message_thumbnails(agent_id, message_ids).await)
     }
 
     /// Atomically clear the agent's message log and reinsert `messages` under
@@ -6994,7 +6994,7 @@ impl Store {
         agent_id: &AgentId,
         messages: &[ReplaceMessage<'_>],
     ) -> Result<Vec<AgentMessage>> {
-        dispatch!(self, backend => backend.replace_agent_messages(agent_id, messages).await)
+        pending_postgres!("replace_agent_messages", self, backend => backend.replace_agent_messages(agent_id, messages).await)
     }
 
     /// Atomically drop every message of `agent_id` with `seq >= first_dropped_seq`
@@ -7025,7 +7025,7 @@ impl Store {
         agent_id: &AgentId,
         first_dropped_seq: i64,
     ) -> Result<usize> {
-        dispatch!(self, backend => backend.truncate_agent_messages_from(agent_id, first_dropped_seq).await)
+        pending_postgres!("truncate_agent_messages_from", self, backend => backend.truncate_agent_messages_from(agent_id, first_dropped_seq).await)
     }
 
     /// Record an interrupted in-flight agent. Upserts: if a pending row exists
@@ -7042,7 +7042,7 @@ impl Store {
         prev_status: &str,
         interrupted_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.insert_interrupted_agent(agent_id, workspace_id, prev_status, interrupted_at).await)
+        pending_postgres!("insert_interrupted_agent", self, backend => backend.insert_interrupted_agent(agent_id, workspace_id, prev_status, interrupted_at).await)
     }
 
     /// Like [`insert_interrupted_agent`], but tags the row with a
@@ -7064,7 +7064,7 @@ impl Store {
         interrupted_at: &str,
         reason: Option<&str>,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.insert_interrupted_agent_with_reason(agent_id, workspace_id, prev_status, interrupted_at, reason).await)
+        pending_postgres!("insert_interrupted_agent_with_reason", self, backend => backend.insert_interrupted_agent_with_reason(agent_id, workspace_id, prev_status, interrupted_at, reason).await)
     }
 
     /// List pending interrupted agents, joined with `agent_session` (name) and
@@ -7074,7 +7074,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_interrupted_agents(&self) -> Result<Vec<InterruptedAgent>> {
-        dispatch!(self, backend => backend.list_interrupted_agents().await)
+        pending_postgres!("list_interrupted_agents", self, backend => backend.list_interrupted_agents().await)
     }
 
     /// Get a single pending interrupted agent by ID. Returns None if not found or not pending.
@@ -7086,7 +7086,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<Option<InterruptedAgent>> {
-        dispatch!(self, backend => backend.get_interrupted_agent(agent_id).await)
+        pending_postgres!("get_interrupted_agent", self, backend => backend.get_interrupted_agent(agent_id).await)
     }
 
     /// Set the resolution (resumed|abandoned) for an interrupted agent. Returns
@@ -7102,7 +7102,7 @@ impl Store {
         resolution: &str,
         resolved_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_interrupted_resolution(agent_id, resolution, resolved_at).await)
+        pending_postgres!("set_interrupted_resolution", self, backend => backend.set_interrupted_resolution(agent_id, resolution, resolved_at).await)
     }
 
     /// Reset an interrupted agent row back to pending (resolution=NULL, `resolved_at=NULL`).
@@ -7113,7 +7113,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn reset_interrupted_resolution(&self, agent_id: &AgentId) -> Result<bool> {
-        dispatch!(self, backend => backend.reset_interrupted_resolution(agent_id).await)
+        pending_postgres!("reset_interrupted_resolution", self, backend => backend.reset_interrupted_resolution(agent_id).await)
     }
 }
 

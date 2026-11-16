@@ -135,7 +135,7 @@ impl Store {
         expected: &QualifiedPrMonitor,
         now: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.cancel_qualified_pr_monitor(expected, now).await)
+        pending_postgres!("cancel_qualified_pr_monitor", self, backend => backend.cancel_qualified_pr_monitor(expected, now).await)
     }
 }
 
@@ -405,7 +405,7 @@ impl Store {
     /// # Errors
     /// Returns `NotFound` for an absent ID, or `Internal` for a database failure.
     pub async fn get_qualified_pr_monitor(&self, id: &PrMonitorId) -> Result<QualifiedPrMonitor> {
-        dispatch!(self, backend => backend.get_qualified_pr_monitor(id).await)
+        pending_postgres!("get_qualified_pr_monitor", self, backend => backend.get_qualified_pr_monitor(id).await)
     }
 
     /// Load active resolved AND unresolved records for recovery/inspection.
@@ -414,7 +414,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` for a database failure.
     pub async fn load_active_qualified_pr_monitors(&self) -> Result<Vec<QualifiedPrMonitor>> {
-        dispatch!(self, backend => backend.load_active_qualified_pr_monitors().await)
+        pending_postgres!("load_active_qualified_pr_monitors", self, backend => backend.load_active_qualified_pr_monitors().await)
     }
 
     /// List an agent's rows with their original target evidence, including history.
@@ -426,7 +426,7 @@ impl Store {
         &self,
         agent: &AgentId,
     ) -> Result<Vec<QualifiedPrMonitor>> {
-        dispatch!(self, backend => backend.list_qualified_pr_monitors_by_agent(agent).await)
+        pending_postgres!("list_qualified_pr_monitors_by_agent", self, backend => backend.list_qualified_pr_monitors_by_agent(agent).await)
     }
 
     /// List a workspace's rows with target evidence for destination-aware projection.
@@ -437,7 +437,7 @@ impl Store {
         &self,
         workspace: &WorkspaceId,
     ) -> Result<Vec<QualifiedPrMonitor>> {
-        dispatch!(self, backend => backend.list_qualified_pr_monitors_by_workspace(workspace).await)
+        pending_postgres!("list_qualified_pr_monitors_by_workspace", self, backend => backend.list_qualified_pr_monitors_by_workspace(workspace).await)
     }
 
     /// Find the active, qualified target owned by this agent. Never uses an
@@ -450,7 +450,7 @@ impl Store {
         agent: &AgentId,
         target: &ReviewTarget,
     ) -> Result<Option<QualifiedPrMonitor>> {
-        dispatch!(self, backend => backend.find_active_qualified_pr_monitor(agent, target).await)
+        pending_postgres!("find_active_qualified_pr_monitor", self, backend => backend.find_active_qualified_pr_monitor(agent, target).await)
     }
 
     /// Owner-agnostic lookup for the existing workspace refusal/adoption boundary.
@@ -462,7 +462,7 @@ impl Store {
         workspace: &WorkspaceId,
         target: &ReviewTarget,
     ) -> Result<Option<QualifiedPrMonitor>> {
-        dispatch!(self, backend => backend.find_active_qualified_pr_monitor_in_workspace(workspace, target).await)
+        pending_postgres!("find_active_qualified_pr_monitor_in_workspace", self, backend => backend.find_active_qualified_pr_monitor_in_workspace(workspace, target).await)
     }
 
     /// Insert a canonical target established by trusted application code.
@@ -478,7 +478,7 @@ impl Store {
         target: &ReviewTarget,
         provenance: MonitorTargetProvenance,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.insert_qualified_pr_monitor(m, target, provenance).await)
+        pending_postgres!("insert_qualified_pr_monitor", self, backend => backend.insert_qualified_pr_monitor(m, target, provenance).await)
     }
 
     /// Qualify an unresolved row using separately established target evidence.
@@ -495,7 +495,7 @@ impl Store {
         target: &ReviewTarget,
         provenance: MonitorTargetProvenance,
     ) -> Result<MonitorQualificationOutcome> {
-        dispatch!(self, backend => backend.qualify_legacy_pr_monitor_target(expected, target, provenance).await)
+        pending_postgres!("qualify_legacy_pr_monitor_target", self, backend => backend.qualify_legacy_pr_monitor_target(expected, target, provenance).await)
     }
 }
 
@@ -1140,7 +1140,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the insert fails for any reason other than a unique-index rejection (which returns `Ok(false)`).
     pub async fn insert_pr_monitor(&self, m: &PrMonitor) -> Result<bool> {
-        dispatch!(self, backend => backend.insert_pr_monitor(m).await)
+        pending_postgres!("insert_pr_monitor", self, backend => backend.insert_pr_monitor(m).await)
     }
 
     /// Get a PR monitor by id; `NotFound` when absent.
@@ -1149,7 +1149,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the PR monitor does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_pr_monitor(&self, monitor_id: &PrMonitorId) -> Result<PrMonitor> {
-        dispatch!(self, backend => backend.get_pr_monitor(monitor_id).await)
+        pending_postgres!("get_pr_monitor", self, backend => backend.get_pr_monitor(monitor_id).await)
     }
 
     /// The ACTIVE monitor an agent already owns for `(owner, name, number)`,
@@ -1166,7 +1166,7 @@ impl Store {
         repo_name: &str,
         pr_number: i64,
     ) -> Result<Option<PrMonitor>> {
-        dispatch!(self, backend => backend.find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number).await)
+        pending_postgres!("find_active_pr_monitor", self, backend => backend.find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number).await)
     }
 
     /// The ACTIVE monitor any agent in `workspace_id` holds for
@@ -1186,7 +1186,7 @@ impl Store {
         repo_name: &str,
         pr_number: i64,
     ) -> Result<Option<PrMonitor>> {
-        dispatch!(self, backend => backend.find_active_pr_monitor_in_workspace(workspace_id, repo_owner, repo_name, pr_number).await)
+        pending_postgres!("find_active_pr_monitor_in_workspace", self, backend => backend.find_active_pr_monitor_in_workspace(workspace_id, repo_owner, repo_name, pr_number).await)
     }
 
     /// List every monitor owned by an agent, oldest first (all states — the
@@ -1196,7 +1196,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_pr_monitors_by_agent(&self, agent_id: &AgentId) -> Result<Vec<PrMonitor>> {
-        dispatch!(self, backend => backend.list_pr_monitors_by_agent(agent_id).await)
+        pending_postgres!("list_pr_monitors_by_agent", self, backend => backend.list_pr_monitors_by_agent(agent_id).await)
     }
 
     /// List every monitor in a workspace, oldest first (all states).
@@ -1208,7 +1208,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<PrMonitor>> {
-        dispatch!(self, backend => backend.list_pr_monitors_by_workspace(workspace_id).await)
+        pending_postgres!("list_pr_monitors_by_workspace", self, backend => backend.list_pr_monitors_by_workspace(workspace_id).await)
     }
 
     /// List an agent's ACTIVE monitors only, oldest first — the SQL-filtered
@@ -1224,7 +1224,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<Vec<PrMonitor>> {
-        dispatch!(self, backend => backend.list_active_pr_monitors_by_agent(agent_id).await)
+        pending_postgres!("list_active_pr_monitors_by_agent", self, backend => backend.list_active_pr_monitors_by_agent(agent_id).await)
     }
 
     /// List a workspace's ACTIVE monitors only, oldest first — the
@@ -1239,7 +1239,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<PrMonitor>> {
-        dispatch!(self, backend => backend.list_active_pr_monitors_by_workspace(workspace_id).await)
+        pending_postgres!("list_active_pr_monitors_by_workspace", self, backend => backend.list_active_pr_monitors_by_workspace(workspace_id).await)
     }
 
     /// List a workspace's ACTIVE monitors plus only its most recently updated
@@ -1257,7 +1257,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<PrMonitor>> {
-        dispatch!(self, backend => backend.list_display_status_pr_monitors_by_workspace(workspace_id).await)
+        pending_postgres!("list_display_status_pr_monitors_by_workspace", self, backend => backend.list_display_status_pr_monitors_by_workspace(workspace_id).await)
     }
 
     /// Display-status monitor rows for every requested workspace in one
@@ -1270,7 +1270,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<Vec<PrMonitor>> {
-        dispatch!(self, backend => backend.list_display_status_pr_monitors_by_workspaces(workspace_ids).await)
+        pending_postgres!("list_display_status_pr_monitors_by_workspaces", self, backend => backend.list_display_status_pr_monitors_by_workspaces(workspace_ids).await)
     }
 
     /// Every `active` monitor across all workspaces, oldest first — the poll
@@ -1280,7 +1280,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
-        dispatch!(self, backend => backend.load_active_pr_monitors().await)
+        pending_postgres!("load_active_pr_monitors", self, backend => backend.load_active_pr_monitors().await)
     }
 
     /// Every non-cancelled (active or completed) monitor across all
@@ -1308,7 +1308,7 @@ impl Store {
         &self,
         include_archived: bool,
     ) -> Result<Vec<PrMonitorListEntry>> {
-        dispatch!(self, backend => backend.load_non_cancelled_pr_monitor_list_entries(include_archived).await)
+        pending_postgres!("load_non_cancelled_pr_monitor_list_entries", self, backend => backend.load_non_cancelled_pr_monitor_list_entries(include_archived).await)
     }
 
     /// One workspace's PR-monitor inputs for `workspace.get` in ONE
@@ -1339,7 +1339,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<WorkspacePrMonitorReads> {
-        dispatch!(self, backend => backend.load_workspace_pr_monitor_reads(workspace_id).await)
+        pending_postgres!("load_workspace_pr_monitor_reads", self, backend => backend.load_workspace_pr_monitor_reads(workspace_id).await)
     }
 
     /// Set a monitor's lifecycle state. Every legal transition starts from
@@ -1356,7 +1356,7 @@ impl Store {
         state: PrMonitorState,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.update_pr_monitor_state(monitor_id, state, updated_at).await)
+        pending_postgres!("update_pr_monitor_state", self, backend => backend.update_pr_monitor_state(monitor_id, state, updated_at).await)
     }
 
     /// Terminalize an ACTIVE monitor: `completed` plus the cleared pending
@@ -1377,7 +1377,7 @@ impl Store {
         updated_at: &str,
         expected_updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.complete_pr_monitor(monitor_id, updated_at, expected_updated_at).await)
+        pending_postgres!("complete_pr_monitor", self, backend => backend.complete_pr_monitor(monitor_id, updated_at, expected_updated_at).await)
     }
 
     /// Write back everything one poll can change: the last-poll snapshot, the
@@ -1406,7 +1406,7 @@ impl Store {
         monitor_id: &PrMonitorId,
         update: PrMonitorPollUpdate<'_>,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.update_pr_monitor_poll(monitor_id, update).await)
+        pending_postgres!("update_pr_monitor_poll", self, backend => backend.update_pr_monitor_poll(monitor_id, update).await)
     }
 
     /// Annotate `last_error` on EVERY active monitor across all workspaces
@@ -1434,7 +1434,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn annotate_active_pr_monitors_pause(&self, pause: &str) -> Result<u64> {
-        dispatch!(self, backend => backend.annotate_active_pr_monitors_pause(pause).await)
+        pending_postgres!("annotate_active_pr_monitors_pause", self, backend => backend.annotate_active_pr_monitors_pause(pause).await)
     }
 
     /// Strip the rate-limit pause annotation ([`pr_monitor_pause_error`])
@@ -1464,7 +1464,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_active_pr_monitors_pause(&self, lifted: Option<&str>) -> Result<u64> {
-        dispatch!(self, backend => backend.clear_active_pr_monitors_pause(lifted).await)
+        pending_postgres!("clear_active_pr_monitors_pause", self, backend => backend.clear_active_pr_monitors_pause(lifted).await)
     }
 
     /// Re-parent an ACTIVE monitor from `from_agent_id` to `to_agent_id` and
@@ -1489,7 +1489,7 @@ impl Store {
         to_agent_id: &AgentId,
         update: PrMonitorPollUpdate<'_>,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.adopt_pr_monitor(monitor_id, from_agent_id, to_agent_id, update).await)
+        pending_postgres!("adopt_pr_monitor", self, backend => backend.adopt_pr_monitor(monitor_id, from_agent_id, to_agent_id, update).await)
     }
 }
 

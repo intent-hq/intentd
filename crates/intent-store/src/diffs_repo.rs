@@ -48,7 +48,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_diff(&self, d: &NewDiff) -> Result<()> {
-        dispatch!(self, backend => backend.upsert_diff(d).await)
+        pending_postgres!("upsert_diff", self, backend => backend.upsert_diff(d).await)
     }
 
     /// List a workspace's stored diffs, oldest first. Internal read used by the
@@ -58,7 +58,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_diffs(&self, workspace_id: &WorkspaceId) -> Result<Vec<DiffRow>> {
-        dispatch!(self, backend => backend.list_diffs(workspace_id).await)
+        pending_postgres!("list_diffs", self, backend => backend.list_diffs(workspace_id).await)
     }
 }
 

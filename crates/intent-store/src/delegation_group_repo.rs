@@ -36,7 +36,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_delegation_group(&self, g: &PersistedDelegationGroup) -> Result<()> {
-        dispatch!(self, backend => backend.upsert_delegation_group(g).await)
+        pending_postgres!("upsert_delegation_group", self, backend => backend.upsert_delegation_group(g).await)
     }
 
     /// Load all undelivered `delegation_group` rows for a workspace.
@@ -48,7 +48,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<PersistedDelegationGroup>> {
-        dispatch!(self, backend => backend.list_undelivered_groups(workspace_id).await)
+        pending_postgres!("list_undelivered_groups", self, backend => backend.list_undelivered_groups(workspace_id).await)
     }
 
     /// Delete a `delegation_group` row (called on delivery).
@@ -57,7 +57,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_delegation_group(&self, group_id: &str) -> Result<()> {
-        dispatch!(self, backend => backend.delete_delegation_group(group_id).await)
+        pending_postgres!("delete_delegation_group", self, backend => backend.delete_delegation_group(group_id).await)
     }
 
     /// STAB-108: Get distinct workspace IDs that have undelivered delegation groups.
@@ -67,7 +67,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces_with_undelivered_groups(&self) -> Result<Vec<WorkspaceId>> {
-        dispatch!(self, backend => backend.list_workspaces_with_undelivered_groups().await)
+        pending_postgres!("list_workspaces_with_undelivered_groups", self, backend => backend.list_workspaces_with_undelivered_groups().await)
     }
 }
 

@@ -22,7 +22,7 @@ impl Store {
         agent_id: &AgentId,
         client_id: &ClientId,
     ) -> Result<Option<Draft>> {
-        dispatch!(self, backend => backend.get_draft(workspace_id, agent_id, client_id).await)
+        pending_postgres!("get_draft", self, backend => backend.get_draft(workspace_id, agent_id, client_id).await)
     }
 
     /// Upsert the draft for one triple, refreshing `text`/`attachments`/
@@ -41,7 +41,7 @@ impl Store {
         text: &str,
         attachments: Option<&serde_json::Value>,
     ) -> Result<String> {
-        dispatch!(self, backend => backend.upsert_draft(workspace_id, agent_id, client_id, text, attachments).await)
+        pending_postgres!("upsert_draft", self, backend => backend.upsert_draft(workspace_id, agent_id, client_id, text, attachments).await)
     }
 
     /// Delete the draft for one triple. Returns `true` when a row was removed
@@ -56,7 +56,7 @@ impl Store {
         agent_id: &AgentId,
         client_id: &ClientId,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.delete_draft(workspace_id, agent_id, client_id).await)
+        pending_postgres!("delete_draft", self, backend => backend.delete_draft(workspace_id, agent_id, client_id).await)
     }
 }
 

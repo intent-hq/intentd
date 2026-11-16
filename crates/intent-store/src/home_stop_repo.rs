@@ -180,7 +180,7 @@ impl Store {
         home: &WorkspaceHome,
         now: &str,
     ) -> Result<Option<HomeStopRecord>> {
-        dispatch!(self, backend => backend.switch_workspace_home(workspace_id, home, now).await)
+        pending_postgres!("switch_workspace_home", self, backend => backend.switch_workspace_home(workspace_id, home, now).await)
     }
 
     /// Record `record` unless its home has a stop already; the stop kept.
@@ -189,7 +189,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn record_home_stop(&self, record: &HomeStopRecord) -> Result<HomeStopRecord> {
-        dispatch!(self, backend => backend.record_home_stop(record).await)
+        pending_postgres!("record_home_stop", self, backend => backend.record_home_stop(record).await)
     }
 
     /// The pending stop of `home_id`.
@@ -198,7 +198,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn get_home_stop(&self, home_id: &HomeId) -> Result<Option<HomeStopRecord>> {
-        dispatch!(self, backend => backend.get_home_stop(home_id).await)
+        pending_postgres!("get_home_stop", self, backend => backend.get_home_stop(home_id).await)
     }
 
     /// Whether the pending stop of `home_id` discards its last push: the
@@ -208,7 +208,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn home_stop_discards_push(&self, home_id: &HomeId) -> Result<bool> {
-        dispatch!(self, backend => backend.home_stop_discards_push(home_id).await)
+        pending_postgres!("home_stop_discards_push", self, backend => backend.home_stop_discards_push(home_id).await)
     }
 
     /// The pending stops of the exposed machine `node_id`, oldest first.
@@ -217,7 +217,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn list_home_stops(&self, node_id: &str) -> Result<Vec<HomeStopRecord>> {
-        dispatch!(self, backend => backend.list_home_stops(node_id).await)
+        pending_postgres!("list_home_stops", self, backend => backend.list_home_stops(node_id).await)
     }
 
     /// The pending stops of `workspace_id`'s homes.
@@ -229,7 +229,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<HomeStopRecord>> {
-        dispatch!(self, backend => backend.list_workspace_home_stops(workspace_id).await)
+        pending_postgres!("list_workspace_home_stops", self, backend => backend.list_workspace_home_stops(workspace_id).await)
     }
 
     /// Delete the stop of `home_id` its ack `stop_id` answers; the deleted
@@ -243,7 +243,7 @@ impl Store {
         home_id: &HomeId,
         stop_id: &str,
     ) -> Result<Option<HomeStopRecord>> {
-        dispatch!(self, backend => backend.finish_home_stop(home_id, stop_id).await)
+        pending_postgres!("finish_home_stop", self, backend => backend.finish_home_stop(home_id, stop_id).await)
     }
 
     /// Delete every stop of the exposed machine `node_id` (it was removed);
@@ -253,7 +253,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn delete_home_stops_on_machine(&self, node_id: &str) -> Result<u64> {
-        dispatch!(self, backend => backend.delete_home_stops_on_machine(node_id).await)
+        pending_postgres!("delete_home_stops_on_machine", self, backend => backend.delete_home_stops_on_machine(node_id).await)
     }
 }
 

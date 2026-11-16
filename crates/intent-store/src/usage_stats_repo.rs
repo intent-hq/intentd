@@ -103,7 +103,7 @@ impl Store {
         local: Option<&LocalStamp>,
         delta: &UsageStatsDelta,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.add_usage_stats(bucket_utc, model, provider, local, delta).await)
+        pending_postgres!("add_usage_stats", self, backend => backend.add_usage_stats(bucket_utc, model, provider, local, delta).await)
     }
 
     /// List every `usage_stats_hourly` row ordered by `(bucket_utc, model,
@@ -114,7 +114,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_usage_stats_hourly(&self) -> Result<Vec<UsageStatsRow>> {
-        dispatch!(self, backend => backend.list_usage_stats_hourly().await)
+        pending_postgres!("list_usage_stats_hourly", self, backend => backend.list_usage_stats_hourly().await)
     }
 }
 

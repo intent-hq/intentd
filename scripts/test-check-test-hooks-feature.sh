@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Regression tests for check-test-hooks-feature.sh: runs the real check
+# Regression tests for check-test-hooks-feature.sh (and its GUARDED_FEATURE
+# override): runs the real check
 # against throwaway cargo workspaces (path dependencies only, so no network).
 # A `test-hooks` feature turned on through a normal, build, target-specific or
 # forwarded edge must fail and name the crate (also via a relative manifest
@@ -125,8 +126,23 @@ rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "missing manifest: expected exit 2, got $rc: $out"
 
-# This repo's shipped binaries must be clean.
+# GUARDED_FEATURE guards another feature name, matched exactly.
+set +e
+out=$(GUARDED_FEATURE=test-hooks-docs CARGO_TREE_FLAGS=--offline "$check" "$tmp/look_alike/Cargo.toml" app 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "GUARDED_FEATURE: expected exit 1, got $rc: $out"
+grep -q '^::error::core feature "test-hooks-docs"' <<<"$out" || fail "GUARDED_FEATURE: no ::error line for core: $out"
+set +e
+out=$(GUARDED_FEATURE=test-hooks-docs CARGO_TREE_FLAGS=--offline "$check" "$tmp/normal/Cargo.toml" app 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "GUARDED_FEATURE: a different feature must pass, got $rc: $out"
+
+# This repo's shipped binaries must be clean, for test-hooks and for the
+# test-only Postgres backend.
 "$check" >/dev/null || fail "this repo: check-test-hooks-feature.sh failed"
+GUARDED_FEATURE=postgres "$check" >/dev/null || fail "this repo: postgres reaches a shipped binary"
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures test(s) failed" >&2

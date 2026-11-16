@@ -66,7 +66,7 @@ impl Store {
         agent: &AgentId,
         message_id: &str,
     ) -> Result<Option<MonitorMessageProvenance>> {
-        dispatch!(self, backend => backend.get_monitor_message_provenance(agent, message_id).await)
+        pending_postgres!("get_monitor_message_provenance", self, backend => backend.get_monitor_message_provenance(agent, message_id).await)
     }
 }
 

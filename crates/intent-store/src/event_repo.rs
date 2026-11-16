@@ -76,7 +76,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_event(&self, ev: &NewEvent) -> Result<Event> {
-        dispatch!(self, backend => backend.insert_event(ev).await)
+        pending_postgres!("insert_event", self, backend => backend.insert_event(ev).await)
     }
 
     /// Batch-insert multiple events in a single transaction, preserving order.
@@ -87,7 +87,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {
-        dispatch!(self, backend => backend.insert_events(events).await)
+        pending_postgres!("insert_events", self, backend => backend.insert_events(events).await)
     }
 
     /// Run a filtered event query (newest-first). See [`EventQuery`].
@@ -96,7 +96,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<Event>> {
-        dispatch!(self, backend => backend.query_events(q).await)
+        pending_postgres!("query_events", self, backend => backend.query_events(q).await)
     }
 
     /// Retention/compaction sweep (§10.2 / finding F4): delete high-volume
@@ -121,7 +121,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if a chunked delete fails.
     pub async fn delete_ephemeral_events_before(&self, cutoff: &str) -> Result<u64> {
-        dispatch!(self, backend => backend.delete_ephemeral_events_before(cutoff).await)
+        pending_postgres!("delete_ephemeral_events_before", self, backend => backend.delete_ephemeral_events_before(cutoff).await)
     }
 
     /// Retention sweep for `agent:tool:call` events (87% of live data on the
@@ -137,7 +137,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if a chunked delete fails.
     pub async fn delete_tool_call_events_before(&self, cutoff: &str) -> Result<u64> {
-        dispatch!(self, backend => backend.delete_tool_call_events_before(cutoff).await)
+        pending_postgres!("delete_tool_call_events_before", self, backend => backend.delete_tool_call_events_before(cutoff).await)
     }
 
     /// Most-recent events for a workspace regardless of type (newest first).
@@ -150,7 +150,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         limit: i64,
     ) -> Result<Vec<Event>> {
-        dispatch!(self, backend => backend.events_by_workspace(workspace_id, limit).await)
+        pending_postgres!("events_by_workspace", self, backend => backend.events_by_workspace(workspace_id, limit).await)
     }
 
     /// Most-recent events of a single `event_type` for a workspace.
@@ -164,7 +164,7 @@ impl Store {
         event_type: &str,
         limit: i64,
     ) -> Result<Vec<Event>> {
-        dispatch!(self, backend => backend.events_by_type(workspace_id, event_type, limit).await)
+        pending_postgres!("events_by_type", self, backend => backend.events_by_type(workspace_id, event_type, limit).await)
     }
 }
 

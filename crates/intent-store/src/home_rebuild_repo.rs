@@ -108,7 +108,7 @@ impl Store {
         rebuild_homes: bool,
         now: &str,
     ) -> Result<Vec<HomeRebuild>> {
-        dispatch!(self, backend => backend.remove_cloud_machine(node_id, rebuild_homes, now).await)
+        pending_postgres!("remove_cloud_machine", self, backend => backend.remove_cloud_machine(node_id, rebuild_homes, now).await)
     }
 
     /// The home that `home_id`, the workspace's home, rebuilds (its
@@ -122,7 +122,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         home_id: &HomeId,
     ) -> Result<Option<HomeId>> {
-        dispatch!(self, backend => backend.home_rebuild_of(workspace_id, home_id).await)
+        pending_postgres!("home_rebuild_of", self, backend => backend.home_rebuild_of(workspace_id, home_id).await)
     }
 
     /// Rebuilt home `home_id` opened: `true` once, for the call that
@@ -136,7 +136,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         home_id: &HomeId,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.finish_home_rebuild(workspace_id, home_id).await)
+        pending_postgres!("finish_home_rebuild", self, backend => backend.finish_home_rebuild(workspace_id, home_id).await)
     }
 }
 

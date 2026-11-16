@@ -158,7 +158,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> NoteWriteLock {
-        dispatch!(self, backend => backend.lock_note_content(workspace_id, note_id).await)
+        pending_postgres!(panic "lock_note_content", self, backend => backend.lock_note_content(workspace_id, note_id).await)
     }
 
     /// Callers holding or awaiting `note_id`'s content-write lock. A test
@@ -166,7 +166,7 @@ impl Store {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn note_content_lock_users(&self, workspace_id: &WorkspaceId, note_id: &NoteId) -> usize {
-        dispatch!(self, backend => backend.note_content_lock_users(workspace_id, note_id))
+        pending_postgres!(panic "note_content_lock_users", self, backend => backend.note_content_lock_users(workspace_id, note_id))
     }
 
     /// `true` when no note's content-write lock is held or awaited. A test
@@ -174,7 +174,7 @@ impl Store {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn note_content_locks_idle(&self) -> bool {
-        dispatch!(self, backend => backend.note_content_locks_idle())
+        pending_postgres!(panic "note_content_locks_idle", self, backend => backend.note_content_locks_idle())
     }
 }
 

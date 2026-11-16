@@ -16,7 +16,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_note_line_attribution(&self, data: &LineAttributionData) -> Result<()> {
-        dispatch!(self, backend => backend.upsert_note_line_attribution(data).await)
+        pending_postgres!("upsert_note_line_attribution", self, backend => backend.upsert_note_line_attribution(data).await)
     }
 
     /// Load the persisted attribution snapshot for a note, or `None` if never
@@ -31,7 +31,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> Result<Option<LineAttributionData>> {
-        dispatch!(self, backend => backend.get_note_line_attribution(workspace_id, note_id).await)
+        pending_postgres!("get_note_line_attribution", self, backend => backend.get_note_line_attribution(workspace_id, note_id).await)
     }
 }
 

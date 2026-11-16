@@ -19,7 +19,7 @@ impl Store {
         monitor: bool,
         options: &ScriptListOptions,
     ) -> Result<Value> {
-        dispatch!(self, backend => backend.script_summary_page(ws, owner, monitor, options).await)
+        pending_postgres!("script_summary_page", self, backend => backend.script_summary_page(ws, owner, monitor, options).await)
     }
 
     /// Select saved scripts before pagination for scoped guest operators.
@@ -30,7 +30,7 @@ impl Store {
         ws: &WorkspaceId,
         options: &ScriptListOptions,
     ) -> Result<Value> {
-        dispatch!(self, backend => backend.saved_script_summary_page(ws, options).await)
+        pending_postgres!("saved_script_summary_page", self, backend => backend.saved_script_summary_page(ws, options).await)
     }
 }
 
