@@ -82,9 +82,9 @@ pub(crate) const STALE_REDRIVE_NOTE_PREFIX: &str =
 /// before you completed"), so the two checks never shadow each other.
 pub(crate) const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
 
-/// Stable prefix of [`Harness::preemption_attribution_note`], used to keep the
-/// annotation idempotent if an already-annotated delivery passes the
-/// preemption path again.
+/// Stable prefix of [`Harness::preemption_attribution_note`], asserted by the
+/// goldens. NOT the annotation skip condition: the guard exact-matches the
+/// whole trailing note, so a body quoting this prefix still gets the note.
 pub(crate) const PREEMPTION_ATTRIBUTION_NOTE_PREFIX: &str =
     "[SYSTEM NOTE] This message interrupted your previous turn.";
 

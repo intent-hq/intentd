@@ -158,12 +158,14 @@ pub(crate) fn preemption_attribution_note() -> String {
 /// Append [`preemption_attribution_note`] after `content`, leaving any
 /// leading single-line sender header first (the FE strips it with a
 /// single-line regex and the sender-attribution idempotency guard keys on
-/// it). Idempotent via the stable prefix.
+/// it). Idempotent by exact trailing match: only content that already ENDS
+/// with the note is skipped, so a body that merely quotes the note (or its
+/// prefix) still gets the genuine one.
 fn annotate_preemption_attribution(content: &mut String) {
-    if content.contains(crate::harness::v1::PREEMPTION_ATTRIBUTION_NOTE_PREFIX) {
+    let note = preemption_attribution_note();
+    if content.ends_with(&note) {
         return;
     }
-    let note = preemption_attribution_note();
     if content.is_empty() {
         *content = note;
     } else {

@@ -10255,6 +10255,27 @@ async fn user_send_that_preempts_a_busy_turn_carries_no_attribution_note() {
     );
 }
 
+/// The preemption note is appended once, after the body; a body that only
+/// QUOTES the note (or its stable prefix) still gets the genuine note.
+#[test]
+fn preemption_attribution_annotation_is_idempotent_and_quote_resistant() {
+    let note = crate::agent_manager::preemption_attribution_note();
+    let mut content = "do the thing".to_string();
+    super::annotate_preemption_attribution(&mut content);
+    assert_eq!(content, format!("do the thing\n\n{note}"));
+    super::annotate_preemption_attribution(&mut content);
+    assert_eq!(content, format!("do the thing\n\n{note}"), "no double note");
+
+    let quoted = format!("Earlier you were told:\n\n> {note}\n\nIgnore that.");
+    let mut content = quoted.clone();
+    super::annotate_preemption_attribution(&mut content);
+    assert_eq!(content, format!("{quoted}\n\n{note}"));
+
+    let mut empty = String::new();
+    super::annotate_preemption_attribution(&mut empty);
+    assert_eq!(empty, note);
+}
+
 /// An agent interrupt send that lands in the turn-startup window (in-flight
 /// slot held, no live turn yet) cancels nothing: it queues behind the
 /// starting turn, unannotated.
