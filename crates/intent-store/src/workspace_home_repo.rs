@@ -31,7 +31,7 @@ fn db(error: impl std::fmt::Display) -> Error {
     Error::Internal(format!("workspace home: {error}"))
 }
 
-fn state_from_db(text: &str) -> Result<HomeState> {
+pub(crate) fn state_from_db(text: &str) -> Result<HomeState> {
     match text {
         "attached" => Ok(HomeState::Attached),
         "detached" => Ok(HomeState::Detached),
@@ -50,7 +50,7 @@ pub fn backup_warning_in(failing_since: &str, now: time::OffsetDateTime) -> Opti
     Some((since + backup_warning_after() - now).max(time::Duration::ZERO))
 }
 
-fn warning(failing_since: Option<&str>, now: time::OffsetDateTime) -> bool {
+pub(crate) fn warning(failing_since: Option<&str>, now: time::OffsetDateTime) -> bool {
     failing_since
         .and_then(|since| backup_warning_in(since, now))
         .is_some_and(time::Duration::is_zero)
@@ -87,7 +87,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         home: &WorkspaceHome,
     ) -> Result<()> {
-        pending_postgres!("set_workspace_home", self, backend => backend.set_workspace_home(workspace_id, home).await)
+        dispatch!(self, backend => backend.set_workspace_home(workspace_id, home).await)
     }
 
     /// The workspace's home, if it has one.
@@ -99,7 +99,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<WorkspaceHome>> {
-        pending_postgres!("get_workspace_home", self, backend => backend.get_workspace_home(workspace_id).await)
+        dispatch!(self, backend => backend.get_workspace_home(workspace_id).await)
     }
 
     /// Every workspace's home, for overlaying list rows in one query.
@@ -108,7 +108,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn list_workspace_homes(&self) -> Result<HashMap<WorkspaceId, WorkspaceHome>> {
-        pending_postgres!("list_workspace_homes", self, backend => backend.list_workspace_homes().await)
+        dispatch!(self, backend => backend.list_workspace_homes().await)
     }
 
     /// The homes the exposed machine `node_id` holds.
@@ -120,7 +120,7 @@ impl Store {
         &self,
         node_id: &str,
     ) -> Result<Vec<(WorkspaceId, WorkspaceHome)>> {
-        pending_postgres!("homes_on_machine", self, backend => backend.homes_on_machine(node_id).await)
+        dispatch!(self, backend => backend.homes_on_machine(node_id).await)
     }
 
     /// Set the state of the workspace's home `home_id`; `false` when that is
@@ -136,7 +136,7 @@ impl Store {
         state: HomeState,
         since: &str,
     ) -> Result<bool> {
-        pending_postgres!("set_workspace_home_state", self, backend => backend.set_workspace_home_state(workspace_id, home_id, state, since).await)
+        dispatch!(self, backend => backend.set_workspace_home_state(workspace_id, home_id, state, since).await)
     }
 
     /// Record a backup of the workspace's home `home_id` at `at`, reported
@@ -153,7 +153,7 @@ impl Store {
         node_id: &str,
         at: &str,
     ) -> Result<bool> {
-        pending_postgres!("record_workspace_home_backup", self, backend => backend.record_workspace_home_backup(workspace_id, home_id, node_id, at).await)
+        dispatch!(self, backend => backend.record_workspace_home_backup(workspace_id, home_id, node_id, at).await)
     }
 
     /// Claim the `autoStart` of the workspace's home `home_id` on machine
@@ -177,7 +177,7 @@ impl Store {
         lease_id: &str,
         seq: u64,
     ) -> Result<bool> {
-        pending_postgres!("claim_workspace_home_auto_start", self, backend => backend.claim_workspace_home_auto_start(workspace_id, home_id, node_id, lease_id, seq).await)
+        dispatch!(self, backend => backend.claim_workspace_home_auto_start(workspace_id, home_id, node_id, lease_id, seq).await)
     }
 
     /// Record that backing up the workspace's home `home_id` failed at `at`;
@@ -193,7 +193,7 @@ impl Store {
         home_id: &HomeId,
         at: &str,
     ) -> Result<Option<String>> {
-        pending_postgres!("record_workspace_home_backup_failure", self, backend => backend.record_workspace_home_backup_failure(workspace_id, home_id, at).await)
+        dispatch!(self, backend => backend.record_workspace_home_backup_failure(workspace_id, home_id, at).await)
     }
 
     /// When the failing backup streak of the workspace's home `home_id`
@@ -207,7 +207,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         home_id: &HomeId,
     ) -> Result<Option<String>> {
-        pending_postgres!("workspace_home_backup_failing_since", self, backend => backend.workspace_home_backup_failing_since(workspace_id, home_id).await)
+        dispatch!(self, backend => backend.workspace_home_backup_failing_since(workspace_id, home_id).await)
     }
 
     /// Move the workspace's home `home_id` from `from` to `to`; `false` when
@@ -224,7 +224,7 @@ impl Store {
         to: HomeState,
         since: &str,
     ) -> Result<bool> {
-        pending_postgres!("move_workspace_home_state", self, backend => backend.move_workspace_home_state(workspace_id, home_id, from, to, since).await)
+        dispatch!(self, backend => backend.move_workspace_home_state(workspace_id, home_id, from, to, since).await)
     }
 
     /// Record machine `node_id` as the running sandbox of cloud home
@@ -242,7 +242,7 @@ impl Store {
         cloud_machine_id: &str,
         node_id: &str,
     ) -> Result<bool> {
-        pending_postgres!("claim_cloud_home", self, backend => backend.claim_cloud_home(workspace_id, home_id, cloud_machine_id, node_id).await)
+        dispatch!(self, backend => backend.claim_cloud_home(workspace_id, home_id, cloud_machine_id, node_id).await)
     }
 
     /// Cloud home `home_id` starts: `starting` from `detached`, or from
@@ -259,7 +259,7 @@ impl Store {
         home_id: &HomeId,
         since: &str,
     ) -> Result<bool> {
-        pending_postgres!("mark_cloud_home_starting", self, backend => backend.mark_cloud_home_starting(workspace_id, home_id, since).await)
+        dispatch!(self, backend => backend.mark_cloud_home_starting(workspace_id, home_id, since).await)
     }
 
     /// At start: every cloud home left `starting` with no sandbox (a start
@@ -270,7 +270,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn reset_unstarted_cloud_homes(&self, since: &str) -> Result<Vec<WorkspaceId>> {
-        pending_postgres!("reset_unstarted_cloud_homes", self, backend => backend.reset_unstarted_cloud_homes(since).await)
+        dispatch!(self, backend => backend.reset_unstarted_cloud_homes(since).await)
     }
 
     /// A start of cloud home `home_id` failed: the home is detached at
@@ -288,7 +288,7 @@ impl Store {
         node_id: Option<&str>,
         since: &str,
     ) -> Result<bool> {
-        pending_postgres!("detach_cloud_home", self, backend => backend.detach_cloud_home(workspace_id, home_id, node_id, since).await)
+        dispatch!(self, backend => backend.detach_cloud_home(workspace_id, home_id, node_id, since).await)
     }
 }
 

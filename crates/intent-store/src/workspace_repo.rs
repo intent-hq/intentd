@@ -22,7 +22,7 @@ tokio::task_local! {
     pub(crate) static DESKTOP_CLEANUP_ENTRY: std::sync::Arc<crate::desktop_repo::DeleteBarrier>;
 }
 
-const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
+pub(crate) const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
     status_message, status_image_asset_id, attention, path, repository_path, repository_owner, \
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
@@ -102,7 +102,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<HashMap<WorkspaceId, WorkspaceContentClock>> {
-        pending_postgres!("workspace_content_clocks", self, backend => backend.workspace_content_clocks(workspace_ids).await)
+        dispatch!(self, backend => backend.workspace_content_clocks(workspace_ids).await)
     }
 
     /// Requested workspaces whose known PRs are all finished: at least one PR
@@ -119,7 +119,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<HashSet<WorkspaceId>> {
-        pending_postgres!("workspaces_with_settled_pull_requests", self, backend => backend.workspaces_with_settled_pull_requests(workspace_ids).await)
+        dispatch!(self, backend => backend.workspaces_with_settled_pull_requests(workspace_ids).await)
     }
 
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
@@ -128,7 +128,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if encoding workspace fields or the insert fails.
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
-        pending_postgres!("insert_workspace", self, backend => backend.insert_workspace(ws).await)
+        dispatch!(self, backend => backend.insert_workspace(ws).await)
     }
 
     /// Insert a workspace row with the per-workspace `auto_commit_enabled`
@@ -146,7 +146,7 @@ impl Store {
         ws: &Workspace,
         auto_commit: Option<bool>,
     ) -> Result<()> {
-        pending_postgres!("insert_workspace_with_auto_commit", self, backend => backend.insert_workspace_with_auto_commit(ws, auto_commit).await)
+        dispatch!(self, backend => backend.insert_workspace_with_auto_commit(ws, auto_commit).await)
     }
 
     /// Insert from an original pre-workspace host admission. The durable facts
@@ -172,7 +172,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<Workspace> {
-        pending_postgres!("get_workspace", self, backend => backend.get_workspace(id).await)
+        dispatch!(self, backend => backend.get_workspace(id).await)
     }
 
     /// Update an existing workspace, preserving `branch`, `id`, the
@@ -210,7 +210,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace(&self, ws: &Workspace) -> Result<String> {
-        pending_postgres!("update_workspace", self, backend => backend.update_workspace(ws).await)
+        dispatch!(self, backend => backend.update_workspace(ws).await)
     }
 
     /// Update workspace fields and optionally apply an explicit branch edit.
@@ -223,7 +223,7 @@ impl Store {
         ws: &Workspace,
         branch: Option<&str>,
     ) -> Result<String> {
-        pending_postgres!("update_workspace_with_branch", self, backend => backend.update_workspace_with_branch(ws, branch).await)
+        dispatch!(self, backend => backend.update_workspace_with_branch(ws, branch).await)
     }
 
     /// Reconcile an observed branch without overwriting concurrent workspace edits.
@@ -236,7 +236,7 @@ impl Store {
         expected: &Workspace,
         branch: &str,
     ) -> Result<bool> {
-        pending_postgres!("reconcile_workspace_branch", self, backend => backend.reconcile_workspace_branch(expected, branch).await)
+        dispatch!(self, backend => backend.reconcile_workspace_branch(expected, branch).await)
     }
 
     /// Scoped PR-linkage write: set ONLY the PR columns (`pr_number`,
@@ -254,7 +254,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_pr_linkage(&self, ws: &Workspace) -> Result<()> {
-        pending_postgres!("update_workspace_pr_linkage", self, backend => backend.update_workspace_pr_linkage(ws).await)
+        dispatch!(self, backend => backend.update_workspace_pr_linkage(ws).await)
     }
 
     /// [`Self::update_workspace_pr_linkage`] rebased on the row at write
@@ -282,7 +282,7 @@ impl Store {
     where
         F: FnOnce(&mut Workspace, Option<Vec<PullRequestInfo>>),
     {
-        pending_postgres!("update_workspace_pr_linkage_rebased", self, backend => backend.update_workspace_pr_linkage_rebased(ws, rebase).await)
+        dispatch!(self, backend => backend.update_workspace_pr_linkage_rebased(ws, rebase).await)
     }
 
     /// Project onto a workspace's persisted PR snapshots atomically
@@ -310,7 +310,7 @@ impl Store {
     where
         F: FnOnce(&mut Option<Vec<PullRequestInfo>>, &mut Option<PullRequestInfo>) -> bool,
     {
-        pending_postgres!("project_workspace_pr_snapshots", self, backend => backend.project_workspace_pr_snapshots(id, updated_at, project).await)
+        dispatch!(self, backend => backend.project_workspace_pr_snapshots(id, updated_at, project).await)
     }
 
     /// Recompute-and-store a workspace's `token_usage` snapshot atomically
@@ -383,7 +383,7 @@ impl Store {
         updated_at: Option<&str>,
         expected: Option<WorkspaceAttention>,
     ) -> Result<bool> {
-        pending_postgres!("set_workspace_attention", self, backend => backend.set_workspace_attention(id, attention, updated_at, expected).await)
+        dispatch!(self, backend => backend.set_workspace_attention(id, attention, updated_at, expected).await)
     }
 
     /// Atomic settle-clear of the stored `unread` flag (§5.1): set
@@ -402,7 +402,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_workspace_unread_if_all_seen(&self, id: &WorkspaceId) -> Result<bool> {
-        pending_postgres!("clear_workspace_unread_if_all_seen", self, backend => backend.clear_workspace_unread_if_all_seen(id).await)
+        dispatch!(self, backend => backend.clear_workspace_unread_if_all_seen(id).await)
     }
 
     /// Scoped, conditional unarchive flip: set `status`/`archived`/
@@ -423,7 +423,7 @@ impl Store {
         id: &WorkspaceId,
         updated_at: &str,
     ) -> Result<bool> {
-        pending_postgres!("unarchive_workspace_if_archived", self, backend => backend.unarchive_workspace_if_archived(id, updated_at).await)
+        dispatch!(self, backend => backend.unarchive_workspace_if_archived(id, updated_at).await)
     }
 
     /// Scoped, monotonic `last_activity` write (monorepo#1580): set ONLY the
@@ -452,7 +452,7 @@ impl Store {
         id: &WorkspaceId,
         last_activity: &str,
     ) -> Result<bool> {
-        pending_postgres!("bump_workspace_last_activity", self, backend => backend.bump_workspace_last_activity(id, last_activity).await)
+        dispatch!(self, backend => backend.bump_workspace_last_activity(id, last_activity).await)
     }
 
     /// Delete a workspace by id, or `NotFound`. Records a tombstone in
@@ -508,7 +508,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails; callers
     /// then skip the sweep (fail closed).
     pub async fn plain_folder_paths(&self) -> Result<Vec<String>> {
-        pending_postgres!("plain_folder_paths", self, backend => backend.plain_folder_paths().await)
+        dispatch!(self, backend => backend.plain_folder_paths().await)
     }
 
     /// Whether a workspace id was ever used — a live row exists **or** a
@@ -519,7 +519,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn workspace_id_ever_used(&self, id: &WorkspaceId) -> Result<bool> {
-        pending_postgres!("workspace_id_ever_used", self, backend => backend.workspace_id_ever_used(id).await)
+        dispatch!(self, backend => backend.workspace_id_ever_used(id).await)
     }
 
     /// Record whether the workspace's branch was auto-generated by the daemon
@@ -536,7 +536,7 @@ impl Store {
         id: &WorkspaceId,
         auto_generated: bool,
     ) -> Result<()> {
-        pending_postgres!("set_workspace_branch_auto_generated", self, backend => backend.set_workspace_branch_auto_generated(id, auto_generated).await)
+        dispatch!(self, backend => backend.set_workspace_branch_auto_generated(id, auto_generated).await)
     }
 
     /// Whether the workspace's branch was auto-generated at create time.
@@ -546,7 +546,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_branch_auto_generated(&self, id: &WorkspaceId) -> Result<bool> {
-        pending_postgres!("workspace_branch_auto_generated", self, backend => backend.workspace_branch_auto_generated(id).await)
+        dispatch!(self, backend => backend.workspace_branch_auto_generated(id).await)
     }
 
     /// Set the persisted per-workspace auto-commit override (spec Diagnosis
@@ -558,7 +558,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_auto_commit(&self, id: &WorkspaceId, enabled: bool) -> Result<()> {
-        pending_postgres!("set_workspace_auto_commit", self, backend => backend.set_workspace_auto_commit(id, enabled).await)
+        dispatch!(self, backend => backend.set_workspace_auto_commit(id, enabled).await)
     }
 
     /// Scoped write of the Home workspace label (`workspace.update { label }`):
@@ -570,7 +570,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_label(&self, id: &WorkspaceId, label: Option<&str>) -> Result<()> {
-        pending_postgres!("set_workspace_label", self, backend => backend.set_workspace_label(id, label).await)
+        dispatch!(self, backend => backend.set_workspace_label(id, label).await)
     }
 
     /// Scoped write of the per-workspace auto-archive opt-out
@@ -587,7 +587,7 @@ impl Store {
         id: &WorkspaceId,
         disabled: bool,
     ) -> Result<()> {
-        pending_postgres!("set_workspace_auto_archive_disabled", self, backend => backend.set_workspace_auto_archive_disabled(id, disabled).await)
+        dispatch!(self, backend => backend.set_workspace_auto_archive_disabled(id, disabled).await)
     }
 
     /// The persisted per-workspace auto-commit override. `Ok(None)` for
@@ -599,7 +599,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_auto_commit(&self, id: &WorkspaceId) -> Result<Option<bool>> {
-        pending_postgres!("workspace_auto_commit", self, backend => backend.workspace_auto_commit(id).await)
+        dispatch!(self, backend => backend.workspace_auto_commit(id).await)
     }
 
     /// Scoped write of the per-workspace browser-client pin (REV-2,
@@ -616,7 +616,7 @@ impl Store {
         id: &WorkspaceId,
         client_id: Option<&ClientId>,
     ) -> Result<()> {
-        pending_postgres!("set_workspace_browser_client", self, backend => backend.set_workspace_browser_client(id, client_id).await)
+        dispatch!(self, backend => backend.set_workspace_browser_client(id, client_id).await)
     }
 
     /// The persisted per-workspace browser-client pin; `Ok(None)` when
@@ -626,7 +626,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_browser_client(&self, id: &WorkspaceId) -> Result<Option<ClientId>> {
-        pending_postgres!("workspace_browser_client", self, backend => backend.workspace_browser_client(id).await)
+        dispatch!(self, backend => backend.workspace_browser_client(id).await)
     }
 
     /// List workspaces admitted by `filter`: archived rows only with
@@ -641,7 +641,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces(&self, filter: WorkspaceListFilter) -> Result<Vec<Workspace>> {
-        pending_postgres!("list_workspaces", self, backend => backend.list_workspaces(filter).await)
+        dispatch!(self, backend => backend.list_workspaces(filter).await)
     }
 
     /// One keyset page of [`Store::list_workspaces`] in `(created_at, id)`
@@ -657,7 +657,7 @@ impl Store {
         after: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<Workspace>> {
-        pending_postgres!("list_workspaces_page", self, backend => backend.list_workspaces_page(filter, after, limit).await)
+        dispatch!(self, backend => backend.list_workspaces_page(filter, after, limit).await)
     }
 
     /// The retired workspace a call is scoped to: `workspace_id` when that
@@ -673,7 +673,7 @@ impl Store {
         workspace_id: Option<&WorkspaceId>,
         agent_id: Option<&AgentId>,
     ) -> Result<Option<WorkspaceId>> {
-        pending_postgres!("retired_workspace_for", self, backend => backend.retired_workspace_for(workspace_id, agent_id).await)
+        dispatch!(self, backend => backend.retired_workspace_for(workspace_id, agent_id).await)
     }
 
     /// Scoped, conditional retire flip (`workspace.retire`, PROTOCOL §5.1):
@@ -695,7 +695,7 @@ impl Store {
         id: &WorkspaceId,
         retired_at: &str,
     ) -> Result<bool> {
-        pending_postgres!("retire_workspace_if_archived", self, backend => backend.retire_workspace_if_archived(id, retired_at).await)
+        dispatch!(self, backend => backend.retire_workspace_if_archived(id, retired_at).await)
     }
 
     /// Scoped, conditional revive flip (PROTOCOL §5.1 "Revive"): flip a
@@ -719,7 +719,7 @@ impl Store {
         base_commit_sha: Option<&str>,
         updated_at: &str,
     ) -> Result<bool> {
-        pending_postgres!("revive_workspace_if_retired", self, backend => backend.revive_workspace_if_retired(id, branch, base_commit_sha, updated_at).await)
+        dispatch!(self, backend => backend.revive_workspace_if_retired(id, branch, base_commit_sha, updated_at).await)
     }
 
     /// [`Self::revive_workspace_if_retired`] that also leaves a one-time
@@ -741,7 +741,7 @@ impl Store {
         updated_at: &str,
         notice: Option<(&str, &str, Option<&AgentId>)>,
     ) -> Result<bool> {
-        pending_postgres!("revive_workspace_if_retired_with_notice", self, backend => backend.revive_workspace_if_retired_with_notice(id, branch, base_commit_sha, updated_at, notice).await)
+        dispatch!(self, backend => backend.revive_workspace_if_retired_with_notice(id, branch, base_commit_sha, updated_at, notice).await)
     }
 
     /// The ids of the machine's hidden home records
@@ -751,7 +751,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` on a database failure.
     pub async fn home_record_ids(&self) -> Result<Vec<WorkspaceId>> {
-        pending_postgres!("home_record_ids", self, backend => backend.home_record_ids().await)
+        dispatch!(self, backend => backend.home_record_ids().await)
     }
 
     /// Remove a machine's hidden home record and (by cascade) its rows,
@@ -763,7 +763,7 @@ impl Store {
     /// `InvalidParams` for an id that is not a home record; `Internal` on a
     /// database failure.
     pub async fn delete_home_record(&self, id: &WorkspaceId) -> Result<()> {
-        pending_postgres!("delete_home_record", self, backend => backend.delete_home_record(id).await)
+        dispatch!(self, backend => backend.delete_home_record(id).await)
     }
 
     /// Ordinary workspace keys for inherited host access, without hydrating
@@ -772,7 +772,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` on a database failure.
     pub async fn ordinary_workspace_ids(&self) -> Result<Vec<WorkspaceId>> {
-        pending_postgres!("ordinary_workspace_ids", self, backend => backend.ordinary_workspace_ids().await)
+        dispatch!(self, backend => backend.ordinary_workspace_ids().await)
     }
 
     /// Live (non-archived, non-remote) workspaces referencing a PR by URL —
@@ -788,7 +788,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces_referencing_pr_url(&self, url: &str) -> Result<Vec<Workspace>> {
-        pending_postgres!("list_workspaces_referencing_pr_url", self, backend => backend.list_workspaces_referencing_pr_url(url).await)
+        dispatch!(self, backend => backend.list_workspaces_referencing_pr_url(url).await)
     }
 
     /// Workspaces linked to the PR whose canonical key is `pr_key`
@@ -808,7 +808,7 @@ impl Store {
         pr_key: &str,
         include_retired: bool,
     ) -> Result<Vec<PullRequestWorkspace>> {
-        pending_postgres!("list_pull_request_workspaces", self, backend => backend.list_pull_request_workspaces(pr_key, include_retired).await)
+        dispatch!(self, backend => backend.list_pull_request_workspaces(pr_key, include_retired).await)
     }
 
     /// Every PR link recorded for the workspaces in `workspace_ids`
@@ -825,7 +825,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<Vec<PullRequestLink>> {
-        pending_postgres!("list_pull_request_links_for_workspaces", self, backend => backend.list_pull_request_links_for_workspaces(workspace_ids).await)
+        dispatch!(self, backend => backend.list_pull_request_links_for_workspaces(workspace_ids).await)
     }
 }
 
@@ -2309,12 +2309,12 @@ where
 }
 
 /// Encode the optional `pr_status` enum to its `PascalCase` DB word, or `None`.
-fn pr_status_to_db(ws: &Workspace) -> Result<Option<String>> {
+pub(crate) fn pr_status_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.pr_status.map(|s| enum_to_db(&s)).transpose()
 }
 
 /// Encode the optional `active_pull_request` snapshot to a JSON TEXT column.
-fn active_pr_to_db(ws: &Workspace) -> Result<Option<String>> {
+pub(crate) fn active_pr_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.active_pull_request
         .as_ref()
         .map(|pr| {
@@ -2325,7 +2325,7 @@ fn active_pr_to_db(ws: &Workspace) -> Result<Option<String>> {
 }
 
 /// Decode the optional `active_pull_request` JSON TEXT column.
-fn active_pr_from_db(s: Option<String>) -> Result<Option<PullRequestInfo>> {
+pub(crate) fn active_pr_from_db(s: Option<String>) -> Result<Option<PullRequestInfo>> {
     s.map(|json| {
         serde_json::from_str::<PullRequestInfo>(&json)
             .map_err(|e| Error::Internal(format!("decode active_pull_request failed: {e}")))
@@ -2353,7 +2353,7 @@ fn pr_linkage_update(
 }
 
 /// Encode the optional `pull_requests` snapshot list to a JSON TEXT column.
-fn pull_requests_to_db(ws: &Workspace) -> Result<Option<String>> {
+pub(crate) fn pull_requests_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.pull_requests
         .as_ref()
         .map(|prs| {
@@ -2364,7 +2364,7 @@ fn pull_requests_to_db(ws: &Workspace) -> Result<Option<String>> {
 }
 
 /// Decode the optional `pull_requests` JSON TEXT column.
-fn pull_requests_from_db(s: Option<String>) -> Result<Option<Vec<PullRequestInfo>>> {
+pub(crate) fn pull_requests_from_db(s: Option<String>) -> Result<Option<Vec<PullRequestInfo>>> {
     s.map(|json| {
         serde_json::from_str::<Vec<PullRequestInfo>>(&json)
             .map_err(|e| Error::Internal(format!("decode pull_requests failed: {e}")))
@@ -2373,7 +2373,7 @@ fn pull_requests_from_db(s: Option<String>) -> Result<Option<Vec<PullRequestInfo
 }
 
 /// Encode the optional `context_links` list to a JSON TEXT column (§5.1).
-fn context_links_to_db(ws: &Workspace) -> Result<Option<String>> {
+pub(crate) fn context_links_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.context_links
         .as_ref()
         .map(|links| {
@@ -2384,7 +2384,7 @@ fn context_links_to_db(ws: &Workspace) -> Result<Option<String>> {
 }
 
 /// Decode the optional `context_links` JSON TEXT column (§5.1).
-fn context_links_from_db(s: Option<String>) -> Result<Option<Vec<ContextLink>>> {
+pub(crate) fn context_links_from_db(s: Option<String>) -> Result<Option<Vec<ContextLink>>> {
     s.map(|json| {
         serde_json::from_str::<Vec<ContextLink>>(&json)
             .map_err(|e| Error::Internal(format!("decode context_links failed: {e}")))
@@ -2393,7 +2393,7 @@ fn context_links_from_db(s: Option<String>) -> Result<Option<Vec<ContextLink>>> 
 }
 
 /// Encode the optional `token_usage` snapshot to a JSON TEXT column (§5.23).
-fn token_usage_to_db(ws: &Workspace) -> Result<Option<String>> {
+pub(crate) fn token_usage_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.token_usage
         .as_ref()
         .map(|tu| {
@@ -2404,7 +2404,7 @@ fn token_usage_to_db(ws: &Workspace) -> Result<Option<String>> {
 }
 
 /// Decode the optional `token_usage` JSON TEXT column (§5.23).
-fn token_usage_from_db(s: Option<String>) -> Result<Option<TokenUsage>> {
+pub(crate) fn token_usage_from_db(s: Option<String>) -> Result<Option<TokenUsage>> {
     s.map(|json| {
         serde_json::from_str::<TokenUsage>(&json)
             .map_err(|e| Error::Internal(format!("decode token_usage failed: {e}")))
@@ -2413,7 +2413,7 @@ fn token_usage_from_db(s: Option<String>) -> Result<Option<TokenUsage>> {
 }
 
 /// Encode the optional `setup_script` record to a JSON TEXT column (§5.25).
-fn setup_script_to_db(ws: &Workspace) -> Result<Option<String>> {
+pub(crate) fn setup_script_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.setup_script
         .as_ref()
         .map(|s| {
@@ -2424,7 +2424,7 @@ fn setup_script_to_db(ws: &Workspace) -> Result<Option<String>> {
 }
 
 /// Decode the optional `setup_script` JSON TEXT column (§5.25).
-fn setup_script_from_db(s: Option<String>) -> Result<Option<SetupScript>> {
+pub(crate) fn setup_script_from_db(s: Option<String>) -> Result<Option<SetupScript>> {
     s.map(|json| {
         serde_json::from_str::<SetupScript>(&json)
             .map_err(|e| Error::Internal(format!("decode setup_script failed: {e}")))
@@ -2433,7 +2433,7 @@ fn setup_script_from_db(s: Option<String>) -> Result<Option<SetupScript>> {
 }
 
 /// Encode the optional `checkout_mode` enum to a TEXT column (§5.1).
-fn checkout_mode_to_db(ws: &Workspace) -> Result<Option<String>> {
+pub(crate) fn checkout_mode_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.checkout_mode.as_ref().map(enum_to_db).transpose()
 }
 

@@ -26,7 +26,7 @@ impl Store {
         server_id: &str,
         disabled: bool,
     ) -> Result<()> {
-        pending_postgres!("set_workspace_mcp_server_disabled", self, backend => backend.set_workspace_mcp_server_disabled(id, server_id, disabled).await)
+        dispatch!(self, backend => backend.set_workspace_mcp_server_disabled(id, server_id, disabled).await)
     }
 
     /// Every server id disabled in workspace `id`, sorted ascending for a
@@ -38,7 +38,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn workspace_mcp_disabled_servers(&self, id: &WorkspaceId) -> Result<Vec<String>> {
-        pending_postgres!("workspace_mcp_disabled_servers", self, backend => backend.workspace_mcp_disabled_servers(id).await)
+        dispatch!(self, backend => backend.workspace_mcp_disabled_servers(id).await)
     }
 
     /// Whether `server_id` is disabled in workspace `id`. Lenient like the
@@ -52,7 +52,7 @@ impl Store {
         id: &WorkspaceId,
         server_id: &str,
     ) -> Result<bool> {
-        pending_postgres!("workspace_mcp_server_disabled", self, backend => backend.workspace_mcp_server_disabled(id, server_id).await)
+        dispatch!(self, backend => backend.workspace_mcp_server_disabled(id, server_id).await)
     }
 }
 
