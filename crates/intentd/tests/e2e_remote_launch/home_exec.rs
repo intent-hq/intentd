@@ -8,7 +8,7 @@
 //! the machine, and the exit code comes back. A lost home answers
 //! `home-unavailable`.
 
-use super::homes::{home_checkout, process_gone, until, HOMES};
+use super::homes::{home_checkout, process_gone, until};
 use super::*;
 use base64::Engine as _;
 
@@ -88,13 +88,13 @@ async fn host_exec_and_exec_stream_of_a_workspace_with_a_home_run_on_the_home() 
     let (head, _, _, _) = start_backend(&head_dir, &repo).await;
     drop(head);
     super::orchestrator::orchestrator_config(&head_dir);
-    let (_head, port, cfg) = serve_backend(&head_dir, &[HOMES]).await;
+    let (_head, port, cfg) = serve_backend(&head_dir, &[]).await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
     let node_dir = scratch.path().join("node-0");
     std::fs::create_dir_all(&node_dir).unwrap();
-    let machine = start_machine_with(&node_dir, &backend_id, &[HOMES]).await;
+    let machine = start_machine_with(&node_dir, &backend_id, &[]).await;
     ok(
         &mut rpc_ws,
         2,

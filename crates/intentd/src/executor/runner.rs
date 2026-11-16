@@ -49,7 +49,6 @@ use super::workspace_api::{self, HeadLink};
 mod home_calls;
 mod home_events;
 mod homes;
-pub(crate) use homes::homes_ready;
 
 pub(super) mod codes {
     /// The machine's shared agent limits (count or memory) deny the launch.
@@ -144,10 +143,9 @@ pub(crate) trait MachineLaunch: Send + Sync {
     /// answered.
     fn policy(&self) -> PermissionPolicy;
     /// Whether this machine may hold workspace homes now: its
-    /// `remoteAgents.allowHomes`, behind the build's readiness gate
-    /// ([`homes_ready`]).
+    /// `remoteAgents.allowHomes`. A launch that does not say holds none.
     fn allows_homes(&self) -> bool {
-        homes_ready()
+        false
     }
 }
 

@@ -1,6 +1,7 @@
 //! Orchestrator mode (monorepo `docs/protocol/methods/nodes.md`,
 //! "Orchestrator mode") against a real backend started with
-//! `daemon.mode = "orchestrator"` and a real machine: the mode is reported;
+//! `daemon.mode = "orchestrator"` and a real machine: the mode is reported,
+//! with `workspaceHomes: 1` (a full daemon has no homes);
 //! the ordered list has no "This computer" row; an unplaced agent with no
 //! machine is `no-agent-machine` and a local placement is refused with
 //! `orchestrator-mode`, creating nothing; providers are only configured (no
@@ -74,6 +75,23 @@ async fn an_orchestrator_runs_nothing_itself() {
     // A local agent made while the daemon ran as a full daemon.
     let (head, port, cfg, ws_id) = start_backend(&head_dir, &repo).await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
+    let full_hello = ok(
+        &mut rpc_ws,
+        89,
+        "client.hello",
+        json!({ "clientId": "orchestrator-e2e", "name": "Orchestrator E2E" }),
+    )
+    .await;
+    assert_eq!(
+        full_hello["server"]["daemonMode"], "regular",
+        "{full_hello}"
+    );
+    assert!(
+        full_hello["server"]["capabilities"]
+            .get("workspaceHomes")
+            .is_none(),
+        "a full daemon keeps no homes: {full_hello}"
+    );
     let before_switch = ok(
         &mut rpc_ws,
         90,
@@ -98,6 +116,10 @@ async fn an_orchestrator_runs_nothing_itself() {
     assert_eq!(hello["server"]["daemonMode"], "orchestrator", "{hello}");
     assert_eq!(
         hello["server"]["capabilities"]["machineOrder"], 1,
+        "{hello}"
+    );
+    assert_eq!(
+        hello["server"]["capabilities"]["workspaceHomes"], 1,
         "{hello}"
     );
     let status = ok(&mut rpc_ws, 2, "host.status", json!({})).await;

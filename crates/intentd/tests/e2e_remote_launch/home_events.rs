@@ -6,7 +6,7 @@
 //! itself (a terminal's) as `changes:git-status`. No event shows the
 //! machine's paths.
 
-use super::homes::{home_checkout, until, HOMES};
+use super::homes::{home_checkout, until};
 use super::*;
 
 /// The next `events.event` of the workspace that `accept` takes; every
@@ -66,13 +66,13 @@ async fn file_and_git_events_of_a_home_reach_the_orchestrators_clients() {
     let (head, _, _, _) = start_backend(&head_dir, &repo).await;
     drop(head);
     super::orchestrator::orchestrator_config(&head_dir);
-    let (_head, port, cfg) = serve_backend(&head_dir, &[HOMES]).await;
+    let (_head, port, cfg) = serve_backend(&head_dir, &[]).await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
     let node_dir = scratch.path().join("node-0");
     std::fs::create_dir_all(&node_dir).unwrap();
-    let machine = start_machine_with(&node_dir, &backend_id, &[HOMES]).await;
+    let machine = start_machine_with(&node_dir, &backend_id, &[]).await;
     ok(
         &mut rpc_ws,
         2,

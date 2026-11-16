@@ -1281,7 +1281,7 @@ impl MachineLaunch for SettingsLaunch {
     }
 
     fn allows_homes(&self) -> bool {
-        self.1 && runner::homes_ready() && self.0.snapshot().effective.remote_agents.allows_homes()
+        self.1 && self.0.snapshot().effective.remote_agents.allows_homes()
     }
 
     fn policy(&self) -> intent_acp::PermissionPolicy {

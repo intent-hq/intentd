@@ -145,7 +145,7 @@ pub(crate) fn server_json(
 /// composition tracks startup, `remoteMachines: 1` when this backend places
 /// agents on exposed machines (the remote feature, not node mode), together
 /// with `remoteInitialAgent: 1`: `workspace.create` accepts
-/// `initialAgent.placement`.
+/// `initialAgent.placement`; `workspaceHomes: 1` on every orchestrator.
 pub(crate) fn with_runtime_capabilities(
     frame: Option<String>,
     daemon_mode: intent_core::settings_file::DaemonMode,
@@ -187,6 +187,11 @@ pub(crate) fn with_runtime_capabilities(
                 // `remoteMachines.order` / `setOrder`: the user-ordered
                 // list that placements without a machine walk.
                 capabilities["machineOrder"] = json!(1);
+            }
+            // Workspace homes are part of orchestrator mode
+            // (`Services::workspace_homes`).
+            if daemon_mode == intent_core::settings_file::DaemonMode::Orchestrator {
+                capabilities["workspaceHomes"] = json!(1);
             }
         }
         value.to_string()

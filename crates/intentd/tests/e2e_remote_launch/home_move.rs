@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use nix::sys::signal::Signal;
 
-use super::homes::{commit_on, home_checkout, until, HOMES};
+use super::homes::{commit_on, home_checkout, until};
 use super::*;
 
 /// An orchestrator whose workspace's home is on machine A, with machine B
@@ -77,13 +77,13 @@ async fn two_machines(prefix: &str) -> Option<TwoMachines> {
     drop(rpc_ws);
     drop(head);
     super::orchestrator::orchestrator_config(&head_dir);
-    let (head, port, cfg) = serve_backend(&head_dir, &[HOMES]).await;
+    let (head, port, cfg) = serve_backend(&head_dir, &[]).await;
     let mut rpc_ws = connect(port, cfg).await;
     let backend = ok(&mut rpc_ws, 2, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
     let a_dir = scratch.path().join("node-a");
     std::fs::create_dir_all(&a_dir).unwrap();
-    let a = start_machine_with(&a_dir, &backend_id, &[HOMES]).await;
+    let a = start_machine_with(&a_dir, &backend_id, &[]).await;
     ok(
         &mut rpc_ws,
         3,
@@ -124,7 +124,7 @@ async fn two_machines(prefix: &str) -> Option<TwoMachines> {
     .await;
     let b_dir = scratch.path().join("node-b");
     std::fs::create_dir_all(&b_dir).unwrap();
-    let b = start_machine_with(&b_dir, &backend_id, &[HOMES]).await;
+    let b = start_machine_with(&b_dir, &backend_id, &[]).await;
     id += 1;
     ok(
         &mut rpc_ws,
@@ -440,7 +440,7 @@ async fn an_orchestrator_restart_mid_move_completes_the_move() {
     drop(store);
     a.daemon.child_mut().signal(Signal::SIGCONT).unwrap();
 
-    let (head, port, cfg) = serve_backend(&head_dir, &[HOMES]).await;
+    let (head, port, cfg) = serve_backend(&head_dir, &[]).await;
     let rpc_ws = connect(port, cfg).await;
     let mut s = TwoMachines {
         scratch,

@@ -16,8 +16,7 @@ use intent_core::HomeId;
 
 use super::*;
 
-/// [`FixedLaunch`] with `remoteAgents.allowHomes` (and the readiness gate)
-/// answered by `allow`.
+/// [`FixedLaunch`] with `remoteAgents.allowHomes` answered by `allow`.
 struct HomesLaunch(bool);
 
 impl MachineLaunch for HomesLaunch {

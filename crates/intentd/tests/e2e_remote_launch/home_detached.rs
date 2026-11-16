@@ -8,7 +8,7 @@
 //! began keeps `backupWarning` on until the home backs up again
 //! ("Continuous backup").
 
-use super::homes::{commit_on, home_checkout, until, HOMES};
+use super::homes::{commit_on, home_checkout, until};
 use super::*;
 
 /// The orchestrator's link-loss grace in this test (60 s in production).
@@ -58,13 +58,13 @@ async fn a_home_whose_link_is_lost_is_detached_and_attached_again_at_the_next_bi
     let (head, _, _, _) = start_backend(&head_dir, &repo).await;
     drop(head);
     super::orchestrator::orchestrator_config(&head_dir);
-    let (_head, port, cfg) = serve_backend(&head_dir, &[HOMES, GRACE, WARNING]).await;
+    let (_head, port, cfg) = serve_backend(&head_dir, &[GRACE, WARNING]).await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
     let node_dir = scratch.path().join("node-0");
     std::fs::create_dir_all(&node_dir).unwrap();
-    let machine = start_machine_with(&node_dir, &backend_id, &[HOMES]).await;
+    let machine = start_machine_with(&node_dir, &backend_id, &[]).await;
     ok(
         &mut rpc_ws,
         2,
@@ -165,7 +165,7 @@ async fn a_home_whose_link_is_lost_is_detached_and_attached_again_at_the_next_bi
     // attached again.
     let pinned = machine_port.to_string();
     let (_machine, again_port, _) =
-        spawn_machine(&node_dir, &[HOMES, ("INTENTD_TCP_PORT", pinned.as_str())]).await;
+        spawn_machine(&node_dir, &[("INTENTD_TCP_PORT", pinned.as_str())]).await;
     assert_eq!(again_port, machine_port, "the machine keeps its WSS port");
     let attached = home_update(&mut events, &ws_id, |home| home["state"] == "attached").await;
     assert_ne!(attached["since"], detached["since"], "{attached}");

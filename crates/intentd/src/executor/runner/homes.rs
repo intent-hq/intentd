@@ -48,11 +48,6 @@ const STOP_TERMINALS_WAIT: Duration = Duration::from_secs(10);
 /// How long after the last writing home call `home/wip` is pushed.
 pub(super) const WIP_DEBOUNCE: Duration = Duration::from_secs(2);
 
-/// Whether this build holds workspace homes ([`intent_core::node_link::homes_ready`]).
-pub(crate) fn homes_ready() -> bool {
-    intent_core::node_link::homes_ready()
-}
-
 /// The homes of the bound backend.
 #[derive(Default)]
 pub(super) struct Homes {
