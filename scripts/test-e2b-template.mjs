@@ -6,8 +6,10 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { compareLayers, imageLayers, parseRef, refDigest, report } from '../packaging/e2b/layers.mjs';
 import {
   APT_PACKAGES,
+  BASE_IMAGE,
   DEFAULT_SIZE,
   GH,
   IMAGE_REPO,
@@ -191,10 +193,14 @@ describe('container image', () => {
     assert.deepEqual(imagePlan({ EVENT_NAME: 'workflow_dispatch', INPUT_VERSION: '0.11.138', INPUT_LATEST: 'false' }).tags,
       ['ghcr.io/intent-hq/intent-node:0.11.138']);
   });
-  it('builds a pull request image without pushing it', () => {
-    assert.deepEqual(imagePlan({ EVENT_NAME: 'pull_request', PR_NUMBER: '42', LATEST_RELEASE_TAG: 'v0.11.139' }), {
-      version: '0.11.139', tags: ['ghcr.io/intent-hq/intent-node:pr-42'], push: false,
+  it('builds a pull request image without pushing it, with the previous release as its baseline', () => {
+    const env = { EVENT_NAME: 'pull_request', PR_NUMBER: '42', LATEST_RELEASE_TAG: 'v0.11.139', PREVIOUS_RELEASE_TAG: 'v0.11.138' };
+    assert.deepEqual(imagePlan(env), {
+      version: '0.11.139', tags: ['ghcr.io/intent-hq/intent-node:pr-42'], push: false, baseline: '0.11.138',
     });
+    assert.throws(() => imagePlan({ ...env, PREVIOUS_RELEASE_TAG: '' }), /not an intentd release version/);
+    assert.throws(() => imagePlan({ ...env, PREVIOUS_RELEASE_TAG: 'v0.11.139' }), /is the newest release/);
+    assert.equal(imagePlan({ EVENT_NAME: 'workflow_dispatch', INPUT_VERSION: '0.11.138', PREVIOUS_RELEASE_TAG: 'v0.11.137' }).baseline, undefined);
   });
   it('passes skips through', () => {
     assert.match(imagePlan({ EVENT_NAME: 'workflow_run', RUN_CONCLUSION: 'failure', RUN_HEAD_BRANCH: 'v0.11.139' }).skip, /failure/);
@@ -202,18 +208,20 @@ describe('container image', () => {
   it('runs the same steps as the E2B template, as root, in order', () => {
     const text = dockerfile({ version: '0.11.139', sha256: SHA });
     const lines = text.trim().split('\n');
-    assert.equal(lines[0], 'FROM node:24-bookworm');
+    assert.equal(lines[0], `FROM ${BASE_IMAGE}`);
     const runs = lines.filter(line => line.startsWith('RUN '));
-    assert.match(runs[0], /apt-get update/);
-    for (const pkg of APT_PACKAGES) assert.match(runs[0], new RegExp(` ${pkg.replace(/[.+]/g, '\\$&')}( |$)`), pkg);
-    assert.match(runs[0], /rm -rf \/var\/lib\/apt\/lists/);
-    assert.doesNotMatch(runs[0], /no-install-recommends/, 'E2B aptInstall keeps recommended packages');
+    assert.equal(runs[0], `RUN ${addUserCommand()}`);
+    const apt = runs[1];
+    assert.match(apt, /apt-get update/);
+    for (const pkg of APT_PACKAGES) assert.match(apt, new RegExp(` ${pkg.replace(/[.+]/g, '\\$&')}( |$)`), pkg);
+    assert.match(apt, /rm -rf \/var\/lib\/apt\/lists/);
+    assert.doesNotMatch(apt, /no-install-recommends/, 'E2B aptInstall keeps recommended packages');
     const { calls, Template } = recorder();
     defineTemplate(Template, { version: '0.11.139', sha256: SHA });
     const commands = calls.filter(([name]) => name === 'runCmd').map(([, command]) => command);
-    assert.deepEqual(runs.slice(1, 1 + commands.length).map(line => line.slice(4)), commands);
+    assert.deepEqual(runs.slice(2).map(line => line.slice(4)), commands);
     const firstUser = lines.findIndex(line => line.startsWith('USER '));
-    assert.ok(firstUser > lines.lastIndexOf(runs[commands.length]), 'every template step runs as root');
+    assert.ok(firstUser > lines.indexOf(runs.at(-1)), 'every template step runs as root');
     assert.ok(text.includes(archiveUrl('0.11.139')));
   });
   it('runs containers as the unprivileged user, with its home where the volume mounts', () => {
@@ -225,6 +233,23 @@ describe('container image', () => {
     assert.deepEqual(lines.filter(line => line.startsWith('USER ')), ['USER user']);
     assert.ok(lines.indexOf('USER user') > lines.indexOf(`RUN ${addUserCommand()}`));
     assert.ok(lines.includes('WORKDIR /home/user'));
+  });
+  it('pins the base by digest, so its layers and the cache above them stay put', () => {
+    assert.match(BASE_IMAGE, /^node:24-bookworm@sha256:[0-9a-f]{64}$/);
+    const { calls, Template } = recorder();
+    defineTemplate(Template, { version: '0.11.139', sha256: SHA });
+    assert.deepEqual(calls[0], ['fromImage', BASE_IMAGE]);
+  });
+  it('orders layers from least to most often changed, intentd last', () => {
+    const a = dockerfile({ version: '0.11.138', sha256: SHA }).trim().split('\n');
+    const b = dockerfile({ version: '0.11.139', sha256: 'f'.repeat(64) }).trim().split('\n');
+    const differ = a.map((line, i) => i).filter(i => a[i] !== b[i]);
+    const lastRun = a.findLastIndex(line => line.startsWith('RUN '));
+    assert.deepEqual(differ.filter(i => i <= lastRun), [lastRun], 'only the last RUN depends on the intentd version');
+    assert.ok(a[lastRun].includes(archiveUrl('0.11.138')));
+    for (const i of differ) assert.ok(i === lastRun || !/^(RUN|COPY|ADD) /.test(a[i]), a[i]);
+    const runs = a.filter(line => line.startsWith('RUN '));
+    assert.ok(runs.findIndex(line => line.includes('npm install')) > runs.findIndex(line => line.includes('apt-get')));
   });
   it('leaves the E2B template without the user step', () => {
     const { calls, Template } = recorder();
@@ -411,8 +436,22 @@ describe('image workflow contract', () => {
   });
   it('builds linux/amd64 and smoke-tests before it pushes', () => {
     assert.match(steps, /node image\.mjs/);
-    assert.match(steps, /docker build --platform linux\/amd64/);
-    assert.ok(steps.indexOf('node smoke-image.mjs') < steps.indexOf('docker push'));
+    assert.match(steps, /docker buildx build --platform linux\/amd64 --pull --cache-to type=inline --load/);
+    assert.ok(steps.indexOf('node smoke-image.mjs') < steps.indexOf('--push'));
+    assert.doesNotMatch(steps, /docker (build|push) /, 'buildx keeps cached layers as the same blobs');
+  });
+  it('reuses the previous image as its layer cache', () => {
+    assert.match(steps, /uses: docker\/setup-buildx-action@v\d+\n.*\n\s+with:\n\s+driver-opts: network=host/);
+    assert.match(steps, /--cache-from "type=registry,ref=ghcr\.io\/intent-hq\/intent-node:latest"/);
+    assert.match(steps, /--cache-to type=inline --push/);
+  });
+  it('fails a PR whose recipe would add more than the intentd layer per release', () => {
+    assert.match(build, /LAYER_BUDGET_MB: \d+/);
+    assert.match(build, /image: \$\{\{ github\.event_name == 'pull_request' && 'registry:2' \|\| '' \}\}/);
+    assert.match(steps, /--file Dockerfile\.baseline/);
+    assert.match(steps, /--cache-from "type=registry,ref=\$LOCAL_IMAGE:baseline,registry\.insecure=true"/);
+    assert.match(steps, /node layers\.mjs "\$LOCAL_IMAGE:baseline" "\$LOCAL_IMAGE:pr-\$PR_NUMBER" --budget-mb "\$LAYER_BUDGET_MB"/);
+    assert.match(steps, /PREVIOUS_RELEASE_TAG: \$\{\{ steps\.latest\.outputs\.previous \}\}/);
   });
   it('grants packages: write only to release and manual runs, which alone push', () => {
     assert.match(job('release'), /permissions:\n\s+contents: read\n\s+packages: write/);
@@ -428,5 +467,76 @@ describe('image workflow contract', () => {
     assert.match(job('release'), /cancel-in-progress: false\n\s+queue: max/);
     assert.match(job('pull-request'), /cancel-in-progress: true/);
     for (const name of ['release', 'pull-request']) assert.match(job(name), /uses: \.\/\.github\/workflows\/intent-node-image-build\.yml/);
+  });
+});
+
+describe('layers', () => {
+  const digest = c => `sha256:${c.repeat(64)}`;
+  function registry(images) {
+    const calls = [];
+    const fetch = async (url, { headers = {} } = {}) => {
+      calls.push([url, headers]);
+      if (url.endsWith('/token?scope=repository:intent-hq/intent-node:pull')) return Response.json({ token: 't' });
+      const path = new URL(url).pathname.replace('/v2/intent-hq/intent-node', '').replace('/v2/intent-node', '');
+      const body = images[path];
+      if (!body) return new Response('', { status: 404 });
+      return Response.json(body, { headers: { 'docker-content-digest': digest('9') } });
+    };
+    return { calls, fetch };
+  }
+  const config = (ids, steps) => ({
+    rootfs: { diff_ids: ids.map(digest) },
+    history: steps.flatMap(step => [{ created_by: 'LABEL x', empty_layer: true }, { created_by: step }]),
+  });
+  it('parses tag and digest references', () => {
+    assert.deepEqual(parseRef('ghcr.io/intent-hq/intent-node:0.11.1'), { registry: 'ghcr.io', repository: 'intent-hq/intent-node', reference: '0.11.1' });
+    assert.deepEqual(parseRef(`localhost:5000/intent-node@${digest('a')}`), { registry: 'localhost:5000', repository: 'intent-node', reference: digest('a') });
+    assert.throws(() => parseRef('intent-node'), /not a registry/);
+    assert.throws(() => parseRef('ghcr.io/intent-hq/intent-node'), /not a registry/);
+  });
+  it('reads the amd64 image of an index, pairing each layer with its diff_id and step', async () => {
+    const { calls, fetch } = registry({
+      '/manifests/latest': { manifests: [
+        { digest: digest('1'), platform: { os: 'linux', architecture: 'arm64' } },
+        { digest: digest('2'), platform: { os: 'linux', architecture: 'amd64' } },
+      ] },
+      [`/manifests/${digest('2')}`]: { config: { digest: digest('3') }, layers: [{ size: 10 }, { size: 20 }] },
+      [`/blobs/${digest('3')}`]: config(['a', 'b'], ['RUN apt', 'RUN intentd']),
+    });
+    assert.deepEqual(await imageLayers('ghcr.io/intent-hq/intent-node:latest', fetch), [
+      { diffId: digest('a'), size: 10, step: 'RUN apt' },
+      { diffId: digest('b'), size: 20, step: 'RUN intentd' },
+    ]);
+    assert.ok(calls.slice(1).every(([url, headers]) => url.startsWith('https://ghcr.io/') && headers.Authorization === 'Bearer t'));
+  });
+  it('talks plain HTTP without a token to a localhost registry', async () => {
+    const { calls, fetch } = registry({
+      '/manifests/pr-1': { config: { digest: digest('3') }, layers: [{ size: 5 }] },
+      [`/blobs/${digest('3')}`]: config(['a'], ['RUN a']),
+    });
+    await imageLayers('localhost:5000/intent-node:pr-1', fetch);
+    assert.ok(calls.every(([url, headers]) => url.startsWith('http://localhost:5000/v2/') && !headers.Authorization));
+  });
+  it('refuses a config whose diff_ids do not match the layers', async () => {
+    const { fetch } = registry({
+      '/manifests/x': { config: { digest: digest('3') }, layers: [{ size: 5 }] },
+      [`/blobs/${digest('3')}`]: config(['a', 'b'], ['RUN a', 'RUN b']),
+    });
+    await assert.rejects(imageLayers('localhost:5000/intent-node:x', fetch), /1 layers but 2 diff_ids/);
+  });
+  it('resolves a tag to a digest reference', async () => {
+    const { fetch } = registry({ '/manifests/latest': { manifests: [] } });
+    assert.equal(await refDigest('ghcr.io/intent-hq/intent-node:latest', fetch), `ghcr.io/intent-hq/intent-node@${digest('9')}`);
+  });
+  it('counts only the new image layers the old one lacks, by diff_id', () => {
+    const older = [{ diffId: 'a', size: 400, step: '' }, { diffId: 'b', size: 300, step: '' }, { diffId: 'c', size: 70, step: '' }];
+    const newer = [{ diffId: 'a', size: 400, step: '' }, { diffId: 'b', size: 300, step: '' }, { diffId: 'd', size: 72, step: '/bin/sh -c tar | x' }];
+    const result = compareLayers(older, newer);
+    assert.equal(result.total, 772);
+    assert.equal(result.changed, 72);
+    assert.deepEqual(result.layers.map(layer => layer.shared), [true, true, false]);
+    const text = report('old', 'new', result);
+    assert.match(text, /0\.0 MB of 0\.0 MB compressed; 1 of 3 layers/);
+    assert.match(text, /\| 3 \| 0\.0 MB \| yes \| `tar \\\| x` \|/);
   });
 });
