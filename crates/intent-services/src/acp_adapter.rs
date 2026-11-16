@@ -2104,7 +2104,7 @@ wait
         slots: &Arc<AdapterSlots>,
     ) -> (tokio::task::JoinHandle<()>, PathBuf, i32) {
         let (adapter, npx_cwd, grandchild) = spawn_fake_npx(tmp, slots, LIVE_FAKE_NPX_SCRIPT).await;
-        let parked = tokio::spawn(park_forever(adapter)); // caller-binding: allow — test-only parking of a fake adapter; reaches no service layer
+        let parked = tokio::spawn(park_forever(adapter));
         (parked, npx_cwd, grandchild)
     }
 
@@ -2216,7 +2216,7 @@ wait
         let terminated = tmp.path().join(LEADER_TERMINATED_MARKER);
         assert!(!terminated.exists());
 
-        let reaping = tokio::spawn(reap_adapter(adapter)); // caller-binding: allow — test-only bounded reap of a fake adapter; reaches no service layer
+        let reaping = tokio::spawn(reap_adapter(adapter));
         let deadline = tokio::time::Instant::now()
             + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !terminated.exists() {
