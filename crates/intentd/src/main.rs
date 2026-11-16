@@ -31,7 +31,6 @@ use intent_transport::{
     WsOptions,
 };
 use serde_json::{json, Value};
-use sqlx::Row;
 
 mod agents_cmd;
 mod client;
@@ -2411,20 +2410,6 @@ async fn cmd_serve_owned(
     // transaction is open on the write connection (a VACUUM requirement).
     // Failure is non-fatal: the daemon runs degraded exactly as before
     // (freelist pages are simply never returned to the filesystem).
-    // Pre-log the rebuild (PR #500 review): on a large legacy DB the VACUUM
-    // can take a while in finalizing, so an operator tailing
-    // the log needs to see why startup is slow before it completes.
-    if let Ok(row) = sqlx::query("PRAGMA auto_vacuum")
-        .fetch_one(store.write_pool())
-        .await
-    {
-        if row.get::<i64, _>(0) == 0 {
-            tracing::info!(
-                "legacy database in auto_vacuum=NONE mode; running one-time VACUUM \
-                 (may take a while on large databases)"
-            );
-        }
-    }
     match store.activate_incremental_vacuum().await {
         Ok(intent_store::AutoVacuumActivation::Activated {
             duration,
@@ -8899,14 +8884,8 @@ async fn report_db_health(
     // in NONE mode until a one-time VACUUM, which `intentd serve` runs
     // automatically at startup (monorepo#720 finding 1); print that story
     // plus the manual fallback.
-    let auto_vacuum = sqlx::query("PRAGMA auto_vacuum")
-        .fetch_one(store.read_pool())
-        .await
-        .ok()
-        .and_then(|row| row.try_get::<i64, _>(0).ok());
-    let freelist = sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
-        .fetch_one(store.read_pool())
-        .await;
+    let auto_vacuum = store.auto_vacuum_mode().await.ok();
+    let freelist = store.freelist_count().await;
     match (auto_vacuum, &freelist) {
         (Some(2), Ok(freelist)) => {
             println!("  [ok] auto_vacuum: INCREMENTAL (freelist_count={freelist} pages)");
@@ -8925,12 +8904,8 @@ async fn report_db_health(
         _ => println!("  [WARN] auto_vacuum/freelist_count: failed to query"),
     }
 
-    let pool = store.read_pool();
-    println!(
-        "  [ok] diagnostic read_pool: size={}, idle={}",
-        pool.size(),
-        pool.num_idle()
-    );
+    let (size, idle) = store.read_pool_stats();
+    println!("  [ok] diagnostic read_pool: size={size}, idle={idle}");
     healthy
 }
 
