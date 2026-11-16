@@ -201,7 +201,8 @@ naming the "action execution" stage instead of a per-action `errorCode`.
 - `{ action: "previewHtml", html, width?, appearance? }` - Check a self-contained `ws-block:html` visual before showing it, in an invisible window with the app sandbox, fonts and themes (no tab, server or focus change). `width` is CSS pixels, 320 to 1600 (default 800; about 390 for phones). `appearance` is `"light"` (default) or `"dark"`. As a single action, `r.result` has `assetUrl`, `width`, `height`, `contentHeight`, `truncated` (full-height PNG capped at 8000px), `appearance` and `consoleMessages` (`[{ level, message }]`); view it with `return await ws.note.readAsset(r.result.assetUrl)`. Without `assetUrl`, the result keeps `base64` and `mimeType`. Frontends without this action report it as unsupported.
 
 ## Input Actions
-Real mouse and keyboard input through the DevTools Input domain. The page gets
+`click`, `hover`, `type` and `press` send real mouse and keyboard input through the
+DevTools Input domain (`selectOption` is the exception, see below). The page gets
 `isTrusted: true` events with native editing and selection, so these work on controls
 that ignore events made in `evaluate`: sectioned date pickers, masked inputs, rich-text
 editors and `isTrusted` checks. Input goes only to the tab's page. It never moves the
@@ -212,7 +213,7 @@ shadow roots (not inside iframes); `x`/`y` are CSS pixels in the tab's viewport.
 - `{ action: "hover", selector | x+y, tabId? }` - Move the mouse over the element
 - `{ action: "type", text, selector?, clear?, mode?, tabId? }` - Type into the focused element, or focus `selector` first. Types at the caret; `clear: true` selects all and deletes first. `mode: "keys"` (default) sends one US-layout key press per character (`\n` is Enter, `\t` is Tab); `"insert"` inserts the text in one step (no key events; use it for long text)
 - `{ action: "press", key, modifiers?, tabId? }` - Press one key: a single character or a named key (`Enter`, `Tab`, `Backspace`, `Delete`, `Escape`, `Insert`, `ArrowUp`/`Down`/`Left`/`Right`, `Home`, `End`, `PageUp`, `PageDown`, `F1`–`F12`). `modifiers` is a list of `Shift`, `Control`, `Alt`, `Meta`, `ControlOrMeta` (Meta on macOS, else Control), e.g. `{ key: "a", modifiers: ["ControlOrMeta"] }` selects all
-- `{ action: "selectOption", selector, value, tabId? }` - Choose options of a native `<select>` by value or label (`value` is a string or a list for `multiple`). This one sets the value and fires synthetic `input` and `change` events, since native dropdown popups cannot be driven. For custom dropdowns, use `click`
+- `{ action: "selectOption", selector, value, tabId? }` - Choose options of a native `<select>` by value or label (`value` is a string or a list for `multiple`). Not trusted: it sets the value and fires synthetic `input` and `change` events (`isTrusted: false`), since native dropdown popups cannot be driven. For a select that checks `isTrusted`, focus it with `click` and choose with `press` (`ArrowDown`, `Enter`); for custom dropdowns, use `click`
 
 Input failures carry an `errorCode`: `element-not-found`, `invalid-selector`,
 `element-not-visible` (no part of it in the viewport, or `visibility: hidden`),
