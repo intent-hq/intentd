@@ -35,6 +35,17 @@ pub(super) async fn backend_with_token_env(
     origin: Option<&str>,
     env: &[(&str, &str)],
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String, String) {
+    backend_with_repo(scratch, origin, env, |_| {}).await
+}
+
+/// [`backend_with_token_env`], with `prepare` run on the workspace
+/// repository after its first commit, before the backend starts.
+pub(super) async fn backend_with_repo(
+    scratch: &Path,
+    origin: Option<&str>,
+    env: &[(&str, &str)],
+    prepare: impl FnOnce(&Path),
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String, String) {
     let repo = scratch.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     // The workspace branch follows the checkout's branch.
@@ -45,6 +56,7 @@ pub(super) async fn backend_with_token_env(
     std::fs::write(repo.join("README.md"), "base\n").unwrap();
     git(&repo, &["add", "README.md"]);
     git(&repo, &["commit", "--quiet", "-m", "base"]);
+    prepare(&repo);
     let head_dir = scratch.join("head");
     std::fs::create_dir_all(&head_dir).unwrap();
     intent_core::FileSecretStore::with_path(head_dir.join("secrets.json"))

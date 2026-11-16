@@ -624,6 +624,9 @@ struct Agent {
     /// Its GitHub repository, fetched through the backend (nodeProtocol
     /// 17): sub-agents only.
     forge_fetch: Option<ForgeFetchLaunch>,
+    /// The submodules it also fetches through the backend, with
+    /// [`Self::forge_fetch`] only.
+    forge_fetch_modules: Vec<intent_core::node_link::ForgeFetchModule>,
     /// The backend's commit identity for the workspace, set as the
     /// provider's `GIT_AUTHOR_*` / `GIT_COMMITTER_*`.
     git_identity: Option<intent_core::node_link::GitIdentity>,
@@ -1527,6 +1530,7 @@ impl Runner {
         command: LaunchCommand,
         resolved: Result<ProviderLaunch, String>,
     ) -> Option<JournalEntry> {
+        let forge_fetch_modules_valid = command.forge_fetch_modules_valid();
         let LaunchCommand {
             agent_id,
             workspace_id,
@@ -1543,6 +1547,7 @@ impl Runner {
             checkout_of,
             forge,
             forge_fetch,
+            forge_fetch_modules,
             git_identity,
             new_machine,
             resumed_from_disk,
@@ -1620,6 +1625,13 @@ impl Runner {
                     codes::CHECKOUT
                 )));
             }
+        }
+        if !forge_fetch_modules_valid {
+            drop(state);
+            return Some(exited(format!(
+                "{}: the launch's submodule forge fetch remotes are not usable",
+                codes::CHECKOUT
+            )));
         }
         if state.agents.contains_key(&agent_id) {
             // The running agent's own records are what head should see; a
@@ -1713,6 +1725,7 @@ impl Runner {
             forge_lease: Mutex::new(None),
             forge,
             forge_fetch,
+            forge_fetch_modules,
             git_identity,
             npx_launch_dir: Mutex::new(None),
             default_account: profile.is_none().then(|| {
@@ -1929,6 +1942,18 @@ impl Runner {
                             .forge_origin(&ready.worktree, &fetch.remote_url)
                             .await?;
                     }
+                    // A submodule's `origin` is a convenience: a failure
+                    // there leaves only that submodule without one.
+                    for module in &agent.forge_fetch_modules {
+                        if let Err(error) = self
+                            .inner
+                            .checkouts
+                            .forge_module_origin(&ready.worktree, &agent.repo_key, module)
+                            .await
+                        {
+                            tracing::warn!(agent = %agent.id, path = %module.path, %error, "node: no origin for the submodule");
+                        }
+                    }
                     Ok::<(), anyhow::Error>(())
                 };
                 Some(configured.await.map(|()| ready))
@@ -2109,7 +2134,17 @@ impl Runner {
             "`GH_TOKEN` is set so that `gh` can read from GitHub. Use it only to read: do not push, and do not create or change anything on GitHub. Your work goes back to your parent agent through Intent.".to_owned()
         });
         let fetch = (agent.forge_fetch.is_some() && self.inner.forge_git.is_some()).then(|| {
-            "`git fetch origin` gets the current branches from GitHub through Intent. `git push` to GitHub is refused: your work goes back to your parent agent through Intent.".to_owned()
+            let modules = agent
+                .forge_fetch_modules
+                .iter()
+                .map(|module| format!("`{}`", module.path))
+                .collect::<Vec<_>>();
+            let inside = if modules.is_empty() {
+                String::new()
+            } else {
+                format!(", also inside the submodules {}", modules.join(", "))
+            };
+            format!("`git fetch origin` gets the current branches from GitHub through Intent{inside}. `git push` to GitHub is refused: your work goes back to your parent agent through Intent.")
         });
         [token, fetch]
             .into_iter()
@@ -2140,37 +2175,57 @@ impl Runner {
             Err(e) => return Err(e.into()),
         }
         let listener = tokio::net::UnixListener::bind(&path)?;
-        let remote =
-            intent_git::node_git::AgentRemote::new(agent.workspace_id.as_str(), &agent.id.0)
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-                .forge();
+        let remotes = Self::forge_remotes(agent)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .into_iter()
+            .map(|(remote, _)| remote)
+            .collect();
         // caller-binding: allow — machine-local git helper socket for one sub-agent
         let task = tokio::spawn(intent_transport::node_link::serve_forge_helpers(
             listener,
             git.sessions.clone(),
-            remote,
+            remotes,
         ));
         Ok(Some(ForgeSocket { path, task }))
+    }
+
+    /// A sub-agent's forge remotes and the GitHub URLs they stand for: the
+    /// workspace repository's, then each of its submodules'. Empty without
+    /// `forgeFetch`.
+    fn forge_remotes(
+        agent: &Agent,
+    ) -> intent_core::Result<Vec<(intent_git::node_git::AgentRemote, &str)>> {
+        let Some(fetch) = &agent.forge_fetch else {
+            return Ok(Vec::new());
+        };
+        let remote =
+            intent_git::node_git::AgentRemote::new(agent.workspace_id.as_str(), &agent.id.0)?;
+        let mut remotes = vec![(remote.forge(), fetch.remote_url.as_str())];
+        for module in &agent.forge_fetch_modules {
+            remotes.push((
+                remote.forge_module(&module.module_key)?,
+                module.remote_url.as_str(),
+            ));
+        }
+        Ok(remotes)
     }
 
     /// The git environment of a sub-agent that fetches GitHub through the
     /// backend (nodeProtocol 17): its GitHub URLs rewritten to its forge
     /// remote, reached through its own socket.
     fn forge_fetch_env(agent: &Agent, socket: &ForgeSocket) -> Vec<(String, String)> {
-        let Some(fetch) = &agent.forge_fetch else {
+        let Ok(remotes) = Self::forge_remotes(agent) else {
             return Vec::new();
         };
-        let Ok(remote) =
-            intent_git::node_git::AgentRemote::new(agent.workspace_id.as_str(), &agent.id.0)
-        else {
+        if remotes.is_empty() {
             return Vec::new();
-        };
+        }
+        let rewrites: Vec<(String, &str)> = remotes
+            .iter()
+            .map(|(remote, url)| (remote.url(), *url))
+            .collect();
         let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
-        let mut env = intent_git::auth::forge_fetch_env(
-            &remote.forge().url(),
-            &fetch.remote_url,
-            inherited.as_deref(),
-        );
+        let mut env = intent_git::auth::forge_fetch_env(&rewrites, inherited.as_deref());
         env.push((
             intent_git::node_git::SOCKET_ENV.to_owned(),
             socket.path.to_string_lossy().into_owned(),

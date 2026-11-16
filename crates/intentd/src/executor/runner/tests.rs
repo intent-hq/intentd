@@ -161,6 +161,7 @@ fn launch(id: &str) -> LaunchCommand {
         checkout_of: None,
         forge: None,
         forge_fetch: None,
+        forge_fetch_modules: Vec::new(),
         git_identity: None,
         new_machine: None,
         resumed_from_disk: false,

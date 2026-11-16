@@ -9,15 +9,16 @@
 //! `HEAD`, so a sub-agent's `origin/<branch>` is the branch on GitHub.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use intent_core::node_link::{ForgeFetchLaunch, ForgeFetchModule, SubmodulePin};
 use intent_core::{Error, Result};
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
-use super::{run, sanitized_git};
+use super::{run, sanitized_git, ModuleRefusal};
 
 /// The git namespace holding head's copy of the GitHub refs.
 pub const NAMESPACE: &str = "intent-forge";
@@ -103,14 +104,14 @@ fn default_branch(ls_remote: &str) -> Option<&str> {
 }
 
 /// `repository`'s git common directory, shared by all its worktrees.
-pub async fn common_dir(repository: &Path) -> Option<std::path::PathBuf> {
+pub async fn common_dir(repository: &Path) -> Option<PathBuf> {
     let mut command = sanitized_git();
     command.arg("-C").arg(repository).args([
         "rev-parse",
         "--path-format=absolute",
         "--git-common-dir",
     ]);
-    run(command).await.ok().map(std::path::PathBuf::from)
+    run(command).await.ok().map(PathBuf::from)
 }
 
 /// Whether the namespace holds any ref.
@@ -192,6 +193,65 @@ pub async fn seed_from_origin(repository: &Path) -> Result<bool> {
         let _ = run(symref).await;
     }
     Ok(true)
+}
+
+/// Head side: the `forgeFetchModules` of a sub-agent launch whose
+/// `forgeFetch` URL is `root_url`, from `pins`, the pins of the agent's
+/// checkout. One entry per pin that is still a submodule of `checkout`
+/// (checked as for a module session) whose own `origin` is on GitHub,
+/// leaving out a URL that is the root's or an earlier entry's.
+#[must_use]
+pub fn modules(checkout: &Path, root_url: &str, pins: &[SubmodulePin]) -> Vec<ForgeFetchModule> {
+    let mut urls = std::collections::HashSet::from([root_url.to_owned()]);
+    let mut keys = std::collections::HashSet::new();
+    pins.iter()
+        .filter(|pin| keys.insert(pin.module_key.as_str()))
+        .filter_map(|pin| {
+            let (_, url) = github_module(checkout, &pin.path, &pin.module_key).ok()?;
+            urls.insert(url.clone()).then(|| ForgeFetchModule {
+                path: pin.path.clone(),
+                module_key: pin.module_key.clone(),
+                remote_url: url,
+            })
+        })
+        .collect()
+}
+
+/// Head side: the work tree a module forge session for `module_key` serves
+/// from, and the GitHub URL it refreshes from: the submodule's `origin`
+/// now. `module_key` must name one of `pins`, the pins of the agent's
+/// checkout, still a submodule of `checkout` (checked as for a module
+/// session) whose own `origin` is on GitHub.
+///
+/// # Errors
+///
+/// [`ModuleRefusal::Denied`] for any other key, or a submodule whose
+/// `origin` is not on GitHub; [`ModuleRefusal::Unavailable`] when it is not
+/// populated any more.
+pub fn module(
+    checkout: &Path,
+    pins: &[SubmodulePin],
+    module_key: &str,
+) -> std::result::Result<(PathBuf, String), ModuleRefusal> {
+    let pin = pins
+        .iter()
+        .find(|pin| pin.module_key == module_key)
+        .ok_or(ModuleRefusal::Denied)?;
+    github_module(checkout, &pin.path, module_key)
+}
+
+fn github_module(
+    checkout: &Path,
+    path: &str,
+    module_key: &str,
+) -> std::result::Result<(PathBuf, String), ModuleRefusal> {
+    let module = super::module_repository(checkout, path, module_key)?;
+    let origin = crate::remote::origin_url(&module.worktree)
+        .ok()
+        .flatten()
+        .ok_or(ModuleRefusal::Denied)?;
+    let launch = ForgeFetchLaunch::for_github(&origin).ok_or(ModuleRefusal::Denied)?;
+    Ok((module.worktree, launch.remote_url))
 }
 
 /// `git upload-pack` serving the namespace: only its refs are advertised,

@@ -9,6 +9,7 @@ use std::process::Command as StdCommand;
 
 use super::*;
 use crate::testutil::{commit_file, init_repo, write_file};
+use intent_core::node_link::ForgeFetchModule;
 
 const WS: &str = "ws-1";
 const AGENT: &str = "agent-1";
@@ -839,6 +840,135 @@ fn unpinned_submodules_are_the_populated_ones_outside_the_pins() {
         ["u/v"]
     );
     assert!(unpinned_submodules(&root.path().join("missing"), &[]).is_err());
+}
+
+/// Forge remotes: the agent's, `…/modules/<key>/forge` for a submodule's,
+/// and a module key that happens to be `forge` stays a module remote.
+#[test]
+fn forge_remote_urls_round_trip_and_reject_other_spellings() {
+    let remote = remote(AGENT);
+    let forge = remote.forge();
+    assert_eq!(forge.url(), "intent://ws/ws-1/agents/agent-1/forge");
+    let module = remote.forge_module("repo-1").unwrap();
+    assert_eq!(
+        module.url(),
+        "intent://ws/ws-1/agents/agent-1/modules/repo-1/forge"
+    );
+    for parsed in [&forge, &module] {
+        assert_eq!(&AgentRemote::parse(&parsed.url()).unwrap(), parsed);
+        assert!(parsed.is_forge());
+    }
+    assert_eq!(module.module_key(), Some("repo-1"));
+    assert_eq!(forge.module_key(), None);
+    let named_forge = AgentRemote::parse("intent://ws/ws-1/agents/agent-1/modules/forge").unwrap();
+    assert!(!named_forge.is_forge());
+    assert_eq!(named_forge.module_key(), Some("forge"));
+    for url in [
+        "intent://ws/ws-1/agents/agent-1/forge/x",
+        "intent://ws/ws-1/agents/agent-1/forge/forge",
+        "intent://ws/ws-1/agents/agent-1/modules/repo-1/forge/x",
+        "intent://ws/ws-1/agents/agent-1/modules//forge",
+        "intent://ws/ws-1/agents/agent-1/modules/a/b/forge",
+        "intent://ws/ws-1/homes/home-1/forge",
+    ] {
+        assert!(AgentRemote::parse(url).is_err(), "{url}");
+    }
+    assert!(remote.forge_module("a/b").is_err());
+}
+
+/// Head lists, and serves, a module forge remote only for a pin of the
+/// agent's checkout that is still a submodule there with a GitHub
+/// `origin`; a URL that repeats the root's or an earlier pin's is left out.
+#[test]
+fn forge_modules_follow_the_pins_and_github_origins() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |dir: &Path, args: &[&str]| {
+        let mut all = vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "protocol.file.allow=always",
+        ];
+        all.extend_from_slice(args);
+        git(dir, &all)
+    };
+    let repo = |name: &str| {
+        let dir = root.path().join("src").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        run(&dir, &["init", "--quiet"]);
+        std::fs::write(dir.join("f.txt"), name).unwrap();
+        run(&dir, &["add", "f.txt"]);
+        run(&dir, &["commit", "--quiet", "-m", name]);
+        dir
+    };
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    run(&work, &["init", "--quiet"]);
+    for path in ["gh", "local", "same", "root", "unpinned"] {
+        let url = repo(path);
+        run(
+            &work,
+            &["submodule", "add", "--quiet", url.to_str().unwrap(), path],
+        );
+    }
+    run(&work, &["commit", "--quiet", "-m", "submodules"]);
+    let origin = |path: &str, url: &str| {
+        run(&work.join(path), &["remote", "set-url", "origin", url]);
+    };
+    origin("gh", "git@github.com:acme/gh.git");
+    origin("same", "https://github.com/acme/gh.git");
+    origin("root", FORGE_URL);
+    origin("unpinned", "https://github.com/acme/unpinned.git");
+    let pins: Vec<SubmodulePin> = submodule_pins(&work)
+        .unwrap()
+        .into_iter()
+        .filter(|pin| pin.path != "unpinned")
+        .collect();
+    let key = |path: &str| {
+        submodule_pins(&work)
+            .unwrap()
+            .into_iter()
+            .find(|pin| pin.path == path)
+            .unwrap()
+            .module_key
+    };
+
+    let modules = forge::modules(&work, FORGE_URL, &pins);
+    assert_eq!(
+        modules,
+        [ForgeFetchModule {
+            path: "gh".into(),
+            module_key: key("gh"),
+            remote_url: "https://github.com/acme/gh.git".into(),
+        }]
+    );
+    let (worktree, url) = forge::module(&work, &pins, &key("gh")).unwrap();
+    assert_eq!(worktree, work.canonicalize().unwrap().join("gh"));
+    assert_eq!(url, "https://github.com/acme/gh.git");
+    // Not on GitHub, not pinned, or no such key: denied.
+    for denied in [key("local"), key("unpinned"), "nope".to_owned()] {
+        assert_eq!(
+            forge::module(&work, &pins, &denied),
+            Err(ModuleRefusal::Denied),
+            "{denied}"
+        );
+    }
+    // No longer populated: unavailable.
+    run(&work, &["submodule", "deinit", "--quiet", "-f", "gh"]);
+    assert!(matches!(
+        forge::module(&work, &pins, &key("same")).map(|(_, url)| url),
+        Ok(url) if url == "https://github.com/acme/gh.git"
+    ));
+    assert!(matches!(
+        forge::module(
+            &work,
+            &pins,
+            &pins.iter().find(|p| p.path == "gh").unwrap().module_key
+        ),
+        Err(ModuleRefusal::Unavailable(_))
+    ));
 }
 
 const FORGE_URL: &str = "https://github.com/acme/widget.git";

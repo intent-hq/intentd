@@ -251,6 +251,20 @@ impl AgentRemote {
         }
     }
 
+    /// The same agent's forge remote for the submodule repository
+    /// `module_key` names: that submodule's GitHub repository, fetched
+    /// through head.
+    ///
+    /// # Errors
+    ///
+    /// `node-git-invalid-remote` when the key is not a safe ref component.
+    pub fn forge_module(&self, module_key: &str) -> Result<Self> {
+        Ok(Self {
+            forge: true,
+            ..self.forge().with_module(module_key)?
+        })
+    }
+
     /// Whether this is a forge remote.
     #[must_use]
     pub fn is_forge(&self) -> bool {
@@ -273,8 +287,8 @@ impl AgentRemote {
     }
 
     /// Parse the canonical `intent://ws/<wsId>/agents/<agentId>` URL,
-    /// `…/modules/<moduleKey>` for a submodule, or `…/forge` for the forge
-    /// remote.
+    /// `…/modules/<moduleKey>` for a submodule, `…/forge` for the forge
+    /// remote, or `…/modules/<moduleKey>/forge` for a submodule's.
     ///
     /// # Errors
     ///
@@ -292,12 +306,20 @@ impl AgentRemote {
             return Ok(remote);
         }
         let (workspace, agent) = rest.split_once("/agents/").ok_or_else(invalid_remote)?;
-        let remote = match agent.split_once(MODULES) {
-            Some((agent, module_key)) => Self::new(workspace, agent)?.with_module(module_key)?,
-            None => match agent.strip_suffix(FORGE) {
-                Some(agent) => Self::new(workspace, agent)?.forge(),
-                None => Self::new(workspace, agent)?,
-            },
+        let plain = |agent: &str| match agent.split_once(MODULES) {
+            Some((agent, module_key)) => Self::new(workspace, agent)?.with_module(module_key),
+            None => Self::new(workspace, agent),
+        };
+        let forge = agent.strip_suffix(FORGE).and_then(|agent| {
+            let remote = plain(agent).ok()?;
+            match remote.module_key() {
+                Some(key) => remote.forge_module(key).ok(),
+                None => Some(remote.forge()),
+            }
+        });
+        let remote = match forge {
+            Some(remote) => remote,
+            None => plain(agent)?,
         };
         if remote.url() != url {
             return Err(invalid_remote());
@@ -309,10 +331,14 @@ impl AgentRemote {
     pub fn url(&self) -> String {
         let owner = if self.home { HOMES } else { "/agents/" };
         let url = format!("{URL_PREFIX}{}{owner}{}", self.workspace_id, self.agent_id);
-        match &self.module_key {
+        let url = match &self.module_key {
             Some(key) => format!("{url}{MODULES}{key}"),
-            None if self.forge => format!("{url}{FORGE}"),
             None => url,
+        };
+        if self.forge {
+            format!("{url}{FORGE}")
+        } else {
+            url
         }
     }
 
@@ -1661,6 +1687,50 @@ impl CheckoutCache {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Node side: [`Self::ensure_origin`] for the submodule at `path` of
+    /// `checkout`, only when no step of `path` is a symlink, it is populated
+    /// there, and its repository is the module cache of `module_key`. `false`
+    /// when it is not populated.
+    ///
+    /// # Errors
+    ///
+    /// When a step is a symlink, the submodule is another repository, or a
+    /// git step fails.
+    pub async fn ensure_module_origin(
+        &self,
+        checkout: &Path,
+        repo_key: &str,
+        path: &str,
+        module_key: &str,
+        remote_url: &str,
+    ) -> Result<bool> {
+        if module_components(path).is_none() {
+            return Err(invalid_pin(path, "not a safe relative path"));
+        }
+        ensure_no_symlink(checkout, path)?;
+        let dir = checkout.join(path);
+        if !populated_here(&dir) {
+            return Ok(false);
+        }
+        let common = self
+            .git
+            .git(
+                &dir,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .await?;
+        let cache = self.module_cache(repo_key, module_key)?;
+        let same = match (Path::new(&common).canonicalize(), cache.canonicalize()) {
+            (Ok(common), Ok(cache)) => common == cache,
+            _ => false,
+        };
+        if !same {
+            return Err(invalid_pin(path, "not the pinned module's repository"));
+        }
+        self.ensure_origin(&dir, remote_url).await?;
+        Ok(true)
     }
 
     /// Undo [`Self::set_forge`]'s config in `worktree` (a relaunch without

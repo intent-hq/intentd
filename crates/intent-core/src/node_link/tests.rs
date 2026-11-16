@@ -494,6 +494,7 @@ fn every_frame() -> Vec<LinkFrame> {
             checkout_of: None,
             forge: None,
             forge_fetch: None,
+            forge_fetch_modules: Vec::new(),
             git_identity: None,
             new_machine: None,
             resumed_from_disk: false,
@@ -1328,6 +1329,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
         checkout_of: None,
         forge: None,
         forge_fetch: None,
+        forge_fetch_modules: Vec::new(),
         git_identity: None,
         new_machine: None,
         resumed_from_disk: false,
@@ -1362,6 +1364,7 @@ fn launch_without_a_profile_omits_profile_env() {
         checkout_of: None,
         forge: None,
         forge_fetch: None,
+        forge_fetch_modules: Vec::new(),
         git_identity: None,
         new_machine: None,
         resumed_from_disk: false,
@@ -1737,6 +1740,7 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             checkout_of: None,
             forge: None,
             forge_fetch: None,
+            forge_fetch_modules: Vec::new(),
             git_identity: None,
             new_machine: None,
             resumed_from_disk: false,
@@ -1773,6 +1777,7 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             checkout_of: None,
             forge: None,
             forge_fetch: None,
+            forge_fetch_modules: Vec::new(),
             git_identity: None,
             new_machine: None,
             resumed_from_disk: false,
@@ -1830,6 +1835,7 @@ fn a_launch_carries_the_harness_version_on_any_protocol() {
         checkout_of: None,
         forge: None,
         forge_fetch: None,
+        forge_fetch_modules: Vec::new(),
         git_identity: None,
         new_machine: None,
         resumed_from_disk: false,
@@ -1869,6 +1875,7 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         checkout_of: Some(AgentId::from("parent").into()),
         forge: None,
         forge_fetch: None,
+        forge_fetch_modules: Vec::new(),
         git_identity: None,
         new_machine: None,
         resumed_from_disk: false,
@@ -2104,6 +2111,93 @@ fn forge_tokens_never_render_in_debug_or_decode_errors() {
 
 /// A launch's `forge` member (protocol 15) is optional and closed, and
 /// raises the launch's protocol only when present.
+/// `forgeFetchModules` rides with `forgeFetch` without raising the launch's
+/// protocol: a machine from before ignores it, as it ignores any launch
+/// member it does not know. Each entry is closed and checked.
+#[test]
+fn launch_forge_fetch_modules_are_optional_closed_and_ignorable() {
+    let LinkFrame::Launch(mut command) = every_frame()
+        .into_iter()
+        .find(|frame| matches!(frame, LinkFrame::Launch(c) if c.checkout.is_none() && c.mcp_proxies.is_empty() && c.checkout_of.is_none()))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    command.is_sub_agent = true;
+    command.forge_fetch = Some(Box::new(
+        ForgeFetchLaunch::for_github("https://github.com/o/root.git").unwrap(),
+    ));
+    let module =
+        ForgeFetchModule::for_github("packages/ios", "k1", "git@github.com:o/ios.git").unwrap();
+    assert_eq!(module.remote_url, "https://github.com/o/ios.git");
+    command.forge_fetch_modules = vec![module];
+    assert!(command.forge_fetch_modules_valid());
+    let frame = LinkFrame::Launch(command.clone());
+    let mut value = serde_json::to_value(&frame).unwrap();
+    assert_eq!(
+        value["forgeFetchModules"],
+        json!([{ "path": "packages/ios", "moduleKey": "k1", "remoteUrl": "https://github.com/o/ios.git" }])
+    );
+    assert_eq!(frame.min_protocol(), FORGE_FETCH_PROTOCOL);
+    assert_eq!(
+        LinkFrame::decode(value.to_string().as_bytes()).unwrap(),
+        frame
+    );
+    // Without entries the member is absent.
+    let mut bare = command.clone();
+    bare.forge_fetch_modules.clear();
+    assert!(serde_json::to_value(LinkFrame::Launch(bare))
+        .unwrap()
+        .get("forgeFetchModules")
+        .is_none());
+    // An older decoder: a launch member it does not know is ignored.
+    let mut later = value.clone();
+    later["someLaterMember"] = json!({ "x": 1 });
+    assert_eq!(
+        LinkFrame::decode(later.to_string().as_bytes()).unwrap(),
+        frame
+    );
+    // Entries are closed.
+    value["forgeFetchModules"][0]["extra"] = json!(1);
+    assert!(LinkFrame::decode(value.to_string().as_bytes()).is_err());
+    assert!(ForgeFetchModule::for_github("a", "k", "https://gitlab.com/o/r.git").is_none());
+
+    let invalid = |edit: &dyn Fn(&mut LaunchCommand)| {
+        let mut bad = command.clone();
+        edit(&mut bad);
+        !bad.forge_fetch_modules_valid()
+    };
+    let entry = |path: &str, key: &str, url: &str| ForgeFetchModule {
+        path: path.into(),
+        module_key: key.into(),
+        remote_url: url.into(),
+    };
+    // Without `forgeFetch`.
+    assert!(invalid(&|c| c.forge_fetch = None));
+    // An unsafe path, a repeated path, an unsafe key, a bad URL.
+    for bad in [
+        entry("../x", "k2", "https://github.com/o/x.git"),
+        entry("/x", "k2", "https://github.com/o/x.git"),
+        entry("packages/ios", "k2", "https://github.com/o/x.git"),
+        entry("x", "a/b", "https://github.com/o/x.git"),
+        entry("x", "k1", "https://github.com/o/x.git"),
+        entry("x", "k2", "https://github.com/o/x"),
+        // The root's URL, or another entry's.
+        entry("x", "k2", "https://github.com/o/root.git"),
+        entry("x", "k2", "https://github.com/o/ios.git"),
+    ] {
+        assert!(
+            invalid(&|c| c.forge_fetch_modules.push(bad.clone())),
+            "{bad:?}"
+        );
+    }
+    assert!(!invalid(&|c| c.forge_fetch_modules.push(entry(
+        "a/b",
+        "k2",
+        "https://github.com/o/b.git"
+    ))));
+}
+
 #[test]
 fn launch_forge_fetch_needs_protocol_17_and_is_closed() {
     let LinkFrame::Launch(mut command) = every_frame()
@@ -2237,6 +2331,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         checkout_of: None,
         forge: None,
         forge_fetch: None,
+        forge_fetch_modules: Vec::new(),
         git_identity: None,
         new_machine: None,
         resumed_from_disk: false,
@@ -2311,6 +2406,7 @@ fn labelled_launch(labels: LaunchLabels) -> LaunchCommand {
         checkout_of: None,
         forge: None,
         forge_fetch: None,
+        forge_fetch_modules: Vec::new(),
         git_identity: None,
         new_machine: None,
         resumed_from_disk: false,

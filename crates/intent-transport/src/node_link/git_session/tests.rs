@@ -47,3 +47,47 @@ fn dropping_a_session_on_a_full_queue_without_a_runtime_closes_the_connection() 
     drop(session);
     assert!(*sender.close.borrow());
 }
+
+/// A sub-agent's own socket opens only the forge remotes of its launch:
+/// another key, another agent's forge remote or any other remote is
+/// refused before a session opens.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_forge_socket_refuses_remotes_outside_its_launch() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let own = AgentRemote::new("ws-1", "agent-1").unwrap();
+    let other = AgentRemote::new("ws-1", "agent-2").unwrap();
+    let allowed = vec![own.forge(), own.forge_module("k1").unwrap()];
+    let server = tokio::spawn(serve_forge_helpers(
+        listener,
+        NodeGitSessions::default(),
+        allowed,
+    ));
+    let ask = |request: String| {
+        let path = path.clone();
+        async move {
+            let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut reply = Vec::new();
+            stream.read_to_end(&mut reply).await.unwrap();
+            String::from_utf8_lossy(&reply).into_owned()
+        }
+    };
+    for (request, code) in [
+        (own.forge_module("k2").unwrap().url(), codes::DENIED),
+        (other.forge().url(), codes::DENIED),
+        (other.forge_module("k1").unwrap().url(), codes::DENIED),
+        (own.with_module("k1").unwrap().url(), codes::INVALID),
+        (own.url(), codes::INVALID),
+    ] {
+        let reply = ask(format!("git-upload-pack {request}\n")).await;
+        assert_eq!(reply, format!("\x01{code}\n"), "{request}");
+    }
+    let reply = ask("credential github.com\n".into()).await;
+    assert_eq!(reply, format!("\x01{}\n", codes::INVALID));
+    server.abort();
+}

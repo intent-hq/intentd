@@ -2445,6 +2445,9 @@ impl RemoteNode {
         if link.protocol() < FORGE_FETCH_PROTOCOL || command.forge.is_some() {
             command.forge_fetch = None;
         }
+        if command.forge_fetch.is_none() {
+            command.forge_fetch_modules.clear();
+        }
         link.send(&LinkFrame::Launch(command)).await?;
         Ok(runtime)
     }

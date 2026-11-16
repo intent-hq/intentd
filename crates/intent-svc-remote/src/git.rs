@@ -183,11 +183,11 @@ async fn forge_refresh(repository: &Path, url: &str, token: Option<&str>) -> boo
     .await
 }
 
-/// The URL head fetches for `launch`.
-fn fetch_url(launch: &ForgeFetchLaunch) -> String {
+/// The URL head fetches for the GitHub `remote_url`.
+fn fetch_url(remote_url: &str) -> String {
     match std::env::var(GIT_BASE_ENV) {
-        Ok(base) if !base.is_empty() => launch.remote_url.replacen("https://github.com/", &base, 1),
-        _ => launch.remote_url.clone(),
+        Ok(base) if !base.is_empty() => remote_url.replacen("https://github.com/", &base, 1),
+        _ => remote_url.to_owned(),
     }
 }
 
@@ -549,7 +549,28 @@ impl NodeGitAccess for HeadGitAccess {
         remote: &'a AgentRemote,
     ) -> BoxFuture<'a, Result<ForgeServe>> {
         Box::pin(async move {
-            let (repository, launch) = self.forge_checkout(binding, remote).await?;
+            let (checkout, launch) = self.forge_checkout(binding, remote).await?;
+            // A submodule's forge remote serves that submodule's own
+            // repository, refreshed from its own GitHub `origin`.
+            let (repository, url) = match remote.module_key() {
+                Some(key) => {
+                    let key = key.to_owned();
+                    let agent_id = AgentId::from(remote.agent_id());
+                    let pins = crate::launch::checkout_pins(&self.shared.store, &agent_id).await?;
+                    let module =
+                        tokio::task::spawn_blocking(move || forge::module(&checkout, &pins, &key))
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!("node git: resolve the submodule: {e}"))
+                            })?;
+                    match module {
+                        Ok(module) => module,
+                        Err(ModuleRefusal::Denied) => return Err(denied()),
+                        Err(ModuleRefusal::Unavailable(what)) => return Err(unavailable(&what)),
+                    }
+                }
+                None => (checkout, launch.remote_url),
+            };
             let registry = self
                 .shared
                 .services()
@@ -558,7 +579,7 @@ impl NodeGitAccess for HeadGitAccess {
             let token = token.map(zeroize::Zeroizing::new);
             let fresh = forge_refresh(
                 &repository,
-                &fetch_url(&launch),
+                &fetch_url(&url),
                 token.as_deref().map(String::as_str),
             )
             .await;
