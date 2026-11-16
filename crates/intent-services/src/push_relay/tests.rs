@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine as _;
 use intent_core::{
@@ -79,18 +80,30 @@ fn pending_coalesces_changes_into_one_flush_per_window() {
 fn a_done_notice_ends_running_during_the_idle_grace_window() {
     let mut settled = Settled::default();
     let ws = WorkspaceId::new();
-    assert!(settled.running(&ws, true, true, false), "a turn in flight runs");
+    assert!(
+        settled.running(&ws, true, true, false),
+        "a turn in flight runs"
+    );
     assert!(
         settled.running(&ws, true, false, false),
         "the grace window alone keeps running, so turns back to back do not end the activity"
     );
-    assert!(!settled.running(&ws, true, false, true), "done ends it at once");
+    assert!(
+        !settled.running(&ws, true, false, true),
+        "done ends it at once"
+    );
     assert!(
         !settled.running(&ws, true, false, false),
         "later publishes in the same grace window stay ended"
     );
-    assert!(settled.running(&ws, true, true, false), "a new turn runs again");
-    assert!(settled.running(&ws, true, false, false), "and clears the mark");
+    assert!(
+        settled.running(&ws, true, true, false),
+        "a new turn runs again"
+    );
+    assert!(
+        settled.running(&ws, true, false, false),
+        "and clears the mark"
+    );
     assert!(!settled.running(&ws, true, false, true));
     assert!(!settled.running(&ws, false, false, false));
     assert!(
@@ -445,6 +458,67 @@ async fn a_revoked_principal_is_unlinked_once_the_relay_answers() {
     assert!(deletes.iter().all(|(m, ..)| m == "DELETE"));
     assert!(svc.push_flush_revocations().await);
     assert!(relay.take().is_empty(), "nothing left to retry");
+}
+
+#[tokio::test]
+async fn a_failed_unlink_is_retried_by_the_publisher() {
+    let tmp = TempDb::new();
+    let (svc, _, member, relay) = linked_services(&tmp, true).await;
+    with_caller(wire(&member, HostRole::Member), svc.push_create_link_op())
+        .await
+        .unwrap();
+    let bus = crate::EventBus::new(svc.store.clone());
+    let publisher = svc.clone();
+    let task = intent_core::spawn_daemon(async move { publisher.push_publisher_loop(&bus).await });
+
+    *relay.delete_status.lock().unwrap() = 503;
+    let first = with_caller(wire(&member, HostRole::Member), svc.push_revoke_link_op())
+        .await
+        .unwrap();
+    assert_eq!(first, json!({ "revoked": false }));
+    *relay.delete_status.lock().unwrap() = 204;
+    let cleared = tokio::time::timeout(Duration::from_secs(10), async {
+        while !svc
+            .push_persisted(|p| p.pending_revocations.is_empty())
+            .await
+            .unwrap()
+        {
+            // timing-guard: poll the persisted queue until the publisher's 1 s retry lands (bounded above).
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    task.abort();
+    assert!(
+        cleared.is_ok(),
+        "the publisher never retried the revocation"
+    );
+}
+
+#[tokio::test]
+async fn links_of_people_who_lost_host_access_are_revoked_on_reconcile() {
+    let tmp = TempDb::new();
+    let (svc, owner, member, relay) = linked_services(&tmp, true).await;
+    for (who, role) in [(&owner, HostRole::Owner), (&member, HostRole::Member)] {
+        with_caller(wire(who, role), svc.push_create_link_op())
+            .await
+            .unwrap();
+    }
+    relay.take();
+    svc.store.remove_host_member(&member).await.unwrap();
+
+    svc.push_reconcile_links().await;
+    let deletes: Vec<String> = relay
+        .take()
+        .into_iter()
+        .filter(|(m, ..)| m == "DELETE")
+        .map(|(_, path, _)| path)
+        .collect();
+    assert_eq!(deletes.len(), 1);
+    assert!(deletes[0].ends_with(&subject_for(&member)));
+    let links = svc.push_persisted(|p| p.links.clone()).await.unwrap();
+    assert!(links.contains(&subject_for(&owner)));
+    assert!(!links.contains(&subject_for(&member)));
 }
 
 #[tokio::test]

@@ -22,8 +22,8 @@ use intent_core::events::{
     WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::{
-    AgentId, Caller, Error, PrincipalId, Result, WorkspaceActivity, WorkspaceApi as _, WorkspaceId,
-    WorkspaceListFilter,
+    AgentId, Caller, Error, HostRole, PrincipalId, Result, WorkspaceActivity, WorkspaceApi as _,
+    WorkspaceId, WorkspaceListFilter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -63,6 +63,9 @@ struct Persisted {
     registered_relay: Option<String>,
     /// Subjects with a link minted at the relay.
     links: BTreeSet<String>,
+    /// The principal behind each linked subject, so links can be checked
+    /// against host membership when a revocation event was missed.
+    principals: BTreeMap<String, String>,
     /// Subjects whose relay revocation has not succeeded yet.
     pending_revocations: BTreeSet<String>,
 }
@@ -206,14 +209,16 @@ impl Services {
         }
     }
 
-    /// The caller's link subject. Owner and host members only: a link shows
-    /// every ordinary workspace on this machine, which is what members can
-    /// already see; guests see only the workspaces they were invited to.
-    async fn push_caller_subject(&self, what: &str) -> Result<String> {
+    /// The caller's principal and link subject. Owner and host members only:
+    /// a link shows every ordinary workspace on this machine, which is what
+    /// members can already see; guests see only the workspaces they were
+    /// invited to.
+    async fn push_caller(&self, what: &str) -> Result<(PrincipalId, String)> {
         match intent_core::current_caller() {
             Some(Caller::Wire { principal_id, .. }) => {
                 self.require_host_execution(what).await?;
-                Ok(subject_for(&principal_id))
+                let subject = subject_for(&principal_id);
+                Ok((principal_id, subject))
             }
             _ => Err(Error::Forbidden(format!(
                 "{what} is for people, not agents"
@@ -223,7 +228,7 @@ impl Services {
 
     /// `push.createLink` → `{linkToken, expiresAt, daemonId, relayUrl}`.
     pub(crate) async fn push_create_link_op(&self) -> Result<Value> {
-        let subject = self.push_caller_subject("push.createLink").await?;
+        let (principal_id, subject) = self.push_caller("push.createLink").await?;
         if !self.push_relay_enabled() {
             return Err(Error::InvalidParams(
                 "the push relay is off (setting push.relayEnabled)".into(),
@@ -237,6 +242,8 @@ impl Services {
             .map_err(|e| relay_failure(&e))?;
         self.push_persisted(|p| {
             p.pending_revocations.remove(&subject);
+            p.principals
+                .insert(subject.clone(), principal_id.as_str().to_string());
             p.links.insert(subject)
         })
         .await?;
@@ -253,14 +260,17 @@ impl Services {
     /// `push.revokeLink` → `{revoked}`; `false` means the relay was not
     /// reached and the daemon keeps retrying.
     pub(crate) async fn push_revoke_link_op(&self) -> Result<Value> {
-        let subject = self.push_caller_subject("push.revokeLink").await?;
+        let (_, subject) = self.push_caller("push.revokeLink").await?;
         let revoked = self.push_queue_revocation(subject).await?;
+        if !revoked {
+            self.push_relay.wake.notify_one();
+        }
         Ok(json!({ "revoked": revoked }))
     }
 
     /// `push.status` → `{enabled, relayUrl, daemonId, linked, linkedDevices, publishing}`.
     pub(crate) async fn push_status_op(&self) -> Result<Value> {
-        let subject = self.push_caller_subject("push.status").await?;
+        let (_, subject) = self.push_caller("push.status").await?;
         let enabled = self.push_relay_enabled();
         let linked = self.push_persisted(|p| p.links.contains(&subject)).await?;
         let daemon_id = if enabled || linked {
@@ -289,6 +299,7 @@ impl Services {
     async fn push_queue_revocation(&self, subject: String) -> Result<bool> {
         let registered = self
             .push_persisted(|p| {
+                p.principals.remove(&subject);
                 let known = p.links.remove(&subject) || p.pending_revocations.contains(&subject);
                 if known && p.registered_relay.is_some() {
                     p.pending_revocations.insert(subject);
@@ -300,6 +311,32 @@ impl Services {
             return Ok(true);
         }
         Ok(self.push_flush_revocations().await)
+    }
+
+    /// Queue revocation for every link whose principal lost host access.
+    /// Covers revocation events the publisher missed (lag, restarts).
+    async fn push_reconcile_links(&self) {
+        let Ok(linked) = self
+            .push_persisted(|p| {
+                p.principals
+                    .iter()
+                    .filter(|(subject, _)| p.links.contains(*subject))
+                    .map(|(s, id)| (s.clone(), id.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .await
+        else {
+            return;
+        };
+        for (subject, principal_id) in linked {
+            let role = self
+                .store
+                .get_host_role(&PrincipalId::from(principal_id.as_str()))
+                .await;
+            if matches!(role, Ok(HostRole::Guest)) {
+                let _ = self.push_queue_revocation(subject).await;
+            }
+        }
     }
 
     /// Retry every pending revocation; `true` when none remain.
@@ -360,6 +397,7 @@ impl Services {
         let mut revocations = Some(self.principal_revocations.subscribe());
         let mut publisher = Publisher::default();
         let mut revocation_retry: Option<(Instant, Duration)> = None;
+        self.push_reconcile_links().await;
         if !self.push_flush_revocations().await {
             revocation_retry = Some((
                 Instant::now() + Duration::from_secs(1),
@@ -367,12 +405,19 @@ impl Services {
             ));
         }
         loop {
+            let (has_links, has_pending) = self
+                .push_persisted(|p| (!p.links.is_empty(), !p.pending_revocations.is_empty()))
+                .await
+                .unwrap_or((false, false));
+            if has_pending && revocation_retry.is_none() {
+                revocation_retry = Some((
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                ));
+            }
             let active = self.push_relay_enabled()
                 && !self.push_relay.dormant.load(Ordering::Relaxed)
-                && self
-                    .push_persisted(|p| !p.links.is_empty())
-                    .await
-                    .unwrap_or(false);
+                && has_links;
             self.push_relay
                 .publishing
                 .store(active && publisher.online, Ordering::Relaxed);
@@ -414,7 +459,9 @@ impl Services {
                             revocation_retry.get_or_insert((Instant::now() + Duration::from_secs(1), Duration::from_secs(1)));
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        self.push_reconcile_links().await;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => revocations = None,
                 },
                 () = self.push_relay.wake.notified() => {}
