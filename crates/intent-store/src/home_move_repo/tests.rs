@@ -186,3 +186,31 @@ async fn a_move_to_a_cloud_home_shows_starting_after_its_last_backup() {
     let shown = store.get_shown_workspace_home(&ws).await.unwrap().unwrap();
     assert_eq!(shown.state, HomeState::Moving);
 }
+
+/// A move whose new home's sandbox went (lost, killed or deleted) cannot
+/// switch onto it; its rollback owes the gone machine no stop.
+#[tokio::test]
+async fn a_move_onto_a_gone_sandbox_rolls_back_without_a_stop() {
+    let (_dir, store) = open().await;
+    let ws = WorkspaceId::from("ws-1");
+    store
+        .set_workspace_home(&ws, &home("h-old", Some("m-mac"), false))
+        .await
+        .unwrap();
+    assert!(store
+        .begin_home_move(&moving_to(home("h-new", Some("m-gone"), true)))
+        .await
+        .unwrap());
+    assert!(store
+        .complete_home_move(&ws, &HomeId::from("h-new"), &person("owner"), &now_iso())
+        .await
+        .is_err());
+    assert!(store
+        .abort_home_move(&ws, &HomeId::from("h-new"), &now_iso())
+        .await
+        .unwrap());
+    assert!(store.list_home_stops("m-gone").await.unwrap().is_empty());
+    let back = store.get_workspace_home(&ws).await.unwrap().unwrap();
+    assert_eq!(back.home_id, HomeId::from("h-old"));
+    assert_eq!(back.state, HomeState::Attached);
+}

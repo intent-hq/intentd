@@ -168,7 +168,13 @@ pub(crate) async fn push_home(
 
 /// Ask the home for one synchronous push.
 async fn push_once(svc: &Services, home: &WorkspaceHome, workspace_id: &WorkspaceId) -> Result<()> {
-    let home = &crate::cloud::home::ready(svc, workspace_id, home.clone()).await?;
+    // A moving home still pushes from where it is, without waiting for
+    // the move's new home.
+    let home = &if home.state == intent_core::HomeState::Moving {
+        home.clone()
+    } else {
+        crate::cloud::home::ready(svc, workspace_id, home.clone()).await?
+    };
     let (node, _) = home_node(svc, workspace_id, home, "homePush", false).await?;
     let request_id = LinkId::new_v4();
     let frame = LinkFrame::HomePush(HomePush {

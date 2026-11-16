@@ -242,7 +242,16 @@ pub(crate) async fn run(svc: &Services, workspace_id: &WorkspaceId) {
     };
     if let Err(error) = steps(svc, &home_move).await {
         tracing::warn!(workspace = %workspace_id, %error, "the home move failed; the old home stays");
-        rollback(svc, &home_move).await;
+        // The steps may have recorded the new home's sandbox meanwhile.
+        let current = svc
+            .store()
+            .get_home_move(workspace_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|current| current.target.home_id == home_move.target.home_id)
+            .unwrap_or(home_move);
+        rollback(svc, &current).await;
     }
 }
 

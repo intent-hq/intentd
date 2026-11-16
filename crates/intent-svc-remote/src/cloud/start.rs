@@ -963,14 +963,41 @@ pub(crate) async fn start_move_home(
         tracing::info!(workspace = %workspace_id, machine = %machine_id, "cloud home: the move takes the sandbox an interrupted start left");
         return Ok(machine_id);
     }
-    start_home_sandbox(
+    // In flight like any home start, so the reaper leaves the new sandbox
+    // alone while it has no machine row.
+    let feature = super::feature(svc)?;
+    let key = super::home::start_key(workspace_id);
+    let (sender, receiver) = watch::channel::<super::StartOutcome>(None);
+    let registered = {
+        let mut starts = crate::lock(&feature.cloud.starts);
+        let free = !starts.contains_key(&key);
+        if free {
+            starts.insert(
+                key.clone(),
+                super::Start {
+                    entry: cloud_machine_id.to_owned(),
+                    workspace: workspace_id.to_string(),
+                    outcome: receiver,
+                },
+            );
+        }
+        free
+    };
+    let started = start_home_sandbox(
         svc,
         workspace_id,
         HomeSandbox::Move(home_id),
         cloud_machine_id,
         &mut None,
     )
-    .await
+    .await;
+    if registered {
+        crate::lock(&feature.cloud.starts).remove(&key);
+        let _ = sender.send(Some(
+            started.as_ref().map(drop).map_err(super::StartFailure::of),
+        ));
+    }
+    started
 }
 
 /// A home-only sandbox of entry `cloud_machine_id` in `workspace_id` that

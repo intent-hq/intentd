@@ -51,7 +51,8 @@ pub(crate) async fn insert(conn: &mut SqliteConnection, record: &HomeStopRecord)
 
 /// Inside a transaction that ends a move without its switch (a rollback,
 /// or the workspace archived or deleted): a `retired` stop of the move's
-/// target when it is on an exposed machine, which may have opened it. Its
+/// target when it is on an exposed machine that still exists, which may
+/// have opened it. Its
 /// last push is discarded (see `discard_push`).
 pub(crate) async fn stop_move_target(
     conn: &mut SqliteConnection,
@@ -67,6 +68,15 @@ pub(crate) async fn stop_move_target(
     let Some((home_id, Some(node_id))) = target else {
         return Ok(());
     };
+    // A machine that is gone (a removed sandbox) is owed nothing.
+    let present: Option<i64> = sqlx::query_scalar("SELECT 1 FROM exposed_machine WHERE id = ?")
+        .bind(&node_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db)?;
+    if present.is_none() {
+        return Ok(());
+    }
     let record = HomeStopRecord::new(
         workspace_id.clone(),
         HomeId(home_id),

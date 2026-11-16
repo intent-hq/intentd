@@ -644,10 +644,18 @@ pub(crate) async fn sandbox_target(svc: &Services, machine_id: &str) -> Result<W
             "that agent's sandbox does not allow homes",
         ));
     }
-    if row.node_protocol.unwrap_or_default() < intent_core::node_link::HOMES_PROTOCOL {
-        return Err(intent_core::Error::MachineUpdateRequired(Box::new(
-            crate::homes::too_old(&row),
-        )));
+    match row.node_protocol {
+        None => {
+            return Err(crate::home_move::target_unavailable(
+                "that agent's sandbox has not connected yet",
+            ));
+        }
+        Some(protocol) if protocol < intent_core::node_link::HOMES_PROTOCOL => {
+            return Err(intent_core::Error::MachineUpdateRequired(Box::new(
+                crate::homes::too_old(&row),
+            )));
+        }
+        Some(_) => {}
     }
     let saved = usable_entry(svc, &cloud.cloud_machine_id).await?;
     Ok(WorkspaceHome {
