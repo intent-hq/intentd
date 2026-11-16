@@ -12,7 +12,6 @@ use tokio::time::Instant;
 use super::client::{validate_id, Call, MAX_TAGS_JSON};
 use super::{
     backend_tag, NorthflankClient, CLOUD_PROVIDER_NORTHFLANK, DEFAULT_DISK_GIB, HOME, NODE_TAG,
-    RUN_AS,
 };
 use crate::cloud::{
     CloudError, CloudErrorKind, CloudFuture, CloudInstance, CloudProvider, Connected,
@@ -119,7 +118,7 @@ fn random_name() -> String {
     format!("intent-{}", &hex[..12])
 }
 
-/// How the setup script exits on an image without the [`RUN_AS`] account.
+/// How the setup script exits on an image without the [`super::RUN_AS`] account.
 pub(super) const NO_USER_EXIT: i32 = 3;
 
 /// How the setup script exits, with the home set up and the command not
@@ -245,7 +244,7 @@ impl NorthflankClient {
     }
 
     /// A new volume mounts root-owned, and a resumed one may: the next
-    /// command as [`RUN_AS`] hands it over first, in the same exec.
+    /// command as [`super::RUN_AS`] hands it over first, in the same exec.
     fn home_pending(&self, id: &str) {
         self.home_pending
             .lock()

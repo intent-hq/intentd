@@ -1230,25 +1230,30 @@ async fn an_image_without_setpriv_sets_up_then_runs_the_command_as_the_user() {
     assert_eq!(ran[2].0, "user", "the home was set up");
 }
 
+/// Readiness is read every second, and the wait ends at the first read
+/// that sees a running container: at most a second after it runs.
 #[tokio::test]
-async fn readiness_is_seen_within_a_second_of_running() {
+async fn readiness_ends_at_the_first_poll_that_sees_a_running_container() {
+    assert_eq!(
+        NorthflankConfig::default().poll_interval,
+        Duration::from_secs(1)
+    );
     let server = FakeServer::start(vec![
         Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
         Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
         containers(&["TASK_STARTING"]),
         Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
         containers(&["TASK_RUNNING"]),
+        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+        containers(&["TASK_RUNNING"]),
     ])
     .await;
-    let mut config = config(&server);
-    config.poll_interval = NorthflankConfig::default().poll_interval;
-    let client = NorthflankClient::new(SecretString::new(TOKEN), config).unwrap();
-    let started = std::time::Instant::now();
-    client.connect("svc-1", 600).await.unwrap();
-    let waited = started.elapsed();
-    assert!(
-        waited < Duration::from_millis(1500),
-        "a container that runs is seen at the next poll: {waited:?}"
+    client(&server).connect("svc-1", 600).await.unwrap();
+    assert_eq!(
+        server.lines().len(),
+        5,
+        "no read after the container runs: {:?}",
+        server.lines()
     );
 }
 
@@ -1263,7 +1268,6 @@ fn run_setup(
     owner: Option<(u32, u32)>,
     setpriv: bool,
 ) -> (std::process::Output, String) {
-    use std::os::unix::fs::PermissionsExt as _;
     let shims = tempfile::tempdir().unwrap();
     let log = shims.path().join("calls.log");
     let id = match owner {
