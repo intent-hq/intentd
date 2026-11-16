@@ -18,6 +18,9 @@ use sqlx::Transaction;
 
 pub use sqlx::postgres::PgPool;
 
+mod comments;
+mod note_search;
+mod notes;
 mod settings;
 mod workspaces;
 
@@ -383,6 +386,11 @@ pub(crate) struct PgStore {
     pool: PgPool,
     tenant: TenantId,
     options: PostgresOptions,
+    /// Per-note content-write locks; see `note_write_lock`. Process-local,
+    /// like `SQLite`'s: they order writers within this store.
+    note_write_lanes: Arc<crate::note_write_lock::NoteWriteLanes>,
+    task_event_baselines: Arc<crate::TaskEventBaselines>,
+    task_events_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PgStore {
@@ -440,6 +448,9 @@ impl crate::Store {
             pool,
             tenant,
             options,
+            note_write_lanes: Arc::default(),
+            task_event_baselines: Arc::default(),
+            task_events_enabled: Arc::default(),
         };
         let mut tx = store.begin().await?;
         sqlx::query("SELECT intent_provision_tenant($1)")

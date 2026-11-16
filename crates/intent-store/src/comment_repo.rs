@@ -17,33 +17,34 @@ use sqlx::Row;
 
 use crate::{enum_from_db, enum_to_db, Store};
 
-const COMMENT_COLUMNS: &str = "id, thread_id, note_id, kind, content, author, author_type, \
+pub(crate) const COMMENT_COLUMNS: &str =
+    "id, thread_id, note_id, kind, content, author, author_type, \
     status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at";
 
 /// The non-columnar comment fields, persisted together as `extra_json`.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ExtraFields {
+pub(crate) struct ExtraFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    author_principal_id: Option<intent_core::PrincipalId>,
+    pub(crate) author_principal_id: Option<intent_core::PrincipalId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    author_identity: Option<intent_core::PrincipalIdentity>,
+    pub(crate) author_identity: Option<intent_core::PrincipalIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    anchor_before: Option<String>,
+    pub(crate) anchor_before: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    anchor_after: Option<String>,
+    pub(crate) anchor_after: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    suggestion_original: Option<String>,
+    pub(crate) suggestion_original: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    suggestion_proposed: Option<String>,
+    pub(crate) suggestion_proposed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    agent_id: Option<AgentId>,
+    pub(crate) agent_id: Option<AgentId>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "lenient_bool"
     )]
-    is_orphaned: Option<bool>,
+    pub(crate) is_orphaned: Option<bool>,
 }
 
 /// Tolerate wrong-typed legacy `isOrphaned` values preserved verbatim in
@@ -64,7 +65,7 @@ impl ExtraFields {
     /// The camelCase keys this struct owns inside `extra_json`. Anything else
     /// in the blob is a preserved legacy/unknown key (see
     /// [`Store::insert_comment_with_extras`]) that updates must not drop.
-    const KNOWN_KEYS: [&'static str; 8] = [
+    pub(crate) const KNOWN_KEYS: [&'static str; 8] = [
         "authorPrincipalId",
         "authorIdentity",
         "anchorBefore",
@@ -76,7 +77,7 @@ impl ExtraFields {
     ];
 
     /// Serialize into the `extra_json` object map (`None` fields omitted).
-    fn to_map(&self) -> Result<Map<String, Value>> {
+    pub(crate) fn to_map(&self) -> Result<Map<String, Value>> {
         match serde_json::to_value(self) {
             Ok(Value::Object(m)) => Ok(m),
             Ok(_) => Err(Error::Internal("encode extra failed: not an object".into())),
@@ -86,7 +87,7 @@ impl ExtraFields {
 }
 
 /// Encode a merged `extra_json` map for persistence: empty → SQL `NULL`.
-fn extra_map_to_json(merged: Map<String, Value>) -> Result<Option<String>> {
+pub(crate) fn extra_map_to_json(merged: Map<String, Value>) -> Result<Option<String>> {
     if merged.is_empty() {
         Ok(None)
     } else {
@@ -99,7 +100,7 @@ fn extra_map_to_json(merged: Map<String, Value>) -> Result<Option<String>> {
 
 /// Encode a comment's `anchor_json` + `extra_json` column values, merging
 /// `legacy_extra` (comment's own fields win on key collision).
-fn encode_comment_json(
+pub(crate) fn encode_comment_json(
     c: &Comment,
     legacy_extra: &Map<String, Value>,
 ) -> Result<(String, Option<String>)> {
@@ -129,6 +130,48 @@ fn encode_comment_json(
     Ok((anchor_json, extra_json))
 }
 
+/// The `anchor_json` + `extra_json` an update writes: the comment's own
+/// fields plus the preserved legacy/unknown keys of the stored `existing`
+/// blob. Creation attribution is immutable and comes only from `existing`.
+pub(crate) fn encode_comment_update(
+    c: &Comment,
+    existing: Option<&str>,
+) -> Result<(String, Option<String>)> {
+    let anchor_json = serde_json::to_string(&c.anchor)
+        .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
+    let extra = ExtraFields {
+        // Creation attribution is immutable. Carry these from the stored
+        // row below, including absence on legacy comments.
+        author_principal_id: None,
+        author_identity: None,
+        anchor_before: c.anchor_before.clone(),
+        anchor_after: c.anchor_after.clone(),
+        suggestion_original: c.suggestion_original.clone(),
+        suggestion_proposed: c.suggestion_proposed.clone(),
+        agent_id: c.agent_id.clone(),
+        is_orphaned: c.is_orphaned,
+    };
+    let mut merged = extra.to_map()?;
+    if let Some(raw) = existing {
+        if let Ok(Value::Object(old)) = serde_json::from_str::<Value>(raw) {
+            for (k, v) in old {
+                // A non-bool `isOrphaned` can only be a legacy value the
+                // importer preserved verbatim (the store itself only ever
+                // encodes booleans here) — carry it over too.
+                let legacy_orphaned = k == "isOrphaned" && !matches!(v, Value::Bool(_));
+                if matches!(k.as_str(), "authorPrincipalId" | "authorIdentity")
+                    || !ExtraFields::KNOWN_KEYS.contains(&k.as_str())
+                    || legacy_orphaned
+                {
+                    merged.entry(k).or_insert(v);
+                }
+            }
+        }
+    }
+    let extra_json = extra_map_to_json(merged)?;
+    Ok((anchor_json, extra_json))
+}
+
 impl Store {
     /// Insert a comment row, scoping it to `workspace_id` (0022 added the
     /// per-workspace column plus the composite FK to `note(id, workspace_id)`).
@@ -139,7 +182,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if encoding the comment JSON or the insert fails.
     pub async fn insert_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
-        pending_postgres!("insert_comment", self, backend => backend.insert_comment(workspace_id, c).await)
+        dispatch!(self, backend => backend.insert_comment(workspace_id, c).await)
     }
 
     /// [`Store::insert_comment`], additionally merging `legacy_extra` — legacy
@@ -157,7 +200,7 @@ impl Store {
         c: &Comment,
         legacy_extra: &Map<String, Value>,
     ) -> Result<()> {
-        pending_postgres!("insert_comment_with_extras", self, backend => backend.insert_comment_with_extras(workspace_id, c, legacy_extra).await)
+        dispatch!(self, backend => backend.insert_comment_with_extras(workspace_id, c, legacy_extra).await)
     }
 
     /// Atomically persist a `comment.add`: the anchor-marker note rewrite
@@ -188,7 +231,7 @@ impl Store {
         c: &Comment,
         author: &NoteVersionAuthor,
     ) -> Result<i64> {
-        pending_postgres!("update_note_with_comment", self, backend => backend.update_note_with_comment(lock, note, expected_version, c, author).await)
+        dispatch!(self, backend => backend.update_note_with_comment(lock, note, expected_version, c, author).await)
     }
 
     /// Fetch a single comment by id, or `NotFound`.
@@ -197,7 +240,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the comment does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_comment(&self, id: &str) -> Result<Comment> {
-        pending_postgres!("get_comment", self, backend => backend.get_comment(id).await)
+        dispatch!(self, backend => backend.get_comment(id).await)
     }
 
     /// Update an existing comment (full row replace). Scoped to `workspace_id`
@@ -214,7 +257,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn update_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
-        pending_postgres!("update_comment", self, backend => backend.update_comment(workspace_id, c).await)
+        dispatch!(self, backend => backend.update_comment(workspace_id, c).await)
     }
 
     /// Flag one root comment of `note_id` orphaned, touching only its
@@ -234,7 +277,7 @@ impl Store {
         comment_id: &str,
         updated_at: &str,
     ) -> Result<bool> {
-        pending_postgres!("mark_comment_orphaned", self, backend => backend.mark_comment_orphaned(workspace_id, note_id, comment_id, updated_at).await)
+        dispatch!(self, backend => backend.mark_comment_orphaned(workspace_id, note_id, comment_id, updated_at).await)
     }
 
     /// Delete a comment by id, scoped to `workspace_id` (defense-in-depth).
@@ -244,7 +287,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn delete_comment(&self, workspace_id: &WorkspaceId, id: &str) -> Result<()> {
-        pending_postgres!("delete_comment", self, backend => backend.delete_comment(workspace_id, id).await)
+        dispatch!(self, backend => backend.delete_comment(workspace_id, id).await)
     }
 
     /// Delete a comment within a note and return its authoritative thread ID.
@@ -262,7 +305,7 @@ impl Store {
         note_id: &NoteId,
         id: &str,
     ) -> Result<String> {
-        pending_postgres!("delete_comment_in_note", self, backend => backend.delete_comment_in_note(workspace_id, note_id, id).await)
+        dispatch!(self, backend => backend.delete_comment_in_note(workspace_id, note_id, id).await)
     }
 
     /// List a note's comments, ordered by creation time.
@@ -271,7 +314,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_comments(&self, note_id: &NoteId) -> Result<Vec<Comment>> {
-        pending_postgres!("list_comments", self, backend => backend.list_comments(note_id).await)
+        dispatch!(self, backend => backend.list_comments(note_id).await)
     }
 
     /// List a note's comments scoped to `workspace_id`, ordered by creation
@@ -288,7 +331,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> Result<Vec<Comment>> {
-        pending_postgres!("list_comments_in_workspace", self, backend => backend.list_comments_in_workspace(workspace_id, note_id).await)
+        dispatch!(self, backend => backend.list_comments_in_workspace(workspace_id, note_id).await)
     }
 
     /// Set the `status` of every comment in a thread, refreshing `updated_at`.
@@ -307,7 +350,7 @@ impl Store {
         status: CommentStatus,
         updated_at: &str,
     ) -> Result<u64> {
-        pending_postgres!("set_thread_status", self, backend => backend.set_thread_status(workspace_id, thread_id, status, updated_at).await)
+        dispatch!(self, backend => backend.set_thread_status(workspace_id, thread_id, status, updated_at).await)
     }
 
     /// Assemble a [`CommentThread`] (the comments sharing `thread_id`).
@@ -316,7 +359,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if no comments share `thread_id`; `Error::Internal` if the database query fails.
     pub async fn get_thread(&self, thread_id: &str) -> Result<CommentThread> {
-        pending_postgres!("get_thread", self, backend => backend.get_thread(thread_id).await)
+        dispatch!(self, backend => backend.get_thread(thread_id).await)
     }
 }
 
@@ -367,7 +410,7 @@ impl crate::SqliteStore {
         c: &Comment,
         author: &NoteVersionAuthor,
     ) -> Result<i64> {
-        lock.ensure_covers(self, note)?;
+        lock.ensure_covers(&self.note_write_lanes, note)?;
         let (anchor_json, extra_json) = encode_comment_json(c, &Map::new())?;
 
         // IMMEDIATE mode: acquires the write lock upfront, avoiding the
@@ -465,21 +508,6 @@ impl crate::SqliteStore {
     }
 
     pub async fn update_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
-        let anchor_json = serde_json::to_string(&c.anchor)
-            .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
-        let extra = ExtraFields {
-            // Creation attribution is immutable. Carry these from the stored
-            // row below, including absence on legacy comments.
-            author_principal_id: None,
-            author_identity: None,
-            anchor_before: c.anchor_before.clone(),
-            anchor_after: c.anchor_after.clone(),
-            suggestion_original: c.suggestion_original.clone(),
-            suggestion_proposed: c.suggestion_proposed.clone(),
-            agent_id: c.agent_id.clone(),
-            is_orphaned: c.is_orphaned,
-        };
-        let mut merged = extra.to_map()?;
         // Carry over preserved legacy/unknown keys from the existing row.
         let existing: Option<String> =
             sqlx::query("SELECT extra_json FROM comment WHERE id = ? AND workspace_id = ?")
@@ -489,23 +517,7 @@ impl crate::SqliteStore {
                 .await
                 .map_err(|e| Error::Internal(format!("read comment extras failed: {e}")))?
                 .and_then(|r| r.get::<Option<String>, _>("extra_json"));
-        if let Some(raw) = existing {
-            if let Ok(Value::Object(old)) = serde_json::from_str::<Value>(&raw) {
-                for (k, v) in old {
-                    // A non-bool `isOrphaned` can only be a legacy value the
-                    // importer preserved verbatim (the store itself only ever
-                    // encodes booleans here) — carry it over too.
-                    let legacy_orphaned = k == "isOrphaned" && !matches!(v, Value::Bool(_));
-                    if matches!(k.as_str(), "authorPrincipalId" | "authorIdentity")
-                        || !ExtraFields::KNOWN_KEYS.contains(&k.as_str())
-                        || legacy_orphaned
-                    {
-                        merged.entry(k).or_insert(v);
-                    }
-                }
-            }
-        }
-        let extra_json = extra_map_to_json(merged)?;
+        let (anchor_json, extra_json) = encode_comment_update(c, existing.as_deref())?;
         let res = sqlx::query(
             "UPDATE comment SET thread_id=?, note_id=?, kind=?, content=?, author=?, \
              author_type=?, status=?, parent_id=?, anchor_json=?, anchor_text=?, extra_json=?, \
