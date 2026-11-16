@@ -221,9 +221,9 @@ Appearance preferences for all chats on this device.
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/ChatAppearanceSettings.svelte; src/lib/components/chat/ChatContentLane.svelte; src/features/layout/tab-types/AgentViewSettingsDropdown.svelte. Test-build behavior pending its frontend release. -->
 
 When asked about the experimental **Notch dock** in test builds, its switch is in
-**Settings → Appearance → Notch dock** (`/settings?tab=display#notch-dock`). The
-switch follows changes from Settings, **Window → Show Intent Dock**, and the dock's
-**Hide** action without a refresh, including when viewing another machine.
+**Settings → Appearance → Notch dock**. The switch follows changes from Settings,
+**Window → Show Intent Dock**, and the dock's **Hide** action without a refresh,
+including when viewing another machine.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/DockLabSettings.svelte; src/main/dock-lab.ts; src/main/dock-window-menu.ts; src/main/window-backend.ts. Test-build behavior pending its frontend release. -->
 
