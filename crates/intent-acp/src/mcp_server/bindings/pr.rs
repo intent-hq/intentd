@@ -379,7 +379,11 @@ mod tests {
             let server = bridge(api.clone(), true, caller);
             for ns in ["pr", "mr"] {
                 let result = body(
-                    &call(&server, &format!("return await ws.{ns}.snapshot(7, {{ repo: 'o/r' }});")).await,
+                    &call(
+                        &server,
+                        &format!("return await ws.{ns}.snapshot(7, {{ repo: 'o/r' }});"),
+                    )
+                    .await,
                 );
                 let mut expected = state.clone();
                 if with_hint && caller && state.is_object() {
@@ -392,7 +396,10 @@ mod tests {
                 let expected = json!({ "workspace": "ws-observation", "caller": "agent-owner", "number": 7, "repo": "o/r" });
                 assert_eq!(*hint_calls, vec![expected; 2]);
             } else {
-                assert!(hint_calls.is_empty(), "no caller or no object, no hint lookup");
+                assert!(
+                    hint_calls.is_empty(),
+                    "no caller or no object, no hint lookup"
+                );
             }
         }
     }

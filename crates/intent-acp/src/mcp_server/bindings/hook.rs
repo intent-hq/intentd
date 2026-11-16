@@ -163,7 +163,10 @@ fn snapshot_targets(code: &str) -> Vec<(u64, Option<String>)> {
 fn literal_repo(call: &str) -> Option<String> {
     let after = call[call.find("repo")? + "repo".len()..].trim_start();
     let value = after.strip_prefix(':')?.trim_start();
-    let quote = value.chars().next().filter(|c| matches!(c, '"' | '\'' | '`'))?;
+    let quote = value
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
     let body = &value[1..];
     Some(body[..body.find(quote)?].to_string())
 }

@@ -3321,17 +3321,12 @@ impl Services {
         let mut current = owner.id.clone();
         let mut parent = owner.parent_agent_id.clone();
         for _ in 0..MAX_DEPTH {
-            let next = parent?;
+            let next = parent.take()?;
             if &next == caller {
                 return Some(current);
             }
-            parent = self
-                .store
-                .get_agent_session_summary(&next)
-                .await
-                .ok()?
-                .parent_agent_id
-                .clone();
+            let session = self.store.get_agent_session_summary(&next).await.ok()?;
+            parent.clone_from(&session.parent_agent_id);
             current = next;
         }
         None
@@ -9104,7 +9099,10 @@ mod tests {
             instruction.contains("ws.agent.watch(\"agent-parent\")"),
             "{instruction}"
         );
-        assert!(!instruction.contains("retry ws.pr.monitor"), "{instruction}");
+        assert!(
+            !instruction.contains("retry ws.pr.monitor"),
+            "{instruction}"
+        );
         let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
         assert_eq!(row.agent_id, child, "not re-parented");
     }
