@@ -172,32 +172,77 @@ pub async fn sqlite_store() -> (Store, tempfile::TempDir) {
     (store, dir)
 }
 
+/// Every row the tenant owns, as `(table, row text)`, in a stable order.
+pub async fn tenant_rows(admin: &PgPool, tenant: &str) -> Vec<(String, String)> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.columns \
+         WHERE table_schema = 'public' AND column_name = 'tenant_id' ORDER BY 1",
+    )
+    .fetch_all(admin)
+    .await
+    .expect("list tenant tables");
+    let mut rows = Vec::new();
+    for table in tables {
+        let texts: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT t::text FROM {table} t WHERE tenant_id = $1 ORDER BY 1"
+        )))
+        .bind(tenant)
+        .fetch_all(admin)
+        .await
+        .expect("read tenant rows");
+        rows.extend(texts.into_iter().map(|t| (table.clone(), t)));
+    }
+    rows
+}
+
 /// One test body, run on every backend: `SQLite`, then Postgres twice in one
-/// database — first for a decoy tenant, then for the tenant under test. The
-/// body uses fixed ids, so a Postgres statement missing its tenant filter
-/// sees or changes the decoy's rows on the second run and the test fails.
-/// Without `INTENT_STORE_TEST_PG_URL` only the `SQLite` run happens (CI
-/// requires the URL). Each run prints its backend, so a failure names it.
+/// database — first for a decoy tenant, then for the tenant under test.
+/// - Reads: the body uses fixed ids and leaves rows behind, so a statement
+///   missing its tenant filter sees the decoy's rows on the subject run.
+/// - Writes: every decoy row is snapshotted before the subject run and
+///   compared after it, so a write that reaches another tenant fails.
+///
+/// The body may also bind the tenant name (`"sqlite"`, `"decoy"`,
+/// `"subject"`) to write tenant-specific values or decoy-only rows. Without
+/// `INTENT_STORE_TEST_PG_URL` only the `SQLite` run happens (CI requires the
+/// URL). Each run prints its backend, so a failure names it.
 ///
 /// ```ignore
-/// parity_test!(name, |store| { store.set_setting("k", "v").await.unwrap(); });
+/// parity_test!(name, |store, tenant| { store.set_setting("k", tenant).await.unwrap(); });
 /// ```
 macro_rules! parity_test {
     ($name:ident, |$store:ident| $body:block) => {
+        $crate::harness::parity_test!($name, |$store, _tenant| $body);
+    };
+    ($name:ident, |$store:ident, $tenant:ident| $body:block) => {
         #[tokio::test]
         async fn $name() {
             {
                 eprintln!("[{}] backend: sqlite", stringify!($name));
                 let (store, _dir) = $crate::harness::sqlite_store().await;
                 let $store = store;
+                let $tenant: &str = "sqlite";
                 $body
             }
             if let Some(db) = $crate::harness::test_db(false).await {
-                for tenant in ["decoy", "subject"] {
-                    eprintln!("[{}] backend: postgres, tenant {tenant}", stringify!($name));
-                    let $store = $crate::harness::open(&db, tenant).await;
+                eprintln!("[{}] backend: postgres, tenant decoy", stringify!($name));
+                {
+                    let $store = $crate::harness::open(&db, "decoy").await;
+                    let $tenant: &str = "decoy";
                     $body
                 }
+                let before = $crate::harness::tenant_rows(&db.admin, "decoy").await;
+                eprintln!("[{}] backend: postgres, tenant subject", stringify!($name));
+                {
+                    let $store = $crate::harness::open(&db, "subject").await;
+                    let $tenant: &str = "subject";
+                    $body
+                }
+                let after = $crate::harness::tenant_rows(&db.admin, "decoy").await;
+                assert!(
+                    before == after,
+                    "the subject tenant's run changed the decoy tenant's rows"
+                );
             }
         }
     };
