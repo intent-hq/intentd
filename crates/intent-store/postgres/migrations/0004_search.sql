@@ -6,7 +6,8 @@
 -- Mirrors MESSAGE_FTS_TEXT_SQL in agent_repo.rs: plain text, a JSON string,
 -- the concatenated `.text` fields of a content-block array, or the JSON itself.
 CREATE FUNCTION intent_message_search_text(content text) RETURNS text
-LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+SET search_path FROM CURRENT AS $$
     SELECT CASE
         WHEN NOT sqlite_json_valid(content) THEN content
         WHEN sqlite_json_type(content) = 'text' THEN sqlite_json_extract(content, '$')
