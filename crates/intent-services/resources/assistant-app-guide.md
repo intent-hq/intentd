@@ -244,6 +244,14 @@ A failed local server start or restart reports `error` with `lastError`. Fix its
 
 Plugins follow the [Agent Plugins](https://agent-plugins.org/specification) format: a folder with `plugin.json`, optional `skills/` and an optional `mcp.json`. Install one once in **Connections → Plugins** (`/settings?tab=connections#plugins`) from a folder path or a git URL, and every agent gets it on any provider. Its skills appear as `<plugin>:<skill>`. Its MCP servers appear in **Connections → MCP servers** as `<plugin>-<server>`, labelled with the plugin; they work like the user's own servers (status, sign-in, switches, `ws.app.mcp` reads) but can only be changed by updating or removing the plugin. Changes reach new agents only. The row shows warnings for parts that were skipped, and **Update** fetches the source again. The Assistant cannot install plugins for the user yet: send the user to that page.
 
+## Desktop release notes
+
+Release notes describe the desktop app, not an individual machine. Automatic notes
+appear once per app start when there is a new release to show. **Help → Show Release Notes**
+opens them again in the window the user is viewing.
+
+<!-- Sources: packages/cloudlands-fe/src/features/release-notes/main/release-notes.ipc.ts; packages/cloudlands-fe/src/store/renderer/slices/release-notes/sagas/release-notes-saga.ts. -->
+
 ## Mac update availability
 
 Mac update availability can differ by architecture. Intel Macs stay on their last
@@ -469,6 +477,19 @@ phone can reach the host. Diagnose address/network reachability separately from
 finding the QR control.
 
 ## Find work on another device
+
+<!-- Labs (machine rail, desktop app only): describe when asked, and label it Labs.
+With the rail enabled, a machine's update, startup, and connection recovery screen
+leaves the rail available to switch to another machine. Each machine keeps its own
+tabs and drafts. Desktop release notes and app update progress belong to the app;
+opening release notes from Help uses the device currently on screen. Quit and restart
+confirmations also appear on the device on screen. Ordinary dialogs still require a
+decision or dismissal before interacting outside them.
+Sources: packages/cloudlands-fe/src/features/daemon-status/{DaemonRecoveryFrame,DaemonStoppedOverlay,DaemonUpdatingOverlay}.svelte;
+packages/cloudlands-fe/src/features/machine-rail/MachineRail.svelte;
+packages/cloudlands-fe/src/features/release-notes/main/release-notes.ipc.ts;
+packages/cloudlands-fe/src/features/auto-update/main/auto-update-broadcast.ts;
+packages/cloudlands-fe/src/main/quit-confirmation.ts. -->
 
 **Settings → Machines** lists **<name> (local)** first, then the backend this window
 is connected to as **<name> (connected backend)**, then saved remote connections. Each
