@@ -10,6 +10,7 @@ import { compareLayers, imageLayers, parseRef, refDigest, report } from '../pack
 import {
   APT_PACKAGES,
   BASE_IMAGE,
+  baseImage,
   DEFAULT_SIZE,
   GH,
   IMAGE_REPO,
@@ -236,6 +237,10 @@ describe('container image', () => {
   });
   it('pins the base by digest, so its layers and the cache above them stay put', () => {
     assert.match(BASE_IMAGE, /^node:24-bookworm@sha256:[0-9a-f]{64}$/);
+    assert.throws(() => baseImage('FROM node:24-bookworm\n'), /pinned by digest/);
+    assert.throws(() => baseImage(`FROM ${BASE_IMAGE}\nFROM ${BASE_IMAGE}\n`), /one FROM line/);
+    const dependabot = readFileSync(join(ROOT, '.github/dependabot.yml'), 'utf8');
+    assert.match(dependabot, /package-ecosystem: "docker"\n\s+directory: "\/packaging\/e2b"/);
     const { calls, Template } = recorder();
     defineTemplate(Template, { version: '0.11.139', sha256: SHA });
     assert.deepEqual(calls[0], ['fromImage', BASE_IMAGE]);
@@ -436,7 +441,8 @@ describe('image workflow contract', () => {
   });
   it('builds linux/amd64 and smoke-tests before it pushes', () => {
     assert.match(steps, /node image\.mjs/);
-    assert.match(steps, /docker buildx build --platform linux\/amd64 --pull --cache-to type=inline --load/);
+    assert.match(steps, /docker buildx build --platform linux\/amd64 --pull --cache-to type=inline "\$\{args\[@\]\}"/);
+    assert.match(steps, /args\+=\(--output "type=docker,name=\$REF"\)/);
     assert.ok(steps.indexOf('node smoke-image.mjs') < steps.indexOf('--push'));
     assert.doesNotMatch(steps, /docker (build|push) /, 'buildx keeps cached layers as the same blobs');
   });
@@ -450,6 +456,9 @@ describe('image workflow contract', () => {
     assert.match(build, /image: \$\{\{ github\.event_name == 'pull_request' && 'registry:2' \|\| '' \}\}/);
     assert.match(steps, /--file Dockerfile\.baseline/);
     assert.match(steps, /--cache-from "type=registry,ref=\$LOCAL_IMAGE:baseline,registry\.insecure=true"/);
+    assert.ok(steps.indexOf('docker buildx prune --all --force') < steps.indexOf('Only the baseline as cache'), 'the PR build only has the registry cache');
+    const pr = steps.split('if [ -n "$PR_NUMBER" ]; then')[1].split('else')[0];
+    assert.doesNotMatch(pr, /args\+=\(--tag/, 'a tag would rename the local registry export');
     assert.match(steps, /node layers\.mjs "\$LOCAL_IMAGE:baseline" "\$LOCAL_IMAGE:pr-\$PR_NUMBER" --budget-mb "\$LAYER_BUDGET_MB"/);
     assert.match(steps, /PREVIOUS_RELEASE_TAG: \$\{\{ steps\.latest\.outputs\.previous \}\}/);
   });
@@ -484,8 +493,7 @@ describe('layers', () => {
     };
     return { calls, fetch };
   }
-  const config = (ids, steps) => ({
-    rootfs: { diff_ids: ids.map(digest) },
+  const config = steps => ({
     history: steps.flatMap(step => [{ created_by: 'LABEL x', empty_layer: true }, { created_by: step }]),
   });
   it('parses tag and digest references', () => {
@@ -494,43 +502,43 @@ describe('layers', () => {
     assert.throws(() => parseRef('intent-node'), /not a registry/);
     assert.throws(() => parseRef('ghcr.io/intent-hq/intent-node'), /not a registry/);
   });
-  it('reads the amd64 image of an index, pairing each layer with its diff_id and step', async () => {
+  it('reads the amd64 image of an index, pairing each blob with its step', async () => {
     const { calls, fetch } = registry({
       '/manifests/latest': { manifests: [
         { digest: digest('1'), platform: { os: 'linux', architecture: 'arm64' } },
         { digest: digest('2'), platform: { os: 'linux', architecture: 'amd64' } },
       ] },
-      [`/manifests/${digest('2')}`]: { config: { digest: digest('3') }, layers: [{ size: 10 }, { size: 20 }] },
-      [`/blobs/${digest('3')}`]: config(['a', 'b'], ['RUN apt', 'RUN intentd']),
+      [`/manifests/${digest('2')}`]: { config: { digest: digest('3') }, layers: [{ digest: digest('a'), size: 10 }, { digest: digest('b'), size: 20 }] },
+      [`/blobs/${digest('3')}`]: config(['RUN apt', 'RUN intentd']),
     });
     assert.deepEqual(await imageLayers('ghcr.io/intent-hq/intent-node:latest', fetch), [
-      { diffId: digest('a'), size: 10, step: 'RUN apt' },
-      { diffId: digest('b'), size: 20, step: 'RUN intentd' },
+      { digest: digest('a'), size: 10, step: 'RUN apt' },
+      { digest: digest('b'), size: 20, step: 'RUN intentd' },
     ]);
     assert.ok(calls.slice(1).every(([url, headers]) => url.startsWith('https://ghcr.io/') && headers.Authorization === 'Bearer t'));
   });
   it('talks plain HTTP without a token to a localhost registry', async () => {
     const { calls, fetch } = registry({
-      '/manifests/pr-1': { config: { digest: digest('3') }, layers: [{ size: 5 }] },
-      [`/blobs/${digest('3')}`]: config(['a'], ['RUN a']),
+      '/manifests/pr-1': { config: { digest: digest('3') }, layers: [{ digest: digest('a'), size: 5 }] },
+      [`/blobs/${digest('3')}`]: config(['RUN a']),
     });
     await imageLayers('localhost:5000/intent-node:pr-1', fetch);
     assert.ok(calls.every(([url, headers]) => url.startsWith('http://localhost:5000/v2/') && !headers.Authorization));
   });
-  it('refuses a config whose diff_ids do not match the layers', async () => {
+  it('refuses a config whose history does not match the layers', async () => {
     const { fetch } = registry({
-      '/manifests/x': { config: { digest: digest('3') }, layers: [{ size: 5 }] },
-      [`/blobs/${digest('3')}`]: config(['a', 'b'], ['RUN a', 'RUN b']),
+      '/manifests/x': { config: { digest: digest('3') }, layers: [{ digest: digest('a'), size: 5 }] },
+      [`/blobs/${digest('3')}`]: config(['RUN a', 'RUN b']),
     });
-    await assert.rejects(imageLayers('localhost:5000/intent-node:x', fetch), /1 layers but 2 diff_ids/);
+    await assert.rejects(imageLayers('localhost:5000/intent-node:x', fetch), /1 layers but 2 layer steps/);
   });
   it('resolves a tag to a digest reference', async () => {
     const { fetch } = registry({ '/manifests/latest': { manifests: [] } });
     assert.equal(await refDigest('ghcr.io/intent-hq/intent-node:latest', fetch), `ghcr.io/intent-hq/intent-node@${digest('9')}`);
   });
-  it('counts only the new image layers the old one lacks, by diff_id', () => {
-    const older = [{ diffId: 'a', size: 400, step: '' }, { diffId: 'b', size: 300, step: '' }, { diffId: 'c', size: 70, step: '' }];
-    const newer = [{ diffId: 'a', size: 400, step: '' }, { diffId: 'b', size: 300, step: '' }, { diffId: 'd', size: 72, step: '/bin/sh -c tar | x' }];
+  it('counts only the new image blobs the old one lacks', () => {
+    const older = [{ digest: 'a', size: 400, step: '' }, { digest: 'b', size: 300, step: '' }, { digest: 'c', size: 70, step: '' }];
+    const newer = [{ digest: 'a', size: 400, step: '' }, { digest: 'b', size: 300, step: '' }, { digest: 'd', size: 72, step: '/bin/sh -c tar | x' }];
     const result = compareLayers(older, newer);
     assert.equal(result.total, 772);
     assert.equal(result.changed, 72);

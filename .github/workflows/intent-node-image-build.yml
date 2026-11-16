@@ -19,8 +19,9 @@ on:
 # (--cache-from) and pushes its own (--cache-to type=inline), so a release
 # reuses the base, apt, gh and CLI layers byte for byte and only adds intentd.
 # A PR proves it: it builds the release before the newest one into a local
-# registry, builds the newest one with that as its only cache, and fails when
-# the new layers are over LAYER_BUDGET_MB.
+# registry, empties the builder's cache, builds the newest one with that image
+# as its only cache, and fails when the new compressed blobs are over
+# LAYER_BUDGET_MB.
 env:
   LAYER_BUDGET_MB: 120
   LOCAL_IMAGE: localhost:5000/intent-node
@@ -85,6 +86,9 @@ jobs:
           docker buildx build --platform linux/amd64 --pull --file Dockerfile.baseline \
             --cache-to type=inline \
             --output "type=image,name=$LOCAL_IMAGE:baseline,push=true,registry.insecure=true" .
+          # Drop the builder's local cache, so the next build can only reuse
+          # layers through the registry cache import, as a release does.
+          docker buildx prune --all --force
 
       - name: Build the image
         if: steps.plan.outputs.skip == 'false'
@@ -92,17 +96,20 @@ jobs:
         env:
           TAGS: ${{ steps.plan.outputs.tags }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          REF: ${{ steps.plan.outputs.ref }}
         run: |
           args=()
-          for tag in $TAGS; do args+=(--tag "$tag"); done
           if [ -n "$PR_NUMBER" ]; then
             # Only the baseline as cache, like a release with the previous image.
+            # No --tag: buildx would put it on the local registry export too.
             args+=(--cache-from "type=registry,ref=$LOCAL_IMAGE:baseline,registry.insecure=true")
+            args+=(--output "type=docker,name=$REF")
             args+=(--output "type=image,name=$LOCAL_IMAGE:pr-$PR_NUMBER,push=true,registry.insecure=true")
           else
-            args+=(--cache-from "type=registry,ref=ghcr.io/intent-hq/intent-node:latest")
+            args+=(--cache-from "type=registry,ref=ghcr.io/intent-hq/intent-node:latest" --load)
+            for tag in $TAGS; do args+=(--tag "$tag"); done
           fi
-          docker buildx build --platform linux/amd64 --pull --cache-to type=inline --load "${args[@]}" .
+          docker buildx build --platform linux/amd64 --pull --cache-to type=inline "${args[@]}" .
 
       - name: Smoke-test the image
         if: steps.plan.outputs.skip == 'false'
@@ -138,11 +145,12 @@ jobs:
             cat "$log"; exit 1
           fi
           previous=$(node layers.mjs --digest ghcr.io/intent-hq/intent-node:latest) || previous=
-          # Rebuilds from the local build cache: the same layers that were smoke-tested.
-          args=()
+          # Rebuilds from the build cache: the same layers that were smoke-tested.
+          args=(--cache-from "type=registry,ref=ghcr.io/intent-hq/intent-node:latest")
           for tag in $TAGS; do args+=(--tag "$tag"); done
           if ! docker buildx build --platform linux/amd64 --cache-to type=inline --push "${args[@]}" . >"$log" 2>&1; then
-            grep -qiE 'denied|unauthorized|403' "$log" && refuse
+            # Only a refused push is fail-soft, not any 403 in the build log.
+            grep -qiE '(push|ghcr\.io).*(denied|unauthorized|403)' "$log" && refuse
             cat "$log"; exit 1
           fi
           echo "### intent-node image (built, smoke-tested, pushed)" >> "$GITHUB_STEP_SUMMARY"

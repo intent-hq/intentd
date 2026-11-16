@@ -37,3 +37,12 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+  # The intent-node base image (packaging/e2b/base.Dockerfile), pinned by
+  # digest so release layers stay cached; a bump rebuilds them once.
+  - package-ecosystem: "docker"
+    directory: "/packaging/e2b"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"

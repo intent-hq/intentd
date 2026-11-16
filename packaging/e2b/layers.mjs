@@ -47,8 +47,8 @@ export async function refDigest(ref, fetch = globalThis.fetch) {
   return `${parsed.registry}/${parsed.repository}@${digest}`;
 }
 
-// The linux/amd64 image's layers, each with its compressed size and its
-// uncompressed digest (diff_id), which stays the same across registries.
+// The linux/amd64 image's layers: compressed blob digest and size, and the
+// step that made each. Hosts pull by blob digest, so that is what compares.
 export async function imageLayers(ref, fetch = globalThis.fetch) {
   const parsed = parseRef(ref);
   const get = await client(parsed, fetch);
@@ -59,15 +59,14 @@ export async function imageLayers(ref, fetch = globalThis.fetch) {
     manifest = await get(`/manifests/${entry.digest}`, MANIFEST_TYPES);
   }
   const config = await get(`/blobs/${manifest.config.digest}`);
-  const diffIds = config.rootfs.diff_ids;
-  if (diffIds.length !== manifest.layers.length) throw new Error(`${ref}: ${manifest.layers.length} layers but ${diffIds.length} diff_ids`);
   const steps = (config.history ?? []).filter(step => !step.empty_layer).map(step => step.created_by ?? '');
-  return manifest.layers.map((layer, i) => ({ diffId: diffIds[i], size: layer.size, step: steps[i] ?? '' }));
+  if (steps.length !== manifest.layers.length) throw new Error(`${ref}: ${manifest.layers.length} layers but ${steps.length} layer steps`);
+  return manifest.layers.map((layer, i) => ({ digest: layer.digest, size: layer.size, step: steps[i] }));
 }
 
 export function compareLayers(older, newer) {
-  const known = new Set(older.map(layer => layer.diffId));
-  const layers = newer.map(layer => ({ ...layer, shared: known.has(layer.diffId) }));
+  const known = new Set(older.map(layer => layer.digest));
+  const layers = newer.map(layer => ({ ...layer, shared: known.has(layer.digest) }));
   const sum = list => list.reduce((total, layer) => total + layer.size, 0);
   return { layers, total: sum(layers), changed: sum(layers.filter(layer => !layer.shared)) };
 }

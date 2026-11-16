@@ -17,12 +17,18 @@
 // This module has no npm dependencies so scripts/test-e2b-template.mjs can run it
 // offline; build.mjs and smoke.mjs pass in the e2b SDK.
 
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 
 export const TEMPLATE_PREFIX = 'intent-node';
-// Pinned by digest so the layers above it stay cached across releases; bump
-// by hand (each change rebuilds every layer above it, once).
-export const BASE_IMAGE = 'node:24-bookworm@sha256:9d266751ca3d7fdbe651c878ffd5ad0a42fed49a18c283509267c97f025b7496';
+// Pinned by digest in base.Dockerfile, where Dependabot keeps it current.
+export const BASE_IMAGE = baseImage(readFileSync(new URL('./base.Dockerfile', import.meta.url), 'utf8'));
+
+export function baseImage(text) {
+  const from = String(text).split('\n').filter(line => /^FROM\s/i.test(line));
+  const match = from.length === 1 && /^FROM\s+(\S+@sha256:[0-9a-f]{64})\s*$/i.exec(from[0]);
+  if (!match) throw new Error('base.Dockerfile must hold one FROM line with an image pinned by digest');
+  return match[1];
+}
 export const ARCHIVE_TARGET = 'x86_64-unknown-linux-musl';
 export const RELEASES_REPO = 'intent-hq/intentd-releases';
 export const INSTALL_DIR = '/opt/intentd';
