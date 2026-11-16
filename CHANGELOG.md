@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.223] - 2026-11-16
+
+### 🧪 Testing
+
+- Run the caller-binding check as a source lint ([#3398](https://github.com/intent-hq/intentd/pull/3398))
+
+
 ## [0.11.222] - 2026-11-15
 
 ### 🚀 Features
