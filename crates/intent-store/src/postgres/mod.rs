@@ -106,6 +106,22 @@ impl PgStore {
         Ok(tx)
     }
 
+    /// A write transaction that holds this tenant's writer lock until it
+    /// ends. `SQLite` runs one writer at a time (`BEGIN IMMEDIATE` on a
+    /// single-connection pool) and store code relies on that for its
+    /// read-then-write sequences; this keeps that guarantee per tenant while
+    /// other tenants write in parallel. Use it for any method that reads and
+    /// then writes, or writes more than one statement.
+    pub(crate) async fn begin_write(&self) -> Result<Transaction<'static, Postgres>> {
+        let mut tx = self.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('intent-writer:' || $1, 0))")
+            .bind(self.tenant())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        Ok(tx)
+    }
+
     /// Nothing to release: tenants share the pool, and closing it would end
     /// every other tenant's store. The pool's owner closes it at shutdown.
     #[expect(clippy::unused_async, reason = "same signature as Store::close")]
