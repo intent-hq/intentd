@@ -16,12 +16,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_mcp_oauth_token(&self, server_id: &str) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT token_bag FROM mcp_oauth_tokens WHERE server_id = ?")
-            .bind(server_id)
-            .fetch_optional(self.read_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("get mcp oauth token failed: {e}")))?;
-        Ok(row.map(|r| r.get::<String, _>("token_bag")))
+        dispatch!(self, backend => backend.get_mcp_oauth_token(server_id).await)
     }
 
     /// Upsert the raw JSON `token_bag` for `server_id`, replacing any prior bag
@@ -30,6 +25,47 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
+    pub async fn set_mcp_oauth_token(
+        &self,
+        server_id: &str,
+        token_bag: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.set_mcp_oauth_token(server_id, token_bag, updated_at).await)
+    }
+
+    /// Delete the persisted bag for `server_id`. Returns `true` when a row was
+    /// removed; absence is an idempotent no-op success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_mcp_oauth_token(&self, server_id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.delete_mcp_oauth_token(server_id).await)
+    }
+
+    /// List every `server_id` with a stored bag, sorted ascending for a stable
+    /// wire order. Values are never returned; use `get_mcp_oauth_token` for
+    /// internal (server-side) reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_mcp_oauth_server_ids(&self) -> Result<Vec<String>> {
+        dispatch!(self, backend => backend.list_mcp_oauth_server_ids().await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn get_mcp_oauth_token(&self, server_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT token_bag FROM mcp_oauth_tokens WHERE server_id = ?")
+            .bind(server_id)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get mcp oauth token failed: {e}")))?;
+        Ok(row.map(|r| r.get::<String, _>("token_bag")))
+    }
+
     pub async fn set_mcp_oauth_token(
         &self,
         server_id: &str,
@@ -51,12 +87,6 @@ impl Store {
         Ok(())
     }
 
-    /// Delete the persisted bag for `server_id`. Returns `true` when a row was
-    /// removed; absence is an idempotent no-op success.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_mcp_oauth_token(&self, server_id: &str) -> Result<bool> {
         let res = sqlx::query("DELETE FROM mcp_oauth_tokens WHERE server_id = ?")
             .bind(server_id)
@@ -66,13 +96,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// List every `server_id` with a stored bag, sorted ascending for a stable
-    /// wire order. Values are never returned; use `get_mcp_oauth_token` for
-    /// internal (server-side) reads.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_mcp_oauth_server_ids(&self) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT server_id FROM mcp_oauth_tokens ORDER BY server_id")
             .fetch_all(self.read_pool())

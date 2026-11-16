@@ -139,8 +139,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if encoding the comment JSON or the insert fails.
     pub async fn insert_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
-        self.insert_comment_with_extras(workspace_id, c, &Map::new())
-            .await
+        dispatch!(self, backend => backend.insert_comment(workspace_id, c).await)
     }
 
     /// [`Store::insert_comment`], additionally merging `legacy_extra` — legacy
@@ -152,6 +151,181 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_comment_with_extras(
+        &self,
+        workspace_id: &WorkspaceId,
+        c: &Comment,
+        legacy_extra: &Map<String, Value>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.insert_comment_with_extras(workspace_id, c, legacy_extra).await)
+    }
+
+    /// Atomically persist a `comment.add`: the anchor-marker note rewrite
+    /// (the same full-row UPDATE + `rev` bump as
+    /// [`Store::update_note_with_version`], gated on `expected_version` when
+    /// `Some`), its version snapshot under the bumped rev (stamped with
+    /// `author`) and the comment INSERT run in ONE transaction, so a failure
+    /// between them can never leave anchor markers embedded in the note with
+    /// no comment row (monorepo#638), no reader can observe the new rev
+    /// before its snapshot, and a rewrite built on a rev another writer has
+    /// since replaced never overwrites that write (it conflicts, so the
+    /// caller can re-read and re-anchor). Returns the post-rewrite note `rev`
+    /// so the caller can echo the authoritative value; nothing persists on
+    /// any error.
+    ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note row is absent; `Error::InvalidInput` on a duplicate comment id; `Error::Internal` if encoding fields or the transaction fails.
+    pub async fn update_note_with_comment(
+        &self,
+        lock: &crate::NoteWriteLock,
+        note: &Note,
+        expected_version: Option<i64>,
+        c: &Comment,
+        author: &NoteVersionAuthor,
+    ) -> Result<i64> {
+        dispatch!(self, backend => backend.update_note_with_comment(lock, note, expected_version, c, author).await)
+    }
+
+    /// Fetch a single comment by id, or `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the comment does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_comment(&self, id: &str) -> Result<Comment> {
+        dispatch!(self, backend => backend.get_comment(id).await)
+    }
+
+    /// Update an existing comment (full row replace). Scoped to `workspace_id`
+    /// (defense-in-depth) so a caller bound to workspace B cannot mutate a
+    /// comment row that belongs to workspace A. `NotFound` if the row is absent
+    /// or the workspace does not match.
+    ///
+    /// `extra_json` is rebuilt from the comment's own fields but any
+    /// unknown/legacy keys already present on the row (preserved by
+    /// [`Store::insert_comment_with_extras`]) are carried over, so updates
+    /// never silently drop imported legacy data.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn update_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
+        dispatch!(self, backend => backend.update_comment(workspace_id, c).await)
+    }
+
+    /// Flag one root comment of `note_id` orphaned, touching only its
+    /// `isOrphaned` extra and `updated_at`. Status, content, attribution and
+    /// every other field are left as stored, so a concurrent
+    /// `comment.resolveThread` (which does not bump the note rev) is never
+    /// undone by a stale whole-row write. Returns whether a row matched; a
+    /// comment deleted in the meantime is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn mark_comment_orphaned(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        comment_id: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.mark_comment_orphaned(workspace_id, note_id, comment_id, updated_at).await)
+    }
+
+    /// Delete a comment by id, scoped to `workspace_id` (defense-in-depth).
+    /// `NotFound` if the row is absent or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn delete_comment(&self, workspace_id: &WorkspaceId, id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.delete_comment(workspace_id, id).await)
+    }
+
+    /// Delete a comment within a note and return its authoritative thread ID.
+    /// The scope check and identity capture share the DELETE statement: a
+    /// concurrent same-ID replacement cannot be deleted outside this note or
+    /// cause a notification naming a thread read before the mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` for an absent or out-of-scope row;
+    /// `Error::Internal` if the database operation fails.
+    pub async fn delete_comment_in_note(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        id: &str,
+    ) -> Result<String> {
+        dispatch!(self, backend => backend.delete_comment_in_note(workspace_id, note_id, id).await)
+    }
+
+    /// List a note's comments, ordered by creation time.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_comments(&self, note_id: &NoteId) -> Result<Vec<Comment>> {
+        dispatch!(self, backend => backend.list_comments(note_id).await)
+    }
+
+    /// List a note's comments scoped to `workspace_id`, ordered by creation
+    /// time. Callers that resolve a caller-supplied `comment_id` from the
+    /// result set must use this variant so a cross-workspace bare-id probe
+    /// cannot match a comment belonging to a different workspace's note that
+    /// happens to share the same `note_id` (e.g. the well-known `spec` id).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_comments_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+    ) -> Result<Vec<Comment>> {
+        dispatch!(self, backend => backend.list_comments_in_workspace(workspace_id, note_id).await)
+    }
+
+    /// Set the `status` of every comment in a thread, refreshing `updated_at`.
+    /// Scoped to `workspace_id` (defense-in-depth) so a caller bound to
+    /// workspace B cannot resolve a thread owned by workspace A. Returns the
+    /// number of rows updated (0 when the thread does not exist in that
+    /// workspace).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn set_thread_status(
+        &self,
+        workspace_id: &WorkspaceId,
+        thread_id: &str,
+        status: CommentStatus,
+        updated_at: &str,
+    ) -> Result<u64> {
+        dispatch!(self, backend => backend.set_thread_status(workspace_id, thread_id, status, updated_at).await)
+    }
+
+    /// Assemble a [`CommentThread`] (the comments sharing `thread_id`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no comments share `thread_id`; `Error::Internal` if the database query fails.
+    pub async fn get_thread(&self, thread_id: &str) -> Result<CommentThread> {
+        dispatch!(self, backend => backend.get_thread(thread_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn insert_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
+        self.insert_comment_with_extras(workspace_id, c, &Map::new())
+            .await
+    }
+
     pub async fn insert_comment_with_extras(
         &self,
         workspace_id: &WorkspaceId,
@@ -185,26 +359,6 @@ impl Store {
         Ok(())
     }
 
-    /// Atomically persist a `comment.add`: the anchor-marker note rewrite
-    /// (the same full-row UPDATE + `rev` bump as
-    /// [`Store::update_note_with_version`], gated on `expected_version` when
-    /// `Some`), its version snapshot under the bumped rev (stamped with
-    /// `author`) and the comment INSERT run in ONE transaction, so a failure
-    /// between them can never leave anchor markers embedded in the note with
-    /// no comment row (monorepo#638), no reader can observe the new rev
-    /// before its snapshot, and a rewrite built on a rev another writer has
-    /// since replaced never overwrites that write (it conflicts, so the
-    /// caller can re-read and re-anchor). Returns the post-rewrite note `rev`
-    /// so the caller can echo the authoritative value; nothing persists on
-    /// any error.
-    ///
-    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
-    /// any other lock is refused with `Error::Internal` before anything is
-    /// written.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note row is absent; `Error::InvalidInput` on a duplicate comment id; `Error::Internal` if encoding fields or the transaction fails.
     pub async fn update_note_with_comment(
         &self,
         lock: &crate::NoteWriteLock,
@@ -297,11 +451,6 @@ impl Store {
         }
     }
 
-    /// Fetch a single comment by id, or `NotFound`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the comment does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_comment(&self, id: &str) -> Result<Comment> {
         let sql = format!("SELECT {COMMENT_COLUMNS} FROM comment WHERE id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -315,19 +464,6 @@ impl Store {
         }
     }
 
-    /// Update an existing comment (full row replace). Scoped to `workspace_id`
-    /// (defense-in-depth) so a caller bound to workspace B cannot mutate a
-    /// comment row that belongs to workspace A. `NotFound` if the row is absent
-    /// or the workspace does not match.
-    ///
-    /// `extra_json` is rebuilt from the comment's own fields but any
-    /// unknown/legacy keys already present on the row (preserved by
-    /// [`Store::insert_comment_with_extras`]) are carried over, so updates
-    /// never silently drop imported legacy data.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn update_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
         let anchor_json = serde_json::to_string(&c.anchor)
             .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
@@ -398,16 +534,6 @@ impl Store {
         Ok(())
     }
 
-    /// Flag one root comment of `note_id` orphaned, touching only its
-    /// `isOrphaned` extra and `updated_at`. Status, content, attribution and
-    /// every other field are left as stored, so a concurrent
-    /// `comment.resolveThread` (which does not bump the note rev) is never
-    /// undone by a stale whole-row write. Returns whether a row matched; a
-    /// comment deleted in the meantime is not an error.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn mark_comment_orphaned(
         &self,
         workspace_id: &WorkspaceId,
@@ -429,12 +555,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Delete a comment by id, scoped to `workspace_id` (defense-in-depth).
-    /// `NotFound` if the row is absent or the workspace does not match.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn delete_comment(&self, workspace_id: &WorkspaceId, id: &str) -> Result<()> {
         let res = sqlx::query("DELETE FROM comment WHERE id = ? AND workspace_id = ?")
             .bind(id)
@@ -448,15 +568,6 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a comment within a note and return its authoritative thread ID.
-    /// The scope check and identity capture share the DELETE statement: a
-    /// concurrent same-ID replacement cannot be deleted outside this note or
-    /// cause a notification naming a thread read before the mutation.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` for an absent or out-of-scope row;
-    /// `Error::Internal` if the database operation fails.
     pub async fn delete_comment_in_note(
         &self,
         workspace_id: &WorkspaceId,
@@ -475,11 +586,6 @@ impl Store {
         .ok_or_else(|| Error::NotFound(format!("comment {id}")))
     }
 
-    /// List a note's comments, ordered by creation time.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_comments(&self, note_id: &NoteId) -> Result<Vec<Comment>> {
         let sql = format!(
             "SELECT {COMMENT_COLUMNS} FROM comment WHERE note_id = ? ORDER BY created_at, id"
@@ -492,15 +598,6 @@ impl Store {
         rows.iter().map(map_comment_row).collect()
     }
 
-    /// List a note's comments scoped to `workspace_id`, ordered by creation
-    /// time. Callers that resolve a caller-supplied `comment_id` from the
-    /// result set must use this variant so a cross-workspace bare-id probe
-    /// cannot match a comment belonging to a different workspace's note that
-    /// happens to share the same `note_id` (e.g. the well-known `spec` id).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_comments_in_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -532,15 +629,6 @@ impl Store {
         rows.iter().map(map_comment_row).collect()
     }
 
-    /// Set the `status` of every comment in a thread, refreshing `updated_at`.
-    /// Scoped to `workspace_id` (defense-in-depth) so a caller bound to
-    /// workspace B cannot resolve a thread owned by workspace A. Returns the
-    /// number of rows updated (0 when the thread does not exist in that
-    /// workspace).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn set_thread_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -561,11 +649,6 @@ impl Store {
         Ok(res.rows_affected())
     }
 
-    /// Assemble a [`CommentThread`] (the comments sharing `thread_id`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if no comments share `thread_id`; `Error::Internal` if the database query fails.
     pub async fn get_thread(&self, thread_id: &str) -> Result<CommentThread> {
         let comments = self.list_thread_comments(thread_id).await?;
         if comments.is_empty() {

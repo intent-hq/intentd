@@ -114,6 +114,20 @@ impl Store {
         metadata: &ReviewMonitorWakeMetadata,
         created_at: &str,
     ) -> Result<PreparedMonitorMessage> {
+        dispatch!(self, backend => backend.prepare_monitor_message(expected, binding, id, text, metadata, created_at).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn prepare_monitor_message(
+        &self,
+        expected: &QualifiedPrMonitor,
+        binding: &ReviewMonitorBinding,
+        id: &str,
+        text: &str,
+        metadata: &ReviewMonitorWakeMetadata,
+        created_at: &str,
+    ) -> Result<PreparedMonitorMessage> {
         let monitor = expected.monitor();
         let PersistedMonitorTarget::Resolved {
             target,

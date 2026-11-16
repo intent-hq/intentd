@@ -52,14 +52,7 @@ impl Store {
         before: Option<&str>,
         limit: u32,
     ) -> Result<serde_json::Value> {
-        let ids: Vec<String> = sqlx::query_scalar("SELECT g.conversation_id FROM discussion_agent_grant g JOIN agent_session a ON a.id=g.agent_id AND a.workspace_id=g.workspace_id WHERE g.workspace_id=? AND g.agent_id=? AND a.retired_at IS NULL AND a.status<>'deleted' AND g.conversation_id<? ORDER BY g.conversation_id DESC LIMIT ?")
-            .bind(ws.as_str()).bind(agent.as_str()).bind(before.unwrap_or("~")).bind(i64::from(limit)+1).fetch_all(self.read_pool()).await.map_err(|e|db(&e))?;
-        let has_more = ids.len() > limit as usize;
-        let mut conversations = vec![];
-        for id in ids.into_iter().take(limit as usize) {
-            conversations.push(self.discussion_conversation(ws, &id).await?);
-        }
-        Ok(serde_json::json!({"conversations":conversations,"hasMore":has_more}))
+        dispatch!(self, backend => backend.discussion_agent_conversations(ws, agent, before, limit).await)
     }
 
     /// Check the current agent and local explicit-address grant.
@@ -71,13 +64,61 @@ impl Store {
         conversation: &str,
         agent: &AgentId,
     ) -> Result<bool> {
-        let mut conn = self.read_pool().acquire().await.map_err(|e| db(&e))?;
-        agent_access_in(&mut conn, ws, conversation, agent).await
+        dispatch!(self, backend => backend.discussion_agent_access(ws, conversation, agent).await)
     }
 
     /// Read bounded pending deliveries, optionally for a single committed message.
     /// # Errors
     /// Returns database or snapshot decoding errors.
+    pub async fn discussion_pending_deliveries(
+        &self,
+        message: Option<&str>,
+    ) -> Result<Vec<DiscussionDelivery>> {
+        dispatch!(self, backend => backend.discussion_pending_deliveries(message).await)
+    }
+
+    /// Atomically hand a pending delivery to the normal durable queue. The caller
+    /// holds the queue persistence gate and publishes in memory after this commit.
+    /// Deleted/retired recipients are discarded; they must not be resurrected.
+    /// # Errors
+    /// Returns database errors; a failed handoff leaves the delivery pending.
+    pub async fn admit_discussion_delivery(
+        &self,
+        message: &str,
+        row: &AgentQueueRow,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.admit_discussion_delivery(message, row).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn discussion_agent_conversations(
+        &self,
+        ws: &WorkspaceId,
+        agent: &AgentId,
+        before: Option<&str>,
+        limit: u32,
+    ) -> Result<serde_json::Value> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT g.conversation_id FROM discussion_agent_grant g JOIN agent_session a ON a.id=g.agent_id AND a.workspace_id=g.workspace_id WHERE g.workspace_id=? AND g.agent_id=? AND a.retired_at IS NULL AND a.status<>'deleted' AND g.conversation_id<? ORDER BY g.conversation_id DESC LIMIT ?")
+            .bind(ws.as_str()).bind(agent.as_str()).bind(before.unwrap_or("~")).bind(i64::from(limit)+1).fetch_all(self.read_pool()).await.map_err(|e|db(&e))?;
+        let has_more = ids.len() > limit as usize;
+        let mut conversations = vec![];
+        for id in ids.into_iter().take(limit as usize) {
+            conversations.push(self.discussion_conversation(ws, &id).await?);
+        }
+        Ok(serde_json::json!({"conversations":conversations,"hasMore":has_more}))
+    }
+
+    pub async fn discussion_agent_access(
+        &self,
+        ws: &WorkspaceId,
+        conversation: &str,
+        agent: &AgentId,
+    ) -> Result<bool> {
+        let mut conn = self.read_pool().acquire().await.map_err(|e| db(&e))?;
+        agent_access_in(&mut conn, ws, conversation, agent).await
+    }
+
     pub async fn discussion_pending_deliveries(
         &self,
         message: Option<&str>,
@@ -102,11 +143,6 @@ impl Store {
             .collect()
     }
 
-    /// Atomically hand a pending delivery to the normal durable queue. The caller
-    /// holds the queue persistence gate and publishes in memory after this commit.
-    /// Deleted/retired recipients are discarded; they must not be resurrected.
-    /// # Errors
-    /// Returns database errors; a failed handoff leaves the delivery pending.
     pub async fn admit_discussion_delivery(
         &self,
         message: &str,

@@ -21,6 +21,31 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        dispatch!(self, backend => backend.get_setting(key).await)
+    }
+
+    /// Upsert the raw JSON-encoded `value` for `key`, replacing any prior value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        dispatch!(self, backend => backend.set_setting(key, value).await)
+    }
+
+    /// Delete the persisted value for `key` (used by `settings.reset`). Returns
+    /// `true` when a row was removed; absence is an idempotent no-op success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_setting(&self, key: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.delete_setting(key).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM settings WHERE key = ?")
             .bind(key)
             .fetch_optional(self.read_pool())
@@ -29,11 +54,6 @@ impl Store {
         Ok(row.map(|r| r.get::<String, _>("value")))
     }
 
-    /// Upsert the raw JSON-encoded `value` for `key`, replacing any prior value.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO settings (key, value) VALUES (?,?) \
@@ -47,12 +67,6 @@ impl Store {
         Ok(())
     }
 
-    /// Delete the persisted value for `key` (used by `settings.reset`). Returns
-    /// `true` when a row was removed; absence is an idempotent no-op success.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_setting(&self, key: &str) -> Result<bool> {
         let res = sqlx::query("DELETE FROM settings WHERE key = ?")
             .bind(key)
@@ -73,6 +87,15 @@ impl Store {
     ///
     /// # Errors
     /// Returns an error on database failure or invalid persisted JSON.
+    pub async fn get_agent_creation_preferences(
+        &self,
+        id: &intent_core::WorkspaceId,
+    ) -> Result<serde_json::Value> {
+        dispatch!(self, backend => backend.get_agent_creation_preferences(id).await)
+    }
+}
+
+impl crate::SqliteStore {
     pub async fn get_agent_creation_preferences(
         &self,
         id: &intent_core::WorkspaceId,

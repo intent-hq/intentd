@@ -616,6 +616,7 @@ async fn workspace_retired_page_sweep_is_bounded_per_statement() {
     seed_retired_index(&store, 350).await;
     seed_other_workspace_index(&store).await;
     let statements = store
+        .sqlite()
         .delete_workspace_retired_note_paging_in_batches("ws", 100)
         .await
         .unwrap();
@@ -657,6 +658,7 @@ async fn workspace_delete_after_the_retired_tables_are_gone() {
     assert!(outcome.finished, "{outcome:?}");
     assert_eq!(
         store
+            .sqlite()
             .delete_workspace_retired_note_paging_in_batches("ws", 100)
             .await
             .unwrap(),

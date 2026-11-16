@@ -192,6 +192,37 @@ impl Store {
         options: &NoteFtsOptions<'_>,
         notes: &[(String, String)],
     ) -> Result<Vec<NoteFtsCursor>> {
+        dispatch!(self, backend => backend.note_fts_positions(match_expr, options, notes).await)
+    }
+
+    /// Search the note FTS index using an already-sanitized MATCH expression
+    /// (from `intent_search::fts_match_expr`). An empty expression returns no
+    /// hits. Raw user text must be sanitized by the service, as for transcripts.
+    ///
+    /// All visibility, scope and archive filters run before the limit. Title,
+    /// body and tags have BM25 weights 5/1/2; the preferred workspace gets a
+    /// 1.0 boost and archived workspaces a 1.0 penalty, matching transcripts.
+    /// Only selected notes' bodies are fetched for preview generation.
+    ///
+    /// # Errors
+    /// Returns an error for a negative limit, invalid MATCH expression or
+    /// database/decoding failure.
+    pub async fn search_notes_fts(
+        &self,
+        match_expr: &str,
+        options: &NoteFtsOptions<'_>,
+    ) -> Result<Vec<NoteFtsMatch>> {
+        dispatch!(self, backend => backend.search_notes_fts(match_expr, options).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn note_fts_positions(
+        &self,
+        match_expr: &str,
+        options: &NoteFtsOptions<'_>,
+        notes: &[(String, String)],
+    ) -> Result<Vec<NoteFtsCursor>> {
         if match_expr.trim().is_empty()
             || notes.is_empty()
             || options
@@ -227,18 +258,6 @@ impl Store {
             .map_err(|e| Error::Internal(format!("decode note search position: {e}")))
     }
 
-    /// Search the note FTS index using an already-sanitized MATCH expression
-    /// (from `intent_search::fts_match_expr`). An empty expression returns no
-    /// hits. Raw user text must be sanitized by the service, as for transcripts.
-    ///
-    /// All visibility, scope and archive filters run before the limit. Title,
-    /// body and tags have BM25 weights 5/1/2; the preferred workspace gets a
-    /// 1.0 boost and archived workspaces a 1.0 penalty, matching transcripts.
-    /// Only selected notes' bodies are fetched for preview generation.
-    ///
-    /// # Errors
-    /// Returns an error for a negative limit, invalid MATCH expression or
-    /// database/decoding failure.
     pub async fn search_notes_fts(
         &self,
         match_expr: &str,

@@ -278,14 +278,7 @@ impl Store {
         observer: Arc<dyn RepositoryLifecycleObserver>,
         original_owner: Box<dyn Any + Send>,
     ) -> Result<RepositoryInitializationClaim> {
-        if !self.has_repository_lifecycle_observer(&observer) {
-            return Err(lifecycle_error("original observer is unavailable"));
-        }
-        Ok(RepositoryInitializationClaim {
-            domain: self.repository_lifecycle.clone(),
-            observer,
-            original_owner,
-        })
+        dispatch!(self, backend => backend.bind_repository_initialization_claim(observer, original_owner))
     }
 
     /// Confirm only the original physical owner's real winning write or load.
@@ -301,15 +294,86 @@ impl Store {
         claim: RepositoryInitializationClaim,
         binding: RepositoryInitializationBinding,
     ) -> Result<RepositoryInitializationConfirmation> {
-        self.initialize_repository_acp_session_outcome(claim, binding)
-            .await
-            .confirmation
+        dispatch!(self, backend => backend.initialize_repository_acp_session(claim, binding).await)
     }
 
     /// Preserve original persistence facts even when owner confirmation fails.
     /// Executes the same strict transaction once; no fallback read or write is
     /// used to recover a canonical ID. A canceled future yields no receipt and
     /// retains the existing unknown-worker protection.
+    pub async fn initialize_repository_acp_session_outcome(
+        &self,
+        claim: RepositoryInitializationClaim,
+        binding: RepositoryInitializationBinding,
+    ) -> RepositoryInitializationOutcome {
+        dispatch!(self, backend => backend.initialize_repository_acp_session_outcome(claim, binding).await)
+    }
+
+    /// Atomically bind an original private native family to the winning session
+    /// write, or verify an exact loaded association without inserting one.
+    /// Persistence remains distinct from later physical-owner confirmation.
+    pub async fn initialize_repository_review_session_outcome(
+        &self,
+        claim: RepositoryInitializationClaim,
+        binding: RepositoryInitializationBinding,
+        enrollment: crate::ReviewContextEnrollmentIntent,
+    ) -> RepositoryInitializationOutcome {
+        dispatch!(self, backend => backend.initialize_repository_review_session_outcome(claim, binding, enrollment).await)
+    }
+
+    /// Preserve ordinary ACP result/accounting behavior in one transaction.
+    /// Optional proof never authorizes the ordinary write: existing service
+    /// gates still apply. Callers must retain their ORIGINAL Store and producer
+    /// result. Strict initialization APIs above are unchanged.
+    pub async fn initialize_repository_acp_session_compatible(
+        &self,
+        claim: Option<RepositoryInitializationClaim>,
+        binding: RepositoryInitializationBinding,
+    ) -> RepositoryAcpCompatibilityOutcome {
+        dispatch!(self, backend => backend.initialize_repository_acp_session_compatible(claim, binding).await)
+    }
+
+    /// Consume a receipt only in its original managed domain/observer.
+    /// The observer's owner must STILL validate its private completion proof
+    /// against intervening retirement before allocating any new live origin.
+    ///
+    /// # Errors
+    /// Rejects a receipt from another or retired database/observer allocation.
+    pub fn consume_repository_initialization_confirmation(
+        &self,
+        observer: &Arc<dyn RepositoryLifecycleObserver>,
+        confirmation: RepositoryInitializationConfirmation,
+    ) -> Result<(RepositoryInitializationBinding, Box<dyn Any + Send>)> {
+        dispatch!(self, backend => backend.consume_repository_initialization_confirmation(observer, confirmation))
+    }
+}
+
+impl crate::SqliteStore {
+    pub fn bind_repository_initialization_claim(
+        &self,
+        observer: Arc<dyn RepositoryLifecycleObserver>,
+        original_owner: Box<dyn Any + Send>,
+    ) -> Result<RepositoryInitializationClaim> {
+        if !self.has_repository_lifecycle_observer(&observer) {
+            return Err(lifecycle_error("original observer is unavailable"));
+        }
+        Ok(RepositoryInitializationClaim {
+            domain: self.repository_lifecycle.clone(),
+            observer,
+            original_owner,
+        })
+    }
+
+    pub async fn initialize_repository_acp_session(
+        &self,
+        claim: RepositoryInitializationClaim,
+        binding: RepositoryInitializationBinding,
+    ) -> Result<RepositoryInitializationConfirmation> {
+        self.initialize_repository_acp_session_outcome(claim, binding)
+            .await
+            .confirmation
+    }
+
     pub async fn initialize_repository_acp_session_outcome(
         &self,
         claim: RepositoryInitializationClaim,
@@ -325,9 +389,6 @@ impl Store {
         }
     }
 
-    /// Atomically bind an original private native family to the winning session
-    /// write, or verify an exact loaded association without inserting one.
-    /// Persistence remains distinct from later physical-owner confirmation.
     pub async fn initialize_repository_review_session_outcome(
         &self,
         claim: RepositoryInitializationClaim,
@@ -511,10 +572,6 @@ impl Store {
         })
     }
 
-    /// Preserve ordinary ACP result/accounting behavior in one transaction.
-    /// Optional proof never authorizes the ordinary write: existing service
-    /// gates still apply. Callers must retain their ORIGINAL Store and producer
-    /// result. Strict initialization APIs above are unchanged.
     pub async fn initialize_repository_acp_session_compatible(
         &self,
         claim: Option<RepositoryInitializationClaim>,
@@ -779,12 +836,6 @@ impl Store {
         Ok(result)
     }
 
-    /// Consume a receipt only in its original managed domain/observer.
-    /// The observer's owner must STILL validate its private completion proof
-    /// against intervening retirement before allocating any new live origin.
-    ///
-    /// # Errors
-    /// Rejects a receipt from another or retired database/observer allocation.
     pub fn consume_repository_initialization_confirmation(
         &self,
         observer: &Arc<dyn RepositoryLifecycleObserver>,

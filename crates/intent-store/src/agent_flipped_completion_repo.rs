@@ -32,6 +32,64 @@ impl Store {
         task_note_id: &NoteId,
         recorded_at: &str,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.record_agent_flipped_completion(agent_id, workspace_id, task_note_id, recorded_at).await)
+    }
+
+    /// Remove every agent's recorded flip of `task_note_id` — called when the
+    /// task transitions back out of `complete`, which stales the flip
+    /// regardless of who reverted it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn remove_agent_flipped_completions_for_task(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_note_id: &NoteId,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.remove_agent_flipped_completions_for_task(workspace_id, task_note_id).await)
+    }
+
+    /// Take (list and clear) the agent's recorded flipped completions,
+    /// oldest-first — the consume-on-stamp read used at wake composition,
+    /// so a flip is attributed as a trigger at most once and can never be
+    /// re-attributed by a later completion cycle. A single atomic
+    /// `DELETE ... RETURNING`, so a flip recorded concurrently with the take
+    /// is either returned by it or left for the next one — never silently
+    /// consumed without attribution. `RETURNING` row order is unspecified,
+    /// so the oldest-first ordering is applied after the fetch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn take_agent_flipped_completions(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Vec<(WorkspaceId, NoteId)>> {
+        dispatch!(self, backend => backend.take_agent_flipped_completions(agent_id).await)
+    }
+
+    /// The agent's recorded flipped completions, oldest-first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_agent_flipped_completions(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Vec<(WorkspaceId, NoteId)>> {
+        dispatch!(self, backend => backend.list_agent_flipped_completions(agent_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn record_agent_flipped_completion(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        task_note_id: &NoteId,
+        recorded_at: &str,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO agent_flipped_completion (
                 agent_id, workspace_id, task_note_id, recorded_at
@@ -63,13 +121,6 @@ impl Store {
         Ok(())
     }
 
-    /// Remove every agent's recorded flip of `task_note_id` — called when the
-    /// task transitions back out of `complete`, which stales the flip
-    /// regardless of who reverted it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn remove_agent_flipped_completions_for_task(
         &self,
         workspace_id: &WorkspaceId,
@@ -87,18 +138,6 @@ impl Store {
         Ok(())
     }
 
-    /// Take (list and clear) the agent's recorded flipped completions,
-    /// oldest-first — the consume-on-stamp read used at wake composition,
-    /// so a flip is attributed as a trigger at most once and can never be
-    /// re-attributed by a later completion cycle. A single atomic
-    /// `DELETE ... RETURNING`, so a flip recorded concurrently with the take
-    /// is either returned by it or left for the next one — never silently
-    /// consumed without attribution. `RETURNING` row order is unspecified,
-    /// so the oldest-first ordering is applied after the fetch.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn take_agent_flipped_completions(
         &self,
         agent_id: &AgentId,
@@ -141,11 +180,6 @@ impl Store {
             .collect())
     }
 
-    /// The agent's recorded flipped completions, oldest-first.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_agent_flipped_completions(
         &self,
         agent_id: &AgentId,

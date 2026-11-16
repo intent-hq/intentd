@@ -38,18 +38,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_note(&self, note: &Note) -> Result<()> {
-        self.prepare_task_events(&note.workspace_id).await;
-        let mut conn = self
-            .write_pool()
-            .acquire()
-            .await
-            .map_err(|e| Error::Internal(format!("note insert connection: {e}")))?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("note insert transaction: {e}")))?;
-        let result = exec_insert_note(&mut conn, note).await;
-        crate::commit_with_rollback_guard(conn, result, "commit note insert").await
+        dispatch!(self, backend => backend.insert_note(note).await)
     }
 
     /// List notes in a workspace, ordered by creation time.
@@ -58,14 +47,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_notes(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
-        let sql =
-            format!("SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? ORDER BY created_at");
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-            .bind(&workspace_id.0)
-            .fetch_all(self.read_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("list notes failed: {e}")))?;
-        rows.iter().map(map_note_row).collect()
+        dispatch!(self, backend => backend.list_notes(workspace_id).await)
     }
 
     /// Read task summaries, dependency statuses and unfiltered stats in one snapshot.
@@ -82,10 +64,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         filter: Option<TaskStatus>,
     ) -> Result<TaskListResult> {
-        Ok(self
-            .list_workspace_tasks_keyed(workspace_id, filter)
-            .await?
-            .0)
+        dispatch!(self, backend => backend.list_workspace_tasks(workspace_id, filter).await)
     }
 
     /// [`Self::list_workspace_tasks`] plus each returned task's `created_at`
@@ -95,6 +74,388 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the query or projected metadata decoding fails.
+    pub async fn list_workspace_tasks_keyed(
+        &self,
+        workspace_id: &WorkspaceId,
+        filter: Option<TaskStatus>,
+    ) -> Result<(TaskListResult, Vec<String>)> {
+        dispatch!(self, backend => backend.list_workspace_tasks_keyed(workspace_id, filter).await)
+    }
+
+    /// Test whether a workspace owns a note without hydrating its row.
+    ///
+    /// The query runs under [`crate::with_read_retry`] for the same transient
+    /// `SQLITE_BUSY` protection as [`Store::get_note`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when the underlying query fails.
+    pub async fn note_exists(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<bool> {
+        dispatch!(self, backend => backend.note_exists(workspace_id, id).await)
+    }
+
+    /// Newest `updated_at` across a workspace's notes, or `None` when the
+    /// workspace has none — the note half of the `lastActivity` derivation
+    /// (`enrich_workspace_aggregates` / `derive_last_activity`) as a single
+    /// aggregate answered from the covering
+    /// `idx_note_workspace_updated_at(workspace_id, updated_at)` index, so
+    /// the hot list/get emit paths never hydrate note bodies just to fold
+    /// timestamps (monorepo#3058).
+    ///
+    /// `MAX` here is a lexicographic TEXT max: it assumes uniform
+    /// daemon-written RFC3339 UTC strings (`now_iso()`), where lexicographic
+    /// order ≈ chronological order. Sub-second skew is possible when
+    /// fractional-second precision varies within the same second (a bare
+    /// `..:00Z` sorts above `..:00.5Z`) — acceptable for `lastActivity`,
+    /// which is a sidebar sort/label.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when the underlying query fails.
+    pub async fn max_note_updated_at(&self, workspace_id: &WorkspaceId) -> Result<Option<String>> {
+        dispatch!(self, backend => backend.max_note_updated_at(workspace_id).await)
+    }
+
+    /// Maximum note timestamp per requested workspace in one statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the aggregate query or row projection fails.
+    pub async fn max_note_updated_at_by_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashMap<WorkspaceId, String>> {
+        dispatch!(self, backend => backend.max_note_updated_at_by_workspace(workspace_ids).await)
+    }
+
+    /// List every note across all workspaces, oldest first. Backs the global
+    /// `search.notes` adapter (PROTOCOL §5.15), which has no `workspaceId`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_all_notes(&self) -> Result<Vec<Note>> {
+        dispatch!(self, backend => backend.list_all_notes().await)
+    }
+
+    /// Fetch a single note by (workspace, id), or `NotFound`. Note identity is
+    /// composite (`(id, workspace_id)`, migration 0030) so callers must supply
+    /// both halves; bare-id lookups would silently match a same-id note owned
+    /// by another workspace.
+    ///
+    /// The query runs under [`crate::with_read_retry`]: this is the exact read
+    /// that surfaced a transient "get note failed: ... (code: 5) database is
+    /// locked" to a production client under heavy write load (monorepo#1139).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn get_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
+        dispatch!(self, backend => backend.get_note(workspace_id, id).await)
+    }
+
+    /// Read the note metadata used by change events without loading its body.
+    /// The returned content is empty; emitters omit it from the wire projection.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an absent note, or a database/decoding error.
+    pub async fn get_note_metadata(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
+        dispatch!(self, backend => backend.get_note_metadata(workspace_id, id).await)
+    }
+
+    /// Update an existing note (full-row replace, except `id` and
+    /// `workspace_id`), or `NotFound`. Unconditional last-writer-wins bump of
+    /// `rev`; `metadata.task` is stored opaquely as `task_json` TEXT. The write
+    /// is scoped by the note's own `workspace_id` so same-id notes across
+    /// workspaces never collide. Returns the post-write `rev`.
+    ///
+    /// **Raw row update — no gate, no snapshot.** It rewrites `content` from
+    /// the caller's copy and records no version for the bumped rev, so it can
+    /// clobber a concurrent content write and leaves the new rev without a
+    /// recoverable base. Production content writes go through
+    /// [`Store::update_note_with_version`]; metadata-only writes through
+    /// [`Store::update_note_metadata`] / [`Store::update_note_metadata_versioned`],
+    /// which leave `content` alone. This method remains for fixtures.
+    ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
+    pub async fn update_note(&self, lock: &crate::NoteWriteLock, note: &Note) -> Result<i64> {
+        dispatch!(self, backend => backend.update_note(lock, note).await)
+    }
+
+    /// Update an existing note, optionally gating on `expected_version`
+    /// (optimistic concurrency, PROTOCOL §5.6). Scoped by
+    /// `(id, workspace_id)` (migration 0030 composite PK). When
+    /// `expected_version` is `Some(rev)`, the write is a conditional
+    /// `... WHERE id = ? AND workspace_id = ? AND rev = ?` that only succeeds
+    /// if the stored `rev` matches; on a 0-row result the row is re-read to
+    /// distinguish a [`Error::Conflict`] (row present, carrying the current
+    /// entity) from a [`Error::NotFound`] (row absent). When `None`, this is
+    /// the unconditional last-writer-wins bump. In all cases `rev` increments;
+    /// the post-write `rev` is returned (`UPDATE … RETURNING rev`) so callers
+    /// can record it on the version snapshot without a second read.
+    ///
+    /// **Raw gated update — records no snapshot.** Pairing it with a separate
+    /// [`Store::append_note_version`] reintroduces the row/snapshot visibility
+    /// gap described there; production content writes use
+    /// [`Store::update_note_with_version`], which runs this same conditional
+    /// UPDATE and the snapshot in one transaction.
+    ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
+    pub async fn update_note_versioned(
+        &self,
+        lock: &crate::NoteWriteLock,
+        note: &Note,
+        expected_version: Option<i64>,
+    ) -> Result<i64> {
+        dispatch!(self, backend => backend.update_note_versioned(lock, note, expected_version).await)
+    }
+
+    /// Metadata-only update: rewrites every column *except* `content` and
+    /// `content_type`, so a writer that read the row before a concurrent
+    /// content write committed can never rewrite the stored content with its
+    /// stale copy (the metadata race in the intentd#1817 review). Unconditional
+    /// last-writer-wins bump of `rev`; a metadata write records no version
+    /// snapshot, and the base lookup for its rev falls back to the newest
+    /// content snapshot at or below it, which is the content the row still
+    /// holds. Returns the post-write `rev`.
+    ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store
+    /// like the content writers: a metadata write that bumped `rev` outside
+    /// the lane could land inside a laned writer's read→persist window, be
+    /// reverted by a whole-row writer's stale copy, or burn a gated writer's
+    /// bounded retries. Any other lock is refused with `Error::Internal`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
+    pub async fn update_note_metadata(
+        &self,
+        lock: &crate::NoteWriteLock,
+        note: &Note,
+    ) -> Result<i64> {
+        dispatch!(self, backend => backend.update_note_metadata(lock, note).await)
+    }
+
+    /// [`Store::update_note_metadata`] optionally gated on `expected_version`,
+    /// with the same conflict / not-found classification as
+    /// [`Store::update_note_versioned`]. Takes `note`'s
+    /// [`NoteWriteLock`](crate::NoteWriteLock), like [`Store::update_note_metadata`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
+    pub async fn update_note_metadata_versioned(
+        &self,
+        lock: &crate::NoteWriteLock,
+        note: &Note,
+        expected_version: Option<i64>,
+    ) -> Result<i64> {
+        dispatch!(self, backend => backend.update_note_metadata_versioned(lock, note, expected_version).await)
+    }
+
+    /// Update recovery metadata only while this agent is still linked to the
+    /// note in the same workspace. The revision and session link are checked
+    /// in one `SQLite` UPDATE, so a session-only relink cannot slip past the CAS.
+    /// Returns None on a stale revision, missing note, or changed agent link.
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock), like
+    /// [`Store::update_note_metadata`].
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if encoding or the database write fails.
+    pub async fn update_note_metadata_if_agent_linked(
+        &self,
+        lock: &crate::NoteWriteLock,
+        note: &Note,
+        expected_version: i64,
+        agent_id: &AgentId,
+    ) -> Result<Option<i64>> {
+        dispatch!(self, backend => backend.update_note_metadata_if_agent_linked(lock, note, expected_version, agent_id).await)
+    }
+
+    /// Delete a note by (workspace, id), unconditional. `NotFound` if absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the delete fails.
+    pub async fn delete_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<()> {
+        dispatch!(self, backend => backend.delete_note(workspace_id, id).await)
+    }
+
+    /// Delete a note, optionally gating on `expected_version` (optimistic
+    /// concurrency, PROTOCOL §5.6). Scoped by `(id, workspace_id)` (migration
+    /// 0030 composite PK). When `expected_version` is `Some(rev)`, the delete
+    /// is conditional (`... WHERE id = ? AND workspace_id = ? AND rev = ?`);
+    /// on a 0-row result the row is re-read to distinguish a
+    /// [`Error::Conflict`] (row present, carrying the current entity snapshot
+    /// prior to deletion) from a [`Error::NotFound`] (row absent). When
+    /// `None`, this is the unconditional delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity snapshot prior to deletion) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the delete fails.
+    pub async fn delete_note_versioned(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &NoteId,
+        expected_version: Option<i64>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.delete_note_versioned(workspace_id, id, expected_version).await)
+    }
+
+    /// List a workspace's task notes (those carrying `task_json`), using the
+    /// `idx_note_task` partial index. Ordered by creation time.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_tasks(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
+        dispatch!(self, backend => backend.list_tasks(workspace_id).await)
+    }
+
+    /// Cheap per-workspace `taskStats` counting query (no note-body
+    /// hydration). Semantics mirror the enriched `compute_task_stats` in
+    /// intent-services (the canonical TS `computeTaskStats` port): count the
+    /// spec's direct child task notes, restricted to the spec-linked ids when
+    /// the spec body carries `intent://local/task/{id}` links (TS
+    /// backward-compat fallback: no links → all direct children with task
+    /// metadata count). `cancelled` is excluded from `total`, `complete`
+    /// counts as `completed`, and `in_progress`/`review_required` count as
+    /// `in_progress`.
+    ///
+    /// Reads only the spec note's `content` (needed for the linked-id filter)
+    /// plus `id` + `json_extract(task_json, '$.status')` for the spec's child
+    /// task rows — never the task notes' content bodies — so it stays cheap
+    /// on workspaces with large notes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
+        dispatch!(self, backend => backend.count_task_stats(workspace_id).await)
+    }
+
+    /// Per-workspace task-note count per status as a single aggregate
+    /// statement over `json_extract(task_json, '$.status')` — every task
+    /// note in the workspace except the spec itself (any parent, archived
+    /// included; the same population as `task.list`), never the note bodies.
+    /// Keys are the wire `snake_case` [`TaskStatus`] strings. A NULL or
+    /// unrecognised stored status is counted under `not_started` (the
+    /// [`TaskStatus`] default) as a best-effort fold for this count only —
+    /// such a row does NOT deserialize that way (`map_note_row` fails on it),
+    /// so the fold keeps the aggregate total honest without hiding the row.
+    /// Statuses with no rows are absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_tasks_by_status(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<BTreeMap<String, u64>> {
+        dispatch!(self, backend => backend.count_tasks_by_status(workspace_id).await)
+    }
+
+    /// Task statistics for every requested workspace in one projected read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the query or row projection fails.
+    pub async fn count_task_stats_by_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashMap<WorkspaceId, WorkspaceTaskStats>> {
+        dispatch!(self, backend => backend.count_task_stats_by_workspace(workspace_ids).await)
+    }
+
+    /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
+    /// bug: if the workspace has no `id='spec'` note but *exactly one*
+    /// top-level (`parent_id IS NULL`), non-task (`task_json IS NULL`),
+    /// non-archived note titled "Spec" (trim + case-insensitive), adopt it as
+    /// the reserved spec in a single transaction — rewrite `note.id` to
+    /// `'spec'`, re-parent children, move `note_version`,
+    /// `note_line_attribution`, and `comment` rows to the new id, set
+    /// `is_pinned=1, is_default=1`, and ensure the `spec` tag is present.
+    /// Foreign keys are deferred to commit so the referenced key can be
+    /// rewritten alongside its dependents (§9.4 keeps `foreign_keys = ON`
+    /// outside this window). Returns `Some((old_id, title))` on adoption, or
+    /// `None` when zero or ≥2 candidates match — both fall through to the
+    /// caller's empty-seed path. The caller (`ensure_spec_note`) has already
+    /// confirmed no `id='spec'` note exists; a concurrent adoption race is
+    /// resolved by the composite PK on `(id, workspace_id)`.
+    ///
+    /// Uses the house raw `BEGIN IMMEDIATE` + [`crate::commit_with_rollback_guard`]
+    /// write-transaction pattern (monorepo#783/#796, same shape as
+    /// `Store::write_acp_session_id` / `Store::update_workspace_token_usage`):
+    /// IMMEDIATE mode acquires the RESERVED (write) lock upfront, avoiding the
+    /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
+    /// that intermittently fails with `SQLITE_BUSY` (code 5). With
+    /// `max_connections=1` on the write pool, in-process writers serialize at
+    /// `pool.acquire()`. The `with_write_txn_retry` wrapper (STAB-7) is kept as
+    /// belt-and-braces: `BEGIN IMMEDIATE` can still return BUSY when a
+    /// connection outside the write pool (e.g. an external process on the same
+    /// DB) holds the write lock past `busy_timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn adopt_stray_spec_note(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<(NoteId, String)>> {
+        dispatch!(self, backend => backend.adopt_stray_spec_note(workspace_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn insert_note(&self, note: &Note) -> Result<()> {
+        self.prepare_task_events(&note.workspace_id).await;
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("note insert connection: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("note insert transaction: {e}")))?;
+        let result = exec_insert_note(&mut conn, note).await;
+        crate::commit_with_rollback_guard(conn, result, "commit note insert").await
+    }
+
+    pub async fn list_notes(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
+        let sql =
+            format!("SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? ORDER BY created_at");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list notes failed: {e}")))?;
+        rows.iter().map(map_note_row).collect()
+    }
+
+    pub async fn list_workspace_tasks(
+        &self,
+        workspace_id: &WorkspaceId,
+        filter: Option<TaskStatus>,
+    ) -> Result<TaskListResult> {
+        Ok(self
+            .list_workspace_tasks_keyed(workspace_id, filter)
+            .await?
+            .0)
+    }
+
     pub async fn list_workspace_tasks_keyed(
         &self,
         workspace_id: &WorkspaceId,
@@ -205,14 +566,6 @@ impl Store {
         Ok((TaskListResult { tasks, stats }, keys))
     }
 
-    /// Test whether a workspace owns a note without hydrating its row.
-    ///
-    /// The query runs under [`crate::with_read_retry`] for the same transient
-    /// `SQLITE_BUSY` protection as [`Store::get_note`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Internal`] when the underlying query fails.
     pub async fn note_exists(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<bool> {
         let present = crate::with_read_retry(|| async {
             sqlx::query_scalar::<_, i64>(
@@ -228,24 +581,6 @@ impl Store {
         Ok(present.is_some())
     }
 
-    /// Newest `updated_at` across a workspace's notes, or `None` when the
-    /// workspace has none — the note half of the `lastActivity` derivation
-    /// (`enrich_workspace_aggregates` / `derive_last_activity`) as a single
-    /// aggregate answered from the covering
-    /// `idx_note_workspace_updated_at(workspace_id, updated_at)` index, so
-    /// the hot list/get emit paths never hydrate note bodies just to fold
-    /// timestamps (monorepo#3058).
-    ///
-    /// `MAX` here is a lexicographic TEXT max: it assumes uniform
-    /// daemon-written RFC3339 UTC strings (`now_iso()`), where lexicographic
-    /// order ≈ chronological order. Sub-second skew is possible when
-    /// fractional-second precision varies within the same second (a bare
-    /// `..:00Z` sorts above `..:00.5Z`) — acceptable for `lastActivity`,
-    /// which is a sidebar sort/label.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Internal`] when the underlying query fails.
     pub async fn max_note_updated_at(&self, workspace_id: &WorkspaceId) -> Result<Option<String>> {
         sqlx::query_scalar("SELECT MAX(updated_at) FROM note WHERE workspace_id = ?")
             .bind(&workspace_id.0)
@@ -254,11 +589,6 @@ impl Store {
             .map_err(|e| Error::Internal(format!("max note updated_at failed: {e}")))
     }
 
-    /// Maximum note timestamp per requested workspace in one statement.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` when the aggregate query or row projection fails.
     pub async fn max_note_updated_at_by_workspace(
         &self,
         workspace_ids: &[WorkspaceId],
@@ -289,12 +619,6 @@ impl Store {
             .collect()
     }
 
-    /// List every note across all workspaces, oldest first. Backs the global
-    /// `search.notes` adapter (PROTOCOL §5.15), which has no `workspaceId`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_notes(&self) -> Result<Vec<Note>> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note ORDER BY created_at");
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -304,18 +628,6 @@ impl Store {
         rows.iter().map(map_note_row).collect()
     }
 
-    /// Fetch a single note by (workspace, id), or `NotFound`. Note identity is
-    /// composite (`(id, workspace_id)`, migration 0030) so callers must supply
-    /// both halves; bare-id lookups would silently match a same-id note owned
-    /// by another workspace.
-    ///
-    /// The query runs under [`crate::with_read_retry`]: this is the exact read
-    /// that surfaced a transient "get note failed: ... (code: 5) database is
-    /// locked" to a production client under heavy write load (monorepo#1139).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn get_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note WHERE id = ? AND workspace_id = ?");
         let row = crate::with_read_retry(|| async {
@@ -333,11 +645,6 @@ impl Store {
         }
     }
 
-    /// Read the note metadata used by change events without loading its body.
-    /// The returned content is empty; emitters omit it from the wire projection.
-    ///
-    /// # Errors
-    /// Returns `NotFound` for an absent note, or a database/decoding error.
     pub async fn get_note_metadata(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
         let columns = NOTE_COLUMNS.replace(" content,", " '' AS content,");
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -354,56 +661,10 @@ impl Store {
             .ok_or_else(|| Error::NotFound(format!("note {id}")))
     }
 
-    /// Update an existing note (full-row replace, except `id` and
-    /// `workspace_id`), or `NotFound`. Unconditional last-writer-wins bump of
-    /// `rev`; `metadata.task` is stored opaquely as `task_json` TEXT. The write
-    /// is scoped by the note's own `workspace_id` so same-id notes across
-    /// workspaces never collide. Returns the post-write `rev`.
-    ///
-    /// **Raw row update — no gate, no snapshot.** It rewrites `content` from
-    /// the caller's copy and records no version for the bumped rev, so it can
-    /// clobber a concurrent content write and leaves the new rev without a
-    /// recoverable base. Production content writes go through
-    /// [`Store::update_note_with_version`]; metadata-only writes through
-    /// [`Store::update_note_metadata`] / [`Store::update_note_metadata_versioned`],
-    /// which leave `content` alone. This method remains for fixtures.
-    ///
-    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
-    /// any other lock is refused with `Error::Internal` before anything is
-    /// written.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note(&self, lock: &crate::NoteWriteLock, note: &Note) -> Result<i64> {
         self.update_note_versioned(lock, note, None).await
     }
 
-    /// Update an existing note, optionally gating on `expected_version`
-    /// (optimistic concurrency, PROTOCOL §5.6). Scoped by
-    /// `(id, workspace_id)` (migration 0030 composite PK). When
-    /// `expected_version` is `Some(rev)`, the write is a conditional
-    /// `... WHERE id = ? AND workspace_id = ? AND rev = ?` that only succeeds
-    /// if the stored `rev` matches; on a 0-row result the row is re-read to
-    /// distinguish a [`Error::Conflict`] (row present, carrying the current
-    /// entity) from a [`Error::NotFound`] (row absent). When `None`, this is
-    /// the unconditional last-writer-wins bump. In all cases `rev` increments;
-    /// the post-write `rev` is returned (`UPDATE … RETURNING rev`) so callers
-    /// can record it on the version snapshot without a second read.
-    ///
-    /// **Raw gated update — records no snapshot.** Pairing it with a separate
-    /// [`Store::append_note_version`] reintroduces the row/snapshot visibility
-    /// gap described there; production content writes use
-    /// [`Store::update_note_with_version`], which runs this same conditional
-    /// UPDATE and the snapshot in one transaction.
-    ///
-    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
-    /// any other lock is refused with `Error::Internal` before anything is
-    /// written.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note_versioned(
         &self,
         lock: &crate::NoteWriteLock,
@@ -415,24 +676,6 @@ impl Store {
             .await
     }
 
-    /// Metadata-only update: rewrites every column *except* `content` and
-    /// `content_type`, so a writer that read the row before a concurrent
-    /// content write committed can never rewrite the stored content with its
-    /// stale copy (the metadata race in the intentd#1817 review). Unconditional
-    /// last-writer-wins bump of `rev`; a metadata write records no version
-    /// snapshot, and the base lookup for its rev falls back to the newest
-    /// content snapshot at or below it, which is the content the row still
-    /// holds. Returns the post-write `rev`.
-    ///
-    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store
-    /// like the content writers: a metadata write that bumped `rev` outside
-    /// the lane could land inside a laned writer's read→persist window, be
-    /// reverted by a whole-row writer's stale copy, or burn a gated writer's
-    /// bounded retries. Any other lock is refused with `Error::Internal`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note_metadata(
         &self,
         lock: &crate::NoteWriteLock,
@@ -441,14 +684,6 @@ impl Store {
         self.update_note_metadata_versioned(lock, note, None).await
     }
 
-    /// [`Store::update_note_metadata`] optionally gated on `expected_version`,
-    /// with the same conflict / not-found classification as
-    /// [`Store::update_note_versioned`]. Takes `note`'s
-    /// [`NoteWriteLock`](crate::NoteWriteLock), like [`Store::update_note_metadata`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note_metadata_versioned(
         &self,
         lock: &crate::NoteWriteLock,
@@ -460,15 +695,6 @@ impl Store {
             .await
     }
 
-    /// Update recovery metadata only while this agent is still linked to the
-    /// note in the same workspace. The revision and session link are checked
-    /// in one `SQLite` UPDATE, so a session-only relink cannot slip past the CAS.
-    /// Returns None on a stale revision, missing note, or changed agent link.
-    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock), like
-    /// [`Store::update_note_metadata`].
-    ///
-    /// # Errors
-    /// Returns `Error::Internal` if encoding or the database write fails.
     pub async fn update_note_metadata_if_agent_linked(
         &self,
         lock: &crate::NoteWriteLock,
@@ -521,27 +747,10 @@ impl Store {
         }
     }
 
-    /// Delete a note by (workspace, id), unconditional. `NotFound` if absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the delete fails.
     pub async fn delete_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<()> {
         self.delete_note_versioned(workspace_id, id, None).await
     }
 
-    /// Delete a note, optionally gating on `expected_version` (optimistic
-    /// concurrency, PROTOCOL §5.6). Scoped by `(id, workspace_id)` (migration
-    /// 0030 composite PK). When `expected_version` is `Some(rev)`, the delete
-    /// is conditional (`... WHERE id = ? AND workspace_id = ? AND rev = ?`);
-    /// on a 0-row result the row is re-read to distinguish a
-    /// [`Error::Conflict`] (row present, carrying the current entity snapshot
-    /// prior to deletion) from a [`Error::NotFound`] (row absent). When
-    /// `None`, this is the unconditional delete.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Conflict` (carrying the current entity snapshot prior to deletion) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the delete fails.
     pub async fn delete_note_versioned(
         &self,
         workspace_id: &WorkspaceId,
@@ -589,12 +798,6 @@ impl Store {
         Ok(())
     }
 
-    /// List a workspace's task notes (those carrying `task_json`), using the
-    /// `idx_note_task` partial index. Ordered by creation time.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_tasks(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
         let sql = format!(
             "SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? AND task_json IS NOT NULL \
@@ -609,24 +812,6 @@ impl Store {
     }
 
     #[expect(clippy::similar_names)] // stats/status are both the natural domain names
-    /// Cheap per-workspace `taskStats` counting query (no note-body
-    /// hydration). Semantics mirror the enriched `compute_task_stats` in
-    /// intent-services (the canonical TS `computeTaskStats` port): count the
-    /// spec's direct child task notes, restricted to the spec-linked ids when
-    /// the spec body carries `intent://local/task/{id}` links (TS
-    /// backward-compat fallback: no links → all direct children with task
-    /// metadata count). `cancelled` is excluded from `total`, `complete`
-    /// counts as `completed`, and `in_progress`/`review_required` count as
-    /// `in_progress`.
-    ///
-    /// Reads only the spec note's `content` (needed for the linked-id filter)
-    /// plus `id` + `json_extract(task_json, '$.status')` for the spec's child
-    /// task rows — never the task notes' content bodies — so it stays cheap
-    /// on workspaces with large notes.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
         let spec_content: Option<String> =
             sqlx::query_scalar("SELECT content FROM note WHERE workspace_id = ? AND id = 'spec'")
@@ -673,20 +858,6 @@ impl Store {
         Ok(stats)
     }
 
-    /// Per-workspace task-note count per status as a single aggregate
-    /// statement over `json_extract(task_json, '$.status')` — every task
-    /// note in the workspace except the spec itself (any parent, archived
-    /// included; the same population as `task.list`), never the note bodies.
-    /// Keys are the wire `snake_case` [`TaskStatus`] strings. A NULL or
-    /// unrecognised stored status is counted under `not_started` (the
-    /// [`TaskStatus`] default) as a best-effort fold for this count only —
-    /// such a row does NOT deserialize that way (`map_note_row` fails on it),
-    /// so the fold keeps the aggregate total honest without hiding the row.
-    /// Statuses with no rows are absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_tasks_by_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -719,11 +890,6 @@ impl Store {
         Ok(counts)
     }
 
-    /// Task statistics for every requested workspace in one projected read.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` when the query or row projection fails.
     pub async fn count_task_stats_by_workspace(
         &self,
         workspace_ids: &[WorkspaceId],
@@ -787,37 +953,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
-    /// bug: if the workspace has no `id='spec'` note but *exactly one*
-    /// top-level (`parent_id IS NULL`), non-task (`task_json IS NULL`),
-    /// non-archived note titled "Spec" (trim + case-insensitive), adopt it as
-    /// the reserved spec in a single transaction — rewrite `note.id` to
-    /// `'spec'`, re-parent children, move `note_version`,
-    /// `note_line_attribution`, and `comment` rows to the new id, set
-    /// `is_pinned=1, is_default=1`, and ensure the `spec` tag is present.
-    /// Foreign keys are deferred to commit so the referenced key can be
-    /// rewritten alongside its dependents (§9.4 keeps `foreign_keys = ON`
-    /// outside this window). Returns `Some((old_id, title))` on adoption, or
-    /// `None` when zero or ≥2 candidates match — both fall through to the
-    /// caller's empty-seed path. The caller (`ensure_spec_note`) has already
-    /// confirmed no `id='spec'` note exists; a concurrent adoption race is
-    /// resolved by the composite PK on `(id, workspace_id)`.
-    ///
-    /// Uses the house raw `BEGIN IMMEDIATE` + [`crate::commit_with_rollback_guard`]
-    /// write-transaction pattern (monorepo#783/#796, same shape as
-    /// `Store::write_acp_session_id` / `Store::update_workspace_token_usage`):
-    /// IMMEDIATE mode acquires the RESERVED (write) lock upfront, avoiding the
-    /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
-    /// that intermittently fails with `SQLITE_BUSY` (code 5). With
-    /// `max_connections=1` on the write pool, in-process writers serialize at
-    /// `pool.acquire()`. The `with_write_txn_retry` wrapper (STAB-7) is kept as
-    /// belt-and-braces: `BEGIN IMMEDIATE` can still return BUSY when a
-    /// connection outside the write pool (e.g. an external process on the same
-    /// DB) holds the write lock past `busy_timeout`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn adopt_stray_spec_note(
         &self,
         workspace_id: &WorkspaceId,

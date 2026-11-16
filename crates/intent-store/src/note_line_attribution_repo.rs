@@ -16,6 +16,27 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_note_line_attribution(&self, data: &LineAttributionData) -> Result<()> {
+        dispatch!(self, backend => backend.upsert_note_line_attribution(data).await)
+    }
+
+    /// Load the persisted attribution snapshot for a note, or `None` if never
+    /// computed. `workspace_id` scopes the lookup so a cross-workspace note-id
+    /// collision surfaces as a miss rather than a cross-workspace leak.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_note_line_attribution(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+    ) -> Result<Option<LineAttributionData>> {
+        dispatch!(self, backend => backend.get_note_line_attribution(workspace_id, note_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn upsert_note_line_attribution(&self, data: &LineAttributionData) -> Result<()> {
         let attributions_json = serde_json::to_string(&data.attributions).map_err(|e| {
             Error::Internal(format!(
                 "encode note_line_attribution attributions failed: {e}"
@@ -44,13 +65,6 @@ impl Store {
         .await
     }
 
-    /// Load the persisted attribution snapshot for a note, or `None` if never
-    /// computed. `workspace_id` scopes the lookup so a cross-workspace note-id
-    /// collision surfaces as a miss rather than a cross-workspace leak.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_note_line_attribution(
         &self,
         workspace_id: &WorkspaceId,

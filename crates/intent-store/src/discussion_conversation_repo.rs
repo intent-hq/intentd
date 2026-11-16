@@ -93,8 +93,7 @@ impl Store {
     /// # Errors
     /// Returns a database error.
     pub async fn has_private_discussions(&self, ws: &WorkspaceId) -> Result<bool> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_conversation WHERE workspace_id=?) OR EXISTS(SELECT 1 FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id<>'default' AND NOT EXISTS(SELECT 1 FROM workspace_discussion_conversation wdc WHERE wdc.workspace_id=workspace_discussion_message.workspace_id AND wdc.id=workspace_discussion_message.conversation_id))")
-            .bind(ws.as_str()).bind(ws.as_str()).fetch_one(self.read_pool()).await.map_err(|e|db(&e))
+        dispatch!(self, backend => backend.has_private_discussions(ws).await)
     }
 
     /// Read metadata after caller authorization.
@@ -105,8 +104,7 @@ impl Store {
         ws: &WorkspaceId,
         id: &str,
     ) -> Result<DiscussionConversation> {
-        let mut conn = self.read_pool().acquire().await.map_err(|e| db(&e))?;
-        read_conversation(&mut conn, ws, id).await
+        dispatch!(self, backend => backend.discussion_conversation(ws, id).await)
     }
 
     /// Check local participant grants; imported source IDs are never authority.
@@ -118,7 +116,7 @@ impl Store {
         id: &str,
         principal: &PrincipalId,
     ) -> Result<bool> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_participant WHERE workspace_id=? AND conversation_id=? AND principal_id=?)").bind(ws.as_str()).bind(id).bind(principal.as_str()).fetch_one(self.read_pool()).await.map_err(|e|db(&e))
+        dispatch!(self, backend => backend.discussion_is_participant(ws, id, principal).await)
     }
 
     /// Filter a roster's conversation IDs in one bounded query.
@@ -130,12 +128,84 @@ impl Store {
         principal: &PrincipalId,
         ids: &[String],
     ) -> Result<Vec<String>> {
-        sqlx::query_scalar("SELECT id AS conversation_id FROM workspace_discussion_conversation WHERE workspace_id=?1 AND deleted_at IS NULL AND id IN (SELECT value FROM json_each(?3)) UNION SELECT conversation_id FROM discussion_participant WHERE workspace_id=?1 AND principal_id=?2 AND conversation_id IN (SELECT value FROM json_each(?3))").bind(ws.as_str()).bind(principal.as_str()).bind(serde_json::to_string(ids).map_err(|e|Error::Internal(e.to_string()))?).fetch_all(self.read_pool()).await.map_err(|e|db(&e))
+        dispatch!(self, backend => backend.discussion_visible_ids(ws, principal, ids).await)
     }
 
     /// Bounded workspace-wide and authorized legacy discovery; default leads when present.
     /// # Errors
     /// Returns invalid bounds or database errors.
+    pub async fn discussion_conversations(
+        &self,
+        ws: &WorkspaceId,
+        principal: &PrincipalId,
+        before: Option<&str>,
+        limit: u32,
+    ) -> Result<Value> {
+        dispatch!(self, backend => backend.discussion_conversations(ws, principal, before, limit).await)
+    }
+
+    /// Bounded effective member picker, independent of online presence.
+    /// # Errors
+    /// Returns invalid bounds or database errors.
+    pub async fn discussion_recipients(
+        &self,
+        ws: &WorkspaceId,
+        principal: &PrincipalId,
+        query: &str,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Value> {
+        dispatch!(self, backend => backend.discussion_recipients(ws, principal, query, after, limit).await)
+    }
+
+    /// Atomically create a conversation on its first message or append/retry.
+    /// # Errors
+    /// Rejects target/body retry mismatches, missing members, and database failures.
+    pub async fn send_discussion_message(
+        &self,
+        ws: &WorkspaceId,
+        key: &str,
+        body: &str,
+        author: &DiscussionAuthor,
+        target: &DiscussionTarget,
+    ) -> Result<(DiscussionSendResult, bool)> {
+        dispatch!(self, backend => backend.send_discussion_message(ws, key, body, author, target).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn has_private_discussions(&self, ws: &WorkspaceId) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_conversation WHERE workspace_id=?) OR EXISTS(SELECT 1 FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id<>'default' AND NOT EXISTS(SELECT 1 FROM workspace_discussion_conversation wdc WHERE wdc.workspace_id=workspace_discussion_message.workspace_id AND wdc.id=workspace_discussion_message.conversation_id))")
+            .bind(ws.as_str()).bind(ws.as_str()).fetch_one(self.read_pool()).await.map_err(|e|db(&e))
+    }
+
+    pub async fn discussion_conversation(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+    ) -> Result<DiscussionConversation> {
+        let mut conn = self.read_pool().acquire().await.map_err(|e| db(&e))?;
+        read_conversation(&mut conn, ws, id).await
+    }
+
+    pub async fn discussion_is_participant(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        principal: &PrincipalId,
+    ) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_participant WHERE workspace_id=? AND conversation_id=? AND principal_id=?)").bind(ws.as_str()).bind(id).bind(principal.as_str()).fetch_one(self.read_pool()).await.map_err(|e|db(&e))
+    }
+
+    pub async fn discussion_visible_ids(
+        &self,
+        ws: &WorkspaceId,
+        principal: &PrincipalId,
+        ids: &[String],
+    ) -> Result<Vec<String>> {
+        sqlx::query_scalar("SELECT id AS conversation_id FROM workspace_discussion_conversation WHERE workspace_id=?1 AND deleted_at IS NULL AND id IN (SELECT value FROM json_each(?3)) UNION SELECT conversation_id FROM discussion_participant WHERE workspace_id=?1 AND principal_id=?2 AND conversation_id IN (SELECT value FROM json_each(?3))").bind(ws.as_str()).bind(principal.as_str()).bind(serde_json::to_string(ids).map_err(|e|Error::Internal(e.to_string()))?).fetch_all(self.read_pool()).await.map_err(|e|db(&e))
+    }
+
     pub async fn discussion_conversations(
         &self,
         ws: &WorkspaceId,
@@ -167,9 +237,6 @@ impl Store {
         Ok(json!({"conversations":conversations,"hasMore":has_more}))
     }
 
-    /// Bounded effective member picker, independent of online presence.
-    /// # Errors
-    /// Returns invalid bounds or database errors.
     pub async fn discussion_recipients(
         &self,
         ws: &WorkspaceId,
@@ -197,9 +264,6 @@ impl Store {
         Ok(json!({"members":members,"hasMore":has_more}))
     }
 
-    /// Atomically create a conversation on its first message or append/retry.
-    /// # Errors
-    /// Rejects target/body retry mismatches, missing members, and database failures.
     pub async fn send_discussion_message(
         &self,
         ws: &WorkspaceId,

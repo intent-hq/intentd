@@ -102,6 +102,738 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<HashMap<WorkspaceId, WorkspaceContentClock>> {
+        dispatch!(self, backend => backend.workspace_content_clocks(workspace_ids).await)
+    }
+
+    /// Requested workspaces whose known PRs are all finished: at least one PR
+    /// snapshot exists on the workspace or its git roots, and every one of
+    /// them (link status, active PR, discovered pools) is `Merged` or
+    /// `Closed`. A link without a status or a malformed snapshot counts as
+    /// unknown, so the workspace is not settled. An active PR monitor watches
+    /// an open PR, so it also keeps the workspace unsettled. Read in bounded
+    /// batches.
+    ///
+    /// # Errors
+    /// Returns an internal error if the metadata query fails.
+    pub async fn workspaces_with_settled_pull_requests(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashSet<WorkspaceId>> {
+        dispatch!(self, backend => backend.workspaces_with_settled_pull_requests(workspace_ids).await)
+    }
+
+    /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if encoding workspace fields or the insert fails.
+    pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
+        dispatch!(self, backend => backend.insert_workspace(ws).await)
+    }
+
+    /// Insert a workspace row with the per-workspace `auto_commit_enabled`
+    /// override seeded in the same INSERT (mirror-at-creation, spec Diagnosis
+    /// §3b). Atomic: the row can never exist without its seed, so a created
+    /// workspace never silently degrades to global-tracking semantics.
+    /// `None` leaves the column NULL (resolves against the global at read
+    /// time).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_workspace_with_auto_commit(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.insert_workspace_with_auto_commit(ws, auto_commit).await)
+    }
+
+    /// Insert from an original pre-workspace host admission. The durable facts
+    /// are compared while authority writers are serialized; the synchronous
+    /// callback admits the already-prepared insert after all pool waits.
+    ///
+    /// # Errors
+    /// Refuses changed original authority or a retired caller/source callback.
+    pub async fn insert_workspace_with_host_admission(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+        expected: &crate::RepositoryHostAuthoritySnapshot,
+        token_hash: Option<&str>,
+        admit: impl FnOnce() -> Result<()> + Send,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.insert_workspace_with_host_admission(ws, auto_commit, expected, token_hash, admit).await)
+    }
+
+    /// Fetch a single workspace by id, or `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<Workspace> {
+        dispatch!(self, backend => backend.get_workspace(id).await)
+    }
+
+    /// Update an existing workspace, preserving `branch`, `id`, the
+    /// guarded `last_activity` and archive lifecycle columns, or return
+    /// `NotFound`. Returns the stored branch.
+    /// `activity` is derived and never persisted (§9.9).
+    ///
+    /// Explicit branch changes use [`Self::update_workspace_with_branch`].
+    /// `last_activity` is one exception to the full-row replace
+    /// (monorepo#1585): it goes through the same monotonic guard as
+    /// [`Self::bump_workspace_last_activity`] — the candidate writes only when
+    /// it parses AND the stored value is NULL, unparseable, or strictly older.
+    /// Otherwise the stored column holds, so a get → mutate → write flow whose
+    /// read predated a concurrent bump can never silently revert it (the
+    /// `attention` clobber shape fixed by #1481).
+    ///
+    /// The archive lifecycle is another exception: `archived` /
+    /// `archived_at` are NEVER written here, and `status` holds whenever the
+    /// row is archived or the candidate is `Archived`. Those columns move
+    /// only through the scoped, fenced flips
+    /// ([`Self::archive_workspace_detaching_guests`] /
+    /// [`Self::unarchive_workspace_if_archived`]), so a full-row write from a
+    /// snapshot read before a concurrent archive can never resurrect the
+    /// workspace behind the archive's guest sweep (the `workspace.archive`
+    /// fence relies on this — see `ArchiveFence` in `intent-services`).
+    ///
+    /// `label` is never written here either: it moves only through
+    /// [`Self::set_workspace_label`], so a stale snapshot cannot revert it.
+    /// Likewise `auto_archive_disabled` moves only through
+    /// [`Self::set_workspace_auto_archive_disabled`].
+    /// `plain_folder` is insert-only: no update path ever writes it (§5.1
+    /// "Plain-folder workspaces").
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_workspace(&self, ws: &Workspace) -> Result<String> {
+        dispatch!(self, backend => backend.update_workspace(ws).await)
+    }
+
+    /// Update workspace fields and optionally apply an explicit branch edit.
+    /// Returns the stored branch so responses cannot echo a stale snapshot.
+    ///
+    /// # Errors
+    /// Returns `Error::NotFound` for a missing workspace or an error on database failure.
+    pub async fn update_workspace_with_branch(
+        &self,
+        ws: &Workspace,
+        branch: Option<&str>,
+    ) -> Result<String> {
+        dispatch!(self, backend => backend.update_workspace_with_branch(ws, branch).await)
+    }
+
+    /// Reconcile an observed branch without overwriting concurrent workspace edits.
+    /// A renamed or switched branch is no longer eligible for automatic deletion.
+    ///
+    /// # Errors
+    /// Returns an error if the database write fails.
+    pub async fn reconcile_workspace_branch(
+        &self,
+        expected: &Workspace,
+        branch: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.reconcile_workspace_branch(expected, branch).await)
+    }
+
+    /// Scoped PR-linkage write: set ONLY the PR columns (`pr_number`,
+    /// `pr_url`, `pr_status`, `active_pull_request`, `pull_requests`) plus
+    /// `updated_at` — never a full-row replace, so a PR refresh whose
+    /// workspace read predates a concurrent mutation (archive, title edit,
+    /// relink) can never clobber the other columns (same scoped-update
+    /// discipline as [`Self::set_workspace_attention`] /
+    /// [`Self::update_workspace_token_usage`]). The PR columns themselves are
+    /// last-writer-wins by design — refreshes are idempotent against the
+    /// forge and the next sweep converges. `NotFound` when the workspace
+    /// does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_workspace_pr_linkage(&self, ws: &Workspace) -> Result<()> {
+        dispatch!(self, backend => backend.update_workspace_pr_linkage(ws).await)
+    }
+
+    /// [`Self::update_workspace_pr_linkage`] rebased on the row at write
+    /// time (intent-hq/intent#5654): inside ONE `BEGIN IMMEDIATE` write-pool
+    /// transaction, read the stored `pull_requests`, hand it to the caller's
+    /// synchronous `rebase` closure together with the entity about to be
+    /// written, then perform the same scoped PR-columns `UPDATE` from the
+    /// (possibly amended) entity. The REST-only PR refreshes build their
+    /// list from a row read that predates the forge round trip, so a
+    /// signal-bearing fold landing in between would otherwise be clobbered;
+    /// the closure (intent-services owns the merge rule) re-derives the
+    /// `is_in_merge_queue` carry against the current row instead. Same
+    /// envelope and layering as [`Self::update_workspace_token_usage`];
+    /// a malformed stored list decodes to `None` (the closure then keeps
+    /// the entity's list). `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_workspace_pr_linkage_rebased<F>(
+        &self,
+        ws: &mut Workspace,
+        rebase: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut Workspace, Option<Vec<PullRequestInfo>>),
+    {
+        dispatch!(self, backend => backend.update_workspace_pr_linkage_rebased(ws, rebase).await)
+    }
+
+    /// Project onto a workspace's persisted PR snapshots atomically
+    /// (intent-hq/intent#5654, the cache-hit fold): inside ONE
+    /// `BEGIN IMMEDIATE` write-pool transaction, read the stored
+    /// `pull_requests` and `active_pull_request`, hand both to the caller's
+    /// synchronous `project` closure, and — when it returns `true` — write
+    /// back ONLY those two columns plus `updated_at`. The closure never
+    /// sees a pre-read entity, so a REST refresh that committed between
+    /// the caller's row lookup and this write is what gets projected onto,
+    /// never rolled back; the linked scalars (`pr_number`, `pr_url`,
+    /// `pr_status`) are untouched. Returns the written pair on a committed
+    /// write, `None` when the closure declined. `NotFound` when the
+    /// workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails or a stored snapshot is malformed.
+    pub async fn project_workspace_pr_snapshots<F>(
+        &self,
+        id: &WorkspaceId,
+        updated_at: &str,
+        project: F,
+    ) -> Result<Option<(Option<Vec<PullRequestInfo>>, Option<PullRequestInfo>)>>
+    where
+        F: FnOnce(&mut Option<Vec<PullRequestInfo>>, &mut Option<PullRequestInfo>) -> bool,
+    {
+        dispatch!(self, backend => backend.project_workspace_pr_snapshots(id, updated_at, project).await)
+    }
+
+    /// Recompute-and-store a workspace's `token_usage` snapshot atomically
+    /// (§5.23, monorepo#738): inside ONE write-pool transaction, read the
+    /// per-session usage rows and the stored workspace `token_usage`, invoke
+    /// the caller's synchronous `compute` closure with both, and — when it
+    /// returns `Some(new_usage)` — perform a scoped
+    /// `UPDATE workspace SET token_usage=?` (never a full-row replace, so a
+    /// concurrent title/status update is never clobbered). Usage bookkeeping
+    /// preserves activity timestamps: a background recount is not new work.
+    /// Returns the written [`TokenUsage`] on a committed write, `None` when
+    /// the closure declined. `NotFound` if the workspace row is absent.
+    /// Layering: aggregation stays in intent-services via the closure; the
+    /// store only supplies the transactional read→write envelope.
+    ///
+    /// Uses raw `BEGIN IMMEDIATE` (same pattern as `insert_events`):
+    /// IMMEDIATE mode acquires the exclusive write lock upfront, avoiding the
+    /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
+    /// that intermittently fails with `SQLITE_BUSY` (code 5). With
+    /// `max_connections=1` on the write pool, concurrent recomputes serialize
+    /// at `pool.acquire()` instead.
+    ///
+    /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`) reads
+    /// `agent_message` for sessions still on the per-message fallback (no
+    /// snapshot/baseline token report), and that work happens while holding
+    /// the daemon's sole write connection and the `SQLite` write lock. The
+    /// report-backed skip keeps the common case cheap, and the fallback read
+    /// projects each message's usage object in SQL and filters to
+    /// usage-bearing rows off a partial index instead of materializing message
+    /// bodies (monorepo#1571) — so what a workspace of long-history fallback
+    /// sessions pays for is its usage-bearing rows, not its transcript bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_workspace_token_usage<F>(
+        &self,
+        workspace_id: &WorkspaceId,
+        compute: F,
+    ) -> Result<Option<TokenUsage>>
+    where
+        F: FnOnce(&[AgentUsageRow], Option<&TokenUsage>) -> Option<TokenUsage>,
+    {
+        dispatch!(self, backend => backend.update_workspace_token_usage(workspace_id, compute).await)
+    }
+
+    /// Scoped, conditional attention write (monorepo#1481): set ONLY the
+    /// `attention` column — plus `updated_at` when the caller intends an
+    /// activity bump — guarded on the current value, so the write and the
+    /// "did it change" decision are a single atomic statement and a
+    /// concurrent mutation of any other column is never clobbered (same
+    /// scoped-update discipline as [`Self::update_workspace_token_usage`]
+    /// and [`Self::set_workspace_branch_auto_generated`]).
+    ///
+    /// `expected = Some(from)` writes only when the current attention equals
+    /// `from` (markSeen's clear-only-when-unread; must differ from
+    /// `attention` — debug-asserted — or the write degenerates to a
+    /// same-value rewrite reported as a change); `None` writes whenever the
+    /// current attention differs from `attention`. Returns whether a row was
+    /// written (`true` ⇒ the value actually changed); `NotFound` when the
+    /// workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` when the workspace does not exist; `Error::Internal` if the update or presence check fails.
+    pub async fn set_workspace_attention(
+        &self,
+        id: &WorkspaceId,
+        attention: WorkspaceAttention,
+        updated_at: Option<&str>,
+        expected: Option<WorkspaceAttention>,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.set_workspace_attention(id, attention, updated_at, expected).await)
+    }
+
+    /// Atomic settle-clear of the stored `unread` flag (§5.1): set
+    /// `attention = none` ONLY when the current value is `unread` AND the
+    /// workspace has no unread top-level session — the derivation re-checked
+    /// INSIDE the same guarded UPDATE (shared predicate with
+    /// [`Store::workspace_has_unread_top_level_session`]), so a message that
+    /// lands between a caller's probe and this write flips the NOT EXISTS
+    /// and the clear declines instead of retiring a freshly-raised unread.
+    /// Scoped to the attention column, `updated_at` untouched (acknowledging
+    /// is not "activity", monorepo#1466). Returns whether a row was written
+    /// (`true` ⇒ stored `unread` was cleared); a missing workspace reads as
+    /// `false` — settle callers are best-effort and never need `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_workspace_unread_if_all_seen(&self, id: &WorkspaceId) -> Result<bool> {
+        dispatch!(self, backend => backend.clear_workspace_unread_if_all_seen(id).await)
+    }
+
+    /// Scoped, conditional unarchive flip: set `status`/`archived`/
+    /// `archived_at` (plus `updated_at`) back to Active ONLY when the row is
+    /// currently archived, so the write and the "did this call flip it"
+    /// decision are a single atomic statement — two concurrent unarchivers
+    /// (or an unarchive racing a turn-start auto-unarchive) can both read
+    /// `archived: true`, but exactly one write affects a row. Same
+    /// scoped-update discipline as [`Self::set_workspace_attention`]. Returns
+    /// whether a row was written (`true` ⇒ this call performed the flip);
+    /// `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn unarchive_workspace_if_archived(
+        &self,
+        id: &WorkspaceId,
+        updated_at: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.unarchive_workspace_if_archived(id, updated_at).await)
+    }
+
+    /// Scoped, monotonic `last_activity` write (monorepo#1580): set ONLY the
+    /// `last_activity` column — never `updated_at`, never a full-row replace —
+    /// and only when the supplied timestamp is strictly newer than the stored
+    /// one (or the column is NULL / unparseable). Same scoped-update
+    /// discipline as [`Self::set_workspace_attention`].
+    ///
+    /// Backs the debounced `lastActivity` derivation in intent-services so the
+    /// persisted column tracks the derived value and cheap read paths
+    /// (`list_workspaces_lite`, the `workspace.subscribe` seq-0 snapshot) serve
+    /// a fresh timestamp after a restart.
+    ///
+    /// Comparison runs through `SQLite`'s `julianday()` rather than raw TEXT so
+    /// timestamps of differing fractional-second precision order correctly
+    /// (lexicographic `…:00Z` vs `…:00.5Z` compares backwards). A malformed
+    /// `last_activity` parses to NULL and is treated as "older" (overwritten);
+    /// a malformed input never writes. Returns whether a row was written;
+    /// `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn bump_workspace_last_activity(
+        &self,
+        id: &WorkspaceId,
+        last_activity: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.bump_workspace_last_activity(id, last_activity).await)
+    }
+
+    /// Delete a workspace by id, or `NotFound`. Records a tombstone in
+    /// `deleted_workspace_id` (same transaction as the row delete) so
+    /// `workspace.create` never recycles the id for a later workspace (FE
+    /// `recentlyDeletedWorkspaces` parity, persisted across restarts).
+    /// Also removes the workspace's `draft` rows explicitly — `draft` has no
+    /// workspace FK (opaque keys, PROTOCOL §5.16), so no cascade applies.
+    /// The `browser_tab` rows and their process-local `displayed`
+    /// overlay entries are removed together after each committed batch (see
+    /// `browser_tab_repo`).
+    ///
+    /// Callers must stop the workspace's runtime writers before deletion.
+    /// Histories and other growing children are swept in committed batches,
+    /// releasing the writer between steps (intent-hq/intent#5337). Failure or
+    /// cancellation can leave a live workspace with partially removed data;
+    /// retry resumes cleanup. Only the final row delete and tombstone are
+    /// atomic. Cleanup errors propagate without falling back to a cascade.
+    /// A started browser batch or final transaction finishes its commit and
+    /// overlay eviction even if the caller is cancelled.
+    ///
+    /// The final transaction uses whole-transaction retry to eliminate
+    /// `SQLITE_BUSY` (code 5) lock-upgrade failures under concurrent load (STAB-7).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+        dispatch!(self, backend => backend.delete_workspace(id).await)
+    }
+
+    /// Run the same deletion once, retaining facts before projecting its result.
+    ///
+    /// `NoEffect` is only the original initial absent observation. A later
+    /// zero-row delete may follow committed cleanup and remains `Unknown`.
+    /// `Committed` describes the acknowledged final commit and owned Store
+    /// completion, not earlier Services teardown or later filesystem cleanup.
+    /// Cancellation yields no returned outcome; it never proves settlement.
+    pub async fn delete_workspace_with_outcome(
+        &self,
+        id: &WorkspaceId,
+    ) -> RepositoryWorkspaceDeleteOutcome {
+        dispatch!(self, backend => backend.delete_workspace_with_outcome(id).await)
+    }
+
+    /// The folder of every plain-folder workspace the store knows (PROTOCOL
+    /// §5.1 "Plain-folder workspaces"): live, archived and retired rows plus
+    /// deleted ones remembered on their tombstone. Path-based cleanup sweeps
+    /// never remove a directory overlapping one of these.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; callers
+    /// then skip the sweep (fail closed).
+    pub async fn plain_folder_paths(&self) -> Result<Vec<String>> {
+        dispatch!(self, backend => backend.plain_folder_paths().await)
+    }
+
+    /// Whether a workspace id was ever used — a live row exists **or** a
+    /// delete tombstone is recorded. `workspace.create` uses this to uniquify
+    /// derived slug ids so a deleted workspace's id is never recycled.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn workspace_id_ever_used(&self, id: &WorkspaceId) -> Result<bool> {
+        dispatch!(self, backend => backend.workspace_id_ever_used(id).await)
+    }
+
+    /// Record whether the workspace's branch was auto-generated by the daemon
+    /// at create time (vs supplied by the caller). Read back by the
+    /// `workspace.delete` cleanup guard: only an auto-generated branch is ever
+    /// deleted with the worktree (TS `removeGitWorktree` parity). Store-only —
+    /// the flag never appears on the wire, so it lives outside [`Workspace`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_branch_auto_generated(
+        &self,
+        id: &WorkspaceId,
+        auto_generated: bool,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.set_workspace_branch_auto_generated(id, auto_generated).await)
+    }
+
+    /// Whether the workspace's branch was auto-generated at create time.
+    /// `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn workspace_branch_auto_generated(&self, id: &WorkspaceId) -> Result<bool> {
+        dispatch!(self, backend => backend.workspace_branch_auto_generated(id).await)
+    }
+
+    /// Set the persisted per-workspace auto-commit override (spec Diagnosis
+    /// §3b). Mirrored from the global `git.autoCommit` at create time and
+    /// toggled via `workspace.setAutoCommit`. Store-only column — the value
+    /// is surfaced through the dedicated getter RPC, not on [`Workspace`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_auto_commit(&self, id: &WorkspaceId, enabled: bool) -> Result<()> {
+        dispatch!(self, backend => backend.set_workspace_auto_commit(id, enabled).await)
+    }
+
+    /// Scoped write of the Home workspace label (`workspace.update { label }`):
+    /// `None` clears it. After insert this is the only writer of the column —
+    /// `update_workspace` never touches it — so a stale [`Workspace`]
+    /// snapshot passed to a full-row update cannot revert a newer label.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_label(&self, id: &WorkspaceId, label: Option<&str>) -> Result<()> {
+        dispatch!(self, backend => backend.set_workspace_label(id, label).await)
+    }
+
+    /// Scoped write of the per-workspace auto-archive opt-out
+    /// (`workspace.update { autoArchiveDisabled }`). After insert this is the
+    /// only writer of the column — `update_workspace` never touches it — so a
+    /// stale [`Workspace`] snapshot passed to a full-row update cannot revert
+    /// a newer value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_auto_archive_disabled(
+        &self,
+        id: &WorkspaceId,
+        disabled: bool,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.set_workspace_auto_archive_disabled(id, disabled).await)
+    }
+
+    /// The persisted per-workspace auto-commit override. `Ok(None)` for
+    /// pre-migration rows (NULL column) — the caller resolves NULL against
+    /// the global `git.autoCommit` setting. `NotFound` when the workspace
+    /// does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn workspace_auto_commit(&self, id: &WorkspaceId) -> Result<Option<bool>> {
+        dispatch!(self, backend => backend.workspace_auto_commit(id).await)
+    }
+
+    /// Scoped write of the per-workspace browser-client pin (REV-2,
+    /// `workspace.setBrowserClient`): `None` clears it. This setter is the
+    /// only writer of the column after insert — `update_workspace` never
+    /// touches it (like `auto_commit_enabled`), so a stale `Workspace`
+    /// snapshot passed to a general update cannot revert a concurrent pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_browser_client(
+        &self,
+        id: &WorkspaceId,
+        client_id: Option<&ClientId>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.set_workspace_browser_client(id, client_id).await)
+    }
+
+    /// The persisted per-workspace browser-client pin; `Ok(None)` when
+    /// unpinned. `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn workspace_browser_client(&self, id: &WorkspaceId) -> Result<Option<ClientId>> {
+        dispatch!(self, backend => backend.workspace_browser_client(id).await)
+    }
+
+    /// List workspaces admitted by `filter`: archived rows only with
+    /// `include_archived`, retired rows only with `include_retired`
+    /// (`include_archived` alone never returns a retired row — retired is
+    /// opt-in on every list surface, PROTOCOL §5.1). The seeded virtual
+    /// [`CHIEF_WORKSPACE_ID`] row is always excluded — Chief is synthesized
+    /// on read by the service layer and never surfaces via `workspace.list`
+    /// (TS `findAll` parity, `workspace.repository.ts`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspaces(&self, filter: WorkspaceListFilter) -> Result<Vec<Workspace>> {
+        dispatch!(self, backend => backend.list_workspaces(filter).await)
+    }
+
+    /// One keyset page of [`Store::list_workspaces`] in `(created_at, id)`
+    /// order: at most `limit` rows strictly after `after` (`(created_at,
+    /// id)` of the previous page's last row), so the read costs O(page).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspaces_page(
+        &self,
+        filter: WorkspaceListFilter,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<Workspace>> {
+        dispatch!(self, backend => backend.list_workspaces_page(filter, after, limit).await)
+    }
+
+    /// The retired workspace a call is scoped to: `workspace_id` when that
+    /// row is `Retired`, else the workspace of the agent session `agent_id`
+    /// when it is `Retired`; `None` otherwise (including unknown ids). One
+    /// indexed statement — the RPC read-only gate for retired workspaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn retired_workspace_for(
+        &self,
+        workspace_id: Option<&WorkspaceId>,
+        agent_id: Option<&AgentId>,
+    ) -> Result<Option<WorkspaceId>> {
+        dispatch!(self, backend => backend.retired_workspace_for(workspace_id, agent_id).await)
+    }
+
+    /// Scoped, conditional retire flip (`workspace.retire`, PROTOCOL §5.1):
+    /// set `status = Retired`, `retired_at`, `updated_at` and the purge
+    /// `status_message` ([`intent_core::WORKSPACE_PURGED_STATUS_MESSAGE`],
+    /// replacing the previous message) ONLY when the
+    /// row is currently archived and not already retired. The caller runs
+    /// the archive flip first for an Active workspace, so a retired row is
+    /// always `archived = 1` (`archived_at` kept). Every other column —
+    /// including the persisted checkout paths and branch — is untouched, and
+    /// no other row is deleted. Returns whether this call performed the flip;
+    /// `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn retire_workspace_if_archived(
+        &self,
+        id: &WorkspaceId,
+        retired_at: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.retire_workspace_if_archived(id, retired_at).await)
+    }
+
+    /// Scoped, conditional revive flip (PROTOCOL §5.1 "Revive"): flip a
+    /// `Retired` row back to `Active` — clear `archived`, `archived_at` and
+    /// `retired_at` — and record the fresh checkout's `branch` and
+    /// `base_commit_sha`, ONLY when the row is currently retired. The purge
+    /// `status_message` is cleared when it still equals
+    /// [`intent_core::WORKSPACE_PURGED_STATUS_MESSAGE`]; a message changed
+    /// since the retire is kept. Every other column is untouched. Returns whether this call performed the flip;
+    /// `NotFound` when the workspace does not exist. Same archive-binding
+    /// lifecycle bracket as [`Self::unarchive_workspace_if_archived`] (a
+    /// retired row is always archived).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn revive_workspace_if_retired(
+        &self,
+        id: &WorkspaceId,
+        branch: &str,
+        base_commit_sha: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.revive_workspace_if_retired(id, branch, base_commit_sha, updated_at).await)
+    }
+
+    /// [`Self::revive_workspace_if_retired`] that also leaves a one-time
+    /// prompt notice pending on the workspace's agent sessions **in the same
+    /// `BEGIN IMMEDIATE` transaction** as the flip: no reader can observe the
+    /// revived (Active) row without the notices, and a crash can never commit
+    /// one without the other. `notice` is `(metadata key, text, excluded
+    /// session)`; every session of the workspace except the excluded one
+    /// gets the key set. Nothing is written when the row is not retired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn revive_workspace_if_retired_with_notice(
+        &self,
+        id: &WorkspaceId,
+        branch: &str,
+        base_commit_sha: Option<&str>,
+        updated_at: &str,
+        notice: Option<(&str, &str, Option<&AgentId>)>,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.revive_workspace_if_retired_with_notice(id, branch, base_commit_sha, updated_at, notice).await)
+    }
+
+    /// The ids of the machine's hidden home records
+    /// ([`intent_core::HOME_RECORD_PREFIX`]), for the executor's purge of
+    /// records whose home is gone.
+    ///
+    /// # Errors
+    /// Returns `Internal` on a database failure.
+    pub async fn home_record_ids(&self) -> Result<Vec<WorkspaceId>> {
+        dispatch!(self, backend => backend.home_record_ids().await)
+    }
+
+    /// Remove a machine's hidden home record and (by cascade) its rows,
+    /// leaving no deletion marker: a record lives as long as its home
+    /// checkout, and its id is never reused or transferred once removed.
+    /// Any other id is refused.
+    ///
+    /// # Errors
+    /// `InvalidParams` for an id that is not a home record; `Internal` on a
+    /// database failure.
+    pub async fn delete_home_record(&self, id: &WorkspaceId) -> Result<()> {
+        dispatch!(self, backend => backend.delete_home_record(id).await)
+    }
+
+    /// Ordinary workspace keys for inherited host access, without hydrating
+    /// rows or issuing a role lookup per workspace. Includes archived rows.
+    ///
+    /// # Errors
+    /// Returns `Internal` on a database failure.
+    pub async fn ordinary_workspace_ids(&self) -> Result<Vec<WorkspaceId>> {
+        dispatch!(self, backend => backend.ordinary_workspace_ids().await)
+    }
+
+    /// Live (non-archived, non-remote) workspaces referencing a PR by URL —
+    /// linked via `pr_url` or carrying a `pull_requests` pool entry with that
+    /// URL — oldest first. Backs the passive `github.pulls.get` fold: the
+    /// match runs in SQL (`json_each` over the pool column) so only the
+    /// referencing rows are decoded, and compares `COLLATE NOCASE` because
+    /// forge slugs are case-insensitive while persisted URLs may carry a
+    /// client-supplied casing. The seeded virtual [`CHIEF_WORKSPACE_ID`]
+    /// row is excluded like [`Self::list_workspaces`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspaces_referencing_pr_url(&self, url: &str) -> Result<Vec<Workspace>> {
+        dispatch!(self, backend => backend.list_workspaces_referencing_pr_url(url).await)
+    }
+
+    /// Workspaces linked to the PR whose canonical key is `pr_key`
+    /// (`workspace.findByPullRequest`, §5.1 "Pull request workspace lookup"),
+    /// most recently linked first, ties by id ascending. Links are recorded
+    /// by the migration 0161 triggers whenever a workspace or git root
+    /// persists a changed PR snapshot. Archived rows are included; remote rows
+    /// and the seeded virtual [`CHIEF_WORKSPACE_ID`] row never are. Reads only
+    /// the four projected columns. `pr_key` must already be canonical — see
+    /// `intent_core::pull_request_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_pull_request_workspaces(
+        &self,
+        pr_key: &str,
+        include_retired: bool,
+    ) -> Result<Vec<PullRequestWorkspace>> {
+        dispatch!(self, backend => backend.list_pull_request_workspaces(pr_key, include_retired).await)
+    }
+
+    /// Every PR link recorded for the workspaces in `workspace_ids`
+    /// (`ws.crossWorkspace.search({ pr })`), most recently linked first, ties
+    /// by key then workspace id. The caller resolves which keys a reference
+    /// names (`intent_core::PullRequestSelector`); this read uses the
+    /// `workspace_id` index, so its cost tracks the scoped workspaces' links
+    /// rather than the whole table. An empty scope reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_pull_request_links_for_workspaces(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<Vec<PullRequestLink>> {
+        dispatch!(self, backend => backend.list_pull_request_links_for_workspaces(workspace_ids).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn workspace_content_clocks(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashMap<WorkspaceId, WorkspaceContentClock>> {
         let ids: Vec<_> = workspace_ids
             .iter()
             .collect::<HashSet<_>>()
@@ -137,16 +869,6 @@ impl Store {
         Ok(clocks)
     }
 
-    /// Requested workspaces whose known PRs are all finished: at least one PR
-    /// snapshot exists on the workspace or its git roots, and every one of
-    /// them (link status, active PR, discovered pools) is `Merged` or
-    /// `Closed`. A link without a status or a malformed snapshot counts as
-    /// unknown, so the workspace is not settled. An active PR monitor watches
-    /// an open PR, so it also keeps the workspace unsettled. Read in bounded
-    /// batches.
-    ///
-    /// # Errors
-    /// Returns an internal error if the metadata query fails.
     pub async fn workspaces_with_settled_pull_requests(
         &self,
         workspace_ids: &[WorkspaceId],
@@ -202,25 +924,10 @@ impl Store {
         Ok(settled)
     }
 
-    /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if encoding workspace fields or the insert fails.
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
         self.insert_workspace_with_auto_commit(ws, None).await
     }
 
-    /// Insert a workspace row with the per-workspace `auto_commit_enabled`
-    /// override seeded in the same INSERT (mirror-at-creation, spec Diagnosis
-    /// §3b). Atomic: the row can never exist without its seed, so a created
-    /// workspace never silently degrades to global-tracking semantics.
-    /// `None` leaves the column NULL (resolves against the global at read
-    /// time).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_workspace_with_auto_commit(
         &self,
         ws: &Workspace,
@@ -229,12 +936,6 @@ impl Store {
         self.insert_workspace_inner(ws, auto_commit, None).await
     }
 
-    /// Insert from an original pre-workspace host admission. The durable facts
-    /// are compared while authority writers are serialized; the synchronous
-    /// callback admits the already-prepared insert after all pool waits.
-    ///
-    /// # Errors
-    /// Refuses changed original authority or a retired caller/source callback.
     pub async fn insert_workspace_with_host_admission(
         &self,
         ws: &Workspace,
@@ -337,11 +1038,6 @@ impl Store {
         Ok(())
     }
 
-    /// Fetch a single workspace by id, or `NotFound`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<Workspace> {
         let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -355,49 +1051,10 @@ impl Store {
         }
     }
 
-    /// Update an existing workspace, preserving `branch`, `id`, the
-    /// guarded `last_activity` and archive lifecycle columns, or return
-    /// `NotFound`. Returns the stored branch.
-    /// `activity` is derived and never persisted (§9.9).
-    ///
-    /// Explicit branch changes use [`Self::update_workspace_with_branch`].
-    /// `last_activity` is one exception to the full-row replace
-    /// (monorepo#1585): it goes through the same monotonic guard as
-    /// [`Self::bump_workspace_last_activity`] — the candidate writes only when
-    /// it parses AND the stored value is NULL, unparseable, or strictly older.
-    /// Otherwise the stored column holds, so a get → mutate → write flow whose
-    /// read predated a concurrent bump can never silently revert it (the
-    /// `attention` clobber shape fixed by #1481).
-    ///
-    /// The archive lifecycle is another exception: `archived` /
-    /// `archived_at` are NEVER written here, and `status` holds whenever the
-    /// row is archived or the candidate is `Archived`. Those columns move
-    /// only through the scoped, fenced flips
-    /// ([`Self::archive_workspace_detaching_guests`] /
-    /// [`Self::unarchive_workspace_if_archived`]), so a full-row write from a
-    /// snapshot read before a concurrent archive can never resurrect the
-    /// workspace behind the archive's guest sweep (the `workspace.archive`
-    /// fence relies on this — see `ArchiveFence` in `intent-services`).
-    ///
-    /// `label` is never written here either: it moves only through
-    /// [`Self::set_workspace_label`], so a stale snapshot cannot revert it.
-    /// Likewise `auto_archive_disabled` moves only through
-    /// [`Self::set_workspace_auto_archive_disabled`].
-    /// `plain_folder` is insert-only: no update path ever writes it (§5.1
-    /// "Plain-folder workspaces").
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace(&self, ws: &Workspace) -> Result<String> {
         self.update_workspace_with_branch(ws, None).await
     }
 
-    /// Update workspace fields and optionally apply an explicit branch edit.
-    /// Returns the stored branch so responses cannot echo a stale snapshot.
-    ///
-    /// # Errors
-    /// Returns `Error::NotFound` for a missing workspace or an error on database failure.
     pub async fn update_workspace_with_branch(
         &self,
         ws: &Workspace,
@@ -474,11 +1131,6 @@ impl Store {
         }
     }
 
-    /// Reconcile an observed branch without overwriting concurrent workspace edits.
-    /// A renamed or switched branch is no longer eligible for automatic deletion.
-    ///
-    /// # Errors
-    /// Returns an error if the database write fails.
     pub async fn reconcile_workspace_branch(
         &self,
         expected: &Workspace,
@@ -514,20 +1166,6 @@ impl Store {
         Ok(result.rows_affected() != 0)
     }
 
-    /// Scoped PR-linkage write: set ONLY the PR columns (`pr_number`,
-    /// `pr_url`, `pr_status`, `active_pull_request`, `pull_requests`) plus
-    /// `updated_at` — never a full-row replace, so a PR refresh whose
-    /// workspace read predates a concurrent mutation (archive, title edit,
-    /// relink) can never clobber the other columns (same scoped-update
-    /// discipline as [`Self::set_workspace_attention`] /
-    /// [`Self::update_workspace_token_usage`]). The PR columns themselves are
-    /// last-writer-wins by design — refreshes are idempotent against the
-    /// forge and the next sweep converges. `NotFound` when the workspace
-    /// does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_pr_linkage(&self, ws: &Workspace) -> Result<()> {
         let res = pr_linkage_update(ws)?
             .execute(self.write_pool())
@@ -539,23 +1177,6 @@ impl Store {
         Ok(())
     }
 
-    /// [`Self::update_workspace_pr_linkage`] rebased on the row at write
-    /// time (intent-hq/intent#5654): inside ONE `BEGIN IMMEDIATE` write-pool
-    /// transaction, read the stored `pull_requests`, hand it to the caller's
-    /// synchronous `rebase` closure together with the entity about to be
-    /// written, then perform the same scoped PR-columns `UPDATE` from the
-    /// (possibly amended) entity. The REST-only PR refreshes build their
-    /// list from a row read that predates the forge round trip, so a
-    /// signal-bearing fold landing in between would otherwise be clobbered;
-    /// the closure (intent-services owns the merge rule) re-derives the
-    /// `is_in_merge_queue` carry against the current row instead. Same
-    /// envelope and layering as [`Self::update_workspace_token_usage`];
-    /// a malformed stored list decodes to `None` (the closure then keeps
-    /// the entity's list). `NotFound` when the workspace does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_pr_linkage_rebased<F>(
         &self,
         ws: &mut Workspace,
@@ -608,22 +1229,6 @@ impl Store {
         .await
     }
 
-    /// Project onto a workspace's persisted PR snapshots atomically
-    /// (intent-hq/intent#5654, the cache-hit fold): inside ONE
-    /// `BEGIN IMMEDIATE` write-pool transaction, read the stored
-    /// `pull_requests` and `active_pull_request`, hand both to the caller's
-    /// synchronous `project` closure, and — when it returns `true` — write
-    /// back ONLY those two columns plus `updated_at`. The closure never
-    /// sees a pre-read entity, so a REST refresh that committed between
-    /// the caller's row lookup and this write is what gets projected onto,
-    /// never rolled back; the linked scalars (`pr_number`, `pr_url`,
-    /// `pr_status`) are untouched. Returns the written pair on a committed
-    /// write, `None` when the closure declined. `NotFound` when the
-    /// workspace does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails or a stored snapshot is malformed.
     pub async fn project_workspace_pr_snapshots<F>(
         &self,
         id: &WorkspaceId,
@@ -700,39 +1305,6 @@ impl Store {
         .await
     }
 
-    /// Recompute-and-store a workspace's `token_usage` snapshot atomically
-    /// (§5.23, monorepo#738): inside ONE write-pool transaction, read the
-    /// per-session usage rows and the stored workspace `token_usage`, invoke
-    /// the caller's synchronous `compute` closure with both, and — when it
-    /// returns `Some(new_usage)` — perform a scoped
-    /// `UPDATE workspace SET token_usage=?` (never a full-row replace, so a
-    /// concurrent title/status update is never clobbered). Usage bookkeeping
-    /// preserves activity timestamps: a background recount is not new work.
-    /// Returns the written [`TokenUsage`] on a committed write, `None` when
-    /// the closure declined. `NotFound` if the workspace row is absent.
-    /// Layering: aggregation stays in intent-services via the closure; the
-    /// store only supplies the transactional read→write envelope.
-    ///
-    /// Uses raw `BEGIN IMMEDIATE` (same pattern as `insert_events`):
-    /// IMMEDIATE mode acquires the exclusive write lock upfront, avoiding the
-    /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
-    /// that intermittently fails with `SQLITE_BUSY` (code 5). With
-    /// `max_connections=1` on the write pool, concurrent recomputes serialize
-    /// at `pool.acquire()` instead.
-    ///
-    /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`) reads
-    /// `agent_message` for sessions still on the per-message fallback (no
-    /// snapshot/baseline token report), and that work happens while holding
-    /// the daemon's sole write connection and the `SQLite` write lock. The
-    /// report-backed skip keeps the common case cheap, and the fallback read
-    /// projects each message's usage object in SQL and filters to
-    /// usage-bearing rows off a partial index instead of materializing message
-    /// bodies (monorepo#1571) — so what a workspace of long-history fallback
-    /// sessions pays for is its usage-bearing rows, not its transcript bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_token_usage<F>(
         &self,
         workspace_id: &WorkspaceId,
@@ -787,25 +1359,6 @@ impl Store {
             .await
     }
 
-    /// Scoped, conditional attention write (monorepo#1481): set ONLY the
-    /// `attention` column — plus `updated_at` when the caller intends an
-    /// activity bump — guarded on the current value, so the write and the
-    /// "did it change" decision are a single atomic statement and a
-    /// concurrent mutation of any other column is never clobbered (same
-    /// scoped-update discipline as [`Self::update_workspace_token_usage`]
-    /// and [`Self::set_workspace_branch_auto_generated`]).
-    ///
-    /// `expected = Some(from)` writes only when the current attention equals
-    /// `from` (markSeen's clear-only-when-unread; must differ from
-    /// `attention` — debug-asserted — or the write degenerates to a
-    /// same-value rewrite reported as a change); `None` writes whenever the
-    /// current attention differs from `attention`. Returns whether a row was
-    /// written (`true` ⇒ the value actually changed); `NotFound` when the
-    /// workspace does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` when the workspace does not exist; `Error::Internal` if the update or presence check fails.
     pub async fn set_workspace_attention(
         &self,
         id: &WorkspaceId,
@@ -859,21 +1412,6 @@ impl Store {
         Ok(false)
     }
 
-    /// Atomic settle-clear of the stored `unread` flag (§5.1): set
-    /// `attention = none` ONLY when the current value is `unread` AND the
-    /// workspace has no unread top-level session — the derivation re-checked
-    /// INSIDE the same guarded UPDATE (shared predicate with
-    /// [`Store::workspace_has_unread_top_level_session`]), so a message that
-    /// lands between a caller's probe and this write flips the NOT EXISTS
-    /// and the clear declines instead of retiring a freshly-raised unread.
-    /// Scoped to the attention column, `updated_at` untouched (acknowledging
-    /// is not "activity", monorepo#1466). Returns whether a row was written
-    /// (`true` ⇒ stored `unread` was cleared); a missing workspace reads as
-    /// `false` — settle callers are best-effort and never need `NotFound`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_workspace_unread_if_all_seen(&self, id: &WorkspaceId) -> Result<bool> {
         let sql = clear_workspace_unread_if_all_seen_sql();
         let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -884,19 +1422,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Scoped, conditional unarchive flip: set `status`/`archived`/
-    /// `archived_at` (plus `updated_at`) back to Active ONLY when the row is
-    /// currently archived, so the write and the "did this call flip it"
-    /// decision are a single atomic statement — two concurrent unarchivers
-    /// (or an unarchive racing a turn-start auto-unarchive) can both read
-    /// `archived: true`, but exactly one write affects a row. Same
-    /// scoped-update discipline as [`Self::set_workspace_attention`]. Returns
-    /// whether a row was written (`true` ⇒ this call performed the flip);
-    /// `NotFound` when the workspace does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn unarchive_workspace_if_archived(
         &self,
         id: &WorkspaceId,
@@ -944,27 +1469,6 @@ impl Store {
         Ok(false)
     }
 
-    /// Scoped, monotonic `last_activity` write (monorepo#1580): set ONLY the
-    /// `last_activity` column — never `updated_at`, never a full-row replace —
-    /// and only when the supplied timestamp is strictly newer than the stored
-    /// one (or the column is NULL / unparseable). Same scoped-update
-    /// discipline as [`Self::set_workspace_attention`].
-    ///
-    /// Backs the debounced `lastActivity` derivation in intent-services so the
-    /// persisted column tracks the derived value and cheap read paths
-    /// (`list_workspaces_lite`, the `workspace.subscribe` seq-0 snapshot) serve
-    /// a fresh timestamp after a restart.
-    ///
-    /// Comparison runs through `SQLite`'s `julianday()` rather than raw TEXT so
-    /// timestamps of differing fractional-second precision order correctly
-    /// (lexicographic `…:00Z` vs `…:00.5Z` compares backwards). A malformed
-    /// `last_activity` parses to NULL and is treated as "older" (overwritten);
-    /// a malformed input never writes. Returns whether a row was written;
-    /// `NotFound` when the workspace does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn bump_workspace_last_activity(
         &self,
         id: &WorkspaceId,
@@ -1000,42 +1504,10 @@ impl Store {
         Ok(false)
     }
 
-    /// Delete a workspace by id, or `NotFound`. Records a tombstone in
-    /// `deleted_workspace_id` (same transaction as the row delete) so
-    /// `workspace.create` never recycles the id for a later workspace (FE
-    /// `recentlyDeletedWorkspaces` parity, persisted across restarts).
-    /// Also removes the workspace's `draft` rows explicitly — `draft` has no
-    /// workspace FK (opaque keys, PROTOCOL §5.16), so no cascade applies.
-    /// The `browser_tab` rows and their process-local `displayed`
-    /// overlay entries are removed together after each committed batch (see
-    /// `browser_tab_repo`).
-    ///
-    /// Callers must stop the workspace's runtime writers before deletion.
-    /// Histories and other growing children are swept in committed batches,
-    /// releasing the writer between steps (intent-hq/intent#5337). Failure or
-    /// cancellation can leave a live workspace with partially removed data;
-    /// retry resumes cleanup. Only the final row delete and tombstone are
-    /// atomic. Cleanup errors propagate without falling back to a cascade.
-    /// A started browser batch or final transaction finishes its commit and
-    /// overlay eviction even if the caller is cancelled.
-    ///
-    /// The final transaction uses whole-transaction retry to eliminate
-    /// `SQLITE_BUSY` (code 5) lock-upgrade failures under concurrent load (STAB-7).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
         self.delete_workspace_with_outcome(id).await.result
     }
 
-    /// Run the same deletion once, retaining facts before projecting its result.
-    ///
-    /// `NoEffect` is only the original initial absent observation. A later
-    /// zero-row delete may follow committed cleanup and remains `Unknown`.
-    /// `Committed` describes the acknowledged final commit and owned Store
-    /// completion, not earlier Services teardown or later filesystem cleanup.
-    /// Cancellation yields no returned outcome; it never proves settlement.
     pub async fn delete_workspace_with_outcome(
         &self,
         id: &WorkspaceId,
@@ -1355,15 +1827,6 @@ impl Store {
         Ok(())
     }
 
-    /// The folder of every plain-folder workspace the store knows (PROTOCOL
-    /// §5.1 "Plain-folder workspaces"): live, archived and retired rows plus
-    /// deleted ones remembered on their tombstone. Path-based cleanup sweeps
-    /// never remove a directory overlapping one of these.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails; callers
-    /// then skip the sweep (fail closed).
     pub async fn plain_folder_paths(&self) -> Result<Vec<String>> {
         sqlx::query_scalar(
             "SELECT repository_path FROM workspace \
@@ -1376,13 +1839,6 @@ impl Store {
         .map_err(|e| Error::Internal(format!("plain folder paths lookup failed: {e}")))
     }
 
-    /// Whether a workspace id was ever used — a live row exists **or** a
-    /// delete tombstone is recorded. `workspace.create` uses this to uniquify
-    /// derived slug ids so a deleted workspace's id is never recycled.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn workspace_id_ever_used(&self, id: &WorkspaceId) -> Result<bool> {
         let row = sqlx::query(
             "SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ?) \
@@ -1396,15 +1852,6 @@ impl Store {
         Ok(col::<i64>(&row, "used")? != 0)
     }
 
-    /// Record whether the workspace's branch was auto-generated by the daemon
-    /// at create time (vs supplied by the caller). Read back by the
-    /// `workspace.delete` cleanup guard: only an auto-generated branch is ever
-    /// deleted with the worktree (TS `removeGitWorktree` parity). Store-only —
-    /// the flag never appears on the wire, so it lives outside [`Workspace`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_branch_auto_generated(
         &self,
         id: &WorkspaceId,
@@ -1422,12 +1869,6 @@ impl Store {
         Ok(())
     }
 
-    /// Whether the workspace's branch was auto-generated at create time.
-    /// `NotFound` when the workspace does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_branch_auto_generated(&self, id: &WorkspaceId) -> Result<bool> {
         let row = sqlx::query("SELECT branch_auto_generated FROM workspace WHERE id = ?")
             .bind(&id.0)
@@ -1440,14 +1881,6 @@ impl Store {
         }
     }
 
-    /// Set the persisted per-workspace auto-commit override (spec Diagnosis
-    /// §3b). Mirrored from the global `git.autoCommit` at create time and
-    /// toggled via `workspace.setAutoCommit`. Store-only column — the value
-    /// is surfaced through the dedicated getter RPC, not on [`Workspace`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_auto_commit(&self, id: &WorkspaceId, enabled: bool) -> Result<()> {
         let res = sqlx::query("UPDATE workspace SET auto_commit_enabled = ? WHERE id = ?")
             .bind(i64::from(enabled))
@@ -1461,14 +1894,6 @@ impl Store {
         Ok(())
     }
 
-    /// Scoped write of the Home workspace label (`workspace.update { label }`):
-    /// `None` clears it. After insert this is the only writer of the column —
-    /// `update_workspace` never touches it — so a stale [`Workspace`]
-    /// snapshot passed to a full-row update cannot revert a newer label.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_label(&self, id: &WorkspaceId, label: Option<&str>) -> Result<()> {
         let res = sqlx::query("UPDATE workspace SET label = ? WHERE id = ?")
             .bind(label)
@@ -1482,15 +1907,6 @@ impl Store {
         Ok(())
     }
 
-    /// Scoped write of the per-workspace auto-archive opt-out
-    /// (`workspace.update { autoArchiveDisabled }`). After insert this is the
-    /// only writer of the column — `update_workspace` never touches it — so a
-    /// stale [`Workspace`] snapshot passed to a full-row update cannot revert
-    /// a newer value.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_auto_archive_disabled(
         &self,
         id: &WorkspaceId,
@@ -1510,14 +1926,6 @@ impl Store {
         Ok(())
     }
 
-    /// The persisted per-workspace auto-commit override. `Ok(None)` for
-    /// pre-migration rows (NULL column) — the caller resolves NULL against
-    /// the global `git.autoCommit` setting. `NotFound` when the workspace
-    /// does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_auto_commit(&self, id: &WorkspaceId) -> Result<Option<bool>> {
         let row = sqlx::query("SELECT auto_commit_enabled FROM workspace WHERE id = ?")
             .bind(&id.0)
@@ -1530,15 +1938,6 @@ impl Store {
         }
     }
 
-    /// Scoped write of the per-workspace browser-client pin (REV-2,
-    /// `workspace.setBrowserClient`): `None` clears it. This setter is the
-    /// only writer of the column after insert — `update_workspace` never
-    /// touches it (like `auto_commit_enabled`), so a stale `Workspace`
-    /// snapshot passed to a general update cannot revert a concurrent pin.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_browser_client(
         &self,
         id: &WorkspaceId,
@@ -1556,12 +1955,6 @@ impl Store {
         Ok(())
     }
 
-    /// The persisted per-workspace browser-client pin; `Ok(None)` when
-    /// unpinned. `NotFound` when the workspace does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_browser_client(&self, id: &WorkspaceId) -> Result<Option<ClientId>> {
         let row = sqlx::query("SELECT browser_client_id FROM workspace WHERE id = ?")
             .bind(&id.0)
@@ -1574,17 +1967,6 @@ impl Store {
         }
     }
 
-    /// List workspaces admitted by `filter`: archived rows only with
-    /// `include_archived`, retired rows only with `include_retired`
-    /// (`include_archived` alone never returns a retired row — retired is
-    /// opt-in on every list surface, PROTOCOL §5.1). The seeded virtual
-    /// [`CHIEF_WORKSPACE_ID`] row is always excluded — Chief is synthesized
-    /// on read by the service layer and never surfaces via `workspace.list`
-    /// (TS `findAll` parity, `workspace.repository.ts`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces(&self, filter: WorkspaceListFilter) -> Result<Vec<Workspace>> {
         let retired = enum_to_db(&WorkspaceStatus::Retired)?;
         // A retired row is also `archived = 1`, so the two predicates are
@@ -1609,13 +1991,6 @@ impl Store {
         rows.iter().map(map_workspace_row).collect()
     }
 
-    /// One keyset page of [`Store::list_workspaces`] in `(created_at, id)`
-    /// order: at most `limit` rows strictly after `after` (`(created_at,
-    /// id)` of the previous page's last row), so the read costs O(page).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces_page(
         &self,
         filter: WorkspaceListFilter,
@@ -1652,14 +2027,6 @@ impl Store {
         rows.iter().map(map_workspace_row).collect()
     }
 
-    /// The retired workspace a call is scoped to: `workspace_id` when that
-    /// row is `Retired`, else the workspace of the agent session `agent_id`
-    /// when it is `Retired`; `None` otherwise (including unknown ids). One
-    /// indexed statement — the RPC read-only gate for retired workspaces.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn retired_workspace_for(
         &self,
         workspace_id: Option<&WorkspaceId>,
@@ -1678,20 +2045,6 @@ impl Store {
         Ok(id.map(WorkspaceId))
     }
 
-    /// Scoped, conditional retire flip (`workspace.retire`, PROTOCOL §5.1):
-    /// set `status = Retired`, `retired_at`, `updated_at` and the purge
-    /// `status_message` ([`intent_core::WORKSPACE_PURGED_STATUS_MESSAGE`],
-    /// replacing the previous message) ONLY when the
-    /// row is currently archived and not already retired. The caller runs
-    /// the archive flip first for an Active workspace, so a retired row is
-    /// always `archived = 1` (`archived_at` kept). Every other column —
-    /// including the persisted checkout paths and branch — is untouched, and
-    /// no other row is deleted. Returns whether this call performed the flip;
-    /// `NotFound` when the workspace does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn retire_workspace_if_archived(
         &self,
         id: &WorkspaceId,
@@ -1728,20 +2081,6 @@ impl Store {
         Ok(false)
     }
 
-    /// Scoped, conditional revive flip (PROTOCOL §5.1 "Revive"): flip a
-    /// `Retired` row back to `Active` — clear `archived`, `archived_at` and
-    /// `retired_at` — and record the fresh checkout's `branch` and
-    /// `base_commit_sha`, ONLY when the row is currently retired. The purge
-    /// `status_message` is cleared when it still equals
-    /// [`intent_core::WORKSPACE_PURGED_STATUS_MESSAGE`]; a message changed
-    /// since the retire is kept. Every other column is untouched. Returns whether this call performed the flip;
-    /// `NotFound` when the workspace does not exist. Same archive-binding
-    /// lifecycle bracket as [`Self::unarchive_workspace_if_archived`] (a
-    /// retired row is always archived).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn revive_workspace_if_retired(
         &self,
         id: &WorkspaceId,
@@ -1753,17 +2092,6 @@ impl Store {
             .await
     }
 
-    /// [`Self::revive_workspace_if_retired`] that also leaves a one-time
-    /// prompt notice pending on the workspace's agent sessions **in the same
-    /// `BEGIN IMMEDIATE` transaction** as the flip: no reader can observe the
-    /// revived (Active) row without the notices, and a crash can never commit
-    /// one without the other. `notice` is `(metadata key, text, excluded
-    /// session)`; every session of the workspace except the excluded one
-    /// gets the key set. Nothing is written when the row is not retired.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn revive_workspace_if_retired_with_notice(
         &self,
         id: &WorkspaceId,
@@ -1848,12 +2176,6 @@ impl Store {
         Ok(flipped)
     }
 
-    /// The ids of the machine's hidden home records
-    /// ([`intent_core::HOME_RECORD_PREFIX`]), for the executor's purge of
-    /// records whose home is gone.
-    ///
-    /// # Errors
-    /// Returns `Internal` on a database failure.
     pub async fn home_record_ids(&self) -> Result<Vec<WorkspaceId>> {
         let ids: Vec<String> =
             sqlx::query_scalar("SELECT id FROM workspace WHERE substr(id, 1, 9) = '__home__:'")
@@ -1863,14 +2185,6 @@ impl Store {
         Ok(ids.into_iter().map(WorkspaceId).collect())
     }
 
-    /// Remove a machine's hidden home record and (by cascade) its rows,
-    /// leaving no deletion marker: a record lives as long as its home
-    /// checkout, and its id is never reused or transferred once removed.
-    /// Any other id is refused.
-    ///
-    /// # Errors
-    /// `InvalidParams` for an id that is not a home record; `Internal` on a
-    /// database failure.
     pub async fn delete_home_record(&self, id: &WorkspaceId) -> Result<()> {
         if !id.is_home_record() {
             return Err(Error::InvalidParams(format!("{id} is not a home record")));
@@ -1883,11 +2197,6 @@ impl Store {
         Ok(())
     }
 
-    /// Ordinary workspace keys for inherited host access, without hydrating
-    /// rows or issuing a role lookup per workspace. Includes archived rows.
-    ///
-    /// # Errors
-    /// Returns `Internal` on a database failure.
     pub async fn ordinary_workspace_ids(&self) -> Result<Vec<WorkspaceId>> {
         let ids: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM workspace WHERE id <> ? AND substr(id, 1, 9) <> '__home__:'",
@@ -1899,18 +2208,6 @@ impl Store {
         Ok(ids.into_iter().map(WorkspaceId).collect())
     }
 
-    /// Live (non-archived, non-remote) workspaces referencing a PR by URL —
-    /// linked via `pr_url` or carrying a `pull_requests` pool entry with that
-    /// URL — oldest first. Backs the passive `github.pulls.get` fold: the
-    /// match runs in SQL (`json_each` over the pool column) so only the
-    /// referencing rows are decoded, and compares `COLLATE NOCASE` because
-    /// forge slugs are case-insensitive while persisted URLs may carry a
-    /// client-supplied casing. The seeded virtual [`CHIEF_WORKSPACE_ID`]
-    /// row is excluded like [`Self::list_workspaces`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces_referencing_pr_url(&self, url: &str) -> Result<Vec<Workspace>> {
         let sql = format!(
             "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND {NOT_HOME_RECORD} \
@@ -1931,18 +2228,6 @@ impl Store {
         rows.iter().map(map_workspace_row).collect()
     }
 
-    /// Workspaces linked to the PR whose canonical key is `pr_key`
-    /// (`workspace.findByPullRequest`, §5.1 "Pull request workspace lookup"),
-    /// most recently linked first, ties by id ascending. Links are recorded
-    /// by the migration 0161 triggers whenever a workspace or git root
-    /// persists a changed PR snapshot. Archived rows are included; remote rows
-    /// and the seeded virtual [`CHIEF_WORKSPACE_ID`] row never are. Reads only
-    /// the four projected columns. `pr_key` must already be canonical — see
-    /// `intent_core::pull_request_key`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_pull_request_workspaces(
         &self,
         pr_key: &str,
@@ -1975,16 +2260,6 @@ impl Store {
             .collect()
     }
 
-    /// Every PR link recorded for the workspaces in `workspace_ids`
-    /// (`ws.crossWorkspace.search({ pr })`), most recently linked first, ties
-    /// by key then workspace id. The caller resolves which keys a reference
-    /// names (`intent_core::PullRequestSelector`); this read uses the
-    /// `workspace_id` index, so its cost tracks the scoped workspaces' links
-    /// rather than the whole table. An empty scope reads nothing.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_pull_request_links_for_workspaces(
         &self,
         workspace_ids: &[WorkspaceId],

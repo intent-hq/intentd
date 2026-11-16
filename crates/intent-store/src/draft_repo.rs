@@ -22,6 +22,51 @@ impl Store {
         agent_id: &AgentId,
         client_id: &ClientId,
     ) -> Result<Option<Draft>> {
+        dispatch!(self, backend => backend.get_draft(workspace_id, agent_id, client_id).await)
+    }
+
+    /// Upsert the draft for one triple, refreshing `text`/`attachments`/
+    /// `updated_at` in place on conflict. `attachments` is stored verbatim as
+    /// serialized JSON (NULL when `None`). Returns the `updated_at` timestamp
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn upsert_draft(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        client_id: &ClientId,
+        text: &str,
+        attachments: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        dispatch!(self, backend => backend.upsert_draft(workspace_id, agent_id, client_id, text, attachments).await)
+    }
+
+    /// Delete the draft for one triple. Returns `true` when a row was removed
+    /// (an idempotent no-op success otherwise).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_draft(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        client_id: &ClientId,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.delete_draft(workspace_id, agent_id, client_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn get_draft(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        client_id: &ClientId,
+    ) -> Result<Option<Draft>> {
         let row = sqlx::query(
             "SELECT workspace_id, agent_id, client_id, text, attachments, updated_at FROM draft \
              WHERE workspace_id = ? AND agent_id = ? AND client_id = ?",
@@ -35,14 +80,6 @@ impl Store {
         row.as_ref().map(map_draft_row).transpose()
     }
 
-    /// Upsert the draft for one triple, refreshing `text`/`attachments`/
-    /// `updated_at` in place on conflict. `attachments` is stored verbatim as
-    /// serialized JSON (NULL when `None`). Returns the `updated_at` timestamp
-    /// written.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_draft(
         &self,
         workspace_id: &WorkspaceId,
@@ -72,12 +109,6 @@ impl Store {
         Ok(now)
     }
 
-    /// Delete the draft for one triple. Returns `true` when a row was removed
-    /// (an idempotent no-op success otherwise).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_draft(
         &self,
         workspace_id: &WorkspaceId,

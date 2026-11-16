@@ -160,7 +160,7 @@ async fn transfer_human_profiles_share_the_rows_wal_snapshot() {
             .unwrap();
     }
     let barrier = Arc::new(crate::transfer_authorship::ExportAuthorBarrier::default());
-    *store.export_author_barrier.lock().unwrap() = Some(barrier.clone());
+    *store.sqlite().export_author_barrier.lock().unwrap() = Some(barrier.clone());
     let exporter = store.clone();
     let export_ws = ws.clone();
     let export = tokio::spawn(async move { exporter.transfer_export_rows(&export_ws).await });
@@ -234,7 +234,7 @@ async fn transfer_human_trust_migration_cleans_legacy_keys_once_and_fences_downg
     let tmp = TempDb::new();
     let write_pool = crate::connect_write(&tmp.path).await.unwrap();
     previous_migrator().run(&write_pool).await.unwrap();
-    let store = Store {
+    let store = Store::from_sqlite(crate::SqliteStore {
         task_event_baselines: std::sync::Arc::default(),
         task_events_enabled: std::sync::Arc::default(),
         note_write_lanes: std::sync::Arc::default(),
@@ -246,7 +246,7 @@ async fn transfer_human_trust_migration_cleans_legacy_keys_once_and_fences_downg
         desktop_delete_barrier: std::sync::Arc::default(),
         export_author_barrier: Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
-    };
+    });
     // Seed the historical schema directly: current workspace inserts include
     // content activity, which did not exist at migration 0134.
     let ws = WorkspaceId::new();

@@ -23,17 +23,42 @@ fn normal_dependency_tables(manifest: &toml::Table) -> Vec<(&str, &toml::Table)>
     tables
 }
 
-fn names_sqlx(key: &str, spec: &toml::Value) -> bool {
-    let package = spec
+/// The package a dependency entry resolves to: its own `package = ...`
+/// rename, or the rename on the `[workspace.dependencies]` entry it inherits.
+fn names_sqlx(key: &str, spec: &toml::Value, workspace_deps: &toml::Table) -> bool {
+    let package_of = |spec: &toml::Value| {
+        spec.as_table()
+            .and_then(|t| t.get("package"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    let inherits = spec
         .as_table()
-        .and_then(|t| t.get("package"))
-        .and_then(toml::Value::as_str);
-    package.unwrap_or(key) == "sqlx"
+        .and_then(|t| t.get("workspace"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let package = package_of(spec).or_else(|| {
+        inherits
+            .then(|| workspace_deps.get(key).and_then(package_of))
+            .flatten()
+    });
+    package.as_deref().unwrap_or(key) == "sqlx"
 }
 
 #[test]
 fn only_intent_store_depends_on_sqlx_outside_tests() {
-    let crates = workspace_root().join("crates");
+    let root = workspace_root();
+    let root_manifest: toml::Table = std::fs::read_to_string(root.join("Cargo.toml"))
+        .expect("read workspace Cargo.toml")
+        .parse()
+        .expect("parse workspace Cargo.toml");
+    let workspace_deps = root_manifest
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let crates = root.join("crates");
     let mut offenders = Vec::new();
     let mut checked = 0;
     for entry in std::fs::read_dir(&crates).expect("read crates/") {
@@ -53,7 +78,10 @@ fn only_intent_store_depends_on_sqlx_outside_tests() {
             continue;
         }
         for (section, deps) in normal_dependency_tables(&manifest) {
-            if deps.iter().any(|(key, spec)| names_sqlx(key, spec)) {
+            if deps
+                .iter()
+                .any(|(key, spec)| names_sqlx(key, spec, &workspace_deps))
+            {
                 offenders.push(format!("{name} {section}"));
             }
         }

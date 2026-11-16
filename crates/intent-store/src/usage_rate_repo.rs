@@ -58,6 +58,36 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn add_usage_rate(&self, bucket_utc: &str, delta: &UsageRateDelta) -> Result<()> {
+        dispatch!(self, backend => backend.add_usage_rate(bucket_utc, delta).await)
+    }
+
+    /// List the `usage_rate_minutely` rows with `bucket_utc >= since`,
+    /// ordered ascending — the read surface the `stats.getRateHistory`
+    /// zero-fill builds on (RFC-3339 UTC keys compare lexicographically).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_usage_rate_since(&self, since: &str) -> Result<Vec<UsageRateRow>> {
+        dispatch!(self, backend => backend.list_usage_rate_since(since).await)
+    }
+
+    /// Retention sweep: delete minute buckets with `bucket_utc <= cutoff`
+    /// (an RFC-3339 UTC string) and return the number of rows removed.
+    /// Inclusive so a sweep landing exactly on a minute boundary still leaves
+    /// at most 1440 buckets (cutoff bucket removed, cutoff+1 .. now retained).
+    /// Idempotent — a re-run with the same cutoff removes nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_usage_rate_before(&self, cutoff: &str) -> Result<u64> {
+        dispatch!(self, backend => backend.delete_usage_rate_before(cutoff).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn add_usage_rate(&self, bucket_utc: &str, delta: &UsageRateDelta) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage_rate_minutely (
                 bucket_utc, input_tokens, output_tokens, cache_read_tokens,
@@ -82,13 +112,6 @@ impl Store {
         Ok(())
     }
 
-    /// List the `usage_rate_minutely` rows with `bucket_utc >= since`,
-    /// ordered ascending — the read surface the `stats.getRateHistory`
-    /// zero-fill builds on (RFC-3339 UTC keys compare lexicographically).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_usage_rate_since(&self, since: &str) -> Result<Vec<UsageRateRow>> {
         let rows = sqlx::query(
             "SELECT bucket_utc, input_tokens, output_tokens, cache_read_tokens,
@@ -114,15 +137,6 @@ impl Store {
             .collect())
     }
 
-    /// Retention sweep: delete minute buckets with `bucket_utc <= cutoff`
-    /// (an RFC-3339 UTC string) and return the number of rows removed.
-    /// Inclusive so a sweep landing exactly on a minute boundary still leaves
-    /// at most 1440 buckets (cutoff bucket removed, cutoff+1 .. now retained).
-    /// Idempotent — a re-run with the same cutoff removes nothing more.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_usage_rate_before(&self, cutoff: &str) -> Result<u64> {
         let result = sqlx::query("DELETE FROM usage_rate_minutely WHERE bucket_utc <= ?")
             .bind(cutoff)

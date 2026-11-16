@@ -37,7 +37,7 @@ async fn short_acquire_store(tmp: &TempDb) -> Store {
             Err(e) => panic!("open short-timeout write pool: {e}"),
         }
     };
-    Store {
+    Store::from_sqlite(crate::SqliteStore {
         task_event_baselines: Arc::default(),
         task_events_enabled: Arc::default(),
         note_write_lanes: std::sync::Arc::default(),
@@ -52,7 +52,7 @@ async fn short_acquire_store(tmp: &TempDb) -> Store {
         desktop_writes: crate::desktop_repo::DesktopWrites::default(),
         desktop_delete_barrier: Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
-    }
+    })
 }
 
 /// Hold the only write connection until `op` has observed at least one real
@@ -391,7 +391,9 @@ async fn retired_note_paging_delete_survives_write_pool_acquire_timeout() {
 
     let statements = run_while_writer_held(
         &store,
-        store.delete_workspace_retired_note_paging_in_batches("ws", 20),
+        store
+            .sqlite()
+            .delete_workspace_retired_note_paging_in_batches("ws", 20),
     )
     .await
     .expect("the retired note-paging sweep must retry through the write-pool acquire timeout");

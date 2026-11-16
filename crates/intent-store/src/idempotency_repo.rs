@@ -17,6 +17,41 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_idempotent(&self, workspace_id: &str, key: &str) -> Result<Option<String>> {
+        dispatch!(self, backend => backend.get_idempotent(workspace_id, key).await)
+    }
+
+    /// Record the serialized `result_json` under `(workspace_id, key)`. Uses
+    /// `INSERT OR IGNORE` so a concurrent duplicate that won the race is kept and
+    /// the loser is a no-op (best-effort dedupe, design §5.3). Returns `true` when
+    /// this call inserted the row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn put_idempotent(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        method: &str,
+        result_json: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.put_idempotent(workspace_id, key, method, result_json).await)
+    }
+
+    /// Reaper sweep (design §5.4): delete rows whose `created_at` is strictly
+    /// older than `cutoff` (an RFC-3339 string), returning the number removed.
+    /// Uses `idx_idempotency_created`; idempotent — a re-run removes nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn reap_idempotent(&self, cutoff: &str) -> Result<u64> {
+        dispatch!(self, backend => backend.reap_idempotent(cutoff).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn get_idempotent(&self, workspace_id: &str, key: &str) -> Result<Option<String>> {
         let row = sqlx::query(
             "SELECT result_json FROM idempotency_key WHERE workspace_id = ? AND idempotency_key = ?",
         )
@@ -28,14 +63,6 @@ impl Store {
         Ok(row.map(|r| r.get::<String, _>("result_json")))
     }
 
-    /// Record the serialized `result_json` under `(workspace_id, key)`. Uses
-    /// `INSERT OR IGNORE` so a concurrent duplicate that won the race is kept and
-    /// the loser is a no-op (best-effort dedupe, design §5.3). Returns `true` when
-    /// this call inserted the row.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn put_idempotent(
         &self,
         workspace_id: &str,
@@ -59,13 +86,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Reaper sweep (design §5.4): delete rows whose `created_at` is strictly
-    /// older than `cutoff` (an RFC-3339 string), returning the number removed.
-    /// Uses `idx_idempotency_created`; idempotent — a re-run removes nothing more.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn reap_idempotent(&self, cutoff: &str) -> Result<u64> {
         let res = sqlx::query("DELETE FROM idempotency_key WHERE created_at < ?")
             .bind(cutoff)

@@ -15,6 +15,219 @@ impl Store {
         ws: &WorkspaceId,
         agent: Option<&AgentId>,
     ) -> Result<Vec<ScriptMonitor>> {
+        dispatch!(self, backend => backend.script_monitors(ws, agent).await)
+    }
+
+    /// Project active waiting metadata without hydrating output or terminal history.
+    /// # Errors
+    /// Returns storage/decoding errors.
+    pub async fn script_monitor_waiting(
+        &self,
+        ws: Option<&WorkspaceId>,
+        agent: Option<&AgentId>,
+    ) -> Result<Vec<(String, serde_json::Value)>> {
+        dispatch!(self, backend => backend.script_monitor_waiting(ws, agent).await)
+    }
+
+    /// Whether an owner still has a committed notification awaiting delivery.
+    /// # Errors
+    /// Returns database failures so callers can defer settlement safely.
+    pub async fn script_monitor_pending_for_agent(&self, agent: &AgentId) -> Result<bool> {
+        dispatch!(self, backend => backend.script_monitor_pending_for_agent(agent).await)
+    }
+
+    /// Read one scoped row. Foreign IDs are indistinguishable from missing IDs.
+    /// # Errors
+    /// Returns invalid parameters for unknown IDs or a storage error.
+    pub async fn script_monitor(&self, ws: &WorkspaceId, id: &str) -> Result<ScriptMonitor> {
+        dispatch!(self, backend => backend.script_monitor(ws, id).await)
+    }
+
+    /// Insert under the durable single-owner constraint; caller serializes admission.
+    /// # Errors
+    /// Storage errors never acknowledge a memory-only watch.
+    pub async fn insert_script_monitor(&self, row: &ScriptMonitor) -> Result<()> {
+        dispatch!(self, backend => backend.insert_script_monitor(row).await)
+    }
+
+    /// Atomically retire an active watch and reserve its notification, without history.
+    /// # Errors
+    /// A failed write rolls back both changes.
+    pub async fn settle_script_monitor(&self, row: &ScriptMonitor) -> Result<bool> {
+        dispatch!(self, backend => backend.settle_script_monitor(row).await)
+    }
+
+    /// Reserve a guarded cancellation before touching the owned process.
+    /// # Errors
+    /// Returns database failures.
+    pub async fn script_monitor_cancel_intent(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        reserve: bool,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.script_monitor_cancel_intent(ws, id, reserve).await)
+    }
+
+    /// Read recovery/outbox work; this is never a hot agent-list read.
+    /// # Errors
+    /// Returns storage/decoding failures.
+    pub async fn pending_script_monitors(&self) -> Result<Vec<(ScriptMonitor, bool)>> {
+        dispatch!(self, backend => backend.pending_script_monitors().await)
+    }
+
+    /// Read pending notification work, never monitor history.
+    /// # Errors
+    /// Returns storage/decoding failures.
+    pub async fn script_notification_jobs(&self) -> Result<Vec<ScriptNotificationJob>> {
+        dispatch!(self, backend => backend.script_notification_jobs().await)
+    }
+
+    /// Read the pending notification fence.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn script_monitor_wake_pending(&self, id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.script_monitor_wake_pending(id).await)
+    }
+
+    /// Delivery authority belongs to transient work, never a transcript alone.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn script_monitor_wake_allowed(&self, id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.script_monitor_wake_allowed(id).await)
+    }
+
+    /// Scope delivery authority to its original owner and workspace.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn script_monitor_wake_allowed_for_agent(
+        &self,
+        id: &str,
+        agent: &AgentId,
+        ws: &WorkspaceId,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.script_monitor_wake_allowed_for_agent(id, agent, ws).await)
+    }
+
+    /// Durable ordinary queue owners to kick after restart or temporary holds.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn script_notification_delivery_owners(&self) -> Result<Vec<(AgentId, WorkspaceId)>> {
+        dispatch!(self, backend => backend.script_notification_delivery_owners().await)
+    }
+
+    /// Suppress outstanding work. Message persistence alone cannot finish a job.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn finish_script_monitor_wake(&self, id: &str, suppress: bool) -> Result<()> {
+        dispatch!(self, backend => backend.finish_script_monitor_wake(id, suppress).await)
+    }
+
+    /// Requested workspaces that own an active hook or an `active` script
+    /// monitor — the two row-backed `Workspace.waiting` signals (§5.1) — in
+    /// ONE statement, so `workspace.list` / `workspace.subscribe` keep their
+    /// constant statement budget. No hook or monitor rows are hydrated.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn workspaces_with_active_hooks_or_script_monitors(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<std::collections::HashSet<WorkspaceId>> {
+        dispatch!(self, backend => backend.workspaces_with_active_hooks_or_script_monitors(workspace_ids).await)
+    }
+
+    /// Outstanding reservations include active watches and untransferred jobs.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn script_monitor_reservations(&self, ws: &WorkspaceId) -> Result<i64> {
+        dispatch!(self, backend => backend.script_monitor_reservations(ws).await)
+    }
+
+    /// Transfer one job to durable ordinary queue ownership in a single commit.
+    /// # Errors
+    /// Any failure preserves the job and leaves no partial admission.
+    pub async fn admit_script_notification(&self, row: &crate::AgentQueueRow) -> Result<bool> {
+        dispatch!(self, backend => backend.admit_script_notification(row).await)
+    }
+
+    /// Repeated guards of the same durable turn are valid; completed receipts are gone.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn accept_script_notification(&self, agent: &AgentId, id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.accept_script_notification(agent, id).await)
+    }
+
+    /// Durably settle delivery before best-effort physical cleanup. A failed
+    /// DELETE cannot make a completed turn eligible for replay on restart.
+    /// # Errors
+    /// Returns database errors; a committed completion is still authoritative
+    /// if the subsequent cleanup fails.
+    pub async fn complete_script_notification(&self, agent: &AgentId, id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.complete_script_notification(agent, id).await)
+    }
+
+    /// Continue a notification on the worker's persisted warning turn. The
+    /// durable recovery payload and any surviving queue snapshot follow that
+    /// turn atomically before it is submitted.
+    /// # Errors
+    /// Returns database failures.
+    pub async fn continue_script_notification(
+        &self,
+        agent: &AgentId,
+        id: &str,
+        turn: &str,
+        content: &str,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.continue_script_notification(agent, id, turn, content).await)
+    }
+
+    /// Retry physical cleanup independently of delivery settlement.
+    /// # Errors
+    /// Returns database failures; completed rows remain non-runnable.
+    pub async fn cleanup_completed_script_notifications(&self) -> Result<()> {
+        dispatch!(self, backend => backend.cleanup_completed_script_notifications().await)
+    }
+
+    /// Owners affected by lifecycle cleanup, including already-retired watches.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn script_notification_owners(
+        &self,
+        ws: &WorkspaceId,
+        agent: Option<&AgentId>,
+    ) -> Result<Vec<AgentId>> {
+        dispatch!(self, backend => backend.script_notification_owners(ws, agent).await)
+    }
+
+    /// Suppress work even when its active watch has already been deleted.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn suppress_script_notifications(
+        &self,
+        ws: &WorkspaceId,
+        agent: Option<&AgentId>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.suppress_script_notifications(ws, agent).await)
+    }
+
+    /// Latest accepted token remains available after settlement and marker dismissal.
+    /// # Errors
+    /// Returns storage errors.
+    pub async fn latest_script_run(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+    ) -> Result<Option<(String, Option<intent_core::ScriptLastRun>)>> {
+        dispatch!(self, backend => backend.latest_script_run(ws, id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn script_monitors(
+        &self,
+        ws: &WorkspaceId,
+        agent: Option<&AgentId>,
+    ) -> Result<Vec<ScriptMonitor>> {
         let rows: Vec<String> = sqlx::query_scalar("SELECT row_json FROM script_monitor WHERE state='active' AND workspace_id = ? AND (? IS NULL OR agent_id = ?) ORDER BY created_at,id")
             .bind(ws.as_str()).bind(agent.map(AgentId::as_str)).bind(agent.map(AgentId::as_str))
             .fetch_all(self.read_pool()).await.map_err(db)?;
@@ -23,9 +236,6 @@ impl Store {
             .collect()
     }
 
-    /// Project active waiting metadata without hydrating output or terminal history.
-    /// # Errors
-    /// Returns storage/decoding errors.
     pub async fn script_monitor_waiting(
         &self,
         ws: Option<&WorkspaceId>,
@@ -38,9 +248,6 @@ impl Store {
             .collect()
     }
 
-    /// Whether an owner still has a committed notification awaiting delivery.
-    /// # Errors
-    /// Returns database failures so callers can defer settlement safely.
     pub async fn script_monitor_pending_for_agent(&self, agent: &AgentId) -> Result<bool> {
         sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM script_notification_job WHERE agent_id=? UNION ALL SELECT 1 FROM agent_queue_admission WHERE agent_id=? AND phase != 'completed')",
@@ -52,9 +259,6 @@ impl Store {
         .map_err(db)
     }
 
-    /// Read one scoped row. Foreign IDs are indistinguishable from missing IDs.
-    /// # Errors
-    /// Returns invalid parameters for unknown IDs or a storage error.
     pub async fn script_monitor(&self, ws: &WorkspaceId, id: &str) -> Result<ScriptMonitor> {
         let value: Option<String> = sqlx::query_scalar(
             "SELECT row_json FROM script_monitor WHERE workspace_id = ? AND id = ?",
@@ -70,9 +274,6 @@ impl Store {
         .map_err(db)
     }
 
-    /// Insert under the durable single-owner constraint; caller serializes admission.
-    /// # Errors
-    /// Storage errors never acknowledge a memory-only watch.
     pub async fn insert_script_monitor(&self, row: &ScriptMonitor) -> Result<()> {
         if row.state != "active" {
             return Err(Error::InvalidParams(
@@ -87,9 +288,6 @@ impl Store {
         Ok(())
     }
 
-    /// Atomically retire an active watch and reserve its notification, without history.
-    /// # Errors
-    /// A failed write rolls back both changes.
     pub async fn settle_script_monitor(&self, row: &ScriptMonitor) -> Result<bool> {
         if !matches!(
             row.state.as_str(),
@@ -115,9 +313,6 @@ impl Store {
         Ok(deleted == 1)
     }
 
-    /// Reserve a guarded cancellation before touching the owned process.
-    /// # Errors
-    /// Returns database failures.
     pub async fn script_monitor_cancel_intent(
         &self,
         ws: &WorkspaceId,
@@ -129,9 +324,6 @@ impl Store {
         Ok(())
     }
 
-    /// Read recovery/outbox work; this is never a hot agent-list read.
-    /// # Errors
-    /// Returns storage/decoding failures.
     pub async fn pending_script_monitors(&self) -> Result<Vec<(ScriptMonitor, bool)>> {
         let rows: Vec<(String, bool)> = sqlx::query_as(
             "SELECT row_json,cancel_intent FROM script_monitor WHERE state='active'",
@@ -144,9 +336,6 @@ impl Store {
             .collect()
     }
 
-    /// Read pending notification work, never monitor history.
-    /// # Errors
-    /// Returns storage/decoding failures.
     pub async fn script_notification_jobs(&self) -> Result<Vec<ScriptNotificationJob>> {
         let rows: Vec<(String,String,String,String,String)> = sqlx::query_as("SELECT wake_id,workspace_id,agent_id,metadata,body FROM script_notification_job ORDER BY created_at,wake_id")
             .fetch_all(self.read_pool()).await.map_err(db)?;
@@ -163,9 +352,6 @@ impl Store {
             .collect()
     }
 
-    /// Read the pending notification fence.
-    /// # Errors
-    /// Returns database errors.
     pub async fn script_monitor_wake_pending(&self, id: &str) -> Result<bool> {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM script_notification_job WHERE wake_id=?)")
             .bind(format!("script-monitor:{id}"))
@@ -174,18 +360,12 @@ impl Store {
             .map_err(db)
     }
 
-    /// Delivery authority belongs to transient work, never a transcript alone.
-    /// # Errors
-    /// Returns database errors.
     pub async fn script_monitor_wake_allowed(&self, id: &str) -> Result<bool> {
         let key = format!("script-monitor:{id}");
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM script_notification_job WHERE wake_id=? UNION ALL SELECT 1 FROM agent_queue_admission WHERE id=? AND phase != 'completed')")
             .bind(&key).bind(&key).fetch_one(self.read_pool()).await.map_err(db)
     }
 
-    /// Scope delivery authority to its original owner and workspace.
-    /// # Errors
-    /// Returns database errors.
     pub async fn script_monitor_wake_allowed_for_agent(
         &self,
         id: &str,
@@ -196,9 +376,6 @@ impl Store {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM (SELECT wake_id AS id,agent_id,workspace_id FROM script_notification_job UNION ALL SELECT id,agent_id,workspace_id FROM agent_queue_admission WHERE phase != 'completed') WHERE id=? AND agent_id=? AND workspace_id=?)")
             .bind(key).bind(agent.as_str()).bind(ws.as_str()).fetch_one(self.read_pool()).await.map_err(db)
     }
-    /// Durable ordinary queue owners to kick after restart or temporary holds.
-    /// # Errors
-    /// Returns database errors.
     pub async fn script_notification_delivery_owners(&self) -> Result<Vec<(AgentId, WorkspaceId)>> {
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT DISTINCT agent_id,workspace_id FROM agent_queue_admission WHERE phase != 'completed'")
@@ -211,9 +388,6 @@ impl Store {
             .collect())
     }
 
-    /// Suppress outstanding work. Message persistence alone cannot finish a job.
-    /// # Errors
-    /// Returns database errors.
     pub async fn finish_script_monitor_wake(&self, id: &str, suppress: bool) -> Result<()> {
         if !suppress {
             return Ok(());
@@ -234,12 +408,6 @@ impl Store {
         tx.commit().await.map_err(db)
     }
 
-    /// Requested workspaces that own an active hook or an `active` script
-    /// monitor — the two row-backed `Workspace.waiting` signals (§5.1) — in
-    /// ONE statement, so `workspace.list` / `workspace.subscribe` keep their
-    /// constant statement budget. No hook or monitor rows are hydrated.
-    /// # Errors
-    /// Returns database errors.
     pub async fn workspaces_with_active_hooks_or_script_monitors(
         &self,
         workspace_ids: &[WorkspaceId],
@@ -264,17 +432,11 @@ impl Store {
         Ok(rows.into_iter().map(WorkspaceId).collect())
     }
 
-    /// Outstanding reservations include active watches and untransferred jobs.
-    /// # Errors
-    /// Returns database errors.
     pub async fn script_monitor_reservations(&self, ws: &WorkspaceId) -> Result<i64> {
         sqlx::query_scalar("SELECT (SELECT count(*) FROM script_monitor WHERE workspace_id=?)+(SELECT count(*) FROM script_notification_job WHERE workspace_id=?)")
             .bind(ws.as_str()).bind(ws.as_str()).fetch_one(self.read_pool()).await.map_err(db)
     }
 
-    /// Transfer one job to durable ordinary queue ownership in a single commit.
-    /// # Errors
-    /// Any failure preserves the job and leaves no partial admission.
     pub async fn admit_script_notification(&self, row: &crate::AgentQueueRow) -> Result<bool> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let inserted=sqlx::query("INSERT INTO agent_queue_admission(id,agent_id,workspace_id,turn_id,payload,created_at,phase) SELECT wake_id,j.agent_id,j.workspace_id,?,?,?,'pending' FROM script_notification_job j JOIN agent_session a ON a.id=j.agent_id JOIN workspace w ON w.id=j.workspace_id WHERE wake_id=? AND j.agent_id=? AND a.retired_at IS NULL AND w.archived=0 ON CONFLICT(id) DO NOTHING")
@@ -294,20 +456,12 @@ impl Store {
         Ok(inserted == 1)
     }
 
-    /// Repeated guards of the same durable turn are valid; completed receipts are gone.
-    /// # Errors
-    /// Returns database errors.
     pub async fn accept_script_notification(&self, agent: &AgentId, id: &str) -> Result<bool> {
         let result=sqlx::query("UPDATE agent_queue_admission SET phase='accepted' WHERE id=? AND agent_id=? AND phase != 'completed' AND EXISTS(SELECT 1 FROM agent_session a JOIN workspace w ON w.id=a.workspace_id WHERE a.id=agent_queue_admission.agent_id AND a.retired_at IS NULL AND w.archived=0)")
             .bind(format!("script-monitor:{id}")).bind(agent.as_str()).execute(self.write_pool()).await.map_err(db)?;
         Ok(result.rows_affected() == 1)
     }
 
-    /// Durably settle delivery before best-effort physical cleanup. A failed
-    /// DELETE cannot make a completed turn eligible for replay on restart.
-    /// # Errors
-    /// Returns database errors; a committed completion is still authoritative
-    /// if the subsequent cleanup fails.
     pub async fn complete_script_notification(&self, agent: &AgentId, id: &str) -> Result<()> {
         sqlx::query("UPDATE agent_queue_admission SET phase='completed',payload='{}' WHERE id=? AND agent_id=?")
             .bind(format!("script-monitor:{id}")).bind(agent.as_str())
@@ -315,11 +469,6 @@ impl Store {
         self.cleanup_completed_script_notifications().await
     }
 
-    /// Continue a notification on the worker's persisted warning turn. The
-    /// durable recovery payload and any surviving queue snapshot follow that
-    /// turn atomically before it is submitted.
-    /// # Errors
-    /// Returns database failures.
     pub async fn continue_script_notification(
         &self,
         agent: &AgentId,
@@ -342,9 +491,6 @@ impl Store {
         tx.commit().await.map_err(db)
     }
 
-    /// Retry physical cleanup independently of delivery settlement.
-    /// # Errors
-    /// Returns database failures; completed rows remain non-runnable.
     pub async fn cleanup_completed_script_notifications(&self) -> Result<()> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         sqlx::query("DELETE FROM agent_queue WHERE id IN (SELECT id FROM agent_queue_admission WHERE phase='completed')")
@@ -356,9 +502,6 @@ impl Store {
         tx.commit().await.map_err(db)
     }
 
-    /// Owners affected by lifecycle cleanup, including already-retired watches.
-    /// # Errors
-    /// Returns database errors.
     pub async fn script_notification_owners(
         &self,
         ws: &WorkspaceId,
@@ -369,9 +512,6 @@ impl Store {
         Ok(ids.into_iter().map(AgentId::from).collect())
     }
 
-    /// Suppress work even when its active watch has already been deleted.
-    /// # Errors
-    /// Returns database errors.
     pub async fn suppress_script_notifications(
         &self,
         ws: &WorkspaceId,
@@ -386,9 +526,6 @@ impl Store {
         tx.commit().await.map_err(db)
     }
 
-    /// Latest accepted token remains available after settlement and marker dismissal.
-    /// # Errors
-    /// Returns storage errors.
     pub async fn latest_script_run(
         &self,
         ws: &WorkspaceId,

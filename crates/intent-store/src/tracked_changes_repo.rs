@@ -74,6 +74,96 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_tracked_change(&self, c: &NewTrackedChange) -> Result<Option<(i64, i64)>> {
+        dispatch!(self, backend => backend.upsert_tracked_change(c).await)
+    }
+
+    /// Max cumulative `(additions, deletions)` across the **sibling** rows for
+    /// the same `(workspace, path, stage)` — every row except `agent_id`'s own
+    /// (`NULL` keys separately via `IS NOT`). `Ok(None)` when the path has no
+    /// sibling rows. Used by the file-tracking pipeline as the usage-stats
+    /// baseline for a fresh row on an already-tracked path (monorepo#1009):
+    /// each row carries the file's full diff counters, so a new agent's first
+    /// row must not re-record lines a sibling row already accounted for.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn max_sibling_tracked_change_counters(
+        &self,
+        workspace_id: &WorkspaceId,
+        path: &str,
+        stage: &str,
+        agent_id: Option<&str>,
+    ) -> Result<Option<(i64, i64)>> {
+        dispatch!(self, backend => backend.max_sibling_tracked_change_counters(workspace_id, path, stage, agent_id).await)
+    }
+
+    /// Transition the `stage` of a workspace's tracked-change rows for `path`
+    /// from `from_stage` to `to_stage` in place, stamping `updated_at` and
+    /// preserving every attribution column (`agent_id`/`session_id`/`turn`) and
+    /// the recorded stats/blobs. Backs `file-tracking.stage`/`unstage` (M4.8):
+    /// staging/unstaging a file moves its audit row across the git stage without
+    /// dropping who produced it. Returns the number of rows transitioned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn set_tracked_change_stage(
+        &self,
+        workspace_id: &WorkspaceId,
+        path: &str,
+        from_stage: &str,
+        to_stage: &str,
+    ) -> Result<u64> {
+        dispatch!(self, backend => backend.set_tracked_change_stage(workspace_id, path, from_stage, to_stage).await)
+    }
+
+    /// Ids of the workspaces that have at least one tracked change at a
+    /// working stage (`unstaged`/`staged`) — the candidate set for the
+    /// stale-row sweep (intent-hq/intent#7266), so a pass never scans a
+    /// workspace with nothing to prune.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspaces_with_working_tracked_changes(&self) -> Result<Vec<WorkspaceId>> {
+        dispatch!(self, backend => backend.list_workspaces_with_working_tracked_changes().await)
+    }
+
+    /// Delete tracked-change rows of `workspace_id` named by `(id, updated_at)`
+    /// pairs, but only while each row is still at a working stage
+    /// (`unstaged`/`staged`) **and** its `updated_at` is exactly the value the
+    /// caller judged — so a row re-recorded or moved to `committed` after the
+    /// caller read it survives (the stale-row sweep, intent-hq/intent#7266).
+    /// Returns the number of rows deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_unchanged_working_tracked_changes(
+        &self,
+        workspace_id: &WorkspaceId,
+        rows: &[(String, String)],
+    ) -> Result<u64> {
+        dispatch!(self, backend => backend.delete_unchanged_working_tracked_changes(workspace_id, rows).await)
+    }
+
+    /// List a workspace's tracked changes, oldest first. Internal read used by the
+    /// pipeline + tests (the UI-facing reads land in M4.8).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_tracked_changes(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<TrackedChangeRow>> {
+        dispatch!(self, backend => backend.list_tracked_changes(workspace_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn upsert_tracked_change(&self, c: &NewTrackedChange) -> Result<Option<(i64, i64)>> {
         let now = now_iso();
         let existing: Option<(String, i64, i64)> = sqlx::query(
             "SELECT id, additions, deletions FROM tracked_changes \
@@ -144,17 +234,6 @@ impl Store {
         }
     }
 
-    /// Max cumulative `(additions, deletions)` across the **sibling** rows for
-    /// the same `(workspace, path, stage)` — every row except `agent_id`'s own
-    /// (`NULL` keys separately via `IS NOT`). `Ok(None)` when the path has no
-    /// sibling rows. Used by the file-tracking pipeline as the usage-stats
-    /// baseline for a fresh row on an already-tracked path (monorepo#1009):
-    /// each row carries the file's full diff counters, so a new agent's first
-    /// row must not re-record lines a sibling row already accounted for.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn max_sibling_tracked_change_counters(
         &self,
         workspace_id: &WorkspaceId,
@@ -179,16 +258,6 @@ impl Store {
         Ok(additions.zip(deletions))
     }
 
-    /// Transition the `stage` of a workspace's tracked-change rows for `path`
-    /// from `from_stage` to `to_stage` in place, stamping `updated_at` and
-    /// preserving every attribution column (`agent_id`/`session_id`/`turn`) and
-    /// the recorded stats/blobs. Backs `file-tracking.stage`/`unstage` (M4.8):
-    /// staging/unstaging a file moves its audit row across the git stage without
-    /// dropping who produced it. Returns the number of rows transitioned.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn set_tracked_change_stage(
         &self,
         workspace_id: &WorkspaceId,
@@ -212,14 +281,6 @@ impl Store {
         Ok(result.rows_affected())
     }
 
-    /// Ids of the workspaces that have at least one tracked change at a
-    /// working stage (`unstaged`/`staged`) — the candidate set for the
-    /// stale-row sweep (intent-hq/intent#7266), so a pass never scans a
-    /// workspace with nothing to prune.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces_with_working_tracked_changes(&self) -> Result<Vec<WorkspaceId>> {
         let rows = sqlx::query(
             "SELECT DISTINCT workspace_id FROM tracked_changes \
@@ -234,16 +295,6 @@ impl Store {
             .collect())
     }
 
-    /// Delete tracked-change rows of `workspace_id` named by `(id, updated_at)`
-    /// pairs, but only while each row is still at a working stage
-    /// (`unstaged`/`staged`) **and** its `updated_at` is exactly the value the
-    /// caller judged — so a row re-recorded or moved to `committed` after the
-    /// caller read it survives (the stale-row sweep, intent-hq/intent#7266).
-    /// Returns the number of rows deleted.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_unchanged_working_tracked_changes(
         &self,
         workspace_id: &WorkspaceId,
@@ -272,12 +323,6 @@ impl Store {
         Ok(deleted)
     }
 
-    /// List a workspace's tracked changes, oldest first. Internal read used by the
-    /// pipeline + tests (the UI-facing reads land in M4.8).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_tracked_changes(
         &self,
         workspace_id: &WorkspaceId,

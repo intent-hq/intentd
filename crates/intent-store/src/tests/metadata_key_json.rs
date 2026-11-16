@@ -41,11 +41,12 @@ async fn setup() -> (TempDb, Store, WorkspaceId, AgentId) {
 async fn shorten_acquire_timeout(store: &mut Store, tmp: &TempDb) {
     // Migrations and fixture inserts use the ordinary pool. Only the real
     // contention control replaces it with the existing short-timeout seam.
-    store.write_pool.close().await;
-    store.write_pool = crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT)
-        .await
-        .expect("open short-timeout writer")
-        .into();
+    store.sqlite().write_pool.close().await;
+    store.sqlite_mut().write_pool =
+        crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT)
+            .await
+            .expect("open short-timeout writer")
+            .into();
 }
 
 async fn wait_for_timeout(observed: &AtomicUsize) {

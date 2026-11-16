@@ -29,6 +29,20 @@ impl Store {
         now: &str,
         pause: Option<&str>,
     ) -> Result<bool> {
+        dispatch!(self, backend => backend.rearm_legacy_pr_monitor(expected, owner, target, baseline, now, pause).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn rearm_legacy_pr_monitor(
+        &self,
+        expected: &PrMonitor,
+        owner: &AgentId,
+        target: &ReviewTarget,
+        baseline: Option<&str>,
+        now: &str,
+        pause: Option<&str>,
+    ) -> Result<bool> {
         validate_monitor_target(
             expected,
             target,

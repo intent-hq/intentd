@@ -127,7 +127,7 @@ impl NoteWriteLock {
 
     /// Refuse a write of `note` unless this lock was taken from `store`'s
     /// registry for exactly that note.
-    pub(crate) fn ensure_covers(&self, store: &Store, note: &Note) -> Result<()> {
+    pub(crate) fn ensure_covers(&self, store: &crate::SqliteStore, note: &Note) -> Result<()> {
         if !Arc::ptr_eq(&self.slot.registry, &store.note_write_lanes) {
             return Err(Error::Internal(format!(
                 "note write lock for {}/{} was taken from another store",
@@ -158,9 +158,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> NoteWriteLock {
-        self.note_write_lanes
-            .lock((workspace_id.clone(), note_id.clone()))
-            .await
+        dispatch!(self, backend => backend.lock_note_content(workspace_id, note_id).await)
     }
 
     /// Callers holding or awaiting `note_id`'s content-write lock. A test
@@ -168,14 +166,36 @@ impl Store {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn note_content_lock_users(&self, workspace_id: &WorkspaceId, note_id: &NoteId) -> usize {
-        self.note_write_lanes
-            .users(&(workspace_id.clone(), note_id.clone()))
+        dispatch!(self, backend => backend.note_content_lock_users(workspace_id, note_id))
     }
 
     /// `true` when no note's content-write lock is held or awaited. A test
     /// seam for checking that locks are released.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
+    pub fn note_content_locks_idle(&self) -> bool {
+        dispatch!(self, backend => backend.note_content_locks_idle())
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn lock_note_content(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+    ) -> NoteWriteLock {
+        self.note_write_lanes
+            .lock((workspace_id.clone(), note_id.clone()))
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn note_content_lock_users(&self, workspace_id: &WorkspaceId, note_id: &NoteId) -> usize {
+        self.note_write_lanes
+            .users(&(workspace_id.clone(), note_id.clone()))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn note_content_locks_idle(&self) -> bool {
         self.note_write_lanes.is_empty()
     }

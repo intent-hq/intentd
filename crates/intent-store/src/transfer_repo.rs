@@ -412,6 +412,83 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<TransferTableStat>> {
+        dispatch!(self, backend => backend.transfer_table_stats(workspace_id).await)
+    }
+
+    /// Export every [`TRANSFER_TABLES`] row for one workspace as JSON objects
+    /// (`column name → value`), in table order. Values map `SQLite` storage
+    /// classes to JSON: NULL → `null`, INTEGER → number, REAL → number,
+    /// TEXT → string, BLOB → `{ "$base64": "<bytes>" }`. This is the row
+    /// payload the export archive writes to `rows/<table>.jsonl` and
+    /// [`Store::transfer_import_rows`] round-trips on the target.
+    ///
+    /// Every table is read inside ONE deferred read transaction on a single
+    /// read-pool connection, so the whole export observes a single WAL
+    /// snapshot: a write committing mid-export can no longer land a `note`
+    /// row and a `note_version` snapshot from different revisions in the
+    /// same archive (intent-hq/intent#4876). Readers never block the writer
+    /// in WAL mode, so concurrent writes still proceed; the cost is that a
+    /// checkpoint cannot advance past this snapshot while it is held, so the
+    /// WAL can grow for the duration of a large export under sustained
+    /// writes (one-shot RPC, reclaimed at the next checkpoint after commit).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn transfer_export_rows(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+        dispatch!(self, backend => backend.transfer_export_rows(workspace_id).await)
+    }
+
+    /// Read retained monitor envelopes for transfer preflight, without changing
+    /// agents or creating an export. This is not the authoritative archive
+    /// snapshot; the caller must also check its final `transfer_export_rows`.
+    ///
+    /// # Errors
+    /// Returns an error if the read snapshot or row decoding fails.
+    pub async fn transfer_monitor_rows(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+        dispatch!(self, backend => backend.transfer_monitor_rows(workspace_id).await)
+    }
+
+    /// Insert transformed transfer rows into their tables inside ONE
+    /// transaction — the atomic heart of `workspace.import.commit`. `rows`
+    /// entries must name [`TRANSFER_TABLES`] members (anything else —
+    /// including `event` — is rejected before any write) and are inserted in
+    /// canonical [`TRANSFER_TABLES`] order regardless of input order, so FK
+    /// parents (`workspace`, `agent_session`, `note`) always land before
+    /// their children. Every row's keys are validated against the live
+    /// schema. Nothing is visible unless the whole batch commits. Returns
+    /// the number of rows inserted.
+    ///
+    /// Invariant the caller owns: `agent_session` rows must arrive with the
+    /// 0103 stats counter columns (`message_count`,
+    /// `assistant_message_count`, `conversation_bytes`) zeroed — the
+    /// `agent_message` inserts in the same batch rebuild them through the
+    /// 0103 triggers, so importing exported values double-counts. The
+    /// production transform (`transfer_import.rs::transform_rows`) does
+    /// this; any new direct caller must too.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` when a row names a table outside the transfer set, is not a JSON object, or carries a key with no matching column; `Error::Internal` if the transaction fails.
+    pub async fn transfer_import_rows(
+        &self,
+        rows: &[(String, Vec<serde_json::Value>)],
+    ) -> Result<usize> {
+        dispatch!(self, backend => backend.transfer_import_rows(rows).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn transfer_table_stats(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<TransferTableStat>> {
         // Statement 1: column names of every transfer table, in declaration
         // order (same source of truth as `table_columns`, one round-trip).
         // The names are interpolated as single-quoted literals, which relies
@@ -502,26 +579,6 @@ impl Store {
         Ok(rows.into_iter().map(|(_, name)| name).collect())
     }
 
-    /// Export every [`TRANSFER_TABLES`] row for one workspace as JSON objects
-    /// (`column name → value`), in table order. Values map `SQLite` storage
-    /// classes to JSON: NULL → `null`, INTEGER → number, REAL → number,
-    /// TEXT → string, BLOB → `{ "$base64": "<bytes>" }`. This is the row
-    /// payload the export archive writes to `rows/<table>.jsonl` and
-    /// [`Store::transfer_import_rows`] round-trips on the target.
-    ///
-    /// Every table is read inside ONE deferred read transaction on a single
-    /// read-pool connection, so the whole export observes a single WAL
-    /// snapshot: a write committing mid-export can no longer land a `note`
-    /// row and a `note_version` snapshot from different revisions in the
-    /// same archive (intent-hq/intent#4876). Readers never block the writer
-    /// in WAL mode, so concurrent writes still proceed; the cost is that a
-    /// checkpoint cannot advance past this snapshot while it is held, so the
-    /// WAL can grow for the duration of a large export under sustained
-    /// writes (one-shot RPC, reclaimed at the next checkpoint after commit).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn transfer_export_rows(
         &self,
         workspace_id: &WorkspaceId,
@@ -564,12 +621,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Read retained monitor envelopes for transfer preflight, without changing
-    /// agents or creating an export. This is not the authoritative archive
-    /// snapshot; the caller must also check its final `transfer_export_rows`.
-    ///
-    /// # Errors
-    /// Returns an error if the read snapshot or row decoding fails.
     pub async fn transfer_monitor_rows(
         &self,
         workspace_id: &WorkspaceId,
@@ -603,27 +654,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Insert transformed transfer rows into their tables inside ONE
-    /// transaction — the atomic heart of `workspace.import.commit`. `rows`
-    /// entries must name [`TRANSFER_TABLES`] members (anything else —
-    /// including `event` — is rejected before any write) and are inserted in
-    /// canonical [`TRANSFER_TABLES`] order regardless of input order, so FK
-    /// parents (`workspace`, `agent_session`, `note`) always land before
-    /// their children. Every row's keys are validated against the live
-    /// schema. Nothing is visible unless the whole batch commits. Returns
-    /// the number of rows inserted.
-    ///
-    /// Invariant the caller owns: `agent_session` rows must arrive with the
-    /// 0103 stats counter columns (`message_count`,
-    /// `assistant_message_count`, `conversation_bytes`) zeroed — the
-    /// `agent_message` inserts in the same batch rebuild them through the
-    /// 0103 triggers, so importing exported values double-counts. The
-    /// production transform (`transfer_import.rs::transform_rows`) does
-    /// this; any new direct caller must too.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::InvalidParams` when a row names a table outside the transfer set, is not a JSON object, or carries a key with no matching column; `Error::Internal` if the transaction fails.
     pub async fn transfer_import_rows(
         &self,
         rows: &[(String, Vec<serde_json::Value>)],

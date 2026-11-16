@@ -203,14 +203,14 @@ async fn held_observer_releases_writer_serialization_and_second_comparison_detec
 async fn preobserver_original_owner_blocks_install_and_unknown_survives_last_handle_reopen() {
     let (dir, store, root) = fixture().await;
     let observer: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Probe::default());
-    let mut original = store.repository_lifecycle_write().await.unwrap();
+    let mut original = store.sqlite().repository_lifecycle_write().await.unwrap();
     original.begin_selection_change(&root).unwrap();
     assert!(store
         .install_repository_lifecycle_observer(observer.clone())
         .await
         .is_err());
     // A second known owner cannot settle the predecessor.
-    let mut other = store.repository_lifecycle_write().await.unwrap();
+    let mut other = store.sqlite().repository_lifecycle_write().await.unwrap();
     other.begin_selection_change(&root).unwrap();
     other.settle();
     drop(original);
@@ -226,11 +226,11 @@ async fn preobserver_original_owner_blocks_install_and_unknown_survives_last_han
 async fn confirmed_preobserver_owner_allows_install_but_installed_unknown_never_resets() {
     let (_dir, store, root) = fixture().await;
     let probe = Arc::new(Probe::default());
-    let mut original = store.repository_lifecycle_write().await.unwrap();
+    let mut original = store.sqlite().repository_lifecycle_write().await.unwrap();
     original.begin_selection_change(&root).unwrap();
     original.settle();
     let observer = probe.install(&store).await;
-    let mut unknown = store.repository_lifecycle_write().await.unwrap();
+    let mut unknown = store.sqlite().repository_lifecycle_write().await.unwrap();
     unknown.begin_selection_change(&root).unwrap();
     drop(unknown);
     store
@@ -281,7 +281,7 @@ async fn unpolled_selection_and_invalid_resume_never_allocate_a_second_ticket() 
     let before = store.repository_selection_snapshot(&root).await.unwrap();
     drop(store.write_repository_selection(&before, change()));
     assert_eq!(probe.count(&selection_key(&root)), 0);
-    let mut owner = store.repository_lifecycle_write().await.unwrap();
+    let mut owner = store.sqlite().repository_lifecycle_write().await.unwrap();
     assert!(owner.resume_serialization().await.is_err());
     owner.begin_selection_change(&root).unwrap();
     assert!(owner.begin_selection_change(&root).is_err());

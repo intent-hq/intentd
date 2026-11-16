@@ -68,6 +68,15 @@ impl Store {
         &self,
         ids: &[AgentId],
     ) -> Result<Vec<SubscriptionAgentProjection>> {
+        dispatch!(self, backend => backend.get_subscription_agent_projections(ids).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn get_subscription_agent_projections(
+        &self,
+        ids: &[AgentId],
+    ) -> Result<Vec<SubscriptionAgentProjection>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(IDS_PER_STATEMENT) {
             let placeholders = vec!["?"; chunk.len()].join(",");

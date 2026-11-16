@@ -68,6 +68,7 @@ async fn desktop_agent_delete_paths_wait_for_repository_retirement_after_sql() {
         let operation = async {
             if workspace_sweep {
                 store
+                    .sqlite()
                     .delete_workspace_agent_session(&workspace, &agent)
                     .await
             } else {
@@ -503,7 +504,7 @@ async fn workspace_delete_final_failure_keeps_row_and_tombstone_atomic() {
         .expect("root delete rolled back");
     assert_eq!(count_history(&store, &doomed).await, 0);
     assert_eq!(
-        store.browser_tab_displayed.len(),
+        store.sqlite().browser_tab_displayed.len(),
         1,
         "committed tab cleanup evicts only doomed overlays"
     );
@@ -864,7 +865,7 @@ async fn workspace_delete_browser_batch_failure_evicts_only_committed_overlays()
         "failed batch keeps its overlay"
     );
     assert_eq!(
-        store.browser_tab_displayed.len(),
+        store.sqlite().browser_tab_displayed.len(),
         2,
         "only remaining and unrelated overlays survive"
     );
@@ -880,7 +881,7 @@ async fn workspace_delete_browser_batch_failure_evicts_only_committed_overlays()
         .delete_workspace(&doomed)
         .await
         .expect("retry succeeds");
-    assert_eq!(store.browser_tab_displayed.len(), 1);
+    assert_eq!(store.sqlite().browser_tab_displayed.len(), 1);
     assert_eq!(
         store
             .get_browser_tab(&keeper.0)
@@ -913,7 +914,7 @@ async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failu
     sqlx::query("CREATE TRIGGER fail_desktop_final_delete BEFORE DELETE ON workspace BEGIN SELECT RAISE(ABORT,'late workspace failure'); END")
         .execute(store.write_pool()).await.unwrap();
     let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
-    *store.desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
+    *store.sqlite().desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
     let deleting = {
         let store = store.clone();
         let workspace = workspace.clone();
@@ -1009,7 +1010,7 @@ async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
     let keeper = seed_workspace(&store, "desktop-unrelated-workspace").await;
     let kept_agent = AgentId::from("desktop-unrelated-agent");
     let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
-    *store.desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
+    *store.sqlite().desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
 
     // The first deletion owns the desktop guard, has released lifecycle
     // serialization, and will need it again for its nested agent deletion.
@@ -1025,7 +1026,7 @@ async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
     )
     .await
     .expect("first deletion reaches the desktop sweep barrier");
-    *store.desktop_delete_barrier.lock().unwrap() = None;
+    *store.sqlite().desktop_delete_barrier.lock().unwrap() = None;
 
     // Poll the competing Store clone to its lock wait without a timing sleep.
     let second_store = store.clone();
@@ -1076,7 +1077,7 @@ async fn cancelled_desktop_workspace_delete_releases_gate_and_retry_drains_state
         .await
         .unwrap();
     let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
-    *store.desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
+    *store.sqlite().desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
     let mut deleting = Box::pin(store.delete_workspace(&workspace));
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
@@ -1101,7 +1102,7 @@ async fn cancelled_desktop_workspace_delete_releases_gate_and_retry_drains_state
     // Cancel after the private-state sweep commits, before the agent is removed.
     // The live target can admit a fresh explicit grant once teardown is dropped.
     drop(deleting);
-    *store.desktop_delete_barrier.lock().unwrap() = None;
+    *store.sqlite().desktop_delete_barrier.lock().unwrap() = None;
     store.get_workspace(&workspace).await.unwrap();
     store.get_agent_session_summary(&agent).await.unwrap();
     store

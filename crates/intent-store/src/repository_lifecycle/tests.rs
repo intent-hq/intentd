@@ -465,10 +465,16 @@ async fn managed_symlink_open_shares_the_same_file_domain() {
 #[tokio::test]
 async fn overlapping_owned_tickets_cannot_settle_each_other() {
     let f = Fixture::new().await;
-    let mut first = f.store.repository_lifecycle_write().await.unwrap();
+    let mut first = f.store.sqlite().repository_lifecycle_write().await.unwrap();
     first.begin(&[f.agent_key(), f.workspace_key()]).unwrap();
     first.release_serialization();
-    let mut second = f.store.clone().repository_lifecycle_write().await.unwrap();
+    let mut second = f
+        .store
+        .clone()
+        .sqlite()
+        .repository_lifecycle_write()
+        .await
+        .unwrap();
     second.begin(&[f.agent_key()]).unwrap();
     first.settle();
     assert!(f.probe.capture(vec![f.workspace_key()]).is_some());
@@ -484,7 +490,7 @@ async fn dropping_original_owner_keeps_every_mutated_key_blocked() {
         .probe
         .capture(vec![f.agent_key(), f.workspace_key()])
         .unwrap();
-    let mut owner = f.store.repository_lifecycle_write().await.unwrap();
+    let mut owner = f.store.sqlite().repository_lifecycle_write().await.unwrap();
     owner.begin(&[f.agent_key(), f.workspace_key()]).unwrap();
     drop(owner);
     assert!(!old.load(Ordering::SeqCst));
@@ -496,7 +502,7 @@ async fn dropping_original_owner_keeps_every_mutated_key_blocked() {
 async fn installation_cannot_reclassify_an_unconfirmed_unobserved_writer() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
-    let mut owner = store.repository_lifecycle_write().await.unwrap();
+    let mut owner = store.sqlite().repository_lifecycle_write().await.unwrap();
     owner.begin(&[RepositoryLifecycleKey::Database]).unwrap();
     owner.release_serialization();
     let observer: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Probe::default());
@@ -518,7 +524,7 @@ async fn installation_waits_for_preexisting_confirmed_writer() {
 
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db")).await.unwrap();
-    let mut owner = store.repository_lifecycle_write().await.unwrap();
+    let mut owner = store.sqlite().repository_lifecycle_write().await.unwrap();
     owner.begin(&[RepositoryLifecycleKey::Database]).unwrap();
     let observer: Arc<dyn RepositoryLifecycleObserver> = Arc::new(Probe::default());
     let mut install = Box::pin(store.install_repository_lifecycle_observer(observer.clone()));
@@ -620,7 +626,7 @@ async fn pre_barrier_scope_failure_and_lost_acp_cas_preserve_requests() {
 async fn confirmed_no_effect_ticket_allows_fresh_but_never_revives_old() {
     let f = Fixture::new().await;
     let old = f.probe.capture(vec![f.agent_key()]).unwrap();
-    let mut owner = f.store.repository_lifecycle_write().await.unwrap();
+    let mut owner = f.store.sqlite().repository_lifecycle_write().await.unwrap();
     owner.begin(&[f.agent_key()]).unwrap();
     // The actual original owner confirms this transaction's rollback.
     let mut tx = f.store.write_pool().begin().await.unwrap();
@@ -671,7 +677,7 @@ async fn file_identity_alias_joins_existing_domain_without_a_second_owner() {
     // This tests identity only: SQLite WAL sidecar compatibility through hard
     // links is not asserted, and no pool is opened on the alias.
     let same = domain_for(&alias).unwrap();
-    assert!(Arc::ptr_eq(&same, &f.store.repository_lifecycle));
+    assert!(Arc::ptr_eq(&same, &f.store.sqlite().repository_lifecycle));
 }
 
 #[tokio::test]
@@ -747,7 +753,7 @@ async fn unconfirmed_owner_survives_last_store_drop_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.db");
     let store = Store::open(&path).await.unwrap();
-    let mut owner = store.repository_lifecycle_write().await.unwrap();
+    let mut owner = store.sqlite().repository_lifecycle_write().await.unwrap();
     owner.begin(&[RepositoryLifecycleKey::Database]).unwrap();
     drop(owner);
     drop(store);
@@ -774,7 +780,7 @@ async fn installed_observer_survives_last_store_drop_and_reopen() {
         .install_repository_lifecycle_observer(observer.clone())
         .await
         .unwrap();
-    let mut owner = store.repository_lifecycle_write().await.unwrap();
+    let mut owner = store.sqlite().repository_lifecycle_write().await.unwrap();
     owner.begin(&[RepositoryLifecycleKey::Database]).unwrap();
     drop(owner);
     drop(store);
@@ -796,8 +802,8 @@ async fn confirmed_unobserved_domain_can_be_reclaimed_after_last_store() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.db");
     let store = Store::open(&path).await.unwrap();
-    let domain = Arc::downgrade(&store.repository_lifecycle);
-    let mut owner = store.repository_lifecycle_write().await.unwrap();
+    let domain = Arc::downgrade(&store.sqlite().repository_lifecycle);
+    let mut owner = store.sqlite().repository_lifecycle_write().await.unwrap();
     owner.begin(&[RepositoryLifecycleKey::Database]).unwrap();
     owner.settle();
     drop(store);

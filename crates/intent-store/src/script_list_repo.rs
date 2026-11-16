@@ -19,13 +19,33 @@ impl Store {
         monitor: bool,
         options: &ScriptListOptions,
     ) -> Result<Value> {
-        self.script_summary_page_inner(ws, owner, monitor, options, false)
-            .await
+        dispatch!(self, backend => backend.script_summary_page(ws, owner, monitor, options).await)
     }
 
     /// Select saved scripts before pagination for scoped guest operators.
     /// # Errors
     /// Rejects invalid cursors and storage failures.
+    pub async fn saved_script_summary_page(
+        &self,
+        ws: &WorkspaceId,
+        options: &ScriptListOptions,
+    ) -> Result<Value> {
+        dispatch!(self, backend => backend.saved_script_summary_page(ws, options).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn script_summary_page(
+        &self,
+        ws: &WorkspaceId,
+        owner: Option<&AgentId>,
+        monitor: bool,
+        options: &ScriptListOptions,
+    ) -> Result<Value> {
+        self.script_summary_page_inner(ws, owner, monitor, options, false)
+            .await
+    }
+
     pub async fn saved_script_summary_page(
         &self,
         ws: &WorkspaceId,

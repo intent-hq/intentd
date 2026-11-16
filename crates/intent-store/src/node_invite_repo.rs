@@ -84,6 +84,62 @@ impl Store {
     /// `InvalidParams` for an empty id or hash or a closed invite;
     /// `Internal` on database failure.
     pub async fn insert_node_invite(&self, invite: &NodeInvite, secret_hash: &str) -> Result<()> {
+        dispatch!(self, backend => backend.insert_node_invite(invite, secret_hash).await)
+    }
+
+    /// The open invites (unused, unrevoked, unexpired), oldest first.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn list_open_node_invites(&self) -> Result<Vec<NodeInvite>> {
+        dispatch!(self, backend => backend.list_open_node_invites().await)
+    }
+
+    /// The invite each claimed credential came from: `(credential id,
+    /// invite id)` pairs.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn claimed_node_invites(&self) -> Result<Vec<(String, String)>> {
+        dispatch!(self, backend => backend.claimed_node_invites().await)
+    }
+
+    /// Revoke an open invite. A used or already revoked invite is left as
+    /// it is.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn revoke_node_invite(&self, id: &str) -> Result<NodeInviteRevocation> {
+        dispatch!(self, backend => backend.revoke_node_invite(id).await)
+    }
+
+    /// Check invite `id` against `secret_hash`, then refuse with `late` if
+    /// set, and otherwise, only while the invite is still open, spend it for `credential` and insert that credential (keyed by
+    /// `token_hash`), all in one immediate transaction. `Ok(Err(_))` is a
+    /// refusal that changed nothing.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidParams` for an invalid credential; `Internal` on database
+    /// failure.
+    pub async fn claim_node_invite(
+        &self,
+        id: &str,
+        secret_hash: &str,
+        backend_id: &str,
+        credential: &ExecutorCredential,
+        token_hash: &str,
+        late: Option<&'static str>,
+    ) -> Result<std::result::Result<(), NodeInviteRefusal>> {
+        dispatch!(self, backend => backend.claim_node_invite(id, secret_hash, backend_id, credential, token_hash, late).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn insert_node_invite(&self, invite: &NodeInvite, secret_hash: &str) -> Result<()> {
         if invite.id.is_empty()
             || secret_hash.is_empty()
             || invite.used_at.is_some()
@@ -106,11 +162,6 @@ impl Store {
         Ok(())
     }
 
-    /// The open invites (unused, unrevoked, unexpired), oldest first.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn list_open_node_invites(&self) -> Result<Vec<NodeInvite>> {
         let sql = format!(
             "SELECT {INVITE_COLUMNS} FROM node_invite \
@@ -128,12 +179,6 @@ impl Store {
             .collect())
     }
 
-    /// The invite each claimed credential came from: `(credential id,
-    /// invite id)` pairs.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn claimed_node_invites(&self) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query(
             "SELECT credential_id, id FROM node_invite WHERE credential_id IS NOT NULL",
@@ -147,12 +192,6 @@ impl Store {
             .collect())
     }
 
-    /// Revoke an open invite. A used or already revoked invite is left as
-    /// it is.
-    ///
-    /// # Errors
-    ///
-    /// `Internal` on database failure.
     pub async fn revoke_node_invite(&self, id: &str) -> Result<NodeInviteRevocation> {
         let updated = sqlx::query(
             "UPDATE node_invite SET revoked_at = ? \
@@ -177,15 +216,6 @@ impl Store {
         })
     }
 
-    /// Check invite `id` against `secret_hash`, then refuse with `late` if
-    /// set, and otherwise, only while the invite is still open, spend it for `credential` and insert that credential (keyed by
-    /// `token_hash`), all in one immediate transaction. `Ok(Err(_))` is a
-    /// refusal that changed nothing.
-    ///
-    /// # Errors
-    ///
-    /// `InvalidParams` for an invalid credential; `Internal` on database
-    /// failure.
     pub async fn claim_node_invite(
         &self,
         id: &str,

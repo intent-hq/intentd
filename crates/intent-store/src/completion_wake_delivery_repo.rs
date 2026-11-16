@@ -26,6 +26,31 @@ impl Store {
         completion_identity: &str,
         delivered_at: &str,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.record_completion_wake_delivery(parent_agent_id, child_agent_id, completion_identity, delivered_at).await)
+    }
+
+    /// The delivered-completion identity recorded for the pair, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_completion_wake_delivery(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> Result<Option<String>> {
+        dispatch!(self, backend => backend.get_completion_wake_delivery(parent_agent_id, child_agent_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn record_completion_wake_delivery(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+        completion_identity: &str,
+        delivered_at: &str,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO completion_wake_delivery (
                 parent_agent_id, child_agent_id, completion_identity, delivered_at
@@ -44,11 +69,6 @@ impl Store {
         Ok(())
     }
 
-    /// The delivered-completion identity recorded for the pair, if any.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_completion_wake_delivery(
         &self,
         parent_agent_id: &AgentId,

@@ -197,7 +197,7 @@ async fn claim_rehome_to_another_host_clears_displayed() {
     let mut shown = input(&f.ws, "tab-1", "https://a.test/");
     shown.displayed = Some(true);
     f.store.upsert_browser_tab(&f.host_a, shown).await.unwrap();
-    assert_eq!(f.store.browser_tab_displayed.len(), 1);
+    assert_eq!(f.store.sqlite().browser_tab_displayed.len(), 1);
 
     let agent = AgentId("agent-1".to_string());
     let (moved, changes) = f
@@ -223,7 +223,7 @@ async fn claim_rehome_to_another_host_clears_displayed() {
         "the new host has not reported the fact"
     );
     assert_eq!(
-        f.store.browser_tab_displayed.len(),
+        f.store.sqlite().browser_tab_displayed.len(),
         0,
         "no stale overlay entry"
     );
@@ -242,7 +242,7 @@ async fn claim_rehome_to_another_host_clears_displayed() {
         .expect("owner changed");
     assert_eq!(changes, json!({ "ownerAgentId": "agent-2" }));
     assert_eq!(kept.displayed, Some(false));
-    assert_eq!(f.store.browser_tab_displayed.len(), 1);
+    assert_eq!(f.store.sqlite().browser_tab_displayed.len(), 1);
 
     // A re-home of a tab whose fact was never reported mentions no
     // `displayed` at all.
@@ -276,7 +276,7 @@ async fn pin_switch_clears_displayed_on_moved_tabs() {
         tab.displayed = displayed;
         f.store.upsert_browser_tab(&f.host_a, tab).await.unwrap();
     }
-    assert_eq!(f.store.browser_tab_displayed.len(), 2);
+    assert_eq!(f.store.sqlite().browser_tab_displayed.len(), 2);
 
     let moved = f
         .store
@@ -296,7 +296,7 @@ async fn pin_switch_clears_displayed_on_moved_tabs() {
     assert_eq!(displayed_of("mine-1"), None);
     assert_eq!(displayed_of("mine-2"), None);
     assert_eq!(displayed_of("user-tab"), Some(true), "not moved, fact kept");
-    assert_eq!(f.store.browser_tab_displayed.len(), 1);
+    assert_eq!(f.store.sqlite().browser_tab_displayed.len(), 1);
 }
 
 #[tokio::test]
@@ -539,6 +539,7 @@ async fn sync_reconciles_host_snapshot() {
     assert!(f.store.get_browser_tab("tab-gone").await.unwrap().is_none());
     assert!(
         f.store
+            .sqlite()
             .get_stored_tab("tab-daemon-closed")
             .await
             .unwrap()
@@ -570,6 +571,7 @@ async fn sync_reconciles_host_snapshot() {
     assert!(again.opened.is_empty() && again.updated.is_empty() && again.closed.is_empty());
     assert!(
         f.store
+            .sqlite()
             .get_stored_tab("tab-daemon-closed")
             .await
             .unwrap()
@@ -610,7 +612,13 @@ async fn repeated_stale_snapshot_keeps_answering_drop() {
         .await
         .unwrap()
         .is_none());
-    assert!(f.store.get_stored_tab("tab-1").await.unwrap().is_none());
+    assert!(f
+        .store
+        .sqlite()
+        .get_stored_tab("tab-1")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -641,7 +649,13 @@ async fn upsert_never_revives_or_steals_a_tombstone() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
-    let stored = f.store.get_stored_tab("tab-1").await.unwrap().unwrap();
+    let stored = f
+        .store
+        .sqlite()
+        .get_stored_tab("tab-1")
+        .await
+        .unwrap()
+        .unwrap();
     assert!(stored.closed);
     assert_eq!(stored.tab.host_client_id, f.host_a);
     assert_eq!(stored.tab.url, "https://a.test/");
@@ -813,17 +827,21 @@ async fn workspace_delete_evicts_displayed_overlay() {
         f.store.upsert_browser_tab(&f.host_a, tab).await.unwrap();
     }
     f.store.close_browser_tab("tombstoned").await.unwrap();
-    assert_eq!(f.store.browser_tab_displayed.len(), 3);
+    assert_eq!(f.store.sqlite().browser_tab_displayed.len(), 3);
 
     let missing = WorkspaceId("ws-missing".to_string());
     assert!(matches!(
         f.store.delete_workspace(&missing).await,
         Err(Error::NotFound(_))
     ));
-    assert_eq!(f.store.browser_tab_displayed.len(), 3, "nothing evicted");
+    assert_eq!(
+        f.store.sqlite().browser_tab_displayed.len(),
+        3,
+        "nothing evicted"
+    );
 
     f.store.delete_workspace(&f.ws).await.unwrap();
-    assert_eq!(f.store.browser_tab_displayed.len(), 1);
+    assert_eq!(f.store.sqlite().browser_tab_displayed.len(), 1);
     assert!(f.store.get_browser_tab("gone-1").await.unwrap().is_none());
     assert_eq!(
         f.store
@@ -915,6 +933,7 @@ async fn reassign_browser_tabs_from_hosts_moves_only_open_rows_of_old_hosts() {
     assert_eq!(host_of("other-host").as_deref(), Some("client-b"));
     let tomb = f
         .store
+        .sqlite()
         .get_stored_tab("stranded-closed")
         .await
         .unwrap()

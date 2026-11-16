@@ -48,6 +48,22 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_diff(&self, d: &NewDiff) -> Result<()> {
+        dispatch!(self, backend => backend.upsert_diff(d).await)
+    }
+
+    /// List a workspace's stored diffs, oldest first. Internal read used by the
+    /// pipeline + tests (UI-facing diffs surface via file-tracking reads, M4.8).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_diffs(&self, workspace_id: &WorkspaceId) -> Result<Vec<DiffRow>> {
+        dispatch!(self, backend => backend.list_diffs(workspace_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn upsert_diff(&self, d: &NewDiff) -> Result<()> {
         let id = Uuid::now_v7().to_string();
         let now = now_iso();
         let sql = format!(
@@ -72,12 +88,6 @@ impl Store {
         Ok(())
     }
 
-    /// List a workspace's stored diffs, oldest first. Internal read used by the
-    /// pipeline + tests (UI-facing diffs surface via file-tracking reads, M4.8).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_diffs(&self, workspace_id: &WorkspaceId) -> Result<Vec<DiffRow>> {
         let sql =
             format!("SELECT {DIFF_COLUMNS} FROM diffs WHERE workspace_id = ? ORDER BY created_at");

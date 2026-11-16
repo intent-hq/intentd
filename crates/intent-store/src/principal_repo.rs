@@ -277,6 +277,646 @@ impl Store {
     /// Returns `Error::NotFound` when no such principal exists and
     /// `Error::Internal` if the database operation fails.
     pub async fn get_principal(&self, id: &PrincipalId) -> Result<Principal> {
+        dispatch!(self, backend => backend.get_principal(id).await)
+    }
+
+    /// Fetch the principals in `ids` that exist, in one `IN (...)` statement
+    /// per chunk of `IDS_PER_STATEMENT` (below the `SQLite` bound-variable
+    /// limit). Unknown ids are simply absent from the result; order is
+    /// unspecified.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_principals(&self, ids: &[PrincipalId]) -> Result<Vec<Principal>> {
+        dispatch!(self, backend => backend.get_principals(ids).await)
+    }
+
+    /// Cached device profiles and effective roles from the same `SQLite` snapshot,
+    /// batched by returned principals rather than scanning the host directory.
+    ///
+    /// # Errors
+    /// Returns an internal error if the database read fails.
+    pub async fn get_device_principals(
+        &self,
+        ids: &[PrincipalId],
+        viewer: Option<&PrincipalId>,
+    ) -> Result<Vec<(Principal, intent_core::HostRole)>> {
+        dispatch!(self, backend => backend.get_device_principals(ids, viewer).await)
+    }
+
+    /// The daemon's primary principal (the original single user, minted by
+    /// migration `0125_principals`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the row is missing (a broken database —
+    /// the migration guarantees exactly one) or the database operation fails.
+    pub async fn get_primary_principal(&self) -> Result<Principal> {
+        dispatch!(self, backend => backend.get_primary_principal().await)
+    }
+
+    /// Look up a principal by its identity triple; `None` when no principal
+    /// has linked that account on that provider / host.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn find_principal_by_identity(
+        &self,
+        identity: &PrincipalIdentity,
+    ) -> Result<Option<Principal>> {
+        dispatch!(self, backend => backend.find_principal_by_identity(identity).await)
+    }
+
+    /// Look up a principal by linked github.com account id — the
+    /// [`PrincipalIdentity::github`] case of
+    /// [`Self::find_principal_by_identity`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn find_principal_by_github_user_id(
+        &self,
+        github_user_id: i64,
+    ) -> Result<Option<Principal>> {
+        dispatch!(self, backend => backend.find_principal_by_github_user_id(github_user_id).await)
+    }
+
+    /// List every principal, primary first then by `created_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_principals(&self) -> Result<Vec<Principal>> {
+        dispatch!(self, backend => backend.list_principals().await)
+    }
+
+    /// The credentialed guests (`principal.list`): every non-primary
+    /// principal holding at least one active (`revoked_at IS NULL`)
+    /// credential, by `created_at`. A guest whose credentials were all
+    /// revoked (`principal.revokeSelf`) is omitted — it cannot connect.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_credentialed_guest_principals(&self) -> Result<Vec<Principal>> {
+        dispatch!(self, backend => backend.list_credentialed_guest_principals().await)
+    }
+
+    /// The safe sharing directory, excluding the primary and revoked people.
+    /// Role and profile are selected together without credential material.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn list_sharing_principals(&self) -> Result<Vec<(Principal, intent_core::HostRole)>> {
+        dispatch!(self, backend => backend.list_sharing_principals().await)
+    }
+
+    /// Insert or update a principal by id. On conflict the identity (triple
+    /// and github projection, see [`principal_identity_columns`]) and cached
+    /// profile fields are overwritten and `updated_at` bumped; `is_primary`
+    /// and `created_at` are never changed by an upsert (the primary flag is
+    /// owned by the migration).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails (including
+    /// an identity already linked to another principal).
+    pub async fn upsert_principal(&self, p: &Principal) -> Result<()> {
+        dispatch!(self, backend => backend.upsert_principal(p).await)
+    }
+
+    /// The workspace's `owner_principal_id` column; `None` only for a
+    /// workspace that does not exist (the insert trigger always fills it).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_workspace_owner_principal_id(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<PrincipalId>> {
+        dispatch!(self, backend => backend.get_workspace_owner_principal_id(workspace_id).await)
+    }
+
+    /// The principals an unstamped (pre-multiplayer) user message in
+    /// `workspace_id` resolves to at serve time, in fallback order:
+    /// `legacy_author_principal_id`, then `owner_principal_id`. `None` when
+    /// the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_workspace_author_fallback(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<WorkspaceAuthorFallback>> {
+        dispatch!(self, backend => backend.get_workspace_author_fallback(workspace_id).await)
+    }
+
+    /// Set (or clear) the workspace's `legacy_author_principal_id` — the
+    /// principal its unstamped user messages are credited to.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` when the workspace does not exist and
+    /// `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_legacy_author_principal_id(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: Option<&PrincipalId>,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.set_workspace_legacy_author_principal_id(workspace_id, principal_id).await)
+    }
+
+    /// Membership summaries for `workspace.get` / `workspace.list`
+    /// (multiplayer w1): owner, member count and `viewer`'s role, computed
+    /// in one scalar projection scoped to exactly `workspace_ids` (the rows the
+    /// caller is about to return — never the whole table, so archived or
+    /// filtered-out workspaces cost nothing), keyed by workspace id. An empty
+    /// `workspace_ids` short-circuits without touching the database.
+    /// `viewer = None` yields no `my_role`. `open_invite_count` is `0` until
+    /// invitations exist (a reusable invite counts as open while unexpired
+    /// and unrevoked, however often it was redeemed). A separate indexed
+    /// deadline probe reconciles due reservations before that same snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn workspace_membership_summaries(
+        &self,
+        viewer: Option<&PrincipalId>,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashMap<WorkspaceId, WorkspaceMembership>> {
+        dispatch!(self, backend => backend.workspace_membership_summaries(viewer, workspace_ids).await)
+    }
+
+    /// List a workspace's members, owners first then by `added_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspace_members(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<WorkspaceMember>> {
+        dispatch!(self, backend => backend.list_workspace_members(workspace_id).await)
+    }
+
+    /// Effective members of an existing workspace, owner first. The union
+    /// deduplicates by principal, never by a forge handle or numeric account ID.
+    /// Chief retains only its direct membership. Explicit roster reads load
+    /// profiles in this one query, not all host principals or per-person reads.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn list_effective_workspace_members(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<EffectiveWorkspaceMember>> {
+        dispatch!(self, backend => backend.list_effective_workspace_members(workspace_id).await)
+    }
+
+    /// IDs for presence fan-out. Members inherit ordinary workspaces; direct
+    /// guest grants remain scoped. This runs on presence changes, never lists.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn effective_principal_workspace_ids(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Vec<WorkspaceId>> {
+        dispatch!(self, backend => backend.effective_principal_workspace_ids(principal).await)
+    }
+
+    /// List every workspace id a principal is a member of, with the role.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_principal_memberships(
+        &self,
+        principal_id: &PrincipalId,
+    ) -> Result<Vec<WorkspaceMember>> {
+        dispatch!(self, backend => backend.list_principal_memberships(principal_id).await)
+    }
+
+    /// Whether a principal retains any workspace grant, without loading the roster.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn has_workspace_membership(&self, principal_id: &PrincipalId) -> Result<bool> {
+        dispatch!(self, backend => backend.has_workspace_membership(principal_id).await)
+    }
+
+    /// A principal's role in a workspace; `None` when not a member.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_workspace_member_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+    ) -> Result<Option<WorkspaceRole>> {
+        dispatch!(self, backend => backend.get_workspace_member_role(workspace_id, principal_id).await)
+    }
+
+    /// Add a principal to a workspace with `role`. Idempotent: an existing
+    /// membership is left untouched (use
+    /// [`Store::set_workspace_member_role`] to change its role). Returns
+    /// whether a row was inserted. `workspace.owner_principal_id` is
+    /// re-derived from the owner membership in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` when `role` is `Owner` and the workspace
+    /// already has one (exactly one owner per workspace, migration `0126`)
+    /// and `Error::Internal` if the database operation fails (including an
+    /// unknown workspace or principal, rejected by the FKs).
+    pub async fn add_workspace_member(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        role: WorkspaceRole,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.add_workspace_member(workspace_id, principal_id, role).await)
+    }
+
+    /// Seat a `collaborator` only while the workspace's committed guest
+    /// seats (collaborators plus open invites, the count
+    /// [`Store::count_workspace_guests`] reports and an invite mint spends)
+    /// stay under `max_guests` and the principal holds an active
+    /// credential: the membership check, the credential check, the count
+    /// and the insert run in one `BEGIN IMMEDIATE` transaction, so two
+    /// concurrent adds — or an add racing an invite join, whose cap check
+    /// is inside its own write transaction — cannot both take the last
+    /// seat, and a `revoke_all_principal_credentials` that committed
+    /// before the transaction began is always observed (no seat for a
+    /// principal that can no longer authenticate). Active host members are
+    /// already effective members and bypass guest admission. For guests the
+    /// credential predicate is evaluated first, so a seated principal whose credentials are all
+    /// revoked is `NoActiveCredential`, not `AlreadyMember`; an already
+    /// seated credentialed principal takes no new seat and is reported
+    /// without a write. An archived workspace is `WorkspaceArchived` (read
+    /// under the same lock, so an archive whose sweep committed first is
+    /// never followed by a fresh seat).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails (including
+    /// an unknown workspace or principal, rejected by the FKs).
+    pub async fn add_workspace_collaborator_within_cap(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        max_guests: u32,
+    ) -> Result<CollaboratorAddOutcome> {
+        dispatch!(self, backend => backend.add_workspace_collaborator_within_cap(workspace_id, principal_id, max_guests).await)
+    }
+
+    /// Change an existing member's role. `workspace.owner_principal_id` is
+    /// re-derived from the owner membership in the same transaction, so
+    /// demoting the owner clears it and promoting a member sets it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` when the principal is not a member of the
+    /// workspace, `Error::InvalidInput` when promoting to `Owner` while the
+    /// workspace already has one, and `Error::Internal` if the database
+    /// operation fails.
+    pub async fn set_workspace_member_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        role: WorkspaceRole,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.set_workspace_member_role(workspace_id, principal_id, role).await)
+    }
+
+    /// Change only a direct guest role, preserving ownership and inherited host
+    /// authority. Check the actor and target under the same write transaction.
+    ///
+    /// # Errors
+    /// Returns `Forbidden` for a non-owner actor, `InvalidParams` for immutable
+    /// roles or inherited membership, and `NotFound` for an absent member.
+    pub async fn set_workspace_guest_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        role: WorkspaceRole,
+        actor: Option<&PrincipalId>,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.set_workspace_guest_role(workspace_id, principal_id, role, actor).await)
+    }
+
+    /// Remove a principal from a workspace. Returns whether a row was
+    /// removed; removing a non-member is not an error. Removing the owner
+    /// clears `workspace.owner_principal_id` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn remove_workspace_member(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.remove_workspace_member(workspace_id, principal_id).await)
+    }
+
+    /// Remove a direct guest grant, refusing inherited access under the same
+    /// write lock as deletion. An upgrade racing removal cannot lose its
+    /// retained collaborator row. Host-wide revocation uses its own transaction.
+    ///
+    /// # Errors
+    /// Returns `HostMembershipRequired` for active members, `InvalidParams`
+    /// for an owner, and `Internal` on database failure.
+    pub async fn remove_workspace_guest(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.remove_workspace_guest(workspace_id, principal_id).await)
+    }
+
+    /// Record a bearer credential for a principal, keyed by `token_hash`
+    /// (hex SHA-256 of the token — never the token itself).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails (including
+    /// a duplicate hash).
+    pub async fn insert_principal_credential(
+        &self,
+        principal_id: &PrincipalId,
+        token_hash: &str,
+    ) -> Result<PrincipalCredential> {
+        dispatch!(self, backend => backend.insert_principal_credential(principal_id, token_hash).await)
+    }
+
+    /// Look up a credential by token hash, revoked or not (`None` when the
+    /// hash is unknown). Callers gate on
+    /// [`PrincipalCredential::is_active`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn lookup_principal_credential(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PrincipalCredential>> {
+        dispatch!(self, backend => backend.lookup_principal_credential(token_hash).await)
+    }
+
+    /// List a principal's credentials, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_principal_credentials(
+        &self,
+        principal_id: &PrincipalId,
+    ) -> Result<Vec<PrincipalCredential>> {
+        dispatch!(self, backend => backend.list_principal_credentials(principal_id).await)
+    }
+
+    /// Bump `last_used_at` on an active credential. Returns whether a row was
+    /// touched (`false` for an unknown or revoked hash).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn touch_principal_credential(&self, token_hash: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.touch_principal_credential(token_hash).await)
+    }
+
+    /// Resolve an **active** credential to its principal and bump
+    /// `last_used_at` in one statement. `None` for an unknown or revoked
+    /// hash. The single `UPDATE … WHERE revoked_at IS NULL RETURNING` closes
+    /// the lookup-then-touch window in which a concurrent revoke would
+    /// otherwise still admit the credential (intent-hq/intentd#1868).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn resolve_active_principal_credential(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PrincipalId>> {
+        dispatch!(self, backend => backend.resolve_active_principal_credential(token_hash).await)
+    }
+
+    /// Revoke a credential by token hash. Idempotent: returns whether the
+    /// row flipped from active to revoked (`false` for an unknown or
+    /// already-revoked hash).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn revoke_principal_credential(&self, token_hash: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.revoke_principal_credential(token_hash).await)
+    }
+
+    /// Revoke every active credential of a principal. Returns how many rows
+    /// flipped from active to revoked.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn revoke_all_principal_credentials(
+        &self,
+        principal_id: &PrincipalId,
+    ) -> Result<u64> {
+        dispatch!(self, backend => backend.revoke_all_principal_credentials(principal_id).await)
+    }
+
+    /// Number of `principal` rows (primary included). Used by the primary
+    /// identity reconnect guard (multiplayer w4).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_principals(&self) -> Result<u64> {
+        dispatch!(self, backend => backend.count_principals().await)
+    }
+
+    /// Number of open invites (see [`INVITE_OPEN`]) across every workspace
+    /// (multiplayer w4).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_open_workspace_invites(&self) -> Result<u64> {
+        dispatch!(self, backend => backend.count_open_workspace_invites().await)
+    }
+
+    /// The guest-cap usage of one workspace: direct non-host collaborators
+    /// and open invites, from maintained scalars after indexed expiry reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_workspace_guests(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceGuestCount> {
+        dispatch!(self, backend => backend.count_workspace_guests(workspace_id).await)
+    }
+
+    /// Persist a freshly minted invite (multiplayer w4). `secret_hash` is the
+    /// hex SHA-256 of the link secret — the service layer hashes; the
+    /// plaintext `secret` is kept alongside so the link can be rebuilt on
+    /// `workspace.invite.list`. The insert runs in a `BEGIN IMMEDIATE`
+    /// transaction behind an archived check on the same connection: an
+    /// archived workspace is `WorkspaceArchived` and nothing is written, so
+    /// no open invite can be minted after an archive's sweep committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_workspace_invite(
+        &self,
+        invite: &WorkspaceInvite,
+    ) -> Result<InviteInsertOutcome> {
+        dispatch!(self, backend => backend.insert_workspace_invite(invite).await)
+    }
+
+    /// Mint a workspace invitation only if a guest seat remains. The limit,
+    /// expiry reconciliation, issuer and archive checks share the insert's
+    /// write transaction with direct guest admissions and invite joins.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_workspace_invite_within_cap(
+        &self,
+        invite: &WorkspaceInvite,
+        max_guests: u32,
+    ) -> Result<InviteInsertOutcome> {
+        dispatch!(self, backend => backend.insert_workspace_invite_within_cap(invite, max_guests).await)
+    }
+
+    /// Fetch an invite by id, open or closed (`None` when unknown).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_workspace_invite(&self, id: &str) -> Result<Option<WorkspaceInvite>> {
+        dispatch!(self, backend => backend.get_workspace_invite(id).await)
+    }
+
+    /// List a workspace's open invites (see [`INVITE_OPEN`]), oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_open_workspace_invites(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<WorkspaceInvite>> {
+        dispatch!(self, backend => backend.list_open_workspace_invites(workspace_id).await)
+    }
+
+    /// Revoke an invite. Idempotent: returns whether the row flipped from
+    /// open to revoked (`false` when unknown, expired, already revoked, or
+    /// — for a pinned invite — redeemed; a closed invite keeps its terminal
+    /// state).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn revoke_workspace_invite(&self, id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.revoke_workspace_invite(id).await)
+    }
+
+    /// `workspace.archive`'s durable write: flip the row to Archived
+    /// (scoped `status`/`archived`/`archived_at`/`updated_at` write), delete
+    /// every direct guest membership, revoke every open invite and count the
+    /// surviving members — in ONE `BEGIN IMMEDIATE` transaction, so the
+    /// archive and the access revocation commit together or not at all.
+    /// Under IMMEDIATE an `invite.accept` / capped member add (both write
+    /// transactions of their own) serializes entirely before or entirely
+    /// after this sweep: a join that committed first is swept here, one that
+    /// commits later finds its invite closed. A failed statement rolls the
+    /// whole transaction back and the workspace stays active.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist;
+    /// `Error::Internal` if the database operation fails.
+    pub async fn archive_workspace_detaching_guests(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+    ) -> Result<ArchivedGuestSweep> {
+        dispatch!(self, backend => backend.archive_workspace_detaching_guests(id, archived_at).await)
+    }
+
+    /// The automatic-sweep variant of [`Self::archive_workspace_detaching_guests`]:
+    /// reads `auto_archive_disabled` inside the same `BEGIN IMMEDIATE`
+    /// transaction as the flip and returns `Ok(None)` (nothing written) when
+    /// the workspace opted out, so an opt-out committed after the sweep's
+    /// last read can never be overtaken by the archive.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::archive_workspace_detaching_guests`].
+    pub async fn archive_workspace_detaching_guests_unless_auto_archive_disabled(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+    ) -> Result<Option<ArchivedGuestSweep>> {
+        dispatch!(self, backend => backend.archive_workspace_detaching_guests_unless_auto_archive_disabled(id, archived_at).await)
+    }
+
+    /// Record a redemption of an **open** invite by `principal_id`: stamps
+    /// the last redemption and counts one more membership. The conditional
+    /// `UPDATE` returns `false` when the invite was revoked or expired
+    /// meanwhile — or, for a pinned invite, already redeemed, which is what
+    /// keeps a single-use link from being redeemed twice concurrently. A
+    /// reusable (unpinned) invite stays open afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn redeem_workspace_invite(
+        &self,
+        id: &str,
+        principal_id: &PrincipalId,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.redeem_workspace_invite(id, principal_id).await)
+    }
+
+    /// Admit a verified identity through one open workspace invitation transaction.
+    /// Resolve the full identity triple before inserting: an existing person keeps
+    /// its principal ID. Redeem the link, apply the profile and grant access together;
+    /// every refusal writes nothing and any failure rolls all changes back.
+    ///
+    /// Existing credentials are rechecked and reused; proofs mint a credential only
+    /// if the challenge's authorization generation still permits the person.
+    /// Effective host members never spend a guest seat or gain a direct grant.
+    /// Pinned invitations remain single-use, including an existing member's join.
+    /// Rejoining a reusable invitation does not increase its redemption count.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` on storage failure or a missing identity key, and
+    /// `Error::InvalidInput` for an empty credential hash or a one-owner violation.
+    pub async fn join_workspace_by_invite(
+        &self,
+        invite_id: &str,
+        workspace_id: &WorkspaceId,
+        identity: &Principal,
+        credential: HostJoinCredential<'_>,
+        max_guests: u32,
+    ) -> Result<InviteJoinOutcome> {
+        dispatch!(self, backend => backend.join_workspace_by_invite(invite_id, workspace_id, identity, credential, max_guests).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn get_principal(&self, id: &PrincipalId) -> Result<Principal> {
         let sql = format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
@@ -288,14 +928,6 @@ impl Store {
             .ok_or_else(|| Error::NotFound(format!("principal {id}")))
     }
 
-    /// Fetch the principals in `ids` that exist, in one `IN (...)` statement
-    /// per chunk of `IDS_PER_STATEMENT` (below the `SQLite` bound-variable
-    /// limit). Unknown ids are simply absent from the result; order is
-    /// unspecified.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_principals(&self, ids: &[PrincipalId]) -> Result<Vec<Principal>> {
         const IDS_PER_STATEMENT: usize = 32_000;
         let mut out = Vec::with_capacity(ids.len());
@@ -316,11 +948,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Cached device profiles and effective roles from the same `SQLite` snapshot,
-    /// batched by returned principals rather than scanning the host directory.
-    ///
-    /// # Errors
-    /// Returns an internal error if the database read fails.
     pub async fn get_device_principals(
         &self,
         ids: &[PrincipalId],
@@ -359,13 +986,6 @@ impl Store {
         Ok(out)
     }
 
-    /// The daemon's primary principal (the original single user, minted by
-    /// migration `0125_principals`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the row is missing (a broken database —
-    /// the migration guarantees exactly one) or the database operation fails.
     pub async fn get_primary_principal(&self) -> Result<Principal> {
         let sql = format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE is_primary = 1");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -377,12 +997,6 @@ impl Store {
             .ok_or_else(|| Error::Internal("primary principal missing".to_string()))
     }
 
-    /// Look up a principal by its identity triple; `None` when no principal
-    /// has linked that account on that provider / host.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn find_principal_by_identity(
         &self,
         identity: &PrincipalIdentity,
@@ -396,13 +1010,6 @@ impl Store {
         Ok(row.as_ref().map(map_principal_row))
     }
 
-    /// Look up a principal by linked github.com account id — the
-    /// [`PrincipalIdentity::github`] case of
-    /// [`Self::find_principal_by_identity`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn find_principal_by_github_user_id(
         &self,
         github_user_id: i64,
@@ -411,11 +1018,6 @@ impl Store {
             .await
     }
 
-    /// List every principal, primary first then by `created_at`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_principals(&self) -> Result<Vec<Principal>> {
         let sql = format!(
             "SELECT {PRINCIPAL_COLUMNS} FROM principal ORDER BY is_primary DESC, created_at, id"
@@ -427,14 +1029,6 @@ impl Store {
         Ok(rows.iter().map(map_principal_row).collect())
     }
 
-    /// The credentialed guests (`principal.list`): every non-primary
-    /// principal holding at least one active (`revoked_at IS NULL`)
-    /// credential, by `created_at`. A guest whose credentials were all
-    /// revoked (`principal.revokeSelf`) is omitted — it cannot connect.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_credentialed_guest_principals(&self) -> Result<Vec<Principal>> {
         let sql = format!(
             "SELECT {PRINCIPAL_COLUMNS} FROM principal p \
@@ -450,11 +1044,6 @@ impl Store {
         Ok(rows.iter().map(map_principal_row).collect())
     }
 
-    /// The safe sharing directory, excluding the primary and revoked people.
-    /// Role and profile are selected together without credential material.
-    ///
-    /// # Errors
-    /// Returns `Internal` on database failure.
     pub async fn list_sharing_principals(&self) -> Result<Vec<(Principal, intent_core::HostRole)>> {
         let rows = sqlx::query(
             "SELECT p.*, h.principal_id IS NOT NULL AS is_host_member \
@@ -481,16 +1070,6 @@ impl Store {
             .collect())
     }
 
-    /// Insert or update a principal by id. On conflict the identity (triple
-    /// and github projection, see [`principal_identity_columns`]) and cached
-    /// profile fields are overwritten and `updated_at` bumped; `is_primary`
-    /// and `created_at` are never changed by an upsert (the primary flag is
-    /// owned by the migration).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails (including
-    /// an identity already linked to another principal).
     pub async fn upsert_principal(&self, p: &Principal) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut conn = self
@@ -514,12 +1093,6 @@ impl Store {
         Ok(())
     }
 
-    /// The workspace's `owner_principal_id` column; `None` only for a
-    /// workspace that does not exist (the insert trigger always fills it).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_owner_principal_id(
         &self,
         workspace_id: &WorkspaceId,
@@ -534,14 +1107,6 @@ impl Store {
             .map(PrincipalId))
     }
 
-    /// The principals an unstamped (pre-multiplayer) user message in
-    /// `workspace_id` resolves to at serve time, in fallback order:
-    /// `legacy_author_principal_id`, then `owner_principal_id`. `None` when
-    /// the workspace does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_author_fallback(
         &self,
         workspace_id: &WorkspaceId,
@@ -563,13 +1128,6 @@ impl Store {
         }))
     }
 
-    /// Set (or clear) the workspace's `legacy_author_principal_id` — the
-    /// principal its unstamped user messages are credited to.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` when the workspace does not exist and
-    /// `Error::Internal` if the database operation fails.
     pub async fn set_workspace_legacy_author_principal_id(
         &self,
         workspace_id: &WorkspaceId,
@@ -588,20 +1146,6 @@ impl Store {
         Ok(())
     }
 
-    /// Membership summaries for `workspace.get` / `workspace.list`
-    /// (multiplayer w1): owner, member count and `viewer`'s role, computed
-    /// in one scalar projection scoped to exactly `workspace_ids` (the rows the
-    /// caller is about to return — never the whole table, so archived or
-    /// filtered-out workspaces cost nothing), keyed by workspace id. An empty
-    /// `workspace_ids` short-circuits without touching the database.
-    /// `viewer = None` yields no `my_role`. `open_invite_count` is `0` until
-    /// invitations exist (a reusable invite counts as open while unexpired
-    /// and unrevoked, however often it was redeemed). A separate indexed
-    /// deadline probe reconciles due reservations before that same snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn workspace_membership_summaries(
         &self,
         viewer: Option<&PrincipalId>,
@@ -664,11 +1208,6 @@ impl Store {
             .collect()
     }
 
-    /// List a workspace's members, owners first then by `added_at`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_members(
         &self,
         workspace_id: &WorkspaceId,
@@ -685,13 +1224,6 @@ impl Store {
         rows.iter().map(map_member_row).collect()
     }
 
-    /// Effective members of an existing workspace, owner first. The union
-    /// deduplicates by principal, never by a forge handle or numeric account ID.
-    /// Chief retains only its direct membership. Explicit roster reads load
-    /// profiles in this one query, not all host principals or per-person reads.
-    ///
-    /// # Errors
-    /// Returns `Internal` on database failure.
     pub async fn list_effective_workspace_members(
         &self,
         workspace_id: &WorkspaceId,
@@ -741,11 +1273,6 @@ impl Store {
             .collect()
     }
 
-    /// IDs for presence fan-out. Members inherit ordinary workspaces; direct
-    /// guest grants remain scoped. This runs on presence changes, never lists.
-    ///
-    /// # Errors
-    /// Returns `Internal` on database failure.
     pub async fn effective_principal_workspace_ids(
         &self,
         principal: &PrincipalId,
@@ -765,11 +1292,6 @@ impl Store {
         .map_err(|e| Error::Internal(format!("effective presence workspaces failed: {e}")))
     }
 
-    /// List every workspace id a principal is a member of, with the role.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_principal_memberships(
         &self,
         principal_id: &PrincipalId,
@@ -786,10 +1308,6 @@ impl Store {
         rows.iter().map(map_member_row).collect()
     }
 
-    /// Whether a principal retains any workspace grant, without loading the roster.
-    ///
-    /// # Errors
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn has_workspace_membership(&self, principal_id: &PrincipalId) -> Result<bool> {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_member WHERE principal_id = ?)")
             .bind(&principal_id.0)
@@ -798,11 +1316,6 @@ impl Store {
             .map_err(|e| Error::Internal(format!("check principal membership failed: {e}")))
     }
 
-    /// A principal's role in a workspace; `None` when not a member.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_member_role(
         &self,
         workspace_id: &WorkspaceId,
@@ -820,18 +1333,6 @@ impl Store {
             .transpose()
     }
 
-    /// Add a principal to a workspace with `role`. Idempotent: an existing
-    /// membership is left untouched (use
-    /// [`Store::set_workspace_member_role`] to change its role). Returns
-    /// whether a row was inserted. `workspace.owner_principal_id` is
-    /// re-derived from the owner membership in the same transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::InvalidInput` when `role` is `Owner` and the workspace
-    /// already has one (exactly one owner per workspace, migration `0126`)
-    /// and `Error::Internal` if the database operation fails (including an
-    /// unknown workspace or principal, rejected by the FKs).
     pub async fn add_workspace_member(
         &self,
         workspace_id: &WorkspaceId,
@@ -876,29 +1377,6 @@ impl Store {
         .await
     }
 
-    /// Seat a `collaborator` only while the workspace's committed guest
-    /// seats (collaborators plus open invites, the count
-    /// [`Store::count_workspace_guests`] reports and an invite mint spends)
-    /// stay under `max_guests` and the principal holds an active
-    /// credential: the membership check, the credential check, the count
-    /// and the insert run in one `BEGIN IMMEDIATE` transaction, so two
-    /// concurrent adds — or an add racing an invite join, whose cap check
-    /// is inside its own write transaction — cannot both take the last
-    /// seat, and a `revoke_all_principal_credentials` that committed
-    /// before the transaction began is always observed (no seat for a
-    /// principal that can no longer authenticate). Active host members are
-    /// already effective members and bypass guest admission. For guests the
-    /// credential predicate is evaluated first, so a seated principal whose credentials are all
-    /// revoked is `NoActiveCredential`, not `AlreadyMember`; an already
-    /// seated credentialed principal takes no new seat and is reported
-    /// without a write. An archived workspace is `WorkspaceArchived` (read
-    /// under the same lock, so an archive whose sweep committed first is
-    /// never followed by a fresh seat).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails (including
-    /// an unknown workspace or principal, rejected by the FKs).
     pub async fn add_workspace_collaborator_within_cap(
         &self,
         workspace_id: &WorkspaceId,
@@ -980,16 +1458,6 @@ impl Store {
         lifecycle.finish(result).await
     }
 
-    /// Change an existing member's role. `workspace.owner_principal_id` is
-    /// re-derived from the owner membership in the same transaction, so
-    /// demoting the owner clears it and promoting a member sets it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` when the principal is not a member of the
-    /// workspace, `Error::InvalidInput` when promoting to `Owner` while the
-    /// workspace already has one, and `Error::Internal` if the database
-    /// operation fails.
     pub async fn set_workspace_member_role(
         &self,
         workspace_id: &WorkspaceId,
@@ -1033,12 +1501,6 @@ impl Store {
         .await
     }
 
-    /// Change only a direct guest role, preserving ownership and inherited host
-    /// authority. Check the actor and target under the same write transaction.
-    ///
-    /// # Errors
-    /// Returns `Forbidden` for a non-owner actor, `InvalidParams` for immutable
-    /// roles or inherited membership, and `NotFound` for an absent member.
     pub async fn set_workspace_guest_role(
         &self,
         workspace_id: &WorkspaceId,
@@ -1099,13 +1561,6 @@ impl Store {
         Ok(changed)
     }
 
-    /// Remove a principal from a workspace. Returns whether a row was
-    /// removed; removing a non-member is not an error. Removing the owner
-    /// clears `workspace.owner_principal_id` in the same transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn remove_workspace_member(
         &self,
         workspace_id: &WorkspaceId,
@@ -1142,13 +1597,6 @@ impl Store {
         .await
     }
 
-    /// Remove a direct guest grant, refusing inherited access under the same
-    /// write lock as deletion. An upgrade racing removal cannot lose its
-    /// retained collaborator row. Host-wide revocation uses its own transaction.
-    ///
-    /// # Errors
-    /// Returns `HostMembershipRequired` for active members, `InvalidParams`
-    /// for an owner, and `Internal` on database failure.
     pub async fn remove_workspace_guest(
         &self,
         workspace_id: &WorkspaceId,
@@ -1197,13 +1645,6 @@ impl Store {
         Ok(deleted.rows_affected() > 0)
     }
 
-    /// Record a bearer credential for a principal, keyed by `token_hash`
-    /// (hex SHA-256 of the token — never the token itself).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails (including
-    /// a duplicate hash).
     pub async fn insert_principal_credential(
         &self,
         principal_id: &PrincipalId,
@@ -1232,13 +1673,6 @@ impl Store {
         })
     }
 
-    /// Look up a credential by token hash, revoked or not (`None` when the
-    /// hash is unknown). Callers gate on
-    /// [`PrincipalCredential::is_active`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn lookup_principal_credential(
         &self,
         token_hash: &str,
@@ -1253,11 +1687,6 @@ impl Store {
         Ok(row.as_ref().map(map_credential_row))
     }
 
-    /// List a principal's credentials, newest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_principal_credentials(
         &self,
         principal_id: &PrincipalId,
@@ -1274,12 +1703,6 @@ impl Store {
         Ok(rows.iter().map(map_credential_row).collect())
     }
 
-    /// Bump `last_used_at` on an active credential. Returns whether a row was
-    /// touched (`false` for an unknown or revoked hash).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn touch_principal_credential(&self, token_hash: &str) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE principal_credential SET last_used_at = ? \
@@ -1293,15 +1716,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Resolve an **active** credential to its principal and bump
-    /// `last_used_at` in one statement. `None` for an unknown or revoked
-    /// hash. The single `UPDATE … WHERE revoked_at IS NULL RETURNING` closes
-    /// the lookup-then-touch window in which a concurrent revoke would
-    /// otherwise still admit the credential (intent-hq/intentd#1868).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn resolve_active_principal_credential(
         &self,
         token_hash: &str,
@@ -1319,13 +1733,6 @@ impl Store {
         Ok(row.map(|r| PrincipalId(r.get::<String, _>("principal_id"))))
     }
 
-    /// Revoke a credential by token hash. Idempotent: returns whether the
-    /// row flipped from active to revoked (`false` for an unknown or
-    /// already-revoked hash).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn revoke_principal_credential(&self, token_hash: &str) -> Result<bool> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut conn = self.write_pool().acquire().await.map_err(|e| {
@@ -1351,12 +1758,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Revoke every active credential of a principal. Returns how many rows
-    /// flipped from active to revoked.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn revoke_all_principal_credentials(
         &self,
         principal_id: &PrincipalId,
@@ -1385,12 +1786,6 @@ impl Store {
         Ok(res.rows_affected())
     }
 
-    /// Number of `principal` rows (primary included). Used by the primary
-    /// identity reconnect guard (multiplayer w4).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_principals(&self) -> Result<u64> {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM principal")
             .fetch_one(self.read_pool())
@@ -1399,12 +1794,6 @@ impl Store {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
-    /// Number of open invites (see [`INVITE_OPEN`]) across every workspace
-    /// (multiplayer w4).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_open_workspace_invites(&self) -> Result<u64> {
         let sql = format!("SELECT COUNT(*) FROM workspace_invite i WHERE {INVITE_OPEN}");
         let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
@@ -1415,12 +1804,6 @@ impl Store {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
-    /// The guest-cap usage of one workspace: direct non-host collaborators
-    /// and open invites, from maintained scalars after indexed expiry reconciliation.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_workspace_guests(
         &self,
         workspace_id: &WorkspaceId,
@@ -1443,17 +1826,6 @@ impl Store {
         })
     }
 
-    /// Persist a freshly minted invite (multiplayer w4). `secret_hash` is the
-    /// hex SHA-256 of the link secret — the service layer hashes; the
-    /// plaintext `secret` is kept alongside so the link can be rebuilt on
-    /// `workspace.invite.list`. The insert runs in a `BEGIN IMMEDIATE`
-    /// transaction behind an archived check on the same connection: an
-    /// archived workspace is `WorkspaceArchived` and nothing is written, so
-    /// no open invite can be minted after an archive's sweep committed.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_workspace_invite(
         &self,
         invite: &WorkspaceInvite,
@@ -1461,12 +1833,6 @@ impl Store {
         self.insert_workspace_invite_with_limit(invite, None).await
     }
 
-    /// Mint a workspace invitation only if a guest seat remains. The limit,
-    /// expiry reconciliation, issuer and archive checks share the insert's
-    /// write transaction with direct guest admissions and invite joins.
-    ///
-    /// # Errors
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_workspace_invite_within_cap(
         &self,
         invite: &WorkspaceInvite,
@@ -1562,11 +1928,6 @@ impl Store {
         .await
     }
 
-    /// Fetch an invite by id, open or closed (`None` when unknown).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_invite(&self, id: &str) -> Result<Option<WorkspaceInvite>> {
         let sql = format!("SELECT {INVITE_COLUMNS} FROM workspace_invite WHERE id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -1577,11 +1938,6 @@ impl Store {
         Ok(row.as_ref().map(map_invite_row))
     }
 
-    /// List a workspace's open invites (see [`INVITE_OPEN`]), oldest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_open_workspace_invites(
         &self,
         workspace_id: &WorkspaceId,
@@ -1600,14 +1956,6 @@ impl Store {
         Ok(rows.iter().map(map_invite_row).collect())
     }
 
-    /// Revoke an invite. Idempotent: returns whether the row flipped from
-    /// open to revoked (`false` when unknown, expired, already revoked, or
-    /// — for a pinned invite — redeemed; a closed invite keeps its terminal
-    /// state).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn revoke_workspace_invite(&self, id: &str) -> Result<bool> {
         let now = now_iso();
         let sql = format!(
@@ -1623,21 +1971,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// `workspace.archive`'s durable write: flip the row to Archived
-    /// (scoped `status`/`archived`/`archived_at`/`updated_at` write), delete
-    /// every direct guest membership, revoke every open invite and count the
-    /// surviving members — in ONE `BEGIN IMMEDIATE` transaction, so the
-    /// archive and the access revocation commit together or not at all.
-    /// Under IMMEDIATE an `invite.accept` / capped member add (both write
-    /// transactions of their own) serializes entirely before or entirely
-    /// after this sweep: a join that committed first is swept here, one that
-    /// commits later finds its invite closed. A failed statement rolls the
-    /// whole transaction back and the workspace stays active.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the workspace does not exist;
-    /// `Error::Internal` if the database operation fails.
     pub async fn archive_workspace_detaching_guests(
         &self,
         id: &WorkspaceId,
@@ -1648,15 +1981,6 @@ impl Store {
             .ok_or_else(|| Error::Internal("manual archive refused".into()))
     }
 
-    /// The automatic-sweep variant of [`Self::archive_workspace_detaching_guests`]:
-    /// reads `auto_archive_disabled` inside the same `BEGIN IMMEDIATE`
-    /// transaction as the flip and returns `Ok(None)` (nothing written) when
-    /// the workspace opted out, so an opt-out committed after the sweep's
-    /// last read can never be overtaken by the archive.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::archive_workspace_detaching_guests`].
     pub async fn archive_workspace_detaching_guests_unless_auto_archive_disabled(
         &self,
         id: &WorkspaceId,
@@ -1793,16 +2117,6 @@ impl Store {
         lifecycle.finish(result).await
     }
 
-    /// Record a redemption of an **open** invite by `principal_id`: stamps
-    /// the last redemption and counts one more membership. The conditional
-    /// `UPDATE` returns `false` when the invite was revoked or expired
-    /// meanwhile — or, for a pinned invite, already redeemed, which is what
-    /// keeps a single-use link from being redeemed twice concurrently. A
-    /// reusable (unpinned) invite stays open afterwards.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn redeem_workspace_invite(
         &self,
         id: &str,
@@ -1825,21 +2139,6 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Admit a verified identity through one open workspace invitation transaction.
-    /// Resolve the full identity triple before inserting: an existing person keeps
-    /// its principal ID. Redeem the link, apply the profile and grant access together;
-    /// every refusal writes nothing and any failure rolls all changes back.
-    ///
-    /// Existing credentials are rechecked and reused; proofs mint a credential only
-    /// if the challenge's authorization generation still permits the person.
-    /// Effective host members never spend a guest seat or gain a direct grant.
-    /// Pinned invitations remain single-use, including an existing member's join.
-    /// Rejoining a reusable invitation does not increase its redemption count.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` on storage failure or a missing identity key, and
-    /// `Error::InvalidInput` for an empty credential hash or a one-owner violation.
     pub async fn join_workspace_by_invite(
         &self,
         invite_id: &str,

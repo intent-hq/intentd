@@ -163,6 +163,172 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn begin_home_move(&self, home_move: &HomeMove) -> Result<bool> {
+        dispatch!(self, backend => backend.begin_home_move(home_move).await)
+    }
+
+    /// The workspace's move in progress, if any.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn get_home_move(&self, workspace_id: &WorkspaceId) -> Result<Option<HomeMove>> {
+        dispatch!(self, backend => backend.get_home_move(workspace_id).await)
+    }
+
+    /// Every move in progress, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn list_home_moves(&self) -> Result<Vec<HomeMove>> {
+        dispatch!(self, backend => backend.list_home_moves().await)
+    }
+
+    /// The moves in progress whose new home is on the exposed machine
+    /// `node_id`.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn home_moves_to_machine(&self, node_id: &str) -> Result<Vec<HomeMove>> {
+        dispatch!(self, backend => backend.home_moves_to_machine(node_id).await)
+    }
+
+    /// The workspace's home as clients see it ([`HomeMove::shown`]).
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn get_shown_workspace_home(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<WorkspaceHome>> {
+        dispatch!(self, backend => backend.get_shown_workspace_home(workspace_id).await)
+    }
+
+    /// Every workspace's home as clients see it ([`HomeMove::shown`]).
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn list_shown_workspace_homes(&self) -> Result<HashMap<WorkspaceId, WorkspaceHome>> {
+        dispatch!(self, backend => backend.list_shown_workspace_homes().await)
+    }
+
+    /// Record exposed machine `node_id` (a sandbox started for it) as the
+    /// new home of the move to `home_id`; `false` when that move is gone
+    /// or already has a machine.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn set_home_move_machine(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        node_id: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.set_home_move_machine(workspace_id, home_id, node_id).await)
+    }
+
+    /// The cloud machines of entry `cloud_machine_id` in `workspace_id`
+    /// started for `owner` (a home-only start's key) that hold no home, owe
+    /// no stop and are no move's target: sandboxes whose start a restart
+    /// cut before anything recorded them. Oldest first.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn unclaimed_home_sandboxes(
+        &self,
+        workspace_id: &WorkspaceId,
+        cloud_machine_id: &str,
+        owner: &str,
+    ) -> Result<Vec<intent_core::machines::ExposedMachine>> {
+        dispatch!(self, backend => backend.unclaimed_home_sandboxes(workspace_id, cloud_machine_id, owner).await)
+    }
+
+    /// Record that the move to `home_id` has the old home's last backup;
+    /// `false` when that move is gone.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn mark_home_move_pushed(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.mark_home_move_pushed(workspace_id, home_id).await)
+    }
+
+    /// A `setupFinished` record of the home `home_id` on `node_id`, seq
+    /// `seq` of lease `lease_id`'s journal, in one transaction: it claims
+    /// the home's `autoStart` (as
+    /// [`Store::claim_workspace_home_auto_start`]) when the home is the
+    /// workspace's; else, when it is the new home of a move, it is recorded
+    /// on the move and the switch claims it.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn claim_home_auto_start_or_record_move(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        node_id: &str,
+        lease_id: &str,
+        seq: u64,
+    ) -> Result<HomeAutoStart> {
+        dispatch!(self, backend => backend.claim_home_auto_start_or_record_move(workspace_id, home_id, node_id, lease_id, seq).await)
+    }
+
+    /// Roll back the move to `home_id`: in one transaction the move goes,
+    /// the old home gets back its state and `since`, and a target on a
+    /// machine gets a `retired` stop whose last push is discarded (its
+    /// machine may have opened it although the reply never came). An old
+    /// cloud home whose sandbox was removed meanwhile is renewed for a
+    /// rebuild in the same transaction. `false` when that move is gone.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn abort_home_move(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        now: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.abort_home_move(workspace_id, home_id, now).await)
+    }
+
+    /// The switch of the move to `home_id` (nodes.md "Moving the home" step
+    /// 3): in one transaction the workspace's home becomes the move's new
+    /// home, `attached` since `now` (its `lastBackupAt` kept: the new home
+    /// starts from that backup), a `moved` stop of the old machine home is
+    /// recorded and the move goes; an error when the new home's cloud
+    /// sandbox is gone, so the move rolls back. A setup the new home finished before
+    /// claims its `autoStart` here. A new home on a cloud sandbox gets
+    /// `owner` as the sandbox's `cloud.startedBy` in the same transaction
+    /// (nodes.md "Cloud homes" 2). `None` when that move is gone (rolled
+    /// back, or the workspace archived or deleted): nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn complete_home_move(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        owner: &intent_core::machines::CloudStartedBy,
+        now: &str,
+    ) -> Result<Option<HomeMoveSwitch>> {
+        dispatch!(self, backend => backend.complete_home_move(workspace_id, home_id, owner, now).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn begin_home_move(&self, home_move: &HomeMove) -> Result<bool> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         let moving = sqlx::query(
             "UPDATE workspace_home SET state = 'moving', since = ? \
@@ -203,21 +369,11 @@ impl Store {
         Ok(true)
     }
 
-    /// The workspace's move in progress, if any.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn get_home_move(&self, workspace_id: &WorkspaceId) -> Result<Option<HomeMove>> {
         let mut conn = self.write_pool().acquire().await.map_err(db)?;
         move_of(&mut conn, workspace_id).await
     }
 
-    /// Every move in progress, oldest first.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn list_home_moves(&self) -> Result<Vec<HomeMove>> {
         let sql = format!("{SELECT} ORDER BY started_at, workspace_id");
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -227,12 +383,6 @@ impl Store {
         rows.iter().map(map_row).collect()
     }
 
-    /// The moves in progress whose new home is on the exposed machine
-    /// `node_id`.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn home_moves_to_machine(&self, node_id: &str) -> Result<Vec<HomeMove>> {
         let sql = format!("{SELECT} WHERE node_id = ? ORDER BY workspace_id");
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -243,11 +393,6 @@ impl Store {
         rows.iter().map(map_row).collect()
     }
 
-    /// The workspace's home as clients see it ([`HomeMove::shown`]).
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn get_shown_workspace_home(
         &self,
         workspace_id: &WorkspaceId,
@@ -264,11 +409,6 @@ impl Store {
         }))
     }
 
-    /// Every workspace's home as clients see it ([`HomeMove::shown`]).
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn list_shown_workspace_homes(&self) -> Result<HashMap<WorkspaceId, WorkspaceHome>> {
         let mut homes = self.list_workspace_homes().await?;
         if homes.values().any(|home| home.state == HomeState::Moving) {
@@ -281,13 +421,6 @@ impl Store {
         Ok(homes)
     }
 
-    /// Record exposed machine `node_id` (a sandbox started for it) as the
-    /// new home of the move to `home_id`; `false` when that move is gone
-    /// or already has a machine.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn set_home_move_machine(
         &self,
         workspace_id: &WorkspaceId,
@@ -307,14 +440,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// The cloud machines of entry `cloud_machine_id` in `workspace_id`
-    /// started for `owner` (a home-only start's key) that hold no home, owe
-    /// no stop and are no move's target: sandboxes whose start a restart
-    /// cut before anything recorded them. Oldest first.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn unclaimed_home_sandboxes(
         &self,
         workspace_id: &WorkspaceId,
@@ -340,12 +465,6 @@ impl Store {
         Ok(left)
     }
 
-    /// Record that the move to `home_id` has the old home's last backup;
-    /// `false` when that move is gone.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn mark_home_move_pushed(
         &self,
         workspace_id: &WorkspaceId,
@@ -361,16 +480,6 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// A `setupFinished` record of the home `home_id` on `node_id`, seq
-    /// `seq` of lease `lease_id`'s journal, in one transaction: it claims
-    /// the home's `autoStart` (as
-    /// [`Store::claim_workspace_home_auto_start`]) when the home is the
-    /// workspace's; else, when it is the new home of a move, it is recorded
-    /// on the move and the switch claims it.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn claim_home_auto_start_or_record_move(
         &self,
         workspace_id: &WorkspaceId,
@@ -422,16 +531,6 @@ impl Store {
         Ok(outcome)
     }
 
-    /// Roll back the move to `home_id`: in one transaction the move goes,
-    /// the old home gets back its state and `since`, and a target on a
-    /// machine gets a `retired` stop whose last push is discarded (its
-    /// machine may have opened it although the reply never came). An old
-    /// cloud home whose sandbox was removed meanwhile is renewed for a
-    /// rebuild in the same transaction. `false` when that move is gone.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn abort_home_move(
         &self,
         workspace_id: &WorkspaceId,
@@ -467,20 +566,6 @@ impl Store {
         Ok(true)
     }
 
-    /// The switch of the move to `home_id` (nodes.md "Moving the home" step
-    /// 3): in one transaction the workspace's home becomes the move's new
-    /// home, `attached` since `now` (its `lastBackupAt` kept: the new home
-    /// starts from that backup), a `moved` stop of the old machine home is
-    /// recorded and the move goes; an error when the new home's cloud
-    /// sandbox is gone, so the move rolls back. A setup the new home finished before
-    /// claims its `autoStart` here. A new home on a cloud sandbox gets
-    /// `owner` as the sandbox's `cloud.startedBy` in the same transaction
-    /// (nodes.md "Cloud homes" 2). `None` when that move is gone (rolled
-    /// back, or the workspace archived or deleted): nothing is written.
-    ///
-    /// # Errors
-    ///
-    /// `Error::Internal` on a database failure.
     pub async fn complete_home_move(
         &self,
         workspace_id: &WorkspaceId,

@@ -67,6 +67,81 @@ impl Store {
         fingerprint: &str,
         expired_before: &str,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.insert_attachment_with_idempotency_key(a, key, fingerprint, expired_before).await)
+    }
+
+    /// Resolve a live idempotency-key binding to its attachment row. `None`
+    /// when the key is unbound in the workspace OR its binding was created
+    /// at/before `expired_before` (an ISO-8601 UTC cutoff — the retention
+    /// boundary; expired rows read as unknown even before the sweep removes
+    /// them).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_attachment_by_idempotency_key(
+        &self,
+        workspace_id: &WorkspaceId,
+        key: &str,
+        expired_before: &str,
+    ) -> Result<Option<(AttachmentIdempotencyBinding, AttachmentRecord)>> {
+        dispatch!(self, backend => backend.get_attachment_by_idempotency_key(workspace_id, key, expired_before).await)
+    }
+
+    /// Retention sweep: delete every idempotency-key binding created
+    /// at/before `expired_before`. The referenced `attachments` rows are
+    /// untouched. Returns the number of bindings removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn sweep_expired_attachment_idempotency_keys(
+        &self,
+        expired_before: &str,
+    ) -> Result<u64> {
+        dispatch!(self, backend => backend.sweep_expired_attachment_idempotency_keys(expired_before).await)
+    }
+
+    /// Insert an attachment-registry row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_attachment(&self, a: &AttachmentRecord) -> Result<()> {
+        dispatch!(self, backend => backend.insert_attachment(a).await)
+    }
+
+    /// Load one attachment by id. `Error::NotFound` when no row exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the attachment does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_attachment(&self, id: &str) -> Result<AttachmentRecord> {
+        dispatch!(self, backend => backend.get_attachment(id).await)
+    }
+
+    /// All attachment rows for one workspace, ordered by id (stable manifest
+    /// ordering for the transfer pipeline).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_attachments(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AttachmentRecord>> {
+        dispatch!(self, backend => backend.list_attachments(workspace_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn insert_attachment_with_idempotency_key(
+        &self,
+        a: &AttachmentRecord,
+        key: &str,
+        fingerprint: &str,
+        expired_before: &str,
+    ) -> Result<()> {
         let pool = self.write_pool();
         let sql = format!("INSERT INTO attachments ({COLUMNS}) VALUES (?,?,?,?,?,?,?)");
         crate::with_write_txn_retry(|| async {
@@ -131,15 +206,6 @@ impl Store {
         .await
     }
 
-    /// Resolve a live idempotency-key binding to its attachment row. `None`
-    /// when the key is unbound in the workspace OR its binding was created
-    /// at/before `expired_before` (an ISO-8601 UTC cutoff — the retention
-    /// boundary; expired rows read as unknown even before the sweep removes
-    /// them).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_attachment_by_idempotency_key(
         &self,
         workspace_id: &WorkspaceId,
@@ -182,13 +248,6 @@ impl Store {
         }))
     }
 
-    /// Retention sweep: delete every idempotency-key binding created
-    /// at/before `expired_before`. The referenced `attachments` rows are
-    /// untouched. Returns the number of bindings removed.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn sweep_expired_attachment_idempotency_keys(
         &self,
         expired_before: &str,
@@ -203,11 +262,6 @@ impl Store {
         Ok(done.rows_affected())
     }
 
-    /// Insert an attachment-registry row.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_attachment(&self, a: &AttachmentRecord) -> Result<()> {
         let sql = format!("INSERT INTO attachments ({COLUMNS}) VALUES (?,?,?,?,?,?,?)");
         sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -224,11 +278,6 @@ impl Store {
         Ok(())
     }
 
-    /// Load one attachment by id. `Error::NotFound` when no row exists.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if the attachment does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_attachment(&self, id: &str) -> Result<AttachmentRecord> {
         let sql = format!("SELECT {COLUMNS} FROM attachments WHERE id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -240,12 +289,6 @@ impl Store {
         Ok(row_to_record(&row))
     }
 
-    /// All attachment rows for one workspace, ordered by id (stable manifest
-    /// ordering for the transfer pipeline).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_attachments(
         &self,
         workspace_id: &WorkspaceId,

@@ -33,6 +33,54 @@ impl Store {
         payload: &serde_json::Value,
         created_at: &str,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.set_stop_redelivery(agent_id, payload, created_at).await)
+    }
+
+    /// Delete the persisted stop-redelivery payload for one agent (no-op when
+    /// none is armed).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_stop_redelivery(&self, agent_id: &AgentId) -> Result<()> {
+        dispatch!(self, backend => backend.clear_stop_redelivery(agent_id).await)
+    }
+
+    /// Batched [`Store::clear_stop_redelivery`]: delete the persisted payloads
+    /// of every agent in `agent_ids` in ONE `IN`-list statement per 32 000
+    /// ids (the `stop_many` sweep — intent-hq/monorepo#4130 — replaces a
+    /// per-agent DELETE loop so a workspace delete stays at a bounded
+    /// statement count). No-op on an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_stop_redeliveries(&self, agent_ids: &[AgentId]) -> Result<()> {
+        dispatch!(self, backend => backend.clear_stop_redeliveries(agent_ids).await)
+    }
+
+    /// Load every persisted stop-redelivery payload for startup rehydration.
+    /// Joined against `agent_session` so rows whose session no longer exists
+    /// are skipped (defensive; the FK cascade should already have removed
+    /// them). A row whose stored payload is not valid JSON comes back as
+    /// `Value::Null` rather than failing the whole load — rehydration is
+    /// best-effort and the caller skips entries it cannot decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn load_all_stop_redeliveries(&self) -> Result<Vec<StopRedeliveryRow>> {
+        dispatch!(self, backend => backend.load_all_stop_redeliveries().await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn set_stop_redelivery(
+        &self,
+        agent_id: &AgentId,
+        payload: &serde_json::Value,
+        created_at: &str,
+    ) -> Result<()> {
         let payload = serde_json::to_string(payload)
             .map_err(|e| Error::Internal(format!("encode stop redelivery payload failed: {e}")))?;
         sqlx::query(
@@ -49,12 +97,6 @@ impl Store {
         Ok(())
     }
 
-    /// Delete the persisted stop-redelivery payload for one agent (no-op when
-    /// none is armed).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_stop_redelivery(&self, agent_id: &AgentId) -> Result<()> {
         sqlx::query("DELETE FROM agent_stop_redelivery WHERE agent_id = ?")
             .bind(&agent_id.0)
@@ -64,15 +106,6 @@ impl Store {
         Ok(())
     }
 
-    /// Batched [`Store::clear_stop_redelivery`]: delete the persisted payloads
-    /// of every agent in `agent_ids` in ONE `IN`-list statement per 32 000
-    /// ids (the `stop_many` sweep — intent-hq/monorepo#4130 — replaces a
-    /// per-agent DELETE loop so a workspace delete stays at a bounded
-    /// statement count). No-op on an empty list.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_stop_redeliveries(&self, agent_ids: &[AgentId]) -> Result<()> {
         const IDS_PER_STATEMENT: usize = 32_000;
         for chunk in agent_ids.chunks(IDS_PER_STATEMENT) {
@@ -91,16 +124,6 @@ impl Store {
         Ok(())
     }
 
-    /// Load every persisted stop-redelivery payload for startup rehydration.
-    /// Joined against `agent_session` so rows whose session no longer exists
-    /// are skipped (defensive; the FK cascade should already have removed
-    /// them). A row whose stored payload is not valid JSON comes back as
-    /// `Value::Null` rather than failing the whole load — rehydration is
-    /// best-effort and the caller skips entries it cannot decode.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_all_stop_redeliveries(&self) -> Result<Vec<StopRedeliveryRow>> {
         let rows = sqlx::query(
             "SELECT r.agent_id, r.payload, r.created_at \

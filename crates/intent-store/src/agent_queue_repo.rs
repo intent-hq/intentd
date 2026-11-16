@@ -104,6 +104,54 @@ impl Store {
         agent_id: &AgentId,
         rows: &[AgentQueueRow],
     ) -> Result<()> {
+        dispatch!(self, backend => backend.replace_agent_queue(agent_id, rows).await)
+    }
+
+    /// Atomically move the persisted queue between two agents: ONE write
+    /// transaction deletes the rows of BOTH agents and inserts `rows` under
+    /// `to` (an empty `rows` slice just clears both). Backs the
+    /// poisoned-session queue migration (monorepo#847): migrated entries
+    /// keep their ids and `agent_queue.id` is a global primary key, so a
+    /// non-atomic clear-then-replace pair risks either a PK-conflict
+    /// rollback or a crash window where the messages are durable on
+    /// NEITHER queue — this op commits the hand-off as a single unit.
+    /// Every row must belong to `to`; a mismatch fails fast.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn move_agent_queue(
+        &self,
+        from: &AgentId,
+        to: &AgentId,
+        rows: &[AgentQueueRow],
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.move_agent_queue(from, to, rows).await)
+    }
+
+    /// Load every persisted queue entry, ordered by agent then queue position,
+    /// for startup rehydration. Joined against `agent_session` so entries
+    /// whose session row no longer exists are skipped (defensive; the FK
+    /// cascade should already have removed them). A row whose stored payload
+    /// is not valid JSON comes back as `Value::Null` rather than failing the
+    /// whole load — rehydration is best-effort and the caller skips entries
+    /// it cannot decode. Legacy rows with a NULL `turn_id` (pre-monorepo#1022)
+    /// load with `turn_id` defaulted to the row `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn load_all_agent_queues(&self) -> Result<Vec<AgentQueueRow>> {
+        dispatch!(self, backend => backend.load_all_agent_queues().await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn replace_agent_queue(
+        &self,
+        agent_id: &AgentId,
+        rows: &[AgentQueueRow],
+    ) -> Result<()> {
         if let Some(row) = rows.iter().find(|r| r.agent_id != *agent_id) {
             return Err(Error::Internal(format!(
                 "replace agent queue row {} belongs to agent {}, not {}",
@@ -133,19 +181,6 @@ impl Store {
         .await
     }
 
-    /// Atomically move the persisted queue between two agents: ONE write
-    /// transaction deletes the rows of BOTH agents and inserts `rows` under
-    /// `to` (an empty `rows` slice just clears both). Backs the
-    /// poisoned-session queue migration (monorepo#847): migrated entries
-    /// keep their ids and `agent_queue.id` is a global primary key, so a
-    /// non-atomic clear-then-replace pair risks either a PK-conflict
-    /// rollback or a crash window where the messages are durable on
-    /// NEITHER queue — this op commits the hand-off as a single unit.
-    /// Every row must belong to `to`; a mismatch fails fast.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn move_agent_queue(
         &self,
         from: &AgentId,
@@ -183,18 +218,6 @@ impl Store {
         .await
     }
 
-    /// Load every persisted queue entry, ordered by agent then queue position,
-    /// for startup rehydration. Joined against `agent_session` so entries
-    /// whose session row no longer exists are skipped (defensive; the FK
-    /// cascade should already have removed them). A row whose stored payload
-    /// is not valid JSON comes back as `Value::Null` rather than failing the
-    /// whole load — rehydration is best-effort and the caller skips entries
-    /// it cannot decode. Legacy rows with a NULL `turn_id` (pre-monorepo#1022)
-    /// load with `turn_id` defaulted to the row `id`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_all_agent_queues(&self) -> Result<Vec<AgentQueueRow>> {
         let rows = sqlx::query(
             "SELECT q.id, q.agent_id, q.position, q.payload, q.created_at, \

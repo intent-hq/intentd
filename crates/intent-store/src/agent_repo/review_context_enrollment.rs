@@ -60,6 +60,17 @@ impl Store {
         agent: &AgentId,
         session: &str,
     ) -> Result<Option<ReviewContextEnrollment>> {
+        dispatch!(self, backend => backend.get_review_context_enrollment(workspace, agent, session).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn get_review_context_enrollment(
+        &self,
+        workspace: &WorkspaceId,
+        agent: &AgentId,
+        session: &str,
+    ) -> Result<Option<ReviewContextEnrollment>> {
         if !valid_session(session) {
             return Err(unavailable());
         }

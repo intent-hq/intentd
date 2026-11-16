@@ -336,7 +336,7 @@ async fn browser_commit_eviction_survives_caller_cancellation() {
             .await
             .expect("retry completes remaining cleanup");
         assert_eq!(
-            store.browser_tab_displayed.len(),
+            store.sqlite().browser_tab_displayed.len(),
             1,
             "retry must not strand the committed batch's overlay"
         );
@@ -372,7 +372,7 @@ async fn cancel_final_transaction(fail_commit: bool) {
         }
         release.send(()).unwrap();
         drain_browser_batch(&store).await;
-        assert_eq!(store.browser_tab_displayed.len(), 1);
+        assert_eq!(store.sqlite().browser_tab_displayed.len(), 1);
 
         // The caller has not consumed the short batch's result. Add a late
         // tab now, so the final transaction must clean its row and overlay.
@@ -405,7 +405,7 @@ async fn cancel_final_transaction(fail_commit: bool) {
         if fail_commit {
             store.get_workspace(&doomed).await.unwrap();
             assert_eq!(tombstones, 0);
-            assert_eq!(store.browser_tab_displayed.len(), 2);
+            assert_eq!(store.sqlite().browser_tab_displayed.len(), 2);
             assert_eq!(
                 store.get_browser_tab(&doomed.0).await.unwrap().unwrap().displayed,
                 Some(true),
@@ -419,7 +419,7 @@ async fn cancel_final_transaction(fail_commit: bool) {
             assert_eq!(tombstones, 1);
             assert!(store.get_browser_tab(&doomed.0).await.unwrap().is_none());
         }
-        assert_eq!(store.browser_tab_displayed.len(), 1);
+        assert_eq!(store.sqlite().browser_tab_displayed.len(), 1);
         assert_eq!(
             store.get_browser_tab(&keeper.0).await.unwrap().unwrap().displayed,
             Some(true)
@@ -452,7 +452,7 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
         ..sqlx::migrate::Migrator::DEFAULT
     };
     legacy.run(&pool).await.unwrap();
-    let store = Store {
+    let store = Store::from_sqlite(crate::SqliteStore {
         task_event_baselines: std::sync::Arc::default(),
         task_events_enabled: std::sync::Arc::default(),
         note_write_lanes: std::sync::Arc::default(),
@@ -464,7 +464,7 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
         desktop_delete_barrier: std::sync::Arc::default(),
         export_author_barrier: std::sync::Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
-    };
+    });
     // This fixture deliberately stops at schema 0130. Current workspace
     // inserts require newer columns, so seed only the historical columns.
     for id in ["doomed", "keeper"] {

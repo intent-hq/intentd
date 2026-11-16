@@ -3717,6 +3717,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
 
     // Legacy alias still works (for backward compat during transition).
     let removed_via_alias = store
+        .sqlite()
         .delete_stream_events_before(cutoff)
         .await
         .expect("legacy alias");
@@ -3861,6 +3862,7 @@ async fn stream_retention_sweep_trims_only_old_stream_events() {
     // Cutoff between old and new: only old stream chunks are eligible.
     let cutoff = "2026-03-01T00:00:00Z";
     let removed = store
+        .sqlite()
         .delete_stream_events_before(cutoff)
         .await
         .expect("sweep");
@@ -3899,6 +3901,7 @@ async fn stream_retention_sweep_trims_only_old_stream_events() {
 
     // Idempotent: a re-run with the same cutoff removes nothing more.
     let removed_again = store
+        .sqlite()
         .delete_stream_events_before(cutoff)
         .await
         .expect("sweep re-run");
@@ -3952,6 +3955,7 @@ async fn stream_retention_sweep_disabled_is_noop_in_practice() {
         .expect("insert");
 
     let removed = store
+        .sqlite()
         .delete_stream_events_before("2020-01-01T00:00:00Z")
         .await
         .expect("sweep");
@@ -7071,6 +7075,7 @@ async fn agent_queue_replace_load_delete_round_trip() {
 
     // Per-agent delete clears the persisted queue.
     store
+        .sqlite()
         .delete_agent_queue(&agent)
         .await
         .expect("delete queue");
@@ -7590,7 +7595,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
             Err(e) => panic!("open short-timeout write pool: {e}"),
         }
     };
-    let store = Store {
+    let store = Store::from_sqlite(crate::SqliteStore {
         task_event_baselines: std::sync::Arc::default(),
         task_events_enabled: std::sync::Arc::default(),
         note_write_lanes: std::sync::Arc::default(),
@@ -7605,7 +7610,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
         desktop_delete_barrier: std::sync::Arc::default(),
         export_author_barrier: std::sync::Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
-    };
+    });
     let ws = WorkspaceId::new();
     store
         .insert_workspace(&sample_workspace(&ws, "WS", false))
@@ -8141,7 +8146,11 @@ async fn hook_state_run_and_error_updates() {
             .update_hook_last_state(&missing, None)
             .await
             .expect_err("last state"),
-        store.delete_hook(&missing).await.expect_err("delete"),
+        store
+            .sqlite()
+            .delete_hook(&missing)
+            .await
+            .expect_err("delete"),
     ] {
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
     }
@@ -8180,6 +8189,7 @@ async fn hook_load_active_and_delete() {
     assert_eq!(ids, vec!["hook-run", "hook-sched"]);
 
     store
+        .sqlite()
         .delete_hook(&HookId("hook-sched".to_string()))
         .await
         .expect("delete");
