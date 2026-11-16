@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.227] - 2026-11-16
+
+### 🐛 Bug Fixes
+
+- *(remote)* Redial a cloud sandbox quickly right after it resumes ([#3418](https://github.com/intent-hq/intentd/pull/3418))
+- *(agent)* Tell the model a message preemption was not the user ([#3416](https://github.com/intent-hq/intentd/pull/3416))
+- *(pr-monitor)* Route parents to sub-agent reports instead of PR polling ([#3413](https://github.com/intent-hq/intentd/pull/3413))
+
+### 🔧 Refactor
+
+- *(store)* Keep production SQL inside intent-store ([#3420](https://github.com/intent-hq/intentd/pull/3420))
+
+### ⚡ Performance
+
+- *(northflank)* Faster readiness after the container runs ([#3419](https://github.com/intent-hq/intentd/pull/3419))
+
+
 ## [0.11.226] - 2026-11-16
 
 ### 🚀 Features
