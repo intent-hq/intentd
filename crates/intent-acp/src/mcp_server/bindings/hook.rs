@@ -117,8 +117,13 @@ async fn schedule(
             monitored.push(hint);
         }
     }
-    // A validation run that dispatched persisted no hook: nothing to cancel.
-    let persisted = scheduled.get("dispatched") != Some(&Value::Bool(true));
+    // A dispatching validation run persists a terminal hook, except a
+    // perpetual one that stays scheduled: advise only while it is active.
+    let persisted = scheduled.get("dispatched") != Some(&Value::Bool(true))
+        || matches!(
+            scheduled["hook"]["state"].as_str(),
+            Some("scheduled" | "running")
+        );
     if let (true, false, Some(object)) =
         (persisted, monitored.is_empty(), scheduled.as_object_mut())
     {
@@ -416,11 +421,12 @@ mod tests {
         }
     }
 
-    /// A validation run that dispatched persisted no hook, so there is
-    /// nothing to cancel and no advisory.
+    /// A validation run that dispatched leaves a terminal hook (nothing to
+    /// cancel, no advisory), except a perpetual hook that stays scheduled
+    /// and still polls: that one keeps the advisory.
     #[tokio::test]
-    async fn schedule_gives_no_advisory_when_the_validation_run_dispatched() {
-        struct DispatchedApi;
+    async fn schedule_advises_after_a_dispatch_only_while_the_hook_stays_active() {
+        struct DispatchedApi(&'static str);
         impl WorkspaceApi for DispatchedApi {
             fn hook_schedule(
                 &self,
@@ -428,7 +434,10 @@ mod tests {
                 _agent_id: AgentId,
                 _params: Value,
             ) -> BoxFuture<'_, Result<Value>> {
-                Box::pin(async { Ok(json!({ "hook": { "hookId": "h" }, "dispatched": true })) })
+                let state = self.0;
+                Box::pin(async move {
+                    Ok(json!({ "hook": { "hookId": "h", "state": state }, "dispatched": true }))
+                })
             }
 
             fn pr_monitor_sub_agent_hint(
@@ -443,18 +452,28 @@ mod tests {
                 )
             }
         }
-        let api: Arc<dyn WorkspaceApi> = Arc::new(DispatchedApi);
-        let scheduled = dispatch(
-            &api,
-            &WorkspaceId::from_string("ws-hook"),
-            Some(&AgentId::from("agent-parent")),
-            "schedule",
-            &json!({ "name": "poll", "delayMs": 60_000, "code": "return await ws.pr.snapshot(1);" }),
-        )
-        .await
-        .expect("scheduled");
-        assert_eq!(scheduled["dispatched"], json!(true));
-        assert!(scheduled.get("advisory").is_none(), "{scheduled}");
+        for (state, advised) in [
+            ("dispatched", false),
+            ("expired", false),
+            ("scheduled", true),
+        ] {
+            let api: Arc<dyn WorkspaceApi> = Arc::new(DispatchedApi(state));
+            let scheduled = dispatch(
+                &api,
+                &WorkspaceId::from_string("ws-hook"),
+                Some(&AgentId::from("agent-parent")),
+                "schedule",
+                &json!({ "name": "poll", "delayMs": 60_000, "code": "return await ws.pr.snapshot(1);" }),
+            )
+            .await
+            .expect("scheduled");
+            assert_eq!(scheduled["dispatched"], json!(true));
+            assert_eq!(
+                scheduled.get("advisory").is_some(),
+                advised,
+                "{state}: {scheduled}"
+            );
+        }
     }
 
     fn spy() -> (Arc<SpyApi>, Arc<dyn WorkspaceApi>, WorkspaceId) {
