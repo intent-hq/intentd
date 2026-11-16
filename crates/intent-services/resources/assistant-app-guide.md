@@ -1598,6 +1598,7 @@ Use the diagram's **View source** action to inspect
 its code, or turn off **Markdown preview** in the panel menu to edit the file's source.
 Mermaid flowcharts keep their authored direction and curved connector style.
 The renderer can compact connected groups and soften tight bends for shorter, clearer connections.
+Routes account for node outlines, including decisions and databases.
 Wide diagrams scroll horizontally to keep text readable.
 Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
@@ -1633,7 +1634,7 @@ chat it opens beside the conversation.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/utils/workspaces-link-handler.ts (workspace links outside Assistant chat); packages/intentd/crates/intent-services/resources/agent-instructions/v3.4/common.md. Test-build behavior pending its frontend release. -->
 
-<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/markdown/{mermaid-curved-routing,mermaid-compact-layout}.ts; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts; packages/cloudlands-fe/src/lib/utils/workspace-file-image.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/markdown/{mermaid-curved-routing,mermaid-compact-layout,mermaid-shape-geometry}.ts; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts; packages/cloudlands-fe/src/lib/utils/workspace-file-image.ts. -->
 
 
 ## Review and commit workspace changes
