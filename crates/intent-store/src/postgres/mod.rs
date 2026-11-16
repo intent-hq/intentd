@@ -106,9 +106,10 @@ impl PgStore {
         Ok(tx)
     }
 
-    pub async fn close(&self) {
-        self.pool.close().await;
-    }
+    /// Nothing to release: tenants share the pool, and closing it would end
+    /// every other tenant's store. The pool's owner closes it at shutdown.
+    #[expect(clippy::unused_async, reason = "same signature as Store::close")]
+    pub async fn close(&self) {}
 }
 
 impl crate::Store {

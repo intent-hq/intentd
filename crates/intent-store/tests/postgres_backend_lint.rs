@@ -99,14 +99,20 @@ fn violations(sql: &str) -> Vec<String> {
     for r in table_refs(sql) {
         let ok = if r.keyword == "INTO" {
             let after_insert = sql[..r.at].trim_end().ends_with("insert");
+            // The column list right after the table must start with tenant_id.
             !after_insert
-                || sql
-                    .find(&format!("into {} (", r.table))
-                    .is_some_and(|i| sql[i..].contains("(tenant_id,"))
+                || sql[r.at..]
+                    .split_once('(')
+                    .is_some_and(|(_, cols)| cols.trim_start().starts_with("tenant_id"))
         } else {
+            // The filter must be in the WHERE (or a JOIN's ON) part of the
+            // same query, not in an UPDATE's SET list.
             let level = same_level(sql, r.at);
-            level.contains(&format!("{}.tenant_id = $", r.alias))
-                || level.contains(" tenant_id = $")
+            let filter = level.split_once(" where ").map_or("", |(_, w)| w);
+            let qualified = format!("{}.tenant_id = $", r.alias);
+            filter.contains(&qualified)
+                || filter.contains("tenant_id = $")
+                || (r.keyword == "JOIN" && level.contains(&qualified))
         };
         if !ok {
             out.push(format!("{} {}", r.keyword, r.table));
@@ -155,6 +161,15 @@ fn the_tenant_rule_catches_unscoped_shapes() {
     assert!(violations("insert into settings (tenant_id, key) values ($1, $2)").is_empty());
     assert!(!violations("insert into settings (key, tenant_id) values ($1, $2)").is_empty());
     assert!(violations("delete from settings where tenant_id = $1 and key = $2").is_empty());
+    // An ON CONFLICT target or a SET list does not stand in for the filter.
+    assert!(!violations(
+        "insert into settings (key, value) values ($1, $2) on conflict (tenant_id, key) do nothing"
+    )
+    .is_empty());
+    assert!(!violations("update settings set tenant_id = $1 where key = $2").is_empty());
+    assert!(
+        violations("update settings set value = $3 where tenant_id = $1 and key = $2").is_empty()
+    );
 }
 
 fn pending_in_source() -> BTreeSet<String> {
