@@ -27,6 +27,8 @@ use crate::machine::{MachineTarget, Route};
 pub(crate) const MACHINE_UNREACHABLE: &str = "machine-unreachable";
 /// `error.data.code` of a machine that refused this backend's credential.
 pub(crate) const MACHINE_REVOKED: &str = "machine-revoked";
+/// `error.data.code` of a machine that now runs as an orchestrator.
+pub(crate) const ORCHESTRATOR_MODE: &str = "orchestrator-mode";
 
 /// Connect timing; tests shorten it.
 #[derive(Debug, Clone)]
@@ -71,6 +73,9 @@ pub(crate) enum ConnectFailure {
     Revoked(Vec<Attempt>),
     /// The machine and this backend share no protocol version.
     UpdateRequired(Box<MachineUpdateRequired>),
+    /// The machine now runs as an orchestrator and refuses every bind: the
+    /// backend forgets it.
+    Orchestrator,
     /// This backend could not prepare the hello (its own store failed),
     /// or the connector stopped.
     Local(String),
@@ -102,6 +107,13 @@ impl ConnectFailure {
                 json!({ "code": MACHINE_REVOKED, "attempts": attempts_json(&attempts) }),
             ),
             Self::UpdateRequired(update) => Error::MachineUpdateRequired(update),
+            Self::Orchestrator => Error::remote_machine(
+                false,
+                format!(
+                    "{name} is now an orchestrator and no longer runs agents for other backends, so it was removed. Pair it again to use it as a backend."
+                ),
+                json!({ "code": ORCHESTRATOR_MODE }),
+            ),
             Self::Local(message) => Error::Internal(format!("remote machine {name}: {message}")),
             Self::Cloud { message, data, .. } => Error::remote_machine(true, message, data),
         }
@@ -331,8 +343,8 @@ where
 
 /// Dial and bind on `route`, within `bound` when given: `Ok(None)` records
 /// its failure in `attempts` for the caller to try the next route; a
-/// version mismatch ends the connect, since every route reaches the same
-/// daemon.
+/// version mismatch or an orchestrator's refusal ends the connect, since
+/// every route reaches the same daemon.
 async fn dial<F, Fut>(
     target: &MachineTarget,
     machine_version: Option<&str>,
@@ -367,6 +379,9 @@ where
         })),
         Err(error) => {
             let code = code_of(&error);
+            if code == codes::ORCHESTRATOR_MODE {
+                return Err(ConnectFailure::Orchestrator);
+            }
             if code == codes::VERSION_MISMATCH {
                 return Err(ConnectFailure::UpdateRequired(Box::new(update_required(
                     target,

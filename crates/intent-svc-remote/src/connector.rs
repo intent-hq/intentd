@@ -1630,7 +1630,9 @@ impl Shared {
             ConnectFailure::Unreachable(_) => RemoteMachineState::Unreachable,
             ConnectFailure::Revoked(_) => RemoteMachineState::Revoked,
             ConnectFailure::UpdateRequired(_) => RemoteMachineState::UpdateRequired,
-            ConnectFailure::Local(_) | ConnectFailure::Cloud { .. } => return,
+            ConnectFailure::Local(_)
+            | ConnectFailure::Cloud { .. }
+            | ConnectFailure::Orchestrator => return,
         };
         let id = self.machine_id();
         if let Err(error) = self.store.set_exposed_machine_state(&id, state).await {
@@ -2646,7 +2648,20 @@ async fn run(
                         tracing::info!(machine = %target.id, ended, "remote machine: revoked; its agents ended");
                     }
                 }
-                shared.announce().await;
+                if matches!(failure, ConnectFailure::Orchestrator) {
+                    shared.drop_stops();
+                    shared.agents.end_all(&format!(
+                        "{}: {} is now an orchestrator and no longer runs agents for other backends",
+                        crate::connect::ORCHESTRATOR_MODE,
+                        target.name
+                    ));
+                    crate::methods::forget_orchestrator(
+                        shared.services().cloned(),
+                        target.id.clone(),
+                    );
+                } else {
+                    shared.announce().await;
+                }
                 for waiter in waiters.drain(..) {
                     let _ = waiter.send(Err(failure.clone()));
                 }
@@ -2664,6 +2679,7 @@ async fn run(
                     let delay = match failure {
                         ConnectFailure::Revoked(_)
                         | ConnectFailure::UpdateRequired(_)
+                        | ConnectFailure::Orchestrator
                         | ConnectFailure::Cloud { lost: true, .. } => shared.tuning.permanent_retry,
                         _ => backoff.next_delay(),
                     };

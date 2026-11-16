@@ -90,6 +90,9 @@ pub mod codes {
     pub const TIMEOUT: &str = "node-link-timeout";
     /// The node could not read or persist its binding.
     pub const BINDING_STORE: &str = "node-link-binding-store";
+    /// The machine runs as an orchestrator: it runs no agents for other
+    /// backends.
+    pub const ORCHESTRATOR_MODE: &str = "node-link-orchestrator-mode";
 }
 
 fn unavailable() -> Error {
