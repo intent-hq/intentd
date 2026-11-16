@@ -920,8 +920,8 @@ when developing or testing them, and say they are Labs. Enable Tab groups in
 Settings → Advanced → Labs. With the frontend change containing the swatch row,
 right-click a tab group and choose a color from two rows of six unlabeled
 swatches directly in the group menu. Until that change ships, do not describe the
-swatch row as released.
-Sources (paths relative to packages/cloudlands-fe): src/lib/components/layout/{WorkspaceTabGroupChip.svelte,workspace-tab-group-controller.ts,workspace-tab-group-actions.ts}; src/lib/components/settings/LabsSettings.svelte. -->
+swatch row as released. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/layout/{WorkspaceTabGroupChip.svelte,workspace-tab-group-controller.ts,workspace-tab-group-actions.ts}; src/lib/components/settings/LabsSettings.svelte. -->
 
 <!-- Numbered navigation requires the matching frontend release. Until it ships,
 describe these bindings only when explicitly asked or testing this change. -->
