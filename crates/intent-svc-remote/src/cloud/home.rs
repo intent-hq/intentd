@@ -664,7 +664,10 @@ pub(crate) async fn sandbox_target(svc: &Services, machine_id: &str) -> Result<W
 
 /// Cloud entry `cloud_machine_id`'s settings, when a sandbox of it can
 /// start: it exists, and its key is saved and not known to be rejected.
-async fn usable_entry(svc: &Services, cloud_machine_id: &str) -> Result<super::config::ProviderConfig> {
+async fn usable_entry(
+    svc: &Services,
+    cloud_machine_id: &str,
+) -> Result<super::config::ProviderConfig> {
     let saved = super::config::load(svc, cloud_machine_id)
         .await?
         .ok_or_else(|| crate::home_move::target_unavailable("there is no such cloud entry"))?;
@@ -673,7 +676,10 @@ async fn usable_entry(svc: &Services, cloud_machine_id: &str) -> Result<super::c
             "the cloud entry's key was rejected; save a new key first",
         ));
     }
-    if super::config::saved_key(svc, cloud_machine_id).await?.is_none() {
+    if super::config::saved_key(svc, cloud_machine_id)
+        .await?
+        .is_none()
+    {
         return Err(crate::home_move::target_unavailable(
             "the cloud entry has no saved key",
         ));

@@ -268,13 +268,8 @@ async fn steps(svc: &Services, home_move: &HomeMove) -> Result<()> {
     let node_id = match (&target.node_id, &target.cloud_machine_id) {
         (Some(node_id), _) => node_id.clone(),
         (None, Some(cloud_machine_id)) => {
-            crate::cloud::start_move_home(
-                svc,
-                workspace_id,
-                &target.home_id,
-                cloud_machine_id,
-            )
-            .await?
+            crate::cloud::start_move_home(svc, workspace_id, &target.home_id, cloud_machine_id)
+                .await?
         }
         (None, None) => return Err(Error::Internal("the new home is not on a machine".into())),
     };

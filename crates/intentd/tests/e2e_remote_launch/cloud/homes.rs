@@ -1665,7 +1665,11 @@ async fn a_home_moves_to_a_cloud_entry_and_to_an_agents_sandbox() {
     assert_eq!(home["nodeId"], before["nodeId"], "{home}");
     assert_eq!(home["state"], "attached", "{home}");
     assert_eq!(home["since"], before["since"], "{home}");
-    assert_eq!(homes.fake.state().creates.len(), made + 1, "one start tried");
+    assert_eq!(
+        homes.fake.state().creates.len(),
+        made + 1,
+        "one start tried"
+    );
     homes.fake.state().failed_mint_templates.clear();
     let failed_sandbox = homes
         .fake
