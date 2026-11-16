@@ -21,7 +21,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<ContextItem>> {
-        dispatch!(self, backend => backend.list_workspace_context_items(workspace_id).await)
+        pending_postgres!("list_workspace_context_items", self, backend => backend.list_workspace_context_items(workspace_id).await)
     }
 
     /// Replace the entire context item list for a workspace atomically —
@@ -42,7 +42,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         items: &[ContextItem],
     ) -> Result<Vec<ContextItem>> {
-        dispatch!(self, backend => backend.replace_workspace_context_items(workspace_id, items).await)
+        pending_postgres!("replace_workspace_context_items", self, backend => backend.replace_workspace_context_items(workspace_id, items).await)
     }
 }
 

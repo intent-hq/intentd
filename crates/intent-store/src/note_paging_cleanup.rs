@@ -119,7 +119,7 @@ impl Store {
     /// # Errors
     /// Returns `Error::Internal` if the schema read or the write fails.
     pub async fn retired_note_paging_step(&self, batch_rows: u32) -> Result<RetiredNotePagingStep> {
-        dispatch!(self, backend => backend.retired_note_paging_step(batch_rows).await)
+        pending_postgres!("retired_note_paging_step", self, backend => backend.retired_note_paging_step(batch_rows).await)
     }
 
     /// Remove the retired note paging tables in short, paced batches until
@@ -136,7 +136,7 @@ impl Store {
         &self,
         policy: NotePagingCleanupPolicy,
     ) -> NotePagingCleanupOutcome {
-        dispatch!(self, backend => backend.run_retired_note_paging_cleanup(policy).await)
+        pending_postgres!(panic "run_retired_note_paging_cleanup", self, backend => backend.run_retired_note_paging_cleanup(policy).await)
     }
 }
 

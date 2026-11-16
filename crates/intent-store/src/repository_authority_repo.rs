@@ -199,7 +199,7 @@ impl Store {
         principal_id: &PrincipalId,
         original_token_hash: Option<&str>,
     ) -> Result<RepositoryHostAuthoritySnapshot> {
-        dispatch!(self, backend => backend.repository_host_authority_snapshot(principal_id, original_token_hash).await)
+        pending_postgres!("repository_host_authority_snapshot", self, backend => backend.repository_host_authority_snapshot(principal_id, original_token_hash).await)
     }
 
     /// Read common workspace/host facts without supplying or looking up a human
@@ -215,7 +215,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<RepositoryWorkspaceAuthoritySnapshot> {
-        dispatch!(self, backend => backend.repository_workspace_authority_snapshot(workspace_id).await)
+        pending_postgres!("repository_workspace_authority_snapshot", self, backend => backend.repository_workspace_authority_snapshot(workspace_id).await)
     }
 
     /// Read exact original workspace/principal/optional personal credential facts
@@ -233,7 +233,7 @@ impl Store {
         principal_id: &PrincipalId,
         original_token_hash: Option<&str>,
     ) -> Result<RepositoryAuthoritySnapshot> {
-        dispatch!(self, backend => backend.repository_authority_snapshot(workspace_id, principal_id, original_token_hash).await)
+        pending_postgres!("repository_authority_snapshot", self, backend => backend.repository_authority_snapshot(workspace_id, principal_id, original_token_hash).await)
     }
 }
 

@@ -17,7 +17,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_idempotent(&self, workspace_id: &str, key: &str) -> Result<Option<String>> {
-        dispatch!(self, backend => backend.get_idempotent(workspace_id, key).await)
+        pending_postgres!("get_idempotent", self, backend => backend.get_idempotent(workspace_id, key).await)
     }
 
     /// Record the serialized `result_json` under `(workspace_id, key)`. Uses
@@ -35,7 +35,7 @@ impl Store {
         method: &str,
         result_json: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.put_idempotent(workspace_id, key, method, result_json).await)
+        pending_postgres!("put_idempotent", self, backend => backend.put_idempotent(workspace_id, key, method, result_json).await)
     }
 
     /// Reaper sweep (design §5.4): delete rows whose `created_at` is strictly
@@ -46,7 +46,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn reap_idempotent(&self, cutoff: &str) -> Result<u64> {
-        dispatch!(self, backend => backend.reap_idempotent(cutoff).await)
+        pending_postgres!("reap_idempotent", self, backend => backend.reap_idempotent(cutoff).await)
     }
 }
 

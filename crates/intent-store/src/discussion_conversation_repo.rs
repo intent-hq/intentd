@@ -93,7 +93,7 @@ impl Store {
     /// # Errors
     /// Returns a database error.
     pub async fn has_private_discussions(&self, ws: &WorkspaceId) -> Result<bool> {
-        dispatch!(self, backend => backend.has_private_discussions(ws).await)
+        pending_postgres!("has_private_discussions", self, backend => backend.has_private_discussions(ws).await)
     }
 
     /// Read metadata after caller authorization.
@@ -104,7 +104,7 @@ impl Store {
         ws: &WorkspaceId,
         id: &str,
     ) -> Result<DiscussionConversation> {
-        dispatch!(self, backend => backend.discussion_conversation(ws, id).await)
+        pending_postgres!("discussion_conversation", self, backend => backend.discussion_conversation(ws, id).await)
     }
 
     /// Check local participant grants; imported source IDs are never authority.
@@ -116,7 +116,7 @@ impl Store {
         id: &str,
         principal: &PrincipalId,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.discussion_is_participant(ws, id, principal).await)
+        pending_postgres!("discussion_is_participant", self, backend => backend.discussion_is_participant(ws, id, principal).await)
     }
 
     /// Filter a roster's conversation IDs in one bounded query.
@@ -128,7 +128,7 @@ impl Store {
         principal: &PrincipalId,
         ids: &[String],
     ) -> Result<Vec<String>> {
-        dispatch!(self, backend => backend.discussion_visible_ids(ws, principal, ids).await)
+        pending_postgres!("discussion_visible_ids", self, backend => backend.discussion_visible_ids(ws, principal, ids).await)
     }
 
     /// Bounded workspace-wide and authorized legacy discovery; default leads when present.
@@ -141,7 +141,7 @@ impl Store {
         before: Option<&str>,
         limit: u32,
     ) -> Result<Value> {
-        dispatch!(self, backend => backend.discussion_conversations(ws, principal, before, limit).await)
+        pending_postgres!("discussion_conversations", self, backend => backend.discussion_conversations(ws, principal, before, limit).await)
     }
 
     /// Bounded effective member picker, independent of online presence.
@@ -155,7 +155,7 @@ impl Store {
         after: Option<&str>,
         limit: u32,
     ) -> Result<Value> {
-        dispatch!(self, backend => backend.discussion_recipients(ws, principal, query, after, limit).await)
+        pending_postgres!("discussion_recipients", self, backend => backend.discussion_recipients(ws, principal, query, after, limit).await)
     }
 
     /// Atomically create a conversation on its first message or append/retry.
@@ -169,7 +169,7 @@ impl Store {
         author: &DiscussionAuthor,
         target: &DiscussionTarget,
     ) -> Result<(DiscussionSendResult, bool)> {
-        dispatch!(self, backend => backend.send_discussion_message(ws, key, body, author, target).await)
+        pending_postgres!("send_discussion_message", self, backend => backend.send_discussion_message(ws, key, body, author, target).await)
     }
 }
 

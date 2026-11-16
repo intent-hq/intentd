@@ -38,7 +38,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_note(&self, note: &Note) -> Result<()> {
-        dispatch!(self, backend => backend.insert_note(note).await)
+        pending_postgres!("insert_note", self, backend => backend.insert_note(note).await)
     }
 
     /// List notes in a workspace, ordered by creation time.
@@ -47,7 +47,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_notes(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
-        dispatch!(self, backend => backend.list_notes(workspace_id).await)
+        pending_postgres!("list_notes", self, backend => backend.list_notes(workspace_id).await)
     }
 
     /// Read task summaries, dependency statuses and unfiltered stats in one snapshot.
@@ -64,7 +64,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         filter: Option<TaskStatus>,
     ) -> Result<TaskListResult> {
-        dispatch!(self, backend => backend.list_workspace_tasks(workspace_id, filter).await)
+        pending_postgres!("list_workspace_tasks", self, backend => backend.list_workspace_tasks(workspace_id, filter).await)
     }
 
     /// [`Self::list_workspace_tasks`] plus each returned task's `created_at`
@@ -79,7 +79,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         filter: Option<TaskStatus>,
     ) -> Result<(TaskListResult, Vec<String>)> {
-        dispatch!(self, backend => backend.list_workspace_tasks_keyed(workspace_id, filter).await)
+        pending_postgres!("list_workspace_tasks_keyed", self, backend => backend.list_workspace_tasks_keyed(workspace_id, filter).await)
     }
 
     /// Test whether a workspace owns a note without hydrating its row.
@@ -91,7 +91,7 @@ impl Store {
     ///
     /// Returns [`Error::Internal`] when the underlying query fails.
     pub async fn note_exists(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<bool> {
-        dispatch!(self, backend => backend.note_exists(workspace_id, id).await)
+        pending_postgres!("note_exists", self, backend => backend.note_exists(workspace_id, id).await)
     }
 
     /// Newest `updated_at` across a workspace's notes, or `None` when the
@@ -113,7 +113,7 @@ impl Store {
     ///
     /// Returns [`Error::Internal`] when the underlying query fails.
     pub async fn max_note_updated_at(&self, workspace_id: &WorkspaceId) -> Result<Option<String>> {
-        dispatch!(self, backend => backend.max_note_updated_at(workspace_id).await)
+        pending_postgres!("max_note_updated_at", self, backend => backend.max_note_updated_at(workspace_id).await)
     }
 
     /// Maximum note timestamp per requested workspace in one statement.
@@ -125,7 +125,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<HashMap<WorkspaceId, String>> {
-        dispatch!(self, backend => backend.max_note_updated_at_by_workspace(workspace_ids).await)
+        pending_postgres!("max_note_updated_at_by_workspace", self, backend => backend.max_note_updated_at_by_workspace(workspace_ids).await)
     }
 
     /// List every note across all workspaces, oldest first. Backs the global
@@ -135,7 +135,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_notes(&self) -> Result<Vec<Note>> {
-        dispatch!(self, backend => backend.list_all_notes().await)
+        pending_postgres!("list_all_notes", self, backend => backend.list_all_notes().await)
     }
 
     /// Fetch a single note by (workspace, id), or `NotFound`. Note identity is
@@ -151,7 +151,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn get_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
-        dispatch!(self, backend => backend.get_note(workspace_id, id).await)
+        pending_postgres!("get_note", self, backend => backend.get_note(workspace_id, id).await)
     }
 
     /// Read the note metadata used by change events without loading its body.
@@ -160,7 +160,7 @@ impl Store {
     /// # Errors
     /// Returns `NotFound` for an absent note, or a database/decoding error.
     pub async fn get_note_metadata(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
-        dispatch!(self, backend => backend.get_note_metadata(workspace_id, id).await)
+        pending_postgres!("get_note_metadata", self, backend => backend.get_note_metadata(workspace_id, id).await)
     }
 
     /// Update an existing note (full-row replace, except `id` and
@@ -185,7 +185,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note(&self, lock: &crate::NoteWriteLock, note: &Note) -> Result<i64> {
-        dispatch!(self, backend => backend.update_note(lock, note).await)
+        pending_postgres!("update_note", self, backend => backend.update_note(lock, note).await)
     }
 
     /// Update an existing note, optionally gating on `expected_version`
@@ -219,7 +219,7 @@ impl Store {
         note: &Note,
         expected_version: Option<i64>,
     ) -> Result<i64> {
-        dispatch!(self, backend => backend.update_note_versioned(lock, note, expected_version).await)
+        pending_postgres!("update_note_versioned", self, backend => backend.update_note_versioned(lock, note, expected_version).await)
     }
 
     /// Metadata-only update: rewrites every column *except* `content` and
@@ -245,7 +245,7 @@ impl Store {
         lock: &crate::NoteWriteLock,
         note: &Note,
     ) -> Result<i64> {
-        dispatch!(self, backend => backend.update_note_metadata(lock, note).await)
+        pending_postgres!("update_note_metadata", self, backend => backend.update_note_metadata(lock, note).await)
     }
 
     /// [`Store::update_note_metadata`] optionally gated on `expected_version`,
@@ -262,7 +262,7 @@ impl Store {
         note: &Note,
         expected_version: Option<i64>,
     ) -> Result<i64> {
-        dispatch!(self, backend => backend.update_note_metadata_versioned(lock, note, expected_version).await)
+        pending_postgres!("update_note_metadata_versioned", self, backend => backend.update_note_metadata_versioned(lock, note, expected_version).await)
     }
 
     /// Update recovery metadata only while this agent is still linked to the
@@ -281,7 +281,7 @@ impl Store {
         expected_version: i64,
         agent_id: &AgentId,
     ) -> Result<Option<i64>> {
-        dispatch!(self, backend => backend.update_note_metadata_if_agent_linked(lock, note, expected_version, agent_id).await)
+        pending_postgres!("update_note_metadata_if_agent_linked", self, backend => backend.update_note_metadata_if_agent_linked(lock, note, expected_version, agent_id).await)
     }
 
     /// Delete a note by (workspace, id), unconditional. `NotFound` if absent.
@@ -290,7 +290,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the delete fails.
     pub async fn delete_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<()> {
-        dispatch!(self, backend => backend.delete_note(workspace_id, id).await)
+        pending_postgres!("delete_note", self, backend => backend.delete_note(workspace_id, id).await)
     }
 
     /// Delete a note, optionally gating on `expected_version` (optimistic
@@ -311,7 +311,7 @@ impl Store {
         id: &NoteId,
         expected_version: Option<i64>,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.delete_note_versioned(workspace_id, id, expected_version).await)
+        pending_postgres!("delete_note_versioned", self, backend => backend.delete_note_versioned(workspace_id, id, expected_version).await)
     }
 
     /// List a workspace's task notes (those carrying `task_json`), using the
@@ -321,7 +321,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_tasks(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
-        dispatch!(self, backend => backend.list_tasks(workspace_id).await)
+        pending_postgres!("list_tasks", self, backend => backend.list_tasks(workspace_id).await)
     }
 
     /// Cheap per-workspace `taskStats` counting query (no note-body
@@ -343,7 +343,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
-        dispatch!(self, backend => backend.count_task_stats(workspace_id).await)
+        pending_postgres!("count_task_stats", self, backend => backend.count_task_stats(workspace_id).await)
     }
 
     /// Per-workspace task-note count per status as a single aggregate
@@ -364,7 +364,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<BTreeMap<String, u64>> {
-        dispatch!(self, backend => backend.count_tasks_by_status(workspace_id).await)
+        pending_postgres!("count_tasks_by_status", self, backend => backend.count_tasks_by_status(workspace_id).await)
     }
 
     /// Task statistics for every requested workspace in one projected read.
@@ -376,7 +376,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<HashMap<WorkspaceId, WorkspaceTaskStats>> {
-        dispatch!(self, backend => backend.count_task_stats_by_workspace(workspace_ids).await)
+        pending_postgres!("count_task_stats_by_workspace", self, backend => backend.count_task_stats_by_workspace(workspace_ids).await)
     }
 
     /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
@@ -414,7 +414,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<(NoteId, String)>> {
-        dispatch!(self, backend => backend.adopt_stray_spec_note(workspace_id).await)
+        pending_postgres!("adopt_stray_spec_note", self, backend => backend.adopt_stray_spec_note(workspace_id).await)
     }
 }
 

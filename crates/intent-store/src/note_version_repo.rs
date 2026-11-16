@@ -45,7 +45,7 @@ impl Store {
         date: &str,
         rev: i64,
     ) -> Result<i64> {
-        dispatch!(self, backend => backend.append_note_version(note, author, date, rev).await)
+        pending_postgres!("append_note_version", self, backend => backend.append_note_version(note, author, date, rev).await)
     }
 
     /// Persist a note content write and its version snapshot in ONE
@@ -74,7 +74,7 @@ impl Store {
         author: &NoteVersionAuthor,
         date: &str,
     ) -> Result<(i64, i64)> {
-        dispatch!(self, backend => backend.update_note_with_version(lock, note, expected_version, author, date).await)
+        pending_postgres!("update_note_with_version", self, backend => backend.update_note_with_version(lock, note, expected_version, author, date).await)
     }
 
     /// Persist a parent-note content write together with the child-note
@@ -105,7 +105,7 @@ impl Store {
         author: &NoteVersionAuthor,
         date: &str,
     ) -> Result<(i64, i64)> {
-        dispatch!(self, backend => backend.update_note_with_version_and_children(lock, note, expected_version, children, author, date).await)
+        pending_postgres!("update_note_with_version_and_children", self, backend => backend.update_note_with_version_and_children(lock, note, expected_version, children, author, date).await)
     }
 
     /// Insert a note row and its initial version snapshot (at `note.rev`) in
@@ -126,7 +126,7 @@ impl Store {
         author: &NoteVersionAuthor,
         date: &str,
     ) -> Result<i64> {
-        dispatch!(self, backend => backend.insert_note_with_version(note, author, date).await)
+        pending_postgres!("insert_note_with_version", self, backend => backend.insert_note_with_version(note, author, date).await)
     }
 
     /// List a note's stored versions ascending by `v`, without content blobs
@@ -142,7 +142,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> Result<Vec<NoteVersionSummary>> {
-        dispatch!(self, backend => backend.list_note_versions(workspace_id, note_id).await)
+        pending_postgres!("list_note_versions", self, backend => backend.list_note_versions(workspace_id, note_id).await)
     }
 
     /// Fetch one stored version (with content), or `NotFound`. Scoped by
@@ -157,7 +157,7 @@ impl Store {
         note_id: &NoteId,
         v: i64,
     ) -> Result<NoteVersion> {
-        dispatch!(self, backend => backend.get_note_version(workspace_id, note_id, v).await)
+        pending_postgres!("get_note_version", self, backend => backend.get_note_version(workspace_id, note_id, v).await)
     }
 
     /// The note's content *as of* `rev`: the content of the newest snapshot
@@ -181,7 +181,7 @@ impl Store {
         note_id: &NoteId,
         rev: i64,
     ) -> Result<Option<String>> {
-        dispatch!(self, backend => backend.get_note_version_content_by_rev(workspace_id, note_id, rev).await)
+        pending_postgres!("get_note_version_content_by_rev", self, backend => backend.get_note_version_content_by_rev(workspace_id, note_id, rev).await)
     }
 }
 

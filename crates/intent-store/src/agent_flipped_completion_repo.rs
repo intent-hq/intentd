@@ -32,7 +32,7 @@ impl Store {
         task_note_id: &NoteId,
         recorded_at: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.record_agent_flipped_completion(agent_id, workspace_id, task_note_id, recorded_at).await)
+        pending_postgres!("record_agent_flipped_completion", self, backend => backend.record_agent_flipped_completion(agent_id, workspace_id, task_note_id, recorded_at).await)
     }
 
     /// Remove every agent's recorded flip of `task_note_id` — called when the
@@ -47,7 +47,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         task_note_id: &NoteId,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.remove_agent_flipped_completions_for_task(workspace_id, task_note_id).await)
+        pending_postgres!("remove_agent_flipped_completions_for_task", self, backend => backend.remove_agent_flipped_completions_for_task(workspace_id, task_note_id).await)
     }
 
     /// Take (list and clear) the agent's recorded flipped completions,
@@ -66,7 +66,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<Vec<(WorkspaceId, NoteId)>> {
-        dispatch!(self, backend => backend.take_agent_flipped_completions(agent_id).await)
+        pending_postgres!("take_agent_flipped_completions", self, backend => backend.take_agent_flipped_completions(agent_id).await)
     }
 
     /// The agent's recorded flipped completions, oldest-first.
@@ -78,7 +78,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<Vec<(WorkspaceId, NoteId)>> {
-        dispatch!(self, backend => backend.list_agent_flipped_completions(agent_id).await)
+        pending_postgres!("list_agent_flipped_completions", self, backend => backend.list_agent_flipped_completions(agent_id).await)
     }
 }
 

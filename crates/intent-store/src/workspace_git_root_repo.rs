@@ -123,7 +123,7 @@ impl Store {
         &self,
         root: &WorkspaceGitRoot,
     ) -> Result<(WorkspaceGitRoot, bool)> {
-        dispatch!(self, backend => backend.upsert_workspace_git_root(root).await)
+        pending_postgres!("upsert_workspace_git_root", self, backend => backend.upsert_workspace_git_root(root).await)
     }
 
     /// Fetch a single git root by id, or `NotFound`.
@@ -135,7 +135,7 @@ impl Store {
         &self,
         id: &WorkspaceGitRootId,
     ) -> Result<WorkspaceGitRoot> {
-        dispatch!(self, backend => backend.get_workspace_git_root(id).await)
+        pending_postgres!("get_workspace_git_root", self, backend => backend.get_workspace_git_root(id).await)
     }
 
     /// The git root registered for `(workspace_id, path)`, if any.
@@ -148,7 +148,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         path: &str,
     ) -> Result<Option<WorkspaceGitRoot>> {
-        dispatch!(self, backend => backend.find_workspace_git_root_by_path(workspace_id, path).await)
+        pending_postgres!("find_workspace_git_root_by_path", self, backend => backend.find_workspace_git_root_by_path(workspace_id, path).await)
     }
 
     /// Every git root registered for a workspace, oldest first.
@@ -160,7 +160,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<WorkspaceGitRoot>> {
-        dispatch!(self, backend => backend.list_workspace_git_roots(workspace_id).await)
+        pending_postgres!("list_workspace_git_roots", self, backend => backend.list_workspace_git_roots(workspace_id).await)
     }
 
     /// Every git root across ALL workspaces that carries a discovered
@@ -178,7 +178,7 @@ impl Store {
         &self,
         include_archived: bool,
     ) -> Result<Vec<WorkspaceGitRoot>> {
-        dispatch!(self, backend => backend.list_workspace_git_roots_with_prs(include_archived).await)
+        pending_postgres!("list_workspace_git_roots_with_prs", self, backend => backend.list_workspace_git_roots_with_prs(include_archived).await)
     }
 
     /// Git roots of live (non-archived, non-remote) workspaces referencing a
@@ -197,7 +197,7 @@ impl Store {
         &self,
         url: &str,
     ) -> Result<Vec<WorkspaceGitRoot>> {
-        dispatch!(self, backend => backend.list_workspace_git_roots_referencing_pr_url(url).await)
+        pending_postgres!("list_workspace_git_roots_referencing_pr_url", self, backend => backend.list_workspace_git_roots_referencing_pr_url(url).await)
     }
 
     /// Delete a git root by id; `NotFound` when absent.
@@ -206,7 +206,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace_git_root(&self, id: &WorkspaceGitRootId) -> Result<()> {
-        dispatch!(self, backend => backend.delete_workspace_git_root(id).await)
+        pending_postgres!("delete_workspace_git_root", self, backend => backend.delete_workspace_git_root(id).await)
     }
 
     /// Update only the PR-linkage fields of a git root (`pr_number`,
@@ -219,7 +219,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_git_root_pr(&self, root: &WorkspaceGitRoot) -> Result<()> {
-        dispatch!(self, backend => backend.update_workspace_git_root_pr(root).await)
+        pending_postgres!("update_workspace_git_root_pr", self, backend => backend.update_workspace_git_root_pr(root).await)
     }
 
     /// [`Self::update_workspace_git_root_pr`] rebased on the row at write
@@ -243,7 +243,7 @@ impl Store {
     where
         F: FnOnce(&mut WorkspaceGitRoot, Option<Vec<PullRequestInfo>>),
     {
-        dispatch!(self, backend => backend.update_workspace_git_root_pr_rebased(root, rebase).await)
+        pending_postgres!("update_workspace_git_root_pr_rebased", self, backend => backend.update_workspace_git_root_pr_rebased(root, rebase).await)
     }
 
     /// Project onto a git root's persisted `pull_requests` atomically — the
@@ -268,7 +268,7 @@ impl Store {
     where
         F: FnOnce(&mut Option<Vec<PullRequestInfo>>) -> bool,
     {
-        dispatch!(self, backend => backend.project_workspace_git_root_pull_requests(id, updated_at, project).await)
+        pending_postgres!("project_workspace_git_root_pull_requests", self, backend => backend.project_workspace_git_root_pull_requests(id, updated_at, project).await)
     }
 
     /// Stamp a git root's `registered_commit_sha` ONLY when it is currently
@@ -287,7 +287,7 @@ impl Store {
         sha: &str,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.backfill_workspace_git_root_commit_sha(id, sha, updated_at).await)
+        pending_postgres!("backfill_workspace_git_root_commit_sha", self, backend => backend.backfill_workspace_git_root_commit_sha(id, sha, updated_at).await)
     }
 }
 

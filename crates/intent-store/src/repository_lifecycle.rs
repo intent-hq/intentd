@@ -451,7 +451,7 @@ impl Store {
     /// settlement, permission or current usability; those checks remain separate.
     #[must_use]
     pub fn shares_repository_lifecycle_domain(&self, other: &Store) -> bool {
-        dispatch!(self, backend => backend.shares_repository_lifecycle_domain(other))
+        pending_postgres!(panic "shares_repository_lifecycle_domain", self, backend => backend.shares_repository_lifecycle_domain(other))
     }
 
     /// Retain original ownership before publishing or claiming pending deletion.
@@ -469,7 +469,7 @@ impl Store {
         &self,
         keys: &[RepositoryLifecycleKey],
     ) -> Result<RepositoryPendingDeleteGuard> {
-        dispatch!(self, backend => backend.begin_repository_pending_delete(keys).await)
+        pending_postgres!("begin_repository_pending_delete", self, backend => backend.begin_repository_pending_delete(keys).await)
     }
 
     /// Install the sole invalidation owner for this managed database lifetime.
@@ -482,7 +482,7 @@ impl Store {
         &self,
         observer: Arc<dyn RepositoryLifecycleObserver>,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.install_repository_lifecycle_observer(observer).await)
+        pending_postgres!("install_repository_lifecycle_observer", self, backend => backend.install_repository_lifecycle_observer(observer).await)
     }
 
     /// Match the actual installed owner; this is evidence, never permission.
@@ -491,7 +491,7 @@ impl Store {
         &self,
         observer: &Arc<dyn RepositoryLifecycleObserver>,
     ) -> bool {
-        dispatch!(self, backend => backend.has_repository_lifecycle_observer(observer))
+        pending_postgres!(panic "has_repository_lifecycle_observer", self, backend => backend.has_repository_lifecycle_observer(observer))
     }
 }
 

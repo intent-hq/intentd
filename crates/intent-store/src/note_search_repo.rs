@@ -192,7 +192,7 @@ impl Store {
         options: &NoteFtsOptions<'_>,
         notes: &[(String, String)],
     ) -> Result<Vec<NoteFtsCursor>> {
-        dispatch!(self, backend => backend.note_fts_positions(match_expr, options, notes).await)
+        pending_postgres!("note_fts_positions", self, backend => backend.note_fts_positions(match_expr, options, notes).await)
     }
 
     /// Search the note FTS index using an already-sanitized MATCH expression
@@ -212,7 +212,7 @@ impl Store {
         match_expr: &str,
         options: &NoteFtsOptions<'_>,
     ) -> Result<Vec<NoteFtsMatch>> {
-        dispatch!(self, backend => backend.search_notes_fts(match_expr, options).await)
+        pending_postgres!("search_notes_fts", self, backend => backend.search_notes_fts(match_expr, options).await)
     }
 }
 

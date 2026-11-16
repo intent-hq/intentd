@@ -23,7 +23,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<Value>> {
-        dispatch!(self, backend => backend.get_workspace_ui_context(workspace_id).await)
+        pending_postgres!("get_workspace_ui_context", self, backend => backend.get_workspace_ui_context(workspace_id).await)
     }
 
     /// Update the UI context blob for a workspace. Upserts the row (replaces
@@ -42,7 +42,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         ui_context: &Value,
     ) -> Result<Value> {
-        dispatch!(self, backend => backend.update_workspace_ui_context(workspace_id, ui_context).await)
+        pending_postgres!("update_workspace_ui_context", self, backend => backend.update_workspace_ui_context(workspace_id, ui_context).await)
     }
 }
 

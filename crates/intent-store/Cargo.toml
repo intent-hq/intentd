@@ -23,6 +23,11 @@ ignored-paths = [
 # test targets (`cargo test`, `--all-targets`), never for release/packaging
 # builds of the daemon.
 test-support = []
+# Multi-tenant Postgres backend (`intent_store::postgres`). Enable only from
+# `[dev-dependencies]` or CI; no shipped crate depends on it, and the
+# `store-postgres` CI job checks that the intentd release graph never
+# includes it.
+postgres = ["sqlx/postgres"]
 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.231" }

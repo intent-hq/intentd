@@ -64,7 +64,7 @@ impl Store {
         m: &PrMonitor,
         target: &ReviewTarget,
     ) -> Result<PreparedMonitorWrite> {
-        dispatch!(self, backend => backend.prepare_monitor_insert(m, target).await)
+        pending_postgres!("prepare_monitor_insert", self, backend => backend.prepare_monitor_insert(m, target).await)
     }
 
     /// Prepare a refresh, lifecycle change or ownership transfer of the exact captured row.
@@ -75,7 +75,7 @@ impl Store {
         expected: &QualifiedPrMonitor,
         replacement: &PrMonitor,
     ) -> Result<PreparedMonitorWrite> {
-        dispatch!(self, backend => backend.prepare_monitor_replace(expected, replacement).await)
+        pending_postgres!("prepare_monitor_replace", self, backend => backend.prepare_monitor_replace(expected, replacement).await)
     }
 
     /// Prepare cancellation without losing the complete captured-row CAS.
@@ -86,7 +86,7 @@ impl Store {
         expected: &QualifiedPrMonitor,
         now: &str,
     ) -> Result<PreparedMonitorWrite> {
-        dispatch!(self, backend => backend.prepare_monitor_cancel(expected, now).await)
+        pending_postgres!("prepare_monitor_cancel", self, backend => backend.prepare_monitor_cancel(expected, now).await)
     }
 }
 

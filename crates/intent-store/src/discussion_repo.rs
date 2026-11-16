@@ -63,7 +63,7 @@ impl Store {
         body: &str,
         author: &DiscussionAuthor,
     ) -> Result<(DiscussionMessage, bool)> {
-        dispatch!(self, backend => backend.insert_discussion_message(workspace_id, client_message_id, body, author).await)
+        pending_postgres!("insert_discussion_message", self, backend => backend.insert_discussion_message(workspace_id, client_message_id, body, author).await)
     }
 
     /// Read a bounded page, oldest first. After a cursor, take the first newer
@@ -78,7 +78,7 @@ impl Store {
         after_sequence: Option<i64>,
         limit: u32,
     ) -> Result<DiscussionPage> {
-        dispatch!(self, backend => backend.list_discussion_messages(workspace_id, before_sequence, after_sequence, limit).await)
+        pending_postgres!("list_discussion_messages", self, backend => backend.list_discussion_messages(workspace_id, before_sequence, after_sequence, limit).await)
     }
 
     /// Read one conversation's bounded history.
@@ -92,7 +92,7 @@ impl Store {
         after_sequence: Option<i64>,
         limit: u32,
     ) -> Result<DiscussionPage> {
-        dispatch!(self, backend => backend.list_discussion_messages_in(workspace_id, conversation_id, before_sequence, after_sequence, limit).await)
+        pending_postgres!("list_discussion_messages_in", self, backend => backend.list_discussion_messages_in(workspace_id, conversation_id, before_sequence, after_sequence, limit).await)
     }
 
     /// Read a bounded page and viewer reaction selection in a single snapshot.
@@ -108,7 +108,7 @@ impl Store {
         limit: u32,
         viewer: Option<&DiscussionActor>,
     ) -> Result<DiscussionPage> {
-        dispatch!(self, backend => backend.list_discussion_messages_for(workspace_id, conversation_id, before_sequence, after_sequence, limit, viewer).await)
+        pending_postgres!("list_discussion_messages_for", self, backend => backend.list_discussion_messages_for(workspace_id, conversation_id, before_sequence, after_sequence, limit, viewer).await)
     }
 }
 

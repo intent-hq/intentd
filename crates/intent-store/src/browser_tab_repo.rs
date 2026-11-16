@@ -125,7 +125,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_browser_tabs(&self, id: &WorkspaceId) -> Result<Vec<BrowserTab>> {
-        dispatch!(self, backend => backend.list_browser_tabs(id).await)
+        pending_postgres!("list_browser_tabs", self, backend => backend.list_browser_tabs(id).await)
     }
 
     /// Every open tab hosted by `host`, across workspaces, oldest first.
@@ -134,7 +134,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_browser_tabs_by_host(&self, host: &ClientId) -> Result<Vec<BrowserTab>> {
-        dispatch!(self, backend => backend.list_browser_tabs_by_host(host).await)
+        pending_postgres!("list_browser_tabs_by_host", self, backend => backend.list_browser_tabs_by_host(host).await)
     }
 
     /// One open tab by id, or `None` (tombstoned rows count as absent).
@@ -143,7 +143,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_browser_tab(&self, tab_id: &str) -> Result<Option<BrowserTab>> {
-        dispatch!(self, backend => backend.get_browser_tab(tab_id).await)
+        pending_postgres!("get_browser_tab", self, backend => backend.get_browser_tab(tab_id).await)
     }
 
     /// Host-reported upsert (`browser.upsertTab`): insert a new row hosted by
@@ -165,7 +165,7 @@ impl Store {
         host: &ClientId,
         input: BrowserTabInput,
     ) -> Result<BrowserTabUpsertOutcome> {
-        dispatch!(self, backend => backend.upsert_browser_tab(host, input).await)
+        pending_postgres!("upsert_browser_tab", self, backend => backend.upsert_browser_tab(host, input).await)
     }
 
     /// Host-reported close (`browser.removeTab`): delete the row outright and
@@ -182,7 +182,7 @@ impl Store {
         host: &ClientId,
         tab_id: &str,
     ) -> Result<Option<BrowserTab>> {
-        dispatch!(self, backend => backend.remove_browser_tab(host, tab_id).await)
+        pending_postgres!("remove_browser_tab", self, backend => backend.remove_browser_tab(host, tab_id).await)
     }
 
     /// Daemon-side close of a tab whose host may be offline (a viewer / agent
@@ -195,7 +195,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn close_browser_tab(&self, tab_id: &str) -> Result<Option<BrowserTab>> {
-        dispatch!(self, backend => backend.close_browser_tab(tab_id).await)
+        pending_postgres!("close_browser_tab", self, backend => backend.close_browser_tab(tab_id).await)
     }
 
     /// Claim migration (REV-2 Model 3 & 5): an agent `claimTab` on a tab
@@ -218,7 +218,7 @@ impl Store {
         new_host: &ClientId,
         owner_agent_id: Option<&AgentId>,
     ) -> Result<Option<(BrowserTab, serde_json::Value)>> {
-        dispatch!(self, backend => backend.reassign_browser_tab_host(tab_id, new_host, owner_agent_id).await)
+        pending_postgres!("reassign_browser_tab_host", self, backend => backend.reassign_browser_tab_host(tab_id, new_host, owner_agent_id).await)
     }
 
     /// Driving-client switch (REV-2 Model 10, `workspace.setBrowserClient`):
@@ -237,7 +237,7 @@ impl Store {
         id: &WorkspaceId,
         new_host: &ClientId,
     ) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
-        dispatch!(self, backend => backend.reassign_claimed_browser_tabs(id, new_host).await)
+        pending_postgres!("reassign_claimed_browser_tabs", self, backend => backend.reassign_claimed_browser_tabs(id, new_host).await)
     }
 
     /// Superseded-host rehome (intent-hq/intent#8045): every **open** row
@@ -262,7 +262,7 @@ impl Store {
         old_hosts: &[ClientId],
         still_movable: &(dyn Fn(&ClientId) -> bool + Send + Sync),
     ) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
-        dispatch!(self, backend => backend.reassign_browser_tabs_from_hosts(new_host, old_hosts, still_movable).await)
+        pending_postgres!("reassign_browser_tabs_from_hosts", self, backend => backend.reassign_browser_tabs_from_hosts(new_host, old_hosts, still_movable).await)
     }
 
     /// Host snapshot reconciliation (`browser.syncTabs`, REV-2 Model 6), one
@@ -286,7 +286,7 @@ impl Store {
         host: &ClientId,
         snapshot: Vec<BrowserTabInput>,
     ) -> Result<BrowserTabSyncResult> {
-        dispatch!(self, backend => backend.sync_browser_tabs(host, snapshot).await)
+        pending_postgres!("sync_browser_tabs", self, backend => backend.sync_browser_tabs(host, snapshot).await)
     }
 }
 

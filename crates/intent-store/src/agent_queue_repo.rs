@@ -104,7 +104,7 @@ impl Store {
         agent_id: &AgentId,
         rows: &[AgentQueueRow],
     ) -> Result<()> {
-        dispatch!(self, backend => backend.replace_agent_queue(agent_id, rows).await)
+        pending_postgres!("replace_agent_queue", self, backend => backend.replace_agent_queue(agent_id, rows).await)
     }
 
     /// Atomically move the persisted queue between two agents: ONE write
@@ -126,7 +126,7 @@ impl Store {
         to: &AgentId,
         rows: &[AgentQueueRow],
     ) -> Result<()> {
-        dispatch!(self, backend => backend.move_agent_queue(from, to, rows).await)
+        pending_postgres!("move_agent_queue", self, backend => backend.move_agent_queue(from, to, rows).await)
     }
 
     /// Load every persisted queue entry, ordered by agent then queue position,
@@ -142,7 +142,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_all_agent_queues(&self) -> Result<Vec<AgentQueueRow>> {
-        dispatch!(self, backend => backend.load_all_agent_queues().await)
+        pending_postgres!("load_all_agent_queues", self, backend => backend.load_all_agent_queues().await)
     }
 }
 

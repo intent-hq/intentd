@@ -67,7 +67,7 @@ impl Store {
         fingerprint: &str,
         expired_before: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.insert_attachment_with_idempotency_key(a, key, fingerprint, expired_before).await)
+        pending_postgres!("insert_attachment_with_idempotency_key", self, backend => backend.insert_attachment_with_idempotency_key(a, key, fingerprint, expired_before).await)
     }
 
     /// Resolve a live idempotency-key binding to its attachment row. `None`
@@ -85,7 +85,7 @@ impl Store {
         key: &str,
         expired_before: &str,
     ) -> Result<Option<(AttachmentIdempotencyBinding, AttachmentRecord)>> {
-        dispatch!(self, backend => backend.get_attachment_by_idempotency_key(workspace_id, key, expired_before).await)
+        pending_postgres!("get_attachment_by_idempotency_key", self, backend => backend.get_attachment_by_idempotency_key(workspace_id, key, expired_before).await)
     }
 
     /// Retention sweep: delete every idempotency-key binding created
@@ -99,7 +99,7 @@ impl Store {
         &self,
         expired_before: &str,
     ) -> Result<u64> {
-        dispatch!(self, backend => backend.sweep_expired_attachment_idempotency_keys(expired_before).await)
+        pending_postgres!("sweep_expired_attachment_idempotency_keys", self, backend => backend.sweep_expired_attachment_idempotency_keys(expired_before).await)
     }
 
     /// Insert an attachment-registry row.
@@ -108,7 +108,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_attachment(&self, a: &AttachmentRecord) -> Result<()> {
-        dispatch!(self, backend => backend.insert_attachment(a).await)
+        pending_postgres!("insert_attachment", self, backend => backend.insert_attachment(a).await)
     }
 
     /// Load one attachment by id. `Error::NotFound` when no row exists.
@@ -117,7 +117,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the attachment does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_attachment(&self, id: &str) -> Result<AttachmentRecord> {
-        dispatch!(self, backend => backend.get_attachment(id).await)
+        pending_postgres!("get_attachment", self, backend => backend.get_attachment(id).await)
     }
 
     /// All attachment rows for one workspace, ordered by id (stable manifest
@@ -130,7 +130,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AttachmentRecord>> {
-        dispatch!(self, backend => backend.list_attachments(workspace_id).await)
+        pending_postgres!("list_attachments", self, backend => backend.list_attachments(workspace_id).await)
     }
 }
 

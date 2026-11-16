@@ -412,7 +412,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<TransferTableStat>> {
-        dispatch!(self, backend => backend.transfer_table_stats(workspace_id).await)
+        pending_postgres!("transfer_table_stats", self, backend => backend.transfer_table_stats(workspace_id).await)
     }
 
     /// Export every [`TRANSFER_TABLES`] row for one workspace as JSON objects
@@ -439,7 +439,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
-        dispatch!(self, backend => backend.transfer_export_rows(workspace_id).await)
+        pending_postgres!("transfer_export_rows", self, backend => backend.transfer_export_rows(workspace_id).await)
     }
 
     /// Read retained monitor envelopes for transfer preflight, without changing
@@ -452,7 +452,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
-        dispatch!(self, backend => backend.transfer_monitor_rows(workspace_id).await)
+        pending_postgres!("transfer_monitor_rows", self, backend => backend.transfer_monitor_rows(workspace_id).await)
     }
 
     /// Insert transformed transfer rows into their tables inside ONE
@@ -480,7 +480,7 @@ impl Store {
         &self,
         rows: &[(String, Vec<serde_json::Value>)],
     ) -> Result<usize> {
-        dispatch!(self, backend => backend.transfer_import_rows(rows).await)
+        pending_postgres!("transfer_import_rows", self, backend => backend.transfer_import_rows(rows).await)
     }
 }
 

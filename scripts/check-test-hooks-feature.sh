@@ -6,6 +6,10 @@
 # can use them from their tests. Only dev-dependencies may enable it; CI
 # (ci.yml check job) runs this guard.
 #
+# GUARDED_FEATURE names another test-only feature to guard the same way
+# (default test-hooks). CI also runs it for `postgres`: intent-store's
+# multi-tenant Postgres backend is tested in CI and never shipped.
+#
 # The graph is `cargo tree -e normal,build,features --target all`: normal and
 # build edges for every target platform, with dev-dependencies left out of
 # both the edges and the feature resolution.
@@ -14,6 +18,7 @@
 #   default manifest: this repo's Cargo.toml; default packages: intentd and
 #   intentd-sitter.
 #   CARGO_TREE_FLAGS: extra cargo flags (default --locked).
+#   GUARDED_FEATURE: the feature to keep out (default test-hooks).
 # Exit 0 when no crate enables it, 1 when one does (one ::error line per
 # crate), 2 when the graph cannot be read.
 set -euo pipefail
@@ -37,6 +42,7 @@ if ! manifest_dir=$(cd "$(dirname "$manifest")" 2>/dev/null && pwd); then
 fi
 manifest="$manifest_dir/$(basename "$manifest")"
 
+feature=${GUARDED_FEATURE:-test-hooks}
 read -r -a flags <<<"${CARGO_TREE_FLAGS---locked}"
 args=()
 for package in "${packages[@]}"; do
@@ -54,13 +60,13 @@ if ! tree=$(cd "$manifest_dir" &&
 fi
 
 # A feature node prints as `<crate> feature "<name>"`.
-offenders=$(printf '%s\n' "$tree" | sed -nE 's/^([A-Za-z0-9_-]+) feature "test-hooks"$/\1/p' | sort -u)
+offenders=$(printf '%s\n' "$tree" | awk -v f="feature \"$feature\"" '$2 " " $3 == f { print $1 }' | sort -u)
 if [ -z "$offenders" ]; then
-  echo "ok: no test-hooks feature in the production graph of ${packages[*]}"
+  echo "ok: no $feature feature in the production graph of ${packages[*]}"
   exit 0
 fi
 
 while IFS= read -r crate; do
-  echo "::error::$crate feature \"test-hooks\" is enabled in the production graph of ${packages[*]}. Enable it from [dev-dependencies] only; find the edge with: cargo tree -e normal,build,features --target all -i $crate"
+  echo "::error::$crate feature \"$feature\" is enabled in the production graph of ${packages[*]}. Enable it from [dev-dependencies] only; find the edge with: cargo tree -e normal,build,features --target all -i $crate"
 done <<<"$offenders"
 exit 1

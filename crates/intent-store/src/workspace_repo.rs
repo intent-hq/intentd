@@ -102,7 +102,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<HashMap<WorkspaceId, WorkspaceContentClock>> {
-        dispatch!(self, backend => backend.workspace_content_clocks(workspace_ids).await)
+        pending_postgres!("workspace_content_clocks", self, backend => backend.workspace_content_clocks(workspace_ids).await)
     }
 
     /// Requested workspaces whose known PRs are all finished: at least one PR
@@ -119,7 +119,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<HashSet<WorkspaceId>> {
-        dispatch!(self, backend => backend.workspaces_with_settled_pull_requests(workspace_ids).await)
+        pending_postgres!("workspaces_with_settled_pull_requests", self, backend => backend.workspaces_with_settled_pull_requests(workspace_ids).await)
     }
 
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
@@ -128,7 +128,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if encoding workspace fields or the insert fails.
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
-        dispatch!(self, backend => backend.insert_workspace(ws).await)
+        pending_postgres!("insert_workspace", self, backend => backend.insert_workspace(ws).await)
     }
 
     /// Insert a workspace row with the per-workspace `auto_commit_enabled`
@@ -146,7 +146,7 @@ impl Store {
         ws: &Workspace,
         auto_commit: Option<bool>,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.insert_workspace_with_auto_commit(ws, auto_commit).await)
+        pending_postgres!("insert_workspace_with_auto_commit", self, backend => backend.insert_workspace_with_auto_commit(ws, auto_commit).await)
     }
 
     /// Insert from an original pre-workspace host admission. The durable facts
@@ -163,7 +163,7 @@ impl Store {
         token_hash: Option<&str>,
         admit: impl FnOnce() -> Result<()> + Send,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.insert_workspace_with_host_admission(ws, auto_commit, expected, token_hash, admit).await)
+        pending_postgres!("insert_workspace_with_host_admission", self, backend => backend.insert_workspace_with_host_admission(ws, auto_commit, expected, token_hash, admit).await)
     }
 
     /// Fetch a single workspace by id, or `NotFound`.
@@ -172,7 +172,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<Workspace> {
-        dispatch!(self, backend => backend.get_workspace(id).await)
+        pending_postgres!("get_workspace", self, backend => backend.get_workspace(id).await)
     }
 
     /// Update an existing workspace, preserving `branch`, `id`, the
@@ -210,7 +210,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace(&self, ws: &Workspace) -> Result<String> {
-        dispatch!(self, backend => backend.update_workspace(ws).await)
+        pending_postgres!("update_workspace", self, backend => backend.update_workspace(ws).await)
     }
 
     /// Update workspace fields and optionally apply an explicit branch edit.
@@ -223,7 +223,7 @@ impl Store {
         ws: &Workspace,
         branch: Option<&str>,
     ) -> Result<String> {
-        dispatch!(self, backend => backend.update_workspace_with_branch(ws, branch).await)
+        pending_postgres!("update_workspace_with_branch", self, backend => backend.update_workspace_with_branch(ws, branch).await)
     }
 
     /// Reconcile an observed branch without overwriting concurrent workspace edits.
@@ -236,7 +236,7 @@ impl Store {
         expected: &Workspace,
         branch: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.reconcile_workspace_branch(expected, branch).await)
+        pending_postgres!("reconcile_workspace_branch", self, backend => backend.reconcile_workspace_branch(expected, branch).await)
     }
 
     /// Scoped PR-linkage write: set ONLY the PR columns (`pr_number`,
@@ -254,7 +254,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_pr_linkage(&self, ws: &Workspace) -> Result<()> {
-        dispatch!(self, backend => backend.update_workspace_pr_linkage(ws).await)
+        pending_postgres!("update_workspace_pr_linkage", self, backend => backend.update_workspace_pr_linkage(ws).await)
     }
 
     /// [`Self::update_workspace_pr_linkage`] rebased on the row at write
@@ -282,7 +282,7 @@ impl Store {
     where
         F: FnOnce(&mut Workspace, Option<Vec<PullRequestInfo>>),
     {
-        dispatch!(self, backend => backend.update_workspace_pr_linkage_rebased(ws, rebase).await)
+        pending_postgres!("update_workspace_pr_linkage_rebased", self, backend => backend.update_workspace_pr_linkage_rebased(ws, rebase).await)
     }
 
     /// Project onto a workspace's persisted PR snapshots atomically
@@ -310,7 +310,7 @@ impl Store {
     where
         F: FnOnce(&mut Option<Vec<PullRequestInfo>>, &mut Option<PullRequestInfo>) -> bool,
     {
-        dispatch!(self, backend => backend.project_workspace_pr_snapshots(id, updated_at, project).await)
+        pending_postgres!("project_workspace_pr_snapshots", self, backend => backend.project_workspace_pr_snapshots(id, updated_at, project).await)
     }
 
     /// Recompute-and-store a workspace's `token_usage` snapshot atomically
@@ -354,7 +354,7 @@ impl Store {
     where
         F: FnOnce(&[AgentUsageRow], Option<&TokenUsage>) -> Option<TokenUsage>,
     {
-        dispatch!(self, backend => backend.update_workspace_token_usage(workspace_id, compute).await)
+        pending_postgres!("update_workspace_token_usage", self, backend => backend.update_workspace_token_usage(workspace_id, compute).await)
     }
 
     /// Scoped, conditional attention write (monorepo#1481): set ONLY the
@@ -383,7 +383,7 @@ impl Store {
         updated_at: Option<&str>,
         expected: Option<WorkspaceAttention>,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_workspace_attention(id, attention, updated_at, expected).await)
+        pending_postgres!("set_workspace_attention", self, backend => backend.set_workspace_attention(id, attention, updated_at, expected).await)
     }
 
     /// Atomic settle-clear of the stored `unread` flag (§5.1): set
@@ -402,7 +402,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_workspace_unread_if_all_seen(&self, id: &WorkspaceId) -> Result<bool> {
-        dispatch!(self, backend => backend.clear_workspace_unread_if_all_seen(id).await)
+        pending_postgres!("clear_workspace_unread_if_all_seen", self, backend => backend.clear_workspace_unread_if_all_seen(id).await)
     }
 
     /// Scoped, conditional unarchive flip: set `status`/`archived`/
@@ -423,7 +423,7 @@ impl Store {
         id: &WorkspaceId,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.unarchive_workspace_if_archived(id, updated_at).await)
+        pending_postgres!("unarchive_workspace_if_archived", self, backend => backend.unarchive_workspace_if_archived(id, updated_at).await)
     }
 
     /// Scoped, monotonic `last_activity` write (monorepo#1580): set ONLY the
@@ -452,7 +452,7 @@ impl Store {
         id: &WorkspaceId,
         last_activity: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.bump_workspace_last_activity(id, last_activity).await)
+        pending_postgres!("bump_workspace_last_activity", self, backend => backend.bump_workspace_last_activity(id, last_activity).await)
     }
 
     /// Delete a workspace by id, or `NotFound`. Records a tombstone in
@@ -481,7 +481,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
-        dispatch!(self, backend => backend.delete_workspace(id).await)
+        pending_postgres!("delete_workspace", self, backend => backend.delete_workspace(id).await)
     }
 
     /// Run the same deletion once, retaining facts before projecting its result.
@@ -495,7 +495,7 @@ impl Store {
         &self,
         id: &WorkspaceId,
     ) -> RepositoryWorkspaceDeleteOutcome {
-        dispatch!(self, backend => backend.delete_workspace_with_outcome(id).await)
+        pending_postgres!(panic "delete_workspace_with_outcome", self, backend => backend.delete_workspace_with_outcome(id).await)
     }
 
     /// The folder of every plain-folder workspace the store knows (PROTOCOL
@@ -508,7 +508,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails; callers
     /// then skip the sweep (fail closed).
     pub async fn plain_folder_paths(&self) -> Result<Vec<String>> {
-        dispatch!(self, backend => backend.plain_folder_paths().await)
+        pending_postgres!("plain_folder_paths", self, backend => backend.plain_folder_paths().await)
     }
 
     /// Whether a workspace id was ever used — a live row exists **or** a
@@ -519,7 +519,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn workspace_id_ever_used(&self, id: &WorkspaceId) -> Result<bool> {
-        dispatch!(self, backend => backend.workspace_id_ever_used(id).await)
+        pending_postgres!("workspace_id_ever_used", self, backend => backend.workspace_id_ever_used(id).await)
     }
 
     /// Record whether the workspace's branch was auto-generated by the daemon
@@ -536,7 +536,7 @@ impl Store {
         id: &WorkspaceId,
         auto_generated: bool,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_workspace_branch_auto_generated(id, auto_generated).await)
+        pending_postgres!("set_workspace_branch_auto_generated", self, backend => backend.set_workspace_branch_auto_generated(id, auto_generated).await)
     }
 
     /// Whether the workspace's branch was auto-generated at create time.
@@ -546,7 +546,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_branch_auto_generated(&self, id: &WorkspaceId) -> Result<bool> {
-        dispatch!(self, backend => backend.workspace_branch_auto_generated(id).await)
+        pending_postgres!("workspace_branch_auto_generated", self, backend => backend.workspace_branch_auto_generated(id).await)
     }
 
     /// Set the persisted per-workspace auto-commit override (spec Diagnosis
@@ -558,7 +558,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_auto_commit(&self, id: &WorkspaceId, enabled: bool) -> Result<()> {
-        dispatch!(self, backend => backend.set_workspace_auto_commit(id, enabled).await)
+        pending_postgres!("set_workspace_auto_commit", self, backend => backend.set_workspace_auto_commit(id, enabled).await)
     }
 
     /// Scoped write of the Home workspace label (`workspace.update { label }`):
@@ -570,7 +570,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_label(&self, id: &WorkspaceId, label: Option<&str>) -> Result<()> {
-        dispatch!(self, backend => backend.set_workspace_label(id, label).await)
+        pending_postgres!("set_workspace_label", self, backend => backend.set_workspace_label(id, label).await)
     }
 
     /// Scoped write of the per-workspace auto-archive opt-out
@@ -587,7 +587,7 @@ impl Store {
         id: &WorkspaceId,
         disabled: bool,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_workspace_auto_archive_disabled(id, disabled).await)
+        pending_postgres!("set_workspace_auto_archive_disabled", self, backend => backend.set_workspace_auto_archive_disabled(id, disabled).await)
     }
 
     /// The persisted per-workspace auto-commit override. `Ok(None)` for
@@ -599,7 +599,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_auto_commit(&self, id: &WorkspaceId) -> Result<Option<bool>> {
-        dispatch!(self, backend => backend.workspace_auto_commit(id).await)
+        pending_postgres!("workspace_auto_commit", self, backend => backend.workspace_auto_commit(id).await)
     }
 
     /// Scoped write of the per-workspace browser-client pin (REV-2,
@@ -616,7 +616,7 @@ impl Store {
         id: &WorkspaceId,
         client_id: Option<&ClientId>,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.set_workspace_browser_client(id, client_id).await)
+        pending_postgres!("set_workspace_browser_client", self, backend => backend.set_workspace_browser_client(id, client_id).await)
     }
 
     /// The persisted per-workspace browser-client pin; `Ok(None)` when
@@ -626,7 +626,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_browser_client(&self, id: &WorkspaceId) -> Result<Option<ClientId>> {
-        dispatch!(self, backend => backend.workspace_browser_client(id).await)
+        pending_postgres!("workspace_browser_client", self, backend => backend.workspace_browser_client(id).await)
     }
 
     /// List workspaces admitted by `filter`: archived rows only with
@@ -641,7 +641,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces(&self, filter: WorkspaceListFilter) -> Result<Vec<Workspace>> {
-        dispatch!(self, backend => backend.list_workspaces(filter).await)
+        pending_postgres!("list_workspaces", self, backend => backend.list_workspaces(filter).await)
     }
 
     /// One keyset page of [`Store::list_workspaces`] in `(created_at, id)`
@@ -657,7 +657,7 @@ impl Store {
         after: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<Workspace>> {
-        dispatch!(self, backend => backend.list_workspaces_page(filter, after, limit).await)
+        pending_postgres!("list_workspaces_page", self, backend => backend.list_workspaces_page(filter, after, limit).await)
     }
 
     /// The retired workspace a call is scoped to: `workspace_id` when that
@@ -673,7 +673,7 @@ impl Store {
         workspace_id: Option<&WorkspaceId>,
         agent_id: Option<&AgentId>,
     ) -> Result<Option<WorkspaceId>> {
-        dispatch!(self, backend => backend.retired_workspace_for(workspace_id, agent_id).await)
+        pending_postgres!("retired_workspace_for", self, backend => backend.retired_workspace_for(workspace_id, agent_id).await)
     }
 
     /// Scoped, conditional retire flip (`workspace.retire`, PROTOCOL §5.1):
@@ -695,7 +695,7 @@ impl Store {
         id: &WorkspaceId,
         retired_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.retire_workspace_if_archived(id, retired_at).await)
+        pending_postgres!("retire_workspace_if_archived", self, backend => backend.retire_workspace_if_archived(id, retired_at).await)
     }
 
     /// Scoped, conditional revive flip (PROTOCOL §5.1 "Revive"): flip a
@@ -719,7 +719,7 @@ impl Store {
         base_commit_sha: Option<&str>,
         updated_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.revive_workspace_if_retired(id, branch, base_commit_sha, updated_at).await)
+        pending_postgres!("revive_workspace_if_retired", self, backend => backend.revive_workspace_if_retired(id, branch, base_commit_sha, updated_at).await)
     }
 
     /// [`Self::revive_workspace_if_retired`] that also leaves a one-time
@@ -741,7 +741,7 @@ impl Store {
         updated_at: &str,
         notice: Option<(&str, &str, Option<&AgentId>)>,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.revive_workspace_if_retired_with_notice(id, branch, base_commit_sha, updated_at, notice).await)
+        pending_postgres!("revive_workspace_if_retired_with_notice", self, backend => backend.revive_workspace_if_retired_with_notice(id, branch, base_commit_sha, updated_at, notice).await)
     }
 
     /// The ids of the machine's hidden home records
@@ -751,7 +751,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` on a database failure.
     pub async fn home_record_ids(&self) -> Result<Vec<WorkspaceId>> {
-        dispatch!(self, backend => backend.home_record_ids().await)
+        pending_postgres!("home_record_ids", self, backend => backend.home_record_ids().await)
     }
 
     /// Remove a machine's hidden home record and (by cascade) its rows,
@@ -763,7 +763,7 @@ impl Store {
     /// `InvalidParams` for an id that is not a home record; `Internal` on a
     /// database failure.
     pub async fn delete_home_record(&self, id: &WorkspaceId) -> Result<()> {
-        dispatch!(self, backend => backend.delete_home_record(id).await)
+        pending_postgres!("delete_home_record", self, backend => backend.delete_home_record(id).await)
     }
 
     /// Ordinary workspace keys for inherited host access, without hydrating
@@ -772,7 +772,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` on a database failure.
     pub async fn ordinary_workspace_ids(&self) -> Result<Vec<WorkspaceId>> {
-        dispatch!(self, backend => backend.ordinary_workspace_ids().await)
+        pending_postgres!("ordinary_workspace_ids", self, backend => backend.ordinary_workspace_ids().await)
     }
 
     /// Live (non-archived, non-remote) workspaces referencing a PR by URL —
@@ -788,7 +788,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces_referencing_pr_url(&self, url: &str) -> Result<Vec<Workspace>> {
-        dispatch!(self, backend => backend.list_workspaces_referencing_pr_url(url).await)
+        pending_postgres!("list_workspaces_referencing_pr_url", self, backend => backend.list_workspaces_referencing_pr_url(url).await)
     }
 
     /// Workspaces linked to the PR whose canonical key is `pr_key`
@@ -808,7 +808,7 @@ impl Store {
         pr_key: &str,
         include_retired: bool,
     ) -> Result<Vec<PullRequestWorkspace>> {
-        dispatch!(self, backend => backend.list_pull_request_workspaces(pr_key, include_retired).await)
+        pending_postgres!("list_pull_request_workspaces", self, backend => backend.list_pull_request_workspaces(pr_key, include_retired).await)
     }
 
     /// Every PR link recorded for the workspaces in `workspace_ids`
@@ -825,7 +825,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<Vec<PullRequestLink>> {
-        dispatch!(self, backend => backend.list_pull_request_links_for_workspaces(workspace_ids).await)
+        pending_postgres!("list_pull_request_links_for_workspaces", self, backend => backend.list_pull_request_links_for_workspaces(workspace_ids).await)
     }
 }
 

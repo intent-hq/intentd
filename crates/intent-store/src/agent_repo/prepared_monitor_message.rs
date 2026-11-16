@@ -114,7 +114,7 @@ impl Store {
         metadata: &ReviewMonitorWakeMetadata,
         created_at: &str,
     ) -> Result<PreparedMonitorMessage> {
-        dispatch!(self, backend => backend.prepare_monitor_message(expected, binding, id, text, metadata, created_at).await)
+        pending_postgres!("prepare_monitor_message", self, backend => backend.prepare_monitor_message(expected, binding, id, text, metadata, created_at).await)
     }
 }
 

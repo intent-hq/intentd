@@ -13,11 +13,36 @@ use sqlx::{Row, SqlitePool};
 pub use intent_core::{Error, Result};
 
 /// Run `$call` against the backend of `$self`, bound to `$s`. Every backend
-/// must provide each `Store` method under the same name and signature.
+/// must provide the method under the same name and signature, so a method
+/// moves here from `pending_postgres!` once its Postgres version exists.
 macro_rules! dispatch {
     ($self:ident, $s:ident => $call:expr) => {
         match &$self.backend {
             $crate::Backend::Sqlite($s) => $call,
+            #[cfg(feature = "postgres")]
+            $crate::Backend::Postgres($s) => $call,
+        }
+    };
+}
+
+/// A `Store` method the Postgres backend does not implement yet: `SQLite`
+/// runs `$call`; Postgres returns an error naming the method (`panic` for
+/// the few methods that do not return `Result`). Without the `postgres`
+/// feature this is exactly `dispatch!`. `postgres_port_ratchet_lint` keeps
+/// the number of these from growing.
+macro_rules! pending_postgres {
+    (panic $name:literal, $self:ident, $s:ident => $call:expr) => {
+        match &$self.backend {
+            $crate::Backend::Sqlite($s) => $call,
+            #[cfg(feature = "postgres")]
+            $crate::Backend::Postgres(_) => $crate::postgres::unported_panic($name),
+        }
+    };
+    ($name:literal, $self:ident, $s:ident => $call:expr) => {
+        match &$self.backend {
+            $crate::Backend::Sqlite($s) => $call,
+            #[cfg(feature = "postgres")]
+            $crate::Backend::Postgres(_) => Err($crate::postgres::unported($name)),
         }
     };
 }
@@ -27,6 +52,9 @@ mod agent_flipped_completion_repo;
 mod agent_queue_repo;
 mod agent_repo;
 mod agent_session_summary;
+/// Multi-tenant Postgres backend. Never enabled in release builds.
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub use agent_session_summary::{AgentSessionSummary, FullAgentSessionRow};
 mod attachment_repo;
 mod browser_tab_repo;
@@ -426,6 +454,8 @@ pub struct Store {
 #[derive(Clone)]
 enum Backend {
     Sqlite(SqliteStore),
+    #[cfg(feature = "postgres")]
+    Postgres(postgres::PgStore),
 }
 
 impl Store {
@@ -442,6 +472,8 @@ impl Store {
     pub(crate) fn sqlite(&self) -> &SqliteStore {
         match &self.backend {
             Backend::Sqlite(store) => store,
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(_) => postgres::unported_panic("SQLite-only internals"),
         }
     }
 }
@@ -453,6 +485,8 @@ impl Store {
     pub(crate) fn sqlite_mut(&mut self) -> &mut SqliteStore {
         match &mut self.backend {
             Backend::Sqlite(store) => store,
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(_) => postgres::unported_panic("SQLite-only internals"),
         }
     }
 }
@@ -553,14 +587,14 @@ impl Store {
     /// The facade exposes read-only settings, not a raw pool or mutable options.
     #[must_use]
     pub fn write_pool(&self) -> &StorePool {
-        dispatch!(self, backend => backend.write_pool())
+        pending_postgres!(panic "write_pool", self, backend => backend.write_pool())
     }
 
     /// Borrow the read pool (32 connections, intended for read/SELECT queries).
     /// The ownership and exported-options boundary is the same as [`Self::write_pool`].
     #[must_use]
     pub fn read_pool(&self) -> &StorePool {
-        dispatch!(self, backend => backend.read_pool())
+        pending_postgres!(panic "read_pool", self, backend => backend.read_pool())
     }
 
     /// Deprecated alias for `read_pool()`. External callers should migrate to
@@ -568,7 +602,7 @@ impl Store {
     #[deprecated(since = "0.1.0", note = "use read_pool() or write_pool() explicitly")]
     #[must_use]
     pub fn pool(&self) -> &StorePool {
-        dispatch!(self, backend => backend.pool())
+        pending_postgres!(panic "pool", self, backend => backend.pool())
     }
 
     /// Spawn a background task that periodically runs PRAGMA `wal_checkpoint(PASSIVE)`
@@ -579,7 +613,7 @@ impl Store {
     /// every ~60s until the returned handle is dropped or aborted.
     #[must_use]
     pub fn spawn_periodic_wal_checkpoint(&self) -> tokio::task::JoinHandle<()> {
-        dispatch!(self, backend => backend.spawn_periodic_wal_checkpoint())
+        pending_postgres!(panic "spawn_periodic_wal_checkpoint", self, backend => backend.spawn_periodic_wal_checkpoint())
     }
 
     /// Number of pages on the database freelist (`PRAGMA freelist_count`):
@@ -591,7 +625,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn freelist_count(&self) -> Result<i64> {
-        dispatch!(self, backend => backend.freelist_count().await)
+        pending_postgres!("freelist_count", self, backend => backend.freelist_count().await)
     }
 
     /// One-time activation of incremental auto-vacuum on a legacy database
@@ -614,7 +648,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn activate_incremental_vacuum(&self) -> Result<AutoVacuumActivation> {
-        dispatch!(self, backend => backend.activate_incremental_vacuum().await)
+        pending_postgres!("activate_incremental_vacuum", self, backend => backend.activate_incremental_vacuum().await)
     }
 
     /// Database page size in bytes (`PRAGMA page_size`), read on the read
@@ -625,7 +659,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn page_size(&self) -> Result<i64> {
-        dispatch!(self, backend => backend.page_size().await)
+        pending_postgres!("page_size", self, backend => backend.page_size().await)
     }
 
     /// One bounded `PRAGMA incremental_vacuum(N)` step, run with the
@@ -647,7 +681,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the acquisition or any statement fails.
     pub async fn incremental_vacuum_chunk(&self, max_pages: u32) -> Result<VacuumChunk> {
-        dispatch!(self, backend => backend.incremental_vacuum_chunk(max_pages).await)
+        pending_postgres!("incremental_vacuum_chunk", self, backend => backend.incremental_vacuum_chunk(max_pages).await)
     }
 
     /// Run `PRAGMA optimize` on the write connection. Cheap when called
@@ -660,7 +694,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn optimize(&self) -> Result<()> {
-        dispatch!(self, backend => backend.optimize().await)
+        pending_postgres!("optimize", self, backend => backend.optimize().await)
     }
 
     /// Close both pools gracefully, checkpointing the WAL and freeing resources.
@@ -678,7 +712,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn migration_status(&self) -> Result<MigrationStatus> {
-        dispatch!(self, backend => backend.migration_status().await)
+        pending_postgres!("migration_status", self, backend => backend.migration_status().await)
     }
 }
 

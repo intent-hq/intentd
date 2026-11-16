@@ -166,7 +166,7 @@ impl Store {
         credential: &ExecutorCredential,
         token_hash: &str,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.insert_executor_credential(credential, token_hash).await)
+        pending_postgres!("insert_executor_credential", self, backend => backend.insert_executor_credential(credential, token_hash).await)
     }
 
     /// Resolve an **active** credential by token hash and bump its
@@ -180,7 +180,7 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<ExecutorCredential>> {
-        dispatch!(self, backend => backend.resolve_active_executor_credential(token_hash).await)
+        pending_postgres!("resolve_active_executor_credential", self, backend => backend.resolve_active_executor_credential(token_hash).await)
     }
 
     /// One credential by id, revoked or not.
@@ -192,7 +192,7 @@ impl Store {
         &self,
         id: &ExecutorCredentialId,
     ) -> Result<Option<ExecutorCredential>> {
-        dispatch!(self, backend => backend.get_executor_credential(id).await)
+        pending_postgres!("get_executor_credential", self, backend => backend.get_executor_credential(id).await)
     }
 
     /// The unrevoked credentials, oldest first (`executor.list`).
@@ -201,7 +201,7 @@ impl Store {
     ///
     /// `Internal` on database failure.
     pub async fn list_active_executor_credentials(&self) -> Result<Vec<ExecutorCredential>> {
-        dispatch!(self, backend => backend.list_active_executor_credentials().await)
+        pending_postgres!("list_active_executor_credentials", self, backend => backend.list_active_executor_credentials().await)
     }
 
     /// Revoke a credential. Idempotent; its binding stays so the revoked
@@ -214,7 +214,7 @@ impl Store {
         &self,
         id: &ExecutorCredentialId,
     ) -> Result<ExecutorRevocation> {
-        dispatch!(self, backend => backend.revoke_executor_credential(id).await)
+        pending_postgres!("revoke_executor_credential", self, backend => backend.revoke_executor_credential(id).await)
     }
 
     /// The current link binding of a credential, `None` before its first
@@ -227,7 +227,7 @@ impl Store {
         &self,
         credential_id: &ExecutorCredentialId,
     ) -> Result<Option<LeaseBinding>> {
-        dispatch!(self, backend => backend.executor_binding(credential_id).await)
+        pending_postgres!("executor_binding", self, backend => backend.executor_binding(credential_id).await)
     }
 
     /// Decide a bind offer on the machine `node_id` for one credential and,
@@ -247,7 +247,7 @@ impl Store {
         node_id: &str,
         offered: &LeaseBinding,
     ) -> Result<BindDecision> {
-        dispatch!(self, backend => backend.bind_executor(credential_id, node_id, offered).await)
+        pending_postgres!("bind_executor", self, backend => backend.bind_executor(credential_id, node_id, offered).await)
     }
 
     /// Save an exposed machine after a successful probe, replacing any row
@@ -263,7 +263,7 @@ impl Store {
         &self,
         machine: &ExposedMachine,
     ) -> Result<Option<ExecutorCredentialId>> {
-        dispatch!(self, backend => backend.save_exposed_machine(machine).await)
+        pending_postgres!("save_exposed_machine", self, backend => backend.save_exposed_machine(machine).await)
     }
 
     /// One exposed machine by id.
@@ -272,7 +272,7 @@ impl Store {
     ///
     /// `Internal` on database failure or a corrupt row.
     pub async fn get_exposed_machine(&self, id: &str) -> Result<Option<ExposedMachine>> {
-        dispatch!(self, backend => backend.get_exposed_machine(id).await)
+        pending_postgres!("get_exposed_machine", self, backend => backend.get_exposed_machine(id).await)
     }
 
     /// Every machine the owner exposed, oldest first. Cloud machine rows
@@ -282,7 +282,7 @@ impl Store {
     ///
     /// `Internal` on database failure or a corrupt row.
     pub async fn list_exposed_machines(&self) -> Result<Vec<ExposedMachine>> {
-        dispatch!(self, backend => backend.list_exposed_machines().await)
+        pending_postgres!("list_exposed_machines", self, backend => backend.list_exposed_machines().await)
     }
 
     /// Every cloud machine row (a machine the backend started in a cloud
@@ -292,7 +292,7 @@ impl Store {
     ///
     /// `Internal` on database failure or a corrupt row.
     pub async fn list_cloud_machines(&self) -> Result<Vec<ExposedMachine>> {
-        dispatch!(self, backend => backend.list_cloud_machines().await)
+        pending_postgres!("list_cloud_machines", self, backend => backend.list_cloud_machines().await)
     }
 
     /// Remove an exposed machine. Returns its credential for the caller to
@@ -302,7 +302,7 @@ impl Store {
     ///
     /// `Internal` on database failure.
     pub async fn remove_exposed_machine(&self, id: &str) -> Result<Option<ExecutorCredentialId>> {
-        dispatch!(self, backend => backend.remove_exposed_machine(id).await)
+        pending_postgres!("remove_exposed_machine", self, backend => backend.remove_exposed_machine(id).await)
     }
 
     /// Replace a cloud machine row's sandbox state. Returns whether the row
@@ -316,7 +316,7 @@ impl Store {
         id: &str,
         cloud: &intent_core::machines::CloudMachine,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.update_cloud_machine(id, cloud).await)
+        pending_postgres!("update_cloud_machine", self, backend => backend.update_cloud_machine(id, cloud).await)
     }
 
     /// The saved settings of cloud machine provider `id` (a JSON document),
@@ -326,7 +326,7 @@ impl Store {
     ///
     /// `Internal` on database failure.
     pub async fn get_cloud_machine_provider(&self, id: &str) -> Result<Option<String>> {
-        dispatch!(self, backend => backend.get_cloud_machine_provider(id).await)
+        pending_postgres!("get_cloud_machine_provider", self, backend => backend.get_cloud_machine_provider(id).await)
     }
 
     /// Every saved cloud machine provider entry as `(id, config_json)`, in
@@ -336,7 +336,7 @@ impl Store {
     ///
     /// `Internal` on database failure.
     pub async fn list_cloud_machine_providers(&self) -> Result<Vec<(String, String)>> {
-        dispatch!(self, backend => backend.list_cloud_machine_providers().await)
+        pending_postgres!("list_cloud_machine_providers", self, backend => backend.list_cloud_machine_providers().await)
     }
 
     /// Rename cloud machine `id`. Returns whether it exists.
@@ -345,7 +345,7 @@ impl Store {
     ///
     /// `InvalidParams` for an empty name; `Internal` on database failure.
     pub async fn rename_cloud_machine(&self, id: &str, name: &str) -> Result<bool> {
-        dispatch!(self, backend => backend.rename_cloud_machine(id, name).await)
+        pending_postgres!("rename_cloud_machine", self, backend => backend.rename_cloud_machine(id, name).await)
     }
 
     /// The agents placed on E2B (`remotePlacement.placement.target` is
@@ -357,7 +357,7 @@ impl Store {
     pub async fn list_cloud_placed_agents(
         &self,
     ) -> Result<Vec<(intent_core::WorkspaceId, intent_core::AgentId)>> {
-        dispatch!(self, backend => backend.list_cloud_placed_agents().await)
+        pending_postgres!("list_cloud_placed_agents", self, backend => backend.list_cloud_placed_agents().await)
     }
 
     /// Save the settings of cloud machine provider `id`.
@@ -366,7 +366,7 @@ impl Store {
     ///
     /// `Internal` on database failure.
     pub async fn save_cloud_machine_provider(&self, id: &str, config_json: &str) -> Result<()> {
-        dispatch!(self, backend => backend.save_cloud_machine_provider(id, config_json).await)
+        pending_postgres!("save_cloud_machine_provider", self, backend => backend.save_cloud_machine_provider(id, config_json).await)
     }
 
     /// Forget cloud machine provider `id`. Returns whether it was saved.
@@ -375,7 +375,7 @@ impl Store {
     ///
     /// `Internal` on database failure.
     pub async fn delete_cloud_machine_provider(&self, id: &str) -> Result<bool> {
-        dispatch!(self, backend => backend.delete_cloud_machine_provider(id).await)
+        pending_postgres!("delete_cloud_machine_provider", self, backend => backend.delete_cloud_machine_provider(id).await)
     }
 
     /// Persist a machine's resting state. Returns whether the machine exists.
@@ -388,7 +388,7 @@ impl Store {
         id: &str,
         state: RemoteMachineState,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_exposed_machine_state(id, state).await)
+        pending_postgres!("set_exposed_machine_state", self, backend => backend.set_exposed_machine_state(id, state).await)
     }
 
     /// After an accepted bind: replace the stored routes with the ones the
@@ -407,7 +407,7 @@ impl Store {
         tc_address: Option<&str>,
         connected_at: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.record_exposed_machine_connection(id, hosts, tc_address, connected_at).await)
+        pending_postgres!("record_exposed_machine_connection", self, backend => backend.record_exposed_machine_connection(id, hosts, tc_address, connected_at).await)
     }
 
     /// Record the node-link protocol a bind negotiated with the machine; it
@@ -418,7 +418,7 @@ impl Store {
     ///
     /// `Internal` on database failure.
     pub async fn record_exposed_machine_protocol(&self, id: &str, protocol: u32) -> Result<bool> {
-        dispatch!(self, backend => backend.record_exposed_machine_protocol(id, protocol).await)
+        pending_postgres!("record_exposed_machine_protocol", self, backend => backend.record_exposed_machine_protocol(id, protocol).await)
     }
 
     /// Cache a machine's capabilities report, its platform and `observedAt`,
@@ -433,7 +433,7 @@ impl Store {
         id: &str,
         capabilities: &MachineCapabilities,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.record_exposed_machine_capabilities(id, capabilities).await)
+        pending_postgres!("record_exposed_machine_capabilities", self, backend => backend.record_exposed_machine_capabilities(id, capabilities).await)
     }
 }
 

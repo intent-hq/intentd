@@ -68,7 +68,7 @@ impl Store {
         &self,
         ids: &[AgentId],
     ) -> Result<Vec<SubscriptionAgentProjection>> {
-        dispatch!(self, backend => backend.get_subscription_agent_projections(ids).await)
+        pending_postgres!("get_subscription_agent_projections", self, backend => backend.get_subscription_agent_projections(ids).await)
     }
 }
 

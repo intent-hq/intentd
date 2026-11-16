@@ -60,7 +60,7 @@ impl Store {
         agent: &AgentId,
         session: &str,
     ) -> Result<Option<ReviewContextEnrollment>> {
-        dispatch!(self, backend => backend.get_review_context_enrollment(workspace, agent, session).await)
+        pending_postgres!("get_review_context_enrollment", self, backend => backend.get_review_context_enrollment(workspace, agent, session).await)
     }
 }
 

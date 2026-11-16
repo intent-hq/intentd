@@ -163,7 +163,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn begin_home_move(&self, home_move: &HomeMove) -> Result<bool> {
-        dispatch!(self, backend => backend.begin_home_move(home_move).await)
+        pending_postgres!("begin_home_move", self, backend => backend.begin_home_move(home_move).await)
     }
 
     /// The workspace's move in progress, if any.
@@ -172,7 +172,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn get_home_move(&self, workspace_id: &WorkspaceId) -> Result<Option<HomeMove>> {
-        dispatch!(self, backend => backend.get_home_move(workspace_id).await)
+        pending_postgres!("get_home_move", self, backend => backend.get_home_move(workspace_id).await)
     }
 
     /// Every move in progress, oldest first.
@@ -181,7 +181,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn list_home_moves(&self) -> Result<Vec<HomeMove>> {
-        dispatch!(self, backend => backend.list_home_moves().await)
+        pending_postgres!("list_home_moves", self, backend => backend.list_home_moves().await)
     }
 
     /// The moves in progress whose new home is on the exposed machine
@@ -191,7 +191,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn home_moves_to_machine(&self, node_id: &str) -> Result<Vec<HomeMove>> {
-        dispatch!(self, backend => backend.home_moves_to_machine(node_id).await)
+        pending_postgres!("home_moves_to_machine", self, backend => backend.home_moves_to_machine(node_id).await)
     }
 
     /// The workspace's home as clients see it ([`HomeMove::shown`]).
@@ -203,7 +203,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<WorkspaceHome>> {
-        dispatch!(self, backend => backend.get_shown_workspace_home(workspace_id).await)
+        pending_postgres!("get_shown_workspace_home", self, backend => backend.get_shown_workspace_home(workspace_id).await)
     }
 
     /// Every workspace's home as clients see it ([`HomeMove::shown`]).
@@ -212,7 +212,7 @@ impl Store {
     ///
     /// `Error::Internal` on a database failure.
     pub async fn list_shown_workspace_homes(&self) -> Result<HashMap<WorkspaceId, WorkspaceHome>> {
-        dispatch!(self, backend => backend.list_shown_workspace_homes().await)
+        pending_postgres!("list_shown_workspace_homes", self, backend => backend.list_shown_workspace_homes().await)
     }
 
     /// Record exposed machine `node_id` (a sandbox started for it) as the
@@ -228,7 +228,7 @@ impl Store {
         home_id: &HomeId,
         node_id: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_home_move_machine(workspace_id, home_id, node_id).await)
+        pending_postgres!("set_home_move_machine", self, backend => backend.set_home_move_machine(workspace_id, home_id, node_id).await)
     }
 
     /// The cloud machines of entry `cloud_machine_id` in `workspace_id`
@@ -245,7 +245,7 @@ impl Store {
         cloud_machine_id: &str,
         owner: &str,
     ) -> Result<Vec<intent_core::machines::ExposedMachine>> {
-        dispatch!(self, backend => backend.unclaimed_home_sandboxes(workspace_id, cloud_machine_id, owner).await)
+        pending_postgres!("unclaimed_home_sandboxes", self, backend => backend.unclaimed_home_sandboxes(workspace_id, cloud_machine_id, owner).await)
     }
 
     /// Record that the move to `home_id` has the old home's last backup;
@@ -259,7 +259,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         home_id: &HomeId,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.mark_home_move_pushed(workspace_id, home_id).await)
+        pending_postgres!("mark_home_move_pushed", self, backend => backend.mark_home_move_pushed(workspace_id, home_id).await)
     }
 
     /// A `setupFinished` record of the home `home_id` on `node_id`, seq
@@ -280,7 +280,7 @@ impl Store {
         lease_id: &str,
         seq: u64,
     ) -> Result<HomeAutoStart> {
-        dispatch!(self, backend => backend.claim_home_auto_start_or_record_move(workspace_id, home_id, node_id, lease_id, seq).await)
+        pending_postgres!("claim_home_auto_start_or_record_move", self, backend => backend.claim_home_auto_start_or_record_move(workspace_id, home_id, node_id, lease_id, seq).await)
     }
 
     /// Roll back the move to `home_id`: in one transaction the move goes,
@@ -299,7 +299,7 @@ impl Store {
         home_id: &HomeId,
         now: &str,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.abort_home_move(workspace_id, home_id, now).await)
+        pending_postgres!("abort_home_move", self, backend => backend.abort_home_move(workspace_id, home_id, now).await)
     }
 
     /// The switch of the move to `home_id` (nodes.md "Moving the home" step
@@ -323,7 +323,7 @@ impl Store {
         owner: &intent_core::machines::CloudStartedBy,
         now: &str,
     ) -> Result<Option<HomeMoveSwitch>> {
-        dispatch!(self, backend => backend.complete_home_move(workspace_id, home_id, owner, now).await)
+        pending_postgres!("complete_home_move", self, backend => backend.complete_home_move(workspace_id, home_id, owner, now).await)
     }
 }
 
