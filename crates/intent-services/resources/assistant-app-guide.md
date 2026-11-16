@@ -50,10 +50,11 @@ members, or turn links off. Remove people, revoke links and pin GitLab accounts 
 **Share…** in the desktop app. Links need the host's Tailcat tunnel; the sheet says so
 when it is off.
 
-Opening an invitation link on a phone with Intent Mobile installed shows **Join
-Workspace** with the workspace and host, then **Join as @login** using the GitHub or
+With an Intent Mobile version that can join from invitation links, opening a link on
+the phone shows **Join Workspace** with the workspace and host, then **Join as @login** using the GitHub or
 GitLab account of the person's own paired Mac; the workspace opens after joining. With
-no paired Mac, the phone asks them to pair one or open the link on their Mac. Some apps,
+no paired Mac, the phone asks them to pair one or open the link on their Mac. Older
+Intent Mobile versions cannot join from a link: open it on the Mac instead. Some apps,
 such as Messages and Mail, do not show `intent://` links as tappable yet; links sent
 through apps that do (for example Slack) open directly.
 
