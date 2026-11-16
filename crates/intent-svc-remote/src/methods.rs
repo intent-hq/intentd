@@ -756,9 +756,9 @@ async fn forget(svc: &Services, machine_id: &str) -> Result<Option<ExecutorCrede
 /// bind because it now runs as an orchestrator (nodes.md "Orchestrator
 /// mode"). Only while the stored token is still `refused` (or already
 /// deleted by a removal that failed later): a machine paired again meanwhile
-/// is kept. Its agents end; an orchestrator runs none. The connector stops
-/// only once the removal succeeded, so a failed one is tried again at its
-/// next dial.
+/// is kept. Its agents end; an orchestrator runs none. A store failure is
+/// retried with backoff until the removal succeeds or no longer applies;
+/// the connector stops only then.
 pub(crate) fn forget_orchestrator(svc: Option<Services>, machine_id: String, refused: String) {
     let Some(svc) = svc else {
         return;
@@ -768,39 +768,57 @@ pub(crate) fn forget_orchestrator(svc: Option<Services>, machine_id: String, ref
         let Some(feature) = svc.remote_feature() else {
             return;
         };
-        let _lifecycle = feature.lifecycle(&machine_id).await;
-        let forgotten = async {
-            let Some(row) = svc
-                .store()
-                .get_exposed_machine(&machine_id)
-                .await?
-                .filter(|row| !row.is_cloud())
-            else {
-                return Ok(());
-            };
-            let stored = svc.load_remote_machine_token(&machine_id).await?;
-            if stored.is_some_and(|token| token != refused) {
-                return Ok(());
+        // A store failure is retried here, not by the connector: once its
+        // leases ended it can no longer dial.
+        let mut retry = intent_transport::node_link::Backoff::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(60),
+        );
+        loop {
+            match forget_orchestrator_once(feature, &svc, &machine_id, &refused).await {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(%error, machine = %machine_id, "remote machine: could not remove the orchestrator; retrying");
+                    tokio::time::sleep(retry.next_delay()).await;
+                }
             }
-            if let Some(node) = feature.running_node(&machine_id) {
-                node.shared_ref().drop_stops();
-                node.shared_ref().agents.end_all(&format!(
-                    "{}: {} is now an orchestrator and no longer runs agents for other backends",
-                    crate::connect::MACHINE_ORCHESTRATOR,
-                    row.name
-                ));
-            }
-            forget(&svc, &machine_id).await?;
-            if let Some(node) = feature.take_node(&machine_id) {
-                node.shutdown();
-            }
-            tracing::info!(machine = %machine_id, "remote machine: now an orchestrator; removed");
-            Ok::<(), Error>(())
-        };
-        if let Err(error) = forgotten.await {
-            tracing::warn!(%error, machine = %machine_id, "remote machine: could not remove the orchestrator");
         }
     });
+}
+
+async fn forget_orchestrator_once(
+    feature: &RemoteFeature,
+    svc: &Services,
+    machine_id: &str,
+    refused: &str,
+) -> Result<()> {
+    let _lifecycle = feature.lifecycle(machine_id).await;
+    let Some(row) = svc
+        .store()
+        .get_exposed_machine(machine_id)
+        .await?
+        .filter(|row| !row.is_cloud())
+    else {
+        return Ok(());
+    };
+    let stored = svc.load_remote_machine_token(machine_id).await?;
+    if stored.is_some_and(|token| token != refused) {
+        return Ok(());
+    }
+    if let Some(node) = feature.running_node(machine_id) {
+        node.shared_ref().drop_stops();
+        node.shared_ref().agents.end_all(&format!(
+            "{}: {} is now an orchestrator and no longer runs agents for other backends",
+            crate::connect::MACHINE_ORCHESTRATOR,
+            row.name
+        ));
+    }
+    forget(svc, machine_id).await?;
+    if let Some(node) = feature.take_node(machine_id) {
+        node.shutdown();
+    }
+    tracing::info!(machine = %machine_id, "remote machine: now an orchestrator; removed");
+    Ok(())
 }
 
 /// The connector to use for removing `row` when no bind in this process has
