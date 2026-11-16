@@ -1,6 +1,7 @@
 //! The "How will you use this computer?" half of `scripts/install.ps1`: the
 //! `daemon-mode-choice` block (flag, env var, validation) and the
-//! `daemon-mode-apply` block (node setup, switching a node back), run
+//! `daemon-mode-apply` block (node and orchestrator setup, switching back,
+//! never switching an existing install to orchestrator), run
 //! verbatim under PowerShell against a fake `intentd` that records its calls
 //! — the Windows counterpart of `install_sh_daemon_mode.rs`. Like
 //! `install_ps1_owner.rs`, the tests skip without `pwsh` and fail instead
@@ -146,8 +147,10 @@ fn apply_with_pair(
     saved: Option<&str>,
     pair: bool,
 ) -> Outcome {
+    // A saved mode means an earlier install left its database behind.
+    let existing = saved.is_some();
     let body = format!(
-        "$installMode = '{mode}'\n$installModeExplicit = ${explicit}\n$verdict = '{verdict}'\n$interactive = $false\n$pair = ${pair}\n{}",
+        "$installMode = '{mode}'\n$installModeExplicit = ${explicit}\n$verdict = '{verdict}'\n$interactive = $false\n$pair = ${pair}\n$existingInstall = ${existing}\n{}",
         ps_region("daemon-mode-apply")
     );
     run(pwsh, &body, &[], saved)
@@ -161,6 +164,8 @@ fn the_choice_folds_spellings_and_the_parameter_beats_the_env_var() {
         ("", Some("regular"), "MODE=full EXPLICIT=True"),
         ("2", Some("full"), "MODE=node EXPLICIT=True"),
         ("", None, "MODE= EXPLICIT=False"),
+        ("3", None, "MODE=orchestrator EXPLICIT=True"),
+        ("", Some("ORCHESTRATOR"), "MODE=orchestrator EXPLICIT=True"),
     ] {
         let out = choice(&pwsh, param, env);
         assert!(
@@ -170,7 +175,7 @@ fn the_choice_folds_spellings_and_the_parameter_beats_the_env_var() {
     }
     let bad = choice(&pwsh, "", Some("server"));
     assert!(
-        bad.contains("invalid INTENTD_DAEMON_MODE value 'server' (expected full or node)"),
+        bad.contains("invalid INTENTD_DAEMON_MODE value 'server' (expected full, node or orchestrator)"),
         "{bad}"
     );
 }
@@ -284,4 +289,79 @@ fn the_pair_option_pairs_a_full_install_once_the_daemon_is_up() {
     );
     let off = apply(&pwsh, "", false, "up", None);
     assert!(off.calls.is_empty(), "{:?}", off.calls);
+}
+
+#[test]
+fn a_fresh_orchestrator_install_sets_the_mode_restarts_then_pairs_like_a_full_install() {
+    let Some(pwsh) = pwsh() else { return };
+    let outcome = apply_with_pair(&pwsh, "orchestrator", true, "up", None, true);
+    assert_eq!(
+        outcome.calls,
+        [
+            "settings daemon.mode",
+            "settings daemon.mode orchestrator",
+            "restart",
+            "pair --yes --tunnel",
+        ],
+        "{}",
+        outcome.output
+    );
+    assert!(
+        outcome.output.contains("orchestrator mode on")
+            && outcome.output.contains("intent://pair?"),
+        "{}",
+        outcome.output
+    );
+}
+
+#[test]
+fn a_reinstall_never_switches_an_existing_install_to_orchestrator() {
+    let Some(pwsh) = pwsh() else { return };
+    for saved in ["regular", "node"] {
+        let outcome = apply(&pwsh, "orchestrator", true, "up", Some(saved));
+        assert_eq!(
+            outcome.calls,
+            ["settings daemon.mode"],
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome
+                .output
+                .contains(&format!("keeps its current mode (daemon.mode = {saved})")),
+            "{}",
+            outcome.output
+        );
+    }
+    let already = apply(&pwsh, "orchestrator", true, "up", Some("orchestrator"));
+    assert_eq!(already.calls, ["settings daemon.mode"], "{}", already.output);
+    assert!(!already.output.contains("keeps its current mode"));
+}
+
+#[test]
+fn an_explicit_full_answer_switches_an_orchestrator_back() {
+    let Some(pwsh) = pwsh() else { return };
+    let outcome = apply(&pwsh, "full", true, "up", Some("orchestrator"));
+    assert_eq!(
+        outcome.calls,
+        [
+            "settings daemon.mode",
+            "settings daemon.mode regular",
+            "restart"
+        ],
+        "{}",
+        outcome.output
+    );
+}
+
+#[test]
+fn orchestrator_setup_waits_for_a_daemon_that_is_up() {
+    let Some(pwsh) = pwsh() else { return };
+    let outcome = apply(&pwsh, "orchestrator", true, "undecided", None);
+    assert!(outcome.calls.is_empty(), "{:?}", outcome.calls);
+    assert!(
+        outcome.output.contains("orchestrator setup did not run"),
+        "{}",
+        outcome.output
+    );
 }

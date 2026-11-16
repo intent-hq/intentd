@@ -38,16 +38,20 @@
 # (y/yes/true, n/no/false), in any case.
 #
 # Before the service question it asks how the computer will be used: run
-# Intent here (the default) or as a node that only runs agents for another
-# Intent. A node install sets daemon.mode=node and turns the Tailcat tunnel
+# Intent here (the default), as a node that only runs agents for another
+# Intent, or as an orchestrator that holds the workspaces and runs every agent
+# on other machines. A node install sets daemon.mode=node and turns the Tailcat tunnel
 # on, restarts the daemon, then runs `intentd pair --node --tunnel` — the interface
 # picker on a terminal, a tunnel-only link without one — and ends with the QR
 # code and the intent://node link. An unattended node install sets the service up
-# unless told not to. Force an answer:
+# unless told not to. An orchestrator install sets daemon.mode=orchestrator,
+# restarts the daemon and pairs like a full install, on a fresh install only:
+# over an existing install it warns and keeps the current mode. An unattended
+# orchestrator install sets the service up unless told not to. Force an answer:
 #
-#   INTENTD_DAEMON_MODE=full|node  (or --daemon-mode=<value>, on direct runs)
+#   INTENTD_DAEMON_MODE=full|node|orchestrator  (or --daemon-mode=<value>, on direct runs)
 #
-# A full install can end by pairing, so the link a desktop app needs is on
+# A full or orchestrator install can end by pairing, so the link a desktop app needs is on
 # screen: once the service's daemon answers, it runs `intentd pair --yes
 # --tunnel` (the Tailcat tunnel, so the link works from any network) and
 # shows its QR code and intent://pair link. Off by default:
@@ -366,13 +370,14 @@ apply_auto_resume() {
 
 # Normalize a daemon-mode answer from the flag, the env var, or the prompt:
 # lowercased, with the prompt's numbers and the daemon's own setting name
-# (`regular`) folded onto full/node. Anything else passes through for
+# (`regular`) folded onto full/node/orchestrator. Anything else passes through for
 # validate_daemon_mode or the prompt to reject.
 normalize_daemon_mode() {
   daemon_mode_lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   case "$daemon_mode_lower" in
     1 | full | regular) printf 'full' ;;
     2 | node) printf 'node' ;;
+    3 | orchestrator) printf 'orchestrator' ;;
     *) printf '%s' "$daemon_mode_lower" ;;
   esac
 }
@@ -380,8 +385,8 @@ normalize_daemon_mode() {
 # Fail fast on a bogus daemon mode from the flag or env var.
 validate_daemon_mode() {
   case "$1" in
-    full | node) ;;
-    *) fail "invalid daemon mode '$1' (expected full or node)" ;;
+    full | node | orchestrator) ;;
+    *) fail "invalid daemon mode '$1' (expected full, node or orchestrator)" ;;
   esac
 }
 
@@ -392,18 +397,19 @@ validate_daemon_mode() {
 prompt_daemon_mode() {
   printf '%s\n' "How will you use this computer?" \
     "1) Run Intent here (recommended if you're just getting started): workspaces, agents and the app connect to it." \
-    "2) Node only: lets another Intent run agents on this computer; nothing else runs here." >/dev/tty
+    "2) Node only: lets another Intent run agents on this computer; nothing else runs here." \
+    "3) Orchestrator: holds your workspaces and sends agents to your other machines; no agents run here." >/dev/tty
   daemon_mode_tries=0
   while [ -z "$daemon_mode" ] && [ "$daemon_mode_tries" -lt 3 ]; do
     daemon_mode_tries=$((daemon_mode_tries + 1))
-    printf 'Choose 1 or 2 [1]: ' >/dev/tty
+    printf 'Choose 1, 2 or 3 [1]: ' >/dev/tty
     reply=""
     read -r reply </dev/tty || reply=""
     case "$(normalize_daemon_mode "$reply")" in
       '') daemon_mode="full" ;;
       full) daemon_mode="full" daemon_mode_explicit="yes" ;;
-      node) daemon_mode="node" daemon_mode_explicit="yes" ;;
-      *) warn "unrecognized answer '$reply' — answer 1 or 2" ;;
+      node | orchestrator) daemon_mode="$(normalize_daemon_mode "$reply")" daemon_mode_explicit="yes" ;;
+      *) warn "unrecognized answer '$reply' — answer 1, 2 or 3" ;;
     esac
   done
   if [ -z "$daemon_mode" ]; then
@@ -458,11 +464,11 @@ run_pair() {
   pair_link=""
 }
 
-# The pair option for a full install: once the daemon answers, pair through
-# the Tailcat tunnel unattended. A failure is a warning; the daemon is
-# installed and running either way.
+# The pair option for a full or orchestrator install: once the daemon
+# answers, pair through the Tailcat tunnel unattended. A failure is a
+# warning; the daemon is installed and running either way.
 apply_pair() {
-  [ "$pair" = "yes" ] && [ "$daemon_mode" = "full" ] || return 0
+  [ "$pair" = "yes" ] && [ "$daemon_mode" != "node" ] || return 0
   info "pairing — the link below adds this computer to the Intent desktop app"
   if run_pair --yes --tunnel; then
     paired="yes"
@@ -481,21 +487,53 @@ To finish setting up this computer as a node, once the daemon is running:
   intentd pair --node --tunnel"
 }
 
+# The saved daemon.mode of the running daemon (regular, node or
+# orchestrator), or nothing when it cannot be read.
+current_daemon_mode() {
+  "$install_dir/intentd" settings daemon.mode 2>/dev/null | head -n 1 \
+    | sed -n 's/^[^=]*=[[:space:]]*"\{0,1\}\([a-z]*\).*$/\1/p'
+}
+
+# Orchestrator: daemon.mode orchestrator and a restart, on a fresh install
+# only. Over an existing install it warns and keeps the current mode, so a
+# re-install never stops the agents a full install or node runs here.
+apply_orchestrator_mode() {
+  current_mode=$(current_daemon_mode)
+  [ "$current_mode" != "orchestrator" ] || return 0
+  if [ "$existing_install" = "yes" ]; then
+    warn "this computer already runs Intent, so it keeps its current mode (daemon.mode = ${current_mode:-unknown}); the installer sets up an orchestrator only on a fresh install"
+    return 0
+  fi
+  restart_from=$(data_dir_owner_pid "$(resolve_data_dir)")
+  if "$install_dir/intentd" settings daemon.mode orchestrator >/dev/null 2>&1 \
+    && "$install_dir/intentd" restart >/dev/null 2>&1 \
+    && await_restarted_daemon "$restart_from"; then
+    info "orchestrator mode on — add the machines that will run its agents in Settings → Machines"
+  else
+    warn "the daemon did not come back in orchestrator mode — check it with: intentd status
+To finish by hand: intentd settings daemon.mode orchestrator && intentd restart"
+  fi
+}
+
 # Apply the daemon-mode answer once the daemon is up (runs after
 # verify_daemon). Node: daemon.mode node and the tunnel on, a restart (the
 # mode applies at the next start), then the normal pairing flow — the
 # interface picker with the tunnel pre-checked on a terminal, a tunnel-only
 # link without one — which prints the QR code and the intent:// link. An
-# explicit full answer switches a node back to regular; the unasked default
+# explicit full answer switches a node or an orchestrator back to regular; the unasked default
 # writes nothing. Failures are warnings that name the commands to finish by
 # hand: the binary and the service are installed either way.
 apply_daemon_mode() {
   case "$daemon_mode" in
     node) ;;
+    orchestrator)
+      apply_orchestrator_mode
+      return 0
+      ;;
     full)
       [ "$daemon_mode_explicit" = "yes" ] || return 0
-      case "$("$install_dir/intentd" settings daemon.mode 2>/dev/null | head -n 1)" in
-        *node*) ;;
+      case "$(current_daemon_mode)" in
+        node | orchestrator) ;;
         *) return 0 ;;
       esac
       restart_from=$(data_dir_owner_pid "$(resolve_data_dir)")
@@ -504,7 +542,7 @@ apply_daemon_mode() {
         && await_restarted_daemon "$restart_from"; then
         info "this computer runs Intent again (daemon.mode = regular)"
       else
-        warn "could not switch this computer back from node mode — run: intentd settings daemon.mode regular && intentd restart"
+        warn "could not switch this computer back to running Intent here — run: intentd settings daemon.mode regular && intentd restart"
       fi
       return 0
       ;;
@@ -916,6 +954,8 @@ EOF
     apply_pair
   elif [ "$daemon_mode" = "node" ]; then
     warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
+  elif [ "$daemon_mode" = "orchestrator" ] && [ "$existing_install" != "yes" ]; then
+    warn "orchestrator setup did not run because the daemon is not up yet — once it is: intentd settings daemon.mode orchestrator && intentd restart"
   elif [ "$pair" = "yes" ]; then
     warn "pairing did not run because the daemon is not up yet — once it is: intentd pair --tunnel"
   fi
@@ -1007,6 +1047,8 @@ EOF
     apply_pair
   elif [ "$daemon_mode" = "node" ]; then
     warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
+  elif [ "$daemon_mode" = "orchestrator" ] && [ "$existing_install" != "yes" ]; then
+    warn "orchestrator setup did not run because the daemon is not up yet — once it is: intentd settings daemon.mode orchestrator && intentd restart"
   elif [ "$pair" = "yes" ]; then
     warn "pairing did not run because the daemon is not up yet — once it is: intentd pair --tunnel"
   fi
@@ -1041,7 +1083,7 @@ main() {
         daemon_mode_arg=$(normalize_daemon_mode "${arg#--daemon-mode=}")
         validate_daemon_mode "$daemon_mode_arg"
         ;;
-      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off, --channel=stable|beta|alpha, --daemon-mode=full|node, --pair, --link-marker)" ;;
+      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off, --channel=stable|beta|alpha, --daemon-mode=full|node|orchestrator, --pair, --link-marker)" ;;
     esac
   done
   # Validated before any download so garbage fails fast, interactive or not.
@@ -1217,9 +1259,9 @@ main() {
   # Service setup decision: flags beat the env var beats the prompt. The
   # prompt talks to /dev/tty because `curl | sh` occupies stdin; when no
   # terminal is available (CI, provisioning) it must never hang, so the
-  # default there is to skip with a hint — except for a node, which is only
-  # useful while its daemon runs, so an unattended node install sets the
-  # service up unless told not to.
+  # default there is to skip with a hint — except for a node or an
+  # orchestrator, which are only useful while their daemon runs, so an
+  # unattended install of either sets the service up unless told not to.
   service_mode="$service_arg"
   if [ -z "$service_mode" ]; then
     # Case-insensitive to match install.ps1 (FALSE/No must also mean skip).
@@ -1238,7 +1280,7 @@ main() {
         [nN]*) service_mode="no" ;;
         *) service_mode="yes" ;;
       esac
-    elif [ "$daemon_mode" = "node" ]; then
+    elif [ "$daemon_mode" = "node" ] || [ "$daemon_mode" = "orchestrator" ]; then
       service_mode="yes"
     else
       service_mode="skip"
@@ -1250,6 +1292,10 @@ main() {
     # owns cannot host a second service, so refuse now rather than register a
     # service that can only crash-loop.
     check_data_dir_not_owned
+    # Before the service's first start creates it: a database already in the
+    # data dir means an earlier install, which never becomes an orchestrator.
+    existing_install="no"
+    [ ! -e "$(resolve_data_dir)/intentd.db" ] || existing_install="yes"
     # Auto-resume choice: flag beats the env var beats the prompt (both were
     # lowercased + validated above). Same /dev/tty pattern as the service
     # prompt; `auto` — or no terminal — is the daemon default and writes
@@ -1297,7 +1343,7 @@ main() {
     return 0
   fi
 
-  if [ "$pair" = "yes" ] && [ "$daemon_mode" = "full" ]; then
+  if [ "$pair" = "yes" ] && [ "$daemon_mode" != "node" ]; then
     warn "pairing needs the service, so it did not run — once the daemon is running: intentd pair --tunnel"
   fi
   if [ "$service_mode" = "skip" ]; then
@@ -1312,6 +1358,17 @@ Next steps for a node:
 To keep node mode across restarts, set it once the daemon runs:
   intentd settings daemon.mode node
 Or re-run this installer with INTENTD_INSTALL_SERVICE=1 INTENTD_DAEMON_MODE=node."
+    return 0
+  fi
+  if [ "$daemon_mode" = "orchestrator" ]; then
+    printf '%s\n' "
+Next steps for an orchestrator:
+  intentd serve --orchestrator   # start the daemon in orchestrator mode in the foreground
+  intentd pair    # once the daemon is running (another terminal): pairing info for the desktop app
+
+To keep orchestrator mode across restarts, set it once the daemon runs:
+  intentd settings daemon.mode orchestrator
+Or re-run this installer with INTENTD_INSTALL_SERVICE=1 INTENTD_DAEMON_MODE=orchestrator."
     return 0
   fi
   printf '%s\n' "

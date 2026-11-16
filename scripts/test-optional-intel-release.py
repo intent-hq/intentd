@@ -42,7 +42,7 @@ def run_installer(command, env):
 
     install.sh asks its questions on /dev/tty (so `curl | sh` still prompts);
     under a PTY-backed runner (a saved workspace script, a developer shell) an
-    un-detached run would block on "Choose 1 or 2" forever. The pinned
+    un-detached run would block on "Choose 1, 2 or 3" forever. The pinned
     daemon mode answers that question, and the new session drops the
     controlling terminal so no later prompt can hang either.
     """
@@ -398,7 +398,7 @@ class Hermetic(unittest.TestCase):
                 _, status = os.waitpid(pid, 0)
             os.close(fd)
         text = output.decode(errors='replace')
-        self.assertNotIn('Choose 1 or 2', text)
+        self.assertNotIn('Choose 1, 2 or 3', text)
         self.assertEqual(os.waitstatus_to_exitcode(status), 0, text[-2000:])
 
 
