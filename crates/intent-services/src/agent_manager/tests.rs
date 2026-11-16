@@ -10086,6 +10086,244 @@ async fn preemption_by_agent_sender_stamps_agent_attribution() {
     assert_eq!(end.data["messageId"], "msg-int-attr");
 }
 
+/// What an interrupt-priority send delivered: the persisted user row's text
+/// and the text blocks of the `session/prompt` that carried it.
+struct PreemptionDelivery {
+    user_row: String,
+    prompt: String,
+}
+
+/// Drive one interrupt-priority send carrying `body` into agent `id`. With
+/// `busy`, the agent is mid-turn (live-turn slot holding a streamed block),
+/// so the send preempts it; without, the agent is idle and the send streams
+/// straight away (nothing to preempt).
+async fn deliver_interrupt_send(
+    id: &str,
+    busy: bool,
+    body: &str,
+    options: super::TurnOptions,
+) -> PreemptionDelivery {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from(id));
+    seed_agent(&mgr, &ws, &id).await;
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .align_with_mock_for_test();
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-preempt-note")
+        .await
+        .unwrap();
+    if busy {
+        assert!(mgr.try_begin(&id, &ws).await);
+        let blocks =
+            vec![json!({ "type": "text", "id": "msg-preempt-note:0", "text": "partial…" })];
+        mgr.services.set_live_turn(&id, "msg-preempt-note", blocks);
+    }
+
+    let result = mgr
+        .interrupt_send_message(id.clone(), ws.clone(), body.to_string(), None, options)
+        .await
+        .expect("interrupt send");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(result["queued"], json!(false), "the send streams: {result}");
+
+    let mut prompt_params = None;
+    for _ in 0..50 {
+        {
+            let log = log.lock().unwrap();
+            if let Some((_, params)) = log.iter().find(|(m, _)| m == "session/prompt") {
+                prompt_params = Some(params.clone());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let params = prompt_params.expect("session/prompt sent for the interrupt turn");
+    let prompt = params["prompt"]
+        .as_array()
+        .expect("prompt blocks")
+        .iter()
+        .filter(|b| b["type"] == json!("text"))
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let row = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .expect("interrupt send persisted a user row");
+    let user_row = match &row.content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => panic!("unexpected user row content: {other:?}"),
+    };
+    PreemptionDelivery { user_row, prompt }
+}
+
+/// Regression for intent-hq/intent#9430: an agent-to-agent send that
+/// preempts a busy turn is delivered with the preemption-attribution
+/// `[SYSTEM NOTE]`, so the recipient does not read the provider's
+/// "[Request interrupted by user]" / "STOP … wait for the user" cancel text
+/// as a human stop. The note follows the body, so a leading sender header
+/// stays the first line.
+#[tokio::test]
+async fn agent_send_that_preempts_a_busy_turn_carries_the_attribution_note() {
+    let note = crate::agent_manager::preemption_attribution_note();
+    let body = "[MESSAGE FROM AGENT Coordinator (agent-sender-1)]\n\nRebase onto origin/main.";
+    let delivery = deliver_interrupt_send(
+        "a-preempt-agent",
+        true,
+        body,
+        super::TurnOptions {
+            message_metadata: Some(json!({
+                "fromAgentId": "agent-sender-1",
+                "fromAgentName": "Coordinator",
+            })),
+            ..super::TurnOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        delivery.user_row,
+        format!("{body}\n\n{note}"),
+        "the note is appended after the body (sender header stays first)"
+    );
+    assert!(
+        delivery.prompt.contains(&note),
+        "the preempting prompt tells the model the interrupt was not the user: {:?}",
+        delivery.prompt
+    );
+}
+
+/// An automatic (non-user, unattributed) interrupt send that preempts a busy
+/// turn is not the user either, so it carries the note too.
+#[tokio::test]
+async fn automatic_send_that_preempts_a_busy_turn_carries_the_attribution_note() {
+    let note = crate::agent_manager::preemption_attribution_note();
+    let delivery = deliver_interrupt_send(
+        "a-preempt-auto",
+        true,
+        "automatic wake",
+        super::TurnOptions::default(),
+    )
+    .await;
+    assert_eq!(delivery.user_row, format!("automatic wake\n\n{note}"));
+    assert!(delivery.prompt.contains(&note), "{:?}", delivery.prompt);
+}
+
+/// A user-origin interrupt really is the user stopping the turn: the
+/// provider's "interrupted by user" text is accurate, so no note is added.
+#[tokio::test]
+async fn user_send_that_preempts_a_busy_turn_carries_no_attribution_note() {
+    let delivery = deliver_interrupt_send(
+        "a-preempt-user",
+        true,
+        "stop and do this instead",
+        super::TurnOptions {
+            origin: intent_core::MessageOrigin::User,
+            ..super::TurnOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(delivery.user_row, "stop and do this instead");
+    assert!(
+        !delivery
+            .prompt
+            .contains(crate::harness::v1::PREEMPTION_ATTRIBUTION_NOTE_PREFIX),
+        "{:?}",
+        delivery.prompt
+    );
+}
+
+/// An agent interrupt send that lands in the turn-startup window (in-flight
+/// slot held, no live turn yet) cancels nothing: it queues behind the
+/// starting turn, unannotated.
+#[tokio::test]
+async fn agent_send_queued_behind_a_starting_turn_carries_no_attribution_note() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-preempt-queued"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-preempt-queued")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "queued sibling note".to_string(),
+            None,
+            super::TurnOptions {
+                message_metadata: Some(json!({ "fromAgentId": "agent-sender-1" })),
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("interrupt send");
+    assert_eq!(
+        result["queued"],
+        json!(true),
+        "queues behind startup: {result}"
+    );
+    let queued = mgr.services.dequeue_message(&id).expect("queued message");
+    assert_eq!(
+        queued.content, "[MESSAGE FROM AGENT (agent-sender-1)]\n\nqueued sibling note",
+        "sender header only, no preemption note"
+    );
+}
+
+/// An agent interrupt send to an IDLE agent preempts nothing, so it carries
+/// no note (there is no cancel text to correct).
+#[tokio::test]
+async fn agent_send_to_an_idle_agent_carries_no_attribution_note() {
+    let delivery = deliver_interrupt_send(
+        "a-preempt-idle",
+        false,
+        "hello sibling",
+        super::TurnOptions {
+            message_metadata: Some(json!({ "fromAgentId": "agent-sender-1" })),
+            ..super::TurnOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        delivery.user_row, "[MESSAGE FROM AGENT (agent-sender-1)]\n\nhello sibling",
+        "sender header only, no preemption note"
+    );
+    assert!(
+        !delivery
+            .prompt
+            .contains(crate::harness::v1::PREEMPTION_ATTRIBUTION_NOTE_PREFIX),
+        "{:?}",
+        delivery.prompt
+    );
+}
+
 /// Regression: the keep-alive interrupt (`agent.stop` mid-turn) must persist
 /// the streamed-so-far assistant content instead of dropping it. The live-turn
 /// slot is pinned BEFORE the worker abort (the abort drops `LiveTurnGuard`,

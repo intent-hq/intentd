@@ -230,6 +230,13 @@ pub(crate) trait Harness: Send + Sync {
     /// prepended to agent-origin (A2A) sends; an absent `name` renders
     /// `[MESSAGE FROM AGENT ({agent_id})]`.
     fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String;
+    /// `[SYSTEM NOTE]` appended to a non-user interrupt-priority delivery
+    /// that actually preempted the recipient's in-flight turn
+    /// (intent-hq/intent#9430): the provider renders that cancel as a user
+    /// interrupt ("[Request interrupted by user]", or a tool rejection telling
+    /// the model to stop and wait for the user), so the note re-attributes it
+    /// to this delivery.
+    fn preemption_attribution_note(&self) -> String;
     /// `Message from @{login} ({display_name}), a collaborator (guest) of
     /// this workspace — not the workspace owner.` sender preamble prepended
     /// to a human message sent by a collaborator principal (multiplayer).

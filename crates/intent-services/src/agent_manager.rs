@@ -147,6 +147,30 @@ pub(crate) fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
     crate::harness::latest().dequeue_wait_note(queued_at, waited)
 }
 
+/// Preemption-attribution note (intent-hq/intent#9430): appended to a
+/// non-user interrupt-priority delivery that actually cut the recipient's
+/// in-flight turn, so the model does not mistake the provider's
+/// user-worded cancel text for a human stop. Wording owned by the harness.
+pub(crate) fn preemption_attribution_note() -> String {
+    crate::harness::latest().preemption_attribution_note()
+}
+
+/// Append [`preemption_attribution_note`] after `content`, leaving any
+/// leading single-line sender header first (the FE strips it with a
+/// single-line regex and the sender-attribution idempotency guard keys on
+/// it). Idempotent via the stable prefix.
+fn annotate_preemption_attribution(content: &mut String) {
+    if content.contains(crate::harness::v1::PREEMPTION_ATTRIBUTION_NOTE_PREFIX) {
+        return;
+    }
+    let note = preemption_attribution_note();
+    if content.is_empty() {
+        *content = note;
+    } else {
+        *content = format!("{content}\n\n{note}");
+    }
+}
+
 /// Stable prefix of [`dequeue_wait_note`], used to keep the annotation
 /// idempotent when an already-annotated entry is requeued and drained again
 /// (the original wait deliberately stays — a terminal-failure requeue keeps
@@ -10390,7 +10414,15 @@ impl AgentManager {
                 ))
                 .await;
             }
-            self.preempt_busy_turn(&agent_id, &mut options).await;
+            let mut content = content;
+            // intent-hq/intent#9430: the provider words the cancel it just
+            // emitted as a USER interrupt ("[Request interrupted by user]",
+            // or a tool rejection telling the model to stop and wait for the
+            // user). When a non-user delivery cut the turn, say so in the
+            // delivery itself; a user-origin interrupt keeps that wording.
+            if self.preempt_busy_turn(&agent_id, &mut options).await && !options.origin.is_user() {
+                annotate_preemption_attribution(&mut content);
+            }
             // The slot was just released (or was never held): the send path claims
             // it and streams the interrupt message right away rather than queueing.
             // If a concurrent send wins the race the message queues instead — it is
@@ -10413,9 +10445,16 @@ impl AgentManager {
     /// `session/new` / `session/load`, including the relaunch of an evicted
     /// child) where the keep-alive interrupt would have nothing to cancel —
     /// the caller's send then queues behind the starting turn instead.
-    async fn preempt_busy_turn(self: &Arc<Self>, agent_id: &AgentId, options: &mut TurnOptions) {
+    /// Returns `true` only when a live turn was actually cut
+    /// (`interrupt_inner`'s `preempted`), so the caller can attribute the
+    /// cancel to its delivery (intent-hq/intent#9430).
+    async fn preempt_busy_turn(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        options: &mut TurnOptions,
+    ) -> bool {
         if !self.is_busy(agent_id) {
-            return;
+            return false;
         }
         // Preempt only when a cancellable turn is live: the live-turn slot
         // is registered by `run_prompt_turn` immediately before
@@ -10443,7 +10482,7 @@ impl AgentManager {
             .live_turn(agent_id)
             .map(|live| !live.blocks.is_empty())
         else {
-            return;
+            return false;
         };
         let cancellable = self.contains(agent_id)
             && self
@@ -10455,7 +10494,7 @@ impl AgentManager {
                 .and_then(|s| s.acp_session_id.clone())
                 .is_some();
         if !cancellable {
-            return;
+            return false;
         }
 
         // Snapshot before cancellation/cleanup removes the live payload.
@@ -10508,7 +10547,7 @@ impl AgentManager {
             )
             .await;
         if !outcome.preempted {
-            return;
+            return false;
         }
         let interrupted_row_id = outcome.interrupted_row_id;
 
@@ -10539,6 +10578,7 @@ impl AgentManager {
                 }
             }
         }
+        true
     }
 
     fn track_discussion_turn(&self, agent: &AgentId, options: &TurnOptions) {

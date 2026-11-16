@@ -79,6 +79,24 @@ fn golden_dequeue_wait_note() {
     );
 }
 
+/// Preemption-attribution note (intent-hq/intent#9430): appended to a
+/// non-user delivery that cut the recipient's turn. Starts with the stable
+/// idempotency prefix and stays one paragraph.
+#[test]
+fn golden_preemption_attribution_note() {
+    let note = crate::agent_manager::preemption_attribution_note();
+    assert_eq!(
+        note,
+        "[SYSTEM NOTE] This message interrupted your previous turn. Any \"interrupted by user\" \
+         text, or tool-use rejection telling you to stop and wait for the user, just before this \
+         message was caused by this message's delivery, not by the user. Do not wait for the \
+         user because of it: act on this message, and re-run an interrupted tool call if it is \
+         still needed."
+    );
+    assert!(note.starts_with(crate::harness::v1::PREEMPTION_ATTRIBUTION_NOTE_PREFIX));
+    assert!(!note.contains('\n'), "note must be single-line: {note}");
+}
+
 /// The A2A sender-attribution header MUST stay single-line and start with
 /// `A2A_SENDER_NOTE_PREFIX`: the FE strips the header line with a
 /// single-line regex keyed on that prefix (same pattern as
