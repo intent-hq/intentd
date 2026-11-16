@@ -93,8 +93,8 @@ name = "suite_wss_s_z"
 # Standalone targets. The two largest files are each as big as a suite, so
 # merging them would only serialize compilation; source lints must keep the
 # `_lint` target-name suffix (`cargo test --workspace --test '*_lint'`);
-# caller_binding_guard and the lints do not compile `common`, whose ctor sets
-# process-wide test env, so they must not share an executable with it.
+# the lints do not compile `common`, whose ctor sets process-wide test env, so
+# they must not share an executable with it.
 [[test]]
 name = "wss_integration"
 
@@ -102,7 +102,7 @@ name = "wss_integration"
 name = "e2e_wss_agent_lifecycle"
 
 [[test]]
-name = "caller_binding_guard"
+name = "caller_binding_lint"
 
 [[test]]
 name = "repo_cache_path_lint"
