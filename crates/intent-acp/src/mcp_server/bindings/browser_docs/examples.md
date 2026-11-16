@@ -395,7 +395,7 @@ default `tabId`.
 ```
 
 Use `type` in the default `keys` mode for date pickers and masked inputs: they read
-each key press. If a click fails with `element-obscured`, close the dialog or banner the
+each key press. If a click fails with `element-obscured`, dismiss the dialog or banner the
 error names first.
 
 ## Capturing a Login Flow

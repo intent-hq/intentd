@@ -205,21 +205,25 @@ Real mouse and keyboard input through the DevTools Input domain. The page gets
 `isTrusted: true` events with native editing and selection, so these work on controls
 that ignore events made in `evaluate`: sectioned date pickers, masked inputs, rich-text
 editors and `isTrusted` checks. Input goes only to the tab's page. It never moves the
-user's focus and works on hidden tabs. `selector` is a CSS selector in the top document
-(not inside iframes); `x`/`y` are CSS pixels in the tab's viewport.
-- `{ action: "click", selector | x+y, button?, clickCount?, tabId? }` - Scroll the element into view and click its center. `button` is `left` (default), `right` or `middle`; `clickCount` is 1–3
+user's focus and works on hidden tabs: the page is told it has focus, and it keeps acting
+focused after you stop. `selector` is a CSS selector, searched in the page and its open
+shadow roots (not inside iframes); `x`/`y` are CSS pixels in the tab's viewport.
+- `{ action: "click", selector | x+y, button?, clickCount?, tabId? }` - Scroll the element into view and click the middle of its visible part. `button` is `left` (default), `right` or `middle`; `clickCount` is 1–3
 - `{ action: "hover", selector | x+y, tabId? }` - Move the mouse over the element
-- `{ action: "type", text, selector?, clear?, mode?, tabId? }` - Type into the focused element, or focus `selector` first. Types at the caret; `clear: true` selects all and deletes first. `mode: "keys"` (default) sends one key press per character (`\n` is Enter); `"insert"` inserts the text in one step (faster, no key events)
-- `{ action: "press", key, modifiers?, tabId? }` - Press one key: a single character or a named key (`Enter`, `Tab`, `Backspace`, `Delete`, `Escape`, `ArrowUp`/`Down`/`Left`/`Right`, `Home`, `End`, `PageUp`, `PageDown`, `F1`–`F12`). `modifiers` is a list of `Shift`, `Control`, `Alt`, `Meta`, `ControlOrMeta` (Meta on macOS, else Control), e.g. `{ key: "a", modifiers: ["ControlOrMeta"] }` selects all
-- `{ action: "selectOption", selector, value, tabId? }` - Choose options of a native `<select>` by value or label (`value` is a string or a list for `multiple`), then fire `input` and `change`. For custom dropdowns, use `click`
+- `{ action: "type", text, selector?, clear?, mode?, tabId? }` - Type into the focused element, or focus `selector` first. Types at the caret; `clear: true` selects all and deletes first. `mode: "keys"` (default) sends one US-layout key press per character (`\n` is Enter, `\t` is Tab); `"insert"` inserts the text in one step (no key events; use it for long text)
+- `{ action: "press", key, modifiers?, tabId? }` - Press one key: a single character or a named key (`Enter`, `Tab`, `Backspace`, `Delete`, `Escape`, `Insert`, `ArrowUp`/`Down`/`Left`/`Right`, `Home`, `End`, `PageUp`, `PageDown`, `F1`–`F12`). `modifiers` is a list of `Shift`, `Control`, `Alt`, `Meta`, `ControlOrMeta` (Meta on macOS, else Control), e.g. `{ key: "a", modifiers: ["ControlOrMeta"] }` selects all
+- `{ action: "selectOption", selector, value, tabId? }` - Choose options of a native `<select>` by value or label (`value` is a string or a list for `multiple`). This one sets the value and fires synthetic `input` and `change` events, since native dropdown popups cannot be driven. For custom dropdowns, use `click`
 
 Input failures carry an `errorCode`: `element-not-found`, `invalid-selector`,
-`element-not-visible` (zero size or `visibility: hidden`), `element-obscured` (another
-element covers the center; the error names it — close it, or click by `x`/`y`),
-`not-focusable`, `not-a-select`, `option-not-found` or `unknown-key`. These checks
-run before any input is sent. Take a `screenshot` or `getAccessibilityTree` after input to see
-the result. The user can still use a tab you drive, and their input is not blocked:
-work in your own hidden tabs when you can.
+`element-not-visible` (no part of it in the viewport, or `visibility: hidden`),
+`element-obscured` (another element covers it; the error names it — dismiss it first,
+because `x`/`y` would click it too), `element-disabled`, `not-focusable`, `not-a-select`,
+`option-not-found` or `unknown-key`. These checks run before any input is sent. A
+request that runs out of time part-way can leave input half done: a failed `type` says
+how many characters landed. Take a `screenshot` or `getAccessibilityTree` after input to
+see the result. Pass `tabId`; without it the action uses the first tab. The user can
+still use a tab you drive, and their input is not blocked: work in your own hidden tabs
+when you can.
 
 ## Capture Actions (for debugging)
 - `{ action: "snapshot", workspaceId, name?, reload?, waitFor? }` - Quick point-in-time capture
