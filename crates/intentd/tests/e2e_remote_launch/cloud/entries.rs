@@ -346,19 +346,14 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
         "the sub-agent's sandbox is in Beta's project"
     );
 
-    // Bee watches the sub-agent it created: its turn and Bee's wake end
-    // before the remove, or the wake would start Bee again on the entry
-    // left, after the remove.
-    agent_until(&mut rpc_ws, (&ws_id, &kid), 300, |a| {
-        a["lastAgentResponse"]
-            .as_str()
-            .is_some_and(|reply| reply.contains("kid-1"))
-    })
-    .await;
-    agent_until(&mut rpc_ws, (&ws_id, &bee), 400, |a| {
-        a["lastAgentResponse"]
-            .as_str()
-            .is_some_and(|reply| reply.contains("Child agent Kid"))
+    // Bee watches the sub-agent it created: Bee's wake turn ends before
+    // the remove, or the wake would start Bee again on the entry left.
+    // The reply is streamed while the turn runs, hence also idle.
+    agent_until(&mut rpc_ws, (&ws_id, &bee), 300, |a| {
+        a["status"] == "idle"
+            && a["lastAgentResponse"]
+                .as_str()
+                .is_some_and(|reply| reply.contains("Child agent Kid"))
     })
     .await;
     step("sub-agent linked");

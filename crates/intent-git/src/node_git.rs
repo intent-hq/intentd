@@ -2018,13 +2018,13 @@ fn io(error: std::io::Error) -> Error {
     Error::Internal(format!("node git I/O: {error}"))
 }
 
-/// Run a git command to completion, returning its trimmed stdout.
 /// Whether `dir` is a bare cache git accepts: a killed `git init` can leave
 /// `HEAD` without `objects`.
 fn is_cache(dir: &Path) -> bool {
     dir.join("HEAD").is_file() && dir.join("objects").is_dir()
 }
 
+/// Run a git command to completion, returning its trimmed stdout.
 async fn run(mut command: Command) -> Result<String> {
     let output = command.output().await.map_err(io)?;
     if output.status.success() {
