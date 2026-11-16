@@ -35507,6 +35507,22 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn pr_monitor_sub_agent_hint(
+        &self,
+        workspace_id: WorkspaceId,
+        caller: AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, Option<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member_in(&caller, &workspace_id)
+                .await
+                .ok()?;
+            self.pr_monitor_sub_agent_hint_op(&workspace_id, &caller, pr_number, repo)
+                .await
+        })
+    }
+
     fn pr_monitor_stop(
         &self,
         workspace_id: WorkspaceId,

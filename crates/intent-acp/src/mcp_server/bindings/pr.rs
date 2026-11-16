@@ -67,7 +67,7 @@ pub(crate) async fn dispatch(
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "snapshot" => snapshot(api, ws, args).await,
+        "snapshot" => snapshot(api, ws, caller, args).await,
         "monitor" => monitor(api, ws, caller, args).await,
         "unmonitor" => unmonitor(api, ws, caller, args).await,
         "monitors" => monitors(api, ws, caller).await,
@@ -108,9 +108,13 @@ fn addressed(args: &Value) -> Result<Option<ReviewMonitorRequest>, String> {
         .map_err(|error| error.to_string())
 }
 
+/// A legacy snapshot also carries `subAgentMonitor` when a sub-agent of the
+/// caller monitors the PR, steering a parent from polling to the child's
+/// report.
 async fn snapshot(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     if let Some(request) = addressed(args)? {
@@ -121,9 +125,19 @@ async fn snapshot(
     }
     let pr_number = req_pr_number(args)?;
     let repo = opt_repo(args)?;
-    api.pr_state(ws.clone(), pr_number, repo)
+    let mut state = api
+        .pr_state(ws.clone(), pr_number, repo.clone())
         .await
-        .map_err(map_err)
+        .map_err(map_err)?;
+    if let (Some(caller), Some(object)) = (caller, state.as_object_mut()) {
+        if let Some(hint) = api
+            .pr_monitor_sub_agent_hint(ws.clone(), caller.clone(), pr_number, repo)
+            .await
+        {
+            object.insert("subAgentMonitor".to_string(), hint);
+        }
+    }
+    Ok(state)
 }
 
 async fn monitor(
@@ -212,6 +226,8 @@ mod tests {
         response: Value,
         error: Option<&'static str>,
         retired: bool,
+        hint: Option<Value>,
+        hint_calls: Mutex<Vec<Value>>,
     }
 
     impl RecordingApi {
@@ -289,6 +305,20 @@ mod tests {
         ) -> BoxFuture<'_, Result<Value>> {
             self.record("monitors", &ws, owner, None, None)
         }
+
+        fn pr_monitor_sub_agent_hint(
+            &self,
+            ws: WorkspaceId,
+            caller: AgentId,
+            number: u64,
+            repo: Option<String>,
+        ) -> BoxFuture<'_, Option<Value>> {
+            self.hint_calls.lock().unwrap().push(json!({
+                "workspace": ws.as_str(), "caller": caller.to_string(),
+                "number": number, "repo": repo,
+            }));
+            Box::pin(async { self.hint.clone() })
+        }
     }
 
     fn bridge(api: Arc<RecordingApi>, enabled: bool, caller: bool) -> WorkspaceMcpServer {
@@ -326,7 +356,45 @@ mod tests {
             response,
             error: None,
             retired: false,
+            hint: None,
+            hint_calls: Mutex::new(Vec::new()),
         })
+    }
+
+    /// A parent's snapshot of a PR its sub-agent monitors carries the
+    /// service hint as `subAgentMonitor`; without a caller (FE front door)
+    /// or a hint the snapshot is forwarded untouched, and a non-object
+    /// result is never rewritten.
+    #[tokio::test]
+    async fn snapshot_carries_the_sub_agent_monitor_hint_for_its_caller() {
+        let hint = json!({ "ownerAgentId": "agent-child", "watchAgentId": "agent-child", "instruction": "watch it" });
+        for (state, caller, with_hint) in [
+            (json!({ "repo": "o/r", "prNumber": 7 }), true, true),
+            (json!({ "repo": "o/r", "prNumber": 7 }), true, false),
+            (json!({ "repo": "o/r", "prNumber": 7 }), false, true),
+            (Value::Null, true, true),
+        ] {
+            let mut api = recording_api(state.clone());
+            Arc::get_mut(&mut api).unwrap().hint = with_hint.then(|| hint.clone());
+            let server = bridge(api.clone(), true, caller);
+            for ns in ["pr", "mr"] {
+                let result = body(
+                    &call(&server, &format!("return await ws.{ns}.snapshot(7, {{ repo: 'o/r' }});")).await,
+                );
+                let mut expected = state.clone();
+                if with_hint && caller && state.is_object() {
+                    expected["subAgentMonitor"] = hint.clone();
+                }
+                assert_eq!(result, expected, "{ns} caller={caller} hint={with_hint}");
+            }
+            let hint_calls = api.hint_calls.lock().unwrap();
+            if caller && state.is_object() {
+                let expected = json!({ "workspace": "ws-observation", "caller": "agent-owner", "number": 7, "repo": "o/r" });
+                assert_eq!(*hint_calls, vec![expected; 2]);
+            } else {
+                assert!(hint_calls.is_empty(), "no caller or no object, no hint lookup");
+            }
+        }
     }
 
     #[tokio::test]

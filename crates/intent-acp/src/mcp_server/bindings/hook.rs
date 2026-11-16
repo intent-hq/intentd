@@ -103,9 +103,69 @@ async fn schedule(
             "hook.schedule requires an agent caller context to attribute ownership".to_string(),
         );
     };
-    api.hook_schedule(ws.clone(), owner.clone(), args.clone())
+    let mut scheduled = api
+        .hook_schedule(ws.clone(), owner.clone(), args.clone())
         .await
-        .map_err(map_err)
+        .map_err(map_err)?;
+    let code = args.get("code").and_then(Value::as_str).unwrap_or_default();
+    let mut monitored = Vec::new();
+    for (pr_number, repo) in snapshot_targets(code) {
+        if let Some(hint) = api
+            .pr_monitor_sub_agent_hint(ws.clone(), owner.clone(), pr_number, repo)
+            .await
+        {
+            monitored.push(hint);
+        }
+    }
+    if let (false, Some(object)) = (monitored.is_empty(), scheduled.as_object_mut()) {
+        let instructions: Vec<&str> = monitored
+            .iter()
+            .filter_map(|hint| hint["instruction"].as_str())
+            .collect();
+        object.insert(
+            "advisory".to_string(),
+            Value::String(format!(
+                "This hook polls a PR your sub-agent already monitors. {} Cancel this \
+                 hook with ws.hook.cancel unless it watches something the sub-agent \
+                 will not report.",
+                instructions.join(" ")
+            )),
+        );
+        object.insert("subAgentMonitors".to_string(), Value::Array(monitored));
+    }
+    Ok(scheduled)
+}
+
+/// Most literal PR reads a hook makes: `pr.snapshot(` / `mr.snapshot(`
+/// followed by a number literal, plus a literal `repo` option in the same
+/// call. Calls with a computed number are not seen; the advisory is a hint.
+fn snapshot_targets(code: &str) -> Vec<(u64, Option<String>)> {
+    const MAX_TARGETS: usize = 8;
+    let mut targets: Vec<(u64, Option<String>)> = Vec::new();
+    for namespace in ["pr.snapshot(", "mr.snapshot("] {
+        for (start, _) in code.match_indices(namespace) {
+            let rest = code[start + namespace.len()..].trim_start();
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            let Ok(pr_number) = rest[..digits].parse::<u64>() else {
+                continue;
+            };
+            let call = &rest[digits..rest.find(')').unwrap_or(rest.len())];
+            let target = (pr_number, literal_repo(call));
+            if !targets.contains(&target) && targets.len() < MAX_TARGETS {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
+/// The string literal after `repo:` in a call's argument text.
+fn literal_repo(call: &str) -> Option<String> {
+    let after = call[call.find("repo")? + "repo".len()..].trim_start();
+    let value = after.strip_prefix(':')?.trim_start();
+    let quote = value.chars().next().filter(|c| matches!(c, '"' | '\'' | '`'))?;
+    let body = &value[1..];
+    Some(body[..body.find(quote)?].to_string())
 }
 
 async fn list(
@@ -200,6 +260,8 @@ mod tests {
         schedule_called: AtomicBool,
         get_called: AtomicBool,
         list_include_retired: Mutex<Option<bool>>,
+        sub_agent_monitored: Vec<(u64, Option<String>)>,
+        hint_calls: Mutex<Vec<(u64, Option<String>)>>,
     }
 
     impl WorkspaceApi for SpyApi {
@@ -240,6 +302,76 @@ mod tests {
         ) -> BoxFuture<'_, Result<Value>> {
             self.schedule_called.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(json!({ "ok": true })) })
+        }
+
+        fn pr_monitor_sub_agent_hint(
+            &self,
+            _workspace_id: WorkspaceId,
+            _caller: AgentId,
+            pr_number: u64,
+            repo: Option<String>,
+        ) -> BoxFuture<'_, Option<Value>> {
+            let target = (pr_number, repo);
+            self.hint_calls.lock().unwrap().push(target.clone());
+            let hint = self.sub_agent_monitored.contains(&target).then(|| {
+                json!({ "prNumber": pr_number, "watchAgentId": "agent-child", "instruction": format!("#{pr_number}: watch agent-child.") })
+            });
+            Box::pin(async { hint })
+        }
+    }
+
+    /// `hook.schedule` still schedules a hook that polls a PR a sub-agent
+    /// monitors, and adds an advisory naming the sub-agent route; every
+    /// literal snapshot read is looked up once, computed numbers are not
+    /// seen, and a hook with no sub-agent-monitored PR gets no advisory.
+    #[tokio::test]
+    async fn schedule_advises_when_the_hook_polls_a_pr_a_sub_agent_monitors() {
+        let caller = AgentId::from("agent-parent");
+        let ws = WorkspaceId::from_string("ws-hook");
+        let code = r#"const a = await ws.pr.snapshot(3408, { repo: "intent-hq/intentd" });
+            const b = await ws.mr.snapshot( 12 );
+            const c = await ws.pr.snapshot(3408, { repo: 'intent-hq/intentd' });
+            const d = await ws.pr.snapshot(n, { repo: "intent-hq/intentd" });
+            const e = await ws.pr.snapshot(9, {repo:`o/r`});
+            return { dispatch: false };"#;
+        let looked_up = vec![
+            (9, Some("o/r".to_string())),
+            (12, None),
+            (3408, Some("intent-hq/intentd".to_string())),
+        ];
+        for monitored in [vec![(3408, Some("intent-hq/intentd".to_string()))], vec![]] {
+            let spy = Arc::new(SpyApi {
+                sub_agent_monitored: monitored.clone(),
+                ..SpyApi::default()
+            });
+            let api: Arc<dyn WorkspaceApi> = spy.clone();
+            let scheduled = dispatch(
+                &api,
+                &ws,
+                Some(&caller),
+                "schedule",
+                &json!({ "name": "poll", "delayMs": 60_000, "code": code }),
+            )
+            .await
+            .expect("an advisory is not a refusal");
+            assert_eq!(scheduled["ok"], json!(true), "{scheduled}");
+            assert!(spy.schedule_called.load(Ordering::SeqCst));
+            let mut calls = spy.hint_calls.lock().unwrap().clone();
+            calls.sort();
+            assert_eq!(calls, looked_up);
+            if monitored.is_empty() {
+                assert!(scheduled.get("advisory").is_none(), "{scheduled}");
+                assert!(scheduled.get("subAgentMonitors").is_none(), "{scheduled}");
+                continue;
+            }
+            let advisory = scheduled["advisory"].as_str().expect("advisory");
+            assert!(
+                advisory.starts_with("This hook polls a PR your sub-agent already monitors. #3408: watch agent-child."),
+                "{advisory}"
+            );
+            assert!(advisory.contains("ws.hook.cancel"), "{advisory}");
+            assert_eq!(scheduled["subAgentMonitors"][0]["prNumber"], json!(3408));
+            assert_eq!(scheduled["subAgentMonitors"].as_array().unwrap().len(), 1);
         }
     }
 
