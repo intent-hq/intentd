@@ -532,6 +532,11 @@ pub(crate) async fn ready(
     workspace_id: &WorkspaceId,
     home: WorkspaceHome,
 ) -> Result<WorkspaceHome> {
+    let home = if home.state == HomeState::Moving {
+        wait_moved(svc, workspace_id, home).await?
+    } else {
+        home
+    };
     let restart = home.cloud_machine_id.is_some()
         && home.state == HomeState::Detached
         && home.node_id.is_none();
@@ -546,6 +551,139 @@ pub(crate) async fn ready(
         return Ok(home);
     }
     wait_started(svc, feature, workspace_id, home).await
+}
+
+/// A call on a home moving to a cloud home that clients see `starting`
+/// ([`intent_store::HomeMove::shown`]) waits up to [`START_WAIT`] for the
+/// move to end, as for any starting cloud home. The home when it is not
+/// such a move (a moving one fails `moving` next), or once the move ended.
+///
+/// # Errors
+///
+/// `home-unavailable` with `starting: true` when the move still runs after
+/// the wait; the store's error.
+async fn wait_moved(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    mut home: WorkspaceHome,
+) -> Result<WorkspaceHome> {
+    let Ok(feature) = super::feature(svc) else {
+        return Ok(home);
+    };
+    let deadline = tokio::time::Instant::now() + START_WAIT;
+    loop {
+        let woken = feature.cloud.home_changed.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        home = match svc.store().get_workspace_home(workspace_id).await? {
+            Some(current) => current,
+            None => return Ok(home),
+        };
+        if home.state != HomeState::Moving {
+            return Ok(home);
+        }
+        let shown = match svc.store().get_home_move(workspace_id).await? {
+            Some(home_move) => home_move.shown(&home),
+            None => continue,
+        };
+        if shown.state != HomeState::Starting {
+            return Ok(home);
+        }
+        if tokio::time::timeout_at(deadline, woken).await.is_err() {
+            return Err(crate::terminals::home_starting(&shown));
+        }
+    }
+}
+
+/// The new home of a move to cloud entry `cloud_machine_id`: a new home
+/// with no sandbox yet (the move starts one), when the entry exists and
+/// its key is saved and not known to be rejected.
+///
+/// # Errors
+///
+/// `home-target-unavailable` naming the reason; the store's error.
+pub(crate) async fn entry_target(svc: &Services, cloud_machine_id: &str) -> Result<WorkspaceHome> {
+    let saved = usable_entry(svc, cloud_machine_id).await?;
+    Ok(new_home(cloud_machine_id, &saved.name))
+}
+
+/// The new home of a move to the sandbox `machine_id` of an agent: a new
+/// home on that sandbox, when it is not revoked, stopping or lost, allows
+/// homes and its entry is usable ([`entry_target`]).
+///
+/// # Errors
+///
+/// `home-target-unavailable` naming the reason, `machine-update-required`
+/// for a sandbox below nodeProtocol 19; the store's error.
+pub(crate) async fn sandbox_target(svc: &Services, machine_id: &str) -> Result<WorkspaceHome> {
+    let row = svc
+        .store()
+        .get_exposed_machine(machine_id)
+        .await?
+        .ok_or_else(|| crate::home_move::target_unavailable("that agent's sandbox is gone"))?;
+    let Some(cloud) = row.cloud.as_ref() else {
+        return Err(crate::home_move::target_unavailable(
+            "that agent is not on a sandbox",
+        ));
+    };
+    let lost = svc
+        .remote_feature()
+        .is_some_and(|feature| feature.cloud.loss(machine_id).is_some());
+    if lost
+        || row.state == intent_core::machines::RemoteMachineState::Revoked
+        || cloud.state == intent_core::machines::CloudSandboxState::Stopping
+    {
+        return Err(crate::home_move::target_unavailable(
+            "that agent's sandbox is stopping or gone",
+        ));
+    }
+    if !crate::homes::allows_homes(&row) {
+        return Err(crate::home_move::target_unavailable(
+            "that agent's sandbox does not allow homes",
+        ));
+    }
+    if row.node_protocol.unwrap_or_default() < intent_core::node_link::HOMES_PROTOCOL {
+        return Err(intent_core::Error::MachineUpdateRequired(Box::new(
+            crate::homes::too_old(&row),
+        )));
+    }
+    let saved = usable_entry(svc, &cloud.cloud_machine_id).await?;
+    Ok(WorkspaceHome {
+        home_id: HomeId::new(),
+        node_id: Some(row.id.clone()),
+        cloud_machine_id: Some(cloud.cloud_machine_id.clone()),
+        name: saved.name,
+        state: HomeState::Attached,
+        since: intent_core::now_iso(),
+        last_backup_at: None,
+        backup_warning: false,
+    })
+}
+
+/// Cloud entry `cloud_machine_id`'s settings, when a sandbox of it can
+/// start: it exists, and its key is saved and not known to be rejected.
+async fn usable_entry(svc: &Services, cloud_machine_id: &str) -> Result<super::config::ProviderConfig> {
+    let saved = super::config::load(svc, cloud_machine_id)
+        .await?
+        .ok_or_else(|| crate::home_move::target_unavailable("there is no such cloud entry"))?;
+    if saved.state == super::config::ProviderState::KeyRejected {
+        return Err(crate::home_move::target_unavailable(
+            "the cloud entry's key was rejected; save a new key first",
+        ));
+    }
+    if super::config::saved_key(svc, cloud_machine_id).await?.is_none() {
+        return Err(crate::home_move::target_unavailable(
+            "the cloud entry has no saved key",
+        ));
+    }
+    Ok(saved)
+}
+
+/// Sandbox `machine_id` now holds `workspace_id`'s home: its `startedBy`
+/// is the workspace owner (nodes.md "Cloud homes" 2).
+pub(crate) async fn co_own(svc: &Services, workspace_id: &WorkspaceId, machine_id: &str) {
+    let owner = super::owner_started_by(svc, workspace_id).await;
+    super::start::set_started_by(svc, machine_id, owner).await;
 }
 
 async fn wait_started(

@@ -888,7 +888,7 @@ async fn start_for_agent(
 }
 
 /// Record `started_by` as machine `machine_id`'s `cloud.startedBy`.
-async fn set_started_by(
+pub(super) async fn set_started_by(
     svc: &Services,
     machine_id: &str,
     started_by: intent_core::machines::CloudStartedBy,
@@ -918,20 +918,62 @@ pub(crate) async fn start_home(
     cloud_machine_id: &str,
 ) -> Result<()> {
     let mut made = None;
-    let started = start_home_sandbox(svc, workspace_id, home_id, cloud_machine_id, &mut made).await;
+    let started = start_home_sandbox(
+        svc,
+        workspace_id,
+        HomeSandbox::Claim(home_id),
+        cloud_machine_id,
+        &mut made,
+    )
+    .await;
     if started.is_err() {
         super::home::start_failed(svc, workspace_id, home_id, made.as_deref()).await;
     }
-    started
+    started.map(drop)
+}
+
+/// The new home-only sandbox of a home move to cloud entry
+/// `cloud_machine_id` (nodes.md "Moving the home" step 2): as
+/// [`start_home`], but the sandbox is recorded as the machine of the move
+/// to `home_id`, which opens it, instead of becoming the workspace's home.
+/// Its machine id. The sandbox is deleted when a step fails, also when the
+/// move ended meanwhile.
+///
+/// # Errors
+///
+/// The start's error.
+pub(crate) async fn start_move_home(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    home_id: &intent_core::HomeId,
+    cloud_machine_id: &str,
+) -> Result<String> {
+    start_home_sandbox(
+        svc,
+        workspace_id,
+        HomeSandbox::Move(home_id),
+        cloud_machine_id,
+        &mut None,
+    )
+    .await
+}
+
+/// What a home-only sandbox is started for.
+#[derive(Clone, Copy)]
+enum HomeSandbox<'a> {
+    /// To become the workspace's cloud home `homeId` and open it.
+    Claim(&'a intent_core::HomeId),
+    /// To be the new home `homeId` of the workspace's move.
+    Move(&'a intent_core::HomeId),
 }
 
 async fn start_home_sandbox(
     svc: &Services,
     workspace_id: &WorkspaceId,
-    home_id: &intent_core::HomeId,
+    purpose: HomeSandbox<'_>,
     cloud_machine_id: &str,
     made: &mut Option<String>,
-) -> Result<()> {
+) -> Result<String> {
     let feature = super::feature(svc)?;
     let owner = super::home::start_key(workspace_id);
     let started_by = super::owner_started_by(svc, workspace_id).await;
@@ -959,12 +1001,30 @@ async fn start_home_sandbox(
         if config::load(svc, cloud_machine_id).await?.is_none() {
             return Err(config::not_configured());
         }
-        if !super::home::claim(svc, workspace_id, home_id, cloud_machine_id, &machine_id).await? {
-            return Err(Error::Internal(
-                "another sandbox became the workspace's home first".into(),
-            ));
+        match purpose {
+            HomeSandbox::Claim(home_id) => {
+                if !super::home::claim(svc, workspace_id, home_id, cloud_machine_id, &machine_id)
+                    .await?
+                {
+                    return Err(Error::Internal(
+                        "another sandbox became the workspace's home first".into(),
+                    ));
+                }
+                super::home::open(svc, workspace_id, home_id, &machine_id).await?;
+            }
+            HomeSandbox::Move(home_id) => {
+                if !svc
+                    .store()
+                    .set_home_move_machine(workspace_id, home_id, &machine_id)
+                    .await?
+                {
+                    return Err(Error::Internal(
+                        "the home move ended while its sandbox started".into(),
+                    ));
+                }
+            }
         }
-        super::home::open(svc, workspace_id, home_id, &machine_id).await
+        Ok(machine_id)
     }
     .await;
     if linked.is_err() {

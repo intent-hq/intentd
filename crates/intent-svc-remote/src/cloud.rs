@@ -36,7 +36,7 @@ pub(crate) use lifecycle::{spawn_supervisor, CloudGate};
 pub(crate) use methods::call;
 #[cfg(test)]
 pub(crate) use start::chain_entry;
-pub(crate) use start::{admit, begin_start, wait_linked};
+pub(crate) use start::{admit, begin_start, start_move_home, wait_linked};
 
 /// A finished start that failed: the error's message and data (with its
 /// `code`), so every waiter can rebuild the same error.

@@ -3,6 +3,8 @@
 //! progress of each workspace, kept so it goes on after a restart.
 
 use intent_core::node_link::{HomeStopReason, HomeStopRecord};
+use std::collections::HashMap;
+
 use intent_core::{Error, HomeId, HomeState, Result, WorkspaceHome, WorkspaceId};
 use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
 
@@ -50,6 +52,31 @@ pub struct HomeMove {
     /// The old home's last backup landed (step 1 is done).
     pub pushed: bool,
     pub started_at: String,
+}
+
+impl HomeMove {
+    /// The home clients see while this move runs from `home`, the
+    /// workspace's home: once the old home's last backup landed, a move to
+    /// a cloud home shows its new home `starting` until the switch
+    /// (nodes.md "Cloud homes" 6); else `home` as is. The store keeps the
+    /// old home `moving`, so every call stays refused as for any move.
+    #[must_use]
+    pub fn shown(&self, home: &WorkspaceHome) -> WorkspaceHome {
+        if home.state != HomeState::Moving
+            || home.home_id != self.from_home_id
+            || !self.pushed
+            || self.target.cloud_machine_id.is_none()
+        {
+            return home.clone();
+        }
+        WorkspaceHome {
+            state: HomeState::Starting,
+            since: home.since.clone(),
+            last_backup_at: home.last_backup_at.clone(),
+            backup_warning: home.backup_warning,
+            ..self.target.clone()
+        }
+    }
 }
 
 fn map_row(row: &SqliteRow) -> Result<HomeMove> {
@@ -183,6 +210,70 @@ impl Store {
             .await
             .map_err(db)?;
         rows.iter().map(map_row).collect()
+    }
+
+    /// The workspace's home as clients see it ([`HomeMove::shown`]).
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn get_shown_workspace_home(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<WorkspaceHome>> {
+        let Some(home) = self.get_workspace_home(workspace_id).await? else {
+            return Ok(None);
+        };
+        if home.state != HomeState::Moving {
+            return Ok(Some(home));
+        }
+        Ok(Some(match self.get_home_move(workspace_id).await? {
+            Some(home_move) => home_move.shown(&home),
+            None => home,
+        }))
+    }
+
+    /// Every workspace's home as clients see it ([`HomeMove::shown`]).
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn list_shown_workspace_homes(&self) -> Result<HashMap<WorkspaceId, WorkspaceHome>> {
+        let mut homes = self.list_workspace_homes().await?;
+        if homes.values().any(|home| home.state == HomeState::Moving) {
+            for home_move in self.list_home_moves().await? {
+                if let Some(home) = homes.get_mut(&home_move.workspace_id) {
+                    *home = home_move.shown(home);
+                }
+            }
+        }
+        Ok(homes)
+    }
+
+    /// Record exposed machine `node_id` (a sandbox started for it) as the
+    /// new home of the move to `home_id`; `false` when that move is gone
+    /// or already has a machine.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn set_home_move_machine(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        node_id: &str,
+    ) -> Result<bool> {
+        let done = sqlx::query(
+            "UPDATE home_move SET node_id = ? \
+             WHERE workspace_id = ? AND home_id = ? AND node_id IS NULL",
+        )
+        .bind(node_id)
+        .bind(&workspace_id.0)
+        .bind(&home_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(db)?;
+        Ok(done.rows_affected() > 0)
     }
 
     /// Record that the move to `home_id` has the old home's last backup;

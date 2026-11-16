@@ -52,14 +52,14 @@ fn no_home_machine() -> Error {
 }
 
 /// Whether `row`'s last report lets it hold a home.
-fn allows_homes(row: &ExposedMachine) -> bool {
+pub(crate) fn allows_homes(row: &ExposedMachine) -> bool {
     row.capabilities
         .as_ref()
         .is_none_or(|caps| caps.homes != Some(false))
 }
 
 /// A machine that is too old to be a home.
-fn too_old(row: &ExposedMachine) -> MachineUpdateRequired {
+pub(crate) fn too_old(row: &ExposedMachine) -> MachineUpdateRequired {
     MachineUpdateRequired {
         machine_name: row.name.clone(),
         machine_version: row.capabilities.as_ref().map_or_else(
