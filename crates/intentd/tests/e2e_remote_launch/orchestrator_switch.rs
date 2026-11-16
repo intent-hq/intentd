@@ -10,6 +10,7 @@ use super::orchestrator::orchestrator_config;
 use super::*;
 
 /// Rewrite the machine's `[daemon] mode` back to a full daemon.
+#[track_caller]
 fn regular_config(data_dir: &Path) {
     let path = data_dir.join("config.toml");
     let text = std::fs::read_to_string(&path).unwrap();
