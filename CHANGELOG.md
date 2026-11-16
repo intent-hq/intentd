@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.228] - 2026-11-16
+
+### 🐛 Bug Fixes
+
+- *(node-git)* Never leave a half-made checkout cache behind a cancelled launch ([#3425](https://github.com/intent-hq/intentd/pull/3425))
+
+### 🔧 Refactor
+
+- *(store)* Put Store in front of a SQLite backend ([#3422](https://github.com/intent-hq/intentd/pull/3422))
+
+
 ## [0.11.227] - 2026-11-16
 
 ### 🐛 Bug Fixes
