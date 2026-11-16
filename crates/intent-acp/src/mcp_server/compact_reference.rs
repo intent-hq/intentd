@@ -165,8 +165,12 @@ pub(crate) const ROUTES: &[(&str, &[&str])] = &[
         &[],
     ),
     (
-        "Wait for a PR or CI → `ws.pr.monitor`; one-shot PR state → `ws.pr.snapshot(n, { repo: \"owner/name\" })` (repo for another repo, e.g. a submodule).",
-        &["pr.monitor", "pr.snapshot"],
+        "Wait for a PR you opened → `ws.pr.monitor`. A PR a sub-agent opened → have it report when approved and green (say so when delegating) and `ws.agent.watch` it; do not monitor or poll that PR yourself.",
+        &["pr.monitor", "agent.watch"],
+    ),
+    (
+        "One-shot PR state → `ws.pr.snapshot(n, { repo: \"owner/name\" })` (repo for another repo, e.g. a submodule).",
+        &["pr.snapshot"],
     ),
     (
         "Wait for another agent → `ws.agent.watch`; for file, task or git events → `ws.event.subscribe`.",

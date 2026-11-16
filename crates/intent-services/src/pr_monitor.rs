@@ -1806,11 +1806,37 @@ enum PrMonitorHolder {
 /// name when it has one. `child_of_caller` marks an owner that is the
 /// caller's own direct sub-agent, still mid-work: the refusal instruction
 /// then names the settlement conditions under which a retry adopts.
+/// `watch_agent` is set when the owner is the caller's sub-agent at any
+/// depth: the caller's direct child on the owner's parent chain, which the
+/// instruction tells the caller to `ws.agent.watch` instead of polling.
 #[derive(Debug, Clone)]
 pub struct PrMonitorRefusal {
     pub owner: PrMonitor,
     pub owner_agent_name: Option<String>,
     pub child_of_caller: bool,
+    pub watch_agent: Option<AgentId>,
+}
+
+/// The lead of every parent-facing hint when the caller's own sub-agent
+/// owns a PR's monitor: let the sub-agent report, never poll the PR.
+pub(crate) fn sub_agent_report_instruction(
+    label: &str,
+    owner_display: &str,
+    watch_agent: &AgentId,
+) -> String {
+    format!(
+        "{label} is monitored by your sub-agent {owner_display}. Do not monitor or poll \
+         this PR yourself (no ws.pr.monitor, no hook polling ws.pr.snapshot): ask the \
+         sub-agent to report when the PR is approved and green (ws.agent.send, or say so \
+         when delegating) and ws.agent.watch(\"{watch_agent}\"); its report wakes you."
+    )
+}
+
+fn owner_display(owner: &PrMonitor, name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("{name} ({})", owner.agent_id),
+        None => owner.agent_id.to_string(),
+    }
 }
 
 impl PrMonitorRefusal {
@@ -1822,25 +1848,27 @@ impl PrMonitorRefusal {
     pub fn to_wire(&self) -> Value {
         let label = monitor_label(&self.owner);
         let owner_id = self.owner.agent_id.to_string();
-        let owner_display = match &self.owner_agent_name {
-            Some(name) => format!("{name} ({owner_id})"),
-            None => owner_id.clone(),
-        };
-        let instruction = if self.child_of_caller {
+        let owner_display = owner_display(&self.owner, self.owner_agent_name.as_deref());
+        let report = self
+            .watch_agent
+            .as_ref()
+            .map(|watch| sub_agent_report_instruction(&label, &owner_display, watch));
+        let instruction = if let (true, Some(report)) = (self.child_of_caller, &report) {
             format!(
-                "{label} is already monitored in this workspace by your sub-agent \
-                 {owner_display}, which is still working; one monitor per PR per \
-                 workspace. A working sub-agent keeps its monitor and receives the \
-                 PR's wakes; do not register a second one. Retry ws.pr.monitor once \
-                 the sub-agent settles — its task is complete or cancelled, or it is \
-                 idle with nothing pending but this monitor (a ws.agent.watch on it \
-                 delivers that as its monitoring-idle advisory): the retry adopts the \
-                 monitor instead of being refused and the sub-agent is notified of the \
+                "{report} The sub-agent is still working and keeps the monitor (one \
+                 monitor per PR per workspace). To take the monitor over later, retry \
+                 ws.pr.monitor once the sub-agent settles — its task is complete or \
+                 cancelled, or it is idle with nothing pending but this monitor (the \
+                 ws.agent.watch delivers that as its monitoring-idle advisory): the \
+                 retry adopts the monitor and the sub-agent is notified of the \
                  transfer. For a one-shot read of the PR's current state use \
-                 ws.pr.snapshot. Only if you need the monitor now, use ws.agent.send \
-                 to ask the sub-agent to relay the events you care about or, as a last \
-                 resort, to relinquish the monitor via ws.pr.unmonitor so you can \
-                 register your own."
+                 ws.pr.snapshot. Only if you need the monitor now, ask the sub-agent \
+                 to relinquish it via ws.pr.unmonitor."
+            )
+        } else if let Some(report) = report {
+            format!(
+                "{report} One monitor per PR per workspace; for a one-shot read of the \
+                 PR's current state use ws.pr.snapshot."
             )
         } else {
             format!(
@@ -1865,6 +1893,9 @@ impl PrMonitorRefusal {
         });
         if let Some(name) = &self.owner_agent_name {
             payload["ownerAgentName"] = json!(name);
+        }
+        if let Some(watch) = &self.watch_agent {
+            payload["watchAgentId"] = json!(watch.to_string());
         }
         payload
     }
@@ -3268,11 +3299,96 @@ impl Services {
             return Ok(Some(PrMonitorHolder::SettledChild(owner)));
         }
         let owner_agent_name = Some(session.name.clone()).filter(|n| !n.trim().is_empty());
+        let watch_agent = self.sub_agent_branch(&session, agent_id).await;
         Ok(Some(PrMonitorHolder::Live(PrMonitorRefusal {
             owner,
             owner_agent_name,
             child_of_caller,
+            watch_agent,
         })))
+    }
+
+    /// The agent to watch when `owner` is the caller's sub-agent at any
+    /// depth: the caller's DIRECT child on `owner`'s parent chain, or, when
+    /// a hop between them has finished (terminal or retired) and so cannot
+    /// relay a report, the highest agent below that hop (`owner` itself at
+    /// worst). `None` when `owner` is not the caller's sub-agent. Advisory
+    /// only, so a broken or cyclic chain, or a failed lookup, reads as "not
+    /// a sub-agent".
+    async fn sub_agent_branch(
+        &self,
+        owner: &intent_core::AgentSession,
+        caller: &AgentId,
+    ) -> Option<AgentId> {
+        const MAX_DEPTH: usize = 16;
+        let mut watch = owner.id.clone();
+        let mut chain_live = true;
+        let mut parent = owner.parent_agent_id.clone();
+        for _ in 0..MAX_DEPTH {
+            let next = parent.take()?;
+            if &next == caller {
+                return Some(watch);
+            }
+            let session = self.store.get_agent_session_summary(&next).await.ok()?;
+            chain_live &= session.retired_at.is_none()
+                && !crate::agent_ops::is_terminal_status(session.status);
+            parent.clone_from(&session.parent_agent_id);
+            if chain_live {
+                watch = next;
+            }
+        }
+        None
+    }
+
+    /// `ws.pr.snapshot` / `ws.hook.schedule` hint: when a sub-agent of
+    /// `caller` (any depth) holds the workspace's active monitor on the PR,
+    /// the owner plus an instruction to watch the sub-agent for its report
+    /// instead of polling. `None` when no sub-agent holds it, and on any
+    /// lookup failure: the hint never fails the call it rides on.
+    pub(crate) async fn pr_monitor_sub_agent_hint_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        caller: &AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> Option<Value> {
+        let (repo_owner, repo_name) = self.resolve_monitor_repo(workspace_id, repo).await.ok()?;
+        let owner = self
+            .store
+            .find_active_pr_monitor_in_workspace(
+                workspace_id,
+                &repo_owner,
+                &repo_name,
+                pr_number.cast_signed(),
+            )
+            .await
+            .ok()??;
+        if &owner.agent_id == caller {
+            return None;
+        }
+        let session = self
+            .store
+            .get_agent_session_summary(&owner.agent_id)
+            .await
+            .ok()?;
+        if session.retired_at.is_some() || crate::agent_ops::is_terminal_status(session.status) {
+            return None;
+        }
+        let watch = self.sub_agent_branch(&session, caller).await?;
+        let name = Some(session.name.as_str()).filter(|n| !n.trim().is_empty());
+        let display = owner_display(&owner, name);
+        let mut hint = json!({
+            "repo": format!("{repo_owner}/{repo_name}"),
+            "prNumber": pr_number,
+            "ownerAgentId": owner.agent_id.to_string(),
+            "monitorId": owner.monitor_id,
+            "watchAgentId": watch.to_string(),
+            "instruction": sub_agent_report_instruction(&monitor_label(&owner), &display, &watch),
+        });
+        if let Some(name) = name {
+            hint["ownerAgentName"] = json!(name);
+        }
+        Some(hint)
     }
 
     /// The parent-takeover predicate behind [`PrMonitorHolder::SettledChild`]:
@@ -8749,30 +8865,36 @@ mod tests {
         assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
         assert_eq!(refused["ownerAgentId"], json!(child.to_string()));
         assert_eq!(refused["monitorId"], json!(first.monitor_id));
+        assert_eq!(refused["watchAgentId"], json!(child.to_string()));
         let instruction = refused["instruction"].as_str().unwrap();
+        // The parent route leads: watch the child for its report, never poll.
         assert!(
-            instruction.contains("by your sub-agent Child (agent-child), which is still working"),
+            instruction.starts_with(
+                "o/r#42 is monitored by your sub-agent Child (agent-child). Do not monitor or poll this PR yourself"
+            ),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("report when the PR is approved and green"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("ws.agent.watch(\"agent-child\")"),
             "{instruction}"
         );
         assert!(
             instruction.contains("its task is complete or cancelled, or it is idle with nothing pending but this monitor"),
             "{instruction}"
         );
-        // Contract first (keep + retry), relinquish only as the explicit
+        // Report route, then takeover, relinquish only as the explicit
         // "need it now" fallback.
-        assert!(
-            instruction.contains("A working sub-agent keeps its monitor"),
-            "{instruction}"
-        );
-        let retry_at = instruction.find("Retry ws.pr.monitor").expect("retry");
-        let fallback_at = instruction
+        let watch_at = instruction.find("ws.agent.watch(").expect("watch");
+        let retry_at = instruction.find("retry ws.pr.monitor").expect("retry");
+        let relinquish_at = instruction
             .find("Only if you need the monitor now")
             .expect("fallback");
-        let relinquish_at = instruction
-            .find("relinquish the monitor via ws.pr.unmonitor")
-            .expect("relinquish");
         assert!(
-            retry_at < fallback_at && fallback_at < relinquish_at,
+            watch_at < retry_at && retry_at < relinquish_at,
             "{instruction}"
         );
         let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
@@ -8977,15 +9099,106 @@ mod tests {
             .expect("payload");
         assert_eq!(refused["refused"], json!(true), "{refused}");
         assert_eq!(refused["ownerAgentId"], json!(child.to_string()));
+        // Still the grandparent's sub-agent: watch the branch it delegated
+        // (the middle agent), and no takeover is offered.
+        assert_eq!(refused["watchAgentId"], json!(parent.to_string()));
+        let instruction = refused["instruction"].as_str().unwrap();
         assert!(
-            !refused["instruction"]
-                .as_str()
-                .unwrap()
-                .contains("sub-agent"),
-            "{refused}"
+            instruction.contains("ws.agent.watch(\"agent-parent\")"),
+            "{instruction}"
+        );
+        assert!(
+            !instruction.contains("retry ws.pr.monitor"),
+            "{instruction}"
         );
         let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
         assert_eq!(row.agent_id, child, "not re-parented");
+    }
+
+    /// The snapshot / hook hint names a monitor held by the caller's
+    /// sub-agent at any depth and the branch to watch; the owner itself, a
+    /// non-ancestor, another PR or another repo, and a retired holder get
+    /// no hint.
+    #[tokio::test]
+    async fn the_sub_agent_hint_names_a_descendant_holder_and_the_branch_to_watch() {
+        let (_db, _root, svc, _forge, ws, root) = setup().await;
+        let middle = child_agent(&svc, &ws, "agent-middle", &root, AgentStatus::Active).await;
+        let leaf = child_agent(&svc, &ws, "agent-leaf", &middle, AgentStatus::Active).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let first = register(&svc, &ws, &leaf).await;
+
+        let hint = svc
+            .pr_monitor_sub_agent_hint_op(&ws, &middle, 42, None)
+            .await
+            .expect("direct parent hint");
+        assert_eq!(hint["ownerAgentId"], json!(leaf.to_string()), "{hint}");
+        assert_eq!(hint["ownerAgentName"], json!("Child"), "{hint}");
+        assert_eq!(hint["monitorId"], json!(first.monitor_id), "{hint}");
+        assert_eq!(hint["watchAgentId"], json!(leaf.to_string()), "{hint}");
+        assert_eq!(hint["repo"], json!("o/r"), "{hint}");
+        assert_eq!(hint["prNumber"], json!(42), "{hint}");
+        let instruction = hint["instruction"].as_str().unwrap();
+        assert!(
+            instruction.starts_with("o/r#42 is monitored by your sub-agent Child (agent-leaf)."),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("ws.agent.watch(\"agent-leaf\")"),
+            "{instruction}"
+        );
+
+        let hint = svc
+            .pr_monitor_sub_agent_hint_op(&ws, &root, 42, Some("o/r".to_string()))
+            .await
+            .expect("grandparent hint");
+        assert_eq!(hint["watchAgentId"], json!(middle.to_string()), "{hint}");
+
+        for (caller, pr, repo) in [
+            (&leaf, 42, None),
+            (&sibling, 42, None),
+            (&root, 43, None),
+            (&root, 42, Some("o/other".to_string())),
+        ] {
+            assert!(
+                svc.pr_monitor_sub_agent_hint_op(&ws, caller, pr, repo.clone())
+                    .await
+                    .is_none(),
+                "{caller} {pr} {repo:?}"
+            );
+        }
+
+        // A finished middle agent cannot relay the leaf's report: the
+        // grandparent watches the leaf itself.
+        let now = now_iso();
+        assert!(svc
+            .store()
+            .set_agent_session_retired_at(&ws, &middle, Some(&now), &now)
+            .await
+            .expect("retire middle"));
+        let hint = svc
+            .pr_monitor_sub_agent_hint_op(&ws, &root, 42, None)
+            .await
+            .expect("hint past a finished middle");
+        assert_eq!(hint["watchAgentId"], json!(leaf.to_string()), "{hint}");
+        assert!(
+            hint["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("ws.agent.watch(\"agent-leaf\")"),
+            "{hint}"
+        );
+
+        assert!(svc
+            .store()
+            .set_agent_session_retired_at(&ws, &leaf, Some(&now), &now)
+            .await
+            .expect("retire leaf"));
+        assert!(
+            svc.pr_monitor_sub_agent_hint_op(&ws, &root, 42, None)
+                .await
+                .is_none(),
+            "a retired holder cannot report"
+        );
     }
 
     /// Settlement only opens the monitor to the DIRECT parent: a sibling

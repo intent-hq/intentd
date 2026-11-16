@@ -9770,6 +9770,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Parent-routing hint for `ws.pr.snapshot` and `ws.hook.schedule`:
+    /// when a sub-agent of `caller` (any depth) holds the workspace's active
+    /// monitor on `(repo, pr_number)`, the owner and an instruction to
+    /// `ws.agent.watch` the sub-agent for its report instead of polling the
+    /// PR. `None` otherwise, and on any lookup failure: the hint never
+    /// fails the call it rides on.
+    fn pr_monitor_sub_agent_hint(
+        &self,
+        workspace_id: WorkspaceId,
+        caller: AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, Option<serde_json::Value>> {
+        let _ = (workspace_id, caller, pr_number, repo);
+        Box::pin(async { None })
+    }
+
     /// `ws.pr.unmonitor`: cancel the calling agent's own active monitor on
     /// `(repo, pr_number)`. MCP-only, and never self-wakes the owner.
     fn pr_monitor_stop(
