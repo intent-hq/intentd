@@ -715,9 +715,10 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     Ok(result)
 }
 
-/// Forget exposed machine `machine_id` once its connector is shut down: its
-/// final stop and home stop records, its row, token and leases and its order
-/// entry, then announce the removal. The removed credential's id, if any.
+/// Forget exposed machine `machine_id`: its final stop and home stop
+/// records, token and leases, then its row (last, so a failure leaves a row
+/// to remove again), then announce the removal and drop its order entry. The
+/// removed credential's id, if any.
 async fn forget(svc: &Services, machine_id: &str) -> Result<Option<ExecutorCredentialId>> {
     let store = svc.store();
     // The machine is forgotten: no connector will resend a final stop it
@@ -736,9 +737,9 @@ async fn forget(svc: &Services, machine_id: &str) -> Result<Option<ExecutorCrede
     // Its pending home stops go too: removing the machine is the user's
     // choice to drop those checkouts (node-link.md "Home final stop").
     store.delete_home_stops_on_machine(machine_id).await?;
-    let credential = store.remove_exposed_machine(machine_id).await?;
     svc.delete_remote_machine_token(machine_id).await?;
     store.end_machine_leases(machine_id, &head_id).await?;
+    let credential = store.remove_exposed_machine(machine_id).await?;
     svc.publish_remote_machine_changed(json!({ "machineId": machine_id, "removed": true }))
         .await;
     crate::order::forget(
@@ -753,8 +754,11 @@ async fn forget(svc: &Services, machine_id: &str) -> Result<Option<ExecutorCrede
 
 /// Remove exposed machine `machine_id` in the background after it refused a
 /// bind because it now runs as an orchestrator (nodes.md "Orchestrator
-/// mode"). Only while the stored token is still `refused`: a machine paired
-/// again meanwhile is kept. Its agents end; an orchestrator runs none.
+/// mode"). Only while the stored token is still `refused` (or already
+/// deleted by a removal that failed later): a machine paired again meanwhile
+/// is kept. Its agents end; an orchestrator runs none. The connector stops
+/// only once the removal succeeded, so a failed one is tried again at its
+/// next dial.
 pub(crate) fn forget_orchestrator(svc: Option<Services>, machine_id: String, refused: String) {
     let Some(svc) = svc else {
         return;
@@ -774,22 +778,24 @@ pub(crate) fn forget_orchestrator(svc: Option<Services>, machine_id: String, ref
             else {
                 return Ok(());
             };
-            if svc.load_remote_machine_token(&machine_id).await?.as_deref()
-                != Some(refused.as_str())
-            {
+            let stored = svc.load_remote_machine_token(&machine_id).await?;
+            if stored.is_some_and(|token| token != refused) {
                 return Ok(());
             }
-            if let Some(node) = feature.take_node(&machine_id) {
+            if let Some(node) = feature.running_node(&machine_id) {
                 node.shared_ref().drop_stops();
                 node.shared_ref().agents.end_all(&format!(
                     "{}: {} is now an orchestrator and no longer runs agents for other backends",
                     crate::connect::MACHINE_ORCHESTRATOR,
                     row.name
                 ));
+            }
+            forget(&svc, &machine_id).await?;
+            if let Some(node) = feature.take_node(&machine_id) {
                 node.shutdown();
             }
             tracing::info!(machine = %machine_id, "remote machine: now an orchestrator; removed");
-            forget(&svc, &machine_id).await.map(|_| ())
+            Ok::<(), Error>(())
         };
         if let Err(error) = forgotten.await {
             tracing::warn!(%error, machine = %machine_id, "remote machine: could not remove the orchestrator");
