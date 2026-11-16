@@ -117,7 +117,11 @@ async fn schedule(
             monitored.push(hint);
         }
     }
-    if let (false, Some(object)) = (monitored.is_empty(), scheduled.as_object_mut()) {
+    // A validation run that dispatched persisted no hook: nothing to cancel.
+    let persisted = scheduled.get("dispatched") != Some(&Value::Bool(true));
+    if let (true, false, Some(object)) =
+        (persisted, monitored.is_empty(), scheduled.as_object_mut())
+    {
         let instructions: Vec<&str> = monitored
             .iter()
             .filter_map(|hint| hint["instruction"].as_str())
@@ -137,8 +141,10 @@ async fn schedule(
 }
 
 /// Most literal PR reads a hook makes: `pr.snapshot(` / `mr.snapshot(`
-/// followed by a number literal, plus a literal `repo` option in the same
-/// call. Calls with a computed number are not seen; the advisory is a hint.
+/// followed by a number literal, with no options or a string-literal `repo`
+/// option. Calls with a computed number, a computed `repo`, or an addressed
+/// selector (`gitRootId` / `target`) are skipped: the advisory is a hint and
+/// must not guess the repository.
 fn snapshot_targets(code: &str) -> Vec<(u64, Option<String>)> {
     const MAX_TARGETS: usize = 8;
     let mut targets: Vec<(u64, Option<String>)> = Vec::new();
@@ -150,7 +156,13 @@ fn snapshot_targets(code: &str) -> Vec<(u64, Option<String>)> {
                 continue;
             };
             let call = &rest[digits..rest.find(')').unwrap_or(rest.len())];
-            let target = (pr_number, literal_repo(call));
+            if call.contains("gitRootId") || call.contains("target") {
+                continue;
+            }
+            let Ok(repo) = literal_repo(call) else {
+                continue;
+            };
+            let target = (pr_number, repo);
             if !targets.contains(&target) && targets.len() < MAX_TARGETS {
                 targets.push(target);
             }
@@ -159,16 +171,37 @@ fn snapshot_targets(code: &str) -> Vec<(u64, Option<String>)> {
     targets
 }
 
-/// The string literal after `repo:` in a call's argument text.
-fn literal_repo(call: &str) -> Option<String> {
-    let after = call[call.find("repo")? + "repo".len()..].trim_start();
-    let value = after.strip_prefix(':')?.trim_start();
-    let quote = value
-        .chars()
-        .next()
-        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
-    let body = &value[1..];
-    Some(body[..body.find(quote)?].to_string())
+/// The call's `repo` option: `Ok(None)` when it has no `repo` key,
+/// `Ok(Some(slug))` for one string-literal value, and `Err` when the key is
+/// present but not a single string literal (shorthand, a variable, or
+/// repeated).
+fn literal_repo(call: &str) -> Result<Option<String>, ()> {
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let mut found = None;
+    for (at, key) in call.match_indices("repo") {
+        let after = &call[at + key.len()..];
+        if call[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| word(c) || c == '.')
+            || after.starts_with(word)
+        {
+            continue;
+        }
+        let after = after.strip_prefix(['"', '\'']).unwrap_or(after);
+        let value = after.trim_start().strip_prefix(':').ok_or(())?.trim_start();
+        let quote = value
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\'' | '`'))
+            .ok_or(())?;
+        let body = &value[1..];
+        if found.is_some() {
+            return Err(());
+        }
+        found = Some(body[..body.find(quote).ok_or(())?].to_string());
+    }
+    Ok(found)
 }
 
 async fn list(
@@ -336,8 +369,13 @@ mod tests {
             const c = await ws.pr.snapshot(3408, { repo: 'intent-hq/intentd' });
             const d = await ws.pr.snapshot(n, { repo: "intent-hq/intentd" });
             const e = await ws.pr.snapshot(9, {repo:`o/r`});
+            const f = await ws.pr.snapshot(5, { gitRootId: "root-1" });
+            const g = await ws.pr.snapshot(6, { repo });
+            const h = await ws.pr.snapshot(7, { repoRoot: x, repo: slug });
+            const i = await ws.pr.snapshot(8, { "repo": "q/s" });
             return { dispatch: false };"#;
         let looked_up = vec![
+            (8, Some("q/s".to_string())),
             (9, Some("o/r".to_string())),
             (12, None),
             (3408, Some("intent-hq/intentd".to_string())),
@@ -376,6 +414,47 @@ mod tests {
             assert_eq!(scheduled["subAgentMonitors"][0]["prNumber"], json!(3408));
             assert_eq!(scheduled["subAgentMonitors"].as_array().unwrap().len(), 1);
         }
+    }
+
+    /// A validation run that dispatched persisted no hook, so there is
+    /// nothing to cancel and no advisory.
+    #[tokio::test]
+    async fn schedule_gives_no_advisory_when_the_validation_run_dispatched() {
+        struct DispatchedApi;
+        impl WorkspaceApi for DispatchedApi {
+            fn hook_schedule(
+                &self,
+                _workspace_id: WorkspaceId,
+                _agent_id: AgentId,
+                _params: Value,
+            ) -> BoxFuture<'_, Result<Value>> {
+                Box::pin(async { Ok(json!({ "hook": { "hookId": "h" }, "dispatched": true })) })
+            }
+
+            fn pr_monitor_sub_agent_hint(
+                &self,
+                _workspace_id: WorkspaceId,
+                _caller: AgentId,
+                pr_number: u64,
+                _repo: Option<String>,
+            ) -> BoxFuture<'_, Option<Value>> {
+                Box::pin(
+                    async move { Some(json!({ "prNumber": pr_number, "instruction": "watch" })) },
+                )
+            }
+        }
+        let api: Arc<dyn WorkspaceApi> = Arc::new(DispatchedApi);
+        let scheduled = dispatch(
+            &api,
+            &WorkspaceId::from_string("ws-hook"),
+            Some(&AgentId::from("agent-parent")),
+            "schedule",
+            &json!({ "name": "poll", "delayMs": 60_000, "code": "return await ws.pr.snapshot(1);" }),
+        )
+        .await
+        .expect("scheduled");
+        assert_eq!(scheduled["dispatched"], json!(true));
+        assert!(scheduled.get("advisory").is_none(), "{scheduled}");
     }
 
     fn spy() -> (Arc<SpyApi>, Arc<dyn WorkspaceApi>, WorkspaceId) {

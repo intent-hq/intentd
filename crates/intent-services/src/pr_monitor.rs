@@ -3308,26 +3308,34 @@ impl Services {
         })))
     }
 
-    /// The caller's DIRECT child on `owner`'s parent chain when `owner` is
-    /// the caller's sub-agent at any depth (the owner itself for a direct
-    /// child); `None` otherwise. Advisory only, so a broken or cyclic
-    /// chain, or a failed lookup, reads as "not a sub-agent".
+    /// The agent to watch when `owner` is the caller's sub-agent at any
+    /// depth: the caller's DIRECT child on `owner`'s parent chain, or, when
+    /// a hop between them has finished (terminal or retired) and so cannot
+    /// relay a report, the highest agent below that hop (`owner` itself at
+    /// worst). `None` when `owner` is not the caller's sub-agent. Advisory
+    /// only, so a broken or cyclic chain, or a failed lookup, reads as "not
+    /// a sub-agent".
     async fn sub_agent_branch(
         &self,
         owner: &intent_core::AgentSession,
         caller: &AgentId,
     ) -> Option<AgentId> {
         const MAX_DEPTH: usize = 16;
-        let mut current = owner.id.clone();
+        let mut watch = owner.id.clone();
+        let mut chain_live = true;
         let mut parent = owner.parent_agent_id.clone();
         for _ in 0..MAX_DEPTH {
             let next = parent.take()?;
             if &next == caller {
-                return Some(current);
+                return Some(watch);
             }
             let session = self.store.get_agent_session_summary(&next).await.ok()?;
+            chain_live &= session.retired_at.is_none()
+                && !crate::agent_ops::is_terminal_status(session.status);
             parent.clone_from(&session.parent_agent_id);
-            current = next;
+            if chain_live {
+                watch = next;
+            }
         }
         None
     }
@@ -9159,7 +9167,27 @@ mod tests {
             );
         }
 
+        // A finished middle agent cannot relay the leaf's report: the
+        // grandparent watches the leaf itself.
         let now = now_iso();
+        assert!(svc
+            .store()
+            .set_agent_session_retired_at(&ws, &middle, Some(&now), &now)
+            .await
+            .expect("retire middle"));
+        let hint = svc
+            .pr_monitor_sub_agent_hint_op(&ws, &root, 42, None)
+            .await
+            .expect("hint past a finished middle");
+        assert_eq!(hint["watchAgentId"], json!(leaf.to_string()), "{hint}");
+        assert!(
+            hint["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("ws.agent.watch(\"agent-leaf\")"),
+            "{hint}"
+        );
+
         assert!(svc
             .store()
             .set_agent_session_retired_at(&ws, &leaf, Some(&now), &now)
