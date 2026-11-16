@@ -915,7 +915,7 @@ Home. With no open workspace tabs, these shortcuts do nothing. Customize them in
 
 <!-- Numbered navigation requires the matching frontend release. Until it ships,
 describe these bindings only when explicitly asked or testing this change. -->
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/shared/keyboard-shortcut-bindings.ts; src/store/renderer/slices/machine-rail/machine-rail-selectors.ts; src/features/machine-rail/MachineRail.svelte; src/features/backend/main/backend.ipc.ts; src/main/machine-rail-state.ts; src/main/machine-rail.ts; src/main/frames.ts; src/main/frame-sessions.ts; src/main/window.ts (saved frames). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/shared/keyboard-shortcut-bindings.ts; src/store/renderer/slices/machine-rail/machine-rail-selectors.ts; src/features/machine-rail/MachineRail.svelte; src/features/backend/main/backend.ipc.ts; src/main/machine-rail-state.ts. -->
 
 Use **Cmd+Alt+1–9** (**Ctrl+Alt+1–9** on Windows/Linux) to select **Home**
 or a workspace tab: **1** opens Home, **2–8** open the first seven workspace
@@ -927,12 +927,16 @@ defaults.
 <!-- Labs (device rail): describe only when explicitly asked about the device rail
 or when developing or testing it, and say it is Labs. In the desktop app,
 Settings → Advanced → Labs → Machine rail shows the machines kept in this window.
-Every machine in the rail is equal: any one can be moved (drag, or Alt+arrow keys)
-or removed, and removing the last machine closes the window. The rail's + menu
-keeps **Remove from this window** for every machine. The same machine can be in
-several windows at once. Each window's layout (its machines, their order, the
-page each one showed and the one shown) is saved per window and restored on the
-next launch; layouts saved by older versions are carried over once.
+Frame windows require the frontend release containing intent-hq/cloudlands-fe#4691.
+Until that release, the window's own machine stays first in the rail and cannot be
+moved or removed; describe the behavior below only with that release.
+With that release, every machine in the rail is equal: any one can be moved (drag,
+or Alt+Up/Down arrow) or removed, and removing the last machine closes the window.
+The rail's + menu keeps **Remove from this window** for every machine. The same
+machine can be in several windows at once. Each window's layout (its machines,
+their order, the page each one showed and the one shown) is saved per window and
+restored on the next launch; layouts saved by older versions are carried over, and
+the old file is left unchanged for older versions.
 Device-detail recovery requires the frontend release containing intent-hq/cloudlands-fe#4583.
 Until that release, do not describe it as available. With that release, an open
 machine keeps its name and icon when duplicate saved entries are hidden;
@@ -943,6 +947,7 @@ Cmd+1–9 (Ctrl+1–9 on Windows/Linux) selects devices in displayed rail order:
 guest hosts, as displayed. Cmd+Alt+1–9 (Ctrl+Alt+1–9 on Windows/Linux) continues
 to select Home/workspace tabs using the numbering above whether the rail is visible
 or hidden. User-customized shortcuts take precedence. -->
+<!-- Sources (Labs device rail, paths relative to packages/cloudlands-fe): src/features/machine-rail/MachineRail.svelte; src/main/machine-rail.ts; src/main/machine-rail-state.ts; src/main/frames.ts; src/main/frame-sessions.ts; src/main/window.ts (saved frames). -->
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/AgentCard.svelte (toggle-pinned menu item); packages/cloudlands-fe/src/lib/components/workspace/{WorkspaceAgentsList.svelte,workspace-agents-list-utils.ts}; packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update pinned). -->
 
