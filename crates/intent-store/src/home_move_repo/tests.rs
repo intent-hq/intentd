@@ -214,3 +214,54 @@ async fn a_move_onto_a_gone_sandbox_rolls_back_without_a_stop() {
     assert_eq!(back.home_id, HomeId::from("h-old"));
     assert_eq!(back.state, HomeState::Attached);
 }
+
+/// A restart between a move's sandbox row and its record on the move
+/// leaves a home-only sandbox nothing holds: the resumed move finds it (so
+/// it takes it instead of starting another), and once the move records it,
+/// or for another workspace, entry or starter, it is not found.
+#[tokio::test]
+async fn a_home_only_sandbox_a_cut_start_left_is_found_for_the_resumed_move() {
+    let (_dir, store) = open().await;
+    let ws = WorkspaceId::from("ws-1");
+    store
+        .set_workspace_home(&ws, &home("h-old", Some("m-mac"), false))
+        .await
+        .unwrap();
+    let mut left = sandbox("m-left", "owner");
+    left.cloud.as_mut().unwrap().agent_id = "home-ws-1".into();
+    store.save_exposed_machine(&left).await.unwrap();
+    let mut agents = sandbox("m-agent", "owner");
+    agents.cloud.as_mut().unwrap().agent_id = "agent-1".into();
+    store.save_exposed_machine(&agents).await.unwrap();
+    assert!(store
+        .begin_home_move(&HomeMove {
+            pushed: true,
+            ..moving_to(home("h-new", None, true))
+        })
+        .await
+        .unwrap());
+
+    let found = store
+        .unclaimed_home_sandboxes(&ws, "e2b", "home-ws-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        found.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["m-left"]
+    );
+    assert!(store
+        .unclaimed_home_sandboxes(&ws, "other-entry", "home-ws-1")
+        .await
+        .unwrap()
+        .is_empty());
+
+    assert!(store
+        .set_home_move_machine(&ws, &HomeId::from("h-new"), "m-left")
+        .await
+        .unwrap());
+    assert!(store
+        .unclaimed_home_sandboxes(&ws, "e2b", "home-ws-1")
+        .await
+        .unwrap()
+        .is_empty());
+}

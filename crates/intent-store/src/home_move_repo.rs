@@ -307,6 +307,39 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
+    /// The cloud machines of entry `cloud_machine_id` in `workspace_id`
+    /// started for `owner` (a home-only start's key) that hold no home, owe
+    /// no stop and are no move's target: sandboxes whose start a restart
+    /// cut before anything recorded them. Oldest first.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` on a database failure.
+    pub async fn unclaimed_home_sandboxes(
+        &self,
+        workspace_id: &WorkspaceId,
+        cloud_machine_id: &str,
+        owner: &str,
+    ) -> Result<Vec<intent_core::machines::ExposedMachine>> {
+        let mut left = Vec::new();
+        for row in self.list_cloud_machines().await? {
+            let Some(cloud) = &row.cloud else { continue };
+            if cloud.agent_id != owner
+                || cloud.workspace_id != workspace_id.as_str()
+                || cloud.cloud_machine_id != cloud_machine_id
+            {
+                continue;
+            }
+            if self.homes_on_machine(&row.id).await?.is_empty()
+                && self.list_home_stops(&row.id).await?.is_empty()
+                && self.home_moves_to_machine(&row.id).await?.is_empty()
+            {
+                left.push(row);
+            }
+        }
+        Ok(left)
+    }
+
     /// Record that the move to `home_id` has the old home's last backup;
     /// `false` when that move is gone.
     ///

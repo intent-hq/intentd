@@ -1014,21 +1014,18 @@ async fn left_move_sandbox(
         return Ok(None);
     }
     let owner = super::home::start_key(workspace_id);
-    for row in svc.store().list_cloud_machines().await? {
-        let Some(cloud) = &row.cloud else { continue };
-        if cloud.agent_id != owner
-            || cloud.workspace_id != workspace_id.as_str()
-            || cloud.cloud_machine_id != cloud_machine_id
-            || cloud.state == CloudSandboxState::Stopping
-            || feature.cloud.loss(&row.id).is_some()
-        {
-            continue;
-        }
-        if !crate::homes::machine_holds_homes(svc.store(), &row.id).await? {
-            return Ok(Some(row.id));
-        }
-    }
-    Ok(None)
+    Ok(svc
+        .store()
+        .unclaimed_home_sandboxes(workspace_id, cloud_machine_id, &owner)
+        .await?
+        .into_iter()
+        .find(|row| {
+            row.cloud
+                .as_ref()
+                .is_some_and(|cloud| cloud.state != CloudSandboxState::Stopping)
+                && feature.cloud.loss(&row.id).is_none()
+        })
+        .map(|row| row.id))
 }
 
 /// What a home-only sandbox is started for.
