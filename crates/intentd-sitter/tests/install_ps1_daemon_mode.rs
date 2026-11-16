@@ -343,7 +343,11 @@ fn a_reinstall_never_switches_an_existing_install_to_orchestrator() {
         "{}",
         already.output
     );
-    assert!(!already.output.contains("can't be changed"), "{}", already.output);
+    assert!(
+        !already.output.contains("can't be changed"),
+        "{}",
+        already.output
+    );
 }
 
 #[test]
