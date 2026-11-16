@@ -5234,9 +5234,9 @@ async fn principal_methods(
     }
 }
 
-/// Push relay linking (§5.58): self-directed, no params. Owner and host
-/// members only (services refuse guests and agents).
 async fn push_methods(api: &dyn WorkspaceApi, method: &str) -> Result<Value, RpcErr> {
+    // Push relay linking (§5.58): self-directed, no params. Owner and host
+    // members only (services refuse guests and agents).
     match method {
         "push.createLink" => match api.push_create_link().await {
             Ok(v) => Ok(v),

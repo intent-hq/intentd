@@ -93,7 +93,10 @@ async fn await_uds(socket: &Path) -> bool {
 async fn boot(root: &Path, relay_url: &str) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).expect("mkdir data");
-    let env = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_PUSH_RELAY_URL", relay_url)];
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_PUSH_RELAY_URL", relay_url),
+    ];
     let child = spawn_serve(&data_dir, &env);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -346,7 +349,11 @@ async fn fake_relay() -> (String, Arc<Mutex<Vec<String>>>) {
                     "PUT" => (200, json!({ "linkedDevices": 0, "pendingLinks": 1 })),
                     _ => (204, Value::Null),
                 };
-                let body = if reply.is_null() { String::new() } else { reply.to_string() };
+                let body = if reply.is_null() {
+                    String::new()
+                } else {
+                    reply.to_string()
+                };
                 let response = format!(
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -417,6 +424,11 @@ async fn members_link_and_revoke_through_the_relay_over_wss() {
 
     let seen = seen.lock().unwrap().clone();
     assert_eq!(seen.first().map(String::as_str), Some("POST /v1/daemons"));
-    assert!(seen.iter().any(|r| r.starts_with("POST /v1/daemons/") && r.ends_with("/links")));
-    assert!(seen.iter().any(|r| r.starts_with("DELETE /v1/daemons/")), "{seen:?}");
+    assert!(seen
+        .iter()
+        .any(|r| r.starts_with("POST /v1/daemons/") && r.ends_with("/links")));
+    assert!(
+        seen.iter().any(|r| r.starts_with("DELETE /v1/daemons/")),
+        "{seen:?}"
+    );
 }
