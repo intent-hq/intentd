@@ -83,6 +83,31 @@ impl DiagnosticStore {
         crate::check_integrity(&self.pool).await
     }
 
+    /// `PRAGMA auto_vacuum`: 0 = NONE, 1 = FULL, 2 = INCREMENTAL.
+    ///
+    /// # Errors
+    /// Returns an error when the pragma cannot run.
+    pub async fn auto_vacuum_mode(&self) -> Result<i64> {
+        sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("auto_vacuum query failed: {e}")))
+    }
+
+    /// `PRAGMA freelist_count`: pages emptied by deletes and not yet reclaimed.
+    ///
+    /// # Errors
+    /// Returns an error when the pragma cannot run.
+    pub async fn freelist_count(&self) -> Result<i64> {
+        crate::freelist_count_on(&self.pool).await
+    }
+
+    /// Connection count and idle connection count of the read-only pool.
+    #[must_use]
+    pub fn read_pool_stats(&self) -> (u32, usize) {
+        (self.pool.size(), self.pool.num_idle())
+    }
+
     /// Close the read-only pool without checkpointing.
     pub async fn close(&self) {
         self.pool.close().await;

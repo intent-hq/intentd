@@ -37,7 +37,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 directories = { workspace = true }
-sqlx = { workspace = true }
 
 intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.226", optional = true }
 intent-core = { path = "../intent-core", version = "0.11.226" }
@@ -162,6 +161,9 @@ required-features = ["repository-test-fixtures"]
 [dev-dependencies]
 # Portable source-lint utilities and Unix process guards; never a runtime dependency.
 intentd-test-support = { path = "../intentd-test-support" }
+# Tests seed and inspect the SQLite store directly; shipped code reaches it
+# only through intent-store (intent-store/tests/sqlx_dependency_lint.rs).
+sqlx = { workspace = true }
 uuid = { workspace = true }
 intent-services = { path = "../intent-services", version = "0.11.226", features = ["repository-test-fixtures"] }
 intent-acp = { path = "../intent-acp", version = "0.11.226" }

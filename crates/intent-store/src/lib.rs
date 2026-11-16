@@ -680,6 +680,12 @@ impl Store {
         if mode != 0 {
             return Ok(AutoVacuumActivation::AlreadyIncremental);
         }
+        // Pre-log the rebuild (PR #500 review): on a large legacy DB the
+        // VACUUM can take a while, so an operator tailing the log sees why.
+        tracing::info!(
+            "legacy database in auto_vacuum=NONE mode; running one-time VACUUM \
+             (may take a while on large databases)"
+        );
         let pages_before = self.page_count().await?;
         let started = std::time::Instant::now();
         {
