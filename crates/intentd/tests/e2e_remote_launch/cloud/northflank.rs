@@ -777,7 +777,7 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     for (n, (member, value)) in [
         ("size", json!("16x32")),
         ("templateProject", json!("intent")),
-        ("diskGiB", json!(4)),
+        ("diskGiB", json!(5)),
     ]
     .into_iter()
     .enumerate()
@@ -790,6 +790,13 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
         )
         .await;
         assert_eq!(invalid["code"], -32602, "{member}: {invalid}");
+        if member == "diskGiB" {
+            let message = invalid["message"].as_str().unwrap();
+            assert!(
+                message.contains("6-500") && message.contains("at least 6 GiB"),
+                "{invalid}"
+            );
+        }
     }
     assert!(NF_TOKEN.len() > 1024, "{}", NF_TOKEN.len());
     let checked = ok(
@@ -824,7 +831,7 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
         &mut rpc_ws,
         21,
         "cloudMachines.configure",
-        northflank_params(&json!({ "size": "2x4", "diskGiB": 5, "idlePauseMinutes": 1440 })),
+        northflank_params(&json!({ "size": "2x4", "diskGiB": 6, "idlePauseMinutes": 1440 })),
     )
     .await;
     let provider = &saved["provider"];
@@ -839,7 +846,7 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     assert_eq!(
         provider["northflank"],
         json!({
-            "projectId": PROJECT, "region": REGION, "image": IMAGE_REPO, "diskGiB": 5,
+            "projectId": PROJECT, "region": REGION, "image": IMAGE_REPO, "diskGiB": 6,
             "plans": { "2x4": "nf-compute-200", "4x8": "nf-compute-400", "8x16": "nf-compute-800-16" },
         })
     );
@@ -883,7 +890,7 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     {
         let state = fake.state();
         let (_, volume) = &state.creates[0];
-        assert_eq!(volume["spec"]["storageSize"], 5 * 1024, "{volume}");
+        assert_eq!(volume["spec"]["storageSize"], 6 * 1024, "{volume}");
         assert_eq!(volume["mounts"][0]["containerMountPath"], "/home/user");
         let (_, created) = &state.creates[1];
         assert_eq!(created["billing"]["deploymentPlan"], "nf-compute-200");
@@ -1091,7 +1098,7 @@ async fn the_reaper_deletes_this_backends_leftover_northflank_machines() {
         &mut rpc_ws,
         2,
         "cloudMachines.configure",
-        northflank_params(&json!({ "size": "2x4", "diskGiB": 5 })),
+        northflank_params(&json!({ "size": "2x4", "diskGiB": 6 })),
     )
     .await;
     timeout(common::test_timeout(Duration::from_secs(60)), async {
