@@ -425,6 +425,13 @@ impl PgStore {
     ) -> Result<()> {
         let wake_id = wake_key(id);
         let mut tx = self.begin_write().await?;
+        // Key order: the `sqlite_json_set` shim round-trips `payload` through
+        // jsonb, so the rewritten object comes back with its keys sorted,
+        // while SQLite's `json_set` keeps the original order and appends new
+        // keys. `Value` equality and struct deserialization ignore the order;
+        // only a caller re-emitting the raw `Value` would see it. The rewrite
+        // stays in SQL (no Rust read-modify-write) so each row changes in one
+        // statement with SQLite's `json_set` semantics.
         let updated = sqlx::query(
             "UPDATE agent_queue_admission SET turn_id = $4, payload = sqlite_json_set( \
                sqlite_json_set(payload, '$.turnId', $4::text, '$.content', $5::text), \
