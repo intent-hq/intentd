@@ -15,7 +15,7 @@ impl Store {
         ws: &WorkspaceId,
         agent: Option<&AgentId>,
     ) -> Result<Vec<ScriptMonitor>> {
-        pending_postgres!("script_monitors", self, backend => backend.script_monitors(ws, agent).await)
+        dispatch!(self, backend => backend.script_monitors(ws, agent).await)
     }
 
     /// Project active waiting metadata without hydrating output or terminal history.
@@ -26,35 +26,35 @@ impl Store {
         ws: Option<&WorkspaceId>,
         agent: Option<&AgentId>,
     ) -> Result<Vec<(String, serde_json::Value)>> {
-        pending_postgres!("script_monitor_waiting", self, backend => backend.script_monitor_waiting(ws, agent).await)
+        dispatch!(self, backend => backend.script_monitor_waiting(ws, agent).await)
     }
 
     /// Whether an owner still has a committed notification awaiting delivery.
     /// # Errors
     /// Returns database failures so callers can defer settlement safely.
     pub async fn script_monitor_pending_for_agent(&self, agent: &AgentId) -> Result<bool> {
-        pending_postgres!("script_monitor_pending_for_agent", self, backend => backend.script_monitor_pending_for_agent(agent).await)
+        dispatch!(self, backend => backend.script_monitor_pending_for_agent(agent).await)
     }
 
     /// Read one scoped row. Foreign IDs are indistinguishable from missing IDs.
     /// # Errors
     /// Returns invalid parameters for unknown IDs or a storage error.
     pub async fn script_monitor(&self, ws: &WorkspaceId, id: &str) -> Result<ScriptMonitor> {
-        pending_postgres!("script_monitor", self, backend => backend.script_monitor(ws, id).await)
+        dispatch!(self, backend => backend.script_monitor(ws, id).await)
     }
 
     /// Insert under the durable single-owner constraint; caller serializes admission.
     /// # Errors
     /// Storage errors never acknowledge a memory-only watch.
     pub async fn insert_script_monitor(&self, row: &ScriptMonitor) -> Result<()> {
-        pending_postgres!("insert_script_monitor", self, backend => backend.insert_script_monitor(row).await)
+        dispatch!(self, backend => backend.insert_script_monitor(row).await)
     }
 
     /// Atomically retire an active watch and reserve its notification, without history.
     /// # Errors
     /// A failed write rolls back both changes.
     pub async fn settle_script_monitor(&self, row: &ScriptMonitor) -> Result<bool> {
-        pending_postgres!("settle_script_monitor", self, backend => backend.settle_script_monitor(row).await)
+        dispatch!(self, backend => backend.settle_script_monitor(row).await)
     }
 
     /// Reserve a guarded cancellation before touching the owned process.
@@ -66,35 +66,35 @@ impl Store {
         id: &str,
         reserve: bool,
     ) -> Result<()> {
-        pending_postgres!("script_monitor_cancel_intent", self, backend => backend.script_monitor_cancel_intent(ws, id, reserve).await)
+        dispatch!(self, backend => backend.script_monitor_cancel_intent(ws, id, reserve).await)
     }
 
     /// Read recovery/outbox work; this is never a hot agent-list read.
     /// # Errors
     /// Returns storage/decoding failures.
     pub async fn pending_script_monitors(&self) -> Result<Vec<(ScriptMonitor, bool)>> {
-        pending_postgres!("pending_script_monitors", self, backend => backend.pending_script_monitors().await)
+        dispatch!(self, backend => backend.pending_script_monitors().await)
     }
 
     /// Read pending notification work, never monitor history.
     /// # Errors
     /// Returns storage/decoding failures.
     pub async fn script_notification_jobs(&self) -> Result<Vec<ScriptNotificationJob>> {
-        pending_postgres!("script_notification_jobs", self, backend => backend.script_notification_jobs().await)
+        dispatch!(self, backend => backend.script_notification_jobs().await)
     }
 
     /// Read the pending notification fence.
     /// # Errors
     /// Returns database errors.
     pub async fn script_monitor_wake_pending(&self, id: &str) -> Result<bool> {
-        pending_postgres!("script_monitor_wake_pending", self, backend => backend.script_monitor_wake_pending(id).await)
+        dispatch!(self, backend => backend.script_monitor_wake_pending(id).await)
     }
 
     /// Delivery authority belongs to transient work, never a transcript alone.
     /// # Errors
     /// Returns database errors.
     pub async fn script_monitor_wake_allowed(&self, id: &str) -> Result<bool> {
-        pending_postgres!("script_monitor_wake_allowed", self, backend => backend.script_monitor_wake_allowed(id).await)
+        dispatch!(self, backend => backend.script_monitor_wake_allowed(id).await)
     }
 
     /// Scope delivery authority to its original owner and workspace.
@@ -106,21 +106,21 @@ impl Store {
         agent: &AgentId,
         ws: &WorkspaceId,
     ) -> Result<bool> {
-        pending_postgres!("script_monitor_wake_allowed_for_agent", self, backend => backend.script_monitor_wake_allowed_for_agent(id, agent, ws).await)
+        dispatch!(self, backend => backend.script_monitor_wake_allowed_for_agent(id, agent, ws).await)
     }
 
     /// Durable ordinary queue owners to kick after restart or temporary holds.
     /// # Errors
     /// Returns database errors.
     pub async fn script_notification_delivery_owners(&self) -> Result<Vec<(AgentId, WorkspaceId)>> {
-        pending_postgres!("script_notification_delivery_owners", self, backend => backend.script_notification_delivery_owners().await)
+        dispatch!(self, backend => backend.script_notification_delivery_owners().await)
     }
 
     /// Suppress outstanding work. Message persistence alone cannot finish a job.
     /// # Errors
     /// Returns database errors.
     pub async fn finish_script_monitor_wake(&self, id: &str, suppress: bool) -> Result<()> {
-        pending_postgres!("finish_script_monitor_wake", self, backend => backend.finish_script_monitor_wake(id, suppress).await)
+        dispatch!(self, backend => backend.finish_script_monitor_wake(id, suppress).await)
     }
 
     /// Requested workspaces that own an active hook or an `active` script
@@ -140,21 +140,21 @@ impl Store {
     /// # Errors
     /// Returns database errors.
     pub async fn script_monitor_reservations(&self, ws: &WorkspaceId) -> Result<i64> {
-        pending_postgres!("script_monitor_reservations", self, backend => backend.script_monitor_reservations(ws).await)
+        dispatch!(self, backend => backend.script_monitor_reservations(ws).await)
     }
 
     /// Transfer one job to durable ordinary queue ownership in a single commit.
     /// # Errors
     /// Any failure preserves the job and leaves no partial admission.
     pub async fn admit_script_notification(&self, row: &crate::AgentQueueRow) -> Result<bool> {
-        pending_postgres!("admit_script_notification", self, backend => backend.admit_script_notification(row).await)
+        dispatch!(self, backend => backend.admit_script_notification(row).await)
     }
 
     /// Repeated guards of the same durable turn are valid; completed receipts are gone.
     /// # Errors
     /// Returns database errors.
     pub async fn accept_script_notification(&self, agent: &AgentId, id: &str) -> Result<bool> {
-        pending_postgres!("accept_script_notification", self, backend => backend.accept_script_notification(agent, id).await)
+        dispatch!(self, backend => backend.accept_script_notification(agent, id).await)
     }
 
     /// Durably settle delivery before best-effort physical cleanup. A failed
@@ -163,7 +163,7 @@ impl Store {
     /// Returns database errors; a committed completion is still authoritative
     /// if the subsequent cleanup fails.
     pub async fn complete_script_notification(&self, agent: &AgentId, id: &str) -> Result<()> {
-        pending_postgres!("complete_script_notification", self, backend => backend.complete_script_notification(agent, id).await)
+        dispatch!(self, backend => backend.complete_script_notification(agent, id).await)
     }
 
     /// Continue a notification on the worker's persisted warning turn. The
@@ -178,14 +178,14 @@ impl Store {
         turn: &str,
         content: &str,
     ) -> Result<()> {
-        pending_postgres!("continue_script_notification", self, backend => backend.continue_script_notification(agent, id, turn, content).await)
+        dispatch!(self, backend => backend.continue_script_notification(agent, id, turn, content).await)
     }
 
     /// Retry physical cleanup independently of delivery settlement.
     /// # Errors
     /// Returns database failures; completed rows remain non-runnable.
     pub async fn cleanup_completed_script_notifications(&self) -> Result<()> {
-        pending_postgres!("cleanup_completed_script_notifications", self, backend => backend.cleanup_completed_script_notifications().await)
+        dispatch!(self, backend => backend.cleanup_completed_script_notifications().await)
     }
 
     /// Owners affected by lifecycle cleanup, including already-retired watches.
@@ -196,7 +196,7 @@ impl Store {
         ws: &WorkspaceId,
         agent: Option<&AgentId>,
     ) -> Result<Vec<AgentId>> {
-        pending_postgres!("script_notification_owners", self, backend => backend.script_notification_owners(ws, agent).await)
+        dispatch!(self, backend => backend.script_notification_owners(ws, agent).await)
     }
 
     /// Suppress work even when its active watch has already been deleted.
@@ -207,7 +207,7 @@ impl Store {
         ws: &WorkspaceId,
         agent: Option<&AgentId>,
     ) -> Result<()> {
-        pending_postgres!("suppress_script_notifications", self, backend => backend.suppress_script_notifications(ws, agent).await)
+        dispatch!(self, backend => backend.suppress_script_notifications(ws, agent).await)
     }
 
     /// Latest accepted token remains available after settlement and marker dismissal.

@@ -1,13 +1,11 @@
 # Store methods with no Postgres implementation yet (pending_postgres!).
 # Porting one removes its line; postgres_backend_lint keeps this list exact.
 abort_home_move
-accept_script_notification
 activate_incremental_vacuum
 add_usage_rate
 add_usage_stats
 add_workspace_collaborator_within_cap
 add_workspace_member
-admit_script_notification
 adopt_pr_monitor
 annotate_active_pr_monitors_pause
 archive_workspace_detaching_guests
@@ -18,7 +16,6 @@ begin_repository_pending_delete
 bind_repository_initialization_claim
 cancel_qualified_pr_monitor
 claim_home_auto_start_or_record_move
-cleanup_completed_script_notifications
 clear_active_pr_monitors_pause
 clear_completion_watch_report_delivered
 clear_stop_redeliveries
@@ -26,9 +23,7 @@ clear_stop_redelivery
 close_browser_tab
 complete_home_move
 complete_pr_monitor
-complete_script_notification
 consume_repository_initialization_confirmation
-continue_script_notification
 count_open_workspace_invites
 count_principals
 count_workspace_guests
@@ -74,7 +69,6 @@ find_principal_by_github_user_id
 find_principal_by_identity
 finish_home_rebuild
 finish_home_stop
-finish_script_monitor_wake
 freelist_count
 get_attachment
 get_attachment_by_idempotency_key
@@ -118,7 +112,6 @@ insert_host_invite
 insert_pr_monitor
 insert_principal_credential
 insert_qualified_pr_monitor
-insert_script_monitor
 insert_workspace_invite
 insert_workspace_invite_within_cap
 insert_workspace_with_host_admission
@@ -178,7 +171,6 @@ migration_status
 optimize
 owner_queue_permit
 page_size
-pending_script_monitors
 pool
 prepare_monitor_cancel
 prepare_monitor_insert
@@ -215,18 +207,6 @@ revoke_host_invite
 revoke_principal_access
 revoke_principal_credential
 revoke_workspace_invite
-script_monitor
-script_monitor_cancel_intent
-script_monitor_pending_for_agent
-script_monitor_reservations
-script_monitor_waiting
-script_monitor_wake_allowed
-script_monitor_wake_allowed_for_agent
-script_monitor_wake_pending
-script_monitors
-script_notification_delivery_owners
-script_notification_jobs
-script_notification_owners
 set_home_move_machine
 set_mcp_oauth_token
 set_stop_redelivery
@@ -235,10 +215,8 @@ set_workspace_guest_role
 set_workspace_legacy_author_principal_id
 set_workspace_member_role
 settle_delegation_group_after_delivery
-settle_script_monitor
 shares_repository_lifecycle_domain
 spawn_periodic_wal_checkpoint
-suppress_script_notifications
 sweep_expired_attachment_idempotency_keys
 switch_workspace_home
 sync_browser_tabs
