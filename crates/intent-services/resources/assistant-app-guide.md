@@ -31,6 +31,12 @@ Sharing needs the host owner's GitHub or GitLab account connected in **Settings 
 Connections**: without one, new invitation links cannot be created and unused links
 cannot be redeemed until it is reconnected. People who already joined keep access.
 
+Starting with desktop v2.343.2 (first released on alpha), invitation prompts and
+joined workspaces use a normal app window, outside the notch. Intent opens or
+restores one when needed. Development launches of these versions do not claim
+`intent://` links. If an older development instance claimed links, reopen installed
+Intent to let it reclaim registration.
+
 GitLab is supported alongside GitHub; there is no Labs switch. Connect a GitLab.com or
 self-managed GitLab account in **Settings → Connections** or during onboarding, by
 device sign-in or a personal access token. With it connected, sharing can pin
@@ -38,7 +44,7 @@ invitations to GitLab accounts and a guest can join with a GitLab identity; on h
 that support GitLab checkout, **Add codebase → Clone** also lists GitLab projects. An
 older connected daemon shows an update note instead of the GitLab setup.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/deeplink/main/invite-attempt.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts; packages/cloudlands-fe/src/routes/(app)/+layout.svelte; packages/cloudlands-fe/src/lib/components/settings/GitLabAuthConnection.svelte; packages/cloudlands-fe/src/features/onboarding/steps/OnboardingForgeStep.svelte; packages/cloudlands-fe/src/features/collaboration-auth/renderer/CollaborationSignInModal.svelte. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/deeplink/main/invite-attempt.ts; packages/cloudlands-fe/src/main/invite-window.ts; packages/cloudlands-fe/src/main/intent-protocol-client.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts; packages/cloudlands-fe/src/routes/(app)/+layout.svelte; packages/cloudlands-fe/src/lib/components/settings/GitLabAuthConnection.svelte; packages/cloudlands-fe/src/features/onboarding/steps/OnboardingForgeStep.svelte; packages/cloudlands-fe/src/features/collaboration-auth/renderer/CollaborationSignInModal.svelte. -->
 
 On iPhone and iPad, with an Intent Mobile version that has sharing, a workspace owner
 opens the workspace's **⋯** menu → **Share…** to make an invitation link: **Anyone
