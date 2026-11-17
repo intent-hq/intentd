@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.235] - 2026-11-17
+
+### 🚀 Features
+
+- *(store)* Port discussion store methods to Postgres ([#3455](https://github.com/intent-hq/intentd/pull/3455))
+- *(store)* Port agent message store methods to Postgres ([#3456](https://github.com/intent-hq/intentd/pull/3456))
+- *(store)* Port agent session store methods to Postgres ([#3457](https://github.com/intent-hq/intentd/pull/3457))
+
+### 🐛 Bug Fixes
+
+- *(skills)* Rescan workspaces only when the user-tier catalog changes ([#3454](https://github.com/intent-hq/intentd/pull/3454))
+- *(specialists)* Recheck workspaces only when the user-tier set changes ([#3462](https://github.com/intent-hq/intentd/pull/3462))
+
+### 📚 Documentation
+
+- *(guide)* Describe onboarding on an orchestrator ([#3460](https://github.com/intent-hq/intentd/pull/3460))
+
+
 ## [0.11.234] - 2026-11-17
 
 ### 🐛 Bug Fixes
