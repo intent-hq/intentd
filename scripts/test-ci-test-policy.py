@@ -1016,6 +1016,7 @@ NAMED_TEST_STEPS = {
     ("windows", "Headless workspace setup (Windows runtime)"): 3,
     ("windows", "Codex diagnostic process ownership (Windows runtime)"): 3,
     ("store-postgres", "Postgres backend tests"): 3,
+    ("store-neki", "Neki migrations and tenant round trip"): 1,
 }
 
 # The macOS queue step as intentd#3205 first queued it: the PR deleted five of

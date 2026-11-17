@@ -97,10 +97,19 @@ fn is_sql(lit: &str) -> bool {
         .any(|k| l.starts_with(k))
 }
 
+/// Tables that belong to the schema rather than a tenant, with why.
+const NON_TENANT_TABLES: &[(&str, &str)] = &[(
+    "intent_schema_migrations",
+    "applied-migration ledger written by postgres::migrate, one per schema",
+)];
+
 /// The violations in one SQL literal (lower-cased).
 fn violations(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     for r in table_refs(sql) {
+        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) {
+            continue;
+        }
         let ok = if r.keyword == "INTO" {
             let after_insert = sql[..r.at].trim_end().ends_with("insert");
             // The column list right after the table must start with tenant_id.

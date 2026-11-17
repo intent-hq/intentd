@@ -27,7 +27,9 @@ test-support = []
 # `[dev-dependencies]` or CI; no shipped crate depends on it, and the
 # `store-postgres` CI job checks that the intentd release graph never
 # includes it.
-postgres = ["sqlx/postgres"]
+# TLS: PlanetScale Neki only accepts TLS connections (rustls + ring, like the
+# rest of the workspace; webpki roots, so no system certificate store).
+postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring-webpki"]
 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.232" }
