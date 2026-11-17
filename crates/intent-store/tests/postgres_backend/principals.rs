@@ -501,7 +501,7 @@ parity_test!(workspace_members_and_roles, |store, tenant, db| {
     assert_eq!(as_carol[&b].my_role, Some(WorkspaceRole::Collaborator));
     assert_eq!(as_carol[&b].member_count, 2);
     let anonymous = store
-        .workspace_membership_summaries(None, &[b.clone()])
+        .workspace_membership_summaries(None, std::slice::from_ref(&b))
         .await
         .unwrap();
     assert_eq!(anonymous[&b].my_role, None);
@@ -519,7 +519,7 @@ parity_test!(workspace_members_and_roles, |store, tenant, db| {
             .effective_principal_workspace_ids(&pid("alice"))
             .await
             .unwrap(),
-        [a.clone()]
+        std::slice::from_ref(&a)
     );
 
     store
@@ -779,7 +779,7 @@ parity_test!(workspace_invites_and_joins, |store, tenant, db| {
     assert_eq!((guests.collaborators, guests.open_invites), (2, 0));
     assert_eq!(
         store
-            .workspace_membership_summaries(None, &[w.clone()])
+            .workspace_membership_summaries(None, std::slice::from_ref(&w))
             .await
             .unwrap()[&w]
             .member_count,
@@ -1033,9 +1033,9 @@ parity_test!(host_members_invites_and_removal, |store, tenant, db| {
     assert!(removed.removed);
     assert_eq!(removed.revision, 3);
     assert_eq!(removed.credentials, 1);
-    assert_eq!(removed.workspaces, [w.clone()]);
+    assert_eq!(removed.workspaces, std::slice::from_ref(&w));
     assert_eq!(removed.revoked_invites, ["inv-c"]);
-    assert_eq!(removed.affected_workspaces, [w.clone()]);
+    assert_eq!(removed.affected_workspaces, std::slice::from_ref(&w));
     assert!(store
         .principal_instructions_revoked(&pid("carol"))
         .await
@@ -1058,7 +1058,7 @@ parity_test!(host_members_invites_and_removal, |store, tenant, db| {
     let revoked = store.revoke_principal_access(&pid("dave")).await.unwrap();
     assert!(!revoked.removed);
     assert_eq!(revoked.credentials, 1);
-    assert_eq!(revoked.workspaces, [w.clone()]);
+    assert_eq!(revoked.workspaces, std::slice::from_ref(&w));
     assert!(revoked.affected_workspaces.is_empty());
     assert!(store
         .principal_instructions_revoked(&pid("dave"))
