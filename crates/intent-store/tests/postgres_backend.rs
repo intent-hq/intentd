@@ -16,6 +16,8 @@
 mod agent_messages;
 #[path = "postgres_backend/agents.rs"]
 mod agents;
+#[path = "postgres_backend/clients.rs"]
+mod clients;
 #[path = "postgres_backend/completion_watches.rs"]
 mod completion_watches;
 #[path = "postgres_backend/desktop.rs"]
@@ -26,12 +28,18 @@ mod discussions;
 mod harness;
 #[path = "postgres_backend/hooks.rs"]
 mod hooks;
+#[path = "postgres_backend/idempotency.rs"]
+mod idempotency;
+#[path = "postgres_backend/mcp_oauth.rs"]
+mod mcp_oauth;
 #[path = "postgres_backend/nodes.rs"]
 mod nodes;
 #[path = "postgres_backend/notes.rs"]
 mod notes;
 #[path = "postgres_backend/pr_monitors.rs"]
 mod pr_monitors;
+#[path = "postgres_backend/presence_focus.rs"]
+mod presence_focus;
 #[path = "postgres_backend/principals.rs"]
 mod principals;
 #[path = "postgres_backend/script_monitors.rs"]
