@@ -7,7 +7,7 @@
 -- Inserting the workspace after the principal lets the workspace triggers
 -- set its owner and create its member, sharing summary, authority revision
 -- and repository selection rows, as the SQLite backfills did.
-CREATE FUNCTION intent_provision_tenant(p_tenant text) RETURNS void
+CREATE OR REPLACE FUNCTION intent_provision_tenant(p_tenant text) RETURNS void
 LANGUAGE plpgsql
 SET search_path FROM CURRENT AS $$
 DECLARE

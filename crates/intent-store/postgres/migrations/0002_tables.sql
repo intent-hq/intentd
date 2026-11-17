@@ -4,7 +4,7 @@
 -- cascade can never cross tenants. Tables with an SQLite rowid get row_seq
 -- (insertion order). JSON stays text; see 0001_compat.sql.
 
-CREATE TABLE advisory_wake_delivery (
+CREATE TABLE IF NOT EXISTS advisory_wake_delivery (
     tenant_id text NOT NULL,
     parent_agent_id text NOT NULL,
     child_agent_id text NOT NULL,
@@ -13,7 +13,7 @@ CREATE TABLE advisory_wake_delivery (
     PRIMARY KEY (tenant_id, parent_agent_id, child_agent_id)
 );
 
-CREATE TABLE agent_flipped_completion (
+CREATE TABLE IF NOT EXISTS agent_flipped_completion (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -23,7 +23,7 @@ CREATE TABLE agent_flipped_completion (
     PRIMARY KEY (tenant_id, agent_id, workspace_id, task_note_id)
 );
 
-CREATE TABLE agent_message (
+CREATE TABLE IF NOT EXISTS agent_message (
     tenant_id text NOT NULL,
     id text NOT NULL,
     agent_id text NOT NULL,
@@ -40,7 +40,7 @@ CREATE TABLE agent_message (
     UNIQUE (tenant_id, agent_id, seq)
 );
 
-CREATE TABLE agent_message_payload (
+CREATE TABLE IF NOT EXISTS agent_message_payload (
     tenant_id text NOT NULL,
     message_id text NOT NULL,
     agent_id text NOT NULL,
@@ -52,7 +52,7 @@ CREATE TABLE agent_message_payload (
     PRIMARY KEY (tenant_id, message_id, block_ordinal, kind)
 );
 
-CREATE TABLE agent_metrics (
+CREATE TABLE IF NOT EXISTS agent_metrics (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -64,7 +64,7 @@ CREATE TABLE agent_metrics (
     PRIMARY KEY (tenant_id, workspace_id, agent_id)
 );
 
-CREATE TABLE agent_queue (
+CREATE TABLE IF NOT EXISTS agent_queue (
     tenant_id text NOT NULL,
     id text NOT NULL,
     agent_id text NOT NULL,
@@ -76,7 +76,7 @@ CREATE TABLE agent_queue (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE agent_queue_admission (
+CREATE TABLE IF NOT EXISTS agent_queue_admission (
     tenant_id text NOT NULL,
     id text NOT NULL,
     agent_id text NOT NULL,
@@ -90,7 +90,7 @@ CREATE TABLE agent_queue_admission (
     CHECK (phase IN ('pending','accepted','completed'))
 );
 
-CREATE TABLE agent_session (
+CREATE TABLE IF NOT EXISTS agent_session (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -152,7 +152,7 @@ CREATE TABLE agent_session (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE agent_stop_redelivery (
+CREATE TABLE IF NOT EXISTS agent_stop_redelivery (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
     payload text NOT NULL,
@@ -161,7 +161,7 @@ CREATE TABLE agent_stop_redelivery (
     PRIMARY KEY (tenant_id, agent_id)
 );
 
-CREATE TABLE agent_usage_cell (
+CREATE TABLE IF NOT EXISTS agent_usage_cell (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
     model text NOT NULL,
@@ -177,7 +177,7 @@ CREATE TABLE agent_usage_cell (
     PRIMARY KEY (tenant_id, agent_id, model)
 );
 
-CREATE TABLE attachment_idempotency_keys (
+CREATE TABLE IF NOT EXISTS attachment_idempotency_keys (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     "key" text NOT NULL,
@@ -188,7 +188,7 @@ CREATE TABLE attachment_idempotency_keys (
     PRIMARY KEY (tenant_id, workspace_id, "key")
 );
 
-CREATE TABLE attachments (
+CREATE TABLE IF NOT EXISTS attachments (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -201,7 +201,7 @@ CREATE TABLE attachments (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE browser_tab (
+CREATE TABLE IF NOT EXISTS browser_tab (
     tenant_id text NOT NULL,
     tab_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -221,7 +221,7 @@ CREATE TABLE browser_tab (
     PRIMARY KEY (tenant_id, tab_id)
 );
 
-CREATE TABLE client (
+CREATE TABLE IF NOT EXISTS client (
     tenant_id text NOT NULL,
     id text NOT NULL,
     name text,
@@ -236,7 +236,7 @@ CREATE TABLE client (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE cloud_machine_provider (
+CREATE TABLE IF NOT EXISTS cloud_machine_provider (
     tenant_id text NOT NULL,
     id text NOT NULL,
     config_json text NOT NULL,
@@ -245,7 +245,7 @@ CREATE TABLE cloud_machine_provider (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE comment (
+CREATE TABLE IF NOT EXISTS comment (
     tenant_id text NOT NULL,
     id text NOT NULL,
     thread_id text NOT NULL,
@@ -266,7 +266,7 @@ CREATE TABLE comment (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE completion_wake_delivery (
+CREATE TABLE IF NOT EXISTS completion_wake_delivery (
     tenant_id text NOT NULL,
     parent_agent_id text NOT NULL,
     child_agent_id text NOT NULL,
@@ -276,7 +276,7 @@ CREATE TABLE completion_wake_delivery (
     PRIMARY KEY (tenant_id, parent_agent_id, child_agent_id)
 );
 
-CREATE TABLE completion_watch (
+CREATE TABLE IF NOT EXISTS completion_watch (
     tenant_id text NOT NULL,
     id text NOT NULL,
     parent_workspace_id text NOT NULL,
@@ -293,7 +293,7 @@ CREATE TABLE completion_watch (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE delegation_group (
+CREATE TABLE IF NOT EXISTS delegation_group (
     tenant_id text NOT NULL,
     group_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -312,7 +312,7 @@ CREATE TABLE delegation_group (
     PRIMARY KEY (tenant_id, group_id)
 );
 
-CREATE TABLE deleted_workspace_id (
+CREATE TABLE IF NOT EXISTS deleted_workspace_id (
     tenant_id text NOT NULL,
     id text NOT NULL,
     deleted_at text NOT NULL,
@@ -321,7 +321,7 @@ CREATE TABLE deleted_workspace_id (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE diffs (
+CREATE TABLE IF NOT EXISTS diffs (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -337,7 +337,7 @@ CREATE TABLE diffs (
     UNIQUE (tenant_id, workspace_id, file_path, staged)
 );
 
-CREATE TABLE discussion_agent_activity (
+CREATE TABLE IF NOT EXISTS discussion_agent_activity (
     tenant_id text NOT NULL,
     message_id text NOT NULL,
     agent_id text NOT NULL,
@@ -355,7 +355,7 @@ CREATE TABLE discussion_agent_activity (
     CHECK (state IN ('queued','working','completed','failed','stopped'))
 );
 
-CREATE TABLE discussion_agent_delivery (
+CREATE TABLE IF NOT EXISTS discussion_agent_delivery (
     tenant_id text NOT NULL,
     message_id text NOT NULL,
     agent_id text NOT NULL,
@@ -364,7 +364,7 @@ CREATE TABLE discussion_agent_delivery (
     PRIMARY KEY (tenant_id, message_id, agent_id)
 );
 
-CREATE TABLE discussion_agent_grant (
+CREATE TABLE IF NOT EXISTS discussion_agent_grant (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     conversation_id text NOT NULL,
@@ -373,7 +373,7 @@ CREATE TABLE discussion_agent_grant (
     PRIMARY KEY (tenant_id, workspace_id, conversation_id, agent_id)
 );
 
-CREATE TABLE discussion_conversation (
+CREATE TABLE IF NOT EXISTS discussion_conversation (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -385,7 +385,7 @@ CREATE TABLE discussion_conversation (
     CHECK (kind IN ('direct','group'))
 );
 
-CREATE TABLE discussion_participant (
+CREATE TABLE IF NOT EXISTS discussion_participant (
     tenant_id text NOT NULL,
     conversation_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -395,7 +395,7 @@ CREATE TABLE discussion_participant (
     PRIMARY KEY (tenant_id, conversation_id, source_principal_id)
 );
 
-CREATE TABLE discussion_reaction (
+CREATE TABLE IF NOT EXISTS discussion_reaction (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -412,7 +412,7 @@ CREATE TABLE discussion_reaction (
     CHECK (principal_id IS NULL OR agent_id IS NULL)
 );
 
-CREATE TABLE draft (
+CREATE TABLE IF NOT EXISTS draft (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     agent_id text NOT NULL,
@@ -424,7 +424,7 @@ CREATE TABLE draft (
     PRIMARY KEY (tenant_id, workspace_id, agent_id, client_id)
 );
 
-CREATE TABLE event (
+CREATE TABLE IF NOT EXISTS event (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -440,7 +440,7 @@ CREATE TABLE event (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE event_subscription (
+CREATE TABLE IF NOT EXISTS event_subscription (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -453,7 +453,7 @@ CREATE TABLE event_subscription (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE execution_node (
+CREATE TABLE IF NOT EXISTS execution_node (
     tenant_id text NOT NULL,
     id text NOT NULL,
     head_id text NOT NULL,
@@ -464,7 +464,7 @@ CREATE TABLE execution_node (
     UNIQUE (tenant_id, node_identity)
 );
 
-CREATE TABLE executor_binding (
+CREATE TABLE IF NOT EXISTS executor_binding (
     tenant_id text NOT NULL,
     credential_id text NOT NULL,
     head_id text NOT NULL,
@@ -476,7 +476,7 @@ CREATE TABLE executor_binding (
     PRIMARY KEY (tenant_id, credential_id)
 );
 
-CREATE TABLE executor_credential (
+CREATE TABLE IF NOT EXISTS executor_credential (
     tenant_id text NOT NULL,
     id text NOT NULL,
     token_hash text NOT NULL,
@@ -491,7 +491,7 @@ CREATE TABLE executor_credential (
     UNIQUE (tenant_id, token_hash)
 );
 
-CREATE TABLE exposed_machine (
+CREATE TABLE IF NOT EXISTS exposed_machine (
     tenant_id text NOT NULL,
     id text NOT NULL,
     name text NOT NULL,
@@ -514,7 +514,7 @@ CREATE TABLE exposed_machine (
     CHECK (state IN ('disconnected', 'unreachable', 'revoked', 'update-required'))
 );
 
-CREATE TABLE home_move (
+CREATE TABLE IF NOT EXISTS home_move (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     home_id text NOT NULL,
@@ -534,7 +534,7 @@ CREATE TABLE home_move (
     CHECK (pushed IN (0, 1))
 );
 
-CREATE TABLE home_rebuild (
+CREATE TABLE IF NOT EXISTS home_rebuild (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     home_id text NOT NULL,
@@ -544,7 +544,7 @@ CREATE TABLE home_rebuild (
     PRIMARY KEY (tenant_id, workspace_id)
 );
 
-CREATE TABLE home_stop (
+CREATE TABLE IF NOT EXISTS home_stop (
     tenant_id text NOT NULL,
     home_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -561,7 +561,7 @@ CREATE TABLE home_stop (
     CHECK ((reason = 'moved') = (orphaned_at IS NOT NULL))
 );
 
-CREATE TABLE hook (
+CREATE TABLE IF NOT EXISTS hook (
     tenant_id text NOT NULL,
     hook_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -589,7 +589,7 @@ CREATE TABLE hook (
                   'expired'))
 );
 
-CREATE TABLE host_invite (
+CREATE TABLE IF NOT EXISTS host_invite (
     tenant_id text NOT NULL,
     id text NOT NULL,
     secret_hash text NOT NULL,
@@ -614,7 +614,7 @@ CREATE TABLE host_invite (
       OR (redemption_count = 1 AND redeemed_at IS NOT NULL AND redeemed_by_principal_id IS NOT NULL))
 );
 
-CREATE TABLE host_member (
+CREATE TABLE IF NOT EXISTS host_member (
     tenant_id text NOT NULL,
     principal_id text NOT NULL,
     added_at text NOT NULL,
@@ -622,7 +622,7 @@ CREATE TABLE host_member (
     PRIMARY KEY (tenant_id, principal_id)
 );
 
-CREATE TABLE host_membership_state (
+CREATE TABLE IF NOT EXISTS host_membership_state (
     tenant_id text NOT NULL,
     id bigint NOT NULL,
     revision bigint NOT NULL DEFAULT 0,
@@ -635,7 +635,7 @@ CREATE TABLE host_membership_state (
     CHECK (authorization_generation >= 0)
 );
 
-CREATE TABLE idempotency_key (
+CREATE TABLE IF NOT EXISTS idempotency_key (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     idempotency_key text NOT NULL,
@@ -646,7 +646,7 @@ CREATE TABLE idempotency_key (
     PRIMARY KEY (tenant_id, workspace_id, idempotency_key)
 );
 
-CREATE TABLE interrupted_agent (
+CREATE TABLE IF NOT EXISTS interrupted_agent (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -659,7 +659,7 @@ CREATE TABLE interrupted_agent (
     PRIMARY KEY (tenant_id, agent_id)
 );
 
-CREATE TABLE known_repo (
+CREATE TABLE IF NOT EXISTS known_repo (
     tenant_id text NOT NULL,
     path text NOT NULL,
     name text NOT NULL,
@@ -670,7 +670,7 @@ CREATE TABLE known_repo (
     PRIMARY KEY (tenant_id, path)
 );
 
-CREATE TABLE mcp_oauth_tokens (
+CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
     tenant_id text NOT NULL,
     server_id text NOT NULL,
     token_bag text NOT NULL,
@@ -679,7 +679,7 @@ CREATE TABLE mcp_oauth_tokens (
     PRIMARY KEY (tenant_id, server_id)
 );
 
-CREATE TABLE node_assignment (
+CREATE TABLE IF NOT EXISTS node_assignment (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -691,7 +691,7 @@ CREATE TABLE node_assignment (
     PRIMARY KEY (tenant_id, agent_id)
 );
 
-CREATE TABLE node_checkpoint (
+CREATE TABLE IF NOT EXISTS node_checkpoint (
     tenant_id text NOT NULL,
     id text NOT NULL,
     agent_id text NOT NULL,
@@ -704,7 +704,7 @@ CREATE TABLE node_checkpoint (
     UNIQUE (tenant_id, agent_id, assignment_epoch, capture_revision)
 );
 
-CREATE TABLE node_invite (
+CREATE TABLE IF NOT EXISTS node_invite (
     tenant_id text NOT NULL,
     id text NOT NULL,
     secret_hash text NOT NULL,
@@ -720,7 +720,7 @@ CREATE TABLE node_invite (
     UNIQUE (tenant_id, secret_hash)
 );
 
-CREATE TABLE node_lease (
+CREATE TABLE IF NOT EXISTS node_lease (
     tenant_id text NOT NULL,
     id text NOT NULL,
     node_id text NOT NULL,
@@ -732,7 +732,7 @@ CREATE TABLE node_lease (
     CHECK (terminal IN (0, 1))
 );
 
-CREATE TABLE note (
+CREATE TABLE IF NOT EXISTS note (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -753,7 +753,7 @@ CREATE TABLE note (
     PRIMARY KEY (tenant_id, id, workspace_id)
 );
 
-CREATE TABLE note_line_attribution (
+CREATE TABLE IF NOT EXISTS note_line_attribution (
     tenant_id text NOT NULL,
     note_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -763,7 +763,7 @@ CREATE TABLE note_line_attribution (
     PRIMARY KEY (tenant_id, workspace_id, note_id)
 );
 
-CREATE TABLE note_page_entry (
+CREATE TABLE IF NOT EXISTS note_page_entry (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     note_id text NOT NULL,
@@ -777,7 +777,7 @@ CREATE TABLE note_page_entry (
     CHECK (octet_length(value) <= 32768)
 );
 
-CREATE TABLE note_page_head (
+CREATE TABLE IF NOT EXISTS note_page_head (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     note_id text NOT NULL,
@@ -796,7 +796,7 @@ CREATE TABLE note_page_head (
     PRIMARY KEY (tenant_id, workspace_id, note_id)
 );
 
-CREATE TABLE note_version (
+CREATE TABLE IF NOT EXISTS note_version (
     tenant_id text NOT NULL,
     note_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -812,7 +812,7 @@ CREATE TABLE note_version (
     PRIMARY KEY (tenant_id, workspace_id, note_id, v)
 );
 
-CREATE TABLE pr_monitor (
+CREATE TABLE IF NOT EXISTS pr_monitor (
     tenant_id text NOT NULL,
     monitor_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -852,7 +852,7 @@ CREATE TABLE pr_monitor (
       AND pr_number > 0))
 );
 
-CREATE TABLE pr_monitor_message_provenance (
+CREATE TABLE IF NOT EXISTS pr_monitor_message_provenance (
     tenant_id text NOT NULL,
     message_id text NOT NULL,
     agent_id text NOT NULL,
@@ -866,7 +866,7 @@ CREATE TABLE pr_monitor_message_provenance (
     CHECK (version = 1)
 );
 
-CREATE TABLE principal (
+CREATE TABLE IF NOT EXISTS principal (
     tenant_id text NOT NULL,
     id text NOT NULL,
     github_user_id bigint,
@@ -885,7 +885,7 @@ CREATE TABLE principal (
     CHECK (is_primary IN (0, 1))
 );
 
-CREATE TABLE principal_credential (
+CREATE TABLE IF NOT EXISTS principal_credential (
     tenant_id text NOT NULL,
     token_hash text NOT NULL,
     principal_id text NOT NULL,
@@ -896,7 +896,7 @@ CREATE TABLE principal_credential (
     PRIMARY KEY (tenant_id, token_hash)
 );
 
-CREATE TABLE principal_revocation (
+CREATE TABLE IF NOT EXISTS principal_revocation (
     tenant_id text NOT NULL,
     principal_id text NOT NULL,
     generation bigint NOT NULL,
@@ -905,7 +905,7 @@ CREATE TABLE principal_revocation (
     CHECK (generation > 0)
 );
 
-CREATE TABLE pull_request_workspace (
+CREATE TABLE IF NOT EXISTS pull_request_workspace (
     tenant_id text NOT NULL,
     pr_key text NOT NULL,
     workspace_id text NOT NULL,
@@ -916,7 +916,7 @@ CREATE TABLE pull_request_workspace (
     CHECK (source IN ('workspace', 'git_root'))
 );
 
-CREATE TABLE pull_request_workspace_candidate (
+CREATE TABLE IF NOT EXISTS pull_request_workspace_candidate (
     tenant_id text NOT NULL,
     url text,
     workspace_id text NOT NULL,
@@ -925,7 +925,7 @@ CREATE TABLE pull_request_workspace_candidate (
     PRIMARY KEY (tenant_id, row_seq)
 );
 
-CREATE TABLE remote_agent (
+CREATE TABLE IF NOT EXISTS remote_agent (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -936,7 +936,7 @@ CREATE TABLE remote_agent (
     PRIMARY KEY (tenant_id, agent_id)
 );
 
-CREATE TABLE remote_final_stop (
+CREATE TABLE IF NOT EXISTS remote_final_stop (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -952,7 +952,7 @@ CREATE TABLE remote_final_stop (
     CHECK (reason IN ('agent-deleted', 'agent-retired', 'workspace-retired', 'workspace-deleted', 'machine-removed'))
 );
 
-CREATE TABLE repository_authority_revision (
+CREATE TABLE IF NOT EXISTS repository_authority_revision (
     tenant_id text NOT NULL,
     kind text NOT NULL,
     subject_id text NOT NULL,
@@ -963,7 +963,7 @@ CREATE TABLE repository_authority_revision (
     CHECK (true AND revision > 0)
 );
 
-CREATE TABLE repository_selection_state (
+CREATE TABLE IF NOT EXISTS repository_selection_state (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     root_kind text NOT NULL,
@@ -984,7 +984,7 @@ CREATE TABLE repository_selection_state (
     CHECK (root_kind IN ('primary','registered'))
 );
 
-CREATE TABLE review_context_enrollment (
+CREATE TABLE IF NOT EXISTS review_context_enrollment (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -1003,7 +1003,7 @@ CREATE TABLE review_context_enrollment (
     CHECK (version=1)
 );
 
-CREATE TABLE review_context_private_family (
+CREATE TABLE IF NOT EXISTS review_context_private_family (
     tenant_id text NOT NULL,
     acp_session_id text NOT NULL,
     version bigint NOT NULL,
@@ -1013,7 +1013,7 @@ CREATE TABLE review_context_private_family (
     CHECK (version=1)
 );
 
-CREATE TABLE script (
+CREATE TABLE IF NOT EXISTS script (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -1040,7 +1040,7 @@ CREATE TABLE script (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE script_monitor (
+CREATE TABLE IF NOT EXISTS script_monitor (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -1056,7 +1056,7 @@ CREATE TABLE script_monitor (
     CHECK (state='active')
 );
 
-CREATE TABLE script_notification_job (
+CREATE TABLE IF NOT EXISTS script_notification_job (
     tenant_id text NOT NULL,
     wake_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -1072,7 +1072,7 @@ CREATE TABLE script_notification_job (
     CHECK (phase IN ('pending','message-persisted'))
 );
 
-CREATE TABLE settings (
+CREATE TABLE IF NOT EXISTS settings (
     tenant_id text NOT NULL,
     "key" text NOT NULL,
     value text NOT NULL,
@@ -1080,7 +1080,7 @@ CREATE TABLE settings (
     PRIMARY KEY (tenant_id, "key")
 );
 
-CREATE TABLE task_agent_link (
+CREATE TABLE IF NOT EXISTS task_agent_link (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     note_id text NOT NULL,
@@ -1092,7 +1092,7 @@ CREATE TABLE task_agent_link (
     PRIMARY KEY (tenant_id, workspace_id, note_id, task_key)
 );
 
-CREATE TABLE tracked_changes (
+CREATE TABLE IF NOT EXISTS tracked_changes (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -1113,7 +1113,7 @@ CREATE TABLE tracked_changes (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE usage_rate_minutely (
+CREATE TABLE IF NOT EXISTS usage_rate_minutely (
     tenant_id text NOT NULL,
     bucket_utc text NOT NULL,
     input_tokens bigint NOT NULL DEFAULT 0,
@@ -1124,7 +1124,7 @@ CREATE TABLE usage_rate_minutely (
     PRIMARY KEY (tenant_id, bucket_utc)
 );
 
-CREATE TABLE usage_stats_hourly (
+CREATE TABLE IF NOT EXISTS usage_stats_hourly (
     tenant_id text NOT NULL,
     bucket_utc text NOT NULL,
     model text NOT NULL,
@@ -1145,7 +1145,7 @@ CREATE TABLE usage_stats_hourly (
     PRIMARY KEY (tenant_id, bucket_utc, model, provider)
 );
 
-CREATE TABLE workspace (
+CREATE TABLE IF NOT EXISTS workspace (
     tenant_id text NOT NULL,
     id text NOT NULL,
     title text NOT NULL,
@@ -1195,7 +1195,7 @@ CREATE TABLE workspace (
     PRIMARY KEY (tenant_id, id)
 );
 
-CREATE TABLE workspace_context_item (
+CREATE TABLE IF NOT EXISTS workspace_context_item (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     id text NOT NULL,
@@ -1205,7 +1205,7 @@ CREATE TABLE workspace_context_item (
     PRIMARY KEY (tenant_id, workspace_id, id)
 );
 
-CREATE TABLE workspace_discussion_conversation (
+CREATE TABLE IF NOT EXISTS workspace_discussion_conversation (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     id text NOT NULL,
@@ -1219,7 +1219,7 @@ CREATE TABLE workspace_discussion_conversation (
     PRIMARY KEY (tenant_id, workspace_id, id)
 );
 
-CREATE TABLE workspace_discussion_message (
+CREATE TABLE IF NOT EXISTS workspace_discussion_message (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -1247,7 +1247,7 @@ CREATE TABLE workspace_discussion_message (
     CHECK (reaction_version >= 0)
 );
 
-CREATE TABLE workspace_git_root (
+CREATE TABLE IF NOT EXISTS workspace_git_root (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -1268,7 +1268,7 @@ CREATE TABLE workspace_git_root (
     CHECK (source IN ('agent', 'auto'))
 );
 
-CREATE TABLE workspace_home (
+CREATE TABLE IF NOT EXISTS workspace_home (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     home_id text NOT NULL,
@@ -1286,7 +1286,7 @@ CREATE TABLE workspace_home (
     CHECK (state IN ('attached', 'detached', 'moving', 'starting'))
 );
 
-CREATE TABLE workspace_invite (
+CREATE TABLE IF NOT EXISTS workspace_invite (
     tenant_id text NOT NULL,
     id text NOT NULL,
     workspace_id text NOT NULL,
@@ -1309,7 +1309,7 @@ CREATE TABLE workspace_invite (
     UNIQUE (tenant_id, secret_hash)
 );
 
-CREATE TABLE workspace_invite_seat (
+CREATE TABLE IF NOT EXISTS workspace_invite_seat (
     tenant_id text NOT NULL,
     invite_id text NOT NULL,
     workspace_id text NOT NULL,
@@ -1318,7 +1318,7 @@ CREATE TABLE workspace_invite_seat (
     PRIMARY KEY (tenant_id, invite_id)
 );
 
-CREATE TABLE workspace_mcp_disabled_server (
+CREATE TABLE IF NOT EXISTS workspace_mcp_disabled_server (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     server_id text NOT NULL,
@@ -1327,7 +1327,7 @@ CREATE TABLE workspace_mcp_disabled_server (
     PRIMARY KEY (tenant_id, workspace_id, server_id)
 );
 
-CREATE TABLE workspace_member (
+CREATE TABLE IF NOT EXISTS workspace_member (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     principal_id text NOT NULL,
@@ -1338,7 +1338,7 @@ CREATE TABLE workspace_member (
     CHECK (role IN ('owner', 'collaborator', 'manager'))
 );
 
-CREATE TABLE workspace_metrics (
+CREATE TABLE IF NOT EXISTS workspace_metrics (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     additions bigint NOT NULL DEFAULT 0,
@@ -1349,7 +1349,7 @@ CREATE TABLE workspace_metrics (
     PRIMARY KEY (tenant_id, workspace_id)
 );
 
-CREATE TABLE workspace_sharing_summary (
+CREATE TABLE IF NOT EXISTS workspace_sharing_summary (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     direct_count bigint NOT NULL DEFAULT 0,
@@ -1364,7 +1364,7 @@ CREATE TABLE workspace_sharing_summary (
     CHECK (open_invite_count >= 0)
 );
 
-CREATE TABLE workspace_ui_context (
+CREATE TABLE IF NOT EXISTS workspace_ui_context (
     tenant_id text NOT NULL,
     workspace_id text NOT NULL,
     payload text NOT NULL,
@@ -1373,209 +1373,209 @@ CREATE TABLE workspace_ui_context (
 );
 
 -- Indexes
-CREATE INDEX idx_advisory_wake_delivery_child ON advisory_wake_delivery (tenant_id, child_agent_id);
-CREATE INDEX idx_agent_flipped_completion_task ON agent_flipped_completion (tenant_id, workspace_id, task_note_id);
-CREATE INDEX idx_agent_message_usage_projection ON agent_message (tenant_id, agent_id, usage_model, usage_origin, role);
-CREATE UNIQUE INDEX idx_agent_message_id_agent ON agent_message (tenant_id, id, agent_id);
-CREATE INDEX idx_agent_message_usage ON agent_message (tenant_id, agent_id, seq) WHERE CASE WHEN sqlite_json_valid(content) THEN
+CREATE INDEX IF NOT EXISTS idx_advisory_wake_delivery_child ON advisory_wake_delivery (tenant_id, child_agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_flipped_completion_task ON agent_flipped_completion (tenant_id, workspace_id, task_note_id);
+CREATE INDEX IF NOT EXISTS idx_agent_message_usage_projection ON agent_message (tenant_id, agent_id, usage_model, usage_origin, role);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_message_id_agent ON agent_message (tenant_id, id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_message_usage ON agent_message (tenant_id, agent_id, seq) WHERE CASE WHEN sqlite_json_valid(content) THEN
     (CASE WHEN sqlite_json_type(content, '$.usage') IS NOT NULL
         THEN sqlite_json_type(content, '$.usage') = 'object'
         ELSE sqlite_json_type(content, '$._meta.usage') = 'object' END) ELSE false END;
-CREATE INDEX idx_agent_message_agent_role_seq ON agent_message (tenant_id, agent_id, role, seq DESC);
-CREATE INDEX idx_agent_message_payload_agent ON agent_message_payload (tenant_id, agent_id);
-CREATE INDEX idx_agent_metrics_agent ON agent_metrics (tenant_id, agent_id);
-CREATE INDEX idx_agent_queue_agent ON agent_queue (tenant_id, agent_id, position);
-CREATE INDEX idx_agent_session_unread_top_level ON agent_session (tenant_id, workspace_id, last_message_id, (sqlite_json_extract(metadata, '$.lastSeenMessageId'))) WHERE parent_agent_id IS NULL
+CREATE INDEX IF NOT EXISTS idx_agent_message_agent_role_seq ON agent_message (tenant_id, agent_id, role, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_message_payload_agent ON agent_message_payload (tenant_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_metrics_agent ON agent_metrics (tenant_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_queue_agent ON agent_queue (tenant_id, agent_id, position);
+CREATE INDEX IF NOT EXISTS idx_agent_session_unread_top_level ON agent_session (tenant_id, workspace_id, last_message_id, (sqlite_json_extract(metadata, '$.lastSeenMessageId'))) WHERE parent_agent_id IS NULL
     AND is_background = 0
     AND status <> 'deleted'
     AND last_message_id IS NOT NULL
     AND last_message_role = 'assistant'
     AND retired_at IS NULL
     AND notifications_muted = 0;
-CREATE INDEX idx_agent_workspace_retired ON agent_session (tenant_id, workspace_id) WHERE retired_at IS NOT NULL;
-CREATE INDEX idx_agent_parent ON agent_session (tenant_id, parent_agent_id);
-CREATE INDEX idx_agent_workspace ON agent_session (tenant_id, workspace_id);
-CREATE INDEX idx_attachment_idempotency_keys_attachment ON attachment_idempotency_keys (tenant_id, attachment_id, workspace_id);
-CREATE INDEX idx_attachment_idempotency_keys_created ON attachment_idempotency_keys (tenant_id, created_at);
-CREATE INDEX idx_attachments_workspace ON attachments (tenant_id, workspace_id);
-CREATE INDEX idx_browser_tab_workspace ON browser_tab (tenant_id, workspace_id);
-CREATE INDEX idx_browser_tab_host ON browser_tab (tenant_id, host_client_id, created_at, tab_id);
-CREATE INDEX idx_browser_tab_workspace_open ON browser_tab (tenant_id, workspace_id, created_at, tab_id) WHERE closed_at IS NULL;
-CREATE INDEX idx_comment_workspace_note ON comment (tenant_id, workspace_id, note_id) WHERE note_id IS NOT NULL;
-CREATE INDEX idx_comment_thread ON comment (tenant_id, thread_id);
-CREATE INDEX idx_comment_note ON comment (tenant_id, note_id, workspace_id);
-CREATE INDEX idx_completion_wake_delivery_child ON completion_wake_delivery (tenant_id, child_agent_id);
-CREATE INDEX idx_completion_watch_child ON completion_watch (tenant_id, child_agent_id);
-CREATE INDEX idx_completion_watch_parent ON completion_watch (tenant_id, parent_agent_id);
-CREATE INDEX idx_delegation_group_delivered ON delegation_group (tenant_id, delivered);
-CREATE INDEX idx_delegation_group_parent ON delegation_group (tenant_id, parent_agent_id);
-CREATE INDEX idx_delegation_group_workspace ON delegation_group (tenant_id, workspace_id);
-CREATE INDEX idx_diffs_ws ON diffs (tenant_id, workspace_id);
-CREATE INDEX discussion_conversation_workspace ON discussion_conversation (tenant_id, workspace_id, id);
-CREATE INDEX discussion_participant_access ON discussion_participant (tenant_id, workspace_id, principal_id, conversation_id);
-CREATE INDEX discussion_reaction_sample ON discussion_reaction (tenant_id, message_id, reaction, id);
-CREATE INDEX discussion_reaction_workspace ON discussion_reaction (tenant_id, workspace_id);
-CREATE INDEX idx_draft_client ON draft (tenant_id, client_id);
-CREATE INDEX idx_event_type_time ON event (tenant_id, event_type, timestamp);
-CREATE INDEX idx_event_session ON event (tenant_id, session_id);
-CREATE INDEX idx_event_type ON event (tenant_id, event_type);
-CREATE INDEX idx_event_ws_time ON event (tenant_id, workspace_id, timestamp);
-CREATE INDEX idx_event_subscription_agent ON event_subscription (tenant_id, subscriber_agent_id);
-CREATE INDEX executor_credential_active ON executor_credential (tenant_id, created_at, id) WHERE revoked_at IS NULL;
-CREATE INDEX home_move_node ON home_move (tenant_id, node_id);
-CREATE INDEX home_stop_workspace ON home_stop (tenant_id, workspace_id);
-CREATE INDEX home_stop_node ON home_stop (tenant_id, node_id);
-CREATE INDEX idx_hook_active_workspace ON hook (tenant_id, workspace_id, created_at) WHERE state IN ('scheduled', 'running');
-CREATE INDEX idx_hook_active_agent ON hook (tenant_id, agent_id, created_at) WHERE state IN ('scheduled', 'running');
-CREATE INDEX idx_hook_state ON hook (tenant_id, state);
-CREATE INDEX idx_hook_agent ON hook (tenant_id, agent_id);
-CREATE INDEX idx_hook_workspace ON hook (tenant_id, workspace_id);
-CREATE INDEX host_invite_order_idx ON host_invite (tenant_id, created_at, id);
-CREATE INDEX host_member_order_idx ON host_member (tenant_id, added_at, principal_id);
-CREATE INDEX idx_idempotency_created ON idempotency_key (tenant_id, created_at);
-CREATE INDEX idx_interrupted_resolution ON interrupted_agent (tenant_id, resolution);
-CREATE INDEX idx_interrupted_workspace ON interrupted_agent (tenant_id, workspace_id);
-CREATE INDEX node_assignment_lease ON node_assignment (tenant_id, lease_id);
-CREATE INDEX node_invite_open ON node_invite (tenant_id, created_at, id) WHERE used_at IS NULL AND revoked_at IS NULL;
-CREATE UNIQUE INDEX node_lease_live ON node_lease (tenant_id, node_id) WHERE terminal = 0;
-CREATE INDEX idx_note_workspace_parented ON note (tenant_id, workspace_id, parent_id) WHERE parent_id IS NOT NULL;
-CREATE INDEX idx_note_workspace_updated_at ON note (tenant_id, workspace_id, updated_at);
-CREATE INDEX idx_note_task ON note (tenant_id, workspace_id) WHERE task_json IS NOT NULL;
-CREATE INDEX idx_note_parent ON note (tenant_id, parent_id);
-CREATE INDEX idx_note_workspace ON note (tenant_id, workspace_id);
-CREATE INDEX idx_note_line_attribution_workspace ON note_line_attribution (tenant_id, workspace_id);
-CREATE INDEX note_page_map_end ON note_page_entry (tenant_id, workspace_id, note_id, collection, source_end, position) WHERE source_end IS NOT NULL;
-CREATE INDEX note_page_map_start ON note_page_entry (tenant_id, workspace_id, note_id, collection, source_start, position) WHERE source_start IS NOT NULL;
-CREATE INDEX note_page_pending ON note_page_head (tenant_id, workspace_id, note_id) WHERE indexed_rev=-1;
-CREATE INDEX idx_note_version_rev ON note_version (tenant_id, workspace_id, note_id, rev);
-CREATE UNIQUE INDEX idx_pr_monitor_qualified_workspace_identity ON pr_monitor (tenant_id, workspace_id, target_provider, target_instance_base_url, (CASE WHEN target_provider = 'github' THEN lower(target_project_path) ELSE target_project_path END), target_kind, pr_number) WHERE state = 'active' AND target_provenance != 'unresolved';
-CREATE UNIQUE INDEX idx_pr_monitor_qualified_identity ON pr_monitor (tenant_id, agent_id, target_provider, target_instance_base_url, (CASE WHEN target_provider = 'github' THEN lower(target_project_path) ELSE target_project_path END), target_kind, pr_number) WHERE state = 'active' AND target_provenance != 'unresolved';
-CREATE UNIQUE INDEX idx_pr_monitor_unresolved_claim_workspace_identity ON pr_monitor (tenant_id, workspace_id, (lower(repo_owner)), (lower(repo_name)), pr_number, (ARRAY[(target_provider)::text, (target_instance_base_url)::text, (target_project_path)::text, (target_kind)::text])) WHERE state = 'active' AND target_provenance = 'unresolved'
+CREATE INDEX IF NOT EXISTS idx_agent_workspace_retired ON agent_session (tenant_id, workspace_id) WHERE retired_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_parent ON agent_session (tenant_id, parent_agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_workspace ON agent_session (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_attachment_idempotency_keys_attachment ON attachment_idempotency_keys (tenant_id, attachment_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_attachment_idempotency_keys_created ON attachment_idempotency_keys (tenant_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_attachments_workspace ON attachments (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_browser_tab_workspace ON browser_tab (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_browser_tab_host ON browser_tab (tenant_id, host_client_id, created_at, tab_id);
+CREATE INDEX IF NOT EXISTS idx_browser_tab_workspace_open ON browser_tab (tenant_id, workspace_id, created_at, tab_id) WHERE closed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_comment_workspace_note ON comment (tenant_id, workspace_id, note_id) WHERE note_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_comment_thread ON comment (tenant_id, thread_id);
+CREATE INDEX IF NOT EXISTS idx_comment_note ON comment (tenant_id, note_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_completion_wake_delivery_child ON completion_wake_delivery (tenant_id, child_agent_id);
+CREATE INDEX IF NOT EXISTS idx_completion_watch_child ON completion_watch (tenant_id, child_agent_id);
+CREATE INDEX IF NOT EXISTS idx_completion_watch_parent ON completion_watch (tenant_id, parent_agent_id);
+CREATE INDEX IF NOT EXISTS idx_delegation_group_delivered ON delegation_group (tenant_id, delivered);
+CREATE INDEX IF NOT EXISTS idx_delegation_group_parent ON delegation_group (tenant_id, parent_agent_id);
+CREATE INDEX IF NOT EXISTS idx_delegation_group_workspace ON delegation_group (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_diffs_ws ON diffs (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS discussion_conversation_workspace ON discussion_conversation (tenant_id, workspace_id, id);
+CREATE INDEX IF NOT EXISTS discussion_participant_access ON discussion_participant (tenant_id, workspace_id, principal_id, conversation_id);
+CREATE INDEX IF NOT EXISTS discussion_reaction_sample ON discussion_reaction (tenant_id, message_id, reaction, id);
+CREATE INDEX IF NOT EXISTS discussion_reaction_workspace ON discussion_reaction (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_draft_client ON draft (tenant_id, client_id);
+CREATE INDEX IF NOT EXISTS idx_event_type_time ON event (tenant_id, event_type, timestamp);
+CREATE INDEX IF NOT EXISTS idx_event_session ON event (tenant_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_event_type ON event (tenant_id, event_type);
+CREATE INDEX IF NOT EXISTS idx_event_ws_time ON event (tenant_id, workspace_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_event_subscription_agent ON event_subscription (tenant_id, subscriber_agent_id);
+CREATE INDEX IF NOT EXISTS executor_credential_active ON executor_credential (tenant_id, created_at, id) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS home_move_node ON home_move (tenant_id, node_id);
+CREATE INDEX IF NOT EXISTS home_stop_workspace ON home_stop (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS home_stop_node ON home_stop (tenant_id, node_id);
+CREATE INDEX IF NOT EXISTS idx_hook_active_workspace ON hook (tenant_id, workspace_id, created_at) WHERE state IN ('scheduled', 'running');
+CREATE INDEX IF NOT EXISTS idx_hook_active_agent ON hook (tenant_id, agent_id, created_at) WHERE state IN ('scheduled', 'running');
+CREATE INDEX IF NOT EXISTS idx_hook_state ON hook (tenant_id, state);
+CREATE INDEX IF NOT EXISTS idx_hook_agent ON hook (tenant_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_hook_workspace ON hook (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS host_invite_order_idx ON host_invite (tenant_id, created_at, id);
+CREATE INDEX IF NOT EXISTS host_member_order_idx ON host_member (tenant_id, added_at, principal_id);
+CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_key (tenant_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_interrupted_resolution ON interrupted_agent (tenant_id, resolution);
+CREATE INDEX IF NOT EXISTS idx_interrupted_workspace ON interrupted_agent (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS node_assignment_lease ON node_assignment (tenant_id, lease_id);
+CREATE INDEX IF NOT EXISTS node_invite_open ON node_invite (tenant_id, created_at, id) WHERE used_at IS NULL AND revoked_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS node_lease_live ON node_lease (tenant_id, node_id) WHERE terminal = 0;
+CREATE INDEX IF NOT EXISTS idx_note_workspace_parented ON note (tenant_id, workspace_id, parent_id) WHERE parent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_note_workspace_updated_at ON note (tenant_id, workspace_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_note_task ON note (tenant_id, workspace_id) WHERE task_json IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_note_parent ON note (tenant_id, parent_id);
+CREATE INDEX IF NOT EXISTS idx_note_workspace ON note (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_note_line_attribution_workspace ON note_line_attribution (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS note_page_map_end ON note_page_entry (tenant_id, workspace_id, note_id, collection, source_end, position) WHERE source_end IS NOT NULL;
+CREATE INDEX IF NOT EXISTS note_page_map_start ON note_page_entry (tenant_id, workspace_id, note_id, collection, source_start, position) WHERE source_start IS NOT NULL;
+CREATE INDEX IF NOT EXISTS note_page_pending ON note_page_head (tenant_id, workspace_id, note_id) WHERE indexed_rev=-1;
+CREATE INDEX IF NOT EXISTS idx_note_version_rev ON note_version (tenant_id, workspace_id, note_id, rev);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_monitor_qualified_workspace_identity ON pr_monitor (tenant_id, workspace_id, target_provider, target_instance_base_url, (CASE WHEN target_provider = 'github' THEN lower(target_project_path) ELSE target_project_path END), target_kind, pr_number) WHERE state = 'active' AND target_provenance != 'unresolved';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_monitor_qualified_identity ON pr_monitor (tenant_id, agent_id, target_provider, target_instance_base_url, (CASE WHEN target_provider = 'github' THEN lower(target_project_path) ELSE target_project_path END), target_kind, pr_number) WHERE state = 'active' AND target_provenance != 'unresolved';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_monitor_unresolved_claim_workspace_identity ON pr_monitor (tenant_id, workspace_id, (lower(repo_owner)), (lower(repo_name)), pr_number, (ARRAY[(target_provider)::text, (target_instance_base_url)::text, (target_project_path)::text, (target_kind)::text])) WHERE state = 'active' AND target_provenance = 'unresolved'
     AND (target_provider IS NOT NULL OR target_instance_base_url IS NOT NULL
       OR target_project_path IS NOT NULL OR target_kind IS NOT NULL);
-CREATE UNIQUE INDEX idx_pr_monitor_unresolved_claim_identity ON pr_monitor (tenant_id, agent_id, (lower(repo_owner)), (lower(repo_name)), pr_number, (ARRAY[(target_provider)::text, (target_instance_base_url)::text, (target_project_path)::text, (target_kind)::text])) WHERE state = 'active' AND target_provenance = 'unresolved'
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_monitor_unresolved_claim_identity ON pr_monitor (tenant_id, agent_id, (lower(repo_owner)), (lower(repo_name)), pr_number, (ARRAY[(target_provider)::text, (target_instance_base_url)::text, (target_project_path)::text, (target_kind)::text])) WHERE state = 'active' AND target_provenance = 'unresolved'
     AND (target_provider IS NOT NULL OR target_instance_base_url IS NOT NULL
       OR target_project_path IS NOT NULL OR target_kind IS NOT NULL);
-CREATE UNIQUE INDEX idx_pr_monitor_workspace_identity ON pr_monitor (tenant_id, workspace_id, (lower(repo_owner)), (lower(repo_name)), pr_number) WHERE state = 'active' AND ((target_provenance = 'unresolved'
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_monitor_workspace_identity ON pr_monitor (tenant_id, workspace_id, (lower(repo_owner)), (lower(repo_name)), pr_number) WHERE state = 'active' AND ((target_provenance = 'unresolved'
     AND target_provider IS NULL AND target_instance_base_url IS NULL
     AND target_project_path IS NULL AND target_kind IS NULL)
     OR (target_provenance != 'unresolved' AND target_provider = 'github' AND target_instance_base_url = 'https://github.com'
       AND target_kind = 'pull-request'));
-CREATE UNIQUE INDEX idx_pr_monitor_identity ON pr_monitor (tenant_id, agent_id, (lower(repo_owner)), (lower(repo_name)), pr_number) WHERE state = 'active' AND ((target_provenance = 'unresolved'
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_monitor_identity ON pr_monitor (tenant_id, agent_id, (lower(repo_owner)), (lower(repo_name)), pr_number) WHERE state = 'active' AND ((target_provenance = 'unresolved'
     AND target_provider IS NULL AND target_instance_base_url IS NULL
     AND target_project_path IS NULL AND target_kind IS NULL)
     OR (target_provenance != 'unresolved' AND target_provider = 'github' AND target_instance_base_url = 'https://github.com'
       AND target_kind = 'pull-request'));
-CREATE INDEX idx_pr_monitor_state ON pr_monitor (tenant_id, state);
-CREATE INDEX idx_pr_monitor_agent ON pr_monitor (tenant_id, agent_id);
-CREATE INDEX idx_pr_monitor_workspace ON pr_monitor (tenant_id, workspace_id);
-CREATE UNIQUE INDEX principal_identity_uq ON principal (tenant_id, identity_provider, instance_host, external_user_id) WHERE identity_provider IS NOT NULL;
-CREATE UNIQUE INDEX principal_primary_uq ON principal (tenant_id, is_primary) WHERE is_primary = 1;
-CREATE INDEX principal_credential_principal_idx ON principal_credential (tenant_id, principal_id);
-CREATE INDEX idx_pull_request_workspace_workspace ON pull_request_workspace (tenant_id, workspace_id);
-CREATE INDEX remote_agent_lease ON remote_agent (tenant_id, lease_id);
-CREATE INDEX remote_final_stop_lease ON remote_final_stop (tenant_id, lease_id);
-CREATE INDEX script_active_page ON script (tenant_id, workspace_id, created_at DESC, id DESC) WHERE archived_at IS NULL;
-CREATE INDEX idx_script_workspace ON script (tenant_id, workspace_id);
-CREATE INDEX script_monitor_workspace ON script_monitor (tenant_id, workspace_id, created_at, id);
-CREATE INDEX script_monitor_agent ON script_monitor (tenant_id, agent_id, state);
-CREATE UNIQUE INDEX script_monitor_owner ON script_monitor (tenant_id, workspace_id, script_id);
-CREATE INDEX script_notification_owner ON script_notification_job (tenant_id, agent_id);
-CREATE INDEX idx_task_agent_link_agent ON task_agent_link (tenant_id, workspace_id, agent_id);
-CREATE INDEX idx_task_agent_link_workspace ON task_agent_link (tenant_id, workspace_id);
-CREATE INDEX idx_tracked_changes_ws_path_stage_agent ON tracked_changes (tenant_id, workspace_id, path, stage, agent_id);
-CREATE INDEX idx_tracked_changes_agent ON tracked_changes (tenant_id, agent_id);
-CREATE INDEX idx_tracked_changes_commit ON tracked_changes (tenant_id, commit_hash);
-CREATE INDEX idx_tracked_changes_ws ON tracked_changes (tenant_id, workspace_id);
-CREATE INDEX idx_workspace_context_item_workspace_ordinal ON workspace_context_item (tenant_id, workspace_id, ordinal);
-CREATE UNIQUE INDEX workspace_discussion_creation_retry ON workspace_discussion_conversation (tenant_id, workspace_id, first_principal_id, first_client_message_id);
-CREATE UNIQUE INDEX discussion_agent_retry ON workspace_discussion_message (tenant_id, workspace_id, agent_id, client_message_id);
-CREATE UNIQUE INDEX discussion_message_scope ON workspace_discussion_message (tenant_id, workspace_id, id);
-CREATE UNIQUE INDEX idx_workspace_git_root_identity ON workspace_git_root (tenant_id, workspace_id, path);
-CREATE INDEX idx_workspace_git_root_workspace ON workspace_git_root (tenant_id, workspace_id);
-CREATE INDEX workspace_home_node ON workspace_home (tenant_id, node_id);
-CREATE INDEX workspace_invite_issuer_idx ON workspace_invite (tenant_id, created_by_principal_id);
-CREATE INDEX workspace_invite_workspace_idx ON workspace_invite (tenant_id, workspace_id);
-CREATE INDEX workspace_invite_seat_expiry_idx ON workspace_invite_seat (tenant_id, workspace_id, expires_at);
-CREATE UNIQUE INDEX workspace_member_owner_uq ON workspace_member (tenant_id, workspace_id) WHERE role = 'owner';
-CREATE INDEX workspace_member_principal_idx ON workspace_member (tenant_id, principal_id);
+CREATE INDEX IF NOT EXISTS idx_pr_monitor_state ON pr_monitor (tenant_id, state);
+CREATE INDEX IF NOT EXISTS idx_pr_monitor_agent ON pr_monitor (tenant_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_pr_monitor_workspace ON pr_monitor (tenant_id, workspace_id);
+CREATE UNIQUE INDEX IF NOT EXISTS principal_identity_uq ON principal (tenant_id, identity_provider, instance_host, external_user_id) WHERE identity_provider IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS principal_primary_uq ON principal (tenant_id, is_primary) WHERE is_primary = 1;
+CREATE INDEX IF NOT EXISTS principal_credential_principal_idx ON principal_credential (tenant_id, principal_id);
+CREATE INDEX IF NOT EXISTS idx_pull_request_workspace_workspace ON pull_request_workspace (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS remote_agent_lease ON remote_agent (tenant_id, lease_id);
+CREATE INDEX IF NOT EXISTS remote_final_stop_lease ON remote_final_stop (tenant_id, lease_id);
+CREATE INDEX IF NOT EXISTS script_active_page ON script (tenant_id, workspace_id, created_at DESC, id DESC) WHERE archived_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_script_workspace ON script (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS script_monitor_workspace ON script_monitor (tenant_id, workspace_id, created_at, id);
+CREATE INDEX IF NOT EXISTS script_monitor_agent ON script_monitor (tenant_id, agent_id, state);
+CREATE UNIQUE INDEX IF NOT EXISTS script_monitor_owner ON script_monitor (tenant_id, workspace_id, script_id);
+CREATE INDEX IF NOT EXISTS script_notification_owner ON script_notification_job (tenant_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_task_agent_link_agent ON task_agent_link (tenant_id, workspace_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_task_agent_link_workspace ON task_agent_link (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_tracked_changes_ws_path_stage_agent ON tracked_changes (tenant_id, workspace_id, path, stage, agent_id);
+CREATE INDEX IF NOT EXISTS idx_tracked_changes_agent ON tracked_changes (tenant_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_tracked_changes_commit ON tracked_changes (tenant_id, commit_hash);
+CREATE INDEX IF NOT EXISTS idx_tracked_changes_ws ON tracked_changes (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_workspace_context_item_workspace_ordinal ON workspace_context_item (tenant_id, workspace_id, ordinal);
+CREATE UNIQUE INDEX IF NOT EXISTS workspace_discussion_creation_retry ON workspace_discussion_conversation (tenant_id, workspace_id, first_principal_id, first_client_message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS discussion_agent_retry ON workspace_discussion_message (tenant_id, workspace_id, agent_id, client_message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS discussion_message_scope ON workspace_discussion_message (tenant_id, workspace_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_git_root_identity ON workspace_git_root (tenant_id, workspace_id, path);
+CREATE INDEX IF NOT EXISTS idx_workspace_git_root_workspace ON workspace_git_root (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS workspace_home_node ON workspace_home (tenant_id, node_id);
+CREATE INDEX IF NOT EXISTS workspace_invite_issuer_idx ON workspace_invite (tenant_id, created_by_principal_id);
+CREATE INDEX IF NOT EXISTS workspace_invite_workspace_idx ON workspace_invite (tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS workspace_invite_seat_expiry_idx ON workspace_invite_seat (tenant_id, workspace_id, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS workspace_member_owner_uq ON workspace_member (tenant_id, workspace_id) WHERE role = 'owner';
+CREATE INDEX IF NOT EXISTS workspace_member_principal_idx ON workspace_member (tenant_id, principal_id);
 
 -- Foreign keys (tenant_id is part of every key, so cascades stay inside one tenant)
-ALTER TABLE advisory_wake_delivery ADD CONSTRAINT advisory_wake_delivery_child_agent_id_fkey FOREIGN KEY (tenant_id, child_agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE advisory_wake_delivery ADD CONSTRAINT advisory_wake_delivery_parent_agent_id_fkey FOREIGN KEY (tenant_id, parent_agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE agent_flipped_completion ADD CONSTRAINT agent_flipped_completion_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE agent_message ADD CONSTRAINT agent_message_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE agent_message_payload ADD CONSTRAINT agent_message_payload_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE agent_metrics ADD CONSTRAINT agent_metrics_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE agent_queue ADD CONSTRAINT agent_queue_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE agent_queue_admission ADD CONSTRAINT agent_queue_admission_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE agent_session ADD CONSTRAINT agent_session_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE agent_stop_redelivery ADD CONSTRAINT agent_stop_redelivery_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE agent_usage_cell ADD CONSTRAINT agent_usage_cell_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE attachment_idempotency_keys ADD CONSTRAINT attachment_idempotency_keys_attachment_id_fkey FOREIGN KEY (tenant_id, attachment_id) REFERENCES attachments (tenant_id, id);
-ALTER TABLE browser_tab ADD CONSTRAINT browser_tab_host_client_id_fkey FOREIGN KEY (tenant_id, host_client_id) REFERENCES client (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE browser_tab ADD CONSTRAINT browser_tab_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE comment ADD CONSTRAINT comment_note_id_workspace_id_fkey FOREIGN KEY (tenant_id, note_id, workspace_id) REFERENCES note (tenant_id, id, workspace_id) ON DELETE CASCADE;
-ALTER TABLE completion_wake_delivery ADD CONSTRAINT completion_wake_delivery_child_agent_id_fkey FOREIGN KEY (tenant_id, child_agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE completion_wake_delivery ADD CONSTRAINT completion_wake_delivery_parent_agent_id_fkey FOREIGN KEY (tenant_id, parent_agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE delegation_group ADD CONSTRAINT delegation_group_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE diffs ADD CONSTRAINT diffs_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_agent_activity ADD CONSTRAINT discussion_agent_activity_message_id_fkey FOREIGN KEY (tenant_id, message_id) REFERENCES workspace_discussion_message (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_agent_delivery ADD CONSTRAINT discussion_agent_delivery_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_agent_delivery ADD CONSTRAINT discussion_agent_delivery_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_agent_delivery ADD CONSTRAINT discussion_agent_delivery_message_id_fkey FOREIGN KEY (tenant_id, message_id) REFERENCES workspace_discussion_message (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_agent_grant ADD CONSTRAINT discussion_agent_grant_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_agent_grant ADD CONSTRAINT discussion_agent_grant_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_conversation ADD CONSTRAINT discussion_conversation_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_participant ADD CONSTRAINT discussion_participant_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_participant ADD CONSTRAINT discussion_participant_conversation_id_fkey FOREIGN KEY (tenant_id, conversation_id) REFERENCES discussion_conversation (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_reaction ADD CONSTRAINT discussion_reaction_workspace_id_message_id_fkey FOREIGN KEY (tenant_id, workspace_id, message_id) REFERENCES workspace_discussion_message (tenant_id, workspace_id, id) ON DELETE CASCADE;
-ALTER TABLE discussion_reaction ADD CONSTRAINT discussion_reaction_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE draft ADD CONSTRAINT draft_client_id_fkey FOREIGN KEY (tenant_id, client_id) REFERENCES client (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE executor_binding ADD CONSTRAINT executor_binding_credential_id_fkey FOREIGN KEY (tenant_id, credential_id) REFERENCES executor_credential (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE home_move ADD CONSTRAINT home_move_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE home_rebuild ADD CONSTRAINT home_rebuild_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE hook ADD CONSTRAINT hook_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE hook ADD CONSTRAINT hook_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE host_invite ADD CONSTRAINT host_invite_redeemed_by_principal_id_fkey FOREIGN KEY (tenant_id, redeemed_by_principal_id) REFERENCES principal (tenant_id, id);
-ALTER TABLE host_invite ADD CONSTRAINT host_invite_created_by_principal_id_fkey FOREIGN KEY (tenant_id, created_by_principal_id) REFERENCES principal (tenant_id, id);
-ALTER TABLE host_member ADD CONSTRAINT host_member_principal_id_fkey FOREIGN KEY (tenant_id, principal_id) REFERENCES principal (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE node_assignment ADD CONSTRAINT node_assignment_lease_id_fkey FOREIGN KEY (tenant_id, lease_id) REFERENCES node_lease (tenant_id, id);
-ALTER TABLE node_checkpoint ADD CONSTRAINT node_checkpoint_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES node_assignment (tenant_id, agent_id);
-ALTER TABLE node_invite ADD CONSTRAINT node_invite_credential_id_fkey FOREIGN KEY (tenant_id, credential_id) REFERENCES executor_credential (tenant_id, id) ON DELETE SET NULL (credential_id);
-ALTER TABLE node_lease ADD CONSTRAINT node_lease_node_id_fkey FOREIGN KEY (tenant_id, node_id) REFERENCES execution_node (tenant_id, id);
-ALTER TABLE note ADD CONSTRAINT note_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE note_line_attribution ADD CONSTRAINT note_line_attribution_note_id_workspace_id_fkey FOREIGN KEY (tenant_id, note_id, workspace_id) REFERENCES note (tenant_id, id, workspace_id) ON DELETE CASCADE;
-ALTER TABLE note_page_entry ADD CONSTRAINT note_page_entry_workspace_id_note_id_fkey FOREIGN KEY (tenant_id, workspace_id, note_id) REFERENCES note_page_head (tenant_id, workspace_id, note_id) ON DELETE CASCADE ON UPDATE CASCADE;
-ALTER TABLE note_page_head ADD CONSTRAINT note_page_head_note_id_workspace_id_fkey FOREIGN KEY (tenant_id, note_id, workspace_id) REFERENCES note (tenant_id, id, workspace_id) ON DELETE CASCADE ON UPDATE CASCADE;
-ALTER TABLE note_version ADD CONSTRAINT note_version_note_id_workspace_id_fkey FOREIGN KEY (tenant_id, note_id, workspace_id) REFERENCES note (tenant_id, id, workspace_id) ON DELETE CASCADE;
-ALTER TABLE pr_monitor ADD CONSTRAINT pr_monitor_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE pr_monitor ADD CONSTRAINT pr_monitor_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE pr_monitor_message_provenance ADD CONSTRAINT pr_monitor_message_provenance_message_id_agent_id_fkey FOREIGN KEY (tenant_id, message_id, agent_id) REFERENCES agent_message (tenant_id, id, agent_id) ON DELETE CASCADE;
-ALTER TABLE pr_monitor_message_provenance ADD CONSTRAINT pr_monitor_message_provenance_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE principal_credential ADD CONSTRAINT principal_credential_principal_id_fkey FOREIGN KEY (tenant_id, principal_id) REFERENCES principal (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE principal_revocation ADD CONSTRAINT principal_revocation_principal_id_fkey FOREIGN KEY (tenant_id, principal_id) REFERENCES principal (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE pull_request_workspace ADD CONSTRAINT pull_request_workspace_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE remote_agent ADD CONSTRAINT remote_agent_lease_id_fkey FOREIGN KEY (tenant_id, lease_id) REFERENCES node_lease (tenant_id, id);
-ALTER TABLE remote_agent ADD CONSTRAINT remote_agent_node_id_fkey FOREIGN KEY (tenant_id, node_id) REFERENCES execution_node (tenant_id, id);
-ALTER TABLE remote_agent ADD CONSTRAINT remote_agent_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE review_context_enrollment ADD CONSTRAINT review_context_enrollment_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE review_context_enrollment ADD CONSTRAINT review_context_enrollment_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE task_agent_link ADD CONSTRAINT task_agent_link_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE tracked_changes ADD CONSTRAINT tracked_changes_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_context_item ADD CONSTRAINT workspace_context_item_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_discussion_conversation ADD CONSTRAINT workspace_discussion_conversation_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_discussion_message ADD CONSTRAINT workspace_discussion_message_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_git_root ADD CONSTRAINT workspace_git_root_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_home ADD CONSTRAINT workspace_home_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_invite ADD CONSTRAINT workspace_invite_redeemed_by_principal_id_fkey FOREIGN KEY (tenant_id, redeemed_by_principal_id) REFERENCES principal (tenant_id, id) ON DELETE SET NULL (redeemed_by_principal_id);
-ALTER TABLE workspace_invite ADD CONSTRAINT workspace_invite_created_by_principal_id_fkey FOREIGN KEY (tenant_id, created_by_principal_id) REFERENCES principal (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_invite ADD CONSTRAINT workspace_invite_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_invite_seat ADD CONSTRAINT workspace_invite_seat_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_invite_seat ADD CONSTRAINT workspace_invite_seat_invite_id_fkey FOREIGN KEY (tenant_id, invite_id) REFERENCES workspace_invite (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_mcp_disabled_server ADD CONSTRAINT workspace_mcp_disabled_server_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_member ADD CONSTRAINT workspace_member_principal_id_fkey FOREIGN KEY (tenant_id, principal_id) REFERENCES principal (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_member ADD CONSTRAINT workspace_member_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_metrics ADD CONSTRAINT workspace_metrics_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_sharing_summary ADD CONSTRAINT workspace_sharing_summary_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
-ALTER TABLE workspace_ui_context ADD CONSTRAINT workspace_ui_context_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE advisory_wake_delivery DROP CONSTRAINT IF EXISTS advisory_wake_delivery_child_agent_id_fkey, ADD CONSTRAINT advisory_wake_delivery_child_agent_id_fkey FOREIGN KEY (tenant_id, child_agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE advisory_wake_delivery DROP CONSTRAINT IF EXISTS advisory_wake_delivery_parent_agent_id_fkey, ADD CONSTRAINT advisory_wake_delivery_parent_agent_id_fkey FOREIGN KEY (tenant_id, parent_agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE agent_flipped_completion DROP CONSTRAINT IF EXISTS agent_flipped_completion_agent_id_fkey, ADD CONSTRAINT agent_flipped_completion_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE agent_message DROP CONSTRAINT IF EXISTS agent_message_agent_id_fkey, ADD CONSTRAINT agent_message_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE agent_message_payload DROP CONSTRAINT IF EXISTS agent_message_payload_agent_id_fkey, ADD CONSTRAINT agent_message_payload_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE agent_metrics DROP CONSTRAINT IF EXISTS agent_metrics_workspace_id_fkey, ADD CONSTRAINT agent_metrics_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE agent_queue DROP CONSTRAINT IF EXISTS agent_queue_agent_id_fkey, ADD CONSTRAINT agent_queue_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE agent_queue_admission DROP CONSTRAINT IF EXISTS agent_queue_admission_agent_id_fkey, ADD CONSTRAINT agent_queue_admission_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE agent_session DROP CONSTRAINT IF EXISTS agent_session_workspace_id_fkey, ADD CONSTRAINT agent_session_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE agent_stop_redelivery DROP CONSTRAINT IF EXISTS agent_stop_redelivery_agent_id_fkey, ADD CONSTRAINT agent_stop_redelivery_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE agent_usage_cell DROP CONSTRAINT IF EXISTS agent_usage_cell_agent_id_fkey, ADD CONSTRAINT agent_usage_cell_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE attachment_idempotency_keys DROP CONSTRAINT IF EXISTS attachment_idempotency_keys_attachment_id_fkey, ADD CONSTRAINT attachment_idempotency_keys_attachment_id_fkey FOREIGN KEY (tenant_id, attachment_id) REFERENCES attachments (tenant_id, id);
+ALTER TABLE browser_tab DROP CONSTRAINT IF EXISTS browser_tab_host_client_id_fkey, ADD CONSTRAINT browser_tab_host_client_id_fkey FOREIGN KEY (tenant_id, host_client_id) REFERENCES client (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE browser_tab DROP CONSTRAINT IF EXISTS browser_tab_workspace_id_fkey, ADD CONSTRAINT browser_tab_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE comment DROP CONSTRAINT IF EXISTS comment_note_id_workspace_id_fkey, ADD CONSTRAINT comment_note_id_workspace_id_fkey FOREIGN KEY (tenant_id, note_id, workspace_id) REFERENCES note (tenant_id, id, workspace_id) ON DELETE CASCADE;
+ALTER TABLE completion_wake_delivery DROP CONSTRAINT IF EXISTS completion_wake_delivery_child_agent_id_fkey, ADD CONSTRAINT completion_wake_delivery_child_agent_id_fkey FOREIGN KEY (tenant_id, child_agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE completion_wake_delivery DROP CONSTRAINT IF EXISTS completion_wake_delivery_parent_agent_id_fkey, ADD CONSTRAINT completion_wake_delivery_parent_agent_id_fkey FOREIGN KEY (tenant_id, parent_agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE delegation_group DROP CONSTRAINT IF EXISTS delegation_group_workspace_id_fkey, ADD CONSTRAINT delegation_group_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE diffs DROP CONSTRAINT IF EXISTS diffs_workspace_id_fkey, ADD CONSTRAINT diffs_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_agent_activity DROP CONSTRAINT IF EXISTS discussion_agent_activity_message_id_fkey, ADD CONSTRAINT discussion_agent_activity_message_id_fkey FOREIGN KEY (tenant_id, message_id) REFERENCES workspace_discussion_message (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_agent_delivery DROP CONSTRAINT IF EXISTS discussion_agent_delivery_workspace_id_fkey, ADD CONSTRAINT discussion_agent_delivery_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_agent_delivery DROP CONSTRAINT IF EXISTS discussion_agent_delivery_agent_id_fkey, ADD CONSTRAINT discussion_agent_delivery_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_agent_delivery DROP CONSTRAINT IF EXISTS discussion_agent_delivery_message_id_fkey, ADD CONSTRAINT discussion_agent_delivery_message_id_fkey FOREIGN KEY (tenant_id, message_id) REFERENCES workspace_discussion_message (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_agent_grant DROP CONSTRAINT IF EXISTS discussion_agent_grant_agent_id_fkey, ADD CONSTRAINT discussion_agent_grant_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_agent_grant DROP CONSTRAINT IF EXISTS discussion_agent_grant_workspace_id_fkey, ADD CONSTRAINT discussion_agent_grant_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_conversation DROP CONSTRAINT IF EXISTS discussion_conversation_workspace_id_fkey, ADD CONSTRAINT discussion_conversation_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_participant DROP CONSTRAINT IF EXISTS discussion_participant_workspace_id_fkey, ADD CONSTRAINT discussion_participant_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_participant DROP CONSTRAINT IF EXISTS discussion_participant_conversation_id_fkey, ADD CONSTRAINT discussion_participant_conversation_id_fkey FOREIGN KEY (tenant_id, conversation_id) REFERENCES discussion_conversation (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_reaction DROP CONSTRAINT IF EXISTS discussion_reaction_workspace_id_message_id_fkey, ADD CONSTRAINT discussion_reaction_workspace_id_message_id_fkey FOREIGN KEY (tenant_id, workspace_id, message_id) REFERENCES workspace_discussion_message (tenant_id, workspace_id, id) ON DELETE CASCADE;
+ALTER TABLE discussion_reaction DROP CONSTRAINT IF EXISTS discussion_reaction_workspace_id_fkey, ADD CONSTRAINT discussion_reaction_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE draft DROP CONSTRAINT IF EXISTS draft_client_id_fkey, ADD CONSTRAINT draft_client_id_fkey FOREIGN KEY (tenant_id, client_id) REFERENCES client (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE executor_binding DROP CONSTRAINT IF EXISTS executor_binding_credential_id_fkey, ADD CONSTRAINT executor_binding_credential_id_fkey FOREIGN KEY (tenant_id, credential_id) REFERENCES executor_credential (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE home_move DROP CONSTRAINT IF EXISTS home_move_workspace_id_fkey, ADD CONSTRAINT home_move_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE home_rebuild DROP CONSTRAINT IF EXISTS home_rebuild_workspace_id_fkey, ADD CONSTRAINT home_rebuild_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE hook DROP CONSTRAINT IF EXISTS hook_agent_id_fkey, ADD CONSTRAINT hook_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE hook DROP CONSTRAINT IF EXISTS hook_workspace_id_fkey, ADD CONSTRAINT hook_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE host_invite DROP CONSTRAINT IF EXISTS host_invite_redeemed_by_principal_id_fkey, ADD CONSTRAINT host_invite_redeemed_by_principal_id_fkey FOREIGN KEY (tenant_id, redeemed_by_principal_id) REFERENCES principal (tenant_id, id);
+ALTER TABLE host_invite DROP CONSTRAINT IF EXISTS host_invite_created_by_principal_id_fkey, ADD CONSTRAINT host_invite_created_by_principal_id_fkey FOREIGN KEY (tenant_id, created_by_principal_id) REFERENCES principal (tenant_id, id);
+ALTER TABLE host_member DROP CONSTRAINT IF EXISTS host_member_principal_id_fkey, ADD CONSTRAINT host_member_principal_id_fkey FOREIGN KEY (tenant_id, principal_id) REFERENCES principal (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE node_assignment DROP CONSTRAINT IF EXISTS node_assignment_lease_id_fkey, ADD CONSTRAINT node_assignment_lease_id_fkey FOREIGN KEY (tenant_id, lease_id) REFERENCES node_lease (tenant_id, id);
+ALTER TABLE node_checkpoint DROP CONSTRAINT IF EXISTS node_checkpoint_agent_id_fkey, ADD CONSTRAINT node_checkpoint_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES node_assignment (tenant_id, agent_id);
+ALTER TABLE node_invite DROP CONSTRAINT IF EXISTS node_invite_credential_id_fkey, ADD CONSTRAINT node_invite_credential_id_fkey FOREIGN KEY (tenant_id, credential_id) REFERENCES executor_credential (tenant_id, id) ON DELETE SET NULL (credential_id);
+ALTER TABLE node_lease DROP CONSTRAINT IF EXISTS node_lease_node_id_fkey, ADD CONSTRAINT node_lease_node_id_fkey FOREIGN KEY (tenant_id, node_id) REFERENCES execution_node (tenant_id, id);
+ALTER TABLE note DROP CONSTRAINT IF EXISTS note_workspace_id_fkey, ADD CONSTRAINT note_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE note_line_attribution DROP CONSTRAINT IF EXISTS note_line_attribution_note_id_workspace_id_fkey, ADD CONSTRAINT note_line_attribution_note_id_workspace_id_fkey FOREIGN KEY (tenant_id, note_id, workspace_id) REFERENCES note (tenant_id, id, workspace_id) ON DELETE CASCADE;
+ALTER TABLE note_page_entry DROP CONSTRAINT IF EXISTS note_page_entry_workspace_id_note_id_fkey, ADD CONSTRAINT note_page_entry_workspace_id_note_id_fkey FOREIGN KEY (tenant_id, workspace_id, note_id) REFERENCES note_page_head (tenant_id, workspace_id, note_id) ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE note_page_head DROP CONSTRAINT IF EXISTS note_page_head_note_id_workspace_id_fkey, ADD CONSTRAINT note_page_head_note_id_workspace_id_fkey FOREIGN KEY (tenant_id, note_id, workspace_id) REFERENCES note (tenant_id, id, workspace_id) ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE note_version DROP CONSTRAINT IF EXISTS note_version_note_id_workspace_id_fkey, ADD CONSTRAINT note_version_note_id_workspace_id_fkey FOREIGN KEY (tenant_id, note_id, workspace_id) REFERENCES note (tenant_id, id, workspace_id) ON DELETE CASCADE;
+ALTER TABLE pr_monitor DROP CONSTRAINT IF EXISTS pr_monitor_agent_id_fkey, ADD CONSTRAINT pr_monitor_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE pr_monitor DROP CONSTRAINT IF EXISTS pr_monitor_workspace_id_fkey, ADD CONSTRAINT pr_monitor_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE pr_monitor_message_provenance DROP CONSTRAINT IF EXISTS pr_monitor_message_provenance_message_id_agent_id_fkey, ADD CONSTRAINT pr_monitor_message_provenance_message_id_agent_id_fkey FOREIGN KEY (tenant_id, message_id, agent_id) REFERENCES agent_message (tenant_id, id, agent_id) ON DELETE CASCADE;
+ALTER TABLE pr_monitor_message_provenance DROP CONSTRAINT IF EXISTS pr_monitor_message_provenance_workspace_id_fkey, ADD CONSTRAINT pr_monitor_message_provenance_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE principal_credential DROP CONSTRAINT IF EXISTS principal_credential_principal_id_fkey, ADD CONSTRAINT principal_credential_principal_id_fkey FOREIGN KEY (tenant_id, principal_id) REFERENCES principal (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE principal_revocation DROP CONSTRAINT IF EXISTS principal_revocation_principal_id_fkey, ADD CONSTRAINT principal_revocation_principal_id_fkey FOREIGN KEY (tenant_id, principal_id) REFERENCES principal (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE pull_request_workspace DROP CONSTRAINT IF EXISTS pull_request_workspace_workspace_id_fkey, ADD CONSTRAINT pull_request_workspace_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE remote_agent DROP CONSTRAINT IF EXISTS remote_agent_lease_id_fkey, ADD CONSTRAINT remote_agent_lease_id_fkey FOREIGN KEY (tenant_id, lease_id) REFERENCES node_lease (tenant_id, id);
+ALTER TABLE remote_agent DROP CONSTRAINT IF EXISTS remote_agent_node_id_fkey, ADD CONSTRAINT remote_agent_node_id_fkey FOREIGN KEY (tenant_id, node_id) REFERENCES execution_node (tenant_id, id);
+ALTER TABLE remote_agent DROP CONSTRAINT IF EXISTS remote_agent_agent_id_fkey, ADD CONSTRAINT remote_agent_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE review_context_enrollment DROP CONSTRAINT IF EXISTS review_context_enrollment_workspace_id_fkey, ADD CONSTRAINT review_context_enrollment_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE review_context_enrollment DROP CONSTRAINT IF EXISTS review_context_enrollment_agent_id_fkey, ADD CONSTRAINT review_context_enrollment_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE task_agent_link DROP CONSTRAINT IF EXISTS task_agent_link_workspace_id_fkey, ADD CONSTRAINT task_agent_link_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE tracked_changes DROP CONSTRAINT IF EXISTS tracked_changes_workspace_id_fkey, ADD CONSTRAINT tracked_changes_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_context_item DROP CONSTRAINT IF EXISTS workspace_context_item_workspace_id_fkey, ADD CONSTRAINT workspace_context_item_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_discussion_conversation DROP CONSTRAINT IF EXISTS workspace_discussion_conversation_workspace_id_fkey, ADD CONSTRAINT workspace_discussion_conversation_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_discussion_message DROP CONSTRAINT IF EXISTS workspace_discussion_message_workspace_id_fkey, ADD CONSTRAINT workspace_discussion_message_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_git_root DROP CONSTRAINT IF EXISTS workspace_git_root_workspace_id_fkey, ADD CONSTRAINT workspace_git_root_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_home DROP CONSTRAINT IF EXISTS workspace_home_workspace_id_fkey, ADD CONSTRAINT workspace_home_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_invite DROP CONSTRAINT IF EXISTS workspace_invite_redeemed_by_principal_id_fkey, ADD CONSTRAINT workspace_invite_redeemed_by_principal_id_fkey FOREIGN KEY (tenant_id, redeemed_by_principal_id) REFERENCES principal (tenant_id, id) ON DELETE SET NULL (redeemed_by_principal_id);
+ALTER TABLE workspace_invite DROP CONSTRAINT IF EXISTS workspace_invite_created_by_principal_id_fkey, ADD CONSTRAINT workspace_invite_created_by_principal_id_fkey FOREIGN KEY (tenant_id, created_by_principal_id) REFERENCES principal (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_invite DROP CONSTRAINT IF EXISTS workspace_invite_workspace_id_fkey, ADD CONSTRAINT workspace_invite_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_invite_seat DROP CONSTRAINT IF EXISTS workspace_invite_seat_workspace_id_fkey, ADD CONSTRAINT workspace_invite_seat_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_invite_seat DROP CONSTRAINT IF EXISTS workspace_invite_seat_invite_id_fkey, ADD CONSTRAINT workspace_invite_seat_invite_id_fkey FOREIGN KEY (tenant_id, invite_id) REFERENCES workspace_invite (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_mcp_disabled_server DROP CONSTRAINT IF EXISTS workspace_mcp_disabled_server_workspace_id_fkey, ADD CONSTRAINT workspace_mcp_disabled_server_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_member DROP CONSTRAINT IF EXISTS workspace_member_principal_id_fkey, ADD CONSTRAINT workspace_member_principal_id_fkey FOREIGN KEY (tenant_id, principal_id) REFERENCES principal (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_member DROP CONSTRAINT IF EXISTS workspace_member_workspace_id_fkey, ADD CONSTRAINT workspace_member_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_metrics DROP CONSTRAINT IF EXISTS workspace_metrics_workspace_id_fkey, ADD CONSTRAINT workspace_metrics_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_sharing_summary DROP CONSTRAINT IF EXISTS workspace_sharing_summary_workspace_id_fkey, ADD CONSTRAINT workspace_sharing_summary_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE workspace_ui_context DROP CONSTRAINT IF EXISTS workspace_ui_context_workspace_id_fkey, ADD CONSTRAINT workspace_ui_context_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;

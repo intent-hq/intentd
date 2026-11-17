@@ -125,8 +125,9 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool> {
 /// (in a separate transaction: Neki also rejects DML after DDL in one), so a
 /// file that fails part-way resumes at the failed statement once it is
 /// fixed, as long as the statements before it are unchanged. A crash between
-/// a statement and its progress record leaves that one statement to repair
-/// by hand.
+/// a statement and its progress record replays that one statement, so every
+/// statement must be safe to run twice (`IF [NOT] EXISTS`, `CREATE OR
+/// REPLACE`); a unit test enforces it.
 ///
 /// A session advisory lock keeps concurrent callers from migrating at once.
 /// The lock's connection is detached from the pool and closed at the end,
@@ -137,12 +138,26 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool> {
 /// the schema has a migration this build does not know, or the schema was
 /// migrated by the earlier sqlx migrator.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
+    migrate_with(pool, false).await
+}
+
+/// [`migrate`], running each statement a second time before recording its
+/// progress: what a crash between the two replays. For the store tests.
+///
+/// # Errors
+/// As [`migrate`].
+#[doc(hidden)]
+pub async fn migrate_replaying_each_statement(pool: &PgPool) -> Result<()> {
+    migrate_with(pool, true).await
+}
+
+async fn migrate_with(pool: &PgPool, replay: bool) -> Result<()> {
     let mut conn = pool.acquire().await.map_err(db)?.detach();
     sqlx::query("SELECT pg_advisory_lock(hashtextextended('intent-schema-migrations', 0))")
         .execute(&mut conn)
         .await
         .map_err(db)?;
-    let outcome = migrate_locked(&mut conn).await;
+    let outcome = migrate_locked(&mut conn, replay).await;
     let closed = sqlx::Connection::close(conn).await.map_err(db);
     outcome.and(closed)
 }
@@ -150,7 +165,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
 /// `(version, checksum, applied_statements, applied_prefix, complete)`.
 type LedgerRow = (i64, Vec<u8>, i32, Vec<u8>, bool);
 
-async fn migrate_locked(conn: &mut sqlx::PgConnection) -> Result<()> {
+async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<()> {
     // The applied-migration ledger belongs to the schema, not to a tenant.
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS intent_schema_migrations \
@@ -231,16 +246,18 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection) -> Result<()> {
         };
         for (i, statement) in stmts.iter().enumerate().skip(start) {
             let done = i32::try_from(i + 1).map_err(db)?;
-            sqlx::raw_sql(sqlx::AssertSqlSafe((*statement).to_owned()))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!(
-                        "postgres migration {version} ({}) statement {} failed: {e}",
-                        migration.description,
-                        i + 1
-                    ))
-                })?;
+            for _ in 0..=usize::from(replay) {
+                sqlx::raw_sql(sqlx::AssertSqlSafe((*statement).to_owned()))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!(
+                            "postgres migration {version} ({}) statement {} failed: {e}",
+                            migration.description,
+                            i + 1
+                        ))
+                    })?;
+            }
             sqlx::query(
                 "UPDATE intent_schema_migrations \
                  SET applied_statements = $2, applied_prefix = $3 WHERE version = $1",
@@ -490,6 +507,97 @@ mod tests {
             for s in statements(m.sql.as_str()) {
                 assert!(s.ends_with(';'), "migration {}: {s}", m.version);
             }
+        }
+    }
+
+    /// Whether `statement` is a no-op when run again right after it applied.
+    fn rerunnable(statement: &str) -> bool {
+        const PREFIXES: &[&str] = &[
+            "CREATE TABLE IF NOT EXISTS ",
+            "CREATE INDEX IF NOT EXISTS ",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ",
+            "CREATE OR REPLACE FUNCTION ",
+            "CREATE OR REPLACE TRIGGER ",
+            "CREATE EXTENSION IF NOT EXISTS ",
+        ];
+        let code: String = statement
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase();
+        let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        if PREFIXES.iter().any(|p| code.starts_with(p)) {
+            return true;
+        }
+        if code.starts_with("DROP ") {
+            return code.split(' ').nth(2) == Some("IF") || code.contains(" IF EXISTS ");
+        }
+        let Some(rest) = code.strip_prefix("ALTER TABLE ") else {
+            return false;
+        };
+        let Some((_, action)) = rest.split_once(' ') else {
+            return false;
+        };
+        if action.starts_with("ADD COLUMN IF NOT EXISTS ")
+            || action.starts_with("DROP COLUMN IF EXISTS ")
+        {
+            return true;
+        }
+        // Re-adding a constraint: drop the same name first, in one statement.
+        action
+            .strip_prefix("DROP CONSTRAINT IF EXISTS ")
+            .and_then(|a| a.split_once(", ADD CONSTRAINT "))
+            .is_some_and(|(dropped, added)| added.starts_with(&format!("{dropped} ")))
+    }
+
+    /// `migrate` records progress after each statement commits, so a crash
+    /// in between replays that one statement: it must be safe to run twice.
+    #[test]
+    fn every_migration_statement_is_safe_to_run_twice() {
+        let bad: Vec<String> = MIGRATOR
+            .iter()
+            .flat_map(|m| {
+                statements(m.sql.as_str())
+                    .into_iter()
+                    .filter(|s| !rerunnable(s))
+                    .map(move |s| {
+                        format!(
+                            "migration {}: {}",
+                            m.version,
+                            s.lines().next().unwrap_or("")
+                        )
+                    })
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "use IF [NOT] EXISTS, CREATE OR REPLACE, or DROP CONSTRAINT IF EXISTS c, ADD CONSTRAINT c:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_rerunnable_rule_rejects_one_shot_statements() {
+        for one_shot in [
+            "CREATE TABLE t (x int);",
+            "CREATE INDEX i ON t (x);",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;",
+            "CREATE TRIGGER g AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();",
+            "ALTER TABLE t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES u (x);",
+            "ALTER TABLE t DROP CONSTRAINT IF EXISTS c, ADD CONSTRAINT d FOREIGN KEY (x) REFERENCES u (x);",
+            "ALTER TABLE t ADD COLUMN y int;",
+            "DROP INDEX i;",
+            "TRUNCATE t;",
+        ] {
+            assert!(!rerunnable(one_shot), "{one_shot}");
+        }
+        for safe in [
+            "-- why\nCREATE TABLE IF NOT EXISTS t (x int);",
+            "ALTER TABLE t DROP CONSTRAINT IF EXISTS c, ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES u (x);",
+            "DROP INDEX IF EXISTS i;",
+        ] {
+            assert!(rerunnable(safe), "{safe}");
         }
     }
 

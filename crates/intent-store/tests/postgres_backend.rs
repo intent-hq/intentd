@@ -19,7 +19,7 @@ mod settings;
 #[path = "postgres_backend/workspaces.rs"]
 mod workspaces;
 
-use harness::{exec, open, open_with, test_db};
+use harness::{empty_db, exec, open, open_with, test_db};
 use intent_store::postgres::{self, TenantId};
 
 #[tokio::test]
@@ -199,6 +199,27 @@ async fn migrate_resumes_a_part_way_file_and_refuses_unknown_history() {
     .await;
     let unknown = postgres::migrate(&db.admin).await.unwrap_err().to_string();
     assert!(unknown.contains("unknown to this build"), "{unknown}");
+}
+
+/// A crash between a statement and its progress record replays that
+/// statement: running each one twice must still build a working schema.
+#[tokio::test]
+async fn every_migration_statement_survives_a_replay() {
+    let Some((_, admin)) = empty_db().await else {
+        return;
+    };
+    postgres::migrate_replaying_each_statement(&admin)
+        .await
+        .expect("each statement runs twice");
+    let store = intent_store::Store::open_postgres(
+        admin,
+        TenantId::new("replayed").unwrap(),
+        intent_store::postgres::PostgresOptions::default(),
+    )
+    .await
+    .expect("open a tenant on the replayed schema");
+    store.set_setting("k", "1").await.unwrap();
+    assert_eq!(store.get_setting("k").await.unwrap().as_deref(), Some("1"));
 }
 
 #[test]
