@@ -14,8 +14,6 @@ adopt_pr_monitor
 annotate_active_pr_monitors_pause
 archive_workspace_detaching_guests
 archive_workspace_detaching_guests_unless_auto_archive_disabled
-assign_node_run
-authorize_node_repo
 authorized_presence_focus
 begin_home_move
 begin_repository_pending_delete
@@ -28,7 +26,6 @@ clear_completion_watch_report_delivered
 clear_stop_redeliveries
 clear_stop_redelivery
 close_browser_tab
-commit_node_checkpoint
 complete_home_move
 complete_pr_monitor
 complete_script_notification
@@ -39,7 +36,6 @@ count_active_hooks_by_workspace
 count_open_workspace_invites
 count_principals
 count_workspace_guests
-current_node_checkpoint
 delete_agent_metrics
 delete_agent_metrics_for_workspace
 delete_agent_session
@@ -81,10 +77,8 @@ find_active_qualified_pr_monitor
 find_active_qualified_pr_monitor_in_workspace
 find_principal_by_github_user_id
 find_principal_by_identity
-finish_final_stop
 finish_home_rebuild
 finish_home_stop
-finish_node_lease
 finish_script_monitor_wake
 freelist_count
 get_agent_session_with_transcript
@@ -100,14 +94,11 @@ get_host_invite
 get_host_role
 get_idempotent
 get_mcp_oauth_token
-get_node_assignment
 get_pr_monitor
 get_primary_principal
 get_principal
 get_principals
 get_qualified_pr_monitor
-get_remote_agent
-get_remote_agents
 get_shown_workspace_home
 get_subscription_agent_projections
 get_workspace_author_fallback
@@ -152,7 +143,6 @@ list_agent_sessions_with_transcripts
 list_attachments
 list_browser_tabs
 list_browser_tabs_by_host
-list_cloud_placed_agents
 list_completion_watches
 list_credentialed_guest_principals
 list_diffs
@@ -178,7 +168,6 @@ list_principal_memberships
 list_principals
 list_qualified_pr_monitors_by_agent
 list_qualified_pr_monitors_by_workspace
-list_remote_agents
 list_sharing_principals
 list_shown_workspace_homes
 list_tracked_changes
@@ -201,7 +190,6 @@ mark_completion_watch_report_delivered
 mark_home_move_pushed
 max_sibling_tracked_change_counters
 migration_status
-next_node_capture_revision
 optimize
 owner_queue_permit
 page_size
@@ -223,14 +211,12 @@ reassign_browser_tabs_from_hosts
 reassign_claimed_browser_tabs
 record_home_stop
 record_hook_dispatch
-record_remote_agent
 redeem_workspace_invite
 remove_browser_tab
 remove_cloud_machine
 remove_host_member
 remove_host_member_by_owner
 remove_known_repo
-remove_remote_agent
 remove_workspace_guest
 remove_workspace_member
 repository_authority_snapshot
@@ -268,7 +254,6 @@ settle_delegation_group_after_delivery
 settle_script_monitor
 shares_repository_lifecycle_domain
 spawn_periodic_wal_checkpoint
-stop_node_assignment
 suppress_script_notifications
 sweep_expired_attachment_idempotency_keys
 switch_workspace_home
@@ -301,7 +286,6 @@ upsert_known_repo
 upsert_principal
 upsert_tracked_change
 upsert_workspace_metrics
-workspace_has_remote_agent_work
 workspace_membership_summaries
 workspaces_with_active_hooks
 workspaces_with_active_hooks_or_script_monitors

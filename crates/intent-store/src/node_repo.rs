@@ -93,7 +93,7 @@ async fn assignment(conn: &mut SqliteConnection, id: &AgentId) -> Result<Option<
             .map_err(db)?;
     json.as_deref().map(decode).transpose()
 }
-fn dispatchable(lease: &NodeLease) -> Result<()> {
+pub(crate) fn dispatchable(lease: &NodeLease) -> Result<()> {
     if lease.release_requested
         || matches!(
             lease.state,
@@ -369,7 +369,7 @@ impl Store {
         terminal: LeaseState,
         fence: LeaseFence,
     ) -> Result<NodeLease> {
-        pending_postgres!("finish_node_lease", self, backend => backend.finish_node_lease(owner, terminal, fence).await)
+        dispatch!(self, backend => backend.finish_node_lease(owner, terminal, fence).await)
     }
 
     /// Admit a new run with a store-allocated epoch. The template's epoch is
@@ -378,7 +378,7 @@ impl Store {
     /// # Errors
     /// Rejects stale/unfenced ownership, changed workspace, deleted agents and DB errors.
     pub async fn assign_node_run(&self, template: &NodeAssignment) -> Result<NodeAssignment> {
-        pending_postgres!("assign_node_run", self, backend => backend.assign_node_run(template).await)
+        dispatch!(self, backend => backend.assign_node_run(template).await)
     }
 
     /// Resolve only the persisted workspace/agent scope, including tombstones.
@@ -389,7 +389,7 @@ impl Store {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<NodeAssignment> {
-        pending_postgres!("get_node_assignment", self, backend => backend.get_node_assignment(agent_id, workspace_id).await)
+        dispatch!(self, backend => backend.get_node_assignment(agent_id, workspace_id).await)
     }
 
     /// Revoke one run after confirmed termination, or permanently tombstone its
@@ -401,7 +401,7 @@ impl Store {
         expected: &NodeAssignment,
         tombstone: bool,
     ) -> Result<()> {
-        pending_postgres!("stop_node_assignment", self, backend => backend.stop_node_assignment(expected, tombstone).await)
+        dispatch!(self, backend => backend.stop_node_assignment(expected, tombstone).await)
     }
 
     /// Check a repository grant without upgrading the caller to daemon authority.
@@ -412,7 +412,7 @@ impl Store {
         expected: &NodeAssignment,
         repo_key: &str,
     ) -> Result<()> {
-        pending_postgres!("authorize_node_repo", self, backend => backend.authorize_node_repo(expected, repo_key).await)
+        dispatch!(self, backend => backend.authorize_node_repo(expected, repo_key).await)
     }
 
     /// Allocate a revision before capture on a store-owning local node. Remote
@@ -423,7 +423,7 @@ impl Store {
         &self,
         expected: &NodeAssignment,
     ) -> Result<NodeCounter> {
-        pending_postgres!("next_node_capture_revision", self, backend => backend.next_node_capture_revision(expected).await)
+        dispatch!(self, backend => backend.next_node_capture_revision(expected).await)
     }
 
     /// Persist metadata ONLY after the caller validates and fsyncs all immutable
@@ -435,7 +435,7 @@ impl Store {
         &self,
         checkpoint: &NodeCheckpoint,
     ) -> Result<CheckpointReceipt> {
-        pending_postgres!("commit_node_checkpoint", self, backend => backend.commit_node_checkpoint(checkpoint).await)
+        dispatch!(self, backend => backend.commit_node_checkpoint(checkpoint).await)
     }
 
     /// Read the last successful checkpoint; it may belong to the previous run
@@ -447,7 +447,7 @@ impl Store {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<NodeCheckpoint>> {
-        pending_postgres!("current_node_checkpoint", self, backend => backend.current_node_checkpoint(agent_id, workspace_id).await)
+        dispatch!(self, backend => backend.current_node_checkpoint(agent_id, workspace_id).await)
     }
 }
 
@@ -895,21 +895,21 @@ impl Store {
     /// Rejects an unknown or terminal lease, an agent already placed
     /// elsewhere, a missing agent or database errors.
     pub async fn record_remote_agent(&self, agent: &RemoteAgentRecord) -> Result<()> {
-        pending_postgres!("record_remote_agent", self, backend => backend.record_remote_agent(agent).await)
+        dispatch!(self, backend => backend.record_remote_agent(agent).await)
     }
 
     /// The agents recorded on `lease_id`, oldest first.
     /// # Errors
     /// Returns database errors.
     pub async fn list_remote_agents(&self, lease_id: &str) -> Result<Vec<RemoteAgentRecord>> {
-        pending_postgres!("list_remote_agents", self, backend => backend.list_remote_agents(lease_id).await)
+        dispatch!(self, backend => backend.list_remote_agents(lease_id).await)
     }
 
     /// Where `agent_id` runs remotely, if it does.
     /// # Errors
     /// Returns database errors.
     pub async fn get_remote_agent(&self, agent_id: &AgentId) -> Result<Option<RemoteAgentRecord>> {
-        pending_postgres!("get_remote_agent", self, backend => backend.get_remote_agent(agent_id).await)
+        dispatch!(self, backend => backend.get_remote_agent(agent_id).await)
     }
 
     /// The remote placements among `agent_ids`, in one statement (agents
@@ -917,14 +917,14 @@ impl Store {
     /// # Errors
     /// Returns database errors.
     pub async fn get_remote_agents(&self, agent_ids: &[AgentId]) -> Result<Vec<RemoteAgentRecord>> {
-        pending_postgres!("get_remote_agents", self, backend => backend.get_remote_agents(agent_ids).await)
+        dispatch!(self, backend => backend.get_remote_agents(agent_ids).await)
     }
 
     /// Forget that `agent_id` runs remotely. Returns whether it was recorded.
     /// # Errors
     /// Returns database errors.
     pub async fn remove_remote_agent(&self, agent_id: &AgentId) -> Result<bool> {
-        pending_postgres!("remove_remote_agent", self, backend => backend.remove_remote_agent(agent_id).await)
+        dispatch!(self, backend => backend.remove_remote_agent(agent_id).await)
     }
 
     /// Record a final stop for `stop.agent_id`, unless one is already
@@ -948,7 +948,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<bool> {
-        pending_postgres!("workspace_has_remote_agent_work", self, backend => backend.workspace_has_remote_agent_work(workspace_id).await)
+        dispatch!(self, backend => backend.workspace_has_remote_agent_work(workspace_id).await)
     }
 
     /// The final stops recorded on `lease_id`, oldest first.
@@ -975,7 +975,7 @@ impl Store {
     /// # Errors
     /// Returns database errors.
     pub async fn finish_final_stop(&self, agent_id: &AgentId, stop_id: &str) -> Result<bool> {
-        pending_postgres!("finish_final_stop", self, backend => backend.finish_final_stop(agent_id, stop_id).await)
+        dispatch!(self, backend => backend.finish_final_stop(agent_id, stop_id).await)
     }
 }
 
@@ -1281,7 +1281,7 @@ fn final_stop_row(row: &sqlx::sqlite::SqliteRow) -> Result<RemoteFinalStopRecord
     })
 }
 
-fn check_assignment(current: &NodeAssignment, expected: &NodeAssignment) -> Result<()> {
+pub(crate) fn check_assignment(current: &NodeAssignment, expected: &NodeAssignment) -> Result<()> {
     if current.agent_id != expected.agent_id
         || current.workspace_id != expected.workspace_id
         || current.owner != expected.owner

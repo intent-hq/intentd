@@ -357,7 +357,7 @@ impl Store {
     pub async fn list_cloud_placed_agents(
         &self,
     ) -> Result<Vec<(intent_core::WorkspaceId, intent_core::AgentId)>> {
-        pending_postgres!("list_cloud_placed_agents", self, backend => backend.list_cloud_placed_agents().await)
+        dispatch!(self, backend => backend.list_cloud_placed_agents().await)
     }
 
     /// Save the settings of cloud machine provider `id`.

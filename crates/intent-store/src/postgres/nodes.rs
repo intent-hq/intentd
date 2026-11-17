@@ -1,4 +1,5 @@
-//! Execution nodes, leases, final stops, node invites and executor
+//! Execution nodes, leases, assignments and checkpoints, remote agents,
+//! final stops, node invites and executor
 //! credentials/bindings/exposed machines (Postgres). Mirrors `node_repo.rs`,
 //! `node_invite_repo.rs` and `executor_repo.rs`; every row belongs to the
 //! store's tenant.
@@ -7,12 +8,13 @@ use intent_core::{
     machines::{CloudMachine, ExecutorCredential, ExposedMachine, RemoteMachineState},
     node_link::{BindDecision, LeaseBinding, MachineCapabilities},
     nodes::{
-        LeaseFence, LeaseFenceKind, LeaseOwner, LeaseState, NodeArch, NodeCounter, NodeLease,
-        NodeOs, NodeRecord, NodeState,
+        CheckpointOutcome, CheckpointReceipt, LeaseFence, LeaseFenceKind, LeaseOwner, LeaseState,
+        NodeArch, NodeAssignment, NodeCheckpoint, NodeCounter, NodeLease, NodeOs, NodeRecord,
+        NodeState,
     },
     now_iso,
     placement::AgentPlatform,
-    remote_launch::{FinalStopReason, RemoteFinalStopRecord},
+    remote_launch::{FinalStopReason, RemoteAgentRecord, RemoteFinalStopRecord},
     AgentId, Error, ExecutorCredentialId, Result, WorkspaceId,
 };
 use sqlx::{postgres::PgRow, PgConnection, Row};
@@ -20,7 +22,9 @@ use sqlx::{postgres::PgRow, PgConnection, Row};
 use super::{db, PgStore, WriteTx};
 use crate::executor_repo::{has_route, resting};
 use crate::node_invite_repo::constant_time_eq;
-use crate::node_repo::{decode, encode, increment, static_only, validate_enrollment};
+use crate::node_repo::{
+    check_assignment, decode, dispatchable, encode, increment, static_only, validate_enrollment,
+};
 use crate::{ExecutorRevocation, NodeInvite, NodeInviteRefusal, NodeInviteRevocation};
 
 fn col<'r, T>(row: &'r PgRow, name: &str) -> Result<T>
@@ -1240,5 +1244,602 @@ impl PgStore {
                 .rows_affected();
         tx.commit().await.map_err(db)?;
         Ok(done > 0)
+    }
+}
+
+fn remote_agent_row(row: &PgRow) -> Result<RemoteAgentRecord> {
+    Ok(RemoteAgentRecord {
+        agent_id: AgentId::from(col::<String>(row, "agent_id")?),
+        workspace_id: WorkspaceId::from(col::<String>(row, "workspace_id")?),
+        node_id: col(row, "node_id")?,
+        lease_id: col(row, "lease_id")?,
+        created_at: col(row, "created_at")?,
+    })
+}
+
+impl PgStore {
+    async fn assignment(
+        &self,
+        conn: &mut PgConnection,
+        agent_id: &AgentId,
+    ) -> Result<Option<NodeAssignment>> {
+        let json: Option<String> = sqlx::query_scalar(
+            "SELECT record_json FROM node_assignment WHERE tenant_id = $1 AND agent_id = $2",
+        )
+        .bind(self.tenant())
+        .bind(agent_id.as_str())
+        .fetch_optional(conn)
+        .await
+        .map_err(db)?;
+        json.as_deref().map(decode).transpose()
+    }
+
+    async fn save_assignment(&self, tx: &mut WriteTx, record: &NodeAssignment) -> Result<()> {
+        sqlx::query(
+            "UPDATE node_assignment SET record_json = $2 WHERE tenant_id = $1 AND agent_id = $3",
+        )
+        .bind(self.tenant())
+        .bind(encode(record)?)
+        .bind(record.agent_id.as_str())
+        .execute(&mut **tx)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    async fn current_checkpoint(
+        &self,
+        conn: &mut PgConnection,
+        agent_id: &AgentId,
+    ) -> Result<Option<NodeCheckpoint>> {
+        let json: Option<String> = sqlx::query_scalar(
+            "SELECT c.record_json FROM node_assignment a \
+             JOIN node_checkpoint c ON c.tenant_id = $1 AND c.id = a.current_checkpoint_id \
+             WHERE a.tenant_id = $1 AND a.agent_id = $2",
+        )
+        .bind(self.tenant())
+        .bind(agent_id.as_str())
+        .fetch_optional(conn)
+        .await
+        .map_err(db)?;
+        json.as_deref().map(decode).transpose()
+    }
+
+    pub async fn finish_node_lease(
+        &self,
+        owner: &LeaseOwner,
+        terminal: LeaseState,
+        fence: LeaseFence,
+    ) -> Result<NodeLease> {
+        if !terminal.is_terminal() || fence.recorded_at.is_empty() {
+            return Err(invalid("terminal lease requires fence evidence"));
+        }
+        let mut tx = self.begin_write().await?;
+        let mut record = self.lease(&mut tx, owner).await?;
+        let mut host = self.node(&mut tx, &owner.node_id, &owner.head_id).await?;
+        static_only(&host)?;
+        if record.state.is_terminal() {
+            return Ok(record);
+        }
+        if !record.state.can_transition_to(terminal)
+            || (terminal == LeaseState::Released && !record.release_requested)
+        {
+            return Err(invalid("release must be requested before completion"));
+        }
+        record.state = terminal;
+        record.fence = Some(fence);
+        host.draining = true;
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT record_json FROM node_assignment WHERE tenant_id = $1 AND lease_id = $2 \
+             ORDER BY row_seq",
+        )
+        .bind(self.tenant())
+        .bind(&owner.lease_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        for json in rows {
+            let mut placed: NodeAssignment = decode(&json)?;
+            placed.active = false;
+            self.save_assignment(&mut tx, &placed).await?;
+        }
+        host.capacity.reserved_agents = 0;
+        host.capacity.exclusive_reserved = false;
+        self.save_node(&mut tx, &host).await?;
+        self.save_lease(&mut tx, &record).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(record)
+    }
+
+    pub async fn assign_node_run(&self, template: &NodeAssignment) -> Result<NodeAssignment> {
+        let mut tx = self.begin_write().await?;
+        let current_lease = self.lease(&mut tx, &template.owner).await?;
+        dispatchable(&current_lease)?;
+        let host = self
+            .node(&mut tx, &template.owner.node_id, &template.owner.head_id)
+            .await?;
+        if host.draining
+            || host.state != NodeState::Ready
+            || uuid::Uuid::parse_str(&template.run_id).is_err()
+        {
+            return Err(invalid("node unavailable or invalid run"));
+        }
+        let workspace: Option<String> = sqlx::query_scalar(
+            "SELECT workspace_id FROM agent_session WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(self.tenant())
+        .bind(template.agent_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if workspace.as_deref() != Some(template.workspace_id.as_str()) {
+            return Err(Error::NotFound("agent workspace".into()));
+        }
+        let old = self.assignment(&mut tx, &template.agent_id).await?;
+        let mut admitted = template.clone();
+        admitted.active = true;
+        admitted.tombstoned = false;
+        admitted.assignment_epoch = NodeCounter(1);
+        if let Some(old) = old {
+            if old.tombstoned
+                || old.workspace_id != template.workspace_id
+                || old.owner.head_id != template.owner.head_id
+            {
+                return Err(invalid("assignment ownership is tombstoned or mismatched"));
+            }
+            if old.merge_target_agent_id != template.merge_target_agent_id
+                || old.inherited_checkpoint_id != template.inherited_checkpoint_id
+            {
+                return Err(invalid(
+                    "reassignment cannot replace inherited baseline or merge target",
+                ));
+            }
+            if old.run_id == template.run_id {
+                admitted.assignment_epoch = old.assignment_epoch;
+                if old != admitted {
+                    return Err(invalid("run identity reused"));
+                }
+                return Ok(old);
+            }
+            if old.active {
+                return Err(invalid("previous run must be stopped before reassignment"));
+            }
+            admitted.assignment_epoch = increment(old.assignment_epoch)?;
+        }
+        if let Some(baseline) = &admitted.inherited_checkpoint_id {
+            let json: Option<String> = sqlx::query_scalar(
+                "SELECT record_json FROM node_checkpoint WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(self.tenant())
+            .bind(baseline)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+            let checkpoint: NodeCheckpoint =
+                decode(&json.ok_or_else(|| Error::NotFound("inherited checkpoint".into()))?)?;
+            if checkpoint.workspace_id != admitted.workspace_id
+                || Some(&checkpoint.agent_id) != admitted.merge_target_agent_id.as_ref()
+            {
+                return Err(Error::NotFound("inherited checkpoint owner".into()));
+            }
+        }
+        sqlx::query(
+            "INSERT INTO node_assignment (tenant_id, agent_id, workspace_id, lease_id, record_json) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (tenant_id, agent_id) DO UPDATE SET lease_id = excluded.lease_id, \
+             record_json = excluded.record_json, capture_revision = '0'",
+        )
+        .bind(self.tenant())
+        .bind(admitted.agent_id.as_str())
+        .bind(admitted.workspace_id.as_str())
+        .bind(&admitted.owner.lease_id)
+        .bind(encode(&admitted)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(admitted)
+    }
+
+    pub async fn get_node_assignment(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<NodeAssignment> {
+        let mut tx = self.begin().await?;
+        let record = self.assignment(&mut tx, agent_id).await?;
+        tx.commit().await.map_err(db)?;
+        let record = record.ok_or_else(|| Error::NotFound("assignment".into()))?;
+        if record.workspace_id != *workspace_id {
+            return Err(Error::NotFound("assignment workspace".into()));
+        }
+        Ok(record)
+    }
+
+    pub async fn stop_node_assignment(
+        &self,
+        expected: &NodeAssignment,
+        tombstone: bool,
+    ) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        self.lease(&mut tx, &expected.owner).await?;
+        let mut record = self
+            .assignment(&mut tx, &expected.agent_id)
+            .await?
+            .ok_or_else(|| Error::NotFound("assignment".into()))?;
+        check_assignment(&record, expected)?;
+        record.active = false;
+        record.tombstoned |= tombstone;
+        self.save_assignment(&mut tx, &record).await?;
+        tx.commit().await.map_err(db)
+    }
+
+    pub async fn authorize_node_repo(
+        &self,
+        expected: &NodeAssignment,
+        repo_key: &str,
+    ) -> Result<()> {
+        let mut tx = self.begin().await?;
+        let current_lease = self.lease(&mut tx, &expected.owner).await?;
+        dispatchable(&current_lease)?;
+        let current = self
+            .assignment(&mut tx, &expected.agent_id)
+            .await?
+            .ok_or_else(|| Error::NotFound("assignment".into()))?;
+        tx.commit().await.map_err(db)?;
+        check_assignment(&current, expected)?;
+        if !current.active
+            || current.tombstoned
+            || !current.repo_keys.iter().any(|key| key == repo_key)
+        {
+            return Err(Error::NotFound("repository grant".into()));
+        }
+        Ok(())
+    }
+
+    pub async fn next_node_capture_revision(
+        &self,
+        expected: &NodeAssignment,
+    ) -> Result<NodeCounter> {
+        let mut tx = self.begin_write().await?;
+        dispatchable(&self.lease(&mut tx, &expected.owner).await?)?;
+        let current = self
+            .assignment(&mut tx, &expected.agent_id)
+            .await?
+            .ok_or_else(|| Error::NotFound("assignment".into()))?;
+        check_assignment(&current, expected)?;
+        if !current.active || current.tombstoned {
+            return Err(invalid("inactive assignment"));
+        }
+        let value: String = sqlx::query_scalar(
+            "SELECT capture_revision FROM node_assignment WHERE tenant_id = $1 AND agent_id = $2",
+        )
+        .bind(self.tenant())
+        .bind(expected.agent_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        let next = increment(NodeCounter(value.parse().map_err(db)?))?;
+        sqlx::query(
+            "UPDATE node_assignment SET capture_revision = $2 WHERE tenant_id = $1 AND agent_id = $3",
+        )
+        .bind(self.tenant())
+        .bind(next.0.to_string())
+        .bind(expected.agent_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(next)
+    }
+
+    pub async fn commit_node_checkpoint(
+        &self,
+        checkpoint: &NodeCheckpoint,
+    ) -> Result<CheckpointReceipt> {
+        if checkpoint.capture_revision == NodeCounter(0)
+            || uuid::Uuid::parse_str(&checkpoint.id).is_err()
+            || checkpoint.manifest_sha256.len() != 64
+            || !checkpoint
+                .manifest_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(invalid("checkpoint-invalid"));
+        }
+        let mut tx = self.begin_write().await?;
+        let owned_lease = self.lease(&mut tx, &checkpoint.owner).await?;
+        let existing = sqlx::query(
+            "SELECT record_json, receipt_json FROM node_checkpoint WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(self.tenant())
+        .bind(&checkpoint.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if let Some(row) = existing {
+            let stored: NodeCheckpoint = decode(&col::<String>(&row, "record_json")?)?;
+            let mut retry = checkpoint.clone();
+            retry.committed_at.clone_from(&stored.committed_at);
+            if stored != retry {
+                return Err(invalid("checkpoint-invalid: UUID reused"));
+            }
+            return decode(&col::<String>(&row, "receipt_json")?);
+        }
+        dispatchable(&owned_lease)?;
+        let assigned = self
+            .assignment(&mut tx, &checkpoint.agent_id)
+            .await?
+            .ok_or_else(|| invalid("stale-checkpoint-owner"))?;
+        if !assigned.active
+            || assigned.tombstoned
+            || assigned.owner != checkpoint.owner
+            || assigned.workspace_id != checkpoint.workspace_id
+            || assigned.run_id != checkpoint.run_id
+            || assigned.assignment_epoch != checkpoint.assignment_epoch
+        {
+            return Err(invalid("stale-checkpoint-owner"));
+        }
+        if checkpoint.journal_seq > owned_lease.ack_seq {
+            return Err(invalid("checkpoint cut is not acknowledged"));
+        }
+        let pair_used: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM node_checkpoint WHERE tenant_id = $1 AND agent_id = $2 \
+             AND assignment_epoch = $3 AND capture_revision = $4)",
+        )
+        .bind(self.tenant())
+        .bind(checkpoint.agent_id.as_str())
+        .bind(checkpoint.assignment_epoch.0.to_string())
+        .bind(checkpoint.capture_revision.0.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        if pair_used {
+            return Err(invalid("checkpoint-invalid: capture revision reused"));
+        }
+        let previous = self
+            .current_checkpoint(&mut tx, &checkpoint.agent_id)
+            .await?;
+        let advanced = previous.as_ref().is_none_or(|p| {
+            (checkpoint.assignment_epoch, checkpoint.capture_revision)
+                > (p.assignment_epoch, p.capture_revision)
+        });
+        let receipt = CheckpointReceipt {
+            checkpoint_id: checkpoint.id.clone(),
+            outcome: if advanced {
+                CheckpointOutcome::Advanced
+            } else {
+                CheckpointOutcome::Historical
+            },
+            current_checkpoint_id: if advanced {
+                checkpoint.id.clone()
+            } else {
+                previous.map_or_else(|| checkpoint.id.clone(), |p| p.id)
+            },
+        };
+        let mut stored = checkpoint.clone();
+        stored.committed_at = now_iso();
+        sqlx::query(
+            "INSERT INTO node_checkpoint (tenant_id, id, agent_id, assignment_epoch, \
+             capture_revision, record_json, receipt_json) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(self.tenant())
+        .bind(&stored.id)
+        .bind(stored.agent_id.as_str())
+        .bind(stored.assignment_epoch.0.to_string())
+        .bind(stored.capture_revision.0.to_string())
+        .bind(encode(&stored)?)
+        .bind(encode(&receipt)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        if advanced {
+            sqlx::query(
+                "UPDATE node_assignment SET current_checkpoint_id = $2 \
+                 WHERE tenant_id = $1 AND agent_id = $3",
+            )
+            .bind(self.tenant())
+            .bind(&stored.id)
+            .bind(stored.agent_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(receipt)
+    }
+
+    pub async fn current_node_checkpoint(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<NodeCheckpoint>> {
+        let mut tx = self.begin().await?;
+        let record = self
+            .assignment(&mut tx, agent_id)
+            .await?
+            .ok_or_else(|| Error::NotFound("assignment".into()))?;
+        if record.workspace_id != *workspace_id {
+            return Err(Error::NotFound("assignment workspace".into()));
+        }
+        let current = self.current_checkpoint(&mut tx, agent_id).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(current)
+    }
+}
+
+const REMOTE_AGENT_COLUMNS: &str = "agent_id, workspace_id, node_id, lease_id, created_at";
+
+impl PgStore {
+    pub async fn record_remote_agent(&self, agent: &RemoteAgentRecord) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let row = sqlx::query(
+            "SELECT node_id, terminal FROM node_lease WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(self.tenant())
+        .bind(&agent.lease_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?
+        .ok_or_else(|| Error::NotFound("lease".into()))?;
+        if col::<String>(&row, "node_id")? != agent.node_id || col::<i64>(&row, "terminal")? != 0 {
+            return Err(invalid("lease does not admit agents on this node"));
+        }
+        let existing = sqlx::query(
+            "SELECT node_id, lease_id FROM remote_agent WHERE tenant_id = $1 AND agent_id = $2",
+        )
+        .bind(self.tenant())
+        .bind(agent.agent_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if let Some(existing) = existing {
+            if col::<String>(&existing, "node_id")? == agent.node_id
+                && col::<String>(&existing, "lease_id")? == agent.lease_id
+            {
+                return Ok(());
+            }
+            return Err(invalid("agent already runs on another lease"));
+        }
+        sqlx::query(
+            "INSERT INTO remote_agent (tenant_id, agent_id, workspace_id, node_id, lease_id, \
+             created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(self.tenant())
+        .bind(agent.agent_id.as_str())
+        .bind(agent.workspace_id.as_str())
+        .bind(&agent.node_id)
+        .bind(&agent.lease_id)
+        .bind(&agent.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
+    pub async fn list_remote_agents(&self, lease_id: &str) -> Result<Vec<RemoteAgentRecord>> {
+        let mut tx = self.begin().await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {REMOTE_AGENT_COLUMNS} FROM remote_agent \
+             WHERE tenant_id = $1 AND lease_id = $2 \
+             ORDER BY created_at COLLATE \"C\", agent_id COLLATE \"C\""
+        )))
+        .bind(self.tenant())
+        .bind(lease_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        rows.iter().map(remote_agent_row).collect()
+    }
+
+    pub async fn get_remote_agent(&self, agent_id: &AgentId) -> Result<Option<RemoteAgentRecord>> {
+        let mut tx = self.begin().await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {REMOTE_AGENT_COLUMNS} FROM remote_agent WHERE tenant_id = $1 AND agent_id = $2"
+        )))
+        .bind(self.tenant())
+        .bind(agent_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        row.as_ref().map(remote_agent_row).transpose()
+    }
+
+    pub async fn get_remote_agents(&self, agent_ids: &[AgentId]) -> Result<Vec<RemoteAgentRecord>> {
+        if agent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<&str> = agent_ids.iter().map(AgentId::as_str).collect();
+        let mut tx = self.begin().await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {REMOTE_AGENT_COLUMNS} FROM remote_agent \
+             WHERE tenant_id = $1 AND agent_id = ANY($2) \
+             ORDER BY created_at COLLATE \"C\", agent_id COLLATE \"C\""
+        )))
+        .bind(self.tenant())
+        .bind(ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        rows.iter().map(remote_agent_row).collect()
+    }
+
+    pub async fn remove_remote_agent(&self, agent_id: &AgentId) -> Result<bool> {
+        let mut tx = self.begin_write().await?;
+        let done = sqlx::query("DELETE FROM remote_agent WHERE tenant_id = $1 AND agent_id = $2")
+            .bind(self.tenant())
+            .bind(agent_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        tx.commit().await.map_err(db)?;
+        Ok(done > 0)
+    }
+
+    pub async fn workspace_has_remote_agent_work(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<bool> {
+        let mut tx = self.begin().await?;
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM remote_agent WHERE tenant_id = $1 AND workspace_id = $2) \
+             OR EXISTS (SELECT 1 FROM remote_final_stop WHERE tenant_id = $1 AND workspace_id = $2)",
+        )
+        .bind(self.tenant())
+        .bind(workspace_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(pending)
+    }
+
+    pub async fn finish_final_stop(&self, agent_id: &AgentId, stop_id: &str) -> Result<bool> {
+        let mut tx = self.begin_write().await?;
+        let reason: Option<String> = sqlx::query_scalar(
+            "DELETE FROM remote_final_stop WHERE tenant_id = $1 AND agent_id = $2 AND stop_id = $3 \
+             RETURNING reason",
+        )
+        .bind(self.tenant())
+        .bind(agent_id.as_str())
+        .bind(stop_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let Some(reason) = reason else {
+            return Ok(false);
+        };
+        if !FinalStopReason::parse(&reason).is_some_and(FinalStopReason::keeps_placement) {
+            sqlx::query("DELETE FROM remote_agent WHERE tenant_id = $1 AND agent_id = $2")
+                .bind(self.tenant())
+                .bind(agent_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
+    pub async fn list_cloud_placed_agents(&self) -> Result<Vec<(WorkspaceId, AgentId)>> {
+        let mut tx = self.begin().await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT workspace_id, id FROM agent_session WHERE tenant_id = $1 \
+             AND sqlite_json_extract(metadata, '$.remotePlacement.placement.target') = 'e2b' \
+             ORDER BY row_seq",
+        )
+        .bind(self.tenant())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|(workspace, agent)| (WorkspaceId::from(workspace), AgentId::from(agent)))
+            .collect())
     }
 }
