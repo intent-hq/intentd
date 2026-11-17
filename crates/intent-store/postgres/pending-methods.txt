@@ -3,8 +3,6 @@
 abort_home_move
 accept_script_notification
 activate_incremental_vacuum
-active_hook_metadata_by_agent
-active_hook_metadata_by_workspace
 add_usage_rate
 add_usage_stats
 add_workspace_collaborator_within_cap
@@ -31,8 +29,6 @@ complete_pr_monitor
 complete_script_notification
 consume_repository_initialization_confirmation
 continue_script_notification
-count_active_hooks_by_agent
-count_active_hooks_by_workspace
 count_open_workspace_invites
 count_principals
 count_workspace_guests
@@ -70,7 +66,6 @@ effective_principal_workspace_ids
 ensure_client
 events_by_type
 events_by_workspace
-expire_hook
 find_active_pr_monitor
 find_active_pr_monitor_in_workspace
 find_active_qualified_pr_monitor
@@ -88,7 +83,6 @@ get_client
 get_device_principals
 get_home_move
 get_home_stop
-get_hook
 get_host_invite
 get_host_role
 get_idempotent
@@ -120,7 +114,6 @@ insert_attachment
 insert_attachment_with_idempotency_key
 insert_event
 insert_events
-insert_hook
 insert_host_invite
 insert_pr_monitor
 insert_principal_credential
@@ -149,10 +142,6 @@ list_effective_workspace_members
 list_event_subscriptions
 list_home_moves
 list_home_stops
-list_hook_rows
-list_hook_rows_page
-list_hooks_by_agent
-list_hooks_by_workspace
 list_host_members
 list_known_repos
 list_mcp_oauth_server_ids
@@ -176,7 +165,6 @@ list_workspace_members
 list_workspace_metrics
 list_workspaces_with_undelivered_groups
 list_workspaces_with_working_tracked_changes
-load_active_hooks
 load_active_pr_monitors
 load_active_qualified_pr_monitors
 load_all_stop_redeliveries
@@ -207,7 +195,6 @@ reassign_browser_tab_host
 reassign_browser_tabs_from_hosts
 reassign_claimed_browser_tabs
 record_home_stop
-record_hook_dispatch
 redeem_workspace_invite
 remove_browser_tab
 remove_cloud_machine
@@ -263,12 +250,6 @@ transfer_table_stats
 unclaimed_home_sandboxes
 ungroup_completion_watch
 update_completion_watch_parent
-update_hook_last_error
-update_hook_last_logs
-update_hook_last_state
-update_hook_next_run
-update_hook_run
-update_hook_state
 update_pr_monitor_poll
 update_pr_monitor_state
 update_workspace_token_usage
@@ -284,7 +265,6 @@ upsert_principal
 upsert_tracked_change
 upsert_workspace_metrics
 workspace_membership_summaries
-workspaces_with_active_hooks
 workspaces_with_active_hooks_or_script_monitors
 write_pool
 write_repository_selection
