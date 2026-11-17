@@ -19,6 +19,7 @@ use sqlx::Transaction;
 pub use sqlx::postgres::PgPool;
 
 mod settings;
+mod workspaces;
 
 /// Postgres schema migrations, separate from the `SQLite` ones.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./postgres/migrations");

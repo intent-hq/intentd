@@ -23,7 +23,7 @@ impl PgStore {
     }
 
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO settings (tenant_id, key, value) VALUES ($1, $2, $3) \
              ON CONFLICT (tenant_id, key) DO UPDATE SET value = excluded.value",
@@ -38,7 +38,7 @@ impl PgStore {
     }
 
     pub async fn delete_setting(&self, key: &str) -> Result<bool> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let removed = sqlx::query("DELETE FROM settings WHERE tenant_id = $1 AND key = $2")
             .bind(self.tenant())
             .bind(key)

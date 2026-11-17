@@ -16,6 +16,8 @@
 mod harness;
 #[path = "postgres_backend/settings.rs"]
 mod settings;
+#[path = "postgres_backend/workspaces.rs"]
+mod workspaces;
 
 use harness::{open, open_with, test_db};
 use intent_store::postgres::TenantId;
@@ -137,12 +139,12 @@ async fn an_unported_method_reports_an_error_instead_of_touching_sqlite() {
     };
     let a = open(&db, "tenant-a").await;
     let err = a
-        .list_workspaces(intent_core::WorkspaceListFilter::default())
+        .delete_workspace(&intent_core::WorkspaceId("ws-1".into()))
         .await
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("list_workspaces is not yet supported on the Postgres store"),
+        err.contains("delete_workspace is not yet supported on the Postgres store"),
         "{err}"
     );
 }
