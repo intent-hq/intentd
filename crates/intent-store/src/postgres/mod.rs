@@ -26,6 +26,7 @@ mod hooks;
 mod nodes;
 mod note_search;
 mod notes;
+mod script_monitors;
 mod scripts;
 mod settings;
 mod workspaces;
