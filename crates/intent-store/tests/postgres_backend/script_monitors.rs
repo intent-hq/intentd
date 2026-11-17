@@ -3,7 +3,9 @@
 //!
 //! Decoy rule: each body ends by giving the decoy rows with the ids the
 //! subject reads, probes as absent or writes, in their pre-write state
-//! (active monitors, pending jobs, a pending admission and its queue copy).
+//! (active monitors, pending jobs, and admissions with their queue copies:
+//! `m1` accepted, which every non-completed admission filter reaches, and
+//! `m2` completed, which only the completed-notification cleanup reaches).
 //! Script names and payloads carry the tenant, so a leaked row never looks
 //! right.
 
@@ -15,7 +17,7 @@ use intent_core::{
 use intent_store::{AgentQueueRow, Store};
 use serde_json::{json, Value};
 
-use crate::harness::parity_test;
+use crate::harness::{parity_test, TestDb};
 
 const T0: &str = "2026-01-01T00:00:00.000Z";
 const T1: &str = "2026-01-02T00:00:00.000Z";
@@ -144,11 +146,15 @@ async fn settle(store: &Store, ids: &[&str], tenant: &str) {
 }
 
 /// Leave the decoy with active `m1`–`m3` and `m-gone`, pending jobs for
-/// `m1`–`m3`, and pending admissions (with queue copies) for `m1` and `m2`.
-async fn decoy_rows(store: &Store, tenant: &str) {
+/// `m1`–`m3`, an accepted admission for `m1` (reached by an unscoped
+/// `continue_script_notification`) and a completed admission for `m2`
+/// (reached by an unscoped `cleanup_completed_script_notifications` while
+/// the subject has `m2` queued), each with its queue copy.
+async fn decoy_rows(store: &Store, tenant: &str, db: Option<&TestDb>) {
     if tenant != "decoy" {
         return;
     }
+    let db = db.expect("the decoy tenant runs only on Postgres");
     store
         .suppress_script_notifications(&wid("ws-m"), None)
         .await
@@ -171,6 +177,21 @@ async fn decoy_rows(store: &Store, tenant: &str) {
             .await
             .unwrap());
     }
+    assert!(store
+        .accept_script_notification(&aid("agent-a"), "m1")
+        .await
+        .unwrap());
+    // `complete_script_notification` sweeps completed rows straight away, so
+    // only SQL can leave one behind; keep its queue copy for the sweep's
+    // queue DELETE.
+    let done = sqlx::query(
+        "UPDATE agent_queue_admission SET phase = 'completed', payload = '{}' \
+         WHERE tenant_id = 'decoy' AND id = 'script-monitor:m2'",
+    )
+    .execute(&db.admin)
+    .await
+    .unwrap();
+    assert_eq!(done.rows_affected(), 1);
     insert(store, &["m1", "m2", "m3"], tenant).await;
     settle(store, &["m1", "m2", "m3"], tenant).await;
     insert(store, &["m1", "m2", "m3", "m-gone"], tenant).await;
@@ -372,7 +393,7 @@ parity_test!(
 
 parity_test!(
     script_monitor_settle_jobs_and_wake_fences,
-    |store, tenant| {
+    |store, tenant, db| {
         let (wm, wn) = (wid("ws-m"), wid("ws-n"));
         let (a, b, c) = (aid("agent-a"), aid("agent-b"), aid("agent-c"));
         seed(&store, tenant).await;
@@ -461,122 +482,134 @@ parity_test!(
             ["m3"]
         );
 
-        decoy_rows(&store, tenant).await;
+        decoy_rows(&store, tenant, db).await;
     }
 );
 
-parity_test!(script_notification_admission_lifecycle, |store, tenant| {
-    let (wm, wn) = (wid("ws-m"), wid("ws-n"));
-    let (a, b) = (aid("agent-a"), aid("agent-b"));
-    seed(&store, tenant).await;
-    assert!(store
-        .script_notification_delivery_owners()
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(store.load_all_agent_queues().await.unwrap().is_empty());
-    insert(&store, &["m1", "m2", "m3"], tenant).await;
-    settle(&store, &["m1", "m2", "m3"], tenant).await;
-
-    let q1 = queue(&monitor("m1", tenant), tenant);
-    let q2 = queue(&monitor("m2", tenant), tenant);
-    assert!(
-        !store
-            .admit_script_notification(&AgentQueueRow {
-                agent_id: a.clone(),
-                ..q2.clone()
-            })
+parity_test!(
+    script_notification_admission_lifecycle,
+    |store, tenant, db| {
+        let (wm, wn) = (wid("ws-m"), wid("ws-n"));
+        let (a, b) = (aid("agent-a"), aid("agent-b"));
+        seed(&store, tenant).await;
+        assert!(store
+            .script_notification_delivery_owners()
             .await
-            .unwrap(),
-        "a job admits only to its owner"
-    );
-    assert!(store.admit_script_notification(&q1).await.unwrap());
-    assert!(!store.admit_script_notification(&q1).await.unwrap());
-    let queued = store.load_all_agent_queues().await.unwrap();
-    assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].id, "script-monitor:m1");
-    assert_eq!(queued[0].payload, q1.payload);
-    let wakes: Vec<String> = store
-        .script_notification_jobs()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|j| j.wake_id)
-        .collect();
-    assert_eq!(wakes, ["script-monitor:m2", "script-monitor:m3"]);
-    assert!(!store.script_monitor_wake_pending("m1").await.unwrap());
-    assert!(store.script_monitor_wake_allowed("m1").await.unwrap());
-    assert!(store
-        .script_monitor_wake_allowed_for_agent("m1", &a, &wm)
-        .await
-        .unwrap());
-    assert_eq!(
-        store.script_notification_delivery_owners().await.unwrap(),
-        [(a.clone(), wm.clone())]
-    );
-    assert_eq!(store.script_monitor_reservations(&wm).await.unwrap(), 1);
+            .unwrap()
+            .is_empty());
+        assert!(store.load_all_agent_queues().await.unwrap().is_empty());
+        insert(&store, &["m1", "m2", "m3"], tenant).await;
+        settle(&store, &["m1", "m2", "m3"], tenant).await;
 
-    assert!(!store.accept_script_notification(&b, "m1").await.unwrap());
-    assert!(store.accept_script_notification(&a, "m1").await.unwrap());
-    assert!(store.accept_script_notification(&a, "m1").await.unwrap());
-    let content = format!("content of {tenant}");
-    store
-        .continue_script_notification(&b, "m1", "turn-x", "x")
-        .await
-        .unwrap();
-    store
-        .continue_script_notification(&a, "m1", "turn-2", &content)
-        .await
-        .unwrap();
-    let queued = store.load_all_agent_queues().await.unwrap();
-    assert_eq!(queued[0].turn_id, "turn-2");
-    let mut expect = q1.payload.clone();
-    expect["turnId"] = json!("turn-2");
-    expect["content"] = json!(content);
-    expect["persisted"] = json!(true);
-    assert_eq!(queued[0].payload, expect);
+        let q1 = queue(&monitor("m1", tenant), tenant);
+        let q2 = queue(&monitor("m2", tenant), tenant);
+        assert!(
+            !store
+                .admit_script_notification(&AgentQueueRow {
+                    agent_id: a.clone(),
+                    ..q2.clone()
+                })
+                .await
+                .unwrap(),
+            "a job admits only to its owner"
+        );
+        assert!(store.admit_script_notification(&q1).await.unwrap());
+        assert!(!store.admit_script_notification(&q1).await.unwrap());
+        let queued = store.load_all_agent_queues().await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, "script-monitor:m1");
+        assert_eq!(queued[0].payload, q1.payload);
+        let wakes: Vec<String> = store
+            .script_notification_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|j| j.wake_id)
+            .collect();
+        assert_eq!(wakes, ["script-monitor:m2", "script-monitor:m3"]);
+        assert!(!store.script_monitor_wake_pending("m1").await.unwrap());
+        assert!(store.script_monitor_wake_allowed("m1").await.unwrap());
+        assert!(store
+            .script_monitor_wake_allowed_for_agent("m1", &a, &wm)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.script_notification_delivery_owners().await.unwrap(),
+            [(a.clone(), wm.clone())]
+        );
+        assert_eq!(store.script_monitor_reservations(&wm).await.unwrap(), 1);
 
-    store.complete_script_notification(&a, "m1").await.unwrap();
-    assert!(!store.script_monitor_wake_allowed("m1").await.unwrap());
-    assert!(!store.accept_script_notification(&a, "m1").await.unwrap());
-    assert!(store.load_all_agent_queues().await.unwrap().is_empty());
-    assert!(store
-        .script_notification_delivery_owners()
-        .await
-        .unwrap()
-        .is_empty());
-    store
-        .cleanup_completed_script_notifications()
-        .await
-        .unwrap();
+        assert!(!store.accept_script_notification(&b, "m1").await.unwrap());
+        assert!(store.accept_script_notification(&a, "m1").await.unwrap());
+        assert!(store.accept_script_notification(&a, "m1").await.unwrap());
+        let content = format!("content of {tenant}");
+        store
+            .continue_script_notification(&b, "m1", "turn-x", "x")
+            .await
+            .unwrap();
+        store
+            .continue_script_notification(&a, "m1", "turn-2", &content)
+            .await
+            .unwrap();
+        let queued = store.load_all_agent_queues().await.unwrap();
+        assert_eq!(queued[0].turn_id, "turn-2");
+        let mut expect = q1.payload.clone();
+        expect["turnId"] = json!("turn-2");
+        expect["content"] = json!(content);
+        expect["persisted"] = json!(true);
+        assert_eq!(queued[0].payload, expect);
 
-    assert!(store.admit_script_notification(&q2).await.unwrap());
-    assert_eq!(
-        store.script_notification_owners(&wm, None).await.unwrap(),
-        std::slice::from_ref(&b)
-    );
-    store
-        .suppress_script_notifications(&wm, Some(&a))
-        .await
-        .unwrap();
-    assert!(store.script_monitor_wake_allowed("m2").await.unwrap());
-    store
-        .suppress_script_notifications(&wm, Some(&b))
-        .await
-        .unwrap();
-    assert!(!store.script_monitor_wake_allowed("m2").await.unwrap());
-    assert!(store.load_all_agent_queues().await.unwrap().is_empty());
-    assert!(store.script_monitor_wake_pending("m3").await.unwrap());
-    store
-        .suppress_script_notifications(&wn, None)
-        .await
-        .unwrap();
-    assert!(store.script_notification_jobs().await.unwrap().is_empty());
-    assert!(store
-        .script_notification_owners(&wm, None)
-        .await
-        .unwrap()
-        .is_empty());
+        store.complete_script_notification(&a, "m1").await.unwrap();
+        assert!(!store.script_monitor_wake_allowed("m1").await.unwrap());
+        assert!(!store.accept_script_notification(&a, "m1").await.unwrap());
+        assert!(store.load_all_agent_queues().await.unwrap().is_empty());
+        assert!(store
+            .script_notification_delivery_owners()
+            .await
+            .unwrap()
+            .is_empty());
+        store
+            .cleanup_completed_script_notifications()
+            .await
+            .unwrap();
 
-    decoy_rows(&store, tenant).await;
-});
+        assert!(store.admit_script_notification(&q2).await.unwrap());
+        store
+            .cleanup_completed_script_notifications()
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_all_agent_queues().await.unwrap()[0].id,
+            "script-monitor:m2",
+            "cleanup leaves a pending admission's queue copy"
+        );
+        assert_eq!(
+            store.script_notification_owners(&wm, None).await.unwrap(),
+            std::slice::from_ref(&b)
+        );
+        store
+            .suppress_script_notifications(&wm, Some(&a))
+            .await
+            .unwrap();
+        assert!(store.script_monitor_wake_allowed("m2").await.unwrap());
+        store
+            .suppress_script_notifications(&wm, Some(&b))
+            .await
+            .unwrap();
+        assert!(!store.script_monitor_wake_allowed("m2").await.unwrap());
+        assert!(store.load_all_agent_queues().await.unwrap().is_empty());
+        assert!(store.script_monitor_wake_pending("m3").await.unwrap());
+        store
+            .suppress_script_notifications(&wn, None)
+            .await
+            .unwrap();
+        assert!(store.script_notification_jobs().await.unwrap().is_empty());
+        assert!(store
+            .script_notification_owners(&wm, None)
+            .await
+            .unwrap()
+            .is_empty());
+
+        decoy_rows(&store, tenant, db).await;
+    }
+);
