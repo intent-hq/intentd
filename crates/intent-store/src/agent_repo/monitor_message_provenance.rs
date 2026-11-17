@@ -15,7 +15,7 @@ pub struct MonitorMessageProvenance {
     pub envelope_sha256: [u8; 32],
 }
 
-pub(super) fn envelope_digest(
+pub(crate) fn envelope_digest(
     message: &AgentMessage,
     workspace: &WorkspaceId,
     binding: &ReviewMonitorBinding,
@@ -66,7 +66,7 @@ impl Store {
         agent: &AgentId,
         message_id: &str,
     ) -> Result<Option<MonitorMessageProvenance>> {
-        pending_postgres!("get_monitor_message_provenance", self, backend => backend.get_monitor_message_provenance(agent, message_id).await)
+        dispatch!(self, backend => backend.get_monitor_message_provenance(agent, message_id).await)
     }
 }
 

@@ -18,6 +18,7 @@ use sqlx::Transaction;
 
 pub use sqlx::postgres::PgPool;
 
+mod agent_messages;
 mod comments;
 mod discussions;
 mod note_search;

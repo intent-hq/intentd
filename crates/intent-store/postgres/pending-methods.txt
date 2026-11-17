@@ -14,14 +14,7 @@ admit_script_notification
 admit_script_run
 adopt_pr_monitor
 advance_node_lease_ack
-agent_has_assistant_after_last_user
-agent_has_assistant_message
 annotate_active_pr_monitors_pause
-append_agent_message
-append_agent_message_prestaged
-append_agent_message_with_id
-append_agent_message_with_metadata
-append_agent_message_with_provenance
 archive_workspace_detaching_guests
 archive_workspace_detaching_guests_unless_auto_archive_disabled
 assign_node_run
@@ -50,7 +43,6 @@ clear_stop_redeliveries
 clear_stop_redelivery
 close_browser_tab
 commit_node_checkpoint
-compact_tool_payloads_before
 complete_home_move
 complete_pr_monitor
 complete_script_notification
@@ -58,7 +50,6 @@ consume_repository_initialization_confirmation
 continue_script_notification
 count_active_hooks_by_agent
 count_active_hooks_by_workspace
-count_agent_messages
 count_agent_sessions_by_scope
 count_child_agents
 count_delegated_agent_sessions_by_parent
@@ -81,7 +72,6 @@ delete_event_subscriptions_for_agent
 delete_event_subscriptions_for_workspace
 delete_home_stops_on_machine
 delete_mcp_oauth_token
-delete_prestaged_agent_message_payloads
 delete_task_agent_link
 delete_tool_call_events_before
 delete_unchanged_working_tracked_changes
@@ -125,22 +115,9 @@ finish_home_stop
 finish_node_lease
 finish_script_monitor_wake
 freelist_count
-get_active_agent_session_message_projections
 get_active_script
-get_agent_history_batch
-get_agent_message_by_id
-get_agent_message_by_id_with_pruned
-get_agent_message_index
-get_agent_message_thumbnails
-get_agent_messages
-get_agent_messages_for_replay
-get_agent_messages_page
-get_agent_messages_page_as_stored
 get_agent_session_last_turn_effort
 get_agent_session_last_turn_model
-get_agent_session_message_projection
-get_agent_session_message_projections
-get_agent_session_message_stats
 get_agent_session_name
 get_agent_session_prompt_breakdown
 get_agent_session_retired_at
@@ -153,8 +130,6 @@ get_agent_session_updated_at_batch
 get_agent_session_with_transcript
 get_agent_session_without_messages
 get_agent_statuses
-get_agent_user_message_index
-get_agent_user_message_index_page
 get_attachment
 get_attachment_by_idempotency_key
 get_browser_tab
@@ -172,9 +147,7 @@ get_host_invite
 get_host_role
 get_idempotent
 get_interrupted_agent
-get_last_non_system_message
 get_mcp_oauth_token
-get_monitor_message_provenance
 get_node
 get_node_assignment
 get_node_lease
@@ -185,9 +158,7 @@ get_principals
 get_qualified_pr_monitor
 get_remote_agent
 get_remote_agents
-get_retired_agent_session_message_projections
 get_review_context_enrollment
-get_scoped_agent_session_message_projections
 get_script_in_workspace
 get_shown_workspace_home
 get_subscription_agent_projections
@@ -195,7 +166,6 @@ get_workspace_agent_usage_data
 get_workspace_author_fallback
 get_workspace_invite
 get_workspace_member_role
-get_workspace_message_watermark
 get_workspace_metrics
 get_workspace_owner_principal_id
 has_advisory_wake_delivery
@@ -274,7 +244,6 @@ list_hooks_by_workspace
 list_host_members
 list_interrupted_agents
 list_known_repos
-list_legacy_question_tail_candidates_by_workspace
 list_mcp_oauth_server_ids
 list_open_host_invites
 list_open_node_invites
@@ -294,7 +263,6 @@ list_scoped_agent_session_summaries
 list_sharing_principals
 list_shown_workspace_homes
 list_task_agent_links
-list_top_level_sessions_with_unseen_last_message
 list_tracked_changes
 list_unarchived_scripts
 list_undelivered_groups
@@ -328,14 +296,12 @@ owner_queue_permit
 page_size
 pending_script_monitors
 pending_script_runs
-persisted_queue_message_ids
 pin_agent_session_provider_if_null
 pool
 prepare_monitor_cancel
 prepare_monitor_insert
 prepare_monitor_message
 prepare_monitor_replace
-prestage_agent_message_payload
 principal_instructions_revoked
 put_idempotent
 qualify_legacy_pr_monitor_target
@@ -376,7 +342,6 @@ remove_workspace_member
 rename_cloud_machine
 renew_machine_lease
 replace_acp_session_id
-replace_agent_messages
 replace_agent_queue
 repository_authority_snapshot
 repository_host_authority_snapshot
@@ -413,7 +378,6 @@ script_notification_jobs
 script_notification_owners
 script_summary_page
 script_workspace
-search_agent_messages_fts
 set_acp_session_id
 set_agent_effort_levels
 set_agent_notifications_muted
@@ -465,7 +429,6 @@ transfer_import_rows
 transfer_monitor_rows
 transfer_table_stats
 transition_node_lease
-truncate_agent_messages_from
 unclaimed_home_sandboxes
 ungroup_completion_watch
 update_agent_session
@@ -498,13 +461,10 @@ upsert_task_agent_link
 upsert_tracked_change
 upsert_workspace_metrics
 workspace_has_remote_agent_work
-workspace_has_unread_top_level_session
 workspace_membership_summaries
 workspace_scripts_initialized
 workspaces_with_active_hooks
 workspaces_with_active_hooks_or_script_monitors
-workspaces_with_unread_top_level_sessions
-workspaces_with_unread_top_level_sessions_by_workspace
 write_pool
 write_repository_selection
 write_repository_selection_admitted

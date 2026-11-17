@@ -193,7 +193,7 @@ impl PgStore {
 pub(crate) struct SearchQuery {
     expr: Expr,
     /// `to_tsquery` inputs: words joined by `<->`, a prefix term ends `:*`.
-    terms: Vec<String>,
+    pub(crate) terms: Vec<String>,
 }
 
 #[derive(Debug)]
