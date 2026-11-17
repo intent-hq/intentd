@@ -54,6 +54,17 @@ pub async fn test_db(rls_guard: bool) -> Option<TestDb> {
     finish_test_db(url, admin, rls_guard).await
 }
 
+/// A migrated database with the leak trap on every tenant table: any
+/// statement that reads, updates, deletes or inserts a row of a tenant other
+/// than the store's own fails with "tenant leak". Open stores on it with
+/// [`open_trapped`] so each transaction names its tenant.
+pub async fn trapped_db() -> Option<TestDb> {
+    let (url, admin) = empty_db().await?;
+    postgres::migrate(&admin).await.expect("migrate");
+    exec(&admin, trap_sql(&admin).await).await;
+    finish_test_db(url, admin, false).await
+}
+
 /// A fresh, unmigrated database: its URL and an admin pool.
 pub async fn empty_db() -> Option<(String, PgPool)> {
     let Ok(base) = std::env::var("INTENT_STORE_TEST_PG_URL") else {
@@ -133,18 +144,7 @@ fn with_database(url: &str, name: &str) -> String {
 
 /// FORCE row-level security on every table with a `tenant_id` column.
 async fn rls_guard_sql(admin: &PgPool) -> String {
-    let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT table_name::text FROM information_schema.columns \
-         WHERE table_schema = 'public' AND column_name = 'tenant_id' ORDER BY 1",
-    )
-    .fetch_all(admin)
-    .await
-    .expect("list tenant tables");
-    assert!(
-        tables.len() > 50,
-        "found only {} tenant tables",
-        tables.len()
-    );
+    let tables = tenant_tables(admin).await;
     let mut sql = String::new();
     for t in &tables {
         write!(
@@ -157,6 +157,75 @@ async fn rls_guard_sql(admin: &PgPool) -> String {
         .expect("write to String");
     }
     sql
+}
+
+/// Policies that raise on any row of another tenant. A tenant filter
+/// (`tenant_id = $n`, a leakproof comparison) runs before the policy, so
+/// correctly scoped statements never reach foreign rows; a statement that
+/// misses its filter reaches the decoy's rows and fails, whatever its result
+/// would have been.
+async fn trap_sql(admin: &PgPool) -> String {
+    let mut sql = String::from(
+        "CREATE FUNCTION intent_test_tenant_trap(row_tenant text) RETURNS boolean \
+         LANGUAGE plpgsql STABLE AS $trap$ \
+         BEGIN \
+           IF row_tenant IS DISTINCT FROM current_setting('intent.tenant_id', true) THEN \
+             RAISE EXCEPTION 'tenant leak: a statement touched a row of tenant % while running as %', \
+               row_tenant, coalesce(nullif(current_setting('intent.tenant_id', true), ''), '<no tenant>'); \
+           END IF; \
+           RETURN true; \
+         END $trap$;",
+    );
+    for t in tenant_tables(admin).await {
+        write!(
+            sql,
+            "ALTER TABLE {t} ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY tenant_trap ON {t} \
+             USING (intent_test_tenant_trap(tenant_id)) \
+             WITH CHECK (intent_test_tenant_trap(tenant_id));"
+        )
+        .expect("write to String");
+    }
+    sql
+}
+
+async fn tenant_tables(admin: &PgPool) -> Vec<String> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.columns \
+         WHERE table_schema = 'public' AND column_name = 'tenant_id' ORDER BY 1",
+    )
+    .fetch_all(admin)
+    .await
+    .expect("list tenant tables");
+    assert!(
+        tables.len() > 50,
+        "found only {} tenant tables",
+        tables.len()
+    );
+    tables
+}
+
+/// A store whose every transaction names its tenant, for [`trapped_db`].
+pub async fn open_trapped(db: &TestDb, tenant: &str) -> Store {
+    open_with(db, tenant, true).await
+}
+
+/// The tables in which the subject left rows but the decoy had none when the
+/// subject started: there the trap had nothing to catch.
+pub fn tables_without_decoy_rows(
+    decoy_before: &[(String, String)],
+    subject_after: &[(String, String)],
+) -> Vec<String> {
+    let decoy: std::collections::BTreeSet<&str> =
+        decoy_before.iter().map(|(t, _)| t.as_str()).collect();
+    let mut missing: Vec<String> = subject_after
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .filter(|t| !decoy.contains(t))
+        .map(str::to_owned)
+        .collect();
+    missing.dedup();
+    missing
 }
 
 pub async fn open(db: &TestDb, tenant: &str) -> Store {
@@ -184,13 +253,7 @@ pub async fn sqlite_store() -> (Store, tempfile::TempDir) {
 
 /// Every row the tenant owns, as `(table, row text)`, in a stable order.
 pub async fn tenant_rows(admin: &PgPool, tenant: &str) -> Vec<(String, String)> {
-    let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT table_name::text FROM information_schema.columns \
-         WHERE table_schema = 'public' AND column_name = 'tenant_id' ORDER BY 1",
-    )
-    .fetch_all(admin)
-    .await
-    .expect("list tenant tables");
+    let tables = tenant_tables(admin).await;
     let mut rows = Vec::new();
     for table in tables {
         let texts: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
@@ -207,10 +270,15 @@ pub async fn tenant_rows(admin: &PgPool, tenant: &str) -> Vec<(String, String)> 
 
 /// One test body, run on every backend: `SQLite`, then Postgres twice in one
 /// database — first for a decoy tenant, then for the tenant under test.
-/// - Reads: the body uses fixed ids and leaves rows behind, so a statement
-///   missing its tenant filter sees the decoy's rows on the subject run.
+/// - Leak trap: the Postgres database fails any statement that touches a row
+///   of another tenant ([`trapped_db`]), so a statement missing its tenant
+///   filter fails on the subject run as soon as it reaches a decoy row, even
+///   when its result or write would not have differed.
+/// - Coverage: every table the subject leaves rows in must hold decoy rows
+///   when the subject starts, or the trap had nothing to catch there; the
+///   body leaves rows behind (fixed ids) and adds decoy-only rows as needed.
 /// - Writes: every decoy row is snapshotted before the subject run and
-///   compared after it, so a write that reaches another tenant fails.
+///   compared after it.
 ///
 /// The body may also bind the tenant name (`"sqlite"`, `"decoy"`,
 /// `"subject"`) to write tenant-specific values or decoy-only rows. Without
@@ -234,17 +302,17 @@ macro_rules! parity_test {
                 let $tenant: &str = "sqlite";
                 $body
             }
-            if let Some(db) = $crate::harness::test_db(false).await {
+            if let Some(db) = $crate::harness::trapped_db().await {
                 eprintln!("[{}] backend: postgres, tenant decoy", stringify!($name));
                 {
-                    let $store = $crate::harness::open(&db, "decoy").await;
+                    let $store = $crate::harness::open_trapped(&db, "decoy").await;
                     let $tenant: &str = "decoy";
                     $body
                 }
                 let before = $crate::harness::tenant_rows(&db.admin, "decoy").await;
                 eprintln!("[{}] backend: postgres, tenant subject", stringify!($name));
                 {
-                    let $store = $crate::harness::open(&db, "subject").await;
+                    let $store = $crate::harness::open_trapped(&db, "subject").await;
                     let $tenant: &str = "subject";
                     $body
                 }
@@ -252,6 +320,13 @@ macro_rules! parity_test {
                 assert!(
                     before == after,
                     "the subject tenant's run changed the decoy tenant's rows"
+                );
+                let subject = $crate::harness::tenant_rows(&db.admin, "subject").await;
+                let uncovered = $crate::harness::tables_without_decoy_rows(&before, &subject);
+                assert!(
+                    uncovered.is_empty(),
+                    "the decoy had no rows in {uncovered:?} when the subject ran, so a missing \
+                     tenant filter there would go unnoticed: leave decoy rows in those tables"
                 );
             }
         }

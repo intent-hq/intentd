@@ -27,7 +27,7 @@ mod settings;
 #[path = "postgres_backend/workspaces.rs"]
 mod workspaces;
 
-use harness::{empty_db, exec, open, open_with, test_db};
+use harness::{empty_db, exec, open, open_trapped, open_with, test_db, trapped_db};
 use intent_store::postgres::{self, TenantId};
 
 #[tokio::test]
@@ -228,6 +228,113 @@ async fn every_migration_statement_survives_a_replay() {
     .expect("open a tenant on the replayed schema");
     store.set_setting("k", "1").await.unwrap();
     assert_eq!(store.get_setting("k").await.unwrap().as_deref(), Some("1"));
+}
+
+/// Runs one statement as the app role with `tenant` set, index scans off so
+/// every row is visited, and rolls back.
+async fn run_as(db: &harness::TestDb, tenant: &str, sql: &str) -> Result<(), String> {
+    let mut tx = db.app.begin().await.unwrap();
+    for setup in [
+        "SET LOCAL enable_indexscan = off",
+        "SET LOCAL enable_indexonlyscan = off",
+        "SET LOCAL enable_bitmapscan = off",
+    ] {
+        sqlx::raw_sql(setup).execute(&mut *tx).await.unwrap();
+    }
+    sqlx::query("SELECT set_config('intent.tenant_id', $1, true)")
+        .bind(tenant)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let outcome = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()))
+        .bind(tenant)
+        .execute(&mut *tx)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    tx.rollback().await.unwrap();
+    outcome
+}
+
+/// The leak trap behind `parity_test!`: it must fail every statement that
+/// reaches another tenant's row (even a write that changes nothing) and must
+/// never fire on a correctly filtered statement, even on a full table scan.
+#[tokio::test]
+async fn the_leak_trap_fails_unscoped_statements_and_only_those() {
+    let Some(db) = trapped_db().await else {
+        return;
+    };
+    for tenant in ["decoy", "subject"] {
+        open_trapped(&db, tenant)
+            .await
+            .set_setting("k", "\"same\"")
+            .await
+            .unwrap();
+    }
+    let leak = |r: Result<(), String>, sql: &str| {
+        let e = r.expect_err(sql);
+        assert!(e.contains("tenant leak"), "{sql}: {e}");
+    };
+    for scoped in [
+        "SELECT value FROM settings WHERE tenant_id = $1 AND key = 'k'",
+        "SELECT count(*) FROM settings WHERE tenant_id = $1",
+        "UPDATE settings SET value = value WHERE tenant_id = $1 AND key = 'k'",
+        "DELETE FROM settings WHERE tenant_id = $1 AND key = 'k'",
+        "SELECT s.key FROM settings s JOIN settings t ON t.tenant_id = $1 AND t.key = s.key \
+         WHERE s.tenant_id = $1",
+    ] {
+        run_as(&db, "subject", scoped).await.expect(scoped);
+    }
+    for unscoped in [
+        "SELECT value FROM settings WHERE key = 'k' AND $1 IS NOT NULL",
+        "SELECT count(*) FROM settings WHERE $1 IS NOT NULL",
+        // A write whose result would be identical still reaches the row.
+        "UPDATE settings SET value = value WHERE key = 'k' AND $1 IS NOT NULL",
+        "DELETE FROM settings WHERE key = 'k' AND $1 IS NOT NULL",
+        // A join that scopes only one side.
+        "SELECT s.key FROM settings s JOIN settings t ON t.key = s.key WHERE s.tenant_id = $1",
+    ] {
+        leak(run_as(&db, "subject", unscoped).await, unscoped);
+    }
+    leak(
+        run_as(
+            &db,
+            "subject",
+            "INSERT INTO settings (tenant_id, key, value) VALUES ('decoy', 'x', $1)",
+        )
+        .await,
+        "insert for another tenant",
+    );
+    // A store that does not name its tenant cannot read anything on a
+    // trapped database, so no code path can skip the tenant context.
+    let unnamed = intent_store::Store::open_postgres(
+        db.app.clone(),
+        TenantId::new("subject").unwrap(),
+        intent_store::postgres::PostgresOptions::default(),
+    )
+    .await;
+    assert!(
+        unnamed.is_err_and(|e| e.to_string().contains("while running as <no tenant>")),
+        "a store without tenant context reached a trapped table"
+    );
+}
+
+#[test]
+fn tables_without_decoy_rows_lists_only_uncovered_tables() {
+    let row = |t: &str| (t.to_owned(), String::new());
+    assert_eq!(
+        harness::tables_without_decoy_rows(
+            &[row("note"), row("settings")],
+            &[
+                row("note"),
+                row("note"),
+                row("comment"),
+                row("comment"),
+                row("settings")
+            ],
+        ),
+        vec!["comment".to_owned()]
+    );
 }
 
 #[test]
