@@ -102,6 +102,11 @@ impl RemoteAgentRuntime {
                 "node-agent-not-running: the remote agent was stopped",
             ));
         }
+        self.exit_failure()
+    }
+
+    /// The turn's error for the node's exit report, if the provider exited.
+    fn exit_failure(&self) -> Option<AcpError> {
         self.exit_error().map(|error| {
             // A cloud machine's documented failure (its sandbox is gone or
             // was deleted as outdated) is the turn's own error, not a
@@ -124,9 +129,13 @@ impl RemoteAgentRuntime {
     /// final stop (the agent ends for good, as on a machine removal) stops
     /// the turn: as a transport error it would be redriven on a fresh child
     /// against the machine being removed, or fail and wake the parent. The
-    /// agent's next message starts it again, on a new runtime.
+    /// agent's next message starts it again, on a new runtime. A provider
+    /// that exited first keeps its exit error.
     fn turn_ended_early(&self) -> Result<PromptOutcome, AcpError> {
         if !self.stopped.load(Ordering::SeqCst) && self.sink.is_closed() {
+            if let Some(error) = self.exit_failure() {
+                return Err(error);
+            }
             return Ok(PromptOutcome {
                 stop_reason: StopReason::Cancelled,
                 usage: None,
