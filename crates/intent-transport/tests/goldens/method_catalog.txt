@@ -329,6 +329,9 @@ router providers.profiles.list
 router providers.profiles.reorder
 router providers.profiles.update
 router providers.profiles.updateDefault
+router push.createLink
+router push.revokeLink
+router push.status
 router remoteLinkTraffic.snapshot
 router remoteLinkTraffic.start
 router remoteLinkTraffic.stop
