@@ -21,6 +21,7 @@ pub use sqlx::postgres::PgPool;
 mod comments;
 mod note_search;
 mod notes;
+mod scripts;
 mod settings;
 mod workspaces;
 

@@ -218,7 +218,7 @@ impl Store {
         ws: &WorkspaceId,
         id: &str,
     ) -> Result<Option<(String, Option<intent_core::ScriptLastRun>)>> {
-        pending_postgres!("latest_script_run", self, backend => backend.latest_script_run(ws, id).await)
+        dispatch!(self, backend => backend.latest_script_run(ws, id).await)
     }
 }
 
