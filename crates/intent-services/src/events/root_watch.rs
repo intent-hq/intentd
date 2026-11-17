@@ -760,4 +760,58 @@ mod tests {
             "a change landing before registration must still trigger a flush"
         );
     }
+
+    /// intent-hq/intent#9484: a discovery scan reads the files and lists the
+    /// directories it watches. inotify reports those reads (`IN_OPEN`), and a
+    /// watch that took them as changes re-ran the scan forever. Reads must
+    /// not fire `on_change`; a write still must. Linux only: `FSEvents`
+    /// reports no reads.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn reading_watched_files_does_not_fire_on_change() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new("reads");
+        let root = dir.path.join("specialists");
+        let nested = root.join("team");
+        std::fs::create_dir_all(&nested).expect("mk nested");
+        std::fs::write(root.join("a.md"), "x").expect("write a.md");
+        std::fs::write(nested.join("b.md"), "y").expect("write b.md");
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let hub = SharedWatchHub::new();
+        let _watch = watch_root(&hub, root.clone(), md_only, move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(
+            wait_for(|| hits.load(Ordering::SeqCst) >= 1, LIVENESS).await,
+            "the catch-up flush must fire once the watch is live"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = hits.load(Ordering::SeqCst);
+
+        for _ in 0..10 {
+            for d in [&root, &nested] {
+                let _ = std::fs::read_dir(d).expect("list dir").count();
+            }
+            std::fs::read_to_string(root.join("a.md")).expect("read a.md");
+            std::fs::read_to_string(nested.join("b.md")).expect("read b.md");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            before,
+            "reading or listing watched paths must not count as a change"
+        );
+
+        std::fs::write(nested.join("b.md"), "z").expect("rewrite b.md");
+        assert!(
+            wait_for(|| hits.load(Ordering::SeqCst) > before, LIVENESS).await,
+            "a write must still count as a change"
+        );
+    }
 }
