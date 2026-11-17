@@ -1440,7 +1440,7 @@ crate::harness::parity_test!(agent_transcripts_insert_and_read, |store, tenant, 
         .await
         .unwrap();
     assert_eq!(loaded.name, format!("tr-a of {tenant}"));
-    assert_eq!(loaded.model.as_deref(), Some("claude:opus"));
+    assert_eq!(loaded.model.as_deref(), Some("opus"));
     assert_eq!(
         loaded.system_prompt.as_deref(),
         Some(format!("prompt of {tenant}").as_str())
