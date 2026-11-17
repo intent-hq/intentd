@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.232] - 2026-11-17
+
+### 🚀 Features
+
+- *(store)* Tenant-scoped Postgres backend behind the postgres feature ([#3428](https://github.com/intent-hq/intentd/pull/3428))
+- *(push)* Publish workspace activity to the push relay ([#3323](https://github.com/intent-hq/intentd/pull/3323))
+
+### 🐛 Bug Fixes
+
+- *(northflank)* Ask for no terminal so the home setup is detected ([#3434](https://github.com/intent-hq/intentd/pull/3434))
+- *(northflank)* Find machines by tag again and clean up the live test ([#3443](https://github.com/intent-hq/intentd/pull/3443))
+
+### 📚 Documentation
+
+- Describe sharing and joining workspaces on iPhone in the app guide ([#3436](https://github.com/intent-hq/intentd/pull/3436))
+- Clarify device rail recovery and app-wide notices ([#3439](https://github.com/intent-hq/intentd/pull/3439))
+- Explain live experimental Notch dock updates ([#3438](https://github.com/intent-hq/intentd/pull/3438))
+- *(diagrams)* Explain automatic flowchart layout and routing ([#3435](https://github.com/intent-hq/intentd/pull/3435))
+
+
 ## [0.11.231] - 2026-11-16
 
 ### 📚 Documentation
