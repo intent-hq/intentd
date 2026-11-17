@@ -26,13 +26,13 @@ fn db(error: impl std::fmt::Display) -> Error {
 fn invalid(message: &str) -> Error {
     Error::InvalidParams(message.into())
 }
-fn encode(value: &impl Serialize) -> Result<String> {
+pub(crate) fn encode(value: &impl Serialize) -> Result<String> {
     serde_json::to_string(value).map_err(db)
 }
-fn decode<T: DeserializeOwned>(json: &str) -> Result<T> {
+pub(crate) fn decode<T: DeserializeOwned>(json: &str) -> Result<T> {
     serde_json::from_str(json).map_err(db)
 }
-fn increment(counter: NodeCounter) -> Result<NodeCounter> {
+pub(crate) fn increment(counter: NodeCounter) -> Result<NodeCounter> {
     counter
         .0
         .checked_add(1)
@@ -104,7 +104,7 @@ fn dispatchable(lease: &NodeLease) -> Result<()> {
     }
     Ok(())
 }
-fn static_only(node: &NodeRecord) -> Result<()> {
+pub(crate) fn static_only(node: &NodeRecord) -> Result<()> {
     if node.kind != NodeKind::Static {
         return Err(invalid("built-in local node cannot be released"));
     }
@@ -118,7 +118,7 @@ impl Store {
     /// # Errors
     /// Rejects malformed/mismatched records, reused identity or database errors.
     pub async fn enroll_node(&self, record: &NodeRecord, initial: &NodeLease) -> Result<()> {
-        pending_postgres!("enroll_node", self, backend => backend.enroll_node(record, initial).await)
+        dispatch!(self, backend => backend.enroll_node(record, initial).await)
     }
 
     /// Daemon-to-daemon: start `initial`, a fresh lease on exposed machine
@@ -136,7 +136,7 @@ impl Store {
         initial: &NodeLease,
         generation: NodeCounter,
     ) -> Result<()> {
-        pending_postgres!("renew_machine_lease", self, backend => backend.renew_machine_lease(record, initial, generation).await)
+        dispatch!(self, backend => backend.renew_machine_lease(record, initial, generation).await)
     }
 
     /// Daemon-to-daemon: end every live lease on exposed machine `node_id`
@@ -144,7 +144,7 @@ impl Store {
     /// # Errors
     /// Returns database or decoding errors.
     pub async fn end_machine_leases(&self, node_id: &str, head_id: &str) -> Result<usize> {
-        pending_postgres!("end_machine_leases", self, backend => backend.end_machine_leases(node_id, head_id).await)
+        dispatch!(self, backend => backend.end_machine_leases(node_id, head_id).await)
     }
 }
 
@@ -255,7 +255,7 @@ async fn end_live_leases(conn: &mut SqliteConnection, node_id: &str) -> Result<u
     Ok(ended)
 }
 
-fn validate_enrollment(record: &NodeRecord, initial: &NodeLease) -> Result<()> {
+pub(crate) fn validate_enrollment(record: &NodeRecord, initial: &NodeLease) -> Result<()> {
     let owner = &initial.owner;
     if record.id.is_empty()
         || record.head_id.is_empty()
@@ -308,28 +308,28 @@ impl Store {
     /// # Errors
     /// Returns database or decoding errors.
     pub async fn list_owned_nodes(&self, head_id: &str) -> Result<Vec<NodeRecord>> {
-        pending_postgres!("list_owned_nodes", self, backend => backend.list_owned_nodes(head_id).await)
+        dispatch!(self, backend => backend.list_owned_nodes(head_id).await)
     }
 
     /// Enumerate all leases, including terminal history, for the bound head.
     /// # Errors
     /// Returns database or decoding errors.
     pub async fn list_owned_node_leases(&self, head_id: &str) -> Result<Vec<NodeLease>> {
-        pending_postgres!("list_owned_node_leases", self, backend => backend.list_owned_node_leases(head_id).await)
+        dispatch!(self, backend => backend.list_owned_node_leases(head_id).await)
     }
 
     /// Read private inventory for the bound head installation.
     /// # Errors
     /// Returns not-found for a different owner or a database failure.
     pub async fn get_node(&self, id: &str, head_id: &str) -> Result<NodeRecord> {
-        pending_postgres!("get_node", self, backend => backend.get_node(id, head_id).await)
+        dispatch!(self, backend => backend.get_node(id, head_id).await)
     }
 
     /// Read a lease only for its exact durable ownership tuple.
     /// # Errors
     /// Returns not-found for stale ownership or a database failure.
     pub async fn get_node_lease(&self, owner: &LeaseOwner) -> Result<NodeLease> {
-        pending_postgres!("get_node_lease", self, backend => backend.get_node_lease(owner).await)
+        dispatch!(self, backend => backend.get_node_lease(owner).await)
     }
 
     /// Apply a reconciled nonterminal state. Terminal states require a fence.
@@ -340,7 +340,7 @@ impl Store {
         owner: &LeaseOwner,
         next: LeaseState,
     ) -> Result<NodeLease> {
-        pending_postgres!("transition_node_lease", self, backend => backend.transition_node_lease(owner, next).await)
+        dispatch!(self, backend => backend.transition_node_lease(owner, next).await)
     }
 
     /// Persist a greater generation before dialing. Releasing leases can still
@@ -348,7 +348,7 @@ impl Store {
     /// # Errors
     /// Rejects terminal/stale leases, exhausted counters or database errors.
     pub async fn next_node_link_generation(&self, owner: &LeaseOwner) -> Result<NodeCounter> {
-        pending_postgres!("next_node_link_generation", self, backend => backend.next_node_link_generation(owner).await)
+        dispatch!(self, backend => backend.next_node_link_generation(owner).await)
     }
 
     /// Drain the static registration and revoke new dispatch, retaining every
@@ -356,7 +356,7 @@ impl Store {
     /// # Errors
     /// Rejects local/stale ownership or database errors.
     pub async fn request_node_lease_release(&self, owner: &LeaseOwner) -> Result<NodeLease> {
-        pending_postgres!("request_node_lease_release", self, backend => backend.request_node_lease_release(owner).await)
+        dispatch!(self, backend => backend.request_node_lease_release(owner).await)
     }
 
     /// Commit externally verified stop/fence evidence, then relinquish managed
@@ -849,7 +849,7 @@ impl Store {
     /// # Errors
     /// Returns database or decoding errors.
     pub async fn find_execution_node(&self, id: &str) -> Result<Option<NodeRecord>> {
-        pending_postgres!("find_execution_node", self, backend => backend.find_execution_node(id).await)
+        dispatch!(self, backend => backend.find_execution_node(id).await)
     }
 
     /// The head id this installation registered its nodes under, if it has
@@ -857,7 +857,7 @@ impl Store {
     /// # Errors
     /// Returns database errors.
     pub async fn node_head_id(&self) -> Result<Option<String>> {
-        pending_postgres!("node_head_id", self, backend => backend.node_head_id().await)
+        dispatch!(self, backend => backend.node_head_id().await)
     }
 
     /// Record what the node reported when a link was bound: its platform,
@@ -873,7 +873,7 @@ impl Store {
         max_agents: u32,
         version: &str,
     ) -> Result<NodeLease> {
-        pending_postgres!("record_node_welcome", self, backend => backend.record_node_welcome(owner, os, arch, max_agents, version).await)
+        dispatch!(self, backend => backend.record_node_welcome(owner, os, arch, max_agents, version).await)
     }
 
     /// Persist that head has ingested every journal record up to `seq`. The
@@ -885,7 +885,7 @@ impl Store {
         owner: &LeaseOwner,
         seq: NodeCounter,
     ) -> Result<NodeCounter> {
-        pending_postgres!("advance_node_lease_ack", self, backend => backend.advance_node_lease_ack(owner, seq).await)
+        dispatch!(self, backend => backend.advance_node_lease_ack(owner, seq).await)
     }
 
     /// Record that `agent.agent_id` runs on `agent.node_id` under
@@ -936,7 +936,7 @@ impl Store {
         &self,
         stop: &RemoteFinalStopRecord,
     ) -> Result<RemoteFinalStopRecord> {
-        pending_postgres!("record_final_stop", self, backend => backend.record_final_stop(stop).await)
+        dispatch!(self, backend => backend.record_final_stop(stop).await)
     }
 
     /// Whether `workspace_id` has a remote agent or a final stop still
@@ -955,7 +955,7 @@ impl Store {
     /// # Errors
     /// Returns database errors.
     pub async fn list_final_stops(&self, lease_id: &str) -> Result<Vec<RemoteFinalStopRecord>> {
-        pending_postgres!("list_final_stops", self, backend => backend.list_final_stops(lease_id).await)
+        dispatch!(self, backend => backend.list_final_stops(lease_id).await)
     }
 
     /// `agent_id`'s recorded final stop, if any.
@@ -965,7 +965,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<Option<RemoteFinalStopRecord>> {
-        pending_postgres!("get_final_stop", self, backend => backend.get_final_stop(agent_id).await)
+        dispatch!(self, backend => backend.get_final_stop(agent_id).await)
     }
 
     /// The final stop `stop_id` of `agent_id` is done (acknowledged, or past
