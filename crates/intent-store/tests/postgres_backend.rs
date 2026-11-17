@@ -16,6 +16,8 @@
 mod harness;
 #[path = "postgres_backend/notes.rs"]
 mod notes;
+#[path = "postgres_backend/scripts.rs"]
+mod scripts;
 #[path = "postgres_backend/settings.rs"]
 mod settings;
 #[path = "postgres_backend/workspaces.rs"]
