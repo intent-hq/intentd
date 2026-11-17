@@ -162,7 +162,7 @@ required-features = ["repository-test-fixtures"]
 # Portable source-lint utilities and Unix process guards; never a runtime dependency.
 intentd-test-support = { path = "../intentd-test-support" }
 # The shared fake Northflank API the Northflank e2e suite serves.
-intent-nodes = { path = "../intent-nodes", version = "0.11.233", features = ["northflank-fake"] }
+intent-nodes = { path = "../intent-nodes", features = ["northflank-fake"] }
 # Tests seed and inspect the SQLite store directly; shipped code reaches it
 # only through intent-store (intent-store/tests/sqlx_dependency_lint.rs).
 sqlx = { workspace = true }

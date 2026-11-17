@@ -159,6 +159,15 @@
             ]
           }
         }
+      },
+      "kept": {
+        "field": "id",
+        "values": [
+          "nf-compute-50",
+          "nf-compute-200",
+          "nf-compute-400",
+          "nf-compute-800-16"
+        ]
       }
     },
     {
@@ -215,9 +224,16 @@
           },
           "pagination": {
             "hasNextPage": false,
-            "count": 4
+            "count": 2
           }
         }
+      },
+      "kept": {
+        "field": "name",
+        "values": [
+          "intent-backend-000000000001",
+          "intent-node"
+        ]
       }
     },
     {
@@ -235,9 +251,13 @@
           "pagination": {
             "hasNextPage": true,
             "cursor": "<scrubbed>",
-            "count": 1
+            "count": 0
           }
         }
+      },
+      "kept": {
+        "field": "name",
+        "values": []
       }
     },
     {
@@ -539,10 +559,10 @@
           "data": {
             "containers": [
               {
-                "name": "intent-000000000001-5bbdfb6444-qzfmt",
-                "createdAt": 1794907375,
+                "name": "intent-000000000001-0",
+                "createdAt": 1767225600,
                 "status": "TASK_RUNNING",
-                "updatedAt": 1794907379
+                "updatedAt": 1767225600
               }
             ]
           },
@@ -592,6 +612,12 @@
             "count": 1
           }
         }
+      },
+      "kept": {
+        "field": "id",
+        "values": [
+          "intent-000000000001"
+        ]
       }
     },
     {
@@ -637,6 +663,12 @@
             "count": 1
           }
         }
+      },
+      "kept": {
+        "field": "id",
+        "values": [
+          "intent-000000000001"
+        ]
       }
     },
     {
@@ -889,10 +921,10 @@
           "data": {
             "containers": [
               {
-                "name": "intent-000000000001-5bbdfb6444-qzfmt",
-                "createdAt": 1794907375,
+                "name": "intent-000000000001-0",
+                "createdAt": 1767225600,
                 "status": "TASK_RUNNING",
-                "updatedAt": 1794907379
+                "updatedAt": 1767225600
               }
             ]
           },
@@ -1040,7 +1072,7 @@
             "data": {
               "auth": "successful",
               "context": {
-                "instanceName": "intent-000000000001-5bbdfb6444-qzfmt",
+                "instanceName": "intent-000000000001-0",
                 "containerName": "main-service"
               }
             }
@@ -1101,7 +1133,7 @@
             "data": {
               "auth": "successful",
               "context": {
-                "instanceName": "intent-000000000001-5bbdfb6444-qzfmt",
+                "instanceName": "intent-000000000001-0",
                 "containerName": "main-service"
               }
             }
@@ -1168,7 +1200,7 @@
             "data": {
               "auth": "successful",
               "context": {
-                "instanceName": "intent-000000000001-5bbdfb6444-qzfmt",
+                "instanceName": "intent-000000000001-0",
                 "containerName": "main-service"
               }
             }
@@ -1200,6 +1232,62 @@
         },
         {
           "close": 1000
+        }
+      ]
+    },
+    {
+      "name": "exec-bad-token",
+      "context": {
+        "command": [
+          "echo",
+          "ok"
+        ],
+        "shell": "none",
+        "user": "user",
+        "tty": false
+      },
+      "program": null,
+      "frames": [
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "init",
+            "data": {
+              "auth": "failed",
+              "message": "Unauthorized"
+            }
+          }
+        },
+        {
+          "silent": 120
+        }
+      ]
+    },
+    {
+      "name": "exec-unknown-service",
+      "context": {
+        "command": [
+          "echo",
+          "ok"
+        ],
+        "shell": "none",
+        "user": "user",
+        "tty": false
+      },
+      "program": null,
+      "frames": [
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "init",
+            "data": {
+              "auth": "failed",
+              "message": "Could not find service 'intent-ffffffffffff'"
+            }
+          }
+        },
+        {
+          "silent": 120
         }
       ]
     }

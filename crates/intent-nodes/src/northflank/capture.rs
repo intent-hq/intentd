@@ -7,11 +7,13 @@
 //! It makes one small service with its volume and one team tag, records
 //! each REST exchange and command stream intentd depends on, and deletes
 //! all three whatever happens, then checks nothing of the run is left.
+//! Every run uses the same backend tag, and starts by deleting whatever an
+//! interrupted run left with it; so never run two captures at once.
 //! Ids, names, timestamps and the token are replaced before the file is
 //! written; review the diff before committing it.
 
 use std::panic::AssertUnwindSafe;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
 use reqwest::Method;
@@ -20,8 +22,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::client::scrub;
 use super::fake_api::{
-    FIXTURE_BACKEND, FIXTURE_BACKEND_TAG, FIXTURE_PROJECT, FIXTURE_SERVICE, FIXTURE_TEAM,
-    FIXTURE_TIME,
+    FIXTURE_BACKEND, FIXTURE_BACKEND_TAG, FIXTURE_EPOCH, FIXTURE_MISSING_SERVICE, FIXTURE_PROJECT,
+    FIXTURE_SERVICE, FIXTURE_TEAM, FIXTURE_TIME,
 };
 use super::provider::TAGS_ENV;
 use super::*;
@@ -31,6 +33,9 @@ const TOKEN_ENV: &str = "NORTHFLANK_API_TOKEN";
 const TOKEN_FILE_ENV: &str = "NORTHFLANK_API_TOKEN_FILE";
 const PROJECT_ENV: &str = "NORTHFLANK_PROJECT_ID";
 const OUT_ENV: &str = "NORTHFLANK_CAPTURE_OUT";
+/// The backend id every capture tags its machine with.
+const CAPTURE_BACKEND: &str = "intent-capture";
+
 const IMAGE: &str = "ghcr.io/intent-hq/intent-node:latest";
 /// The cheapest plans first: the image only idles.
 const PLANS: [&str; 3] = ["nf-compute-20", "nf-compute-50", "nf-compute-200"];
@@ -49,6 +54,8 @@ const SCRUBBED_KEYS: [&str; 5] = [
     "storageClassObjectId",
     "cursor",
 ];
+/// Keys of times, also as Unix seconds.
+const TIME_KEYS: [&str; 3] = ["createdAt", "updatedAt", "lastTransitionTime"];
 /// One command, its output on both channels and a failing exit.
 const SCRIPT: &str = "printf 'out\\n'; printf 'err\\n' >&2; exit 3";
 
@@ -59,6 +66,8 @@ struct Recorder {
     swaps: Vec<(String, String)>,
     exchanges: Vec<Value>,
     exec: Vec<Value>,
+    /// The team slug, which must not reach the file.
+    team: Option<String>,
 }
 
 impl Recorder {
@@ -167,16 +176,40 @@ impl Recorder {
         context: Value,
         program: Value,
     ) -> Result<(), String> {
+        let token = self.client.token.expose().to_owned();
+        self.exec_as(name, service, context, program, &token).await
+    }
+
+    /// [`Self::exec`] with `token` in the `init`. A refused upgrade is
+    /// recorded as `{"refused": status}`.
+    async fn exec_as(
+        &mut self,
+        name: &str,
+        service: &str,
+        context: Value,
+        program: Value,
+        token: &str,
+    ) -> Result<(), String> {
         let url = format!(
             "{}/command-exec/projects/{}/services/{service}",
             self.client.config.exec_url.trim_end_matches('/'),
             self.project
         );
-        let mut ws = self.client.open(&url).await.map_err(|e| e.to_string())?;
+        let mut ws = match self.client.open(&url).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                eprintln!("exec {name}: refused: {e}");
+                let frames = json!([{ "refused": e.status() }]);
+                self.exec.push(json!({
+                    "name": name, "context": context, "program": program, "frames": frames,
+                }));
+                return Ok(());
+            }
+        };
         let init = json!({
             "type": "init",
             "data": {
-                "auth": { "type": "apiToken", "apiToken": self.client.token.expose() },
+                "auth": { "type": "apiToken", "apiToken": token },
                 "context": context,
             }
         });
@@ -246,6 +279,9 @@ impl Recorder {
                             .any(|w| lower.contains(w))
                             || SCRUBBED_KEYS.contains(&k.as_str());
                         let value = match v {
+                            Value::Number(_) if TIME_KEYS.contains(&k.as_str()) => {
+                                json!(FIXTURE_EPOCH)
+                            }
                             Value::Null | Value::Object(_) => self.sanitised(v),
                             Value::Array(items) if secret => {
                                 Value::Array(items.iter().map(|_| json!("<scrubbed>")).collect())
@@ -281,6 +317,10 @@ impl Recorder {
         for (real, placeholder) in &self.swaps {
             out = out.replace(real, placeholder);
         }
+        // A pod: the service, then Kubernetes' hash and suffix.
+        if out.starts_with(&format!("{FIXTURE_SERVICE}-")) {
+            out = format!("{FIXTURE_SERVICE}-0");
+        }
         scrub(&out, &[self.client.token.expose()])
     }
 }
@@ -301,22 +341,30 @@ fn keep_only(body: &mut Value, key: Option<&str>, field: &str, keep: &[&str]) {
         Some(key) => body["data"].get_mut(key),
         None => body.get_mut("data"),
     };
+    let mut kept = 0;
     if let Some(Value::Array(items)) = list {
         items.retain(|item| item[field].as_str().is_some_and(|v| keep.contains(&v)));
+        kept = items.len();
+    }
+    if let Some(count) = body.pointer_mut("/pagination/count") {
+        *count = json!(kept);
     }
 }
 
+/// Filter the last recorded list, and note what it kept: the contract
+/// filters the fake's list the same way.
 fn filter_last(recorder: &mut Recorder, key: Option<&str>, field: &str, keep: &[&str]) {
     if let Some(last) = recorder.exchanges.last_mut() {
         keep_only(&mut last["response"]["body"], key, field, keep);
+        last["kept"] = json!({ "field": field, "values": keep });
     }
 }
 
-async fn record(recorder: &mut Recorder, run: &str) -> Result<(), String> {
+async fn record(recorder: &mut Recorder) -> Result<(), String> {
     let p = recorder.project.clone();
-    let backend = format!("capture-{run}");
-    let tag = backend_tag(&backend);
-    recorder.swap(&backend, FIXTURE_BACKEND);
+    let backend = CAPTURE_BACKEND;
+    let tag = backend_tag(backend);
+    recorder.swap(backend, FIXTURE_BACKEND);
     recorder.swap(&tag, FIXTURE_BACKEND_TAG);
 
     recorder
@@ -361,6 +409,7 @@ async fn record(recorder: &mut Recorder, run: &str) -> Result<(), String> {
         .await;
     filter_last(recorder, Some("tags"), "name", &[&tag, NODE_TAG]);
     // The team has this run's tag and intent-node at least: a second page.
+    // Its items are the team's, so only its pagination is kept.
     recorder
         .call(
             Some("list-tags-paged"),
@@ -370,7 +419,7 @@ async fn record(recorder: &mut Recorder, run: &str) -> Result<(), String> {
             None,
         )
         .await;
-    filter_last(recorder, Some("tags"), "name", &[&tag, NODE_TAG]);
+    filter_last(recorder, Some("tags"), "name", &[]);
 
     let name = format!(
         "intent-{}",
@@ -480,6 +529,7 @@ async fn record(recorder: &mut Recorder, run: &str) -> Result<(), String> {
         .as_str()
         .and_then(|a| a.split('/').nth(1))
     {
+        recorder.team = Some(team.to_owned());
         let app = format!("/{team}/{p}/");
         recorder.swap(&app, &format!("/{FIXTURE_TEAM}/{FIXTURE_PROJECT}/"));
     }
@@ -556,6 +606,24 @@ async fn record(recorder: &mut Recorder, run: &str) -> Result<(), String> {
             &id,
             json!({ "command": ["echo", "ok"], "shell": "none", "user": RUN_AS, "tty": false }),
             json!({ "stdout": "ok\n", "stderr": "", "exitCode": 0 }),
+        )
+        .await?;
+    let echo = json!({ "command": ["echo", "ok"], "shell": "none", "user": RUN_AS, "tty": false });
+    recorder
+        .exec_as(
+            "exec-bad-token",
+            &id,
+            echo.clone(),
+            Value::Null,
+            "not-a-northflank-token",
+        )
+        .await?;
+    recorder
+        .exec(
+            "exec-unknown-service",
+            FIXTURE_MISSING_SERVICE,
+            echo,
+            Value::Null,
         )
         .await?;
 
@@ -644,65 +712,102 @@ async fn record(recorder: &mut Recorder, run: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Delete everything the run made until nothing is left, then the tag.
-async fn clean_up(recorder: &mut Recorder, run: &str) -> Result<(), String> {
+impl Recorder {
+    /// Every item of a list, following its cursor. A refused page is an
+    /// error, never an empty list.
+    async fn list(&mut self, path: &str, key: Option<&str>) -> Result<Vec<Value>, String> {
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..100 {
+            let mut query = vec![("per_page", "100")];
+            if let Some(cursor) = &cursor {
+                query.push(("cursor", cursor.as_str()));
+            }
+            let (status, body) = self.call(None, Method::GET, path, &query, None).await;
+            if !(200..300).contains(&status) {
+                return Err(format!("GET {path}: HTTP {status}"));
+            }
+            let page = match key {
+                Some(key) => body["data"].get(key),
+                None => body.get("data"),
+            };
+            let Some(Value::Array(page)) = page else {
+                return Err(format!("GET {path}: no list in the answer"));
+            };
+            items.extend(page.iter().cloned());
+            cursor = body
+                .pointer("/pagination/cursor")
+                .and_then(Value::as_str)
+                .filter(|_| body.pointer("/pagination/hasNextPage") == Some(&json!(true)))
+                .map(str::to_owned);
+            if cursor.is_none() {
+                return Ok(items);
+            }
+        }
+        Err(format!("GET {path}: the list did not end"))
+    }
+}
+
+/// Delete every service and volume with the capture's backend tag until
+/// none is listed, then the tag: after this run, or what an interrupted
+/// run left.
+async fn clean_up(recorder: &mut Recorder) -> Result<(), String> {
     let p = recorder.project.clone();
-    let tag = backend_tag(&format!("capture-{run}"));
+    let tag = backend_tag(CAPTURE_BACKEND);
+    let ours = |items: &[Value]| -> Vec<String> {
+        items
+            .iter()
+            .filter(|i| {
+                i["tags"]
+                    .as_array()
+                    .is_some_and(|t| t.contains(&json!(tag)))
+            })
+            .filter_map(|i| i["id"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let mut last_error = String::new();
     for _ in 0..60 {
-        let (_, services) = recorder
-            .call(
-                None,
-                Method::GET,
-                &format!("/projects/{p}/services"),
-                &[("per_page", "100")],
-                None,
-            )
-            .await;
-        let (_, volumes) = recorder
-            .call(
-                None,
-                Method::GET,
-                &format!("/projects/{p}/volumes"),
-                &[("per_page", "100")],
-                None,
-            )
-            .await;
-        let ours = |items: Option<&Vec<Value>>| -> Vec<String> {
-            items
-                .into_iter()
-                .flatten()
-                .filter(|i| {
-                    i["tags"]
-                        .as_array()
-                        .is_some_and(|t| t.contains(&json!(tag)))
-                })
-                .filter_map(|i| i["id"].as_str().map(str::to_owned))
-                .collect()
+        let listed = async {
+            let services = recorder
+                .list(&format!("/projects/{p}/services"), Some("services"))
+                .await?;
+            let volumes = recorder
+                .list(&format!("/projects/{p}/volumes"), None)
+                .await?;
+            Ok::<_, String>((ours(&services), ours(&volumes)))
+        }
+        .await;
+        let (services, volumes) = match listed {
+            Ok(listed) => listed,
+            Err(e) => {
+                last_error = e;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
         };
-        let services = ours(services["data"]["services"].as_array());
-        let volumes = ours(volumes["data"].as_array());
         if services.is_empty() && volumes.is_empty() {
-            let (_, tags) = recorder
-                .call(None, Method::GET, "/tags", &[("per_page", "100")], None)
-                .await;
-            for found in tags["data"]["tags"].as_array().into_iter().flatten() {
-                if found["name"] == tag.as_str() {
-                    let path = format!("/tags/{}", found["id"].as_str().unwrap_or_default());
-                    recorder.call(None, Method::DELETE, &path, &[], None).await;
+            let tags = match recorder.list("/tags", Some("tags")).await {
+                Ok(tags) => tags,
+                Err(e) => {
+                    last_error = e;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            for found in tags.iter().filter(|t| t["name"] == tag.as_str()) {
+                let path = format!("/tags/{}", found["id"].as_str().unwrap_or_default());
+                let (status, _) = recorder.call(None, Method::DELETE, &path, &[], None).await;
+                if !(200..300).contains(&status) {
+                    return Err(format!("the tag {tag} could not be deleted: HTTP {status}"));
                 }
             }
             return Ok(());
         }
         for id in services {
             let path = format!("/projects/{p}/services/{id}");
+            let query = [("delete_child_objects", "true")];
             recorder
-                .call(
-                    None,
-                    Method::DELETE,
-                    &path,
-                    &[("delete_child_objects", "true")],
-                    None,
-                )
+                .call(None, Method::DELETE, &path, &query, None)
                 .await;
         }
         for id in volumes {
@@ -711,7 +816,9 @@ async fn clean_up(recorder: &mut Recorder, run: &str) -> Result<(), String> {
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    Err("the run's service or volume is still there after 5 minutes".into())
+    Err(format!(
+        "services or volumes tagged {tag} are still there after 5 minutes (last error: {last_error:?})"
+    ))
 }
 
 #[tokio::test]
@@ -744,17 +851,14 @@ async fn capture_northflank_fixtures() {
         swaps: Vec::new(),
         exchanges: Vec::new(),
         exec: Vec::new(),
+        team: None,
     };
-    let run = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .to_string();
+    if let Err(e) = clean_up(&mut recorder).await {
+        panic!("an earlier capture's leftovers could not be deleted: {e}");
+    }
 
-    let outcome = AssertUnwindSafe(record(&mut recorder, &run))
-        .catch_unwind()
-        .await;
-    let cleaned = clean_up(&mut recorder, &run).await;
+    let outcome = AssertUnwindSafe(record(&mut recorder)).catch_unwind().await;
+    let cleaned = clean_up(&mut recorder).await;
     match outcome {
         Err(panic) => std::panic::resume_unwind(panic),
         Ok(Err(e)) => panic!("capture failed: {e} (clean-up: {cleaned:?})"),
@@ -780,6 +884,12 @@ async fn capture_northflank_fixtures() {
         !text.contains(recorder.client.token.expose()),
         "the token would be written"
     );
+    if let Some(team) = &recorder.team {
+        assert!(
+            !text.contains(team.as_str()),
+            "the team slug would be written"
+        );
+    }
     std::fs::write(&out, text).unwrap();
     eprintln!("wrote {out}");
 }

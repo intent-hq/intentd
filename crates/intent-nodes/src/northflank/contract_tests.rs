@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 
 use super::client::error_message;
 use super::fake_api::{
-    exec_frames, message, NorthflankApi, FIXTURE_BACKEND_TAG, FIXTURE_PROJECT, FIXTURE_SERVICE,
+    exec_frames, message, refused_frame, NorthflankApi, Refusal, FIXTURE_BACKEND_TAG,
+    FIXTURE_MISSING_SERVICE, FIXTURE_PROJECT, FIXTURE_SERVICE,
 };
 use super::fields::Read;
 
@@ -108,6 +109,9 @@ struct Replayed {
     recorded: Value,
     fake_status: u16,
     fake: Value,
+    /// The recording kept only the list items whose `field` is one of
+    /// `values` (a team's other tags and services stay private).
+    kept: Option<(String, Vec<Value>)>,
 }
 
 /// Every recorded call, answered again by a fake that starts with the
@@ -150,6 +154,10 @@ fn replay() -> Vec<Replayed> {
                 recorded: exchange["response"]["body"].clone(),
                 fake_status: reply.status,
                 fake: reply.body,
+                kept: exchange.get("kept").map(|k| {
+                    let field = k["field"].as_str().unwrap_or("id").to_owned();
+                    (field, k["values"].as_array().cloned().unwrap_or_default())
+                }),
             }
         })
         .collect()
@@ -157,6 +165,29 @@ fn replay() -> Vec<Replayed> {
 
 fn same_kind(a: &Value, b: &Value) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+/// An object, or an array holding one: a serde struct's nested items,
+/// which their own [`Read`] compares. An array of plain values (tags) is
+/// compared whole.
+fn nested(value: &Value) -> bool {
+    match value {
+        Value::Object(_) => true,
+        Value::Array(items) => items.iter().any(|i| i.is_object() || i.is_array()),
+        _ => false,
+    }
+}
+
+/// An RFC 3339 time, as intentd reads `createdAt` (`2026-01-01T00:00:00Z`).
+fn looks_like_a_time(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() >= 20
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && (text.ends_with('Z') || text.contains('+'))
 }
 
 /// Equal JSON, numbers by value (`2` is `2.0`).
@@ -235,35 +266,44 @@ fn field_problems(calls: &[Replayed]) -> Vec<String> {
         {
             let recorded = read_items(read, &call.recorded);
             let fake = read_items(read, &call.fake);
-            // A recorded list keeps only this run's items: match each to
-            // the fake's by id, or by position when items have none.
-            let pairs: Vec<(&Value, Option<&Value>)> =
-                if recorded.iter().all(|r| r.get("id").is_some()) {
-                    recorded
-                        .iter()
-                        .map(|r| {
-                            (
-                                *r,
-                                fake.iter().copied().find(|f| f.get("id") == r.get("id")),
-                            )
-                        })
-                        .collect()
-                } else if recorded.len() == fake.len() {
-                    recorded
-                        .iter()
-                        .copied()
-                        .zip(fake.iter().copied().map(Some))
-                        .collect()
-                } else {
-                    problems.push(format!(
-                        "{} {}: {} items from the fake, {} recorded",
-                        call.name,
-                        read.at,
-                        fake.len(),
-                        recorded.len()
-                    ));
-                    continue;
-                };
+            // Filter the fake's list as the recording was, then pair items
+            // by id (by position when they have none): every recorded item
+            // must be returned, and nothing more.
+            let fake: Vec<&Value> = match &call.kept {
+                Some((field, values)) if read.at.ends_with('*') => fake
+                    .into_iter()
+                    .filter(|f| f.get(field).is_some_and(|v| values.contains(v)))
+                    .collect(),
+                _ => fake,
+            };
+            if recorded.len() != fake.len() {
+                problems.push(format!(
+                    "{} {}: {} items from the fake, {} recorded",
+                    call.name,
+                    read.at,
+                    fake.len(),
+                    recorded.len()
+                ));
+                continue;
+            }
+            let by_id = recorded.iter().all(|r| r.get("id").is_some());
+            let pairs: Vec<(&Value, Option<&Value>)> = if by_id {
+                recorded
+                    .iter()
+                    .map(|r| {
+                        (
+                            *r,
+                            fake.iter().copied().find(|f| f.get("id") == r.get("id")),
+                        )
+                    })
+                    .collect()
+            } else {
+                recorded
+                    .iter()
+                    .copied()
+                    .zip(fake.iter().copied().map(Some))
+                    .collect()
+            };
             for (i, (recorded, fake)) in pairs.into_iter().enumerate() {
                 let Some(fake) = fake else {
                     problems.push(format!(
@@ -275,12 +315,12 @@ fn field_problems(calls: &[Replayed]) -> Vec<String> {
                 for field in &read.fields {
                     let (r, f) = (recorded.pointer(field), fake.pointer(field));
                     let matches = match (r, f) {
-                        (Some(r), Some(f)) if VOLATILE.contains(&field.as_str()) => same_kind(r, f),
-                        (Some(r @ (Value::Array(_) | Value::Object(_))), Some(f))
-                            if !read.exact =>
-                        {
+                        (Some(r), Some(f)) if VOLATILE.contains(&field.as_str()) => {
                             same_kind(r, f)
+                                && (field != "/createdAt"
+                                    || f.as_str().is_none_or(looks_like_a_time))
                         }
+                        (Some(r), Some(f)) if !read.exact && nested(r) => same_kind(r, f),
                         (Some(r), Some(f)) => same(r, f),
                         (None, None) => true,
                         _ => false,
@@ -341,6 +381,24 @@ fn the_recording_holds_every_field_intentd_reads() {
     assert_none(&problems);
 }
 
+/// The frame types in order, a run of output frames counted once as
+/// `output`: Northflank splits output as it comes, and stdout and stderr
+/// race each other.
+fn kinds(frames: &[Value]) -> Vec<String> {
+    let mut kinds: Vec<String> = Vec::new();
+    for frame in frames {
+        let kind = match frame["type"].as_str() {
+            Some("stdOut" | "stdErr") => "output",
+            Some(other) => other,
+            None => "?",
+        };
+        if !(kind == "output" && kinds.last().is_some_and(|k| k == "output")) {
+            kinds.push(kind.to_owned());
+        }
+    }
+    kinds
+}
+
 /// Each output channel's text, and the `completion` frame's data.
 fn stream(frames: &[Value]) -> (String, String, Option<Value>, Option<Value>) {
     let mut out = String::new();
@@ -360,9 +418,18 @@ fn stream(frames: &[Value]) -> (String, String, Option<Value>, Option<Value>) {
     (out, err, init, completion)
 }
 
-/// How a fake streams one command: (`init` context, stdout, stderr, exit)
-/// to the frames after the client's `init`.
+/// How a fake streams one command that runs: (`init` context, stdout,
+/// stderr, exit) to the frames after the client's `init`.
 type Render = dyn Fn(&Value, &str, &str, i32) -> Vec<Value>;
+
+/// The refusal a recorded command without a program stands for.
+fn refusal(session: &str) -> Refusal<'static> {
+    match session {
+        "exec-bad-token" => Refusal::BadToken,
+        "exec-unknown-service" => Refusal::UnknownService(FIXTURE_MISSING_SERVICE),
+        other => panic!("the recorded command {other} has no program and no known refusal"),
+    }
+}
 
 #[test]
 fn the_fake_streams_each_recorded_command_as_northflank_did() {
@@ -382,12 +449,16 @@ fn stream_problems(render: &Render) -> Vec<String> {
     for session in sessions {
         let name = session["name"].as_str().unwrap_or_default();
         let program = &session["program"];
-        let fake = render(
-            &session["context"],
-            program["stdout"].as_str().unwrap_or_default(),
-            program["stderr"].as_str().unwrap_or_default(),
-            i32::try_from(program["exitCode"].as_i64().unwrap_or(-1)).unwrap_or(-1),
-        );
+        let fake = if program.is_null() {
+            vec![refused_frame(refusal(name))]
+        } else {
+            render(
+                &session["context"],
+                program["stdout"].as_str().unwrap_or_default(),
+                program["stderr"].as_str().unwrap_or_default(),
+                i32::try_from(program["exitCode"].as_i64().unwrap_or(-1)).unwrap_or(-1),
+            )
+        };
         let recorded: Vec<Value> = session["frames"]
             .as_array()
             .into_iter()
@@ -410,6 +481,12 @@ fn stream_problems(render: &Render) -> Vec<String> {
                 ));
             }
         }
+        let (kinds_recorded, kinds_fake) = (kinds(&recorded), kinds(&fake));
+        if kinds_recorded != kinds_fake {
+            problems.push(format!(
+                "{name}: the fake sends frames {kinds_fake:?}, Northflank sent {kinds_recorded:?}"
+            ));
+        }
         let (r_out, r_err, r_init, r_done) = stream(&recorded);
         let (f_out, f_err, f_init, f_done) = stream(&fake);
         if (r_out.as_str(), r_err.as_str()) != (f_out.as_str(), f_err.as_str()) {
@@ -417,17 +494,26 @@ fn stream_problems(render: &Render) -> Vec<String> {
                 "{name}: the fake streams stdout {f_out:?} and stderr {f_err:?}, Northflank streamed {r_out:?} and {r_err:?}"
             ));
         }
-        let auth = |init: &Option<Value>| init.as_ref().and_then(|d| d.get("auth")).cloned();
+        // intentd reads `auth`, and a refusal's `message` to tell a bad
+        // token from a missing permission.
+        let auth = |init: &Option<Value>| {
+            init.as_ref()
+                .map(|d| (d.get("auth").cloned(), d.get("message").cloned()))
+        };
         if auth(&r_init) != auth(&f_init) {
             problems.push(format!(
                 "{name}: init {f_init:?} from the fake, {r_init:?} recorded"
             ));
         }
-        let (Some(r_done), Some(f_done)) = (&r_done, &f_done) else {
-            problems.push(format!(
-                "{name}: completion {f_done:?} from the fake, {r_done:?} recorded"
-            ));
-            continue;
+        let (r_done, f_done) = match (&r_done, &f_done) {
+            (Some(r), Some(f)) => (r, f),
+            (None, None) => continue,
+            _ => {
+                problems.push(format!(
+                    "{name}: completion {f_done:?} from the fake, {r_done:?} recorded"
+                ));
+                continue;
+            }
         };
         for field in completion_fields {
             let (r, f) = (r_done.get(*field), f_done.get(*field));

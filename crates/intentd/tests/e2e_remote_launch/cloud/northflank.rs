@@ -394,15 +394,25 @@ impl FakeNorthflank {
         };
         let init: Value = serde_json::from_str(&init).unwrap();
         let send = |value: Value| fake_api::message(&value);
-        let refusal = self.state().exec_refusal.clone();
-        if init["data"]["auth"]["apiToken"] != NF_TOKEN.as_str() || refusal.is_some() {
-            let message = refusal.unwrap_or_else(|| "Invalid token".into());
-            let _ = ws
-                .send(send(
-                    json!({ "type": "init", "data": { "auth": "failed", "message": message } }),
-                ))
-                .await;
-            let _ = ws.close(None).await;
+        // Northflank answers a refused `init` with one frame and then keeps
+        // the socket open: the client has to stop on that frame.
+        let refused = if init["data"]["auth"]["apiToken"] != NF_TOKEN.as_str() {
+            Some(fake_api::refused_frame(fake_api::Refusal::BadToken))
+        } else if !self.state().services.contains_key(&service_id) {
+            Some(fake_api::refused_frame(fake_api::Refusal::UnknownService(
+                &service_id,
+            )))
+        } else {
+            // A token without the exec permission: no recording has its
+            // message, so the test names one.
+            self.state()
+                .exec_refusal
+                .clone()
+                .map(|message| fake_api::init_failed_frame(&message))
+        };
+        if let Some(frame) = refused {
+            let _ = ws.send(send(frame)).await;
+            while let Some(Ok(_)) = ws.next().await {}
             return;
         }
         let argv: Vec<String> =
@@ -419,11 +429,6 @@ impl FakeNorthflank {
             .get(&service_id)
             .map(|s| (s.home.clone(), s.env.clone(), s.group.pgid()));
         let Some((home, env, group)) = running else {
-            let _ = ws
-                .send(send(
-                    json!({ "type": "error", "data": { "message": "Service not found" } }),
-                ))
-                .await;
             return;
         };
         // The container's home folder is the volume: the same path the

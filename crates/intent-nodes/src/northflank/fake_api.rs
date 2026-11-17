@@ -25,6 +25,8 @@ pub const FIXTURE_SERVICE: &str = "intent-000000000001";
 pub const FIXTURE_BACKEND: &str = "capture-000000000001";
 pub const FIXTURE_BACKEND_TAG: &str = "intent-backend-000000000001";
 pub const FIXTURE_TIME: &str = "2026-01-01T00:00:00.000Z";
+/// [`FIXTURE_TIME`] in Unix seconds, as container times are.
+pub const FIXTURE_EPOCH: u64 = 1_767_225_600;
 
 /// The smallest volume Northflank's default `nvme` storage class makes.
 pub const MIN_VOLUME_MB: u64 = 6144;
@@ -568,9 +570,9 @@ fn not_found_service() -> Reply {
 pub fn container_body(service: &str) -> Value {
     json!({
         "name": format!("{service}-0"),
-        "createdAt": 1_700_000_000,
+        "createdAt": FIXTURE_EPOCH,
         "status": "TASK_RUNNING",
-        "updatedAt": 1_700_000_000,
+        "updatedAt": FIXTURE_EPOCH,
     })
 }
 
@@ -610,6 +612,35 @@ pub fn output_frame(tty: bool, stderr: bool, text: &str) -> Value {
     } else {
         json!({ "type": "stdOut", "data": text })
     }
+}
+
+/// A service id the recording never made, for its refused command.
+pub const FIXTURE_MISSING_SERVICE: &str = "intent-ffffffffffff";
+
+/// Why Northflank refuses a command's `init`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal<'a> {
+    /// The `init` token is not a Northflank API token.
+    BadToken,
+    /// The URL names no service of the project.
+    UnknownService(&'a str),
+}
+
+/// The one frame Northflank sends for a refused `init`. It then keeps the
+/// socket open and sends nothing more: the client must stop reading.
+#[must_use]
+pub fn refused_frame(refusal: Refusal<'_>) -> Value {
+    let message = match refusal {
+        Refusal::BadToken => "Unauthorized".to_owned(),
+        Refusal::UnknownService(id) => format!("Could not find service '{id}'"),
+    };
+    init_failed_frame(&message)
+}
+
+/// An `init` answer of `failed` with `message`.
+#[must_use]
+pub fn init_failed_frame(message: &str) -> Value {
+    json!({ "type": "init", "data": { "auth": "failed", "message": message } })
 }
 
 /// The answer to an accepted `init`.

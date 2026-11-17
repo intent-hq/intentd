@@ -18,6 +18,9 @@ if [ -z "${NORTHFLANK_PROJECT_ID:-}" ] || { [ -z "${NORTHFLANK_API_TOKEN:-}" ] &
   exit 2
 fi
 
+# Plain cargo test, not nextest: nextest kills a test after 180 s, before
+# the capture's own clean-up could run. Interrupted anyway? The next run
+# deletes what this one left before it starts.
 cd "$(dirname "$0")/.."
-NORTHFLANK_CAPTURE=1 exec cargo nextest run -p intent-nodes --lib --no-capture --no-fail-fast --retries 0 \
-  -E 'test(=northflank::capture::capture_northflank_fixtures)'
+NORTHFLANK_CAPTURE=1 exec cargo test -p intent-nodes --lib -- --exact --nocapture \
+  northflank::capture::capture_northflank_fixtures
