@@ -23,7 +23,7 @@ impl Store {
         child_agent_id: &AgentId,
         delivered_at: &str,
     ) -> Result<()> {
-        pending_postgres!("record_advisory_wake_delivery", self, backend => backend.record_advisory_wake_delivery(parent_agent_id, child_agent_id, delivered_at).await)
+        dispatch!(self, backend => backend.record_advisory_wake_delivery(parent_agent_id, child_agent_id, delivered_at).await)
     }
 
     /// Whether an advisory-delivered marker stands for the pair.
@@ -36,7 +36,7 @@ impl Store {
         parent_agent_id: &AgentId,
         child_agent_id: &AgentId,
     ) -> Result<bool> {
-        pending_postgres!("has_advisory_wake_delivery", self, backend => backend.has_advisory_wake_delivery(parent_agent_id, child_agent_id).await)
+        dispatch!(self, backend => backend.has_advisory_wake_delivery(parent_agent_id, child_agent_id).await)
     }
 
     /// Clear the advisory-delivered marker for the pair (the child's genuine
@@ -51,7 +51,7 @@ impl Store {
         parent_agent_id: &AgentId,
         child_agent_id: &AgentId,
     ) -> Result<()> {
-        pending_postgres!("clear_advisory_wake_delivery", self, backend => backend.clear_advisory_wake_delivery(parent_agent_id, child_agent_id).await)
+        dispatch!(self, backend => backend.clear_advisory_wake_delivery(parent_agent_id, child_agent_id).await)
     }
 
     /// Clear every advisory-delivered marker naming `child_agent_id` as the
@@ -68,7 +68,7 @@ impl Store {
         &self,
         child_agent_id: &AgentId,
     ) -> Result<()> {
-        pending_postgres!("clear_advisory_wake_deliveries_for_child", self, backend => backend.clear_advisory_wake_deliveries_for_child(child_agent_id).await)
+        dispatch!(self, backend => backend.clear_advisory_wake_deliveries_for_child(child_agent_id).await)
     }
 
     /// Batched [`Store::clear_advisory_wake_deliveries_for_child`]: clear the
@@ -85,7 +85,7 @@ impl Store {
         &self,
         child_agent_ids: &[AgentId],
     ) -> Result<()> {
-        pending_postgres!("clear_advisory_wake_deliveries_for_children", self, backend => backend.clear_advisory_wake_deliveries_for_children(child_agent_ids).await)
+        dispatch!(self, backend => backend.clear_advisory_wake_deliveries_for_children(child_agent_ids).await)
     }
 }
 

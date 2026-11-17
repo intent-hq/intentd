@@ -21,7 +21,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_task_agent_link(&self, link: &TaskAgentLink) -> Result<TaskAgentLink> {
-        pending_postgres!("upsert_task_agent_link", self, backend => backend.upsert_task_agent_link(link).await)
+        dispatch!(self, backend => backend.upsert_task_agent_link(link).await)
     }
 
     /// Delete a single link by its full key. Returns whether a row was
@@ -36,7 +36,7 @@ impl Store {
         note_id: &NoteId,
         task_key: &str,
     ) -> Result<bool> {
-        pending_postgres!("delete_task_agent_link", self, backend => backend.delete_task_agent_link(workspace_id, note_id, task_key).await)
+        dispatch!(self, backend => backend.delete_task_agent_link(workspace_id, note_id, task_key).await)
     }
 
     /// List every link for a workspace, oldest first — hydration read for
@@ -49,7 +49,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<TaskAgentLink>> {
-        pending_postgres!("list_task_agent_links", self, backend => backend.list_task_agent_links(workspace_id).await)
+        dispatch!(self, backend => backend.list_task_agent_links(workspace_id).await)
     }
 }
 

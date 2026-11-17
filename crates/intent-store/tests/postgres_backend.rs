@@ -14,6 +14,8 @@
 
 #[path = "postgres_backend/agent_messages.rs"]
 mod agent_messages;
+#[path = "postgres_backend/agents.rs"]
+mod agents;
 #[path = "postgres_backend/discussions.rs"]
 mod discussions;
 #[path = "postgres_backend/harness.rs"]
