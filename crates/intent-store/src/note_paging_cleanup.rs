@@ -119,7 +119,7 @@ impl Store {
     /// # Errors
     /// Returns `Error::Internal` if the schema read or the write fails.
     pub async fn retired_note_paging_step(&self, batch_rows: u32) -> Result<RetiredNotePagingStep> {
-        pending_postgres!("retired_note_paging_step", self, backend => backend.retired_note_paging_step(batch_rows).await)
+        dispatch!(self, backend => backend.retired_note_paging_step(batch_rows).await)
     }
 
     /// Remove the retired note paging tables in short, paced batches until
@@ -136,7 +136,7 @@ impl Store {
         &self,
         policy: NotePagingCleanupPolicy,
     ) -> NotePagingCleanupOutcome {
-        pending_postgres!(panic "run_retired_note_paging_cleanup", self, backend => backend.run_retired_note_paging_cleanup(policy).await)
+        dispatch!(self, backend => backend.run_retired_note_paging_cleanup(policy).await)
     }
 }
 
@@ -181,81 +181,94 @@ impl crate::SqliteStore {
         &self,
         policy: NotePagingCleanupPolicy,
     ) -> NotePagingCleanupOutcome {
-        let started = Instant::now();
-        let mut last_progress = started;
-        let mut batch = policy.batch_rows.max(1);
-        let mut outcome = NotePagingCleanupOutcome::default();
-        let mut announced = false;
-        let mut consecutive_failures = 0u32;
-        loop {
-            let step_started = Instant::now();
-            let step = match self.retired_note_paging_step(batch).await {
-                Ok(step) => {
-                    consecutive_failures = 0;
-                    step
-                }
-                Err(e) => {
-                    consecutive_failures += 1;
-                    outcome.failed_steps += 1;
-                    let backoff = retry_backoff(&policy, consecutive_failures);
-                    tracing::warn!(
-                        error = %e,
-                        attempt = consecutive_failures,
-                        retry_in_ms = backoff.as_millis(),
-                        rows_removed = outcome.rows_removed,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "retired note paging cleanup step failed; retrying"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-            };
-            let elapsed = step_started.elapsed();
-            outcome.max_step = outcome.max_step.max(elapsed);
-            match step {
-                RetiredNotePagingStep::Done => {
-                    outcome.finished = true;
-                    if announced {
-                        tracing::info!(
-                            rows_removed = outcome.rows_removed,
-                            tables_dropped = outcome.tables_dropped,
-                            max_step_ms = outcome.max_step.as_millis(),
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "retired note paging cleanup finished"
-                        );
-                    }
-                    return outcome;
-                }
-                RetiredNotePagingStep::Deleted { table, rows } => {
-                    if !announced {
-                        announced = true;
-                        tracing::info!(table, "retired note paging cleanup started");
-                    }
-                    outcome.rows_removed += rows;
-                    if elapsed > policy.hold_budget {
-                        batch = (batch / 2).max(policy.min_batch_rows.max(1));
-                    }
-                }
-                RetiredNotePagingStep::Dropped { table } => {
-                    if !announced {
-                        announced = true;
-                        tracing::info!(table, "retired note paging cleanup started");
-                    }
-                    outcome.tables_dropped += 1;
-                    tracing::info!(table, "retired note paging table dropped");
-                }
+        run_paced_cleanup(policy, |batch| self.retired_note_paging_step(batch)).await
+    }
+}
+
+/// The paced, retrying cleanup loop behind
+/// [`Store::run_retired_note_paging_cleanup`], over one backend's `step`.
+pub(crate) async fn run_paced_cleanup<F, Fut>(
+    policy: NotePagingCleanupPolicy,
+    mut run_step: F,
+) -> NotePagingCleanupOutcome
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<RetiredNotePagingStep>>,
+{
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut batch = policy.batch_rows.max(1);
+    let mut outcome = NotePagingCleanupOutcome::default();
+    let mut announced = false;
+    let mut consecutive_failures = 0u32;
+    loop {
+        let step_started = Instant::now();
+        let step = match run_step(batch).await {
+            Ok(step) => {
+                consecutive_failures = 0;
+                step
             }
-            if last_progress.elapsed() >= policy.progress_every {
-                last_progress = Instant::now();
-                tracing::info!(
+            Err(e) => {
+                consecutive_failures += 1;
+                outcome.failed_steps += 1;
+                let backoff = retry_backoff(&policy, consecutive_failures);
+                tracing::warn!(
+                    error = %e,
+                    attempt = consecutive_failures,
+                    retry_in_ms = backoff.as_millis(),
                     rows_removed = outcome.rows_removed,
-                    batch_rows = batch,
                     elapsed_ms = started.elapsed().as_millis(),
-                    "retired note paging cleanup progress"
+                    "retired note paging cleanup step failed; retrying"
                 );
+                tokio::time::sleep(backoff).await;
+                continue;
             }
-            tokio::time::sleep(elapsed.max(policy.min_pause)).await;
+        };
+        let elapsed = step_started.elapsed();
+        outcome.max_step = outcome.max_step.max(elapsed);
+        match step {
+            RetiredNotePagingStep::Done => {
+                outcome.finished = true;
+                if announced {
+                    tracing::info!(
+                        rows_removed = outcome.rows_removed,
+                        tables_dropped = outcome.tables_dropped,
+                        max_step_ms = outcome.max_step.as_millis(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "retired note paging cleanup finished"
+                    );
+                }
+                return outcome;
+            }
+            RetiredNotePagingStep::Deleted { table, rows } => {
+                if !announced {
+                    announced = true;
+                    tracing::info!(table, "retired note paging cleanup started");
+                }
+                outcome.rows_removed += rows;
+                if elapsed > policy.hold_budget {
+                    batch = (batch / 2).max(policy.min_batch_rows.max(1));
+                }
+            }
+            RetiredNotePagingStep::Dropped { table } => {
+                if !announced {
+                    announced = true;
+                    tracing::info!(table, "retired note paging cleanup started");
+                }
+                outcome.tables_dropped += 1;
+                tracing::info!(table, "retired note paging table dropped");
+            }
         }
+        if last_progress.elapsed() >= policy.progress_every {
+            last_progress = Instant::now();
+            tracing::info!(
+                rows_removed = outcome.rows_removed,
+                batch_rows = batch,
+                elapsed_ms = started.elapsed().as_millis(),
+                "retired note paging cleanup progress"
+            );
+        }
+        tokio::time::sleep(elapsed.max(policy.min_pause)).await;
     }
 }
 

@@ -70,7 +70,7 @@ impl Drop for LaneSlot {
 }
 
 impl NoteWriteLanes {
-    async fn lock(self: &Arc<Self>, key: NoteKey) -> NoteWriteLock {
+    pub(crate) async fn lock(self: &Arc<Self>, key: NoteKey) -> NoteWriteLock {
         let mutex = {
             let mut lanes = self
                 .lanes
@@ -95,7 +95,7 @@ impl NoteWriteLanes {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn users(&self, key: &NoteKey) -> usize {
+    pub(crate) fn users(&self, key: &NoteKey) -> usize {
         self.lanes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -104,7 +104,7 @@ impl NoteWriteLanes {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.lanes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -127,8 +127,8 @@ impl NoteWriteLock {
 
     /// Refuse a write of `note` unless this lock was taken from `store`'s
     /// registry for exactly that note.
-    pub(crate) fn ensure_covers(&self, store: &crate::SqliteStore, note: &Note) -> Result<()> {
-        if !Arc::ptr_eq(&self.slot.registry, &store.note_write_lanes) {
+    pub(crate) fn ensure_covers(&self, lanes: &Arc<NoteWriteLanes>, note: &Note) -> Result<()> {
+        if !Arc::ptr_eq(&self.slot.registry, lanes) {
             return Err(Error::Internal(format!(
                 "note write lock for {}/{} was taken from another store",
                 self.workspace_id().0,
@@ -158,7 +158,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> NoteWriteLock {
-        pending_postgres!(panic "lock_note_content", self, backend => backend.lock_note_content(workspace_id, note_id).await)
+        dispatch!(self, backend => backend.lock_note_content(workspace_id, note_id).await)
     }
 
     /// Callers holding or awaiting `note_id`'s content-write lock. A test
@@ -166,7 +166,7 @@ impl Store {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn note_content_lock_users(&self, workspace_id: &WorkspaceId, note_id: &NoteId) -> usize {
-        pending_postgres!(panic "note_content_lock_users", self, backend => backend.note_content_lock_users(workspace_id, note_id))
+        dispatch!(self, backend => backend.note_content_lock_users(workspace_id, note_id))
     }
 
     /// `true` when no note's content-write lock is held or awaited. A test
@@ -174,7 +174,7 @@ impl Store {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn note_content_locks_idle(&self) -> bool {
-        pending_postgres!(panic "note_content_locks_idle", self, backend => backend.note_content_locks_idle())
+        dispatch!(self, backend => backend.note_content_locks_idle())
     }
 }
 

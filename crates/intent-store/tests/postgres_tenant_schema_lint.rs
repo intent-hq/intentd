@@ -308,3 +308,102 @@ fn every_sqlite_migration_after_the_baseline_has_a_postgres_counterpart() {
          with `-- sqlite: <file>`, or a reasoned line in postgres/sqlite-noop.txt): {missing:?}"
     );
 }
+
+/// Text-search configurations the store may name: Postgres built-ins only.
+const BUILTIN_TS_CONFIGS: &[&str] = &["english", "simple"];
+
+/// Text-search functions whose first argument may name a configuration.
+const TS_CONFIG_FUNCTIONS: &[&str] = &[
+    "to_tsvector(",
+    "to_tsquery(",
+    "plainto_tsquery(",
+    "phraseto_tsquery(",
+    "websearch_to_tsquery(",
+    "ts_headline(",
+    "ts_debug(",
+];
+
+/// Text-search objects the store must not depend on beyond the built-ins.
+/// `PlanetScale` Neki rejects user-created text-search dictionaries and
+/// configurations ("creating a text search dictionary/configuration through
+/// the router is not supported; router-side text-search evaluation supports
+/// only `PostgreSQL` built-ins", router errors 302/303), so a migration that
+/// creates one, or a query that names one, fails on the production target.
+fn text_search_violations(sql: &str) -> Vec<String> {
+    let flat = sql
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out = Vec::new();
+    for kind in ["dictionary", "configuration", "parser", "template"] {
+        if flat.contains(&format!("create text search {kind}")) {
+            out.push(format!("creates a text search {kind}"));
+        }
+    }
+    let mut named = Vec::new();
+    for function in TS_CONFIG_FUNCTIONS {
+        for (at, _) in flat.match_indices(function) {
+            let rest = flat[at + function.len()..].trim_start();
+            if let Some(name) = rest.strip_prefix('\'').and_then(|r| r.split('\'').next()) {
+                named.push(name.to_owned());
+            }
+        }
+    }
+    for (at, _) in flat.match_indices("'::regconfig") {
+        if let Some(open) = flat[..at].rfind('\'') {
+            named.push(flat[open + 1..at].to_owned());
+        }
+    }
+    for name in named {
+        if !BUILTIN_TS_CONFIGS.contains(&name.as_str()) {
+            out.push(format!("names text search configuration {name:?}"));
+        }
+    }
+    out
+}
+
+#[test]
+fn full_text_search_uses_only_builtin_configurations() {
+    let mut findings = Vec::new();
+    for (file, text) in migrations() {
+        for v in text_search_violations(&without_comments(&text)) {
+            findings.push(format!("postgres/migrations/{file}: {v}"));
+        }
+    }
+    let src = store_dir().join("src/postgres");
+    for entry in std::fs::read_dir(&src).expect("read src/postgres") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).expect("read");
+            for v in text_search_violations(&text) {
+                findings.push(format!("{}: {v}", path.display()));
+            }
+        }
+    }
+    assert!(
+        findings.is_empty(),
+        "Neki supports only the built-in text search configurations:\n{}",
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn the_text_search_rule_catches_custom_objects() {
+    assert!(text_search_violations(
+        "SELECT to_tsvector('english', x) || to_tsvector( 'simple', x), \
+         to_tsquery('simple', $3[1]), 'english'::regconfig"
+    )
+    .is_empty());
+    for bad in [
+        "CREATE TEXT SEARCH DICTIONARY d (TEMPLATE = snowball, Language = english)",
+        "create text  search\nconfiguration c (copy = english)",
+        "CREATE TEXT SEARCH PARSER p (START = s, GETTOKEN = g, END = e, LEXTYPES = l)",
+        "CREATE TEXT SEARCH TEMPLATE t (LEXIZE = l)",
+        "SELECT to_tsquery('intent_search', $1)",
+        "SELECT ts_headline('french', body, q)",
+        "SELECT 'custom'::regconfig",
+    ] {
+        assert!(!text_search_violations(bad).is_empty(), "{bad}");
+    }
+}

@@ -1938,7 +1938,7 @@ impl PgStore {
 
 /// Run one conditional write in `tx` and commit; whether a row changed.
 async fn rows_changed(
-    mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    mut tx: super::WriteTx,
     query: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
 ) -> Result<bool> {
     let changed = query.execute(&mut *tx).await.map_err(db)?.rows_affected() > 0;

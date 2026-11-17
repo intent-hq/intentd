@@ -18,6 +18,9 @@ use sqlx::Transaction;
 
 pub use sqlx::postgres::PgPool;
 
+mod comments;
+mod note_search;
+mod notes;
 mod settings;
 mod workspaces;
 
@@ -378,11 +381,40 @@ fn dollar_tag(s: &str) -> Option<&str> {
     valid.then(|| &s[..end + 2])
 }
 
+/// A transaction holding the tenant's writer lock; only
+/// [`PgStore::begin_write`] makes one. Helpers that write inside a caller's
+/// transaction take `&mut WriteTx`, so they cannot run without the lock.
+pub(crate) struct WriteTx(Transaction<'static, Postgres>);
+
+impl WriteTx {
+    pub(crate) async fn commit(self) -> std::result::Result<(), sqlx::Error> {
+        self.0.commit().await
+    }
+}
+
+impl std::ops::Deref for WriteTx {
+    type Target = sqlx::PgConnection;
+    fn deref(&self) -> &sqlx::PgConnection {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for WriteTx {
+    fn deref_mut(&mut self) -> &mut sqlx::PgConnection {
+        &mut self.0
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PgStore {
     pool: PgPool,
     tenant: TenantId,
     options: PostgresOptions,
+    /// Per-note content-write locks; see `note_write_lock`. Process-local,
+    /// like `SQLite`'s: they order writers within this store.
+    note_write_lanes: Arc<crate::note_write_lock::NoteWriteLanes>,
+    task_event_baselines: Arc<crate::TaskEventBaselines>,
+    task_events_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PgStore {
@@ -409,14 +441,14 @@ impl PgStore {
     /// read-then-write sequences; this keeps that guarantee per tenant while
     /// other tenants write in parallel. Use it for any method that reads and
     /// then writes, or writes more than one statement.
-    pub(crate) async fn begin_write(&self) -> Result<Transaction<'static, Postgres>> {
+    pub(crate) async fn begin_write(&self) -> Result<WriteTx> {
         let mut tx = self.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('intent-writer:' || $1, 0))")
             .bind(self.tenant())
             .execute(&mut *tx)
             .await
             .map_err(db)?;
-        Ok(tx)
+        Ok(WriteTx(tx))
     }
 
     /// Nothing to release: tenants share the pool, and closing it would end
@@ -440,6 +472,9 @@ impl crate::Store {
             pool,
             tenant,
             options,
+            note_write_lanes: Arc::default(),
+            task_event_baselines: Arc::default(),
+            task_events_enabled: Arc::default(),
         };
         let mut tx = store.begin().await?;
         sqlx::query("SELECT intent_provision_tenant($1)")
