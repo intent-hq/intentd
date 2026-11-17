@@ -1247,7 +1247,7 @@ impl PgStore {
         server_id: &str,
         disabled: bool,
     ) -> Result<()> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         if !self.workspace_exists(&mut tx, id).await? {
             return Err(not_found(id));
         }

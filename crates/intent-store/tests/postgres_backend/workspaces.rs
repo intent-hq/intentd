@@ -339,74 +339,99 @@ parity_test!(
 
 parity_test!(workspace_archive_retire_and_revive, |store, tenant| {
     let id = wid("ws-r");
+    let (r2, r3, r5) = (wid("ws-r2"), wid("ws-r3"), wid("ws-r5"));
     let missing = wid("missing");
     store
         .insert_workspace(&workspace("ws-r", T0))
         .await
         .unwrap();
-
     assert!(!store
         .unarchive_workspace_if_archived(&id, T1)
         .await
         .unwrap());
     assert!(!store.retire_workspace_if_archived(&id, T1).await.unwrap());
-    let mut archived = store.get_workspace(&id).await.unwrap();
-    archived.archived = true;
-    archived.status = WorkspaceStatus::Archived;
-    // Archive columns move only through the scoped flips, so stage the
-    // archived row by re-inserting it under a second id.
-    let mut staged = archived.clone();
-    staged.id = wid("ws-r2");
-    store.insert_workspace(&staged).await.unwrap();
-    let id2 = wid("ws-r2");
-
+    // Archive columns move only through the scoped flips, so stage archived
+    // rows by inserting them archived.
+    for staged in ["ws-r2", "ws-r3", "ws-r5"] {
+        let mut ws = workspace(staged, T0);
+        ws.archived = true;
+        ws.archived_at = Some(T0.into());
+        ws.status = WorkspaceStatus::Archived;
+        store.insert_workspace(&ws).await.unwrap();
+    }
     assert_eq!(
-        store.retired_workspace_for(Some(&id2), None).await.unwrap(),
+        store.retired_workspace_for(Some(&r5), None).await.unwrap(),
         None
     );
-    assert!(store.retire_workspace_if_archived(&id2, T1).await.unwrap());
-    assert!(!store.retire_workspace_if_archived(&id2, T1).await.unwrap());
-    let retired = store.get_workspace(&id2).await.unwrap();
-    assert_eq!(retired.status, WorkspaceStatus::Retired);
-    assert_eq!(retired.retired_at.as_deref(), Some(T1));
-    assert_eq!(
-        store.retired_workspace_for(Some(&id2), None).await.unwrap(),
-        Some(id2.clone())
-    );
-    assert_eq!(
-        store
-            .retired_workspace_for(None, Some(&AgentId("no-agent".into())))
+    assert!(store.retire_workspace_if_archived(&r5, T1).await.unwrap());
+
+    // The decoy stops here: ws-r2 and ws-r3 stay archived and ws-r5 stays
+    // retired, so the subject's retire, unarchive and revive of the same ids
+    // would match them without the tenant filter.
+    if tenant != "decoy" {
+        assert!(store.retire_workspace_if_archived(&r2, T1).await.unwrap());
+        assert!(!store.retire_workspace_if_archived(&r2, T1).await.unwrap());
+        let retired = store.get_workspace(&r2).await.unwrap();
+        assert_eq!(retired.status, WorkspaceStatus::Retired);
+        assert!(retired.archived);
+        assert_eq!(retired.retired_at.as_deref(), Some(T1));
+        assert_eq!(
+            retired.status_message.as_deref(),
+            Some(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE)
+        );
+        assert_eq!(
+            store.retired_workspace_for(Some(&r2), None).await.unwrap(),
+            Some(r2.clone())
+        );
+        assert_eq!(
+            store
+                .retired_workspace_for(None, Some(&AgentId("no-agent".into())))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(ids(&list(&store, true, false).await), ["ws-r", "ws-r3"]);
+        assert_eq!(
+            ids(&list(&store, false, true).await),
+            ["ws-r", "ws-r2", "ws-r5"]
+        );
+        assert!(!store
+            .unarchive_workspace_if_archived(&r2, T1)
             .await
-            .unwrap(),
-        None
-    );
-    assert_eq!(ids(&list(&store, true, false).await), ["ws-r"]);
-    assert_eq!(ids(&list(&store, false, true).await), ["ws-r", "ws-r2"]);
-    assert!(!store
-        .unarchive_workspace_if_archived(&id2, T1)
-        .await
-        .unwrap());
+            .unwrap());
 
-    assert!(!store
-        .revive_workspace_if_retired(&id, "b", None, T2)
-        .await
-        .unwrap());
-    assert!(store
-        .revive_workspace_if_retired_with_notice(
-            &id2,
-            "revived",
-            Some(tenant),
-            T2,
-            Some(("notice", "text", None))
-        )
-        .await
-        .unwrap());
-    let revived = store.get_workspace(&id2).await.unwrap();
-    assert_eq!(revived.status, WorkspaceStatus::Active);
-    assert!(!revived.archived);
-    assert_eq!(revived.branch, "revived");
-    assert_eq!(revived.base_commit_sha.as_deref(), Some(tenant));
-    assert_eq!(revived.status_message, None);
+        assert!(store
+            .unarchive_workspace_if_archived(&r3, T1)
+            .await
+            .unwrap());
+        let unarchived = store.get_workspace(&r3).await.unwrap();
+        assert_eq!(unarchived.status, WorkspaceStatus::Active);
+        assert!(!unarchived.archived);
+        assert_eq!(unarchived.archived_at, None);
+        assert_eq!(unarchived.updated_at, T1);
+
+        assert!(!store
+            .revive_workspace_if_retired(&id, "b", None, T2)
+            .await
+            .unwrap());
+        assert!(store
+            .revive_workspace_if_retired_with_notice(
+                &r5,
+                "revived",
+                Some(tenant),
+                T2,
+                Some(("notice", "text", None))
+            )
+            .await
+            .unwrap());
+        let revived = store.get_workspace(&r5).await.unwrap();
+        assert_eq!(revived.status, WorkspaceStatus::Active);
+        assert!(!revived.archived);
+        assert_eq!(revived.retired_at, None);
+        assert_eq!(revived.branch, "revived");
+        assert_eq!(revived.base_commit_sha.as_deref(), Some(tenant));
+        assert_eq!(revived.status_message, None);
+    }
     for err in [
         store.unarchive_workspace_if_archived(&missing, T1).await,
         store.retire_workspace_if_archived(&missing, T1).await,
