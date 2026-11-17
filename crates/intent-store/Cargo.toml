@@ -1,6 +1,6 @@
 [package]
 name = "intent-store"
-version = "0.11.235"
+version = "0.11.236"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -32,7 +32,7 @@ test-support = []
 postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring-webpki"]
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.235" }
+intent-core = { path = "../intent-core", version = "0.11.236" }
 time = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
