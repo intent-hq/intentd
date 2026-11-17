@@ -132,7 +132,7 @@ without moving the messages or monitor cards.
 
 <!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-transport/src/retired_gate.rs; packages/intentd/crates/intent-store/src/discussion_management_repo.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/features/layout/tab-types/DiscussionTabType.svelte; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
+<!-- Sources (Labs device rail, paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
 Only when explicitly asked about personal device pairing: it pairs another device
 with the signed-in person's current access. It is separate from the local Remote
