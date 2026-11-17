@@ -1,0 +1,4 @@
+delete_mcp_oauth_token
+get_mcp_oauth_token
+list_mcp_oauth_server_ids
+set_mcp_oauth_token

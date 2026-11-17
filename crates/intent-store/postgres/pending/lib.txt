@@ -1,0 +1,10 @@
+activate_incremental_vacuum
+freelist_count
+incremental_vacuum_chunk
+migration_status
+optimize
+page_size
+pool
+read_pool
+spawn_periodic_wal_checkpoint
+write_pool
