@@ -49,9 +49,9 @@ older connected daemon shows an update note instead of the GitLab setup.
 On iPhone and iPad, with an Intent Mobile version that has sharing, a workspace owner
 opens the workspace's **⋯** menu → **Share…** to make an invitation link: **Anyone
 with the link** (reusable until it expires) or **One person** (a GitHub username; that
-account can use it once). **Send Invite Link** opens the iOS share sheet and **Copy
-Link** copies it. To invite a few people one at a time, open **Share…** again for each
-link. The phone only creates links: it does not add people directly, list
+account can use it once). **Send Invite Link** opens the iOS share sheet, which can
+also copy the link. To invite a few people one at a time, open **Share…** again for
+each link. The phone only creates links: it does not add people directly, list
 members, or turn links off. Remove people, revoke links and pin GitLab accounts from
 **Share…** in the desktop app. Links need the host's Tailcat tunnel; the sheet says so
 when it is off.
