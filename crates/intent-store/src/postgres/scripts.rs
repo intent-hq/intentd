@@ -125,7 +125,13 @@ impl PgStore {
 
     /// Replace the rows of `scripts` (by id) inside the caller's transaction.
     /// A repeated id keeps its last definition, as consecutive replaces do.
-    async fn replace_scripts(&self, tx: &mut WriteTx, scripts: &[Script]) -> Result<()> {
+    /// `what` names the operation in errors, as the `SQLite` messages do.
+    async fn replace_scripts(
+        &self,
+        tx: &mut WriteTx,
+        scripts: &[Script],
+        what: &str,
+    ) -> Result<()> {
         const MAX_BINDS_PER_STATEMENT: usize = 32_000;
         let mut seen = HashSet::new();
         let mut last: Vec<&Script> = scripts
@@ -143,7 +149,7 @@ impl PgStore {
                 .bind(&ids)
                 .execute(&mut **tx)
                 .await
-                .map_err(|e| Error::Internal(format!("bulk upsert scripts failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("{what} failed: {e}")))?;
             let mut placeholders = Vec::with_capacity(chunk.len());
             for row in 0..chunk.len() {
                 let first = 2 + row * binds_per_row;
@@ -167,7 +173,7 @@ impl PgStore {
             query
                 .execute(&mut **tx)
                 .await
-                .map_err(|e| Error::Internal(format!("bulk upsert scripts failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("{what} failed: {e}")))?;
         }
         Ok(())
     }
@@ -226,7 +232,7 @@ impl PgStore {
                 return Err(Error::NotFound(format!("script {}", s.id)));
             }
         }
-        self.replace_scripts(&mut tx, std::slice::from_ref(s))
+        self.replace_scripts(&mut tx, std::slice::from_ref(s), "upsert script")
             .await?;
         tx.commit()
             .await
@@ -276,7 +282,8 @@ impl PgStore {
                 return Ok(false);
             }
         }
-        self.replace_scripts(&mut tx, scripts).await?;
+        self.replace_scripts(&mut tx, scripts, "bulk upsert scripts")
+            .await?;
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("bulk upsert scripts commit failed: {e}")))?;
@@ -649,6 +656,8 @@ impl PgStore {
         let more = keys.len() > options.limit;
         keys.truncate(options.limit);
         let ids: Vec<&str> = keys.iter().map(|(_, id)| id.as_str()).collect();
+        // The monitor branch has no two-tenant test yet: monitor rows need a
+        // live agent_session, which is not ported.
         let rows = if monitor {
             sqlx::query(
                 "SELECT id, workspace_id, agent_id, script_id, run_id, created_at, \
@@ -673,7 +682,8 @@ impl PgStore {
                 "SELECT id, workspace_id, name, mode, source, created_at, updated_at, category, \
                  auto_start, purpose, remote_author, \
                  left(command, 160) AS preview, octet_length(command) AS preview_bytes, \
-                 (last_run::jsonb - 'error')::text AS last_run, \
+                 CASE WHEN jsonb_typeof(last_run::jsonb) = 'object' \
+                   THEN (last_run::jsonb - 'error')::text ELSE last_run END AS last_run, \
                  left(last_run::jsonb ->> 'error', 256) AS last_error, \
                  octet_length(last_run::jsonb ->> 'error') AS last_error_bytes \
                  FROM script WHERE tenant_id = $1 AND workspace_id = $2 \
@@ -778,6 +788,8 @@ fn script_summary(r: &PgRow) -> Result<Value> {
     if let Some((text, _)) = &preview {
         put(&mut row, "commandPreview", json!(text));
     }
+    // jsonb sorts `lastRun`'s keys (SQLite keeps the stored order); clients
+    // read it as JSON, so only the raw text differs.
     let mut last_run = parse_json(col(r, "last_run")?)?;
     if let Some(error) = col::<Option<String>>(r, "last_error")? {
         let (prefix, _) = script_lists::prefix(&error, 256);
