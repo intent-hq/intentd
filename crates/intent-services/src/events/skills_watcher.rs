@@ -430,6 +430,10 @@ async fn debounce_loop(
                 if user_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
                     user_deadline = None;
                     linked.refresh_user().await;
+                    // Past the scan bounds a workspace's merged scan can
+                    // truncate differently from this user-only one, so a
+                    // change hidden here may still shift its catalog. Its
+                    // cache was invalidated on the change; only the event is skipped.
                     let fingerprint = user_catalog().await;
                     if fingerprint != user_baseline {
                         user_baseline = fingerprint;
@@ -761,8 +765,10 @@ mod tests {
         }
 
         let user_version = Arc::new(AtomicU64::new(0));
-        let version = Arc::clone(&user_version);
+        let catalog_reads = Arc::new(AtomicU64::new(0));
+        let (version, reads) = (Arc::clone(&user_version), Arc::clone(&catalog_reads));
         let catalog: UserCatalog = Arc::new(move || {
+            reads.fetch_add(1, Ordering::SeqCst);
             let value = version.load(Ordering::SeqCst);
             Box::pin(async move { value })
         });
@@ -780,11 +786,18 @@ mod tests {
         watcher.barrier().await;
         let scans = || [&ws1, &ws2].map(|ws| crate::skills::scan_count(&ws.path));
         let before = scans();
+        let reads_before = catalog_reads.load(Ordering::SeqCst);
 
         for _ in 0..3 {
             let _ = watcher.raw_tx.send(SkillsMsg::Change(None));
         }
-        tokio::time::sleep(DEBOUNCE * 3).await;
+        // The catalog is read when the user window closes, and any fan-out
+        // flush runs in that same loop turn, so the barrier after it sees it.
+        let deadline = Instant::now() + LIVENESS;
+        while catalog_reads.load(Ordering::SeqCst) == reads_before {
+            assert!(Instant::now() < deadline, "the user window never closed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         watcher.barrier().await;
         assert_eq!(
             scans(),
