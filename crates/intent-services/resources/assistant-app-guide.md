@@ -586,7 +586,9 @@ orchestrator, **Start on** offers **First available machine** instead of the bac
 each machine. Pending frontend release (not in current builds): first-run onboarding on an
 orchestrator checks only git (no Node.js), shows each provider card as **Runs on your
 machines** with no install or sign-in step, and keeps **Let's go** disabled with a link to
-**Settings → Machines** while the machine list is empty.
+**Settings → Machines** while its machine list is empty (an orchestrator shows **Settings → Machines**
+and reads that list without the Labs **Remote agents** switch; if the list can't be read,
+onboarding does not block).
 <!-- Sources: packages/cloudlands-fe/src/features/onboarding/{steps/OnboardingAgentMachinesNotice.svelte,utils/onboarding-agent-machines.ts,utils/resolve-onboarding-model.ts,messages/ProviderCard.svelte}; packages/cloudlands-fe/src/store/renderer/slices/host-requirements/host-requirements-selectors.ts. -->
 Switching a machine to orchestrator removes it from the backends that used
 it to run agents; pair with it again to use it as a backend. Homes are part of
