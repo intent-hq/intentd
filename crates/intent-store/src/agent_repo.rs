@@ -1227,7 +1227,7 @@ impl Store {
         s: &impl FullAgentSessionRow,
         messages: &[ReplaceMessage<'_>],
     ) -> Result<()> {
-        pending_postgres!("insert_agent_session_with_messages", self, backend => backend.insert_agent_session_with_messages(s, messages).await)
+        dispatch!(self, backend => backend.insert_agent_session_with_messages(s, messages).await)
     }
 
     /// Fetch a session by id (with its message log), or `NotFound`.
@@ -1242,7 +1242,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_with_transcript(&self, id: &AgentId) -> Result<AgentSession> {
-        pending_postgres!("get_agent_session_with_transcript", self, backend => backend.get_agent_session_with_transcript(id).await)
+        dispatch!(self, backend => backend.get_agent_session_with_transcript(id).await)
     }
 
     /// Every persisted session column (the heavy `system_prompt`,
@@ -1392,7 +1392,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentSession>> {
-        pending_postgres!("list_agent_sessions_with_transcripts", self, backend => backend.list_agent_sessions_with_transcripts(workspace_id).await)
+        dispatch!(self, backend => backend.list_agent_sessions_with_transcripts(workspace_id).await)
     }
 
     /// List a workspace's sessions WITHOUT message logs, oldest first. Used by hot

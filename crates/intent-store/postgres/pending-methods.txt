@@ -81,7 +81,6 @@ finish_home_rebuild
 finish_home_stop
 finish_script_monitor_wake
 freelist_count
-get_agent_session_with_transcript
 get_attachment
 get_attachment_by_idempotency_key
 get_browser_tab
@@ -117,7 +116,6 @@ initialize_repository_acp_session
 initialize_repository_acp_session_compatible
 initialize_repository_acp_session_outcome
 initialize_repository_review_session_outcome
-insert_agent_session_with_messages
 insert_attachment
 insert_attachment_with_idempotency_key
 insert_event
@@ -139,7 +137,6 @@ list_active_pr_monitors_by_agent
 list_active_pr_monitors_by_workspace
 list_agent_metrics
 list_agent_metrics_for_workspace
-list_agent_sessions_with_transcripts
 list_attachments
 list_browser_tabs
 list_browser_tabs_by_host

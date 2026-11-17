@@ -15,28 +15,32 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
-use intent_core::{AgentId, AgentListRowScope, AgentMessage, Error, Result, WorkspaceId};
+use intent_core::{
+    AgentId, AgentListRowScope, AgentMessage, AgentSession, Error, Result, WorkspaceId,
+};
 use sqlx::postgres::{PgConnection, PgRow, Postgres};
 use sqlx::Transaction;
 use uuid::Uuid;
 
+use super::agents::map_session;
 use super::note_search::SearchQuery;
 use super::notes::col;
 use super::{db, PgStore, WriteTx};
 use crate::agent_repo::monitor_message_provenance::envelope_digest;
 use crate::agent_repo::{
     batch_content_cols_and_payload_rows, batch_preview_col_values, content_col_and_payload_rows,
-    decode_last_tool_use_col, decode_preview_col, last_tool_use_col_value, preview_col_value,
-    OwnedBatchMessage, PreparedContent,
+    decode_last_tool_use_col, decode_preview_col, inferred_import_origin, last_tool_use_col_value,
+    normalize_compound_model, preview_col_value, OwnedBatchMessage, PreparedContent,
+    SESSION_COLUMNS,
 };
 use crate::message_payload::{
     self as payload, KIND_THUMBNAILS, KIND_TOOL_RESULT_OUTPUT, KIND_TOOL_RESULT_OUTPUT_REPLAY,
     KIND_TOOL_USE_INPUT, KIND_TOOL_USE_INPUT_REPLAY,
 };
 use crate::{
-    project_user_message_index_metadata, MessageFtsMatch, MonitorMessageProvenance,
-    PrunedToolPayload, ReplaceMessage, SessionMessageProjection, UsageMessageOrigin,
-    UserMessageIndexItem, UserMessageIndexPage, UserMessageIndexPageRequest,
+    project_user_message_index_metadata, FullAgentSessionRow, MessageFtsMatch,
+    MonitorMessageProvenance, PrunedToolPayload, ReplaceMessage, SessionMessageProjection,
+    UsageMessageOrigin, UserMessageIndexItem, UserMessageIndexPage, UserMessageIndexPageRequest,
 };
 use intent_core::review_monitor::ReviewMonitorBinding;
 
@@ -734,6 +738,20 @@ impl PgStore {
         agent_id: &AgentId,
         limit: Option<i64>,
     ) -> Result<Vec<AgentMessage>> {
+        let mut tx = self.begin_read_snapshot().await?;
+        let messages = self.messages_in(&mut tx, agent_id, limit).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(messages)
+    }
+
+    /// One agent's messages (the newest `limit`, or all) in `seq` order, with
+    /// their payloads spliced back in.
+    async fn messages_in(
+        &self,
+        conn: &mut PgConnection,
+        agent_id: &AgentId,
+        limit: Option<i64>,
+    ) -> Result<Vec<AgentMessage>> {
         let sql = match limit {
             Some(_) => format!(
                 "SELECT {MESSAGE_COLUMNS} FROM (SELECT {MESSAGE_COLUMNS} FROM agent_message \
@@ -745,7 +763,6 @@ impl PgStore {
                  WHERE tenant_id = $1 AND agent_id = $2 ORDER BY seq"
             ),
         };
-        let mut tx = self.begin_read_snapshot().await?;
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(self.tenant())
             .bind(&agent_id.0);
@@ -753,14 +770,12 @@ impl PgStore {
             query = query.bind(n.max(0));
         }
         let rows = query
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut *conn)
             .await
             .map_err(internal("get agent messages failed"))?;
         let mut messages: Vec<AgentMessage> =
             rows.iter().map(map_message_row).collect::<Result<_>>()?;
-        self.hydrate_message_payloads(&mut tx, &mut messages)
-            .await?;
-        tx.commit().await.map_err(db)?;
+        self.hydrate_message_payloads(conn, &mut messages).await?;
         Ok(messages)
     }
 
@@ -2031,5 +2046,140 @@ fn role_origin(role: &str) -> UsageMessageOrigin {
         "assistant" => UsageMessageOrigin::Agent,
         "user" => UsageMessageOrigin::Human,
         _ => UsageMessageOrigin::Excluded,
+    }
+}
+
+/// Whole transcripts: a session inserted with its message log, and sessions
+/// read back with theirs. Each read runs in one snapshot, so a session and
+/// its messages always come from the same state.
+impl PgStore {
+    pub async fn insert_agent_session_with_messages(
+        &self,
+        s: &impl FullAgentSessionRow,
+        messages: &[ReplaceMessage<'_>],
+    ) -> Result<()> {
+        let s = s.full_row();
+        let owned: Vec<OwnedBatchMessage> = messages
+            .iter()
+            .map(|m| {
+                (
+                    m.role.to_string(),
+                    m.content.clone(),
+                    m.metadata.cloned(),
+                    m.created_at.to_string(),
+                )
+            })
+            .collect();
+        // CPU-bound extraction and thumbnails run before the transaction.
+        let prepared = batch_content_cols_and_payload_rows(&owned).await?;
+        let metadata_json: Vec<Option<String>> = owned
+            .iter()
+            .map(|(_, _, metadata, _)| encode_metadata(metadata.as_ref()))
+            .collect::<Result<_>>()?;
+        let (import_model, _) = normalize_compound_model(s.model.clone(), s.provider.clone());
+        let import_model = import_model.unwrap_or_else(|| "unknown".to_string());
+        let tenant = self.tenant();
+        let mut tx = self.begin_write().await?;
+        self.insert_session_row(&mut tx, s, false)
+            .await?
+            .map_err(internal("insert agent session failed"))?;
+        let mut human_messages = 0_i64;
+        let mut agent_messages = 0_i64;
+        let mut last_message_id: Option<String> = None;
+        for (idx, (role, _, metadata, created_at)) in owned.iter().enumerate() {
+            let PreparedContent {
+                content_json,
+                payload_rows,
+                ..
+            } = &prepared[idx];
+            let id = Uuid::now_v7().to_string();
+            if role == "user" || role == "assistant" {
+                last_message_id = Some(id.clone());
+            }
+            let origin = inferred_import_origin(role, metadata.as_ref());
+            match origin {
+                UsageMessageOrigin::Human => human_messages += 1,
+                UsageMessageOrigin::Agent => agent_messages += 1,
+                UsageMessageOrigin::Excluded => {}
+            }
+            insert_message_row(
+                &mut tx,
+                tenant,
+                &id,
+                &s.id.0,
+                i64::try_from(idx).unwrap_or(i64::MAX),
+                role,
+                content_json,
+                metadata_json[idx].as_deref(),
+                created_at,
+                (import_model.as_str(), Some(origin.as_db())),
+            )
+            .await
+            .map_err(internal("append agent message failed"))?;
+            insert_payload_rows(&mut tx, tenant, &id, &s.id.0, payload_rows).await?;
+        }
+        if human_messages != 0 || agent_messages != 0 {
+            sqlx::query(
+                "INSERT INTO agent_usage_cell \
+                 (tenant_id, agent_id, model, human_messages, agent_messages) \
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (tenant_id, agent_id, model) \
+                 DO UPDATE SET human_messages = excluded.human_messages, \
+                 agent_messages = excluded.agent_messages",
+            )
+            .bind(tenant)
+            .bind(&s.id.0)
+            .bind(&import_model)
+            .bind(human_messages)
+            .bind(agent_messages)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal("materialize imported usage counts failed"))?;
+        }
+        update_session_previews(&mut tx, tenant, &s.id.0, &owned, last_message_id.as_deref())
+            .await?;
+        tx.commit()
+            .await
+            .map_err(internal("insert session with messages commit failed"))
+    }
+
+    pub async fn get_agent_session_with_transcript(&self, id: &AgentId) -> Result<AgentSession> {
+        let mut tx = self.begin_read_snapshot().await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {SESSION_COLUMNS} FROM agent_session WHERE tenant_id = $1 AND id = $2"
+        )))
+        .bind(self.tenant())
+        .bind(&id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal("get agent session failed"))?
+        .ok_or_else(|| Error::NotFound(format!("agent session {id}")))?;
+        let mut session = map_session(&row, true)?;
+        session.messages = self.messages_in(&mut tx, id, None).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(session)
+    }
+
+    pub async fn list_agent_sessions_with_transcripts(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AgentSession>> {
+        let mut tx = self.begin_read_snapshot().await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {SESSION_COLUMNS} FROM agent_session WHERE tenant_id = $1 \
+             AND workspace_id = $2 ORDER BY created_at COLLATE \"C\", row_seq"
+        )))
+        .bind(self.tenant())
+        .bind(&workspace_id.0)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(internal("list agent sessions failed"))?;
+        let mut sessions = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut session = map_session(row, true)?;
+            session.messages = self.messages_in(&mut tx, &session.id, None).await?;
+            sessions.push(session);
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(sessions)
     }
 }

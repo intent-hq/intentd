@@ -1294,3 +1294,325 @@ message_test!(append_to_a_missing_session_fails, |store, _tenant| {
         .await
         .is_err());
 });
+
+fn transcript_session(
+    id: &str,
+    workspace: &str,
+    tenant: &str,
+    created_at: &str,
+) -> intent_core::AgentSession {
+    intent_core::AgentSession {
+        id: agent(id),
+        workspace_id: WorkspaceId(workspace.into()),
+        name: format!("{id} of {tenant}"),
+        model: Some("claude:opus".into()),
+        status: intent_core::AgentStatus::Idle,
+        system_prompt: Some(format!("prompt of {tenant}")),
+        metadata: Some(json!({ "tenant": tenant })),
+        created_at: created_at.into(),
+        updated_at: created_at.into(),
+        ..Default::default()
+    }
+}
+
+/// `agent_usage_cell` message counts of one agent, `(model, human, agent)`.
+async fn agent_usage_cells(
+    store: &Store,
+    db: Option<&TestDb>,
+    tenant: &str,
+    agent_id: &str,
+) -> Vec<(String, i64, i64)> {
+    match db {
+        None => {
+            sqlx::query_as(
+                "SELECT model, human_messages, agent_messages FROM agent_usage_cell \
+                 WHERE agent_id = ? ORDER BY model",
+            )
+            .bind(agent_id)
+            .fetch_all(store.read_pool())
+            .await
+        }
+        Some(db) => {
+            sqlx::query_as(
+                "SELECT model, human_messages, agent_messages FROM agent_usage_cell \
+                 WHERE tenant_id = $1 AND agent_id = $2 ORDER BY model",
+            )
+            .bind(tenant)
+            .bind(agent_id)
+            .fetch_all(&db.admin)
+            .await
+        }
+    }
+    .expect("read usage cells")
+}
+
+/// Make every `agent_message` insert with role `boom` fail, on either
+/// backend, to force an error after a transcript insert has written rows.
+async fn fail_boom_messages(store: &Store, db: Option<&TestDb>) {
+    match db {
+        None => {
+            sqlx::raw_sql(
+                "CREATE TRIGGER IF NOT EXISTS transcript_test_boom BEFORE INSERT ON agent_message \
+                 WHEN NEW.role = 'boom' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .execute(store.write_pool())
+            .await
+            .expect("install sqlite boom trigger");
+        }
+        Some(db) => {
+            exec(
+                &db.admin,
+                "CREATE OR REPLACE FUNCTION transcript_test_boom() RETURNS trigger \
+                 LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'boom'; END $$; \
+                 DROP TRIGGER IF EXISTS transcript_test_boom ON agent_message; \
+                 CREATE TRIGGER transcript_test_boom BEFORE INSERT ON agent_message \
+                 FOR EACH ROW WHEN (NEW.role = 'boom') EXECUTE FUNCTION transcript_test_boom();"
+                    .to_owned(),
+            )
+            .await;
+        }
+    }
+}
+
+// Sessions inserted with whole transcripts, then read back one at a time and
+// per workspace. Names, prompts and message bodies carry the tenant, and the
+// decoy leaves `tr-a`, `tr-b`, `tr-o`, `tr-n` with the same ids plus decoy-only
+// `tr-zz` (probed as missing, listed in the same workspace) and `tr-x` (probed
+// as missing after its failed insert), so a read
+// without its tenant filter returns the decoy's rows on the subject run.
+crate::harness::parity_test!(agent_transcripts_insert_and_read, |store, tenant, db| {
+    let ws = WorkspaceId(WS.into());
+    seed_workspace(&store).await;
+    assert!(store
+        .list_agent_sessions_with_transcripts(&ws)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        store
+            .get_agent_session_with_transcript(&agent("tr-zz"))
+            .await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+
+    let user_meta = json!({ "tenant": tenant });
+    let peer_meta = json!({ "fromAgentId": "tr-b" });
+    let contents = [
+        json!([{ "type": "text", "text": format!("hi from {tenant}") }]),
+        json!([
+            { "type": "text", "text": format!("reply to {tenant}") },
+            heavy_tool_use(tenant)
+        ]),
+        json!([{ "type": "text", "text": format!("peer of {tenant}") }]),
+        json!([{ "type": "text", "text": "system note" }]),
+    ];
+    let rows = [
+        ReplaceMessage {
+            role: "user",
+            content: &contents[0],
+            metadata: Some(&user_meta),
+            created_at: "2026-02-01T00:00:00Z",
+        },
+        ReplaceMessage {
+            role: "assistant",
+            content: &contents[1],
+            metadata: None,
+            created_at: "2026-02-01T00:00:01Z",
+        },
+        ReplaceMessage {
+            role: "user",
+            content: &contents[2],
+            metadata: Some(&peer_meta),
+            created_at: "2026-02-01T00:00:02Z",
+        },
+        ReplaceMessage {
+            role: "system",
+            content: &contents[3],
+            metadata: None,
+            created_at: "2026-02-01T00:00:03Z",
+        },
+    ];
+    store
+        .insert_agent_session_with_messages(
+            &transcript_session("tr-a", WS, tenant, "2026-02-01T00:00:02Z"),
+            &rows,
+        )
+        .await
+        .unwrap();
+    store
+        .insert_agent_session_with_messages(
+            &transcript_session("tr-b", WS, tenant, "2026-02-01T00:00:01Z"),
+            &[],
+        )
+        .await
+        .unwrap();
+    store
+        .insert_agent_session_with_messages(
+            &transcript_session("tr-o", ARCHIVED_WS, tenant, "2026-02-01T00:00:00Z"),
+            &rows[..1],
+        )
+        .await
+        .unwrap();
+    // A duplicate id fails wholesale: no message of it lands.
+    assert!(matches!(
+        store
+            .insert_agent_session_with_messages(
+                &transcript_session("tr-a", WS, "dup", "2026-02-02T00:00:00Z"),
+                &rows[..1],
+            )
+            .await,
+        Err(intent_core::Error::Internal(_))
+    ));
+    assert_eq!(store.count_agent_messages(&agent("tr-a")).await.unwrap(), 4);
+    // A message that fails after the session row and a first message are
+    // written rolls the whole insert back.
+    fail_boom_messages(&store, db).await;
+    let boom = json!([{ "type": "text", "text": "boom" }]);
+    let failing = [
+        ReplaceMessage {
+            role: "user",
+            content: &contents[0],
+            metadata: Some(&user_meta),
+            created_at: "2026-02-01T00:00:00Z",
+        },
+        ReplaceMessage {
+            role: "boom",
+            content: &boom,
+            metadata: None,
+            created_at: "2026-02-01T00:00:04Z",
+        },
+    ];
+    assert!(matches!(
+        store
+            .insert_agent_session_with_messages(
+                &transcript_session("tr-x", WS, tenant, "2026-02-01T00:00:05Z"),
+                &failing,
+            )
+            .await,
+        Err(intent_core::Error::Internal(_))
+    ));
+    assert!(matches!(
+        store
+            .get_agent_session_with_transcript(&agent("tr-x"))
+            .await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    assert_eq!(store.count_agent_messages(&agent("tr-x")).await.unwrap(), 0);
+
+    let loaded = store
+        .get_agent_session_with_transcript(&agent("tr-a"))
+        .await
+        .unwrap();
+    assert_eq!(loaded.name, format!("tr-a of {tenant}"));
+    assert_eq!(loaded.model.as_deref(), Some("opus"));
+    assert_eq!(
+        loaded.system_prompt.as_deref(),
+        Some(format!("prompt of {tenant}").as_str())
+    );
+    let messages: Vec<(i64, &str, &Value, Option<&Value>)> = loaded
+        .messages
+        .iter()
+        .map(|m| (m.seq, m.role.as_str(), &m.content, m.metadata.as_ref()))
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            (0, "user", &contents[0], Some(&user_meta)),
+            (1, "assistant", &contents[1], None),
+            (2, "user", &contents[2], Some(&peer_meta)),
+            (3, "system", &contents[3], None),
+        ]
+    );
+    assert!(loaded.messages.iter().all(|m| m.agent_id == agent("tr-a")));
+
+    let projection = store
+        .get_agent_session_message_projection(&agent("tr-a"))
+        .await
+        .unwrap();
+    assert_eq!(projection.message_count, 4);
+    assert_eq!(projection.last_message_role.as_deref(), Some("user"));
+    assert_eq!(
+        projection.last_message_id.as_deref(),
+        Some(loaded.messages[2].id.as_str())
+    );
+    assert_eq!(
+        projection.last_assistant_text_blocks,
+        Some(vec![format!("reply to {tenant}")])
+    );
+    assert_eq!(
+        projection.last_user_text_blocks,
+        Some(vec![format!("peer of {tenant}")])
+    );
+    assert_eq!(
+        agent_usage_cells(&store, db, tenant, "tr-a").await,
+        vec![("opus".to_owned(), 1, 2)]
+    );
+    assert!(agent_usage_cells(&store, db, tenant, "tr-b")
+        .await
+        .is_empty());
+    let mut unknown = transcript_session("tr-n", ARCHIVED_WS, tenant, "2026-02-01T00:00:01Z");
+    unknown.model = None;
+    store
+        .insert_agent_session_with_messages(&unknown, &rows[..2])
+        .await
+        .unwrap();
+    assert_eq!(
+        agent_usage_cells(&store, db, tenant, "tr-n").await,
+        vec![("unknown".to_owned(), 1, 1)]
+    );
+    let archived = store
+        .list_agent_sessions_with_transcripts(&WorkspaceId(ARCHIVED_WS.into()))
+        .await
+        .unwrap();
+    let archived: Vec<(&str, Option<&str>, Vec<&Value>)> = archived
+        .iter()
+        .map(|s| {
+            (
+                s.id.as_str(),
+                s.model.as_deref(),
+                s.messages.iter().map(|m| &m.content).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        archived,
+        vec![
+            ("tr-o", Some("opus"), vec![&contents[0]]),
+            ("tr-n", None, vec![&contents[0], &contents[1]]),
+        ]
+    );
+
+    let listed = store
+        .list_agent_sessions_with_transcripts(&ws)
+        .await
+        .unwrap();
+    let shape: Vec<(&str, String, usize)> = listed
+        .iter()
+        .map(|s| (s.id.as_str(), s.name.clone(), s.messages.len()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("tr-b", format!("tr-b of {tenant}"), 0),
+            ("tr-a", format!("tr-a of {tenant}"), 4),
+        ]
+    );
+    assert_eq!(listed[1].messages, loaded.messages);
+
+    if tenant == "decoy" {
+        store
+            .insert_agent_session_with_messages(
+                &transcript_session("tr-zz", WS, tenant, "2026-02-01T00:00:00Z"),
+                &rows[..2],
+            )
+            .await
+            .unwrap();
+        store
+            .insert_agent_session_with_messages(
+                &transcript_session("tr-x", WS, tenant, "2026-02-01T00:00:05Z"),
+                &rows[..2],
+            )
+            .await
+            .unwrap();
+    }
+});

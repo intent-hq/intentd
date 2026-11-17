@@ -71,7 +71,7 @@ fn workspace_ids(ids: &[WorkspaceId]) -> Vec<&str> {
     ids.iter().map(|id| id.0.as_str()).collect()
 }
 
-fn map_session(row: &PgRow, heavy: bool) -> Result<AgentSession> {
+pub(super) fn map_session(row: &PgRow, heavy: bool) -> Result<AgentSession> {
     let metadata = match col::<Option<String>>(row, "metadata")? {
         Some(raw) if !raw.is_empty() => {
             Some(serde_json::from_str::<Value>(&raw).map_err(|e| {
@@ -539,6 +539,30 @@ impl PgStore {
         Ok(row)
     }
 
+    /// Insert one session row inside the caller's write transaction. The
+    /// outer error is a bind failure, the inner one the database's.
+    pub(super) async fn insert_session_row(
+        &self,
+        tx: &mut WriteTx,
+        s: &AgentSession,
+        task_graph_enabled: bool,
+    ) -> Result<std::result::Result<(), sqlx::Error>> {
+        let sql = format!(
+            "INSERT INTO agent_session (tenant_id, {SESSION_COLUMNS}) VALUES ($1, \
+             $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, \
+             $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, \
+             $36, $37, $38, $39, $40, $41)"
+        );
+        Ok(bind_session(
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(self.tenant()),
+            s,
+            task_graph_enabled,
+        )?
+        .execute(&mut **tx)
+        .await
+        .map(|_| ()))
+    }
+
     async fn remember_specialist(&self, tx: &mut WriteTx, s: &AgentSession) -> Result<()> {
         sqlx::query(
             "INSERT INTO settings (tenant_id, key, value) VALUES ($1, $2, $3) \
@@ -581,31 +605,20 @@ impl PgStore {
     ) -> Result<()> {
         let s = s.full_row();
         let mut tx = self.begin_write().await?;
-        let sql = format!(
-            "INSERT INTO agent_session (tenant_id, {SESSION_COLUMNS}) VALUES ($1, \
-             $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, \
-             $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, \
-             $36, $37, $38, $39, $40, $41)"
-        );
-        bind_session(
-            sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(self.tenant()),
-            s,
-            task_graph_enabled,
-        )?
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            if e.as_database_error()
-                .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
-            {
-                Error::Internal(format!(
-                    "server-minted agent id {} collided with an existing session",
-                    s.id
-                ))
-            } else {
-                Error::Internal(format!("insert agent session failed: {e}"))
-            }
-        })?;
+        self.insert_session_row(&mut tx, s, task_graph_enabled)
+            .await?
+            .map_err(|e| {
+                if e.as_database_error()
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+                {
+                    Error::Internal(format!(
+                        "server-minted agent id {} collided with an existing session",
+                        s.id
+                    ))
+                } else {
+                    Error::Internal(format!("insert agent session failed: {e}"))
+                }
+            })?;
         if remember_specialist {
             self.remember_specialist(&mut tx, s).await?;
         }
