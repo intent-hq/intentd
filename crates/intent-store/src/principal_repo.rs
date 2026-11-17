@@ -34,9 +34,10 @@ pub(crate) const PRINCIPAL_UPSERT_SET: &str = "github_user_id = excluded.github_
      instance_host = excluded.instance_host, \
      external_user_id = excluded.external_user_id";
 
-const MEMBER_COLUMNS: &str = "workspace_id, principal_id, role, added_at";
+pub(crate) const MEMBER_COLUMNS: &str = "workspace_id, principal_id, role, added_at";
 
-const CREDENTIAL_COLUMNS: &str = "token_hash, principal_id, created_at, last_used_at, revoked_at";
+pub(crate) const CREDENTIAL_COLUMNS: &str =
+    "token_hash, principal_id, created_at, last_used_at, revoked_at";
 
 pub(crate) const INVITE_COLUMNS: &str =
     "id, workspace_id, secret_hash, secret, created_by_principal_id, \
@@ -56,7 +57,9 @@ pub(crate) const INVITE_OPEN: &str = "i.revoked_at IS NULL AND i.expires_at > ? 
 /// resolves by ([`Principal::identity_key`]) and its github.com projection —
 /// `github_user_id` as given, else parsed back out of a github triple — so a
 /// caller that set either field alone still dual-writes both.
-fn principal_identity_columns(p: &Principal) -> (Option<PrincipalIdentity>, Option<i64>) {
+pub(crate) fn principal_identity_columns(
+    p: &Principal,
+) -> (Option<PrincipalIdentity>, Option<i64>) {
     let identity = p.identity_key();
     let github_user_id = p.github_user_id.or_else(|| {
         identity
@@ -277,7 +280,7 @@ impl Store {
     /// Returns `Error::NotFound` when no such principal exists and
     /// `Error::Internal` if the database operation fails.
     pub async fn get_principal(&self, id: &PrincipalId) -> Result<Principal> {
-        pending_postgres!("get_principal", self, backend => backend.get_principal(id).await)
+        dispatch!(self, backend => backend.get_principal(id).await)
     }
 
     /// Fetch the principals in `ids` that exist, in one `IN (...)` statement
@@ -289,7 +292,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_principals(&self, ids: &[PrincipalId]) -> Result<Vec<Principal>> {
-        pending_postgres!("get_principals", self, backend => backend.get_principals(ids).await)
+        dispatch!(self, backend => backend.get_principals(ids).await)
     }
 
     /// Cached device profiles and effective roles from the same `SQLite` snapshot,
@@ -302,7 +305,7 @@ impl Store {
         ids: &[PrincipalId],
         viewer: Option<&PrincipalId>,
     ) -> Result<Vec<(Principal, intent_core::HostRole)>> {
-        pending_postgres!("get_device_principals", self, backend => backend.get_device_principals(ids, viewer).await)
+        dispatch!(self, backend => backend.get_device_principals(ids, viewer).await)
     }
 
     /// The daemon's primary principal (the original single user, minted by
@@ -313,7 +316,7 @@ impl Store {
     /// Returns `Error::Internal` if the row is missing (a broken database —
     /// the migration guarantees exactly one) or the database operation fails.
     pub async fn get_primary_principal(&self) -> Result<Principal> {
-        pending_postgres!("get_primary_principal", self, backend => backend.get_primary_principal().await)
+        dispatch!(self, backend => backend.get_primary_principal().await)
     }
 
     /// Look up a principal by its identity triple; `None` when no principal
@@ -326,7 +329,7 @@ impl Store {
         &self,
         identity: &PrincipalIdentity,
     ) -> Result<Option<Principal>> {
-        pending_postgres!("find_principal_by_identity", self, backend => backend.find_principal_by_identity(identity).await)
+        dispatch!(self, backend => backend.find_principal_by_identity(identity).await)
     }
 
     /// Look up a principal by linked github.com account id — the
@@ -340,7 +343,7 @@ impl Store {
         &self,
         github_user_id: i64,
     ) -> Result<Option<Principal>> {
-        pending_postgres!("find_principal_by_github_user_id", self, backend => backend.find_principal_by_github_user_id(github_user_id).await)
+        dispatch!(self, backend => backend.find_principal_by_github_user_id(github_user_id).await)
     }
 
     /// List every principal, primary first then by `created_at`.
@@ -349,7 +352,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_principals(&self) -> Result<Vec<Principal>> {
-        pending_postgres!("list_principals", self, backend => backend.list_principals().await)
+        dispatch!(self, backend => backend.list_principals().await)
     }
 
     /// The credentialed guests (`principal.list`): every non-primary
@@ -361,7 +364,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_credentialed_guest_principals(&self) -> Result<Vec<Principal>> {
-        pending_postgres!("list_credentialed_guest_principals", self, backend => backend.list_credentialed_guest_principals().await)
+        dispatch!(self, backend => backend.list_credentialed_guest_principals().await)
     }
 
     /// The safe sharing directory, excluding the primary and revoked people.
@@ -370,7 +373,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` on database failure.
     pub async fn list_sharing_principals(&self) -> Result<Vec<(Principal, intent_core::HostRole)>> {
-        pending_postgres!("list_sharing_principals", self, backend => backend.list_sharing_principals().await)
+        dispatch!(self, backend => backend.list_sharing_principals().await)
     }
 
     /// Insert or update a principal by id. On conflict the identity (triple
@@ -384,7 +387,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails (including
     /// an identity already linked to another principal).
     pub async fn upsert_principal(&self, p: &Principal) -> Result<()> {
-        pending_postgres!("upsert_principal", self, backend => backend.upsert_principal(p).await)
+        dispatch!(self, backend => backend.upsert_principal(p).await)
     }
 
     /// The workspace's `owner_principal_id` column; `None` only for a
@@ -397,7 +400,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<PrincipalId>> {
-        pending_postgres!("get_workspace_owner_principal_id", self, backend => backend.get_workspace_owner_principal_id(workspace_id).await)
+        dispatch!(self, backend => backend.get_workspace_owner_principal_id(workspace_id).await)
     }
 
     /// The principals an unstamped (pre-multiplayer) user message in
@@ -412,7 +415,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<WorkspaceAuthorFallback>> {
-        pending_postgres!("get_workspace_author_fallback", self, backend => backend.get_workspace_author_fallback(workspace_id).await)
+        dispatch!(self, backend => backend.get_workspace_author_fallback(workspace_id).await)
     }
 
     /// Set (or clear) the workspace's `legacy_author_principal_id` — the
@@ -427,7 +430,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         principal_id: Option<&PrincipalId>,
     ) -> Result<()> {
-        pending_postgres!("set_workspace_legacy_author_principal_id", self, backend => backend.set_workspace_legacy_author_principal_id(workspace_id, principal_id).await)
+        dispatch!(self, backend => backend.set_workspace_legacy_author_principal_id(workspace_id, principal_id).await)
     }
 
     /// Membership summaries for `workspace.get` / `workspace.list`
@@ -449,7 +452,7 @@ impl Store {
         viewer: Option<&PrincipalId>,
         workspace_ids: &[WorkspaceId],
     ) -> Result<HashMap<WorkspaceId, WorkspaceMembership>> {
-        pending_postgres!("workspace_membership_summaries", self, backend => backend.workspace_membership_summaries(viewer, workspace_ids).await)
+        dispatch!(self, backend => backend.workspace_membership_summaries(viewer, workspace_ids).await)
     }
 
     /// List a workspace's members, owners first then by `added_at`.
@@ -461,7 +464,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<WorkspaceMember>> {
-        pending_postgres!("list_workspace_members", self, backend => backend.list_workspace_members(workspace_id).await)
+        dispatch!(self, backend => backend.list_workspace_members(workspace_id).await)
     }
 
     /// Effective members of an existing workspace, owner first. The union
@@ -475,7 +478,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<EffectiveWorkspaceMember>> {
-        pending_postgres!("list_effective_workspace_members", self, backend => backend.list_effective_workspace_members(workspace_id).await)
+        dispatch!(self, backend => backend.list_effective_workspace_members(workspace_id).await)
     }
 
     /// IDs for presence fan-out. Members inherit ordinary workspaces; direct
@@ -487,7 +490,7 @@ impl Store {
         &self,
         principal: &PrincipalId,
     ) -> Result<Vec<WorkspaceId>> {
-        pending_postgres!("effective_principal_workspace_ids", self, backend => backend.effective_principal_workspace_ids(principal).await)
+        dispatch!(self, backend => backend.effective_principal_workspace_ids(principal).await)
     }
 
     /// List every workspace id a principal is a member of, with the role.
@@ -499,7 +502,7 @@ impl Store {
         &self,
         principal_id: &PrincipalId,
     ) -> Result<Vec<WorkspaceMember>> {
-        pending_postgres!("list_principal_memberships", self, backend => backend.list_principal_memberships(principal_id).await)
+        dispatch!(self, backend => backend.list_principal_memberships(principal_id).await)
     }
 
     /// Whether a principal retains any workspace grant, without loading the roster.
@@ -507,7 +510,7 @@ impl Store {
     /// # Errors
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn has_workspace_membership(&self, principal_id: &PrincipalId) -> Result<bool> {
-        pending_postgres!("has_workspace_membership", self, backend => backend.has_workspace_membership(principal_id).await)
+        dispatch!(self, backend => backend.has_workspace_membership(principal_id).await)
     }
 
     /// A principal's role in a workspace; `None` when not a member.
@@ -520,7 +523,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) -> Result<Option<WorkspaceRole>> {
-        pending_postgres!("get_workspace_member_role", self, backend => backend.get_workspace_member_role(workspace_id, principal_id).await)
+        dispatch!(self, backend => backend.get_workspace_member_role(workspace_id, principal_id).await)
     }
 
     /// Add a principal to a workspace with `role`. Idempotent: an existing
@@ -541,7 +544,7 @@ impl Store {
         principal_id: &PrincipalId,
         role: WorkspaceRole,
     ) -> Result<bool> {
-        pending_postgres!("add_workspace_member", self, backend => backend.add_workspace_member(workspace_id, principal_id, role).await)
+        dispatch!(self, backend => backend.add_workspace_member(workspace_id, principal_id, role).await)
     }
 
     /// Seat a `collaborator` only while the workspace's committed guest
@@ -573,7 +576,7 @@ impl Store {
         principal_id: &PrincipalId,
         max_guests: u32,
     ) -> Result<CollaboratorAddOutcome> {
-        pending_postgres!("add_workspace_collaborator_within_cap", self, backend => backend.add_workspace_collaborator_within_cap(workspace_id, principal_id, max_guests).await)
+        dispatch!(self, backend => backend.add_workspace_collaborator_within_cap(workspace_id, principal_id, max_guests).await)
     }
 
     /// Change an existing member's role. `workspace.owner_principal_id` is
@@ -592,7 +595,7 @@ impl Store {
         principal_id: &PrincipalId,
         role: WorkspaceRole,
     ) -> Result<()> {
-        pending_postgres!("set_workspace_member_role", self, backend => backend.set_workspace_member_role(workspace_id, principal_id, role).await)
+        dispatch!(self, backend => backend.set_workspace_member_role(workspace_id, principal_id, role).await)
     }
 
     /// Change only a direct guest role, preserving ownership and inherited host
@@ -608,7 +611,7 @@ impl Store {
         role: WorkspaceRole,
         actor: Option<&PrincipalId>,
     ) -> Result<bool> {
-        pending_postgres!("set_workspace_guest_role", self, backend => backend.set_workspace_guest_role(workspace_id, principal_id, role, actor).await)
+        dispatch!(self, backend => backend.set_workspace_guest_role(workspace_id, principal_id, role, actor).await)
     }
 
     /// Remove a principal from a workspace. Returns whether a row was
@@ -623,7 +626,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) -> Result<bool> {
-        pending_postgres!("remove_workspace_member", self, backend => backend.remove_workspace_member(workspace_id, principal_id).await)
+        dispatch!(self, backend => backend.remove_workspace_member(workspace_id, principal_id).await)
     }
 
     /// Remove a direct guest grant, refusing inherited access under the same
@@ -638,7 +641,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) -> Result<bool> {
-        pending_postgres!("remove_workspace_guest", self, backend => backend.remove_workspace_guest(workspace_id, principal_id).await)
+        dispatch!(self, backend => backend.remove_workspace_guest(workspace_id, principal_id).await)
     }
 
     /// Record a bearer credential for a principal, keyed by `token_hash`
@@ -653,7 +656,7 @@ impl Store {
         principal_id: &PrincipalId,
         token_hash: &str,
     ) -> Result<PrincipalCredential> {
-        pending_postgres!("insert_principal_credential", self, backend => backend.insert_principal_credential(principal_id, token_hash).await)
+        dispatch!(self, backend => backend.insert_principal_credential(principal_id, token_hash).await)
     }
 
     /// Look up a credential by token hash, revoked or not (`None` when the
@@ -667,7 +670,7 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<PrincipalCredential>> {
-        pending_postgres!("lookup_principal_credential", self, backend => backend.lookup_principal_credential(token_hash).await)
+        dispatch!(self, backend => backend.lookup_principal_credential(token_hash).await)
     }
 
     /// List a principal's credentials, newest first.
@@ -679,7 +682,7 @@ impl Store {
         &self,
         principal_id: &PrincipalId,
     ) -> Result<Vec<PrincipalCredential>> {
-        pending_postgres!("list_principal_credentials", self, backend => backend.list_principal_credentials(principal_id).await)
+        dispatch!(self, backend => backend.list_principal_credentials(principal_id).await)
     }
 
     /// Bump `last_used_at` on an active credential. Returns whether a row was
@@ -689,7 +692,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn touch_principal_credential(&self, token_hash: &str) -> Result<bool> {
-        pending_postgres!("touch_principal_credential", self, backend => backend.touch_principal_credential(token_hash).await)
+        dispatch!(self, backend => backend.touch_principal_credential(token_hash).await)
     }
 
     /// Resolve an **active** credential to its principal and bump
@@ -705,7 +708,7 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<PrincipalId>> {
-        pending_postgres!("resolve_active_principal_credential", self, backend => backend.resolve_active_principal_credential(token_hash).await)
+        dispatch!(self, backend => backend.resolve_active_principal_credential(token_hash).await)
     }
 
     /// Revoke a credential by token hash. Idempotent: returns whether the
@@ -716,7 +719,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn revoke_principal_credential(&self, token_hash: &str) -> Result<bool> {
-        pending_postgres!("revoke_principal_credential", self, backend => backend.revoke_principal_credential(token_hash).await)
+        dispatch!(self, backend => backend.revoke_principal_credential(token_hash).await)
     }
 
     /// Revoke every active credential of a principal. Returns how many rows
@@ -729,7 +732,7 @@ impl Store {
         &self,
         principal_id: &PrincipalId,
     ) -> Result<u64> {
-        pending_postgres!("revoke_all_principal_credentials", self, backend => backend.revoke_all_principal_credentials(principal_id).await)
+        dispatch!(self, backend => backend.revoke_all_principal_credentials(principal_id).await)
     }
 
     /// Number of `principal` rows (primary included). Used by the primary
@@ -739,7 +742,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_principals(&self) -> Result<u64> {
-        pending_postgres!("count_principals", self, backend => backend.count_principals().await)
+        dispatch!(self, backend => backend.count_principals().await)
     }
 
     /// Number of open invites (see [`INVITE_OPEN`]) across every workspace
@@ -749,7 +752,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_open_workspace_invites(&self) -> Result<u64> {
-        pending_postgres!("count_open_workspace_invites", self, backend => backend.count_open_workspace_invites().await)
+        dispatch!(self, backend => backend.count_open_workspace_invites().await)
     }
 
     /// The guest-cap usage of one workspace: direct non-host collaborators
@@ -762,7 +765,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<WorkspaceGuestCount> {
-        pending_postgres!("count_workspace_guests", self, backend => backend.count_workspace_guests(workspace_id).await)
+        dispatch!(self, backend => backend.count_workspace_guests(workspace_id).await)
     }
 
     /// Persist a freshly minted invite (multiplayer w4). `secret_hash` is the
@@ -780,7 +783,7 @@ impl Store {
         &self,
         invite: &WorkspaceInvite,
     ) -> Result<InviteInsertOutcome> {
-        pending_postgres!("insert_workspace_invite", self, backend => backend.insert_workspace_invite(invite).await)
+        dispatch!(self, backend => backend.insert_workspace_invite(invite).await)
     }
 
     /// Mint a workspace invitation only if a guest seat remains. The limit,
@@ -794,7 +797,7 @@ impl Store {
         invite: &WorkspaceInvite,
         max_guests: u32,
     ) -> Result<InviteInsertOutcome> {
-        pending_postgres!("insert_workspace_invite_within_cap", self, backend => backend.insert_workspace_invite_within_cap(invite, max_guests).await)
+        dispatch!(self, backend => backend.insert_workspace_invite_within_cap(invite, max_guests).await)
     }
 
     /// Fetch an invite by id, open or closed (`None` when unknown).
@@ -803,7 +806,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_invite(&self, id: &str) -> Result<Option<WorkspaceInvite>> {
-        pending_postgres!("get_workspace_invite", self, backend => backend.get_workspace_invite(id).await)
+        dispatch!(self, backend => backend.get_workspace_invite(id).await)
     }
 
     /// List a workspace's open invites (see [`INVITE_OPEN`]), oldest first.
@@ -815,7 +818,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<WorkspaceInvite>> {
-        pending_postgres!("list_open_workspace_invites", self, backend => backend.list_open_workspace_invites(workspace_id).await)
+        dispatch!(self, backend => backend.list_open_workspace_invites(workspace_id).await)
     }
 
     /// Revoke an invite. Idempotent: returns whether the row flipped from
@@ -827,7 +830,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn revoke_workspace_invite(&self, id: &str) -> Result<bool> {
-        pending_postgres!("revoke_workspace_invite", self, backend => backend.revoke_workspace_invite(id).await)
+        dispatch!(self, backend => backend.revoke_workspace_invite(id).await)
     }
 
     /// `workspace.archive`'s durable write: flip the row to Archived
@@ -885,7 +888,7 @@ impl Store {
         id: &str,
         principal_id: &PrincipalId,
     ) -> Result<bool> {
-        pending_postgres!("redeem_workspace_invite", self, backend => backend.redeem_workspace_invite(id, principal_id).await)
+        dispatch!(self, backend => backend.redeem_workspace_invite(id, principal_id).await)
     }
 
     /// Admit a verified identity through one open workspace invitation transaction.
@@ -911,7 +914,7 @@ impl Store {
         credential: HostJoinCredential<'_>,
         max_guests: u32,
     ) -> Result<InviteJoinOutcome> {
-        pending_postgres!("join_workspace_by_invite", self, backend => backend.join_workspace_by_invite(invite_id, workspace_id, identity, credential, max_guests).await)
+        dispatch!(self, backend => backend.join_workspace_by_invite(invite_id, workspace_id, identity, credential, max_guests).await)
     }
 }
 
@@ -2476,7 +2479,11 @@ pub(crate) fn map_principal_row(r: &SqliteRow) -> Principal {
 /// principal_id)` primary key is handled by `ON CONFLICT` / the `UPDATE`
 /// shape and never reaches here — and surfaces as a client-facing
 /// `InvalidInput`; anything else is `Internal`.
-fn map_owner_violation(e: &sqlx::Error, workspace_id: &WorkspaceId, what: &str) -> Error {
+pub(crate) fn map_owner_violation(
+    e: &sqlx::Error,
+    workspace_id: &WorkspaceId,
+    what: &str,
+) -> Error {
     if e.as_database_error()
         .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
     {
