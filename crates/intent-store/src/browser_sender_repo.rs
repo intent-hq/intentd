@@ -15,6 +15,40 @@ impl Store {
         received_order: &str,
         client_id: Option<&ClientId>,
     ) -> Result<()> {
+        dispatch!(self, backend => backend.record_browser_sender(agent_id, submission_id, received_order, client_id).await)
+    }
+
+    /// Return the latest accepted human sender; unknown senders clear preference.
+    ///
+    /// # Errors
+    /// Returns an error if the database read fails.
+    pub async fn latest_browser_sender(&self, agent_id: &AgentId) -> Result<Option<ClientId>> {
+        dispatch!(self, backend => backend.latest_browser_sender(agent_id).await)
+    }
+
+    /// Resolve the nearest human receipt on this conversation or its delegation
+    /// parents. Unknown devices stop inheritance. Sponsor links are not parents.
+    /// Reads at most 16 same-workspace rows, stopping on cycles or missing agents.
+    ///
+    /// # Errors
+    /// Returns an error if the database read fails.
+    pub async fn preferred_browser_sender(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<ClientId>> {
+        dispatch!(self, backend => backend.preferred_browser_sender(agent_id, workspace_id).await)
+    }
+}
+
+impl crate::SqliteStore {
+    pub async fn record_browser_sender(
+        &self,
+        agent_id: &AgentId,
+        submission_id: &str,
+        received_order: &str,
+        client_id: Option<&ClientId>,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT OR IGNORE INTO agent_browser_sender (agent_id, submission_id, received_order, client_id) VALUES (?, ?, ?, ?)",
         )
@@ -27,10 +61,6 @@ impl Store {
         Ok(())
     }
 
-    /// Return the latest accepted human sender; unknown senders clear preference.
-    ///
-    /// # Errors
-    /// Returns an error if the database read fails.
     pub async fn latest_browser_sender(&self, agent_id: &AgentId) -> Result<Option<ClientId>> {
         let client: Option<Option<String>> = sqlx::query_scalar(
             "SELECT client_id FROM agent_browser_sender WHERE agent_id = ? ORDER BY received_order DESC LIMIT 1",
@@ -41,12 +71,6 @@ impl Store {
         Ok(client.flatten().map(ClientId::from))
     }
 
-    /// Resolve the nearest human receipt on this conversation or its delegation
-    /// parents. Unknown devices stop inheritance. Sponsor links are not parents.
-    /// Reads at most 16 same-workspace rows, stopping on cycles or missing agents.
-    ///
-    /// # Errors
-    /// Returns an error if the database read fails.
     pub async fn preferred_browser_sender(
         &self,
         agent_id: &AgentId,

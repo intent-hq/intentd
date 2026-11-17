@@ -54,6 +54,7 @@ pub(crate) use agents::PreparedPgMonitorMessage;
 mod agent_messages;
 mod agents;
 mod attachments;
+mod browser_sender;
 mod browser_tabs;
 mod clients;
 mod comments;
