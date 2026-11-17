@@ -477,16 +477,19 @@ async fn a_failed_unlink_is_retried_by_the_publisher() {
         .unwrap();
     assert_eq!(first, json!({ "revoked": false }));
     *relay.delete_status.lock().unwrap() = 204;
-    let cleared = tokio::time::timeout(Duration::from_secs(10), async {
-        while !svc
-            .push_persisted(|p| p.pending_revocations.is_empty())
-            .await
-            .unwrap()
-        {
-            // timing-guard: poll the persisted queue until the publisher's 1 s retry lands (bounded above).
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+    let cleared = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !svc
+                .push_persisted(|p| p.pending_revocations.is_empty())
+                .await
+                .unwrap()
+            {
+                // timing-guard: poll the persisted queue until the publisher's 1 s retry lands (bounded above).
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        },
+    )
     .await;
     task.abort();
     assert!(
