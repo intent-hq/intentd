@@ -277,27 +277,42 @@ fn project_dir(workspace_path: &Path) -> PathBuf {
 /// event is emitted only when the resolved set actually changed (analogous to
 /// `check_skills_changed`).
 async fn specialists_fingerprint(user_dir: Option<&PathBuf>, workspace_path: &Path) -> u64 {
-    resolved_fingerprint(user_dir, Some(workspace_path)).await
-}
-
-/// Fingerprint the set with no workspace: the user tier, Claude user agents
-/// and the bundled tiers, i.e. everything a user-tier change can alter.
-async fn user_fingerprint(user_dir: Option<&PathBuf>) -> u64 {
-    resolved_fingerprint(user_dir, None).await
-}
-
-async fn resolved_fingerprint(user_dir: Option<&PathBuf>, workspace_path: Option<&Path>) -> u64 {
     #[cfg(test)]
-    record_check(workspace_path.unwrap_or(Path::new("")));
+    record_check(workspace_path);
     let user_dir = user_dir.cloned();
-    let workspace_path = workspace_path.map(Path::to_path_buf);
+    let workspace_path = workspace_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let svc = SpecialistsService::new(user_dir, None);
         let list = svc
-            .list(workspace_path.as_deref())
+            .list(Some(&workspace_path))
             .unwrap_or(serde_json::Value::Null);
         let mut hasher = DefaultHasher::new();
         list.to_string().hash(&mut hasher);
+        hasher.finish()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Fingerprint everything a user-tier change can alter: the set with no
+/// workspace (user tier over the bundled tiers) plus the raw Claude user
+/// agents. The set alone hides a Claude user agent shadowed by a native id
+/// or alias, and a project tier can unshadow it.
+async fn user_fingerprint(user_dir: Option<&PathBuf>) -> u64 {
+    #[cfg(test)]
+    record_check(user_dir.map_or(Path::new(""), PathBuf::as_path));
+    let user_dir = user_dir.cloned();
+    tokio::task::spawn_blocking(move || {
+        let claude = claude_agents::user_root(user_dir.as_deref())
+            .map(|root| claude_agents::collect(&root, "user").definitions);
+        let list = SpecialistsService::new(user_dir, None)
+            .list(None)
+            .unwrap_or(serde_json::Value::Null);
+        let mut hasher = DefaultHasher::new();
+        list.to_string().hash(&mut hasher);
+        serde_json::to_string(&claude)
+            .unwrap_or_default()
+            .hash(&mut hasher);
         hasher.finish()
     })
     .await
@@ -317,8 +332,8 @@ fn record_check(workspace_path: &Path) {
         .or_default() += 1;
 }
 
-/// Test-only: how many times the set was resolved for `workspace_path`
-/// (the empty path is the user-tier set alone).
+/// Test-only: how many times the set was resolved for a workspace path, or
+/// the user-tier fingerprint taken for a user dir.
 #[cfg(test)]
 fn check_count(workspace_path: &Path) -> usize {
     CHECKS
@@ -345,6 +360,9 @@ async fn debounce_loop(
 
     // Prime the per-workspace fingerprints so the first flush compares against
     // the set as it stood at watcher start (no spurious first event).
+    // The user baseline comes first: a user-tier edit landing during the
+    // priming then still differs from it, so the workspaces get rechecked.
+    let mut user_baseline = user_fingerprint(user_dir.as_ref()).await;
     let mut fingerprints: HashMap<WorkspaceId, u64> = HashMap::new();
     for (id, path) in &workspace_paths {
         fingerprints.insert(
@@ -352,8 +370,6 @@ async fn debounce_loop(
             specialists_fingerprint(user_dir.as_ref(), path).await,
         );
     }
-
-    let mut user_baseline = user_fingerprint(user_dir.as_ref()).await;
 
     let mut linked = ScopedLinkedWatches::new(hub, move |scope| {
         let _ = raw_tx.send(SpecialistsMsg::Change(scope));
@@ -1003,13 +1019,13 @@ mod tests {
         watcher.settle().await;
         let checks = || [&ws1, &ws2].map(|ws| check_count(&ws.path));
         let before = checks();
-        let user_before = check_count(Path::new(""));
+        let user_before = check_count(&user.path);
 
         std::fs::write(&shared, &content).expect("rewrite identical content");
         // Wait for the change to be handled: the user-tier set is resolved
         // when its window closes (a workspace check means it fanned out).
         let deadline = Instant::now() + LIVENESS;
-        while check_count(Path::new("")) == user_before && checks() == before {
+        while check_count(&user.path) == user_before && checks() == before {
             assert!(
                 Instant::now() < deadline,
                 "the user-tier rewrite was never handled"
@@ -1031,6 +1047,36 @@ mod tests {
             ws_ids,
             vec![ws1_id.as_str(), ws2_id.as_str()],
             "a changed user-tier set must still emit once per workspace, got {events:?}"
+        );
+    }
+
+    /// A Claude user agent can be shadowed by a native id or alias in the
+    /// workspace-free set while a project tier unshadows it, so an edit to it
+    /// must still move the user-tier fingerprint.
+    #[tokio::test]
+    async fn user_fingerprint_covers_claude_user_agents() {
+        let home = TempDir::new("claude-user-fp");
+        let user_dir = home.path.join(".intent/specialists");
+        let agents = home.path.join(".claude/agents");
+        std::fs::create_dir_all(&user_dir).expect("mk user tier");
+        std::fs::create_dir_all(&agents).expect("mk claude agents");
+        let agent = agents.join("coordinator.md");
+        std::fs::write(
+            &agent,
+            "---\nname: coordinator\ndescription: d\n---\n\nfirst",
+        )
+        .expect("write claude agent");
+        let before = user_fingerprint(Some(&user_dir)).await;
+
+        std::fs::write(
+            &agent,
+            "---\nname: coordinator\ndescription: d\n---\n\nsecond",
+        )
+        .expect("edit claude agent");
+        assert_ne!(
+            user_fingerprint(Some(&user_dir)).await,
+            before,
+            "an edit to a Claude user agent must change the user-tier fingerprint"
         );
     }
 
