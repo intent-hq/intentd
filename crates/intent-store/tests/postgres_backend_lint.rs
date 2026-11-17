@@ -298,11 +298,17 @@ fn pending_in_source() -> BTreeSet<(String, String)> {
 }
 
 /// `(module, method)` for every line of `postgres/pending/<module>.txt`, and
-/// the modules whose file lists nothing.
+/// the modules whose file lists nothing. Git drops the directory once the
+/// last file is deleted, so a missing directory lists nothing.
 fn pending_listed() -> (BTreeSet<(String, String)>, Vec<String>) {
     let mut listed = BTreeSet::new();
     let mut empty = Vec::new();
-    for entry in std::fs::read_dir(pending_dir()).expect("read postgres/pending") {
+    let entries = match std::fs::read_dir(pending_dir()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (listed, empty),
+        Err(e) => panic!("read postgres/pending: {e}"),
+    };
+    for entry in entries {
         let path = entry.expect("entry").path();
         if path.extension().is_none_or(|e| e != "txt") {
             continue;
