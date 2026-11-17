@@ -36,6 +36,9 @@ pub enum CloudErrorKind {
     PermissionDenied,
     /// The project the entry names does not exist, or the key cannot see it.
     ProjectMissing,
+    /// The provider has no room for the machine where the entry asks
+    /// (Agent37 `no_capacity`); it never places it elsewhere.
+    NoCapacity,
     /// Any other HTTP refusal; [`CloudError::status`] says which.
     Api,
     Other,

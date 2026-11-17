@@ -1,6 +1,7 @@
 //! The provider boundary for cloud machines: the calls a backend makes to
 //! create, run, pause, resume and delete one machine per agent, whatever
-//! service hosts it. [`crate::e2b::E2bClient`] is the first adapter.
+//! service hosts it: [`crate::e2b::E2bClient`],
+//! [`crate::northflank::NorthflankClient`] and [`crate::agent37::Agent37Client`].
 //!
 //! GUARDRAIL: provider keys and per-machine access tokens are
 //! [`SecretString`]s, and [`CloudError`] messages are already scrubbed of
@@ -42,6 +43,14 @@ pub struct CreateInstance {
     pub plan: Option<String>,
     /// Disk of a new machine, in GiB, for a provider that makes one.
     pub disk_gib: Option<u32>,
+    /// The provider's machine type (Agent37: `default` or `vm`).
+    pub machine_type: Option<String>,
+    /// Where the machine runs, for a provider that takes a region per machine.
+    pub region: Option<String>,
+    /// The machine's vCPUs and memory, for a provider that takes them per
+    /// machine (Agent37). Others read the size from the image or plan.
+    pub vcpu: Option<u32>,
+    pub memory_gib: Option<u32>,
 }
 
 /// A machine the backend can run commands in.
@@ -134,6 +143,12 @@ pub trait CloudProvider: Send + Sync + fmt::Debug {
     /// backend's idle pause is the only one, and `keep_alive` does nothing.
     fn has_lease(&self) -> bool {
         true
+    }
+
+    /// Whether the provider stops a machine that ran too long without a
+    /// pause (E2B), so the backend pauses and resumes it before that.
+    fn caps_run(&self) -> bool {
+        self.has_lease()
     }
 
     /// Whether a paused machine resumes with its memory and processes.

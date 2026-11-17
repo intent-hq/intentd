@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
-description = "Node provider contracts, static host adapter, E2B sandbox client and Northflank adapter"
+description = "Node provider contracts, static host adapter, E2B sandbox client, Northflank and Agent37 adapters"
 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.235" }
@@ -23,8 +23,12 @@ webpki-roots = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 sha2 = "0.11"
 uuid = { workspace = true }
+time = { workspace = true }
 
 [features]
+# The shared fake Agent37 API and its server, for the e2e suites. Never in a
+# shipped build.
+agent37-fake = []
 # The shared fake Northflank API, for the e2e suites. Never in a shipped build.
 northflank-fake = []
 

@@ -711,7 +711,10 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
         json!([]),
         "nothing was saved: {listed}"
     );
-    assert_eq!(listed["providerKinds"], json!(["e2b", "northflank"]));
+    assert_eq!(
+        listed["providerKinds"],
+        json!(["e2b", "northflank", "agent37"])
+    );
 
     let saved = ok(
         &mut rpc_ws,

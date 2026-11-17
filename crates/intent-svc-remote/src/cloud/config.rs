@@ -1,5 +1,5 @@
-//! The saved settings of each named cloud machine entry (E2B or
-//! Northflank), its provider client and the mapping of provider failures
+//! The saved settings of each named cloud machine entry (E2B, Northflank
+//! or Agent37), its provider client and the mapping of provider failures
 //! onto the documented `cloud-*` errors.
 //!
 //! Every entry is one `cloud_machine_provider` row (its id is the entry id)
@@ -15,10 +15,11 @@ use std::collections::BTreeMap;
 
 use intent_core::machines::{
     cloud_machine_unavailable, cloud_provider_name, cloud_quota, with_cloud_machine_id,
-    with_cloud_provider, CloudMachineSize, CLOUD_E2B_LEGACY_ENTRY, CLOUD_PROVIDER_E2B,
-    CLOUD_PROVIDER_E2B_NAME, CLOUD_PROVIDER_NORTHFLANK,
+    with_cloud_provider, CloudMachineSize, CLOUD_E2B_LEGACY_ENTRY, CLOUD_PROVIDER_AGENT37,
+    CLOUD_PROVIDER_E2B, CLOUD_PROVIDER_E2B_NAME, CLOUD_PROVIDER_NORTHFLANK,
 };
 use intent_core::{now_iso, Error, Result};
+use intent_nodes::agent37::{Agent37Client, Agent37Config};
 use intent_nodes::cloud::{CloudError, CloudErrorKind, CloudProvider, QuotaLimit, SecretString};
 use intent_nodes::e2b::{E2bClient, E2bConfig};
 use intent_nodes::northflank::{NorthflankClient, NorthflankConfig, MIN_DISK_GIB};
@@ -47,6 +48,9 @@ const MANIFEST_BASE_URL_ENV: &str = "INTENTD_E2B_MANIFEST_BASE_URL";
 const NORTHFLANK_API_URL_ENV: &str = "INTENTD_NORTHFLANK_API_URL";
 const NORTHFLANK_EXEC_URL_ENV: &str = "INTENTD_NORTHFLANK_EXEC_URL";
 const NORTHFLANK_REGISTRY_URL_ENV: &str = "INTENTD_NORTHFLANK_REGISTRY_URL";
+/// The Agent37 REST and exec base URLs (test seams).
+const AGENT37_API_URL_ENV: &str = "INTENTD_AGENT37_API_URL";
+const AGENT37_EXEC_URL_ENV: &str = "INTENTD_AGENT37_EXEC_URL";
 
 /// The image Northflank entries start unless the owner sets another.
 pub(crate) const DEFAULT_NORTHFLANK_IMAGE: &str = "ghcr.io/intent-hq/intent-node";
@@ -128,6 +132,41 @@ impl NorthflankSettings {
     }
 }
 
+/// The disk of a new Agent37 instance unless the owner sets one.
+pub(crate) const DEFAULT_AGENT37_DISK_GIB: u32 = 20;
+
+/// An Agent37 entry's own settings (`CloudMachineProvider.agent37`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Agent37Settings {
+    pub(crate) instance_type: String,
+    pub(crate) region: String,
+    pub(crate) disk_gib: u32,
+}
+
+impl Default for Agent37Settings {
+    fn default() -> Self {
+        Self {
+            instance_type: "default".to_owned(),
+            region: "us".to_owned(),
+            disk_gib: DEFAULT_AGENT37_DISK_GIB,
+        }
+    }
+}
+
+impl Agent37Settings {
+    fn vm(&self) -> bool {
+        self.instance_type == "vm"
+    }
+
+    /// The disk a new instance of `size` gets: the setting, capped at the
+    /// shape's largest disk.
+    pub(crate) fn disk_for(&self, size: CloudMachineSize) -> u32 {
+        size.agent37_max_disk_gib(self.vm())
+            .map_or(self.disk_gib, |max| self.disk_gib.min(max))
+    }
+}
+
 /// The saved settings of one entry (`cloud_machine_provider.config_json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -139,6 +178,9 @@ pub(crate) struct ProviderConfig {
     /// Northflank entries only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) northflank: Option<NorthflankSettings>,
+    /// Agent37 entries only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent37: Option<Agent37Settings>,
     /// The entry's name; settings saved before entries existed read as
     /// "E2B".
     #[serde(default = "legacy_name")]
@@ -180,6 +222,7 @@ impl ProviderConfig {
         Self {
             provider: e2b_kind(),
             northflank: None,
+            agent37: None,
             name: name.to_owned(),
             retired_from: None,
             migrated: true,
@@ -210,8 +253,39 @@ impl ProviderConfig {
         config
     }
 
+    /// A new Agent37 entry: `default` instances in `us`, its four sizes.
+    pub(crate) fn new_agent37(name: &str) -> Self {
+        let mut config = Self::new(name);
+        CLOUD_PROVIDER_AGENT37.clone_into(&mut config.provider);
+        config.template_project = String::new();
+        config.agent37 = Some(Agent37Settings::default());
+        config.sizes = CloudMachineSize::AGENT37.to_vec();
+        config.sizes_verified = true;
+        config.sizes_version = Some(intentd_version().to_owned());
+        config
+    }
+
     pub(crate) fn is_northflank(&self) -> bool {
         self.provider == CLOUD_PROVIDER_NORTHFLANK
+    }
+
+    pub(crate) fn is_agent37(&self) -> bool {
+        self.provider == CLOUD_PROVIDER_AGENT37
+    }
+
+    pub(crate) fn is_e2b(&self) -> bool {
+        self.provider == CLOUD_PROVIDER_E2B
+    }
+
+    /// The sizes this entry's provider offers, smallest first.
+    pub(crate) fn offered_sizes(&self) -> &'static [CloudMachineSize] {
+        if self.is_northflank() {
+            &CloudMachineSize::NORTHFLANK
+        } else if self.is_agent37() {
+            &CloudMachineSize::AGENT37
+        } else {
+            &CloudMachineSize::E2B
+        }
     }
 
     /// The provider's display name, for messages.
@@ -251,23 +325,38 @@ impl ProviderConfig {
     /// Whether `size` may be saved: any size while the list is not
     /// verified (the create is the real check), else a listed one.
     pub(crate) fn allows(&self, size: CloudMachineSize) -> bool {
-        if self.is_northflank() {
-            return CloudMachineSize::NORTHFLANK.contains(&size);
+        if !self.offered_sizes().contains(&size) {
+            return false;
         }
-        !self.sizes_verified || self.sizes.contains(&size)
+        self.is_northflank()
+            || self.is_agent37()
+            || !self.sizes_verified
+            || self.sizes.contains(&size)
     }
 
-    /// The template (E2B) or image (Northflank) a new sandbox of `size`
-    /// starts from.
+    /// The template (E2B, Agent37) or image (Northflank) a new sandbox of
+    /// `size` starts from, as the entry reports it.
     pub(crate) fn template(&self, size: CloudMachineSize) -> String {
         if let Some(nf) = &self.northflank {
             return format!("{}:{}", nf.image, intentd_version());
+        }
+        if self.agent37.is_some() {
+            return intent_nodes::agent37::template_name(&self.start_image(size));
         }
         format!(
             "{}:{}",
             template_name(&self.template_project, size),
             intentd_version()
         )
+    }
+
+    /// What a create asks the provider to start: the template, except on
+    /// Agent37, whose adapter imports the image as its template.
+    pub(crate) fn start_image(&self, size: CloudMachineSize) -> String {
+        if self.agent37.is_some() {
+            return intent_nodes::agent37::image_ref(intentd_version());
+        }
+        self.template(size)
     }
 
     /// Whether the published-size list is missing, stale or for another
@@ -288,12 +377,16 @@ impl ProviderConfig {
     /// `CloudMachineProvider` on the wire for entry `id`. Never holds the
     /// key.
     pub(crate) fn to_json(&self, id: &str) -> Value {
-        let sizes: Vec<Value> = match &self.northflank {
-            Some(nf) => CloudMachineSize::NORTHFLANK
+        let sizes: Vec<Value> = match (&self.northflank, &self.agent37) {
+            (Some(nf), _) => CloudMachineSize::NORTHFLANK
                 .into_iter()
                 .filter_map(|size| Some(size.deployment_info_json(&nf.plan(size)?)))
                 .collect(),
-            None => self.sizes.iter().map(|size| size.info_json()).collect(),
+            (None, Some(_)) => CloudMachineSize::AGENT37
+                .into_iter()
+                .map(CloudMachineSize::bare_info_json)
+                .collect(),
+            (None, None) => self.sizes.iter().map(|size| size.info_json()).collect(),
         };
         let mut provider = json!({
             "id": id,
@@ -308,8 +401,8 @@ impl ProviderConfig {
             "pausedDeleteDays": self.paused_delete_days,
             "configuredAt": self.configured_at,
         });
-        match &self.northflank {
-            Some(nf) => {
+        match (&self.northflank, &self.agent37) {
+            (Some(nf), _) => {
                 provider["northflank"] = json!({
                     "projectId": nf.project_id,
                     "region": nf.region,
@@ -318,7 +411,14 @@ impl ProviderConfig {
                     "diskGiB": nf.disk_gib.max(MIN_DISK_GIB),
                 });
             }
-            None => provider["templateProject"] = json!(self.template_project),
+            (None, Some(a37)) => {
+                provider["agent37"] = json!({
+                    "instanceType": a37.instance_type,
+                    "region": a37.region,
+                    "diskGiB": a37.disk_gib,
+                });
+            }
+            (None, None) => provider["templateProject"] = json!(self.template_project),
         }
         if let Some(checked) = &self.checked_at {
             provider["checkedAt"] = json!(checked);
@@ -535,7 +635,7 @@ pub(crate) async fn resolve(
         return find(&mut all, id).ok_or_else(|| with_cloud_machine_id(not_configured(), id));
     }
     if !any_provider {
-        all.retain(|(_, saved)| !saved.is_northflank());
+        all.retain(|(_, saved)| saved.is_e2b());
         if all.is_empty() {
             return Err(not_configured());
         }
@@ -646,10 +746,26 @@ pub(crate) fn northflank_client(
         .map_err(|error| to_error(&error, Phase::Other, CLOUD_PROVIDER_NORTHFLANK))
 }
 
+/// An Agent37 client with `key`.
+pub(crate) fn agent37_client(key: SecretString) -> Result<Agent37Client> {
+    let env = |name: &str| std::env::var(name).ok().filter(|url| !url.is_empty());
+    let defaults = Agent37Config::default();
+    let config = Agent37Config {
+        api_url: env(AGENT37_API_URL_ENV).unwrap_or_else(|| defaults.api_url.clone()),
+        exec_url: env(AGENT37_EXEC_URL_ENV).unwrap_or_else(|| defaults.exec_url.clone()),
+        ..defaults
+    };
+    Agent37Client::new(key, config)
+        .map_err(|error| to_error(&error, Phase::Other, CLOUD_PROVIDER_AGENT37))
+}
+
 /// A provider client for entry `saved` with `key`.
 pub(crate) fn client(saved: &ProviderConfig, key: SecretString) -> Result<Provider> {
     if let Some(nf) = &saved.northflank {
         return Ok(std::sync::Arc::new(northflank_client(nf, key)?));
+    }
+    if saved.agent37.is_some() {
+        return Ok(std::sync::Arc::new(agent37_client(key)?));
     }
     let mut config = E2bConfig::default();
     if let Ok(url) = std::env::var(API_URL_ENV) {
@@ -696,6 +812,8 @@ pub(crate) fn key_rejected(status: Option<u16>) -> Error {
 pub(crate) fn key_rejected_by(kind: &str, status: Option<u16>) -> Error {
     let message = if kind == CLOUD_PROVIDER_NORTHFLANK {
         "Northflank rejected the saved API token: save a working token for this Northflank entry in Settings → Nodes."
+    } else if kind == CLOUD_PROVIDER_AGENT37 {
+        "Agent37 rejected the saved API key: save a working key for this Agent37 entry in Settings → Nodes."
     } else {
         "E2B rejected the saved API key: save a working key for this E2B entry in Settings → Nodes."
     };
@@ -719,18 +837,21 @@ pub(crate) fn project_missing(status: Option<u16>) -> Error {
     )
 }
 
-/// `permission-denied`: the Northflank token lacks the permission for
-/// `action`.
-pub(crate) fn permission_denied(action: &str, status: Option<u16>) -> Error {
-    let error = cloud_machine_unavailable(
-        "permission-denied",
-        false,
-        status,
+/// `permission-denied`: the provider `kind` refused `action` for the key
+/// (a Northflank token without the permission, an Agent37 key whose IP
+/// allowlist leaves this backend out).
+pub(crate) fn permission_denied(kind: &str, action: &str, status: Option<u16>) -> Error {
+    let message = if kind == CLOUD_PROVIDER_AGENT37 {
+        format!(
+            "Agent37 refused {action} for the saved key: its IP allowlist does not include this backend's address. Allow it at Agent37, or save another key in Settings → Nodes."
+        )
+    } else {
         format!(
             "The Northflank token lacks the permission for {action}: give it access to the project's services, volumes, tags and command execution, then save it in Settings → Nodes."
-        ),
-    );
-    match with_cloud_provider(error, CLOUD_PROVIDER_NORTHFLANK) {
+        )
+    };
+    let error = cloud_machine_unavailable("permission-denied", false, status, message);
+    match with_cloud_provider(error, kind) {
         Error::RemoteMachine(mut failure) => {
             failure.data["action"] = json!(action);
             Error::RemoteMachine(failure)
@@ -765,6 +886,38 @@ pub(crate) fn image_missing(image: &str) -> Error {
     )
 }
 
+/// `template-missing` for an Agent37 template whose image Agent37 cannot
+/// import.
+pub(crate) fn agent37_image_missing(image: &str) -> Error {
+    with_cloud_provider(
+        cloud_machine_unavailable(
+            "template-missing",
+            false,
+            None,
+            format!(
+                "Agent37 could not import the image {image} for this backend's Intent version; no instance was started. Update Intent."
+            ),
+        ),
+        CLOUD_PROVIDER_AGENT37,
+    )
+}
+
+/// `no-capacity`: Agent37 has no room for the entry's instance where it
+/// asked; it never places it elsewhere.
+pub(crate) fn no_capacity(detail: &str, status: Option<u16>) -> Error {
+    with_cloud_provider(
+        cloud_machine_unavailable(
+            "no-capacity",
+            true,
+            status,
+            format!(
+                "Agent37 has no room for {detail} right now; nothing was started elsewhere. Try again later, or pick another size or region in Settings → Nodes."
+            ),
+        ),
+        CLOUD_PROVIDER_AGENT37,
+    )
+}
+
 /// What the backend was doing when E2B failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -780,6 +933,9 @@ pub(crate) fn to_error(error: &CloudError, phase: Phase, kind: &str) -> Error {
 }
 
 fn provider_error(error: &CloudError, phase: Phase, kind: &str) -> Error {
+    if kind == CLOUD_PROVIDER_AGENT37 {
+        return agent37_error(error, phase);
+    }
     let northflank = kind == CLOUD_PROVIDER_NORTHFLANK;
     if let Some(limit) = error.quota_limit() {
         let retry_after = error.retry_after().map(|d| d.as_secs());
@@ -797,7 +953,11 @@ fn provider_error(error: &CloudError, phase: Phase, kind: &str) -> Error {
         match error.kind() {
             CloudErrorKind::Unauthorized => return key_rejected_by(kind, error.status()),
             CloudErrorKind::PermissionDenied => {
-                return permission_denied(error.action().unwrap_or("this call"), error.status())
+                return permission_denied(
+                    kind,
+                    error.action().unwrap_or("this call"),
+                    error.status(),
+                )
             }
             CloudErrorKind::ProjectMissing => return project_missing(error.status()),
             CloudErrorKind::NotFound if phase == Phase::Create => {
@@ -849,6 +1009,44 @@ fn provider_error(error: &CloudError, phase: Phase, kind: &str) -> Error {
     }
 }
 
+fn agent37_error(error: &CloudError, phase: Phase) -> Error {
+    let kind = CLOUD_PROVIDER_AGENT37;
+    if let Some(limit) = error.quota_limit() {
+        let retry_after = error.retry_after().map(|d| d.as_secs());
+        let message = match limit {
+            QuotaLimit::Plan => "The Agent37 wallet cannot pay for this instance: top up the Agent37 wallet, then try again.",
+            QuotaLimit::Concurrency => "Agent37's limit on awake memory for this workspace is reached: pause another Agent37 machine, or raise the limit at Agent37.",
+            QuotaLimit::Rate => "Agent37's request rate limit is reached: try again shortly.",
+        };
+        return cloud_quota(limit.as_str(), retry_after, message);
+    }
+    match error.kind() {
+        CloudErrorKind::NotConfigured => not_configured(),
+        CloudErrorKind::Unauthorized => key_rejected_by(kind, error.status()),
+        CloudErrorKind::PermissionDenied => {
+            permission_denied(kind, error.action().unwrap_or("this call"), error.status())
+        }
+        CloudErrorKind::NoCapacity => {
+            no_capacity("this entry's instance type and size in its region", error.status())
+        }
+        CloudErrorKind::NotFound if phase == Phase::Create => cloud_machine_unavailable(
+            "template-missing",
+            false,
+            error.status(),
+            format!("Agent37 could not start the Intent image for this backend's version; no instance was left behind: {error}"),
+        ),
+        other => cloud_machine_unavailable(
+            "api-error",
+            error.is_retryable(),
+            match other {
+                CloudErrorKind::Api => error.status(),
+                _ => None,
+            },
+            format!("Agent37 failed: {error}"),
+        ),
+    }
+}
+
 /// The sizes published for this backend's version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Published {
@@ -884,7 +1082,7 @@ pub(crate) async fn published_sizes(project: &str) -> Option<Published> {
     {
         Ok(manifest) if manifest.project == project && manifest.version == intentd_version() => {
             Some(Published {
-                sizes: CloudMachineSize::ALL
+                sizes: CloudMachineSize::E2B
                     .into_iter()
                     .filter(|size| manifest.sizes.iter().any(|id| id == size.id()))
                     .collect(),
@@ -965,5 +1163,41 @@ mod tests {
         assert_eq!(config.to_json("e")["northflank"]["diskGiB"], json!(6));
         config.northflank.as_mut().unwrap().disk_gib = 40;
         assert_eq!(config.to_json("e")["northflank"]["diskGiB"], json!(40));
+    }
+
+    #[test]
+    fn an_agent37_disk_is_capped_at_the_shapes_largest_disk() {
+        let mut a37 = Agent37Settings {
+            disk_gib: 30,
+            ..Agent37Settings::default()
+        };
+        assert_eq!(a37.disk_for(CloudMachineSize::S2x4), 12);
+        assert_eq!(a37.disk_for(CloudMachineSize::S4x8), 20);
+        assert_eq!(a37.disk_for(CloudMachineSize::S4x16), 30);
+        a37.instance_type = "vm".into();
+        assert_eq!(a37.disk_for(CloudMachineSize::S2x4), 30);
+        a37.disk_gib = 100;
+        assert_eq!(a37.disk_for(CloudMachineSize::S4x32), 100);
+    }
+
+    #[test]
+    fn each_provider_allows_only_its_own_sizes() {
+        let e2b = ProviderConfig::new("e");
+        let nf = ProviderConfig::new_northflank("n", "p1");
+        let a37 = ProviderConfig::new_agent37("a");
+        assert!(e2b.allows(CloudMachineSize::S16x32));
+        assert!(!e2b.allows(CloudMachineSize::S4x16));
+        assert!(nf.allows(CloudMachineSize::S8x16));
+        assert!(!nf.allows(CloudMachineSize::S4x32));
+        assert!(a37.allows(CloudMachineSize::S4x32));
+        assert!(!a37.allows(CloudMachineSize::S8x16));
+        assert_eq!(
+            a37.start_image(CloudMachineSize::S4x8),
+            format!("ghcr.io/intent-hq/intent-node:{}", intentd_version())
+        );
+        assert_eq!(
+            a37.template(CloudMachineSize::S4x8),
+            format!("intent-node-{}", intentd_version().replace('.', "-"))
+        );
     }
 }

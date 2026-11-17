@@ -769,8 +769,8 @@ async fn check(
             let busy = node.as_ref().is_some_and(|node| node.shared_ref().busy());
             let last_active = node.as_ref().map(|node| node.shared_ref().last_activity());
             let activity = feature.cloud.activity(&row.id, busy, last_active);
-            // A provider without a lease has nothing to renew and no
-            // continuous-run cap: only the idle pause below stops it.
+            // A provider without a lease has nothing to renew: only the
+            // idle pause below stops it. Only E2B caps a continuous run.
             let lease = client.has_lease();
             if lease
                 && activity
@@ -788,8 +788,8 @@ async fn check(
                 return;
             }
             let idle = activity.last_busy.elapsed() >= clock.minutes(saved.idle_pause_minutes);
-            let capped =
-                lease && since(cloud.running_since.as_deref()) >= clock.minutes(RUN_CAP_MINUTES);
+            let capped = client.caps_run()
+                && since(cloud.running_since.as_deref()) >= clock.minutes(RUN_CAP_MINUTES);
             if idle || capped {
                 spawn_pause(
                     svc,

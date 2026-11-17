@@ -1,0 +1,885 @@
+{
+  "recorded": "the real Agent37 API, by scripts/capture-agent37-fixtures.sh",
+  "image": "ghcr.io/intent-hq/intent-node:0.11.235",
+  "key": "fixture-agent37-key-000000000000",
+  "exchanges": [
+    {
+      "name": "list-instances-wrong-key",
+      "request": {
+        "plane": "rest",
+        "auth": "wrong",
+        "method": "GET",
+        "path": "/instances"
+      },
+      "response": {
+        "status": 401,
+        "body": {
+          "error": {
+            "code": "invalid_api_key",
+            "message": "Missing, malformed, or revoked API key."
+          }
+        }
+      }
+    },
+    {
+      "name": "exec-wrong-key",
+      "request": {
+        "plane": "exec",
+        "auth": "wrong",
+        "method": "POST",
+        "path": "/instances/zz00000000/exec",
+        "body": {
+          "command": "true"
+        }
+      },
+      "response": {
+        "status": 401,
+        "body": {
+          "error": "invalid_api_key",
+          "message": "The API key or signed URL you provided is invalid, expired, or revoked."
+        }
+      }
+    },
+    {
+      "name": "get-template-missing",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "GET",
+        "path": "/templates/intent-capture-template"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Template not found."
+          }
+        }
+      }
+    },
+    {
+      "name": "import-template-unpullable",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/templates",
+        "body": {
+          "name": "intent-capture-template",
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.0.1"
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "Could not fetch the manifest for \"ghcr.io/intent-hq/intent-node:0.0.1\". The image must be publicly pullable, or pass registry_auth with a username and password for its registry."
+          }
+        }
+      }
+    },
+    {
+      "name": "import-template",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/templates",
+        "body": {
+          "name": "intent-capture-template",
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235"
+        }
+      },
+      "response": {
+        "status": 201,
+        "body": {
+          "name": "intent-capture-template",
+          "scope": "workspace",
+          "revision": 1,
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235",
+          "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "agents": [],
+          "description": null,
+          "default_port": null,
+          "entrypoint": null,
+          "created": 1794900000,
+          "updated": 1794900000
+        }
+      }
+    },
+    {
+      "name": "import-template-conflict",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/templates",
+        "body": {
+          "name": "intent-capture-template",
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235"
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "error": {
+            "code": "template_conflict",
+            "message": "Template \"intent-capture-template\" already exists."
+          }
+        }
+      }
+    },
+    {
+      "name": "get-template",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "GET",
+        "path": "/templates/intent-capture-template"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "name": "intent-capture-template",
+          "scope": "workspace",
+          "revision": 1,
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235",
+          "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "agents": [],
+          "description": null,
+          "default_port": null,
+          "entrypoint": null,
+          "created": 1794900000,
+          "updated": 1794900000,
+          "revisions": [
+            {
+              "revision": 1,
+              "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "created": 1794900000
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "update-template-same-image",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "PATCH",
+        "path": "/templates/intent-capture-template",
+        "body": {
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "name": "intent-capture-template",
+          "scope": "workspace",
+          "revision": 1,
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235",
+          "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "agents": [],
+          "description": null,
+          "default_port": null,
+          "entrypoint": null,
+          "created": 1794900000,
+          "updated": 1794900000
+        }
+      }
+    },
+    {
+      "name": "create-default-in-eu",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances",
+        "body": {
+          "template": "intent-capture-template",
+          "type": "default",
+          "region": "eu",
+          "resources": {
+            "cpu": 2,
+            "memory": 4,
+            "disk": 12
+          },
+          "name": "intent-capture",
+          "metadata": {
+            "intentBackendId": "intent-capture",
+            "agentId": "capture"
+          },
+          "auto_sleep": true,
+          "idle_timeout_seconds": 1800
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "Europe runs VM and Performance instances only: send \"type\": \"vm\" or \"performance\", or create in US."
+          }
+        }
+      }
+    },
+    {
+      "name": "create-bad-shape",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances",
+        "body": {
+          "template": "intent-capture-template",
+          "resources": {
+            "cpu": 2,
+            "memory": 6
+          }
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "Unsupported resource combination. Valid combinations right now: 2 vCPU / 4 GB / 2-12 GB disk, 4 vCPU / 8 GB / 2-20 GB disk, 4 vCPU / 16 GB / 2-40 GB disk, 4 vCPU / 32 GB / 2-80 GB disk."
+          }
+        }
+      }
+    },
+    {
+      "name": "create-default",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances",
+        "body": {
+          "template": "intent-capture-template",
+          "type": "default",
+          "region": "us",
+          "resources": {
+            "cpu": 2,
+            "memory": 4,
+            "disk": 12
+          },
+          "name": "intent-capture",
+          "metadata": {
+            "intentBackendId": "intent-capture",
+            "agentId": "capture"
+          },
+          "auto_sleep": true,
+          "idle_timeout_seconds": 1800
+        }
+      },
+      "response": {
+        "status": 201,
+        "body": {
+          "id": "fx00000001",
+          "status": "running",
+          "status_reason": null,
+          "template": "intent-capture-template",
+          "template_revision": 1,
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235",
+          "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "type": "default",
+          "region": "us",
+          "mount_path": "/home/user",
+          "resources": {
+            "cpu": 2,
+            "memory": 4,
+            "disk": 12
+          },
+          "url": "https://fx00000001.agent37.app",
+          "domain_urls": [],
+          "public_ports": [],
+          "name": "intent-capture",
+          "metadata": {
+            "intentBackendId": "intent-capture",
+            "agentId": "capture"
+          },
+          "auto_sleep": true,
+          "idle_timeout_seconds": 1800,
+          "network": "allow-all",
+          "past_due": false,
+          "created": 1794900000
+        }
+      }
+    },
+    {
+      "name": "get-instance",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "GET",
+        "path": "/instances/fx00000001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000001",
+          "status": "running",
+          "status_reason": null,
+          "template": "intent-capture-template",
+          "template_revision": 1,
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235",
+          "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "type": "default",
+          "region": "us",
+          "mount_path": "/home/user",
+          "resources": {
+            "cpu": 2,
+            "memory": 4,
+            "disk": 12
+          },
+          "url": "https://fx00000001.agent37.app",
+          "domain_urls": [],
+          "public_ports": [],
+          "name": "intent-capture",
+          "metadata": {
+            "intentBackendId": "intent-capture",
+            "agentId": "capture"
+          },
+          "auto_sleep": true,
+          "idle_timeout_seconds": 1800,
+          "network": "allow-all",
+          "past_due": false,
+          "created": 1794900000
+        }
+      }
+    },
+    {
+      "name": "list-instances",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "GET",
+        "path": "/instances"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": [
+            {
+              "id": "fx00000001",
+              "status": "running",
+              "status_reason": null,
+              "template": "intent-capture-template",
+              "template_revision": 1,
+              "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235",
+              "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "type": "default",
+              "region": "us",
+              "mount_path": "/home/user",
+              "resources": {
+                "cpu": 2,
+                "memory": 4,
+                "disk": 12
+              },
+              "url": "https://fx00000001.agent37.app",
+              "domain_urls": [],
+              "public_ports": [],
+              "name": "intent-capture",
+              "metadata": {
+                "intentBackendId": "intent-capture",
+                "agentId": "capture"
+              },
+              "auto_sleep": true,
+              "idle_timeout_seconds": 1800,
+              "network": "allow-all",
+              "past_due": false,
+              "created": 1794900000
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "exec-as-user",
+      "request": {
+        "plane": "exec",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000001/exec",
+        "body": {
+          "command": "id -un; printf 'out\\n'; printf 'err\\n' >&2; exit 3",
+          "name": "intent-capture-1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "exit_code": 3,
+          "stdout": "user out ",
+          "stderr": "err ",
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "exec-as-root",
+      "request": {
+        "plane": "exec",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000001/exec",
+        "body": {
+          "command": "id -un",
+          "user": "root",
+          "name": "intent-capture-2"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "exit_code": 0,
+          "stdout": "root ",
+          "stderr": "",
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "exec-unknown-instance",
+      "request": {
+        "plane": "exec",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/zz00000000/exec",
+        "body": {
+          "command": "true"
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": "not_found"
+        }
+      }
+    },
+    {
+      "name": "sleep",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000001/sleep"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000001",
+          "status": "sleeping"
+        }
+      }
+    },
+    {
+      "name": "get-instance-sleeping",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "GET",
+        "path": "/instances/fx00000001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000001",
+          "status": "sleeping",
+          "status_reason": null,
+          "template": "intent-capture-template",
+          "template_revision": 1,
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235",
+          "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "type": "default",
+          "region": "us",
+          "mount_path": "/home/user",
+          "resources": {
+            "cpu": 2,
+            "memory": 4,
+            "disk": 12
+          },
+          "url": "https://fx00000001.agent37.app",
+          "domain_urls": [],
+          "public_ports": [],
+          "name": "intent-capture",
+          "metadata": {
+            "intentBackendId": "intent-capture",
+            "agentId": "capture"
+          },
+          "auto_sleep": true,
+          "idle_timeout_seconds": 1800,
+          "network": "allow-all",
+          "slept_at": 1794900000,
+          "past_due": false,
+          "created": 1794900000
+        }
+      }
+    },
+    {
+      "name": "sleep-sleeping",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000001/sleep"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000001",
+          "status": "sleeping"
+        }
+      }
+    },
+    {
+      "name": "start-sleeping",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000001/start"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000001",
+          "status": "running"
+        }
+      }
+    },
+    {
+      "name": "start-running",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000001/start"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000001",
+          "status": "running"
+        }
+      }
+    },
+    {
+      "name": "sleep-again",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000001/sleep"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000001",
+          "status": "sleeping"
+        }
+      }
+    },
+    {
+      "name": "exec-wakes-a-sleeper",
+      "request": {
+        "plane": "exec",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000001/exec",
+        "body": {
+          "command": "echo awake",
+          "name": "intent-capture-3"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "exit_code": 0,
+          "stdout": "awake ",
+          "stderr": "",
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "get-instance-woken",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "GET",
+        "path": "/instances/fx00000001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000001",
+          "status": "running",
+          "status_reason": null,
+          "template": "intent-capture-template",
+          "template_revision": 1,
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235",
+          "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "type": "default",
+          "region": "us",
+          "mount_path": "/home/user",
+          "resources": {
+            "cpu": 2,
+            "memory": 4,
+            "disk": 12
+          },
+          "url": "https://fx00000001.agent37.app",
+          "domain_urls": [],
+          "public_ports": [],
+          "name": "intent-capture",
+          "metadata": {
+            "intentBackendId": "intent-capture",
+            "agentId": "capture"
+          },
+          "auto_sleep": true,
+          "idle_timeout_seconds": 1800,
+          "network": "allow-all",
+          "past_due": false,
+          "created": 1794900000
+        }
+      }
+    },
+    {
+      "name": "delete",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "DELETE",
+        "path": "/instances/fx00000001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000001",
+          "deleted": true
+        }
+      }
+    },
+    {
+      "name": "delete-again",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "DELETE",
+        "path": "/instances/fx00000001"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Instance not found."
+          }
+        }
+      }
+    },
+    {
+      "name": "get-deleted",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "GET",
+        "path": "/instances/fx00000001"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Instance not found."
+          }
+        }
+      }
+    },
+    {
+      "name": "start-unknown",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/zz00000000/start"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Instance not found."
+          }
+        }
+      }
+    },
+    {
+      "name": "create-vm-in-eu",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances",
+        "body": {
+          "template": "intent-capture-template",
+          "type": "vm",
+          "region": "eu",
+          "resources": {
+            "cpu": 2,
+            "memory": 4,
+            "disk": 20
+          },
+          "name": "intent-capture",
+          "metadata": {
+            "intentBackendId": "intent-capture",
+            "agentId": "capture-vm"
+          },
+          "auto_sleep": true,
+          "idle_timeout_seconds": 1800
+        }
+      },
+      "response": {
+        "status": 201,
+        "body": {
+          "id": "fx00000002",
+          "status": "running",
+          "status_reason": null,
+          "template": "intent-capture-template",
+          "template_revision": 1,
+          "image_ref": "ghcr.io/intent-hq/intent-node:0.11.235",
+          "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "type": "vm",
+          "region": "eu",
+          "mount_path": "/home/user",
+          "resources": {
+            "cpu": 2,
+            "memory": 4,
+            "disk": 20
+          },
+          "url": "https://fx00000002.agent37.app",
+          "domain_urls": [],
+          "public_ports": [],
+          "name": "intent-capture",
+          "metadata": {
+            "intentBackendId": "intent-capture",
+            "agentId": "capture-vm"
+          },
+          "auto_sleep": true,
+          "idle_timeout_seconds": 1800,
+          "network": "allow-all",
+          "past_due": false,
+          "created": 1794900000
+        }
+      }
+    },
+    {
+      "name": "exec-vm",
+      "request": {
+        "plane": "exec",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000002/exec",
+        "body": {
+          "command": "id -un",
+          "name": "intent-capture-4"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "exit_code": 0,
+          "stdout": "user ",
+          "stderr": "",
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "sleep-vm",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000002/sleep"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000002",
+          "status": "sleeping"
+        }
+      }
+    },
+    {
+      "name": "start-vm",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "POST",
+        "path": "/instances/fx00000002/start"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000002",
+          "status": "running"
+        }
+      }
+    },
+    {
+      "name": "delete-vm",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "DELETE",
+        "path": "/instances/fx00000002"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "fx00000002",
+          "deleted": true
+        }
+      }
+    },
+    {
+      "name": "delete-template",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "DELETE",
+        "path": "/templates/intent-capture-template"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "name": "intent-capture-template",
+          "deleted": true
+        }
+      }
+    },
+    {
+      "name": "delete-template-again",
+      "request": {
+        "plane": "rest",
+        "auth": "key",
+        "method": "DELETE",
+        "path": "/templates/intent-capture-template"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Template not found."
+          }
+        }
+      }
+    }
+  ]
+}

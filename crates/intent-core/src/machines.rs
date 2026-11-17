@@ -432,15 +432,23 @@ pub const CLOUD_PROVIDER_E2B_NAME: &str = "E2B";
 /// The Northflank cloud machine provider (`cloudMachineProviders: 1`).
 pub const CLOUD_PROVIDER_NORTHFLANK: &str = "northflank";
 pub const CLOUD_PROVIDER_NORTHFLANK_NAME: &str = "Northflank";
+/// The Agent37 cloud machine provider (listed in `providerKinds`).
+pub const CLOUD_PROVIDER_AGENT37: &str = "agent37";
+pub const CLOUD_PROVIDER_AGENT37_NAME: &str = "Agent37";
 /// The providers this backend can configure, in the order clients offer
 /// them (`cloudMachines.list` `providerKinds`).
-pub const CLOUD_PROVIDER_KINDS: [&str; 2] = [CLOUD_PROVIDER_E2B, CLOUD_PROVIDER_NORTHFLANK];
+pub const CLOUD_PROVIDER_KINDS: [&str; 3] = [
+    CLOUD_PROVIDER_E2B,
+    CLOUD_PROVIDER_NORTHFLANK,
+    CLOUD_PROVIDER_AGENT37,
+];
 
 /// The display name of cloud provider `kind`, for messages.
 #[must_use]
 pub fn cloud_provider_name(kind: &str) -> &'static str {
     match kind {
         CLOUD_PROVIDER_NORTHFLANK => CLOUD_PROVIDER_NORTHFLANK_NAME,
+        CLOUD_PROVIDER_AGENT37 => CLOUD_PROVIDER_AGENT37_NAME,
         _ => CLOUD_PROVIDER_E2B_NAME,
     }
 }
@@ -458,7 +466,8 @@ fn legacy_entry() -> String {
     CLOUD_E2B_LEGACY_ENTRY.to_owned()
 }
 
-/// A cloud sandbox size, `<vCPU>x<GiB>`; each size is its own template.
+/// A cloud sandbox size, `<vCPU>x<GiB>`. Each provider offers some of
+/// them: [`Self::E2B`], [`Self::NORTHFLANK`], [`Self::AGENT37`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CloudMachineSize {
     #[serde(rename = "2x4")]
@@ -469,11 +478,26 @@ pub enum CloudMachineSize {
     S8x16,
     #[serde(rename = "16x32")]
     S16x32,
+    #[serde(rename = "4x16")]
+    S4x16,
+    #[serde(rename = "4x32")]
+    S4x32,
 }
 
 impl CloudMachineSize {
-    /// Every size, smallest first.
-    pub const ALL: [Self; 4] = [Self::S2x4, Self::S4x8, Self::S8x16, Self::S16x32];
+    /// Every size.
+    pub const ALL: [Self; 6] = [
+        Self::S2x4,
+        Self::S4x8,
+        Self::S8x16,
+        Self::S16x32,
+        Self::S4x16,
+        Self::S4x32,
+    ];
+    /// The sizes an E2B entry offers (each its own template), smallest first.
+    pub const E2B: [Self; 4] = [Self::S2x4, Self::S4x8, Self::S8x16, Self::S16x32];
+    /// The sizes an Agent37 entry offers, smallest first.
+    pub const AGENT37: [Self; 4] = [Self::S2x4, Self::S4x8, Self::S4x16, Self::S4x32];
     /// The size new sandboxes use unless the owner picks another.
     pub const DEFAULT: Self = Self::S4x8;
 
@@ -484,6 +508,8 @@ impl CloudMachineSize {
             Self::S4x8 => "4x8",
             Self::S8x16 => "8x16",
             Self::S16x32 => "16x32",
+            Self::S4x16 => "4x16",
+            Self::S4x32 => "4x32",
         }
     }
 
@@ -496,7 +522,7 @@ impl CloudMachineSize {
     pub fn vcpu(self) -> u32 {
         match self {
             Self::S2x4 => 2,
-            Self::S4x8 => 4,
+            Self::S4x8 | Self::S4x16 | Self::S4x32 => 4,
             Self::S8x16 => 8,
             Self::S16x32 => 16,
         }
@@ -504,7 +530,17 @@ impl CloudMachineSize {
 
     #[must_use]
     pub fn memory_mib(self) -> u32 {
-        self.vcpu() * 2048
+        self.memory_gib() * 1024
+    }
+
+    #[must_use]
+    pub fn memory_gib(self) -> u32 {
+        match self {
+            Self::S2x4 => 4,
+            Self::S4x8 => 8,
+            Self::S8x16 | Self::S4x16 => 16,
+            Self::S16x32 | Self::S4x32 => 32,
+        }
     }
 
     /// The lowest E2B plan that allows the size.
@@ -528,8 +564,37 @@ impl CloudMachineSize {
             Self::S2x4 => Some("nf-compute-200"),
             Self::S4x8 => Some("nf-compute-400"),
             Self::S8x16 => Some("nf-compute-800-16"),
-            Self::S16x32 => None,
+            Self::S16x32 | Self::S4x16 | Self::S4x32 => None,
         }
+    }
+
+    /// The largest disk Agent37 gives an instance of the size and `vm`
+    /// type (`vm`) or `default` type, in GiB; `None` for a size Agent37
+    /// does not offer.
+    #[must_use]
+    pub fn agent37_max_disk_gib(self, vm: bool) -> Option<u32> {
+        if !Self::AGENT37.contains(&self) {
+            return None;
+        }
+        if vm {
+            return Some(100);
+        }
+        Some(match self {
+            Self::S2x4 => 12,
+            Self::S4x8 => 20,
+            Self::S4x16 => 40,
+            _ => 80,
+        })
+    }
+
+    /// `CloudMachineSizeInfo` of an Agent37 entry: no plan of either kind.
+    #[must_use]
+    pub fn bare_info_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id(),
+            "vcpu": self.vcpu(),
+            "memoryMiB": self.memory_mib(),
+        })
     }
 
     /// `CloudMachineSizeInfo` of a Northflank entry: its deployment plan,

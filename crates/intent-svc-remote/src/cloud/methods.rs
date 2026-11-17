@@ -9,8 +9,8 @@ use intent_core::machines::{
     with_cloud_machine_id, MAX_CLOUD_MACHINE_ENTRIES, MAX_CLOUD_MACHINE_ID_BYTES,
 };
 use intent_core::machines::{
-    CloudMachineSize, ExposedMachine, CLOUD_PROVIDER_E2B, CLOUD_PROVIDER_KINDS,
-    CLOUD_PROVIDER_NORTHFLANK,
+    CloudMachineSize, ExposedMachine, CLOUD_PROVIDER_AGENT37, CLOUD_PROVIDER_E2B,
+    CLOUD_PROVIDER_KINDS, CLOUD_PROVIDER_NORTHFLANK,
 };
 use intent_core::{now_iso, Error, Result, WorkspaceId};
 use intent_nodes::cloud::SecretString;
@@ -52,7 +52,7 @@ fn provider_param(params: &Value) -> Result<Option<String>> {
             Ok(Some(provider.clone()))
         }
         Some(_) => Err(Error::InvalidParams(
-            "provider must be \"e2b\" or \"northflank\"".into(),
+            "provider must be \"e2b\", \"northflank\" or \"agent37\"".into(),
         )),
     }
 }
@@ -97,22 +97,52 @@ fn image_repository(image: &str) -> bool {
     first_ok && rest.iter().all(|part| path_part(part))
 }
 
-/// The Northflank-only `configure` members.
+/// The Northflank-only `configure` members (`diskGiB` is shared with
+/// Agent37: [`disk_param`]).
 #[derive(Default)]
 struct NorthflankParams {
     project_id: Option<String>,
     plans: Option<Vec<(CloudMachineSize, String)>>,
     image: Option<String>,
-    disk_gib: Option<u32>,
 }
 
 impl NorthflankParams {
     fn any(&self) -> bool {
-        self.project_id.is_some()
-            || self.plans.is_some()
-            || self.image.is_some()
-            || self.disk_gib.is_some()
+        self.project_id.is_some() || self.plans.is_some() || self.image.is_some()
     }
+}
+
+/// The Agent37-only `configure` members (`diskGiB` is shared with
+/// Northflank).
+#[derive(Default)]
+struct Agent37Params {
+    instance_type: Option<String>,
+    region: Option<String>,
+}
+
+impl Agent37Params {
+    fn any(&self) -> bool {
+        self.instance_type.is_some() || self.region.is_some()
+    }
+}
+
+fn agent37_params(params: &Value) -> Result<Agent37Params> {
+    let pick = |name: &str, allowed: &[&str]| match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if allowed.contains(&value.as_str()) => Ok(Some(value.clone())),
+        Some(_) => Err(Error::InvalidParams(format!(
+            "{name} must be one of {}",
+            allowed
+                .iter()
+                .map(|v| format!("\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    };
+    Ok(Agent37Params {
+        instance_type: pick("instanceType", &intent_nodes::agent37::INSTANCE_TYPES)?,
+        region: pick("region", &intent_nodes::agent37::REGIONS)?,
+    })
 }
 
 fn northflank_params(params: &Value) -> Result<NorthflankParams> {
@@ -170,17 +200,26 @@ fn northflank_params(params: &Value) -> Result<NorthflankParams> {
         project_id,
         plans,
         image,
-        disk_gib: disk_param(params)?,
     })
 }
 
-/// `diskGiB`: Northflank makes no volume under [`MIN_DISK_GIB`].
-fn disk_param(params: &Value) -> Result<Option<u32>> {
-    range_param(params, "diskGiB", MIN_DISK_GIB, 500).map_err(|_| {
-        Error::InvalidParams(format!(
-            "diskGiB must be an integer {MIN_DISK_GIB}-500: a Northflank volume is at least {MIN_DISK_GIB} GiB"
-        ))
-    })
+/// `diskGiB` for an entry of provider `kind`: a Northflank volume is
+/// 6-500 GiB, an Agent37 disk 4-100 GiB, and E2B takes none.
+fn disk_param(params: &Value, kind: &str) -> Result<Option<u32>> {
+    if params.get("diskGiB").is_none_or(Value::is_null) {
+        return Ok(None);
+    }
+    match kind {
+        CLOUD_PROVIDER_NORTHFLANK => range_param(params, "diskGiB", MIN_DISK_GIB, 500).map_err(|_| {
+            Error::InvalidParams(format!(
+                "diskGiB must be an integer {MIN_DISK_GIB}-500: a Northflank volume is at least {MIN_DISK_GIB} GiB"
+            ))
+        }),
+        CLOUD_PROVIDER_AGENT37 => range_param(params, "diskGiB", 4, 100),
+        _ => Err(Error::InvalidParams(
+            "diskGiB is a Northflank or Agent37 setting; an E2B entry has none".into(),
+        )),
+    }
 }
 
 /// An entry id member (`cloudMachineId`, `apiKeyFrom`), when given.
@@ -234,6 +273,9 @@ fn range_param(params: &Value, name: &str, min: u32, max: u32) -> Result<Option<
 struct ConfigureParams {
     provider: Option<String>,
     northflank: NorthflankParams,
+    agent37: Agent37Params,
+    /// `diskGiB` as sent; checked against the entry's provider later.
+    raw: Value,
     cloud_machine_id: Option<String>,
     name: Option<String>,
     api_key_from: Option<String>,
@@ -248,6 +290,7 @@ struct ConfigureParams {
 fn configure_params(params: &Value) -> Result<ConfigureParams> {
     let provider = provider_param(params)?;
     let northflank = northflank_params(params)?;
+    let agent37 = agent37_params(params)?;
     let api_key = match params.get("apiKey") {
         None | Some(Value::Null) => None,
         Some(Value::String(key))
@@ -266,7 +309,10 @@ fn configure_params(params: &Value) -> Result<ConfigureParams> {
     let size = match params.get("size") {
         None | Some(Value::Null) => None,
         Some(Value::String(id)) => Some(CloudMachineSize::parse(id).ok_or_else(|| {
-            Error::InvalidParams("size must be one of \"2x4\", \"4x8\", \"8x16\", \"16x32\"".into())
+            Error::InvalidParams(
+                "size must be one of \"2x4\", \"4x8\", \"8x16\", \"16x32\", \"4x16\", \"4x32\""
+                    .into(),
+            )
         })?),
         Some(_) => return Err(Error::InvalidParams("size must be a string".into())),
     };
@@ -302,6 +348,8 @@ fn configure_params(params: &Value) -> Result<ConfigureParams> {
     Ok(ConfigureParams {
         provider,
         northflank,
+        agent37,
+        raw: json!({ "diskGiB": params.get("diskGiB").cloned().unwrap_or(Value::Null) }),
         cloud_machine_id: entry_param(params, "cloudMachineId")?,
         name,
         api_key_from,
@@ -344,9 +392,19 @@ fn configure_target(
             Ok((Some(id.clone()), Some(saved)))
         }
         (None, Some(_)) => Ok((None, None)),
-        (None, None) if params.provider.as_deref() == Some(CLOUD_PROVIDER_NORTHFLANK) => Err(
-            Error::InvalidParams("a new Northflank entry needs a name".into()),
-        ),
+        (None, None)
+            if params
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider != CLOUD_PROVIDER_E2B) =>
+        {
+            Err(Error::InvalidParams(format!(
+                "a new {} entry needs a name",
+                intent_core::machines::cloud_provider_name(
+                    params.provider.as_deref().unwrap_or_default()
+                )
+            )))
+        }
         (None, None) => {
             let id = config::legacy_entry();
             Ok((Some(id.to_owned()), find(id)))
@@ -369,27 +427,45 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
         |saved| saved.provider.clone(),
     );
     let northflank = kind == CLOUD_PROVIDER_NORTHFLANK;
+    let agent37 = kind == CLOUD_PROVIDER_AGENT37;
+    let disk_gib = disk_param(&params.raw, &kind)?;
     let tag = |error: Error| {
         intent_core::machines::with_cloud_provider(
             with_cloud_machine_id(error, id.as_deref().unwrap_or_default()),
             &kind,
         )
     };
-    if northflank && params.template_project.is_some() {
-        return Err(Error::InvalidParams(
-            "templateProject is an E2B setting; a Northflank entry has none".into(),
-        ));
+    let provider_name = intent_core::machines::cloud_provider_name(&kind);
+    if kind != CLOUD_PROVIDER_E2B && params.template_project.is_some() {
+        return Err(Error::InvalidParams(format!(
+            "templateProject is an E2B setting; a {provider_name} entry has none"
+        )));
     }
     if !northflank && params.northflank.any() {
-        return Err(Error::InvalidParams(
-            "projectId, plans, image and diskGiB are Northflank settings; an E2B entry has none"
-                .into(),
-        ));
+        return Err(Error::InvalidParams(format!(
+            "projectId, plans and image are Northflank settings; a {provider_name} entry has none"
+        )));
     }
-    if northflank && params.size == Some(CloudMachineSize::S16x32) {
-        return Err(Error::InvalidParams(
-            "Northflank entries offer the sizes \"2x4\", \"4x8\" and \"8x16\"".into(),
-        ));
+    if !agent37 && params.agent37.any() {
+        return Err(Error::InvalidParams(format!(
+            "instanceType and region are Agent37 settings; a {provider_name} entry has none"
+        )));
+    }
+    let offered: &[CloudMachineSize] = match kind.as_str() {
+        CLOUD_PROVIDER_NORTHFLANK => &CloudMachineSize::NORTHFLANK,
+        CLOUD_PROVIDER_AGENT37 => &CloudMachineSize::AGENT37,
+        _ => &CloudMachineSize::E2B,
+    };
+    if let Some(size) = params.size.filter(|size| !offered.contains(size)) {
+        return Err(Error::InvalidParams(format!(
+            "{provider_name} entries offer the sizes {}, not \"{}\"",
+            offered
+                .iter()
+                .map(|s| format!("\"{}\"", s.id()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            size.id()
+        )));
     }
     let creating = saved.is_none();
     if creating && northflank && params.northflank.project_id.is_none() {
@@ -447,6 +523,8 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
                 &name,
                 params.northflank.project_id.as_deref().unwrap_or_default(),
             )
+        } else if agent37 {
+            ProviderConfig::new_agent37(&name)
         } else {
             ProviderConfig::new(&name)
         }
@@ -477,8 +555,25 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
         if let Some(image) = &params.northflank.image {
             nf.image.clone_from(image);
         }
-        if let Some(disk) = params.northflank.disk_gib {
+        if let Some(disk) = disk_gib {
             nf.disk_gib = disk;
+        }
+    }
+    if let Some(a37) = next.agent37.as_mut() {
+        if let Some(instance_type) = &params.agent37.instance_type {
+            a37.instance_type.clone_from(instance_type);
+        }
+        if let Some(region) = &params.agent37.region {
+            a37.region.clone_from(region);
+        }
+        if let Some(disk) = disk_gib {
+            a37.disk_gib = disk;
+        }
+        if !intent_nodes::agent37::region_allows(&a37.instance_type, &a37.region) {
+            return Err(Error::InvalidParams(format!(
+                "Agent37 runs {} instances only in \"us\"; region \"{}\" needs instanceType \"vm\"",
+                a37.instance_type, a37.region
+            )));
         }
     }
     if let Some(size) = params.size {
@@ -519,6 +614,11 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
                 .map_err(tag)?;
             config::note_outcome(&mut next, None);
         }
+    } else if agent37 {
+        if creating || params.validate_only || given.is_some() {
+            check_agent37(key.clone()).await.map_err(tag)?;
+            config::note_outcome(&mut next, None);
+        }
     } else if given.is_some() || params.validate_only {
         config::client(&next, key.clone())
             .map_err(tag)?
@@ -527,7 +627,7 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
             .map_err(|error| tag(config::to_error(&error, config::Phase::Other, &kind)))?;
         config::note_outcome(&mut next, None);
     }
-    let check_template = !northflank
+    let check_template = kind == CLOUD_PROVIDER_E2B
         && (params.validate_only
             || given.is_some()
             || params.size.is_some()
@@ -606,6 +706,24 @@ async fn check_northflank(next: &mut ProviderConfig, key: SecretString) -> Resul
         return Err(config::image_missing(&image));
     }
     client.check_services().await.map_err(to_error)?;
+    Ok(())
+}
+
+/// The tests an Agent37 entry passes before it is saved, in order: the
+/// template for this backend's version (imported when missing, which also
+/// tests the key), then the instance list the reaper needs.
+async fn check_agent37(key: SecretString) -> Result<()> {
+    use intent_nodes::cloud::CloudProvider as _;
+    let kind = CLOUD_PROVIDER_AGENT37;
+    let client = config::agent37_client(key)?;
+    let to_error = |error: intent_nodes::cloud::CloudError| {
+        config::to_error(&error, config::Phase::Other, kind)
+    };
+    let image = intent_nodes::agent37::image_ref(config::intentd_version());
+    if !client.image_ready(&image).await.map_err(to_error)? {
+        return Err(config::agent37_image_missing(&image));
+    }
+    client.check_key().await.map_err(to_error)?;
     Ok(())
 }
 
@@ -713,11 +831,11 @@ async fn refresh_sizes(
         _ => return,
     }
     let mut next = saved.clone();
-    if next.is_northflank() {
+    if next.is_e2b() {
+        next.set_sizes(config::published_sizes(&saved.template_project).await);
+    } else {
         next.sizes_checked_at = Some(now_iso());
         next.sizes_version = Some(config::intentd_version().to_owned());
-    } else {
-        next.set_sizes(config::published_sizes(&saved.template_project).await);
     }
     // The key too, so one revoked at E2B shows as rejected and placement
     // refuses before any sandbox.

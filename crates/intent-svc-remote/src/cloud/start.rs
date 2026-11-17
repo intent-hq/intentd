@@ -307,7 +307,7 @@ pub(crate) async fn chain_entry(
             .and_then(|view| view.placement.cloud_machine_id);
         if let Some(entry) = named {
             if let Some(saved) = config::load(svc, &entry).await? {
-                if any_provider || !saved.is_northflank() {
+                if any_provider || saved.is_e2b() {
                     return Ok(Some(entry));
                 }
             }
@@ -635,19 +635,41 @@ async fn create(
         "intentdVersion".to_owned(),
         config::intentd_version().to_owned(),
     );
+    let a37 = saved.agent37.as_ref();
     let created = prepared
         .client
         .create(&CreateInstance {
-            image: saved.template(saved.size),
+            image: saved.start_image(saved.size),
             timeout_secs: Some(super::lifecycle::SANDBOX_TIMEOUT_SECS),
             pause_on_timeout: Some(true),
             tags: metadata,
             idempotency_key: Some(idempotency_key(owner)),
             plan: saved.plan(saved.size),
-            disk_gib: saved.northflank.as_ref().map(|nf| nf.disk_gib),
+            disk_gib: saved
+                .northflank
+                .as_ref()
+                .map(|nf| nf.disk_gib)
+                .or_else(|| a37.map(|a37| a37.disk_for(saved.size))),
+            machine_type: a37.map(|a37| a37.instance_type.clone()),
+            region: a37.map(|a37| a37.region.clone()),
+            vcpu: a37.map(|_| saved.size.vcpu()),
+            memory_gib: a37.map(|_| saved.size.memory_gib()),
         })
         .await
-        .map_err(|error| config::to_error(&error, config::Phase::Create, prepared.client.kind()));
+        .map_err(|error| match a37 {
+            Some(a37) if error.kind() == intent_nodes::cloud::CloudErrorKind::NoCapacity => {
+                config::no_capacity(
+                    &format!(
+                        "a {} {} instance in region {}",
+                        a37.instance_type,
+                        saved.size.id(),
+                        a37.region
+                    ),
+                    error.status(),
+                )
+            }
+            _ => config::to_error(&error, config::Phase::Create, prepared.client.kind()),
+        });
     if let Err(error) = &created {
         if is_key_rejected(error) {
             config::note_key_rejected(svc, cloud_machine_id, &prepared.key).await;

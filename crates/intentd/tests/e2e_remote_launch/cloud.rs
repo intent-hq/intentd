@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 
 use super::*;
 
+mod agent37;
 mod entries;
 mod homes;
 mod northflank;
@@ -1443,7 +1444,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     let after = ok(&mut rpc_ws, 403, "cloudMachines.list", json!({})).await;
     assert_eq!(
         after,
-        json!({ "providers": [], "machines": [], "providerKinds": ["e2b", "northflank"] }),
+        json!({ "providers": [], "machines": [], "providerKinds": ["e2b", "northflank", "agent37"] }),
         "{after}"
     );
 
