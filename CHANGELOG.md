@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.236] - 2026-11-17
+
+### 🚀 Features
+
+- *(store)* Port node and executor store methods to Postgres ([#3463](https://github.com/intent-hq/intentd/pull/3463))
+- *(store)* Port script store methods to Postgres ([#3464](https://github.com/intent-hq/intentd/pull/3464))
+
+### 🐛 Bug Fixes
+
+- *(nodes)* Report an exec on a missing Northflank service as not found ([#3468](https://github.com/intent-hq/intentd/pull/3468))
+
+### 📚 Documentation
+
+- *(guide)* Describe frame windows in the machine rail Labs note ([#3430](https://github.com/intent-hq/intentd/pull/3430))
+- Match the trimmed iPhone share sheet in the app guide ([#3446](https://github.com/intent-hq/intentd/pull/3446))
+
+### 🧪 Testing
+
+- *(store)* Tenant-leak trap and decoy coverage check for Postgres parity tests ([#3461](https://github.com/intent-hq/intentd/pull/3461))
+- *(e2e)* Wait for the archived home's E2B delete ([#3467](https://github.com/intent-hq/intentd/pull/3467))
+- *(northflank)* Hold the fakes to a recording of the real API ([#3465](https://github.com/intent-hq/intentd/pull/3465))
+
+
 ## [0.11.235] - 2026-11-17
 
 ### 🚀 Features
