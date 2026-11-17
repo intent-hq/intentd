@@ -462,10 +462,22 @@ async fn insert_credential(
 }
 
 impl PgStore {
-    /// `SqliteStore::sharing_snapshot`: a read snapshot of `ids`' sharing
-    /// counters, restarted under the writer lock to drop due reservations.
+    /// `SqliteStore::sharing_snapshot`: one read-only snapshot of `ids`'
+    /// sharing counters (so the due-seat probe and the count agree),
+    /// restarted under the writer lock to drop due reservations.
     async fn sharing_snapshot(&self, ids: &[String]) -> Result<SharingTx> {
-        let mut tx = self.begin().await?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .await
+            .map_err(db)?;
+        if self.options.rls_guard {
+            sqlx::query("SELECT set_config('intent.tenant_id', $1, true)")
+                .bind(self.tenant())
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
         let due: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM workspace_invite_seat WHERE tenant_id = $1 AND workspace_id = ANY($2) \
              AND expires_at COLLATE \"C\" <= $3 LIMIT 1",
