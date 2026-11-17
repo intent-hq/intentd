@@ -583,7 +583,14 @@ orchestrator (`intentd serve --orchestrator`, experimental) runs every agent on 
 machines: its list has no **This computer** row, and **Settings → Providers** shows only
 the enable switches and profiles, with no **Test** button and no sign-in status. On an
 orchestrator, **Start on** offers **First available machine** instead of the backend, plus
-each machine. Switching a machine to orchestrator removes it from the backends that used
+each machine. Pending frontend release (not in current builds): first-run onboarding on an
+orchestrator checks only git (no Node.js), shows each provider card as **Runs on your
+machines** with no install or sign-in step, and keeps **Let's go** disabled with a link to
+**Settings → Machines** while its machine list is empty (an orchestrator shows **Settings → Machines**
+and reads that list without the Labs **Remote agents** switch; if the list can't be read,
+onboarding does not block).
+<!-- Sources: packages/cloudlands-fe/src/features/onboarding/{steps/OnboardingAgentMachinesNotice.svelte,utils/onboarding-agent-machines.ts,utils/resolve-onboarding-model.ts,messages/ProviderCard.svelte}; packages/cloudlands-fe/src/store/renderer/slices/host-requirements/host-requirements-selectors.ts. -->
+Switching a machine to orchestrator removes it from the backends that used
 it to run agents; pair with it again to use it as a backend. Homes are part of
 orchestrator mode: on an orchestrator a git workspace
 gets a **home**, a machine that holds its files, terminals and scripts, shown as
