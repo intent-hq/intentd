@@ -487,6 +487,28 @@ jobs:
               --source-commit "$commit" --component intentd --component-root "$GITHUB_WORKSPACE" </dev/null \
               | tee -a "$GITHUB_STEP_SUMMARY"
           done
+      # The assistant app guide's `<!-- Sources ... -->` comments must parse.
+      # This runs only the format check of intent-hq/intent main's
+      # scripts/check-app-guide-sources.mjs, in seconds; cited files are
+      # checked against the pins later, by monorepo-consumer-checks, which was
+      # the first job to catch intentd#3430's malformed header.
+      - name: Check assistant app guide Sources format
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GUIDE: crates/intent-services/resources/assistant-app-guide.md
+        run: |
+          set -euo pipefail
+          git fetch -q --depth=1 origin "$BASE_SHA" </dev/null
+          if git diff --quiet "$BASE_SHA" HEAD -- "$GUIDE"; then
+            echo "$GUIDE is unchanged; skipping the Sources format check."
+            exit 0
+          fi
+          source_root="$RUNNER_TEMP/app-guide-checker"
+          git init -q "$source_root"
+          git -C "$source_root" remote add origin https://github.com/intent-hq/intent.git
+          git -C "$source_root" fetch -q --depth=1 --filter=blob:none origin main </dev/null
+          git -C "$source_root" show FETCH_HEAD:scripts/check-app-guide-sources.mjs >"$RUNNER_TEMP/check-app-guide-sources.mjs"
+          node "$RUNNER_TEMP/check-app-guide-sources.mjs" --format-only "$GUIDE"
       # Release PRs run this job too: a release that would split the intentd
       # version_group (intent-hq/intentd#2461) fails here before it merges.
       - name: Check release-plz version groups stay in lockstep
