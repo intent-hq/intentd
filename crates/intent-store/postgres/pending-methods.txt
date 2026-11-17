@@ -3,8 +3,6 @@
 abort_home_move
 accept_script_notification
 activate_incremental_vacuum
-active_hook_metadata_by_agent
-active_hook_metadata_by_workspace
 add_usage_rate
 add_usage_stats
 add_workspace_collaborator_within_cap
@@ -55,8 +53,6 @@ complete_script_notification
 consume_repository_initialization_confirmation
 continue_script_notification
 control_discussion_activity
-count_active_hooks_by_agent
-count_active_hooks_by_workspace
 count_agent_messages
 count_agent_sessions_by_scope
 count_child_agents
@@ -119,7 +115,6 @@ ensure_client
 events_by_type
 events_by_workspace
 executor_binding
-expire_hook
 failover_agent_session_provider
 fill_agent_session_effort_if_identity
 fill_agent_session_identity_if_null
@@ -177,7 +172,6 @@ get_exposed_machine
 get_final_stop
 get_home_move
 get_home_stop
-get_hook
 get_host_invite
 get_host_role
 get_idempotent
@@ -230,7 +224,6 @@ insert_discussion_message
 insert_event
 insert_events
 insert_executor_credential
-insert_hook
 insert_host_invite
 insert_interrupted_agent
 insert_interrupted_agent_with_reason
@@ -279,10 +272,6 @@ list_exposed_machines
 list_final_stops
 list_home_moves
 list_home_stops
-list_hook_rows
-list_hook_rows_page
-list_hooks_by_agent
-list_hooks_by_workspace
 list_host_members
 list_interrupted_agents
 list_known_repos
@@ -316,7 +305,6 @@ list_workspace_members
 list_workspace_metrics
 list_workspaces_with_undelivered_groups
 list_workspaces_with_working_tracked_changes
-load_active_hooks
 load_active_pr_monitors
 load_active_qualified_pr_monitors
 load_all_agent_queues
@@ -365,7 +353,6 @@ record_exposed_machine_connection
 record_exposed_machine_protocol
 record_final_stop
 record_home_stop
-record_hook_dispatch
 record_node_welcome
 record_remote_agent
 recover_discussion_activity
@@ -479,12 +466,6 @@ update_agent_session_metadata
 update_agent_session_with_preferences
 update_cloud_machine
 update_completion_watch_parent
-update_hook_last_error
-update_hook_last_logs
-update_hook_last_state
-update_hook_next_run
-update_hook_run
-update_hook_state
 update_pr_monitor_poll
 update_pr_monitor_state
 update_workspace_token_usage
@@ -503,7 +484,6 @@ upsert_workspace_metrics
 workspace_has_remote_agent_work
 workspace_has_unread_top_level_session
 workspace_membership_summaries
-workspaces_with_active_hooks
 workspaces_with_active_hooks_or_script_monitors
 workspaces_with_unread_top_level_sessions
 workspaces_with_unread_top_level_sessions_by_workspace
