@@ -4,7 +4,8 @@
 //! project (`<workspace>/.intent/specialists/` per workspace) — and emits
 //! `specialists:changed` events when `<id>.md` files are created, modified, or
 //! deleted — or when a tier directory itself appears or disappears (#612).
-//! User-tier changes affect all workspaces; project-tier changes are
+//! User-tier changes affect all workspaces, so they recheck the workspaces
+//! only when the user-tier set itself changed; project-tier changes are
 //! scoped to their workspace. Debounce is 500ms per workspace to coalesce rapid
 //! edits, and an event is emitted only when the resolved specialist set
 //! actually changed (fingerprint check, analogous to `check_skills_changed`).
@@ -276,6 +277,8 @@ fn project_dir(workspace_path: &Path) -> PathBuf {
 /// event is emitted only when the resolved set actually changed (analogous to
 /// `check_skills_changed`).
 async fn specialists_fingerprint(user_dir: Option<&PathBuf>, workspace_path: &Path) -> u64 {
+    #[cfg(test)]
+    record_check(workspace_path);
     let user_dir = user_dir.cloned();
     let workspace_path = workspace_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -289,6 +292,56 @@ async fn specialists_fingerprint(user_dir: Option<&PathBuf>, workspace_path: &Pa
     })
     .await
     .unwrap_or_default()
+}
+
+/// Fingerprint everything a user-tier change can alter: the set with no
+/// workspace (user tier over the bundled tiers) plus the raw Claude user
+/// agents. The set alone hides a Claude user agent shadowed by a native id
+/// or alias, and a project tier can unshadow it.
+async fn user_fingerprint(user_dir: Option<&PathBuf>) -> u64 {
+    #[cfg(test)]
+    record_check(user_dir.map_or(Path::new(""), PathBuf::as_path));
+    let user_dir = user_dir.cloned();
+    tokio::task::spawn_blocking(move || {
+        let claude = claude_agents::user_root(user_dir.as_deref())
+            .map(|root| claude_agents::collect(&root, "user").definitions);
+        let list = SpecialistsService::new(user_dir, None)
+            .list(None)
+            .unwrap_or(serde_json::Value::Null);
+        let mut hasher = DefaultHasher::new();
+        list.to_string().hash(&mut hasher);
+        serde_json::to_string(&claude)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        hasher.finish()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+static CHECKS: std::sync::LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn record_check(workspace_path: &Path) {
+    *CHECKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(workspace_path.to_path_buf())
+        .or_default() += 1;
+}
+
+/// Test-only: how many times the set was resolved for a workspace path, or
+/// the user-tier fingerprint taken for a user dir.
+#[cfg(test)]
+fn check_count(workspace_path: &Path) -> usize {
+    CHECKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(workspace_path)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Debounce loop that coalesces rapid specialist file changes per workspace.
@@ -307,6 +360,9 @@ async fn debounce_loop(
 
     // Prime the per-workspace fingerprints so the first flush compares against
     // the set as it stood at watcher start (no spurious first event).
+    // The user baseline comes first: a user-tier edit landing during the
+    // priming then still differs from it, so the workspaces get rechecked.
+    let mut user_baseline = user_fingerprint(user_dir.as_ref()).await;
     let mut fingerprints: HashMap<WorkspaceId, u64> = HashMap::new();
     for (id, path) in &workspace_paths {
         fingerprints.insert(
@@ -333,12 +389,10 @@ async fn debounce_loop(
                 Some(SpecialistsMsg::Change(workspace_id)) => {
                     let now = tokio::time::Instant::now();
                     match workspace_id {
-                        // User-tier change: affects all workspaces
+                        // User-tier change: the workspaces are rechecked only if
+                        // the user-tier set changed, once its window closes.
                         None => {
                             user_deadline.get_or_insert(now + DEBOUNCE);
-                            for ws_id in workspace_paths.keys() {
-                                schedule_change(&mut pending, ws_id.clone(), now);
-                            }
                         }
                         // Project-tier change: affects specific workspace
                         Some(ws_id) => {
@@ -376,11 +430,17 @@ async fn debounce_loop(
                 }
                 #[cfg(test)]
                 Some(SpecialistsMsg::Settle(done)) => {
+                    if user_deadline.take().is_some() {
+                        close_user_window(user_dir.as_ref(), &mut linked, &mut user_baseline, &workspace_paths, &mut pending).await;
+                    }
                     flush_all(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
                     done.notify_one();
                 }
                 None => {
                     // All senders dropped: flush and exit
+                    if user_deadline.take().is_some() {
+                        close_user_window(user_dir.as_ref(), &mut linked, &mut user_baseline, &workspace_paths, &mut pending).await;
+                    }
                     flush_all(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
                     return;
                 }
@@ -388,7 +448,7 @@ async fn debounce_loop(
             () = sleep_until(next_deadline), if next_deadline.is_some() => {
                 if user_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
                     user_deadline = None;
-                    refresh_claude_user_watches(user_dir.as_deref(), &mut linked).await;
+                    close_user_window(user_dir.as_ref(), &mut linked, &mut user_baseline, &workspace_paths, &mut pending).await;
                 }
                 for (id, deadline) in &pending {
                     if *deadline <= tokio::time::Instant::now() {
@@ -399,6 +459,27 @@ async fn debounce_loop(
                 }
                 flush_due(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
             }
+        }
+    }
+}
+
+/// Close the user-tier window: resolve the user-tier set once and, only if
+/// it changed, make every workspace due for a recheck now. One shared-folder
+/// edit used to resolve every workspace's full set.
+async fn close_user_window(
+    user_dir: Option<&PathBuf>,
+    linked: &mut ScopedLinkedWatches,
+    user_baseline: &mut u64,
+    workspace_paths: &HashMap<WorkspaceId, PathBuf>,
+    pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
+) {
+    refresh_claude_user_watches(user_dir.map(PathBuf::as_path), linked).await;
+    let fingerprint = user_fingerprint(user_dir).await;
+    if fingerprint != *user_baseline {
+        *user_baseline = fingerprint;
+        let now = tokio::time::Instant::now();
+        for ws_id in workspace_paths.keys() {
+            pending.insert(ws_id.clone(), now);
         }
     }
 }
@@ -902,6 +983,100 @@ mod tests {
             ws_ids,
             vec![ws1_id.as_str(), ws2_id.as_str()],
             "user-tier change must emit exactly one event per workspace, got {events:?}"
+        );
+    }
+
+    /// A user-tier change re-resolves the workspaces only when the user-tier
+    /// set changed. A no-op rewrite in the shared folder used to re-resolve
+    /// every workspace's full set, one resolution per workspace.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn user_tier_noop_rewrite_does_not_recheck_workspaces() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let user = TempDir::new("noop-fan-user");
+        let ws1 = TempDir::new("noop-fan-ws1");
+        let ws2 = TempDir::new("noop-fan-ws2");
+        let ws1_id = WorkspaceId::from("ws-noop-fan-1");
+        let ws2_id = WorkspaceId::from("ws-noop-fan-2");
+        let shared = user.path.join("shared.md");
+        let content = specialist_md("Shared", "same body");
+        std::fs::write(&shared, &content).expect("seed user specialist");
+
+        let watcher = SpecialistsWatcher::start_with_user_dir(
+            &SharedWatchHub::new(),
+            bus.clone(),
+            vec![
+                (ws1_id.clone(), ws1.path.clone()),
+                (ws2_id.clone(), ws2.path.clone()),
+            ],
+            Some(user.path.clone()),
+        );
+        watcher.wait_established(LIVENESS).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        watcher.settle().await;
+        let checks = || [&ws1, &ws2].map(|ws| check_count(&ws.path));
+        let before = checks();
+        let user_before = check_count(&user.path);
+
+        std::fs::write(&shared, &content).expect("rewrite identical content");
+        // Wait for the change to be handled: the user-tier set is resolved
+        // when its window closes (a workspace check means it fanned out).
+        let deadline = Instant::now() + LIVENESS;
+        while check_count(&user.path) == user_before && checks() == before {
+            assert!(
+                Instant::now() < deadline,
+                "the user-tier rewrite was never handled"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        watcher.settle().await;
+        assert_eq!(
+            checks(),
+            before,
+            "an unchanged user-tier set must not re-resolve any workspace"
+        );
+
+        std::fs::write(&shared, specialist_md("Shared", "new body")).expect("edit specialist");
+        let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
+        let mut ws_ids: Vec<&str> = events.iter().map(|e| e.workspace_id.as_str()).collect();
+        ws_ids.sort_unstable();
+        assert_eq!(
+            ws_ids,
+            vec![ws1_id.as_str(), ws2_id.as_str()],
+            "a changed user-tier set must still emit once per workspace, got {events:?}"
+        );
+    }
+
+    /// A Claude user agent can be shadowed by a native id or alias in the
+    /// workspace-free set while a project tier unshadows it, so an edit to it
+    /// must still move the user-tier fingerprint.
+    #[tokio::test]
+    async fn user_fingerprint_covers_claude_user_agents() {
+        let home = TempDir::new("claude-user-fp");
+        let user_dir = home.path.join(".intent/specialists");
+        let agents = home.path.join(".claude/agents");
+        std::fs::create_dir_all(&user_dir).expect("mk user tier");
+        std::fs::create_dir_all(&agents).expect("mk claude agents");
+        let agent = agents.join("coordinator.md");
+        std::fs::write(
+            &agent,
+            "---\nname: coordinator\ndescription: d\n---\n\nfirst",
+        )
+        .expect("write claude agent");
+        let before = user_fingerprint(Some(&user_dir)).await;
+
+        std::fs::write(
+            &agent,
+            "---\nname: coordinator\ndescription: d\n---\n\nsecond",
+        )
+        .expect("edit claude agent");
+        assert_ne!(
+            user_fingerprint(Some(&user_dir)).await,
+            before,
+            "an edit to a Claude user agent must change the user-tier fingerprint"
         );
     }
 
