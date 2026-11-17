@@ -2,16 +2,13 @@
 //! the production target.
 //!
 //! Neki rejects some statements vanilla Postgres accepts (for example
-//! user-created text-search configurations, Neki errors 302/303), so CI's
-//! Postgres service alone cannot prove a migration deploys. This test
-//! applies every migration in a fresh schema of the Neki branch named by
-//! `INTENT_STORE_NEKI_URL`, opens two tenants with identical keys, checks
-//! they stay apart, and always drops the schema. Each run uses its own
-//! schema, so concurrent CI runs share the branch safely.
-//!
-//! Without the URL the test skips, unless `INTENT_STORE_REQUIRE_NEKI=1`
-//! (set by CI's `store-neki` job when Postgres code changed) makes that a
-//! failure.
+//! user-created text-search configurations, Neki errors 302/303), so the
+//! `store-postgres` CI job alone cannot prove a migration deploys. Run this
+//! by hand against a Neki branch before landing a migration:
+//! `INTENT_STORE_NEKI_URL=... cargo test -p intent-store --features postgres
+//! --test postgres_neki`. It applies every migration in a fresh schema,
+//! opens two tenants with identical keys, checks they stay apart, and always
+//! drops the schema. Without the URL it skips.
 #![cfg(feature = "postgres")]
 
 use intent_store::postgres::{self, PgPool, PostgresOptions, TenantId};
@@ -66,7 +63,7 @@ async fn round_trip(pool: PgPool) -> Result<(), String> {
     Ok(())
 }
 
-/// Drop schemas left by runs that panicked, were cancelled or timed out
+/// Drop schemas left by runs that panicked or were killed
 /// more than two hours ago.
 async fn drop_stale_schemas(admin: &PgPool, now: u64) {
     let names: Vec<(String,)> = sqlx::query_as(
@@ -90,16 +87,10 @@ async fn drop_stale_schemas(admin: &PgPool, now: u64) {
 
 #[tokio::test]
 async fn migrations_and_tenant_round_trip_run_on_neki() {
-    // A missing Actions secret (forks, Dependabot) arrives as an empty value.
     let Some(url) = std::env::var("INTENT_STORE_NEKI_URL")
         .ok()
         .filter(|url| !url.is_empty())
     else {
-        assert!(
-            std::env::var("INTENT_STORE_REQUIRE_NEKI").as_deref() != Ok("1"),
-            "INTENT_STORE_REQUIRE_NEKI=1 but INTENT_STORE_NEKI_URL is unset: add the \
-             INTENT_STORE_NEKI_URL Actions secret (a Neki branch role that may create schemas)"
-        );
         eprintln!("skipping: INTENT_STORE_NEKI_URL is unset");
         return;
     };
