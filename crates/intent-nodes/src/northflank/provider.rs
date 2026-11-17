@@ -83,6 +83,25 @@ struct ServiceView {
     tags: Option<BTreeMap<String, String>>,
 }
 
+const PAUSED: &str = "/servicePaused";
+const INSTANCES: &str = "/deployment/instances";
+const DEPLOYMENT_STATUS: &str = "/status/deployment/status";
+const IMAGE_PATH: &str = "/deployment/external/imagePath";
+const CREATED_AT: &str = "/createdAt";
+/// `/runtimeEnvironment/` and [`TAGS_ENV`].
+const TAGS_POINTER: &str = "/runtimeEnvironment/INTENT_TAGS";
+
+/// Every field [`ServiceView`] reads, for the contract test.
+#[cfg(test)]
+pub(super) const SERVICE_READS: [&str; 6] = [
+    PAUSED,
+    INSTANCES,
+    DEPLOYMENT_STATUS,
+    IMAGE_PATH,
+    CREATED_AT,
+    TAGS_POINTER,
+];
+
 impl ServiceView {
     fn from(value: &Value) -> Self {
         let text = |ptr: &str| {
@@ -92,25 +111,61 @@ impl ServiceView {
                 .unwrap_or("")
                 .to_string()
         };
-        let instances = value
-            .pointer("/deployment/instances")
-            .and_then(Value::as_u64);
+        let instances = value.pointer(INSTANCES).and_then(Value::as_u64);
         let flagged = value
-            .get("servicePaused")
+            .pointer(PAUSED)
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let tags = value
-            .pointer(&format!("/runtimeEnvironment/{TAGS_ENV}"))
+            .pointer(TAGS_POINTER)
             .and_then(Value::as_str)
             .and_then(|s| serde_json::from_str(s).ok());
         Self {
             paused: flagged || instances == Some(0),
-            deployment_status: text("/status/deployment/status"),
-            image: text("/deployment/external/imagePath"),
-            created_at: text("/createdAt"),
+            deployment_status: text(DEPLOYMENT_STATUS),
+            image: text(IMAGE_PATH),
+            created_at: text(CREATED_AT),
             tags,
         }
     }
+}
+
+/// What this adapter reads of each response, for the contract test.
+#[cfg(test)]
+pub(super) fn reads() -> Vec<super::fields::Read> {
+    use super::fields::{fields_of, Read};
+    vec![
+        Read::serde("POST /tags", "", fields_of::<Named>()),
+        Read::serde("GET /tags", "/tags/*", fields_of::<Named>()),
+        Read::serde("POST /projects/*/volumes", "", fields_of::<Named>()),
+        Read::serde(
+            "POST /projects/*/services/deployment",
+            "",
+            fields_of::<Named>(),
+        ),
+        Read::serde(
+            "GET /projects/*/services",
+            "/services/*",
+            fields_of::<ListedService>(),
+        ),
+        Read::serde("GET /projects/*/volumes", "/*", fields_of::<ListedVolume>()),
+        Read::serde(
+            "GET /projects/*/volumes",
+            "/*/attachedObjects/*",
+            fields_of::<Attached>(),
+        ),
+        Read::serde(
+            "GET /projects/*/services/*/containers",
+            "",
+            fields_of::<Containers>(),
+        ),
+        Read::serde(
+            "GET /projects/*/services/*/containers",
+            "/containers/*",
+            fields_of::<Container>(),
+        ),
+        Read::pointers("GET /projects/*/services/*", "", &SERVICE_READS),
+    ]
 }
 
 fn random_name() -> String {

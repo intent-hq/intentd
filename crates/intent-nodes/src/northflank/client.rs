@@ -164,6 +164,30 @@ struct PlanBody {
     ram_resource: f64,
 }
 
+/// What the client reads of each response, for the contract test.
+#[cfg(test)]
+pub(super) fn reads() -> Vec<super::fields::Read> {
+    use super::fields::{fields_of, Read};
+    let mut reads = vec![
+        Read::serde("GET /projects/*", "", fields_of::<ProjectBody>()),
+        Read::serde(
+            "GET /projects/*",
+            "/deployment",
+            fields_of::<ProjectDeployment>(),
+        ),
+        Read::serde("GET /plans", "", fields_of::<PlansBody>()),
+        Read::serde("GET /plans", "/plans/*", fields_of::<PlanBody>()),
+    ];
+    for list in [
+        "GET /tags",
+        "GET /projects/*/services",
+        "GET /projects/*/volumes",
+    ] {
+        reads.push(Read::envelope(list, fields_of::<Pagination>()));
+    }
+    reads
+}
+
 impl NorthflankClient {
     /// # Errors
     ///

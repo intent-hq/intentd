@@ -37,10 +37,10 @@ const MAX_FRAME: usize = 8 * 1024 * 1024;
 
 const STREAM_ENDED: &str = "the command stream ended before the command finished";
 
-trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(super) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
-type Socket = WebSocketStream<Box<dyn Io>>;
+pub(super) type Socket = WebSocketStream<Box<dyn Io>>;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +51,12 @@ struct Completion {
     status: Option<String>,
     #[serde(default)]
     message: Option<String>,
+}
+
+/// What a command's `completion` frame is read for, for the contract test.
+#[cfg(test)]
+pub(super) fn completion_fields() -> &'static [&'static str] {
+    super::fields::fields_of::<Completion>()
 }
 
 /// `env [-C cwd] HOME=/home/user K=V… cmd args…`: `env` sets the
@@ -301,7 +307,7 @@ impl NorthflankClient {
         })
     }
 
-    async fn open(&self, url: &str) -> Result<Socket, CloudError> {
+    pub(super) async fn open(&self, url: &str) -> Result<Socket, CloudError> {
         let request = url.into_client_request().map_err(|_| {
             CloudError::new(
                 CloudErrorKind::InvalidArgument,

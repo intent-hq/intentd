@@ -19,6 +19,8 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 
+use super::fake_api;
+
 #[derive(Debug, Clone)]
 pub struct Recorded {
     pub method: String,
@@ -92,10 +94,10 @@ impl Reply {
 pub enum WsStep {
     /// Wait for the client's next text frame and record it.
     Receive,
+    /// A frame, as Northflank sends one ([`fake_api::message`]).
     Send(serde_json::Value),
-    /// Command output, delivered as real Northflank does: in a terminal
-    /// (stderr merged into `stdOut`, `\n` sent as `\r\n`) unless the
-    /// `init` context sets `"tty": false`.
+    /// Command output, as Northflank streams it for this command's `init`
+    /// ([`fake_api::output_frame`]).
     Output {
         stderr: bool,
         text: String,
@@ -251,7 +253,7 @@ impl FakeServer {
                         Some(Ok(Message::Text(text))) => {
                             if let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) {
                                 if frame["type"] == "init" {
-                                    tty = frame["data"]["context"]["tty"] != false;
+                                    tty = fake_api::wants_tty(&frame["data"]["context"]);
                                 }
                             }
                             self.frames.lock().unwrap().push(text.to_string());
@@ -262,18 +264,11 @@ impl FakeServer {
                     }
                 },
                 WsStep::Send(value) => {
-                    let _ = ws.send(Message::text(value.to_string())).await;
+                    let _ = ws.send(fake_api::message(&value)).await;
                 }
                 WsStep::Output { stderr, text } => {
-                    let (kind, data) = if tty {
-                        ("stdOut", text.replace('\n', "\r\n"))
-                    } else if stderr {
-                        ("stdErr", text)
-                    } else {
-                        ("stdOut", text)
-                    };
-                    let frame = serde_json::json!({ "type": kind, "data": data });
-                    let _ = ws.send(Message::text(frame.to_string())).await;
+                    let frame = fake_api::output_frame(tty, stderr, &text);
+                    let _ = ws.send(fake_api::message(&frame)).await;
                 }
                 WsStep::SendText(text) => {
                     let _ = ws.send(Message::text(text)).await;
