@@ -26,7 +26,7 @@ impl Store {
         completion_identity: &str,
         delivered_at: &str,
     ) -> Result<()> {
-        pending_postgres!("record_completion_wake_delivery", self, backend => backend.record_completion_wake_delivery(parent_agent_id, child_agent_id, completion_identity, delivered_at).await)
+        dispatch!(self, backend => backend.record_completion_wake_delivery(parent_agent_id, child_agent_id, completion_identity, delivered_at).await)
     }
 
     /// The delivered-completion identity recorded for the pair, if any.
@@ -39,7 +39,7 @@ impl Store {
         parent_agent_id: &AgentId,
         child_agent_id: &AgentId,
     ) -> Result<Option<String>> {
-        pending_postgres!("get_completion_wake_delivery", self, backend => backend.get_completion_wake_delivery(parent_agent_id, child_agent_id).await)
+        dispatch!(self, backend => backend.get_completion_wake_delivery(parent_agent_id, child_agent_id).await)
     }
 }
 

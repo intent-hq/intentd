@@ -28,6 +28,22 @@ pub struct ReviewContextEnrollment {
 }
 
 impl ReviewContextEnrollment {
+    /// For backends that read the row themselves; `owner` is already validated.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn from_parts(
+        workspace: WorkspaceId,
+        agent: AgentId,
+        session: String,
+        owner: String,
+    ) -> Self {
+        Self {
+            workspace,
+            agent,
+            session,
+            owner: ReviewContextOwnerKey(owner),
+        }
+    }
+
     #[must_use]
     pub fn owner_key(&self) -> &str {
         self.owner.as_str()
@@ -60,7 +76,7 @@ impl Store {
         agent: &AgentId,
         session: &str,
     ) -> Result<Option<ReviewContextEnrollment>> {
-        pending_postgres!("get_review_context_enrollment", self, backend => backend.get_review_context_enrollment(workspace, agent, session).await)
+        dispatch!(self, backend => backend.get_review_context_enrollment(workspace, agent, session).await)
     }
 }
 
