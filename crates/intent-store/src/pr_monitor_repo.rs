@@ -18,8 +18,10 @@ use crate::Store;
 
 mod prepared_write;
 mod registration;
+#[cfg(feature = "postgres")]
 pub(crate) use prepared_write::check_replacement_identity;
 pub use prepared_write::PreparedMonitorWrite;
+#[cfg(feature = "postgres")]
 pub(crate) use registration::check_rearm_compatible;
 
 pub(crate) fn captured_monitor_exists(expected: &QualifiedPrMonitor) -> QueryBuilder<Sqlite> {
