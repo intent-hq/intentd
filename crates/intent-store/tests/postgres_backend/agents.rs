@@ -869,7 +869,16 @@ parity_test!(agent_session_state_writers, |store, tenant| {
     assert_eq!(store.reset_all_active_flags().await.unwrap(), 1);
     assert_eq!(store.reset_all_active_flags().await.unwrap(), 0);
     if tenant == "decoy" {
-        // Left for the subject's reset to leave alone.
+        // Decoy-only state the subject's writes must leave alone.
+        store.set_agent_pinned(&w, &a, false).await.unwrap();
+        store
+            .set_agent_notifications_muted(&w, &a, false)
+            .await
+            .unwrap();
+        store
+            .set_agent_permission_policy(&w, &a, None)
+            .await
+            .unwrap();
         store
             .set_agent_session_status(&w, &b, AgentStatus::Active, true, &at(14), None)
             .await
