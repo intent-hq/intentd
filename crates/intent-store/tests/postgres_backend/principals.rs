@@ -1,0 +1,1119 @@
+//! Principals, credentials, workspace membership and invites, and host
+//! membership on both backends.
+//!
+//! Bodies use fixed ids, leave rows behind and assert exact values from an
+//! empty start; profiles carry the tenant (`alice-{tenant}`), so a row read
+//! from another tenant shows. Ids the subject probes as absent are created
+//! by the decoy after its own probes, and rows the subject's writes reach
+//! are put back in their pre-write state at the end of the decoy run.
+
+use intent_core::{
+    AgentId, AgentSession, Error, HostInvite, HostRole, Principal, PrincipalId, PrincipalIdentity,
+    Workspace, WorkspaceId, WorkspaceInvite, WorkspaceRole,
+};
+use intent_store::{
+    AgentQueueRow, CollaboratorAddOutcome, HostInviteJoinOutcome, HostJoinCredential,
+    InviteInsertOutcome, InviteJoinOutcome, Store,
+};
+use serde_json::json;
+
+use crate::harness::{exec, parity_test, TestDb};
+
+const T1: &str = "2026-02-01T00:00:01.000Z";
+const T2: &str = "2026-02-01T00:00:02.000Z";
+const T3: &str = "2026-02-01T00:00:03.000Z";
+const T4: &str = "2026-02-01T00:00:04.000Z";
+const FAR: &str = "2099-01-01T00:00:00.000Z";
+
+fn pid(id: &str) -> PrincipalId {
+    PrincipalId(id.into())
+}
+
+fn wid(id: &str) -> WorkspaceId {
+    WorkspaceId(id.into())
+}
+
+fn person(id: &str, identity: PrincipalIdentity, tenant: &str, created_at: &str) -> Principal {
+    Principal {
+        id: pid(id),
+        github_user_id: identity.github_user_id(),
+        identity: Some(identity),
+        login: Some(format!("{id}-{tenant}")),
+        display_name: Some(format!("{id} of {tenant}")),
+        avatar_url: None,
+        is_primary: false,
+        created_at: created_at.into(),
+        updated_at: created_at.into(),
+    }
+}
+
+fn gh(n: i64) -> PrincipalIdentity {
+    PrincipalIdentity::github(n)
+}
+
+fn ids(people: &[Principal]) -> Vec<&str> {
+    people.iter().map(|p| p.id.as_str()).collect()
+}
+
+async fn workspace(store: &Store, id: &str, tenant: &str) {
+    store
+        .insert_workspace(&Workspace {
+            id: wid(id),
+            title: format!("{id} of {tenant}"),
+            branch: "main".into(),
+            created_at: T1.into(),
+            updated_at: T1.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// Raw SQL on the decoy tenant only, for putting rows back in the state the
+/// subject's writes expect. A no-op on `SQLite` and for the subject.
+async fn decoy_sql(db: Option<&TestDb>, tenant: &str, sql: &str) {
+    if let (Some(db), "decoy") = (db, tenant) {
+        exec(&db.admin, sql.replace("{w}", "tenant_id = 'decoy'")).await;
+    }
+}
+
+/// Make `p` a host member through a fresh host invite.
+async fn host_member(store: &Store, owner: &PrincipalId, invite_id: &str, p: &Principal) {
+    let identity = p.identity.clone().unwrap();
+    let invite = HostInvite::new(
+        invite_id.into(),
+        owner.clone(),
+        identity,
+        p.login.clone().unwrap(),
+        format!("secret-{invite_id}"),
+        None,
+    )
+    .unwrap();
+    store.insert_host_invite(&invite).await.unwrap();
+    let generation = store
+        .host_membership_state()
+        .await
+        .unwrap()
+        .authorization_generation;
+    let joined = store
+        .join_host_by_invite(
+            invite_id,
+            p,
+            HostJoinCredential::Proof {
+                token_hash: &format!("h-{}", p.id),
+                authorization_generation: generation,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        joined,
+        HostInviteJoinOutcome::Joined {
+            membership_added: true,
+            ..
+        }
+    ));
+}
+
+parity_test!(principals_and_credentials, |store, tenant, db| {
+    let primary = store.get_primary_principal().await.unwrap();
+    assert!(primary.is_primary);
+    assert_eq!(store.count_principals().await.unwrap(), 1);
+    assert_eq!(
+        ids(&store.list_principals().await.unwrap()),
+        [primary.id.as_str()]
+    );
+
+    let alice = person("alice", gh(101), tenant, T1);
+    let bob = person(
+        "bob",
+        PrincipalIdentity {
+            provider: "gitlab".into(),
+            host: "gitlab.example".into(),
+            external_user_id: "b7".into(),
+        },
+        tenant,
+        T2,
+    );
+    let carol = person("carol", gh(103), tenant, T3);
+    for p in [&alice, &bob, &carol] {
+        store.upsert_principal(p).await.unwrap();
+    }
+    assert_eq!(store.get_principal(&pid("alice")).await.unwrap(), alice);
+    assert!(matches!(
+        store.get_principal(&pid("ghost")).await,
+        Err(Error::NotFound(_))
+    ));
+    let mut some = store
+        .get_principals(&[pid("bob"), pid("alice"), pid("ghost")])
+        .await
+        .unwrap();
+    some.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    assert_eq!(some, [alice.clone(), bob.clone()]);
+    assert_eq!(
+        store
+            .find_principal_by_identity(bob.identity.as_ref().unwrap())
+            .await
+            .unwrap(),
+        Some(bob.clone())
+    );
+    assert_eq!(
+        store.find_principal_by_github_user_id(101).await.unwrap(),
+        Some(alice.clone())
+    );
+    assert_eq!(
+        store.find_principal_by_github_user_id(999).await.unwrap(),
+        None
+    );
+
+    let mut renamed = alice.clone();
+    renamed.display_name = Some(format!("Alice R of {tenant}"));
+    renamed.updated_at = T4.into();
+    renamed.created_at = T4.into();
+    renamed.is_primary = true;
+    store.upsert_principal(&renamed).await.unwrap();
+    let stored = store.get_principal(&pid("alice")).await.unwrap();
+    assert_eq!(stored.display_name, renamed.display_name);
+    assert_eq!(stored.updated_at, T4);
+    assert_eq!(stored.created_at, T1);
+    assert!(!stored.is_primary);
+    assert_eq!(
+        ids(&store.list_principals().await.unwrap()),
+        [primary.id.as_str(), "alice", "bob", "carol"]
+    );
+    assert_eq!(store.count_principals().await.unwrap(), 4);
+
+    let created = store
+        .insert_principal_credential(&pid("alice"), "h-alice")
+        .await
+        .unwrap();
+    assert!(created.is_active());
+    store
+        .insert_principal_credential(&pid("bob"), "h-bob")
+        .await
+        .unwrap();
+    store
+        .insert_principal_credential(&pid("bob"), "h-bob2")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.lookup_principal_credential("h-alice").await.unwrap(),
+        Some(created)
+    );
+    assert_eq!(
+        store.lookup_principal_credential("h-ghost").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        ids(&store.list_credentialed_guest_principals().await.unwrap()),
+        ["alice", "bob"]
+    );
+    let sharing = store.list_sharing_principals().await.unwrap();
+    assert_eq!(
+        sharing
+            .iter()
+            .map(|(p, r)| (p.login.clone().unwrap(), *r))
+            .collect::<Vec<_>>(),
+        [
+            (format!("alice-{tenant}"), HostRole::Guest),
+            (format!("bob-{tenant}"), HostRole::Guest)
+        ]
+    );
+    let probe = [primary.id.clone(), pid("alice"), pid("carol"), pid("ghost")];
+    let mut devices = store.get_device_principals(&probe, None).await.unwrap();
+    devices.sort_by_key(|(p, _)| !p.is_primary);
+    devices[1..].sort_by(|a, b| a.0.id.0.cmp(&b.0.id.0));
+    assert_eq!(
+        devices
+            .iter()
+            .map(|(p, r)| (p.id.as_str(), *r))
+            .collect::<Vec<_>>(),
+        [
+            (primary.id.as_str(), HostRole::Owner),
+            ("alice", HostRole::Guest),
+            ("carol", HostRole::Guest)
+        ]
+    );
+    let seen_by_alice = store
+        .get_device_principals(&probe, Some(&pid("alice")))
+        .await
+        .unwrap();
+    assert_eq!(seen_by_alice.len(), 1);
+    assert_eq!(seen_by_alice[0].0.id, pid("alice"));
+    assert_eq!(
+        store
+            .get_device_principals(&probe, Some(&primary.id))
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+
+    assert!(store.touch_principal_credential("h-alice").await.unwrap());
+    let touched = store
+        .lookup_principal_credential("h-alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(touched.last_used_at.is_some());
+    assert_eq!(
+        store
+            .resolve_active_principal_credential("h-bob")
+            .await
+            .unwrap(),
+        Some(pid("bob"))
+    );
+    assert!(store.revoke_principal_credential("h-bob").await.unwrap());
+    assert!(!store.revoke_principal_credential("h-bob").await.unwrap());
+    assert_eq!(
+        store
+            .resolve_active_principal_credential("h-bob")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(!store.touch_principal_credential("h-bob").await.unwrap());
+    assert_eq!(
+        store
+            .revoke_all_principal_credentials(&pid("bob"))
+            .await
+            .unwrap(),
+        1
+    );
+    let bobs = store.list_principal_credentials(&pid("bob")).await.unwrap();
+    assert_eq!(
+        bobs.iter()
+            .map(|c| c.token_hash.as_str())
+            .collect::<Vec<_>>(),
+        ["h-bob2", "h-bob"]
+    );
+    assert!(bobs.iter().all(|c| c.revoked_at.is_some()));
+    assert_eq!(
+        ids(&store.list_credentialed_guest_principals().await.unwrap()),
+        ["alice"]
+    );
+
+    if tenant == "decoy" {
+        store
+            .upsert_principal(&person("ghost", gh(999), tenant, T4))
+            .await
+            .unwrap();
+        store
+            .insert_principal_credential(&pid("ghost"), "h-ghost")
+            .await
+            .unwrap();
+        decoy_sql(
+            db,
+            tenant,
+            "UPDATE principal_credential SET revoked_at = NULL, last_used_at = NULL WHERE {w}",
+        )
+        .await;
+    }
+});
+
+parity_test!(workspace_members_and_roles, |store, tenant, db| {
+    let primary = store.get_primary_principal().await.unwrap().id;
+    workspace(&store, "ws-a", tenant).await;
+    workspace(&store, "ws-b", tenant).await;
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&wid("ws-a"))
+            .await
+            .unwrap(),
+        Some(primary.clone())
+    );
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&wid("ws-ghost"))
+            .await
+            .unwrap(),
+        None
+    );
+    let alice = person("alice", gh(201), tenant, T1);
+    let bob = person("bob", gh(202), tenant, T2);
+    let carol = person("carol", gh(203), tenant, T3);
+    let dave = person("dave", gh(204), tenant, T4);
+    let erin = person("erin", gh(205), tenant, T4);
+    for p in [&alice, &bob, &carol, &dave, &erin] {
+        store.upsert_principal(p).await.unwrap();
+    }
+    for p in ["alice", "bob", "erin"] {
+        store
+            .insert_principal_credential(&pid(p), &format!("h-{p}"))
+            .await
+            .unwrap();
+    }
+    host_member(&store, &primary, "hi-carol", &carol).await;
+
+    let (a, b) = (wid("ws-a"), wid("ws-b"));
+    assert!(store
+        .add_workspace_member(&a, &pid("alice"), WorkspaceRole::Collaborator)
+        .await
+        .unwrap());
+    assert!(!store
+        .add_workspace_member(&a, &pid("alice"), WorkspaceRole::Manager)
+        .await
+        .unwrap());
+    assert!(matches!(
+        store
+            .add_workspace_member(&a, &pid("bob"), WorkspaceRole::Owner)
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+    let cap = |p: &'static str, max| {
+        let store = &store;
+        let a = a.clone();
+        async move {
+            store
+                .add_workspace_collaborator_within_cap(&a, &pid(p), max)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(cap("bob", 5).await, CollaboratorAddOutcome::Added);
+    assert_eq!(
+        cap("dave", 5).await,
+        CollaboratorAddOutcome::NoActiveCredential
+    );
+    assert_eq!(cap("alice", 5).await, CollaboratorAddOutcome::AlreadyMember);
+    assert_eq!(cap("carol", 5).await, CollaboratorAddOutcome::AlreadyMember);
+    assert_eq!(cap("erin", 2).await, CollaboratorAddOutcome::WorkspaceFull);
+
+    let members = store.list_workspace_members(&a).await.unwrap();
+    assert_eq!(
+        members
+            .iter()
+            .map(|m| (m.principal_id.as_str(), m.role))
+            .collect::<Vec<_>>(),
+        [
+            (primary.as_str(), WorkspaceRole::Owner),
+            ("alice", WorkspaceRole::Collaborator),
+            ("bob", WorkspaceRole::Collaborator)
+        ]
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&a, &pid("alice"))
+            .await
+            .unwrap(),
+        Some(WorkspaceRole::Collaborator)
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&a, &pid("dave"))
+            .await
+            .unwrap(),
+        None
+    );
+    store
+        .set_workspace_member_role(&a, &pid("alice"), WorkspaceRole::Manager)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .set_workspace_member_role(&a, &pid("dave"), WorkspaceRole::Manager)
+            .await,
+        Err(Error::NotFound(_))
+    ));
+    let guest_role = |p: &'static str, role, actor: Option<PrincipalId>| {
+        let store = &store;
+        let a = a.clone();
+        async move {
+            store
+                .set_workspace_guest_role(&a, &pid(p), role, actor.as_ref())
+                .await
+        }
+    };
+    assert!(
+        guest_role("bob", WorkspaceRole::Manager, Some(primary.clone()))
+            .await
+            .unwrap()
+    );
+    assert!(!guest_role("bob", WorkspaceRole::Manager, None)
+        .await
+        .unwrap());
+    assert!(matches!(
+        guest_role("bob", WorkspaceRole::Collaborator, Some(pid("alice"))).await,
+        Err(Error::Forbidden(_))
+    ));
+    assert!(matches!(
+        guest_role("dave", WorkspaceRole::Collaborator, None).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(store.has_workspace_membership(&pid("alice")).await.unwrap());
+    assert!(!store.has_workspace_membership(&pid("dave")).await.unwrap());
+    let alice_in = store
+        .list_principal_memberships(&pid("alice"))
+        .await
+        .unwrap();
+    assert_eq!(alice_in.len(), 1);
+    assert_eq!(
+        (alice_in[0].workspace_id.as_str(), alice_in[0].role),
+        ("ws-a", WorkspaceRole::Manager)
+    );
+
+    let roster = store.list_effective_workspace_members(&a).await.unwrap();
+    assert_eq!(
+        roster
+            .iter()
+            .map(|m| (m.principal.login.clone(), m.role, m.host_role))
+            .collect::<Vec<_>>(),
+        [
+            (None, WorkspaceRole::Owner, HostRole::Owner),
+            (
+                Some(format!("carol-{tenant}")),
+                WorkspaceRole::Collaborator,
+                HostRole::Member
+            ),
+            (
+                Some(format!("alice-{tenant}")),
+                WorkspaceRole::Manager,
+                HostRole::Guest
+            ),
+            (
+                Some(format!("bob-{tenant}")),
+                WorkspaceRole::Manager,
+                HostRole::Guest
+            ),
+        ]
+    );
+    assert!(store
+        .list_effective_workspace_members(&wid("ws-ghost"))
+        .await
+        .unwrap()
+        .is_empty());
+    let summaries = store
+        .workspace_membership_summaries(Some(&pid("alice")), &[a.clone(), wid("ws-ghost")])
+        .await
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    let summary = &summaries[&a];
+    assert_eq!(summary.owner_principal_id, Some(primary.clone()));
+    assert_eq!(summary.my_role, Some(WorkspaceRole::Manager));
+    assert!(!summary.can_manage);
+    assert_eq!(summary.member_count, 4);
+    assert_eq!(summary.open_invite_count, 0);
+    let as_carol = store
+        .workspace_membership_summaries(Some(&pid("carol")), &[a.clone(), b.clone()])
+        .await
+        .unwrap();
+    assert!(as_carol[&b].can_manage);
+    assert_eq!(as_carol[&b].my_role, Some(WorkspaceRole::Collaborator));
+    assert_eq!(as_carol[&b].member_count, 2);
+    let anonymous = store
+        .workspace_membership_summaries(None, &[b.clone()])
+        .await
+        .unwrap();
+    assert_eq!(anonymous[&b].my_role, None);
+    assert!(!anonymous[&b].can_manage);
+
+    assert_eq!(
+        store
+            .effective_principal_workspace_ids(&pid("carol"))
+            .await
+            .unwrap(),
+        [a.clone(), b.clone()]
+    );
+    assert_eq!(
+        store
+            .effective_principal_workspace_ids(&pid("alice"))
+            .await
+            .unwrap(),
+        [a.clone()]
+    );
+
+    store
+        .set_workspace_legacy_author_principal_id(&a, Some(&pid("alice")))
+        .await
+        .unwrap();
+    let fallback = store
+        .get_workspace_author_fallback(&a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fallback.legacy_author_principal_id, Some(pid("alice")));
+    assert_eq!(fallback.owner_principal_id, Some(primary.clone()));
+    assert_eq!(
+        store
+            .get_workspace_author_fallback(&wid("ws-ghost"))
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        store
+            .set_workspace_legacy_author_principal_id(&wid("ws-ghost"), None)
+            .await,
+        Err(Error::NotFound(_))
+    ));
+
+    assert!(matches!(
+        store.remove_workspace_guest(&a, &pid("carol")).await,
+        Err(Error::HostMembershipRequired)
+    ));
+    assert!(matches!(
+        store.remove_workspace_guest(&a, &primary).await,
+        Err(Error::InvalidParams(_))
+    ));
+    assert!(store.remove_workspace_guest(&a, &pid("bob")).await.unwrap());
+    assert!(!store.remove_workspace_guest(&a, &pid("bob")).await.unwrap());
+    assert!(store
+        .remove_workspace_member(&a, &pid("alice"))
+        .await
+        .unwrap());
+    assert!(!store
+        .remove_workspace_member(&a, &pid("alice"))
+        .await
+        .unwrap());
+
+    store
+        .set_workspace_member_role(&b, &primary, WorkspaceRole::Manager)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_workspace_owner_principal_id(&b).await.unwrap(),
+        None
+    );
+    store
+        .add_workspace_member(&b, &pid("alice"), WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_workspace_owner_principal_id(&b).await.unwrap(),
+        Some(pid("alice"))
+    );
+    assert!(store
+        .remove_workspace_member(&b, &pid("alice"))
+        .await
+        .unwrap());
+    assert_eq!(
+        store.get_workspace_owner_principal_id(&b).await.unwrap(),
+        None
+    );
+
+    if tenant == "decoy" {
+        workspace(&store, "ws-ghost", tenant).await;
+        for (w, p) in [(&a, "alice"), (&a, "bob"), (&a, "dave"), (&b, "alice")] {
+            store
+                .add_workspace_member(w, &pid(p), WorkspaceRole::Collaborator)
+                .await
+                .unwrap();
+        }
+        decoy_sql(
+            db,
+            tenant,
+            "UPDATE workspace SET legacy_author_principal_id = NULL WHERE {w} AND id = 'ws-a'",
+        )
+        .await;
+    }
+});
+
+fn invite(
+    id: &str,
+    created_by: &PrincipalId,
+    pin: Option<i64>,
+    expires_at: &str,
+) -> WorkspaceInvite {
+    WorkspaceInvite {
+        id: id.into(),
+        workspace_id: wid("ws-i"),
+        secret_hash: format!("sh-{id}"),
+        secret: Some(format!("secret-{id}")),
+        created_by_principal_id: created_by.clone(),
+        pin_identity: pin.map(gh),
+        pin_github_user_id: pin,
+        pin_login: pin.map(|n| format!("user{n}")),
+        created_at: T1.into(),
+        expires_at: expires_at.into(),
+        redeemed_at: None,
+        redeemed_by_principal_id: None,
+        revoked_at: None,
+        redemption_count: 0,
+    }
+}
+
+parity_test!(workspace_invites_and_joins, |store, tenant, db| {
+    let primary = store.get_primary_principal().await.unwrap().id;
+    workspace(&store, "ws-i", tenant).await;
+    let w = wid("ws-i");
+    let alice = person("alice", gh(301), tenant, T1);
+    store.upsert_principal(&alice).await.unwrap();
+    store
+        .insert_principal_credential(&pid("alice"), "h-alice")
+        .await
+        .unwrap();
+    let bob = person("bob", gh(302), tenant, T2);
+
+    assert_eq!(
+        store
+            .insert_workspace_invite(&invite("inv-open", &primary, None, FAR))
+            .await
+            .unwrap(),
+        InviteInsertOutcome::Inserted
+    );
+    assert_eq!(
+        store
+            .insert_workspace_invite(&invite("inv-alice", &pid("alice"), None, FAR))
+            .await
+            .unwrap(),
+        InviteInsertOutcome::IssuerForbidden
+    );
+    assert_eq!(
+        store
+            .insert_workspace_invite_within_cap(&invite("inv-full", &primary, None, FAR), 1)
+            .await
+            .unwrap(),
+        InviteInsertOutcome::WorkspaceFull
+    );
+    assert_eq!(
+        store
+            .insert_workspace_invite_within_cap(&invite("inv-bob", &primary, Some(302), FAR), 5)
+            .await
+            .unwrap(),
+        InviteInsertOutcome::Inserted
+    );
+    store
+        .insert_workspace_invite(&invite(
+            "inv-old",
+            &primary,
+            None,
+            "2020-01-01T00:00:00.000Z",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(store.count_open_workspace_invites().await.unwrap(), 2);
+    let open = store.list_open_workspace_invites(&w).await.unwrap();
+    assert_eq!(
+        open.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["inv-bob", "inv-open"]
+    );
+    assert_eq!(open[0], invite("inv-bob", &primary, Some(302), FAR));
+    assert_eq!(store.get_workspace_invite("inv-ghost").await.unwrap(), None);
+    let guests = store.count_workspace_guests(&w).await.unwrap();
+    assert_eq!((guests.collaborators, guests.open_invites), (0, 2));
+
+    let joined = store
+        .join_workspace_by_invite(
+            "inv-bob",
+            &w,
+            &bob,
+            HostJoinCredential::Proof {
+                token_hash: "h-bob",
+                authorization_generation: 0,
+            },
+            5,
+        )
+        .await
+        .unwrap();
+    let InviteJoinOutcome::Joined(joined) = joined else {
+        panic!("bob did not join: {joined:?}");
+    };
+    assert_eq!(joined.login, Some(format!("bob-{tenant}")));
+    assert_eq!(
+        store
+            .lookup_principal_credential("h-bob")
+            .await
+            .unwrap()
+            .unwrap()
+            .principal_id,
+        pid("bob")
+    );
+    let again = store
+        .join_workspace_by_invite(
+            "inv-bob",
+            &w,
+            &bob,
+            HostJoinCredential::Existing {
+                token_hash: "h-bob",
+            },
+            5,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again, InviteJoinOutcome::Closed);
+    let existing = HostJoinCredential::Existing {
+        token_hash: "h-alice",
+    };
+    let first = store
+        .join_workspace_by_invite("inv-open", &w, &alice, existing, 5)
+        .await
+        .unwrap();
+    assert!(matches!(first, InviteJoinOutcome::Joined(_)));
+    let second = store
+        .join_workspace_by_invite("inv-open", &w, &alice, existing, 5)
+        .await
+        .unwrap();
+    assert!(matches!(second, InviteJoinOutcome::Rejoined(_)));
+    let wrong = store
+        .join_workspace_by_invite(
+            "inv-open",
+            &w,
+            &person("carol", gh(303), tenant, T3),
+            HostJoinCredential::Existing {
+                token_hash: "h-alice",
+            },
+            5,
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong, InviteJoinOutcome::CredentialInvalid);
+    assert!(store
+        .redeem_workspace_invite("inv-open", &pid("alice"))
+        .await
+        .unwrap());
+    let reused = store
+        .get_workspace_invite("inv-open")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reused.redemption_count, 2);
+    assert_eq!(reused.redeemed_by_principal_id, Some(pid("alice")));
+    assert!(store.revoke_workspace_invite("inv-open").await.unwrap());
+    assert!(!store.revoke_workspace_invite("inv-open").await.unwrap());
+    assert!(!store
+        .redeem_workspace_invite("inv-open", &pid("alice"))
+        .await
+        .unwrap());
+    assert_eq!(store.count_open_workspace_invites().await.unwrap(), 0);
+    let guests = store.count_workspace_guests(&w).await.unwrap();
+    assert_eq!((guests.collaborators, guests.open_invites), (2, 0));
+    assert_eq!(
+        store
+            .workspace_membership_summaries(None, &[w.clone()])
+            .await
+            .unwrap()[&w]
+            .member_count,
+        3
+    );
+
+    if tenant == "decoy" {
+        store
+            .upsert_principal(&person("carol", gh(303), tenant, T3))
+            .await
+            .unwrap();
+        store
+            .insert_workspace_invite(&invite("inv-ghost", &primary, None, FAR))
+            .await
+            .unwrap();
+        decoy_sql(
+            db,
+            tenant,
+            "UPDATE workspace_invite SET redeemed_at = NULL, redeemed_by_principal_id = NULL, \
+             redemption_count = 0, revoked_at = NULL WHERE {w}",
+        )
+        .await;
+    }
+});
+
+parity_test!(host_members_invites_and_removal, |store, tenant, db| {
+    let primary = store.get_primary_principal().await.unwrap().id;
+    let state = store.host_membership_state().await.unwrap();
+    assert_eq!(
+        (
+            state.revision,
+            state.member_count,
+            state.authorization_generation
+        ),
+        (0, 0, 0)
+    );
+    workspace(&store, "ws-h", tenant).await;
+    let w = wid("ws-h");
+    let carol = person("carol", gh(403), tenant, T1);
+    let dave = person("dave", gh(404), tenant, T2);
+    let erin = person("erin", gh(405), tenant, T3);
+    for p in [&dave, &erin] {
+        store.upsert_principal(p).await.unwrap();
+        store
+            .insert_principal_credential(&p.id, &format!("h-{}", p.id))
+            .await
+            .unwrap();
+    }
+    store
+        .add_workspace_member(&w, &pid("dave"), WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let new_invite = |id: &str, identity, by: &PrincipalId| {
+        HostInvite::new(
+            id.into(),
+            by.clone(),
+            identity,
+            format!("{id}-{tenant}"),
+            format!("sh-{id}"),
+            None,
+        )
+        .unwrap()
+    };
+    for (id, n) in [("hi-carol", 403), ("hi-erin", 405), ("hi-x", 406)] {
+        store
+            .insert_host_invite(&new_invite(id, gh(n), &primary))
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        store
+            .insert_host_invite(&new_invite("hi-dave", gh(407), &pid("dave")))
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+    let open = store.list_open_host_invites().await.unwrap();
+    assert_eq!(
+        open.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["hi-carol", "hi-erin", "hi-x"]
+    );
+    assert_eq!(
+        store
+            .get_host_invite("hi-erin")
+            .await
+            .unwrap()
+            .unwrap()
+            .pin_login,
+        format!("hi-erin-{tenant}")
+    );
+    assert_eq!(store.get_host_invite("hi-ghost").await.unwrap(), None);
+    assert!(store.revoke_host_invite("hi-x").await.unwrap());
+    assert!(!store.revoke_host_invite("hi-x").await.unwrap());
+    assert!(matches!(
+        store.revoke_host_invite("hi-ghost").await,
+        Err(Error::NotFound(_))
+    ));
+
+    let proof = HostJoinCredential::Proof {
+        token_hash: "h-carol",
+        authorization_generation: 0,
+    };
+    let joined = store
+        .join_host_by_invite("hi-carol", &carol, proof)
+        .await
+        .unwrap();
+    let HostInviteJoinOutcome::Joined {
+        principal,
+        membership_added,
+        revision,
+    } = joined
+    else {
+        panic!("carol did not join: {joined:?}");
+    };
+    assert_eq!(principal.login, Some(format!("carol-{tenant}")));
+    assert!(membership_added);
+    assert_eq!(revision, 1);
+    let join = |id: &'static str, p: Principal, c: HostJoinCredential<'static>| {
+        let store = &store;
+        async move { store.join_host_by_invite(id, &p, c).await.unwrap() }
+    };
+    assert_eq!(
+        join("hi-carol", carol.clone(), proof).await,
+        HostInviteJoinOutcome::Redeemed
+    );
+    assert_eq!(
+        join("hi-x", carol.clone(), proof).await,
+        HostInviteJoinOutcome::Revoked
+    );
+    assert_eq!(
+        join("hi-ghost", carol.clone(), proof).await,
+        HostInviteJoinOutcome::NotFound
+    );
+    assert_eq!(
+        join("hi-erin", dave.clone(), proof).await,
+        HostInviteJoinOutcome::PinMismatch
+    );
+    assert_eq!(
+        join(
+            "hi-erin",
+            erin.clone(),
+            HostJoinCredential::Existing {
+                token_hash: "h-dave"
+            }
+        )
+        .await,
+        HostInviteJoinOutcome::CredentialInvalid
+    );
+    let erin_joined = join(
+        "hi-erin",
+        erin.clone(),
+        HostJoinCredential::Existing {
+            token_hash: "h-erin",
+        },
+    )
+    .await;
+    assert!(matches!(
+        erin_joined,
+        HostInviteJoinOutcome::Joined {
+            membership_added: true,
+            revision: 2,
+            ..
+        }
+    ));
+
+    assert_eq!(
+        store.get_host_role(&pid("carol")).await.unwrap(),
+        HostRole::Member
+    );
+    assert_eq!(
+        store.get_host_role(&pid("dave")).await.unwrap(),
+        HostRole::Guest
+    );
+    assert_eq!(
+        store.get_host_role(&primary).await.unwrap(),
+        HostRole::Owner
+    );
+    assert!(matches!(
+        store.get_host_role(&pid("ghost")).await,
+        Err(Error::NotFound(_))
+    ));
+    let roster = store.list_host_members().await.unwrap();
+    assert_eq!(roster.revision, 2);
+    assert_eq!(
+        roster
+            .members
+            .iter()
+            .map(|m| (m.principal_id.as_str(), m.host_role, m.login.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (primary.as_str(), HostRole::Owner, None),
+            ("carol", HostRole::Member, Some(format!("carol-{tenant}"))),
+            ("erin", HostRole::Member, Some(format!("erin-{tenant}"))),
+        ]
+    );
+
+    store
+        .add_workspace_member(&w, &pid("carol"), WorkspaceRole::Manager)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .insert_workspace_invite(&WorkspaceInvite {
+                workspace_id: w.clone(),
+                ..invite("inv-c", &pid("carol"), None, FAR)
+            })
+            .await
+            .unwrap(),
+        InviteInsertOutcome::Inserted
+    );
+    store
+        .insert_agent_session(&AgentSession {
+            id: AgentId("agent-h".into()),
+            workspace_id: w.clone(),
+            name: format!("agent of {tenant}"),
+            created_at: T1.into(),
+            updated_at: T1.into(),
+            ..AgentSession::default()
+        })
+        .await
+        .unwrap();
+    let queued = |id: &str, from: &str| AgentQueueRow {
+        id: id.into(),
+        agent_id: AgentId("agent-h".into()),
+        position: 0,
+        payload: json!({ "text": tenant, "messageMetadata": { "fromPrincipalId": from } }),
+        created_at: T1.into(),
+        turn_id: format!("turn-{id}"),
+    };
+    store
+        .replace_agent_queue(
+            &AgentId("agent-h".into()),
+            &[queued("q-carol", "carol"), queued("q-dave", "dave")],
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .remove_host_member_by_owner(&pid("dave"), &pid("carol"))
+            .await,
+        Err(Error::Forbidden(_))
+    ));
+    assert!(matches!(
+        store.remove_host_member_by_owner(&primary, &primary).await,
+        Err(Error::InvalidInput(_))
+    ));
+    let removed = store
+        .remove_host_member_by_owner(&primary, &pid("carol"))
+        .await
+        .unwrap();
+    assert!(removed.removed);
+    assert_eq!(removed.revision, 3);
+    assert_eq!(removed.credentials, 1);
+    assert_eq!(removed.workspaces, [w.clone()]);
+    assert_eq!(removed.revoked_invites, ["inv-c"]);
+    assert_eq!(removed.affected_workspaces, [w.clone()]);
+    assert!(store
+        .principal_instructions_revoked(&pid("carol"))
+        .await
+        .unwrap());
+    assert!(!store
+        .principal_instructions_revoked(&pid("dave"))
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .load_all_agent_queues()
+            .await
+            .unwrap()
+            .iter()
+            .map(|q| q.id.as_str())
+            .collect::<Vec<_>>(),
+        ["q-dave"]
+    );
+
+    let revoked = store.revoke_principal_access(&pid("dave")).await.unwrap();
+    assert!(!revoked.removed);
+    assert_eq!(revoked.credentials, 1);
+    assert_eq!(revoked.workspaces, [w.clone()]);
+    assert!(revoked.affected_workspaces.is_empty());
+    assert!(store
+        .principal_instructions_revoked(&pid("dave"))
+        .await
+        .unwrap());
+    assert!(store.load_all_agent_queues().await.unwrap().is_empty());
+    let none = store.remove_host_member(&pid("carol")).await.unwrap();
+    assert!(!none.removed);
+    assert_eq!(none.credentials, 0);
+    let erin_out = store.remove_host_member(&pid("erin")).await.unwrap();
+    assert!(erin_out.removed);
+    let state = store.host_membership_state().await.unwrap();
+    assert_eq!(
+        (
+            state.revision,
+            state.member_count,
+            state.authorization_generation
+        ),
+        (4, 0, 3)
+    );
+    assert!(store.list_host_members().await.unwrap().members.len() == 1);
+
+    if tenant == "decoy" {
+        store
+            .upsert_principal(&person("ghost", gh(499), tenant, T4))
+            .await
+            .unwrap();
+        store
+            .insert_host_invite(&new_invite("hi-ghost", gh(498), &primary))
+            .await
+            .unwrap();
+        for p in ["carol", "dave"] {
+            store
+                .add_workspace_member(&w, &pid(p), WorkspaceRole::Collaborator)
+                .await
+                .unwrap();
+        }
+        store
+            .replace_agent_queue(
+                &AgentId("agent-h".into()),
+                &[queued("q-carol", "carol"), queued("q-dave", "dave")],
+            )
+            .await
+            .unwrap();
+        decoy_sql(
+            db,
+            tenant,
+            "UPDATE host_invite SET redeemed_at = NULL, redeemed_by_principal_id = NULL, \
+             redemption_count = 0, revoked_at = NULL WHERE {w}; \
+             UPDATE principal_credential SET revoked_at = NULL WHERE {w}; \
+             UPDATE workspace_invite SET revoked_at = NULL WHERE {w}; \
+             INSERT INTO host_member (tenant_id, principal_id, added_at) \
+             VALUES ('decoy', 'carol', '2026-02-01T00:00:05.000Z'), \
+                    ('decoy', 'erin', '2026-02-01T00:00:05.000Z')",
+        )
+        .await;
+    }
+});

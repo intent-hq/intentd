@@ -26,6 +26,8 @@ mod hooks;
 mod nodes;
 #[path = "postgres_backend/notes.rs"]
 mod notes;
+#[path = "postgres_backend/principals.rs"]
+mod principals;
 #[path = "postgres_backend/script_monitors.rs"]
 mod script_monitors;
 #[path = "postgres_backend/scripts.rs"]
