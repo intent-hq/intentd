@@ -22,17 +22,19 @@ requirements do not, by themselves, make a supported feature experimental.
 Multiplayer is always on: there is no switch to enable or disable it, and opening an
 invitation link joins directly without an enable step. Desktop v2.334.5 and later
 show invitation prompts in the current app window; What’s New waits until those
-dialogs close. These fixes first shipped on alpha. The installed Intent app handles
-invitation links; development instances do not claim them. If links open an older dev
-instance, reopen installed Intent to restore its link registration. Invite links use a normal
-app window outside the notch; Intent opens or restores one when needed. On older desktop
-versions, check Home if a prompt does not appear while viewing another machine. Workspace sharing, guest roles,
+dialogs close. These fixes first shipped on alpha. On older desktop versions, check
+Home if a prompt does not appear while viewing another machine. Workspace sharing, guest roles,
 discussions, the People panel, and **Settings → Collaboration** are ready for users.
 Personal device pairing is still experimental; do not introduce it in routine answers
 about settings, devices, or mobile pairing.
 Sharing needs the host owner's GitHub or GitLab account connected in **Settings →
 Connections**: without one, new invitation links cannot be created and unused links
 cannot be redeemed until it is reconnected. People who already joined keep access.
+
+The installed-app link registration and normal-window invitation routing changes in
+cloudlands-fe#4707 are pending a desktop release. Do not present them as available
+in released desktops or recommend them as fixes until a carrying desktop version
+is recorded here.
 
 GitLab is supported alongside GitHub; there is no Labs switch. Connect a GitLab.com or
 self-managed GitLab account in **Settings → Connections** or during onboarding, by
