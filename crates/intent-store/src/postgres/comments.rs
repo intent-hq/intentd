@@ -7,10 +7,9 @@ use intent_core::{
 };
 use serde_json::{Map, Value};
 use sqlx::postgres::PgRow;
-use sqlx::PgConnection;
 
 use super::notes::{col, exec_update_note, insert_note_version};
-use super::{db, PgStore};
+use super::{db, PgStore, WriteTx};
 use crate::comment_repo::{
     encode_comment_json, encode_comment_update, ExtraFields, COMMENT_COLUMNS,
 };
@@ -395,7 +394,7 @@ impl PgStore {
 
 async fn exec_insert_comment(
     store: &PgStore,
-    conn: &mut PgConnection,
+    conn: &mut WriteTx,
     workspace_id: &WorkspaceId,
     c: &Comment,
     anchor_json: &str,
@@ -425,7 +424,7 @@ async fn exec_insert_comment(
     .bind(&c.created_at)
     .bind(&c.updated_at)
     .bind(workspace_id.as_str())
-    .execute(&mut *conn)
+    .execute(&mut **conn)
     .await?;
     Ok(())
 }

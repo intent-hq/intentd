@@ -205,7 +205,9 @@ fn writers_without_lock(text: &str) -> Vec<String> {
                 .any(|w| l.starts_with(w))
                 && !NON_TENANT_TABLES.iter().any(|(t, _)| l.contains(t))
         });
-        if writes && !chunk.contains("begin_write()") {
+        // `&mut WriteTx` can only come from begin_write().
+        let locked = chunk.contains("begin_write()") || chunk.contains("&mut WriteTx");
+        if writes && !locked {
             let name = chunk[3..]
                 .split(|c: char| !(c.is_alphanumeric() || c == '_'))
                 .next()

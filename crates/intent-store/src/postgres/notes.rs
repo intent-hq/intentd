@@ -14,9 +14,9 @@ use intent_core::{
     TaskStatus, WorkspaceId, WorkspaceTask, WorkspaceTaskStats,
 };
 use sqlx::postgres::PgRow;
-use sqlx::{PgConnection, Row};
+use sqlx::Row;
 
-use super::{db, PgStore};
+use super::{db, PgStore, WriteTx};
 use crate::note_paging_cleanup::{
     NotePagingCleanupOutcome, NotePagingCleanupPolicy, RetiredNotePagingStep,
     RETIRED_NOTE_PAGING_TABLES,
@@ -937,7 +937,7 @@ impl PgStore {
 /// The note INSERT, inside the caller's transaction.
 pub(super) async fn exec_insert_note(
     store: &PgStore,
-    conn: &mut PgConnection,
+    conn: &mut WriteTx,
     note: &Note,
 ) -> Result<()> {
     let task_json = note
@@ -966,7 +966,7 @@ pub(super) async fn exec_insert_note(
     .bind(&note.created_at)
     .bind(note.rev)
     .bind(&note.updated_at)
-    .execute(&mut *conn)
+    .execute(&mut **conn)
     .await
     .map_err(internal("insert note failed"))?;
     Ok(())
@@ -977,7 +977,7 @@ pub(super) async fn exec_insert_note(
 /// Every parameter is always bound so the numbering stays fixed.
 pub(super) async fn exec_update_note(
     store: &PgStore,
-    conn: &mut PgConnection,
+    conn: &mut WriteTx,
     note: &Note,
     expected_version: Option<i64>,
     scope: NoteUpdateScope,
@@ -1028,7 +1028,7 @@ pub(super) async fn exec_update_note(
     .bind(&note.updated_at)
     .bind(expected_version)
     .bind(required_link.map(|a| a.0.as_str()))
-    .fetch_optional(&mut *conn)
+    .fetch_optional(&mut **conn)
     .await
     .map_err(internal("note update failed"))?;
     Ok(rev)
@@ -1038,7 +1038,7 @@ pub(super) async fn exec_update_note(
 /// `rev`, and prune to the newest [`MAX_NOTE_VERSIONS`]. Returns the new `v`.
 pub(super) async fn insert_note_version(
     store: &PgStore,
-    conn: &mut PgConnection,
+    conn: &mut WriteTx,
     note: &Note,
     author: &NoteVersionAuthor,
     date: &str,
@@ -1051,7 +1051,7 @@ pub(super) async fn insert_note_version(
     .bind(store.tenant())
     .bind(note.id.as_str())
     .bind(note.workspace_id.as_str())
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut **conn)
     .await
     .map_err(internal("next note_version failed"))?;
     sqlx::query(
@@ -1070,7 +1070,7 @@ pub(super) async fn insert_note_version(
     .bind(&note.title)
     .bind(&note.content)
     .bind(rev)
-    .execute(&mut *conn)
+    .execute(&mut **conn)
     .await
     .map_err(internal("insert note_version failed"))?;
     sqlx::query(
@@ -1081,7 +1081,7 @@ pub(super) async fn insert_note_version(
     .bind(note.id.as_str())
     .bind(note.workspace_id.as_str())
     .bind(next_v - MAX_NOTE_VERSIONS)
-    .execute(&mut *conn)
+    .execute(&mut **conn)
     .await
     .map_err(internal("prune note_version failed"))?;
     Ok(next_v)

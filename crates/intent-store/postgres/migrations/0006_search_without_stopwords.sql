@@ -6,19 +6,19 @@
 -- Neki rejects user-created text-search dictionaries and configurations
 -- (router errors 302/303). Postgres only; no SQLite counterpart.
 
-ALTER TABLE agent_message DROP COLUMN search_tsv;
-ALTER TABLE agent_message ADD COLUMN search_tsv tsvector GENERATED ALWAYS AS (
+ALTER TABLE agent_message DROP COLUMN IF EXISTS search_tsv;
+ALTER TABLE agent_message ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (
     CASE WHEN role IN ('user', 'assistant')
         THEN to_tsvector('english', intent_message_search_text(content))
             || to_tsvector('simple', intent_message_search_text(content)) END
 ) STORED;
-CREATE INDEX agent_message_search_tsv ON agent_message USING gin (search_tsv);
+CREATE INDEX IF NOT EXISTS agent_message_search_tsv ON agent_message USING gin (search_tsv);
 
-ALTER TABLE note DROP COLUMN search_tsv;
-ALTER TABLE note ADD COLUMN search_tsv tsvector GENERATED ALWAYS AS (
+ALTER TABLE note DROP COLUMN IF EXISTS search_tsv;
+ALTER TABLE note ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (
     to_tsvector('english',
         coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(tags, ''))
     || to_tsvector('simple',
         coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(tags, ''))
 ) STORED;
-CREATE INDEX note_search_tsv ON note USING gin (search_tsv);
+CREATE INDEX IF NOT EXISTS note_search_tsv ON note USING gin (search_tsv);
