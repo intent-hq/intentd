@@ -337,10 +337,11 @@ impl ExecutorService {
         self.push_capabilities().await;
     }
 
-    /// The background refresh: rebuild the full report and, when its
-    /// providers changed, send it unasked on every live backend link. The
-    /// first full report after a bind replaces the primed one (no models
-    /// yet), which a backend would otherwise keep until its next request.
+    /// Rebuild the full report (in the background or for a backend's
+    /// capabilities request) and, when its providers changed, send it
+    /// unasked on every live backend link. The first full report after a
+    /// bind replaces the primed one (no models yet), which every other
+    /// backend would otherwise keep until its own next request.
     pub(crate) async fn refresh_report(&self) {
         let before = self.deps.report.providers();
         self.deps.report.refresh().await;
@@ -504,7 +505,9 @@ impl ExecutorService {
                         Box::pin(async move {
                             match service.upgrade() {
                                 Some(service) => {
-                                    service.deps.report.refresh().await;
+                                    // A changed report reaches the other
+                                    // links too, not only this reply.
+                                    service.refresh_report().await;
                                     service.capabilities()
                                 }
                                 // The daemon is stopping.

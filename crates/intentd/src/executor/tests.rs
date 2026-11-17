@@ -2230,6 +2230,46 @@ async fn a_background_refresh_that_changes_the_report_pushes_it_unasked() {
     node.stop().await;
 }
 
+/// One backend's capabilities request that changes the report reaches every
+/// other live link too: two backends bound to the primed report, the first
+/// asks, and the second gets the full report unasked instead of keeping the
+/// empty one until its own next request (review of Homes GA 7).
+#[tokio::test]
+async fn a_requested_refresh_that_changes_the_report_reaches_every_link() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    node.report.primed.store(true, Ordering::SeqCst);
+    let mut asking = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut asking).await;
+    let mut other = dial_link(
+        &node.endpoint_for(&other_token()),
+        hello_from(OTHER_HEAD, 1, "lease-o", 0),
+    )
+    .await
+    .unwrap();
+    replay_complete(&mut other).await;
+
+    asking.link.send(&LinkFrame::Capabilities).await.unwrap();
+    let models = loop {
+        match next_frame(&mut other).await {
+            Some(LinkFrame::CapabilitiesReply { capabilities }) => {
+                break capabilities
+                    .providers
+                    .into_iter()
+                    .map(|p| p.models)
+                    .collect::<Vec<_>>();
+            }
+            Some(LinkFrame::Journal(_)) => {}
+            other => panic!("expected a pushed capabilities report, got {other:?}"),
+        }
+    };
+    assert_eq!(models, vec![vec!["mock-model".to_owned()]]);
+    node.stop().await;
+}
+
 /// The report follows the enabled set by value: a change is reported once,
 /// however many settings notices it arrived in (or none, when a newer
 /// notice replaced it), and changing back before the loop acts reports
