@@ -9258,7 +9258,9 @@ async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
         "naming instruction prepends the prompt: {text:?}"
     );
     assert!(
-        text.contains("call `ws.workspace.setTitle` through the `workspace_api_workspace-mcp` tool"),
+        text.contains(
+            "call `ws.workspace.setTitle` through the `workspace_api_workspace-mcp` tool"
+        ),
         "instruction names the call and the daemon MCP tool: {text:?}"
     );
     assert!(

@@ -278,10 +278,7 @@ fn golden_first_turn_naming_nudges() {
          with information-gathering.\n</system>"
     );
     assert_eq!(
-        harness.naming_nudge(
-            None,
-            Some("the `workspace_api_workspace-mcp` tool"),
-        ),
+        harness.naming_nudge(None, Some("the `workspace_api_workspace-mcp` tool"),),
         "<system>\nThis workspace needs a title. As your first action, call \
          `ws.workspace.setTitle` through the `workspace_api_workspace-mcp` tool with a short \
          3–5 word sentence-case title describing the task. This can be called in parallel with \

@@ -95,9 +95,15 @@ async fn the_first_agent_on_an_orchestrator_names_itself_and_the_workspace() {
             tokio::time::sleep(Duration::from_millis(200)).await;
         };
         let ws_id = created["workspace"]["id"].as_str().unwrap().to_owned();
-        assert_eq!(created["workspace"]["home"]["name"], "Machine A", "{label}: {created}");
+        assert_eq!(
+            created["workspace"]["home"]["name"], "Machine A",
+            "{label}: {created}"
+        );
         let agent_id = created["initialAgent"]["id"].as_str().unwrap().to_owned();
-        assert_eq!(created["initialAgent"]["name"], "Developer", "{label}: {created}");
+        assert_eq!(
+            created["initialAgent"]["name"], "Developer",
+            "{label}: {created}"
+        );
 
         id += 100;
         let raw = reply_containing(&mut rpc_ws, (&ws_id, &agent_id), "raw: ", id).await;
@@ -139,7 +145,11 @@ async fn the_first_agent_on_an_orchestrator_names_itself_and_the_workspace() {
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
     .await;
-    let value = wsapi_value(got["agent"]["lastAgentResponse"].as_str().unwrap_or_default());
+    let value = wsapi_value(
+        got["agent"]["lastAgentResponse"]
+            .as_str()
+            .unwrap_or_default(),
+    );
     assert_eq!(value["details"]["hasTitle"], false, "{value}");
     assert_eq!(value["title"]["title"], "Named on the home", "{value}");
     assert!(value["title"].get("skipped").is_none(), "{value}");
