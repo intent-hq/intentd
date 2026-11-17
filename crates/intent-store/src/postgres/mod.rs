@@ -26,6 +26,7 @@ mod hooks;
 mod nodes;
 mod note_search;
 mod notes;
+pub(crate) mod pr_monitors;
 mod principals;
 mod script_monitors;
 mod scripts;
