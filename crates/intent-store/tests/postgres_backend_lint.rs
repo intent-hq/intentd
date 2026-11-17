@@ -8,10 +8,13 @@
 //!    INSERT, UPDATE or DELETE) opens its transaction with `begin_write()`.
 //!    The per-tenant writer lock orders only writers that take it, so one
 //!    writer on plain `begin()` can commit between another's read and write.
-//! 3. `postgres/pending-methods.txt` lists exactly the `Store` methods that
-//!    still go through `pending_postgres!` (no Postgres implementation yet).
-//!    Porting a method removes its line; a new `Store` method should ship
-//!    with its Postgres version (`dispatch!`) or be listed here on purpose.
+//! 3. `postgres/pending/<module>.txt` lists exactly the `Store` methods whose
+//!    `pending_postgres!` forwarder (no Postgres implementation yet) lives in
+//!    `src/<module>.rs` or `src/<module>/`. Porting a method removes its line,
+//!    and the last port in a module deletes its file. One file per module
+//!    keeps ports of different domains from editing the same file. A new
+//!    `Store` method should ship with its Postgres version (`dispatch!`) or
+//!    be listed on purpose.
 //!
 //! Limit: text-level. SQL built at runtime from fragments is checked only
 //! where a literal holds the table reference.
@@ -264,7 +267,21 @@ fn the_writer_lock_rule_catches_unlocked_writes() {
     );
 }
 
-fn pending_in_source() -> BTreeSet<String> {
+fn pending_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/pending")
+}
+
+/// The top-level module under `src/` a file belongs to: `lib.rs` is `lib`,
+/// `pr_monitor_repo/prepared_write.rs` is `pr_monitor_repo`.
+fn module_of(file: &Path) -> String {
+    let rel = file.strip_prefix(src()).expect("file under src");
+    let first = rel.components().next().expect("nonempty path");
+    let first = first.as_os_str().to_string_lossy();
+    first.strip_suffix(".rs").unwrap_or(&first).to_owned()
+}
+
+/// `(module, method)` for every `pending_postgres!` forwarder.
+fn pending_in_source() -> BTreeSet<(String, String)> {
     let mut files = Vec::new();
     rust_files(&src(), &mut files);
     let mut out = BTreeSet::new();
@@ -273,34 +290,74 @@ fn pending_in_source() -> BTreeSet<String> {
         for part in text.split("pending_postgres!(").skip(1) {
             let part = part.strip_prefix("panic ").unwrap_or(part);
             if let Some(name) = part.strip_prefix('"').and_then(|p| p.split('"').next()) {
-                out.insert(name.to_owned());
+                out.insert((module_of(&file), name.to_owned()));
             }
         }
     }
     out
 }
 
+/// `(module, method)` for every line of `postgres/pending/<module>.txt`, and
+/// the modules whose file lists nothing. Git drops the directory once the
+/// last file is deleted, so a missing directory lists nothing.
+fn pending_listed() -> (BTreeSet<(String, String)>, Vec<String>) {
+    let mut listed = BTreeSet::new();
+    let mut empty = Vec::new();
+    let entries = match std::fs::read_dir(pending_dir()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (listed, empty),
+        Err(e) => panic!("read postgres/pending: {e}"),
+    };
+    for entry in entries {
+        let path = entry.expect("entry").path();
+        if path.extension().is_none_or(|e| e != "txt") {
+            continue;
+        }
+        let module = path
+            .file_stem()
+            .expect("stem")
+            .to_string_lossy()
+            .into_owned();
+        let before = listed.len();
+        for line in std::fs::read_to_string(&path).expect("read list").lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                listed.insert((module.clone(), line.to_owned()));
+            }
+        }
+        if listed.len() == before {
+            empty.push(module);
+        }
+    }
+    (listed, empty)
+}
+
+fn list_entries<'a>(items: impl Iterator<Item = &'a (String, String)>) -> String {
+    items
+        .map(|(module, name)| format!("  postgres/pending/{module}.txt: {name}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
-fn pending_postgres_methods_match_the_list() {
-    let list_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/pending-methods.txt");
-    let listed: BTreeSet<String> = std::fs::read_to_string(&list_path)
-        .expect("read postgres/pending-methods.txt")
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_owned)
-        .collect();
+fn pending_postgres_methods_match_the_lists() {
     let pending = pending_in_source();
+    let (listed, empty) = pending_listed();
     let unlisted: Vec<_> = pending.difference(&listed).collect();
     let ported: Vec<_> = listed.difference(&pending).collect();
     assert!(
         unlisted.is_empty(),
         "new pending_postgres! methods: give them a Postgres implementation (dispatch!) \
-         or add them to postgres/pending-methods.txt: {unlisted:?}"
+         or add each line below:\n{}",
+        list_entries(unlisted.into_iter())
     );
     assert!(
         ported.is_empty(),
-        "these methods no longer use pending_postgres!; remove them from \
-         postgres/pending-methods.txt: {ported:?}"
+        "these lines name no pending_postgres! forwarder in that module; remove them:\n{}",
+        list_entries(ported.into_iter())
+    );
+    assert!(
+        empty.is_empty(),
+        "these modules have no pending methods left; delete their file: {empty:?}"
     );
 }

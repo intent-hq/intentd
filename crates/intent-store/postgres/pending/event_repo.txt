@@ -1,0 +1,7 @@
+delete_ephemeral_events_before
+delete_tool_call_events_before
+events_by_type
+events_by_workspace
+insert_event
+insert_events
+query_events

@@ -1,0 +1,5 @@
+delete_event_subscription
+delete_event_subscriptions_for_agent
+delete_event_subscriptions_for_workspace
+list_event_subscriptions
+upsert_event_subscription

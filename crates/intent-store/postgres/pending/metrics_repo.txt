@@ -1,0 +1,9 @@
+delete_agent_metrics
+delete_agent_metrics_for_workspace
+delete_workspace_metrics
+get_workspace_metrics
+list_agent_metrics
+list_agent_metrics_for_workspace
+list_workspace_metrics
+upsert_agent_metrics
+upsert_workspace_metrics
