@@ -178,6 +178,15 @@ fn metadata_object(raw: Option<&str>) -> Result<Map<String, Value>> {
     }
 }
 
+/// The stored document for `json_extract`, which raises on malformed JSON.
+fn extractable_metadata(raw: Option<&str>) -> Result<Option<Value>> {
+    raw.map(|r| {
+        serde_json::from_str(r)
+            .map_err(|e| Error::Internal(format!("agent session metadata is malformed JSON: {e}")))
+    })
+    .transpose()
+}
+
 /// The stored document when it is valid JSON (`json_valid`).
 fn metadata_value(raw: Option<&str>) -> Option<Value> {
     raw.and_then(|r| serde_json::from_str(r).ok())
@@ -1550,6 +1559,7 @@ impl PgStore {
         let message_rows = if fallback.is_empty() {
             Vec::new()
         } else {
+            // jsonb orders the usage object's keys unlike SQLite; readers decode it.
             sqlx::query(
                 "SELECT m.agent_id, \
                  COALESCE(NULLIF(m.usage_model, ''), NULLIF(s.model, ''), 'unknown') AS model, \
@@ -1646,8 +1656,11 @@ impl PgStore {
             return Err(Error::Internal("acpSessionId is write-once".to_string()));
         }
         let keep_choice = stored_model == s.model && stored_provider == s.provider;
+        let stored_metadata: Option<String> = col(&row, "metadata")?;
+        // SQLite's chiefPromptVersion check runs json_extract on the stored row.
+        extractable_metadata(stored_metadata.as_deref())?;
         let metadata = whole_metadata(
-            col::<Option<String>>(&row, "metadata")?.as_deref(),
+            stored_metadata.as_deref(),
             s.metadata.as_ref(),
             keep_choice,
             true,
@@ -2291,7 +2304,11 @@ impl PgStore {
             return Err(not_found(id));
         };
         if let Some(expected) = expected {
-            if !extract_is(metadata_value(stored.as_deref()).as_ref(), key, expected) {
+            if !extract_is(
+                extractable_metadata(stored.as_deref())?.as_ref(),
+                key,
+                expected,
+            ) {
                 tx.commit().await.map_err(db)?;
                 return Ok(false);
             }
@@ -2374,7 +2391,7 @@ impl PgStore {
         };
         if let Some(expected) = expected {
             if !extract_is(
-                metadata_value(stored.as_deref()).as_ref(),
+                extractable_metadata(stored.as_deref())?.as_ref(),
                 PENDING_QUESTIONS_MESSAGE_ID_KEY,
                 expected,
             ) {

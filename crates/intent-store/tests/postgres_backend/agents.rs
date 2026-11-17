@@ -92,6 +92,20 @@ async fn seed_sessions(store: &Store, tenant: &str) {
     store.insert_agent_session(&retired).await.unwrap();
 }
 
+/// Decoy-only sessions with the ids the subject probes as missing
+/// (`agent-zz`) or as a missing parent (`agent-gone`): a lookup without its
+/// tenant filter finds them on the subject run.
+async fn decoy_only_sessions(store: &Store, tenant: &str) {
+    if tenant == "decoy" {
+        for id in ["agent-zz", "agent-gone"] {
+            store
+                .insert_agent_session(&session(id, tenant, "2026-01-01T00:00:09Z"))
+                .await
+                .unwrap();
+        }
+    }
+}
+
 parity_test!(agent_sessions_insert_and_read, |store, tenant| {
     assert!(store
         .list_agent_session_summaries(&ws())
@@ -176,6 +190,17 @@ parity_test!(agent_sessions_insert_and_read, |store, tenant| {
             .materialize_agent_session_harness_features(&aid("agent-zz"), &json!({}))
             .await
     ));
+    // The decoy's agent-e keeps no snapshot for the subject's write to reach.
+    if tenant != "decoy" {
+        let snapshot = json!({ "taskGraph": false, "tenant": tenant });
+        assert_eq!(
+            store
+                .materialize_agent_session_harness_features(&aid("agent-e"), &snapshot)
+                .await
+                .unwrap(),
+            Some(snapshot)
+        );
+    }
     assert_eq!(
         store
             .get_agent_session_status(&aid("agent-b"))
@@ -190,12 +215,17 @@ parity_test!(agent_sessions_insert_and_read, |store, tenant| {
             .unwrap(),
         "2026-01-01T00:00:03Z"
     );
+    let stamp = format!("2026-01-01T00:00:01Z {tenant}");
+    store
+        .refresh_agent_session_timestamp(&ws(), &aid("agent-a"), &stamp)
+        .await
+        .unwrap();
     let batch = store
         .get_agent_session_updated_at_batch(&[aid("agent-a"), aid("agent-zz")])
         .await
         .unwrap();
     assert_eq!(batch.len(), 1);
-    assert_eq!(batch[&aid("agent-a")], "2026-01-01T00:00:01Z");
+    assert_eq!(batch[&aid("agent-a")], stamp);
     assert_eq!(
         store.get_agent_session_name(&aid("agent-a")).await.unwrap(),
         Some(format!("agent-a of {tenant}"))
@@ -325,6 +355,7 @@ parity_test!(agent_sessions_insert_and_read, |store, tenant| {
         ),
         ["agent-b"]
     );
+    decoy_only_sessions(&store, tenant).await;
 });
 
 parity_test!(
@@ -603,6 +634,24 @@ parity_test!(
                 .set_agent_session_model(&w, &aid("agent-zz"), "m", None, &at(15))
                 .await
         ));
+        assert!(not_found(
+            &store
+                .pin_agent_session_provider_if_null(&w, &aid("agent-zz"), "x", &at(16))
+                .await
+        ));
+        if tenant == "decoy" {
+            // Back to the state the subject's guarded writes start from.
+            let mut row = store.get_agent_session_without_messages(&c).await.unwrap();
+            (row.provider, row.model, row.reasoning_effort) = (None, None, None);
+            store.update_agent_session(&w, &row).await.unwrap();
+            let mut row = store
+                .get_agent_session_without_messages(&aid("agent-b"))
+                .await
+                .unwrap();
+            row.reasoning_effort = None;
+            store.update_agent_session(&w, &row).await.unwrap();
+        }
+        decoy_only_sessions(&store, tenant).await;
     }
 );
 
@@ -883,7 +932,20 @@ parity_test!(agent_session_state_writers, |store, tenant| {
             .set_agent_session_status(&w, &b, AgentStatus::Active, true, &at(14), None)
             .await
             .unwrap();
+        let mut row = store.get_agent_session_without_messages(&b).await.unwrap();
+        row.completion_report = Some("decoy report".into());
+        store.update_agent_session(&w, &row).await.unwrap();
+        // The subject's timestamp, so its blocker clear would match this row.
+        store
+            .set_attention_request(&w, &a, "blocker", "stuck", "2026-03-01T00:00:10Z subject")
+            .await
+            .unwrap();
+        store
+            .set_agent_session_retired_at(&w, &a, Some("decoy retired"), "decoy")
+            .await
+            .unwrap();
     }
+    decoy_only_sessions(&store, tenant).await;
 });
 
 parity_test!(agent_session_token_usage_and_acp_fold, |store, tenant| {
@@ -977,6 +1039,13 @@ parity_test!(agent_session_token_usage_and_acp_fold, |store, tenant| {
         (row_a.2.clone(), row_a.3.clone()),
         (None, Some(usage(4, 5)))
     );
+    if tenant == "decoy" {
+        assert!(store
+            .set_agent_session_resolved_model(&w, &a, Some("opus"), Some("decoy resolved"))
+            .await
+            .unwrap());
+    }
+    decoy_only_sessions(&store, tenant).await;
 });
 
 parity_test!(interrupted_agents_round_trip, |store, tenant| {
@@ -1031,7 +1100,12 @@ parity_test!(interrupted_agents_round_trip, |store, tenant| {
             .set_interrupted_resolution(&b, "abandoned", "decoy-only")
             .await
             .unwrap();
+        store
+            .set_interrupted_resolution(&a, "resumed", "decoy-only")
+            .await
+            .unwrap();
     }
+    decoy_only_sessions(&store, tenant).await;
 });
 
 fn queue_row(id: &str, agent: &str, position: i64, tenant: &str) -> AgentQueueRow {
@@ -1212,6 +1286,10 @@ parity_test!(agent_flipped_completions_round_trip, |store, tenant| {
             .record_agent_flipped_completion(&a, &w, &note("decoy-only"), &tag)
             .await
             .unwrap();
+        store
+            .record_agent_flipped_completion(&a, &w, &note("c00"), &tag)
+            .await
+            .unwrap();
     }
 });
 
@@ -1264,10 +1342,12 @@ parity_test!(wake_delivery_markers_round_trip, |store, tenant| {
     assert!(!store.has_advisory_wake_delivery(&a, &b).await.unwrap());
     assert!(!store.has_advisory_wake_delivery(&a, &c).await.unwrap());
     if tenant == "decoy" {
-        store
-            .record_advisory_wake_delivery(&a, &b, "decoy")
-            .await
-            .unwrap();
+        for (parent, child) in [(&a, &b), (&a, &c), (&c, &b)] {
+            store
+                .record_advisory_wake_delivery(parent, child, "decoy")
+                .await
+                .unwrap();
+        }
     }
 
     assert_eq!(
@@ -1593,6 +1673,7 @@ message_parity_test!(
                 )
                 .await
         ));
+        decoy_only_sessions(&store, tenant).await;
     }
 );
 
@@ -1626,6 +1707,16 @@ message_parity_test!(
             .map(|c| (c.model.clone(), c.human_messages))
             .collect();
         assert_eq!(cells, [(resolved.clone(), 1)]);
+        if let (Some(admin), "decoy") = (admin, tenant) {
+            // An old-model cell the subject's decrement and prune must not reach.
+            sqlx::query(
+                "INSERT INTO agent_usage_cell (tenant_id, agent_id, model, human_messages) \
+                 VALUES ('decoy', 'agent-b', 'opus', 1)",
+            )
+            .execute(admin)
+            .await
+            .unwrap();
+        }
 
         // No reported usage: the tally reads per-message usage instead.
         let usage = json!({ "inputTokens": 7, "tenant": tenant });
@@ -1671,3 +1762,105 @@ message_parity_test!(
         assert_eq!(row_c.5[0].message_usage.len(), 2);
     }
 );
+
+/// A session whose stored `metadata` is not JSON: the writers that read it
+/// with `json_extract` fail on both backends, as `SQLite` raises.
+async fn malformed_metadata_writes_fail(
+    store: &Store,
+    corrupt: impl std::future::Future<Output = ()>,
+) {
+    seed_sessions(store, "malformed").await;
+    let (w, a) = (ws(), aid("agent-a"));
+    let row = store.get_agent_session_without_messages(&a).await.unwrap();
+    corrupt.await;
+    assert!(store.update_agent_session(&w, &row).await.is_err());
+    assert!(store
+        .set_agent_session_metadata_key(&w, &a, "k", "v", Some(None), None)
+        .await
+        .is_err());
+    let question = AgentMessage {
+        id: "q".into(),
+        agent_id: a.clone(),
+        seq: 0,
+        role: "assistant".into(),
+        content: json!([]),
+        metadata: None,
+        app_message_id: None,
+        author: None,
+        created_at: "t".into(),
+    };
+    assert!(store
+        .set_pending_questions_marker_if_unanswered(&w, &a, Some(None), &question, "t")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn malformed_session_metadata_fails_guarded_writes_on_both_backends() {
+    let (sqlite, dir) = sqlite_store().await;
+    let path = dir.path().join("intent.db");
+    malformed_metadata_writes_fail(&sqlite, async {
+        use sqlx::Connection as _;
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_session SET metadata = '{bad' WHERE id = 'agent-a'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    })
+    .await;
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let store = open(&db, "subject").await;
+    malformed_metadata_writes_fail(&store, async {
+        sqlx::query(
+            "UPDATE agent_session SET metadata = '{bad' \
+             WHERE tenant_id = 'subject' AND id = 'agent-a'",
+        )
+        .execute(&db.admin)
+        .await
+        .unwrap();
+    })
+    .await;
+}
+
+/// A tenant with a reported snapshot but no usage cells seeds its legacy
+/// cell, even when another tenant has cells for the same agent id.
+#[tokio::test]
+async fn token_usage_seeds_legacy_cells_per_tenant() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let (w, a) = (ws(), aid("agent-a"));
+    let usage = |input: u64| TokenUsageTotals {
+        input_tokens: input,
+        ..TokenUsageTotals::default()
+    };
+    let a_store = open(&db, "tenant-a").await;
+    let b_store = open(&db, "tenant-b").await;
+    for (tenant, store) in [("tenant-a", &a_store), ("tenant-b", &b_store)] {
+        store
+            .insert_agent_session(&session("agent-a", tenant, "2026-01-01T00:00:01Z"))
+            .await
+            .unwrap();
+    }
+    b_store
+        .set_agent_session_token_usage(&w, &a, &usage(3))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE agent_session SET token_usage = $1 WHERE tenant_id = 'tenant-a' AND id = 'agent-a'",
+    )
+    .bind(serde_json::to_string(&usage(10)).unwrap())
+    .execute(&db.admin)
+    .await
+    .unwrap();
+    a_store
+        .set_agent_session_token_usage(&w, &a, &usage(15))
+        .await
+        .unwrap();
+    let rows = a_store.get_workspace_agent_usage_data(&w).await.unwrap();
+    assert_eq!(rows[0].5[0].reported_totals, usage(15));
+}
