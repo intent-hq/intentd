@@ -783,7 +783,11 @@ async fn a_cloud_home_sandbox_is_co_owned_by_its_workspace() {
     let id = homes.next();
     machine_until(&mut homes.rpc_ws, id, &sandbox, |machine| machine.is_none()).await;
     homes.id += 1000;
-    assert!(homes.deleted(&sandbox), "the archived home's sandbox stays");
+    // The row goes before the E2B delete is sent.
+    super::super::homes::until("E2B deletes the archived home's sandbox", || {
+        homes.deleted(&sandbox).then_some(())
+    })
+    .await;
     let id = homes.next();
     let listed = ok(&mut homes.rpc_ws, id, "cloudMachines.list", json!({})).await;
     assert!(
