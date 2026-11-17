@@ -656,8 +656,6 @@ impl PgStore {
         let more = keys.len() > options.limit;
         keys.truncate(options.limit);
         let ids: Vec<&str> = keys.iter().map(|(_, id)| id.as_str()).collect();
-        // The monitor branch has no two-tenant test yet: monitor rows need a
-        // live agent_session, which is not ported.
         let rows = if monitor {
             sqlx::query(
                 "SELECT id, workspace_id, agent_id, script_id, run_id, created_at, \
