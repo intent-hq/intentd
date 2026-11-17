@@ -97,10 +97,19 @@ fn is_sql(lit: &str) -> bool {
         .any(|k| l.starts_with(k))
 }
 
+/// Tables that belong to the schema rather than a tenant, with why.
+const NON_TENANT_TABLES: &[(&str, &str)] = &[(
+    "intent_schema_migrations",
+    "applied-migration ledger written by postgres::migrate, one per schema",
+)];
+
 /// The violations in one SQL literal (lower-cased).
 fn violations(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     for r in table_refs(sql) {
+        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) {
+            continue;
+        }
         let ok = if r.keyword == "INTO" {
             let after_insert = sql[..r.at].trim_end().ends_with("insert");
             // The column list right after the table must start with tenant_id.
@@ -188,11 +197,13 @@ fn writers_without_lock(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (k, &start) in starts.iter().enumerate() {
         let chunk = &text[start..starts.get(k + 1).copied().unwrap_or(text.len())];
+        // Schema-level tables (the migration ledger) have no tenant to lock.
         let writes = string_literals(chunk).iter().any(|(_, lit)| {
             let l = lit.trim_start().to_lowercase();
             ["insert ", "update ", "delete "]
                 .iter()
                 .any(|w| l.starts_with(w))
+                && !NON_TENANT_TABLES.iter().any(|(t, _)| l.contains(t))
         });
         if writes && !chunk.contains("begin_write()") {
             let name = chunk[3..]

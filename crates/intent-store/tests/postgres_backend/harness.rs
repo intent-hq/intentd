@@ -36,7 +36,7 @@ async fn drop_stale_databases(server: &PgPool, now: u64) {
     }
 }
 
-async fn exec(pool: &PgPool, sql: String) {
+pub async fn exec(pool: &PgPool, sql: String) {
     sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
         .execute(pool)
         .await
@@ -49,6 +49,13 @@ pub struct TestDb {
 }
 
 pub async fn test_db(rls_guard: bool) -> Option<TestDb> {
+    let (url, admin) = empty_db().await?;
+    postgres::migrate(&admin).await.expect("migrate");
+    finish_test_db(url, admin, rls_guard).await
+}
+
+/// A fresh, unmigrated database: its URL and an admin pool.
+pub async fn empty_db() -> Option<(String, PgPool)> {
     let Ok(base) = std::env::var("INTENT_STORE_TEST_PG_URL") else {
         assert!(
             std::env::var("INTENT_STORE_REQUIRE_PG").as_deref() != Ok("1"),
@@ -80,7 +87,10 @@ pub async fn test_db(rls_guard: bool) -> Option<TestDb> {
 
     let url = with_database(&base, &name);
     let admin = postgres::connect(&url, 2).await.expect("connect admin");
-    postgres::migrate(&admin).await.expect("migrate");
+    Some((url, admin))
+}
+
+async fn finish_test_db(url: String, admin: PgPool, rls_guard: bool) -> Option<TestDb> {
     if rls_guard {
         exec(&admin, rls_guard_sql(&admin).await).await;
     }

@@ -5,7 +5,7 @@
 -- pins its search_path: Postgres 17+ builds indexes with a restricted one.
 
 -- Parse JSON text; NULL when malformed (SQLite json_valid is false).
-CREATE FUNCTION intent_json(t text) RETURNS jsonb
+CREATE OR REPLACE FUNCTION intent_json(t text) RETURNS jsonb
 LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
 BEGIN
@@ -16,7 +16,7 @@ END
 $$;
 
 -- '$.a.b[2]' -> '{a,b,2}'. Only the path shapes the store uses.
-CREATE FUNCTION intent_json_path(p text) RETURNS text[]
+CREATE OR REPLACE FUNCTION intent_json_path(p text) RETURNS text[]
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT CASE WHEN p = '$' THEN ARRAY[]::text[]
@@ -26,7 +26,7 @@ SET search_path FROM CURRENT AS $$
     END
 $$;
 
-CREATE FUNCTION sqlite_json_valid(t text) RETURNS boolean
+CREATE OR REPLACE FUNCTION sqlite_json_valid(t text) RETURNS boolean
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT t IS NOT NULL AND intent_json(t) IS NOT NULL
@@ -34,7 +34,7 @@ $$;
 
 -- SQLite json_extract: SQL scalar for scalars (text here), JSON text for
 -- objects/arrays, NULL for JSON null or a missing path.
-CREATE FUNCTION sqlite_json_extract(t text, p text) RETURNS text
+CREATE OR REPLACE FUNCTION sqlite_json_extract(t text, p text) RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT CASE jsonb_typeof(v)
@@ -47,7 +47,7 @@ SET search_path FROM CURRENT AS $$
 $$;
 
 -- SQLite json_type names: null, true, false, integer, real, text, array, object.
-CREATE FUNCTION sqlite_json_type(t text, p text DEFAULT '$') RETURNS text
+CREATE OR REPLACE FUNCTION sqlite_json_type(t text, p text DEFAULT '$') RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT CASE jsonb_typeof(v)
@@ -61,7 +61,7 @@ $$;
 
 -- SQLite json_each over an array or object: key, value (scalar as text,
 -- containers as JSON text), type.
-CREATE FUNCTION sqlite_json_each(t text)
+CREATE OR REPLACE FUNCTION sqlite_json_each(t text)
 RETURNS TABLE (key text, value text, type text)
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
@@ -74,35 +74,35 @@ SET search_path FROM CURRENT AS $$
 $$;
 
 -- strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-CREATE FUNCTION intent_now_iso() RETURNS text
+CREATE OR REPLACE FUNCTION intent_now_iso() RETURNS text
 LANGUAGE sql STABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
 $$;
 
 -- x GLOB p, with p already translated to an anchored regex.
-CREATE FUNCTION intent_regex(x text, re text) RETURNS boolean
+CREATE OR REPLACE FUNCTION intent_regex(x text, re text) RETURNS boolean
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT x ~ re
 $$;
 
 -- SQLite typeof() over the column types the baseline uses.
-CREATE FUNCTION sqlite_typeof(x bigint) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE
+CREATE OR REPLACE FUNCTION sqlite_typeof(x bigint) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS
 $$ SELECT CASE WHEN x IS NULL THEN 'null' ELSE 'integer' END $$;
-CREATE FUNCTION sqlite_typeof(x text) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE
+CREATE OR REPLACE FUNCTION sqlite_typeof(x text) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS
 $$ SELECT CASE WHEN x IS NULL THEN 'null' ELSE 'text' END $$;
-CREATE FUNCTION sqlite_typeof(x double precision) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE
+CREATE OR REPLACE FUNCTION sqlite_typeof(x double precision) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS
 $$ SELECT CASE WHEN x IS NULL THEN 'null' ELSE 'real' END $$;
-CREATE FUNCTION sqlite_typeof(x bytea) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE
+CREATE OR REPLACE FUNCTION sqlite_typeof(x bytea) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS
 $$ SELECT CASE WHEN x IS NULL THEN 'null' ELSE 'blob' END $$;
 
 -- SQLite `t -> '$.p'`: the JSON text of the value at the path.
-CREATE FUNCTION sqlite_json_arrow(t text, p text) RETURNS text
+CREATE OR REPLACE FUNCTION sqlite_json_arrow(t text, p text) RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT (intent_json(t) #> intent_json_path(p))::text
@@ -110,7 +110,7 @@ $$;
 
 -- SQLite julianday() over 'now' and the ISO-8601 forms the store writes;
 -- NULL otherwise. STABLE because of 'now'.
-CREATE FUNCTION sqlite_julianday(t text) RETURNS double precision
+CREATE OR REPLACE FUNCTION sqlite_julianday(t text) RETURNS double precision
 LANGUAGE plpgsql STABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
 BEGIN
@@ -129,7 +129,7 @@ $$;
 
 -- SQLite json(): the value as JSON (an error when malformed). Pass it to
 -- sqlite_json_set to store JSON rather than a string.
-CREATE FUNCTION sqlite_json(t text) RETURNS jsonb
+CREATE OR REPLACE FUNCTION sqlite_json(t text) RETURNS jsonb
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT t::jsonb
@@ -137,7 +137,7 @@ $$;
 
 -- One json_set step: like SQLite, create missing parent objects, then set
 -- the leaf (SQL NULL becomes JSON null).
-CREATE FUNCTION intent_json_set_step(doc jsonb, p text, v jsonb) RETURNS jsonb
+CREATE OR REPLACE FUNCTION intent_json_set_step(doc jsonb, p text, v jsonb) RETURNS jsonb
 LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
 DECLARE
@@ -157,32 +157,32 @@ $$;
 -- value is stored: text as a JSON string, numbers as numbers, and
 -- sqlite_json(...) (SQLite json(...)) as JSON. A NULL document stays NULL;
 -- a malformed one is an error, as in SQLite.
-CREATE FUNCTION sqlite_json_set(t text, p text, v jsonb) RETURNS text
+CREATE OR REPLACE FUNCTION sqlite_json_set(t text, p text, v jsonb) RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT intent_json_set_step(t::jsonb, p, v)::text
 $$;
-CREATE FUNCTION sqlite_json_set(t text, p text, v text) RETURNS text
+CREATE OR REPLACE FUNCTION sqlite_json_set(t text, p text, v text) RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT intent_json_set_step(t::jsonb, p, to_jsonb(v))::text
 $$;
-CREATE FUNCTION sqlite_json_set(t text, p text, v bigint) RETURNS text
+CREATE OR REPLACE FUNCTION sqlite_json_set(t text, p text, v bigint) RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT intent_json_set_step(t::jsonb, p, to_jsonb(v))::text
 $$;
-CREATE FUNCTION sqlite_json_set(t text, p text, v double precision) RETURNS text
+CREATE OR REPLACE FUNCTION sqlite_json_set(t text, p text, v double precision) RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT intent_json_set_step(t::jsonb, p, to_jsonb(v))::text
 $$;
-CREATE FUNCTION sqlite_json_set(t text, p1 text, v1 jsonb, p2 text, v2 jsonb) RETURNS text
+CREATE OR REPLACE FUNCTION sqlite_json_set(t text, p1 text, v1 jsonb, p2 text, v2 jsonb) RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT intent_json_set_step(intent_json_set_step(t::jsonb, p1, v1), p2, v2)::text
 $$;
-CREATE FUNCTION sqlite_json_set(t text, p1 text, v1 text, p2 text, v2 text) RETURNS text
+CREATE OR REPLACE FUNCTION sqlite_json_set(t text, p1 text, v1 text, p2 text, v2 text) RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 SET search_path FROM CURRENT AS $$
     SELECT intent_json_set_step(intent_json_set_step(t::jsonb, p1, to_jsonb(v1)), p2, to_jsonb(v2))::text

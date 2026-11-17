@@ -147,7 +147,8 @@ fn check_indexes(file: &str, sql: &str, out: &mut Findings) -> usize {
         let name = s
             .split_whitespace()
             .skip_while(|w| !w.eq_ignore_ascii_case("INDEX"))
-            .nth(1)
+            .skip(1)
+            .find(|w| !["IF", "NOT", "EXISTS"].contains(&w.to_uppercase().as_str()))
             .unwrap_or("?");
         let on = upper.find(" ON ").expect("index ON");
         let open = on + s[on..].find('(').expect("index columns");
@@ -204,9 +205,9 @@ fn tenant_of(name: &str, body: &str) -> String {
 fn check_functions(file: &str, sql: &str, out: &mut Findings) -> usize {
     let mut count = 0;
     let mut rest = sql;
-    while let Some(pos) = rest.find("CREATE FUNCTION ") {
+    while let Some(pos) = rest.find("CREATE OR REPLACE FUNCTION ") {
         let after = &rest[pos..];
-        let name = word_after(after, "CREATE FUNCTION")
+        let name = word_after(after, "CREATE OR REPLACE FUNCTION")
             .unwrap_or("?")
             .to_owned();
         let body_start = after.find("$$").expect("function body") + 2;
