@@ -19,6 +19,7 @@ use sqlx::Transaction;
 pub use sqlx::postgres::PgPool;
 
 mod comments;
+mod discussions;
 mod note_search;
 mod notes;
 mod settings;

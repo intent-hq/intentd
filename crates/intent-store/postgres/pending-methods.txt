@@ -10,7 +10,6 @@ add_usage_rate
 add_usage_stats
 add_workspace_collaborator_within_cap
 add_workspace_member
-admit_discussion_delivery
 admit_script_notification
 admit_script_run
 adopt_pr_monitor
@@ -57,7 +56,6 @@ complete_pr_monitor
 complete_script_notification
 consume_repository_initialization_confirmation
 continue_script_notification
-control_discussion_activity
 count_active_hooks_by_agent
 count_active_hooks_by_workspace
 count_agent_messages
@@ -103,18 +101,6 @@ desktop_resolve_request
 desktop_set_permission
 desktop_terminal
 desktop_wake_exists
-discussion_activity
-discussion_actor_reaction_state
-discussion_agent_access
-discussion_agent_conversations
-discussion_conversation
-discussion_conversations
-discussion_invocation_allowed
-discussion_is_participant
-discussion_pending_deliveries
-discussion_reaction_state
-discussion_recipients
-discussion_visible_ids
 effective_principal_workspace_ids
 end_machine_leases
 enroll_node
@@ -213,7 +199,6 @@ get_workspace_message_watermark
 get_workspace_metrics
 get_workspace_owner_principal_id
 has_advisory_wake_delivery
-has_private_discussions
 has_repository_lifecycle_observer
 has_workspace_membership
 home_moves_to_machine
@@ -231,7 +216,6 @@ insert_agent_session_with_preferences
 insert_agent_session_with_task_graph
 insert_attachment
 insert_attachment_with_idempotency_key
-insert_discussion_message
 insert_event
 insert_events
 insert_executor_credential
@@ -275,9 +259,6 @@ list_cloud_placed_agents
 list_completion_watches
 list_credentialed_guest_principals
 list_diffs
-list_discussion_messages
-list_discussion_messages_for
-list_discussion_messages_in
 list_display_status_pr_monitors_by_workspace
 list_display_status_pr_monitors_by_workspaces
 list_effective_workspace_members
@@ -333,7 +314,6 @@ load_all_stop_redeliveries
 load_non_cancelled_pr_monitor_list_entries
 load_workspace_pr_monitor_reads
 lookup_principal_credential
-manage_discussion
 mark_completion_watch_report_delivered
 mark_home_move_pushed
 materialize_agent_session_harness_features
@@ -378,7 +358,6 @@ record_home_stop
 record_hook_dispatch
 record_node_welcome
 record_remote_agent
-recover_discussion_activity
 redeem_workspace_invite
 refresh_agent_session_timestamp
 rehome_agent_session_provider
@@ -435,7 +414,6 @@ script_notification_owners
 script_summary_page
 script_workspace
 search_agent_messages_fts
-send_discussion_message
 set_acp_session_id
 set_agent_effort_levels
 set_agent_notifications_muted
@@ -455,8 +433,6 @@ set_agent_session_system_prompt
 set_agent_session_system_prompt_with_breakdown
 set_agent_session_token_usage
 set_attention_request
-set_discussion_actor_reaction
-set_discussion_reaction
 set_exposed_machine_state
 set_home_move_machine
 set_interrupted_resolution
@@ -488,7 +464,6 @@ transfer_export_rows
 transfer_import_rows
 transfer_monitor_rows
 transfer_table_stats
-transition_discussion_activity
 transition_node_lease
 truncate_agent_messages_from
 unclaimed_home_sandboxes
