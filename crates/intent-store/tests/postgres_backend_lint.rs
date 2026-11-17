@@ -197,11 +197,13 @@ fn writers_without_lock(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (k, &start) in starts.iter().enumerate() {
         let chunk = &text[start..starts.get(k + 1).copied().unwrap_or(text.len())];
+        // Schema-level tables (the migration ledger) have no tenant to lock.
         let writes = string_literals(chunk).iter().any(|(_, lit)| {
             let l = lit.trim_start().to_lowercase();
             ["insert ", "update ", "delete "]
                 .iter()
                 .any(|w| l.starts_with(w))
+                && !NON_TENANT_TABLES.iter().any(|(t, _)| l.contains(t))
         });
         if writes && !chunk.contains("begin_write()") {
             let name = chunk[3..]
