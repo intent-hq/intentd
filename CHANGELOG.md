@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.234] - 2026-11-17
+
+### 🐛 Bug Fixes
+
+- Bump Codex ACP fallback to v2.7.0 ([#3458](https://github.com/intent-hq/intentd/pull/3458))
+
+
 ## [0.11.233] - 2026-11-17
 
 ### 🚀 Features
