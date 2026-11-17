@@ -181,7 +181,7 @@ impl FakeNorthflank {
 
     /// A service with its volume, as an earlier run left it: created
     /// `created_at`, with `tags` as team tags and `runtime_env`, paused.
-    fn seed_service(&self, id: &str, tags: &[String], runtime_env: Value, created_at: &str) {
+    fn seed_service(&self, id: &str, tags: &[String], runtime_env: &Value, created_at: &str) {
         let home = self.root.join(id);
         std::fs::create_dir_all(&home).unwrap();
         let group = Arc::new(ProcessGroup::new().unwrap());
@@ -969,9 +969,9 @@ async fn the_reaper_deletes_this_backends_leftover_northflank_machines() {
     ];
     let tags_env = |backend: &str| json!({ "INTENT_TAGS": json!({ "intentBackendId": backend, "agentId": "gone" }).to_string() });
     let old = "2026-01-01T00:00:00Z";
-    fake.seed_service("left-new", &mine, tags_env(&backend_id), old);
-    fake.seed_service("left-legacy", &mine, json!({}), old);
-    fake.seed_service("foreign", &theirs, tags_env("another-backend"), old);
+    fake.seed_service("left-new", &mine, &tags_env(&backend_id), old);
+    fake.seed_service("left-legacy", &mine, &json!({}), old);
+    fake.seed_service("foreign", &theirs, &tags_env("another-backend"), old);
     fake.state().api.seed_volume("left-volume", &mine, old);
 
     ok(

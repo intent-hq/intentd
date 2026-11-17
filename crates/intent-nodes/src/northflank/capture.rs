@@ -88,6 +88,7 @@ impl Recorder {
             .http
             .request(method.clone(), self.api(path))
             .bearer_auth(self.client.token.expose())
+            // fixed-deadline: allow — a live Northflank request in a by-hand capture, never under the test multiplier
             .timeout(Duration::from_secs(60));
         if !query.is_empty() {
             request = request.query(query);
@@ -186,6 +187,7 @@ impl Recorder {
         let mut done = false;
         loop {
             let wait = if done { 10 } else { 120 };
+            // fixed-deadline: allow — a live Northflank stream in a by-hand capture, never under the test multiplier
             let Ok(next) = tokio::time::timeout(Duration::from_secs(wait), ws.next()).await else {
                 frames.push(json!({ "silent": wait }));
                 break;
@@ -749,11 +751,11 @@ async fn capture_northflank_fixtures() {
         .as_millis()
         .to_string();
 
-    let recorded = AssertUnwindSafe(record(&mut recorder, &run))
+    let outcome = AssertUnwindSafe(record(&mut recorder, &run))
         .catch_unwind()
         .await;
     let cleaned = clean_up(&mut recorder, &run).await;
-    match recorded {
+    match outcome {
         Err(panic) => std::panic::resume_unwind(panic),
         Ok(Err(e)) => panic!("capture failed: {e} (clean-up: {cleaned:?})"),
         Ok(Ok(())) => {}

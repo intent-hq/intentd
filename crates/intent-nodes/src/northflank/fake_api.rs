@@ -44,7 +44,7 @@ impl Reply {
     pub fn data(data: Value) -> Self {
         Self {
             status: 200,
-            body: json!({ "data": data }),
+            body: object([("data", data)]),
         }
     }
 
@@ -75,12 +75,12 @@ pub fn page(key: Option<&str>, items: Vec<Value>, query: &str) -> Reply {
         .and_then(|c| c.strip_prefix("cursor-")?.parse::<usize>().ok())
         .unwrap_or(0)
         .min(items.len());
-    let end = (start + per_page).min(items.len());
     let count = items.len();
-    let shown: Vec<Value> = items[start..end].to_vec();
+    let end = (start + per_page).min(count);
+    let shown = Value::Array(items.into_iter().skip(start).take(end - start).collect());
     let data = match key {
-        Some(key) => json!({ key: shown }),
-        None => Value::Array(shown),
+        Some(key) => object([(key, shown)]),
+        None => shown,
     };
     let mut pagination = json!({ "hasNextPage": end < count, "count": count });
     if end < count {
@@ -88,8 +88,12 @@ pub fn page(key: Option<&str>, items: Vec<Value>, query: &str) -> Reply {
     }
     Reply {
         status: 200,
-        body: json!({ "data": data, "pagination": pagination }),
+        body: object([("data", data), ("pagination", pagination)]),
     }
+}
+
+fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
+    Value::Object(fields.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
 }
 
 /// A compute plan.
