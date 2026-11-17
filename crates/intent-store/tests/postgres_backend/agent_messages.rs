@@ -1346,10 +1346,39 @@ async fn agent_usage_cells(
     .expect("read usage cells")
 }
 
+/// Make every `agent_message` insert with role `boom` fail, on either
+/// backend, to force an error after a transcript insert has written rows.
+async fn fail_boom_messages(store: &Store, db: Option<&TestDb>) {
+    match db {
+        None => {
+            sqlx::raw_sql(
+                "CREATE TRIGGER IF NOT EXISTS transcript_test_boom BEFORE INSERT ON agent_message \
+                 WHEN NEW.role = 'boom' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .execute(store.write_pool())
+            .await
+            .expect("install sqlite boom trigger");
+        }
+        Some(db) => {
+            exec(
+                &db.admin,
+                "CREATE OR REPLACE FUNCTION transcript_test_boom() RETURNS trigger \
+                 LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'boom'; END $$; \
+                 DROP TRIGGER IF EXISTS transcript_test_boom ON agent_message; \
+                 CREATE TRIGGER transcript_test_boom BEFORE INSERT ON agent_message \
+                 FOR EACH ROW WHEN (NEW.role = 'boom') EXECUTE FUNCTION transcript_test_boom();"
+                    .to_owned(),
+            )
+            .await;
+        }
+    }
+}
+
 // Sessions inserted with whole transcripts, then read back one at a time and
 // per workspace. Names, prompts and message bodies carry the tenant, and the
-// decoy leaves `tr-a`, `tr-b`, `tr-o` with the same ids plus a decoy-only
-// `tr-zz` (probed as missing, listed in the same workspace), so a read
+// decoy leaves `tr-a`, `tr-b`, `tr-o`, `tr-n` with the same ids plus decoy-only
+// `tr-zz` (probed as missing, listed in the same workspace) and `tr-x` (probed
+// as missing after its failed insert), so a read
 // without its tenant filter returns the decoy's rows on the subject run.
 crate::harness::parity_test!(agent_transcripts_insert_and_read, |store, tenant, db| {
     let ws = WorkspaceId(WS.into());
@@ -1434,6 +1463,41 @@ crate::harness::parity_test!(agent_transcripts_insert_and_read, |store, tenant, 
             .await,
         Err(intent_core::Error::Internal(_))
     ));
+    assert_eq!(store.count_agent_messages(&agent("tr-a")).await.unwrap(), 4);
+    // A message that fails after the session row and a first message are
+    // written rolls the whole insert back.
+    fail_boom_messages(&store, db).await;
+    let boom = json!([{ "type": "text", "text": "boom" }]);
+    let failing = [
+        ReplaceMessage {
+            role: "user",
+            content: &contents[0],
+            metadata: Some(&user_meta),
+            created_at: "2026-02-01T00:00:00Z",
+        },
+        ReplaceMessage {
+            role: "boom",
+            content: &boom,
+            metadata: None,
+            created_at: "2026-02-01T00:00:04Z",
+        },
+    ];
+    assert!(matches!(
+        store
+            .insert_agent_session_with_messages(
+                &transcript_session("tr-x", WS, tenant, "2026-02-01T00:00:05Z"),
+                &failing,
+            )
+            .await,
+        Err(intent_core::Error::Internal(_))
+    ));
+    assert!(matches!(
+        store
+            .get_agent_session_with_transcript(&agent("tr-x"))
+            .await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+    assert_eq!(store.count_agent_messages(&agent("tr-x")).await.unwrap(), 0);
 
     let loaded = store
         .get_agent_session_with_transcript(&agent("tr-a"))
@@ -1486,6 +1550,37 @@ crate::harness::parity_test!(agent_transcripts_insert_and_read, |store, tenant, 
     assert!(agent_usage_cells(&store, db, tenant, "tr-b")
         .await
         .is_empty());
+    let mut unknown = transcript_session("tr-n", ARCHIVED_WS, tenant, "2026-02-01T00:00:01Z");
+    unknown.model = None;
+    store
+        .insert_agent_session_with_messages(&unknown, &rows[..2])
+        .await
+        .unwrap();
+    assert_eq!(
+        agent_usage_cells(&store, db, tenant, "tr-n").await,
+        vec![("unknown".to_owned(), 1, 1)]
+    );
+    let archived = store
+        .list_agent_sessions_with_transcripts(&WorkspaceId(ARCHIVED_WS.into()))
+        .await
+        .unwrap();
+    let archived: Vec<(&str, Option<&str>, Vec<&Value>)> = archived
+        .iter()
+        .map(|s| {
+            (
+                s.id.as_str(),
+                s.model.as_deref(),
+                s.messages.iter().map(|m| &m.content).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        archived,
+        vec![
+            ("tr-o", Some("opus"), vec![&contents[0]]),
+            ("tr-n", None, vec![&contents[0], &contents[1]]),
+        ]
+    );
 
     let listed = store
         .list_agent_sessions_with_transcripts(&ws)
@@ -1508,6 +1603,13 @@ crate::harness::parity_test!(agent_transcripts_insert_and_read, |store, tenant, 
         store
             .insert_agent_session_with_messages(
                 &transcript_session("tr-zz", WS, tenant, "2026-02-01T00:00:00Z"),
+                &rows[..2],
+            )
+            .await
+            .unwrap();
+        store
+            .insert_agent_session_with_messages(
+                &transcript_session("tr-x", WS, tenant, "2026-02-01T00:00:05Z"),
                 &rows[..2],
             )
             .await

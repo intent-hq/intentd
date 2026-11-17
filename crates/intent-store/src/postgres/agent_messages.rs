@@ -738,6 +738,20 @@ impl PgStore {
         agent_id: &AgentId,
         limit: Option<i64>,
     ) -> Result<Vec<AgentMessage>> {
+        let mut tx = self.begin_read_snapshot().await?;
+        let messages = self.messages_in(&mut tx, agent_id, limit).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(messages)
+    }
+
+    /// One agent's messages (the newest `limit`, or all) in `seq` order, with
+    /// their payloads spliced back in.
+    async fn messages_in(
+        &self,
+        conn: &mut PgConnection,
+        agent_id: &AgentId,
+        limit: Option<i64>,
+    ) -> Result<Vec<AgentMessage>> {
         let sql = match limit {
             Some(_) => format!(
                 "SELECT {MESSAGE_COLUMNS} FROM (SELECT {MESSAGE_COLUMNS} FROM agent_message \
@@ -749,7 +763,6 @@ impl PgStore {
                  WHERE tenant_id = $1 AND agent_id = $2 ORDER BY seq"
             ),
         };
-        let mut tx = self.begin_read_snapshot().await?;
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(self.tenant())
             .bind(&agent_id.0);
@@ -757,14 +770,12 @@ impl PgStore {
             query = query.bind(n.max(0));
         }
         let rows = query
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut *conn)
             .await
             .map_err(internal("get agent messages failed"))?;
         let mut messages: Vec<AgentMessage> =
             rows.iter().map(map_message_row).collect::<Result<_>>()?;
-        self.hydrate_message_payloads(&mut tx, &mut messages)
-            .await?;
-        tx.commit().await.map_err(db)?;
+        self.hydrate_message_payloads(conn, &mut messages).await?;
         Ok(messages)
     }
 
@@ -2143,7 +2154,7 @@ impl PgStore {
         .map_err(internal("get agent session failed"))?
         .ok_or_else(|| Error::NotFound(format!("agent session {id}")))?;
         let mut session = map_session(&row, true)?;
-        session.messages = self.transcript_in(&mut tx, id).await?;
+        session.messages = self.messages_in(&mut tx, id, None).await?;
         tx.commit().await.map_err(db)?;
         Ok(session)
     }
@@ -2165,31 +2176,10 @@ impl PgStore {
         let mut sessions = Vec::with_capacity(rows.len());
         for row in &rows {
             let mut session = map_session(row, true)?;
-            session.messages = self.transcript_in(&mut tx, &session.id).await?;
+            session.messages = self.messages_in(&mut tx, &session.id, None).await?;
             sessions.push(session);
         }
         tx.commit().await.map_err(db)?;
         Ok(sessions)
-    }
-
-    /// One agent's whole message log with its payloads spliced back in.
-    async fn transcript_in(
-        &self,
-        conn: &mut PgConnection,
-        agent_id: &AgentId,
-    ) -> Result<Vec<AgentMessage>> {
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {MESSAGE_COLUMNS} FROM agent_message \
-             WHERE tenant_id = $1 AND agent_id = $2 ORDER BY seq"
-        )))
-        .bind(self.tenant())
-        .bind(&agent_id.0)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(internal("get agent messages failed"))?;
-        let mut messages: Vec<AgentMessage> =
-            rows.iter().map(map_message_row).collect::<Result<_>>()?;
-        self.hydrate_message_payloads(conn, &mut messages).await?;
-        Ok(messages)
     }
 }
