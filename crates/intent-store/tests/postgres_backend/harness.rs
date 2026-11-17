@@ -36,7 +36,7 @@ async fn drop_stale_databases(server: &PgPool, now: u64) {
     }
 }
 
-async fn exec(pool: &PgPool, sql: String) {
+pub async fn exec(pool: &PgPool, sql: String) {
     sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
         .execute(pool)
         .await

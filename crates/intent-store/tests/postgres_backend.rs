@@ -19,8 +19,8 @@ mod settings;
 #[path = "postgres_backend/workspaces.rs"]
 mod workspaces;
 
-use harness::{open, open_with, test_db};
-use intent_store::postgres::TenantId;
+use harness::{exec, open, open_with, test_db};
+use intent_store::postgres::{self, TenantId};
 
 #[tokio::test]
 async fn settings_are_isolated_between_tenants_with_identical_keys() {
