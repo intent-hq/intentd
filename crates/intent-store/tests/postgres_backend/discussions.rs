@@ -106,6 +106,13 @@ impl Seed {
         .expect("check query")
     }
 
+    fn tenant(&self) -> &str {
+        match self {
+            Self::Sqlite(_) => "sqlite",
+            Self::Pg(_, t) => t,
+        }
+    }
+
     async fn primary(&self) -> PrincipalId {
         let ids = self
             .texts("SELECT id FROM principal WHERE {w}is_primary = 1")
@@ -116,7 +123,8 @@ impl Seed {
 
     /// Workspace `ws-d` (owned by the primary principal), members alice
     /// (collaborator) and bob (manager), host member carol, outsider dave,
-    /// and agents agent-a and agent-b.
+    /// and agents agent-a and agent-b. Logins are `{id}-{tenant}`, so a
+    /// profile read from another tenant shows.
     async fn workspace(&self, store: &Store) {
         store
             .insert_workspace(&Workspace {
@@ -129,12 +137,9 @@ impl Seed {
             })
             .await
             .unwrap();
-        for (id, login) in [
-            ("alice", "alice-l"),
-            ("bob", "bob-l"),
-            ("carol", "carol-l"),
-            ("dave", "dave-l"),
-        ] {
+        let tenant = self.tenant().to_owned();
+        for id in ["alice", "bob", "carol", "dave"] {
+            let login = format!("{id}-{tenant}");
             self.exec(&format!(
                 "INSERT INTO principal ({{c}}id, login, display_name, created_at, updated_at) \
                  VALUES ({{v}}'{id}', '{login}', 'Name {id}', '{T0}', '{T0}')"
@@ -159,6 +164,23 @@ impl Seed {
             ))
             .await;
         }
+    }
+
+    /// Access that only the decoy has, added after its own run: outsider
+    /// dave becomes a member and a host member, agent-b gets the default
+    /// conversation and agent-c exists. A subject query that misses its
+    /// tenant filter then grants access its assertions deny.
+    async fn decoy_only_access(&self) {
+        self.exec(&format!(
+            "INSERT INTO workspace_member ({{c}}workspace_id, principal_id, role, added_at) \
+             VALUES ({{v}}'{WS}', 'dave', 'collaborator', '{T0}'); \
+             INSERT INTO host_member ({{c}}principal_id, added_at) VALUES ({{v}}'dave', '{T0}'); \
+             INSERT INTO agent_session ({{c}}id, workspace_id, name, status, created_at, updated_at) \
+             VALUES ({{v}}'agent-c', '{WS}', 'agent-c', 'idle', '{T0}', '{T0}'); \
+             INSERT INTO discussion_agent_grant ({{c}}workspace_id, conversation_id, agent_id) \
+             VALUES ({{v}}'{WS}', 'default', 'agent-b')"
+        ))
+        .await;
     }
 }
 
@@ -286,11 +308,27 @@ seeded_test!(messages_page_retry_and_reply, |store, seed, tenant| {
         .messages
         .is_empty());
     assert!(!store.has_private_discussions(&ws()).await.unwrap());
+    if tenant == "decoy" {
+        store
+            .send_discussion_message(
+                &ws(),
+                "decoy-private",
+                "only here",
+                &human(&pid("alice")),
+                &DiscussionTarget {
+                    recipient_principal_ids: Some(vec![pid("bob")]),
+                    ..DiscussionTarget::default()
+                },
+            )
+            .await
+            .unwrap();
+        seed.decoy_only_access().await;
+    }
 });
 
 seeded_test!(
     conversations_participants_and_management,
-    |store, seed, _tenant| {
+    |store, seed, tenant| {
         seed.workspace(&store).await;
         let primary = seed.primary().await;
         let (alice, bob, dave) = (pid("alice"), pid("bob"), pid("dave"));
@@ -347,7 +385,7 @@ seeded_test!(
             .iter()
             .map(|p| p.login.clone().unwrap())
             .collect();
-        assert_eq!(logins, ["alice-l", "bob-l"]);
+        assert_eq!(logins, [format!("alice-{tenant}"), format!("bob-{tenant}")]);
 
         assert!(store.has_private_discussions(&ws()).await.unwrap());
         assert!(store
@@ -408,17 +446,23 @@ seeded_test!(
         assert_eq!(page["hasMore"], false);
 
         let members = store
-            .discussion_recipients(&ws(), &alice, "-L", None, 1)
+            .discussion_recipients(
+                &ws(),
+                &alice,
+                &format!("-{}", tenant.to_uppercase()),
+                None,
+                1,
+            )
             .await
             .unwrap();
-        assert_eq!(members["members"][0]["login"], "bob-l");
+        assert_eq!(members["members"][0]["login"], format!("bob-{tenant}"));
         assert_eq!(members["hasMore"], true);
         let members = store
-            .discussion_recipients(&ws(), &alice, "-l", Some("bob"), 10)
+            .discussion_recipients(&ws(), &alice, &format!("-{tenant}"), Some("bob"), 10)
             .await
             .unwrap();
         assert_eq!(members["members"].as_array().unwrap().len(), 1);
-        assert_eq!(members["members"][0]["login"], "carol-l");
+        assert_eq!(members["members"][0]["login"], format!("carol-{tenant}"));
         assert_eq!(members["hasMore"], false);
 
         assert!(matches!(
@@ -465,6 +509,26 @@ seeded_test!(
             .unwrap()
             .messages
             .is_empty());
+        if tenant == "decoy" {
+            let (live, _) = store
+                .send_discussion_message(
+                    &ws(),
+                    "decoy-topic",
+                    "still listed",
+                    &human(&alice),
+                    &DiscussionTarget {
+                        create_conversation: true,
+                        ..DiscussionTarget::default()
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .manage_discussion(&ws(), &bob, &live.conversation.id, Some("Decoy"))
+                .await
+                .unwrap();
+            seed.decoy_only_access().await;
+        }
     }
 );
 
@@ -529,6 +593,22 @@ seeded_test!(agent_deliveries_and_activity, |store, seed, tenant| {
                 "x",
                 &agent("agent-b"),
                 &DiscussionTarget::default()
+            )
+            .await,
+        Err(Error::NotFound(_))
+    ));
+
+    assert!(matches!(
+        store
+            .send_discussion_message(
+                &ws(),
+                "m-c",
+                "@agent-c",
+                &human(&primary),
+                &DiscussionTarget {
+                    recipient_agent_ids: vec![aid("agent-c")],
+                    ..DiscussionTarget::default()
+                },
             )
             .await,
         Err(Error::NotFound(_))
@@ -689,7 +769,33 @@ seeded_test!(agent_deliveries_and_activity, |store, seed, tenant| {
         .unwrap();
     assert_eq!(history.messages[0].agent_activity[0].state, "stopped");
     if tenant == "decoy" {
-        // Left pending: the subject's recovery must not abandon it.
+        // Left behind for the subject's run: a pending delivery, a working
+        // invocation with its queued row, and a pending interruption. The
+        // subject's reads must not list them and its recovery must not
+        // stop, delete or abandon them.
+        let address = DiscussionTarget {
+            recipient_agent_ids: vec![a.clone()],
+            ..DiscussionTarget::default()
+        };
+        store
+            .send_discussion_message(&ws(), "left-pending", "x", &human(&primary), &address)
+            .await
+            .unwrap();
+        let (busy, _) = store
+            .send_discussion_message(&ws(), "left-working", "y", &human(&primary), &address)
+            .await
+            .unwrap();
+        let busy_turn = format!("discussion:{}:agent-a", busy.message.id);
+        assert!(store
+            .admit_discussion_delivery(&busy.message.id, &queued(&busy_turn, &busy_turn))
+            .await
+            .unwrap());
+        store
+            .transition_discussion_activity(&busy_turn, "working", None)
+            .await
+            .unwrap()
+            .expect("decoy invocation");
+        seed.decoy_only_access().await;
         seed.exec(
             "UPDATE interrupted_agent SET resolution = 'pending' WHERE {w}agent_id = 'agent-a'",
         )
@@ -697,7 +803,7 @@ seeded_test!(agent_deliveries_and_activity, |store, seed, tenant| {
     }
 });
 
-seeded_test!(reactions_by_humans_and_agents, |store, seed, _tenant| {
+seeded_test!(reactions_by_humans_and_agents, |store, seed, tenant| {
     seed.workspace(&store).await;
     let primary = seed.primary().await;
     let alice = pid("alice");
@@ -734,7 +840,7 @@ seeded_test!(reactions_by_humans_and_agents, |store, seed, _tenant| {
     );
     assert_eq!(
         state.reactions[0].reactors[0].login.as_deref(),
-        Some("alice-l")
+        Some(format!("alice-{tenant}").as_str())
     );
     let (_, changed) = store
         .set_discussion_reaction(&ws(), DEFAULT_CONVERSATION, &message, &alice, "👍", true)
@@ -816,4 +922,7 @@ seeded_test!(reactions_by_humans_and_agents, |store, seed, _tenant| {
             .await,
         Err(Error::NotFound(_))
     ));
+    if tenant == "decoy" {
+        seed.decoy_only_access().await;
+    }
 });
