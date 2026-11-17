@@ -133,7 +133,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<std::collections::HashSet<WorkspaceId>> {
-        pending_postgres!("workspaces_with_active_hooks_or_script_monitors", self, backend => backend.workspaces_with_active_hooks_or_script_monitors(workspace_ids).await)
+        dispatch!(self, backend => backend.workspaces_with_active_hooks_or_script_monitors(workspace_ids).await)
     }
 
     /// Outstanding reservations include active watches and untransferred jobs.

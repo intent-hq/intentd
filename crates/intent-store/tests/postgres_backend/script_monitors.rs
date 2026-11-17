@@ -10,9 +10,11 @@
 //! right.
 
 use intent_core::script_lists::ScriptListOptions;
+use std::collections::HashSet;
+
 use intent_core::{
-    AgentId, AgentSession, Error, ScriptMode, ScriptMonitor, ScriptMonitorTrigger, Workspace,
-    WorkspaceId,
+    AgentId, AgentSession, Error, Hook, HookId, HookState, ScriptMode, ScriptMonitor,
+    ScriptMonitorTrigger, Workspace, WorkspaceId,
 };
 use intent_store::{AgentQueueRow, Store};
 use serde_json::{json, Value};
@@ -611,5 +613,152 @@ parity_test!(
             .is_empty());
 
         decoy_rows(&store, tenant, db).await;
+    }
+);
+
+fn hook(id: &str, ws: &str, agent: &str, state: HookState, tenant: &str) -> Hook {
+    Hook {
+        hook_id: HookId(id.into()),
+        workspace_id: wid(ws),
+        agent_id: aid(agent),
+        name: format!("{tenant} {id}"),
+        code: format!("return '{tenant}'"),
+        delay_ms: 1000,
+        cron: None,
+        run_at: None,
+        state,
+        created_at: T0.into(),
+        last_run_at: None,
+        next_run_at: Some(T1.into()),
+        run_count: 0,
+        last_error: None,
+        last_logs: None,
+        last_state: None,
+        expires_at: None,
+        perpetual: false,
+        dispatch_count: 0,
+    }
+}
+
+/// A workspace with one agent of the same suffix (`ws-h` / `agent-h`).
+async fn seed_parent(store: &Store, tenant: &str, suffix: &str) {
+    let ws = format!("ws-{suffix}");
+    store
+        .insert_workspace(&Workspace {
+            id: wid(&ws),
+            title: format!("{tenant} {ws}"),
+            branch: "main".into(),
+            created_at: T0.into(),
+            updated_at: T0.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    store
+        .insert_agent_session(&AgentSession {
+            id: aid(&format!("agent-{suffix}")),
+            workspace_id: wid(&ws),
+            name: format!("agent-{suffix} of {tenant}"),
+            created_at: T0.into(),
+            updated_at: T0.into(),
+            ..AgentSession::default()
+        })
+        .await
+        .unwrap();
+}
+
+parity_test!(
+    workspaces_with_active_hooks_or_script_monitors_unions_both_signals,
+    |store, tenant| {
+        // `ws-m` is waiting through its monitor alone, `ws-n` through a
+        // scheduled hook alone, `ws-h` through a running hook; `ws-x` holds
+        // only settled rows and `ws-d` is never created by the subject.
+        seed(&store, tenant).await;
+        seed_parent(&store, tenant, "h").await;
+        seed_parent(&store, tenant, "x").await;
+        let requested: Vec<WorkspaceId> = ["ws-m", "ws-n", "ws-h", "ws-x", "ws-d", "ws-missing"]
+            .into_iter()
+            .map(wid)
+            .collect();
+        assert!(store
+            .workspaces_with_active_hooks_or_script_monitors(&requested)
+            .await
+            .unwrap()
+            .is_empty());
+
+        insert(&store, &["m1", "m3"], tenant).await;
+        settle(&store, &["m3"], tenant).await;
+        for (id, ws, agent, state) in [
+            ("hm", "ws-m", "agent-a", HookState::Cancelled),
+            ("hn", "ws-n", "agent-c", HookState::Scheduled),
+            ("hh", "ws-h", "agent-h", HookState::Running),
+            ("hx", "ws-x", "agent-x", HookState::Dispatched),
+        ] {
+            store
+                .insert_hook(&hook(id, ws, agent, state, tenant))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .workspaces_with_active_hooks_or_script_monitors(&requested)
+                .await
+                .unwrap(),
+            HashSet::from([wid("ws-m"), wid("ws-n"), wid("ws-h")])
+        );
+        assert_eq!(
+            store
+                .workspaces_with_active_hooks_or_script_monitors(&[wid("ws-m"), wid("ws-x")])
+                .await
+                .unwrap(),
+            HashSet::from([wid("ws-m")])
+        );
+        assert!(store
+            .workspaces_with_active_hooks_or_script_monitors(&[wid("ws-x"), wid("ws-d")])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .workspaces_with_active_hooks_or_script_monitors(&[])
+            .await
+            .unwrap()
+            .is_empty());
+
+        if tenant == "decoy" {
+            // Active rows where the subject has none, and inactive hooks
+            // under the subject's active hook ids. Settling deletes a
+            // monitor row, so the decoy's `m1` stays active.
+            seed_parent(&store, tenant, "d").await;
+            store
+                .insert_hook(&hook("hd", "ws-d", "agent-d", HookState::Scheduled, tenant))
+                .await
+                .unwrap();
+            store
+                .insert_hook(&hook("hx2", "ws-x", "agent-x", HookState::Running, tenant))
+                .await
+                .unwrap();
+            for (id, ws, agent, script) in [
+                ("md", "ws-d", "agent-d", "s-d"),
+                ("mx", "ws-x", "agent-x", "s-x"),
+            ] {
+                store
+                    .insert_script_monitor(&ScriptMonitor {
+                        monitor_id: id.into(),
+                        workspace_id: wid(ws),
+                        agent_id: aid(agent),
+                        script_id: script.into(),
+                        ..monitor(id, tenant)
+                    })
+                    .await
+                    .unwrap();
+            }
+            for id in ["hn", "hh"] {
+                store
+                    .update_hook_state(&HookId(id.into()), HookState::Cancelled)
+                    .await
+                    .unwrap();
+            }
+        }
     }
 );

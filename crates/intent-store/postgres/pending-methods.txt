@@ -188,7 +188,6 @@ upsert_event_subscription
 upsert_known_repo
 upsert_tracked_change
 upsert_workspace_metrics
-workspaces_with_active_hooks_or_script_monitors
 write_pool
 write_repository_selection
 write_repository_selection_admitted
