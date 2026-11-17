@@ -112,7 +112,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` on a database failure.
     pub async fn principal_instructions_revoked(&self, principal: &PrincipalId) -> Result<bool> {
-        pending_postgres!("principal_instructions_revoked", self, backend => backend.principal_instructions_revoked(principal).await)
+        dispatch!(self, backend => backend.principal_instructions_revoked(principal).await)
     }
 
     /// Read durable counters, also suitable for taking a proof challenge's
@@ -121,7 +121,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` for a database failure.
     pub async fn host_membership_state(&self) -> Result<HostMembershipState> {
-        pending_postgres!("host_membership_state", self, backend => backend.host_membership_state().await)
+        dispatch!(self, backend => backend.host_membership_state().await)
     }
 
     /// Resolve host authority without inspecting any workspace membership.
@@ -129,7 +129,7 @@ impl Store {
     /// # Errors
     /// Returns `NotFound` for an unknown principal, `Internal` on DB failure.
     pub async fn get_host_role(&self, principal_id: &PrincipalId) -> Result<HostRole> {
-        pending_postgres!("get_host_role", self, backend => backend.get_host_role(principal_id).await)
+        dispatch!(self, backend => backend.get_host_role(principal_id).await)
     }
 
     /// Owner first, then members by grant time and ID. Profiles and revision
@@ -138,7 +138,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` for a database failure.
     pub async fn list_host_members(&self) -> Result<HostMembersSnapshot> {
-        pending_postgres!("list_host_members", self, backend => backend.list_host_members().await)
+        dispatch!(self, backend => backend.list_host_members().await)
     }
 
     /// Insert a new pinned invite; the creator must still be the primary.
@@ -148,7 +148,7 @@ impl Store {
     /// Returns `InvalidInput` for an invalid invite/non-owner issuer, or
     /// `Internal` on database failure (including a duplicate invitation).
     pub async fn insert_host_invite(&self, invite: &HostInvite) -> Result<()> {
-        pending_postgres!("insert_host_invite", self, backend => backend.insert_host_invite(invite).await)
+        dispatch!(self, backend => backend.insert_host_invite(invite).await)
     }
 
     /// Read only the host scope, retaining closed history.
@@ -156,7 +156,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` for a database failure.
     pub async fn get_host_invite(&self, id: &str) -> Result<Option<HostInvite>> {
-        pending_postgres!("get_host_invite", self, backend => backend.get_host_invite(id).await)
+        dispatch!(self, backend => backend.get_host_invite(id).await)
     }
 
     /// List open host invitations by creation time, then ID.
@@ -164,7 +164,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` for a database failure.
     pub async fn list_open_host_invites(&self) -> Result<Vec<HostInvite>> {
-        pending_postgres!("list_open_host_invites", self, backend => backend.list_open_host_invites().await)
+        dispatch!(self, backend => backend.list_open_host_invites().await)
     }
 
     /// Revoke only a usable host invitation. Unknown/wrong-scope IDs are
@@ -173,7 +173,7 @@ impl Store {
     /// # Errors
     /// Returns `NotFound` for an unknown host invite, `Internal` on DB failure.
     pub async fn revoke_host_invite(&self, id: &str) -> Result<bool> {
-        pending_postgres!("revoke_host_invite", self, backend => backend.revoke_host_invite(id).await)
+        dispatch!(self, backend => backend.revoke_host_invite(id).await)
     }
 
     /// Redeem one verified host invite, resolving the full stable identity
@@ -190,7 +190,7 @@ impl Store {
         identity: &Principal,
         credential: HostJoinCredential<'_>,
     ) -> Result<HostInviteJoinOutcome> {
-        pending_postgres!("join_host_by_invite", self, backend => backend.join_host_by_invite(invite_id, identity, credential).await)
+        dispatch!(self, backend => backend.join_host_by_invite(invite_id, identity, credential).await)
     }
 
     /// Remove an active host member and their direct collaborator grants,
@@ -205,7 +205,7 @@ impl Store {
         &self,
         principal_id: &PrincipalId,
     ) -> Result<HostMemberRemoval> {
-        pending_postgres!("remove_host_member", self, backend => backend.remove_host_member(principal_id).await)
+        dispatch!(self, backend => backend.remove_host_member(principal_id).await)
     }
 
     /// Owner removal, with authority checked under the same write transaction.
@@ -218,7 +218,7 @@ impl Store {
         actor: &PrincipalId,
         principal_id: &PrincipalId,
     ) -> Result<HostMemberRemoval> {
-        pending_postgres!("remove_host_member_by_owner", self, backend => backend.remove_host_member_by_owner(actor, principal_id).await)
+        dispatch!(self, backend => backend.remove_host_member_by_owner(actor, principal_id).await)
     }
 
     /// Revoke the caller's own access, whether a guest or an active member.
@@ -230,7 +230,7 @@ impl Store {
         &self,
         principal_id: &PrincipalId,
     ) -> Result<HostMemberRemoval> {
-        pending_postgres!("revoke_principal_access", self, backend => backend.revoke_principal_access(principal_id).await)
+        dispatch!(self, backend => backend.revoke_principal_access(principal_id).await)
     }
 }
 
