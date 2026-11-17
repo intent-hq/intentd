@@ -2207,7 +2207,15 @@ pub(crate) fn watch_capacity_diagnostics() -> String {
 /// the hub-wide `state` mutex — and through it every other group's `subscribe`,
 /// contradicting the per-group isolation this module claims. A sink that goes
 /// away mid-send just makes the send a no-op.
+///
+/// `Access` events are dropped before any of that: they carry no change, and
+/// a subscriber that reads the files it watches (skills and specialists
+/// discovery) would otherwise see its own reads as changes and rescan forever
+/// (intent-hq/intent#9484). inotify always reports `IN_OPEN`.
 fn demux(sinks: &Arc<Mutex<Vec<Sink>>>, event: &notify::Event) {
+    if matches!(event.kind, notify::EventKind::Access(_)) {
+        return;
+    }
     let routes: Vec<(PathBuf, bool, mpsc::UnboundedSender<notify::Event>)> = match sinks.lock() {
         Ok(sinks) => sinks
             .iter()
@@ -3917,6 +3925,113 @@ mod tests {
         assert_eq!(got_a.kind, event.kind, "event kind must survive narrowing");
         let got_b = rx_b.try_recv().expect("destination side must be delivered");
         assert_eq!(got_b.paths, vec![b.join("moved.txt")]);
+    }
+
+    /// intent-hq/intent#9484: read-access events carry no change, and a sink
+    /// that took them as one looped on its own discovery scan. The hub drops
+    /// every `Access` kind before routing, while a mutation on the same path
+    /// still reaches the sink.
+    #[test]
+    fn demux_drops_access_events() {
+        use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind};
+
+        let root = PathBuf::from("/parent/ws");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sinks = Arc::new(Mutex::new(vec![Sink {
+            id: 0,
+            root: root.clone(),
+            recursive: true,
+            tx,
+        }]));
+        let file = root.join(".claude/skills/s1/SKILL.md");
+
+        for kind in [
+            AccessKind::Open(AccessMode::Any),
+            AccessKind::Close(AccessMode::Read),
+            AccessKind::Close(AccessMode::Write),
+            AccessKind::Read,
+            AccessKind::Any,
+        ] {
+            demux(
+                &sinks,
+                &notify::Event::new(EventKind::Access(kind)).add_path(file.clone()),
+            );
+        }
+        assert!(rx.try_recv().is_err(), "access events must not be routed");
+
+        let write = notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(file.clone());
+        demux(&sinks, &write);
+        assert_eq!(
+            rx.try_recv().expect("a write must be routed").paths,
+            vec![file]
+        );
+    }
+
+    /// intent-hq/intent#9484, end to end on a tier watch: reading the skill
+    /// files and listing the tier (what discovery does) must not fire
+    /// `on_change`; a write must. Linux only: `FSEvents` reports no reads.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_tier_watch_ignores_reads_of_its_own_files() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("tier-reads");
+        let ws = base.path.join("ws");
+        let tier = ws.join(".claude/skills");
+        let skill = tier.join("s1");
+        std::fs::create_dir_all(&skill).expect("mk skill");
+        std::fs::write(skill.join("SKILL.md"), "x").expect("write SKILL.md");
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let hub = SharedWatchHub::new();
+        let _watch = watch_tiers(
+            &hub,
+            &ws,
+            &[".claude/skills"],
+            |p| p.file_name().is_some_and(|n| n == "SKILL.md"),
+            move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        while hits.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the catch-up flush must fire once the watch is live"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = hits.load(Ordering::SeqCst);
+
+        for _ in 0..10 {
+            for d in [&ws, &tier, &skill] {
+                let _ = std::fs::read_dir(d).expect("list dir").count();
+            }
+            std::fs::read_to_string(skill.join("SKILL.md")).expect("read SKILL.md");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            before,
+            "reading or listing a tier must not count as a change"
+        );
+
+        std::fs::write(skill.join("SKILL.md"), "y").expect("rewrite SKILL.md");
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        while hits.load(Ordering::SeqCst) == before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a write must still count as a change"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// A path under neither root reaches neither sink, even when it shares the
