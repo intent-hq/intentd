@@ -2216,7 +2216,8 @@ async fn a_background_refresh_that_changes_the_report_pushes_it_unasked() {
 
     node.service.refresh_report().await;
     assert_eq!(node.report.refreshes.load(Ordering::SeqCst), 2);
-    let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+    let window = intentd_test_support::test_timeout(Duration::from_millis(300));
+    let quiet = tokio::time::timeout(window, async {
         loop {
             match next_frame(&mut dialed).await {
                 Some(LinkFrame::Journal(_)) => {}
