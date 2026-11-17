@@ -361,302 +361,305 @@ parity_test!(agent_sessions_insert_and_read, |store, tenant| {
 parity_test!(
     agent_session_full_row_and_metadata_writers,
     |store, tenant| {
-        seed_sessions(&store, tenant).await;
-        let at = |n: u32| format!("2026-02-01T00:00:{n:02}Z {tenant}");
-        let (w, a) = (ws(), aid("agent-a"));
-
-        // A manual choice is a daemon-owned key: whole-document writes keep it.
-        store
-            .set_agent_session_model_choice(&w, &a, "opus", Some("claude"), Some("tok"), &at(1))
-            .await
-            .unwrap();
-        assert_eq!(
-            metadata(&store, "agent-a").await,
-            Some(json!({ "tenant": tenant, "manualChoice": "tok" }))
-        );
-        let mut row = store.get_agent_session_without_messages(&a).await.unwrap();
-        row.name = format!("renamed {tenant}");
-        row.status = AgentStatus::Waiting;
-        row.metadata = Some(json!({ "x": tenant, "manualChoice": "forged" }));
-        row.updated_at = at(2);
-        store
-            .update_agent_session_with_preferences(&w, &row, true, Some(true), Some(true), false)
-            .await
-            .unwrap();
-        let got = store.get_agent_session_without_messages(&a).await.unwrap();
-        assert_eq!(got.name, format!("renamed {tenant}"));
-        assert_eq!(got.status, AgentStatus::Waiting);
-        assert!(got.notifications_muted && got.pinned);
-        assert_eq!(
-            got.metadata,
-            Some(json!({ "x": tenant, "manualChoice": "tok" }))
-        );
-        assert!(not_found(
-            &store
-                .update_agent_session(&WorkspaceId("ws-none".into()), &row)
-                .await
-        ));
-        assert!(!store
-            .take_agent_session_manual_choice(&w, &a, "wrong")
-            .await
-            .unwrap());
-        assert!(store
-            .take_agent_session_manual_choice(&w, &a, "tok")
-            .await
-            .unwrap());
-        assert_eq!(
-            metadata(&store, "agent-a").await,
-            Some(json!({ "x": tenant }))
-        );
-
-        // Selection changes reset the manual choice; whole writes after it keep the rest.
-        store
-            .set_agent_session_model_choice(&w, &a, "opus", Some("claude"), Some("t2"), &at(3))
-            .await
-            .unwrap();
-        store
-            .set_agent_session_model(&w, &a, "opus", Some("claude"), &at(4))
-            .await
-            .unwrap();
-        assert_eq!(
-            metadata(&store, "agent-a").await,
-            Some(json!({ "x": tenant }))
-        );
-
-        store
-            .update_agent_session_metadata(&w, &a, Some(&json!({ "y": tenant })), &at(5))
-            .await
-            .unwrap();
-        assert_eq!(
-            metadata(&store, "agent-a").await,
-            Some(json!({ "y": tenant }))
-        );
-        assert!(not_found(
-            &store
-                .update_agent_session_metadata(&w, &aid("agent-zz"), None, &at(5))
-                .await
-        ));
-
-        let key = "lastSeenMessageId";
-        assert!(store
-            .set_agent_session_metadata_key(&w, &a, key, "m1", None, Some(&at(6)))
-            .await
-            .unwrap());
-        assert!(!store
-            .set_agent_session_metadata_key(&w, &a, key, "m2", Some(Some("m0")), None)
-            .await
-            .unwrap());
-        assert!(store
-            .set_agent_session_metadata_key(&w, &a, key, "m2", Some(Some("m1")), None)
-            .await
-            .unwrap());
-        assert!(not_found(
-            &store
-                .set_agent_session_metadata_key(&w, &aid("agent-zz"), key, "m", Some(None), None)
-                .await
-        ));
-        assert_eq!(
-            store
-                .take_agent_session_metadata_key(&w, &a, key)
-                .await
-                .unwrap(),
-            Some("m2".into())
-        );
-        assert_eq!(
-            store
-                .take_agent_session_metadata_key(&w, &a, key)
-                .await
-                .unwrap(),
-            None
-        );
-        store
-            .set_agent_session_metadata_key_json(&w, &a, "obj", r#"{"n":1}"#, &at(7))
-            .await
-            .unwrap();
-        assert_eq!(
-            metadata(&store, "agent-a").await,
-            Some(json!({ "y": tenant, "obj": { "n": 1 } }))
-        );
-        let got = store.get_agent_session_without_messages(&a).await.unwrap();
-        assert_eq!(got.updated_at, at(7));
-
-        // Provider moves.
-        store.set_acp_session_id(&w, &a, "acp-1").await.unwrap();
-        store.set_acp_session_id(&w, &a, "acp-1").await.unwrap();
-        assert!(store.set_acp_session_id(&w, &a, "acp-x").await.is_err());
-        let mut moved = store.get_agent_session_without_messages(&a).await.unwrap();
-        moved.provider = Some("codex".into());
-        assert!(store.update_agent_session(&w, &moved).await.is_err());
-        assert!(store
-            .rehome_agent_session_provider(&w, &a, Some("claude"), "codex", Some("gpt"), &at(8))
-            .await
-            .unwrap());
-        assert!(!store
-            .rehome_agent_session_provider(&w, &a, Some("claude"), "codex", Some("gpt"), &at(8))
-            .await
-            .unwrap());
-        assert!(not_found(
-            &store
-                .rehome_agent_session_provider(&w, &aid("agent-zz"), None, "codex", None, &at(8))
-                .await
-        ));
-        assert!(store
-            .failover_agent_session_provider(
-                &w,
-                &a,
-                "codex",
-                Some("gpt"),
-                "claude",
-                Some(("providerReturn", r#"{"to":"codex"}"#)),
-                true,
-                &at(9),
-            )
-            .await
-            .unwrap());
-        assert!(!store
-            .failover_agent_session_provider(
-                &w,
-                &a,
-                "codex",
-                Some("gpt"),
-                "claude",
-                None,
-                false,
-                &at(9)
-            )
-            .await
-            .unwrap());
-        assert!(store
-            .set_agent_session_metadata_key_json_if_identity(
-                &w,
-                &a,
-                "claude",
-                Some("gpt"),
-                "k",
-                "[1,2]",
-                true,
-                &at(10),
-            )
-            .await
-            .unwrap());
-        assert!(!store
-            .set_agent_session_metadata_key_json_if_identity(
-                &w,
-                &a,
-                "codex",
-                Some("gpt"),
-                "k",
-                "[3]",
-                false,
-                &at(10),
-            )
-            .await
-            .unwrap());
-        assert_eq!(
-            metadata(&store, "agent-a").await,
-            Some(
-                json!({ "y": tenant, "obj": { "n": 1 }, "providerReturn": { "to": "codex" }, "k": [1, 2] })
-            )
-        );
-        // The return state is daemon-owned too.
-        store
-            .update_agent_session_metadata(&w, &a, Some(&json!(["not", "an", "object"])), &at(11))
-            .await
-            .unwrap();
-        assert_eq!(
-            metadata(&store, "agent-a").await,
-            Some(
-                json!({ "priorNonObjectMetadata": ["not", "an", "object"], "providerReturn": { "to": "codex" } })
-            )
-        );
-        let got = store.get_agent_session_without_messages(&a).await.unwrap();
-        assert_eq!(
-            (got.provider.as_deref(), got.model.as_deref()),
-            (Some("claude"), Some("gpt"))
-        );
-
-        let c = aid("agent-c");
-        assert!(store
-            .pin_agent_session_provider_if_null(&w, &c, "claude", &at(12))
-            .await
-            .unwrap());
-        assert!(!store
-            .pin_agent_session_provider_if_null(&w, &c, "codex", &at(12))
-            .await
-            .unwrap());
-        assert!(not_found(
-            &store
-                .pin_agent_session_provider_if_null(
-                    &WorkspaceId("ws-none".into()),
-                    &c,
-                    "x",
-                    &at(12)
-                )
-                .await
-        ));
-        assert!(store
-            .fill_agent_session_identity_if_null(&w, &c, Some("sonnet"), Some("high"), &at(13))
-            .await
-            .unwrap());
-        assert!(!store
-            .fill_agent_session_identity_if_null(&w, &c, Some("haiku"), Some("low"), &at(13))
-            .await
-            .unwrap());
-        assert!(store
-            .fill_agent_session_effort_if_identity(
-                &w,
-                &aid("agent-b"),
-                "low",
-                Some("codex"),
-                Some("opus"),
-                &at(14)
-            )
-            .await
-            .unwrap());
-        let got = store.get_agent_session_without_messages(&c).await.unwrap();
-        assert_eq!(
-            (
-                got.model.as_deref(),
-                got.reasoning_effort.as_deref(),
-                got.provider.as_deref()
-            ),
-            (Some("sonnet"), Some("high"), Some("claude"))
-        );
-        // A model change drops an effort the daemon pinned from Auto.
-        store
-            .set_agent_session_model(&w, &c, "haiku", Some("claude"), &at(15))
-            .await
-            .unwrap();
-        let got = store.get_agent_session_without_messages(&c).await.unwrap();
-        assert_eq!(got.reasoning_effort, None);
-        assert!(not_found(
-            &store
-                .set_agent_session_model(&w, &aid("agent-zz"), "m", None, &at(15))
-                .await
-        ));
-        assert!(not_found(
-            &store
-                .pin_agent_session_provider_if_null(&w, &aid("agent-zz"), "x", &at(16))
-                .await
-        ));
-        if tenant == "decoy" {
-            // Back to the state the subject's guarded writes start from.
-            let mut row = store.get_agent_session_without_messages(&c).await.unwrap();
-            (row.provider, row.model, row.reasoning_effort) = (None, None, None);
-            store.update_agent_session(&w, &row).await.unwrap();
-            let mut row = store
-                .get_agent_session_without_messages(&aid("agent-b"))
-                .await
-                .unwrap();
-            row.reasoning_effort = None;
-            store.update_agent_session(&w, &row).await.unwrap();
-        }
-        decoy_only_sessions(&store, tenant).await;
+        Box::pin(full_row_and_metadata_writers(&store, tenant)).await;
     }
 );
 
+async fn full_row_and_metadata_writers(store: &Store, tenant: &str) {
+    seed_sessions(store, tenant).await;
+    let at = |n: u32| format!("2026-02-01T00:00:{n:02}Z {tenant}");
+    let (w, a) = (ws(), aid("agent-a"));
+
+    // A manual choice is a daemon-owned key: whole-document writes keep it.
+    store
+        .set_agent_session_model_choice(&w, &a, "opus", Some("claude"), Some("tok"), &at(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata(store, "agent-a").await,
+        Some(json!({ "tenant": tenant, "manualChoice": "tok" }))
+    );
+    let mut row = store.get_agent_session_without_messages(&a).await.unwrap();
+    row.name = format!("renamed {tenant}");
+    row.status = AgentStatus::Waiting;
+    row.metadata = Some(json!({ "x": tenant, "manualChoice": "forged" }));
+    row.updated_at = at(2);
+    store
+        .update_agent_session_with_preferences(&w, &row, true, Some(true), Some(true), false)
+        .await
+        .unwrap();
+    let got = store.get_agent_session_without_messages(&a).await.unwrap();
+    assert_eq!(got.name, format!("renamed {tenant}"));
+    assert_eq!(got.status, AgentStatus::Waiting);
+    assert!(got.notifications_muted && got.pinned);
+    assert_eq!(
+        got.metadata,
+        Some(json!({ "x": tenant, "manualChoice": "tok" }))
+    );
+    assert!(not_found(
+        &store
+            .update_agent_session(&WorkspaceId("ws-none".into()), &row)
+            .await
+    ));
+    assert!(!store
+        .take_agent_session_manual_choice(&w, &a, "wrong")
+        .await
+        .unwrap());
+    assert!(store
+        .take_agent_session_manual_choice(&w, &a, "tok")
+        .await
+        .unwrap());
+    assert_eq!(
+        metadata(store, "agent-a").await,
+        Some(json!({ "x": tenant }))
+    );
+
+    // Selection changes reset the manual choice; whole writes after it keep the rest.
+    store
+        .set_agent_session_model_choice(&w, &a, "opus", Some("claude"), Some("t2"), &at(3))
+        .await
+        .unwrap();
+    store
+        .set_agent_session_model(&w, &a, "opus", Some("claude"), &at(4))
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata(store, "agent-a").await,
+        Some(json!({ "x": tenant }))
+    );
+
+    store
+        .update_agent_session_metadata(&w, &a, Some(&json!({ "y": tenant })), &at(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata(store, "agent-a").await,
+        Some(json!({ "y": tenant }))
+    );
+    assert!(not_found(
+        &store
+            .update_agent_session_metadata(&w, &aid("agent-zz"), None, &at(5))
+            .await
+    ));
+
+    let key = "lastSeenMessageId";
+    assert!(store
+        .set_agent_session_metadata_key(&w, &a, key, "m1", None, Some(&at(6)))
+        .await
+        .unwrap());
+    assert!(!store
+        .set_agent_session_metadata_key(&w, &a, key, "m2", Some(Some("m0")), None)
+        .await
+        .unwrap());
+    assert!(store
+        .set_agent_session_metadata_key(&w, &a, key, "m2", Some(Some("m1")), None)
+        .await
+        .unwrap());
+    assert!(not_found(
+        &store
+            .set_agent_session_metadata_key(&w, &aid("agent-zz"), key, "m", Some(None), None)
+            .await
+    ));
+    assert_eq!(
+        store
+            .take_agent_session_metadata_key(&w, &a, key)
+            .await
+            .unwrap(),
+        Some("m2".into())
+    );
+    assert_eq!(
+        store
+            .take_agent_session_metadata_key(&w, &a, key)
+            .await
+            .unwrap(),
+        None
+    );
+    store
+        .set_agent_session_metadata_key_json(&w, &a, "obj", r#"{"n":1}"#, &at(7))
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata(store, "agent-a").await,
+        Some(json!({ "y": tenant, "obj": { "n": 1 } }))
+    );
+    let got = store.get_agent_session_without_messages(&a).await.unwrap();
+    assert_eq!(got.updated_at, at(7));
+
+    // Provider moves.
+    store.set_acp_session_id(&w, &a, "acp-1").await.unwrap();
+    store.set_acp_session_id(&w, &a, "acp-1").await.unwrap();
+    assert!(store.set_acp_session_id(&w, &a, "acp-x").await.is_err());
+    let mut moved = store.get_agent_session_without_messages(&a).await.unwrap();
+    moved.provider = Some("codex".into());
+    assert!(store.update_agent_session(&w, &moved).await.is_err());
+    assert!(store
+        .rehome_agent_session_provider(&w, &a, Some("claude"), "codex", Some("gpt"), &at(8))
+        .await
+        .unwrap());
+    assert!(!store
+        .rehome_agent_session_provider(&w, &a, Some("claude"), "codex", Some("gpt"), &at(8))
+        .await
+        .unwrap());
+    assert!(not_found(
+        &store
+            .rehome_agent_session_provider(&w, &aid("agent-zz"), None, "codex", None, &at(8))
+            .await
+    ));
+    assert!(store
+        .failover_agent_session_provider(
+            &w,
+            &a,
+            "codex",
+            Some("gpt"),
+            "claude",
+            Some(("providerReturn", r#"{"to":"codex"}"#)),
+            true,
+            &at(9),
+        )
+        .await
+        .unwrap());
+    assert!(!store
+        .failover_agent_session_provider(
+            &w,
+            &a,
+            "codex",
+            Some("gpt"),
+            "claude",
+            None,
+            false,
+            &at(9)
+        )
+        .await
+        .unwrap());
+    assert!(store
+        .set_agent_session_metadata_key_json_if_identity(
+            &w,
+            &a,
+            "claude",
+            Some("gpt"),
+            "k",
+            "[1,2]",
+            true,
+            &at(10),
+        )
+        .await
+        .unwrap());
+    assert!(!store
+        .set_agent_session_metadata_key_json_if_identity(
+            &w,
+            &a,
+            "codex",
+            Some("gpt"),
+            "k",
+            "[3]",
+            false,
+            &at(10),
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        metadata(store, "agent-a").await,
+        Some(
+            json!({ "y": tenant, "obj": { "n": 1 }, "providerReturn": { "to": "codex" }, "k": [1, 2] })
+        )
+    );
+    // The return state is daemon-owned too.
+    store
+        .update_agent_session_metadata(&w, &a, Some(&json!(["not", "an", "object"])), &at(11))
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata(store, "agent-a").await,
+        Some(
+            json!({ "priorNonObjectMetadata": ["not", "an", "object"], "providerReturn": { "to": "codex" } })
+        )
+    );
+    let got = store.get_agent_session_without_messages(&a).await.unwrap();
+    assert_eq!(
+        (got.provider.as_deref(), got.model.as_deref()),
+        (Some("claude"), Some("gpt"))
+    );
+
+    let c = aid("agent-c");
+    assert!(store
+        .pin_agent_session_provider_if_null(&w, &c, "claude", &at(12))
+        .await
+        .unwrap());
+    assert!(!store
+        .pin_agent_session_provider_if_null(&w, &c, "codex", &at(12))
+        .await
+        .unwrap());
+    assert!(not_found(
+        &store
+            .pin_agent_session_provider_if_null(&WorkspaceId("ws-none".into()), &c, "x", &at(12))
+            .await
+    ));
+    assert!(store
+        .fill_agent_session_identity_if_null(&w, &c, Some("sonnet"), Some("high"), &at(13))
+        .await
+        .unwrap());
+    assert!(!store
+        .fill_agent_session_identity_if_null(&w, &c, Some("haiku"), Some("low"), &at(13))
+        .await
+        .unwrap());
+    assert!(store
+        .fill_agent_session_effort_if_identity(
+            &w,
+            &aid("agent-b"),
+            "low",
+            Some("codex"),
+            Some("opus"),
+            &at(14)
+        )
+        .await
+        .unwrap());
+    let got = store.get_agent_session_without_messages(&c).await.unwrap();
+    assert_eq!(
+        (
+            got.model.as_deref(),
+            got.reasoning_effort.as_deref(),
+            got.provider.as_deref()
+        ),
+        (Some("sonnet"), Some("high"), Some("claude"))
+    );
+    // A model change drops an effort the daemon pinned from Auto.
+    store
+        .set_agent_session_model(&w, &c, "haiku", Some("claude"), &at(15))
+        .await
+        .unwrap();
+    let got = store.get_agent_session_without_messages(&c).await.unwrap();
+    assert_eq!(got.reasoning_effort, None);
+    assert!(not_found(
+        &store
+            .set_agent_session_model(&w, &aid("agent-zz"), "m", None, &at(15))
+            .await
+    ));
+    assert!(not_found(
+        &store
+            .pin_agent_session_provider_if_null(&w, &aid("agent-zz"), "x", &at(16))
+            .await
+    ));
+    if tenant == "decoy" {
+        // Back to the state the subject's guarded writes start from.
+        let mut row = store.get_agent_session_without_messages(&c).await.unwrap();
+        (row.provider, row.model, row.reasoning_effort) = (None, None, None);
+        store.update_agent_session(&w, &row).await.unwrap();
+        let mut row = store
+            .get_agent_session_without_messages(&aid("agent-b"))
+            .await
+            .unwrap();
+        row.reasoning_effort = None;
+        store.update_agent_session(&w, &row).await.unwrap();
+    }
+    decoy_only_sessions(store, tenant).await;
+}
+
 parity_test!(agent_session_state_writers, |store, tenant| {
-    seed_sessions(&store, tenant).await;
+    Box::pin(state_writers(&store, tenant)).await;
+});
+
+async fn state_writers(store: &Store, tenant: &str) {
+    seed_sessions(store, tenant).await;
     let at = |n: u32| format!("2026-03-01T00:00:{n:02}Z {tenant}");
     let (w, a, b) = (ws(), aid("agent-a"), aid("agent-b"));
     let missing = aid("agent-zz");
@@ -945,8 +948,8 @@ parity_test!(agent_session_state_writers, |store, tenant| {
             .await
             .unwrap();
     }
-    decoy_only_sessions(&store, tenant).await;
-});
+    decoy_only_sessions(store, tenant).await;
+}
 
 parity_test!(agent_session_token_usage_and_acp_fold, |store, tenant| {
     seed_sessions(&store, tenant).await;
