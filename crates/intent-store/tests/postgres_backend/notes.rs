@@ -1014,3 +1014,40 @@ async fn retired_note_paging_cleanup_deletes_only_the_tenants_rows() {
     .unwrap();
     assert_eq!(left, [("tenant-b".into(), 5), ("tenant-b/head".into(), 1)]);
 }
+
+// SQLite FTS5 has no stopword list, so the Postgres search keeps stopwords
+// too: a single "the" or "about" still finds the note.
+parity_test!(note_search_finds_stopwords, |store| {
+    store
+        .insert_note(&note(
+            "sw1",
+            "Notes",
+            "about the plan",
+            "2026-09-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+    store
+        .insert_note(&note(
+            "sw2",
+            "Other",
+            "unrelated words",
+            "2026-09-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+    let options = NoteFtsOptions::default();
+    for expr in [
+        "(\"the\" OR \"the\"*)",
+        "(\"about\" OR \"about\"*)",
+        "(\"ab\" OR \"ab\"*)",
+        "\"about\" AND (\"the\" OR \"the\"*)",
+    ] {
+        let hits = store.search_notes_fts(expr, &options).await.unwrap();
+        assert_eq!(
+            search_ids(&hits),
+            ["sw1"].map(String::from).into(),
+            "{expr}"
+        );
+    }
+});

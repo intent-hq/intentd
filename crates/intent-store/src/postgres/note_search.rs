@@ -41,7 +41,7 @@ fn ranked_sql(options: &NoteFtsOptions<'_>) -> String {
                + CASE WHEN w.archived <> 0 THEN 1.0 ELSE 0.0 END)::float8 AS adjusted_rank \
          FROM note n \
          JOIN workspace w ON w.tenant_id = $1 AND w.id = n.workspace_id \
-         CROSS JOIN to_tsquery('english', $3) AS q(query) \
+         CROSS JOIN to_tsquery('intent_search', $3) AS q(query) \
          WHERE n.tenant_id = $1 AND n.search_tsv @@ q.query{filters}"
     )
 }
