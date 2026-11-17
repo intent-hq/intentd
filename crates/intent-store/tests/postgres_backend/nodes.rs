@@ -95,6 +95,7 @@ parity_test!(nodes_enroll_list_get_and_find, |store, tenant| {
     if tenant == "decoy" {
         enroll(&store, tenant, "node-first", "head-decoy").await;
         enroll(&store, tenant, "node-decoy", "head-1").await;
+        enroll(&store, tenant, "node-c2", "head-1").await;
     }
     let (a, lease_a) = enroll(&store, tenant, "node-a", "head-1").await;
     let (b, lease_b) = enroll(&store, tenant, "node-b", "head-1").await;
@@ -126,6 +127,10 @@ parity_test!(nodes_enroll_list_get_and_find, |store, tenant| {
             Err(Error::NotFound(_))
         ));
         assert_eq!(store.find_execution_node("node-decoy").await.unwrap(), None);
+        assert!(matches!(
+            store.get_node("node-c2", "head-1").await,
+            Err(Error::NotFound(_))
+        ));
         let decoy = node("decoy", "node-decoy", "head-1");
         assert!(matches!(
             store
@@ -256,11 +261,7 @@ parity_test!(machine_leases_renew_and_end, |store, tenant| {
         if !writes {
             let other = node(tenant, "m-decoy", "head-1");
             store
-                .renew_machine_lease(
-                    &other,
-                    &lease(tenant, &other, "lease-m-decoy"),
-                    NodeCounter(0),
-                )
+                .renew_machine_lease(&other, &lease(tenant, &other, "lease-2"), NodeCounter(0))
                 .await
                 .unwrap();
             return;
@@ -282,6 +283,11 @@ parity_test!(machine_leases_renew_and_end, |store, tenant| {
         assert_eq!(leases[1].owner.lease_id, "lease-2");
         assert_eq!(leases[1].state, LeaseState::Acquiring);
         assert_eq!(leases[1].link_generation, NodeCounter(3));
+        let welcomed = store
+            .record_node_welcome(&second.owner, NodeOs::Linux, NodeArch::X86_64, 2, "3.0.0")
+            .await
+            .unwrap();
+        assert_eq!(welcomed.state, LeaseState::Ready);
 
         let foreign = node(tenant, "m1", "head-other");
         assert!(matches!(
@@ -306,6 +312,22 @@ parity_test!(machine_leases_renew_and_end, |store, tenant| {
         assert_eq!(store.end_machine_leases("m1", "head-1").await.unwrap(), 0);
         let ended = store.get_node_lease(&second.owner).await.unwrap();
         assert_eq!(ended.state, LeaseState::Lost);
+        assert!(matches!(
+            store.next_node_link_generation(&second.owner).await,
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            store
+                .record_node_welcome(&second.owner, NodeOs::Linux, NodeArch::X86_64, 2, "3.0.1")
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            store
+                .advance_node_lease_ack(&second.owner, NodeCounter(9))
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
     }
     .await;
 });
@@ -332,6 +354,10 @@ parity_test!(final_stops_record_list_and_get, |store, tenant| {
     if tenant == "decoy" {
         store
             .record_final_stop(&stop(tenant, "agent-decoy", "lease-a", T0))
+            .await
+            .unwrap();
+        store
+            .record_final_stop(&stop(tenant, "agent-decoy-2", "lease-none", T0))
             .await
             .unwrap();
     }
@@ -365,7 +391,9 @@ parity_test!(final_stops_record_list_and_get, |store, tenant| {
         store.list_final_stops("lease-b").await.unwrap(),
         vec![three]
     );
-    assert_eq!(store.list_final_stops("lease-none").await.unwrap(), vec![]);
+    if tenant != "decoy" {
+        assert_eq!(store.list_final_stops("lease-none").await.unwrap(), vec![]);
+    }
 });
 
 fn invite(tenant: &str, id: &str, expires_at: &str) -> NodeInvite {
@@ -419,7 +447,7 @@ parity_test!(
                         "inv-decoy-claimed",
                         &hash("inv-decoy-claimed"),
                         "backend-x",
-                        &credential(tenant, "cred-decoy", "backend-x", T0),
+                        &credential(tenant, "cred-inv", "backend-x", T0),
                         "token-decoy",
                         None,
                     )
@@ -655,6 +683,17 @@ parity_test!(executor_bindings_decide_and_persist, |store, tenant| {
             assert_eq!(
                 store
                     .bind_executor(&cred, "node-1", &binding("head-b", "node-1", 7))
+                    .await
+                    .unwrap(),
+                BindDecision::Accept
+            );
+            assert_eq!(
+                store
+                    .bind_executor(
+                        &cred_id("cred-only"),
+                        "node-1",
+                        &binding("head-b", "node-1", 5)
+                    )
                     .await
                     .unwrap(),
                 BindDecision::Accept
