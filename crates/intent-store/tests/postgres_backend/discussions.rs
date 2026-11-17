@@ -13,8 +13,6 @@ use intent_core::discussion::{
 use intent_core::{AgentId, Error, PrincipalId, Workspace, WorkspaceId};
 use intent_store::{AgentQueueRow, Store};
 
-use crate::harness::{open, sqlite_store, tenant_rows, test_db};
-
 const WS: &str = "ws-d";
 const T0: &str = "2026-01-01T00:00:00.000Z";
 
@@ -184,38 +182,16 @@ impl Seed {
     }
 }
 
-/// Like `parity_test!`, with a [`Seed`] for the backend under test.
+/// [`parity_test!`] with a [`Seed`] for the backend under test.
 macro_rules! seeded_test {
     ($name:ident, |$store:ident, $seed:ident, $tenant:ident| $body:block) => {
-        #[tokio::test]
-        async fn $name() {
-            {
-                eprintln!("[{}] backend: sqlite", stringify!($name));
-                let (store, _dir) = sqlite_store().await;
-                let $seed = Seed::Sqlite(store.write_pool().clone());
-                let $store = store;
-                let $tenant: &str = "sqlite";
-                $body
-            }
-            if let Some(db) = test_db(false).await {
-                let mut before = Vec::new();
-                for t in ["decoy", "subject"] {
-                    eprintln!("[{}] backend: postgres, tenant {t}", stringify!($name));
-                    if t == "subject" {
-                        before = tenant_rows(&db.admin, "decoy").await;
-                    }
-                    let $store = open(&db, t).await;
-                    let $seed = Seed::Pg(db.admin.clone(), t.to_owned());
-                    let $tenant: &str = t;
-                    $body
-                }
-                let after = tenant_rows(&db.admin, "decoy").await;
-                assert!(
-                    before == after,
-                    "the subject tenant's run changed the decoy tenant's rows"
-                );
-            }
-        }
+        $crate::harness::parity_test!($name, |$store, $tenant, test_db| {
+            let $seed = match test_db {
+                None => Seed::Sqlite($store.write_pool().clone()),
+                Some(db) => Seed::Pg(db.admin.clone(), $tenant.to_owned()),
+            };
+            $body
+        });
     };
 }
 
