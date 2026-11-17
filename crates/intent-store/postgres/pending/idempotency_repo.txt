@@ -1,3 +1,0 @@
-get_idempotent
-put_idempotent
-reap_idempotent

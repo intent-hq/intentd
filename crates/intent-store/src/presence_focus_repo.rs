@@ -18,7 +18,7 @@ impl Store {
         person: &PrincipalId,
         candidates: &[Value],
     ) -> Result<Value> {
-        pending_postgres!("authorized_presence_focus", self, backend => backend.authorized_presence_focus(source, viewer, person, candidates).await)
+        dispatch!(self, backend => backend.authorized_presence_focus(source, viewer, person, candidates).await)
     }
 }
 

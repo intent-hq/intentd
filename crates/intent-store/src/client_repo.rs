@@ -29,7 +29,7 @@ impl Store {
         capabilities: Option<&serde_json::Value>,
         host: &ClientHostInfo,
     ) -> Result<()> {
-        pending_postgres!("upsert_client", self, backend => backend.upsert_client(id, name, capabilities, host).await)
+        dispatch!(self, backend => backend.upsert_client(id, name, capabilities, host).await)
     }
 
     /// Ensure a `client` row exists for `id` without recording a hello: the
@@ -42,7 +42,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn ensure_client(&self, id: &ClientId) -> Result<()> {
-        pending_postgres!("ensure_client", self, backend => backend.ensure_client(id).await)
+        dispatch!(self, backend => backend.ensure_client(id).await)
     }
 
     /// Fetch a logical client by id — `None` when the id was never seen. A
@@ -54,7 +54,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_client(&self, id: &ClientId) -> Result<Option<Client>> {
-        pending_postgres!("get_client", self, backend => backend.get_client(id).await)
+        dispatch!(self, backend => backend.get_client(id).await)
     }
 }
 
