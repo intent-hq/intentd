@@ -357,6 +357,18 @@ fn keys_without_decoy_rows_lists_uncovered_keys() {
     );
 }
 
+// An early `return` in a body must end only that run: the subject run (the
+// one that catches leaks) still happens.
+harness::parity_test!(
+    #[should_panic(expected = "the subject run happened")]
+    an_early_return_does_not_skip_the_subject_run,
+    |_store, tenant| {
+        let postgres = std::env::var("INTENT_STORE_TEST_PG_URL").is_ok();
+        assert!(tenant != "subject" && postgres, "the subject run happened");
+        return;
+    }
+);
+
 #[test]
 fn tenant_ids_are_validated() {
     assert!(TenantId::new("org_1:prod-eu.a").is_ok());
