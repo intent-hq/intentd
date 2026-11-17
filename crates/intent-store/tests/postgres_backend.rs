@@ -163,6 +163,44 @@ async fn closing_one_tenant_store_leaves_the_shared_pool_open() {
     assert_eq!(b.get_setting("k").await.unwrap().as_deref(), Some("1"));
 }
 
+#[tokio::test]
+async fn migrate_resumes_a_part_way_file_and_refuses_unknown_history() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let ledger = |sql: &str| exec(&db.admin, sql.to_owned());
+    // Every statement of 0002 committed, but the run stopped before the file
+    // was marked complete: a re-run must not repeat its CREATE TABLEs.
+    ledger("UPDATE intent_schema_migrations SET complete = false WHERE version = 2").await;
+    postgres::migrate(&db.admin)
+        .await
+        .expect("resume after the last applied statement");
+    let (complete,): (bool,) =
+        sqlx::query_as("SELECT complete FROM intent_schema_migrations WHERE version = 2")
+            .fetch_one(&db.admin)
+            .await
+            .unwrap();
+    assert!(complete);
+
+    ledger(
+        "UPDATE intent_schema_migrations SET complete = false, applied_prefix = '\\x00' \
+         WHERE version = 2",
+    )
+    .await;
+    let changed = postgres::migrate(&db.admin).await.unwrap_err().to_string();
+    assert!(changed.contains("changed since"), "{changed}");
+    ledger("UPDATE intent_schema_migrations SET complete = true WHERE version = 2").await;
+
+    ledger(
+        "INSERT INTO intent_schema_migrations \
+         (version, description, checksum, applied_statements, applied_prefix, complete) \
+         VALUES (9999, 'future', '\\x00', 0, '\\x00', true)",
+    )
+    .await;
+    let unknown = postgres::migrate(&db.admin).await.unwrap_err().to_string();
+    assert!(unknown.contains("unknown to this build"), "{unknown}");
+}
+
 #[test]
 fn tenant_ids_are_validated() {
     assert!(TenantId::new("org_1:prod-eu.a").is_ok());

@@ -2852,7 +2852,8 @@ jobs:
         run: |
           changed=$(git diff --name-only "$BASE_SHA" HEAD -- \
             crates/intent-store/postgres crates/intent-store/src/postgres \
-            crates/intent-store/tests/postgres_neki.rs)
+            crates/intent-store/tests/postgres_neki.rs crates/intent-store/Cargo.toml \
+            Cargo.lock .github/workflows/ci.yml)
           if [ -n "$changed" ]; then
             printf 'Postgres changes:\n%s\n' "$changed"
             echo "run=true" >> "$GITHUB_OUTPUT"

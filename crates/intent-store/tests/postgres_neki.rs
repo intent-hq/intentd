@@ -66,9 +66,35 @@ async fn round_trip(pool: PgPool) -> Result<(), String> {
     Ok(())
 }
 
+/// Drop schemas left by runs that panicked, were cancelled or timed out
+/// more than two hours ago.
+async fn drop_stale_schemas(admin: &PgPool, now: u64) {
+    let names: Vec<(String,)> = sqlx::query_as(
+        "SELECT nspname::text FROM pg_namespace WHERE nspname LIKE 'intent\\_ci\\_%'",
+    )
+    .fetch_all(admin)
+    .await
+    .expect("list run schemas");
+    for (name,) in names {
+        let started = name
+            .strip_prefix("intent_ci_")
+            .and_then(|rest| rest.split_once('_'))
+            .and_then(|(secs, _)| secs.parse::<u64>().ok());
+        if started.is_some_and(|secs| now.saturating_sub(secs) > 2 * 60 * 60) {
+            if let Err(e) = exec(admin, format!("DROP SCHEMA IF EXISTS {name} CASCADE")).await {
+                eprintln!("could not drop stale schema {name}: {e}");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn migrations_and_tenant_round_trip_run_on_neki() {
-    let Ok(url) = std::env::var("INTENT_STORE_NEKI_URL") else {
+    // A missing Actions secret (forks, Dependabot) arrives as an empty value.
+    let Some(url) = std::env::var("INTENT_STORE_NEKI_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+    else {
         assert!(
             std::env::var("INTENT_STORE_REQUIRE_NEKI").as_deref() != Ok("1"),
             "INTENT_STORE_REQUIRE_NEKI=1 but INTENT_STORE_NEKI_URL is unset: add the \
@@ -77,8 +103,13 @@ async fn migrations_and_tenant_round_trip_run_on_neki() {
         eprintln!("skipping: INTENT_STORE_NEKI_URL is unset");
         return;
     };
-    let schema = format!("intent_ci_{}", uuid::Uuid::new_v4().simple());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_secs();
+    let schema = format!("intent_ci_{now}_{}", uuid::Uuid::new_v4().simple());
     let admin = postgres::connect(&url, 1).await.expect("connect to Neki");
+    drop_stale_schemas(&admin, now).await;
     exec(&admin, format!("CREATE SCHEMA {schema}"))
         .await
         .expect("create the run's schema");
