@@ -68,7 +68,7 @@ impl PgStore {
 
     pub async fn daemon_id(&self) -> Result<String> {
         let candidate = serde_json::Value::String(uuid::Uuid::new_v4().to_string()).to_string();
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO settings (tenant_id, key, value) VALUES ($1, $2, $3) \
              ON CONFLICT (tenant_id, key) DO NOTHING",
