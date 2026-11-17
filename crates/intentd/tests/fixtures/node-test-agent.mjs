@@ -275,6 +275,8 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     }
     case 'session/prompt': {
       const text = promptText(msg.params);
+      // A specialist's role reminder leads its prompts.
+      const command = text.replace(/^\[Role Reminder: [^\]]*\]\s*/, '');
       const earlier = currentSession ? readHistory(currentSession) ?? [] : [];
       if (currentSession) fs.writeFileSync(sessionFile(currentSession), JSON.stringify([...earlier, text]));
       const recall = currentSession && text.match(/recall (\S[^\n]*)$/);
@@ -292,7 +294,10 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
         });
         return send({ id: msg.id, result: { stopReason: 'end_turn' } });
       }
-      if ((msg.params?.prompt ?? []).some((block) => promptText({ prompt: [block] }) === 'echo-raw')) {
+      if (
+        (msg.params?.prompt ?? []).some((block) => promptText({ prompt: [block] }) === 'echo-raw') ||
+        command === 'echo-raw'
+      ) {
         const raw = (msg.params?.prompt ?? []).map((block) => block?.text ?? '').join('\n');
         send({
           method: 'session/update',
@@ -340,9 +345,9 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
         });
         return send({ id: msg.id, result: { stopReason: 'end_turn' } });
       }
-      const asTool = text.startsWith('wsapi-tool ');
-      if (asTool || text.startsWith('wsapi ')) {
-        const code = text.slice(asTool ? 'wsapi-tool '.length : 'wsapi '.length);
+      const asTool = command.startsWith('wsapi-tool ');
+      if (asTool || command.startsWith('wsapi ')) {
+        const code = command.slice(asTool ? 'wsapi-tool '.length : 'wsapi '.length);
         const toolCallId = `tc_${process.hrtime.bigint()}`;
         if (asTool) {
           send({
