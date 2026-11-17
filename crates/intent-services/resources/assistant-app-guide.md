@@ -947,7 +947,7 @@ Cmd+1–9 (Ctrl+1–9 on Windows/Linux) selects devices in displayed rail order:
 guest hosts, as displayed. Cmd+Alt+1–9 (Ctrl+Alt+1–9 on Windows/Linux) continues
 to select Home/workspace tabs using the numbering above whether the rail is visible
 or hidden. User-customized shortcuts take precedence. -->
-<!-- Sources (Labs device rail, paths relative to packages/cloudlands-fe): src/features/machine-rail/MachineRail.svelte; src/main/machine-rail.ts; src/main/machine-rail-state.ts; src/main/frames.ts; src/main/frame-sessions.ts; src/main/window.ts (saved frames). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/machine-rail/MachineRail.svelte; src/main/machine-rail.ts; src/main/machine-rail-state.ts; src/main/frames.ts; src/main/frame-sessions.ts; src/main/window.ts (saved frames). -->
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/AgentCard.svelte (toggle-pinned menu item); packages/cloudlands-fe/src/lib/components/workspace/{WorkspaceAgentsList.svelte,workspace-agents-list-utils.ts}; packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update pinned). -->
 
