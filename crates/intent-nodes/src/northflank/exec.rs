@@ -438,8 +438,8 @@ fn stream_error(error: &tungstenite::Error, secrets: &[&str]) -> CloudError {
     }
 }
 
-/// An `init` answer other than `successful`: a rejected token, or a token
-/// without the permission to run commands, by its message.
+/// An `init` answer other than `successful`: a missing service, a rejected
+/// token, or a token without the permission to run commands, by its message.
 fn init_refused(data: &Value, secrets: &[&str]) -> CloudError {
     let message = data
         .get("message")
@@ -447,6 +447,13 @@ fn init_refused(data: &Value, secrets: &[&str]) -> CloudError {
         .unwrap_or("Reason unknown");
     let message = scrub(message, secrets);
     let lower = message.to_ascii_lowercase();
+    // "Could not find service '<id>'": the machine is gone, not the token.
+    if lower.contains("could not find service") {
+        return CloudError::new(
+            CloudErrorKind::NotFound,
+            format!("the service is gone: {message}"),
+        );
+    }
     let denied = [
         "permission",
         "forbidden",

@@ -1640,6 +1640,12 @@ async fn exec_auth_failures_are_unauthorized_or_denied() {
             ]),
             WsSession::Refuse(403, json!({"error": {"status": 403, "message": "Forbidden"}}).to_string()),
             WsSession::Refuse(404, json!({"error": {"status": 404, "message": "Service not found"}}).to_string()),
+            // The recorded bad-token answer.
+            WsSession::Steps(vec![
+                WsStep::Receive,
+                WsStep::Send(json!({"type": "init", "data": {"auth": "failed", "message": "Unauthorized"}})),
+                WsStep::Close,
+            ]),
         ],
     )
     .await;
@@ -1669,6 +1675,31 @@ async fn exec_auth_failures_are_unauthorized_or_denied() {
         .await
         .unwrap_err();
     assert!(missing.is_not_found(), "{missing}");
+    let unauthorized = client
+        .run_command(&instance("svc-1"), &spec)
+        .await
+        .unwrap_err();
+    assert_eq!(unauthorized.kind(), CloudErrorKind::Unauthorized);
+}
+
+/// Northflank accepts the stream for a service that does not exist, fails
+/// the `init` with this message and keeps the socket open (recorded
+/// 2026-11-17): the machine is gone, the token is fine.
+#[tokio::test]
+async fn an_exec_on_a_missing_service_is_not_found_not_a_rejected_token() {
+    let server = exec_server(vec![
+        WsStep::Receive,
+        WsStep::Send(json!({"type": "init", "data": {"auth": "failed", "message": "Could not find service 'svc-1'"}})),
+    ])
+    .await;
+    let error = client(&server)
+        .run_command(&instance("svc-1"), &ProcessSpec::new("x"))
+        .await
+        .unwrap_err();
+    assert!(error.is_not_found(), "{error}");
+    assert!(!error.is_retryable(), "{error}");
+    assert!(error.to_string().contains("svc-1"), "{error}");
+    assert!(!error.to_string().contains("token"), "{error}");
 }
 
 #[tokio::test]
