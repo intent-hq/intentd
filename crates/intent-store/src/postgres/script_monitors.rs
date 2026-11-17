@@ -309,6 +309,30 @@ impl PgStore {
         tx.commit().await.map_err(db)
     }
 
+    pub async fn workspaces_with_active_hooks_or_script_monitors(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<std::collections::HashSet<WorkspaceId>> {
+        if workspace_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<&str> = workspace_ids.iter().map(WorkspaceId::as_str).collect();
+        let mut tx = self.begin().await?;
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT workspace_id FROM hook WHERE tenant_id = $1 \
+               AND workspace_id = ANY($2) AND state IN ('scheduled', 'running') \
+             UNION SELECT workspace_id FROM script_monitor WHERE tenant_id = $1 \
+               AND state = 'active' AND workspace_id = ANY($2)",
+        )
+        .bind(self.tenant())
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(rows.into_iter().map(WorkspaceId).collect())
+    }
+
     pub async fn script_monitor_reservations(&self, ws: &WorkspaceId) -> Result<i64> {
         let mut tx = self.begin().await?;
         let count: i64 = sqlx::query_scalar(
