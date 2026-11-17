@@ -1826,6 +1826,8 @@ impl PgStore {
     }
 
     pub async fn list_cloud_placed_agents(&self) -> Result<Vec<(WorkspaceId, AgentId)>> {
+        // SQLite has no ORDER BY and scans in rowid order; `row_seq` is the
+        // same insertion order, made explicit because Postgres has no default.
         let mut tx = self.begin().await?;
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT workspace_id, id FROM agent_session WHERE tenant_id = $1 \
