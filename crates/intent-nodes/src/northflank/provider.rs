@@ -11,7 +11,8 @@ use tokio::time::Instant;
 
 use super::client::{validate_id, Call, MAX_TAGS_JSON};
 use super::{
-    backend_tag, NorthflankClient, CLOUD_PROVIDER_NORTHFLANK, DEFAULT_DISK_GIB, HOME, NODE_TAG,
+    backend_tag, NorthflankClient, CLOUD_PROVIDER_NORTHFLANK, DEFAULT_DISK_GIB, HOME, MIN_DISK_GIB,
+    NODE_TAG,
 };
 use crate::cloud::{
     CloudError, CloudErrorKind, CloudFuture, CloudInstance, CloudProvider, Connected,
@@ -168,10 +169,10 @@ impl NorthflankClient {
             .filter(|b| !b.is_empty())
             .ok_or_else(|| invalid("a Northflank machine needs the intentBackendId tag"))?;
         super::ImageRef::parse(&request.image)?;
-        let disk = request.disk_gib.unwrap_or(DEFAULT_DISK_GIB);
-        if disk == 0 {
-            return Err(invalid("the disk must be at least 1 GiB"));
-        }
+        let disk = request
+            .disk_gib
+            .unwrap_or(DEFAULT_DISK_GIB)
+            .max(MIN_DISK_GIB);
         let tags_json = serde_json::to_string(&request.tags)
             .map_err(|e| invalid(format!("the tags cannot be stored: {e}")))?;
         if tags_json.len() > MAX_TAGS_JSON {
