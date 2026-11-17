@@ -1555,7 +1555,28 @@ parity_test!(host_join_refusals_and_guest_roles, |store, tenant, db| {
 parity_test!(
     owner_queue_permit_binds_owner_and_exact_key,
     |store, tenant, db| {
-        let owner = store.get_primary_principal().await.unwrap().id;
+        // Each Postgres tenant is provisioned with a random owner id; a fixed
+        // owner id lets the decoy's credentials match the subject's probes.
+        let owner = match db {
+            Some(db) => {
+                store
+                    .upsert_principal(&person("qowner", gh(700), tenant, T1))
+                    .await
+                    .unwrap();
+                exec(
+                    &db.admin,
+                    format!(
+                        "UPDATE principal SET is_primary = 0 \
+                         WHERE tenant_id = '{tenant}' AND is_primary = 1; \
+                         UPDATE principal SET is_primary = 1 \
+                         WHERE tenant_id = '{tenant}' AND id = 'qowner'"
+                    ),
+                )
+                .await;
+                pid("qowner")
+            }
+            None => store.get_primary_principal().await.unwrap().id,
+        };
         let guest = person("qguest", gh(701), tenant, T1);
         store.upsert_principal(&guest).await.unwrap();
         store
@@ -1657,7 +1678,20 @@ async fn owner_queue_permit_blocks_revoke_until_dropped() {
         let store = store.clone();
         async move { store.revoke_principal_credential("k").await }
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut waiting = false;
+    for _ in 0..250 {
+        waiting = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+        )
+        .fetch_one(&db.admin)
+        .await
+        .unwrap();
+        if waiting {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(waiting, "the revoke queues on the writer lock");
     assert!(!revoke.is_finished(), "revoke waits for the permit");
     drop(held);
     assert!(tokio::time::timeout(Duration::from_secs(5), revoke)
