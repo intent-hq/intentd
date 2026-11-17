@@ -234,7 +234,7 @@
           },
           "pagination": {
             "hasNextPage": true,
-            "cursor": "6af46fcbb7d8a80b647f6ba7",
+            "cursor": "<scrubbed>",
             "count": 1
           }
         }
@@ -410,7 +410,7 @@
         "body": {
           "data": {
             "id": "intent-000000000001",
-            "appId": "/team-1/default/intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
             "serviceType": "deployment",
             "name": "intent-000000000001",
             "description": "Intent cloud machine",
@@ -469,7 +469,7 @@
         "body": {
           "data": {
             "id": "intent-000000000001",
-            "appId": "/team-1/default/intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
             "serviceType": "deployment",
             "name": "intent-000000000001",
             "description": "Intent cloud machine",
@@ -539,10 +539,10 @@
           "data": {
             "containers": [
               {
-                "name": "intent-000000000001-6dd47d4474-hj5sm",
-                "createdAt": 1794904046,
+                "name": "intent-000000000001-5bbdfb6444-qzfmt",
+                "createdAt": 1794907375,
                 "status": "TASK_RUNNING",
-                "updatedAt": 1794904060
+                "updatedAt": 1794907379
               }
             ]
           },
@@ -568,7 +568,7 @@
                 "id": "intent-000000000001",
                 "uid": "<scrubbed>",
                 "name": "intent-000000000001",
-                "appId": "/team-1/default/intent-000000000001",
+                "appId": "/team-1/project-1/intent-000000000001",
                 "disabledCD": false,
                 "serviceType": "deployment",
                 "description": "Intent cloud machine",
@@ -675,7 +675,7 @@
         "body": {
           "data": {
             "id": "intent-000000000001",
-            "appId": "/team-1/default/intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
             "serviceType": "deployment",
             "name": "intent-000000000001",
             "description": "Intent cloud machine",
@@ -736,7 +736,7 @@
         "body": {
           "data": {
             "id": "intent-000000000001",
-            "appId": "/team-1/default/intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
             "serviceType": "deployment",
             "name": "intent-000000000001",
             "description": "Intent cloud machine",
@@ -819,7 +819,7 @@
         "body": {
           "data": {
             "id": "intent-000000000001",
-            "appId": "/team-1/default/intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
             "serviceType": "deployment",
             "name": "intent-000000000001",
             "description": "Intent cloud machine",
@@ -889,10 +889,10 @@
           "data": {
             "containers": [
               {
-                "name": "intent-000000000001-6dd47d4474-hj5sm",
-                "createdAt": 1794904046,
+                "name": "intent-000000000001-5bbdfb6444-qzfmt",
+                "createdAt": 1794907375,
                 "status": "TASK_RUNNING",
-                "updatedAt": 1794904060
+                "updatedAt": 1794907379
               }
             ]
           },
@@ -930,7 +930,7 @@
         "body": {
           "data": {
             "id": "intent-000000000001",
-            "appId": "/team-1/default/intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
             "serviceType": "deployment",
             "name": "intent-000000000001",
             "description": "Intent cloud machine",
@@ -1040,7 +1040,7 @@
             "data": {
               "auth": "successful",
               "context": {
-                "instanceName": "intent-000000000001-6dd47d4474-hj5sm",
+                "instanceName": "intent-000000000001-5bbdfb6444-qzfmt",
                 "containerName": "main-service"
               }
             }
@@ -1101,10 +1101,17 @@
             "data": {
               "auth": "successful",
               "context": {
-                "instanceName": "intent-000000000001-6dd47d4474-hj5sm",
+                "instanceName": "intent-000000000001-5bbdfb6444-qzfmt",
                 "containerName": "main-service"
               }
             }
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "stdOut",
+            "data": ""
           }
         },
         {
@@ -1161,7 +1168,7 @@
             "data": {
               "auth": "successful",
               "context": {
-                "instanceName": "intent-000000000001-6dd47d4474-hj5sm",
+                "instanceName": "intent-000000000001-5bbdfb6444-qzfmt",
                 "containerName": "main-service"
               }
             }
