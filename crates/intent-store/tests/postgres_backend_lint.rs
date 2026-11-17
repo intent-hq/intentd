@@ -96,7 +96,7 @@ fn string_literals(text: &str) -> Vec<(usize, String)> {
 fn is_sql(lit: &str) -> bool {
     let l = lit.trim_start().to_lowercase();
     if l.starts_with("update ") {
-        return l.contains(" set ");
+        return l.split_whitespace().any(|w| w == "set");
     }
     ["select ", "insert ", "delete ", "with "]
         .iter()
@@ -172,6 +172,7 @@ fn every_postgres_query_is_filtered_by_the_bound_tenant() {
 #[test]
 fn the_tenant_rule_catches_unscoped_shapes() {
     assert!(is_sql("UPDATE hook SET state = $3 WHERE hook_id = $2"));
+    assert!(is_sql("update hook\nset state = $3 where hook_id = $2"));
     assert!(!is_sql("update hook state failed: {e}"));
     assert!(violations("select value from settings where tenant_id = $1 and key = $2").is_empty());
     assert!(!violations("select value from settings where key = $1").is_empty());
