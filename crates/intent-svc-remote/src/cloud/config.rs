@@ -21,7 +21,7 @@ use intent_core::machines::{
 use intent_core::{now_iso, Error, Result};
 use intent_nodes::cloud::{CloudError, CloudErrorKind, CloudProvider, QuotaLimit, SecretString};
 use intent_nodes::e2b::{E2bClient, E2bConfig};
-use intent_nodes::northflank::{NorthflankClient, NorthflankConfig};
+use intent_nodes::northflank::{NorthflankClient, NorthflankConfig, MIN_DISK_GIB};
 use intent_services::feature_api::Services;
 
 /// The E2B project that publishes the intent-node templates (Intent's).
@@ -315,7 +315,7 @@ impl ProviderConfig {
                     "region": nf.region,
                     "image": nf.image,
                     "plans": nf.plans_json(),
-                    "diskGiB": nf.disk_gib,
+                    "diskGiB": nf.disk_gib.max(MIN_DISK_GIB),
                 });
             }
             None => provider["templateProject"] = json!(self.template_project),
