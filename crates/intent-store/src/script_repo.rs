@@ -24,7 +24,7 @@ impl Store {
     /// # Errors
     /// Returns `Error::Internal` if the database read fails.
     pub async fn workspace_scripts_initialized(&self, workspace_id: &WorkspaceId) -> Result<bool> {
-        pending_postgres!("workspace_scripts_initialized", self, backend => backend.workspace_scripts_initialized(workspace_id).await)
+        dispatch!(self, backend => backend.workspace_scripts_initialized(workspace_id).await)
     }
 
     /// Resolve a script's durable scope without reading its command or environment.
@@ -33,7 +33,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database read fails.
     pub async fn script_workspace(&self, id: &str) -> Result<Option<WorkspaceId>> {
-        pending_postgres!("script_workspace", self, backend => backend.script_workspace(id).await)
+        dispatch!(self, backend => backend.script_workspace(id).await)
     }
 
     /// Insert or replace a script definition, keyed on `id` (mirrors the FE
@@ -45,7 +45,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_script(&self, s: &Script) -> Result<()> {
-        pending_postgres!("upsert_script", self, backend => backend.upsert_script(s).await)
+        dispatch!(self, backend => backend.upsert_script(s).await)
     }
 
     /// Upsert a definition only if its id is new or already belongs to this
@@ -56,7 +56,7 @@ impl Store {
     /// Returns `Error::NotFound` for an id in another workspace, or
     /// `Error::Internal` if the database operation fails.
     pub async fn upsert_script_in_workspace(&self, s: &Script) -> Result<()> {
-        pending_postgres!("upsert_script_in_workspace", self, backend => backend.upsert_script_in_workspace(s).await)
+        dispatch!(self, backend => backend.upsert_script_in_workspace(s).await)
     }
 
     /// Bulk [`upsert_script`](Self::upsert_script): insert or replace many
@@ -71,7 +71,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_scripts(&self, scripts: &[Script]) -> Result<()> {
-        pending_postgres!("upsert_scripts", self, backend => backend.upsert_scripts(scripts).await)
+        dispatch!(self, backend => backend.upsert_scripts(scripts).await)
     }
 
     /// Seed defaults only if no definition has ever been persisted in this
@@ -87,7 +87,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         scripts: &[Script],
     ) -> Result<bool> {
-        pending_postgres!("bootstrap_scripts", self, backend => backend.bootstrap_scripts(workspace_id, scripts).await)
+        dispatch!(self, backend => backend.bootstrap_scripts(workspace_id, scripts).await)
     }
 
     /// Delete a script definition by `id` (FE `removeScript`). Returns whether
@@ -97,7 +97,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn remove_script(&self, id: &str) -> Result<bool> {
-        pending_postgres!("remove_script", self, backend => backend.remove_script(id).await)
+        dispatch!(self, backend => backend.remove_script(id).await)
     }
 
     /// Delete only the definition in the admitted workspace. Scope validation
@@ -113,7 +113,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &str,
     ) -> Result<()> {
-        pending_postgres!("remove_script_in_workspace", self, backend => backend.remove_script_in_workspace(workspace_id, id).await)
+        dispatch!(self, backend => backend.remove_script_in_workspace(workspace_id, id).await)
     }
 
     /// List every persisted script definition (all workspaces), oldest first —
@@ -123,21 +123,21 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_scripts(&self) -> Result<Vec<Script>> {
-        pending_postgres!("list_all_scripts", self, backend => backend.list_all_scripts().await)
+        dispatch!(self, backend => backend.list_all_scripts().await)
     }
 
     /// Hydrate only unarchived definitions; archived output remains a known-ID read.
     /// # Errors
     /// Returns database or decoding errors.
     pub async fn list_unarchived_scripts(&self) -> Result<Vec<Script>> {
-        pending_postgres!("list_unarchived_scripts", self, backend => backend.list_unarchived_scripts().await)
+        dispatch!(self, backend => backend.list_unarchived_scripts().await)
     }
 
     /// Read one unarchived definition without fetching an excluded archived body.
     /// # Errors
     /// Returns database or decoding errors.
     pub async fn get_active_script(&self, ws: &WorkspaceId, id: &str) -> Result<Option<Script>> {
-        pending_postgres!("get_active_script", self, backend => backend.get_active_script(ws, id).await)
+        dispatch!(self, backend => backend.get_active_script(ws, id).await)
     }
 
     /// Read one persisted definition only if it belongs to this workspace.
@@ -149,7 +149,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &str,
     ) -> Result<Option<Script>> {
-        pending_postgres!("get_script_in_workspace", self, backend => backend.get_script_in_workspace(workspace_id, id).await)
+        dispatch!(self, backend => backend.get_script_in_workspace(workspace_id, id).await)
     }
 
     /// Commit archive state without replacing the definition, result or recovery marker.
@@ -161,14 +161,14 @@ impl Store {
         id: &str,
         archived_at: Option<&str>,
     ) -> Result<()> {
-        pending_postgres!("set_script_archived_at", self, backend => backend.set_script_archived_at(workspace_id, id, archived_at).await)
+        dispatch!(self, backend => backend.set_script_archived_at(workspace_id, id, archived_at).await)
     }
 
     /// Persist command admission before spawn; retain the preceding result.
     /// # Errors
     /// Returns a database error or `NotFound` for a missing/foreign definition.
     pub async fn admit_script_run(&self, ws: &WorkspaceId, id: &str, token: &str) -> Result<()> {
-        pending_postgres!("admit_script_run", self, backend => backend.admit_script_run(ws, id, token).await)
+        dispatch!(self, backend => backend.admit_script_run(ws, id, token).await)
     }
 
     /// Persist the observed start only for the still-current admission.
@@ -181,7 +181,7 @@ impl Store {
         token: &str,
         started: &str,
     ) -> Result<()> {
-        pending_postgres!("start_script_run", self, backend => backend.start_script_run(ws, id, token, started).await)
+        dispatch!(self, backend => backend.start_script_run(ws, id, token, started).await)
     }
 
     /// Cancel an unspawned RPC reservation without inventing a result.
@@ -194,7 +194,7 @@ impl Store {
         token: &str,
         preserve_marker: bool,
     ) -> Result<()> {
-        pending_postgres!("abandon_script_run", self, backend => backend.abandon_script_run(ws, id, token, preserve_marker).await)
+        dispatch!(self, backend => backend.abandon_script_run(ws, id, token, preserve_marker).await)
     }
 
     /// Atomically settle the matching admission and retire explicit one-offs.
@@ -211,7 +211,7 @@ impl Store {
         result: &ScriptLastRun,
         recovery: bool,
     ) -> Result<bool> {
-        pending_postgres!("settle_script_run", self, backend => backend.settle_script_run(ws, id, token, result, recovery).await)
+        dispatch!(self, backend => backend.settle_script_run(ws, id, token, result, recovery).await)
     }
 
     /// Outstanding durable command admissions, including pre-spawn/restart gaps.
@@ -220,7 +220,7 @@ impl Store {
     pub async fn pending_script_runs(
         &self,
     ) -> Result<Vec<(WorkspaceId, String, String, Option<String>)>> {
-        pending_postgres!("pending_script_runs", self, backend => backend.pending_script_runs().await)
+        dispatch!(self, backend => backend.pending_script_runs().await)
     }
 
     /// Set or clear the service was-running marker (stored-on-write): set on a
@@ -239,7 +239,7 @@ impl Store {
         id: &str,
         was_running: bool,
     ) -> Result<()> {
-        pending_postgres!("set_script_was_running", self, backend => backend.set_script_was_running(workspace_id, id, was_running).await)
+        dispatch!(self, backend => backend.set_script_was_running(workspace_id, id, was_running).await)
     }
 
     /// `(workspace_id, id)` pairs of scripts still carrying the was-running
@@ -251,7 +251,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_was_running_script_ids(&self) -> Result<Vec<(String, String)>> {
-        pending_postgres!("list_was_running_script_ids", self, backend => backend.list_was_running_script_ids().await)
+        dispatch!(self, backend => backend.list_was_running_script_ids().await)
     }
 }
 
@@ -611,7 +611,7 @@ impl crate::SqliteStore {
 }
 
 /// Encode the optional `env` string map to a JSON TEXT column.
-fn env_to_db(s: &Script) -> Result<Option<String>> {
+pub(crate) fn env_to_db(s: &Script) -> Result<Option<String>> {
     s.env
         .as_ref()
         .map(|env| {
@@ -622,7 +622,7 @@ fn env_to_db(s: &Script) -> Result<Option<String>> {
 }
 
 /// Decode the optional `env` JSON TEXT column.
-fn env_from_db(s: Option<String>) -> Result<Option<BTreeMap<String, String>>> {
+pub(crate) fn env_from_db(s: Option<String>) -> Result<Option<BTreeMap<String, String>>> {
     s.map(|json| {
         serde_json::from_str::<BTreeMap<String, String>>(&json)
             .map_err(|e| Error::Internal(format!("decode script env failed: {e}")))
@@ -631,7 +631,7 @@ fn env_from_db(s: Option<String>) -> Result<Option<BTreeMap<String, String>>> {
 }
 
 /// Encode the optional `remote_author` JSON TEXT column.
-fn remote_author_to_db(s: &Script) -> Result<Option<String>> {
+pub(crate) fn remote_author_to_db(s: &Script) -> Result<Option<String>> {
     s.remote_author
         .as_ref()
         .map(|remote_author| {

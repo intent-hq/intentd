@@ -25,6 +25,7 @@ mod discussions;
 mod nodes;
 mod note_search;
 mod notes;
+mod scripts;
 mod settings;
 mod workspaces;
 
