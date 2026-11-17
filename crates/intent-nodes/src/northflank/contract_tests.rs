@@ -7,7 +7,7 @@
 //! fails here until the fixtures are captured again
 //! (`scripts/capture-northflank-fixtures.sh`).
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::client::error_message;
 use super::fake_api::{
@@ -185,8 +185,12 @@ fn assert_none(problems: &[String]) {
 
 #[test]
 fn the_fake_answers_every_recorded_call_with_its_status_and_error() {
+    assert_none(&status_problems(&replay()));
+}
+
+fn status_problems(calls: &[Replayed]) -> Vec<String> {
     let mut problems = Vec::new();
-    for call in replay() {
+    for call in calls {
         if call.fake_status != call.recorded_status {
             problems.push(format!(
                 "{} ({} {}): HTTP {} from the fake, {} recorded: {}",
@@ -210,15 +214,19 @@ fn the_fake_answers_every_recorded_call_with_its_status_and_error() {
             }
         }
     }
-    assert_none(&problems);
+    problems
 }
 
 #[test]
 fn the_fake_returns_every_field_intentd_reads_as_recorded() {
+    assert_none(&field_problems(&replay()));
+}
+
+fn field_problems(calls: &[Replayed]) -> Vec<String> {
     let mut reads = reads();
     reads.extend(behaviour());
     let mut problems = Vec::new();
-    for call in replay() {
+    for call in calls {
         let ok =
             (200..300).contains(&call.recorded_status) && call.fake_status == call.recorded_status;
         for read in reads
@@ -290,7 +298,7 @@ fn the_fake_returns_every_field_intentd_reads_as_recorded() {
             }
         }
     }
-    assert_none(&problems);
+    problems
 }
 
 #[test]
@@ -352,8 +360,19 @@ fn stream(frames: &[Value]) -> (String, String, Option<Value>, Option<Value>) {
     (out, err, init, completion)
 }
 
+/// How a fake streams one command: (`init` context, stdout, stderr, exit)
+/// to the frames after the client's `init`.
+type Render = dyn Fn(&Value, &str, &str, i32) -> Vec<Value>;
+
 #[test]
 fn the_fake_streams_each_recorded_command_as_northflank_did() {
+    let render = |context: &Value, out: &str, err: &str, code: i32| {
+        exec_frames(FIXTURE_SERVICE, context, out, err, code)
+    };
+    assert_none(&stream_problems(&render));
+}
+
+fn stream_problems(render: &Render) -> Vec<String> {
     let fixture = fixture();
     let sessions = fixture["exec"].as_array().expect("exec sessions");
     assert!(!sessions.is_empty(), "the recording has no command stream");
@@ -363,8 +382,7 @@ fn the_fake_streams_each_recorded_command_as_northflank_did() {
     for session in sessions {
         let name = session["name"].as_str().unwrap_or_default();
         let program = &session["program"];
-        let fake = exec_frames(
-            FIXTURE_SERVICE,
+        let fake = render(
             &session["context"],
             program["stdout"].as_str().unwrap_or_default(),
             program["stderr"].as_str().unwrap_or_default(),
@@ -433,5 +451,62 @@ fn the_fake_streams_each_recorded_command_as_northflank_did() {
             ));
         }
     }
-    assert_none(&problems);
+    problems
+}
+
+// The fakes as they were before each bug a live run found. The contract
+// must fail on each, or it would not have caught the bug.
+
+/// intent#9469: the old fakes sent stderr on its own channel whatever the
+/// `init` asked, so the home-ready marker the setup prints to stderr was
+/// found in tests and never on Northflank, which runs a command in a
+/// terminal unless the `init` sets `"tty": false`.
+#[test]
+fn a_fake_that_ignores_the_terminal_fails_the_contract() {
+    let terminal_blind = |_: &Value, out: &str, err: &str, code: i32| {
+        let status = if code == 0 { "Success" } else { "Failure" };
+        vec![
+            json!({ "type": "init", "data": { "auth": "successful" } }),
+            json!({ "type": "stdOut", "data": out }),
+            json!({ "type": "stdErr", "data": err }),
+            json!({ "type": "completion", "data": { "exitCode": code, "status": status } }),
+        ]
+    };
+    let problems = stream_problems(&terminal_blind);
+    assert!(
+        problems.iter().any(|p| p.starts_with(
+            "exec-tty-default: the fake streams stdout \"out\\n\" and stderr \"err\\n\""
+        )),
+        "{problems:#?}"
+    );
+}
+
+/// intentd#3443: the old fakes echoed a service's custom annotations, so
+/// tags kept there read back in tests and never on Northflank, which drops
+/// them (and lists by tag found no machine).
+#[test]
+fn a_fake_that_echoes_annotations_fails_the_contract() {
+    let mut calls = replay();
+    let sent = fixture()["exchanges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["name"] == "create-service-with-annotations")
+        .and_then(|e| {
+            e.pointer("/request/body/deployment/metadata/annotations")
+                .cloned()
+        })
+        .expect("the recording creates a service with annotations");
+    for call in &mut calls {
+        if route_matches("GET /projects/*/services/*", &call.method, &call.path) {
+            call.fake["data"]["deployment"]["metadata"]["annotations"] = sent.clone();
+        }
+    }
+    let problems = field_problems(&calls);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.starts_with("get-service-running [0]/deployment/metadata/annotations")),
+        "{problems:#?}"
+    );
 }

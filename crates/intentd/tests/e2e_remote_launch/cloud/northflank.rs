@@ -1,5 +1,8 @@
 //! Northflank cloud machines end to end, against a fake Northflank: its
-//! REST API, its command-exec WebSocket and a public image registry. Each
+//! REST API and command streams from the shared model
+//! (`intent_nodes::northflank::fake_api`, held to a recording of the real
+//! API by its contract tests), its command-exec WebSocket and a public
+//! image registry. Each
 //! service's "container" is a real `intentd serve` that the backend's own
 //! start script starts, with the service's volume as its home folder. A
 //! pause stops every process of the container and keeps the volume, as a
@@ -19,6 +22,7 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
+use intent_nodes::northflank::fake_api::{self, NorthflankApi};
 use intentd_test_support::ProcessGroup;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -45,27 +49,21 @@ const ID_SHIM: &str = "#!/bin/sh\nif [ \"$#\" -eq 2 ] && [ \"$2\" = user ]; then
 /// `setpriv` drops nothing here: it runs the command after `--`.
 const SETPRIV_SHIM: &str = "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in --) shift; break ;; *) shift ;; esac\ndone\nexec \"$@\"\n";
 
-/// One fake service: its volume (the container's home folder), the
-/// environment its commands run with, and the process group of its current
-/// container (replaced at each start, since a stop ends every process).
+/// One fake service's container: its volume (the container's home folder),
+/// the environment its commands run with, and the process group of its
+/// current container (replaced at each start, since a stop ends every
+/// process). What Northflank stores and returns of it is in `api`.
 struct FakeService {
     home: std::path::PathBuf,
     env: Vec<(String, String)>,
     group: Arc<ProcessGroup>,
-    paused: bool,
-    image: String,
-    /// Northflank keeps the runtime environment, and drops annotations.
-    runtime_env: Value,
-    created_at: String,
-    tags: Vec<String>,
 }
 
-#[derive(Default)]
 struct FakeState {
+    /// The REST API: projects, plans, tags, volumes and services.
+    api: NorthflankApi,
+    /// Containers of the services `api` holds.
     services: HashMap<String, FakeService>,
-    /// Volume id → its tags.
-    volumes: HashMap<String, Vec<String>>,
-    team_tags: Vec<String>,
     /// Every create request body: (path, body).
     creates: Vec<(String, Value)>,
     /// Every lifecycle call: (method, path).
@@ -77,6 +75,21 @@ struct FakeState {
     /// While set, exec answers this init auth instead of "successful".
     exec_refusal: Option<String>,
     groups: Vec<Arc<ProcessGroup>>,
+}
+
+impl Default for FakeState {
+    fn default() -> Self {
+        Self {
+            api: NorthflankApi::new(PROJECT, REGION),
+            services: HashMap::new(),
+            creates: Vec::new(),
+            calls: Vec::new(),
+            execs: Vec::new(),
+            outputs: Vec::new(),
+            exec_refusal: None,
+            groups: Vec::new(),
+        }
+    }
 }
 
 /// The fake Northflank API and registry on one port, its command-exec
@@ -167,25 +180,30 @@ impl FakeNorthflank {
     }
 
     /// A service with its volume, as an earlier run left it: created
-    /// `created_at`, with `tags` as team tags and `runtime_env`.
+    /// `created_at`, with `tags` as team tags and `runtime_env`, paused.
     fn seed_service(&self, id: &str, tags: &[String], runtime_env: Value, created_at: &str) {
         let home = self.root.join(id);
         std::fs::create_dir_all(&home).unwrap();
         let group = Arc::new(ProcessGroup::new().unwrap());
+        let request = json!({
+            "name": id,
+            "description": "Intent cloud machine",
+            "tags": tags,
+            "deployment": {
+                "instances": 1,
+                "external": { "imagePath": format!("{IMAGE_REPO}:{}", env!("CARGO_PKG_VERSION")) },
+            },
+            "runtimeEnvironment": runtime_env,
+        });
         let mut state = self.state();
         state.groups.push(group.clone());
-        state.volumes.insert(id.to_owned(), tags.to_vec());
+        state.api.seed(id, request, true, created_at);
         state.services.insert(
             id.to_owned(),
             FakeService {
                 env: self.container_env(&home),
                 home,
                 group,
-                paused: true,
-                image: format!("{IMAGE_REPO}:{}", env!("CARGO_PKG_VERSION")),
-                runtime_env,
-                created_at: created_at.to_owned(),
-                tags: tags.to_vec(),
             },
         );
     }
@@ -265,7 +283,6 @@ impl FakeNorthflank {
                 json!({ "error": { "status": status, "message": message } }),
             )
         };
-        let data = |value: Value| reply(200, json!({ "data": value }));
         let path = target.split('?').next().unwrap_or_default();
         // The public registry: no credentials.
         if let Some(manifest) = path.strip_prefix("/v2/") {
@@ -285,185 +302,68 @@ impl FakeNorthflank {
         {
             return error(401, "Invalid API token");
         }
-        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         if method != "GET" {
             self.state()
                 .calls
                 .push((method.to_owned(), path.to_owned()));
         }
+        if path == format!("/projects/{LOCKED_PROJECT}") {
+            return error(403, "Forbidden: read-project");
+        }
+        let request: Option<Value> = serde_json::from_slice(body).ok();
+        let answer = self.state().api.handle(method, target, request.as_ref());
+        if (200..300).contains(&answer.status) {
+            self.container_side_effects(method, path, request.as_ref());
+        }
+        reply(answer.status, answer.body)
+    }
+
+    /// What a successful call does to the containers: a volume is a home
+    /// folder, a service's container runs commands, a pause stops every
+    /// process and a delete ends them.
+    fn container_side_effects(&self, method: &str, path: &str, request: Option<&Value>) {
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        let name = || {
+            request
+                .and_then(|r| r["name"].as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
         match (method, parts.as_slice()) {
-            ("GET", ["plans"]) => data(json!({ "plans": [
-                { "id": "nf-compute-50", "cpuResource": 0.5, "ramResource": 1024 },
-                { "id": "nf-compute-200", "cpuResource": 2, "ramResource": 4096 },
-                { "id": "nf-compute-400", "cpuResource": 4, "ramResource": 8192 },
-                { "id": "nf-compute-800-16", "cpuResource": 8, "ramResource": 16384 },
-            ] })),
-            ("GET", ["tags"]) => {
-                let tags: Vec<Value> = self
-                    .state()
-                    .team_tags
-                    .iter()
-                    .map(|name| json!({ "id": name, "name": name }))
-                    .collect();
-                reply(
-                    200,
-                    json!({ "data": { "tags": tags }, "pagination": { "hasNextPage": false } }),
-                )
-            }
-            ("POST", ["tags"]) => {
-                let request: Value = serde_json::from_slice(body).unwrap();
-                let name = request["name"].as_str().unwrap().to_owned();
-                self.state().team_tags.push(name.clone());
-                data(json!({ "id": name, "name": name }))
-            }
-            ("GET", ["projects", LOCKED_PROJECT]) => error(403, "Forbidden: read-project"),
-            ("GET", ["projects", project]) if *project == PROJECT => {
-                data(json!({ "id": PROJECT, "deployment": { "region": REGION } }))
-            }
-            ("GET", ["projects", _]) => error(404, "Project not found"),
-            (_, ["projects", project, ..]) if *project != PROJECT => {
-                error(404, "Project not found")
-            }
-            ("GET", ["projects", _, "services"]) => {
-                let services: Vec<Value> = self
-                    .state()
-                    .services
-                    .iter()
-                    .map(|(id, s)| json!({ "id": id, "tags": s.tags }))
-                    .collect();
-                reply(
-                    200,
-                    json!({ "data": { "services": services }, "pagination": { "hasNextPage": false } }),
-                )
-            }
-            ("GET", ["projects", _, "volumes"]) => {
-                let state = self.state();
-                let volumes: Vec<Value> = state
-                    .volumes
-                    .iter()
-                    .map(|(id, tags)| {
-                        let attached: Vec<Value> = state
-                            .services
-                            .contains_key(id)
-                            .then(|| json!({ "id": id }))
-                            .into_iter()
-                            .collect();
-                        json!({ "id": id, "tags": tags, "attachedObjects": attached, "createdAt": "2026-01-01T00:00:00Z" })
-                    })
-                    .collect();
-                reply(
-                    200,
-                    json!({ "data": volumes, "pagination": { "hasNextPage": false } }),
-                )
-            }
             ("POST", ["projects", _, "volumes"]) => {
-                let request: Value = serde_json::from_slice(body).unwrap();
-                let name = request["name"].as_str().unwrap().to_owned();
-                let tags: Vec<String> = serde_json::from_value(request["tags"].clone()).unwrap();
-                std::fs::create_dir_all(self.root.join(&name)).unwrap();
-                let mut state = self.state();
-                state.creates.push((path.to_owned(), request));
-                state.volumes.insert(name.clone(), tags);
-                data(json!({ "id": name, "name": name }))
+                std::fs::create_dir_all(self.root.join(name())).unwrap();
+                let request = request.cloned().unwrap_or_default();
+                self.state().creates.push((path.to_owned(), request));
             }
             ("POST", ["projects", _, "services", "deployment"]) => {
-                let request: Value = serde_json::from_slice(body).unwrap();
-                let name = request["name"].as_str().unwrap().to_owned();
+                let name = name();
                 let home = self.root.join(&name);
                 let env = self.container_env(&home);
                 let group = Arc::new(ProcessGroup::new().unwrap());
                 let mut state = self.state();
-                state.creates.push((path.to_owned(), request.clone()));
+                let request = request.cloned().unwrap_or_default();
+                state.creates.push((path.to_owned(), request));
                 state.groups.push(group.clone());
-                state.services.insert(
-                    name.clone(),
-                    FakeService {
-                        home,
-                        env,
-                        group,
-                        paused: false,
-                        image: request["deployment"]["external"]["imagePath"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned(),
-                        runtime_env: request
-                            .get("runtimeEnvironment")
-                            .cloned()
-                            .unwrap_or_else(|| json!({})),
-                        created_at: "2026-01-01T00:00:00Z".to_owned(),
-                        tags: serde_json::from_value(request["tags"].clone()).unwrap(),
-                    },
-                );
-                data(json!({ "id": name, "name": name }))
-            }
-            ("GET", ["projects", _, "services", id]) => {
-                let state = self.state();
-                let Some(service) = state.services.get(*id) else {
-                    return error(404, "Service not found");
-                };
-                data(json!({
-                    "id": id,
-                    "servicePaused": service.paused,
-                    "createdAt": service.created_at,
-                    "deployment": {
-                        "instances": u8::from(!service.paused),
-                        "external": { "imagePath": service.image },
-                        "metadata": { "labels": {}, "annotations": {} },
-                    },
-                    "runtimeEnvironment": service.runtime_env,
-                    "status": { "deployment": { "status": "COMPLETED" } },
-                }))
-            }
-            ("GET", ["projects", _, "services", id, "containers"]) => {
-                let state = self.state();
-                let Some(service) = state.services.get(*id) else {
-                    return error(404, "Service not found");
-                };
-                let containers: Vec<Value> = (!service.paused)
-                    .then(|| json!({ "status": "TASK_RUNNING" }))
-                    .into_iter()
-                    .collect();
-                data(json!({ "containers": containers }))
+                state
+                    .services
+                    .insert(name, FakeService { home, env, group });
             }
             ("POST", ["projects", _, "services", id, "pause"]) => {
                 let mut state = self.state();
                 let Some(service) = state.services.get_mut(*id) else {
-                    return error(404, "Service not found");
+                    return;
                 };
-                service.paused = true;
                 service.group.kill();
                 let group = Arc::new(ProcessGroup::new().unwrap());
                 service.group = group.clone();
                 state.groups.push(group);
-                data(json!({}))
-            }
-            ("POST", ["projects", _, "services", id, "resume"]) => {
-                let mut state = self.state();
-                let Some(service) = state.services.get_mut(*id) else {
-                    return error(404, "Service not found");
-                };
-                service.paused = false;
-                data(json!({}))
             }
             ("DELETE", ["projects", _, "services", id]) => {
-                let mut state = self.state();
-                let Some(service) = state.services.remove(*id) else {
-                    return error(404, "Service not found");
-                };
-                service.group.terminate(stop_grace());
-                if target.contains("delete_child_objects=true") {
-                    state.volumes.remove(*id);
-                }
-                data(json!({}))
-            }
-            ("DELETE", ["projects", _, "volumes", id]) => {
-                if self.state().volumes.remove(*id).is_some() {
-                    data(json!({}))
-                } else {
-                    error(404, "Volume not found")
+                if let Some(service) = self.state().services.remove(*id) {
+                    service.group.terminate(stop_grace());
                 }
             }
-            _ => error(404, "not found"),
+            _ => {}
         }
     }
 
@@ -493,7 +393,7 @@ impl FakeNorthflank {
             return;
         };
         let init: Value = serde_json::from_str(&init).unwrap();
-        let send = |value: Value| Message::text(value.to_string());
+        let send = |value: Value| fake_api::message(&value);
         let refusal = self.state().exec_refusal.clone();
         if init["data"]["auth"]["apiToken"] != NF_TOKEN.as_str() || refusal.is_some() {
             let message = refusal.unwrap_or_else(|| "Invalid token".into());
@@ -512,17 +412,13 @@ impl FakeNorthflank {
             .unwrap_or_default()
             .to_string();
         self.state().execs.push((user.clone(), argv.clone()));
-        let _ = ws
-            .send(send(
-                json!({ "type": "init", "data": { "auth": "successful" } }),
-            ))
-            .await;
-        let Some((home, env, group)) = self
+        let _ = ws.send(send(fake_api::init_frame(&service_id))).await;
+        let running = self
             .state()
             .services
             .get(&service_id)
-            .map(|s| (s.home.clone(), s.env.clone(), s.group.pgid()))
-        else {
+            .map(|s| (s.home.clone(), s.env.clone(), s.group.pgid()));
+        let Some((home, env, group)) = running else {
             let _ = ws
                 .send(send(
                     json!({ "type": "error", "data": { "message": "Service not found" } }),
@@ -557,29 +453,14 @@ impl FakeNorthflank {
             .outputs
             .push(String::from_utf8_lossy(&output.stdout).into_owned());
         let code = output.status.code().unwrap_or(-1);
-        let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        // As on Northflank: a terminal, with stderr in stdout and CRLF line
-        // ends, unless the command asks for `"tty": false`.
-        if init["data"]["context"]["tty"] != false {
-            stdout = (stdout + &std::mem::take(&mut stderr)).replace('\n', "\r\n");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let context = &init["data"]["context"];
+        let frames = fake_api::exec_frames(&service_id, context, &stdout, &stderr, code);
+        // The auth answer went before the command ran.
+        for frame in frames.into_iter().skip(1) {
+            let _ = ws.send(send(frame)).await;
         }
-        if !stdout.is_empty() {
-            let _ = ws
-                .send(send(json!({ "type": "stdOut", "data": stdout })))
-                .await;
-        }
-        if !stderr.is_empty() {
-            let _ = ws
-                .send(send(json!({ "type": "stdErr", "data": stderr })))
-                .await;
-        }
-        let status = if code == 0 { "Success" } else { "Failure" };
-        let _ = ws
-            .send(send(
-                json!({ "type": "completion", "data": { "exitCode": code, "status": status } }),
-            ))
-            .await;
         let _ = ws.close(None).await;
     }
 
@@ -898,9 +779,10 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
             created["deployment"]["external"]["imagePath"],
             format!("{IMAGE_REPO}:{}", env!("CARGO_PKG_VERSION"))
         );
-        assert!(state.team_tags.iter().any(|tag| tag == "intent-node"));
+        assert!(state.api.tags.iter().any(|tag| tag == "intent-node"));
         assert!(state
-            .team_tags
+            .api
+            .tags
             .iter()
             .any(|tag| tag.starts_with("intent-backend-")));
         let home = &state.services[&service].home;
@@ -931,7 +813,7 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     )
     .await;
     assert_eq!(paused["machine"]["cloud"]["state"], "paused", "{paused}");
-    assert!(fake.state().services[&service].paused);
+    assert!(fake.state().api.services[&service].paused);
     let resumed = echoed(&mut rpc_ws, agent, "after the pause", 70).await;
     assert!(resumed.contains(DISK_NOTICE), "{resumed}");
     assert_eq!(resumed.matches("Note from Intent").count(), 1, "{resumed}");
@@ -1018,7 +900,7 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     .await;
     machine_until(&mut rpc_ws, 130, &service, |m| m.is_none()).await;
     assert!(fake.state().services.is_empty());
-    assert!(fake.state().volumes.is_empty());
+    assert!(fake.state().api.volumes.is_empty());
     assert!(fake
         .calls_for(&service)
         .iter()
@@ -1090,9 +972,7 @@ async fn the_reaper_deletes_this_backends_leftover_northflank_machines() {
     fake.seed_service("left-new", &mine, tags_env(&backend_id), old);
     fake.seed_service("left-legacy", &mine, json!({}), old);
     fake.seed_service("foreign", &theirs, tags_env("another-backend"), old);
-    fake.state()
-        .volumes
-        .insert("left-volume".to_owned(), mine.clone());
+    fake.state().api.seed_volume("left-volume", &mine, old);
 
     ok(
         &mut rpc_ws,
@@ -1107,7 +987,7 @@ async fn the_reaper_deletes_this_backends_leftover_northflank_machines() {
                 let state = fake.state();
                 if !state.services.contains_key("left-new")
                     && !state.services.contains_key("left-legacy")
-                    && !state.volumes.contains_key("left-volume")
+                    && !state.api.volumes.contains_key("left-volume")
                 {
                     break;
                 }
@@ -1121,9 +1001,10 @@ async fn the_reaper_deletes_this_backends_leftover_northflank_machines() {
     .expect("this backend's leftovers are reaped");
     let state = fake.state();
     assert!(state.services.contains_key("foreign"));
-    assert!(state.volumes.contains_key("foreign"));
+    assert!(state.api.volumes.contains_key("foreign"));
     assert!(
-        !state.volumes.contains_key("left-new") && !state.volumes.contains_key("left-legacy"),
+        !state.api.volumes.contains_key("left-new")
+            && !state.api.volumes.contains_key("left-legacy"),
         "a reaped service's volume goes with it"
     );
 }

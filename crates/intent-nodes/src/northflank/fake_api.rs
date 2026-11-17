@@ -287,20 +287,10 @@ impl NorthflankApi {
         }
     }
 
-    /// Add a service with its volume, as an earlier run left it.
+    /// Add a service with its volume (named like it), as an earlier run
+    /// left it.
     pub fn seed(&mut self, id: &str, request: Value, paused: bool, created_at: &str) {
-        self.volumes.insert(
-            id.to_owned(),
-            Volume {
-                request: json!({
-                    "name": id,
-                    "tags": request["tags"],
-                    "spec": { "accessMode": "ReadWriteOnce", "storageSize": MIN_VOLUME_MB },
-                }),
-                created_at: created_at.to_owned(),
-                deleting: false,
-            },
-        );
+        self.seed_volume(id, &strings(&request["tags"]), created_at);
         self.services.insert(
             id.to_owned(),
             Service {
@@ -308,6 +298,22 @@ impl NorthflankApi {
                 paused,
                 created_at: created_at.to_owned(),
                 volumes: vec![id.to_owned()],
+            },
+        );
+    }
+
+    /// Add a volume with these team tags.
+    pub fn seed_volume(&mut self, id: &str, tags: &[String], created_at: &str) {
+        self.volumes.insert(
+            id.to_owned(),
+            Volume {
+                request: json!({
+                    "name": id,
+                    "tags": tags,
+                    "spec": { "accessMode": "ReadWriteOnce", "storageSize": MIN_VOLUME_MB },
+                }),
+                created_at: created_at.to_owned(),
+                deleting: false,
             },
         );
     }
