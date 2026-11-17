@@ -262,7 +262,7 @@ impl PgStore {
              $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, \
              $34, $35, $36, $37, $38, $39, $40, $41)"
         );
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(self.tenant())
             .bind(&ws.id.0)
@@ -329,7 +329,7 @@ impl PgStore {
         ws: &Workspace,
         branch: Option<&str>,
     ) -> Result<String> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let stored: Option<String> = sqlx::query_scalar(
             "UPDATE workspace SET title = $3, branch = COALESCE($4, branch), base_ref = $5, \
              base_commit_sha = $6, \
@@ -392,7 +392,7 @@ impl PgStore {
         expected: &Workspace,
         branch: &str,
     ) -> Result<bool> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let changed = sqlx::query(
             "UPDATE workspace SET branch = $3, branch_auto_generated = 0 \
              WHERE tenant_id = $1 AND id = $2 AND branch = $4 AND branch <> $3 \
@@ -413,34 +413,10 @@ impl PgStore {
         Ok(changed != 0)
     }
 
-    async fn write_pr_linkage(&self, conn: &mut PgConnection, ws: &Workspace) -> Result<()> {
-        let updated = sqlx::query(
-            "UPDATE workspace SET pr_number = $3, pr_url = $4, pr_status = $5, \
-             active_pull_request = $6, pull_requests = $7, updated_at = $8 \
-             WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(self.tenant())
-        .bind(&ws.id.0)
-        .bind(ws.pr_number.map(u64::cast_signed))
-        .bind(&ws.pr_url)
-        .bind(ws_repo::pr_status_to_db(ws)?)
-        .bind(ws_repo::active_pr_to_db(ws)?)
-        .bind(ws_repo::pull_requests_to_db(ws)?)
-        .bind(&ws.updated_at)
-        .execute(conn)
-        .await
-        .map_err(|e| Error::Internal(format!("workspace pr linkage write failed: {e}")))?
-        .rows_affected();
-        if updated == 0 {
-            return Err(not_found(&ws.id));
-        }
-        Ok(())
-    }
-
     pub async fn update_workspace_pr_linkage(&self, ws: &Workspace) -> Result<()> {
-        let mut tx = self.begin().await?;
-        self.write_pr_linkage(&mut tx, ws).await?;
-        tx.commit().await.map_err(db)
+        let mut ws = ws.clone();
+        self.update_workspace_pr_linkage_rebased(&mut ws, |_, _| {})
+            .await
     }
 
     pub async fn update_workspace_pr_linkage_rebased<F>(
@@ -465,7 +441,26 @@ impl PgStore {
         };
         let persisted = stored.and_then(|s| serde_json::from_str::<Vec<PullRequestInfo>>(&s).ok());
         rebase(ws, persisted);
-        self.write_pr_linkage(&mut tx, ws).await?;
+        let updated = sqlx::query(
+            "UPDATE workspace SET pr_number = $3, pr_url = $4, pr_status = $5, \
+             active_pull_request = $6, pull_requests = $7, updated_at = $8 \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(self.tenant())
+        .bind(&ws.id.0)
+        .bind(ws.pr_number.map(u64::cast_signed))
+        .bind(&ws.pr_url)
+        .bind(ws_repo::pr_status_to_db(ws)?)
+        .bind(ws_repo::active_pr_to_db(ws)?)
+        .bind(ws_repo::pull_requests_to_db(ws)?)
+        .bind(&ws.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("workspace pr linkage write failed: {e}")))?
+        .rows_affected();
+        if updated == 0 {
+            return Err(not_found(&ws.id));
+        }
         tx.commit().await.map_err(db)
     }
 
@@ -561,7 +556,7 @@ impl PgStore {
                  WHERE tenant_id = $1 AND id = $2 AND attention <> $4"
             }
         };
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let mut query = sqlx::query(sql)
             .bind(self.tenant())
             .bind(&id.0)
@@ -580,7 +575,7 @@ impl PgStore {
     }
 
     pub async fn clear_workspace_unread_if_all_seen(&self, id: &WorkspaceId) -> Result<bool> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let cleared = sqlx::query(
             "UPDATE workspace w SET attention = 'none' \
              WHERE w.tenant_id = $1 AND w.id = $2 AND w.attention = 'unread' \
@@ -609,7 +604,7 @@ impl PgStore {
         id: &WorkspaceId,
         updated_at: &str,
     ) -> Result<bool> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let changed = sqlx::query(
             "UPDATE workspace SET status = $3, archived = 0, archived_at = NULL, updated_at = $4 \
              WHERE tenant_id = $1 AND id = $2 AND archived = 1 AND status <> $5",
@@ -637,7 +632,7 @@ impl PgStore {
         id: &WorkspaceId,
         last_activity: &str,
     ) -> Result<bool> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let changed = sqlx::query(
             "UPDATE workspace SET last_activity = $3 \
              WHERE tenant_id = $1 AND id = $2 AND sqlite_julianday($3) IS NOT NULL \
@@ -694,13 +689,16 @@ impl PgStore {
     /// One scoped column write by id; `NotFound` when no row matched.
     async fn set_workspace_column(
         &self,
-        sql: &'static str,
+        column: &'static str,
         id: &WorkspaceId,
         value: Option<String>,
         int: Option<i64>,
     ) -> Result<()> {
-        let mut tx = self.begin().await?;
-        let query = sqlx::query(sql).bind(self.tenant()).bind(&id.0);
+        let sql = format!("UPDATE workspace SET {column} = $3 WHERE tenant_id = $1 AND id = $2");
+        let mut tx = self.begin_write().await?;
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(self.tenant())
+            .bind(&id.0);
         let query = match int {
             Some(v) => query.bind(v),
             None => query.bind(value),
@@ -735,7 +733,7 @@ impl PgStore {
         auto_generated: bool,
     ) -> Result<()> {
         self.set_workspace_column(
-            "UPDATE workspace SET branch_auto_generated = $3 WHERE tenant_id = $1 AND id = $2",
+            "branch_auto_generated",
             id,
             None,
             Some(i64::from(auto_generated)),
@@ -754,23 +752,13 @@ impl PgStore {
     }
 
     pub async fn set_workspace_auto_commit(&self, id: &WorkspaceId, enabled: bool) -> Result<()> {
-        self.set_workspace_column(
-            "UPDATE workspace SET auto_commit_enabled = $3 WHERE tenant_id = $1 AND id = $2",
-            id,
-            None,
-            Some(i64::from(enabled)),
-        )
-        .await
+        self.set_workspace_column("auto_commit_enabled", id, None, Some(i64::from(enabled)))
+            .await
     }
 
     pub async fn set_workspace_label(&self, id: &WorkspaceId, label: Option<&str>) -> Result<()> {
-        self.set_workspace_column(
-            "UPDATE workspace SET label = $3 WHERE tenant_id = $1 AND id = $2",
-            id,
-            label.map(str::to_owned),
-            None,
-        )
-        .await
+        self.set_workspace_column("label", id, label.map(str::to_owned), None)
+            .await
     }
 
     pub async fn set_workspace_auto_archive_disabled(
@@ -778,13 +766,8 @@ impl PgStore {
         id: &WorkspaceId,
         disabled: bool,
     ) -> Result<()> {
-        self.set_workspace_column(
-            "UPDATE workspace SET auto_archive_disabled = $3 WHERE tenant_id = $1 AND id = $2",
-            id,
-            None,
-            Some(i64::from(disabled)),
-        )
-        .await
+        self.set_workspace_column("auto_archive_disabled", id, None, Some(i64::from(disabled)))
+            .await
     }
 
     pub async fn workspace_auto_commit(&self, id: &WorkspaceId) -> Result<Option<bool>> {
@@ -803,7 +786,7 @@ impl PgStore {
         client_id: Option<&ClientId>,
     ) -> Result<()> {
         self.set_workspace_column(
-            "UPDATE workspace SET browser_client_id = $3 WHERE tenant_id = $1 AND id = $2",
+            "browser_client_id",
             id,
             client_id.map(|c| c.0.clone()),
             None,
@@ -912,7 +895,7 @@ impl PgStore {
         id: &WorkspaceId,
         retired_at: &str,
     ) -> Result<bool> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let changed = sqlx::query(
             "UPDATE workspace SET status = $3, retired_at = $4, updated_at = $4, \
              status_message = $5 \
@@ -1025,7 +1008,7 @@ impl PgStore {
         if !id.is_home_record() {
             return Err(Error::InvalidParams(format!("{id} is not a home record")));
         }
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query("DELETE FROM workspace WHERE tenant_id = $1 AND id = $2")
             .bind(self.tenant())
             .bind(&id.0)
@@ -1221,7 +1204,7 @@ impl PgStore {
     ) -> Result<serde_json::Value> {
         let payload = serde_json::to_string(ui_context)
             .map_err(|e| Error::Internal(format!("encode ui context failed: {e}")))?;
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO workspace_ui_context (tenant_id, workspace_id, payload) \
              VALUES ($1, $2, $3) \
@@ -1500,7 +1483,7 @@ impl PgStore {
     }
 
     pub async fn delete_workspace_git_root(&self, id: &WorkspaceGitRootId) -> Result<()> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let deleted =
             sqlx::query("DELETE FROM workspace_git_root WHERE tenant_id = $1 AND id = $2")
                 .bind(self.tenant())
@@ -1516,32 +1499,10 @@ impl PgStore {
         Ok(())
     }
 
-    async fn write_root_pr(&self, conn: &mut PgConnection, root: &WorkspaceGitRoot) -> Result<()> {
-        let updated = sqlx::query(
-            "UPDATE workspace_git_root SET pr_number = $3, pr_url = $4, pr_status = $5, \
-             pull_requests = $6, updated_at = $7 WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(self.tenant())
-        .bind(&root.id.0)
-        .bind(root.pr_number.map(u64::cast_signed))
-        .bind(&root.pr_url)
-        .bind(root.pr_status.map(|s| enum_to_db(&s)).transpose()?)
-        .bind(roots::pull_requests_to_db(root.pull_requests.as_ref())?)
-        .bind(&root.updated_at)
-        .execute(conn)
-        .await
-        .map_err(|e| Error::Internal(format!("workspace git root pr write failed: {e}")))?
-        .rows_affected();
-        if updated == 0 {
-            return Err(root_not_found(&root.id));
-        }
-        Ok(())
-    }
-
     pub async fn update_workspace_git_root_pr(&self, root: &WorkspaceGitRoot) -> Result<()> {
-        let mut tx = self.begin().await?;
-        self.write_root_pr(&mut tx, root).await?;
-        tx.commit().await.map_err(db)
+        let mut root = root.clone();
+        self.update_workspace_git_root_pr_rebased(&mut root, |_, _| {})
+            .await
     }
 
     pub async fn update_workspace_git_root_pr_rebased<F>(
@@ -1566,7 +1527,24 @@ impl PgStore {
         };
         let persisted = stored.and_then(|s| serde_json::from_str::<Vec<PullRequestInfo>>(&s).ok());
         rebase(root, persisted);
-        self.write_root_pr(&mut tx, root).await?;
+        let updated = sqlx::query(
+            "UPDATE workspace_git_root SET pr_number = $3, pr_url = $4, pr_status = $5, \
+             pull_requests = $6, updated_at = $7 WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(self.tenant())
+        .bind(&root.id.0)
+        .bind(root.pr_number.map(u64::cast_signed))
+        .bind(&root.pr_url)
+        .bind(root.pr_status.map(|s| enum_to_db(&s)).transpose()?)
+        .bind(roots::pull_requests_to_db(root.pull_requests.as_ref())?)
+        .bind(&root.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("workspace git root pr write failed: {e}")))?
+        .rows_affected();
+        if updated == 0 {
+            return Err(root_not_found(&root.id));
+        }
         tx.commit().await.map_err(db)
     }
 
@@ -1620,7 +1598,7 @@ impl PgStore {
         sha: &str,
         updated_at: &str,
     ) -> Result<bool> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let stamped = sqlx::query(
             "UPDATE workspace_git_root SET registered_commit_sha = $3, updated_at = $4 \
              WHERE tenant_id = $1 AND id = $2 AND registered_commit_sha IS NULL",
@@ -1657,7 +1635,7 @@ impl PgStore {
         workspace_id: &WorkspaceId,
         home: &WorkspaceHome,
     ) -> Result<()> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO workspace_home (tenant_id, workspace_id, home_id, node_id, \
              cloud_machine_id, name, state, since, last_backup_at) \
@@ -1734,17 +1712,6 @@ impl PgStore {
         self.home_rows(&sql, Some(node_id)).await
     }
 
-    /// Run one conditional `workspace_home` write; whether a row changed.
-    async fn home_write(
-        &self,
-        query: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
-    ) -> Result<bool> {
-        let mut tx = self.begin().await?;
-        let changed = query.execute(&mut *tx).await.map_err(db)?.rows_affected() > 0;
-        tx.commit().await.map_err(db)?;
-        Ok(changed)
-    }
-
     pub async fn set_workspace_home_state(
         &self,
         workspace_id: &WorkspaceId,
@@ -1752,7 +1719,8 @@ impl PgStore {
         state: HomeState,
         since: &str,
     ) -> Result<bool> {
-        self.home_write(
+        rows_changed(
+            self.begin_write().await?,
             sqlx::query(
                 "UPDATE workspace_home SET state = $4, since = $5 \
                  WHERE tenant_id = $1 AND workspace_id = $2 AND home_id = $3 AND state != $4",
@@ -1773,7 +1741,8 @@ impl PgStore {
         node_id: &str,
         at: &str,
     ) -> Result<bool> {
-        self.home_write(
+        rows_changed(
+            self.begin_write().await?,
             sqlx::query(
                 "UPDATE workspace_home SET last_backup_at = $5, backup_failing_since = NULL \
                  WHERE tenant_id = $1 AND workspace_id = $2 AND home_id = $3 AND node_id = $4",
@@ -1796,7 +1765,8 @@ impl PgStore {
         seq: u64,
     ) -> Result<bool> {
         let seq = i64::try_from(seq).map_err(db)?;
-        self.home_write(
+        rows_changed(
+            self.begin_write().await?,
             sqlx::query(
                 "UPDATE workspace_home SET auto_start_lease_id = $5, auto_start_seq = $6 \
                  WHERE tenant_id = $1 AND workspace_id = $2 AND home_id = $3 AND node_id = $4 \
@@ -1819,7 +1789,7 @@ impl PgStore {
         home_id: &HomeId,
         at: &str,
     ) -> Result<Option<String>> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let since: Option<Option<String>> = sqlx::query_scalar(
             "UPDATE workspace_home SET backup_failing_since = COALESCE(backup_failing_since, $4) \
              WHERE tenant_id = $1 AND workspace_id = $2 AND home_id = $3 \
@@ -1864,7 +1834,8 @@ impl PgStore {
         to: HomeState,
         since: &str,
     ) -> Result<bool> {
-        self.home_write(
+        rows_changed(
+            self.begin_write().await?,
             sqlx::query(
                 "UPDATE workspace_home SET state = $5, since = $6 \
                  WHERE tenant_id = $1 AND workspace_id = $2 AND home_id = $3 AND state = $4",
@@ -1886,7 +1857,8 @@ impl PgStore {
         cloud_machine_id: &str,
         node_id: &str,
     ) -> Result<bool> {
-        self.home_write(
+        rows_changed(
+            self.begin_write().await?,
             sqlx::query(
                 "UPDATE workspace_home SET node_id = $5 \
                  WHERE tenant_id = $1 AND workspace_id = $2 AND home_id = $3 \
@@ -1907,7 +1879,8 @@ impl PgStore {
         home_id: &HomeId,
         since: &str,
     ) -> Result<bool> {
-        self.home_write(
+        rows_changed(
+            self.begin_write().await?,
             sqlx::query(
                 "UPDATE workspace_home SET state = 'starting', since = $4 \
                  WHERE tenant_id = $1 AND workspace_id = $2 AND home_id = $3 \
@@ -1923,7 +1896,7 @@ impl PgStore {
     }
 
     pub async fn reset_unstarted_cloud_homes(&self, since: &str) -> Result<Vec<WorkspaceId>> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let ids: Vec<String> = sqlx::query_scalar(
             "UPDATE workspace_home SET state = 'attached', since = $2 \
              WHERE tenant_id = $1 AND state = 'starting' AND node_id IS NULL \
@@ -1945,7 +1918,8 @@ impl PgStore {
         node_id: Option<&str>,
         since: &str,
     ) -> Result<bool> {
-        self.home_write(
+        rows_changed(
+            self.begin_write().await?,
             sqlx::query(
                 "UPDATE workspace_home SET node_id = NULL, state = 'detached', since = $5 \
                  WHERE tenant_id = $1 AND workspace_id = $2 AND home_id = $3 \
@@ -1960,4 +1934,14 @@ impl PgStore {
         )
         .await
     }
+}
+
+/// Run one conditional write in `tx` and commit; whether a row changed.
+async fn rows_changed(
+    mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    query: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
+) -> Result<bool> {
+    let changed = query.execute(&mut *tx).await.map_err(db)?.rows_affected() > 0;
+    tx.commit().await.map_err(db)?;
+    Ok(changed)
 }

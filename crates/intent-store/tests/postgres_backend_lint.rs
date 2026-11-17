@@ -4,7 +4,11 @@
 //!    a bound tenant parameter (`tenant_id = $n`) in the same query, and
 //!    every INSERT sets `tenant_id`. One database holds every tenant, so a
 //!    statement without the filter reads or changes other tenants' rows.
-//! 2. `postgres/pending-methods.txt` lists exactly the `Store` methods that
+//! 2. Every function there that writes (an SQL literal starting with
+//!    INSERT, UPDATE or DELETE) opens its transaction with `begin_write()`.
+//!    The per-tenant writer lock orders only writers that take it, so one
+//!    writer on plain `begin()` can commit between another's read and write.
+//! 3. `postgres/pending-methods.txt` lists exactly the `Store` methods that
 //!    still go through `pending_postgres!` (no Postgres implementation yet).
 //!    Porting a method removes its line; a new `Store` method should ship
 //!    with its Postgres version (`dispatch!`) or be listed here on purpose.
@@ -169,6 +173,72 @@ fn the_tenant_rule_catches_unscoped_shapes() {
     assert!(!violations("update settings set tenant_id = $1 where key = $2").is_empty());
     assert!(
         violations("update settings set value = $3 where tenant_id = $1 and key = $2").is_empty()
+    );
+}
+
+/// The functions in `text` that write without the tenant's writer lock:
+/// their text (up to the next `fn`) holds an INSERT, UPDATE or DELETE
+/// literal but no `begin_write()` call.
+fn writers_without_lock(text: &str) -> Vec<String> {
+    let starts: Vec<usize> = text
+        .match_indices("fn ")
+        .map(|(i, _)| i)
+        .filter(|&i| i == 0 || text.as_bytes()[i - 1].is_ascii_whitespace())
+        .collect();
+    let mut out = Vec::new();
+    for (k, &start) in starts.iter().enumerate() {
+        let chunk = &text[start..starts.get(k + 1).copied().unwrap_or(text.len())];
+        let writes = string_literals(chunk).iter().any(|(_, lit)| {
+            let l = lit.trim_start().to_lowercase();
+            ["insert ", "update ", "delete "]
+                .iter()
+                .any(|w| l.starts_with(w))
+        });
+        if writes && !chunk.contains("begin_write()") {
+            let name = chunk[3..]
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or_default();
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+#[test]
+fn every_postgres_write_takes_the_tenant_writer_lock() {
+    let mut files = Vec::new();
+    rust_files(&src().join("postgres"), &mut files);
+    let findings: Vec<String> = files
+        .iter()
+        .flat_map(|file| {
+            let text = std::fs::read_to_string(file).expect("read");
+            writers_without_lock(&text)
+                .into_iter()
+                .map(move |name| format!("{}: {name}", file.display()))
+        })
+        .collect();
+    assert!(
+        findings.is_empty(),
+        "these Postgres functions write without begin_write():\n{}",
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn the_writer_lock_rule_catches_unlocked_writes() {
+    let locked = r#"async fn a(&self) { let tx = self.begin_write().await?;
+        sqlx::query("UPDATE t SET x = 1 WHERE tenant_id = $1"); }"#;
+    let unlocked = r#"async fn b(&self) { let tx = self.begin().await?;
+        sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
+    let read = r#"async fn c(&self) { let tx = self.begin().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1"); }"#;
+    assert!(writers_without_lock(locked).is_empty());
+    assert!(writers_without_lock(read).is_empty());
+    assert_eq!(writers_without_lock(unlocked), ["b"]);
+    assert_eq!(
+        writers_without_lock(&format!("{locked}\n{read}\n{unlocked}")),
+        ["b"]
     );
 }
 
