@@ -400,6 +400,15 @@ enabled provider/model. New agents and quick actions cannot run on a disabled
 provider; update their saved selections or re-enable it. Intent does not choose an
 arbitrary replacement for a disabled app default.
 
+<!-- Sources: packages/cloudlands-fe/src/features/onboarding/messages/{ProviderCard,ProviderTerminalButton}.svelte; packages/cloudlands-fe/src/features/providers/utils/provider-install-commands.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-availability/sagas/provider-availability-saga.ts. -->
+Pending frontend release (not in current builds): in onboarding, a card that is not
+installed shows **Install** when Intent knows the provider's install command, and a
+card that needs sign-in shows **Log in** for Claude Code or a provider whose catalog
+lists a login command. These buttons run that command in Intent's terminal drawer, and
+the drawer closes when the card's check passes. Otherwise (and in current builds,
+except Claude Code's **Log in**) the card shows a plain status: send the user to the
+provider's docs, linked from the card, to run the command in a terminal.
+
 <!-- Auggie visibility: packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/cloudlands-fe/src/features/onboarding/messages/AgentGrid.svelte; packages/cloudlands-fe/src/store/renderer/slices/provider-catalog/workspace-catalog-selectors.ts. -->
 Auggie appears in provider lists, including onboarding, only when its CLI is
 installed or it is already enabled. An enabled but missing installation stays
