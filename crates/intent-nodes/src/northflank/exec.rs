@@ -451,7 +451,7 @@ fn init_refused(data: &Value, secrets: &[&str]) -> CloudError {
     if lower.contains("could not find service") {
         return CloudError::new(
             CloudErrorKind::NotFound,
-            format!("the Northflank service is gone: {message}"),
+            format!("the service is gone: {message}"),
         );
     }
     let denied = [

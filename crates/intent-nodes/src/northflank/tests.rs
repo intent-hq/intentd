@@ -1640,6 +1640,12 @@ async fn exec_auth_failures_are_unauthorized_or_denied() {
             ]),
             WsSession::Refuse(403, json!({"error": {"status": 403, "message": "Forbidden"}}).to_string()),
             WsSession::Refuse(404, json!({"error": {"status": 404, "message": "Service not found"}}).to_string()),
+            // The recorded bad-token answer.
+            WsSession::Steps(vec![
+                WsStep::Receive,
+                WsStep::Send(json!({"type": "init", "data": {"auth": "failed", "message": "Unauthorized"}})),
+                WsStep::Close,
+            ]),
         ],
     )
     .await;
@@ -1669,6 +1675,11 @@ async fn exec_auth_failures_are_unauthorized_or_denied() {
         .await
         .unwrap_err();
     assert!(missing.is_not_found(), "{missing}");
+    let unauthorized = client
+        .run_command(&instance("svc-1"), &spec)
+        .await
+        .unwrap_err();
+    assert_eq!(unauthorized.kind(), CloudErrorKind::Unauthorized);
 }
 
 /// Northflank accepts the stream for a service that does not exist, fails
