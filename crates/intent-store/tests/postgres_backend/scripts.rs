@@ -25,7 +25,6 @@ const T0: &str = "2026-01-01T00:00:00.000Z";
 const T1: &str = "2026-01-02T00:00:00.000Z";
 const T2: &str = "2026-01-03T00:00:00.000Z";
 const T3: &str = "2026-01-04T00:00:00.000Z";
-const TOK: &str = "run-1";
 
 fn wid(id: &str) -> WorkspaceId {
     WorkspaceId(id.into())
@@ -107,7 +106,7 @@ parity_test!(script_definitions_round_trip, |store, tenant| {
         node_id: "node-1".into(),
     });
     c.last_run = Some(ScriptLastRun {
-        run_id: Some(TOK.into()),
+        run_id: Some("run-c".into()),
         outcome: ScriptRunOutcome::Succeeded,
         exit_code: Some(0),
         started_at: Some(T1.into()),
@@ -122,10 +121,6 @@ parity_test!(script_definitions_round_trip, |store, tenant| {
         Some(a.clone())
     );
     assert_eq!(
-        store.get_script_in_workspace(&wb, "s-a").await.unwrap(),
-        None
-    );
-    assert_eq!(
         store.get_script_in_workspace(&wa, "missing").await.unwrap(),
         None
     );
@@ -134,10 +129,6 @@ parity_test!(script_definitions_round_trip, |store, tenant| {
         Some(b.clone())
     );
     assert_eq!(store.get_active_script(&wb, "s-c").await.unwrap(), None);
-    assert_eq!(
-        store.script_workspace("s-c").await.unwrap(),
-        Some(wb.clone())
-    );
 
     // A replace swaps the whole definition; a repeated id keeps the last one.
     let mut a2 = a.clone();
@@ -170,9 +161,6 @@ parity_test!(script_definitions_round_trip, |store, tenant| {
     assert!(not_found(
         &store.set_script_archived_at(&wa, "missing", Some(T3)).await
     ));
-    assert!(not_found(
-        &store.set_script_archived_at(&wb, "s-a", None).await
-    ));
 
     store
         .upsert_script(&script("s-gone", "ws-a", T0, tenant))
@@ -185,9 +173,6 @@ parity_test!(script_definitions_round_trip, |store, tenant| {
         .upsert_script(&script("s-rm", "ws-a", T0, tenant))
         .await
         .unwrap();
-    assert!(not_found(
-        &store.remove_script_in_workspace(&wb, "s-rm").await
-    ));
     store.remove_script_in_workspace(&wa, "s-rm").await.unwrap();
     assert!(not_found(
         &store.remove_script_in_workspace(&wa, "s-rm").await
@@ -197,6 +182,32 @@ parity_test!(script_definitions_round_trip, |store, tenant| {
     b3.archived_at = Some(T3.into());
     assert_eq!(all(&store).await, [a2.clone(), b3, c, new.clone()]);
     assert_eq!(active(&store).await, [a2, new]);
+
+    // Each tenant's s-t lives in its own workspace, so the answer is per tenant.
+    let ws_t = format!("ws-{tenant}");
+    store
+        .upsert_script(&script("s-t", &ws_t, T3, tenant))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.script_workspace("s-t").await.unwrap(),
+        Some(wid(&ws_t))
+    );
+    // s-ws is in ws-a here and in ws-b for the decoy.
+    store
+        .upsert_script(&script("s-ws", "ws-a", T3, tenant))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_script_in_workspace(&wb, "s-ws").await.unwrap(),
+        None
+    );
+    assert!(not_found(
+        &store.set_script_archived_at(&wb, "s-ws", None).await
+    ));
+    assert!(not_found(
+        &store.remove_script_in_workspace(&wb, "s-ws").await
+    ));
 
     if tenant == "decoy" {
         // Pre-write states for the subject's writes, and rows its absent probes would see.
@@ -212,6 +223,7 @@ parity_test!(script_definitions_round_trip, |store, tenant| {
             ("s-gone", "ws-a"),
             ("s-rm", "ws-a"),
             ("s-new", "ws-b"),
+            ("s-ws", "ws-b"),
             ("missing", "ws-a"),
         ] {
             store
@@ -224,13 +236,15 @@ parity_test!(script_definitions_round_trip, |store, tenant| {
 
 parity_test!(script_runs_admit_start_and_settle, |store, tenant| {
     let wa = wid("ws-a");
+    let tok = format!("{tenant}-run");
+    let tok = tok.as_str();
     assert!(store.pending_script_runs().await.unwrap().is_empty());
     assert!(store
         .list_was_running_script_ids()
         .await
         .unwrap()
         .is_empty());
-    for id in ["r-start", "r-settle"] {
+    for id in ["r-start", "r-settle", "r-reset"] {
         assert_eq!(store.latest_script_run(&wa, id).await.unwrap(), None);
     }
 
@@ -251,35 +265,42 @@ parity_test!(script_runs_admit_start_and_settle, |store, tenant| {
     }
 
     if tenant == "decoy" {
-        // Leave each row in the state the subject's write starts from.
+        // Leave each row in the state the subject's write starts from. Rows
+        // behind token-keyed writes hold the subject's token and a T0 start,
+        // so a leaky admit (clears the start), start (sets T1), abandon or
+        // settle still changes them.
         store
             .upsert_script(&run_script("r-missing", Command, Saved, tenant))
             .await
             .unwrap();
         for id in ["r-start", "r-abandon", "r-settle", "r-recover"] {
-            store.admit_script_run(&wa, id, TOK).await.unwrap();
+            store
+                .admit_script_run(&wa, id, "subject-run")
+                .await
+                .unwrap();
+            store
+                .start_script_run(&wa, id, "subject-run", T0)
+                .await
+                .unwrap();
         }
-        store
-            .start_script_run(&wa, "r-abandon", TOK, T1)
-            .await
-            .unwrap();
+        store.admit_script_run(&wa, "r-reset", tok).await.unwrap();
         store
             .set_script_was_running("ws-a", "r-unmark", true)
             .await
             .unwrap();
     } else {
-        store.admit_script_run(&wa, "r-admit", TOK).await.unwrap();
+        store.admit_script_run(&wa, "r-admit", tok).await.unwrap();
         assert!(not_found(
-            &store.admit_script_run(&wa, "r-missing", TOK).await
+            &store.admit_script_run(&wa, "r-missing", tok).await
         ));
         assert_eq!(
             store.latest_script_run(&wa, "r-admit").await.unwrap(),
-            Some((TOK.to_owned(), None))
+            Some((tok.to_owned(), None))
         );
 
-        store.admit_script_run(&wa, "r-start", TOK).await.unwrap();
+        store.admit_script_run(&wa, "r-start", tok).await.unwrap();
         store
-            .start_script_run(&wa, "r-start", TOK, T1)
+            .start_script_run(&wa, "r-start", tok, T1)
             .await
             .unwrap();
         store
@@ -287,36 +308,36 @@ parity_test!(script_runs_admit_start_and_settle, |store, tenant| {
             .await
             .unwrap();
 
-        store.admit_script_run(&wa, "r-abandon", TOK).await.unwrap();
+        store.admit_script_run(&wa, "r-abandon", tok).await.unwrap();
         store
-            .start_script_run(&wa, "r-abandon", TOK, T1)
+            .start_script_run(&wa, "r-abandon", tok, T1)
             .await
             .unwrap();
         store
-            .abandon_script_run(&wa, "r-abandon", TOK, false)
+            .abandon_script_run(&wa, "r-abandon", tok, false)
             .await
             .unwrap();
 
         let result = ScriptLastRun {
-            run_id: Some(TOK.into()),
+            run_id: Some(tok.into()),
             outcome: ScriptRunOutcome::Failed,
             exit_code: Some(2),
             started_at: Some(T1.into()),
             stopped_at: T2.into(),
             error: Some(format!("{tenant} failed")),
         };
-        store.admit_script_run(&wa, "r-settle", TOK).await.unwrap();
+        store.admit_script_run(&wa, "r-settle", tok).await.unwrap();
         assert!(store
-            .settle_script_run(&wa, "r-settle", TOK, &result, false)
+            .settle_script_run(&wa, "r-settle", tok, &result, false)
             .await
             .unwrap());
         assert!(!store
-            .settle_script_run(&wa, "r-settle", TOK, &result, false)
+            .settle_script_run(&wa, "r-settle", tok, &result, false)
             .await
             .unwrap());
         assert_eq!(
             store.latest_script_run(&wa, "r-settle").await.unwrap(),
-            Some((TOK.to_owned(), Some(result.clone())))
+            Some((tok.to_owned(), Some(result.clone())))
         );
         let settled = store
             .get_script_in_workspace(&wa, "r-settle")
@@ -326,9 +347,9 @@ parity_test!(script_runs_admit_start_and_settle, |store, tenant| {
         assert_eq!(settled.last_run, Some(result.clone()));
         assert_eq!(settled.archived_at.as_deref(), Some(T2));
 
-        store.admit_script_run(&wa, "r-recover", TOK).await.unwrap();
+        store.admit_script_run(&wa, "r-recover", tok).await.unwrap();
         assert!(store
-            .settle_script_run(&wa, "r-recover", TOK, &result, true)
+            .settle_script_run(&wa, "r-recover", tok, &result, true)
             .await
             .unwrap());
 
@@ -346,7 +367,7 @@ parity_test!(script_runs_admit_start_and_settle, |store, tenant| {
             .unwrap();
 
         // A replace clears the admission and the latest run.
-        store.admit_script_run(&wa, "r-reset", TOK).await.unwrap();
+        store.admit_script_run(&wa, "r-reset", tok).await.unwrap();
         store
             .upsert_script(&run_script("r-reset", Command, Saved, tenant))
             .await
@@ -358,8 +379,8 @@ parity_test!(script_runs_admit_start_and_settle, |store, tenant| {
         assert_eq!(
             pending,
             [
-                (wa.clone(), "r-admit".into(), TOK.into(), None),
-                (wa.clone(), "r-start".into(), TOK.into(), Some(T1.into())),
+                (wa.clone(), "r-admit".into(), tok.into(), None),
+                (wa.clone(), "r-start".into(), tok.into(), Some(T1.into())),
             ]
         );
         let mut running = store.list_was_running_script_ids().await.unwrap();
@@ -415,11 +436,15 @@ parity_test!(script_bootstrap_claims_a_workspace_once, |store, tenant| {
 
     if tenant == "decoy" {
         // ws-b stays unclaimed for the subject's claim; ws-none is initialized.
+        // The ids the subject writes and removes live in ws-none, so placing
+        // them does not claim ws-a or ws-b.
         store.insert_workspace(&workspace("ws-none")).await.unwrap();
-        store
-            .upsert_script(&script("d-none", "ws-none", T0, tenant))
-            .await
-            .unwrap();
+        for id in ["d-none", "d-1", "d-2", "d-b"] {
+            store
+                .upsert_script(&script(id, "ws-none", T0, tenant))
+                .await
+                .unwrap();
+        }
     } else {
         assert!(!store.workspace_scripts_initialized(&wb).await.unwrap());
         let b = [script("d-b", "ws-b", T0, tenant)];
@@ -544,6 +569,9 @@ parity_test!(script_summary_pages_bound_and_page_rows, |store, tenant| {
             .unwrap(),
         empty
     );
+    // Known gap: no tenant can hold script_monitor rows yet (the registration
+    // fence needs a live agent_session, not ported), so the monitor branch
+    // is only checked empty. Leak-test it when the monitor domain is ported.
     assert_eq!(
         store
             .script_summary_page(&wa, None, true, &opts(10, None))
