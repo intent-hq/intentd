@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.237] - 2026-11-17
+
+### 🚀 Features
+
+- *(store)* Port node assignment, checkpoint and remote agent store methods to Postgres ([#3472](https://github.com/intent-hq/intentd/pull/3472))
+- *(store)* Port agent transcript store methods to Postgres ([#3473](https://github.com/intent-hq/intentd/pull/3473))
+- *(store)* Port hook store methods to Postgres ([#3474](https://github.com/intent-hq/intentd/pull/3474))
+- *(store)* Port script monitor and notification store methods to Postgres ([#3475](https://github.com/intent-hq/intentd/pull/3475))
+
+### 🐛 Bug Fixes
+
+- *(executor)* Push the machine report when a background refresh changes it ([#3471](https://github.com/intent-hq/intentd/pull/3471))
+
+
 ## [0.11.236] - 2026-11-17
 
 ### 🚀 Features
