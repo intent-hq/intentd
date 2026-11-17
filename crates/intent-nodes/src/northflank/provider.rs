@@ -1,6 +1,6 @@
 //! [`NorthflankClient`] as a [`CloudProvider`]: a machine is a deployment
 //! service with one volume, tags are two team tags plus the full tag map
-//! in an annotation, and pause scales the service to zero.
+//! in the runtime environment, and pause scales the service to zero.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -18,10 +18,11 @@ use crate::cloud::{
     CreateInstance, InstanceState, ListInstances, ListedInstance, ProcessOutput, ProcessSpec,
 };
 
-/// The annotation that holds a machine's tags as compact JSON. A service
-/// description is at most 200 characters and refuses `{` and `}`, too short
-/// for the backend's tags, so the tags live on the workload instead.
-pub(super) const TAGS_ANNOTATION: &str = "intent.dev/tags";
+/// The runtime environment variable that holds a machine's tags as compact
+/// JSON. Northflank drops a service's annotations and labels, team tag
+/// names cannot hold a value, and a description is at most 200 characters
+/// without `{` or `}`: the runtime environment is what reads back.
+pub(super) const TAGS_ENV: &str = "INTENT_TAGS";
 const BACKEND_ID_TAG: &str = "intentBackendId";
 /// Prefix of a [`ListedInstance::id`] that names a volume without a service.
 const VOLUME_PREFIX: &str = "volume:";
@@ -98,10 +99,7 @@ impl ServiceView {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let tags = value
-            .pointer(&format!(
-                "/deployment/metadata/annotations/{}",
-                TAGS_ANNOTATION.replace('~', "~0").replace('/', "~1")
-            ))
+            .pointer(&format!("/runtimeEnvironment/{TAGS_ENV}"))
             .and_then(Value::as_str)
             .and_then(|s| serde_json::from_str(s).ok());
         Self {
@@ -213,8 +211,8 @@ impl NorthflankClient {
                     "deployment": {
                         "instances": 1,
                         "external": { "imagePath": request.image },
-                        "metadata": { "annotations": { TAGS_ANNOTATION: tags_json } },
                     },
+                    "runtimeEnvironment": { TAGS_ENV: tags_json },
                     "ports": [],
                     "createOptions": { "volumesToAttach": [volume.id] },
                 }),
@@ -416,7 +414,13 @@ impl NorthflankClient {
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e),
         };
-        let volume = self.delete_volume(volume.unwrap_or(id)).await?;
+        let volume = match self.delete_volume(volume.unwrap_or(id)).await {
+            Ok(volume) => volume,
+            // The service goes in the background and holds its volume
+            // until then: the reaper deletes that volume as an orphan.
+            Err(e) if service && e.kind() == CloudErrorKind::Conflict => false,
+            Err(e) => return Err(e),
+        };
         Ok(service || volume)
     }
 
@@ -458,7 +462,11 @@ impl NorthflankClient {
                 Err(e) => return Err(e),
             };
             let view = ServiceView::from(&value);
-            let tags = view.tags.unwrap_or_default();
+            // A service made before the tags moved here has none to read:
+            // its team tag still says it is this backend's.
+            let tags = view
+                .tags
+                .unwrap_or_else(|| BTreeMap::from([(BACKEND_ID_TAG.to_string(), backend.clone())]));
             if !filter.tags.iter().all(|(k, v)| tags.get(k) == Some(v)) {
                 continue;
             }

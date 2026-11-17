@@ -16,8 +16,8 @@ const MAX_ERROR_MESSAGE: usize = 512;
 const MAX_LIST_PAGES: usize = 1000;
 /// Northflank's largest page.
 const PAGE_SIZE: &str = "100";
-/// Longest compact JSON of a machine's tags. It is stored as a Kubernetes
-/// annotation, whose values may total 256 KiB; this keeps it far below.
+/// Longest compact JSON of a machine's tags, kept in one runtime
+/// environment variable.
 pub(super) const MAX_TAGS_JSON: usize = 16 * 1024;
 /// Wait after a 429 that says nothing about when to come back.
 const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(1);
