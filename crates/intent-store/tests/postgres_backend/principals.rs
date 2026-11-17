@@ -17,7 +17,7 @@ use intent_store::{
 };
 use serde_json::json;
 
-use crate::harness::{exec, parity_test, TestDb};
+use crate::harness::{exec, open, parity_test, test_db, TestDb};
 
 const T1: &str = "2026-02-01T00:00:01.000Z";
 const T2: &str = "2026-02-01T00:00:02.000Z";
@@ -1551,3 +1551,123 @@ parity_test!(host_join_refusals_and_guest_roles, |store, tenant, db| {
         .await;
     }
 });
+
+parity_test!(
+    owner_queue_permit_binds_owner_and_exact_key,
+    |store, tenant, db| {
+        let owner = store.get_primary_principal().await.unwrap().id;
+        let guest = person("qguest", gh(701), tenant, T1);
+        store.upsert_principal(&guest).await.unwrap();
+        store
+            .insert_principal_credential(&guest.id, "q-guest-key")
+            .await
+            .unwrap();
+        for key in ["q-own-key", "q-old-key"] {
+            store
+                .insert_principal_credential(&owner, key)
+                .await
+                .unwrap();
+        }
+        let permit = |id: PrincipalId, key: Option<&'static str>| {
+            let store = &store;
+            async move { store.owner_queue_permit(&id, key).await.unwrap().is_some() }
+        };
+
+        assert!(
+            !permit(guest.id.clone(), None).await,
+            "a guest is not the owner"
+        );
+        assert!(!permit(guest.id.clone(), Some("q-guest-key")).await);
+        assert!(permit(owner.clone(), None).await);
+        assert!(
+            !permit(owner.clone(), Some("q-guest-key")).await,
+            "another principal's key"
+        );
+        assert!(!permit(owner.clone(), Some("q-missing-key")).await);
+        assert!(permit(owner.clone(), Some("q-old-key")).await);
+        assert!(store
+            .revoke_principal_credential("q-old-key")
+            .await
+            .unwrap());
+        assert!(
+            !permit(owner.clone(), Some("q-old-key")).await,
+            "a revoked key"
+        );
+        assert!(permit(owner.clone(), Some("q-own-key")).await);
+
+        if tenant == "decoy" {
+            store
+                .insert_principal_credential(&owner, "q-missing-key")
+                .await
+                .unwrap();
+            decoy_sql(
+                db,
+                tenant,
+                "UPDATE principal SET is_primary = 0 WHERE {w} AND is_primary = 1; \
+                 UPDATE principal SET is_primary = 1 WHERE {w} AND id = 'qguest'",
+            )
+            .await;
+            decoy_sql(
+                db,
+                tenant,
+                &format!(
+                    "UPDATE principal_credential SET principal_id = '{}', revoked_at = NULL \
+                 WHERE {{w}} AND token_hash IN ('q-guest-key', 'q-old-key')",
+                    owner.as_str()
+                ),
+            )
+            .await;
+        }
+    }
+);
+
+/// The permit holds the tenant writer lock: a revoke waits for it, and
+/// dropping the permit (a rollback in sqlx's drop) lets the revoke finish.
+#[tokio::test]
+async fn owner_queue_permit_blocks_revoke_until_dropped() {
+    use std::time::Duration;
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let store = open(&db, "tenant-a").await;
+    let other = open(&db, "tenant-b").await;
+    let owner = store.get_primary_principal().await.unwrap().id;
+    store
+        .insert_principal_credential(&owner, "k")
+        .await
+        .unwrap();
+    other
+        .insert_principal_credential(&other.get_primary_principal().await.unwrap().id, "k")
+        .await
+        .unwrap();
+
+    let held = store
+        .owner_queue_permit(&owner, Some("k"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tokio::time::timeout(
+        Duration::from_secs(5),
+        other.revoke_principal_credential("k")
+    )
+    .await
+    .expect("another tenant's writer is not blocked")
+    .unwrap());
+    let revoke = tokio::spawn({
+        let store = store.clone();
+        async move { store.revoke_principal_credential("k").await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!revoke.is_finished(), "revoke waits for the permit");
+    drop(held);
+    assert!(tokio::time::timeout(Duration::from_secs(5), revoke)
+        .await
+        .expect("dropping the permit releases the lock")
+        .unwrap()
+        .unwrap());
+    assert!(store
+        .owner_queue_permit(&owner, Some("k"))
+        .await
+        .unwrap()
+        .is_none());
+}
