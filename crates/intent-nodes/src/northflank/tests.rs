@@ -1671,6 +1671,26 @@ async fn exec_auth_failures_are_unauthorized_or_denied() {
     assert!(missing.is_not_found(), "{missing}");
 }
 
+/// Northflank accepts the stream for a service that does not exist, fails
+/// the `init` with this message and keeps the socket open (recorded
+/// 2026-11-17): the machine is gone, the token is fine.
+#[tokio::test]
+async fn an_exec_on_a_missing_service_is_not_found_not_a_rejected_token() {
+    let server = exec_server(vec![
+        WsStep::Receive,
+        WsStep::Send(json!({"type": "init", "data": {"auth": "failed", "message": "Could not find service 'svc-1'"}})),
+    ])
+    .await;
+    let error = client(&server)
+        .run_command(&instance("svc-1"), &ProcessSpec::new("x"))
+        .await
+        .unwrap_err();
+    assert!(error.is_not_found(), "{error}");
+    assert!(!error.is_retryable(), "{error}");
+    assert!(error.to_string().contains("svc-1"), "{error}");
+    assert!(!error.to_string().contains("token"), "{error}");
+}
+
 #[tokio::test]
 async fn exec_error_frame_ends_the_command() {
     let server = exec_server(vec![
