@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
-use intent_core::{AgentId, AgentListRowScope, WorkspaceId};
+use intent_core::{AgentId, AgentListRowScope, Workspace, WorkspaceId};
 use intent_store::{
     PrunedToolField, ReplaceMessage, Store, UsageMessageOrigin, UserMessageIndexPageRequest,
 };
@@ -17,9 +17,12 @@ use serde_json::{json, Value};
 use crate::harness::{exec, open, sqlite_store, tenant_rows, test_db, TestDb};
 
 const WS: &str = "__chief__";
+/// An archived workspace, for the search ranking penalty.
+const ARCHIVED_WS: &str = "ws-arch";
 
-/// `(id, parent, is_background, metadata, created_at)`.
+/// `(id, workspace, parent, is_background, metadata, created_at)`.
 type Session = (
+    &'static str,
     &'static str,
     Option<&'static str>,
     i64,
@@ -28,27 +31,29 @@ type Session = (
 );
 
 const SESSIONS: &[Session] = &[
-    ("a1", None, 0, None, "2026-01-01T00:00:00Z"),
+    ("a1", WS, None, 0, None, "2026-01-01T00:00:00Z"),
     (
         "a2",
+        WS,
         None,
         0,
         Some(r#"{"lastSeenMessageId":"x"}"#),
         "2026-01-02T00:00:00Z",
     ),
-    ("c1", Some("a1"), 0, None, "2026-01-03T00:00:00Z"),
-    ("bg", None, 1, None, "2026-01-04T00:00:00Z"),
+    ("c1", WS, Some("a1"), 0, None, "2026-01-03T00:00:00Z"),
+    ("bg", WS, None, 1, None, "2026-01-04T00:00:00Z"),
+    ("z1", ARCHIVED_WS, None, 0, None, "2026-01-05T00:00:00Z"),
 ];
 
 fn session_values(tenant: Option<&str>) -> String {
     SESSIONS
         .iter()
-        .map(|(id, parent, bg, metadata, at)| {
+        .map(|(id, workspace, parent, bg, metadata, at)| {
             let lit = |v: Option<&str>| v.map_or("NULL".to_owned(), |v| format!("'{v}'"));
             let tenant = tenant.map_or(String::new(), |t| format!("'{t}', "));
             format!(
-                "({tenant}'{id}', '{WS}', 'Agent {id}', 'idle', '{at}', '{at}', 'model-{id}', \
-                 {}, {bg}, {})",
+                "({tenant}'{id}', '{workspace}', 'Agent {id}', 'idle', '{at}', '{at}', \
+                 'model-{id}', {}, {bg}, {})",
                 lit(*parent),
                 lit(*metadata)
             )
@@ -61,7 +66,24 @@ const SESSION_COLUMNS: &str =
     "id, workspace_id, name, status, created_at, updated_at, model, parent_agent_id, \
      is_background, metadata";
 
+/// The archived workspace, through the (ported) workspace store.
+async fn seed_workspace(store: &Store) {
+    store
+        .insert_workspace(&Workspace {
+            id: WorkspaceId(ARCHIVED_WS.into()),
+            title: "Archived".into(),
+            branch: "main".into(),
+            archived: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("seed archived workspace");
+}
+
 async fn seed_sqlite(store: &Store) {
+    seed_workspace(store).await;
     let sql = format!(
         "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES {}",
         session_values(None)
@@ -72,7 +94,8 @@ async fn seed_sqlite(store: &Store) {
         .expect("seed sqlite sessions");
 }
 
-async fn seed_postgres(db: &TestDb, tenant: &str) {
+async fn seed_postgres(db: &TestDb, store: &Store, tenant: &str) {
+    seed_workspace(store).await;
     exec(
         &db.admin,
         format!(
@@ -83,9 +106,32 @@ async fn seed_postgres(db: &TestDb, tenant: &str) {
     .await;
 }
 
-/// Like `parity_test!`, with the sessions seeded before each run.
+/// `agent_usage_cell` message counts of one agent, `(model, human, agent)`.
+async fn usage_cells(store: &Store, db: Option<&TestDb>, tenant: &str) -> Vec<(String, i64, i64)> {
+    let sql = "SELECT model, human_messages, agent_messages FROM agent_usage_cell \
+               WHERE agent_id = 'a1' ORDER BY model";
+    match db {
+        None => sqlx::query_as(sql).fetch_all(store.read_pool()).await,
+        Some(db) => {
+            sqlx::query_as(
+                "SELECT model, human_messages, agent_messages FROM agent_usage_cell \
+                 WHERE tenant_id = $1 AND agent_id = 'a1' ORDER BY model",
+            )
+            .bind(tenant)
+            .fetch_all(&db.admin)
+            .await
+        }
+    }
+    .expect("read usage cells")
+}
+
+/// Like `parity_test!`, with the sessions seeded before each run. `$db` is
+/// `None` on `SQLite` and the test database on Postgres.
 macro_rules! message_test {
     ($name:ident, |$store:ident, $tenant:ident| $body:block) => {
+        message_test!($name, |$store, $tenant, _db| $body);
+    };
+    ($name:ident, |$store:ident, $tenant:ident, $db:ident| $body:block) => {
         #[tokio::test]
         async fn $name() {
             {
@@ -94,6 +140,7 @@ macro_rules! message_test {
                 seed_sqlite(&store).await;
                 let $store = store;
                 let $tenant: &str = "sqlite";
+                let $db: Option<&TestDb> = None;
                 $body
             }
             let Some(db) = test_db(false).await else {
@@ -102,17 +149,19 @@ macro_rules! message_test {
             eprintln!("[{}] backend: postgres, tenant decoy", stringify!($name));
             {
                 let $store = open(&db, "decoy").await;
-                seed_postgres(&db, "decoy").await;
+                seed_postgres(&db, &$store, "decoy").await;
                 let $tenant: &str = "decoy";
+                let $db = Some(&db);
                 $body
             }
             let subject = open(&db, "subject").await;
-            seed_postgres(&db, "subject").await;
+            seed_postgres(&db, &subject, "subject").await;
             let before = tenant_rows(&db.admin, "decoy").await;
             eprintln!("[{}] backend: postgres, tenant subject", stringify!($name));
             {
                 let $store = subject;
                 let $tenant: &str = "subject";
+                let $db = Some(&db);
                 $body
             }
             assert!(
@@ -534,138 +583,470 @@ message_test!(unread_probes_and_question_tails, |store, tenant| {
     );
 });
 
+/// A small `tool_use` block with the same id as [`heavy_tool_use`]: kept
+/// inline, so it has no payload row.
+fn small_tool_use() -> Value {
+    json!({ "type": "tool_use", "id": "tu1", "name": "write", "input": { "body": "small" } })
+}
+
+// Message `h2` is heavy only in the decoy: a hydration or replay read
+// without its tenant filter would splice the decoy's body into the
+// subject's inline block.
 message_test!(
-    heavy_payloads_hydrate_compact_and_prestage,
+    payload_reads_splice_only_the_tenants_rows,
     |store, tenant| {
         let a1 = agent("a1");
-        let heavy = heavy_tool_use(tenant);
-        let content = json!([heavy.clone()]);
-        store
-            .append_agent_message_with_id(
-                &a1,
-                "h1",
-                "assistant",
-                &content,
-                None,
-                "2026-04-01T00:00:00Z",
-            )
-            .await
-            .unwrap();
-        let full = store
-            .get_agent_message_by_id(&a1, "h1")
+        let h1 = json!([heavy_tool_use(tenant)]);
+        let h2 = if tenant == "decoy" {
+            json!([heavy_tool_use("decoy only")])
+        } else {
+            json!([small_tool_use()])
+        };
+        for (id, content) in [("h1", &h1), ("h2", &h2)] {
+            store
+                .append_agent_message_with_id(
+                    &a1,
+                    id,
+                    "assistant",
+                    content,
+                    None,
+                    "2026-04-01T00:00:00Z",
+                )
+                .await
+                .unwrap();
+        }
+        let by_id = store
+            .get_agent_message_by_id(&a1, "h2")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(full.content, content);
+        assert_eq!(by_id.content, h2);
+        let all = store.get_agent_messages(&a1, None).await.unwrap();
+        assert_eq!(
+            all.iter().map(|m| &m.content).collect::<Vec<_>>(),
+            [&h1, &h2]
+        );
+        let page = store.get_agent_messages_page(&a1, 1, 1).await.unwrap();
+        assert_eq!(page[0].content, h2);
+        assert_eq!(
+            store
+                .get_last_non_system_message(&a1)
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            h2
+        );
         let stored = store
             .get_agent_messages_page_as_stored(&a1, 0, 10)
             .await
             .unwrap();
         assert_eq!(stored[0].content[0]["inputTruncated"], json!(true));
-        assert_eq!(
-            store.get_agent_messages(&a1, None).await.unwrap()[0].content,
-            content
-        );
-        let (_, pruned) = store
-            .get_agent_message_by_id_with_pruned(&a1, "h1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(pruned.is_empty());
-
-        // Too early: nothing before the cutoff.
-        assert_eq!(
-            store
-                .compact_tool_payloads_before("2026-03-01T00:00:00Z", 100)
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            store
-                .compact_tool_payloads_before("2026-05-01T00:00:00Z", 100)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            store
-                .compact_tool_payloads_before("2026-05-01T00:00:00Z", 100)
-                .await
-                .unwrap(),
-            0
-        );
-        let (pruned_message, pruned) = store
-            .get_agent_message_by_id_with_pruned(&a1, "h1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(pruned.len(), 1);
-        assert_eq!(
-            (pruned[0].block_ordinal, pruned[0].field),
-            (0, PrunedToolField::ToolUseInput)
-        );
-        assert_eq!(pruned_message.content[0]["inputTruncated"], json!(true));
         let replay = store.get_agent_messages_for_replay(&a1, 100).await.unwrap();
-        assert_eq!(ids(&replay), ["h1"]);
-        assert_ne!(replay[0].content, content);
+        assert_eq!(ids(&replay), ["h1", "h2"]);
+        assert_ne!(replay[0].content, h1);
+        if tenant != "decoy" {
+            assert_eq!(replay[1].content, h2);
+        }
+    }
+);
 
-        // Pre-staged payload: an orphan is deleted; an adopted one stays.
-        let slim = store
-            .prestage_agent_message_payload(&a1, "p1", 0, &heavy)
-            .await
-            .unwrap()
-            .expect("heavy block is staged");
-        assert!(store
-            .prestage_agent_message_payload(&a1, "p1", 1, &json!({"type": "text", "text": "small"}))
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(
+// Decoy-only rows left after the decoy run share keys with rows the
+// subject run compacts and deletes, so a compaction or prestaged-payload
+// DELETE without its tenant filter changes the decoy's rows.
+message_test!(compaction_and_prestaged_payloads, |store, tenant| {
+    let a1 = agent("a1");
+    let heavy = heavy_tool_use(tenant);
+    let content = json!([heavy.clone()]);
+    let append = |id: &'static str, content: Value| {
+        let (store, a1) = (&store, &a1);
+        async move {
             store
-                .delete_prestaged_agent_message_payloads("p1")
+                .append_agent_message_with_id(
+                    a1,
+                    id,
+                    "assistant",
+                    &content,
+                    None,
+                    "2026-04-01T00:00:00Z",
+                )
                 .await
-                .unwrap(),
-            1
-        );
+                .unwrap();
+        }
+    };
+    if tenant != "decoy" {
+        append("h3", content.clone()).await;
+    }
+    append("h1", content.clone()).await;
+    let (_, pruned) = store
+        .get_agent_message_by_id_with_pruned(&a1, "h1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(pruned.is_empty());
+    assert_eq!(
         store
-            .prestage_agent_message_payload(&a1, "p2", 0, &heavy)
+            .compact_tool_payloads_before("2026-03-01T00:00:00Z", 100)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .compact_tool_payloads_before("2026-05-01T00:00:00Z", 100)
+            .await
+            .unwrap(),
+        if tenant == "decoy" { 1 } else { 2 }
+    );
+    assert_eq!(
+        store
+            .compact_tool_payloads_before("2026-05-01T00:00:00Z", 100)
+            .await
+            .unwrap(),
+        0
+    );
+    let (pruned_message, pruned) = store
+        .get_agent_message_by_id_with_pruned(&a1, "h1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pruned
+            .iter()
+            .map(|p| (p.block_ordinal, p.field))
+            .collect::<Vec<_>>(),
+        [(0, PrunedToolField::ToolUseInput)]
+    );
+    assert_eq!(pruned_message.content[0]["inputTruncated"], json!(true));
+
+    // An orphan staged row is deleted; an adopted one stays.
+    let slim = store
+        .prestage_agent_message_payload(&a1, "p1", 0, &heavy)
+        .await
+        .unwrap()
+        .expect("heavy block is staged");
+    assert!(store
+        .prestage_agent_message_payload(&a1, "p1", 1, &json!({"type": "text", "text": "small"}))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .delete_prestaged_agent_message_payloads("p1")
+            .await
+            .unwrap(),
+        1
+    );
+    store
+        .prestage_agent_message_payload(&a1, "p2", 0, &heavy)
+        .await
+        .unwrap();
+    store
+        .append_agent_message_prestaged(
+            &a1,
+            "p2",
+            "assistant",
+            &json!([slim.clone()]),
+            None,
+            "2026-04-01T00:00:01Z",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .delete_prestaged_agent_message_payloads("p2")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .get_agent_message_by_id(&a1, "p2")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        content
+    );
+    let replay = store.get_agent_messages_for_replay(&a1, 100).await.unwrap();
+    let expected = if tenant == "decoy" {
+        vec!["h1", "p2"]
+    } else {
+        vec!["h3", "h1", "p2"]
+    };
+    assert_eq!(ids(&replay), expected);
+
+    if tenant == "decoy" {
+        // An uncompacted h3 and an adopted p1, with the subject's keys.
+        append("h3", content.clone()).await;
+        store
+            .prestage_agent_message_payload(&a1, "p1", 0, &heavy)
             .await
             .unwrap();
         store
             .append_agent_message_prestaged(
                 &a1,
-                "p2",
+                "p1",
                 "assistant",
                 &json!([slim]),
                 None,
-                "2026-04-01T00:00:01Z",
+                "2026-06-01T00:00:00Z",
             )
+            .await
+            .unwrap();
+    }
+});
+
+// A staged row the final content no longer uses (block 1, re-patched
+// small) is deleted at append, or hydration would splice it back.
+message_test!(prestaged_append_drops_stale_staged_rows, |store, tenant| {
+    let a1 = agent("a1");
+    let heavy = heavy_tool_use(tenant);
+    let slim = store
+        .prestage_agent_message_payload(&a1, "p3", 0, &heavy)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .prestage_agent_message_payload(&a1, "p3", 1, &heavy_tool_use("stale"))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .append_agent_message_prestaged(
+            &a1,
+            "p3",
+            "assistant",
+            &json!([slim, small_tool_use()]),
+            None,
+            "2026-04-03T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_agent_message_by_id(&a1, "p3")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        json!([heavy, small_tool_use()])
+    );
+    assert_eq!(
+        store
+            .delete_prestaged_agent_message_payloads("p3")
+            .await
+            .unwrap(),
+        0
+    );
+    if tenant == "decoy" {
+        // A decoy row with the stale key the subject's append deletes.
+        store
+            .prestage_agent_message_payload(&a1, "p3", 1, &heavy_tool_use("stale"))
+            .await
+            .unwrap();
+    }
+});
+
+message_test!(
+    usage_cells_follow_appends_replace_and_truncate,
+    |store, tenant, db| {
+        let a1 = agent("a1");
+        let cells = |human, agent| vec![("model-a1".to_owned(), human, agent)];
+        assert!(usage_cells(&store, db, tenant).await.is_empty());
+        let first = text("first");
+        store
+            .append_agent_message_with_id(&a1, "m1", "user", &first, None, "2026-08-01T00:00:00Z")
+            .await
+            .unwrap();
+        store
+            .append_agent_message_with_id(
+                &a1,
+                "m2",
+                "assistant",
+                &text(tenant),
+                None,
+                "2026-08-01T00:00:01Z",
+            )
+            .await
+            .unwrap();
+        store
+            .append_agent_message_with_id(
+                &a1,
+                "m3",
+                "system",
+                &json!("sys"),
+                None,
+                "2026-08-01T00:00:02Z",
+            )
+            .await
+            .unwrap();
+        store
+            .append_agent_message_with_provenance(
+                &a1,
+                "m4",
+                "user",
+                &text("relay"),
+                None,
+                "2026-08-01T00:00:03Z",
+                UsageMessageOrigin::Agent,
+            )
+            .await
+            .unwrap();
+        assert_eq!(usage_cells(&store, db, tenant).await, cells(1, 2));
+        store.truncate_agent_messages_from(&a1, 3).await.unwrap();
+        assert_eq!(usage_cells(&store, db, tenant).await, cells(1, 1));
+        // m1 keeps its provenance; the relayed user row is new, so human.
+        let relayed = json!({ "fromAgentId": "c1" });
+        let fresh = text("fresh");
+        store
+            .replace_agent_messages(
+                &a1,
+                &[
+                    ReplaceMessage {
+                        role: "user",
+                        content: &first,
+                        metadata: None,
+                        created_at: "2026-08-01T00:00:00Z",
+                    },
+                    ReplaceMessage {
+                        role: "user",
+                        content: &fresh,
+                        metadata: Some(&relayed),
+                        created_at: "2026-08-02T00:00:00Z",
+                    },
+                    ReplaceMessage {
+                        role: "assistant",
+                        content: &fresh,
+                        metadata: None,
+                        created_at: "2026-08-02T00:00:01Z",
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(usage_cells(&store, db, tenant).await, cells(2, 1));
+    }
+);
+
+// The workspace boost and archived penalty are soft on both backends:
+// identical matches order active before archived, and a match with more
+// hits of the term in an archived workspace beats a single hit in an
+// active one. With `SQLite`'s 1.0 in `ts_rank` units the second fails.
+message_test!(message_search_boosts_are_soft, |store, _tenant| {
+    let (a1, a2, z1) = (agent("a1"), agent("a2"), agent("z1"));
+    let filler = "the build pipeline runs tests and then we check the logs for errors";
+    for i in 0..30 {
+        store
+            .append_agent_message_with_id(
+                &a2,
+                &format!("f{i}"),
+                "user",
+                &text(&format!("lunch menu notes {i}")),
+                None,
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+    }
+    let docs = [
+        (&z1, "strong", "rocket rocket rocket".to_owned()),
+        (
+            &a1,
+            "weak",
+            format!("{filler} {filler} {filler} {filler} {filler} rocket"),
+        ),
+        (&a1, "same-active", "rocket fuel".to_owned()),
+        (&z1, "same-archived", "rocket fuel".to_owned()),
+    ];
+    for (agent_id, id, body) in &docs {
+        store
+            .append_agent_message_with_id(
+                agent_id,
+                id,
+                "user",
+                &text(body),
+                None,
+                "2026-09-02T00:00:00Z",
+            )
+            .await
+            .unwrap();
+    }
+    let hits: Vec<String> = store
+        .search_agent_messages_fts("\"rocket\"", None, None, None, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.message_id)
+        .collect();
+    let at = |id: &str| hits.iter().position(|h| h == id).unwrap();
+    assert_eq!(hits.len(), 4, "{hits:?}");
+    assert!(at("strong") < at("weak"), "{hits:?}");
+    assert!(at("same-active") < at("same-archived"), "{hits:?}");
+});
+
+// jsonb rejects \u0000; SQLite JSON1 accepts it. A document with one still
+// classifies, extracts and previews like on SQLite, and an escaped
+// backslash before "u0000" is not a NUL.
+message_test!(
+    nul_escapes_keep_json_documents_readable,
+    |store, _tenant| {
+        let a1 = agent("a1");
+        let n1 = json!([{ "type": "text", "text": "hello" }, { "type": "note", "raw": "a\u{0}b" }]);
+        let n1_meta = json!({ "nul": "\u{0}", "queueInfo": { "queuedMessageId": "qn" } });
+        let wake = json!({ "type": "pr_monitor_wake", "resource": { "n": 1 }, "nul": "\u{0}" });
+        let n3 = text("x\\u0000y");
+        store
+            .append_agent_message_with_id(
+                &a1,
+                "n1",
+                "user",
+                &n1,
+                Some(&n1_meta),
+                "2026-10-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        store
+            .append_agent_message_with_id(
+                &a1,
+                "n2",
+                "user",
+                &text("wake"),
+                Some(&wake),
+                "2026-10-01T00:00:01Z",
+            )
+            .await
+            .unwrap();
+        store
+            .append_agent_message_with_id(&a1, "n3", "user", &n3, None, "2026-10-01T00:00:02Z")
             .await
             .unwrap();
         assert_eq!(
             store
-                .delete_prestaged_agent_message_payloads("p2")
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            store
-                .get_agent_message_by_id(&a1, "p2")
+                .get_agent_message_by_id(&a1, "n1")
                 .await
                 .unwrap()
                 .unwrap()
                 .content,
-            content
+            n1
         );
         assert_eq!(
-            store
-                .get_agent_messages_for_replay(&a1, 100)
-                .await
-                .unwrap()
-                .len(),
-            2
+            store.persisted_queue_message_ids(&a1).await.unwrap(),
+            HashSet::from(["qn".to_owned()])
+        );
+        let index = store.get_agent_user_message_index(&a1, 50).await.unwrap();
+        let rows: Vec<_> = index
+            .iter()
+            .map(|i| (i.id.as_str(), i.preview.as_str(), i.qualified_monitor))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("n1", "hello", false),
+                ("n2", "wake", true),
+                ("n3", "x\\u0000y", false)
+            ]
         );
     }
 );
