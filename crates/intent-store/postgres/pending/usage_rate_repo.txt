@@ -1,3 +1,0 @@
-add_usage_rate
-delete_usage_rate_before
-list_usage_rate_since

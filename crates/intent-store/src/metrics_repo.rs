@@ -44,7 +44,7 @@ impl Store {
         deletions: i64,
         files_changed: i64,
     ) -> Result<()> {
-        pending_postgres!("upsert_workspace_metrics", self, backend => backend.upsert_workspace_metrics(workspace_id, additions, deletions, files_changed).await)
+        dispatch!(self, backend => backend.upsert_workspace_metrics(workspace_id, additions, deletions, files_changed).await)
     }
 
     /// Read one workspace's metrics row (absent → `None`).
@@ -56,7 +56,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<WorkspaceMetricsRow>> {
-        pending_postgres!("get_workspace_metrics", self, backend => backend.get_workspace_metrics(workspace_id).await)
+        dispatch!(self, backend => backend.get_workspace_metrics(workspace_id).await)
     }
 
     /// List every workspace's metrics row (for `metrics.getAllWorkspaceStats`).
@@ -65,7 +65,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_metrics(&self) -> Result<Vec<WorkspaceMetricsRow>> {
-        pending_postgres!("list_workspace_metrics", self, backend => backend.list_workspace_metrics().await)
+        dispatch!(self, backend => backend.list_workspace_metrics().await)
     }
 
     /// Delete one workspace's metrics row (used when it has no tracked changes).
@@ -74,7 +74,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_workspace_metrics(&self, workspace_id: &WorkspaceId) -> Result<()> {
-        pending_postgres!("delete_workspace_metrics", self, backend => backend.delete_workspace_metrics(workspace_id).await)
+        dispatch!(self, backend => backend.delete_workspace_metrics(workspace_id).await)
     }
 
     /// Upsert one per-agent, per-workspace metrics row, stamping `updated_at`.
@@ -90,7 +90,7 @@ impl Store {
         deletions: i64,
         files_changed: i64,
     ) -> Result<()> {
-        pending_postgres!("upsert_agent_metrics", self, backend => backend.upsert_agent_metrics(workspace_id, agent_id, additions, deletions, files_changed).await)
+        dispatch!(self, backend => backend.upsert_agent_metrics(workspace_id, agent_id, additions, deletions, files_changed).await)
     }
 
     /// List the per-agent metrics rows for one workspace (powers `byAgent`).
@@ -102,7 +102,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentMetricsRow>> {
-        pending_postgres!("list_agent_metrics_for_workspace", self, backend => backend.list_agent_metrics_for_workspace(workspace_id).await)
+        dispatch!(self, backend => backend.list_agent_metrics_for_workspace(workspace_id).await)
     }
 
     /// List one agent's metrics rows across every workspace (for
@@ -112,7 +112,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_agent_metrics(&self, agent_id: &str) -> Result<Vec<AgentMetricsRow>> {
-        pending_postgres!("list_agent_metrics", self, backend => backend.list_agent_metrics(agent_id).await)
+        dispatch!(self, backend => backend.list_agent_metrics(agent_id).await)
     }
 
     /// Delete one workspace's per-agent metrics rows (cleared before a recompute
@@ -125,7 +125,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<()> {
-        pending_postgres!("delete_agent_metrics_for_workspace", self, backend => backend.delete_agent_metrics_for_workspace(workspace_id).await)
+        dispatch!(self, backend => backend.delete_agent_metrics_for_workspace(workspace_id).await)
     }
 
     /// Delete one agent's metrics rows across every workspace, returning the
@@ -135,7 +135,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_agent_metrics(&self, agent_id: &str) -> Result<u64> {
-        pending_postgres!("delete_agent_metrics", self, backend => backend.delete_agent_metrics(agent_id).await)
+        dispatch!(self, backend => backend.delete_agent_metrics(agent_id).await)
     }
 }
 

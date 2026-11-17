@@ -30,6 +30,7 @@ mod principals;
 mod script_monitors;
 mod scripts;
 mod settings;
+mod usage_metrics;
 mod workspaces;
 
 /// Postgres schema migrations, separate from the `SQLite` ones.
