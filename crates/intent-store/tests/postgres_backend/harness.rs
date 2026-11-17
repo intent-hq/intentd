@@ -346,7 +346,8 @@ pub async fn tenant_rows(admin: &PgPool, tenant: &str) -> Vec<(String, String)> 
 /// URL). Each run prints its backend, so a failure names it.
 ///
 /// Each run is its own `async` block, so an early `return` ends only that
-/// run. Attributes such as `#[should_panic]` may precede the name.
+/// run. A third closure argument binds the test database (`None` on
+/// `SQLite`) for bodies that seed rows with SQL. Attributes such as `#[should_panic]` may precede the name.
 ///
 /// ```ignore
 /// parity_test!(name, |store, tenant| { store.set_setting("k", tenant).await.unwrap(); });
@@ -356,6 +357,9 @@ macro_rules! parity_test {
         $crate::harness::parity_test!($(#[$meta])* $name, |$store, _tenant| $body);
     };
     ($(#[$meta:meta])* $name:ident, |$store:ident, $tenant:ident| $body:block) => {
+        $crate::harness::parity_test!($(#[$meta])* $name, |$store, $tenant, _db| $body);
+    };
+    ($(#[$meta:meta])* $name:ident, |$store:ident, $tenant:ident, $db:ident| $body:block) => {
         #[tokio::test]
         $(#[$meta])*
         async fn $name() {
@@ -364,6 +368,7 @@ macro_rules! parity_test {
                 let (store, _dir) = $crate::harness::sqlite_store().await;
                 let $store = store;
                 let $tenant: &str = "sqlite";
+                let $db: Option<&$crate::harness::TestDb> = None;
                 async { $body }.await;
             }
             if let Some(db) = $crate::harness::trapped_db().await {
@@ -371,6 +376,7 @@ macro_rules! parity_test {
                 {
                     let $store = $crate::harness::open_trapped(&db, "decoy").await;
                     let $tenant: &str = "decoy";
+                    let $db: Option<&$crate::harness::TestDb> = Some(&db);
                     async { $body }.await;
                 }
                 let before = $crate::harness::tenant_rows(&db.admin, "decoy").await;
@@ -379,6 +385,7 @@ macro_rules! parity_test {
                 {
                     let $store = $crate::harness::open_trapped(&db, "subject").await;
                     let $tenant: &str = "subject";
+                    let $db: Option<&$crate::harness::TestDb> = Some(&db);
                     async { $body }.await;
                 }
                 let after = $crate::harness::tenant_rows(&db.admin, "decoy").await;

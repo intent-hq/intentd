@@ -13,7 +13,7 @@ use intent_core::{
 use intent_store::{AgentQueueRow, AgentTurnEffort, Store};
 use serde_json::{json, Value};
 
-use crate::harness::{open, parity_test, sqlite_store, tenant_rows, test_db};
+use crate::harness::{open, parity_test, sqlite_store, test_db};
 
 const WS: &str = "__chief__";
 
@@ -1540,35 +1540,10 @@ async fn append(
 /// pool (`None` on `SQLite`) for [`append`].
 macro_rules! message_parity_test {
     ($name:ident, |$store:ident, $tenant:ident, $admin:ident| $body:block) => {
-        #[tokio::test]
-        async fn $name() {
-            {
-                let (store, _dir) = sqlite_store().await;
-                let $store = store;
-                let $tenant: &str = "sqlite";
-                let $admin: Option<&sqlx::PgPool> = None;
-                $body
-            }
-            if let Some(db) = test_db(false).await {
-                {
-                    let $store = open(&db, "decoy").await;
-                    let $tenant: &str = "decoy";
-                    let $admin = Some(&db.admin);
-                    $body
-                }
-                let before = tenant_rows(&db.admin, "decoy").await;
-                {
-                    let $store = open(&db, "subject").await;
-                    let $tenant: &str = "subject";
-                    let $admin = Some(&db.admin);
-                    $body
-                }
-                assert!(
-                    before == tenant_rows(&db.admin, "decoy").await,
-                    "the subject tenant's run changed the decoy tenant's rows"
-                );
-            }
-        }
+        $crate::harness::parity_test!($name, |$store, $tenant, test_db| {
+            let $admin: Option<&sqlx::PgPool> = test_db.map(|db| &db.admin);
+            $body
+        });
     };
 }
 
@@ -1712,9 +1687,10 @@ message_parity_test!(
         assert_eq!(cells, [(resolved.clone(), 1)]);
         if let (Some(admin), "decoy") = (admin, tenant) {
             // An old-model cell the subject's decrement and prune must not reach.
+            // Plus the subject's resolved-model cell key.
             sqlx::query(
                 "INSERT INTO agent_usage_cell (tenant_id, agent_id, model, human_messages) \
-                 VALUES ('decoy', 'agent-b', 'opus', 1)",
+                 VALUES ('decoy', 'agent-b', 'opus', 1), ('decoy', 'agent-b', 'Opus subject', 1)",
             )
             .execute(admin)
             .await

@@ -14,7 +14,7 @@ use intent_store::{
 };
 use serde_json::{json, Value};
 
-use crate::harness::{exec, open, sqlite_store, tenant_rows, test_db, TestDb};
+use crate::harness::{exec, TestDb};
 
 const WS: &str = "__chief__";
 /// An archived workspace, for the search ranking penalty.
@@ -125,50 +125,20 @@ async fn usage_cells(store: &Store, db: Option<&TestDb>, tenant: &str) -> Vec<(S
     .expect("read usage cells")
 }
 
-/// Like `parity_test!`, with the sessions seeded before each run. `$db` is
+/// [`parity_test!`] with the sessions seeded before each run. `$db` is
 /// `None` on `SQLite` and the test database on Postgres.
 macro_rules! message_test {
     ($name:ident, |$store:ident, $tenant:ident| $body:block) => {
         message_test!($name, |$store, $tenant, _db| $body);
     };
     ($name:ident, |$store:ident, $tenant:ident, $db:ident| $body:block) => {
-        #[tokio::test]
-        async fn $name() {
-            {
-                eprintln!("[{}] backend: sqlite", stringify!($name));
-                let (store, _dir) = sqlite_store().await;
-                seed_sqlite(&store).await;
-                let $store = store;
-                let $tenant: &str = "sqlite";
-                let $db: Option<&TestDb> = None;
-                $body
+        $crate::harness::parity_test!($name, |$store, $tenant, $db| {
+            match $db {
+                None => seed_sqlite(&$store).await,
+                Some(db) => seed_postgres(db, &$store, $tenant).await,
             }
-            let Some(db) = test_db(false).await else {
-                return;
-            };
-            eprintln!("[{}] backend: postgres, tenant decoy", stringify!($name));
-            {
-                let $store = open(&db, "decoy").await;
-                seed_postgres(&db, &$store, "decoy").await;
-                let $tenant: &str = "decoy";
-                let $db = Some(&db);
-                $body
-            }
-            let subject = open(&db, "subject").await;
-            seed_postgres(&db, &subject, "subject").await;
-            let before = tenant_rows(&db.admin, "decoy").await;
-            eprintln!("[{}] backend: postgres, tenant subject", stringify!($name));
-            {
-                let $store = subject;
-                let $tenant: &str = "subject";
-                let $db = Some(&db);
-                $body
-            }
-            assert!(
-                before == tenant_rows(&db.admin, "decoy").await,
-                "the subject tenant's run changed the decoy tenant's rows"
-            );
-        }
+            $body
+        });
     };
 }
 
@@ -654,7 +624,7 @@ message_test!(
 // Decoy-only rows left after the decoy run share keys with rows the
 // subject run compacts and deletes, so a compaction or prestaged-payload
 // DELETE without its tenant filter changes the decoy's rows.
-message_test!(compaction_and_prestaged_payloads, |store, tenant| {
+message_test!(compaction_and_prestaged_payloads, |store, tenant, db| {
     let a1 = agent("a1");
     let heavy = heavy_tool_use(tenant);
     let content = json!([heavy.clone()]);
@@ -779,6 +749,20 @@ message_test!(compaction_and_prestaged_payloads, |store, tenant| {
     if tenant == "decoy" {
         // An uncompacted h3 and an adopted p1, with the subject's keys.
         append("h3", content.clone()).await;
+        // And the replay row the subject's compacted h3 keeps.
+        if let Some(db) = db {
+            sqlx::query(
+                "INSERT INTO agent_message_payload \
+                 (tenant_id, message_id, agent_id, block_ordinal, kind, encoding, body) \
+                 SELECT tenant_id, message_id, agent_id, block_ordinal, 'tool_use_input_replay', \
+                        encoding, body \
+                 FROM agent_message_payload WHERE tenant_id = 'decoy' AND message_id = 'h3' \
+                 LIMIT 1 ON CONFLICT DO NOTHING",
+            )
+            .execute(&db.admin)
+            .await
+            .unwrap();
+        }
         store
             .prestage_agent_message_payload(&a1, "p1", 0, &heavy)
             .await
