@@ -90,9 +90,15 @@ fn string_literals(text: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// Whether a literal is a SQL statement. An UPDATE needs its SET clause, so
+/// error text such as `"update hook state failed: {e}"` (the `SQLite`
+/// wording) is not mistaken for a statement.
 fn is_sql(lit: &str) -> bool {
     let l = lit.trim_start().to_lowercase();
-    ["select ", "insert ", "update ", "delete ", "with "]
+    if l.starts_with("update ") {
+        return l.contains(" set ");
+    }
+    ["select ", "insert ", "delete ", "with "]
         .iter()
         .any(|k| l.starts_with(k))
 }
@@ -165,6 +171,8 @@ fn every_postgres_query_is_filtered_by_the_bound_tenant() {
 
 #[test]
 fn the_tenant_rule_catches_unscoped_shapes() {
+    assert!(is_sql("UPDATE hook SET state = $3 WHERE hook_id = $2"));
+    assert!(!is_sql("update hook state failed: {e}"));
     assert!(violations("select value from settings where tenant_id = $1 and key = $2").is_empty());
     assert!(!violations("select value from settings where key = $1").is_empty());
     assert!(!violations(

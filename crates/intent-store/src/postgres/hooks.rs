@@ -1,8 +1,10 @@
 //! Background hooks (Postgres). Mirrors `hook_repo.rs`.
 //!
-//! `SQLite` orders by `created_at` alone; ties here fall back to insertion
-//! order (`row_seq`). Text ordering uses `COLLATE "C"` to match `SQLite`'s
-//! byte order.
+//! `SQLite` orders most reads by `created_at` alone; ties here fall back to
+//! insertion order (`row_seq`). The `hook.list` page (`list_hook_rows_page`)
+//! instead breaks ties on `hook_id`, matching `SQLite`'s
+//! `ORDER BY created_at, hook_id` and its keyset cursor. Text ordering uses
+//! `COLLATE "C"` to match `SQLite`'s byte order.
 
 use std::collections::HashSet;
 
@@ -346,7 +348,7 @@ impl PgStore {
             .bind(state_to_db(state))
             .execute(&mut *tx)
             .await
-            .map_err(|e| Error::Internal(format!("hook state update failed: {e}")))?;
+            .map_err(|e| Error::Internal(format!("update hook state failed: {e}")))?;
         updated(&res, hook_id)?;
         tx.commit().await.map_err(db)
     }
@@ -385,7 +387,7 @@ impl PgStore {
         .bind(next_run_at)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Error::Internal(format!("hook run update failed: {e}")))?;
+        .map_err(|e| Error::Internal(format!("update hook run failed: {e}")))?;
         updated(&res, hook_id)?;
         tx.commit().await.map_err(db)
     }
@@ -401,7 +403,7 @@ impl PgStore {
         .bind(dispatch_count)
         .execute(&mut *tx)
         .await
-        .map_err(|e| Error::Internal(format!("hook dispatch count update failed: {e}")))?;
+        .map_err(|e| Error::Internal(format!("update hook dispatch count failed: {e}")))?;
         updated(&res, hook_id)?;
         tx.commit().await.map_err(db)
     }
@@ -419,7 +421,7 @@ impl PgStore {
                 .bind(next_run_at)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| Error::Internal(format!("hook next run update failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("update hook next run failed: {e}")))?;
         updated(&res, hook_id)?;
         tx.commit().await.map_err(db)
     }
@@ -437,7 +439,7 @@ impl PgStore {
                 .bind(last_error)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| Error::Internal(format!("hook last error update failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("update hook last error failed: {e}")))?;
         updated(&res, hook_id)?;
         tx.commit().await.map_err(db)
     }
@@ -455,7 +457,7 @@ impl PgStore {
                 .bind(last_logs)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| Error::Internal(format!("hook last logs update failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("update hook last logs failed: {e}")))?;
         updated(&res, hook_id)?;
         tx.commit().await.map_err(db)
     }
@@ -473,7 +475,7 @@ impl PgStore {
                 .bind(last_state)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| Error::Internal(format!("hook last state update failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("update hook last state failed: {e}")))?;
         updated(&res, hook_id)?;
         tx.commit().await.map_err(db)
     }
