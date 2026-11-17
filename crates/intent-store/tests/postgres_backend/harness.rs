@@ -210,22 +210,78 @@ pub async fn open_trapped(db: &TestDb, tenant: &str) -> Store {
     open_with(db, tenant, true).await
 }
 
-/// The tables in which the subject left rows but the decoy had none when the
-/// subject started: there the trap had nothing to catch.
-pub fn tables_without_decoy_rows(
+/// Each tenant row's primary key without `tenant_id`, as `(table, key)`.
+/// Keys the store generates itself (identity columns, UUIDs) can never match
+/// between tenants and are reported as `(table, "*")`: there only the table is
+/// compared.
+pub async fn tenant_keys(admin: &PgPool, tenant: &str) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    for table in tenant_tables(admin).await {
+        let cols: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT a.attname::text, (a.attidentity <> '' OR coalesce(pg_get_expr(d.adbin, d.adrelid), '') \
+                 LIKE 'nextval(%') \
+             FROM pg_index i \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+             LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE i.indrelid = $1::regclass AND i.indisprimary AND a.attname <> 'tenant_id' \
+             ORDER BY array_position(i.indkey::int2[], a.attnum)",
+        )
+        .bind(&table)
+        .fetch_all(admin)
+        .await
+        .expect("read primary key");
+        let generated = cols.is_empty() || cols.iter().any(|(_, g)| *g);
+        let expr = if generated {
+            "'*'".to_owned()
+        } else {
+            let list: Vec<&str> = cols.iter().map(|(c, _)| c.as_str()).collect();
+            format!("ROW({}, NULL)::text", list.join(", "))
+        };
+        let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT DISTINCT {expr} FROM {table} WHERE tenant_id = $1"
+        )))
+        .bind(tenant)
+        .fetch_all(admin)
+        .await
+        .expect("read tenant keys");
+        keys.extend(rows.into_iter().map(|k| (table.clone(), k)));
+    }
+    keys
+}
+
+/// Subject rows the trap could not have guarded: their key (or, for
+/// generated keys, their table) had no decoy row when the subject started.
+/// Keys holding a UUID are skipped: the store generated them, so no tenant
+/// can share them.
+pub fn keys_without_decoy_rows(
     decoy_before: &[(String, String)],
     subject_after: &[(String, String)],
 ) -> Vec<String> {
-    let decoy: std::collections::BTreeSet<&str> =
+    let decoy: std::collections::BTreeSet<&(String, String)> = decoy_before.iter().collect();
+    let decoy_tables: std::collections::BTreeSet<&str> =
         decoy_before.iter().map(|(t, _)| t.as_str()).collect();
-    let mut missing: Vec<String> = subject_after
+    let missing: std::collections::BTreeSet<String> = subject_after
         .iter()
-        .map(|(t, _)| t.as_str())
-        .filter(|t| !decoy.contains(t))
-        .map(str::to_owned)
+        .filter(|row| {
+            let (table, key) = row;
+            if key == "*" {
+                !decoy_tables.contains(table.as_str())
+            } else {
+                !decoy.contains(row) && !holds_uuid(key)
+            }
+        })
+        .map(|(t, k)| format!("{t} {k}"))
         .collect();
-    missing.dedup();
-    missing
+    missing.into_iter().collect()
+}
+
+fn holds_uuid(key: &str) -> bool {
+    key.as_bytes().windows(36).any(|w| {
+        w.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+    })
 }
 
 pub async fn open(db: &TestDb, tenant: &str) -> Store {
@@ -274,9 +330,13 @@ pub async fn tenant_rows(admin: &PgPool, tenant: &str) -> Vec<(String, String)> 
 ///   of another tenant ([`trapped_db`]), so a statement missing its tenant
 ///   filter fails on the subject run as soon as it reaches a decoy row, even
 ///   when its result or write would not have differed.
-/// - Coverage: every table the subject leaves rows in must hold decoy rows
-///   when the subject starts, or the trap had nothing to catch there; the
-///   body leaves rows behind (fixed ids) and adds decoy-only rows as needed.
+/// - Coverage: the trap fires only on rows a statement reaches through its
+///   other filters (an unscoped `WHERE id = $2` reaches only rows with that
+///   id), so every row the subject leaves must have a decoy row with the same
+///   primary key when the subject starts (generated keys: the same table).
+///   The body uses fixed ids, leaves rows behind and adds decoy-only rows as
+///   needed. Not covered: tables the body empties by its end, and ids the
+///   subject only probes as absent; give the decoy those rows.
 /// - Writes: every decoy row is snapshotted before the subject run and
 ///   compared after it.
 ///
@@ -310,6 +370,7 @@ macro_rules! parity_test {
                     $body
                 }
                 let before = $crate::harness::tenant_rows(&db.admin, "decoy").await;
+                let decoy_keys = $crate::harness::tenant_keys(&db.admin, "decoy").await;
                 eprintln!("[{}] backend: postgres, tenant subject", stringify!($name));
                 {
                     let $store = $crate::harness::open_trapped(&db, "subject").await;
@@ -321,12 +382,13 @@ macro_rules! parity_test {
                     before == after,
                     "the subject tenant's run changed the decoy tenant's rows"
                 );
-                let subject = $crate::harness::tenant_rows(&db.admin, "subject").await;
-                let uncovered = $crate::harness::tables_without_decoy_rows(&before, &subject);
+                let subject = $crate::harness::tenant_keys(&db.admin, "subject").await;
+                let uncovered = $crate::harness::keys_without_decoy_rows(&decoy_keys, &subject);
                 assert!(
                     uncovered.is_empty(),
-                    "the decoy had no rows in {uncovered:?} when the subject ran, so a missing \
-                     tenant filter there would go unnoticed: leave decoy rows in those tables"
+                    "the decoy had no row with these keys when the subject ran, so a statement \
+                     missing its tenant filter there would go unnoticed (leave decoy rows with \
+                     the same keys): {uncovered:?}"
                 );
             }
         }

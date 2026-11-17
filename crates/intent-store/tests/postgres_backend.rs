@@ -282,6 +282,12 @@ async fn the_leak_trap_fails_unscoped_statements_and_only_those() {
         "DELETE FROM settings WHERE tenant_id = $1 AND key = 'k'",
         "SELECT s.key FROM settings s JOIN settings t ON t.tenant_id = $1 AND t.key = s.key \
          WHERE s.tenant_id = $1",
+        "SELECT s.key FROM settings s JOIN settings t ON t.tenant_id = s.tenant_id \
+         AND t.key = s.key WHERE s.tenant_id = $1",
+        "SELECT key FROM settings s WHERE tenant_id = $1 AND EXISTS \
+         (SELECT 1 FROM settings t WHERE t.tenant_id = s.tenant_id AND t.key = s.key)",
+        "INSERT INTO settings (tenant_id, key, value) VALUES ($1, 'k', '1') \
+         ON CONFLICT (tenant_id, key) DO UPDATE SET value = excluded.value",
     ] {
         run_as(&db, "subject", scoped).await.expect(scoped);
     }
@@ -305,6 +311,21 @@ async fn the_leak_trap_fails_unscoped_statements_and_only_those() {
         .await,
         "insert for another tenant",
     );
+    // The known limit the coverage check exists for: an unscoped statement
+    // reaches only rows matching its other filters, so a key the decoy lacks
+    // is not trapped.
+    open_trapped(&db, "subject")
+        .await
+        .set_setting("subject-only", "1")
+        .await
+        .unwrap();
+    run_as(
+        &db,
+        "subject",
+        "SELECT value FROM settings WHERE key = 'subject-only' AND $1 IS NOT NULL",
+    )
+    .await
+    .expect("an unscoped read of a key only the subject has reaches no decoy row");
     // A store that does not name its tenant cannot read anything on a
     // trapped database, so no code path can skip the tenant context.
     let unnamed = intent_store::Store::open_postgres(
@@ -320,20 +341,19 @@ async fn the_leak_trap_fails_unscoped_statements_and_only_those() {
 }
 
 #[test]
-fn tables_without_decoy_rows_lists_only_uncovered_tables() {
-    let row = |t: &str| (t.to_owned(), String::new());
+fn keys_without_decoy_rows_lists_uncovered_keys() {
+    let row = |t: &str, k: &str| (t.to_owned(), k.to_owned());
+    let decoy = [row("note", "(n1,)"), row("agent_message", "*")];
+    let subject = [
+        row("note", "(n1,)"),
+        row("note", "(subject-only,)"),
+        row("note", "(1b4e28ba-2fa1-11d2-883f-0016d3cca427,)"),
+        row("agent_message", "*"),
+        row("comment", "*"),
+    ];
     assert_eq!(
-        harness::tables_without_decoy_rows(
-            &[row("note"), row("settings")],
-            &[
-                row("note"),
-                row("note"),
-                row("comment"),
-                row("comment"),
-                row("settings")
-            ],
-        ),
-        vec!["comment".to_owned()]
+        harness::keys_without_decoy_rows(&decoy, &subject),
+        vec!["comment *".to_owned(), "note (subject-only,)".to_owned()]
     );
 }
 
