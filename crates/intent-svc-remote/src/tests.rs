@@ -2225,7 +2225,7 @@ mod final_stops {
         let (mut machine, backend, node) = exposed().await;
         let agent = placed(&backend, &node, &machine).await;
         let runtime = node.attach(&agent, &workspace());
-        let mut link = machine.accept().await;
+        let link = machine.accept().await;
         link.replay_complete(0).await;
         bound(&node).await;
         link.journal(exited(1, &agent)).await;
