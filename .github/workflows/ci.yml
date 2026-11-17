@@ -692,6 +692,7 @@ jobs:
           ./scripts/check-test-hooks-feature.sh
           GUARDED_FEATURE=postgres ./scripts/check-test-hooks-feature.sh
           GUARDED_FEATURE=northflank-fake ./scripts/check-test-hooks-feature.sh
+          GUARDED_FEATURE=agent37-fake ./scripts/check-test-hooks-feature.sh
       # Services feature crates (intent-svc-*) sit above intent-services with
       # intent-app on top. Fail on a wrong-way edge: core or intent-transport
       # depending on a feature (dev-dependencies too), or a feature-to-feature
