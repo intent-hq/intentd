@@ -1,8 +1,11 @@
-//! Node, lease, final stop, node invite and executor store methods on both
-//! backends. Every tenant creates the same fixed ids with tenant-specific
-//! values. The decoy also owns decoy-only rows that the subject probes as
-//! absent, and skips the writes under test (`writes` is false), so its rows
-//! are still in the pre-write state when the subject writes.
+//! Node, lease, assignment, checkpoint, remote agent, final stop, node
+//! invite and executor store methods on both backends. Every tenant creates
+//! the same fixed ids with tenant-specific values, and the decoy also owns
+//! the rows behind every id the subject probes as absent. Some bodies have
+//! the decoy skip the writes under test, so its rows are still in the
+//! pre-write state when the subject writes; the others filter only by key
+//! (the leak trap reaches the decoy's row in any state) and have the decoy
+//! seed again the rows the body deletes.
 
 use intent_core::{
     machines::{
@@ -11,12 +14,15 @@ use intent_core::{
     },
     node_link::{BindDecision, LeaseBinding, MachineCapabilities},
     nodes::{
-        LeaseOwner, LeaseState, NodeArch, NodeCapacity, NodeCounter, NodeKind, NodeLease, NodeOs,
-        NodeRecord, NodeState,
+        CheckpointOutcome, CheckpointReceipt, LeaseFence, LeaseFenceKind, LeaseOwner, LeaseState,
+        NodeArch, NodeAssignment, NodeCapacity, NodeCheckpoint, NodeCounter, NodeKind, NodeLease,
+        NodeOs, NodePath, NodeRecord, NodeState,
     },
     placement::AgentPlatform,
-    remote_launch::{FinalStopReason, FinalStopSubmodule, RemoteFinalStopRecord},
-    AgentId, Error, ExecutorCredentialId,
+    remote_launch::{
+        FinalStopReason, FinalStopSubmodule, RemoteAgentRecord, RemoteFinalStopRecord,
+    },
+    AgentId, AgentSession, AgentStatus, Error, ExecutorCredentialId,
 };
 use intent_store::{
     ExecutorRevocation, NodeInvite, NodeInviteRefusal, NodeInviteRevocation, Store,
@@ -1039,3 +1045,661 @@ parity_test!(
         .await;
     }
 );
+
+const WS: &str = "__chief__";
+
+fn tenant_index(tenant: &str) -> u8 {
+    match tenant {
+        "sqlite" => 1,
+        "decoy" => 2,
+        _ => 3,
+    }
+}
+
+fn aid(id: &str) -> AgentId {
+    AgentId::from(id.to_owned())
+}
+
+/// A per-tenant run id, so an assignment read without its tenant filter
+/// fails the owner check.
+fn run(tenant: &str, k: u8) -> String {
+    format!(
+        "00000000-0000-4000-8{k}00-00000000000{}",
+        tenant_index(tenant)
+    )
+}
+
+/// Checkpoint ids are shared by every tenant (primary-key coverage).
+fn checkpoint_id(k: u8) -> String {
+    format!("10000000-0000-4000-8000-00000000000{k}")
+}
+
+async fn seed_session(store: &Store, tenant: &str, id: &str, metadata: serde_json::Value) {
+    store
+        .insert_agent_session(&AgentSession {
+            id: aid(id),
+            workspace_id: WS.into(),
+            name: format!("{id} of {tenant}"),
+            status: AgentStatus::Idle,
+            metadata: Some(metadata),
+            created_at: T0.into(),
+            updated_at: T0.into(),
+            ..AgentSession::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// A welcomed node: the node and its lease are ready to dispatch.
+async fn ready_node(store: &Store, tenant: &str, id: &str) -> NodeLease {
+    let (_, initial) = enroll(store, tenant, id, "head-1").await;
+    store
+        .record_node_welcome(&initial.owner, NodeOs::Linux, NodeArch::X86_64, 4, "1.0.0")
+        .await
+        .unwrap()
+}
+
+fn template(tenant: &str, agent: &str, owner: &LeaseOwner, k: u8) -> NodeAssignment {
+    NodeAssignment {
+        agent_id: aid(agent),
+        workspace_id: WS.into(),
+        owner: owner.clone(),
+        run_id: run(tenant, k),
+        assignment_epoch: NodeCounter(999),
+        repo_keys: vec![format!("repo-{tenant}")],
+        node_path: Some(NodePath(format!("/checkout/{tenant}"))),
+        active: true,
+        tombstoned: false,
+        inherited_checkpoint_id: None,
+        merge_target_agent_id: None,
+    }
+}
+
+fn checkpoint(tenant: &str, placed: &NodeAssignment, k: u8, revision: u64) -> NodeCheckpoint {
+    let hex = char::from(b'a' + tenant_index(tenant));
+    NodeCheckpoint {
+        id: checkpoint_id(k),
+        agent_id: placed.agent_id.clone(),
+        workspace_id: placed.workspace_id.clone(),
+        owner: placed.owner.clone(),
+        run_id: placed.run_id.clone(),
+        assignment_epoch: placed.assignment_epoch,
+        capture_revision: NodeCounter(revision),
+        journal_seq: NodeCounter(0),
+        manifest_sha256: hex.to_string().repeat(64),
+        captured_at: T0.into(),
+        committed_at: String::new(),
+    }
+}
+
+fn not_found<T: std::fmt::Debug>(r: &intent_core::Result<T>) -> bool {
+    matches!(r, Err(Error::NotFound(_)))
+}
+
+fn invalid<T: std::fmt::Debug>(r: &intent_core::Result<T>) -> bool {
+    matches!(r, Err(Error::InvalidParams(_)))
+}
+
+parity_test!(
+    node_assignments_admit_stop_and_checkpoint,
+    |store, tenant| {
+        let owner = ready_node(&store, tenant, "node-a").await.owner;
+        for agent in ["agent-1", "agent-2", "agent-3"] {
+            seed_session(&store, tenant, agent, serde_json::json!({})).await;
+        }
+        if tenant == "decoy" {
+            let decoy_only = store
+                .assign_node_run(&template(tenant, "agent-2", &owner, 9))
+                .await
+                .unwrap();
+            store
+                .commit_node_checkpoint(&checkpoint(tenant, &decoy_only, 3, 1))
+                .await
+                .unwrap();
+        }
+
+        let first = template(tenant, "agent-1", &owner, 1);
+        let placed = store.assign_node_run(&first).await.unwrap();
+        assert_eq!(placed.assignment_epoch, NodeCounter(1));
+        assert_eq!(placed.run_id, run(tenant, 1));
+        assert_eq!(store.assign_node_run(&first).await.unwrap(), placed);
+        assert!(invalid(
+            &store
+                .assign_node_run(&template(tenant, "agent-1", &owner, 2))
+                .await
+        ));
+        let mut moved = first.clone();
+        moved.repo_keys.push("other".into());
+        assert!(invalid(&store.assign_node_run(&moved).await));
+        let mut elsewhere = template(tenant, "agent-1", &owner, 1);
+        elsewhere.workspace_id = "ws-other".into();
+        assert!(not_found(&store.assign_node_run(&elsewhere).await));
+
+        let ws = WS.into();
+        assert_eq!(
+            store
+                .get_node_assignment(&aid("agent-1"), &ws)
+                .await
+                .unwrap(),
+            placed
+        );
+        assert!(not_found(
+            &store
+                .get_node_assignment(&aid("agent-1"), &"ws-other".into())
+                .await
+        ));
+        if tenant != "decoy" {
+            assert!(not_found(
+                &store.get_node_assignment(&aid("agent-2"), &ws).await
+            ));
+            assert!(not_found(
+                &store.current_node_checkpoint(&aid("agent-2"), &ws).await
+            ));
+        }
+
+        let repo = format!("repo-{tenant}");
+        store.authorize_node_repo(&placed, &repo).await.unwrap();
+        assert!(not_found(
+            &store.authorize_node_repo(&placed, "repo-decoy-only").await
+        ));
+        let mut stale = placed.clone();
+        stale.run_id = run(tenant, 7);
+        assert!(not_found(&store.authorize_node_repo(&stale, &repo).await));
+
+        assert_eq!(
+            store.next_node_capture_revision(&placed).await.unwrap(),
+            NodeCounter(1)
+        );
+        assert_eq!(
+            store.next_node_capture_revision(&placed).await.unwrap(),
+            NodeCounter(2)
+        );
+        assert_eq!(
+            store
+                .current_node_checkpoint(&aid("agent-1"), &ws)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let newer = checkpoint(tenant, &placed, 1, 2);
+        let receipt = store.commit_node_checkpoint(&newer).await.unwrap();
+        assert_eq!(
+            receipt,
+            CheckpointReceipt {
+                checkpoint_id: newer.id.clone(),
+                outcome: CheckpointOutcome::Advanced,
+                current_checkpoint_id: newer.id.clone(),
+            }
+        );
+        let older = checkpoint(tenant, &placed, 2, 1);
+        assert_eq!(
+            store.commit_node_checkpoint(&older).await.unwrap(),
+            CheckpointReceipt {
+                checkpoint_id: older.id.clone(),
+                outcome: CheckpointOutcome::Historical,
+                current_checkpoint_id: newer.id.clone(),
+            }
+        );
+        assert_eq!(store.commit_node_checkpoint(&newer).await.unwrap(), receipt);
+        let mut reused = newer.clone();
+        reused.capture_revision = NodeCounter(5);
+        assert!(invalid(&store.commit_node_checkpoint(&reused).await));
+        let mut pair = checkpoint(tenant, &placed, 3, 2);
+        pair.captured_at = T1.into();
+        assert!(invalid(&store.commit_node_checkpoint(&pair).await));
+        let current = store
+            .current_node_checkpoint(&aid("agent-1"), &ws)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (current.id.as_str(), current.manifest_sha256.as_str()),
+            (newer.id.as_str(), newer.manifest_sha256.as_str())
+        );
+        assert!(not_found(
+            &store
+                .current_node_checkpoint(&aid("agent-1"), &"ws-other".into())
+                .await
+        ));
+
+        store.stop_node_assignment(&placed, false).await.unwrap();
+        assert!(not_found(&store.stop_node_assignment(&stale, false).await));
+        let stopped = store
+            .get_node_assignment(&aid("agent-1"), &ws)
+            .await
+            .unwrap();
+        assert!(!stopped.active && !stopped.tombstoned);
+        assert!(not_found(&store.authorize_node_repo(&stopped, &repo).await));
+        assert!(invalid(&store.next_node_capture_revision(&stopped).await));
+
+        let second = store
+            .assign_node_run(&template(tenant, "agent-1", &owner, 2))
+            .await
+            .unwrap();
+        assert_eq!(second.assignment_epoch, NodeCounter(2));
+        assert_eq!(
+            store.next_node_capture_revision(&second).await.unwrap(),
+            NodeCounter(1)
+        );
+        assert_eq!(
+            store
+                .current_node_checkpoint(&aid("agent-1"), &ws)
+                .await
+                .unwrap()
+                .map(|c| c.id),
+            Some(newer.id.clone())
+        );
+        store.stop_node_assignment(&second, true).await.unwrap();
+        assert!(
+            store
+                .get_node_assignment(&aid("agent-1"), &ws)
+                .await
+                .unwrap()
+                .tombstoned
+        );
+        assert!(invalid(
+            &store
+                .assign_node_run(&template(tenant, "agent-1", &owner, 3))
+                .await
+        ));
+
+        let third = store
+            .assign_node_run(&template(tenant, "agent-3", &owner, 3))
+            .await
+            .unwrap();
+        let fence = LeaseFence {
+            kind: LeaseFenceKind::ProcessesStopped,
+            recorded_at: T1.into(),
+        };
+        assert!(invalid(
+            &store
+                .finish_node_lease(&owner, LeaseState::Released, fence.clone())
+                .await
+        ));
+        store.request_node_lease_release(&owner).await.unwrap();
+        let finished = store
+            .finish_node_lease(&owner, LeaseState::Released, fence.clone())
+            .await
+            .unwrap();
+        assert_eq!(finished.state, LeaseState::Released);
+        assert_eq!(finished.fence, Some(fence.clone()));
+        assert_eq!(finished.owner.incarnation, incarnation(tenant));
+        let mut other = fence.clone();
+        other.recorded_at = T0.into();
+        assert_eq!(
+            store
+                .finish_node_lease(&owner, LeaseState::Lost, other)
+                .await
+                .unwrap(),
+            finished
+        );
+        let idle = store
+            .get_node_assignment(&aid("agent-3"), &ws)
+            .await
+            .unwrap();
+        assert!(!idle.active);
+        assert_eq!(idle.run_id, third.run_id);
+        let host = store.get_node("node-a", "head-1").await.unwrap();
+        assert!(host.draining);
+        assert_eq!(host.name, format!("{tenant} node-a"));
+    }
+);
+
+// The inherited checkpoint a child assignment pins is looked up by id; the
+// rejection paths of admission and checkpoint commits. The decoy owns every
+// checkpoint id the subject probes as absent (on its decoy-only `agent-q`).
+parity_test!(node_assignments_inherit_and_reject, |store, tenant| {
+    let owner = ready_node(&store, tenant, "node-i").await.owner;
+    let other_head = {
+        let (_, initial) = enroll(&store, tenant, "node-j", "head-2").await;
+        store
+            .record_node_welcome(&initial.owner, NodeOs::Linux, NodeArch::X86_64, 4, "1.0.0")
+            .await
+            .unwrap()
+            .owner
+    };
+    for agent in ["agent-p", "agent-k", "agent-q"] {
+        seed_session(&store, tenant, agent, serde_json::json!({})).await;
+    }
+    if tenant == "decoy" {
+        let decoy_only = store
+            .assign_node_run(&template(tenant, "agent-q", &owner, 9))
+            .await
+            .unwrap();
+        for k in 5..=8 {
+            store
+                .commit_node_checkpoint(&checkpoint(tenant, &decoy_only, k, u64::from(k)))
+                .await
+                .unwrap();
+        }
+    }
+    let ws = WS.into();
+    let parent = store
+        .assign_node_run(&template(tenant, "agent-p", &owner, 1))
+        .await
+        .unwrap();
+    let base = checkpoint(tenant, &parent, 4, 1);
+    let receipt = store.commit_node_checkpoint(&base).await.unwrap();
+
+    let mut stale = checkpoint(tenant, &parent, 6, 2);
+    stale.run_id = run(tenant, 8);
+    assert!(invalid(&store.commit_node_checkpoint(&stale).await));
+    let mut uncut = checkpoint(tenant, &parent, 7, 2);
+    uncut.journal_seq = NodeCounter(5);
+    assert!(invalid(&store.commit_node_checkpoint(&uncut).await));
+
+    assert!(invalid(
+        &store
+            .assign_node_run(&template(tenant, "agent-p", &other_head, 2))
+            .await
+    ));
+
+    let child = |k: u8, baseline: u8, target: &str| NodeAssignment {
+        inherited_checkpoint_id: Some(checkpoint_id(baseline)),
+        merge_target_agent_id: Some(aid(target)),
+        ..template(tenant, "agent-k", &owner, k)
+    };
+    if tenant != "decoy" {
+        assert!(not_found(
+            &store.assign_node_run(&child(1, 5, "agent-p")).await
+        ));
+    }
+    assert!(not_found(
+        &store.assign_node_run(&child(1, 4, "agent-k")).await
+    ));
+    let inherited = store
+        .assign_node_run(&child(1, 4, "agent-p"))
+        .await
+        .unwrap();
+    assert_eq!(inherited.inherited_checkpoint_id, Some(checkpoint_id(4)));
+    assert_eq!(
+        store
+            .get_node_assignment(&aid("agent-k"), &ws)
+            .await
+            .unwrap(),
+        inherited
+    );
+    store.stop_node_assignment(&inherited, false).await.unwrap();
+    assert!(invalid(
+        &store
+            .assign_node_run(&template(tenant, "agent-k", &owner, 2))
+            .await
+    ));
+    let rerun = store
+        .assign_node_run(&child(2, 4, "agent-p"))
+        .await
+        .unwrap();
+    assert_eq!(rerun.assignment_epoch, NodeCounter(2));
+
+    store.request_node_lease_release(&owner).await.unwrap();
+    assert!(invalid(
+        &store
+            .assign_node_run(&template(tenant, "agent-q", &owner, 3))
+            .await
+    ));
+    assert!(invalid(
+        &store
+            .authorize_node_repo(&parent, &format!("repo-{tenant}"))
+            .await
+    ));
+    assert!(invalid(&store.next_node_capture_revision(&parent).await));
+    assert_eq!(store.commit_node_checkpoint(&base).await.unwrap(), receipt);
+    assert!(invalid(
+        &store
+            .commit_node_checkpoint(&checkpoint(tenant, &parent, 8, 3))
+            .await
+    ));
+    assert_eq!(
+        store
+            .current_node_checkpoint(&aid("agent-p"), &ws)
+            .await
+            .unwrap()
+            .map(|c| c.manifest_sha256),
+        Some(base.manifest_sha256.clone())
+    );
+});
+
+fn placement(
+    tenant: &str,
+    agent: &str,
+    node_id: &str,
+    workspace: &str,
+    at: &str,
+) -> RemoteAgentRecord {
+    RemoteAgentRecord {
+        agent_id: aid(agent),
+        workspace_id: workspace.into(),
+        node_id: node_id.into(),
+        lease_id: format!("lease-{node_id}"),
+        created_at: format!("{at} {tenant}"),
+    }
+}
+
+parity_test!(remote_agents_record_list_get_and_remove, |store, tenant| {
+    enroll(&store, tenant, "node-r", "head-1").await;
+    enroll(&store, tenant, "node-x", "head-1").await;
+    enroll(&store, tenant, "node-t", "head-1").await;
+    assert_eq!(
+        store.end_machine_leases("node-t", "head-1").await.unwrap(),
+        1
+    );
+    for agent in ["agent-a", "agent-b", "agent-c", "Agent-Z", "agent-0"] {
+        seed_session(
+            &store,
+            tenant,
+            agent,
+            serde_json::json!({ "tenant": tenant }),
+        )
+        .await;
+    }
+    let e2b = serde_json::json!({ "remotePlacement": { "placement": { "target": "e2b" } } });
+    seed_session(&store, tenant, "agent-e2b", e2b.clone()).await;
+    if tenant == "decoy" {
+        enroll(&store, tenant, "none", "head-1").await;
+        seed_session(&store, tenant, "agent-d", serde_json::json!({})).await;
+        seed_session(&store, tenant, "agent-e2b-decoy", e2b).await;
+        for (agent, workspace) in [("agent-c", WS), ("agent-d", "ws-decoy")] {
+            store
+                .record_remote_agent(&placement(tenant, agent, "node-r", workspace, T1))
+                .await
+                .unwrap();
+        }
+        store
+            .record_final_stop(&RemoteFinalStopRecord {
+                workspace_id: "ws-decoy".into(),
+                ..stop(tenant, "agent-decoy-stop", "lease-node-r", T0)
+            })
+            .await
+            .unwrap();
+    }
+
+    // Ties on created_at order by agent id in byte order ("Agent-Z" first),
+    // not by insertion order; "agent-0" is newest.
+    let late = placement(tenant, "agent-0", "node-r", WS, T1);
+    let b = placement(tenant, "agent-b", "node-r", WS, T0);
+    let a = placement(tenant, "agent-a", "node-r", WS, T0);
+    let z = placement(tenant, "Agent-Z", "node-r", WS, T0);
+    for placed in [&late, &b, &a, &z, &a] {
+        store.record_remote_agent(placed).await.unwrap();
+    }
+    assert!(invalid(
+        &store
+            .record_remote_agent(&placement(tenant, "agent-a", "node-x", WS, T0))
+            .await
+    ));
+    let mut mismatched = placement(tenant, "agent-c", "node-r", WS, T0);
+    mismatched.lease_id = "lease-node-x".into();
+    assert!(invalid(&store.record_remote_agent(&mismatched).await));
+    assert!(invalid(
+        &store
+            .record_remote_agent(&placement(tenant, "agent-c", "node-t", WS, T0))
+            .await
+    ));
+    if tenant != "decoy" {
+        assert!(not_found(
+            &store
+                .record_remote_agent(&placement(tenant, "agent-c", "none", WS, T0))
+                .await
+        ));
+    }
+
+    let mut gone = stop(tenant, "agent-gone", "lease-node-r", T0);
+    gone.workspace_id = "ws-stop".into();
+    store.record_final_stop(&gone).await.unwrap();
+    assert!(store
+        .workspace_has_remote_agent_work(&WS.into())
+        .await
+        .unwrap());
+    assert!(store
+        .workspace_has_remote_agent_work(&"ws-stop".into())
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .workspace_has_remote_agent_work(&"ws-decoy".into())
+            .await
+            .unwrap(),
+        tenant == "decoy"
+    );
+
+    assert_eq!(
+        store.get_remote_agent(&aid("agent-a")).await.unwrap(),
+        Some(a.clone())
+    );
+    assert_eq!(store.get_remote_agents(&[]).await.unwrap(), vec![]);
+    if tenant != "decoy" {
+        assert_eq!(
+            store.list_remote_agents("lease-node-r").await.unwrap(),
+            vec![z.clone(), a.clone(), b.clone(), late.clone()]
+        );
+        assert_eq!(store.get_remote_agent(&aid("agent-d")).await.unwrap(), None);
+        assert_eq!(
+            store
+                .get_remote_agents(&[
+                    aid("agent-c"),
+                    aid("agent-b"),
+                    aid("agent-d"),
+                    aid("agent-a")
+                ])
+                .await
+                .unwrap(),
+            vec![a.clone(), b.clone()]
+        );
+        assert_eq!(
+            store.list_cloud_placed_agents().await.unwrap(),
+            vec![(WS.into(), aid("agent-e2b"))]
+        );
+    }
+    assert_eq!(
+        store.list_remote_agents("lease-node-x").await.unwrap(),
+        vec![]
+    );
+
+    assert!(store.remove_remote_agent(&aid("agent-b")).await.unwrap());
+    assert!(!store.remove_remote_agent(&aid("agent-b")).await.unwrap());
+    assert_eq!(store.get_remote_agent(&aid("agent-b")).await.unwrap(), None);
+    if tenant == "decoy" {
+        store.record_remote_agent(&b).await.unwrap();
+    } else {
+        assert!(!store.remove_remote_agent(&aid("agent-d")).await.unwrap());
+        assert_eq!(
+            store.list_remote_agents("lease-node-r").await.unwrap(),
+            vec![z.clone(), a.clone(), late.clone()]
+        );
+    }
+});
+
+fn closing_stop(tenant: &str, agent: &str, reason: FinalStopReason) -> RemoteFinalStopRecord {
+    RemoteFinalStopRecord {
+        stop_id: format!("stop-{agent}"),
+        reason,
+        ..stop(tenant, agent, "lease-node-f", T0)
+    }
+}
+
+/// Places `agent-1`..`agent-3` on `node-f` (where not placed yet) and
+/// records their final stops; tenant-neutral stop ids, so a delete without
+/// its tenant filter reaches the decoy's.
+async fn seed_final_stops(store: &Store, tenant: &str, stops: &[RemoteFinalStopRecord]) {
+    for s in stops {
+        if store.get_remote_agent(&s.agent_id).await.unwrap().is_none() {
+            store
+                .record_remote_agent(&placement(tenant, s.agent_id.as_str(), "node-f", WS, T0))
+                .await
+                .unwrap();
+        }
+        store.record_final_stop(s).await.unwrap();
+    }
+}
+
+parity_test!(final_stops_finish_and_drop_placement, |store, tenant| {
+    enroll(&store, tenant, "node-f", "head-1").await;
+    for agent in ["agent-1", "agent-2", "agent-3"] {
+        seed_session(&store, tenant, agent, serde_json::json!({})).await;
+    }
+    let stops = [
+        closing_stop(tenant, "agent-1", FinalStopReason::AgentDeleted),
+        closing_stop(tenant, "agent-2", FinalStopReason::AgentRetired),
+        closing_stop(tenant, "agent-3", FinalStopReason::MachineRemoved),
+    ];
+    seed_final_stops(&store, tenant, &stops).await;
+    if tenant == "decoy" {
+        store
+            .record_final_stop(&closing_stop(
+                tenant,
+                "agent-missing",
+                FinalStopReason::AgentDeleted,
+            ))
+            .await
+            .unwrap();
+    }
+    let record = |agent: &str| placement(tenant, agent, "node-f", WS, T0);
+
+    assert!(!store
+        .finish_final_stop(&aid("agent-1"), "stop-other")
+        .await
+        .unwrap());
+    if tenant != "decoy" {
+        assert!(!store
+            .finish_final_stop(&aid("agent-missing"), "stop-agent-missing")
+            .await
+            .unwrap());
+    }
+    assert_eq!(
+        store.get_final_stop(&aid("agent-1")).await.unwrap(),
+        Some(stops[0].clone())
+    );
+
+    assert!(store
+        .finish_final_stop(&aid("agent-1"), "stop-agent-1")
+        .await
+        .unwrap());
+    assert_eq!(store.get_final_stop(&aid("agent-1")).await.unwrap(), None);
+    assert_eq!(store.get_remote_agent(&aid("agent-1")).await.unwrap(), None);
+    assert!(!store
+        .finish_final_stop(&aid("agent-1"), "stop-agent-1")
+        .await
+        .unwrap());
+
+    assert!(store
+        .finish_final_stop(&aid("agent-2"), "stop-agent-2")
+        .await
+        .unwrap());
+    assert_eq!(
+        store.get_remote_agent(&aid("agent-2")).await.unwrap(),
+        Some(record("agent-2"))
+    );
+    assert_eq!(
+        store.list_remote_agents("lease-node-f").await.unwrap(),
+        vec![record("agent-2"), record("agent-3")]
+    );
+    if tenant == "decoy" {
+        seed_final_stops(&store, tenant, &stops).await;
+    } else {
+        assert_eq!(
+            store.list_final_stops("lease-node-f").await.unwrap(),
+            vec![stops[2].clone()]
+        );
+    }
+});
