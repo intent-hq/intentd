@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.233] - 2026-11-17
+
+### 🚀 Features
+
+- *(store)* Port workspace store methods to Postgres ([#3442](https://github.com/intent-hq/intentd/pull/3442))
+- *(store)* Port note, comment and draft store methods to Postgres ([#3445](https://github.com/intent-hq/intentd/pull/3445))
+- *(browser)* Document trusted input actions for agents ([#3437](https://github.com/intent-hq/intentd/pull/3437))
+
+### 🐛 Bug Fixes
+
+- *(store)* Connect to and migrate on PlanetScale Neki ([#3449](https://github.com/intent-hq/intentd/pull/3449))
+- *(events)* Drop read-access events in the shared watch hub ([#3451](https://github.com/intent-hq/intentd/pull/3451))
+- *(nodes)* Raise the Northflank disk minimum to 6 GiB ([#3448](https://github.com/intent-hq/intentd/pull/3448))
+- *(remote)* A final stop ends the turn in flight as stopped ([#3452](https://github.com/intent-hq/intentd/pull/3452))
+
+### 📚 Documentation
+
+- Describe installed Intent invitation routing ([#3441](https://github.com/intent-hq/intentd/pull/3441))
+- Describe onboarding Install and Log in buttons in the app guide ([#3453](https://github.com/intent-hq/intentd/pull/3453))
+
+### 🧪 Testing
+
+- *(store)* Run store tests on both backends; per-tenant Postgres writer lock ([#3440](https://github.com/intent-hq/intentd/pull/3440))
+
+
 ## [0.11.232] - 2026-11-17
 
 ### 🚀 Features
