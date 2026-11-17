@@ -255,6 +255,54 @@ async fn a_remote_agent_fails_over_once_the_backup_runs_on_its_node() {
     );
 }
 
+/// A final stop (as on a machine removal) ends the backup's first turn
+/// before it ran: the switch is not announced, and the agent's next turn
+/// that completes on the backup announces it once.
+#[intent_test_macros::daemon_test]
+async fn a_stopped_turn_does_not_confirm_a_remote_failover() {
+    let ws = WorkspaceId::from("ws-remote-failover-stopped");
+    let id = AgentId::from("agent-remote-failover-stopped");
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let stopped = FakeRuntime::new();
+    stopped.final_stops.store(1, Ordering::SeqCst);
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(stopped.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    let rows = || async {
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        failover_rows(&messages).len()
+    };
+
+    send(&mgr, &id, &ws, "hello").await;
+    stopped.wait_prompts(1).await;
+    wait_idle(&mgr, &id).await;
+    assert_eq!(rows().await, 0, "a stopped turn announces no switch");
+
+    send(&mgr, &id, &ws, "again").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+    assert_eq!(port.asked.load(Ordering::SeqCst), 3);
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.provider.as_deref(), Some(backup.as_str()));
+    assert_eq!(rows().await, 1, "the completed turn announces it once");
+}
+
 /// A remote agent out of quota whose backup cannot start on its node: no
 /// "switched to the backup" row, the previous configuration restored, and
 /// the agent failed with a message saying what went wrong and what to do.

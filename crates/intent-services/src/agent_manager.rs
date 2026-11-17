@@ -15864,23 +15864,24 @@ async fn run_message_worker(
                         // state); a user stop proves nothing.
                         if stop_reason != StopReason::Cancelled {
                             mgr.services.note_provider_working(&agent_id);
+                            // A remote agent's automatic switch, or one its
+                            // user made, is confirmed by a completed turn on
+                            // its new configuration; a stopped one stays
+                            // pending (a final stop may end it unrun).
+                            mgr.services.confirm_remote_model_switch(&agent_id);
+                            boxed_await(|| {
+                                mgr.services
+                                    .complete_remote_failover(&workspace_id, &agent_id)
+                            })
+                            .await;
+                            // A turn that went back to the home provider and
+                            // completed there is home (PROTOCOL §5.54).
+                            boxed_await(|| {
+                                mgr.services
+                                    .complete_provider_return(&workspace_id, &agent_id)
+                            })
+                            .await;
                         }
-                        // A remote agent's automatic switch, or one its
-                        // user made, is confirmed by a completed turn on its
-                        // new configuration.
-                        mgr.services.confirm_remote_model_switch(&agent_id);
-                        boxed_await(|| {
-                            mgr.services
-                                .complete_remote_failover(&workspace_id, &agent_id)
-                        })
-                        .await;
-                        // A turn that went back to the home provider and
-                        // completed there is home (PROTOCOL §5.54).
-                        boxed_await(|| {
-                            mgr.services
-                                .complete_provider_return(&workspace_id, &agent_id)
-                        })
-                        .await;
                         // A completed turn also resets the consecutive
                         // idle-timeout streak (warn-and-continue).
                         consecutive_idle_timeouts = 0;

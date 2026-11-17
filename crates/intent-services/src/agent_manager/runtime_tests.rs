@@ -24,6 +24,9 @@ struct FakeRuntime {
     /// When set, the node reported the agent exited before it started:
     /// every prompt fails before output, as the production runtime does.
     exited: Mutex<Option<String>>,
+    /// Prompts still to end as stopped before output, the runtime then not
+    /// alive: a final stop's close, as on a machine removal.
+    final_stops: AtomicUsize,
 }
 
 impl FakeRuntime {
@@ -41,6 +44,7 @@ impl FakeRuntime {
             responses: AtomicUsize::new(0),
             quota_failures: AtomicUsize::new(0),
             exited: Mutex::new(None),
+            final_stops: AtomicUsize::new(0),
         })
     }
 
@@ -95,6 +99,19 @@ impl AgentRuntime for FakeRuntime {
                         "{\"type\":\"rate_limit_error\",\"message\":\"usage limit reached\"}"
                     )),
                 }));
+            }
+            if self
+                .final_stops
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                self.alive.store(false, Ordering::SeqCst);
+                self.entered.notify_one();
+                return Ok(PromptOutcome {
+                    stop_reason: StopReason::Cancelled,
+                    usage: None,
+                    meta: None,
+                });
             }
             self.updates
                 .send(IncomingNotification {

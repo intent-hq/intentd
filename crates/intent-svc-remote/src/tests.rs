@@ -2174,6 +2174,80 @@ mod final_stops {
         node.shutdown();
     }
 
+    /// A final stop (here a machine removal) ends the agent's turn in flight
+    /// as stopped. A transport error, before any output, would make the
+    /// turn worker redrive the prompt on a fresh child against the removed
+    /// machine; after output, it would fail the turn and wake the parent.
+    #[tokio::test]
+    async fn a_final_stop_ends_the_turn_in_flight_as_stopped() {
+        let (mut machine, backend, node) = exposed().await;
+        let agent = placed(&backend, &node, &machine).await;
+        let runtime = node.attach(&agent, &workspace());
+        let mut link = machine.accept().await;
+        link.replay_complete(0).await;
+        bound(&node).await;
+        let spawn_prompt = |runtime: Arc<crate::RemoteAgentRuntime>| {
+            tokio::spawn(async move {
+                let activity = ActivityTracker::new();
+                runtime.prompt("s", text_prompt("go"), &activity).await
+            })
+        };
+        let turn = spawn_prompt(runtime.clone());
+        link.expect(|frame| matches!(frame, LinkFrame::Prompt { .. }).then_some(()))
+            .await;
+
+        node.final_stop(&agent, FinalStopReason::MachineRemoved)
+            .await;
+        match tokio::time::timeout(wait(), turn).await.unwrap().unwrap() {
+            Ok(outcome) => assert_eq!(outcome.stop_reason, StopReason::Cancelled),
+            other => panic!("expected a stopped turn, got {other:?}"),
+        }
+        // Not alive, so the agent's next message starts a new runtime; a
+        // prompt that raced the stop onto this one is stopped too.
+        assert!(!runtime.is_alive());
+        match spawn_prompt(runtime.clone()).await.unwrap() {
+            Ok(outcome) => assert_eq!(outcome.stop_reason, StopReason::Cancelled),
+            other => panic!("expected a stopped turn, got {other:?}"),
+        }
+        // A stop from head still fails a prompt as before.
+        runtime.stop().await;
+        assert!(matches!(
+            spawn_prompt(runtime.clone()).await.unwrap(),
+            Err(AcpError::Transport(_))
+        ));
+        node.shutdown();
+    }
+
+    /// A provider that exited before the final stop still fails the turn
+    /// with its exit: the stop does not hide it.
+    #[tokio::test]
+    async fn a_final_stop_after_an_exit_keeps_the_exit_error() {
+        let (mut machine, backend, node) = exposed().await;
+        let agent = placed(&backend, &node, &machine).await;
+        let runtime = node.attach(&agent, &workspace());
+        let link = machine.accept().await;
+        link.replay_complete(0).await;
+        bound(&node).await;
+        link.journal(exited(1, &agent)).await;
+        let exiting = runtime.clone();
+        until("the exit is recorded", || {
+            let exiting = exiting.clone();
+            Box::pin(async move { exiting.exit_error().is_some() })
+        })
+        .await;
+
+        node.final_stop(&agent, FinalStopReason::MachineRemoved)
+            .await;
+        let activity = ActivityTracker::new();
+        match runtime.prompt("s", text_prompt("go"), &activity).await {
+            Err(AcpError::Transport(message)) => {
+                assert!(message.contains("status 3"), "{message}");
+            }
+            other => panic!("expected the exit error, got {other:?}"),
+        }
+        node.shutdown();
+    }
+
     #[tokio::test]
     async fn a_retired_agents_placement_outlives_its_final_stop() {
         let (mut machine, backend, node) = exposed().await;
