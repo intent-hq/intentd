@@ -120,6 +120,24 @@ impl RemoteAgentRuntime {
         })
     }
 
+    /// The outcome of a prompt for an agent that is no longer running. A
+    /// final stop (the agent ends for good, as on a machine removal) stops
+    /// the turn: as a transport error it would be redriven on a fresh child
+    /// against the machine being removed, or fail and wake the parent. The
+    /// agent's next message starts it again, on a new runtime.
+    fn turn_ended_early(&self) -> Result<PromptOutcome, AcpError> {
+        if !self.stopped.load(Ordering::SeqCst) && self.sink.is_closed() {
+            return Ok(PromptOutcome {
+                stop_reason: StopReason::Cancelled,
+                usage: None,
+                meta: None,
+            });
+        }
+        Err(self
+            .not_running()
+            .unwrap_or_else(|| transport("node-agent-not-running")))
+    }
+
     /// Detach from ingestion and queue the node-side stop, which is resent
     /// until the machine acknowledges it; idempotent.
     fn begin_stop(&self) {
@@ -137,8 +155,8 @@ impl RemoteAgentRuntime {
         prompt: Vec<ContentBlock>,
         activity: &ActivityTracker,
     ) -> Result<PromptOutcome, AcpError> {
-        if let Some(error) = self.not_running() {
-            return Err(error);
+        if self.not_running().is_some() {
+            return self.turn_ended_early();
         }
         let prompt = prompt
             .iter()
@@ -169,9 +187,7 @@ impl RemoteAgentRuntime {
             self.shared.ask_link();
         }
         let Some(mut ended) = self.sink.expect_turn(&turn_id) else {
-            return Err(self
-                .not_running()
-                .unwrap_or_else(|| transport("node-agent-not-running")));
+            return self.turn_ended_early();
         };
         let _guard = TurnGuard {
             sink: &self.sink,
@@ -199,15 +215,11 @@ impl RemoteAgentRuntime {
                     data: None,
                 }));
             }
-            _ = &mut ended => {
-                return Err(self
-                    .not_running()
-                    .unwrap_or_else(|| transport("node-agent-not-running")));
-            }
+            _ = &mut ended => return self.turn_ended_early(),
         };
         // The agent may have been stopped just as the link came up.
-        if let Some(error) = self.not_running() {
-            return Err(error);
+        if self.not_running().is_some() {
+            return self.turn_ended_early();
         }
         // Never prompt behind this agent's unacknowledged stop.
         self.shared
@@ -223,9 +235,7 @@ impl RemoteAgentRuntime {
                 end = &mut ended => {
                     return match end {
                         Ok(end) => outcome(end),
-                        Err(_) => Err(self
-                            .not_running()
-                            .unwrap_or_else(|| transport("node-agent-not-running"))),
+                        Err(_) => self.turn_ended_early(),
                     };
                 }
                 () = tokio::time::sleep(self.shared.tuning.turn_poll) => {

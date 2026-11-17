@@ -375,6 +375,33 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
     assert_eq!(bee_now["placement"]["cloudMachineId"], beta_id.as_str());
 
     step("renamed");
+    // The sub-agent is mid-turn at the remove: its final stop ends the turn
+    // as stopped, never failed or redriven against the removed entry.
+    let streamed = |a: &Value| a["lastStreamActivityAt"].clone();
+    let idle_kid = ok(
+        &mut rpc_ws,
+        73,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": kid }),
+    )
+    .await;
+    let streamed_before = streamed(&idle_kid["agent"]);
+    ok(
+        &mut rpc_ws,
+        74,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": kid, "content": "block here" }),
+    )
+    .await;
+    // A remote turn's text is not served mid-turn: its first streamed
+    // chunk ("echo: block here") moves the stream stamp, and then it parks.
+    agent_until(&mut rpc_ws, (&ws_id, &kid), 75, |a| {
+        a["turnInFlight"] == true
+            && a["lastUserMessage"] == "block here"
+            && streamed(a) != streamed_before
+    })
+    .await;
+    let creates_before = fake.state().creates.len();
     // Removing one entry: its live sandbox needs stopAgents; then only its
     // sandbox goes, and its agent no longer names it.
     let busy = rpc(
@@ -433,6 +460,22 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
     })
     .await;
     assert_eq!(bee_left["placement"]["target"], "e2b", "{bee_left}");
+    let kid_left = agent_until(&mut rpc_ws, (&ws_id, &kid), 85, |a| {
+        a.get("nodeId").is_none() && !matches!(a["status"].as_str(), Some("pending" | "active"))
+    })
+    .await;
+    assert_eq!(kid_left["status"], "idle", "{kid_left}");
+    assert!(kid_left.get("placementError").is_none(), "{kid_left}");
+    let log = std::fs::read_to_string(head_dir.join("head.log")).unwrap_or_default();
+    assert!(
+        !log.contains("redriving the prompt"),
+        "a stopped turn was redriven"
+    );
+    assert_eq!(
+        fake.state().creates.len(),
+        creates_before,
+        "nothing started again on a sandbox"
+    );
     let again = ok(
         &mut rpc_ws,
         90,
