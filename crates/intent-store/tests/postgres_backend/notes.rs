@@ -1050,4 +1050,22 @@ parity_test!(note_search_finds_stopwords, |store| {
             "{expr}"
         );
     }
+    // Stemming: "plans" and "plan" find each other.
+    store
+        .insert_note(&note(
+            "sw3",
+            "Roadmap",
+            "several plans",
+            "2026-09-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+    for expr in ["\"plan\"", "\"plans\""] {
+        let hits = store.search_notes_fts(expr, &options).await.unwrap();
+        assert_eq!(
+            search_ids(&hits),
+            ["sw1", "sw3"].map(String::from).into(),
+            "{expr}"
+        );
+    }
 });

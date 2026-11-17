@@ -1,8 +1,11 @@
 //! Ranked note search (Postgres). Mirrors `note_search_repo.rs` over the
 //! generated `note.search_tsv` column. The FTS5 MATCH expression callers pass
-//! (`intent_search::fts_match_expr`) is translated to a `tsquery`. Ranking is
-//! `ts_rank`, not bm25, so the order of hits can differ from `SQLite`; the
-//! filters, boosts, per-workspace cap, cursor and limit are the same.
+//! (`intent_search::fts_match_expr`) is translated to a `tsquery` in which
+//! each term matches through the built-in 'english' (stemmed) or 'simple'
+//! (stopwords kept) configuration, the same two the column is built from.
+//! Ranking is `ts_rank`, not bm25, so the order of hits can differ from
+//! `SQLite`; the filters, boosts, per-workspace cap, cursor and limit are the
+//! same.
 
 use intent_core::{Error, Result, WorkspaceId};
 
@@ -20,9 +23,10 @@ const AFTER_CURSOR: &str = " AND (adjusted_rank > $7 OR (adjusted_rank = $7 AND 
      (updated_at COLLATE \"C\" < $8 OR (updated_at = $8 AND (workspace_id COLLATE \"C\" > $9 \
      OR (workspace_id = $9 AND note_id COLLATE \"C\" > $10))))))";
 
-/// The ranked candidate rows. Binds: `$1` tenant, `$2` preferred workspace,
-/// `$3` tsquery, `$4` hard scope, `$5` allowed workspaces.
-fn ranked_sql(options: &NoteFtsOptions<'_>) -> String {
+/// The ranked candidate rows for `query` (a [`SearchQuery::sql`] tsquery
+/// expression). Binds: `$1` tenant, `$2` preferred workspace, `$3` the query
+/// terms, `$4` hard scope, `$5` allowed workspaces.
+fn ranked_sql(options: &NoteFtsOptions<'_>, query: &str) -> String {
     let mut filters = String::new();
     if options.workspace_id.is_some() {
         filters.push_str(" AND n.workspace_id = $4");
@@ -41,7 +45,7 @@ fn ranked_sql(options: &NoteFtsOptions<'_>) -> String {
                + CASE WHEN w.archived <> 0 THEN 1.0 ELSE 0.0 END)::float8 AS adjusted_rank \
          FROM note n \
          JOIN workspace w ON w.tenant_id = $1 AND w.id = n.workspace_id \
-         CROSS JOIN to_tsquery('intent_search', $3) AS q(query) \
+         CROSS JOIN (SELECT {query} AS query) q \
          WHERE n.tenant_id = $1 AND n.search_tsv @@ q.query{filters}"
     )
 }
@@ -51,13 +55,13 @@ type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArgu
 fn bind_ranked<'q>(
     store: &'q PgStore,
     sql: &'q str,
-    tsquery: String,
+    terms: Vec<String>,
     options: &NoteFtsOptions<'q>,
 ) -> PgQuery<'q> {
     sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(store.tenant())
         .bind(options.prefer_workspace_id.map(WorkspaceId::as_str))
-        .bind(tsquery)
+        .bind(terms)
         .bind(options.workspace_id.map(WorkspaceId::as_str))
         .bind(
             options
@@ -80,17 +84,17 @@ impl PgStore {
         {
             return Ok(Vec::new());
         }
-        let Some(tsquery) = fts5_to_tsquery(match_expr) else {
+        let Some(query) = SearchQuery::parse(match_expr) else {
             return Ok(Vec::new());
         };
         let sql = format!(
             "SELECT note_id, workspace_id, updated_at, adjusted_rank FROM ({}) r \
              WHERE (workspace_id, note_id) IN (SELECT * FROM unnest($6::text[], $7::text[]))",
-            ranked_sql(options)
+            ranked_sql(options, &query.sql())
         );
         let (workspaces, note_ids): (Vec<String>, Vec<String>) = notes.iter().cloned().unzip();
         let mut tx = self.begin().await?;
-        let rows = bind_ranked(self, &sql, tsquery, options)
+        let rows = bind_ranked(self, &sql, query.terms, options)
             .bind(workspaces)
             .bind(note_ids)
             .fetch_all(&mut *tx)
@@ -129,10 +133,10 @@ impl PgStore {
         {
             return Ok(Vec::new());
         }
-        let Some(tsquery) = fts5_to_tsquery(match_expr) else {
+        let Some(query) = SearchQuery::parse(match_expr) else {
             return Ok(Vec::new());
         };
-        let ranked = ranked_sql(options);
+        let ranked = ranked_sql(options, &query.sql());
         let after = if options.after.is_some() {
             AFTER_CURSOR
         } else {
@@ -154,7 +158,7 @@ impl PgStore {
         };
         let after = options.after;
         let mut tx = self.begin().await?;
-        let rows = bind_ranked(self, &sql, tsquery, options)
+        let rows = bind_ranked(self, &sql, query.terms, options)
             .bind(options.per_workspace_limit)
             .bind(after.map(|a| a.rank))
             .bind(after.map(|a| a.updated_at.as_str()))
@@ -183,7 +187,24 @@ impl PgStore {
     }
 }
 
-#[derive(Debug, PartialEq)]
+/// A parsed FTS5 MATCH expression: the boolean shape plus its terms, which
+/// are bound as the `$3` text array, never spliced into the SQL.
+#[derive(Debug)]
+pub(crate) struct SearchQuery {
+    expr: Expr,
+    /// `to_tsquery` inputs: words joined by `<->`, a prefix term ends `:*`.
+    terms: Vec<String>,
+}
+
+#[derive(Debug)]
+enum Expr {
+    Term(usize),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    AndNot(Box<Expr>, Box<Expr>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum Token {
     Open,
     Close,
@@ -193,57 +214,115 @@ enum Token {
     Term(String),
 }
 
-/// Translate an FTS5 MATCH expression (quoted or bare terms, `*` prefixes,
-/// `AND`/`OR`/`NOT`, parentheses, implicit AND) into a `to_tsquery` input.
-/// Terms keep only their letters and digits, so no tsquery syntax can come
-/// from the caller. `None` when no term remains.
-pub(crate) fn fts5_to_tsquery(expr: &str) -> Option<String> {
-    let tokens = lex(expr);
-    let mut out = String::new();
-    // True after an operand or `)`: the next operand needs an operator.
-    let mut after_operand = false;
-    let mut pending_op: Option<&str> = None;
-    for (i, token) in tokens.iter().enumerate() {
-        let starts_operand = matches!(token, Token::Open | Token::Term(_));
-        if starts_operand {
-            if after_operand {
-                out.push_str(pending_op.take().unwrap_or(" & "));
-            }
-            pending_op = None;
-        }
-        match token {
-            Token::Open => {
-                out.push('(');
-                after_operand = false;
-            }
-            Token::Close => {
-                if !after_operand {
-                    return None;
-                }
-                out.push(')');
-            }
-            Token::Term(t) => {
-                out.push_str(t);
-                after_operand = true;
-            }
-            Token::And | Token::Or | Token::Not => {
-                let next_is_operand =
-                    matches!(tokens.get(i + 1), Some(Token::Open | Token::Term(_)));
-                if after_operand && next_is_operand {
-                    pending_op = Some(match token {
-                        Token::And => " & ",
-                        Token::Or => " | ",
-                        _ => " & !",
-                    });
+impl SearchQuery {
+    /// Parse FTS5 syntax: quoted or bare terms, `*` prefixes, `AND`, `OR`,
+    /// `NOT`, parentheses and implicit AND, with FTS5 precedence (NOT, then
+    /// AND, then OR). Terms keep only letters and digits. Operators with a
+    /// missing side are dropped. `None` when no term remains or the
+    /// parentheses do not balance.
+    pub(crate) fn parse(expr: &str) -> Option<Self> {
+        let raw = lex(expr);
+        let mut tokens = Vec::with_capacity(raw.len());
+        for (i, token) in raw.iter().enumerate() {
+            if matches!(token, Token::And | Token::Or | Token::Not) {
+                let before = matches!(tokens.last(), Some(Token::Close | Token::Term(_)));
+                let after = matches!(raw.get(i + 1), Some(Token::Open | Token::Term(_)));
+                if !(before && after) {
+                    continue;
                 }
             }
+            tokens.push(token.clone());
         }
-        if matches!(token, Token::Close) {
-            after_operand = true;
+        let mut parser = Parser {
+            tokens,
+            at: 0,
+            terms: Vec::new(),
+        };
+        let expr = parser.or()?;
+        (parser.at == parser.tokens.len()).then_some(Self {
+            expr,
+            terms: parser.terms,
+        })
+    }
+
+    /// The tsquery SQL expression. Each term matches through 'english'
+    /// (stemmed; stopwords dropped) or 'simple' (every word kept), the two
+    /// configurations `search_tsv` is built from.
+    pub(crate) fn sql(&self) -> String {
+        render(&self.expr, &|i| {
+            format!("(to_tsquery('english', $3[{i}]) || to_tsquery('simple', $3[{i}]))")
+        })
+    }
+}
+
+fn render(expr: &Expr, term: &dyn Fn(usize) -> String) -> String {
+    match expr {
+        Expr::Term(i) => term(*i),
+        Expr::And(a, b) => format!("({} && {})", render(a, term), render(b, term)),
+        Expr::Or(a, b) => format!("({} || {})", render(a, term), render(b, term)),
+        Expr::AndNot(a, b) => format!("({} && !!{})", render(a, term), render(b, term)),
+    }
+}
+
+struct Parser {
+    tokens: Vec<Token>,
+    at: usize,
+    terms: Vec<String>,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.at)
+    }
+
+    fn or(&mut self) -> Option<Expr> {
+        let mut left = self.and()?;
+        while self.peek() == Some(&Token::Or) {
+            self.at += 1;
+            left = Expr::Or(Box::new(left), Box::new(self.and()?));
+        }
+        Some(left)
+    }
+
+    fn and(&mut self) -> Option<Expr> {
+        let mut left = self.not()?;
+        loop {
+            match self.peek() {
+                Some(Token::And) => self.at += 1,
+                Some(Token::Open | Token::Term(_)) => {}
+                _ => return Some(left),
+            }
+            left = Expr::And(Box::new(left), Box::new(self.not()?));
         }
     }
-    let opens = out.matches('(').count();
-    (after_operand && opens == out.matches(')').count()).then_some(out)
+
+    fn not(&mut self) -> Option<Expr> {
+        let mut left = self.primary()?;
+        while self.peek() == Some(&Token::Not) {
+            self.at += 1;
+            left = Expr::AndNot(Box::new(left), Box::new(self.primary()?));
+        }
+        Some(left)
+    }
+
+    fn primary(&mut self) -> Option<Expr> {
+        match self.tokens.get(self.at).cloned()? {
+            Token::Term(term) => {
+                self.at += 1;
+                self.terms.push(term);
+                Some(Expr::Term(self.terms.len()))
+            }
+            Token::Open => {
+                self.at += 1;
+                let inner = self.or()?;
+                (self.peek() == Some(&Token::Close)).then(|| {
+                    self.at += 1;
+                    inner
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 fn lex(expr: &str) -> Vec<Token> {
@@ -252,13 +331,8 @@ fn lex(expr: &str) -> Vec<Token> {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        if c == '(' {
-            tokens.push(Token::Open);
-            i += 1;
-            continue;
-        }
-        if c == ')' {
-            tokens.push(Token::Close);
+        if c == '(' || c == ')' {
+            tokens.push(if c == '(' { Token::Open } else { Token::Close });
             i += 1;
             continue;
         }
@@ -285,13 +359,14 @@ fn lex(expr: &str) -> Vec<Token> {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
-            match word.as_str() {
-                "AND" => tokens.push(Token::And),
-                "OR" => tokens.push(Token::Or),
-                "NOT" => tokens.push(Token::Not),
-                _ => {}
-            }
-            if matches!(word.as_str(), "AND" | "OR" | "NOT") {
+            let operator = match word.as_str() {
+                "AND" => Some(Token::And),
+                "OR" => Some(Token::Or),
+                "NOT" => Some(Token::Not),
+                _ => None,
+            };
+            if let Some(operator) = operator {
+                tokens.push(operator);
                 continue;
             }
             word
@@ -315,33 +390,54 @@ fn lex(expr: &str) -> Vec<Token> {
         if prefix {
             term.push_str(":*");
         }
-        tokens.push(Token::Term(format!("({term})")));
+        tokens.push(Token::Term(term));
     }
     tokens
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fts5_to_tsquery;
+    use super::{render, SearchQuery};
+
+    /// The boolean shape with each term written inline.
+    fn shape(fts5: &str) -> Option<String> {
+        let q = SearchQuery::parse(fts5)?;
+        Some(render(&q.expr, &|i| q.terms[i - 1].clone()))
+    }
 
     #[test]
     fn translates_fts5_match_expressions() {
-        for (fts5, tsquery) in [
+        for (fts5, expected) in [
             (
                 r#""alpha" AND ("beta" OR "beta"*)"#,
-                Some("(alpha) & ((beta) | (beta:*))"),
+                Some("(alpha && (beta || beta:*))"),
             ),
-            (r#""two words""#, Some("(two <-> words)")),
-            ("a b", Some("(a) & (b)")),
-            ("a NOT b", Some("(a) & !(b)")),
-            (r#""it's" OR x"#, Some("(it <-> s) | (x)")),
-            (r#"" " AND "x""#, Some("(x)")),
+            (r#""two words""#, Some("two <-> words")),
+            ("a b", Some("(a && b)")),
+            ("a NOT b", Some("(a && !!b)")),
+            // FTS5 precedence: NOT, then AND, then OR.
+            ("a OR b AND c", Some("(a || (b && c))")),
+            ("a AND b NOT c OR d", Some("((a && (b && !!c)) || d)")),
+            (r#""it's" OR x"#, Some("(it <-> s || x)")),
+            (r#"" " AND "x""#, Some("x")),
             ("AND", None),
             ("", None),
             ("(a", None),
-            ("x:&|!'", Some("(x)")),
+            ("a)", None),
+            ("x:&|!'", Some("x")),
         ] {
-            assert_eq!(fts5_to_tsquery(fts5).as_deref(), tsquery, "{fts5}");
+            assert_eq!(shape(fts5).as_deref(), expected, "{fts5}");
         }
+    }
+
+    #[test]
+    fn terms_are_bound_not_spliced() {
+        let q = SearchQuery::parse(r#""it's" OR x*"#).unwrap();
+        assert_eq!(q.terms, ["it <-> s", "x:*"]);
+        assert_eq!(
+            q.sql(),
+            "((to_tsquery('english', $3[1]) || to_tsquery('simple', $3[1])) || \
+             (to_tsquery('english', $3[2]) || to_tsquery('simple', $3[2])))"
+        );
     }
 }

@@ -1,28 +1,24 @@
--- Full-text search without a stopword list, like SQLite FTS5 (porter
--- unicode61): the 'english' configuration drops stopwords ("a", "the",
--- "about") at index and query time, so a search for one returned nothing.
--- `intent_search` is 'english' with an English snowball stemmer that keeps
--- every word. Postgres only; no SQLite counterpart.
+-- Full-text search that keeps stopwords, like SQLite FTS5 (porter unicode61,
+-- no stopword list): the 'english' configuration drops "a", "the", "about" at
+-- index and query time, so a search for one returned nothing. Each vector is
+-- now 'english' (stemmed: "plans" -> "plan") plus 'simple' (every word as
+-- written, stopwords included). Built-in configurations only: PlanetScale
+-- Neki rejects user-created text-search dictionaries and configurations
+-- (router errors 302/303). Postgres only; no SQLite counterpart.
 
-CREATE TEXT SEARCH DICTIONARY intent_english_stem (TEMPLATE = snowball, Language = english);
-
-CREATE TEXT SEARCH CONFIGURATION intent_search (COPY = english);
-ALTER TEXT SEARCH CONFIGURATION intent_search
-    ALTER MAPPING FOR asciiword, asciihword, hword_asciipart, word, hword, hword_part
-    WITH intent_english_stem;
-
--- Re-create the generated columns (and their GIN indexes) with the new
--- configuration; the expressions are otherwise those of 0004_search.sql.
 ALTER TABLE agent_message DROP COLUMN search_tsv;
 ALTER TABLE agent_message ADD COLUMN search_tsv tsvector GENERATED ALWAYS AS (
     CASE WHEN role IN ('user', 'assistant')
-        THEN to_tsvector('intent_search', intent_message_search_text(content)) END
+        THEN to_tsvector('english', intent_message_search_text(content))
+            || to_tsvector('simple', intent_message_search_text(content)) END
 ) STORED;
 CREATE INDEX agent_message_search_tsv ON agent_message USING gin (search_tsv);
 
 ALTER TABLE note DROP COLUMN search_tsv;
 ALTER TABLE note ADD COLUMN search_tsv tsvector GENERATED ALWAYS AS (
-    to_tsvector('intent_search',
+    to_tsvector('english',
+        coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(tags, ''))
+    || to_tsvector('simple',
         coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(tags, ''))
 ) STORED;
 CREATE INDEX note_search_tsv ON note USING gin (search_tsv);
