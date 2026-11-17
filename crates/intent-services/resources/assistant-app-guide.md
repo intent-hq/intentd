@@ -31,10 +31,11 @@ Sharing needs the host owner's GitHub or GitLab account connected in **Settings 
 Connections**: without one, new invitation links cannot be created and unused links
 cannot be redeemed until it is reconnected. People who already joined keep access.
 
-The installed-app link registration and normal-window invitation routing changes in
-cloudlands-fe#4707 are pending a desktop release. Do not present them as available
-in released desktops or recommend them as fixes until a carrying desktop version
-is recorded here.
+Starting with desktop v2.343.2 (first released on alpha), invitation prompts and
+joined workspaces use a normal app window, outside the notch. Intent opens or
+restores one when needed. Development launches of these versions do not claim
+`intent://` links. If an older development instance claimed links, reopen installed
+Intent to let it reclaim registration.
 
 GitLab is supported alongside GitHub; there is no Labs switch. Connect a GitLab.com or
 self-managed GitLab account in **Settings → Connections** or during onboarding, by
