@@ -4,6 +4,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::fake::{FakeServer, Reply, WsSession, WsStep};
+use super::fake_api;
 use super::*;
 use crate::cloud::{
     CloudErrorKind, CloudInstance, CloudProvider, CreateInstance, InstanceState, ListInstances,
@@ -69,32 +70,48 @@ fn tag_list(names: &[&str]) -> Reply {
     )
 }
 
-/// A deployment service as `GET /projects/p1/services/{id}` returns it:
-/// Northflank keeps no annotation, and returns the runtime environment.
+/// A deployment service as `GET /projects/p1/services/{id}` returns it,
+/// from the shared fake: no annotation, and the runtime environment.
 fn service(id: &str, status: &str, instances: u32, tags: &BTreeMap<String, String>) -> Value {
-    let mut value = legacy_service(id, status, instances);
-    value["runtimeEnvironment"] =
-        json!({"INTENT_TAGS": serde_json::to_string(tags).unwrap(), "OTHER": "x"});
-    value
+    let env = json!({"INTENT_TAGS": serde_json::to_string(tags).unwrap(), "OTHER": "x"});
+    service_from(id, status, instances, Some(env), None)
 }
 
 /// A service made before the tags moved to the runtime environment: they
 /// went to an annotation, which Northflank drops, so none can be read.
 fn legacy_service(id: &str, status: &str, instances: u32) -> Value {
-    json!({
-        "id": id,
+    let annotations = json!({"intent.dev/tags": serde_json::to_string(&tags()).unwrap()});
+    service_from(id, status, instances, None, Some(annotations))
+}
+
+fn service_from(
+    id: &str,
+    status: &str,
+    instances: u32,
+    env: Option<Value>,
+    annotations: Option<Value>,
+) -> Value {
+    let mut request = json!({
         "name": id,
-        "serviceType": "deployment",
-        "tags": [NODE_TAG, BACKEND_TAG],
         "description": "Intent cloud machine",
-        "createdAt": "2026-11-11T10:00:00.000Z",
+        "tags": [NODE_TAG, BACKEND_TAG],
+        "billing": {"deploymentPlan": "nf-compute-400"},
         "deployment": {
-            "instances": instances,
+            "instances": 1,
             "external": {"imagePath": "ghcr.io/intent-hq/intent-node:0.11.184"},
-            "metadata": {"labels": {}, "annotations": {}}
         },
-        "status": {"deployment": {"status": status, "reason": "DEPLOYING"}}
-    })
+    });
+    if let Some(env) = env {
+        request["runtimeEnvironment"] = env;
+    }
+    if let Some(annotations) = annotations {
+        request["deployment"]["metadata"] = json!({ "annotations": annotations });
+    }
+    let mut api = fake_api::NorthflankApi::new("p1", "europe-west");
+    api.seed(id, request, instances == 0, "2026-11-11T10:00:00.000Z");
+    let mut value = api.service_body(id, &api.services[id]);
+    value["status"]["deployment"]["status"] = json!(status);
+    value
 }
 
 fn containers(statuses: &[&str]) -> Reply {
@@ -1038,7 +1055,7 @@ async fn an_unreachable_api_is_a_retryable_error() {
 // --- command execution ---
 
 fn init_ok() -> WsStep {
-    WsStep::Send(json!({"type": "init", "data": {"auth": "successful"}}))
+    WsStep::Send(fake_api::init_frame("svc-1"))
 }
 
 /// Output as real Northflank sends it for this command's `init`.
@@ -1049,8 +1066,8 @@ fn out(kind: &str, text: &str) -> WsStep {
     }
 }
 
-fn completion(code: i32, status: &str) -> WsStep {
-    WsStep::Send(json!({"type": "completion", "data": {"exitCode": code, "status": status}}))
+fn completion(code: i32) -> WsStep {
+    WsStep::Send(fake_api::completion_frame(code))
 }
 
 async fn exec_server(steps: Vec<WsStep>) -> FakeServer {
@@ -1108,7 +1125,7 @@ async fn exec_collects_output_and_the_exit_code() {
         init_ok(),
         out("stdOut", "out\n"),
         out("stdErr", "err\n"),
-        completion(3, "Failure"),
+        completion(3),
         WsStep::Close,
     ])
     .await;
@@ -1151,7 +1168,7 @@ async fn exec_success_has_no_error() {
         WsStep::Receive,
         init_ok(),
         out("stdOut", "hi\n"),
-        completion(0, "Success"),
+        completion(0),
         WsStep::Close,
     ])
     .await;
@@ -1168,7 +1185,7 @@ async fn exec_builds_the_argv_with_cwd_env_home_and_user() {
     let server = exec_server(vec![
         WsStep::Receive,
         init_ok(),
-        completion(0, "Success"),
+        completion(0),
         WsStep::Close,
     ])
     .await;
@@ -1202,7 +1219,7 @@ async fn exec_runs_as_the_unprivileged_user_unless_the_spec_names_one() {
         WsSession::Steps(vec![
             WsStep::Receive,
             init_ok(),
-            completion(0, "Success"),
+            completion(0),
             WsStep::Close,
         ])
     };
@@ -1231,9 +1248,9 @@ async fn the_first_command_after_a_connect_sets_up_the_home_in_the_same_exec() {
             out("stdErr", &ready),
             out("stdOut", "started\n"),
             out("stdErr", "warn\n"),
-            completion(0, "Success"),
+            completion(0),
         ]),
-        session(vec![completion(0, "Success")]),
+        session(vec![completion(0)]),
     ])
     .await;
     let output = client
@@ -1276,9 +1293,9 @@ async fn the_home_setup_marker_is_found_in_a_terminal_stream() {
     let (server, client) = connected(vec![
         session(vec![
             WsStep::Send(json!({"type": "stdOut", "data": format!("{ready}started\r\n")})),
-            completion(0, "Success"),
+            completion(0),
         ]),
-        session(vec![completion(0, "Success")]),
+        session(vec![completion(0)]),
     ])
     .await;
     let output = client
@@ -1306,8 +1323,8 @@ async fn the_home_setup_marker_is_found_in_a_terminal_stream() {
 async fn a_root_command_after_a_connect_leaves_the_setup_to_the_next_user_command() {
     let ready = format!("{}\n", super::provider::HOME_READY);
     let (server, client) = connected(vec![
-        session(vec![completion(0, "Success")]),
-        session(vec![out("stdErr", &ready), completion(0, "Success")]),
+        session(vec![completion(0)]),
+        session(vec![out("stdErr", &ready), completion(0)]),
     ])
     .await;
     let mut root = ProcessSpec::new("id");
@@ -1333,9 +1350,9 @@ async fn a_failed_setup_is_an_error_and_the_next_command_sets_up_again() {
     let (server, client) = connected(vec![
         session(vec![
             out("stdErr", "chown: Operation not permitted\n"),
-            completion(1, "Failure"),
+            completion(1),
         ]),
-        session(vec![out("stdErr", &ready), completion(0, "Success")]),
+        session(vec![out("stdErr", &ready), completion(0)]),
     ])
     .await;
     let err = client
@@ -1363,9 +1380,9 @@ async fn a_failed_setup_is_an_error_and_the_next_command_sets_up_again() {
 #[tokio::test]
 async fn an_image_without_setpriv_sets_up_then_runs_the_command_as_the_user() {
     let (server, client) = connected(vec![
-        session(vec![completion(super::provider::NO_DROP_EXIT, "Failure")]),
-        session(vec![out("stdOut", "hi\n"), completion(0, "Success")]),
-        session(vec![completion(0, "Success")]),
+        session(vec![completion(super::provider::NO_DROP_EXIT)]),
+        session(vec![out("stdOut", "hi\n"), completion(0)]),
+        session(vec![completion(0)]),
     ])
     .await;
     let output = client
@@ -1519,7 +1536,6 @@ fn the_setup_hands_the_home_over_only_when_the_owner_differs_then_drops_to_the_u
 async fn an_image_without_the_user_account_is_refused_at_the_first_command() {
     let (server, client) = connected(vec![session(vec![completion(
         super::provider::NO_USER_EXIT,
-        "Failure",
     )])])
     .await;
     let err = client
@@ -1543,7 +1559,7 @@ async fn exec_keeps_reading_after_completion_until_close() {
         WsStep::Receive,
         init_ok(),
         out("stdOut", "a"),
-        completion(0, "Success"),
+        completion(0),
         WsStep::Sleep(Duration::from_millis(100)),
         out("stdOut", "b"),
         out("stdErr", "late"),
@@ -1566,7 +1582,7 @@ async fn exec_pings_do_not_extend_the_drain() {
         WsStep::Receive,
         init_ok(),
         out("stdOut", "early"),
-        completion(0, "Success"),
+        completion(0),
     ];
     for _ in 0..10 {
         steps.push(WsStep::Sleep(Duration::from_millis(100)));
@@ -1587,7 +1603,7 @@ async fn exec_gives_up_waiting_for_more_output_after_the_drain_time() {
     let server = exec_server(vec![
         WsStep::Receive,
         init_ok(),
-        completion(0, "Success"),
+        completion(0),
         WsStep::Sleep(Duration::from_millis(100)),
         out("stdOut", "late"),
         WsStep::Sleep(Duration::from_secs(30)),
@@ -1745,7 +1761,7 @@ async fn exec_output_is_capped() {
     for _ in 0..17 {
         steps.push(out("stdOut", &big));
     }
-    steps.push(completion(0, "Success"));
+    steps.push(completion(0));
     steps.push(WsStep::Close);
     let server = exec_server(steps).await;
     let output = client(&server)

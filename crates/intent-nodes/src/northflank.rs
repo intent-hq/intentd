@@ -56,7 +56,15 @@ pub fn backend_tag(backend_id: &str) -> String {
 }
 
 #[cfg(test)]
+mod capture;
+#[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
 mod fake;
+#[cfg(any(test, feature = "northflank-fake"))]
+pub mod fake_api;
+#[cfg(test)]
+mod fields;
 #[cfg(test)]
 mod live_tests;
 #[cfg(test)]

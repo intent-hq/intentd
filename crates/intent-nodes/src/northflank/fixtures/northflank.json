@@ -1,0 +1,1295 @@
+{
+  "about": "Recorded from the real Northflank API by scripts/capture-northflank-fixtures.sh; ids, names, times and secrets replaced. The contract test holds the fake to it.",
+  "image": "ghcr.io/intent-hq/intent-node:latest",
+  "exchanges": [
+    {
+      "name": "get-project",
+      "request": {
+        "method": "GET",
+        "path": "/projects/project-1"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "id": "project-1",
+            "uid": "<scrubbed>",
+            "name": "Default",
+            "description": "",
+            "lifecycleStatus": "created",
+            "deployment": {
+              "region": "us-central"
+            },
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "cluster": {
+              "id": "nf-us-central",
+              "name": "nf-us-central",
+              "namespace": "<scrubbed>",
+              "loadBalancers": [
+                "<scrubbed>"
+              ]
+            },
+            "services": [],
+            "jobs": [],
+            "addons": []
+          }
+        }
+      }
+    },
+    {
+      "name": "list-plans",
+      "request": {
+        "method": "GET",
+        "path": "/plans"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "plans": [
+              {
+                "id": "nf-compute-200",
+                "name": "nf-compute-200",
+                "type": [
+                  "deployment"
+                ],
+                "currency": "usd",
+                "cpuResource": 2,
+                "ramResource": 4096,
+                "configuration": {
+                  "type": "northflank",
+                  "resources": {
+                    "cpu": {
+                      "resources": {
+                        "limit": 2
+                      }
+                    },
+                    "memory": {
+                      "resources": {
+                        "limit": 4096
+                      }
+                    }
+                  }
+                },
+                "amountPerHour": 0.067,
+                "amountPerMonth": 48
+              },
+              {
+                "id": "nf-compute-400",
+                "name": "nf-compute-400",
+                "type": [
+                  "deployment"
+                ],
+                "currency": "usd",
+                "cpuResource": 4,
+                "ramResource": 8192,
+                "configuration": {
+                  "type": "northflank",
+                  "resources": {
+                    "cpu": {
+                      "resources": {
+                        "limit": 4
+                      }
+                    },
+                    "memory": {
+                      "resources": {
+                        "limit": 8192
+                      }
+                    }
+                  }
+                },
+                "amountPerHour": 0.133,
+                "amountPerMonth": 96
+              },
+              {
+                "id": "nf-compute-50",
+                "name": "nf-compute-50",
+                "type": [
+                  "deployment"
+                ],
+                "currency": "usd",
+                "cpuResource": 0.5,
+                "ramResource": 1024,
+                "configuration": {
+                  "type": "northflank",
+                  "resources": {
+                    "cpu": {
+                      "resources": {
+                        "limit": 0.5
+                      }
+                    },
+                    "memory": {
+                      "resources": {
+                        "limit": 1024
+                      }
+                    }
+                  }
+                },
+                "amountPerHour": 0.017,
+                "amountPerMonth": 12
+              },
+              {
+                "id": "nf-compute-800-16",
+                "name": "nf-compute-800-16",
+                "type": [
+                  "deployment",
+                  "build"
+                ],
+                "currency": "usd",
+                "cpuResource": 8,
+                "ramResource": 16384,
+                "configuration": {
+                  "type": "northflank",
+                  "resources": {
+                    "cpu": {
+                      "resources": {
+                        "limit": 8
+                      }
+                    },
+                    "memory": {
+                      "resources": {
+                        "limit": 16384
+                      }
+                    }
+                  }
+                },
+                "amountPerHour": 0.267,
+                "amountPerMonth": 192
+              }
+            ]
+          }
+        }
+      },
+      "kept": {
+        "field": "id",
+        "values": [
+          "nf-compute-50",
+          "nf-compute-200",
+          "nf-compute-400",
+          "nf-compute-800-16"
+        ]
+      }
+    },
+    {
+      "name": "create-tag",
+      "request": {
+        "method": "POST",
+        "path": "/tags",
+        "body": {
+          "name": "intent-backend-000000000001"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "id": "intent-backend-000000000001",
+            "name": "intent-backend-000000000001",
+            "color": "#57637A",
+            "description": "",
+            "useAsInfrastructureLabel": false,
+            "createdAt": "2026-01-01T00:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "name": "list-tags",
+      "request": {
+        "method": "GET",
+        "path": "/tags?per_page=100"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "tags": [
+              {
+                "id": "intent-node",
+                "name": "intent-node",
+                "description": "",
+                "useAsInfrastructureLabel": false,
+                "color": "#57637A",
+                "createdAt": "2026-01-01T00:00:00.000Z"
+              },
+              {
+                "id": "intent-backend-000000000001",
+                "name": "intent-backend-000000000001",
+                "description": "",
+                "useAsInfrastructureLabel": false,
+                "color": "#57637A",
+                "createdAt": "2026-01-01T00:00:00.000Z"
+              }
+            ]
+          },
+          "pagination": {
+            "hasNextPage": false,
+            "count": 2
+          }
+        }
+      },
+      "kept": {
+        "field": "name",
+        "values": [
+          "intent-backend-000000000001",
+          "intent-node"
+        ]
+      }
+    },
+    {
+      "name": "list-tags-paged",
+      "request": {
+        "method": "GET",
+        "path": "/tags?per_page=1"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "tags": []
+          },
+          "pagination": {
+            "hasNextPage": true,
+            "cursor": "<scrubbed>",
+            "count": 0
+          }
+        }
+      },
+      "kept": {
+        "field": "name",
+        "values": []
+      }
+    },
+    {
+      "name": "create-volume-under-minimum",
+      "request": {
+        "method": "POST",
+        "path": "/projects/project-1/volumes",
+        "body": {
+          "name": "intent-000000000001",
+          "tags": [
+            "intent-node",
+            "intent-backend-000000000001"
+          ],
+          "mounts": [
+            {
+              "containerMountPath": "/home/user"
+            }
+          ],
+          "spec": {
+            "accessMode": "ReadWriteOnce",
+            "storageSize": 5120
+          }
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "error": {
+            "status": 409,
+            "message": "Storage class nvme requires a minimum storage size of 6144MB, requested size 5120MB"
+          }
+        }
+      }
+    },
+    {
+      "name": "create-volume",
+      "request": {
+        "method": "POST",
+        "path": "/projects/project-1/volumes",
+        "body": {
+          "name": "intent-000000000001",
+          "tags": [
+            "intent-node",
+            "intent-backend-000000000001"
+          ],
+          "mounts": [
+            {
+              "containerMountPath": "/home/user"
+            }
+          ],
+          "spec": {
+            "accessMode": "ReadWriteOnce",
+            "storageSize": 6144
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "id": "intent-000000000001",
+            "status": "PENDING",
+            "name": "intent-000000000001",
+            "mounts": [
+              {
+                "volumeMountPath": "",
+                "containerMountPath": "/home/user"
+              }
+            ],
+            "tags": [
+              "intent-node",
+              "intent-backend-000000000001"
+            ],
+            "spec": {
+              "accessMode": "ReadWriteOnce",
+              "storageSize": 6144,
+              "storageClassName": "nvme"
+            },
+            "attachedObjects": []
+          }
+        }
+      }
+    },
+    {
+      "name": "create-service-with-labels",
+      "request": {
+        "method": "POST",
+        "path": "/projects/project-1/services/deployment",
+        "body": {
+          "name": "intent-000000000001",
+          "description": "Intent cloud machine",
+          "tags": [
+            "intent-node",
+            "intent-backend-000000000001"
+          ],
+          "billing": {
+            "deploymentPlan": "nf-compute-20"
+          },
+          "deployment": {
+            "instances": 1,
+            "external": {
+              "imagePath": "ghcr.io/intent-hq/intent-node:latest"
+            },
+            "metadata": {
+              "labels": {
+                "intent-backend": "intent-backend-000000000001"
+              }
+            }
+          },
+          "runtimeEnvironment": {
+            "INTENT_TAGS": "{\"intentBackendId\":\"capture-000000000001\"}"
+          },
+          "ports": [],
+          "createOptions": {
+            "volumesToAttach": [
+              "intent-000000000001"
+            ]
+          }
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "status": 400,
+            "message": "Custom labels or annotations can only be set on BYOC projects"
+          }
+        }
+      }
+    },
+    {
+      "name": "create-service-with-annotations",
+      "request": {
+        "method": "POST",
+        "path": "/projects/project-1/services/deployment",
+        "body": {
+          "name": "intent-000000000001",
+          "description": "Intent cloud machine",
+          "tags": [
+            "intent-node",
+            "intent-backend-000000000001"
+          ],
+          "billing": {
+            "deploymentPlan": "nf-compute-20"
+          },
+          "deployment": {
+            "instances": 1,
+            "external": {
+              "imagePath": "ghcr.io/intent-hq/intent-node:latest"
+            },
+            "metadata": {
+              "annotations": {
+                "intent.dev/tags": "{\"intentBackendId\":\"capture-000000000001\"}"
+              }
+            }
+          },
+          "runtimeEnvironment": {
+            "INTENT_TAGS": "{\"intentBackendId\":\"capture-000000000001\"}"
+          },
+          "ports": [],
+          "createOptions": {
+            "volumesToAttach": [
+              "intent-000000000001"
+            ]
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "id": "intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
+            "serviceType": "deployment",
+            "name": "intent-000000000001",
+            "description": "Intent cloud machine",
+            "tags": [
+              "intent-node",
+              "intent-backend-000000000001"
+            ],
+            "infrastructure": {
+              "architecture": "x86"
+            },
+            "billing": {
+              "deploymentPlan": "nf-compute-20"
+            },
+            "deployment": {
+              "type": "deployment",
+              "instances": 1,
+              "storage": {
+                "ephemeralStorage": {
+                  "storageSize": 1024
+                },
+                "shmSize": 64
+              },
+              "external": {
+                "imagePath": "ghcr.io/intent-hq/intent-node:latest"
+              },
+              "metadata": {
+                "labels": {},
+                "annotations": {}
+              },
+              "imageUrl": "ghcr.io/intent-hq/intent-node:latest"
+            },
+            "runtimeEnvironment": {
+              "INTENT_TAGS": "{\"intentBackendId\":\"capture-000000000001\"}"
+            },
+            "status": {},
+            "cluster": {
+              "id": "nf-us-central",
+              "name": "nf-us-central",
+              "namespace": "<scrubbed>",
+              "loadBalancers": [
+                "<scrubbed>"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "get-service-running",
+      "request": {
+        "method": "GET",
+        "path": "/projects/project-1/services/intent-000000000001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "id": "intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
+            "serviceType": "deployment",
+            "name": "intent-000000000001",
+            "description": "Intent cloud machine",
+            "projectId": "project-1",
+            "tags": [
+              "intent-node",
+              "intent-backend-000000000001"
+            ],
+            "infrastructure": {
+              "architecture": "x86"
+            },
+            "billing": {
+              "deploymentPlan": "nf-compute-20"
+            },
+            "deployment": {
+              "type": "deployment",
+              "instances": 1,
+              "storage": {
+                "ephemeralStorage": {
+                  "storageSize": 1024
+                },
+                "shmSize": 64
+              },
+              "external": {
+                "imagePath": "ghcr.io/intent-hq/intent-node:latest"
+              },
+              "metadata": {
+                "labels": {},
+                "annotations": {}
+              },
+              "imageUrl": "ghcr.io/intent-hq/intent-node:latest"
+            },
+            "runtimeEnvironment": {
+              "INTENT_TAGS": "{\"intentBackendId\":\"capture-000000000001\"}"
+            },
+            "status": {
+              "deployment": {
+                "status": "COMPLETED",
+                "reason": "DEPLOYING",
+                "lastTransitionTime": "2026-01-01T00:00:00.000Z"
+              }
+            },
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+            "cluster": {
+              "id": "nf-us-central",
+              "name": "nf-us-central",
+              "namespace": "<scrubbed>",
+              "loadBalancers": [
+                "<scrubbed>"
+              ]
+            },
+            "uid": "<scrubbed>"
+          }
+        }
+      }
+    },
+    {
+      "name": "list-containers-running",
+      "request": {
+        "method": "GET",
+        "path": "/projects/project-1/services/intent-000000000001/containers"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "containers": [
+              {
+                "name": "intent-000000000001-0",
+                "createdAt": 1767225600,
+                "status": "TASK_RUNNING",
+                "updatedAt": 1767225600
+              }
+            ]
+          },
+          "pagination": {
+            "hasNextPage": false,
+            "count": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "list-services",
+      "request": {
+        "method": "GET",
+        "path": "/projects/project-1/services?per_page=100"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "services": [
+              {
+                "id": "intent-000000000001",
+                "uid": "<scrubbed>",
+                "name": "intent-000000000001",
+                "appId": "/team-1/project-1/intent-000000000001",
+                "disabledCD": false,
+                "serviceType": "deployment",
+                "description": "Intent cloud machine",
+                "tags": [
+                  "intent-node",
+                  "intent-backend-000000000001"
+                ],
+                "status": {
+                  "deployment": {
+                    "status": "COMPLETED",
+                    "reason": "DEPLOYING",
+                    "lastTransitionTime": "2026-01-01T00:00:00.000Z"
+                  }
+                },
+                "projectId": "project-1"
+              }
+            ]
+          },
+          "pagination": {
+            "hasNextPage": false,
+            "count": 1
+          }
+        }
+      },
+      "kept": {
+        "field": "id",
+        "values": [
+          "intent-000000000001"
+        ]
+      }
+    },
+    {
+      "name": "list-volumes",
+      "request": {
+        "method": "GET",
+        "path": "/projects/project-1/volumes?per_page=100"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": [
+            {
+              "id": "intent-000000000001",
+              "uid": "<scrubbed>",
+              "name": "intent-000000000001",
+              "tags": [
+                "intent-node",
+                "intent-backend-000000000001"
+              ],
+              "projectId": "project-1",
+              "owningObject": null,
+              "attachedObjects": [
+                {
+                  "id": "intent-000000000001",
+                  "type": "service"
+                }
+              ],
+              "spec": {
+                "accessMode": "ReadWriteOnce",
+                "storageSize": 6144,
+                "storageClassName": "nvme",
+                "storageClassObjectId": "<scrubbed>",
+                "namespaceIsolated": false
+              },
+              "status": "BOUND",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "updatedAt": "2026-01-01T00:00:00.000Z"
+            }
+          ],
+          "pagination": {
+            "hasNextPage": false,
+            "count": 1
+          }
+        }
+      },
+      "kept": {
+        "field": "id",
+        "values": [
+          "intent-000000000001"
+        ]
+      }
+    },
+    {
+      "name": "delete-volume-attached",
+      "request": {
+        "method": "DELETE",
+        "path": "/projects/project-1/volumes/intent-000000000001"
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "error": {
+            "status": 409,
+            "message": "Volume must be detached before it can be deleted"
+          }
+        }
+      }
+    },
+    {
+      "name": "patch-service-metadata",
+      "request": {
+        "method": "PATCH",
+        "path": "/projects/project-1/services/deployment/intent-000000000001",
+        "body": {
+          "deployment": {
+            "metadata": {
+              "annotations": {
+                "intent.dev/tags": "{\"intentBackendId\":\"capture-000000000001\"}"
+              }
+            }
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "id": "intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
+            "serviceType": "deployment",
+            "name": "intent-000000000001",
+            "description": "Intent cloud machine",
+            "tags": [
+              "intent-node",
+              "intent-backend-000000000001"
+            ],
+            "infrastructure": {
+              "architecture": "x86"
+            },
+            "billing": {
+              "deploymentPlan": "nf-compute-20"
+            },
+            "deployment": {
+              "type": "deployment",
+              "instances": 1,
+              "storage": {
+                "ephemeralStorage": {
+                  "storageSize": 1024
+                },
+                "shmSize": 64
+              },
+              "external": {
+                "imagePath": "ghcr.io/intent-hq/intent-node:latest"
+              },
+              "metadata": {
+                "labels": {},
+                "annotations": {}
+              },
+              "imageUrl": "ghcr.io/intent-hq/intent-node:latest"
+            },
+            "runtimeEnvironment": {
+              "INTENT_TAGS": "{\"intentBackendId\":\"capture-000000000001\"}"
+            },
+            "status": {},
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+            "cluster": {
+              "id": "nf-us-central",
+              "name": "nf-us-central",
+              "namespace": "<scrubbed>",
+              "loadBalancers": [
+                "<scrubbed>"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "get-service-after-patch",
+      "request": {
+        "method": "GET",
+        "path": "/projects/project-1/services/intent-000000000001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "id": "intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
+            "serviceType": "deployment",
+            "name": "intent-000000000001",
+            "description": "Intent cloud machine",
+            "projectId": "project-1",
+            "tags": [
+              "intent-node",
+              "intent-backend-000000000001"
+            ],
+            "infrastructure": {
+              "architecture": "x86"
+            },
+            "billing": {
+              "deploymentPlan": "nf-compute-20"
+            },
+            "deployment": {
+              "type": "deployment",
+              "instances": 1,
+              "storage": {
+                "ephemeralStorage": {
+                  "storageSize": 1024
+                },
+                "shmSize": 64
+              },
+              "external": {
+                "imagePath": "ghcr.io/intent-hq/intent-node:latest"
+              },
+              "metadata": {
+                "labels": {},
+                "annotations": {}
+              },
+              "imageUrl": "ghcr.io/intent-hq/intent-node:latest"
+            },
+            "runtimeEnvironment": {
+              "INTENT_TAGS": "{\"intentBackendId\":\"capture-000000000001\"}"
+            },
+            "status": {
+              "deployment": {
+                "status": "COMPLETED",
+                "reason": "DEPLOYING",
+                "lastTransitionTime": "2026-01-01T00:00:00.000Z"
+              }
+            },
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+            "cluster": {
+              "id": "nf-us-central",
+              "name": "nf-us-central",
+              "namespace": "<scrubbed>",
+              "loadBalancers": [
+                "<scrubbed>"
+              ]
+            },
+            "uid": "<scrubbed>"
+          }
+        }
+      }
+    },
+    {
+      "name": "pause",
+      "request": {
+        "method": "POST",
+        "path": "/projects/project-1/services/intent-000000000001/pause",
+        "body": {}
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {}
+        }
+      }
+    },
+    {
+      "name": "get-service-paused",
+      "request": {
+        "method": "GET",
+        "path": "/projects/project-1/services/intent-000000000001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "id": "intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
+            "serviceType": "deployment",
+            "name": "intent-000000000001",
+            "description": "Intent cloud machine",
+            "projectId": "project-1",
+            "tags": [
+              "intent-node",
+              "intent-backend-000000000001"
+            ],
+            "infrastructure": {
+              "architecture": "x86"
+            },
+            "billing": {
+              "deploymentPlan": "nf-compute-20"
+            },
+            "deployment": {
+              "type": "deployment",
+              "instances": 0,
+              "storage": {
+                "ephemeralStorage": {
+                  "storageSize": 1024
+                },
+                "shmSize": 64
+              },
+              "external": {
+                "imagePath": "ghcr.io/intent-hq/intent-node:latest"
+              },
+              "metadata": {
+                "labels": {},
+                "annotations": {}
+              },
+              "imageUrl": "ghcr.io/intent-hq/intent-node:latest"
+            },
+            "runtimeEnvironment": {
+              "INTENT_TAGS": "{\"intentBackendId\":\"capture-000000000001\"}"
+            },
+            "status": {
+              "deployment": {
+                "status": "PENDING",
+                "reason": "SCALING",
+                "lastTransitionTime": "2026-01-01T00:00:00.000Z"
+              }
+            },
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+            "cluster": {
+              "id": "nf-us-central",
+              "name": "nf-us-central",
+              "namespace": "<scrubbed>",
+              "loadBalancers": [
+                "<scrubbed>"
+              ]
+            },
+            "uid": "<scrubbed>"
+          }
+        }
+      }
+    },
+    {
+      "name": "list-containers-paused",
+      "request": {
+        "method": "GET",
+        "path": "/projects/project-1/services/intent-000000000001/containers"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "containers": [
+              {
+                "name": "intent-000000000001-0",
+                "createdAt": 1767225600,
+                "status": "TASK_RUNNING",
+                "updatedAt": 1767225600
+              }
+            ]
+          },
+          "pagination": {
+            "hasNextPage": false,
+            "count": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "resume",
+      "request": {
+        "method": "POST",
+        "path": "/projects/project-1/services/intent-000000000001/resume",
+        "body": {
+          "instances": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {}
+        }
+      }
+    },
+    {
+      "name": "get-service-resumed",
+      "request": {
+        "method": "GET",
+        "path": "/projects/project-1/services/intent-000000000001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {
+            "id": "intent-000000000001",
+            "appId": "/team-1/project-1/intent-000000000001",
+            "serviceType": "deployment",
+            "name": "intent-000000000001",
+            "description": "Intent cloud machine",
+            "projectId": "project-1",
+            "tags": [
+              "intent-node",
+              "intent-backend-000000000001"
+            ],
+            "infrastructure": {
+              "architecture": "x86"
+            },
+            "billing": {
+              "deploymentPlan": "nf-compute-20"
+            },
+            "deployment": {
+              "type": "deployment",
+              "instances": 1,
+              "storage": {
+                "ephemeralStorage": {
+                  "storageSize": 1024
+                },
+                "shmSize": 64
+              },
+              "external": {
+                "imagePath": "ghcr.io/intent-hq/intent-node:latest"
+              },
+              "metadata": {
+                "labels": {},
+                "annotations": {}
+              },
+              "imageUrl": "ghcr.io/intent-hq/intent-node:latest"
+            },
+            "runtimeEnvironment": {
+              "INTENT_TAGS": "{\"intentBackendId\":\"capture-000000000001\"}"
+            },
+            "status": {
+              "deployment": {
+                "status": "COMPLETED",
+                "reason": "DEPLOYING",
+                "lastTransitionTime": "2026-01-01T00:00:00.000Z"
+              }
+            },
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+            "cluster": {
+              "id": "nf-us-central",
+              "name": "nf-us-central",
+              "namespace": "<scrubbed>",
+              "loadBalancers": [
+                "<scrubbed>"
+              ]
+            },
+            "uid": "<scrubbed>"
+          }
+        }
+      }
+    },
+    {
+      "name": "delete-service",
+      "request": {
+        "method": "DELETE",
+        "path": "/projects/project-1/services/intent-000000000001?delete_child_objects=true"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {}
+        }
+      }
+    },
+    {
+      "name": "delete-volume-after-service",
+      "request": {
+        "method": "DELETE",
+        "path": "/projects/project-1/volumes/intent-000000000001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "data": {}
+        }
+      }
+    }
+  ],
+  "exec": [
+    {
+      "name": "exec-tty-default",
+      "context": {
+        "command": [
+          "sh",
+          "-c",
+          "printf 'out\\n'; printf 'err\\n' >&2; exit 3"
+        ],
+        "shell": "none",
+        "user": "user"
+      },
+      "program": {
+        "stdout": "out\n",
+        "stderr": "err\n",
+        "exitCode": 3
+      },
+      "frames": [
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "init",
+            "data": {
+              "auth": "successful",
+              "context": {
+                "instanceName": "intent-000000000001-0",
+                "containerName": "main-service"
+              }
+            }
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "stdOut",
+            "data": ""
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "stdOut",
+            "data": "out\r\nerr\r\n"
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "completion",
+            "data": {
+              "exitCode": 3,
+              "status": "Failure",
+              "message": "command terminated with non-zero exit code: command terminated with exit code 3"
+            }
+          }
+        },
+        {
+          "close": 1000
+        }
+      ]
+    },
+    {
+      "name": "exec-tty-false",
+      "context": {
+        "command": [
+          "sh",
+          "-c",
+          "printf 'out\\n'; printf 'err\\n' >&2; exit 3"
+        ],
+        "shell": "none",
+        "user": "user",
+        "tty": false
+      },
+      "program": {
+        "stdout": "out\n",
+        "stderr": "err\n",
+        "exitCode": 3
+      },
+      "frames": [
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "init",
+            "data": {
+              "auth": "successful",
+              "context": {
+                "instanceName": "intent-000000000001-0",
+                "containerName": "main-service"
+              }
+            }
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "stdOut",
+            "data": ""
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "stdOut",
+            "data": "out\n"
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "stdErr",
+            "data": "err\n"
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "completion",
+            "data": {
+              "exitCode": 3,
+              "status": "Failure",
+              "message": "command terminated with non-zero exit code: command terminated with exit code 3"
+            }
+          }
+        },
+        {
+          "close": 1000
+        }
+      ]
+    },
+    {
+      "name": "exec-tty-false-success",
+      "context": {
+        "command": [
+          "echo",
+          "ok"
+        ],
+        "shell": "none",
+        "user": "user",
+        "tty": false
+      },
+      "program": {
+        "stdout": "ok\n",
+        "stderr": "",
+        "exitCode": 0
+      },
+      "frames": [
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "init",
+            "data": {
+              "auth": "successful",
+              "context": {
+                "instanceName": "intent-000000000001-0",
+                "containerName": "main-service"
+              }
+            }
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "stdOut",
+            "data": ""
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "stdOut",
+            "data": "ok\n"
+          }
+        },
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "completion",
+            "data": {
+              "exitCode": 0,
+              "status": "Success"
+            }
+          }
+        },
+        {
+          "close": 1000
+        }
+      ]
+    },
+    {
+      "name": "exec-bad-token",
+      "context": {
+        "command": [
+          "echo",
+          "ok"
+        ],
+        "shell": "none",
+        "user": "user",
+        "tty": false
+      },
+      "program": null,
+      "frames": [
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "init",
+            "data": {
+              "auth": "failed",
+              "message": "Unauthorized"
+            }
+          }
+        },
+        {
+          "silent": 120
+        }
+      ]
+    },
+    {
+      "name": "exec-unknown-service",
+      "context": {
+        "command": [
+          "echo",
+          "ok"
+        ],
+        "shell": "none",
+        "user": "user",
+        "tty": false
+      },
+      "program": null,
+      "frames": [
+        {
+          "opcode": "binary",
+          "frame": {
+            "type": "init",
+            "data": {
+              "auth": "failed",
+              "message": "Could not find service 'intent-ffffffffffff'"
+            }
+          }
+        },
+        {
+          "silent": 120
+        }
+      ]
+    }
+  ]
+}
