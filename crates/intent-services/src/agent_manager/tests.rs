@@ -9222,9 +9222,10 @@ async fn set_session_provider(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
 }
 
 /// Slug-shaped workspace title on an agent's first turn → the naming instruction
-/// is prepended as a `<system>` block naming the daemon MCP tool as the
-/// session's provider (auggie) surfaces it (`set_workspace_title_workspace-mcp`),
-/// not the FE `workspace_api` surface.
+/// is prepended as a `<system>` block asking for `ws.workspace.setTitle` through
+/// the `workspace_api` tool as the session's provider (auggie) surfaces it
+/// (`workspace_api_workspace-mcp`). The discrete `set_workspace_title` tool was
+/// retired in WSAPI-8.
 #[tokio::test]
 async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
     let (_tmp, mgr) = manager().await;
@@ -9257,12 +9258,12 @@ async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
         "naming instruction prepends the prompt: {text:?}"
     );
     assert!(
-        text.contains("`set_workspace_title_workspace-mcp`"),
-        "instruction names the daemon MCP tool: {text:?}"
+        text.contains("call `ws.workspace.setTitle` through the `workspace_api_workspace-mcp` tool"),
+        "instruction names the call and the daemon MCP tool: {text:?}"
     );
     assert!(
-        !text.contains("workspace_api"),
-        "instruction must not reference the FE workspace_api surface: {text:?}"
+        !text.contains("set_workspace_title"),
+        "instruction must not name the retired tool: {text:?}"
     );
     assert!(text.trim_end().ends_with("hello"));
 }
@@ -9300,11 +9301,11 @@ async fn build_turn_prompt_injects_naming_instruction_for_empty_title() {
         text.starts_with("<system>"),
         "empty title still triggers the naming instruction: {text:?}"
     );
-    assert!(text.contains("`set_workspace_title_workspace-mcp`"));
+    assert!(text.contains("`workspace_api_workspace-mcp`"));
 }
 
 /// opencode session → the naming instruction spells the tool with opencode's
-/// LEADING server prefix (`workspace-mcp_set_workspace_title`), the mirror of
+/// LEADING server prefix (`workspace-mcp_workspace_api`), the mirror of
 /// auggie's trailing `_workspace-mcp` suffix.
 #[tokio::test]
 async fn build_turn_prompt_naming_instruction_uses_opencode_tool_name() {
@@ -9332,11 +9333,11 @@ async fn build_turn_prompt_naming_instruction_uses_opencode_tool_name() {
         .unwrap()
         .to_string();
     assert!(
-        text.contains("`workspace-mcp_set_workspace_title`"),
+        text.contains("`workspace-mcp_workspace_api`"),
         "opencode nudge uses the leading server prefix: {text:?}"
     );
     assert!(
-        !text.contains("set_workspace_title_workspace-mcp"),
+        !text.contains("workspace_api_workspace-mcp"),
         "opencode nudge must not use auggie's trailing suffix: {text:?}"
     );
 }
@@ -9388,11 +9389,11 @@ async fn build_turn_prompt_naming_instruction_ignores_model_string() {
         .unwrap()
         .to_string();
     assert!(
-        text.contains("`workspace-mcp_set_workspace_title`"),
+        text.contains("`workspace-mcp_workspace_api`"),
         "compound prefix wins on read; the nudge uses the opencode spelling: {text:?}"
     );
     assert!(
-        !text.contains("set_workspace_title_workspace-mcp"),
+        !text.contains("workspace_api_workspace-mcp"),
         "the stale auggie provider column must not drive the spelling: {text:?}"
     );
 }
@@ -9427,12 +9428,14 @@ async fn build_turn_prompt_naming_instruction_generic_for_unknown_provider() {
         .unwrap()
         .to_string();
     assert!(
-        text.contains("call the `set_workspace_title` tool from the workspace MCP server"),
+        text.contains(
+            "call `ws.workspace.setTitle` through the `workspace_api` tool from the workspace MCP server"
+        ),
         "unknown-provider nudge uses the generic phrasing: {text:?}"
     );
     assert!(
-        !text.contains("set_workspace_title_workspace-mcp")
-            && !text.contains("workspace-mcp_set_workspace_title"),
+        !text.contains("workspace_api_workspace-mcp")
+            && !text.contains("workspace-mcp_workspace_api"),
         "unknown-provider nudge must not carry an affixed tool name: {text:?}"
     );
 }

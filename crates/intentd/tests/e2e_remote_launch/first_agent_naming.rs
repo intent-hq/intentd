@@ -109,6 +109,13 @@ async fn the_first_agent_on_an_orchestrator_names_itself_and_the_workspace() {
             raw.contains("This workspace needs a title"),
             "{label}: the first prompt asks for a workspace title: {raw}"
         );
+        // The title tool was retired from the instructions in harness 3.10:
+        // the instruction names the call the agent actually has.
+        assert!(
+            raw.contains("call `ws.workspace.setTitle` through"),
+            "{label}: the title instruction names a call the agent has: {raw}"
+        );
+        assert!(!raw.contains("set_workspace_title"), "{label}: {raw}");
         first.get_or_insert((ws_id, agent_id));
     }
     let (ws_id, agent_id) = first.unwrap();

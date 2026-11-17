@@ -255,19 +255,15 @@ fn golden_naming_tool_references() {
     );
     assert_eq!(
         crate::agent_manager::workspace_naming_tool_reference("auggie"),
-        "the `set_workspace_title_workspace-mcp` tool"
+        "the `workspace_api_workspace-mcp` tool"
     );
     assert_eq!(
         crate::agent_manager::workspace_naming_tool_reference("opencode"),
-        "the `workspace-mcp_set_workspace_title` tool"
+        "the `workspace-mcp_workspace_api` tool"
     );
     assert_eq!(
         crate::agent_manager::workspace_naming_tool_reference("codex"),
-        crate::agent_manager::GENERIC_NAMING_TOOL_REFERENCE
-    );
-    assert_eq!(
-        crate::agent_manager::GENERIC_NAMING_TOOL_REFERENCE,
-        "the `set_workspace_title` tool from the workspace MCP server"
+        crate::agent_manager::GENERIC_AGENT_NAMING_TOOL_REFERENCE
     );
 }
 
@@ -284,11 +280,12 @@ fn golden_first_turn_naming_nudges() {
     assert_eq!(
         harness.naming_nudge(
             None,
-            Some("the `set_workspace_title_workspace-mcp` tool"),
+            Some("the `workspace_api_workspace-mcp` tool"),
         ),
-        "<system>\nThis workspace needs a title. As your first action, call the \
-         `set_workspace_title_workspace-mcp` tool with a short 3–5 word sentence-case title \
-         describing the task. This can be called in parallel with information-gathering.\n</system>"
+        "<system>\nThis workspace needs a title. As your first action, call \
+         `ws.workspace.setTitle` through the `workspace_api_workspace-mcp` tool with a short \
+         3–5 word sentence-case title describing the task. This can be called in parallel with \
+         information-gathering.\n</system>"
     );
 }
 
