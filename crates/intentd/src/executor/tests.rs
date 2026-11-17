@@ -222,6 +222,8 @@ struct FixedReport {
     /// enabled or not per `mock_enabled`.
     reconciles: std::sync::atomic::AtomicUsize,
     mock_enabled: std::sync::atomic::AtomicBool,
+    /// Reports `mock` primed (no models, stale) until the next refresh.
+    primed: std::sync::atomic::AtomicBool,
 }
 
 impl MachineReport for FixedReport {
@@ -230,6 +232,7 @@ impl MachineReport for FixedReport {
             return Vec::new();
         }
         let failed = lock(&self.auth_failures).iter().any(|p| p == "mock");
+        let primed = self.primed.load(std::sync::atomic::Ordering::SeqCst);
         vec![ProviderCapability {
             id: "mock".into(),
             visible: true,
@@ -238,8 +241,12 @@ impl MachineReport for FixedReport {
             } else {
                 ProviderStatus::Unknown
             },
-            models: vec!["mock-model".into()],
-            models_stale: false,
+            models: if primed {
+                Vec::new()
+            } else {
+                vec!["mock-model".into()]
+            },
+            models_stale: primed,
         }]
     }
     fn routes(&self) -> (Vec<String>, Option<String>) {
@@ -248,6 +255,8 @@ impl MachineReport for FixedReport {
     fn refresh(&self) -> intent_core::BoxFuture<'_, ()> {
         self.refreshes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.primed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async {})
     }
     fn prime(&self) {
@@ -379,6 +388,7 @@ impl Running {
             auth_failures: Mutex::new(Vec::new()),
             reconciles: std::sync::atomic::AtomicUsize::new(0),
             mock_enabled: std::sync::atomic::AtomicBool::new(true),
+            primed: std::sync::atomic::AtomicBool::new(false),
         });
         let service = ExecutorService::start_with_checkouts(
             ExecutorDeps {
@@ -2169,6 +2179,94 @@ async fn an_enabled_providers_change_pushes_the_report_unasked() {
     let on = (vec!["mock".to_owned()], Vec::<String>::new());
     assert_eq!(pushed(&mut dialed).await, on);
     assert_eq!(pushed(&mut dialed).await, on);
+    node.stop().await;
+}
+
+/// A backend binding right after its first mint gets the primed report (no
+/// models yet). When the background refresh lands the full one, every live
+/// link gets it unasked, so an orchestrator's model picker does not wait an
+/// hour for its next request (Homes GA 7); a refresh that changes nothing
+/// pushes nothing.
+#[tokio::test]
+async fn a_background_refresh_that_changes_the_report_pushes_it_unasked() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    node.report.primed.store(true, Ordering::SeqCst);
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+
+    node.service.refresh_report().await;
+    let models = loop {
+        match next_frame(&mut dialed).await {
+            Some(LinkFrame::CapabilitiesReply { capabilities }) => {
+                break capabilities
+                    .providers
+                    .into_iter()
+                    .map(|p| (p.models, p.models_stale))
+                    .collect::<Vec<_>>();
+            }
+            Some(LinkFrame::Journal(_)) => {}
+            other => panic!("expected a pushed capabilities report, got {other:?}"),
+        }
+    };
+    assert_eq!(models, vec![(vec!["mock-model".to_owned()], false)]);
+
+    node.service.refresh_report().await;
+    assert_eq!(node.report.refreshes.load(Ordering::SeqCst), 2);
+    let window = intentd_test_support::test_timeout(Duration::from_millis(300));
+    let quiet = tokio::time::timeout(window, async {
+        loop {
+            match next_frame(&mut dialed).await {
+                Some(LinkFrame::Journal(_)) => {}
+                other => return other,
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "an unchanged refresh pushed {quiet:?}");
+    node.stop().await;
+}
+
+/// One backend's capabilities request that changes the report reaches every
+/// other live link too: two backends bound to the primed report, the first
+/// asks, and the second gets the full report unasked instead of keeping the
+/// empty one until its own next request (review of Homes GA 7).
+#[tokio::test]
+async fn a_requested_refresh_that_changes_the_report_reaches_every_link() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    node.report.primed.store(true, Ordering::SeqCst);
+    let mut asking = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut asking).await;
+    let mut other = dial_link(
+        &node.endpoint_for(&other_token()),
+        hello_from(OTHER_HEAD, 1, "lease-o", 0),
+    )
+    .await
+    .unwrap();
+    replay_complete(&mut other).await;
+
+    asking.link.send(&LinkFrame::Capabilities).await.unwrap();
+    let models = loop {
+        match next_frame(&mut other).await {
+            Some(LinkFrame::CapabilitiesReply { capabilities }) => {
+                break capabilities
+                    .providers
+                    .into_iter()
+                    .map(|p| p.models)
+                    .collect::<Vec<_>>();
+            }
+            Some(LinkFrame::Journal(_)) => {}
+            other => panic!("expected a pushed capabilities report, got {other:?}"),
+        }
+    };
+    assert_eq!(models, vec![vec!["mock-model".to_owned()]]);
     node.stop().await;
 }
 

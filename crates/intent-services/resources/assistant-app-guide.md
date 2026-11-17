@@ -637,9 +637,17 @@ installed outside the home folder may be gone. The agent is told this at its nex
 While its machine is paused or gone, the agent's model picker lists no models and says
 the machine isn't running; the next message resumes it or starts a new one, and its
 models then appear. **Check again** is not offered for a cloud machine.
+Right after a machine joins a backend it may not have listed a provider's models yet:
+that provider's tab says **<machine> hasn't listed these models yet**, and the refresh
+button in the picker header asks again (the machine also sends its list once ready).
+A report with nothing the agent can use says **Nothing to choose on <machine>** with
+**Check again**. On an orchestrator, pickers not tied to one machine (such as the
+default model in Settings) list the models its machines report.
 Sources: packages/intentd/crates/intent-svc-remote/src/cloud/ (config.rs, lifecycle.rs),
 packages/intentd/crates/intentd/src/executor/checkout.rs (first_turn_notice),
-packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte (remoteCloudEmpty). -->
+packages/intentd/crates/intentd/src/executor.rs (refresh_report),
+packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte (remoteCloudEmpty, orchestratorCatalogModels),
+packages/cloudlands-fe/src/lib/components/chat/input/model-picker-groups.ts (buildMachineModelGroups). -->
 Workspaces and agents belong to a host, so identify the intended device before
 explaining missing work or changing host settings. **Mobile** follows the active
 connection and its permissions; do not describe a remote connection's QR as belonging

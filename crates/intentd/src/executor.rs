@@ -337,6 +337,19 @@ impl ExecutorService {
         self.push_capabilities().await;
     }
 
+    /// Rebuild the full report (in the background or for a backend's
+    /// capabilities request) and, when its providers changed, send it
+    /// unasked on every live backend link. The first full report after a
+    /// bind replaces the primed one (no models yet), which every other
+    /// backend would otherwise keep until its own next request.
+    pub(crate) async fn refresh_report(&self) {
+        let before = self.deps.report.providers();
+        self.deps.report.refresh().await;
+        if self.deps.report.providers() != before {
+            self.push_capabilities().await;
+        }
+    }
+
     /// Send the current report, unasked, on every live backend link.
     async fn push_capabilities(&self) {
         let links: Vec<NodeLink> = lock(&self.backends)
@@ -492,7 +505,9 @@ impl ExecutorService {
                         Box::pin(async move {
                             match service.upgrade() {
                                 Some(service) => {
-                                    service.deps.report.refresh().await;
+                                    // A changed report reaches the other
+                                    // links too, not only this reply.
+                                    service.refresh_report().await;
                                     service.capabilities()
                                 }
                                 // The daemon is stopping.
@@ -1543,7 +1558,8 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
     // Keep the provider report warm while any executor credential is
     // active; model discovery may run provider CLIs, so it never runs on a
     // bind, and never on a machine no backend was given access to. A change
-    // of the enabled providers is reported to the bound backends at once.
+    // of the enabled providers is reported to the bound backends at once, and
+    // so is a refresh that changes the report (the first full one included).
     // caller-binding: allow — the executor service's background report refresh
     let refresher = tokio::spawn({
         let report = Arc::downgrade(&report);
@@ -1590,7 +1606,10 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
                 } else if !active {
                     last = None;
                 } else if report_due(active, last, now) {
-                    report.refresh().await;
+                    match service.upgrade() {
+                        Some(service) => service.refresh_report().await,
+                        None => return,
+                    }
                     last = Some(now);
                 }
             }
