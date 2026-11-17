@@ -13,6 +13,7 @@
 //! match `SQLite`'s byte order. `rowid` order is `row_seq`.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 
 use intent_core::{AgentId, AgentListRowScope, AgentMessage, Error, Result, WorkspaceId};
 use sqlx::postgres::{PgConnection, PgRow, Postgres};
@@ -26,7 +27,7 @@ use crate::agent_repo::monitor_message_provenance::envelope_digest;
 use crate::agent_repo::{
     batch_content_cols_and_payload_rows, batch_preview_col_values, content_col_and_payload_rows,
     decode_last_tool_use_col, decode_preview_col, last_tool_use_col_value, preview_col_value,
-    OwnedBatchMessage, PreparedContent, ARCHIVED_WORKSPACE_PENALTY, PREFER_WORKSPACE_BOOST,
+    OwnedBatchMessage, PreparedContent,
 };
 use crate::message_payload::{
     self as payload, KIND_THUMBNAILS, KIND_TOOL_RESULT_OUTPUT, KIND_TOOL_RESULT_OUTPUT_REPLAY,
@@ -41,28 +42,64 @@ use intent_core::review_monitor::ReviewMonitorBinding;
 
 const MESSAGE_COLUMNS: &str = "id, agent_id, seq, role, content, metadata, created_at";
 
+/// The `SQLite` search's preferred-workspace boost and archived-workspace
+/// penalty (1.0 each) are soft in bm25 units: bm25 spreads over about 0-10
+/// on a real corpus, so a decisively better match from another or an
+/// archived workspace still wins. `ts_rank` has no IDF and spreads over
+/// about 0.03-0.1, where 1.0 would make strict tiers. 0.01 keeps both soft:
+/// identical matches still order preferred, other, archived, and a match
+/// with more hits of the term still beats a single hit in a preferred or
+/// active workspace (`message_search_boosts_are_soft`).
+const PREFER_WORKSPACE_BOOST: f64 = 0.01;
+const ARCHIVED_WORKSPACE_PENALTY: f64 = 0.01;
+
 /// An unread top-level session row of `agent_session s` (see
 /// `UNREAD_TOP_LEVEL_SESSION_PREDICATE` in `agent_repo.rs`).
 const UNREAD_TOP_LEVEL: &str = "s.parent_agent_id IS NULL AND s.is_background = 0 \
      AND s.status <> 'deleted' AND s.last_message_id IS NOT NULL \
      AND s.last_message_role = 'assistant' AND s.retired_at IS NULL \
      AND s.notifications_muted = 0 \
-     AND (sqlite_json_extract(s.metadata, '$.lastSeenMessageId') IS NULL \
-          OR sqlite_json_extract(s.metadata, '$.lastSeenMessageId') <> s.last_message_id)";
+     AND (sqlite_json_extract(NUL_FREE(s.metadata), '$.lastSeenMessageId') IS NULL \
+          OR sqlite_json_extract(NUL_FREE(s.metadata), '$.lastSeenMessageId') <> s.last_message_id)";
 
 /// Whether a user row is a qualified monitor wake (see the `SQLite`
 /// `get_agent_user_message_index_page`): by its metadata, or by a content
 /// block's `messageMetadata`.
 const QUALIFIED_MONITOR: &str =
-    "(COALESCE(sqlite_json_extract(m.metadata, '$.type') = 'pr_monitor_wake' \
-       AND (sqlite_json_type(m.metadata, '$.resource') IS NOT NULL \
-         OR sqlite_json_type(m.metadata, '$.availability') IS NOT NULL), false) \
-     OR CASE WHEN sqlite_json_valid(m.content) AND sqlite_json_type(m.content) = 'array' \
-       THEN EXISTS(SELECT 1 FROM jsonb_array_elements(intent_json(m.content)) AS b(block) \
+    "(COALESCE(sqlite_json_extract(NUL_FREE(m.metadata), '$.type') = 'pr_monitor_wake' \
+       AND (sqlite_json_type(NUL_FREE(m.metadata), '$.resource') IS NOT NULL \
+         OR sqlite_json_type(NUL_FREE(m.metadata), '$.availability') IS NOT NULL), false) \
+     OR CASE WHEN sqlite_json_type(NUL_FREE(m.content)) = 'array' \
+       THEN EXISTS(SELECT 1 FROM jsonb_array_elements(intent_json(NUL_FREE(m.content))) \
+         AS b(block) \
          WHERE b.block #>> '{messageMetadata,type}' = 'pr_monitor_wake' \
            AND (b.block #> '{messageMetadata,resource}' IS NOT NULL \
              OR b.block #> '{messageMetadata,availability}' IS NOT NULL)) \
        ELSE false END)";
+
+/// Expand each `NUL_FREE(col)` in `sql` to `col` without escaped NULs
+/// (`\u0000`, not an escaped backslash followed by `u0000`). `jsonb`, which
+/// the JSON compat functions parse into, rejects them, so such a document
+/// would read as malformed; `SQLite` JSON1 accepts it. Only the NUL
+/// characters are lost. `col` is a plain column reference.
+fn nul_free(sql: &str) -> String {
+    const MARK: &str = "NUL_FREE(";
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(at) = rest.find(MARK) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + MARK.len()..];
+        let end = after.find(')').expect("NUL_FREE( is closed");
+        let col = &after[..end];
+        let _ = write!(
+            out,
+            r"(CASE WHEN strpos({col}, '\u0000') > 0 THEN regexp_replace({col}, '(?<!\\)((?:\\\\)*)\\u0000', '\1', 'g') ELSE {col} END)"
+        );
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
 
 fn internal(context: &str) -> impl Fn(sqlx::Error) -> Error + '_ {
     move |e| Error::Internal(format!("{context}: {e}"))
@@ -1047,11 +1084,11 @@ impl PgStore {
 
     pub async fn persisted_queue_message_ids(&self, agent_id: &AgentId) -> Result<HashSet<String>> {
         let mut tx = self.begin().await?;
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT sqlite_json_extract(metadata, '$.queueInfo.queuedMessageId') \
+        let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(nul_free(
+            "SELECT sqlite_json_extract(NUL_FREE(metadata), '$.queueInfo.queuedMessageId') \
              FROM agent_message WHERE tenant_id = $1 AND agent_id = $2 AND role = 'user' \
-             AND sqlite_json_type(metadata, '$.queueInfo.queuedMessageId') = 'text'",
-        )
+             AND sqlite_json_type(NUL_FREE(metadata), '$.queueInfo.queuedMessageId') = 'text'",
+        )))
         .bind(self.tenant())
         .bind(&agent_id.0)
         .fetch_all(&mut *tx)
@@ -1278,13 +1315,13 @@ impl PgStore {
         // (`project_user_message_index_metadata`), as SQLite's pre-trim is.
         let sql = format!(
             "SELECT m.id, m.seq, \
-                    substr(intent_message_search_text(m.content), 1, LEAST($2, 2147483647)::int) \
+                    substr(intent_message_search_text(NUL_FREE(m.content)), 1, LEAST($2, 2147483647)::int) \
                       AS preview, \
                     m.metadata, m.created_at, {QUALIFIED_MONITOR} AS qualified_monitor \
              FROM agent_message m \
              WHERE m.tenant_id = $1 AND m.agent_id = $3 AND m.role = 'user' {tail}"
         );
-        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(nul_free(&sql)))
             .bind(self.tenant())
             .bind(i64::try_from(preview_chars).unwrap_or(i64::MAX))
             .bind(&agent_id.0);
@@ -1828,7 +1865,7 @@ impl PgStore {
              WHERE s.tenant_id = $1 AND s.workspace_id = $2 AND {UNREAD_TOP_LEVEL})"
         );
         let mut tx = self.begin().await?;
-        let unread: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        let unread: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(nul_free(&sql)))
             .bind(self.tenant())
             .bind(&workspace_id.0)
             .fetch_one(&mut *tx)
@@ -1844,7 +1881,7 @@ impl PgStore {
              WHERE s.tenant_id = $1 AND {UNREAD_TOP_LEVEL}"
         );
         let mut tx = self.begin().await?;
-        let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(nul_free(&sql)))
             .bind(self.tenant())
             .fetch_all(&mut *tx)
             .await
@@ -1866,7 +1903,7 @@ impl PgStore {
         );
         let wanted: Vec<&str> = workspace_ids.iter().map(WorkspaceId::as_str).collect();
         let mut tx = self.begin().await?;
-        let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(nul_free(&sql)))
             .bind(self.tenant())
             .bind(wanted)
             .fetch_all(&mut *tx)
@@ -1885,8 +1922,9 @@ impl PgStore {
         }
         let wanted: Vec<&str> = workspace_ids.iter().map(WorkspaceId::as_str).collect();
         let mut tx = self.begin().await?;
-        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
-            "SELECT s.id, m.id, m.role, m.content FROM agent_session s \
+        let rows: Vec<(String, String, String, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(nul_free(
+                "SELECT s.id, m.id, m.role, m.content FROM agent_session s \
              JOIN agent_message m ON m.tenant_id = $1 AND m.id = (\
                  SELECT tail.id FROM agent_message tail \
                  WHERE tail.tenant_id = $1 AND tail.agent_id = s.id AND tail.role <> 'system' \
@@ -1895,14 +1933,14 @@ impl PgStore {
                AND s.parent_agent_id IS NULL AND s.is_background = 0 \
                AND s.status <> 'deleted' AND s.retired_at IS NULL \
                AND s.notifications_muted = 0 \
-               AND (sqlite_json_type(s.metadata, '$.pendingQuestionsMessageId') IS NULL \
-                    OR sqlite_json_type(s.metadata, '$.pendingQuestionsMessageId') <> 'text')",
-        )
-        .bind(self.tenant())
-        .bind(wanted)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(internal("batch legacy question tail read failed"))?;
+               AND COALESCE(sqlite_json_type(NUL_FREE(s.metadata), \
+                    '$.pendingQuestionsMessageId'), '') <> 'text'",
+            )))
+            .bind(self.tenant())
+            .bind(wanted)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(internal("batch legacy question tail read failed"))?;
         tx.commit().await.map_err(db)?;
         rows.into_iter()
             .map(|(agent, message, role, raw)| {
@@ -1919,15 +1957,16 @@ impl PgStore {
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, String)>> {
         let mut tx = self.begin().await?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
+        let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(nul_free(
             "SELECT id, last_message_id FROM agent_session \
              WHERE tenant_id = $1 AND workspace_id = $2 \
                AND parent_agent_id IS NULL AND is_background = 0 AND status <> 'deleted' \
                AND last_message_id IS NOT NULL \
-               AND (sqlite_json_extract(metadata, '$.lastSeenMessageId') IS NULL \
-                    OR sqlite_json_extract(metadata, '$.lastSeenMessageId') <> last_message_id) \
+               AND (sqlite_json_extract(NUL_FREE(metadata), '$.lastSeenMessageId') IS NULL \
+                    OR sqlite_json_extract(NUL_FREE(metadata), '$.lastSeenMessageId') \
+                       <> last_message_id) \
              ORDER BY created_at COLLATE \"C\"",
-        )
+        )))
         .bind(self.tenant())
         .bind(&workspace_id.0)
         .fetch_all(&mut *tx)

@@ -6296,7 +6296,7 @@ pub(crate) async fn rebuild_agent_message_search(conn: &mut sqlx::SqliteConnecti
 /// preferred workspace. Large enough to lift a preferred-workspace match above
 /// equally-relevant (and modestly better-scoring) matches elsewhere, small
 /// enough that a decisively better match from another workspace still wins.
-pub(crate) const PREFER_WORKSPACE_BOOST: f64 = 1.0;
+const PREFER_WORKSPACE_BOOST: f64 = 1.0;
 
 /// `search.messages` archived-workspace ranking penalty, in bm25 units,
 /// added to the bm25 rank (lower = better) of matches owned by an archived
@@ -6304,7 +6304,7 @@ pub(crate) const PREFER_WORKSPACE_BOOST: f64 = 1.0;
 /// tier as preferred workspace → other active workspaces → archived
 /// workspaces, while a decisively better match from an archived workspace
 /// still wins.
-pub(crate) const ARCHIVED_WORKSPACE_PENALTY: f64 = 1.0;
+const ARCHIVED_WORKSPACE_PENALTY: f64 = 1.0;
 
 /// One `search.messages` hit from [`Store::search_agent_messages_fts`]: the
 /// message/agent ids and result-row context (owning workspace, agent display
