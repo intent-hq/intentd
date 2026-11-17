@@ -37,7 +37,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_event_subscription(&self, s: &PersistedEventSubscription) -> Result<()> {
-        pending_postgres!("upsert_event_subscription", self, backend => backend.upsert_event_subscription(s).await)
+        dispatch!(self, backend => backend.upsert_event_subscription(s).await)
     }
 
     /// Load every persisted `event_subscription` row (the registry is
@@ -47,7 +47,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_event_subscriptions(&self) -> Result<Vec<PersistedEventSubscription>> {
-        pending_postgres!("list_event_subscriptions", self, backend => backend.list_event_subscriptions().await)
+        dispatch!(self, backend => backend.list_event_subscriptions().await)
     }
 
     /// Delete an `event_subscription` row (`event.unsubscribe`, startup prune).
@@ -56,7 +56,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_event_subscription(&self, id: &str) -> Result<()> {
-        pending_postgres!("delete_event_subscription", self, backend => backend.delete_event_subscription(id).await)
+        dispatch!(self, backend => backend.delete_event_subscription(id).await)
     }
 
     /// Delete every `event_subscription` row registered by `subscriber_agent_id`
@@ -69,7 +69,7 @@ impl Store {
         &self,
         subscriber_agent_id: &AgentId,
     ) -> Result<()> {
-        pending_postgres!("delete_event_subscriptions_for_agent", self, backend => backend.delete_event_subscriptions_for_agent(subscriber_agent_id).await)
+        dispatch!(self, backend => backend.delete_event_subscriptions_for_agent(subscriber_agent_id).await)
     }
 
     /// Delete every `event_subscription` row scoped to `workspace_id`
@@ -83,7 +83,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<()> {
-        pending_postgres!("delete_event_subscriptions_for_workspace", self, backend => backend.delete_event_subscriptions_for_workspace(workspace_id).await)
+        dispatch!(self, backend => backend.delete_event_subscriptions_for_workspace(workspace_id).await)
     }
 }
 

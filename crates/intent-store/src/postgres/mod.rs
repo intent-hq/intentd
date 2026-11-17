@@ -22,6 +22,7 @@ mod agent_messages;
 mod agents;
 mod comments;
 mod discussions;
+mod events;
 mod hooks;
 mod nodes;
 mod note_search;
