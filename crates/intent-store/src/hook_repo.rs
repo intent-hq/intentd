@@ -47,7 +47,7 @@ const ACTIVE_BY_WORKSPACE_SQL: &str =
     "SELECT agent_id, hook_id, name, next_run_at, expires_at FROM hook \
      WHERE workspace_id = ? AND state IN ('scheduled', 'running') ORDER BY created_at";
 
-fn state_to_db(state: HookState) -> &'static str {
+pub(crate) fn state_to_db(state: HookState) -> &'static str {
     match state {
         HookState::Scheduled => "scheduled",
         HookState::Running => "running",
@@ -58,7 +58,7 @@ fn state_to_db(state: HookState) -> &'static str {
     }
 }
 
-fn state_from_db(s: &str) -> Result<HookState> {
+pub(crate) fn state_from_db(s: &str) -> Result<HookState> {
     match s {
         "scheduled" => Ok(HookState::Scheduled),
         "running" => Ok(HookState::Running),
@@ -161,7 +161,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_hook(&self, h: &Hook) -> Result<()> {
-        pending_postgres!("insert_hook", self, backend => backend.insert_hook(h).await)
+        dispatch!(self, backend => backend.insert_hook(h).await)
     }
 
     /// Get a hook by id; `NotFound` when absent.
@@ -170,7 +170,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_hook(&self, hook_id: &HookId) -> Result<Hook> {
-        pending_postgres!("get_hook", self, backend => backend.get_hook(hook_id).await)
+        dispatch!(self, backend => backend.get_hook(hook_id).await)
     }
 
     /// List all hooks in a workspace, oldest first.
@@ -179,7 +179,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<Vec<Hook>> {
-        pending_postgres!("list_hooks_by_workspace", self, backend => backend.list_hooks_by_workspace(workspace_id).await)
+        dispatch!(self, backend => backend.list_hooks_by_workspace(workspace_id).await)
     }
 
     /// Active hook metadata for one agent, oldest first. Filtering and payload
@@ -191,7 +191,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<Vec<ActiveHookMetadata>> {
-        pending_postgres!("active_hook_metadata_by_agent", self, backend => backend.active_hook_metadata_by_agent(agent_id).await)
+        dispatch!(self, backend => backend.active_hook_metadata_by_agent(agent_id).await)
     }
 
     /// Active hook metadata for a workspace, oldest first, for batched agent
@@ -203,7 +203,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<ActiveHookMetadata>> {
-        pending_postgres!("active_hook_metadata_by_workspace", self, backend => backend.active_hook_metadata_by_workspace(workspace_id).await)
+        dispatch!(self, backend => backend.active_hook_metadata_by_workspace(workspace_id).await)
     }
 
     /// The `hook.list` read for a workspace (optionally one agent's rows),
@@ -223,7 +223,7 @@ impl Store {
         agent_id: Option<&AgentId>,
         include_retired: bool,
     ) -> Result<Vec<HookListRow>> {
-        pending_postgres!("list_hook_rows", self, backend => backend.list_hook_rows(workspace_id, agent_id, include_retired).await)
+        dispatch!(self, backend => backend.list_hook_rows(workspace_id, agent_id, include_retired).await)
     }
 
     /// One `hook.list` page: [`Self::list_hook_rows`]' rows (whole workspace)
@@ -241,7 +241,7 @@ impl Store {
         after: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<(String, HookListRow)>> {
-        pending_postgres!("list_hook_rows_page", self, backend => backend.list_hook_rows_page(workspace_id, include_retired, after, limit).await)
+        dispatch!(self, backend => backend.list_hook_rows_page(workspace_id, include_retired, after, limit).await)
     }
 
     /// Number of ACTIVE (`scheduled`/`running`) hooks owned by an agent —
@@ -254,7 +254,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_active_hooks_by_agent(&self, agent_id: &AgentId) -> Result<u64> {
-        pending_postgres!("count_active_hooks_by_agent", self, backend => backend.count_active_hooks_by_agent(agent_id).await)
+        dispatch!(self, backend => backend.count_active_hooks_by_agent(agent_id).await)
     }
 
     /// Number of ACTIVE (`scheduled`/`running`) hooks in a workspace — the
@@ -268,7 +268,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_active_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<u64> {
-        pending_postgres!("count_active_hooks_by_workspace", self, backend => backend.count_active_hooks_by_workspace(workspace_id).await)
+        dispatch!(self, backend => backend.count_active_hooks_by_workspace(workspace_id).await)
     }
 
     /// Requested workspaces that own at least one active hook, in one
@@ -281,7 +281,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<std::collections::HashSet<WorkspaceId>> {
-        pending_postgres!("workspaces_with_active_hooks", self, backend => backend.workspaces_with_active_hooks(workspace_ids).await)
+        dispatch!(self, backend => backend.workspaces_with_active_hooks(workspace_ids).await)
     }
 
     /// List all hooks owned by an agent, oldest first.
@@ -290,7 +290,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_hooks_by_agent(&self, agent_id: &AgentId) -> Result<Vec<Hook>> {
-        pending_postgres!("list_hooks_by_agent", self, backend => backend.list_hooks_by_agent(agent_id).await)
+        dispatch!(self, backend => backend.list_hooks_by_agent(agent_id).await)
     }
 
     /// Set a hook's lifecycle state; `NotFound` when the row is absent.
@@ -299,7 +299,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_state(&self, hook_id: &HookId, state: HookState) -> Result<()> {
-        pending_postgres!("update_hook_state", self, backend => backend.update_hook_state(hook_id, state).await)
+        dispatch!(self, backend => backend.update_hook_state(hook_id, state).await)
     }
 
     /// Atomically persist a hook's TTL expiry: a single UPDATE sets
@@ -311,7 +311,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn expire_hook(&self, hook_id: &HookId) -> Result<()> {
-        pending_postgres!("expire_hook", self, backend => backend.expire_hook(hook_id).await)
+        dispatch!(self, backend => backend.expire_hook(hook_id).await)
     }
 
     /// Record a completed run: bump `run_count`, set `last_run_at`, and set
@@ -331,7 +331,7 @@ impl Store {
         last_run_at: &str,
         next_run_at: Option<&str>,
     ) -> Result<()> {
-        pending_postgres!("update_hook_run", self, backend => backend.update_hook_run(hook_id, last_run_at, next_run_at).await)
+        dispatch!(self, backend => backend.update_hook_run(hook_id, last_run_at, next_run_at).await)
     }
 
     /// Record a hook dispatch by raising `dispatch_count` to at least
@@ -346,7 +346,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn record_hook_dispatch(&self, hook_id: &HookId, dispatch_count: i64) -> Result<()> {
-        pending_postgres!("record_hook_dispatch", self, backend => backend.record_hook_dispatch(hook_id, dispatch_count).await)
+        dispatch!(self, backend => backend.record_hook_dispatch(hook_id, dispatch_count).await)
     }
 
     /// Set (or clear) a hook's `next_run_at`; `NotFound` when the row is
@@ -360,7 +360,7 @@ impl Store {
         hook_id: &HookId,
         next_run_at: Option<&str>,
     ) -> Result<()> {
-        pending_postgres!("update_hook_next_run", self, backend => backend.update_hook_next_run(hook_id, next_run_at).await)
+        dispatch!(self, backend => backend.update_hook_next_run(hook_id, next_run_at).await)
     }
 
     /// Set (or clear) a hook's `last_error`; `NotFound` when the row is
@@ -374,7 +374,7 @@ impl Store {
         hook_id: &HookId,
         last_error: Option<&str>,
     ) -> Result<()> {
-        pending_postgres!("update_hook_last_error", self, backend => backend.update_hook_last_error(hook_id, last_error).await)
+        dispatch!(self, backend => backend.update_hook_last_error(hook_id, last_error).await)
     }
 
     /// Set (or clear) a hook's `last_logs`; `NotFound` when the row is
@@ -388,7 +388,7 @@ impl Store {
         hook_id: &HookId,
         last_logs: Option<&str>,
     ) -> Result<()> {
-        pending_postgres!("update_hook_last_logs", self, backend => backend.update_hook_last_logs(hook_id, last_logs).await)
+        dispatch!(self, backend => backend.update_hook_last_logs(hook_id, last_logs).await)
     }
 
     /// Set (or clear) a hook's `last_state`; `NotFound` when the row is
@@ -402,7 +402,7 @@ impl Store {
         hook_id: &HookId,
         last_state: Option<&str>,
     ) -> Result<()> {
-        pending_postgres!("update_hook_last_state", self, backend => backend.update_hook_last_state(hook_id, last_state).await)
+        dispatch!(self, backend => backend.update_hook_last_state(hook_id, last_state).await)
     }
 
     /// Load every active (`scheduled` or `running`) hook across all
@@ -413,7 +413,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_active_hooks(&self) -> Result<Vec<Hook>> {
-        pending_postgres!("load_active_hooks", self, backend => backend.load_active_hooks().await)
+        dispatch!(self, backend => backend.load_active_hooks().await)
     }
 }
 
