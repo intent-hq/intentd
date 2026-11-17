@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.238] - 2026-11-17
+
+### 🚀 Features
+
+- *(store)* Port principal and host membership store methods to Postgres ([#3476](https://github.com/intent-hq/intentd/pull/3476))
+- *(store)* Port workspaces_with_active_hooks_or_script_monitors to Postgres ([#3479](https://github.com/intent-hq/intentd/pull/3479))
+
+
 ## [0.11.237] - 2026-11-17
 
 ### 🚀 Features
