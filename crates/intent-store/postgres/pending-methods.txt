@@ -1,6 +1,5 @@
 # Store methods with no Postgres implementation yet (pending_postgres!).
 # Porting one removes its line; postgres_backend_lint keeps this list exact.
-abandon_script_run
 abort_home_move
 accept_script_notification
 activate_incremental_vacuum
@@ -11,7 +10,6 @@ add_usage_stats
 add_workspace_collaborator_within_cap
 add_workspace_member
 admit_script_notification
-admit_script_run
 adopt_pr_monitor
 annotate_active_pr_monitors_pause
 archive_workspace_detaching_guests
@@ -22,7 +20,6 @@ authorized_presence_focus
 begin_home_move
 begin_repository_pending_delete
 bind_repository_initialization_claim
-bootstrap_scripts
 cancel_qualified_pr_monitor
 claim_home_auto_start_or_record_move
 cleanup_completed_script_notifications
@@ -90,7 +87,6 @@ finish_home_stop
 finish_node_lease
 finish_script_monitor_wake
 freelist_count
-get_active_script
 get_agent_session_with_transcript
 get_attachment
 get_attachment_by_idempotency_key
@@ -112,7 +108,6 @@ get_principals
 get_qualified_pr_monitor
 get_remote_agent
 get_remote_agents
-get_script_in_workspace
 get_shown_workspace_home
 get_subscription_agent_projections
 get_workspace_author_fallback
@@ -149,13 +144,11 @@ install_repository_lifecycle_observer
 join_host_by_invite
 join_workspace_by_invite
 known_repo_exists
-latest_script_run
 list_active_pr_monitors_by_agent
 list_active_pr_monitors_by_workspace
 list_agent_metrics
 list_agent_metrics_for_workspace
 list_agent_sessions_with_transcripts
-list_all_scripts
 list_attachments
 list_browser_tabs
 list_browser_tabs_by_host
@@ -189,11 +182,9 @@ list_remote_agents
 list_sharing_principals
 list_shown_workspace_homes
 list_tracked_changes
-list_unarchived_scripts
 list_undelivered_groups
 list_usage_rate_since
 list_usage_stats_hourly
-list_was_running_script_ids
 list_workspace_home_stops
 list_workspace_members
 list_workspace_metrics
@@ -215,7 +206,6 @@ optimize
 owner_queue_permit
 page_size
 pending_script_monitors
-pending_script_runs
 pool
 prepare_monitor_cancel
 prepare_monitor_insert
@@ -241,8 +231,6 @@ remove_host_member
 remove_host_member_by_owner
 remove_known_repo
 remove_remote_agent
-remove_script
-remove_script_in_workspace
 remove_workspace_guest
 remove_workspace_member
 repository_authority_snapshot
@@ -257,7 +245,6 @@ revoke_host_invite
 revoke_principal_access
 revoke_principal_credential
 revoke_workspace_invite
-saved_script_summary_page
 script_monitor
 script_monitor_cancel_intent
 script_monitor_pending_for_agent
@@ -270,12 +257,8 @@ script_monitors
 script_notification_delivery_owners
 script_notification_jobs
 script_notification_owners
-script_summary_page
-script_workspace
 set_home_move_machine
 set_mcp_oauth_token
-set_script_archived_at
-set_script_was_running
 set_stop_redelivery
 set_tracked_change_stage
 set_workspace_guest_role
@@ -283,10 +266,8 @@ set_workspace_legacy_author_principal_id
 set_workspace_member_role
 settle_delegation_group_after_delivery
 settle_script_monitor
-settle_script_run
 shares_repository_lifecycle_domain
 spawn_periodic_wal_checkpoint
-start_script_run
 stop_node_assignment
 suppress_script_notifications
 sweep_expired_attachment_idempotency_keys
@@ -318,14 +299,10 @@ upsert_diff
 upsert_event_subscription
 upsert_known_repo
 upsert_principal
-upsert_script
-upsert_script_in_workspace
-upsert_scripts
 upsert_tracked_change
 upsert_workspace_metrics
 workspace_has_remote_agent_work
 workspace_membership_summaries
-workspace_scripts_initialized
 workspaces_with_active_hooks
 workspaces_with_active_hooks_or_script_monitors
 write_pool
