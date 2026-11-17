@@ -953,3 +953,17 @@ pub(crate) fn note_outcome(config: &mut ProviderConfig, error: Option<&Error>) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_entry_saved_under_the_northflank_disk_minimum_reports_the_disk_it_gets() {
+        let mut config = ProviderConfig::new_northflank("nf", "p1");
+        config.northflank.as_mut().unwrap().disk_gib = 5;
+        assert_eq!(config.to_json("e")["northflank"]["diskGiB"], json!(6));
+        config.northflank.as_mut().unwrap().disk_gib = 40;
+        assert_eq!(config.to_json("e")["northflank"]["diskGiB"], json!(40));
+    }
+}
