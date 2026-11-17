@@ -14,7 +14,7 @@ impl Store {
         id: &str,
         name: Option<&str>,
     ) -> Result<DiscussionConversation> {
-        pending_postgres!("manage_discussion", self, backend => backend.manage_discussion(ws, principal, id, name).await)
+        dispatch!(self, backend => backend.manage_discussion(ws, principal, id, name).await)
     }
 }
 

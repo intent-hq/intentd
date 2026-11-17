@@ -12,6 +12,8 @@
 //! store's `rls_guard` mode works with them, for a later production opt-in.
 #![cfg(feature = "postgres")]
 
+#[path = "postgres_backend/discussions.rs"]
+mod discussions;
 #[path = "postgres_backend/harness.rs"]
 mod harness;
 #[path = "postgres_backend/notes.rs"]

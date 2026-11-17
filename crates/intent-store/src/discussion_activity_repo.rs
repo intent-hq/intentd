@@ -65,7 +65,7 @@ impl Store {
         message: &str,
         agent: &AgentId,
     ) -> Result<DiscussionActivityReceipt> {
-        pending_postgres!("discussion_activity", self, backend => backend.discussion_activity(ws, conversation, message, agent).await)
+        dispatch!(self, backend => backend.discussion_activity(ws, conversation, message, agent).await)
     }
 
     /// Transition only this live invocation; stale worker completions cannot rewrite retries.
@@ -77,14 +77,14 @@ impl Store {
         state: &str,
         error: Option<&str>,
     ) -> Result<Option<DiscussionActivityReceipt>> {
-        pending_postgres!("transition_discussion_activity", self, backend => backend.transition_discussion_activity(turn, state, error).await)
+        dispatch!(self, backend => backend.transition_discussion_activity(turn, state, error).await)
     }
 
     /// Gate an exact invocation immediately before its provider work.
     /// # Errors
     /// Returns storage errors.
     pub async fn discussion_invocation_allowed(&self, turn: &str, agent: &AgentId) -> Result<bool> {
-        pending_postgres!("discussion_invocation_allowed", self, backend => backend.discussion_invocation_allowed(turn, agent).await)
+        dispatch!(self, backend => backend.discussion_invocation_allowed(turn, agent).await)
     }
 
     /// Stop or retry exactly the observed attempt, atomically with its outbox/queue.
@@ -99,7 +99,7 @@ impl Store {
         attempt: u32,
         retry: bool,
     ) -> Result<(DiscussionActivityReceipt, bool)> {
-        pending_postgres!("control_discussion_activity", self, backend => backend.control_discussion_activity(ws, conversation, message, agent, attempt, retry).await)
+        dispatch!(self, backend => backend.control_discussion_activity(ws, conversation, message, agent, attempt, retry).await)
     }
 
     /// Interrupted processes cannot report success. Keep their receipts stopped,
@@ -107,7 +107,7 @@ impl Store {
     /// # Errors
     /// Returns storage errors.
     pub async fn recover_discussion_activity(&self) -> Result<()> {
-        pending_postgres!("recover_discussion_activity", self, backend => backend.recover_discussion_activity().await)
+        dispatch!(self, backend => backend.recover_discussion_activity().await)
     }
 }
 

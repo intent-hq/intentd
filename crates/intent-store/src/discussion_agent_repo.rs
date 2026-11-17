@@ -52,7 +52,7 @@ impl Store {
         before: Option<&str>,
         limit: u32,
     ) -> Result<serde_json::Value> {
-        pending_postgres!("discussion_agent_conversations", self, backend => backend.discussion_agent_conversations(ws, agent, before, limit).await)
+        dispatch!(self, backend => backend.discussion_agent_conversations(ws, agent, before, limit).await)
     }
 
     /// Check the current agent and local explicit-address grant.
@@ -64,7 +64,7 @@ impl Store {
         conversation: &str,
         agent: &AgentId,
     ) -> Result<bool> {
-        pending_postgres!("discussion_agent_access", self, backend => backend.discussion_agent_access(ws, conversation, agent).await)
+        dispatch!(self, backend => backend.discussion_agent_access(ws, conversation, agent).await)
     }
 
     /// Read bounded pending deliveries, optionally for a single committed message.
@@ -74,7 +74,7 @@ impl Store {
         &self,
         message: Option<&str>,
     ) -> Result<Vec<DiscussionDelivery>> {
-        pending_postgres!("discussion_pending_deliveries", self, backend => backend.discussion_pending_deliveries(message).await)
+        dispatch!(self, backend => backend.discussion_pending_deliveries(message).await)
     }
 
     /// Atomically hand a pending delivery to the normal durable queue. The caller
@@ -87,7 +87,7 @@ impl Store {
         message: &str,
         row: &AgentQueueRow,
     ) -> Result<bool> {
-        pending_postgres!("admit_discussion_delivery", self, backend => backend.admit_discussion_delivery(message, row).await)
+        dispatch!(self, backend => backend.admit_discussion_delivery(message, row).await)
     }
 }
 
