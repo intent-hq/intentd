@@ -62,7 +62,7 @@ fn count_status(totals: &mut WorkspaceTaskStats, status: Option<&str>) {
 impl PgStore {
     pub async fn insert_note(&self, note: &Note) -> Result<()> {
         self.prepare_task_events(&note.workspace_id).await;
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         exec_insert_note(self, &mut tx, note).await?;
         tx.commit().await.map_err(db)
     }
@@ -837,7 +837,7 @@ impl PgStore {
                 "encode note_line_attribution attributions failed: {e}"
             ))
         })?;
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO note_line_attribution \
                  (tenant_id, note_id, workspace_id, computed_at, attributions_json) \
@@ -907,7 +907,7 @@ impl PgStore {
                  (SELECT row_seq FROM note_page_head WHERE tenant_id = $1 LIMIT $2)",
             ),
         ] {
-            let mut tx = self.begin().await?;
+            let mut tx = self.begin_write().await?;
             let rows = sqlx::query(sql)
                 .bind(self.tenant())
                 .bind(batch)

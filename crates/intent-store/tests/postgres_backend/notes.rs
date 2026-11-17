@@ -11,7 +11,7 @@ use intent_core::{
 use intent_store::note_paging_cleanup::{NotePagingCleanupPolicy, RetiredNotePagingStep};
 use intent_store::{NoteFtsOptions, Store};
 
-use crate::harness::{open, parity_test, sqlite_store, test_db};
+use crate::harness::{open, parity_test, sqlite_store, tenant_rows, test_db};
 
 const WS: &str = "__chief__";
 
@@ -92,7 +92,7 @@ fn ids(notes: &[Note]) -> Vec<&str> {
     notes.iter().map(|n| n.id.as_str()).collect()
 }
 
-async fn notes_crud(store: &Store) {
+async fn notes_crud(store: &Store, tenant: &str) {
     assert!(store.list_all_notes().await.unwrap().is_empty());
     assert_eq!(store.max_note_updated_at(&ws()).await.unwrap(), None);
     assert!(!store.note_exists(&ws(), &nid("n1")).await.unwrap());
@@ -149,13 +149,23 @@ async fn notes_crud(store: &Store) {
         .insert_note(&note("n3", "Three", "kept", "2026-01-03T00:00:00Z"))
         .await
         .unwrap();
+    // Decoy-only rows with the ids the subject deletes: a delete without
+    // its tenant filter removes them.
+    if tenant == "decoy" {
+        for id in ["n1", "n2"] {
+            store
+                .insert_note(&note(id, "Decoy", "decoy", "2026-01-04T00:00:00Z"))
+                .await
+                .unwrap();
+        }
+    }
 }
 
-parity_test!(notes_insert_list_get_and_delete, |store| {
-    notes_crud(&store).await;
+parity_test!(notes_insert_list_get_and_delete, |store, tenant| {
+    notes_crud(&store, tenant).await;
 });
 
-async fn note_updates(store: &Store) {
+async fn note_updates(store: &Store, tenant: &str) {
     let base = note("u1", "Title", "v0", "2026-02-01T00:00:00Z");
     store.insert_note(&base).await.unwrap();
     let lock = store.lock_note_content(&ws(), &nid("u1")).await;
@@ -166,14 +176,14 @@ async fn note_updates(store: &Store) {
     }
 
     let mut next = base.clone();
-    next.content = "v1".into();
+    next.content = format!("v1-{tenant}");
     next.title = "Title 1".into();
     assert_eq!(store.update_note(&lock, &next).await.unwrap(), 1);
     assert!(matches!(
         store.update_note_versioned(&lock, &next, Some(0)).await,
         Err(Error::Conflict { .. })
     ));
-    next.content = "v2".into();
+    next.content = format!("v2-{tenant}");
     assert_eq!(
         store
             .update_note_versioned(&lock, &next, Some(1))
@@ -202,7 +212,7 @@ async fn note_updates(store: &Store) {
         None
     );
     let stored = store.get_note(&ws(), &nid("u1")).await.unwrap();
-    assert_eq!(stored.content, "v2");
+    assert_eq!(stored.content, format!("v2-{tenant}"));
     assert!(stored.is_pinned);
     assert_eq!(stored.tags, ["a", "b"]);
     assert_eq!(stored.rev, 4);
@@ -219,6 +229,11 @@ async fn note_updates(store: &Store) {
     assert!(store.note_content_locks_idle());
 
     let missing = note("absent", "x", "x", "2026-02-01T00:00:00Z");
+    if tenant == "decoy" {
+        // Decoy-only: the subject's update of "absent" must stay a miss.
+        store.insert_note(&missing).await.unwrap();
+        return;
+    }
     let lock = store.lock_note_content(&ws(), &nid("absent")).await;
     assert!(matches!(
         store.update_note(&lock, &missing).await,
@@ -226,11 +241,11 @@ async fn note_updates(store: &Store) {
     ));
 }
 
-parity_test!(note_updates_are_gated_and_scoped, |store| {
-    note_updates(&store).await;
+parity_test!(note_updates_are_gated_and_scoped, |store, tenant| {
+    note_updates(&store, tenant).await;
 });
 
-async fn note_versions(store: &Store) {
+async fn note_versions(store: &Store, tenant: &str) {
     let n = note("v1", "Versioned", "c0", "2026-03-01T00:00:00Z");
     assert_eq!(
         store
@@ -255,7 +270,7 @@ async fn note_versions(store: &Store) {
             .await,
         Err(Error::Conflict { .. })
     ));
-    next.content = "c2".into();
+    next.content = format!("c2-{tenant}");
     let mut child = note("v1-child", "Child", "child body", "2026-03-02T00:00:00Z");
     child.parent_id = Some(nid("v1"));
     assert_eq!(
@@ -288,14 +303,16 @@ async fn note_versions(store: &Store) {
         .iter()
         .map(|v| (v.v, v.date.as_str(), v.content_length))
         .collect();
-    assert_eq!(summary, [(1, "d0", 2), (2, "d1", 2), (3, "d2", 2)]);
+    let c2_len = i64::try_from(format!("c2-{tenant}").len()).unwrap();
+    assert_eq!(summary, [(1, "d0", 2), (2, "d1", 2), (3, "d2", c2_len)]);
     let v2 = store.get_note_version(&ws(), &nid("v1"), 2).await.unwrap();
     assert_eq!((v2.content.as_str(), v2.author), ("c1", author()));
     assert!(matches!(
         store.get_note_version(&ws(), &nid("v1"), 9).await,
         Err(Error::NotFound(_))
     ));
-    for (rev, content) in [(0, Some("c0")), (1, Some("c1")), (5, Some("c2"))] {
+    let c2 = format!("c2-{tenant}");
+    for (rev, content) in [(0, Some("c0")), (1, Some("c1")), (5, Some(c2.as_str()))] {
         assert_eq!(
             store
                 .get_note_version_content_by_rev(&ws(), &nid("v1"), rev)
@@ -325,8 +342,8 @@ async fn note_versions(store: &Store) {
     assert_eq!((versions[0].v, versions[49].v), (4, 53));
 }
 
-parity_test!(note_versions_snapshot_and_prune, |store| {
-    note_versions(&store).await;
+parity_test!(note_versions_snapshot_and_prune, |store, tenant| {
+    note_versions(&store, tenant).await;
 });
 
 async fn tasks(store: &Store) {
@@ -421,7 +438,7 @@ parity_test!(task_projections_and_counts, |store| {
     tasks(&store).await;
 });
 
-async fn adopt_spec(store: &Store) {
+async fn adopt_spec(store: &Store, tenant: &str) {
     assert_eq!(store.adopt_stray_spec_note(&ws()).await.unwrap(), None);
     store
         .insert_note_with_version(
@@ -487,13 +504,23 @@ async fn adopt_spec(store: &Store) {
         .is_some());
     // A spec now exists: nothing more to adopt.
     assert_eq!(store.adopt_stray_spec_note(&ws()).await.unwrap(), None);
+    // Decoy-only: a child still pointing at "stray", which the subject's
+    // re-parenting must not touch.
+    if tenant == "decoy" {
+        let mut orphan = note("stray-orphan", "Orphan", "", "2026-05-05T00:00:00Z");
+        orphan.parent_id = Some(nid("stray"));
+        store.insert_note(&orphan).await.unwrap();
+    }
 }
 
-parity_test!(stray_spec_note_is_adopted_with_its_dependents, |store| {
-    adopt_spec(&store).await;
-});
+parity_test!(
+    stray_spec_note_is_adopted_with_its_dependents,
+    |store, tenant| {
+        adopt_spec(&store, tenant).await;
+    }
+);
 
-async fn comments(store: &Store) {
+async fn comments(store: &Store, tenant: &str) {
     store
         .insert_note(&note("cn", "Commented", "text", "2026-06-01T00:00:00Z"))
         .await
@@ -537,7 +564,7 @@ async fn comments(store: &Store) {
         .is_empty());
 
     let mut edited = store.get_comment("c1").await.unwrap();
-    edited.content = "edited".into();
+    edited.content = format!("edited-{tenant}");
     edited.anchor_before = Some("before".into());
     edited.updated_at = "2026-06-03".into();
     store.update_comment(&ws(), &edited).await.unwrap();
@@ -623,13 +650,22 @@ async fn comments(store: &Store) {
         "2026-06-06T00:00:00Z"
     );
     assert_eq!(store.get_thread("th3").await.unwrap().comments, [c3]);
+    // Decoy-only comments with the ids the subject updates and deletes.
+    if tenant == "decoy" {
+        for id in ["c1", "c2"] {
+            store
+                .insert_comment(&ws(), &comment(id, "th1", "cn", "2026-06-07"))
+                .await
+                .unwrap();
+        }
+    }
 }
 
-parity_test!(comments_round_trip, |store| {
-    comments(&store).await;
+parity_test!(comments_round_trip, |store, tenant| {
+    comments(&store, tenant).await;
 });
 
-parity_test!(line_attribution_round_trip, |store| {
+parity_test!(line_attribution_round_trip, |store, tenant| {
     store
         .insert_note(&note("la", "Lines", "a\nb", "2026-07-01T00:00:00Z"))
         .await
@@ -648,7 +684,7 @@ parity_test!(line_attribution_round_trip, |store| {
         attributions: std::collections::BTreeMap::new(),
     };
     store.upsert_note_line_attribution(&data).await.unwrap();
-    data.computed_at = "second".into();
+    data.computed_at = format!("second-{tenant}");
     data.attributions.insert(
         "1".into(),
         serde_json::from_value(serde_json::json!({"timestamp": 5})).unwrap(),
@@ -819,7 +855,7 @@ parity_test!(note_search_matches_the_same_notes, |store| {
     search(&store).await;
 });
 
-async fn drafts(store: &Store) {
+async fn drafts(store: &Store, tenant: &str) {
     let (agent, client) = (AgentId("agent-1".into()), ClientId("client-1".into()));
     assert_eq!(store.get_draft(&ws(), &agent, &client).await.unwrap(), None);
     store
@@ -828,7 +864,13 @@ async fn drafts(store: &Store) {
         .unwrap();
     let attachments = serde_json::json!([{"name": "a.png"}]);
     let at = store
-        .upsert_draft(&ws(), &agent, &client, "second", Some(&attachments))
+        .upsert_draft(
+            &ws(),
+            &agent,
+            &client,
+            &format!("second-{tenant}"),
+            Some(&attachments),
+        )
         .await
         .unwrap();
     let draft = store
@@ -838,7 +880,7 @@ async fn drafts(store: &Store) {
         .unwrap();
     assert_eq!(
         (draft.text.as_str(), draft.attachments, draft.updated_at),
-        ("second", Some(attachments), at)
+        (format!("second-{tenant}").as_str(), Some(attachments), at)
     );
     assert!(store.delete_draft(&ws(), &agent, &client).await.unwrap());
     assert!(!store.delete_draft(&ws(), &agent, &client).await.unwrap());
@@ -857,7 +899,7 @@ async fn drafts_round_trip() {
         .ensure_client(&ClientId("client-1".into()))
         .await
         .unwrap();
-    drafts(&sqlite).await;
+    drafts(&sqlite, "sqlite").await;
     let Some(db) = test_db(false).await else {
         return;
     };
@@ -869,7 +911,12 @@ async fn drafts_round_trip() {
         .execute(&db.admin)
         .await
         .unwrap();
-        drafts(&open(&db, tenant).await).await;
+        // The decoy's leftover "kept" draft has the ids the subject deletes.
+        let before = tenant_rows(&db.admin, "decoy").await;
+        drafts(&open(&db, tenant).await, tenant).await;
+        if tenant == "subject" {
+            assert!(before == tenant_rows(&db.admin, "decoy").await);
+        }
     }
 }
 

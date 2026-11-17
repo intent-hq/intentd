@@ -34,7 +34,7 @@ impl PgStore {
         legacy_extra: &Map<String, Value>,
     ) -> Result<()> {
         let (anchor_json, extra_json) = encode_comment_json(c, legacy_extra)?;
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         exec_insert_comment(
             self,
             &mut tx,
@@ -165,7 +165,7 @@ impl PgStore {
         comment_id: &str,
         updated_at: &str,
     ) -> Result<bool> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let updated = sqlx::query(
             "UPDATE comment SET extra_json = \
                  sqlite_json_set(COALESCE(extra_json, '{}'), '$.isOrphaned', sqlite_json('true')), \
@@ -187,7 +187,7 @@ impl PgStore {
     }
 
     pub async fn delete_comment(&self, workspace_id: &WorkspaceId, id: &str) -> Result<()> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let deleted = sqlx::query(
             "DELETE FROM comment WHERE tenant_id = $1 AND id = $2 AND workspace_id = $3",
         )
@@ -211,7 +211,7 @@ impl PgStore {
         note_id: &NoteId,
         id: &str,
     ) -> Result<String> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let thread: Option<String> = sqlx::query_scalar(
             "DELETE FROM comment WHERE tenant_id = $1 AND id = $2 AND workspace_id = $3 \
              AND note_id = $4 RETURNING thread_id",
@@ -270,7 +270,7 @@ impl PgStore {
         status: CommentStatus,
         updated_at: &str,
     ) -> Result<u64> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let updated = sqlx::query(
             "UPDATE comment SET status = $4, updated_at = $5 \
              WHERE tenant_id = $1 AND thread_id = $2 AND workspace_id = $3",
@@ -346,7 +346,7 @@ impl PgStore {
         attachments: Option<&Value>,
     ) -> Result<String> {
         let now = now_iso();
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO draft (tenant_id, workspace_id, agent_id, client_id, text, attachments, \
                  updated_at) \
@@ -375,7 +375,7 @@ impl PgStore {
         agent_id: &AgentId,
         client_id: &ClientId,
     ) -> Result<bool> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_write().await?;
         let deleted = sqlx::query(
             "DELETE FROM draft \
              WHERE tenant_id = $1 AND workspace_id = $2 AND agent_id = $3 AND client_id = $4",
