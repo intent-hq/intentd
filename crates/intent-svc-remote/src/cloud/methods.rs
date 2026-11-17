@@ -14,6 +14,7 @@ use intent_core::machines::{
 };
 use intent_core::{now_iso, Error, Result, WorkspaceId};
 use intent_nodes::cloud::SecretString;
+use intent_nodes::northflank::MIN_DISK_GIB;
 use intent_services::feature_api::Services;
 
 use super::config::{self, ProviderConfig};
@@ -169,7 +170,16 @@ fn northflank_params(params: &Value) -> Result<NorthflankParams> {
         project_id,
         plans,
         image,
-        disk_gib: range_param(params, "diskGiB", 5, 500)?,
+        disk_gib: disk_param(params)?,
+    })
+}
+
+/// `diskGiB`: Northflank makes no volume under [`MIN_DISK_GIB`].
+fn disk_param(params: &Value) -> Result<Option<u32>> {
+    range_param(params, "diskGiB", MIN_DISK_GIB, 500).map_err(|_| {
+        Error::InvalidParams(format!(
+            "diskGiB must be an integer {MIN_DISK_GIB}-500: a Northflank volume is at least {MIN_DISK_GIB} GiB"
+        ))
     })
 }
 

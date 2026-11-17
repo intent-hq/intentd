@@ -21,7 +21,7 @@ use intent_core::machines::{
 use intent_core::{now_iso, Error, Result};
 use intent_nodes::cloud::{CloudError, CloudErrorKind, CloudProvider, QuotaLimit, SecretString};
 use intent_nodes::e2b::{E2bClient, E2bConfig};
-use intent_nodes::northflank::{NorthflankClient, NorthflankConfig};
+use intent_nodes::northflank::{NorthflankClient, NorthflankConfig, MIN_DISK_GIB};
 use intent_services::feature_api::Services;
 
 /// The E2B project that publishes the intent-node templates (Intent's).
@@ -315,7 +315,7 @@ impl ProviderConfig {
                     "region": nf.region,
                     "image": nf.image,
                     "plans": nf.plans_json(),
-                    "diskGiB": nf.disk_gib,
+                    "diskGiB": nf.disk_gib.max(MIN_DISK_GIB),
                 });
             }
             None => provider["templateProject"] = json!(self.template_project),
@@ -951,5 +951,19 @@ pub(crate) fn note_outcome(config: &mut ProviderConfig, error: Option<&Error>) {
         Some("key-rejected") => config.state = ProviderState::KeyRejected,
         Some("api-error") => config.state = ProviderState::Unreachable,
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_entry_saved_under_the_northflank_disk_minimum_reports_the_disk_it_gets() {
+        let mut config = ProviderConfig::new_northflank("nf", "p1");
+        config.northflank.as_mut().unwrap().disk_gib = 5;
+        assert_eq!(config.to_json("e")["northflank"]["diskGiB"], json!(6));
+        config.northflank.as_mut().unwrap().disk_gib = 40;
+        assert_eq!(config.to_json("e")["northflank"]["diskGiB"], json!(40));
     }
 }

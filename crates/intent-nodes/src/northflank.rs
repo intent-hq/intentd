@@ -40,6 +40,9 @@ pub const RUN_AS: &str = "user";
 /// Disk of a new machine when the request does not say.
 pub const DEFAULT_DISK_GIB: u32 = 20;
 
+/// The smallest volume Northflank makes; a smaller request is raised to it.
+pub const MIN_DISK_GIB: u32 = 6;
+
 /// The team tag of the machines of backend `backend_id`:
 /// `intent-backend-` and the first 12 lowercase hex digits of its SHA-256.
 #[must_use]

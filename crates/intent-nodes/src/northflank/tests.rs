@@ -325,7 +325,7 @@ async fn create_makes_tags_volume_then_service_and_waits_until_ready() {
             "name": name,
             "tags": [NODE_TAG, BACKEND_TAG],
             "mounts": [{"containerMountPath": "/home/user"}],
-            "spec": {"accessMode": "ReadWriteOnce", "storageSize": 5 * 1024}
+            "spec": {"accessMode": "ReadWriteOnce", "storageSize": 6 * 1024}
         })
     );
 
@@ -372,6 +372,33 @@ async fn create_reuses_existing_tags_and_defaults_the_disk() {
 }
 
 #[tokio::test]
+async fn create_never_asks_for_less_disk_than_northflank_allows() {
+    for disk in [0, 1, 5] {
+        let server = FakeServer::start_with(
+            vec![
+                tag_list(&[NODE_TAG, BACKEND_TAG]),
+                Reply::data(&json!({"id": "vol-1"})),
+                Reply::data(&json!({"id": "svc-1"})),
+                Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+                containers(&["TASK_RUNNING"]),
+            ],
+            vec![],
+        )
+        .await;
+        let mut request = create_request();
+        request.disk_gib = Some(disk);
+        client(&server).create(&request).await.unwrap();
+        let requests = server.requests();
+        assert_eq!(requests[1].line(), "POST /projects/p1/volumes");
+        assert_eq!(
+            requests[1].json()["spec"]["storageSize"],
+            json!(6 * 1024),
+            "disk {disk}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn create_follows_tag_pages() {
     let server = FakeServer::start_with(
         vec![
@@ -408,9 +435,7 @@ async fn create_checks_its_input_before_any_request() {
     no_backend.tags.remove("intentBackendId");
     let mut no_tag = create_request();
     no_tag.image = "ghcr.io/intent-hq/intent-node".into();
-    let mut zero_disk = create_request();
-    zero_disk.disk_gib = Some(0);
-    for request in [no_plan, no_backend, no_tag, zero_disk] {
+    for request in [no_plan, no_backend, no_tag] {
         let err = client.create(&request).await.unwrap_err();
         assert_eq!(err.kind(), CloudErrorKind::InvalidArgument, "{err}");
     }
