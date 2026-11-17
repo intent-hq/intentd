@@ -1,5 +1,7 @@
 //! Hook store methods on both backends: inserts, the full-row and `hook.list`
-//! reads, active counts and metadata, and the per-field run updates.
+//! reads, active counts and metadata, and the per-field run updates. Tie
+//! hooks share a `created_at` and have ids whose order depends on collation,
+//! so the tie-breaks and `COLLATE "C"` decide results.
 //!
 //! Decoy rule: reads run while the decoy owns the same hook ids (plus a
 //! decoy-only workspace, agent and hook the subject probes as absent), and
@@ -24,6 +26,8 @@ const T2: &str = "2026-01-03T00:00:00.000Z";
 const T3: &str = "2026-01-04T00:00:00.000Z";
 const T4: &str = "2026-01-05T00:00:00.000Z";
 const T5: &str = "2026-01-06T00:00:00.000Z";
+/// Shared `created_at` of the tie hooks (see [`seed_ties`]).
+const TIE: &str = "2026-01-07T00:00:00.000Z";
 const NEXT: &str = "2026-02-01T00:00:00.000Z";
 const EXPIRES: &str = "2026-03-01T00:00:00.000Z";
 
@@ -155,6 +159,27 @@ async fn seed(store: &Store, tenant: &str, prefix: &str) -> Vec<Hook> {
     hooks
 }
 
+/// Three hooks in `ws-t` (agent `a3`) sharing [`TIE`], inserted as `hc`
+/// (active), `hB` (cancelled), `ha` (active). Insertion order, byte order
+/// (`hB` < `ha` < `hc`) and a locale collation (`ha` < `hB` < `hc`) all
+/// differ, so the `row_seq` tie-break and `COLLATE "C"` each decide a result.
+async fn seed_ties(store: &Store, tenant: &str) -> Vec<Hook> {
+    store.insert_workspace(&workspace("ws-t")).await.unwrap();
+    store
+        .insert_agent_session(&session("a3", "ws-t", tenant))
+        .await
+        .unwrap();
+    let hooks = vec![
+        hook("hc", "ws-t", "a3", TIE, HookState::Scheduled, tenant),
+        hook("hB", "ws-t", "a3", TIE, HookState::Cancelled, tenant),
+        hook("ha", "ws-t", "a3", TIE, HookState::Scheduled, tenant),
+    ];
+    for h in &hooks {
+        store.insert_hook(h).await.unwrap();
+    }
+    hooks
+}
+
 /// Decoy-only rows: a workspace, agent and active hook the subject never
 /// creates and probes as absent.
 async fn seed_decoy_only(store: &Store, tenant: &str) {
@@ -232,6 +257,9 @@ parity_test!(hook_reads_round_trip, |store, tenant| {
     let hooks = seed(&store, tenant, "").await;
     let [h1, h2, h3, h4, h5] = <[Hook; 5]>::try_from(hooks).unwrap();
     assert!(store.insert_hook(&h1).await.is_err());
+    let ties = seed_ties(&store, tenant).await;
+    let [hc, hb, ha] = <[Hook; 3]>::try_from(ties).unwrap();
+    let (wt, a3) = (wid("ws-t"), aid("a3"));
 
     assert_eq!(store.get_hook(&hid("h2")).await.unwrap(), h2);
     assert_eq!(store.get_hook(&hid("h3")).await.unwrap(), h3);
@@ -299,6 +327,84 @@ parity_test!(hook_reads_round_trip, |store, tenant| {
         .await
         .unwrap()
         .is_empty());
+    assert_eq!(
+        store
+            .list_hook_rows(&chief, Some(&a1), false)
+            .await
+            .unwrap(),
+        [HookListRow::Active(h1.clone())]
+    );
+
+    // Ties on `created_at`: row-ordered reads keep insertion order.
+    assert_eq!(
+        store.list_hooks_by_workspace(&wt).await.unwrap(),
+        [hc.clone(), hb.clone(), ha.clone()]
+    );
+    assert_eq!(
+        store.list_hooks_by_agent(&a3).await.unwrap(),
+        [hc.clone(), hb.clone(), ha.clone()]
+    );
+    assert_eq!(
+        metadata(store.active_hook_metadata_by_workspace(&wt).await.unwrap()),
+        [
+            ("a3".into(), "hc".into(), name("hc")),
+            ("a3".into(), "ha".into(), name("ha"))
+        ]
+    );
+    assert_eq!(
+        metadata(store.active_hook_metadata_by_agent(&a3).await.unwrap()),
+        [
+            ("a3".into(), "hc".into(), name("hc")),
+            ("a3".into(), "ha".into(), name("ha"))
+        ]
+    );
+    assert_eq!(
+        store.list_hook_rows(&wt, None, true).await.unwrap(),
+        [
+            HookListRow::Active(hc.clone()),
+            HookListRow::Retired(summary(&hb)),
+            HookListRow::Active(ha.clone()),
+        ]
+    );
+    assert_eq!(
+        store.list_hook_rows(&wt, Some(&a3), false).await.unwrap(),
+        [
+            HookListRow::Active(hc.clone()),
+            HookListRow::Active(ha.clone())
+        ]
+    );
+    // The page breaks ties on `hook_id` in byte order: `hB`, `ha`, `hc`.
+    assert_eq!(
+        store.list_hook_rows_page(&wt, true, None, 2).await.unwrap(),
+        [
+            (TIE.to_owned(), HookListRow::Retired(summary(&hb))),
+            (TIE.to_owned(), HookListRow::Active(ha.clone())),
+        ]
+    );
+    assert_eq!(
+        store
+            .list_hook_rows_page(&wt, true, Some((TIE, "hB")), 10)
+            .await
+            .unwrap(),
+        [
+            (TIE.to_owned(), HookListRow::Active(ha.clone())),
+            (TIE.to_owned(), HookListRow::Active(hc.clone())),
+        ]
+    );
+    assert_eq!(
+        store
+            .list_hook_rows_page(&wt, false, Some((TIE, "hB")), 1)
+            .await
+            .unwrap(),
+        [(TIE.to_owned(), HookListRow::Active(ha.clone()))]
+    );
+    assert_eq!(
+        store
+            .list_hook_rows_page(&wt, false, Some((TIE, "ha")), 10)
+            .await
+            .unwrap(),
+        [(TIE.to_owned(), HookListRow::Active(hc.clone()))]
+    );
 
     let page = store
         .list_hook_rows_page(&chief, true, None, 2)
@@ -355,7 +461,10 @@ parity_test!(hook_reads_round_trip, |store, tenant| {
         .await
         .unwrap()
         .is_empty());
-    assert_eq!(store.load_active_hooks().await.unwrap(), [h1, h3, h5]);
+    assert_eq!(
+        store.load_active_hooks().await.unwrap(),
+        [h1, h3, h5, hc, ha]
+    );
 
     assert!(not_found(&store.get_hook(&hid("h-decoy")).await));
     assert!(store.list_hooks_by_workspace(&wc).await.unwrap().is_empty());
@@ -452,11 +561,15 @@ parity_test!(hook_writes_update_one_row, |store, tenant| {
     assert_eq!(store.get_hook(&h1).await.unwrap(), want);
 
     store.update_hook_last_error(&h2, None).await.unwrap();
+    assert_eq!(hooks[1].next_run_at.as_deref(), Some(NEXT));
+    store.expire_hook(&h2).await.unwrap();
     store.update_hook_last_logs(&h3, None).await.unwrap();
     store.update_hook_next_run(&h3, None).await.unwrap();
     store.expire_hook(&h3).await.unwrap();
     let mut want2 = hooks[1].clone();
     want2.last_error = None;
+    want2.state = HookState::Expired;
+    want2.next_run_at = None;
     let mut want3 = hooks[2].clone();
     want3.last_logs = None;
     want3.state = HookState::Expired;
