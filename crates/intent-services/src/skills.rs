@@ -442,6 +442,8 @@ async fn load_skills_payload_with_home(
             );
         }
 
+        #[cfg(test)]
+        record_scan(&cache_key);
         let result = scan_skills_with_home(normalized.as_deref(), home_override.clone()).await;
 
         let invalidated = {
@@ -464,6 +466,31 @@ async fn load_skills_payload_with_home(
 
         return result;
     }
+}
+
+#[cfg(test)]
+static SCAN_COUNTS: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn record_scan(cache_key: &str) {
+    *SCAN_COUNTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(cache_key.to_owned())
+        .or_default() += 1;
+}
+
+/// Test-only: how many cached-discovery scans have run for a workspace.
+#[cfg(test)]
+pub(crate) fn scan_count(workspace_path: &Path) -> usize {
+    let key = normalize_workspace_path(&workspace_path.to_string_lossy());
+    SCAN_COUNTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key.as_deref().unwrap_or(NO_WORKSPACE_CACHE_KEY))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Run filesystem traversal off async executor threads; synchronous consumers

@@ -3,7 +3,8 @@
 //! Watches the 8-tier skills scan roots (4 user-tier + 4 project-tier per workspace)
 //! and emits `skills:changed` events when SKILL.md files are created, modified, or
 //! deleted — or when a tier directory itself appears or disappears (#612).
-//! User-tier changes affect all workspaces; project-tier changes are scoped
+//! User-tier changes affect all workspaces, so they rescan the workspaces only
+//! when the user-tier catalog itself changed; project-tier changes are scoped
 //! to their workspace. Debounce is 500ms per workspace to coalesce rapid edits.
 //! Workspaces can be registered/deregistered at runtime (#611) via
 //! [`SkillsWatcher::add_workspace`] / [`SkillsWatcher::remove_workspace`].
@@ -27,6 +28,15 @@ use super::root_watch::{watch_root, RootWatch};
 use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Fingerprints the user-tier catalog (discovery with no workspace).
+/// Injected so tests, whose discovery has no home, can drive it.
+type UserCatalog =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send>> + Send + Sync>;
+
+fn user_catalog() -> UserCatalog {
+    Arc::new(|| Box::pin(skills_fingerprint(Path::new(""))))
+}
 
 /// Holds watchers for all skills directories (user-tier + project-tier).
 /// Dropping this tears down all watchers.
@@ -62,6 +72,15 @@ impl SkillsWatcher {
         bus: EventBus,
         workspaces: Vec<(WorkspaceId, PathBuf)>,
     ) -> Self {
+        Self::start_with(hub, bus, workspaces, user_catalog())
+    }
+
+    fn start_with(
+        hub: &Arc<SharedWatchHub>,
+        bus: EventBus,
+        workspaces: Vec<(WorkspaceId, PathBuf)>,
+        user_catalog: UserCatalog,
+    ) -> Self {
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<SkillsMsg>();
 
         // Start user-tier watchers (affect all workspaces)
@@ -86,6 +105,7 @@ impl SkillsWatcher {
             raw_rx,
             Arc::clone(hub),
             raw_tx.clone(),
+            user_catalog,
         ));
 
         Self {
@@ -251,6 +271,10 @@ enum SkillsMsg {
 /// and locations. Body-only edits do not change the discovery catalog.
 async fn skills_fingerprint(workspace_path: &Path) -> u64 {
     let skills = crate::skills::discover_skills(&workspace_path.to_string_lossy()).await;
+    fingerprint_of(&skills)
+}
+
+fn fingerprint_of(skills: &[crate::skills::SkillMetadata]) -> u64 {
     let rendered = serde_json::to_string(&skills).unwrap_or_default();
     let mut hasher = DefaultHasher::new();
     rendered.hash(&mut hasher);
@@ -319,6 +343,7 @@ async fn debounce_loop(
     mut raw_rx: mpsc::UnboundedReceiver<SkillsMsg>,
     hub: Arc<SharedWatchHub>,
     tx: mpsc::UnboundedSender<SkillsMsg>,
+    user_catalog: UserCatalog,
 ) {
     let mut pending: HashMap<WorkspaceId, tokio::time::Instant> = HashMap::new();
     let mut workspace_paths: HashMap<WorkspaceId, PathBuf> = workspaces.into_iter().collect();
@@ -331,6 +356,7 @@ async fn debounce_loop(
         }),
     };
     linked.refresh_user().await;
+    let mut user_baseline = user_catalog().await;
     let mut user_deadline: Option<tokio::time::Instant> = None;
     for (id, path) in &workspace_paths {
         linked.refresh(id, path).await;
@@ -345,13 +371,14 @@ async fn debounce_loop(
                 Some(SkillsMsg::Change(workspace_id)) => {
                     let deadline = tokio::time::Instant::now() + DEBOUNCE;
                     match workspace_id {
-                        // User-tier change: affects all workspaces
+                        // User-tier change: every workspace cache goes stale, but
+                        // the workspaces are rescanned only if the user-tier
+                        // catalog changed (checked once when the window closes).
                         None => {
                             crate::skills::invalidate_skills_cache(Path::new(""));
                             user_deadline.get_or_insert(deadline);
-                            for (ws_id, path) in &workspace_paths {
+                            for path in workspace_paths.values() {
                                 crate::skills::invalidate_skills_cache(path);
-                                pending.entry(ws_id.clone()).or_insert(deadline);
                             }
                         }
                         // Project-tier change: affects specific workspace
@@ -403,6 +430,18 @@ async fn debounce_loop(
                 if user_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
                     user_deadline = None;
                     linked.refresh_user().await;
+                    // Past the scan bounds a workspace's merged scan can
+                    // truncate differently from this user-only one, so a
+                    // change hidden here may still shift its catalog. Its
+                    // cache was invalidated on the change; only the event is skipped.
+                    let fingerprint = user_catalog().await;
+                    if fingerprint != user_baseline {
+                        user_baseline = fingerprint;
+                        let now = tokio::time::Instant::now();
+                        for ws_id in workspace_paths.keys() {
+                            pending.insert(ws_id.clone(), now);
+                        }
+                    }
                 }
                 flush_due(&bus, &workspace_paths, &mut suspend_baselines, &mut pending, &mut linked).await;
             }
@@ -462,7 +501,7 @@ async fn emit_skills_changed(
 ) -> u64 {
     // Re-run discovery to check if the skill set actually changed
     let (skills, _) = crate::skills::check_skills_changed(&workspace_path.to_string_lossy()).await;
-    let fingerprint = skills_fingerprint(workspace_path).await;
+    let fingerprint = fingerprint_of(&skills);
     let changed = match suspend_baseline {
         Some(baseline) => fingerprint != baseline,
         None => !skills.is_empty(),
@@ -702,6 +741,82 @@ mod tests {
                 && message.contains("injected watch failure"),
             "the panic must name the dead project-tier root and its cause: {message}"
         );
+    }
+
+    /// A user-tier change rescans the workspaces only when the user-tier
+    /// catalog changed. Every user-tier event (a body edit, a touch) used to
+    /// rescan every workspace's full catalog, user tiers included, so one
+    /// edit to the shared folder cost one scan per workspace.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn user_tier_change_rescans_workspaces_only_when_the_user_catalog_changes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, _sub) = bus_and_sub().await;
+        let ws1 = TempDir::new("user-fan-1");
+        let ws2 = TempDir::new("user-fan-2");
+        for (ws, name) in [(&ws1, "fan-one"), (&ws2, "fan-two")] {
+            let dir = ws.path.join(".intent/skills").join(name);
+            std::fs::create_dir_all(&dir).expect("mk skill dir");
+            std::fs::write(dir.join("SKILL.md"), skill_md(name)).expect("seed skill");
+        }
+
+        let user_version = Arc::new(AtomicU64::new(0));
+        let catalog_reads = Arc::new(AtomicU64::new(0));
+        let (version, reads) = (Arc::clone(&user_version), Arc::clone(&catalog_reads));
+        let catalog: UserCatalog = Arc::new(move || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            let value = version.load(Ordering::SeqCst);
+            Box::pin(async move { value })
+        });
+        let watcher = SkillsWatcher::start_with(
+            &SharedWatchHub::new(),
+            bus,
+            vec![
+                (WorkspaceId::from("ws-user-fan-1"), ws1.path.clone()),
+                (WorkspaceId::from("ws-user-fan-2"), ws2.path.clone()),
+            ],
+            catalog,
+        );
+        watcher.wait_established(LIVENESS).await;
+        tokio::time::sleep(DEBOUNCE * 2).await;
+        watcher.barrier().await;
+        let scans = || [&ws1, &ws2].map(|ws| crate::skills::scan_count(&ws.path));
+        let before = scans();
+        let reads_before = catalog_reads.load(Ordering::SeqCst);
+
+        for _ in 0..3 {
+            let _ = watcher.raw_tx.send(SkillsMsg::Change(None));
+        }
+        // The catalog is read when the user window closes, and any fan-out
+        // flush runs in that same loop turn, so the barrier after it sees it.
+        let deadline = Instant::now() + LIVENESS;
+        while catalog_reads.load(Ordering::SeqCst) == reads_before {
+            assert!(Instant::now() < deadline, "the user window never closed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        watcher.barrier().await;
+        assert_eq!(
+            scans(),
+            before,
+            "an unchanged user-tier catalog must not rescan any workspace"
+        );
+
+        user_version.store(1, Ordering::SeqCst);
+        let _ = watcher.raw_tx.send(SkillsMsg::Change(None));
+        let deadline = Instant::now() + LIVENESS;
+        while scans().iter().zip(before).any(|(now, was)| *now <= was) {
+            assert!(
+                Instant::now() < deadline,
+                "a changed user-tier catalog must rescan every workspace: {:?} -> {:?}",
+                before,
+                scans()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
