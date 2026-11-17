@@ -389,7 +389,7 @@ parity_test!(
         insert(&store, &["m1", "m2", "m3"], tenant).await;
         assert_eq!(
             store.script_notification_owners(&wn, None).await.unwrap(),
-            [c.clone()]
+            std::slice::from_ref(&c)
         );
         let m1 = settled(&monitor("m1", tenant), "triggered");
         assert!(invalid(
@@ -442,7 +442,7 @@ parity_test!(
         assert!(!store.script_monitor_pending_for_agent(&b).await.unwrap());
         assert_eq!(
             store.script_notification_owners(&wm, None).await.unwrap(),
-            [a.clone()]
+            std::slice::from_ref(&a)
         );
         assert!(store
             .script_notification_owners(&wm, Some(&b))
@@ -553,7 +553,7 @@ parity_test!(script_notification_admission_lifecycle, |store, tenant| {
     assert!(store.admit_script_notification(&q2).await.unwrap());
     assert_eq!(
         store.script_notification_owners(&wm, None).await.unwrap(),
-        [b.clone()]
+        std::slice::from_ref(&b)
     );
     store
         .suppress_script_notifications(&wm, Some(&a))
