@@ -20,6 +20,8 @@ mod agents;
 mod discussions;
 #[path = "postgres_backend/harness.rs"]
 mod harness;
+#[path = "postgres_backend/hooks.rs"]
+mod hooks;
 #[path = "postgres_backend/nodes.rs"]
 mod nodes;
 #[path = "postgres_backend/notes.rs"]
