@@ -407,16 +407,19 @@ pub(crate) fn classify_probe(status: Option<u16>) -> ProbeOutcome {
 /// Working directory for every `unsloth` child: `~/.unsloth/studio`, created
 /// on demand. The CLI stats `<cwd>/unsloth_compiled_cache` at startup and
 /// crashes on an unreadable inherited cwd (a daemon started from `/root` via
-/// sudo). Falls back to `home` when the studio dir cannot be created, and to
-/// the inherited cwd when no home is known.
-fn child_working_dir(home: Option<&Path>) -> Option<PathBuf> {
-    let home = home?;
+/// sudo). Falls back to the temp dir, which is always accessible, when no
+/// home is known or the studio dir cannot be created (home itself is then
+/// likely unwritable or unreadable too).
+fn child_working_dir(home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return std::env::temp_dir();
+    };
     let studio = home.join(".unsloth").join("studio");
     match std::fs::create_dir_all(&studio) {
-        Ok(()) => Some(studio),
+        Ok(()) => studio,
         Err(e) => {
-            tracing::warn!(dir = %studio.display(), "cannot create unsloth studio dir, running unsloth from home: {e}");
-            Some(home.to_path_buf())
+            tracing::warn!(dir = %studio.display(), "cannot create unsloth studio dir, running unsloth from the temp dir: {e}");
+            std::env::temp_dir()
         }
     }
 }
@@ -579,42 +582,111 @@ impl ManagedServer {
         self.child.as_ref().and_then(tokio::process::Child::id)
     }
 
-    /// Snapshot the first Python exception line and the retained output tail
-    /// (newline-joined). Waits (bounded) for the drain tasks first so a
-    /// fast-exiting child's final lines are captured — call only after the
-    /// child is dead.
+    /// Snapshot the root-cause exception line ([`OutputCapture::cause`]) and
+    /// the retained output tail (newline-joined). Waits (bounded) for the
+    /// drain tasks first so a fast-exiting child's final lines are captured
+    /// — call only after the child is dead.
     async fn tail(&mut self) -> (Option<String>, String) {
         for task in self.drain_tasks.drain(..) {
             let _ = tokio::time::timeout(DRAIN_SETTLE_TIMEOUT, task).await;
         }
         let capture = self.output_tail.lock().unwrap();
         let tail = capture.tail.iter().cloned().collect::<Vec<_>>().join("\n");
-        (capture.first_exception.clone(), tail)
+        (capture.cause.clone(), tail)
     }
 }
 
-/// Child output kept for startup diagnostics: a rolling tail plus the first
-/// Python exception line. Python prints a chained traceback root cause
-/// first, so a long traceback pushes it out of the tail and leaves only a
-/// generic wrapper such as "Uvicorn server failed before startup completed".
+/// Longest root-cause line kept, in chars (an `…` marks a cut).
+const CAUSE_MAX_CHARS: usize = 500;
+
+/// Child output kept for startup diagnostics: a rolling tail plus the root
+/// cause of the crash. Python prints a chained traceback's root cause first,
+/// so a long traceback pushes it out of the tail and leaves only a generic
+/// wrapper such as "Uvicorn server failed before startup completed".
 #[derive(Default)]
 struct OutputCapture {
     tail: std::collections::VecDeque<String>,
-    first_exception: Option<String>,
+    /// The first exception line after the last plain
+    /// `Traceback (most recent call last):` header that does not continue a
+    /// chain (or the first exception line at all, before any header). Rich
+    /// box headers never reset it: rich re-prints the same crash with extra
+    /// wrapper exceptions (`SystemExit: 3`) that are not the cause.
+    cause: Option<String>,
+    /// A chain marker was seen; the next header continues that traceback.
+    chained: bool,
+    /// An unchained header was seen; its first exception replaces `cause`.
+    new_traceback: bool,
 }
 
-/// Whether `line` is the final line of a Python traceback
-/// (`pkg.module.SomeError: message`), unindented and not inside a rich box.
+impl OutputCapture {
+    fn push(&mut self, line: String) {
+        let plain = strip_ansi(&line);
+        let trimmed = plain.trim_end();
+        if trimmed == "The above exception was the direct cause of the following exception:"
+            || trimmed == "During handling of the above exception, another exception occurred:"
+        {
+            self.chained = true;
+        } else if trimmed.ends_with("Traceback (most recent call last):") {
+            self.new_traceback |= !self.chained;
+            self.chained = false;
+        } else if is_python_exception_line(trimmed) {
+            if self.cause.is_none() || self.new_traceback {
+                self.cause = Some(truncate_chars(trimmed, CAUSE_MAX_CHARS));
+            }
+            self.new_traceback = false;
+            // A rich-boxed chain link ends here, without a plain header.
+            self.chained = false;
+        }
+        if self.tail.len() >= OUTPUT_TAIL_LINES {
+            self.tail.pop_front();
+        }
+        self.tail.push_back(line);
+    }
+}
+
+/// Whether `line` is the final line of a Python traceback: an unindented
+/// exception name (`pkg.module.SomeError`), alone or followed by `: message`.
 fn is_python_exception_line(line: &str) -> bool {
-    let Some((name, _)) = line.split_once(": ") else {
-        return false;
-    };
+    let name = line.split_once(": ").map_or(line, |(name, _)| name);
     let ident = name.rsplit('.').next().unwrap_or(name);
-    (ident.ends_with("Error") || ident.ends_with("Exception"))
+    // A bare suffix ("Error") is a word, not a class; `ExceptionGroup` is
+    // itself a builtin class.
+    let has_suffix = ident.ends_with("ExceptionGroup")
+        || ["Error", "Exception", "Interrupt", "Exit", "Timeout"]
+            .iter()
+            .any(|suffix| ident.len() > suffix.len() && ident.ends_with(suffix));
+    has_suffix
         && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+/// Drop ANSI CSI escape sequences (`ESC [ … final-byte`), e.g. colours.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
 }
 
 /// Resolver seam for the `unsloth` CLI binary. The argument is the
@@ -1035,7 +1107,7 @@ impl UnslothServerManager {
                 return Err(stop_requested_error());
             }
             let cwd = child_working_dir(self.config.home_dir.as_deref());
-            let server = Self::start_server(&binary, repo_id, &quant, port, cwd.as_deref())?;
+            let server = Self::start_server(&binary, repo_id, &quant, port, &cwd)?;
             self.set_identity(Some(ServerIdentity {
                 repo_id: server.repo_id.clone(),
                 pid: server.pid(),
@@ -1176,12 +1248,10 @@ impl UnslothServerManager {
         repo_id: &str,
         quant: &str,
         port: u16,
-        cwd: Option<&Path>,
+        cwd: &Path,
     ) -> Result<ManagedServer> {
         let mut cmd = Command::new(binary);
-        if let Some(cwd) = cwd {
-            cmd.current_dir(cwd);
-        }
+        cmd.current_dir(cwd);
         cmd.arg("run")
             .arg("--model")
             .arg(run_model_arg(repo_id, quant))
@@ -1451,9 +1521,7 @@ impl UnslothServerManager {
         timeout: Duration,
     ) -> std::result::Result<UnslothEndpoint, StartupFailure> {
         let mut cmd = Command::new(binary);
-        if let Some(cwd) = child_working_dir(self.config.home_dir.as_deref()) {
-            cmd.current_dir(cwd);
-        }
+        cmd.current_dir(child_working_dir(self.config.home_dir.as_deref()));
         cmd.arg("start")
             .arg("opencode")
             .arg("--no-launch")
@@ -1566,11 +1634,11 @@ impl UnslothServerManager {
             return Err(StartupFailure::terminal(Error::Internal(format!(
                 "unsloth start opencode --no-launch failed ({}): {}",
                 exit_status,
-                if stderr.trim().is_empty() {
+                redact_key_material(if stderr.trim().is_empty() {
                     stdout.trim()
                 } else {
                     stderr.trim()
-                }
+                })
             ))));
         }
         // InvalidInput (not Internal) for the same reason as
@@ -1781,14 +1849,7 @@ where
 {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let mut capture = tail.lock().unwrap();
-        if capture.first_exception.is_none() && is_python_exception_line(&line) {
-            capture.first_exception = Some(line.clone());
-        }
-        if capture.tail.len() >= OUTPUT_TAIL_LINES {
-            capture.tail.pop_front();
-        }
-        capture.tail.push_back(line);
+        tail.lock().unwrap().push(line);
     }
 }
 
@@ -1888,23 +1949,129 @@ mod tests {
             "PermissionError: [Errno 13] Permission denied: '/root/x'",
             "RuntimeError: Uvicorn server failed before startup completed",
             "huggingface_hub.errors.RepositoryNotFoundError: 404 Client Error",
-            "torch.OutOfMemoryException: CUDA out of memory",
+            "torch.OutOfMemoryError: CUDA out of memory",
+            "httpx.ConnectTimeout: timed out",
+            "SystemExit: 3",
+            "KeyboardInterrupt",
+            "RuntimeError",
+            "ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
         ] {
             assert!(is_python_exception_line(line), "should match: {line}");
         }
         for line in [
             "  File \"/x/run.py\", line 2614, in run_server",
             "    raise RuntimeError(\"boom\")",
+            "    ValueError: indented, part of a frame or a nested group",
             "ERROR:    Application startup failed. Exiting.",
+            "ERROR:    ValueError: log-prefixed",
+            "2026-11-18 02:06:01 INFO ValueError: inside a log message",
             "Traceback (most recent call last):",
             "│ RuntimeError: inside a rich traceback box",
-            "PermissionError",
+            "Error",
             "Some Error: free text with a space in the name",
             "{\"level\": \"info\", \"event\": \"ValueError: in json\"}",
             "",
         ] {
             assert!(!is_python_exception_line(line), "should not match: {line}");
         }
+    }
+
+    fn capture_cause(lines: &[&str]) -> Option<String> {
+        let mut capture = OutputCapture::default();
+        for line in lines {
+            capture.push((*line).to_string());
+        }
+        capture.cause
+    }
+
+    /// Replays the layout of a real unsloth studio startup crash (an
+    /// unreadable cwd), preceded by a harmless logged traceback. The fatal
+    /// traceback's own root cause must win over the earlier exception and
+    /// over the later `SystemExit` / wrapper lines rich prints after it.
+    #[test]
+    fn cause_is_the_root_of_the_last_unchained_traceback() {
+        let cause = capture_cause(&[
+            "WARNING:  flash_attn unavailable, using sdpa",
+            "Traceback (most recent call last):",
+            "  File \"/x/attn.py\", line 3, in <module>",
+            "ModuleNotFoundError: No module named 'flash_attn'",
+            "INFO:     Waiting for application startup.",
+            "ERROR:    Traceback (most recent call last):",
+            "  File \"/x/cache_cleanup.py\", line 66, in get_existing_cache_dirs",
+            "PermissionError: [Errno 13] Permission denied: '/root/unsloth_compiled_cache'",
+            "",
+            "ERROR:    Application startup failed. Exiting.",
+            "╭───────── Traceback (most recent call last) ─────────╮",
+            "│ /x/uvicorn/server.py:109 in startup                  │",
+            "╰──────────────────────────────────────────────────────╯",
+            "SystemExit: 3",
+            "",
+            "The above exception was the direct cause of the following exception:",
+            "",
+            "╭───────── Traceback (most recent call last) ─────────╮",
+            "╰──────────────────────────────────────────────────────╯",
+            "RuntimeError: Uvicorn server failed before startup completed",
+        ]);
+        assert_eq!(
+            cause.as_deref(),
+            Some("PermissionError: [Errno 13] Permission denied: '/root/unsloth_compiled_cache'")
+        );
+    }
+
+    #[test]
+    fn cause_keeps_the_root_of_a_chained_plain_traceback() {
+        for marker in [
+            "The above exception was the direct cause of the following exception:",
+            "During handling of the above exception, another exception occurred:",
+        ] {
+            let cause = capture_cause(&[
+                "Traceback (most recent call last):",
+                "OSError: disk full",
+                "",
+                marker,
+                "",
+                "Traceback (most recent call last):",
+                "RuntimeError: wrapper",
+            ]);
+            assert_eq!(cause.as_deref(), Some("OSError: disk full"), "{marker}");
+        }
+    }
+
+    #[test]
+    fn cause_without_traceback_headers_is_the_first_exception() {
+        let cause = capture_cause(&[
+            "INFO: starting",
+            "ValueError: first",
+            "RuntimeError: second",
+        ]);
+        assert_eq!(cause.as_deref(), Some("ValueError: first"));
+        assert_eq!(capture_cause(&["INFO: fine", "done"]), None);
+    }
+
+    #[test]
+    fn cause_strips_ansi_and_is_length_capped() {
+        let cause = capture_cause(&["\u{1b}[31mValueError\u{1b}[0m: \u{1b}[1mbad\u{1b}[0m"]);
+        assert_eq!(cause.as_deref(), Some("ValueError: bad"));
+
+        let long = format!("ValueError: {}", "é".repeat(2 * CAUSE_MAX_CHARS));
+        let cause = capture_cause(&[long.as_str()]).expect("cause");
+        assert_eq!(cause.chars().count(), CAUSE_MAX_CHARS + 1);
+        assert!(cause.ends_with('…'));
+    }
+
+    #[test]
+    fn child_working_dir_prefers_the_studio_dir_then_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let studio = child_working_dir(Some(dir.path()));
+        assert_eq!(studio, dir.path().join(".unsloth").join("studio"));
+        assert!(studio.is_dir(), "studio dir created");
+
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir_all(&blocked).expect("create home");
+        std::fs::write(blocked.join(".unsloth"), b"not a directory").expect("block studio");
+        assert_eq!(child_working_dir(Some(&blocked)), std::env::temp_dir());
+
+        assert_eq!(child_working_dir(None), std::env::temp_dir());
     }
 
     #[test]
@@ -3195,7 +3362,7 @@ mod tests {
             let port = spawn_stub_http("sk-unsloth-test-key").await;
             let binary_path = dir.path().join("unsloth");
             // Stub whose `start` arm fails (no generated config written).
-            let script = "#!/bin/sh\ncase \"$1\" in\n  run) sleep 300 ;;\n  start) echo 'No running Unsloth server found' >&2; exit 1 ;;\nesac\n".to_string();
+            let script = "#!/bin/sh\ncase \"$1\" in\n  run) sleep 300 ;;\n  start) echo 'No running Unsloth server found (key sk-leaked-mint-key)' >&2; exit 1 ;;\nesac\n".to_string();
             std::fs::write(&binary_path, script).expect("write stub");
             std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod");
@@ -3212,6 +3379,10 @@ mod tests {
             assert!(
                 msg.contains("No running Unsloth server found"),
                 "got: {msg}"
+            );
+            assert!(
+                !msg.contains("sk-leaked-mint-key"),
+                "mint output is redacted: {msg}"
             );
             assert!(mgr.state.lock().await.is_none(), "state cleared on failure");
         }
