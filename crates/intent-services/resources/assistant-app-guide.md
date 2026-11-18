@@ -734,8 +734,10 @@ the user's agy history. Choose the thinking level as the reasoning effort.
 
 `@intent-hq/web` (command `intent-web`) is a new, separately installed server that
 serves the Intent web app without the desktop app, for example on a VPS or dev box.
-It ships with Intent releases on npm. It is the only way to use Intent from a browser:
-the desktop app does not serve itself to browsers.
+It ships with Intent releases on npm and is the supported way to use Intent from a
+browser. Desktop builds are dropping their experimental Labs **Browser access**
+option; some installed builds may still show it. Do not recommend it; if asked,
+say it is experimental and being removed, and suggest `@intent-hq/web` instead.
 
 - Start it with `npx @intent-hq/web` (Node.js 22.22.2+, 24.15.0+ or 26+). It listens
   only on `127.0.0.1:47120` and prints an **access key** on first run;
