@@ -58,6 +58,10 @@ intentd-test-support = { path = "../intentd-test-support" }
 libsqlite3-sys = { workspace = true }
 toml = { workspace = true }
 trybuild = "1"
+# Parser spike for the Postgres lints (tests/postgres_sql_parse_spike.rs).
+# No default features: `recursive-protection` pulls in stacker/psm, which
+# compile C and assembly.
+sqlparser = { version = "0.64", default-features = false, features = ["std"] }
 tempfile = "3"
 tokio = { workspace = true }
 uuid = { workspace = true }
