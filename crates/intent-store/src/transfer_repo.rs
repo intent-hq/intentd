@@ -412,7 +412,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<TransferTableStat>> {
-        pending_postgres!("transfer_table_stats", self, backend => backend.transfer_table_stats(workspace_id).await)
+        dispatch!(self, backend => backend.transfer_table_stats(workspace_id).await)
     }
 
     /// Export every [`TRANSFER_TABLES`] row for one workspace as JSON objects
@@ -439,7 +439,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
-        pending_postgres!("transfer_export_rows", self, backend => backend.transfer_export_rows(workspace_id).await)
+        dispatch!(self, backend => backend.transfer_export_rows(workspace_id).await)
     }
 
     /// Read retained monitor envelopes for transfer preflight, without changing
@@ -452,7 +452,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
-        pending_postgres!("transfer_monitor_rows", self, backend => backend.transfer_monitor_rows(workspace_id).await)
+        dispatch!(self, backend => backend.transfer_monitor_rows(workspace_id).await)
     }
 
     /// Insert transformed transfer rows into their tables inside ONE
@@ -480,7 +480,7 @@ impl Store {
         &self,
         rows: &[(String, Vec<serde_json::Value>)],
     ) -> Result<usize> {
-        pending_postgres!("transfer_import_rows", self, backend => backend.transfer_import_rows(rows).await)
+        dispatch!(self, backend => backend.transfer_import_rows(rows).await)
     }
 }
 
@@ -1154,7 +1154,7 @@ fn bind_json_value<'q>(
 /// session with 0108 `agent_message_payload` rows (externalized heavy
 /// bodies / write-time thumbnails, `body` BLOB); other transfer tables
 /// declare no BLOB columns.
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -1183,7 +1183,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// Inverse of [`base64_encode`]; `None` on any malformed input.
 // Byte extraction from a 24-bit accumulator: truncation is the point.
 #[expect(clippy::cast_possible_truncation)]
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
             b'A'..=b'Z' => Some(u32::from(c - b'A')),

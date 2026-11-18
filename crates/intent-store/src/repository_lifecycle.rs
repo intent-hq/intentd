@@ -126,7 +126,8 @@ pub(crate) struct LifecycleDomain {
     writers: Arc<AsyncMutex<()>>,
     // Keep the file incarnation alive even after one Store closes its pools;
     // device/inode reuse cannot silently attach a replacement database.
-    _database_file: std::fs::File,
+    // Postgres domains have no file.
+    _database_file: Option<std::fs::File>,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -135,6 +136,9 @@ enum DatabaseIdentity {
     File(u64, u64),
     #[cfg(not(unix))]
     Path(PathBuf),
+    /// One tenant of one Postgres database.
+    #[cfg(feature = "postgres")]
+    Postgres(String),
 }
 
 #[derive(Default)]
@@ -148,7 +152,7 @@ struct Domains {
 
 static DOMAINS: OnceLock<Mutex<Domains>> = OnceLock::new();
 
-fn lifecycle_error(message: &str) -> Error {
+pub(crate) fn lifecycle_error(message: &str) -> Error {
     Error::Internal(format!("repository lifecycle: {message}"))
 }
 
@@ -212,11 +216,34 @@ pub(crate) fn domain_for(path: &Path) -> Result<Arc<LifecycleDomain>> {
         identity: identity.clone(),
         state: Mutex::default(),
         writers: Arc::default(),
-        _database_file: database_file,
+        _database_file: Some(database_file),
     });
     domains
         .paths
         .insert(canonical, (identity.clone(), Arc::downgrade(&domain)));
+    domains.files.insert(identity, Arc::downgrade(&domain));
+    Ok(domain)
+}
+
+/// The domain every open of one tenant in one Postgres database shares, the
+/// way managed opens of one `SQLite` file share theirs. `key` names both.
+#[cfg(feature = "postgres")]
+pub(crate) fn postgres_domain(key: String) -> Result<Arc<LifecycleDomain>> {
+    let identity = DatabaseIdentity::Postgres(key);
+    let mut domains = DOMAINS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| lifecycle_error("managed database registry poisoned"))?;
+    domains.files.retain(|_, domain| domain.strong_count() > 0);
+    if let Some(domain) = domains.files.get(&identity).and_then(Weak::upgrade) {
+        return Ok(domain);
+    }
+    let domain = Arc::new(LifecycleDomain {
+        identity: identity.clone(),
+        state: Mutex::default(),
+        writers: Arc::default(),
+        _database_file: None,
+    });
     domains.files.insert(identity, Arc::downgrade(&domain));
     Ok(domain)
 }
@@ -234,6 +261,46 @@ impl LifecycleDomain {
             .retained
             .entry(self.identity.clone())
             .or_insert_with(|| self.clone());
+    }
+
+    pub(crate) fn has_observer(&self, observer: &Arc<dyn RepositoryLifecycleObserver>) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            !state.invalidated
+                && state
+                    .observer
+                    .as_ref()
+                    .is_some_and(|installed| Arc::ptr_eq(installed, observer))
+        })
+    }
+
+    pub(crate) async fn begin_pending_delete(
+        self: &Arc<Self>,
+        keys: &[RepositoryLifecycleKey],
+    ) -> Result<RepositoryPendingDeleteGuard> {
+        if keys.is_empty() {
+            return Err(lifecycle_error("pending deletion requires original keys"));
+        }
+        let mut lifecycle = self.write().await?;
+        let observer = {
+            let state = lifecycle
+                .domain
+                .state
+                .lock()
+                .map_err(|_| lifecycle_error("database domain poisoned"))?;
+            if state.invalidated {
+                return Err(lifecycle_error("database incarnation was retired"));
+            }
+            state.observer.clone()
+        };
+        // This incremented owner and captured observer are protected by the
+        // existing writer/install serialization. A first install now sees an
+        // active owner even if this begin captured no observer.
+        lifecycle.begun = true;
+        lifecycle.release_serialization();
+        if let Some(observer) = observer {
+            lifecycle.ticket = Some(observer.begin_pending_delete(keys)?);
+        }
+        Ok(RepositoryPendingDeleteGuard { lifecycle })
     }
 
     pub(crate) async fn write(self: &Arc<Self>) -> Result<LifecycleWrite> {
@@ -357,6 +424,12 @@ impl LifecycleWrite {
         self.serial.take();
     }
 
+    /// Record that this owner dispatched SQL, without a ticket.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn mark_begun(&mut self) {
+        self.begun = true;
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn settle(mut self) {
         if let Some(ticket) = self.ticket.take() {
@@ -451,7 +524,16 @@ impl Store {
     /// settlement, permission or current usability; those checks remain separate.
     #[must_use]
     pub fn shares_repository_lifecycle_domain(&self, other: &Store) -> bool {
-        pending_postgres!(panic "shares_repository_lifecycle_domain", self, backend => backend.shares_repository_lifecycle_domain(other))
+        match (self.repository_lifecycle(), other.repository_lifecycle()) {
+            (Ok(mine), Ok(theirs)) => Arc::ptr_eq(&mine, &theirs),
+            _ => false,
+        }
+    }
+
+    /// This store's lifecycle domain: its database file's on `SQLite`, its
+    /// tenant's in its database on Postgres.
+    pub(crate) fn repository_lifecycle(&self) -> Result<Arc<LifecycleDomain>> {
+        dispatch!(self, backend => backend.repository_lifecycle_domain())
     }
 
     /// Retain original ownership before publishing or claiming pending deletion.
@@ -469,7 +551,7 @@ impl Store {
         &self,
         keys: &[RepositoryLifecycleKey],
     ) -> Result<RepositoryPendingDeleteGuard> {
-        pending_postgres!("begin_repository_pending_delete", self, backend => backend.begin_repository_pending_delete(keys).await)
+        dispatch!(self, backend => backend.begin_repository_pending_delete(keys).await)
     }
 
     /// Install the sole invalidation owner for this managed database lifetime.
@@ -482,7 +564,7 @@ impl Store {
         &self,
         observer: Arc<dyn RepositoryLifecycleObserver>,
     ) -> Result<()> {
-        pending_postgres!("install_repository_lifecycle_observer", self, backend => backend.install_repository_lifecycle_observer(observer).await)
+        dispatch!(self, backend => backend.install_repository_lifecycle_observer(observer).await)
     }
 
     /// Match the actual installed owner; this is evidence, never permission.
@@ -491,46 +573,24 @@ impl Store {
         &self,
         observer: &Arc<dyn RepositoryLifecycleObserver>,
     ) -> bool {
-        pending_postgres!(panic "has_repository_lifecycle_observer", self, backend => backend.has_repository_lifecycle_observer(observer))
+        dispatch!(self, backend => backend.has_repository_lifecycle_observer(observer))
     }
 }
 
 impl crate::SqliteStore {
-    pub fn shares_repository_lifecycle_domain(&self, other: &Store) -> bool {
-        Arc::ptr_eq(
-            &self.repository_lifecycle,
-            &other.sqlite().repository_lifecycle,
-        )
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "same signature as the Postgres domain"
+    )]
+    pub(crate) fn repository_lifecycle_domain(&self) -> Result<Arc<LifecycleDomain>> {
+        Ok(self.repository_lifecycle.clone())
     }
 
     pub async fn begin_repository_pending_delete(
         &self,
         keys: &[RepositoryLifecycleKey],
     ) -> Result<RepositoryPendingDeleteGuard> {
-        if keys.is_empty() {
-            return Err(lifecycle_error("pending deletion requires original keys"));
-        }
-        let mut lifecycle = self.repository_lifecycle_write().await?;
-        let observer = {
-            let state = lifecycle
-                .domain
-                .state
-                .lock()
-                .map_err(|_| lifecycle_error("database domain poisoned"))?;
-            if state.invalidated {
-                return Err(lifecycle_error("database incarnation was retired"));
-            }
-            state.observer.clone()
-        };
-        // This incremented owner and captured observer are protected by the
-        // existing writer/install serialization. A first install now sees an
-        // active owner even if this begin captured no observer.
-        lifecycle.begun = true;
-        lifecycle.release_serialization();
-        if let Some(observer) = observer {
-            lifecycle.ticket = Some(observer.begin_pending_delete(keys)?);
-        }
-        Ok(RepositoryPendingDeleteGuard { lifecycle })
+        self.repository_lifecycle.begin_pending_delete(keys).await
     }
 
     pub async fn install_repository_lifecycle_observer(
@@ -574,13 +634,7 @@ impl crate::SqliteStore {
         &self,
         observer: &Arc<dyn RepositoryLifecycleObserver>,
     ) -> bool {
-        self.repository_lifecycle.state.lock().is_ok_and(|state| {
-            !state.invalidated
-                && state
-                    .observer
-                    .as_ref()
-                    .is_some_and(|installed| Arc::ptr_eq(installed, observer))
-        })
+        self.repository_lifecycle.has_observer(observer)
     }
 
     pub(crate) async fn repository_lifecycle_write(&self) -> Result<LifecycleWrite> {

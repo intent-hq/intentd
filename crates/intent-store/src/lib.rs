@@ -467,8 +467,9 @@ impl Store {
 }
 
 impl Store {
-    /// The `SQLite` backend behind this handle, for crate-internal code that
-    /// compares two handles' process-local state.
+    /// The `SQLite` backend behind this handle, for in-crate tests that
+    /// reach its process-local state.
+    #[cfg(test)]
     pub(crate) fn sqlite(&self) -> &SqliteStore {
         match &self.backend {
             Backend::Sqlite(store) => store,

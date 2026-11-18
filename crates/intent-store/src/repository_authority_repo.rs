@@ -12,7 +12,7 @@ use crate::{enum_from_db, Error, Result, Store};
 /// Positive, checked `SQLite` counter. Compare only for the same database and key.
 /// This private-service evidence has no wire representation or timestamp fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AuthorityRevision(u64);
+pub struct AuthorityRevision(pub(crate) u64);
 
 impl AuthorityRevision {
     /// The exact durable counter; never combine independent revisions into a hash.
@@ -125,7 +125,7 @@ fn db_error(error: sqlx::Error) -> Error {
     Error::Internal(format!("repository authority snapshot failed: {error}"))
 }
 
-fn counter(value: i64, positive: bool) -> Result<u64> {
+pub(crate) fn counter(value: i64, positive: bool) -> Result<u64> {
     u64::try_from(value)
         .ok()
         .filter(|v| !positive || *v > 0)
@@ -199,7 +199,7 @@ impl Store {
         principal_id: &PrincipalId,
         original_token_hash: Option<&str>,
     ) -> Result<RepositoryHostAuthoritySnapshot> {
-        pending_postgres!("repository_host_authority_snapshot", self, backend => backend.repository_host_authority_snapshot(principal_id, original_token_hash).await)
+        dispatch!(self, backend => backend.repository_host_authority_snapshot(principal_id, original_token_hash).await)
     }
 
     /// Read common workspace/host facts without supplying or looking up a human
@@ -215,7 +215,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<RepositoryWorkspaceAuthoritySnapshot> {
-        pending_postgres!("repository_workspace_authority_snapshot", self, backend => backend.repository_workspace_authority_snapshot(workspace_id).await)
+        dispatch!(self, backend => backend.repository_workspace_authority_snapshot(workspace_id).await)
     }
 
     /// Read exact original workspace/principal/optional personal credential facts
@@ -233,7 +233,7 @@ impl Store {
         principal_id: &PrincipalId,
         original_token_hash: Option<&str>,
     ) -> Result<RepositoryAuthoritySnapshot> {
-        pending_postgres!("repository_authority_snapshot", self, backend => backend.repository_authority_snapshot(workspace_id, principal_id, original_token_hash).await)
+        dispatch!(self, backend => backend.repository_authority_snapshot(workspace_id, principal_id, original_token_hash).await)
     }
 }
 

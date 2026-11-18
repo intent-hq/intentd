@@ -11,17 +11,17 @@ use crate::{Result, Store};
 /// A pending owner's opaque proof bound to the actual managed database/observer.
 /// Only that observer authenticates the erased proof; this envelope is no grant.
 pub struct RepositoryInitializationClaim {
-    domain: Arc<LifecycleDomain>,
-    observer: Arc<dyn RepositoryLifecycleObserver>,
-    original_owner: Box<dyn Any + Send>,
+    pub(crate) domain: Arc<LifecycleDomain>,
+    pub(crate) observer: Arc<dyn RepositoryLifecycleObserver>,
+    pub(crate) original_owner: Box<dyn Any + Send>,
 }
 
 /// A committed original initialization, still subject to owner retirement.
 /// The service must consume its private proof and allocate a NEW live origin;
 /// neither this receipt nor a stored ID upgrades any old/pending callback.
 pub struct RepositoryInitializationConfirmation {
-    domain: Arc<LifecycleDomain>,
-    observer: Arc<dyn RepositoryLifecycleObserver>,
+    pub(crate) domain: Arc<LifecycleDomain>,
+    pub(crate) observer: Arc<dyn RepositoryLifecycleObserver>,
     binding: RepositoryInitializationBinding,
     completion: Box<dyn Any + Send>,
 }
@@ -278,7 +278,7 @@ impl Store {
         observer: Arc<dyn RepositoryLifecycleObserver>,
         original_owner: Box<dyn Any + Send>,
     ) -> Result<RepositoryInitializationClaim> {
-        pending_postgres!("bind_repository_initialization_claim", self, backend => backend.bind_repository_initialization_claim(observer, original_owner))
+        dispatch!(self, backend => backend.bind_repository_initialization_claim(observer, original_owner))
     }
 
     /// Confirm only the original physical owner's real winning write or load.
@@ -294,7 +294,7 @@ impl Store {
         claim: RepositoryInitializationClaim,
         binding: RepositoryInitializationBinding,
     ) -> Result<RepositoryInitializationConfirmation> {
-        pending_postgres!("initialize_repository_acp_session", self, backend => backend.initialize_repository_acp_session(claim, binding).await)
+        dispatch!(self, backend => backend.initialize_repository_acp_session(claim, binding).await)
     }
 
     /// Preserve original persistence facts even when owner confirmation fails.
@@ -306,7 +306,7 @@ impl Store {
         claim: RepositoryInitializationClaim,
         binding: RepositoryInitializationBinding,
     ) -> RepositoryInitializationOutcome {
-        pending_postgres!(panic "initialize_repository_acp_session_outcome", self, backend => backend.initialize_repository_acp_session_outcome(claim, binding).await)
+        dispatch!(self, backend => backend.initialize_repository_acp_session_outcome(claim, binding).await)
     }
 
     /// Atomically bind an original private native family to the winning session
@@ -318,7 +318,7 @@ impl Store {
         binding: RepositoryInitializationBinding,
         enrollment: crate::ReviewContextEnrollmentIntent,
     ) -> RepositoryInitializationOutcome {
-        pending_postgres!(panic "initialize_repository_review_session_outcome", self, backend => backend.initialize_repository_review_session_outcome(claim, binding, enrollment).await)
+        dispatch!(self, backend => backend.initialize_repository_review_session_outcome(claim, binding, enrollment).await)
     }
 
     /// Preserve ordinary ACP result/accounting behavior in one transaction.
@@ -330,7 +330,7 @@ impl Store {
         claim: Option<RepositoryInitializationClaim>,
         binding: RepositoryInitializationBinding,
     ) -> RepositoryAcpCompatibilityOutcome {
-        pending_postgres!(panic "initialize_repository_acp_session_compatible", self, backend => backend.initialize_repository_acp_session_compatible(claim, binding).await)
+        dispatch!(self, backend => backend.initialize_repository_acp_session_compatible(claim, binding).await)
     }
 
     /// Consume a receipt only in its original managed domain/observer.
@@ -344,7 +344,7 @@ impl Store {
         observer: &Arc<dyn RepositoryLifecycleObserver>,
         confirmation: RepositoryInitializationConfirmation,
     ) -> Result<(RepositoryInitializationBinding, Box<dyn Any + Send>)> {
-        pending_postgres!("consume_repository_initialization_confirmation", self, backend => backend.consume_repository_initialization_confirmation(observer, confirmation))
+        dispatch!(self, backend => backend.consume_repository_initialization_confirmation(observer, confirmation))
     }
 }
 
@@ -851,17 +851,20 @@ impl crate::SqliteStore {
     }
 }
 
-struct CompatibilityBody {
-    canonical: String,
-    observed: RepositoryInitializationObservation,
-    effect: Option<RepositoryAcpCompatibilityEffect>,
-    rows: u64,
-    dispatched: bool,
-    strict_winner: bool,
+pub(crate) struct CompatibilityBody {
+    pub(crate) canonical: String,
+    pub(crate) observed: RepositoryInitializationObservation,
+    pub(crate) effect: Option<RepositoryAcpCompatibilityEffect>,
+    pub(crate) rows: u64,
+    pub(crate) dispatched: bool,
+    pub(crate) strict_winner: bool,
 }
 
 impl CompatibilityBody {
-    fn observed(canonical: String, observed: RepositoryInitializationObservation) -> Self {
+    pub(crate) fn observed(
+        canonical: String,
+        observed: RepositoryInitializationObservation,
+    ) -> Self {
         Self {
             canonical,
             observed,
@@ -872,7 +875,7 @@ impl CompatibilityBody {
         }
     }
 
-    fn into_result(self) -> RepositoryAcpCompatibilityResult {
+    pub(crate) fn into_result(self) -> RepositoryAcpCompatibilityResult {
         if !matches!(&self.observed, RepositoryInitializationObservation::Present {
             session_id: Some(session_id),
         } if *session_id == self.canonical)
@@ -895,7 +898,7 @@ impl CompatibilityBody {
     }
 }
 
-fn observation(stored: Option<&Option<String>>) -> RepositoryInitializationObservation {
+pub(crate) fn observation(stored: Option<&Option<String>>) -> RepositoryInitializationObservation {
     stored.map_or(RepositoryInitializationObservation::Missing, |session_id| {
         RepositoryInitializationObservation::Present {
             session_id: session_id.clone(),

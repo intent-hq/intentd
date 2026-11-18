@@ -1,3 +1,0 @@
-repository_authority_snapshot
-repository_host_authority_snapshot
-repository_workspace_authority_snapshot

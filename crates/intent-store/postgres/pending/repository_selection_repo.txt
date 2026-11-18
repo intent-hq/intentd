@@ -1,4 +1,0 @@
-repository_selection_snapshot
-reset_repository_selection
-write_repository_selection
-write_repository_selection_admitted

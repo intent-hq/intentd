@@ -10,7 +10,7 @@ use futures_util::FutureExt;
 use intent_core::{
     HistoricalTargetSource, RepositoryRootId, RepositoryRootKind, SavedReviewSelection, WorkspaceId,
 };
-use sqlx::{sqlite::SqliteRow, Row, SqliteConnection};
+use sqlx::SqliteConnection;
 
 use crate::repository_lifecycle::{LifecycleDomain, LifecycleWrite};
 use crate::{Error, Result, Store};
@@ -27,7 +27,7 @@ impl RepositoryRootIncarnation {
 
 /// Positive durable choice counter, independent of root and authority counters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RepositorySelectionRevision(u64);
+pub struct RepositorySelectionRevision(pub(crate) u64);
 impl RepositorySelectionRevision {
     #[must_use]
     pub fn get(self) -> u64 {
@@ -59,10 +59,10 @@ pub enum RepositoryStoredSelection {
 /// An owned observation, not serializable, constructible by IDs, or a grant.
 /// Fields are private so a caller cannot rewrite a captured comparison stamp.
 pub struct RepositorySelectionSnapshot {
-    domain: Arc<LifecycleDomain>,
+    pub(crate) domain: Arc<LifecycleDomain>,
     root: RepositoryRootId,
     binding: Option<RepositorySelectionBinding>,
-    state: Option<SelectionRow>,
+    pub(crate) state: Option<SelectionRow>,
     selection: Option<RepositoryStoredSelection>,
 }
 
@@ -133,9 +133,9 @@ pub struct RepositorySelectionWriteOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SelectionRow {
-    incarnation: u64,
-    revision: u64,
+pub(crate) struct SelectionRow {
+    pub(crate) incarnation: u64,
+    pub(crate) revision: u64,
     present: bool,
     binding: RepositorySelectionBinding,
     choice_incarnation: u64,
@@ -145,77 +145,90 @@ struct SelectionRow {
     record_id: Option<String>,
 }
 
-fn error() -> Error {
+/// One `repository_selection_state` row as stored, on either backend.
+#[derive(sqlx::FromRow)]
+pub(crate) struct StoredSelectionRow {
+    root_incarnation: i64,
+    selection_revision: i64,
+    root_present: i64,
+    repository_path: Option<String>,
+    worktree_path: Option<String>,
+    is_remote: Option<i64>,
+    registered_path: Option<String>,
+    choice_incarnation: i64,
+    choice_mode: String,
+    remote_name: Option<String>,
+    historical_source: Option<String>,
+    historical_record_id: Option<String>,
+}
+
+pub(crate) fn error() -> Error {
     Error::Internal("invalid or unavailable repository selection continuity".into())
 }
-fn sql_error(_: sqlx::Error) -> Error {
+pub(crate) fn sql_error(_: sqlx::Error) -> Error {
     error()
 }
-fn positive(row: &SqliteRow, field: &str) -> Result<u64> {
-    let n: i64 = row.try_get(field).map_err(sql_error)?;
+fn positive(n: i64) -> Result<u64> {
     u64::try_from(n).ok().filter(|n| *n > 0).ok_or_else(error)
 }
-fn text(row: &SqliteRow, field: &str) -> Result<Option<String>> {
-    row.try_get(field).map_err(sql_error)
-}
-fn bit(row: &SqliteRow, field: &str) -> Result<bool> {
-    match row.try_get::<i64, _>(field).map_err(sql_error)? {
+fn bit(n: i64) -> Result<bool> {
+    match n {
         0 => Ok(false),
         1 => Ok(true),
         _ => Err(error()),
     }
 }
-fn key(root: &RepositoryRootId) -> (&str, &str) {
+pub(crate) fn key(root: &RepositoryRootId) -> (&str, &str) {
     match &root.kind {
         RepositoryRootKind::Primary => ("primary", ""),
         RepositoryRootKind::Registered { git_root_id } => ("registered", git_root_id.as_str()),
     }
 }
-fn stored_binding(row: &SqliteRow, root: &RepositoryRootId) -> Result<RepositorySelectionBinding> {
+fn stored_binding(
+    row: &StoredSelectionRow,
+    root: &RepositoryRootId,
+) -> Result<RepositorySelectionBinding> {
     match &root.kind {
         RepositoryRootKind::Primary => {
-            if text(row, "registered_path")?.is_some() {
+            if row.registered_path.is_some() {
                 return Err(error());
             }
             Ok(RepositorySelectionBinding::Primary {
-                repository_path: text(row, "repository_path")?,
-                worktree_path: text(row, "worktree_path")?,
-                is_remote: bit(row, "is_remote")?,
+                repository_path: row.repository_path.clone(),
+                worktree_path: row.worktree_path.clone(),
+                is_remote: bit(row.is_remote.ok_or_else(error)?)?,
             })
         }
         RepositoryRootKind::Registered { .. } => {
-            if text(row, "repository_path")?.is_some()
-                || text(row, "worktree_path")?.is_some()
-                || row
-                    .try_get::<Option<i64>, _>("is_remote")
-                    .map_err(sql_error)?
-                    .is_some()
+            if row.repository_path.is_some()
+                || row.worktree_path.is_some()
+                || row.is_remote.is_some()
             {
                 return Err(error());
             }
             Ok(RepositorySelectionBinding::Registered {
-                path: text(row, "registered_path")?.ok_or_else(error)?,
+                path: row.registered_path.clone().ok_or_else(error)?,
             })
         }
     }
 }
-fn decode(row: &SqliteRow, root: &RepositoryRootId) -> Result<SelectionRow> {
-    let source = match text(row, "historical_source")?.as_deref() {
+fn decode(row: &StoredSelectionRow, root: &RepositoryRootId) -> Result<SelectionRow> {
+    let source = match row.historical_source.as_deref() {
         None => None,
         Some("workspace-metadata") => Some(HistoricalTargetSource::WorkspaceMetadata),
         Some("registered-root-metadata") => Some(HistoricalTargetSource::RegisteredRootMetadata),
         Some(_) => return Err(error()),
     };
     let state = SelectionRow {
-        incarnation: positive(row, "root_incarnation")?,
-        revision: positive(row, "selection_revision")?,
-        present: bit(row, "root_present")?,
+        incarnation: positive(row.root_incarnation)?,
+        revision: positive(row.selection_revision)?,
+        present: bit(row.root_present)?,
         binding: stored_binding(row, root)?,
-        choice_incarnation: positive(row, "choice_incarnation")?,
-        mode: row.try_get("choice_mode").map_err(sql_error)?,
-        remote: text(row, "remote_name")?,
+        choice_incarnation: positive(row.choice_incarnation)?,
+        mode: row.choice_mode.clone(),
+        remote: row.remote_name.clone(),
         source,
-        record_id: text(row, "historical_record_id")?,
+        record_id: row.historical_record_id.clone(),
     };
     if state.choice_incarnation > state.incarnation
         || state.source.is_some() != state.record_id.is_some()
@@ -232,7 +245,7 @@ fn decode(row: &SqliteRow, root: &RepositoryRootId) -> Result<SelectionRow> {
     }
     Ok(state)
 }
-fn valid_remote(name: &str) -> bool {
+pub(crate) fn valid_remote(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 1024
         && name.trim() == name
@@ -274,43 +287,62 @@ fn project(row: &SelectionRow, root: &RepositoryRootId) -> Result<RepositoryStor
     })
 }
 
+/// The primary binding from a `workspace` row's
+/// `(repository_path, worktree_path, is_remote)`.
+pub(crate) fn primary_binding(
+    (repository_path, worktree_path, is_remote): (Option<String>, Option<String>, i64),
+) -> Result<RepositorySelectionBinding> {
+    Ok(RepositorySelectionBinding::Primary {
+        repository_path,
+        worktree_path,
+        is_remote: bit(is_remote)?,
+    })
+}
+
 async fn read_at(
     store: &crate::SqliteStore,
     root: &RepositoryRootId,
     conn: &mut SqliteConnection,
 ) -> Result<RepositorySelectionSnapshot> {
-    let workspace =
-        sqlx::query("SELECT repository_path,worktree_path,is_remote FROM workspace WHERE id=?")
+    let workspace: Option<(Option<String>, Option<String>, i64)> =
+        sqlx::query_as("SELECT repository_path,worktree_path,is_remote FROM workspace WHERE id=?")
             .bind(root.workspace_id.as_str())
             .fetch_optional(&mut *conn)
             .await
             .map_err(sql_error)?;
     let binding = match (&root.kind, workspace) {
         (_, None) => None,
-        (RepositoryRootKind::Primary, Some(row)) => Some(RepositorySelectionBinding::Primary {
-            repository_path: text(&row, "repository_path")?,
-            worktree_path: text(&row, "worktree_path")?,
-            is_remote: bit(&row, "is_remote")?,
-        }),
+        (RepositoryRootKind::Primary, Some(row)) => Some(primary_binding(row)?),
         (RepositoryRootKind::Registered { git_root_id }, Some(_)) => {
-            sqlx::query("SELECT path FROM workspace_git_root WHERE id=? AND workspace_id=?")
+            sqlx::query_scalar("SELECT path FROM workspace_git_root WHERE id=? AND workspace_id=?")
                 .bind(git_root_id.as_str())
                 .bind(root.workspace_id.as_str())
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(sql_error)?
-                .map(|r| {
-                    Ok(RepositorySelectionBinding::Registered {
-                        path: r.try_get("path").map_err(sql_error)?,
-                    })
-                })
-                .transpose()?
+                .map(|path| RepositorySelectionBinding::Registered { path })
         }
     };
     let (kind, id) = key(root);
-    let state = sqlx::query("SELECT * FROM repository_selection_state WHERE workspace_id=? AND root_kind=? AND root_id=?")
-        .bind(root.workspace_id.as_str()).bind(kind).bind(id).fetch_optional(&mut *conn).await.map_err(sql_error)?
-        .map(|r| decode(&r,root)).transpose()?;
+    let state = sqlx::query_as("SELECT * FROM repository_selection_state WHERE workspace_id=? AND root_kind=? AND root_id=?")
+        .bind(root.workspace_id.as_str()).bind(kind).bind(id).fetch_optional(&mut *conn).await.map_err(sql_error)?;
+    assemble(
+        store.repository_lifecycle.clone(),
+        root,
+        binding,
+        state.as_ref(),
+    )
+}
+
+/// The snapshot from one transaction's reads: the root's binding and its
+/// stored selection row.
+pub(crate) fn assemble(
+    domain: Arc<LifecycleDomain>,
+    root: &RepositoryRootId,
+    binding: Option<RepositorySelectionBinding>,
+    state: Option<&StoredSelectionRow>,
+) -> Result<RepositorySelectionSnapshot> {
+    let state = state.map(|r| decode(r, root)).transpose()?;
     if binding.is_some() != state.as_ref().is_some_and(|r| r.present)
         || state
             .as_ref()
@@ -320,7 +352,7 @@ async fn read_at(
     }
     let selection = state.as_ref().map(|r| project(r, root)).transpose()?;
     Ok(RepositorySelectionSnapshot {
-        domain: store.repository_lifecycle.clone(),
+        domain,
         root: root.clone(),
         binding,
         state,
@@ -328,19 +360,19 @@ async fn read_at(
     })
 }
 
-fn desired(change: &RepositorySelectionChange) -> (&str, Option<&str>) {
+pub(crate) fn desired(change: &RepositorySelectionChange) -> (&str, Option<&str>) {
     match change {
         RepositorySelectionChange::Automatic => ("automatic", None),
         RepositorySelectionChange::Reset => ("reset", None),
         RepositorySelectionChange::ExplicitRemote { remote_name } => ("remote", Some(remote_name)),
     }
 }
-enum SelectionComparison {
+pub(crate) enum SelectionComparison {
     Write(RepositorySelectionSnapshot),
     Finished(RepositorySelectionWriteResult),
 }
 
-fn classify(
+pub(crate) fn classify(
     current: RepositorySelectionSnapshot,
     original: &RepositorySelectionSnapshot,
     change: &RepositorySelectionChange,
@@ -359,7 +391,7 @@ fn classify(
     }
     SelectionComparison::Write(current)
 }
-async fn settled(
+pub(crate) async fn settled(
     lifecycle: LifecycleWrite,
     result: RepositorySelectionWriteResult,
     persistence: RepositorySelectionPersistence,
@@ -371,10 +403,10 @@ async fn settled(
     }
 }
 
-struct SelectionAdmission<'a> {
-    authority: &'a crate::RepositoryAuthoritySnapshot,
-    token_hash: Option<&'a str>,
-    admit: Option<Box<dyn FnOnce() -> Result<()> + Send + 'a>>,
+pub(crate) struct SelectionAdmission<'a> {
+    pub(crate) authority: &'a crate::RepositoryAuthoritySnapshot,
+    pub(crate) token_hash: Option<&'a str>,
+    pub(crate) admit: Option<Box<dyn FnOnce() -> Result<()> + Send + 'a>>,
 }
 impl SelectionAdmission<'_> {
     async fn current(
@@ -401,7 +433,7 @@ async fn settle_selection(lifecycle: LifecycleWrite) -> Result<()> {
         .await
         .map_err(|_| Error::Internal("repository selection settlement failed".into()))?
 }
-async fn settled_denial(
+pub(crate) async fn settled_denial(
     lifecycle: LifecycleWrite,
     error: Error,
 ) -> RepositorySelectionWriteOutcome {
@@ -411,7 +443,7 @@ async fn settled_denial(
         persistence: RepositorySelectionPersistence::NoEffect,
     }
 }
-fn admission_denied() -> Error {
+pub(crate) fn admission_denied() -> Error {
     Error::Forbidden("Repository selection unavailable".into())
 }
 
@@ -425,7 +457,7 @@ impl Store {
         &self,
         root: &RepositoryRootId,
     ) -> Result<RepositorySelectionSnapshot> {
-        pending_postgres!("repository_selection_snapshot", self, backend => backend.repository_selection_snapshot(root).await)
+        dispatch!(self, backend => backend.repository_selection_snapshot(root).await)
     }
 
     /// Compare against the original domain/root/choice facts. Unknown attempts
@@ -435,7 +467,7 @@ impl Store {
         original: &RepositorySelectionSnapshot,
         change: RepositorySelectionChange,
     ) -> RepositorySelectionWriteOutcome {
-        pending_postgres!(panic "write_repository_selection", self, backend => backend.write_repository_selection(original, change).await)
+        dispatch!(self, backend => backend.write_repository_selection(original, change).await)
     }
 
     /// Native selection CAS under the caller's already validated original authority.
@@ -452,7 +484,7 @@ impl Store {
         original_token_hash: Option<&str>,
         admit: impl FnOnce() -> Result<()> + Send,
     ) -> RepositorySelectionWriteOutcome {
-        pending_postgres!(panic "write_repository_selection_admitted", self, backend => backend.write_repository_selection_admitted(original, change, expected_authority, original_token_hash, admit).await)
+        dispatch!(self, backend => backend.write_repository_selection_admitted(original, change, expected_authority, original_token_hash, admit).await)
     }
 
     /// Persist an explicit reset through the same comparison/transaction path.
@@ -460,7 +492,7 @@ impl Store {
         &self,
         original: &RepositorySelectionSnapshot,
     ) -> RepositorySelectionWriteOutcome {
-        pending_postgres!(panic "reset_repository_selection", self, backend => backend.reset_repository_selection(original).await)
+        dispatch!(self, backend => backend.reset_repository_selection(original).await)
     }
 }
 
