@@ -61,6 +61,7 @@ fn map_row(r: &PgRow, displayed: &DisplayedOverlay) -> Result<StoredTab> {
                 .map(AgentId),
             owner_agent_name: r.try_get("owner_agent_name").map_err(&get)?,
             visibility: BrowserTabVisibility::parse(&visibility),
+            navigation_only: r.try_get::<i64, _>("navigation_only").map_err(&get)? != 0,
             emulated_size,
             created_at: r.try_get("created_at").map_err(&get)?,
             updated_at: r.try_get("updated_at").map_err(&get)?,
@@ -133,15 +134,16 @@ impl PgStore {
         sqlx::query(
             "INSERT INTO browser_tab (tenant_id, tab_id, workspace_id, host_client_id, url, \
              requested_url, title, owner_agent_id, owner_agent_name, visibility, emulated_width, \
-             emulated_height, created_at, updated_at, closed_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULL) \
+             emulated_height, created_at, updated_at, navigation_only, closed_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NULL) \
              ON CONFLICT (tenant_id, tab_id) DO UPDATE SET \
              workspace_id = excluded.workspace_id, \
              url = excluded.url, requested_url = excluded.requested_url, title = excluded.title, \
              owner_agent_id = excluded.owner_agent_id, \
              owner_agent_name = excluded.owner_agent_name, visibility = excluded.visibility, \
              emulated_width = excluded.emulated_width, \
-             emulated_height = excluded.emulated_height, updated_at = excluded.updated_at",
+             emulated_height = excluded.emulated_height, updated_at = excluded.updated_at, \
+             navigation_only = GREATEST(browser_tab.navigation_only, excluded.navigation_only)",
         )
         .bind(self.tenant())
         .bind(&tab.tab_id)
@@ -157,6 +159,7 @@ impl PgStore {
         .bind(tab.emulated_size.map(|s| i64::from(s.height)))
         .bind(&tab.created_at)
         .bind(&tab.updated_at)
+        .bind(i64::from(tab.navigation_only))
         .execute(&mut **tx)
         .await
         .map_err(failed("write browser tab"))?;
@@ -301,6 +304,11 @@ impl PgStore {
         };
         let mut changes = serde_json::Map::new();
         let host_changes = tab.host_client_id != *new_host;
+        if tab.navigation_only && host_changes {
+            return Err(Error::InvalidParams(
+                "native browser tabs cannot move between clients".into(),
+            ));
+        }
         if host_changes {
             changes.insert(
                 "hostClientId".to_string(),
@@ -345,7 +353,7 @@ impl PgStore {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM browser_tab \
              WHERE tenant_id = $1 AND workspace_id = $2 AND closed_at IS NULL \
-             AND owner_agent_id IS NOT NULL AND host_client_id <> $3 {ORDER}"
+             AND owner_agent_id IS NOT NULL AND navigation_only = 0 AND host_client_id <> $3 {ORDER}"
         )))
         .bind(self.tenant())
         .bind(&id.0)
@@ -380,7 +388,8 @@ impl PgStore {
         }
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM browser_tab \
-             WHERE tenant_id = $1 AND closed_at IS NULL AND host_client_id = ANY($2) {ORDER}"
+             WHERE tenant_id = $1 AND closed_at IS NULL AND navigation_only = 0 \
+             AND host_client_id = ANY($2) {ORDER}"
         )))
         .bind(self.tenant())
         .bind(&old_hosts)

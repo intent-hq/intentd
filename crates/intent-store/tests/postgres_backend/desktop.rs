@@ -695,6 +695,7 @@ fn input(id: &str, ws: &str, tenant: &str) -> BrowserTabInput {
         owner_agent_id: None,
         owner_agent_name: None,
         visibility: BrowserTabVisibility::Visible,
+        navigation_only: false,
         emulated_size: None,
         displayed: None,
     }
@@ -714,6 +715,69 @@ async fn open_tab(store: &Store, host: &str, input: BrowserTabInput) -> BrowserT
         other => panic!("expected opened, got {other:?}"),
     }
 }
+
+parity_test!(native_navigation_tabs_stay_on_host, |store, tenant, db| {
+    seed(&store, db, tenant).await;
+    let (c1, c2, wa) = (cid("c1"), cid("c2"), wid("ws-a"));
+    let mut native = input("t-native", "ws-a", tenant);
+    native.navigation_only = true;
+    native.owner_agent_id = Some(aid("a1"));
+    assert!(open_tab(&store, "c1", native.clone()).await.navigation_only);
+
+    // A host refresh or reconnect snapshot cannot promote a native tab to automation.
+    native.navigation_only = false;
+    native.title = Some(format!("refreshed by {tenant}"));
+    assert!(
+        store
+            .upsert_browser_tab(&c1, native.clone())
+            .await
+            .unwrap()
+            .tab()
+            .navigation_only
+    );
+    native.url = format!("https://{tenant}.example/reconnected");
+    let synced = store.sync_browser_tabs(&c1, vec![native]).await.unwrap();
+    assert_eq!(synced.updated.len(), 1);
+    assert!(synced.updated[0].0.navigation_only);
+    assert!(invalid(
+        &store.reassign_browser_tab_host("t-native", &c2, None).await
+    ));
+    // Claiming ownership on the same device remains supported.
+    assert!(
+        store
+            .reassign_browser_tab_host("t-native", &c1, Some(&aid("a2")))
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .navigation_only
+    );
+
+    let mut desktop = input("t-desktop", "ws-a", tenant);
+    desktop.owner_agent_id = Some(aid("a1"));
+    assert!(!open_tab(&store, "c1", desktop).await.navigation_only);
+    assert_eq!(
+        moved_ids(&store.reassign_claimed_browser_tabs(&wa, &c2).await.unwrap()),
+        ["t-desktop"]
+    );
+    open_tab(&store, "c1", input("t-free", "ws-a", tenant)).await;
+    assert_eq!(
+        moved_ids(
+            &store
+                .reassign_browser_tabs_from_hosts(&c2, std::slice::from_ref(&c1), &|_| true)
+                .await
+                .unwrap()
+        ),
+        ["t-free"]
+    );
+    let persisted = store.get_browser_tab("t-native").await.unwrap().unwrap();
+    assert!(persisted.navigation_only);
+    assert_eq!(persisted.host_client_id, c1);
+    assert_eq!(
+        persisted.url,
+        format!("https://{tenant}.example/reconnected")
+    );
+});
 
 parity_test!(browser_tab_reports_and_closes, |store, tenant, db| {
     seed(&store, db, tenant).await;
