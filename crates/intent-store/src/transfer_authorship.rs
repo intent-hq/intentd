@@ -94,7 +94,7 @@ fn fallback_author(rows: &Rows) -> Option<PrincipalId> {
 pub(crate) fn authors_to_snapshot(rows: &Rows) -> Result<Vec<PrincipalId>> {
     let fallback = fallback_author(rows);
     let mut ids = HashSet::new();
-    for (table, objects) in rows.iter() {
+    for (table, objects) in rows {
         for row in objects {
             if let AuthorMetadata::Candidate(metadata) = metadata(table, row)? {
                 if needs_snapshot(metadata.as_ref()) {

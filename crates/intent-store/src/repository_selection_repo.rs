@@ -165,10 +165,6 @@ pub(crate) struct StoredSelectionRow {
 pub(crate) fn error() -> Error {
     Error::Internal("invalid or unavailable repository selection continuity".into())
 }
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Result::map_err passes its owned database error"
-)]
 pub(crate) fn sql_error(_: sqlx::Error) -> Error {
     error()
 }
