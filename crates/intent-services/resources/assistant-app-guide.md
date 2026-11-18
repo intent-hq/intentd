@@ -246,8 +246,10 @@ Appearance preferences for all chats on this device.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/ChatAppearanceSettings.svelte; src/lib/components/chat/ChatContentLane.svelte; src/features/layout/tab-types/AgentViewSettingsDropdown.svelte. Test-build behavior pending its frontend release. -->
 
-When asked about the experimental **Notch dock** in test builds, its switch is in
-**Settings → Appearance → Notch dock**. The switch follows changes from Settings,
+When asked about the **Notch dock**, its switch is in
+**Settings → Appearance → Notch dock**. Starting with the desktop release that turns
+it on by default, the dock is on unless the user turned it off; a user who turned it
+off keeps it off. The switch follows changes from Settings,
 **Window → Show Intent Dock**, and the dock's **Hide** action without a refresh,
 including when viewing another machine.
 
@@ -1020,6 +1022,8 @@ defaults.
 <!-- Labs (device rail): describe only when explicitly asked about the device rail
 or when developing or testing it, and say it is Labs. In the desktop app,
 Settings → Advanced → Labs → Machine rail shows the machines kept in this window.
+Starting with the desktop release that turns it on by default, the rail is on unless
+the user turned it off; a user who turned it off keeps it off.
 Frame windows require the frontend release containing intent-hq/cloudlands-fe#4691.
 Until that release, the window's own machine stays first in the rail and cannot be
 moved or removed; describe the behavior below only with that release.
