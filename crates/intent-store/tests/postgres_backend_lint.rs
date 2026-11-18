@@ -151,19 +151,27 @@ fn ctes(sql: &str) -> (Vec<Cte>, bool) {
             continue;
         }
         let open = words[i + 2].0;
-        let mut depth = 0usize;
-        let mut close = sql.len();
-        for (j, b) in sql.bytes().enumerate().skip(open) {
-            match b {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = j;
-                        break;
-                    }
+        // Parentheses inside quoted text or a `--` comment do not count.
+        let bytes = sql.as_bytes();
+        let (mut depth, mut close) = (0usize, sql.len());
+        let (mut in_string, mut in_comment) = (false, false);
+        for (j, &b) in bytes.iter().enumerate().skip(open) {
+            if in_comment {
+                in_comment = b != b'\n';
+            } else if b == b'\'' {
+                in_string = !in_string;
+            } else if in_string {
+                // Quoted text: no comment or parenthesis starts here.
+            } else if b == b'-' && bytes.get(j + 1) == Some(&b'-') {
+                in_comment = true;
+            } else if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                depth -= 1;
+                if depth == 0 {
+                    close = j;
+                    break;
                 }
-                _ => {}
             }
         }
         let name = words[i].1.trim_start_matches(',').to_owned();
@@ -282,6 +290,11 @@ fn the_tenant_rule_catches_unscoped_shapes() {
     // Inside its own non-recursive body, a WITH name is still the real table.
     assert_eq!(
         violations("with note as (select id from note n) select id from note"),
+        ["FROM note"]
+    );
+    // A parenthesis in quoted text does not end the body early.
+    assert_eq!(
+        violations("with note as (select ')' as marker, id from note n) select id from note"),
         ["FROM note"]
     );
     // A table that shares no name with a WITH clause is still checked.
