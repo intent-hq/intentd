@@ -239,13 +239,11 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
-Font picker search is in development and not yet released. In builds that include
-it, open **Settings → Appearance → Font Style → Font** and type part of a font
-name, regardless of case.
-Use the arrow keys and Enter to choose a result. Typing or finding no matches keeps
-the current font until you choose another.
+Open **Settings → Appearance → Font Style → Font** and type part of a font name
+to search, regardless of case. Use the arrow keys and Enter to choose a result.
+Typing or finding no matches keeps the current font until you choose another.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/routes/(app)/settings/+page.svelte (code-font); src/features/settings/FontPicker.svelte; messages/en.json (settings_section_fontStyle, settings_font_code_label). Coordinate with the frontend search release before describing this as generally available. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/routes/(app)/settings/+page.svelte (code-font); src/features/settings/FontPicker.svelte; messages/en.json (settings_section_fontStyle, settings_font_code_label). -->
 
 In test builds with **Full width**, open **Settings → Appearance → Full width**.
 It uses the full panel width for messages, the composer, and status content and is
