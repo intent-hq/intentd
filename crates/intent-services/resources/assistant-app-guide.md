@@ -525,7 +525,8 @@ finding the QR control.
 
 ## Find work on another device
 
-<!-- Machine rail (desktop app only): describe when asked.
+<!-- Machine rail (desktop app only): describe when asked. It is a Labs feature until the
+desktop release that moves its switch to Settings → Appearance; label it Labs before then.
 With the rail enabled, a machine's update, startup, and connection recovery screen
 leaves the rail available to switch to another machine. Each machine keeps its own
 tabs and drafts. Desktop release notes and app update progress belong to the app;
