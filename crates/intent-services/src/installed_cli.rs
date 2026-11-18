@@ -185,8 +185,10 @@ impl InstalledContext {
             );
         }
         if self.codex_api_key {
-            self.env
-                .insert(DEFAULT_AUTH_REQUEST.into(), CODEX_API_KEY_AUTH_REQUEST.into());
+            self.env.insert(
+                DEFAULT_AUTH_REQUEST.into(),
+                CODEX_API_KEY_AUTH_REQUEST.into(),
+            );
         }
         self.context_key = None;
         self.profile = Some(profile);
@@ -640,7 +642,9 @@ fn codex_api_key(profile: &ProfileEnv) -> Option<&str> {
 /// the adapter's login never reads or replaces the user's `~/.codex` login.
 /// It persists so sessions can resume.
 fn codex_api_key_home(home: &Path, provider_ref: &str) -> PathBuf {
-    let id = provider_ref.split_once('@').map_or(provider_ref, |(_, id)| id);
+    let id = provider_ref
+        .split_once('@')
+        .map_or(provider_ref, |(_, id)| id);
     let id: String = id
         .chars()
         .map(|c| {

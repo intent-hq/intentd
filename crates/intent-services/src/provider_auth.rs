@@ -648,9 +648,9 @@ async fn probe_provider(
         // The adapter signs a Codex API key profile in at launch, so a
         // `login status` before the first launch says nothing about the key.
         "codex"
-            if context
-                .as_ref()
-                .is_some_and(crate::installed_cli::InstalledContext::signs_in_with_codex_api_key) =>
+            if context.as_ref().is_some_and(
+                crate::installed_cli::InstalledContext::signs_in_with_codex_api_key,
+            ) =>
         {
             AuthVerdict::plain(Some(true))
         }
