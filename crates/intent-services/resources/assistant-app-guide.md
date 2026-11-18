@@ -518,6 +518,25 @@ Pairing links and QR codes contain credentials; keep them private. A visible QR 
 phone can reach the host. Diagnose address/network reachability separately from
 finding the QR control.
 
+## Keep the iPhone Live Activity and alerts current while Intent is closed
+
+Turn on **Settings → Mobile → Push notifications** on each machine whose agents should
+reach the phone (setting `push.relayEnabled`, off by default; `intentd settings
+push.relayEnabled true` does the same on a headless host). The owner and host members can
+use it; workspace guests cannot. While it is on, the machine sends workspace status to
+Intent's push relay, which updates the iPhone's Live Activity and sends agent alerts even
+when the app is closed. The row shows how many phones receive updates, or **Paused — no
+phone linked** when none has linked yet.
+
+A phone links itself the next time it connects with **Live Activities** on in the Intent
+app (**Settings → Notifications**). An agent that finishes while the card is showing
+appears on the card with its summary instead of as a separate notification. Turning the
+switch off stops sending and ends that machine's Live Activities. Machines without the
+switch, or with it off, keep the app's own Live Activity and notifications, which only
+update while the app is running.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/PushNotificationSettings.svelte; packages/cloudlands-fe/src/features/settings/push-status-line.ts; packages/intentd/crates/intent-services/src/push_relay.rs; packages/ios/Intent/LiveActivity/Relay/PushRelayController.swift; intent-hq/intent-push (relay). -->
+
 ## Find work on another device
 
 <!-- Labs (machine rail, desktop app only): describe when asked, and label it Labs.
