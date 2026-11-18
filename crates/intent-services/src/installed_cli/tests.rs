@@ -2438,3 +2438,87 @@ fn missing_cli_discovery_is_classified_as_cli_missing() {
         assert_eq!(String::from(err), expected);
     }
 }
+
+#[test]
+fn codex_api_key_profile_runs_in_its_own_home_and_signs_in_with_the_key() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let personal = root.path().join("personal");
+    std::fs::create_dir_all(&personal).unwrap();
+    std::fs::write(personal.join("auth.json"), "personal-login").unwrap();
+    let context = base.with_profile(Some(profile(
+        "codex@work/1",
+        "f1",
+        &[
+            ("CODEX_API_KEY", Some("sk-work")),
+            ("CODEX_ACCESS_TOKEN", None),
+            ("OPENAI_API_KEY", None),
+        ],
+    )));
+    let home = root.path().join(".intent/codex-api-key/work-1");
+    assert!(context.signs_in_with_codex_api_key());
+    assert_eq!(context.codex_home(), Some(home.clone()));
+    assert!(home.is_dir());
+    let command = launch(&context, root.path());
+    assert_eq!(env(&command, "CODEX_HOME"), Some(home.into_os_string()));
+    assert_eq!(
+        env(&command, "DEFAULT_AUTH_REQUEST"),
+        Some(r#"{"methodId":"api-key"}"#.into())
+    );
+    assert_eq!(env(&command, "CODEX_API_KEY"), Some("sk-work".into()));
+    let mut isolated = Command::new("unused-adapter");
+    context.apply_isolated(&mut isolated);
+    assert_eq!(
+        env(&isolated, "DEFAULT_AUTH_REQUEST"),
+        Some(r#"{"methodId":"api-key"}"#.into())
+    );
+    assert_eq!(
+        std::fs::read_to_string(personal.join("auth.json")).unwrap(),
+        "personal-login"
+    );
+}
+
+#[test]
+fn codex_api_key_home_drops_the_login_of_a_replaced_key_only() {
+    let root = tempfile::tempdir().unwrap();
+    let with_key = |key: &str| {
+        conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n").with_profile(Some(
+            profile("codex@work", "f1", &[("CODEX_API_KEY", Some(key))]),
+        ))
+    };
+    let home = with_key("sk-one").codex_home().unwrap();
+    std::fs::write(home.join("auth.json"), "login-one").unwrap();
+    let _ = with_key("sk-one");
+    assert_eq!(
+        std::fs::read_to_string(home.join("auth.json")).unwrap(),
+        "login-one"
+    );
+    let _ = with_key("sk-two");
+    assert!(!home.join("auth.json").exists());
+}
+
+#[test]
+fn codex_profiles_without_an_api_key_keep_their_account_home() {
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("work");
+    for entries in [
+        vec![("CODEX_ACCESS_TOKEN", Some("a.b.c"))],
+        vec![
+            ("CODEX_HOME", Some(work.to_str().unwrap())),
+            ("CODEX_API_KEY", Some("sk-work")),
+        ],
+        vec![("CODEX_API_KEY", Some(""))],
+    ] {
+        let context = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n")
+            .with_profile(Some(profile("codex@work", "f1", &entries)));
+        let command = launch(&context, root.path());
+        assert_eq!(env(&command, "DEFAULT_AUTH_REQUEST"), None, "{entries:?}");
+        assert!(!context.signs_in_with_codex_api_key(), "{entries:?}");
+        assert_ne!(
+            context.codex_home(),
+            Some(root.path().join(".intent/codex-api-key/work")),
+            "{entries:?}"
+        );
+    }
+    assert!(!root.path().join(".intent").exists());
+}
