@@ -211,6 +211,25 @@ fn the_tenant_rule_catches_unscoped_shapes() {
          from note where tenant_id = $1"
     )
     .is_empty());
+    // A join inside grouping parentheses, a `(with` subquery and a
+    // parenthesis in a quoted string all leave their tables checked.
+    assert!(
+        violations("select n.id from (note n join task t on t.id = n.id) where n.id = $1")
+            .contains(&"JOIN task".to_owned())
+    );
+    assert!(violations(
+        "select id from task where tenant_id = $1 \
+         and id in (with c as (select id from note) select id from c)"
+    )
+    .contains(&"FROM note".to_owned()));
+    assert_eq!(
+        violations("select '(' || name from note where id = $1"),
+        ["FROM note"]
+    );
+    assert_eq!(
+        violations("select name -- count(\nfrom note where id = $1"),
+        ["FROM note"]
+    );
 }
 
 /// The functions in `text` that write without the tenant's writer lock:
