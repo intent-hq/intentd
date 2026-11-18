@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.242] - 2026-11-18
+
+### 🚀 Features
+
+- *(store)* Port event and event subscription store methods to Postgres ([#3493](https://github.com/intent-hq/intentd/pull/3493))
+
+
 ## [0.11.241] - 2026-11-18
 
 ### 🚀 Features
