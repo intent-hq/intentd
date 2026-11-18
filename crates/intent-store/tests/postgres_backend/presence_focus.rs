@@ -185,11 +185,15 @@ parity_test!(
             note_at("ws-a", "n1"),
             agent_at("ws-a", "ag1"),
         ];
+        let winner = focus("ws-a", me.clone(), alice.id.clone(), all.clone())
+            .await
+            .unwrap();
+        assert_eq!(winner, agent_at("ws-a", "ag1"));
+        // The caller's object comes back as given, keys in its own order:
+        // the wire re-emits it, so a reordered copy would change the bytes.
         assert_eq!(
-            focus("ws-a", me.clone(), alice.id.clone(), all.clone())
-                .await
-                .unwrap(),
-            agent_at("ws-a", "ag1")
+            serde_json::to_string(&winner).unwrap(),
+            serde_json::to_string(&all[3]).unwrap()
         );
         assert_eq!(
             focus("ws-a", me.clone(), alice.id.clone(), all[..3].to_vec())

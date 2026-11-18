@@ -19,10 +19,12 @@ impl PgStore {
         person: &PrincipalId,
         candidates: &[Value],
     ) -> Result<Value> {
-        let candidates = serde_json::to_string(candidates)
+        let encoded = serde_json::to_string(candidates)
             .map_err(|_| Error::Internal("presence focus encoding failed".into()))?;
         let mut tx = self.begin().await.map_err(read_failed)?;
-        let row: Option<(Option<String>,)> = sqlx::query_as(
+        // Select the winner's index, not its JSON: a jsonb round trip would
+        // reorder its keys, and the caller's object goes out on the wire.
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
             "WITH candidates AS (SELECT e.key::bigint AS ord, e.value AS target, \
                  sqlite_json_extract(e.value, '$.workspaceId') AS workspace_id, \
                  sqlite_json_extract(e.value, '$.agentId') AS agent_id, \
@@ -44,15 +46,15 @@ impl PgStore {
                        WHERE a.tenant_id = $1 AND a.id = c.agent_id AND a.workspace_id = c.workspace_id)) \
                    AND (c.note_id IS NULL OR EXISTS (SELECT 1 FROM note n \
                        WHERE n.tenant_id = $1 AND n.id = c.note_id AND n.workspace_id = c.workspace_id))) \
-             SELECT (SELECT target FROM permitted ORDER BY (workspace_id = $3) DESC, \
+             SELECT (SELECT ord FROM permitted ORDER BY (workspace_id = $3) DESC, \
                  workspace_id COLLATE \"C\", \
                  CASE WHEN agent_id IS NOT NULL THEN 0 WHEN note_id IS NOT NULL THEN 1 ELSE 2 END, \
-                 COALESCE(agent_id, note_id, '') COLLATE \"C\", ord LIMIT 1) AS target \
+                 COALESCE(agent_id, note_id, '') COLLATE \"C\", ord LIMIT 1) AS ord \
              WHERE EXISTS (SELECT 1 FROM access WHERE workspace_id = $3 AND principal_id = $4) \
                AND EXISTS (SELECT 1 FROM access WHERE workspace_id = $3 AND principal_id = $5)",
         )
         .bind(self.tenant())
-        .bind(&candidates)
+        .bind(&encoded)
         .bind(source.as_str())
         .bind(viewer.as_str())
         .bind(person.as_str())
@@ -61,10 +63,13 @@ impl PgStore {
         .await
         .map_err(read_failed)?;
         tx.commit().await.map_err(read_failed)?;
-        let (target,) = row.ok_or_else(|| Error::NotFound("presence focus".into()))?;
-        target.map_or(Ok(Value::Null), |value| {
-            serde_json::from_str(&value)
-                .map_err(|_| Error::Internal("presence focus decoding failed".into()))
+        let (ord,) = row.ok_or_else(|| Error::NotFound("presence focus".into()))?;
+        ord.map_or(Ok(Value::Null), |ord| {
+            usize::try_from(ord)
+                .ok()
+                .and_then(|i| candidates.get(i))
+                .cloned()
+                .ok_or_else(|| Error::Internal("presence focus decoding failed".into()))
         })
     }
 }
