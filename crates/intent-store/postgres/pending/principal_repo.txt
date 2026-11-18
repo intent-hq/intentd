@@ -1,2 +1,0 @@
-archive_workspace_detaching_guests
-archive_workspace_detaching_guests_unless_auto_archive_disabled

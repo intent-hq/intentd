@@ -853,7 +853,7 @@ impl Store {
         id: &WorkspaceId,
         archived_at: &str,
     ) -> Result<ArchivedGuestSweep> {
-        pending_postgres!("archive_workspace_detaching_guests", self, backend => backend.archive_workspace_detaching_guests(id, archived_at).await)
+        dispatch!(self, backend => backend.archive_workspace_detaching_guests(id, archived_at).await)
     }
 
     /// The automatic-sweep variant of [`Self::archive_workspace_detaching_guests`]:
@@ -870,7 +870,7 @@ impl Store {
         id: &WorkspaceId,
         archived_at: &str,
     ) -> Result<Option<ArchivedGuestSweep>> {
-        pending_postgres!("archive_workspace_detaching_guests_unless_auto_archive_disabled", self, backend => backend.archive_workspace_detaching_guests_unless_auto_archive_disabled(id, archived_at).await)
+        dispatch!(self, backend => backend.archive_workspace_detaching_guests_unless_auto_archive_disabled(id, archived_at).await)
     }
 
     /// Record a redemption of an **open** invite by `principal_id`: stamps
