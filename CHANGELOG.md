@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.244] - 2026-11-18
+
+### 🚀 Features
+
+- *(profiles)* Sign Codex in with a profile's CODEX_API_KEY ([#3509](https://github.com/intent-hq/intentd/pull/3509))
+
+### 🧪 Testing
+
+- *(store)* Check the Postgres tenant rule on parsed SQL ([#3510](https://github.com/intent-hq/intentd/pull/3510))
+
+
 ## [0.11.243] - 2026-11-18
 
 ### 🚀 Features
