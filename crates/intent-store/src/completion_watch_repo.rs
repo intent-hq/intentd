@@ -51,7 +51,7 @@ impl Store {
         completion_identity: Option<&str>,
         delivered_at: &str,
     ) -> Result<()> {
-        pending_postgres!("retire_completion_watch_after_delivery", self, backend => backend.retire_completion_watch_after_delivery(watch_id, parent_agent_id, child_agent_id, completion_identity, delivered_at).await)
+        dispatch!(self, backend => backend.retire_completion_watch_after_delivery(watch_id, parent_agent_id, child_agent_id, completion_identity, delivered_at).await)
     }
 
     /// Atomically settle a delivered delegation group: failed children that
@@ -68,7 +68,7 @@ impl Store {
         group_id: &str,
         retain_children: &[AgentId],
     ) -> Result<()> {
-        pending_postgres!("settle_delegation_group_after_delivery", self, backend => backend.settle_delegation_group_after_delivery(group_id, retain_children).await)
+        dispatch!(self, backend => backend.settle_delegation_group_after_delivery(group_id, retain_children).await)
     }
 
     /// Insert a `completion_watch` row, or update its mutable columns on id
@@ -80,7 +80,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {
-        pending_postgres!("upsert_completion_watch", self, backend => backend.upsert_completion_watch(w).await)
+        dispatch!(self, backend => backend.upsert_completion_watch(w).await)
     }
 
     /// Load every persisted `completion_watch` row (the registry is
@@ -90,7 +90,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_completion_watches(&self) -> Result<Vec<PersistedCompletionWatch>> {
-        pending_postgres!("list_completion_watches", self, backend => backend.list_completion_watches().await)
+        dispatch!(self, backend => backend.list_completion_watches().await)
     }
 
     /// Delete a `completion_watch` row (fired watch, cancellation).
@@ -99,7 +99,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_completion_watch(&self, id: &str) -> Result<()> {
-        pending_postgres!("delete_completion_watch", self, backend => backend.delete_completion_watch(id).await)
+        dispatch!(self, backend => backend.delete_completion_watch(id).await)
     }
 
     /// Delete every `completion_watch` row registered by `parent_agent_id`
@@ -112,7 +112,7 @@ impl Store {
         &self,
         parent_agent_id: &AgentId,
     ) -> Result<()> {
-        pending_postgres!("delete_completion_watches_for_parent", self, backend => backend.delete_completion_watches_for_parent(parent_agent_id).await)
+        dispatch!(self, backend => backend.delete_completion_watches_for_parent(parent_agent_id).await)
     }
 
     /// Set `report_delivered = 1` (report-time wake already delivered).
@@ -121,7 +121,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn mark_completion_watch_report_delivered(&self, id: &str) -> Result<()> {
-        pending_postgres!("mark_completion_watch_report_delivered", self, backend => backend.mark_completion_watch_report_delivered(id).await)
+        dispatch!(self, backend => backend.mark_completion_watch_report_delivered(id).await)
     }
 
     /// Reset `report_delivered = 0` (fresh-interest re-arm on watch reuse,
@@ -131,7 +131,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_completion_watch_report_delivered(&self, id: &str) -> Result<()> {
-        pending_postgres!("clear_completion_watch_report_delivered", self, backend => backend.clear_completion_watch_report_delivered(id).await)
+        dispatch!(self, backend => backend.clear_completion_watch_report_delivered(id).await)
     }
 
     /// Convert a grouped watch into an ungrouped watch (group settlement
@@ -141,7 +141,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn ungroup_completion_watch(&self, id: &str) -> Result<()> {
-        pending_postgres!("ungroup_completion_watch", self, backend => backend.ungroup_completion_watch(id).await)
+        dispatch!(self, backend => backend.ungroup_completion_watch(id).await)
     }
 
     /// Refresh a watch's stored parent display name and home-workspace anchor
@@ -156,7 +156,7 @@ impl Store {
         parent_agent_name: &str,
         parent_workspace_id: &WorkspaceId,
     ) -> Result<()> {
-        pending_postgres!("update_completion_watch_parent", self, backend => backend.update_completion_watch_parent(id, parent_agent_name, parent_workspace_id).await)
+        dispatch!(self, backend => backend.update_completion_watch_parent(id, parent_agent_name, parent_workspace_id).await)
     }
 }
 

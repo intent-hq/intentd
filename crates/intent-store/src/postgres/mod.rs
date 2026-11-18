@@ -21,6 +21,7 @@ pub use sqlx::postgres::PgPool;
 mod agent_messages;
 mod agents;
 mod comments;
+mod completion_watches;
 mod discussions;
 mod hooks;
 mod nodes;

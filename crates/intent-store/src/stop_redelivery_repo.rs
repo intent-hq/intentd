@@ -33,7 +33,7 @@ impl Store {
         payload: &serde_json::Value,
         created_at: &str,
     ) -> Result<()> {
-        pending_postgres!("set_stop_redelivery", self, backend => backend.set_stop_redelivery(agent_id, payload, created_at).await)
+        dispatch!(self, backend => backend.set_stop_redelivery(agent_id, payload, created_at).await)
     }
 
     /// Delete the persisted stop-redelivery payload for one agent (no-op when
@@ -43,7 +43,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_stop_redelivery(&self, agent_id: &AgentId) -> Result<()> {
-        pending_postgres!("clear_stop_redelivery", self, backend => backend.clear_stop_redelivery(agent_id).await)
+        dispatch!(self, backend => backend.clear_stop_redelivery(agent_id).await)
     }
 
     /// Batched [`Store::clear_stop_redelivery`]: delete the persisted payloads
@@ -56,7 +56,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_stop_redeliveries(&self, agent_ids: &[AgentId]) -> Result<()> {
-        pending_postgres!("clear_stop_redeliveries", self, backend => backend.clear_stop_redeliveries(agent_ids).await)
+        dispatch!(self, backend => backend.clear_stop_redeliveries(agent_ids).await)
     }
 
     /// Load every persisted stop-redelivery payload for startup rehydration.
@@ -70,7 +70,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_all_stop_redeliveries(&self) -> Result<Vec<StopRedeliveryRow>> {
-        pending_postgres!("load_all_stop_redeliveries", self, backend => backend.load_all_stop_redeliveries().await)
+        dispatch!(self, backend => backend.load_all_stop_redeliveries().await)
     }
 }
 
