@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.241] - 2026-11-18
+
+### 🚀 Features
+
+- *(store)* Port client, idempotency, MCP OAuth and presence focus store methods to Postgres ([#3494](https://github.com/intent-hq/intentd/pull/3494))
+
+### 📚 Documentation
+
+- Agent Install and Log in buttons have shipped; note drawer sign-in links ([#3488](https://github.com/intent-hq/intentd/pull/3488))
+
+### 🧪 Testing
+
+- *(store)* Check tables written right before a closing parenthesis ([#3498](https://github.com/intent-hq/intentd/pull/3498))
+
+
 ## [0.11.240] - 2026-11-18
 
 ### 🚀 Features
