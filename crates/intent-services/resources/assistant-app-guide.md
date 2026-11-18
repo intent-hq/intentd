@@ -231,7 +231,7 @@ Open Settings and use these sidebar labels (English labels shown):
 | Appearance | Theme, colors, language, fonts, and chat display | `/settings?tab=display#theme` |
 | General | Notifications, updates, external apps, GitHub link behavior | `/settings?tab=app-behavior#notifications` |
 | Input and shortcuts | Voice dictation and keyboard shortcuts | `/settings?tab=input#keyboard-shortcuts` |
-| Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
+| Agent defaults | Global instructions; tool approvals and agent features under **Advanced** | `/settings?tab=agent-behavior#global-instructions` |
 | Providers | AI coding CLIs and default model | `/settings?tab=providers#providers` |
 | Connections | Integrations, MCP servers and plugins | `/settings?tab=connections#integrations` |
 | Machines | Local machine, connected backend and saved remote connections | `/settings?tab=devices#devices` |
@@ -389,13 +389,13 @@ custom specialist instructions can override the defaults.
 
 <!-- Sources: packages/intentd/crates/intent-services/resources/specialists/{v3.8,v3.9,v3.10}/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_8.rs,harness/v3_9.rs,harness/v3_10.rs,harness/v3_12.rs}. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte. Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte; src/routes/(app)/settings/+page.svelte (Agent defaults Advanced disclosure). Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
 **Secret requests.** Off by default. Open **Agent defaults**
-(`/settings?tab=agent-behavior#global-instructions`) and turn on **Secret requests**
-under **Agent features**; **Host command execution** must also be on. It applies to
-top-level workspace agents created afterwards, not to sub-agents, background hooks
-or Assistant chat. When such an agent asks for a secret such as an API key, a masked
+(`/settings?tab=agent-behavior#global-instructions`), expand **Advanced** if it is shown,
+and turn on **Secret requests** under **Agent features**; **Host command execution**
+must also be on. It applies to top-level workspace agents created afterwards, not to
+sub-agents, background hooks or Assistant chat. When such an agent asks for a secret such as an API key, a masked
 card appears above the message box after its turn ends; **Hide** collapses it to a
 "Secret requested" chip, and the user can provide or dismiss it. The value is not
 put in the chat: Intent holds it in daemon memory and passes it only to that agent's
@@ -1072,7 +1072,7 @@ this setting on, it edits files in the workspace freely and asks only before wri
 outside the workspace or using the network.
 
 To change the default for every chat, open **Settings → Agent defaults → Tool
-approvals**: **Ask each time**, **Allow all** (the default), **Allow reads only**, or
+approvals** (expand **Advanced** first if it is shown): **Ask each time**, **Allow all** (the default), **Allow reads only**, or
 **Deny all**. A chat's own setting wins. If the backend was started with the
 `INTENTD_PERMISSION_POLICY` environment variable, that value replaces this default.
 An Assistant settings card cannot change this setting.
