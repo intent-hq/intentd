@@ -24,10 +24,30 @@ const HOST_INVITE_COLUMNS: &str = "id, secret_hash, secret, created_by_principal
 const HOST_INVITE_CANDIDATE: &str = "revoked_at IS NULL AND redeemed_at IS NULL \
     AND redemption_count = 0 AND julianday(expires_at) >= julianday(?)";
 
-/// A validated current owner, held through a synchronous queue pop. The write
-/// transaction excludes changes to both role and the exact personal credential.
+/// A validated current owner, held through a synchronous queue pop. The open
+/// write transaction (`SQLite` `BEGIN IMMEDIATE`, or the Postgres tenant
+/// writer lock) excludes changes to both role and the exact personal
+/// credential. Dropping it rolls back; it never writes.
 pub struct OwnerQueuePermit {
-    _transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
+    _transaction: PermitTransaction,
+}
+
+enum PermitTransaction {
+    Sqlite(
+        #[expect(dead_code, reason = "held only for its lock")]
+        sqlx::Transaction<'static, sqlx::Sqlite>,
+    ),
+    #[cfg(feature = "postgres")]
+    Postgres(#[expect(dead_code, reason = "held only for its lock")] crate::postgres::WriteTx),
+}
+
+impl OwnerQueuePermit {
+    #[cfg(feature = "postgres")]
+    pub(crate) fn postgres(transaction: crate::postgres::WriteTx) -> Self {
+        Self {
+            _transaction: PermitTransaction::Postgres(transaction),
+        }
+    }
 }
 
 /// A roster and its revision read from one `SQLite` snapshot.
@@ -710,7 +730,7 @@ impl Store {
         principal_id: &PrincipalId,
         token_hash: Option<&str>,
     ) -> Result<Option<OwnerQueuePermit>> {
-        pending_postgres!("owner_queue_permit", self, backend => backend.owner_queue_permit(principal_id, token_hash).await)
+        dispatch!(self, backend => backend.owner_queue_permit(principal_id, token_hash).await)
     }
 }
 
@@ -730,7 +750,7 @@ impl crate::SqliteStore {
              AND (? IS NULL OR EXISTS(SELECT 1 FROM principal_credential c WHERE c.principal_id = p.id AND c.token_hash = ? AND c.revoked_at IS NULL)))"
         ).bind(principal_id.as_str()).bind(token_hash).bind(token_hash).fetch_one(&mut *transaction).await.map_err(db_error)?;
         Ok(authorized.then_some(OwnerQueuePermit {
-            _transaction: transaction,
+            _transaction: PermitTransaction::Sqlite(transaction),
         }))
     }
 }
