@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.245] - 2026-11-18
+
+### 🚀 Features
+
+- *(store)* Port workspace and agent delete cascades and the last workspace writers to Postgres ([#3512](https://github.com/intent-hq/intentd/pull/3512))
+
+
 ## [0.11.244] - 2026-11-18
 
 ### 🚀 Features
