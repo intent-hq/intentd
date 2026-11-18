@@ -1709,9 +1709,101 @@ parity_test!(
     }
 );
 
-parity_test!(migration_status_matches_the_embedded_migrations, |store| {
-    let status = store.migration_status().await.unwrap();
-    assert!(!status.expected.is_empty());
-    assert_eq!(status.applied, status.expected);
-    assert!(status.is_current());
-});
+parity_test!(
+    migration_status_matches_the_embedded_migrations,
+    |store, _tenant, db| {
+        let status = store.migration_status().await.unwrap();
+        assert!(!status.expected.is_empty());
+        assert_eq!(status.applied, status.expected);
+        assert!(status.is_current());
+        if let Some(db) = db {
+            // A part-way migration is not applied yet.
+            let last = *status.expected.last().unwrap();
+            for complete in [false, true] {
+                sqlx::query("UPDATE intent_schema_migrations SET complete = $1 WHERE version = $2")
+                    .bind(complete)
+                    .bind(last)
+                    .execute(&db.admin)
+                    .await
+                    .unwrap();
+                let status = store.migration_status().await.unwrap();
+                assert_eq!(status.applied.contains(&last), complete);
+                assert_eq!(status.is_current(), complete);
+            }
+        }
+    }
+);
+
+// Several chunks: real sessions sit in the first, second and third chunk
+// of absent ids. Decoy rule: the decoy also owns one absent id per chunk.
+parity_test!(
+    subscription_agent_projections_span_several_chunks,
+    |store, tenant| {
+        let chunk = 500;
+        let mut ids: Vec<AgentId> = (0..chunk * 2 + 10)
+            .map(|i| aid(&format!("absent-{i:04}")))
+            .collect();
+        let placed = [
+            (3, "agent-a"),
+            (chunk + 7, "agent-b"),
+            (chunk * 2 + 1, "agent-c"),
+        ];
+        for (at, id) in placed {
+            ids[at] = aid(id);
+        }
+        for ws in ["ws-a", "ws-b"] {
+            store
+                .insert_workspace(&Workspace {
+                    id: wid(ws),
+                    title: format!("{tenant} {ws}"),
+                    branch: "main".into(),
+                    created_at: T0.into(),
+                    updated_at: T0.into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let mut sessions: Vec<String> = placed.iter().map(|(_, id)| (*id).to_owned()).collect();
+        if tenant == "decoy" {
+            sessions.extend(["absent-0004", "absent-0508", "absent-1002"].map(str::to_owned));
+        }
+        for id in &sessions {
+            store
+                .insert_agent_session(&AgentSession {
+                    id: aid(id),
+                    workspace_id: wid("ws-a"),
+                    name: format!("{id} of {tenant}"),
+                    created_at: T0.into(),
+                    updated_at: T0.into(),
+                    ..AgentSession::default()
+                })
+                .await
+                .unwrap();
+            store
+                .insert_hook(&projection_hook(
+                    &format!("h-{id}"),
+                    id,
+                    T1,
+                    HookState::Scheduled,
+                    tenant,
+                ))
+                .await
+                .unwrap();
+        }
+        let mut got: Vec<(String, Vec<Value>)> = store
+            .get_subscription_agent_projections(&ids)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.session.id.0.clone(), p.waiting_on_hooks))
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        sessions.sort();
+        let expected: Vec<(String, Vec<Value>)> = sessions
+            .iter()
+            .map(|id| (id.clone(), vec![hook_value(&format!("h-{id}"), tenant)]))
+            .collect();
+        assert_eq!(got, expected);
+    }
+);

@@ -565,13 +565,24 @@ fn may_call_sqlite_only(rel: &str) -> bool {
         || SQLITE_ONLY_CALLERS.iter().any(|(file, _)| *file == rel)
 }
 
-/// `file: .method(` for every call of a name in `methods` in `text`.
+/// `file: <use>` for every method call (`.name(`), path call (`::name(`)
+/// or path used as a function value (`::name,` / `::name)`) of a name in
+/// `methods` in `text`.
 fn sqlite_only_calls(rel: &str, text: &str, methods: &BTreeSet<String>) -> Vec<String> {
-    methods
-        .iter()
-        .filter(|m| text.contains(&format!(".{m}(")))
-        .map(|m| format!("{rel}: .{m}("))
-        .collect()
+    let mut out = Vec::new();
+    for m in methods {
+        for shape in [
+            format!(".{m}("),
+            format!("::{m}("),
+            format!("::{m},"),
+            format!("::{m})"),
+        ] {
+            if text.contains(&shape) {
+                out.push(format!("{rel}: {shape}"));
+            }
+        }
+    }
+    out
 }
 
 #[test]
@@ -635,4 +646,17 @@ fn the_sqlite_only_rule_catches_new_callers() {
         sqlite_only_calls("x.rs", concat!("store.", "optimize().await"), &methods),
         [concat!("x.rs: .", "optimize(")]
     );
+    assert_eq!(
+        sqlite_only_calls("x.rs", concat!("Store::", "optimize(&store)"), &methods),
+        [concat!("x.rs: ::", "optimize(")]
+    );
+    assert_eq!(
+        sqlite_only_calls("x.rs", concat!("run(Store::", "optimize, 3)"), &methods),
+        [concat!("x.rs: ::", "optimize,")]
+    );
+    assert_eq!(
+        sqlite_only_calls("x.rs", concat!("map(Store::", "optimize)"), &methods),
+        [concat!("x.rs: ::", "optimize)")]
+    );
+    assert!(sqlite_only_calls("x.rs", "Store::optimize_plan(&store)", &methods).is_empty());
 }
