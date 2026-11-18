@@ -141,7 +141,7 @@ pub(super) fn map_session(row: &PgRow, heavy: bool) -> Result<AgentSession> {
     })
 }
 
-fn map_summary(row: &PgRow) -> Result<AgentSessionSummary> {
+pub(super) fn map_summary(row: &PgRow) -> Result<AgentSessionSummary> {
     map_session(row, false).map(AgentSessionSummary::from_session)
 }
 

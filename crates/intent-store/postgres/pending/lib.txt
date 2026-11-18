@@ -1,10 +1,4 @@
-activate_incremental_vacuum
-freelist_count
-incremental_vacuum_chunk
-migration_status
-optimize
-page_size
-pool
+# read_pool/write_pool return the SQLite pool; raw-SQL callers in intent-services,
+# intent-svc-* and intentd must move behind Store methods before these can go SQLite-only.
 read_pool
-spawn_periodic_wal_checkpoint
 write_pool

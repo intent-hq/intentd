@@ -530,6 +530,36 @@ pub(crate) fn unported_panic(method: &'static str) -> ! {
     panic!("{method} is not yet supported on the Postgres store")
 }
 
+/// The error a SQLite-only `Store` method returns on Postgres.
+pub(crate) fn sqlite_only(method: &'static str) -> Error {
+    Error::Internal(format!(
+        "{method} is SQLite-only and has no Postgres equivalent"
+    ))
+}
+
+/// For the SQLite-only methods that do not return `Result`.
+#[track_caller]
+pub(crate) fn sqlite_only_panic(method: &'static str) -> ! {
+    panic!("{method} is SQLite-only and has no Postgres equivalent")
+}
+
+impl PgStore {
+    /// The embedded migrations against the schema's completed ledger rows;
+    /// a part-way migration is not applied yet.
+    pub async fn migration_status(&self) -> Result<crate::MigrationStatus> {
+        let expected: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
+        let mut tx = self.begin().await?;
+        let applied: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM intent_schema_migrations WHERE complete ORDER BY version",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("query migrations failed: {e}")))?;
+        tx.commit().await.map_err(db)?;
+        Ok(crate::MigrationStatus { expected, applied })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{statements, with_bundled_root_cert, MIGRATOR};

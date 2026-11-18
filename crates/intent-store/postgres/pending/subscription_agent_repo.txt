@@ -1,1 +1,0 @@
-get_subscription_agent_projections

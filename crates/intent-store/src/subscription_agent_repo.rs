@@ -25,7 +25,7 @@ pub struct SubscriptionAgentProjection {
 }
 
 // Below SQLite's bind-variable limit; chunking bounds each fetched batch.
-const IDS_PER_STATEMENT: usize = 500;
+pub(crate) const IDS_PER_STATEMENT: usize = 500;
 
 fn session_sql(placeholders: &str) -> String {
     format!(
@@ -68,7 +68,7 @@ impl Store {
         &self,
         ids: &[AgentId],
     ) -> Result<Vec<SubscriptionAgentProjection>> {
-        pending_postgres!("get_subscription_agent_projections", self, backend => backend.get_subscription_agent_projections(ids).await)
+        dispatch!(self, backend => backend.get_subscription_agent_projections(ids).await)
     }
 }
 
