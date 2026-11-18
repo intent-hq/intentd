@@ -255,19 +255,15 @@ fn golden_naming_tool_references() {
     );
     assert_eq!(
         crate::agent_manager::workspace_naming_tool_reference("auggie"),
-        "the `set_workspace_title_workspace-mcp` tool"
+        "the `workspace_api_workspace-mcp` tool"
     );
     assert_eq!(
         crate::agent_manager::workspace_naming_tool_reference("opencode"),
-        "the `workspace-mcp_set_workspace_title` tool"
+        "the `workspace-mcp_workspace_api` tool"
     );
     assert_eq!(
         crate::agent_manager::workspace_naming_tool_reference("codex"),
-        crate::agent_manager::GENERIC_NAMING_TOOL_REFERENCE
-    );
-    assert_eq!(
-        crate::agent_manager::GENERIC_NAMING_TOOL_REFERENCE,
-        "the `set_workspace_title` tool from the workspace MCP server"
+        crate::agent_manager::GENERIC_AGENT_NAMING_TOOL_REFERENCE
     );
 }
 
@@ -282,10 +278,33 @@ fn golden_first_turn_naming_nudges() {
          with information-gathering.\n</system>"
     );
     assert_eq!(
-        harness.naming_nudge(
-            None,
-            Some("the `set_workspace_title_workspace-mcp` tool"),
-        ),
+        harness.naming_nudge(None, Some("the `workspace_api_workspace-mcp` tool"),),
+        "<system>\nThis workspace needs a title. As your first action, call \
+         `ws.workspace.setTitle` through the `workspace_api_workspace-mcp` tool with a short \
+         3–5 word sentence-case title describing the task. This can be called in parallel with \
+         information-gathering.\n</system>"
+    );
+}
+
+/// v1's frozen title wording; harness 3.14 replaced it in the live envelope.
+#[test]
+fn golden_v1_title_naming_surfaces() {
+    use crate::harness::Harness as _;
+    let v1 = crate::harness::v1::V1;
+    assert_eq!(
+        v1.naming_tool_reference("auggie"),
+        "the `set_workspace_title_workspace-mcp` tool"
+    );
+    assert_eq!(
+        v1.naming_tool_reference("opencode"),
+        "the `workspace-mcp_set_workspace_title` tool"
+    );
+    assert_eq!(
+        v1.naming_tool_reference("codex"),
+        "the `set_workspace_title` tool from the workspace MCP server"
+    );
+    assert_eq!(
+        v1.naming_nudge(None, Some("the `set_workspace_title_workspace-mcp` tool")),
         "<system>\nThis workspace needs a title. As your first action, call the \
          `set_workspace_title_workspace-mcp` tool with a short 3–5 word sentence-case title \
          describing the task. This can be called in parallel with information-gathering.\n</system>"

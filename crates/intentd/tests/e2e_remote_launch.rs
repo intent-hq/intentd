@@ -35,6 +35,7 @@ use crate::common;
 
 mod cloud;
 mod file_pull;
+mod first_agent_naming;
 mod forge_fetch;
 mod forge_push;
 mod forge_token;
