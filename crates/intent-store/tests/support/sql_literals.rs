@@ -77,3 +77,22 @@ pub fn is_sql(lit: &str) -> bool {
         .iter()
         .any(|k| l.starts_with(k))
 }
+
+/// A literal's text with its Rust escapes (`\"`, `\\`, `\n`, `\t`) undone.
+pub fn unescape(lit: &str) -> String {
+    let mut out = String::with_capacity(lit.len());
+    let mut chars = lit.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(o) => out.push(o),
+            None => {}
+        }
+    }
+    out
+}
