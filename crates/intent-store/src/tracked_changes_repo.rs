@@ -74,7 +74,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_tracked_change(&self, c: &NewTrackedChange) -> Result<Option<(i64, i64)>> {
-        pending_postgres!("upsert_tracked_change", self, backend => backend.upsert_tracked_change(c).await)
+        dispatch!(self, backend => backend.upsert_tracked_change(c).await)
     }
 
     /// Max cumulative `(additions, deletions)` across the **sibling** rows for
@@ -95,7 +95,7 @@ impl Store {
         stage: &str,
         agent_id: Option<&str>,
     ) -> Result<Option<(i64, i64)>> {
-        pending_postgres!("max_sibling_tracked_change_counters", self, backend => backend.max_sibling_tracked_change_counters(workspace_id, path, stage, agent_id).await)
+        dispatch!(self, backend => backend.max_sibling_tracked_change_counters(workspace_id, path, stage, agent_id).await)
     }
 
     /// Transition the `stage` of a workspace's tracked-change rows for `path`
@@ -115,7 +115,7 @@ impl Store {
         from_stage: &str,
         to_stage: &str,
     ) -> Result<u64> {
-        pending_postgres!("set_tracked_change_stage", self, backend => backend.set_tracked_change_stage(workspace_id, path, from_stage, to_stage).await)
+        dispatch!(self, backend => backend.set_tracked_change_stage(workspace_id, path, from_stage, to_stage).await)
     }
 
     /// Ids of the workspaces that have at least one tracked change at a
@@ -127,7 +127,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces_with_working_tracked_changes(&self) -> Result<Vec<WorkspaceId>> {
-        pending_postgres!("list_workspaces_with_working_tracked_changes", self, backend => backend.list_workspaces_with_working_tracked_changes().await)
+        dispatch!(self, backend => backend.list_workspaces_with_working_tracked_changes().await)
     }
 
     /// Delete tracked-change rows of `workspace_id` named by `(id, updated_at)`
@@ -145,7 +145,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         rows: &[(String, String)],
     ) -> Result<u64> {
-        pending_postgres!("delete_unchanged_working_tracked_changes", self, backend => backend.delete_unchanged_working_tracked_changes(workspace_id, rows).await)
+        dispatch!(self, backend => backend.delete_unchanged_working_tracked_changes(workspace_id, rows).await)
     }
 
     /// List a workspace's tracked changes, oldest first. Internal read used by the
@@ -158,7 +158,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<TrackedChangeRow>> {
-        pending_postgres!("list_tracked_changes", self, backend => backend.list_tracked_changes(workspace_id).await)
+        dispatch!(self, backend => backend.list_tracked_changes(workspace_id).await)
     }
 }
 
