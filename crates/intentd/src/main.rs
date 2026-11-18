@@ -2106,11 +2106,11 @@ async fn cmd_serve(
     // on `data_dir/intentd.lock` for the whole process. Acquired before the
     // socket/pidfile guard so the strongest, configuration-independent guard
     // fires first; released automatically when the held fd closes on drop.
-    let _datadir_lock = acquire_data_dir_lock(&config)?;
+    let datadir_lock = acquire_data_dir_lock(&config)?;
     // Single-instance guard (§5.6): refuse to start if a live daemon owns the
     // UDS or a live pid holds the pidfile; clean a stale socket/pidfile whose
     // owner is gone. The returned guard removes our pidfile on shutdown.
-    let _pidfile = acquire_single_instance(&config).await?;
+    let _pidfile = acquire_single_instance(&config, Some(&datadir_lock)).await?;
     let prepared =
         Store::prepare_for_daemon(&config.db_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let mut bootstrap = startup::Bootstrap::new(&config);
@@ -6742,7 +6742,14 @@ async fn uds_is_live(_socket_path: &Path) -> bool {
 /// Enforce single-instance startup (§5.6). Refuses to start when a live daemon
 /// owns the UDS or a live pid holds the pidfile; otherwise removes a stale
 /// socket/pidfile whose owner is gone and claims the pidfile with our pid.
-async fn acquire_single_instance(config: &Config) -> anyhow::Result<PidFile> {
+/// `data_dir_lock` proves this process holds the exclusive data-dir lock. On
+/// Unix that lock dies with its holder, so while we hold it no other intentd
+/// can own this data dir: a pidfile naming a live process is then stale (its
+/// pid was reused after an unclean shutdown) rather than a running daemon.
+async fn acquire_single_instance(
+    config: &Config,
+    data_dir_lock: Option<&DataDirLock>,
+) -> anyhow::Result<PidFile> {
     // On Unix a leftover socket file marks a candidate daemon: probe it, and
     // remove it when its owner is gone. On Windows named pipes are per-boot
     // kernel objects with no filesystem entry, so probe the pipe directly —
@@ -6773,7 +6780,9 @@ async fn acquire_single_instance(config: &Config) -> anyhow::Result<PidFile> {
                 process.matches_record(&config.pid_path, pid) && !process.exited().unwrap_or(false)
             });
         #[cfg(unix)]
-        let holder_is_alive = pid_is_alive(pid);
+        let holder_is_alive = pid_is_alive(pid) && data_dir_lock.is_none();
+        #[cfg(windows)]
+        let _ = data_dir_lock;
         if pid != std::process::id() && holder_is_alive {
             anyhow::bail!(
                 "intentd is already running (pid {pid}, pidfile {}) — refusing to start a second instance",
@@ -11322,8 +11331,27 @@ for line in sys.stdin:
         let config = temp_config();
         // pid 1 (init/launchd) is always alive; a signal-0 probe yields EPERM.
         std::fs::write(&config.pid_path, "1").unwrap();
-        let result = acquire_single_instance(&config).await;
+        let result = acquire_single_instance(&config, None).await;
         assert!(result.is_err(), "a live pidfile owner must refuse startup");
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    /// After an unclean shutdown the old pid can belong to an unrelated live
+    /// process. Holding the data-dir lock proves no intentd owns this data dir,
+    /// so startup treats that pidfile as stale instead of refusing forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn data_dir_lock_overrides_a_reused_live_pid() {
+        let config = temp_config();
+        let lock = acquire_data_dir_lock(&config).expect("take the data-dir lock");
+        // pid 1 is always alive but is not an intentd for this data dir.
+        std::fs::write(&config.pid_path, "1").unwrap();
+        let guard = acquire_single_instance(&config, Some(&lock))
+            .await
+            .expect("a reused live pid must not block a lock holder");
+        assert_eq!(read_pid(&config.pid_path), Some(std::process::id()));
+        drop(guard);
+        drop(lock);
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
@@ -11332,7 +11360,7 @@ for line in sys.stdin:
         let config = temp_config();
         // A pid essentially guaranteed not to be running.
         std::fs::write(&config.pid_path, "2147483640").unwrap();
-        let guard = acquire_single_instance(&config)
+        let guard = acquire_single_instance(&config, None)
             .await
             .expect("startup proceeds past a stale pidfile");
         assert_eq!(
@@ -11353,7 +11381,7 @@ for line in sys.stdin:
         let config = temp_config();
         // A leftover socket path with nothing listening → connect refused → stale.
         std::fs::write(&config.socket_path, b"").unwrap();
-        let _guard = acquire_single_instance(&config)
+        let _guard = acquire_single_instance(&config, None)
             .await
             .expect("startup proceeds past a stale socket");
         assert!(!config.socket_path.exists(), "stale socket removed");
@@ -11366,7 +11394,7 @@ for line in sys.stdin:
     async fn refuses_when_uds_is_live() {
         let config = temp_config();
         let listener = tokio::net::UnixListener::bind(&config.socket_path).expect("bind live uds");
-        let result = acquire_single_instance(&config).await;
+        let result = acquire_single_instance(&config, None).await;
         assert!(result.is_err(), "a live UDS owner must refuse startup");
         drop(listener);
         std::fs::remove_file(&config.socket_path).ok();
