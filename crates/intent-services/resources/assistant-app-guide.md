@@ -886,7 +886,7 @@ watches, its last update on GitHub as of the watch's latest check). Home's short
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,BranchSelector,SetupScriptPicker,SetupScriptEditor,StartOnPicker,WorkspaceCreateButton,CreateButtonProgress}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/{ProjectPickerMessage,WorkspaceSetupCard}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/create-progress-transfer.ts; packages/cloudlands-fe/src/features/hardware-console/voice/transcription-service.ts; packages/cloudlands-fe/messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,BranchSelector,SetupScriptPicker,SetupScriptEditor,StartOnPicker,WorkspaceCreateButton,CreateButtonProgress}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/src/features/hardware-console/voice/transcription-service.ts; packages/cloudlands-fe/messages/en.json. -->
 
 <!-- The searchable Machines picker for initial-agent placement is Labs-only;
 do not list it among the normal workspace settings below. -->
@@ -915,9 +915,7 @@ your branch selection. If the branch list fails to load, open **Branch** and use
 **Refresh branches**.
 **Clone** is hidden only once Intent has confirmed no forge account is connected;
 to clone, use the connect link or **Settings → Connections**. Onboarding uses
-the same tab names. In onboarding's last step, the repository row shows the current step and percent;
-while a new repository downloads it also shows the amount received, the download speed
-and, once enough has arrived, a rough time left for the download only. Open the agent picker to choose who starts the workspace;
+the same tab names. Open the agent picker to choose who starts the workspace;
 **None**, last in the list, starts an agent without specialist instructions.
 **Create new or manage specialists** closes the workspace form and opens specialist settings.
 In **Setup script**, search the list and select the repository's config, a previously
