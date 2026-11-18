@@ -55,31 +55,7 @@ pub(crate) async fn capture(
     connection: &mut sqlx::SqliteConnection,
     rows: &mut Rows,
 ) -> Result<()> {
-    let fallback = rows
-        .iter()
-        .find(|(table, _)| table == "workspace")
-        .and_then(|(_, rows)| rows.first())
-        .and_then(|row| {
-            row["legacy_author_principal_id"]
-                .as_str()
-                .or(row["owner_principal_id"].as_str())
-        })
-        .map(|id| PrincipalId(id.to_string()));
-    let mut ids = HashSet::new();
-    for (table, objects) in rows.iter() {
-        for row in objects {
-            if let AuthorMetadata::Candidate(metadata) = metadata(table, row)? {
-                if needs_snapshot(metadata.as_ref()) {
-                    if let Some(id) =
-                        lift_from_principal_id(metadata.as_ref()).or_else(|| fallback.clone())
-                    {
-                        ids.insert(id);
-                    }
-                }
-            }
-        }
-    }
-    let ids: Vec<_> = ids.into_iter().collect();
+    let ids = authors_to_snapshot(rows)?;
     let mut people: HashMap<PrincipalId, Principal> = HashMap::new();
     for chunk in ids.chunks(32_000) {
         let sql = format!(
@@ -99,6 +75,47 @@ pub(crate) async fn capture(
             people.insert(person.id.clone(), person);
         }
     }
+    apply_snapshots(rows, &people)
+}
+
+fn fallback_author(rows: &Rows) -> Option<PrincipalId> {
+    rows.iter()
+        .find(|(table, _)| table == "workspace")
+        .and_then(|(_, rows)| rows.first())
+        .and_then(|row| {
+            row["legacy_author_principal_id"]
+                .as_str()
+                .or(row["owner_principal_id"].as_str())
+        })
+        .map(|id| PrincipalId(id.to_string()))
+}
+
+/// The principals whose profiles the export must snapshot into `rows`.
+pub(crate) fn authors_to_snapshot(rows: &Rows) -> Result<Vec<PrincipalId>> {
+    let fallback = fallback_author(rows);
+    let mut ids = HashSet::new();
+    for (table, objects) in rows.iter() {
+        for row in objects {
+            if let AuthorMetadata::Candidate(metadata) = metadata(table, row)? {
+                if needs_snapshot(metadata.as_ref()) {
+                    if let Some(id) =
+                        lift_from_principal_id(metadata.as_ref()).or_else(|| fallback.clone())
+                    {
+                        ids.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+/// Write each candidate row's author snapshot, from `people`.
+pub(crate) fn apply_snapshots(
+    rows: &mut Rows,
+    people: &HashMap<PrincipalId, Principal>,
+) -> Result<()> {
+    let fallback = fallback_author(rows);
     for (table, objects) in rows.iter_mut() {
         for row in objects {
             let AuthorMetadata::Candidate(metadata) = metadata(table, row)? else {

@@ -18,7 +18,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_known_repos(&self) -> Result<Vec<KnownRepo>> {
-        pending_postgres!("list_known_repos", self, backend => backend.list_known_repos().await)
+        dispatch!(self, backend => backend.list_known_repos().await)
     }
 
     /// Check one explicitly supplied registry path without loading every row.
@@ -27,7 +27,7 @@ impl Store {
     /// # Errors
     /// Returns an error if the registry query fails.
     pub async fn known_repo_exists(&self, path: &str) -> Result<bool> {
-        pending_postgres!("known_repo_exists", self, backend => backend.known_repo_exists(path).await)
+        dispatch!(self, backend => backend.known_repo_exists(path).await)
     }
 
     /// Insert or update a known repo, keyed on `path` (TS `addRepo`). A new row
@@ -45,7 +45,7 @@ impl Store {
         name: &str,
         owner: Option<&str>,
     ) -> Result<()> {
-        pending_postgres!("upsert_known_repo", self, backend => backend.upsert_known_repo(path, name, owner).await)
+        dispatch!(self, backend => backend.upsert_known_repo(path, name, owner).await)
     }
 
     /// Delete a known repo by `path` (TS `removeRepo`). Returns whether a row
@@ -55,7 +55,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn remove_known_repo(&self, path: &str) -> Result<bool> {
-        pending_postgres!("remove_known_repo", self, backend => backend.remove_known_repo(path).await)
+        dispatch!(self, backend => backend.remove_known_repo(path).await)
     }
 }
 

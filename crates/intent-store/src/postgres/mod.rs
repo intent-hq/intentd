@@ -36,6 +36,7 @@ mod notes;
 pub(crate) mod pr_monitors;
 mod presence_focus;
 mod principals;
+mod repositories;
 mod script_monitors;
 mod scripts;
 mod settings;

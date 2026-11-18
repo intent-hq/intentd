@@ -1,4 +1,0 @@
-known_repo_exists
-list_known_repos
-remove_known_repo
-upsert_known_repo

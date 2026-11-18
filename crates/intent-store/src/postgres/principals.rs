@@ -86,7 +86,7 @@ fn identity_columns(
     }))
 }
 
-fn principal(row: &PgRow) -> Result<Principal> {
+pub(super) fn principal(row: &PgRow) -> Result<Principal> {
     Ok(Principal {
         id: PrincipalId(col(row, "id")?),
         identity: identity_columns(

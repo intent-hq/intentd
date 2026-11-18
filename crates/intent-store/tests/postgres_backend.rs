@@ -44,6 +44,8 @@ mod pr_monitors;
 mod presence_focus;
 #[path = "postgres_backend/principals.rs"]
 mod principals;
+#[path = "postgres_backend/repositories.rs"]
+mod repositories;
 #[path = "postgres_backend/script_monitors.rs"]
 mod script_monitors;
 #[path = "postgres_backend/scripts.rs"]
