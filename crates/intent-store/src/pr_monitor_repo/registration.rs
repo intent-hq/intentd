@@ -1,8 +1,8 @@
 //! Explicit GitHub registration repairs old rows atomically with their baseline.
 use super::{
     pause_preserving_last_error_sql, validate_monitor_target, AgentId, MonitorTargetProvenance,
-    MonitorTargetUnresolvedReason, PersistedMonitorTarget, PrMonitor, Result, ReviewTarget, Store,
-    PR_MONITOR_PAUSE_MARKER,
+    MonitorTargetUnresolvedReason, PersistedMonitorTarget, PrMonitor, QualifiedPrMonitor, Result,
+    ReviewTarget, Store, PR_MONITOR_PAUSE_MARKER,
 };
 
 impl Store {
@@ -29,7 +29,7 @@ impl Store {
         now: &str,
         pause: Option<&str>,
     ) -> Result<bool> {
-        pending_postgres!("rearm_legacy_pr_monitor", self, backend => backend.rearm_legacy_pr_monitor(expected, owner, target, baseline, now, pause).await)
+        dispatch!(self, backend => backend.rearm_legacy_pr_monitor(expected, owner, target, baseline, now, pause).await)
     }
 }
 
@@ -49,26 +49,7 @@ impl crate::SqliteStore {
             MonitorTargetProvenance::LegacyGithubWriter,
         )?;
         let captured = self.get_qualified_pr_monitor(&expected.monitor_id).await?;
-        let compatible = match captured.target() {
-            PersistedMonitorTarget::Resolved {
-                provenance: MonitorTargetProvenance::LegacyGithubWriter,
-                ..
-            } => true,
-            PersistedMonitorTarget::Unresolved {
-                reason: MonitorTargetUnresolvedReason::MissingProvenance,
-            } => {
-                captured.columns.provider.is_none()
-                    && captured.columns.instance.is_none()
-                    && captured.columns.project.is_none()
-                    && captured.columns.kind.is_none()
-            }
-            _ => false,
-        };
-        if !compatible {
-            return Err(intent_core::Error::InvalidParams(
-                "pr.monitor: existing monitor has incompatible target evidence; use its original repository route or explicitly cancel it before registering again".into(),
-            ));
-        }
+        check_rearm_compatible(&captured)?;
         let sql = format!(
             "UPDATE pr_monitor SET agent_id=?1, last_snapshot=?2, baseline_snapshot=?2,
              pending_changes='[]', pending_since=NULL, last_change_at=NULL, last_polled_at=?3,
@@ -107,4 +88,30 @@ impl crate::SqliteStore {
         })?;
         Ok(result.rows_affected() == 1)
     }
+}
+
+/// Only writer-provenance rows, or pre-target-column rows with no target claim,
+/// may be re-armed by a legacy GitHub registration.
+pub(crate) fn check_rearm_compatible(captured: &QualifiedPrMonitor) -> Result<()> {
+    let compatible = match captured.target() {
+        PersistedMonitorTarget::Resolved {
+            provenance: MonitorTargetProvenance::LegacyGithubWriter,
+            ..
+        } => true,
+        PersistedMonitorTarget::Unresolved {
+            reason: MonitorTargetUnresolvedReason::MissingProvenance,
+        } => {
+            captured.columns.provider.is_none()
+                && captured.columns.instance.is_none()
+                && captured.columns.project.is_none()
+                && captured.columns.kind.is_none()
+        }
+        _ => false,
+    };
+    if !compatible {
+        return Err(intent_core::Error::InvalidParams(
+            "pr.monitor: existing monitor has incompatible target evidence; use its original repository route or explicitly cancel it before registering again".into(),
+        ));
+    }
+    Ok(())
 }

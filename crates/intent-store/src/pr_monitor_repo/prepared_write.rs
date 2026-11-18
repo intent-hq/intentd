@@ -11,15 +11,23 @@ use sqlx::Transaction;
 /// code must retain original authority through `commit`, not just preparation.
 /// No pool acquisition, provider call or application callback occurs in commit.
 pub struct PreparedMonitorWrite {
-    transaction: Transaction<'static, Sqlite>,
-    query: QueryBuilder<Sqlite>,
-    insert: bool,
+    inner: PreparedInner,
+}
+
+enum PreparedInner {
+    Sqlite {
+        transaction: Transaction<'static, Sqlite>,
+        query: QueryBuilder<Sqlite>,
+        insert: bool,
+    },
+    #[cfg(feature = "postgres")]
+    Postgres(crate::postgres::pr_monitors::PreparedPgWrite),
 }
 
 impl PreparedMonitorWrite {
     /// Execute and finish while the caller's original authority fences are held.
     /// This synchronous method is only for a blocking worker: it waits for the
-    /// reserved `SQLite` worker through COMMIT (or rollback on failure). Dropping
+    /// reserved database writer through COMMIT (or rollback on failure). Dropping
     /// the async caller cannot cancel a commit that has already been admitted.
     ///
     /// # Errors
@@ -30,12 +38,28 @@ impl PreparedMonitorWrite {
         tokio::runtime::Handle::current().block_on(self.finish())
     }
 
-    async fn finish(mut self) -> Result<bool> {
-        let result = self.query.build().execute(&mut *self.transaction).await;
+    #[cfg(feature = "postgres")]
+    pub(crate) fn postgres(write: crate::postgres::pr_monitors::PreparedPgWrite) -> Self {
+        Self {
+            inner: PreparedInner::Postgres(write),
+        }
+    }
+
+    async fn finish(self) -> Result<bool> {
+        let (mut transaction, mut query, insert) = match self.inner {
+            PreparedInner::Sqlite {
+                transaction,
+                query,
+                insert,
+            } => (transaction, query, insert),
+            #[cfg(feature = "postgres")]
+            PreparedInner::Postgres(write) => return write.finish().await,
+        };
+        let result = query.build().execute(&mut *transaction).await;
         let changed = match result {
             Ok(result) => result.rows_affected() == 1,
             Err(error)
-                if self.insert
+                if insert
                     && error
                         .as_database_error()
                         .is_some_and(sqlx::error::DatabaseError::is_unique_violation) =>
@@ -48,7 +72,7 @@ impl PreparedMonitorWrite {
                 )))
             }
         };
-        self.transaction.commit().await.map_err(|error| {
+        transaction.commit().await.map_err(|error| {
             intent_core::Error::Internal(format!("qualified monitor commit: {error}"))
         })?;
         Ok(changed)
@@ -64,7 +88,7 @@ impl Store {
         m: &PrMonitor,
         target: &ReviewTarget,
     ) -> Result<PreparedMonitorWrite> {
-        pending_postgres!("prepare_monitor_insert", self, backend => backend.prepare_monitor_insert(m, target).await)
+        dispatch!(self, backend => backend.prepare_monitor_insert(m, target).await)
     }
 
     /// Prepare a refresh, lifecycle change or ownership transfer of the exact captured row.
@@ -75,7 +99,7 @@ impl Store {
         expected: &QualifiedPrMonitor,
         replacement: &PrMonitor,
     ) -> Result<PreparedMonitorWrite> {
-        pending_postgres!("prepare_monitor_replace", self, backend => backend.prepare_monitor_replace(expected, replacement).await)
+        dispatch!(self, backend => backend.prepare_monitor_replace(expected, replacement).await)
     }
 
     /// Prepare cancellation without losing the complete captured-row CAS.
@@ -86,7 +110,7 @@ impl Store {
         expected: &QualifiedPrMonitor,
         now: &str,
     ) -> Result<PreparedMonitorWrite> {
-        pending_postgres!("prepare_monitor_cancel", self, backend => backend.prepare_monitor_cancel(expected, now).await)
+        dispatch!(self, backend => backend.prepare_monitor_cancel(expected, now).await)
     }
 }
 
@@ -107,9 +131,11 @@ impl crate::SqliteStore {
                 intent_core::Error::Internal(format!("prepare monitor write: {error}"))
             })?;
         Ok(PreparedMonitorWrite {
-            transaction,
-            query,
-            insert,
+            inner: PreparedInner::Sqlite {
+                transaction,
+                query,
+                insert,
+            },
         })
     }
 
@@ -155,18 +181,7 @@ impl crate::SqliteStore {
         expected: &QualifiedPrMonitor,
         replacement: &PrMonitor,
     ) -> Result<PreparedMonitorWrite> {
-        let old = expected.monitor();
-        if old.monitor_id != replacement.monitor_id
-            || old.workspace_id != replacement.workspace_id
-            || old.repo_owner != replacement.repo_owner
-            || old.repo_name != replacement.repo_name
-            || old.pr_number != replacement.pr_number
-            || old.created_at != replacement.created_at
-        {
-            return Err(intent_core::Error::InvalidParams(
-                "monitor replacement changed resource identity".into(),
-            ));
-        }
+        check_replacement_identity(expected, replacement)?;
         let mut query = QueryBuilder::new("UPDATE pr_monitor SET agent_id = ");
         query
             .push_bind(replacement.agent_id.0.clone())
@@ -203,6 +218,26 @@ impl crate::SqliteStore {
         captured_condition(&mut query, expected);
         self.prepare_monitor_write(query, false).await
     }
+}
+
+/// A replacement may change the owner and poll state, never the resource.
+pub(crate) fn check_replacement_identity(
+    expected: &QualifiedPrMonitor,
+    replacement: &PrMonitor,
+) -> Result<()> {
+    let old = expected.monitor();
+    if old.monitor_id != replacement.monitor_id
+        || old.workspace_id != replacement.workspace_id
+        || old.repo_owner != replacement.repo_owner
+        || old.repo_name != replacement.repo_name
+        || old.pr_number != replacement.pr_number
+        || old.created_at != replacement.created_at
+    {
+        return Err(intent_core::Error::InvalidParams(
+            "monitor replacement changed resource identity".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Both the legacy Store CAS entry and prepared writes compare original bytes.

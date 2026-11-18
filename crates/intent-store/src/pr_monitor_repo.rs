@@ -18,7 +18,11 @@ use crate::Store;
 
 mod prepared_write;
 mod registration;
+#[cfg(feature = "postgres")]
+pub(crate) use prepared_write::check_replacement_identity;
 pub use prepared_write::PreparedMonitorWrite;
+#[cfg(feature = "postgres")]
+pub(crate) use registration::check_rearm_compatible;
 
 pub(crate) fn captured_monitor_exists(expected: &QualifiedPrMonitor) -> QueryBuilder<Sqlite> {
     let mut query = QueryBuilder::new("SELECT monitor_id FROM pr_monitor");
@@ -29,7 +33,8 @@ pub(crate) fn captured_monitor_exists(expected: &QualifiedPrMonitor) -> QueryBui
 #[cfg(test)]
 mod qualification_tests;
 
-const COLUMNS: &str = "monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, \
+pub(crate) const COLUMNS: &str =
+    "monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, \
     state, last_snapshot, baseline_snapshot, pending_changes, pending_since, last_change_at, \
     last_polled_at, last_error, created_at, updated_at";
 
@@ -39,7 +44,7 @@ pub(crate) const TARGET_COLUMNS: &str =
 
 // This is a compatibility boundary, not evidence that an unresolved row is
 // GitHub. Only a later service with original-writer evidence may qualify it.
-const LEGACY_LOOKUP: &str = "((target_provenance = 'unresolved' AND target_provider IS NULL \
+pub(crate) const LEGACY_LOOKUP: &str = "((target_provenance = 'unresolved' AND target_provider IS NULL \
     AND target_instance_base_url IS NULL AND target_project_path IS NULL AND target_kind IS NULL) OR \
     (target_provenance != 'unresolved' AND target_provider = 'github' AND target_instance_base_url = 'https://github.com' \
      AND target_kind = 'pull-request'))";
@@ -54,7 +59,7 @@ pub enum MonitorTargetProvenance {
 }
 
 impl MonitorTargetProvenance {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::CapturedRequest => "captured-request",
             Self::LegacyGithubWriter => "legacy-github-writer",
@@ -93,8 +98,8 @@ pub struct QualifiedPrMonitor {
     target: PersistedMonitorTarget,
     // Preserve raw pending JSON (including malformed or unusually formatted
     // legacy values). The legacy PrMonitor decoder deliberately normalizes it.
-    original_text: Vec<Option<String>>,
-    columns: TargetColumns,
+    pub(crate) original_text: Vec<Option<String>>,
+    pub(crate) columns: TargetColumns,
 }
 
 impl QualifiedPrMonitor {
@@ -135,7 +140,7 @@ impl Store {
         expected: &QualifiedPrMonitor,
         now: &str,
     ) -> Result<bool> {
-        pending_postgres!("cancel_qualified_pr_monitor", self, backend => backend.cancel_qualified_pr_monitor(expected, now).await)
+        dispatch!(self, backend => backend.cancel_qualified_pr_monitor(expected, now).await)
     }
 }
 
@@ -169,23 +174,23 @@ pub enum MonitorQualificationOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TargetColumns {
-    provider: Option<String>,
-    instance: Option<String>,
-    project: Option<String>,
-    kind: Option<String>,
-    provenance: String,
-    reason: Option<String>,
+pub(crate) struct TargetColumns {
+    pub(crate) provider: Option<String>,
+    pub(crate) instance: Option<String>,
+    pub(crate) project: Option<String>,
+    pub(crate) kind: Option<String>,
+    pub(crate) provenance: String,
+    pub(crate) reason: Option<String>,
 }
 
-fn provider_word(provider: RepositoryProvider) -> &'static str {
+pub(crate) fn provider_word(provider: RepositoryProvider) -> &'static str {
     match provider {
         RepositoryProvider::Github => "github",
         RepositoryProvider::Gitlab => "gitlab",
     }
 }
 
-fn kind_word(kind: RepositoryResourceKind) -> &'static str {
+pub(crate) fn kind_word(kind: RepositoryResourceKind) -> &'static str {
     match kind {
         RepositoryResourceKind::PullRequest => "pull-request",
         RepositoryResourceKind::MergeRequest => "merge-request",
@@ -195,7 +200,7 @@ fn kind_word(kind: RepositoryResourceKind) -> &'static str {
 
 /// Validate storage invariants only. Provider URL/path canonicalization belongs
 /// to the caller's canonical resolver, not a second parser in the Store.
-fn target_number(target: &ReviewTarget) -> Result<i64> {
+pub(crate) fn target_number(target: &ReviewTarget) -> Result<i64> {
     let number = i64::try_from(target.number)
         .ok()
         .filter(|n| *n > 0)
@@ -225,7 +230,7 @@ fn target_number(target: &ReviewTarget) -> Result<i64> {
     Ok(number)
 }
 
-fn validate_monitor_target(
+pub(crate) fn validate_monitor_target(
     monitor: &PrMonitor,
     target: &ReviewTarget,
     provenance: MonitorTargetProvenance,
@@ -268,15 +273,15 @@ fn validate_target_identity(
 
 /// Classify a narrow summary row with the same target decoder as full reads.
 /// Private and unresolved monitors never enter generic agent summaries.
-pub(crate) fn legacy_monitor_summary(row: &SqliteRow) -> Result<bool> {
+pub(crate) fn legacy_monitor_summary(row: &impl MonitorRow) -> Result<bool> {
     let repo = intent_core::RepoRef::new(
-        row.try_get::<String, _>("repo_owner")
+        row.text("repo_owner")
             .map_err(|error| intent_core::Error::Internal(error.to_string()))?,
-        row.try_get::<String, _>("repo_name")
+        row.text("repo_name")
             .map_err(|error| intent_core::Error::Internal(error.to_string()))?,
     );
     let number = row
-        .try_get("pr_number")
+        .int("pr_number")
         .map_err(|error| intent_core::Error::Internal(error.to_string()))?;
     Ok(matches!(
         TargetColumns::from_row(row)?.resolution(&repo, number),
@@ -288,7 +293,7 @@ pub(crate) fn legacy_monitor_summary(row: &SqliteRow) -> Result<bool> {
 }
 
 impl TargetColumns {
-    fn resolved(target: &ReviewTarget, provenance: MonitorTargetProvenance) -> Self {
+    pub(crate) fn resolved(target: &ReviewTarget, provenance: MonitorTargetProvenance) -> Self {
         Self {
             provider: Some(provider_word(target.repository.provider).into()),
             instance: Some(target.repository.instance_base_url.clone()),
@@ -299,9 +304,9 @@ impl TargetColumns {
         }
     }
 
-    fn from_row(row: &SqliteRow) -> Result<Self> {
+    fn from_row(row: &impl MonitorRow) -> Result<Self> {
         let text = |column| {
-            row.try_get(column).map_err(|e| {
+            row.opt_text(column).map_err(|e| {
                 intent_core::Error::Internal(format!("read monitor target {column}: {e}"))
             })
         };
@@ -310,7 +315,7 @@ impl TargetColumns {
             instance: text("target_instance_base_url")?,
             project: text("target_project_path")?,
             kind: text("target_kind")?,
-            provenance: row.try_get("target_provenance").map_err(|e| {
+            provenance: row.text("target_provenance").map_err(|e| {
                 intent_core::Error::Internal(format!("read monitor provenance: {e}"))
             })?,
             reason: text("target_unresolved_reason")?,
@@ -363,7 +368,7 @@ impl TargetColumns {
         decode().unwrap_or_else(|| unresolved(MonitorTargetUnresolvedReason::InvalidTarget))
     }
 
-    fn values(&self) -> [Option<&str>; 6] {
+    pub(crate) fn values(&self) -> [Option<&str>; 6] {
         [
             self.provider.as_deref(),
             self.instance.as_deref(),
@@ -375,7 +380,7 @@ impl TargetColumns {
     }
 }
 
-fn qualified_from_row(row: &SqliteRow) -> Result<QualifiedPrMonitor> {
+pub(crate) fn qualified_from_row(row: &impl MonitorRow) -> Result<QualifiedPrMonitor> {
     let monitor = monitor_from_row(row)?;
     let columns = TargetColumns::from_row(row)?;
     let original_text = COLUMNS
@@ -385,7 +390,7 @@ fn qualified_from_row(row: &SqliteRow) -> Result<QualifiedPrMonitor> {
             if column == "pr_number" {
                 Ok(None)
             } else {
-                row.try_get(column).map_err(|e| {
+                row.opt_text(column).map_err(|e| {
                     intent_core::Error::Internal(format!("capture monitor {column}: {e}"))
                 })
             }
@@ -405,7 +410,7 @@ impl Store {
     /// # Errors
     /// Returns `NotFound` for an absent ID, or `Internal` for a database failure.
     pub async fn get_qualified_pr_monitor(&self, id: &PrMonitorId) -> Result<QualifiedPrMonitor> {
-        pending_postgres!("get_qualified_pr_monitor", self, backend => backend.get_qualified_pr_monitor(id).await)
+        dispatch!(self, backend => backend.get_qualified_pr_monitor(id).await)
     }
 
     /// Load active resolved AND unresolved records for recovery/inspection.
@@ -414,7 +419,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` for a database failure.
     pub async fn load_active_qualified_pr_monitors(&self) -> Result<Vec<QualifiedPrMonitor>> {
-        pending_postgres!("load_active_qualified_pr_monitors", self, backend => backend.load_active_qualified_pr_monitors().await)
+        dispatch!(self, backend => backend.load_active_qualified_pr_monitors().await)
     }
 
     /// List an agent's rows with their original target evidence, including history.
@@ -426,7 +431,7 @@ impl Store {
         &self,
         agent: &AgentId,
     ) -> Result<Vec<QualifiedPrMonitor>> {
-        pending_postgres!("list_qualified_pr_monitors_by_agent", self, backend => backend.list_qualified_pr_monitors_by_agent(agent).await)
+        dispatch!(self, backend => backend.list_qualified_pr_monitors_by_agent(agent).await)
     }
 
     /// List a workspace's rows with target evidence for destination-aware projection.
@@ -437,7 +442,7 @@ impl Store {
         &self,
         workspace: &WorkspaceId,
     ) -> Result<Vec<QualifiedPrMonitor>> {
-        pending_postgres!("list_qualified_pr_monitors_by_workspace", self, backend => backend.list_qualified_pr_monitors_by_workspace(workspace).await)
+        dispatch!(self, backend => backend.list_qualified_pr_monitors_by_workspace(workspace).await)
     }
 
     /// Find the active, qualified target owned by this agent. Never uses an
@@ -450,7 +455,7 @@ impl Store {
         agent: &AgentId,
         target: &ReviewTarget,
     ) -> Result<Option<QualifiedPrMonitor>> {
-        pending_postgres!("find_active_qualified_pr_monitor", self, backend => backend.find_active_qualified_pr_monitor(agent, target).await)
+        dispatch!(self, backend => backend.find_active_qualified_pr_monitor(agent, target).await)
     }
 
     /// Owner-agnostic lookup for the existing workspace refusal/adoption boundary.
@@ -462,7 +467,7 @@ impl Store {
         workspace: &WorkspaceId,
         target: &ReviewTarget,
     ) -> Result<Option<QualifiedPrMonitor>> {
-        pending_postgres!("find_active_qualified_pr_monitor_in_workspace", self, backend => backend.find_active_qualified_pr_monitor_in_workspace(workspace, target).await)
+        dispatch!(self, backend => backend.find_active_qualified_pr_monitor_in_workspace(workspace, target).await)
     }
 
     /// Insert a canonical target established by trusted application code.
@@ -478,7 +483,7 @@ impl Store {
         target: &ReviewTarget,
         provenance: MonitorTargetProvenance,
     ) -> Result<bool> {
-        pending_postgres!("insert_qualified_pr_monitor", self, backend => backend.insert_qualified_pr_monitor(m, target, provenance).await)
+        dispatch!(self, backend => backend.insert_qualified_pr_monitor(m, target, provenance).await)
     }
 
     /// Qualify an unresolved row using separately established target evidence.
@@ -495,7 +500,7 @@ impl Store {
         target: &ReviewTarget,
         provenance: MonitorTargetProvenance,
     ) -> Result<MonitorQualificationOutcome> {
-        pending_postgres!("qualify_legacy_pr_monitor_target", self, backend => backend.qualify_legacy_pr_monitor_target(expected, target, provenance).await)
+        dispatch!(self, backend => backend.qualify_legacy_pr_monitor_target(expected, target, provenance).await)
     }
 }
 
@@ -715,7 +720,7 @@ impl crate::SqliteStore {
     }
 }
 
-fn state_to_db(state: PrMonitorState) -> &'static str {
+pub(crate) fn state_to_db(state: PrMonitorState) -> &'static str {
     match state {
         PrMonitorState::Active => "active",
         PrMonitorState::Completed => "completed",
@@ -742,7 +747,7 @@ fn pending_from_db(raw: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn pending_to_db(pending: &[String]) -> Option<String> {
+pub(crate) fn pending_to_db(pending: &[String]) -> Option<String> {
     if pending.is_empty() {
         return None;
     }
@@ -769,7 +774,7 @@ pub fn pr_monitor_pause_error(until: Option<&str>) -> String {
     }
 }
 
-const PAUSE_UNTIL_SEPARATOR: &str = " until ";
+pub(crate) const PAUSE_UNTIL_SEPARATOR: &str = " until ";
 
 /// The SQL expression for the deadline named by the pause `annotation` (an
 /// expression: the marker, [`PAUSE_UNTIL_SEPARATOR`], an RFC 3339 instant),
@@ -1071,17 +1076,51 @@ fn workspace_pr_monitor_reads_sql() -> &'static str {
      ORDER BY created_at"
 }
 
-fn list_entry_from_row(r: &SqliteRow) -> Result<PrMonitorListEntry> {
+/// The column reads both backends' monitor rows share, so one decoder serves
+/// `SQLite` and Postgres alike.
+pub(crate) trait MonitorRow {
+    fn text(&self, column: &str) -> std::result::Result<String, sqlx::Error>;
+    fn opt_text(&self, column: &str) -> std::result::Result<Option<String>, sqlx::Error>;
+    fn int(&self, column: &str) -> std::result::Result<i64, sqlx::Error>;
+    fn boolean(&self, column: &str) -> std::result::Result<bool, sqlx::Error>;
+    fn opt_bool(&self, column: &str) -> std::result::Result<Option<bool>, sqlx::Error>;
+}
+
+macro_rules! monitor_row {
+    ($row:ty) => {
+        impl MonitorRow for $row {
+            fn text(&self, column: &str) -> std::result::Result<String, sqlx::Error> {
+                self.try_get(column)
+            }
+            fn opt_text(&self, column: &str) -> std::result::Result<Option<String>, sqlx::Error> {
+                self.try_get(column)
+            }
+            fn int(&self, column: &str) -> std::result::Result<i64, sqlx::Error> {
+                self.try_get(column)
+            }
+            fn boolean(&self, column: &str) -> std::result::Result<bool, sqlx::Error> {
+                self.try_get(column)
+            }
+            fn opt_bool(&self, column: &str) -> std::result::Result<Option<bool>, sqlx::Error> {
+                self.try_get(column)
+            }
+        }
+    };
+}
+monitor_row!(SqliteRow);
+#[cfg(feature = "postgres")]
+monitor_row!(sqlx::postgres::PgRow);
+
+pub(crate) fn list_entry_from_row(r: &impl MonitorRow) -> Result<PrMonitorListEntry> {
     let err =
         |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor list row: {e}"));
-    let get = |col: &str| -> Result<String> { r.try_get::<String, _>(col).map_err(err) };
-    let get_opt =
-        |col: &str| -> Result<Option<String>> { r.try_get::<Option<String>, _>(col).map_err(err) };
+    let get = |col: &str| -> Result<String> { r.text(col).map_err(err) };
+    let get_opt = |col: &str| -> Result<Option<String>> { r.opt_text(col).map_err(err) };
     Ok(PrMonitorListEntry {
         workspace_id: WorkspaceId(get("workspace_id")?),
         repo_owner: get("repo_owner")?,
         repo_name: get("repo_name")?,
-        pr_number: r.try_get::<i64, _>("pr_number").map_err(err)?,
+        pr_number: r.int("pr_number").map_err(err)?,
         state: state_from_db(&get("state")?)?,
         created_at: get("created_at")?,
         updated_at: get("updated_at")?,
@@ -1089,31 +1128,24 @@ fn list_entry_from_row(r: &SqliteRow) -> Result<PrMonitorListEntry> {
         snapshot_title: get_opt("snapshot_title")?,
         snapshot_head_sha: get_opt("snapshot_head_sha")?,
         snapshot_state: get_opt("snapshot_state")?,
-        snapshot_is_draft: r
-            .try_get::<Option<bool>, _>("snapshot_is_draft")
-            .map_err(err)?,
-        snapshot_mergeable: r
-            .try_get::<Option<bool>, _>("snapshot_mergeable")
-            .map_err(err)?,
-        snapshot_is_in_merge_queue: r
-            .try_get::<Option<bool>, _>("snapshot_is_in_merge_queue")
-            .map_err(err)?,
+        snapshot_is_draft: r.opt_bool("snapshot_is_draft").map_err(err)?,
+        snapshot_mergeable: r.opt_bool("snapshot_mergeable").map_err(err)?,
+        snapshot_is_in_merge_queue: r.opt_bool("snapshot_is_in_merge_queue").map_err(err)?,
         snapshot_pr_updated_at: get_opt("snapshot_pr_updated_at")?,
     })
 }
 
-fn monitor_from_row(r: &SqliteRow) -> Result<PrMonitor> {
+pub(crate) fn monitor_from_row(r: &impl MonitorRow) -> Result<PrMonitor> {
     let err = |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor row: {e}"));
-    let get = |col: &str| -> Result<String> { r.try_get::<String, _>(col).map_err(err) };
-    let get_opt =
-        |col: &str| -> Result<Option<String>> { r.try_get::<Option<String>, _>(col).map_err(err) };
+    let get = |col: &str| -> Result<String> { r.text(col).map_err(err) };
+    let get_opt = |col: &str| -> Result<Option<String>> { r.opt_text(col).map_err(err) };
     Ok(PrMonitor {
         monitor_id: PrMonitorId(get("monitor_id")?),
         workspace_id: WorkspaceId(get("workspace_id")?),
         agent_id: AgentId(get("agent_id")?),
         repo_owner: get("repo_owner")?,
         repo_name: get("repo_name")?,
-        pr_number: r.try_get::<i64, _>("pr_number").map_err(err)?,
+        pr_number: r.int("pr_number").map_err(err)?,
         state: state_from_db(&get("state")?)?,
         last_snapshot: get_opt("last_snapshot")?,
         baseline_snapshot: get_opt("baseline_snapshot")?,
@@ -1125,6 +1157,41 @@ fn monitor_from_row(r: &SqliteRow) -> Result<PrMonitor> {
         created_at: get("created_at")?,
         updated_at: get("updated_at")?,
     })
+}
+
+/// Split the [`workspace_pr_monitor_reads_sql`]-shaped rows into the
+/// displayStatus rows and the list entries.
+pub(crate) fn workspace_reads_from_rows(
+    rows: &[impl MonitorRow],
+) -> Result<WorkspacePrMonitorReads> {
+    let err =
+        |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor list row: {e}"));
+    let mut reads = WorkspacePrMonitorReads::default();
+    for r in rows {
+        let entry = list_entry_from_row(r)?;
+        if r.boolean("display_row").map_err(err)? {
+            reads.display_rows.push(PrMonitor {
+                monitor_id: PrMonitorId(r.text("monitor_id").map_err(err)?),
+                workspace_id: entry.workspace_id.clone(),
+                agent_id: AgentId(r.text("agent_id").map_err(err)?),
+                repo_owner: entry.repo_owner.clone(),
+                repo_name: entry.repo_name.clone(),
+                pr_number: entry.pr_number,
+                state: entry.state,
+                last_snapshot: r.opt_text("display_snapshot").map_err(err)?,
+                baseline_snapshot: None,
+                pending_changes: Vec::new(),
+                pending_since: None,
+                last_change_at: None,
+                last_polled_at: None,
+                last_error: None,
+                created_at: entry.created_at.clone(),
+                updated_at: entry.updated_at.clone(),
+            });
+        }
+        reads.list_entries.push(entry);
+    }
+    Ok(reads)
 }
 
 impl Store {
@@ -1140,7 +1207,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the insert fails for any reason other than a unique-index rejection (which returns `Ok(false)`).
     pub async fn insert_pr_monitor(&self, m: &PrMonitor) -> Result<bool> {
-        pending_postgres!("insert_pr_monitor", self, backend => backend.insert_pr_monitor(m).await)
+        dispatch!(self, backend => backend.insert_pr_monitor(m).await)
     }
 
     /// Get a PR monitor by id; `NotFound` when absent.
@@ -1149,7 +1216,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the PR monitor does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_pr_monitor(&self, monitor_id: &PrMonitorId) -> Result<PrMonitor> {
-        pending_postgres!("get_pr_monitor", self, backend => backend.get_pr_monitor(monitor_id).await)
+        dispatch!(self, backend => backend.get_pr_monitor(monitor_id).await)
     }
 
     /// The ACTIVE monitor an agent already owns for `(owner, name, number)`,
@@ -1166,7 +1233,7 @@ impl Store {
         repo_name: &str,
         pr_number: i64,
     ) -> Result<Option<PrMonitor>> {
-        pending_postgres!("find_active_pr_monitor", self, backend => backend.find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number).await)
+        dispatch!(self, backend => backend.find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number).await)
     }
 
     /// The ACTIVE monitor any agent in `workspace_id` holds for
@@ -1186,7 +1253,7 @@ impl Store {
         repo_name: &str,
         pr_number: i64,
     ) -> Result<Option<PrMonitor>> {
-        pending_postgres!("find_active_pr_monitor_in_workspace", self, backend => backend.find_active_pr_monitor_in_workspace(workspace_id, repo_owner, repo_name, pr_number).await)
+        dispatch!(self, backend => backend.find_active_pr_monitor_in_workspace(workspace_id, repo_owner, repo_name, pr_number).await)
     }
 
     /// List every monitor owned by an agent, oldest first (all states — the
@@ -1196,7 +1263,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_pr_monitors_by_agent(&self, agent_id: &AgentId) -> Result<Vec<PrMonitor>> {
-        pending_postgres!("list_pr_monitors_by_agent", self, backend => backend.list_pr_monitors_by_agent(agent_id).await)
+        dispatch!(self, backend => backend.list_pr_monitors_by_agent(agent_id).await)
     }
 
     /// List every monitor in a workspace, oldest first (all states).
@@ -1208,7 +1275,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<PrMonitor>> {
-        pending_postgres!("list_pr_monitors_by_workspace", self, backend => backend.list_pr_monitors_by_workspace(workspace_id).await)
+        dispatch!(self, backend => backend.list_pr_monitors_by_workspace(workspace_id).await)
     }
 
     /// List an agent's ACTIVE monitors only, oldest first — the SQL-filtered
@@ -1224,7 +1291,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<Vec<PrMonitor>> {
-        pending_postgres!("list_active_pr_monitors_by_agent", self, backend => backend.list_active_pr_monitors_by_agent(agent_id).await)
+        dispatch!(self, backend => backend.list_active_pr_monitors_by_agent(agent_id).await)
     }
 
     /// List a workspace's ACTIVE monitors only, oldest first — the
@@ -1239,7 +1306,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<PrMonitor>> {
-        pending_postgres!("list_active_pr_monitors_by_workspace", self, backend => backend.list_active_pr_monitors_by_workspace(workspace_id).await)
+        dispatch!(self, backend => backend.list_active_pr_monitors_by_workspace(workspace_id).await)
     }
 
     /// List a workspace's ACTIVE monitors plus only its most recently updated
@@ -1257,7 +1324,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<PrMonitor>> {
-        pending_postgres!("list_display_status_pr_monitors_by_workspace", self, backend => backend.list_display_status_pr_monitors_by_workspace(workspace_id).await)
+        dispatch!(self, backend => backend.list_display_status_pr_monitors_by_workspace(workspace_id).await)
     }
 
     /// Display-status monitor rows for every requested workspace in one
@@ -1270,7 +1337,7 @@ impl Store {
         &self,
         workspace_ids: &[WorkspaceId],
     ) -> Result<Vec<PrMonitor>> {
-        pending_postgres!("list_display_status_pr_monitors_by_workspaces", self, backend => backend.list_display_status_pr_monitors_by_workspaces(workspace_ids).await)
+        dispatch!(self, backend => backend.list_display_status_pr_monitors_by_workspaces(workspace_ids).await)
     }
 
     /// Every `active` monitor across all workspaces, oldest first — the poll
@@ -1280,7 +1347,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
-        pending_postgres!("load_active_pr_monitors", self, backend => backend.load_active_pr_monitors().await)
+        dispatch!(self, backend => backend.load_active_pr_monitors().await)
     }
 
     /// Every non-cancelled (active or completed) monitor across all
@@ -1308,7 +1375,7 @@ impl Store {
         &self,
         include_archived: bool,
     ) -> Result<Vec<PrMonitorListEntry>> {
-        pending_postgres!("load_non_cancelled_pr_monitor_list_entries", self, backend => backend.load_non_cancelled_pr_monitor_list_entries(include_archived).await)
+        dispatch!(self, backend => backend.load_non_cancelled_pr_monitor_list_entries(include_archived).await)
     }
 
     /// One workspace's PR-monitor inputs for `workspace.get` in ONE
@@ -1339,7 +1406,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<WorkspacePrMonitorReads> {
-        pending_postgres!("load_workspace_pr_monitor_reads", self, backend => backend.load_workspace_pr_monitor_reads(workspace_id).await)
+        dispatch!(self, backend => backend.load_workspace_pr_monitor_reads(workspace_id).await)
     }
 
     /// Set a monitor's lifecycle state. Every legal transition starts from
@@ -1356,7 +1423,7 @@ impl Store {
         state: PrMonitorState,
         updated_at: &str,
     ) -> Result<bool> {
-        pending_postgres!("update_pr_monitor_state", self, backend => backend.update_pr_monitor_state(monitor_id, state, updated_at).await)
+        dispatch!(self, backend => backend.update_pr_monitor_state(monitor_id, state, updated_at).await)
     }
 
     /// Terminalize an ACTIVE monitor: `completed` plus the cleared pending
@@ -1377,7 +1444,7 @@ impl Store {
         updated_at: &str,
         expected_updated_at: &str,
     ) -> Result<bool> {
-        pending_postgres!("complete_pr_monitor", self, backend => backend.complete_pr_monitor(monitor_id, updated_at, expected_updated_at).await)
+        dispatch!(self, backend => backend.complete_pr_monitor(monitor_id, updated_at, expected_updated_at).await)
     }
 
     /// Write back everything one poll can change: the last-poll snapshot, the
@@ -1406,7 +1473,7 @@ impl Store {
         monitor_id: &PrMonitorId,
         update: PrMonitorPollUpdate<'_>,
     ) -> Result<bool> {
-        pending_postgres!("update_pr_monitor_poll", self, backend => backend.update_pr_monitor_poll(monitor_id, update).await)
+        dispatch!(self, backend => backend.update_pr_monitor_poll(monitor_id, update).await)
     }
 
     /// Annotate `last_error` on EVERY active monitor across all workspaces
@@ -1434,7 +1501,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn annotate_active_pr_monitors_pause(&self, pause: &str) -> Result<u64> {
-        pending_postgres!("annotate_active_pr_monitors_pause", self, backend => backend.annotate_active_pr_monitors_pause(pause).await)
+        dispatch!(self, backend => backend.annotate_active_pr_monitors_pause(pause).await)
     }
 
     /// Strip the rate-limit pause annotation ([`pr_monitor_pause_error`])
@@ -1464,7 +1531,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_active_pr_monitors_pause(&self, lifted: Option<&str>) -> Result<u64> {
-        pending_postgres!("clear_active_pr_monitors_pause", self, backend => backend.clear_active_pr_monitors_pause(lifted).await)
+        dispatch!(self, backend => backend.clear_active_pr_monitors_pause(lifted).await)
     }
 
     /// Re-parent an ACTIVE monitor from `from_agent_id` to `to_agent_id` and
@@ -1489,7 +1556,7 @@ impl Store {
         to_agent_id: &AgentId,
         update: PrMonitorPollUpdate<'_>,
     ) -> Result<bool> {
-        pending_postgres!("adopt_pr_monitor", self, backend => backend.adopt_pr_monitor(monitor_id, from_agent_id, to_agent_id, update).await)
+        dispatch!(self, backend => backend.adopt_pr_monitor(monitor_id, from_agent_id, to_agent_id, update).await)
     }
 }
 
@@ -1763,36 +1830,7 @@ impl crate::SqliteStore {
                     "load pr monitor reads for workspace failed: {e}"
                 ))
             })?;
-        let err =
-            |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor list row: {e}"));
-        let mut reads = WorkspacePrMonitorReads::default();
-        for r in &rows {
-            let entry = list_entry_from_row(r)?;
-            if r.try_get::<bool, _>("display_row").map_err(err)? {
-                reads.display_rows.push(PrMonitor {
-                    monitor_id: PrMonitorId(r.try_get::<String, _>("monitor_id").map_err(err)?),
-                    workspace_id: entry.workspace_id.clone(),
-                    agent_id: AgentId(r.try_get::<String, _>("agent_id").map_err(err)?),
-                    repo_owner: entry.repo_owner.clone(),
-                    repo_name: entry.repo_name.clone(),
-                    pr_number: entry.pr_number,
-                    state: entry.state,
-                    last_snapshot: r
-                        .try_get::<Option<String>, _>("display_snapshot")
-                        .map_err(err)?,
-                    baseline_snapshot: None,
-                    pending_changes: Vec::new(),
-                    pending_since: None,
-                    last_change_at: None,
-                    last_polled_at: None,
-                    last_error: None,
-                    created_at: entry.created_at.clone(),
-                    updated_at: entry.updated_at.clone(),
-                });
-            }
-            reads.list_entries.push(entry);
-        }
-        Ok(reads)
+        workspace_reads_from_rows(&rows)
     }
 
     pub async fn update_pr_monitor_state(
