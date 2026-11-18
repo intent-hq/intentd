@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.247] - 2026-11-18
+
+### 📚 Documentation
+
+- Mark font picker search as released ([#3520](https://github.com/intent-hq/intentd/pull/3520))
+- Align inline visual guidance with controls ([#3517](https://github.com/intent-hq/intentd/pull/3517))
+
+
 ## [0.11.246] - 2026-11-18
 
 ### 📚 Documentation
