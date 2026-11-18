@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.239] - 2026-11-18
+
+### 🚀 Features
+
+- *(cloud)* Agent37 cloud machine provider ([#3477](https://github.com/intent-hq/intentd/pull/3477))
+
+### 🔧 Refactor
+
+- *(store)* Split the Postgres pending-methods list per module ([#3481](https://github.com/intent-hq/intentd/pull/3481))
+
+
 ## [0.11.238] - 2026-11-17
 
 ### 🚀 Features
