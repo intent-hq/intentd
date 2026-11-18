@@ -197,25 +197,28 @@ per provider — pick exactly one delivery path:
 they honor; do not assume wiring works because the spawn succeeded. Unit-test the
 translator output (tests in `crates/intent-acp/src/tests.rs`), integration-test with the
 mock fixtures (`crates/intentd/tests/fixtures/mock-acp-agent.mjs`, `mock-mcp-server.mjs`),
-and dogfood: ask the new agent to list its tools and to call `set_workspace_title` (§8).
+and dogfood: ask the new agent to list its tools and to call `ws.workspace.setTitle` through
+`workspace_api` (§8).
 
-## 4. Workspace naming nudge
+## 4. Naming nudges
 
-On an agent's first turn in a still-untitled workspace, the daemon prepends a nudge to
-call the workspace-rename tool (`build_workspace_naming_instruction`,
-`crates/intent-services/src/agent_manager.rs`). The tool must be spelled the way the
-provider actually surfaces it — providers affix the MCP server name differently:
+On an agent's first turn, the daemon prepends a `<system>` block asking an agent with a
+generated name to call `ws.workspace.setAgentName`, and, in a still-untitled workspace, to
+call `ws.workspace.setTitle` (`build_first_turn_naming_instruction`,
+`crates/intent-services/src/agent_manager.rs`; wording in the harness, `naming_nudge`). Both
+go through the `workspace_api` tool, which must be spelled the way the provider actually
+surfaces it — providers affix the MCP server name differently:
 
-- auggie: trailing *suffix* — `set_workspace_title_workspace-mcp`
-- opencode: leading *prefix* — `workspace-mcp_set_workspace_title` (confirmed against
+- auggie: trailing *suffix* — `workspace_api_workspace-mcp`
+- opencode: leading *prefix* — `workspace-mcp_workspace_api` (confirmed against
   captured opencode 1.18.3 traffic)
-- everyone else: the generic fallback phrasing (`GENERIC_NAMING_TOOL_REFERENCE`,
-  "the `set_workspace_title` tool from the workspace MCP server")
+- everyone else: the generic fallback phrasing (`GENERIC_AGENT_NAMING_TOOL_REFERENCE`,
+  "the `workspace_api` tool from the workspace MCP server")
 
-Register the new provider's spelling in `workspace_naming_tool_reference`
-(`crates/intent-services/src/agent_manager.rs`) **only after empirically capturing it**
-(spawn the agent, list its tools or observe a tool call). Until then the generic fallback
-is correct and safe. Tests: the `build_turn_prompt_naming_instruction_*` cases in
+Register the new provider's spelling in the harness `agent_naming_tool_reference`
+**only after empirically capturing it** (spawn the agent, list its tools or observe a tool
+call). Until then the generic fallback is correct and safe. Tests: the
+`build_turn_prompt_naming_instruction_*` cases in
 `crates/intent-services/src/agent_manager/tests.rs`.
 
 ## 5. Tool-name / kind derivation

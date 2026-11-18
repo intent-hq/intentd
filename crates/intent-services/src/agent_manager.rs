@@ -6103,7 +6103,7 @@ impl AgentManager {
         });
         let workspace_tool_ref = needs_workspace_title.then(|| {
             provider_id.as_deref().map_or(
-                GENERIC_NAMING_TOOL_REFERENCE,
+                GENERIC_AGENT_NAMING_TOOL_REFERENCE,
                 workspace_naming_tool_reference,
             )
         });
@@ -14770,12 +14770,9 @@ fn session_provider_id(session: &AgentSession, configured_default: Option<&str>)
     crate::agent_session::resolve_provider_id(session.provider.as_deref(), configured_default)
 }
 
-/// Fallback phrasing for the workspace-naming nudge when the provider's MCP
-/// tool naming convention is unknown (or its workspace-MCP wiring hasn't
-/// landed yet). Wording owned by the harness (H5).
-pub(crate) use crate::harness::v1::{
-    GENERIC_AGENT_NAMING_TOOL_REFERENCE, GENERIC_NAMING_TOOL_REFERENCE,
-};
+/// Fallback phrasing for the naming nudges when the provider's MCP tool
+/// naming convention is unknown. Wording owned by the harness (H5).
+pub(crate) use crate::harness::v1::GENERIC_AGENT_NAMING_TOOL_REFERENCE;
 
 /// Generated UI names use a display name plus an optional collision number;
 /// daemon-created General agents use `Agent` plus six hexadecimal characters.
@@ -14822,8 +14819,8 @@ pub(crate) fn agent_naming_tool_reference(provider_id: &str) -> &'static str {
 }
 
 /// Provider-correct spelling of the workspace-MCP rename tool for the naming
-/// nudge (e.g. auggie → `set_workspace_title_workspace-mcp`, opencode →
-/// `workspace-mcp_set_workspace_title`). Wording owned by the harness (H5).
+/// nudge (e.g. auggie → `workspace_api_workspace-mcp`, opencode →
+/// `workspace-mcp_workspace_api`). Wording owned by the harness (H5).
 pub(crate) fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
     crate::harness::latest().naming_tool_reference(provider_id)
 }
@@ -23597,10 +23594,10 @@ mod v1_turn_envelope_goldens {
             rest,
             "Context:\nrepo: demo\n\n---\n\n\
              <system>\n\
-             This workspace needs a title. As your first action, call the \
-             `set_workspace_title_workspace-mcp` tool with a short 3–5 word sentence-case \
-             title describing the task. This can be called in parallel with \
-             information-gathering.\n\
+             This workspace needs a title. As your first action, call \
+             `ws.workspace.setTitle` through the `workspace_api_workspace-mcp` tool with a \
+             short 3–5 word sentence-case title describing the task. This can be called in \
+             parallel with information-gathering.\n\
              </system>\n\n\
              [Role Reminder: You are a Implementor. Stay in scope.]\n\n\
              start the task"
