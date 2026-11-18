@@ -1668,7 +1668,7 @@ async fn owner_queue_permit_blocks_revoke_until_dropped() {
         .unwrap()
         .unwrap();
     assert!(tokio::time::timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         other.revoke_principal_credential("k")
     )
     .await
@@ -1694,11 +1694,14 @@ async fn owner_queue_permit_blocks_revoke_until_dropped() {
     assert!(waiting, "the revoke queues on the writer lock");
     assert!(!revoke.is_finished(), "revoke waits for the permit");
     drop(held);
-    assert!(tokio::time::timeout(Duration::from_secs(5), revoke)
-        .await
-        .expect("dropping the permit releases the lock")
-        .unwrap()
-        .unwrap());
+    assert!(tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        revoke
+    )
+    .await
+    .expect("dropping the permit releases the lock")
+    .unwrap()
+    .unwrap());
     assert!(store
         .owner_queue_permit(&owner, Some("k"))
         .await
