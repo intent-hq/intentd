@@ -759,16 +759,15 @@ impl PgStore {
         };
         let json = serde_json::to_string(&new_usage)
             .map_err(|e| Error::Internal(format!("encode token_usage failed: {e}")))?;
-        let updated = sqlx::query(
-            "UPDATE workspace SET token_usage = $3 WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(self.tenant())
-        .bind(&workspace_id.0)
-        .bind(json)
-        .execute(&mut *tx)
-        .await
-        .map_err(db)?
-        .rows_affected();
+        let updated =
+            sqlx::query("UPDATE workspace SET token_usage = $3 WHERE tenant_id = $1 AND id = $2")
+                .bind(self.tenant())
+                .bind(&workspace_id.0)
+                .bind(json)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?
+                .rows_affected();
         if updated == 0 {
             return Err(not_found(workspace_id));
         }
@@ -829,7 +828,12 @@ impl PgStore {
         // deletion; this one transaction owns all of them.
         let keys: Vec<crate::RepositoryLifecycleKey> =
             std::iter::once(crate::RepositoryLifecycleKey::Workspace(id.clone()))
-                .chain(agents.iter().cloned().map(crate::RepositoryLifecycleKey::Agent))
+                .chain(
+                    agents
+                        .iter()
+                        .cloned()
+                        .map(crate::RepositoryLifecycleKey::Agent),
+                )
                 .collect();
         lifecycle.begin(&keys)?;
         // A started transaction finishes its commit and overlay eviction even
@@ -854,9 +858,7 @@ impl PgStore {
         agents: &[AgentId],
     ) -> Result<()> {
         let tenant = self.tenant();
-        let exec = |sql: &'static str| {
-            sqlx::query(sql).bind(tenant.to_owned()).bind(id.0.clone())
-        };
+        let exec = |sql: &'static str| sqlx::query(sql).bind(tenant.to_owned()).bind(id.0.clone());
         // Recovery history of this workspace, except a row naming a live
         // session of another workspace.
         exec(

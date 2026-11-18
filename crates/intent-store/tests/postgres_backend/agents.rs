@@ -13,7 +13,9 @@ use intent_core::{
 use intent_store::{AgentQueueRow, AgentTurnEffort, Store};
 use serde_json::{json, Value};
 
-use crate::harness::{open, parity_test, sqlite_store, test_db};
+use crate::harness::{
+    count_rows as count, open, parity_test, seed_sql as sql, sqlite_store, test_db, TestDb,
+};
 
 const WS: &str = "__chief__";
 
@@ -1843,3 +1845,318 @@ async fn token_usage_seeds_legacy_cells_per_tenant() {
     let rows = a_store.get_workspace_agent_usage_data(&w).await.unwrap();
     assert_eq!(rows[0].5[0].reported_totals, usage(15));
 }
+
+// ---- session deletion and monitor wake messages -----------------------------
+
+fn agent_in(id: &str, ws: &str, tenant: &str) -> AgentSession {
+    AgentSession {
+        workspace_id: WorkspaceId(ws.into()),
+        ..session(id, tenant, "2026-01-01T00:00:01Z")
+    }
+}
+
+async fn workspace_row(store: &Store, id: &str) {
+    store
+        .insert_workspace(&intent_core::Workspace {
+            id: WorkspaceId(id.into()),
+            title: id.into(),
+            branch: "main".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// `d1` in `ws-d` with a row in every table its deletion clears: messages
+/// and a payload, a queue entry, a hook, a monitor, wake markers in both
+/// directions, recovery history and a private desktop record.
+async fn seed_doomed_agent(store: &Store, db: Option<&TestDb>, tenant: &str) {
+    store
+        .insert_agent_session(&agent_in("d1", "ws-d", tenant))
+        .await
+        .unwrap();
+    let heavy = json!([{
+        "type": "tool_use", "id": "tu1", "name": "write",
+        "input": { "body": format!("{tenant} {}", "x".repeat(20_000)) },
+    }]);
+    store
+        .append_agent_message(&aid("d1"), "assistant", &heavy, "2026-01-01T00:00:02Z")
+        .await
+        .unwrap();
+    let record = json!({"workspaceId": "ws-d", "agentId": "d1", "tenant": tenant});
+    for stmt in [
+        "INSERT INTO agent_queue ({t}id, agent_id, position, payload, created_at) \
+         VALUES ({v}'q-d1', 'd1', 0, '{}', 'T0')"
+            .to_owned(),
+        "INSERT INTO hook ({t}hook_id, workspace_id, agent_id, name, code, delay_ms, state, \
+         created_at) VALUES ({v}'hk-d1', 'ws-d', 'd1', 'n', 'c', 1, 'scheduled', 'T0')"
+            .to_owned(),
+        "INSERT INTO pr_monitor ({t}monitor_id, workspace_id, agent_id, repo_owner, repo_name, \
+         pr_number, state, created_at, updated_at) \
+         VALUES ({v}'m-d1', 'ws-d', 'd1', 'o', 'r', 1, 'active', 'T0', 'T0')"
+            .to_owned(),
+        "INSERT INTO completion_wake_delivery ({t}parent_agent_id, child_agent_id, \
+         completion_identity, delivered_at) \
+         VALUES ({v}'d1', 'd2', 'c', 'T0'), ({v}'d2', 'd1', 'c', 'T0')"
+            .to_owned(),
+        "INSERT INTO advisory_wake_delivery ({t}parent_agent_id, child_agent_id, delivered_at) \
+         VALUES ({v}'d2', 'd1', 'T0')"
+            .to_owned(),
+        "INSERT INTO interrupted_agent ({t}agent_id, workspace_id, prev_status, interrupted_at) \
+         VALUES ({v}'d1', 'ws-d', 'active', 'T0')"
+            .to_owned(),
+        format!(
+            "INSERT INTO settings ({{t}}key, value) VALUES ({{v}}'desktop.v1/request/r-d1', '{record}')"
+        ),
+    ] {
+        sql(store, db, tenant, &stmt).await;
+    }
+}
+
+parity_test!(agent_session_delete_cascades, |store, tenant, db| {
+    workspace_row(&store, "ws-d").await;
+    workspace_row(&store, "ws-other").await;
+    store
+        .insert_agent_session(&agent_in("d2", "ws-d", tenant))
+        .await
+        .unwrap();
+    let record = json!({"workspaceId": "ws-d", "agentId": "d2", "tenant": tenant});
+    sql(
+        &store,
+        db,
+        tenant,
+        &format!("INSERT INTO settings ({{t}}key, value) VALUES ({{v}}'desktop.v1/request/r-d2', '{record}')"),
+    )
+    .await;
+    seed_doomed_agent(&store, db, tenant).await;
+    let ws = WorkspaceId("ws-d".into());
+
+    assert!(!store
+        .delete_agent_session(&WorkspaceId("ws-other".into()), &aid("d1"))
+        .await
+        .unwrap());
+    assert_eq!(
+        count(&store, db, tenant, "agent_message", "agent_id = 'd1'").await,
+        1
+    );
+    assert!(!store
+        .delete_agent_session(&ws, &aid("ghost"))
+        .await
+        .unwrap());
+
+    assert!(store.delete_agent_session(&ws, &aid("d1")).await.unwrap());
+    assert!(!store.delete_agent_session(&ws, &aid("d1")).await.unwrap());
+    for (table, filter) in [
+        ("agent_session", "id = 'd1'"),
+        ("agent_message", "agent_id = 'd1'"),
+        ("agent_message_payload", "agent_id = 'd1'"),
+        ("agent_queue", "agent_id = 'd1'"),
+        ("hook", "agent_id = 'd1'"),
+        ("pr_monitor", "agent_id = 'd1'"),
+        ("completion_wake_delivery", "1 = 1"),
+        ("advisory_wake_delivery", "1 = 1"),
+        ("interrupted_agent", "agent_id = 'd1'"),
+        ("settings", "key = 'desktop.v1/request/r-d1'"),
+    ] {
+        assert_eq!(count(&store, db, tenant, table, filter).await, 0, "{table}");
+    }
+    assert_eq!(
+        count(&store, db, tenant, "agent_session", "id = 'd2'").await,
+        1
+    );
+    assert_eq!(
+        count(
+            &store,
+            db,
+            tenant,
+            "settings",
+            "key = 'desktop.v1/request/r-d2'"
+        )
+        .await,
+        1
+    );
+    if tenant == "decoy" {
+        seed_doomed_agent(&store, db, tenant).await;
+        store
+            .insert_agent_session(&agent_in("ghost", "ws-d", tenant))
+            .await
+            .unwrap();
+    }
+});
+
+fn wake_target() -> intent_core::ReviewTarget {
+    serde_json::from_value(json!({
+        "repository": {
+            "provider": "gitlab", "instanceBaseUrl": "https://gitlab.example",
+            "projectPath": "o/r",
+        },
+        "kind": "merge-request", "number": 42,
+    }))
+    .unwrap()
+}
+
+parity_test!(
+    monitor_wake_message_prepare_and_commit,
+    |store, tenant, db| {
+        workspace_row(&store, "ws-m").await;
+        store
+            .insert_agent_session(&agent_in("am", "ws-m", tenant))
+            .await
+            .unwrap();
+        store
+            .append_agent_message(
+                &aid("am"),
+                "user",
+                &json!([{"type": "text", "text": tenant}]),
+                "2026-01-01T00:00:02Z",
+            )
+            .await
+            .unwrap();
+        let target = wake_target();
+        let binding = json!({
+            "scope": {"daemonId": "d", "authorityScopeId": "o", "authorityGeneration": "3"},
+            "connection": {"connectionId": "c", "accountId": "a", "connectionGeneration": "7"},
+            "resource": target,
+        });
+        let monitor = intent_core::PrMonitor {
+            monitor_id: intent_core::PrMonitorId("mm".into()),
+            workspace_id: WorkspaceId("ws-m".into()),
+            agent_id: aid("am"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: intent_core::PrMonitorState::Active,
+            last_snapshot: Some(json!({"monitorBinding": binding, "tenant": tenant}).to_string()),
+            baseline_snapshot: None,
+            pending_changes: vec![format!("{tenant} change")],
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        assert!(store
+            .insert_qualified_pr_monitor(
+                &monitor,
+                &target,
+                intent_store::MonitorTargetProvenance::CapturedRequest
+            )
+            .await
+            .unwrap());
+        let row = store
+            .get_qualified_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let binding: intent_core::review_monitor::ReviewMonitorBinding =
+            serde_json::from_value(binding).unwrap();
+        let metadata: intent_core::review_monitor::ReviewMonitorWakeMetadata =
+            serde_json::from_value(json!({
+                "type": "pr_monitor_wake", "monitorId": "mm", "repo": "o/r", "prNumber": 42,
+                "reason": "changes", "resource": target,
+            }))
+            .unwrap();
+        let at = "2026-01-02T00:00:00Z";
+        let commit = |prepared: intent_store::PreparedMonitorMessage| async move {
+            tokio::task::spawn_blocking(move || prepared.commit())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        let mut wrong = metadata.clone();
+        wrong.pr_number = 7;
+        assert!(matches!(
+            store
+                .prepare_monitor_message(&row, &binding, "wake", "text", &wrong, at)
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+        let dropped = store
+            .prepare_monitor_message(&row, &binding, "wake-0", "text", &metadata, at)
+            .await
+            .unwrap();
+        drop(dropped);
+        assert_eq!(
+            count(&store, db, tenant, "agent_message", "agent_id = 'am'").await,
+            1
+        );
+
+        let text = format!("{tenant} private change");
+        let prepared = store
+            .prepare_monitor_message(&row, &binding, "wake-1", &text, &metadata, at)
+            .await
+            .unwrap();
+        let message = commit(prepared).await.expect("current monitor writes");
+        assert_eq!((message.id.as_str(), message.seq), ("wake-1", 1));
+        let history = store.get_agent_messages(&aid("am"), None).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].content, message.content);
+        assert_eq!(history[1].metadata, message.metadata);
+        let proof = store
+            .get_monitor_message_provenance(&aid("am"), "wake-1")
+            .await
+            .unwrap()
+            .expect("provenance row");
+        assert_eq!(proof.binding, binding);
+        assert_eq!(proof.workspace_id, WorkspaceId("ws-m".into()));
+        assert_eq!(
+            store
+                .get_agent_session_without_messages(&aid("am"))
+                .await
+                .unwrap()
+                .updated_at,
+            at
+        );
+
+        // A monitor changed since its capture writes nothing.
+        sql(
+            &store,
+            db,
+            tenant,
+            "UPDATE pr_monitor SET last_error = 'moved on' WHERE {w} AND monitor_id = 'mm'",
+        )
+        .await;
+        let stale = store
+            .prepare_monitor_message(&row, &binding, "wake-2", &text, &metadata, at)
+            .await
+            .unwrap();
+        assert!(commit(stale).await.is_none());
+        assert_eq!(
+            count(&store, db, tenant, "agent_message", "id = 'wake-2'").await,
+            0
+        );
+
+        // A retired destination is unavailable.
+        sql(
+            &store,
+            db,
+            tenant,
+            "UPDATE agent_session SET retired_at = 'T9' WHERE {w} AND id = 'am'",
+        )
+        .await;
+        let current = store
+            .get_qualified_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .prepare_monitor_message(&current, &binding, "wake-3", &text, &metadata, at)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        if tenant == "decoy" {
+            // Back to the captured, live state the subject prepares against.
+            sql(
+                &store,
+                db,
+                tenant,
+                "UPDATE pr_monitor SET last_error = NULL WHERE {w} AND monitor_id = 'mm'; \
+             UPDATE agent_session SET retired_at = NULL WHERE {w} AND id = 'am'",
+            )
+            .await;
+        }
+    }
+);
