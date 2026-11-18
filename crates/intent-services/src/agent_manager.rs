@@ -12434,6 +12434,17 @@ impl AgentManager {
         } else {
             None
         };
+        // A Codex API key profile signs in in its own home. Derived before
+        // the command is built, so a login-shell `CODEX_HOME` never fills in
+        // over it.
+        let profile_env = profile_env.map(|profile| {
+            if resolved.provider.id == "codex" {
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                Arc::new((*profile).clone().with_codex_api_key_home(home.as_deref()))
+            } else {
+                profile
+            }
+        });
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.profile_env = profile_env.as_deref();
         opts.cwd = Some(&resolved.cwd);

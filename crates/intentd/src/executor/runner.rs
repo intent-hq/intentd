@@ -2670,6 +2670,7 @@ impl Runner {
         })?;
         profile
             .for_node(self.inner.home.as_deref())
+            .map(|profile| profile.with_codex_api_key_home(self.inner.home.as_deref()))
             .map_err(|missing| missing.to_string())
     }
 
