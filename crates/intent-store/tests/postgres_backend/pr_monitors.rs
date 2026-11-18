@@ -1531,6 +1531,25 @@ parity_test!(
                 .await
                 .unwrap();
         }
+        let done = (
+            "m-wdone",
+            "agent-a",
+            "ws-a",
+            "Org",
+            "Done",
+            12,
+            PrMonitorState::Completed,
+            T1,
+            T1,
+        );
+        assert!(store
+            .insert_qualified_pr_monitor(
+                &monitor(&done, tenant),
+                &gh("Org/Done", 12),
+                MonitorTargetProvenance::LegacyGithubWriter
+            )
+            .await
+            .unwrap());
         store
             .insert_agent_session(&AgentSession {
                 id: aid("agent-bad"),
@@ -1619,8 +1638,8 @@ parity_test!(
             .await
             .unwrap();
         let title = format!("{tenant} one");
-        // Legacy-inserted rows stay unresolved, so only writer-proven
-        // monitors (`m-lgw`, the decoy's ghosts) are listed.
+        // Legacy-inserted rows stay unresolved, so only active writer-proven
+        // monitors (`m-lgw`, the decoy's ghosts; not `m-wdone`) are listed.
         let ghost = |id: &str| monitor_value(id, &format!("Ghost/{id}"), 60, Some(&title));
         let mut agent_a_monitors = Vec::new();
         if tenant == "decoy" {
