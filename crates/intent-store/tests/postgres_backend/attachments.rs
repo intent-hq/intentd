@@ -2,7 +2,8 @@
 //!
 //! Decoy rule: the body leaves the same keyed rows on every tenant, and the
 //! decoy ends its run with rows behind every id the subject probes as absent
-//! (`missing`, `att-k2`, `ws-empty`, the `nope` path, the `ws-c` diffs).
+//! (`missing`, `att-k2`, `ws-empty`, the `nope` path, the `ws-c` diffs) and
+//! behind every row the subject's stage moves select (unstaged `f`, `g`).
 //! Values carry the tenant name. Ids mix case and cutoffs end in a lowercase
 //! `t`, so ordering and expiry depend on `COLLATE "C"`: `<date>t` sorts after
 //! `<date>T…` bytewise but before it under a case-insensitive locale.
@@ -455,6 +456,10 @@ parity_test!(tracked_changes_upsert_stage_and_sweep, |store, tenant| {
     );
 
     if tenant == "decoy" {
-        upsert(change("ws-a", "nope", "unstaged", Some("B"), 1)).await;
+        // Unstaged rows the subject's stage moves would reach without
+        // their tenant filter.
+        for path in ["nope", "f", "g"] {
+            upsert(change("ws-a", path, "unstaged", Some("D"), 1)).await;
+        }
     }
 });
