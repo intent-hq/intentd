@@ -1,3 +1,0 @@
-ensure_client
-get_client
-upsert_client

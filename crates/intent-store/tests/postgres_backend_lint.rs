@@ -112,11 +112,80 @@ const NON_TENANT_TABLES: &[(&str, &str)] = &[(
     "applied-migration ledger written by postgres::migrate, one per schema",
 )];
 
+/// Every table the Postgres migrations create.
+fn schema_tables() -> BTreeSet<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/migrations");
+    let mut out = BTreeSet::new();
+    for entry in std::fs::read_dir(&dir).expect("read postgres/migrations") {
+        let sql = std::fs::read_to_string(entry.unwrap().path())
+            .unwrap()
+            .to_lowercase();
+        for (at, _) in sql.match_indices("create table ") {
+            let rest = sql[at + "create table ".len()..].trim_start();
+            let rest = rest.strip_prefix("if not exists ").unwrap_or(rest);
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// The names a marker comment declares as a query's own `WITH` subqueries:
+/// `// tenant-lint: not-tables a b — <reason>`, on one of the three lines
+/// above the literal's first line (`line` is 1-based). The tenant rule
+/// skips those names in that query only, and each must be defined there
+/// (`a as (`) and must not be a real table, so a marker cannot hide one.
+/// Every real table in the query is still checked.
+#[track_caller]
+fn declared_subqueries(text: &str, line: usize, sql: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    for k in 1..=3 {
+        let Some(i) = line.checked_sub(1 + k) else {
+            break;
+        };
+        let Some(rest) = lines
+            .get(i)
+            .and_then(|l| l.trim().strip_prefix("// tenant-lint: not-tables "))
+        else {
+            continue;
+        };
+        let (names, reason) = rest
+            .split_once(" — ")
+            .expect("tenant-lint marker needs ` — <reason>`");
+        assert!(
+            !reason.trim().is_empty(),
+            "tenant-lint marker needs a reason"
+        );
+        let names: Vec<String> = names.split_whitespace().map(str::to_lowercase).collect();
+        let tables = schema_tables();
+        for name in &names {
+            assert!(
+                !tables.contains(name),
+                "tenant-lint marker names the real table `{name}`; rename the subquery"
+            );
+            assert!(
+                sql.contains(&format!("{name} as (")),
+                "tenant-lint marker names `{name}`, which this query does not define"
+            );
+        }
+        return names;
+    }
+    Vec::new()
+}
+
 /// The violations in one SQL literal (lower-cased).
 fn violations(sql: &str) -> Vec<String> {
+    violations_skipping(sql, &[])
+}
+
+/// [`violations`], treating the `skip` names as the query's own subqueries.
+fn violations_skipping(sql: &str, skip: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for r in table_refs(sql) {
-        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) {
+        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) || skip.contains(&r.table) {
             continue;
         }
         let ok = if r.keyword == "INTO" {
@@ -156,7 +225,9 @@ fn every_postgres_query_is_filtered_by_the_bound_tenant() {
                 continue;
             }
             checked += 1;
-            for v in violations(&lit.to_lowercase()) {
+            let sql = lit.to_lowercase();
+            let skip = declared_subqueries(&text, line, &sql);
+            for v in violations_skipping(&sql, &skip) {
                 findings.push(format!(
                     "{}:{line}: {v} is not filtered by tenant_id = $n",
                     file.display()
@@ -234,6 +305,38 @@ fn the_tenant_rule_catches_unscoped_shapes() {
     assert_eq!(
         violations("select distinct (select id from note) from task where tenant_id = $1"),
         ["FROM note"]
+    );
+    // A marker skips only the names it declares; real tables stay checked.
+    let declared = ["c".to_owned()];
+    assert!(violations_skipping(
+        "with c as (select id from note where tenant_id = $1) select id from c",
+        &declared
+    )
+    .is_empty());
+    assert_eq!(
+        violations_skipping(
+            "with c as (select id from note where id = $2) select id from c",
+            &declared
+        ),
+        ["FROM note"]
+    );
+    let text = "x\n// tenant-lint: not-tables c — own subquery\nlet q = f(\n\"with c as (...";
+    assert_eq!(
+        declared_subqueries(text, 4, "with c as (select 1) select * from c"),
+        ["c"]
+    );
+    assert!(declared_subqueries("a\nb\nc\nd", 4, "select 1").is_empty());
+}
+
+#[test]
+#[should_panic(expected = "names the real table `note`")]
+fn a_marker_cannot_name_a_real_table() {
+    // A subquery named after a table would hide that table's own reads.
+    let text = "x\n// tenant-lint: not-tables note — own subquery\nlet q = f(\n\"with note...";
+    declared_subqueries(
+        text,
+        4,
+        "with note as (select id from note n) select id from note",
     );
 }
 
