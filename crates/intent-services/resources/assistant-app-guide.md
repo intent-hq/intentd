@@ -596,8 +596,8 @@ machines** with no install or sign-in step, and keeps **Let's go** disabled with
 **Settings → Machines** while its machine list is empty (an orchestrator shows **Settings → Machines**
 and reads that list without the Labs **Remote agents** switch; if the list can't be read,
 onboarding does not block). Also pending: on an orchestrator, onboarding and **Settings →
-Providers** offer only Claude Code and Codex (another provider stays listed while it is
-turned on), and onboarding has five steps: after the provider, **Connect <provider>** asks
+Providers** offer only Claude Code and Codex (in Settings, another provider stays listed
+while it is turned on), and onboarding has five steps: after the provider, **Connect <provider>** asks
 for **Subscription token** (`claude setup-token`) or **API key** for Claude Code, or
 **ChatGPT access token** or **API key** for Codex. **Continue** is enabled once the pasted
 value has the right format; it saves a profile and makes it the provider's default. The

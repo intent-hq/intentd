@@ -1324,6 +1324,36 @@ async fn node_runner_applies_the_profile_with_local_launch_precedence_and_node_h
 }
 
 #[tokio::test]
+async fn node_runner_signs_a_codex_api_key_profile_in_its_own_home() {
+    let Some(h) = harness(1, &["--dump-env"]) else {
+        return;
+    };
+    h.runner
+        .launch(launch_with_profile(
+            "a1",
+            &json!([
+                { "key": "CODEX_API_KEY", "value": CANARY },
+                { "key": "CODEX_ACCESS_TOKEN", "value": null },
+                { "key": "OPENAI_API_KEY", "value": null },
+            ]),
+        ))
+        .await;
+    let env = agent_env(&h.storage, "a1").await;
+    let codex_home = std::path::PathBuf::from(env["CODEX_HOME"].as_str().unwrap());
+    // The node's own home, never the user's ~/.codex.
+    assert!(
+        codex_home.starts_with(h.home.join(".intent/codex-api-key")),
+        "{}",
+        codex_home.display()
+    );
+    assert!(codex_home.is_dir());
+    assert_eq!(env["DEFAULT_AUTH_REQUEST"], r#"{"methodId":"api-key"}"#);
+    assert_eq!(env["CODEX_API_KEY"], CANARY);
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
+}
+
+#[tokio::test]
 async fn node_runner_without_a_profile_keeps_the_node_login_environment() {
     let Some(h) = harness(1, &["--dump-env"]) else {
         return;

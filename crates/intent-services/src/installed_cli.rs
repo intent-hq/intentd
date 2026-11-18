@@ -29,17 +29,7 @@ pub(crate) struct InstalledContext {
     /// The confirmed-too-old host CLI this context replaced with Intent's
     /// bundled copy (`runtime`). Re-discovery checks the host again.
     host: Option<InstalledCliRuntime>,
-    /// A Codex profile signs in with its `CODEX_API_KEY` in its own home.
-    codex_api_key: bool,
 }
-
-/// What the Codex ACP adapter runs when its Codex home has no login: the
-/// adapter's `api-key` method, which reads `CODEX_API_KEY` from the launch
-/// environment. Codex ignores a key that is only in the environment.
-const CODEX_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
-const DEFAULT_AUTH_REQUEST: &str = "DEFAULT_AUTH_REQUEST";
-/// Holds the SHA-256 of the key the home's `auth.json` was written for.
-const CODEX_API_KEY_MARKER: &str = ".intent-api-key";
 
 fn private_hash(value: &impl Hash) -> u64 {
     static HASHER: OnceLock<RandomState> = OnceLock::new();
@@ -125,7 +115,6 @@ impl InstalledContext {
             names: names.clone(),
             profile: None,
             host: None,
-            codex_api_key: false,
         })
     }
 
@@ -141,17 +130,19 @@ impl InstalledContext {
         let Some(profile) = profile else {
             return self;
         };
-        profile.apply_to_map(&mut self.env);
         let cli = self.runtime.cli();
-        self.codex_api_key = false;
-        if cli == InstalledCli::Codex && !profile.controls("CODEX_HOME") {
-            if let (Some(key), Some(home)) = (codex_api_key(&profile), self.home()) {
-                let codex_home = codex_api_key_home(&home, profile.provider_ref());
-                prepare_codex_api_key_home(&codex_home, key);
-                self.env.insert("CODEX_HOME".into(), codex_home.into());
-                self.codex_api_key = true;
-            }
-        }
+        // A Codex API key profile signs in in its own home (resolved against
+        // this host's home, as a node does for a remote launch).
+        let profile = if cli == InstalledCli::Codex {
+            Arc::new(
+                (*profile)
+                    .clone()
+                    .with_codex_api_key_home(self.home().as_deref()),
+            )
+        } else {
+            profile
+        };
+        profile.apply_to_map(&mut self.env);
         // A profile that selects its own Codex home also selects the custom
         // credential names that home's config declares, so the isolated model
         // probe, fingerprint and redaction use the same names as runs. Bounded
@@ -184,12 +175,6 @@ impl InstalledContext {
                 intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into(),
             );
         }
-        if self.codex_api_key {
-            self.env.insert(
-                DEFAULT_AUTH_REQUEST.into(),
-                CODEX_API_KEY_AUTH_REQUEST.into(),
-            );
-        }
         self.context_key = None;
         self.profile = Some(profile);
         self
@@ -198,7 +183,9 @@ impl InstalledContext {
     /// Whether the applied profile is a Codex API key profile, which the
     /// adapter signs in with the key at launch.
     pub fn signs_in_with_codex_api_key(&self) -> bool {
-        self.codex_api_key
+        self.profile
+            .as_ref()
+            .is_some_and(|p| p.signs_in_with_codex_api_key())
     }
 
     /// The applied profile, if any.
@@ -251,7 +238,6 @@ impl InstalledContext {
                     || names.contains(k)
                     || k == "SystemRoot"
                     || self.profile.as_ref().is_some_and(|p| p.controls(k))
-                    || self.codex_api_key && k == DEFAULT_AUTH_REQUEST
             })
         });
         selected.apply(command);
@@ -626,69 +612,6 @@ fn warn_bundled_once(
             bundled = %bundled.spec(),
             "installed CLI is below the adapter minimum; launching Intent's bundled CLI until it is upgraded"
         );
-    }
-}
-
-/// The profile's non-empty `CODEX_API_KEY`.
-fn codex_api_key(profile: &ProfileEnv) -> Option<&str> {
-    profile
-        .entries()
-        .filter(|(key, _)| key.eq_ignore_ascii_case("CODEX_API_KEY"))
-        .find_map(|(_, value)| value)
-        .filter(|value| !value.is_empty())
-}
-
-/// `~/.intent/codex-api-key/<profile id>`: the profile's own Codex home, so
-/// the adapter's login never reads or replaces the user's `~/.codex` login.
-/// It persists so sessions can resume.
-fn codex_api_key_home(home: &Path, provider_ref: &str) -> PathBuf {
-    let id = provider_ref
-        .split_once('@')
-        .map_or(provider_ref, |(_, id)| id);
-    let id: String = id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    home.join(".intent").join("codex-api-key").join(id)
-}
-
-/// Create the home and drop a login written for another key, so a replaced
-/// key signs in again. Failures leave the launch to report the login error.
-fn prepare_codex_api_key_home(codex_home: &Path, key: &str) {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write as _;
-    let digest =
-        Sha256::digest(key.as_bytes())
-            .iter()
-            .fold(String::with_capacity(64), |mut hex, b| {
-                let _ = write!(hex, "{b:02x}");
-                hex
-            });
-    let result = (|| -> std::io::Result<()> {
-        std::fs::create_dir_all(codex_home)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(codex_home, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let marker = codex_home.join(CODEX_API_KEY_MARKER);
-        if std::fs::read_to_string(&marker).ok().as_deref() == Some(digest.as_str()) {
-            return Ok(());
-        }
-        match std::fs::remove_file(codex_home.join("auth.json")) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-        std::fs::write(marker, digest)
-    })();
-    if let Err(e) = result {
-        tracing::warn!("could not prepare the Codex home of an API key profile: {e}");
     }
 }
 
