@@ -53,6 +53,7 @@ fn ev(ws: &str, n: &str, event_type: &str, timestamp: &str, tenant: &str) -> New
     }
 }
 
+#[track_caller]
 fn with_data(mut e: NewEvent, extra: Value) -> NewEvent {
     let Value::Object(extra) = extra else {
         panic!("extra data must be an object");
