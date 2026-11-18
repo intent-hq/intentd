@@ -40,7 +40,7 @@ fn words_with_offsets(stmt: &str) -> Vec<(usize, &str)> {
 fn in_call_args(stmt: &str, at: usize) -> bool {
     const NOT_A_CALL: &[&str] = &[
         "", "in", "exists", "from", "join", "on", "and", "or", "not", "where", "select", "as",
-        "values", "when", "then", "else", "using", "lateral", "union", "all", "any",
+        "values", "when", "then", "else", "using", "lateral", "union", "all", "any", "distinct",
     ];
     let bytes = stmt.as_bytes();
     let mut quoted = vec![false; bytes.len()];
@@ -68,6 +68,11 @@ fn in_call_args(stmt: &str, at: usize) -> bool {
             b')' => depth += 1,
             b'(' if depth > 0 => depth -= 1,
             b'(' => {
+                // A group led by SELECT or WITH is a subquery whatever precedes it.
+                let inner = stmt[i + 1..].trim_start().to_lowercase();
+                if inner.starts_with("select") || inner.starts_with("with ") {
+                    return false;
+                }
                 let before = stmt[..i].trim_end();
                 let start = before
                     .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))

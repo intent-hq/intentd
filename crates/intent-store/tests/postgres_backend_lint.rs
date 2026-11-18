@@ -230,6 +230,11 @@ fn the_tenant_rule_catches_unscoped_shapes() {
         violations("select name -- count(\nfrom note where id = $1"),
         ["FROM note"]
     );
+    // A SELECT-led group is a subquery whatever word precedes it.
+    assert_eq!(
+        violations("select distinct (select id from note) from task where tenant_id = $1"),
+        ["FROM note"]
+    );
 }
 
 /// The functions in `text` that write without the tenant's writer lock:
