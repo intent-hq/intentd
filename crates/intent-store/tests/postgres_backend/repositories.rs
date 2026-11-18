@@ -262,6 +262,19 @@ parity_test!(
 
 parity_test!(repository_selections_compare_and_write, |store, tenant| {
     workspace(&store, "ws-sel", tenant).await;
+    // The decoy leaves this root at its first revision, so the subject's
+    // compare-and-set write matches a decoy row's revision too.
+    workspace(&store, "ws-sel-cas", tenant).await;
+    if tenant != "decoy" {
+        let fresh = store
+            .repository_selection_snapshot(&primary("ws-sel-cas"))
+            .await
+            .unwrap();
+        let written = store
+            .write_repository_selection(&fresh, remote("origin"))
+            .await;
+        assert_eq!(outcome_kind(&written.result), "applied");
+    }
     store
         .upsert_workspace_git_root(&git_root("gr-sel", "ws-sel", "/src/sel"))
         .await
