@@ -1691,14 +1691,40 @@ struct SetupTail {
 }
 
 impl Shared {
+    /// Keep a `setupOutput` of a home's checkout as its `setup.output`
+    /// (nodes.md "Opening the home") and announce it, throttled. Output of
+    /// a home this backend saw no open of is dropped.
+    async fn home_setup_output(
+        &self,
+        home: &intent_core::node_link::HomeRef,
+        seq: u64,
+        data: &str,
+    ) {
+        let Some(services) = &self.services else {
+            return;
+        };
+        if services.home_setups().output(
+            &home.workspace_id,
+            &home.home_id,
+            seq,
+            data,
+            std::time::Instant::now(),
+        ) {
+            services
+                .publish_workspace_home_changed(&home.workspace_id)
+                .await;
+        }
+    }
+
     /// Keep a `setupOutput` of an agent attached here (seq 0 starts the
     /// output over) and announce it, throttled.
     async fn setup_output(&self, output: intent_core::node_link::SetupOutput) {
-        let intent_core::node_link::CheckoutOwner::Agent(agent_id) = &output.owner else {
-            tracing::debug!(
-                "remote machine: setup output for a home this backend does not hold; dropped"
-            );
-            return;
+        let agent_id = match &output.owner {
+            intent_core::node_link::CheckoutOwner::Agent(agent_id) => agent_id,
+            intent_core::node_link::CheckoutOwner::Home(home) => {
+                self.home_setup_output(home, output.seq, &output.data).await;
+                return;
+            }
         };
         let agent_id = agent_id.clone();
         let Some(workspace_id) = self.agents.workspace_of(&agent_id) else {

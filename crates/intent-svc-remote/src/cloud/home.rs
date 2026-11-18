@@ -44,6 +44,7 @@ pub(crate) fn new_home(cloud_machine_id: &str, name: &str) -> WorkspaceHome {
         since: intent_core::now_iso(),
         last_backup_at: None,
         backup_warning: false,
+        setup: None,
     }
 }
 
@@ -667,6 +668,7 @@ pub(crate) async fn sandbox_target(svc: &Services, machine_id: &str) -> Result<W
         since: intent_core::now_iso(),
         last_backup_at: None,
         backup_warning: false,
+        setup: None,
     })
 }
 

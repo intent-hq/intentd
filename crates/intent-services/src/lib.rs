@@ -134,6 +134,7 @@ mod git_ops;
 mod git_status_cache;
 mod git_status_singleflight;
 mod home_routing;
+pub mod home_setup;
 pub mod host_exec;
 pub mod host_exec_stream;
 mod installed_cli;
@@ -750,6 +751,9 @@ pub struct Services {
     /// started at create time can observe it. In-memory only — a workspace
     /// absent from the map reads `unknown` — shared across clones.
     workspace_setup_states: WorkspaceSetupStates,
+    /// How far each workspace home's opening has got on its machine
+    /// (nodes.md "Opening the home"). In-memory only, shared across clones.
+    home_setups: home_setup::HomeSetups,
     /// Per-workspace gates held while an `archiveScript` runs, so a delete or
     /// purge waits for it before removing the folder.
     archive_script_gates: archive_script::ArchiveScriptGates,
@@ -1806,6 +1810,7 @@ impl Services {
             auto_commit_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             worktree_presence: worktree_presence::WorktreePresence::default(),
             workspace_setup_states: WorkspaceSetupStates::default(),
+            home_setups: home_setup::HomeSetups::default(),
             archive_script_gates: archive_script::ArchiveScriptGates::default(),
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
@@ -21239,6 +21244,11 @@ impl WorkspaceApi for Services {
             Self::merge_workspace_external_pull_requests(&mut ws, external);
             // Membership summary (multiplayer w1), relative to the caller.
             this.attach_workspace_membership(&mut ws).await;
+            // A detail read adds the home's checkout and setup output
+            // (nodes.md "Opening the home").
+            if let Some(home) = ws.home.as_deref_mut() {
+                this.home_setups.attach(&id, home, true);
+            }
             Ok(ws)
         })
     }

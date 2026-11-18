@@ -1565,7 +1565,12 @@ impl Services {
         }
         if self.workspace_homes() {
             match self.store.get_shown_workspace_home(&ws.id).await {
-                Ok(home) => ws.home = home.map(Box::new),
+                Ok(home) => {
+                    ws.home = home.map(|mut home| {
+                        self.home_setups.attach(&ws.id, &mut home, false);
+                        Box::new(home)
+                    });
+                }
                 Err(e) => tracing::debug!(error = %e, "workspace.get: home failed"),
             }
         }
@@ -1596,7 +1601,10 @@ impl Services {
             match self.store.list_shown_workspace_homes().await {
                 Ok(mut homes) => {
                     for ws in list.iter_mut() {
-                        ws.home = homes.remove(&ws.id).map(Box::new);
+                        ws.home = homes.remove(&ws.id).map(|mut home| {
+                            self.home_setups.attach(&ws.id, &mut home, false);
+                            Box::new(home)
+                        });
                     }
                 }
                 Err(e) => tracing::debug!(error = %e, "workspace.list: homes failed"),

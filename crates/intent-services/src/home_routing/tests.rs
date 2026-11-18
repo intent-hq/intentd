@@ -324,6 +324,7 @@ async fn home_harness(reply: Option<Value>) -> HomeHarness {
                 since: now,
                 last_backup_at: None,
                 backup_warning: false,
+                setup: None,
             },
         )
         .await

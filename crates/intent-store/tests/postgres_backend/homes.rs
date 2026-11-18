@@ -51,6 +51,7 @@ fn home(home_id: &str, node: Option<&str>, cloud: bool) -> WorkspaceHome {
         since: T0.into(),
         last_backup_at: Some(T0.into()),
         backup_warning: false,
+        setup: None,
     }
 }
 

@@ -28,6 +28,7 @@ fn home(id: &str, node: &str, cloud: bool, state: HomeState) -> WorkspaceHome {
         since: now_iso(),
         last_backup_at: Some("2026-11-15T10:00:00Z".into()),
         backup_warning: false,
+        setup: None,
     }
 }
 

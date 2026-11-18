@@ -685,6 +685,7 @@ fn home(home_id: &str, node: Option<&str>, cloud: Option<&str>, state: HomeState
         since: T0.into(),
         last_backup_at: None,
         backup_warning: false,
+        setup: None,
     }
 }
 
@@ -968,6 +969,7 @@ fn machine_home(home_id: &str, node: &str) -> WorkspaceHome {
         since: T0.into(),
         last_backup_at: None,
         backup_warning: false,
+        setup: None,
     }
 }
 

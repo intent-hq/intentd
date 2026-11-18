@@ -3276,6 +3276,7 @@ mod home_stops {
                     since: intent_core::now_iso(),
                     last_backup_at: None,
                     backup_warning: false,
+                    setup: None,
                 },
             )
             .await
@@ -3514,6 +3515,7 @@ mod home_stops {
             since: now.clone(),
             last_backup_at: None,
             backup_warning: false,
+            setup: None,
         };
         backend
             .store()
@@ -3576,6 +3578,7 @@ mod home_stops {
             since: intent_core::now_iso(),
             last_backup_at: None,
             backup_warning: false,
+            setup: None,
         }
     }
 

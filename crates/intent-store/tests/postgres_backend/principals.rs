@@ -1727,6 +1727,7 @@ fn machine_home(home_id: &str, node: &str) -> WorkspaceHome {
         since: T1.into(),
         last_backup_at: None,
         backup_warning: false,
+        setup: None,
     }
 }
 

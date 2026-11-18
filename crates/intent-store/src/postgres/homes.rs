@@ -62,6 +62,7 @@ fn move_row(row: &PgRow) -> Result<HomeMove> {
             since: started_at.clone(),
             last_backup_at: None,
             backup_warning: false,
+            setup: None,
         },
         from_home_id: HomeId(col(row, "from_home_id")?),
         from_state,
