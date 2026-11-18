@@ -139,7 +139,7 @@ fn encode_metadata(metadata: Option<&serde_json::Value>) -> Result<Option<String
         .map_err(|e| Error::Internal(format!("encode message metadata failed: {e}")))
 }
 
-fn projection_from_row(row: &PgRow) -> Result<SessionMessageProjection> {
+pub(super) fn projection_from_row(row: &PgRow) -> Result<SessionMessageProjection> {
     let message_count: i64 = col(row, "message_count")?;
     Ok(SessionMessageProjection {
         message_count: message_count.max(0).cast_unsigned(),

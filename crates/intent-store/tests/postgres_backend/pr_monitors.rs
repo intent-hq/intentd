@@ -15,13 +15,16 @@
 //! and pending changes carry the tenant, so a leaked row never looks right.
 
 use intent_core::{
-    AgentId, AgentSession, Error, PrMonitor, PrMonitorId, PrMonitorState, RepositoryProvider,
-    RepositoryResourceKind, RepositoryTarget, ReviewTarget, Workspace, WorkspaceId,
+    AgentId, AgentSession, Error, Hook, HookId, HookState, PrMonitor, PrMonitorId, PrMonitorState,
+    RepositoryProvider, RepositoryResourceKind, RepositoryTarget, ReviewTarget, Workspace,
+    WorkspaceId,
 };
 use intent_store::{
     pr_monitor_pause_error, MonitorQualificationOutcome, MonitorTargetProvenance,
     PersistedMonitorTarget, PrMonitorListEntry, PrMonitorPollUpdate, PreparedMonitorWrite, Store,
+    SubscriptionAgentProjection,
 };
+use serde_json::{json, Value};
 
 use crate::harness::{parity_test, TestDb};
 
@@ -1406,5 +1409,401 @@ parity_test!(
         );
 
         decoy_rows(&store, tenant, db).await;
+    }
+);
+
+fn projection_hook(
+    id: &str,
+    agent: &str,
+    created_at: &str,
+    state: HookState,
+    tenant: &str,
+) -> Hook {
+    let timed = id != "h-b";
+    Hook {
+        hook_id: HookId(id.into()),
+        workspace_id: wid(if agent == "agent-c" { "ws-b" } else { "ws-a" }),
+        agent_id: aid(agent),
+        name: format!("{tenant} {id}"),
+        code: format!("return '{tenant}'"),
+        delay_ms: 1000,
+        cron: None,
+        run_at: None,
+        state,
+        created_at: created_at.into(),
+        last_run_at: None,
+        next_run_at: timed.then(|| T3.into()),
+        run_count: 0,
+        last_error: None,
+        last_logs: Some(format!("{tenant} logs")),
+        last_state: None,
+        expires_at: timed.then(|| T3.into()),
+        perpetual: false,
+        dispatch_count: 0,
+    }
+}
+
+/// `(id, workspace, name, message_count, last role, assistant preview,
+/// hooks, monitors)`, sorted by id.
+type ProjectionView = (
+    String,
+    String,
+    String,
+    u64,
+    Option<String>,
+    Option<Vec<String>>,
+    Vec<Value>,
+    Vec<Value>,
+);
+
+fn projection_view(rows: Vec<SubscriptionAgentProjection>) -> Vec<ProjectionView> {
+    let mut out: Vec<ProjectionView> = rows
+        .into_iter()
+        .map(|p| {
+            (
+                p.session.id.0.clone(),
+                p.session.workspace_id.0.clone(),
+                p.session.name.clone(),
+                p.messages.message_count,
+                p.messages.last_message_role,
+                p.messages.last_assistant_text_blocks,
+                p.waiting_on_hooks,
+                p.waiting_on_pr_monitors,
+            )
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn hook_value(id: &str, tenant: &str) -> Value {
+    if id == "h-b" {
+        json!({"hookId": id, "name": format!("{tenant} {id}")})
+    } else {
+        json!({"hookId": id, "name": format!("{tenant} {id}"), "nextRunAt": T3, "expiresAt": T3})
+    }
+}
+
+fn monitor_value(id: &str, repo: &str, number: i64, title: Option<&str>) -> Value {
+    let mut value = json!({"monitorId": id, "repo": repo, "prNumber": number});
+    if let Some(title) = title {
+        value["title"] = json!(title);
+    }
+    value
+}
+
+// Decoy rule: the decoy owns every row the subject reads (sessions,
+// messages, hooks, monitors via `decoy_rows`) plus `agent-missing`,
+// which the subject probes as absent, and an extra active hook and
+// monitors on `agent-a` that a leaked read would add.
+parity_test!(
+    subscription_agent_projections_batch_sessions_hooks_and_monitors,
+    |store, tenant, db| {
+        seed(&store, tenant).await;
+        decoy_rows(&store, tenant, db).await;
+        store
+            .append_agent_message(
+                &aid("agent-a"),
+                "user",
+                &json!([{"type": "text", "text": "hi"}]),
+                T1,
+            )
+            .await
+            .unwrap();
+        store
+            .append_agent_message(
+                &aid("agent-a"),
+                "assistant",
+                &json!([{"type": "text", "text": format!("{tenant} reply")}]),
+                T2,
+            )
+            .await
+            .unwrap();
+        for (id, agent, created_at, state) in [
+            ("h-1", "agent-a", T1, HookState::Scheduled),
+            ("h-0", "agent-a", T1, HookState::Running),
+            ("h-gone", "agent-a", T0, HookState::Cancelled),
+            ("h-b", "agent-b", T0, HookState::Scheduled),
+            ("h-c", "agent-c", T2, HookState::Dispatched),
+        ] {
+            store
+                .insert_hook(&projection_hook(id, agent, created_at, state, tenant))
+                .await
+                .unwrap();
+        }
+        let done = (
+            "m-wdone",
+            "agent-a",
+            "ws-a",
+            "Org",
+            "Done",
+            12,
+            PrMonitorState::Completed,
+            T1,
+            T1,
+        );
+        assert!(store
+            .insert_qualified_pr_monitor(
+                &monitor(&done, tenant),
+                &gh("Org/Done", 12),
+                MonitorTargetProvenance::LegacyGithubWriter
+            )
+            .await
+            .unwrap());
+        store
+            .insert_agent_session(&AgentSession {
+                id: aid("agent-bad"),
+                workspace_id: wid("ws-a"),
+                name: format!("agent-bad of {tenant}"),
+                created_at: T0.into(),
+                updated_at: T0.into(),
+                ..AgentSession::default()
+            })
+            .await
+            .unwrap();
+        match db {
+            Some(db) => sqlx::query(
+                "UPDATE agent_session SET status = 'bogus' WHERE tenant_id = $1 AND id = 'agent-bad'",
+            )
+            .bind(tenant)
+            .execute(&db.admin)
+            .await
+            .map(drop)
+            .unwrap(),
+            None => sqlx::query("UPDATE agent_session SET status = 'bogus' WHERE id = 'agent-bad'")
+                .execute(store.write_pool())
+                .await
+                .map(drop)
+                .unwrap(),
+        }
+        if tenant == "decoy" {
+            store
+                .insert_agent_session(&AgentSession {
+                    id: aid("agent-missing"),
+                    workspace_id: wid("ws-a"),
+                    name: "decoy only".into(),
+                    created_at: T0.into(),
+                    updated_at: T0.into(),
+                    ..AgentSession::default()
+                })
+                .await
+                .unwrap();
+            for (id, agent) in [("h-ghost", "agent-a"), ("h-missing", "agent-missing")] {
+                store
+                    .insert_hook(&projection_hook(
+                        id,
+                        agent,
+                        T0,
+                        HookState::Scheduled,
+                        tenant,
+                    ))
+                    .await
+                    .unwrap();
+                let spec = (
+                    id,
+                    agent,
+                    "ws-a",
+                    "Ghost",
+                    id,
+                    60,
+                    PrMonitorState::Active,
+                    T0,
+                    T0,
+                );
+                assert!(store
+                    .insert_qualified_pr_monitor(
+                        &monitor(&spec, tenant),
+                        &gh(&format!("Ghost/{id}"), 60),
+                        MonitorTargetProvenance::LegacyGithubWriter
+                    )
+                    .await
+                    .unwrap());
+            }
+        }
+
+        assert!(store
+            .get_subscription_agent_projections(&[])
+            .await
+            .unwrap()
+            .is_empty());
+        let rows = store
+            .get_subscription_agent_projections(&[
+                aid("agent-z"),
+                aid("agent-missing"),
+                aid("agent-a"),
+                aid("agent-bad"),
+                aid("agent-b"),
+                aid("agent-c"),
+            ])
+            .await
+            .unwrap();
+        let title = format!("{tenant} one");
+        // Legacy-inserted rows stay unresolved, so only active writer-proven
+        // monitors (`m-lgw`, the decoy's ghosts; not `m-wdone`) are listed.
+        let ghost = |id: &str| monitor_value(id, &format!("Ghost/{id}"), 60, Some(&title));
+        let mut agent_a_monitors = Vec::new();
+        if tenant == "decoy" {
+            agent_a_monitors.push(ghost("h-ghost"));
+        }
+        agent_a_monitors.push(monitor_value("m-lgw", "Org/Repo3", 8, Some(&title)));
+        let mut agent_a_hooks = Vec::new();
+        if tenant == "decoy" {
+            agent_a_hooks.push(hook_value("h-ghost", tenant));
+        }
+        agent_a_hooks.extend([hook_value("h-1", tenant), hook_value("h-0", tenant)]);
+        let mut expected = vec![
+            (
+                "agent-a".to_owned(),
+                "ws-a".to_owned(),
+                format!("agent-a of {tenant}"),
+                2,
+                Some("assistant".to_owned()),
+                Some(vec![format!("{tenant} reply")]),
+                agent_a_hooks,
+                agent_a_monitors,
+            ),
+            (
+                "agent-b".to_owned(),
+                "ws-a".to_owned(),
+                format!("agent-b of {tenant}"),
+                0,
+                None,
+                None,
+                vec![hook_value("h-b", tenant)],
+                Vec::new(),
+            ),
+            (
+                "agent-c".to_owned(),
+                "ws-b".to_owned(),
+                format!("agent-c of {tenant}"),
+                0,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            ),
+        ];
+        if tenant == "decoy" {
+            expected.push((
+                "agent-missing".to_owned(),
+                "ws-a".to_owned(),
+                "decoy only".to_owned(),
+                0,
+                None,
+                None,
+                vec![hook_value("h-missing", tenant)],
+                vec![ghost("h-missing")],
+            ));
+        }
+        expected.push((
+            "agent-z".to_owned(),
+            "ws-z".to_owned(),
+            format!("agent-z of {tenant}"),
+            0,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert_eq!(projection_view(rows), expected);
+    }
+);
+
+parity_test!(
+    migration_status_matches_the_embedded_migrations,
+    |store, _tenant, db| {
+        let status = store.migration_status().await.unwrap();
+        assert!(!status.expected.is_empty());
+        assert_eq!(status.applied, status.expected);
+        assert!(status.is_current());
+        if let Some(db) = db {
+            // A part-way migration is not applied yet.
+            let last = *status.expected.last().unwrap();
+            for complete in [false, true] {
+                sqlx::query("UPDATE intent_schema_migrations SET complete = $1 WHERE version = $2")
+                    .bind(complete)
+                    .bind(last)
+                    .execute(&db.admin)
+                    .await
+                    .unwrap();
+                let status = store.migration_status().await.unwrap();
+                assert_eq!(status.applied.contains(&last), complete);
+                assert_eq!(status.is_current(), complete);
+            }
+        }
+    }
+);
+
+// Several chunks: real sessions sit in the first, second and third chunk
+// of absent ids. Decoy rule: the decoy also owns one absent id per chunk.
+parity_test!(
+    subscription_agent_projections_span_several_chunks,
+    |store, tenant| {
+        let chunk = 500;
+        let mut ids: Vec<AgentId> = (0..chunk * 2 + 10)
+            .map(|i| aid(&format!("absent-{i:04}")))
+            .collect();
+        let placed = [
+            (3, "agent-a"),
+            (chunk + 7, "agent-b"),
+            (chunk * 2 + 1, "agent-c"),
+        ];
+        for (at, id) in placed {
+            ids[at] = aid(id);
+        }
+        for ws in ["ws-a", "ws-b"] {
+            store
+                .insert_workspace(&Workspace {
+                    id: wid(ws),
+                    title: format!("{tenant} {ws}"),
+                    branch: "main".into(),
+                    created_at: T0.into(),
+                    updated_at: T0.into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let mut sessions: Vec<String> = placed.iter().map(|(_, id)| (*id).to_owned()).collect();
+        if tenant == "decoy" {
+            sessions.extend(["absent-0004", "absent-0508", "absent-1002"].map(str::to_owned));
+        }
+        for id in &sessions {
+            store
+                .insert_agent_session(&AgentSession {
+                    id: aid(id),
+                    workspace_id: wid("ws-a"),
+                    name: format!("{id} of {tenant}"),
+                    created_at: T0.into(),
+                    updated_at: T0.into(),
+                    ..AgentSession::default()
+                })
+                .await
+                .unwrap();
+            store
+                .insert_hook(&projection_hook(
+                    &format!("h-{id}"),
+                    id,
+                    T1,
+                    HookState::Scheduled,
+                    tenant,
+                ))
+                .await
+                .unwrap();
+        }
+        let mut got: Vec<(String, Vec<Value>)> = store
+            .get_subscription_agent_projections(&ids)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.session.id.0.clone(), p.waiting_on_hooks))
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        sessions.sort();
+        let expected: Vec<(String, Vec<Value>)> = sessions
+            .iter()
+            .map(|id| (id.clone(), vec![hook_value(&format!("h-{id}"), tenant)]))
+            .collect();
+        assert_eq!(got, expected);
     }
 );

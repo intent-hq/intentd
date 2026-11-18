@@ -1,0 +1,8 @@
+# Store methods with no Postgres meaning: `name — reason`. Postgres fails loudly
+# on each; postgres_backend_lint limits which files may call them.
+activate_incremental_vacuum — SQLite auto_vacuum/VACUUM; Postgres autovacuum manages space
+freelist_count — SQLite PRAGMA freelist_count; Postgres has no freelist
+incremental_vacuum_chunk — SQLite PRAGMA incremental_vacuum; Postgres autovacuum manages space
+optimize — SQLite PRAGMA optimize; Postgres autoanalyze keeps planner statistics
+page_size — SQLite PRAGMA page_size, only to size the freelist backlog
+spawn_periodic_wal_checkpoint — SQLite WAL checkpoint; Postgres checkpoints on its own

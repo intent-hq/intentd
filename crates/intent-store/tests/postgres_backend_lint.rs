@@ -15,6 +15,11 @@
 //!    keeps ports of different domains from editing the same file. A new
 //!    `Store` method should ship with its Postgres version (`dispatch!`) or
 //!    be listed on purpose.
+//! 4. `postgres/sqlite_only.txt` lists exactly the `Store` methods marked
+//!    `sqlite_only!` (no Postgres meaning), each with a reason. Postgres
+//!    fails loudly on them, so only the files in `SQLITE_ONLY_CALLERS`,
+//!    which run on a `SQLite` store alone, may call one; a new caller must
+//!    prove the same or the method needs a Postgres version.
 //!
 //! Limit: text-level. SQL built at runtime from fragments is checked only
 //! where a literal holds the table reference.
@@ -503,4 +508,155 @@ fn pending_postgres_methods_match_the_lists() {
         empty.is_empty(),
         "these modules have no pending methods left; delete their file: {empty:?}"
     );
+}
+
+fn sqlite_only_in_source() -> BTreeSet<String> {
+    let mut files = Vec::new();
+    rust_files(&src(), &mut files);
+    let mut out = BTreeSet::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("read");
+        for part in text.split("sqlite_only!(").skip(1) {
+            let part = part.strip_prefix("panic ").unwrap_or(part);
+            if let Some(name) = part.strip_prefix('"').and_then(|p| p.split('"').next()) {
+                out.insert(name.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// `name — reason` lines of `postgres/sqlite_only.txt`, and lines without a reason.
+fn sqlite_only_listed() -> (BTreeSet<String>, Vec<String>) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/sqlite_only.txt");
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut listed = BTreeSet::new();
+    let mut unexplained = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line.split_once(" — ") {
+            Some((name, reason)) if !reason.trim().is_empty() => {
+                listed.insert(name.trim().to_owned());
+            }
+            _ => unexplained.push(line.to_owned()),
+        }
+    }
+    (listed, unexplained)
+}
+
+/// Files (relative to `crates/`) that may call a SQLite-only method, with why
+/// they only ever hold a `SQLite` store. `intent-store/src` outside
+/// `postgres/` is the `SQLite` backend itself.
+const SQLITE_ONLY_CALLERS: &[(&str, &str)] = &[
+    (
+        "intentd/src/main.rs",
+        "opens the daemon store with Store::prepare_for_daemon, which is SQLite-only",
+    ),
+    (
+        "intent-services/src/retention.rs",
+        "its vacuum drain runs only from intentd's maintenance loop on the daemon store",
+    ),
+];
+
+fn may_call_sqlite_only(rel: &str) -> bool {
+    (rel.starts_with("intent-store/src/") && !rel.starts_with("intent-store/src/postgres/"))
+        || SQLITE_ONLY_CALLERS.iter().any(|(file, _)| *file == rel)
+}
+
+/// `file: <use>` for every method call (`.name(`), path call (`::name(`)
+/// or path used as a function value (`::name,` / `::name)`) of a name in
+/// `methods` in `text`.
+fn sqlite_only_calls(rel: &str, text: &str, methods: &BTreeSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in methods {
+        for shape in [
+            format!(".{m}("),
+            format!("::{m}("),
+            format!("::{m},"),
+            format!("::{m})"),
+        ] {
+            if text.contains(&shape) {
+                out.push(format!("{rel}: {shape}"));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn sqlite_only_methods_match_the_list_and_stay_off_postgres() {
+    let marked = sqlite_only_in_source();
+    let (listed, unexplained) = sqlite_only_listed();
+    assert!(
+        unexplained.is_empty(),
+        "postgres/sqlite_only.txt lines need `name — reason`: {unexplained:?}"
+    );
+    assert_eq!(
+        marked, listed,
+        "postgres/sqlite_only.txt must list exactly the sqlite_only! methods"
+    );
+    let pending: BTreeSet<String> = pending_in_source().into_iter().map(|(_, m)| m).collect();
+    let both: Vec<_> = marked.intersection(&pending).collect();
+    assert!(both.is_empty(), "both pending and SQLite-only: {both:?}");
+
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&crates).expect("read crates") {
+        let dir = entry.expect("entry").path();
+        for sub in ["src", "tests", "benches"] {
+            if dir.join(sub).is_dir() {
+                rust_files(&dir.join(sub), &mut files);
+            }
+        }
+    }
+    let mut findings = Vec::new();
+    for file in &files {
+        let rel = file
+            .strip_prefix(&crates)
+            .expect("under crates")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if may_call_sqlite_only(&rel) {
+            continue;
+        }
+        let text = std::fs::read_to_string(file).expect("read");
+        findings.extend(sqlite_only_calls(&rel, &text, &marked));
+    }
+    assert!(
+        findings.is_empty(),
+        "these files call SQLite-only Store methods, which fail on Postgres. Give the \
+         method a Postgres version, or add the file to SQLITE_ONLY_CALLERS with proof it \
+         only holds a SQLite store:\n{}",
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn the_sqlite_only_rule_catches_new_callers() {
+    let methods: BTreeSet<String> = ["optimize".to_owned()].into();
+    assert!(may_call_sqlite_only("intent-store/src/lib.rs"));
+    assert!(may_call_sqlite_only("intentd/src/main.rs"));
+    assert!(!may_call_sqlite_only("intent-store/src/postgres/notes.rs"));
+    assert!(!may_call_sqlite_only("intent-services/src/settings.rs"));
+    assert!(sqlite_only_calls("x.rs", "store.optimize_plan().await", &methods).is_empty());
+    // Built with concat! so this file does not itself call the method.
+    assert_eq!(
+        sqlite_only_calls("x.rs", concat!("store.", "optimize().await"), &methods),
+        [concat!("x.rs: .", "optimize(")]
+    );
+    assert_eq!(
+        sqlite_only_calls("x.rs", concat!("Store::", "optimize(&store)"), &methods),
+        [concat!("x.rs: ::", "optimize(")]
+    );
+    assert_eq!(
+        sqlite_only_calls("x.rs", concat!("run(Store::", "optimize, 3)"), &methods),
+        [concat!("x.rs: ::", "optimize,")]
+    );
+    assert_eq!(
+        sqlite_only_calls("x.rs", concat!("map(Store::", "optimize)"), &methods),
+        [concat!("x.rs: ::", "optimize)")]
+    );
+    assert!(sqlite_only_calls("x.rs", "Store::optimize_plan(&store)", &methods).is_empty());
 }

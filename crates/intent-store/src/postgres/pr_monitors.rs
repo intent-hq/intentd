@@ -12,12 +12,17 @@
 //!   `instr`, `left` for `substr(x, 1, n)` (Postgres rejects a negative
 //!   length) and `sqlite_julianday` for `strftime('%s', …)`.
 
+use std::collections::HashMap;
+
 use intent_core::{
     AgentId, Error, PrMonitor, PrMonitorId, PrMonitorState, Result, ReviewTarget, WorkspaceId,
 };
+use serde_json::json;
 use sqlx::postgres::{PgArguments, PgRow, Postgres};
+use sqlx::Row;
 
 use super::{PgStore, WriteTx};
+use crate::agent_repo::SESSION_SUMMARY_COLUMNS;
 use crate::pr_monitor_repo::{
     check_rearm_compatible, check_replacement_identity, kind_word, list_entry_from_row,
     monitor_from_row, pending_to_db, provider_word, qualified_from_row, state_to_db, target_number,
@@ -26,6 +31,7 @@ use crate::pr_monitor_repo::{
     PreparedMonitorWrite, QualifiedPrMonitor, TargetColumns, WorkspacePrMonitorReads, COLUMNS,
     LEGACY_LOOKUP, PAUSE_UNTIL_SEPARATOR, PR_MONITOR_PAUSE_MARKER, TARGET_COLUMNS,
 };
+use crate::subscription_agent_repo::{SubscriptionAgentProjection, IDS_PER_STATEMENT};
 
 type PgQuery = sqlx::query::Query<'static, Postgres, PgArguments>;
 
@@ -1009,6 +1015,118 @@ impl PgStore {
             == 1;
         tx.commit().await.map_err(|e| internal(context, e))?;
         Ok(changed)
+    }
+}
+
+impl PgStore {
+    /// `subscription_agent_repo.rs`: one batch of session, hook and PR monitor
+    /// reads per chunk, in one transaction. Ties keep insertion order.
+    pub async fn get_subscription_agent_projections(
+        &self,
+        ids: &[AgentId],
+    ) -> Result<Vec<SubscriptionAgentProjection>> {
+        let mut out = Vec::with_capacity(ids.len());
+        let session_sql = format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS}, message_count, last_assistant_preview, \
+             last_user_preview, last_message_role, last_message_id, last_tool_use_preview \
+             FROM agent_session WHERE tenant_id = $1 AND id = ANY($2)"
+        );
+        let monitors_sql = format!(
+            "SELECT agent_id, monitor_id, repo_owner, repo_name, pr_number, {TARGET_COLUMNS}, \
+             CASE WHEN sqlite_json_valid(last_snapshot) THEN \
+             CASE WHEN sqlite_json_type(last_snapshot, '$.title') = 'text' \
+             THEN sqlite_json_extract(last_snapshot, '$.title') END END AS title \
+             FROM pr_monitor WHERE tenant_id = $1 AND agent_id = ANY($2) AND state = 'active' \
+             ORDER BY created_at COLLATE \"C\", row_seq"
+        );
+        let mut tx = self.begin().await?;
+        for chunk in ids.chunks(IDS_PER_STATEMENT) {
+            let chunk: Vec<&str> = chunk.iter().map(|id| id.0.as_str()).collect();
+            let rows = sqlx::query(sqlx::AssertSqlSafe(session_sql.as_str()))
+                .bind(self.tenant())
+                .bind(&chunk)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| internal("subscription agent projection failed", e))?;
+            let mut batch = HashMap::with_capacity(rows.len());
+            for row in rows {
+                let session = match super::agents::map_summary(&row) {
+                    Ok(session) => session,
+                    Err(e) => {
+                        tracing::warn!(agent = %row.get::<String, _>("id"), error = %e,
+                            "decode subscription agent failed; omitting row");
+                        continue;
+                    }
+                };
+                let messages = super::agent_messages::projection_from_row(&row)?;
+                batch.insert(
+                    session.id.0.clone(),
+                    SubscriptionAgentProjection {
+                        session,
+                        messages,
+                        waiting_on_hooks: Vec::new(),
+                        waiting_on_pr_monitors: Vec::new(),
+                    },
+                );
+            }
+            for row in sqlx::query(
+                "SELECT agent_id, hook_id, name, next_run_at, expires_at FROM hook \
+                 WHERE tenant_id = $1 AND agent_id = ANY($2) AND state IN ('scheduled', 'running') \
+                 ORDER BY created_at COLLATE \"C\", row_seq",
+            )
+            .bind(self.tenant())
+            .bind(&chunk)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| internal("subscription hook projection failed", e))?
+            {
+                if let Some(agent) = batch.get_mut(&row.get::<String, _>("agent_id")) {
+                    let mut value = json!({
+                        "hookId": row.get::<String, _>("hook_id"),
+                        "name": row.get::<String, _>("name"),
+                    });
+                    for (column, field) in
+                        [("next_run_at", "nextRunAt"), ("expires_at", "expiresAt")]
+                    {
+                        if let Some(text) = row.get::<Option<String>, _>(column) {
+                            value[field] = json!(text);
+                        }
+                    }
+                    agent.waiting_on_hooks.push(value);
+                }
+            }
+            for row in sqlx::query(sqlx::AssertSqlSafe(monitors_sql.as_str()))
+                .bind(self.tenant())
+                .bind(&chunk)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| internal("subscription PR monitor projection failed", e))?
+            {
+                if !crate::pr_monitor_repo::legacy_monitor_summary(&row)? {
+                    continue;
+                }
+                if let Some(agent) = batch.get_mut(&row.get::<String, _>("agent_id")) {
+                    let mut value = json!({
+                        "monitorId": row.get::<String, _>("monitor_id"),
+                        "repo": format!(
+                            "{}/{}",
+                            row.get::<String, _>("repo_owner"),
+                            row.get::<String, _>("repo_name")
+                        ),
+                        "prNumber": row.get::<i64, _>("pr_number"),
+                    });
+                    if let Some(title) = row.get::<Option<String>, _>("title") {
+                        value["title"] = json!(title);
+                    }
+                    agent.waiting_on_pr_monitors.push(value);
+                }
+            }
+            out.extend(batch.into_values());
+        }
+        tx.commit()
+            .await
+            .map_err(|e| internal("subscription agent projection failed", e))?;
+        Ok(out)
     }
 }
 
