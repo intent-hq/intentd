@@ -165,14 +165,17 @@ If controls do not respond in a scaled embedded-browser preview, choose
 Visuals use app typography and theme colors, fit the chat width, and retain local
 inputs through theme and size changes. They cannot access external libraries,
 network resources, arbitrary app APIs, navigation, popups or embedded frames.
-If a visual does not load, choose **Source** to inspect its code or **Reload** to
-retry from the last published configuration.
+The **Actions** menu below a visual has **Source** to inspect its code and
+**Reload** to retry from the last published configuration.
 
 Visuals publish bounded JSON state, inputs and derived results through
-`window.intentVisual`. The host toolbar can **Save scenario** (up to six),
-compare, restore or remove scenarios. **Use this configuration** appends the
-selected inputs and results to the editable composer draft without sending it.
-**Export** saves JSON and editable source to fixed workspace paths. It does not
+`window.intentVisual`. After you change the visual's inputs, the suggested
+message **→ Add configuration to message** appears. Restoring the inputs you
+opened the visual with hides it again. The suggestion appends the current inputs
+and results to your editable message without sending it or replacing your draft.
+In **Actions**, **Save scenario** keeps up to six alternatives,
+**Compare** shows them for comparison, restoration or removal, and **Export JSON**
+saves JSON and editable source to fixed workspace paths. Export does not
 provide general SVG/PNG export. For an image to share elsewhere, ask for a saved
 PNG instead. A labeled file input can read an explicitly selected local CSV,
 JSON or image; it cannot read other paths or fetch resources automatically.
