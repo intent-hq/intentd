@@ -169,10 +169,11 @@ The **Actions** menu below a visual has **Source** to inspect its code and
 **Reload** to retry from the last published configuration.
 
 Visuals publish bounded JSON state, inputs and derived results through
-`window.intentVisual`. The suggested message with a right arrow, **Add
-configuration to message**, appends the current inputs and results to your
-editable message without sending it or replacing your draft. In **Actions**,
-**Save scenario** keeps up to six alternatives,
+`window.intentVisual`. After you change the visual's inputs, the suggested
+message **→ Add configuration to message** appears. Restoring the inputs you
+opened the visual with hides it again. The suggestion appends the current inputs
+and results to your editable message without sending it or replacing your draft.
+In **Actions**, **Save scenario** keeps up to six alternatives,
 **Compare** shows them for comparison, restoration or removal, and **Export JSON**
 saves JSON and editable source to fixed workspace paths. Export does not
 provide general SVG/PNG export. For an image to share elsewhere, ask for a saved
