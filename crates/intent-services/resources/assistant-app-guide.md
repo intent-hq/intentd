@@ -237,8 +237,8 @@ Open Settings and use these sidebar labels (English labels shown):
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
 Font picker search is in development and not yet released. In builds that include
-it, open **Settings → Appearance → Font Style → Font**
-(`/settings?tab=display#code-font`) and type part of a font name, regardless of case.
+it, open **Settings → Appearance → Font Style → Font** and type part of a font
+name, regardless of case.
 Use the arrow keys and Enter to choose a result. Typing or finding no matches keeps
 the current font until you choose another.
 
