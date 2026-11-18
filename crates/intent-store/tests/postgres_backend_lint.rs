@@ -112,11 +112,30 @@ const NON_TENANT_TABLES: &[(&str, &str)] = &[(
     "applied-migration ledger written by postgres::migrate, one per schema",
 )];
 
+/// Names a `WITH` statement defines (`with a as (`, `, b as (`). A reference
+/// to one is not a table; the tables inside its body are checked as usual.
+fn cte_names(sql: &str) -> Vec<String> {
+    if !sql.trim_start().starts_with("with ") {
+        return Vec::new();
+    }
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    let mut out = Vec::new();
+    for i in 1..words.len().saturating_sub(2) {
+        let opens = words[i + 1] == "as" && words[i + 2].starts_with('(');
+        let after = words[i - 1];
+        if opens && (after == "with" || after == "recursive" || after.ends_with(',')) {
+            out.push(words[i].trim_start_matches(',').to_owned());
+        }
+    }
+    out
+}
+
 /// The violations in one SQL literal (lower-cased).
 fn violations(sql: &str) -> Vec<String> {
+    let ctes = cte_names(sql);
     let mut out = Vec::new();
     for r in table_refs(sql) {
-        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) {
+        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) || ctes.contains(&r.table) {
             continue;
         }
         let ok = if r.keyword == "INTO" {
@@ -195,6 +214,21 @@ fn the_tenant_rule_catches_unscoped_shapes() {
     assert!(
         violations("update settings set value = $3 where tenant_id = $1 and key = $2").is_empty()
     );
+    // A WITH name is not a table, but the tables inside its body still are.
+    assert!(violations(
+        "with c as (select id from note where tenant_id = $1), d as (select id from c) \
+         select id from d"
+    )
+    .is_empty());
+    assert_eq!(
+        violations(
+            "with c as (select id from note where id = $2), d as (select id from c) \
+             select id from d"
+        ),
+        ["FROM note"]
+    );
+    // A table that shares no name with a WITH clause is still checked.
+    assert!(!violations("with c as (select 1) select id from note").is_empty());
 }
 
 /// The functions in `text` that write without the tenant's writer lock:

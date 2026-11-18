@@ -22,8 +22,9 @@ impl PgStore {
         let encoded = serde_json::to_string(candidates)
             .map_err(|_| Error::Internal("presence focus encoding failed".into()))?;
         let mut tx = self.begin().await.map_err(read_failed)?;
-        // Select the winner's index, not its JSON: a jsonb round trip would
-        // reorder its keys, and the caller's object goes out on the wire.
+        // Select the index of the winner, not its JSON: a jsonb round trip
+        // would reorder its keys, and the object from the caller goes out on
+        // the wire as given.
         let row: Option<(Option<i64>,)> = sqlx::query_as(
             "WITH candidates AS (SELECT e.key::bigint AS ord, e.value AS target, \
                  sqlite_json_extract(e.value, '$.workspaceId') AS workspace_id, \
