@@ -5,4 +5,6 @@ freelist_count — SQLite PRAGMA freelist_count; Postgres has no freelist
 incremental_vacuum_chunk — SQLite PRAGMA incremental_vacuum; Postgres autovacuum manages space
 optimize — SQLite PRAGMA optimize; Postgres autoanalyze keeps planner statistics
 page_size — SQLite PRAGMA page_size, only to size the freelist backlog
+read_pool — test-only raw SQLite pool (cfg test / test-support); tests seed, inspect and fault-inject SQLite directly
 spawn_periodic_wal_checkpoint — SQLite WAL checkpoint; Postgres checkpoints on its own
+write_pool — test-only raw SQLite pool (cfg test / test-support); tests hold the single writer and fault-inject SQLite directly

@@ -524,6 +524,13 @@ pub(crate) fn db(e: impl std::fmt::Display) -> Error {
 
 /// What a not-yet-ported `Store` method does on Postgres.
 #[track_caller]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no Store method is pending today; kept for the next unported one"
+    )
+)]
 pub(crate) fn unported_panic(method: &'static str) -> ! {
     panic!("{method} is not yet supported on the Postgres store")
 }

@@ -171,7 +171,8 @@ intent-services = { path = "../intent-services", version = "0.11.246", features 
 intent-acp = { path = "../intent-acp", version = "0.11.246" }
 intent-providers = { path = "../intent-providers", version = "0.11.246", features = ["test-support"] }
 intent-core = { path = "../intent-core", version = "0.11.246" }
-intent-store = { path = "../intent-store", version = "0.11.246" }
+# Tests seed and inspect SQLite through the test-only raw pools.
+intent-store = { path = "../intent-store", version = "0.11.246", features = ["test-support"] }
 # `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice
 # never touches the network (no `LINEAR_API_KEY`, no GraphQL call).
 intent-linear = { path = "../intent-linear", version = "0.11.246" }

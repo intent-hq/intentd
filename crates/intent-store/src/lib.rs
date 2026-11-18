@@ -26,10 +26,14 @@ macro_rules! dispatch {
 }
 
 /// A `Store` method the Postgres backend does not implement yet: `SQLite`
-/// runs `$call`; Postgres panics naming the method. Only the raw pools are
-/// left (`postgres/pending/lib.txt`). Without the `postgres` feature this is
+/// runs `$call`; Postgres panics naming the method. None are left; a new
+/// one is listed in `postgres/pending/<module>.txt`. Without the `postgres` feature this is
 /// exactly `dispatch!`. `postgres_port_ratchet_lint` keeps the number of
 /// these from growing.
+#[expect(
+    unused_macros,
+    reason = "no Store method is pending today; kept for the next unported one"
+)]
 macro_rules! pending_postgres {
     (panic $name:literal, $self:ident, $s:ident => $call:expr) => {
         match &$self.backend {
@@ -86,6 +90,12 @@ pub use derived_index::{
 mod desktop_repo;
 mod diagnostics;
 mod store_pool;
+#[cfg(not(any(test, feature = "test-support")))]
+use store_pool::StorePool;
+/// The raw `SQLite` pool types: tests and `test-support` builds only, with
+/// [`Store::write_pool`] / [`Store::read_pool`]. Release builds reach the
+/// database through `Store` methods alone.
+#[cfg(any(test, feature = "test-support"))]
 pub use store_pool::{StorePool, StorePoolOptions};
 mod diffs_repo;
 mod discussion_activity_repo;
@@ -598,18 +608,23 @@ impl Store {
 
     /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
     ///
+    /// Tests and `test-support` builds only: release builds reach the database
+    /// through `Store` methods alone. `SQLite`-only; Postgres panics.
     /// Acquisition and queries retain ownership throughout initialization.
     /// The facade exposes read-only settings, not a raw pool or mutable options.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn write_pool(&self) -> &StorePool {
-        pending_postgres!(panic "write_pool", self, backend => backend.write_pool())
+        sqlite_only!(panic "write_pool", self, backend => backend.write_pool())
     }
 
     /// Borrow the read pool (32 connections, intended for read/SELECT queries).
-    /// The ownership and exported-options boundary is the same as [`Self::write_pool`].
+    /// The test-only, ownership and exported-options boundary is the same as
+    /// [`Self::write_pool`].
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn read_pool(&self) -> &StorePool {
-        pending_postgres!(panic "read_pool", self, backend => backend.read_pool())
+        sqlite_only!(panic "read_pool", self, backend => backend.read_pool())
     }
 
     /// Spawn a background task that periodically runs PRAGMA `wal_checkpoint(PASSIVE)`
@@ -734,7 +749,7 @@ impl crate::SqliteStore {
     ) -> Result<Self> {
         let write_pool = match &owner {
             Some(_) => connect_write_owned(db_path, WRITE_ACQUIRE_TIMEOUT, owner.clone()).await?,
-            None => connect_write(db_path).await?,
+            None => connect_write_with_acquire_timeout(db_path, WRITE_ACQUIRE_TIMEOUT).await?,
         };
         let repository_lifecycle = repository_lifecycle::domain_for(db_path)?;
         let mut lifecycle = repository_lifecycle.write().await?;
@@ -1095,6 +1110,7 @@ impl MigrationStatus {
 /// # Errors
 ///
 /// Returns `Error::Internal` if the pool cannot be opened (or the acquire timeout is exceeded).
+#[cfg(any(test, feature = "test-support"))]
 pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
     connect_write_with_acquire_timeout(db_path, WRITE_ACQUIRE_TIMEOUT).await
 }

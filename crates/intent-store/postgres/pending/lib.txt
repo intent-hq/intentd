@@ -1,4 +1,0 @@
-# read_pool/write_pool return the SQLite pool; raw-SQL callers in intent-services,
-# intent-svc-* and intentd must move behind Store methods before these can go SQLite-only.
-read_pool
-write_pool

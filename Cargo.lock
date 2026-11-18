@@ -2560,6 +2560,7 @@ dependencies = [
  "futures-util",
  "image",
  "intent-core",
+ "intent-store",
  "intentd-test-support",
  "libsqlite3-sys",
  "nix 0.31.3",
