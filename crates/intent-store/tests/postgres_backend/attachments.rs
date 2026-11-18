@@ -2,7 +2,8 @@
 //!
 //! Decoy rule: the body leaves the same keyed rows on every tenant, and the
 //! decoy ends its run with rows behind every id the subject probes as absent
-//! (`missing`, `att-k2`, `ws-empty`, the `nope` path, the `ws-c` diffs) and
+//! (`missing`, `att-k2`, `ws-empty`, the `nope` path, the `ws-c` diffs), an
+//! expired `k-exp` binding for the subject's keyed insert to replace, and
 //! behind every row the subject's stage moves select (unstaged `f`, `g`).
 //! Values carry the tenant name. Ids mix case and cutoffs end in a lowercase
 //! `t`, so ordering and expiry depend on `COLLATE "C"`: `<date>t` sorts after
@@ -221,6 +222,30 @@ parity_test!(
                     .await
                     .unwrap();
             }
+            // An expired binding the subject's keyed insert below would
+            // replace without its tenant filter.
+            store
+                .insert_attachment_with_idempotency_key(
+                    &attachment("att-kx", "ws-1", tenant, T1),
+                    "k-exp",
+                    "fp-decoy",
+                    "2000",
+                )
+                .await
+                .unwrap();
+        } else {
+            let kx = attachment("att-kx", "ws-1", tenant, T2);
+            store
+                .insert_attachment_with_idempotency_key(&kx, "k-exp", "fp-x", AFTER_T1)
+                .await
+                .unwrap();
+            let (binding, record) = store
+                .get_attachment_by_idempotency_key(&ws1, "k-exp", "2000")
+                .await
+                .unwrap()
+                .expect("fresh binding");
+            assert_eq!(binding.created_at, T2);
+            assert_eq!(record, kx);
         }
     }
 );
