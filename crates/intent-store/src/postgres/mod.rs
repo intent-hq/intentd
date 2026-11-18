@@ -20,17 +20,26 @@ pub use sqlx::postgres::PgPool;
 
 mod agent_messages;
 mod agents;
+mod browser_tabs;
+mod clients;
 mod comments;
+mod completion_watches;
+mod desktop;
 mod discussions;
 mod events;
 mod hooks;
+mod idempotency;
+mod mcp_oauth;
 mod nodes;
 mod note_search;
 mod notes;
+pub(crate) mod pr_monitors;
+mod presence_focus;
 mod principals;
 mod script_monitors;
 mod scripts;
 mod settings;
+mod usage_metrics;
 mod workspaces;
 
 /// Postgres schema migrations, separate from the `SQLite` ones.
@@ -424,6 +433,10 @@ pub(crate) struct PgStore {
     note_write_lanes: Arc<crate::note_write_lock::NoteWriteLanes>,
     task_event_baselines: Arc<crate::TaskEventBaselines>,
     task_events_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Process-local, like `SQLite`'s; see `browser_tab_repo`.
+    browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay,
+    /// Process-local teardown gates; see `desktop_repo`.
+    desktop_writes: crate::desktop_repo::DesktopWrites,
 }
 
 impl PgStore {
@@ -484,6 +497,8 @@ impl crate::Store {
             note_write_lanes: Arc::default(),
             task_event_baselines: Arc::default(),
             task_events_enabled: Arc::default(),
+            browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+            desktop_writes: crate::desktop_repo::DesktopWrites::default(),
         };
         let mut tx = store.begin().await?;
         sqlx::query("SELECT intent_provision_tenant($1)")

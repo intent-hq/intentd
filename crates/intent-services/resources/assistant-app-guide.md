@@ -246,8 +246,10 @@ Appearance preferences for all chats on this device.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/ChatAppearanceSettings.svelte; src/lib/components/chat/ChatContentLane.svelte; src/features/layout/tab-types/AgentViewSettingsDropdown.svelte. Test-build behavior pending its frontend release. -->
 
-When asked about the experimental **Notch dock** in test builds, its switch is in
-**Settings → Appearance → Notch dock**. The switch follows changes from Settings,
+When asked about the **Notch dock**, its switch is in
+**Settings → Appearance → Notch dock**. Starting with the desktop release that turns
+it on by default, the dock is on unless the user turned it off; a user who turned it
+off keeps it off. The switch follows changes from Settings,
 **Window → Show Intent Dock**, and the dock's **Hide** action without a refresh,
 including when viewing another machine.
 
@@ -400,14 +402,16 @@ enabled provider/model. New agents and quick actions cannot run on a disabled
 provider; update their saved selections or re-enable it. Intent does not choose an
 arbitrary replacement for a disabled app default.
 
-<!-- Sources: packages/cloudlands-fe/src/features/onboarding/messages/{ProviderCard,ProviderTerminalButton}.svelte; packages/cloudlands-fe/src/features/providers/utils/provider-install-commands.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-availability/sagas/provider-availability-saga.ts. -->
-Pending frontend release (not in current builds): in onboarding, a card that is not
-installed shows **Install** when Intent knows the provider's install command, and a
-card that needs sign-in shows **Log in** for Claude Code or a provider whose catalog
-lists a login command. These buttons run that command in Intent's terminal drawer, and
-the drawer closes when the card's check passes. Otherwise (and in current builds,
-except Claude Code's **Log in**) the card shows a plain status: send the user to the
-provider's docs, linked from the card, to run the command in a terminal.
+<!-- Sources: packages/cloudlands-fe/src/features/onboarding/messages/{ProviderCard,ProviderTerminalButton}.svelte; packages/cloudlands-fe/src/features/providers/utils/provider-install-commands.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-availability/sagas/provider-availability-saga.ts; packages/cloudlands-fe/src/features/terminal/TerminalAdapter.ts (handleLinkClick). -->
+In onboarding, a card that is not installed shows **Install** when Intent knows the
+provider's install command, and a card that needs sign-in shows **Log in** for Claude
+Code or a provider whose catalog lists a login command. These buttons run that command
+in Intent's terminal drawer, and the drawer closes when the card's check passes.
+Otherwise the card shows a plain status: send the user to the provider's docs, linked
+from the card, to run the command in a terminal. Pending frontend release: a sign-in
+link clicked in that drawer opens in the system browser (in current builds the click
+does nothing; open the link from a workspace terminal instead, which uses Intent's
+browser panel).
 
 <!-- Auggie visibility: packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/cloudlands-fe/src/features/onboarding/messages/AgentGrid.svelte; packages/cloudlands-fe/src/store/renderer/slices/provider-catalog/workspace-catalog-selectors.ts. -->
 Auggie appears in provider lists, including onboarding, only when its CLI is
@@ -662,35 +666,6 @@ running in WSL on the same Windows PC, add a machine with host `localhost`;
 changing listening addresses, and configuring a tunnel are separate choices from
 displaying pairing information. Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/settings/LabsSettings.svelte; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts; packages/cloudlands-fe/src/features/intent-web/components/. -->
-
-## Use Intent from a browser on another device (experimental)
-
-Browser access is experimental and hidden until the user turns on **Browser access** in
-**Settings → Advanced → Labs**. Do not offer it as a normal option; describe it only
-when the user asks about it, and say it is experimental.
-Turning that switch off hides the section and turns the server off.
-
-Once unlocked, **Settings → Mobile → Browser access** (`/settings?tab=mobile#mobile`) lets
-a browser on another device, such as a laptop, use the desktop app, including every
-backend that desktop connects to. It is off by default and the desktop app must stay
-open. Intent listens only on this machine (`127.0.0.1`, port 47120 by default), so the
-user reaches it through a private HTTPS front-end they set up themselves; with
-Tailscale that is `tailscale serve --bg <port>` on the desktop, then the desktop's
-Tailscale address in the browser. Never suggest Tailscale Funnel or another public tunnel.
-
-The browser asks once for the **Access key** shown in that section, or for a code from
-**Create sign-in link**: a 6-character code (such as `ABC-DEF`) that works once and
-expires after 10 minutes, plus a link once a browser has signed in. Opening the link only
-fills in the code; the user still selects **Sign in**. Sessions survive closing the
-browser and last 400 days from the last visit. **Reset key** signs out every browser and
-cancels unused codes. In the browser, opening a saved connection opens that backend in a
-new tab; adding or forgetting connections stays on the desktop. Desktop-only features
-such as native file dialogs and window controls are unavailable in the browser; a notice
-listing them appears each time the browser loads Intent. If the section shows the port
-is in use, change **Port**. If it says the build does not include the browser version,
-the installed app predates the feature.
-
 <!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; packages/cloudlands-fe/messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter,ReadOnlyBanner,RemoteReadOnly,AvailableWhenReconnectedView}.swift; packages/ios/Intent/Services/ConversationStorePool.swift; packages/ios/Intent/Views/Workspaces/WorkspaceDetailStores.swift; packages/ios/Intent/App/{AppCoordinator,RootView}.swift. -->
 
 When the app and connected daemon support startup status, the connection screen
@@ -763,8 +738,10 @@ the user's agy history. Choose the thinking level as the reasoning effort.
 
 `@intent-hq/web` (command `intent-web`) is a new, separately installed server that
 serves the Intent web app without the desktop app, for example on a VPS or dev box.
-It ships with Intent releases on npm. It is unrelated to the experimental desktop
-**Browser access** above: do not tell the user to unlock Labs for it.
+It ships with Intent releases on npm and is the supported way to use Intent from a
+browser. Desktop builds are dropping their experimental Labs **Browser access**
+option; some installed builds may still show it. Do not recommend it; if asked,
+say it is experimental and being removed, and suggest `@intent-hq/web` instead.
 
 - Start it with `npx @intent-hq/web` (Node.js 22.22.2+, 24.15.0+ or 26+). It listens
   only on `127.0.0.1:47120` and prints an **access key** on first run;
@@ -789,7 +766,7 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
   available there; a notice listing them appears each time the browser loads Intent,
   and **Got it** closes it.
 
-<!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md; packages/cloudlands-fe/src/features/browser-access/main/browser-access-sign-in-codes.ts. -->
+<!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md. -->
 
 ## Start or continue work
 
@@ -1020,6 +997,8 @@ defaults.
 <!-- Labs (device rail): describe only when explicitly asked about the device rail
 or when developing or testing it, and say it is Labs. In the desktop app,
 Settings → Advanced → Labs → Machine rail shows the machines kept in this window.
+Starting with the desktop release that turns it on by default, the rail is on unless
+the user turned it off; a user who turned it off keeps it off.
 Frame windows require the frontend release containing intent-hq/cloudlands-fe#4691.
 Until that release, the window's own machine stays first in the rail and cannot be
 moved or removed; describe the behavior below only with that release.

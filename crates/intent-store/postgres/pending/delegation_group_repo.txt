@@ -1,4 +1,0 @@
-delete_delegation_group
-list_undelivered_groups
-list_workspaces_with_undelivered_groups
-upsert_delegation_group

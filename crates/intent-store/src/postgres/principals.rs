@@ -20,7 +20,9 @@ use sqlx::postgres::{PgConnection, PgRow, Postgres};
 use sqlx::{Row, Transaction};
 
 use super::{db, PgStore, WriteTx};
-use crate::host_membership_repo::{HostInviteJoinOutcome, HostMemberRemoval, HostMembersSnapshot};
+use crate::host_membership_repo::{
+    HostInviteJoinOutcome, HostMemberRemoval, HostMembersSnapshot, OwnerQueuePermit,
+};
 use crate::principal_repo::{
     map_owner_violation, principal_identity_columns, CollaboratorAddOutcome,
     EffectiveWorkspaceMember, InviteInsertOutcome, InviteJoinOutcome, WorkspaceAuthorFallback,
@@ -1225,6 +1227,29 @@ impl PgStore {
         .rows_affected();
         tx.commit().await.map_err(db)?;
         Ok(revoked > 0)
+    }
+
+    /// `SqliteStore::owner_queue_permit` under the tenant writer lock, which
+    /// every credential revoke takes too.
+    pub async fn owner_queue_permit(
+        &self,
+        principal_id: &PrincipalId,
+        token_hash: Option<&str>,
+    ) -> Result<Option<OwnerQueuePermit>> {
+        let mut tx = self.begin_write().await?;
+        let authorized: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM principal p WHERE p.tenant_id = $1 AND p.id = $2 \
+             AND p.is_primary = 1 AND ($3::text IS NULL OR EXISTS(SELECT 1 \
+             FROM principal_credential c WHERE c.tenant_id = $1 AND c.principal_id = p.id \
+             AND c.token_hash = $3 AND c.revoked_at IS NULL)))",
+        )
+        .bind(self.tenant())
+        .bind(&principal_id.0)
+        .bind(token_hash)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        Ok(authorized.then(|| OwnerQueuePermit::postgres(tx)))
     }
 
     pub async fn revoke_all_principal_credentials(

@@ -1,2 +1,0 @@
-add_usage_stats
-list_usage_stats_hourly

@@ -31,6 +31,63 @@ fn words_with_offsets(stmt: &str) -> Vec<(usize, &str)> {
     out
 }
 
+/// Whether byte `at` sits directly inside a function call's parentheses
+/// (`extract(epoch from x)`, `substring(x from $2)`): the innermost open
+/// parenthesis before it follows a function name. A parenthesis after a
+/// keyword (`in (select`, `from (a join b`) or after another parenthesis
+/// opens a subquery or a group, whose tables are checked. Parentheses inside
+/// quoted strings and `--` comments do not count.
+fn in_call_args(stmt: &str, at: usize) -> bool {
+    const NOT_A_CALL: &[&str] = &[
+        "", "in", "exists", "from", "join", "on", "and", "or", "not", "where", "select", "as",
+        "values", "when", "then", "else", "using", "lateral", "union", "all", "any", "distinct",
+    ];
+    let bytes = stmt.as_bytes();
+    let mut quoted = vec![false; bytes.len()];
+    let (mut in_string, mut in_comment) = (false, false);
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_comment {
+            in_comment = b != b'\n';
+            quoted[i] = true;
+        } else if b == b'\'' {
+            in_string = !in_string;
+            quoted[i] = true;
+        } else if !in_string && b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            in_comment = true;
+            quoted[i] = true;
+        } else {
+            quoted[i] = in_string;
+        }
+    }
+    let mut depth = 0usize;
+    for i in (0..at).rev() {
+        if quoted[i] {
+            continue;
+        }
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' if depth > 0 => depth -= 1,
+            b'(' => {
+                // A group led by SELECT or WITH is a subquery whatever precedes it.
+                let inner = stmt[i + 1..].trim_start().to_lowercase();
+                if inner.starts_with("select") || inner.starts_with("with ") {
+                    return false;
+                }
+                let before = stmt[..i].trim_end();
+                let start = before
+                    .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .map_or(0, |p| {
+                        p + before[p..].chars().next().map_or(1, char::len_utf8)
+                    });
+                let name = before[start..].to_lowercase();
+                return !NOT_A_CALL.contains(&name.as_str());
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn ident(w: &str) -> String {
     w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_'))
         .to_lowercase()
@@ -66,8 +123,14 @@ pub fn table_refs(stmt: &str) -> Vec<TableRef> {
         if keyword == "UPDATE" && i > 0 && words[i - 1].1.eq_ignore_ascii_case("DO") {
             continue; // ON CONFLICT DO UPDATE SET
         }
-        if raw.contains(['(', ')', '.']) || raw.starts_with(|c: char| c.is_ascii_digit()) {
-            // subquery, table function, `IS DISTINCT FROM old.x`, SUBSTRING(x FROM n)
+        // A subquery or table function (`from (select`, `json_each($2)`),
+        // `IS DISTINCT FROM old.x`, a number, or a `FROM` inside a call's
+        // arguments. A closing parenthesis alone does not count: in
+        // `(select id from note)` the table is `note`.
+        if raw.contains(['(', '.'])
+            || raw.starts_with(|c: char| c.is_ascii_digit())
+            || in_call_args(stmt, *at)
+        {
             continue;
         }
         let table = ident(raw);
