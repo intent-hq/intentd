@@ -662,35 +662,6 @@ running in WSL on the same Windows PC, add a machine with host `localhost`;
 changing listening addresses, and configuring a tunnel are separate choices from
 displaying pairing information. Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/settings/LabsSettings.svelte; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts; packages/cloudlands-fe/src/features/intent-web/components/. -->
-
-## Use Intent from a browser on another device (experimental)
-
-Browser access is experimental and hidden until the user turns on **Browser access** in
-**Settings → Advanced → Labs**. Do not offer it as a normal option; describe it only
-when the user asks about it, and say it is experimental.
-Turning that switch off hides the section and turns the server off.
-
-Once unlocked, **Settings → Mobile → Browser access** (`/settings?tab=mobile#mobile`) lets
-a browser on another device, such as a laptop, use the desktop app, including every
-backend that desktop connects to. It is off by default and the desktop app must stay
-open. Intent listens only on this machine (`127.0.0.1`, port 47120 by default), so the
-user reaches it through a private HTTPS front-end they set up themselves; with
-Tailscale that is `tailscale serve --bg <port>` on the desktop, then the desktop's
-Tailscale address in the browser. Never suggest Tailscale Funnel or another public tunnel.
-
-The browser asks once for the **Access key** shown in that section, or for a code from
-**Create sign-in link**: a 6-character code (such as `ABC-DEF`) that works once and
-expires after 10 minutes, plus a link once a browser has signed in. Opening the link only
-fills in the code; the user still selects **Sign in**. Sessions survive closing the
-browser and last 400 days from the last visit. **Reset key** signs out every browser and
-cancels unused codes. In the browser, opening a saved connection opens that backend in a
-new tab; adding or forgetting connections stays on the desktop. Desktop-only features
-such as native file dialogs and window controls are unavailable in the browser; a notice
-listing them appears each time the browser loads Intent. If the section shows the port
-is in use, change **Port**. If it says the build does not include the browser version,
-the installed app predates the feature.
-
 <!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; packages/cloudlands-fe/messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter,ReadOnlyBanner,RemoteReadOnly,AvailableWhenReconnectedView}.swift; packages/ios/Intent/Services/ConversationStorePool.swift; packages/ios/Intent/Views/Workspaces/WorkspaceDetailStores.swift; packages/ios/Intent/App/{AppCoordinator,RootView}.swift. -->
 
 When the app and connected daemon support startup status, the connection screen
@@ -763,8 +734,8 @@ the user's agy history. Choose the thinking level as the reasoning effort.
 
 `@intent-hq/web` (command `intent-web`) is a new, separately installed server that
 serves the Intent web app without the desktop app, for example on a VPS or dev box.
-It ships with Intent releases on npm. It is unrelated to the experimental desktop
-**Browser access** above: do not tell the user to unlock Labs for it.
+It ships with Intent releases on npm. It is the only way to use Intent from a browser:
+the desktop app does not serve itself to browsers.
 
 - Start it with `npx @intent-hq/web` (Node.js 22.22.2+, 24.15.0+ or 26+). It listens
   only on `127.0.0.1:47120` and prints an **access key** on first run;
@@ -789,7 +760,7 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
   available there; a notice listing them appears each time the browser loads Intent,
   and **Got it** closes it.
 
-<!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md; packages/cloudlands-fe/src/features/browser-access/main/browser-access-sign-in-codes.ts. -->
+<!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md. -->
 
 ## Start or continue work
 
