@@ -195,6 +195,22 @@ fn the_tenant_rule_catches_unscoped_shapes() {
     assert!(
         violations("update settings set value = $3 where tenant_id = $1 and key = $2").is_empty()
     );
+    // A table right before a closing parenthesis is still a table.
+    assert_eq!(
+        violations("select id from task where tenant_id = $1 and id in (select id from note)"),
+        ["FROM note"]
+    );
+    assert!(violations(
+        "select id from task where tenant_id = $1 \
+         and id in (select id from note where tenant_id = $1)"
+    )
+    .is_empty());
+    // FROM inside a function call's arguments names no table.
+    assert!(violations(
+        "select extract(epoch from created_at), substring(name from $2) \
+         from note where tenant_id = $1"
+    )
+    .is_empty());
 }
 
 /// The functions in `text` that write without the tenant's writer lock:

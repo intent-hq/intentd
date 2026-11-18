@@ -31,6 +31,28 @@ fn words_with_offsets(stmt: &str) -> Vec<(usize, &str)> {
     out
 }
 
+/// Whether byte `at` sits directly inside a function call's parentheses
+/// (`extract(epoch from x)`, `substring(x from $2)`), as opposed to a
+/// `(select …)` subquery or the top level of the statement.
+fn in_call_args(stmt: &str, at: usize) -> bool {
+    let bytes = stmt.as_bytes();
+    let mut depth = 0usize;
+    for i in (0..at).rev() {
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' if depth > 0 => depth -= 1,
+            b'(' => {
+                let inner = stmt[i + 1..].trim_start();
+                return !inner
+                    .get(..6)
+                    .is_some_and(|w| w.eq_ignore_ascii_case("select"));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn ident(w: &str) -> String {
     w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_'))
         .to_lowercase()
@@ -66,8 +88,14 @@ pub fn table_refs(stmt: &str) -> Vec<TableRef> {
         if keyword == "UPDATE" && i > 0 && words[i - 1].1.eq_ignore_ascii_case("DO") {
             continue; // ON CONFLICT DO UPDATE SET
         }
-        if raw.contains(['(', ')', '.']) || raw.starts_with(|c: char| c.is_ascii_digit()) {
-            // subquery, table function, `IS DISTINCT FROM old.x`, SUBSTRING(x FROM n)
+        // A subquery or table function (`from (select`, `json_each($2)`),
+        // `IS DISTINCT FROM old.x`, a number, or a `FROM` inside a call's
+        // arguments. A closing parenthesis alone does not count: in
+        // `(select id from note)` the table is `note`.
+        if raw.contains(['(', '.'])
+            || raw.starts_with(|c: char| c.is_ascii_digit())
+            || in_call_args(stmt, *at)
+        {
             continue;
         }
         let table = ident(raw);
