@@ -1,0 +1,3 @@
+# Postgres SQL literals the tenant lint cannot parse, so its parsed-form
+# rule skips them (the text rule still checks them). One per line:
+# <file> | <first 80 characters, whitespace collapsed> — <reason>
