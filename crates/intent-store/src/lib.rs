@@ -26,23 +26,16 @@ macro_rules! dispatch {
 }
 
 /// A `Store` method the Postgres backend does not implement yet: `SQLite`
-/// runs `$call`; Postgres returns an error naming the method (`panic` for
-/// the few methods that do not return `Result`). Without the `postgres`
-/// feature this is exactly `dispatch!`. `postgres_port_ratchet_lint` keeps
-/// the number of these from growing.
+/// runs `$call`; Postgres panics naming the method. Only the raw pools are
+/// left (`postgres/pending/lib.txt`). Without the `postgres` feature this is
+/// exactly `dispatch!`. `postgres_port_ratchet_lint` keeps the number of
+/// these from growing.
 macro_rules! pending_postgres {
     (panic $name:literal, $self:ident, $s:ident => $call:expr) => {
         match &$self.backend {
             $crate::Backend::Sqlite($s) => $call,
             #[cfg(feature = "postgres")]
             $crate::Backend::Postgres(_) => $crate::postgres::unported_panic($name),
-        }
-    };
-    ($name:literal, $self:ident, $s:ident => $call:expr) => {
-        match &$self.backend {
-            $crate::Backend::Sqlite($s) => $call,
-            #[cfg(feature = "postgres")]
-            $crate::Backend::Postgres(_) => Err($crate::postgres::unported($name)),
         }
     };
 }

@@ -324,6 +324,58 @@ pub async fn tenant_rows(admin: &PgPool, tenant: &str) -> Vec<(String, String)> 
     rows
 }
 
+/// `stmt` on this run's rows. `{t}` becomes `tenant_id, ` (column lists) and
+/// `{v}` the tenant value on Postgres, `{w}` the tenant filter; Postgres runs
+/// it through the admin pool, which the leak trap does not apply to.
+pub async fn seed_sql(store: &Store, db: Option<&TestDb>, tenant: &str, stmt: &str) {
+    let (column, value, filter) = if db.is_some() {
+        (
+            "tenant_id, ".to_owned(),
+            format!("'{tenant}', "),
+            format!("tenant_id = '{tenant}'"),
+        )
+    } else {
+        (String::new(), String::new(), "1 = 1".to_owned())
+    };
+    let stmt = stmt
+        .replace("{t}", &column)
+        .replace("{v}", &value)
+        .replace("{w}", &filter);
+    let query = sqlx::raw_sql(sqlx::AssertSqlSafe(stmt));
+    if let Some(db) = db {
+        query.execute(&db.admin).await.expect("setup statement");
+    } else {
+        query
+            .execute(store.write_pool())
+            .await
+            .expect("setup statement");
+    }
+}
+
+/// Rows of `table` matching `filter`, among this run's rows.
+pub async fn count_rows(
+    store: &Store,
+    db: Option<&TestDb>,
+    tenant: &str,
+    table: &str,
+    filter: &str,
+) -> i64 {
+    match db {
+        Some(db) => sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {table} WHERE tenant_id = '{tenant}' AND ({filter})"
+        )))
+        .fetch_one(&db.admin)
+        .await
+        .expect("count rows"),
+        None => sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {table} WHERE {filter}"
+        )))
+        .fetch_one(store.read_pool())
+        .await
+        .expect("count rows"),
+    }
+}
+
 /// One test body, run on every backend: `SQLite`, then Postgres twice in one
 /// database — first for a decoy tenant, then for the tenant under test.
 /// - Leak trap: the Postgres database fails any statement that touches a row

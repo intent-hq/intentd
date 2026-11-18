@@ -5,8 +5,9 @@
 //! `agent_flipped_completion_repo.rs`, `advisory_wake_delivery_repo.rs`,
 //! `completion_wake_delivery_repo.rs` and `agent_repo/review_context_enrollment.rs`.
 //!
-//! As in `workspaces.rs`, the `SQLite` repository lifecycle brackets are left
-//! out: a Postgres store never installs that observer. `SQLite` edits
+//! Session deletion takes the repository lifecycle bracket as on `SQLite`;
+//! the other writers here predate the Postgres lifecycle domain and leave
+//! it out. `SQLite` edits
 //! session `metadata` with JSON1 inside one statement; here the same edits
 //! run in Rust on the row read inside the writer-locked transaction, which
 //! orders them against every other writer of the tenant.
@@ -29,13 +30,19 @@ use sqlx::Row;
 use super::{db, PgStore, WriteTx};
 use crate::agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 use crate::agent_queue_repo::AgentQueueRow;
+use crate::agent_repo::prepared_monitor_message::{draft_monitor_message, MonitorMessageDraft};
+use crate::agent_repo::UsageMessageOrigin;
 use crate::agent_repo::{
     effort_levels_from_db, effort_levels_to_db, encode_metadata, json_col_from_db, json_col_to_db,
     normalize_compound_model, AgentTurnEffort, AgentUsageCellRow, AgentUsageRow, ChildAgentCounts,
     InterruptedAgent, ReviewContextEnrollment, DAEMON_OWNED_METADATA_KEYS,
     MANUAL_CHOICE_METADATA_KEY, SESSION_COLUMNS,
 };
-use crate::{enum_from_db, enum_to_db, AgentSessionSummary, FullAgentSessionRow};
+use crate::{
+    enum_from_db, enum_to_db, AgentSessionSummary, FullAgentSessionRow, PreparedMonitorMessage,
+    QualifiedPrMonitor,
+};
+use intent_core::review_monitor::{ReviewMonitorBinding, ReviewMonitorWakeMetadata};
 
 /// [`crate::agent_repo::SESSION_SUMMARY_COLUMNS`] without the heavy columns.
 const SUMMARY_COLUMNS: &str = crate::agent_repo::SESSION_SUMMARY_COLUMNS;
@@ -1484,12 +1491,22 @@ impl PgStore {
         Ok((model, col(&row, "resolved_model")?, provider, snapshot))
     }
 
-    /// `fetch_agent_usage_rows` in `agent_repo.rs`.
     pub async fn get_workspace_agent_usage_data(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentUsageRow>> {
         let mut tx = self.begin().await?;
+        let rows = self.agent_usage_rows(&mut tx, workspace_id).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(rows)
+    }
+
+    /// `fetch_agent_usage_rows` in `agent_repo.rs`, on the caller's connection.
+    pub(super) async fn agent_usage_rows(
+        &self,
+        conn: &mut PgConnection,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AgentUsageRow>> {
         let session_rows = sqlx::query(
             "SELECT id, name, COALESCE(NULLIF(resolved_model, ''), model) AS model, \
              token_usage, token_usage_baseline FROM agent_session \
@@ -1497,7 +1514,7 @@ impl PgStore {
         )
         .bind(self.tenant())
         .bind(&workspace_id.0)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await
         .map_err(db)?;
         let mut result: Vec<AgentUsageRow> = Vec::with_capacity(session_rows.len());
@@ -1528,7 +1545,7 @@ impl PgStore {
         )
         .bind(self.tenant())
         .bind(&workspace_id.0)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await
         .map_err(db)?;
         for cell in &cell_rows {
@@ -1589,11 +1606,10 @@ impl PgStore {
             )
             .bind(self.tenant())
             .bind(&fallback)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut *conn)
             .await
             .map_err(db)?
         };
-        tx.commit().await.map_err(db)?;
         for row in &message_rows {
             let Some(&idx) = by_agent.get(&col::<String>(row, "agent_id")?) else {
                 continue;
@@ -3486,5 +3502,236 @@ impl PgStore {
             session.into(),
             key,
         )))
+    }
+}
+
+// ---- session deletion and monitor wake messages ---------------------------
+
+/// The child rows `SQLite` deletes before an agent's session row, then the
+/// row itself; the rest cascade through the tenant-scoped foreign keys.
+/// `cleanup_scope` also removes the agent's recovery history and private
+/// desktop records (workspace deletion removes those for every agent first).
+async fn delete_session_rows(
+    tx: &mut WriteTx,
+    tenant: &str,
+    workspace_id: &WorkspaceId,
+    id: &AgentId,
+    cleanup_scope: bool,
+) -> Result<u64> {
+    for sql in [
+        "DELETE FROM agent_message_payload WHERE tenant_id = $1 AND agent_id = $2",
+        "DELETE FROM agent_message WHERE tenant_id = $1 AND agent_id = $2",
+        "DELETE FROM agent_queue WHERE tenant_id = $1 AND agent_id = $2",
+        "DELETE FROM hook WHERE tenant_id = $1 AND agent_id = $2",
+        "DELETE FROM pr_monitor WHERE tenant_id = $1 AND agent_id = $2",
+        "DELETE FROM completion_wake_delivery WHERE tenant_id = $1 \
+         AND (parent_agent_id = $2 OR child_agent_id = $2)",
+        "DELETE FROM advisory_wake_delivery WHERE tenant_id = $1 \
+         AND (parent_agent_id = $2 OR child_agent_id = $2)",
+    ] {
+        sqlx::query(sql)
+            .bind(tenant)
+            .bind(&id.0)
+            .execute(&mut **tx)
+            .await
+            .map_err(db)?;
+    }
+    if cleanup_scope {
+        sqlx::query(
+            "DELETE FROM interrupted_agent \
+             WHERE tenant_id = $1 AND agent_id = $2 AND workspace_id = $3",
+        )
+        .bind(tenant)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(&mut **tx)
+        .await
+        .map_err(db)?;
+        super::desktop::delete_desktop_scope(tx, tenant, workspace_id, Some(id)).await?;
+    }
+    Ok(sqlx::query(
+        "DELETE FROM agent_session WHERE tenant_id = $1 AND id = $2 AND workspace_id = $3",
+    )
+    .bind(tenant)
+    .bind(&id.0)
+    .bind(&workspace_id.0)
+    .execute(&mut **tx)
+    .await
+    .map_err(db)?
+    .rows_affected())
+}
+
+/// Workspace deletion's per-agent step, inside its transaction.
+pub(super) async fn delete_workspace_session(
+    tx: &mut WriteTx,
+    tenant: &str,
+    workspace_id: &WorkspaceId,
+    id: &AgentId,
+) -> Result<()> {
+    delete_session_rows(tx, tenant, workspace_id, id, false)
+        .await
+        .map(drop)
+}
+
+/// A monitor wake message holding the tenant's writer lock until it
+/// finishes, like `SQLite`'s reserved `BEGIN IMMEDIATE` writer.
+pub(crate) struct PreparedPgMonitorMessage {
+    tx: WriteTx,
+    tenant: String,
+    expected: sqlx::query::Query<'static, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    message: AgentMessage,
+    draft: MonitorMessageDraft,
+    usage_model: String,
+    workspace_id: WorkspaceId,
+    envelope_sha256: [u8; 32],
+}
+
+fn monitor_message_error(error: impl std::fmt::Display) -> Error {
+    Error::Internal(format!("qualified monitor message write: {error}"))
+}
+
+impl PreparedPgMonitorMessage {
+    pub(crate) async fn finish(self) -> Result<Option<AgentMessage>> {
+        let Self {
+            tx,
+            tenant,
+            expected,
+            message,
+            draft,
+            usage_model,
+            workspace_id,
+            envelope_sha256,
+        } = self;
+        // Typed so the writer-lock lint sees the lock this message holds.
+        let mut tx: WriteTx = tx;
+        if expected
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(monitor_message_error)?
+            .is_none()
+        {
+            // Dropping the transaction rolls it back.
+            return Ok(None);
+        }
+        let m = &message;
+        super::agent_messages::insert_message_row(
+            &mut tx,
+            &tenant,
+            &m.id,
+            &m.agent_id.0,
+            m.seq,
+            "user",
+            &draft.content.content_json,
+            Some(&draft.metadata_json),
+            &m.created_at,
+            (&usage_model, Some(UsageMessageOrigin::Excluded.as_db())),
+        )
+        .await
+        .map_err(monitor_message_error)?;
+        super::agent_messages::insert_payload_rows(
+            &mut tx,
+            &tenant,
+            &m.id,
+            &m.agent_id.0,
+            &draft.content.payload_rows,
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO pr_monitor_message_provenance \
+             (tenant_id, message_id, agent_id, workspace_id, binding_json, envelope_sha256, version) \
+             VALUES ($1, $2, $3, $4, $5, $6, 1)",
+        )
+        .bind(&tenant)
+        .bind(&m.id)
+        .bind(&m.agent_id.0)
+        .bind(&workspace_id.0)
+        .bind(&draft.binding_json)
+        .bind(envelope_sha256.as_slice())
+        .execute(&mut *tx)
+        .await
+        .map_err(monitor_message_error)?;
+        // As on SQLite: no preview projection of private monitor text.
+        sqlx::query("UPDATE agent_session SET updated_at = $3 WHERE tenant_id = $1 AND id = $2")
+            .bind(&tenant)
+            .bind(&m.agent_id.0)
+            .bind(&m.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(monitor_message_error)?;
+        tx.commit().await.map_err(monitor_message_error)?;
+        Ok(Some(message))
+    }
+}
+
+impl PgStore {
+    pub async fn delete_agent_session(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+    ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut tx = self.begin_write().await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_session \
+             WHERE tenant_id = $1 AND id = $2 AND workspace_id = $3)",
+        )
+        .bind(self.tenant())
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        if !exists {
+            return Ok(false);
+        }
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
+        let removed = delete_session_rows(&mut tx, self.tenant(), workspace_id, id, true).await?;
+        tx.commit().await.map_err(db)?;
+        lifecycle.settle_after_retirement().await?;
+        Ok(removed > 0)
+    }
+
+    pub async fn prepare_monitor_message(
+        &self,
+        expected: &QualifiedPrMonitor,
+        binding: &ReviewMonitorBinding,
+        id: &str,
+        text: &str,
+        metadata: &ReviewMonitorWakeMetadata,
+        created_at: &str,
+    ) -> Result<PreparedMonitorMessage> {
+        let draft = draft_monitor_message(expected, binding, id, text, metadata).await?;
+        let monitor = expected.monitor();
+        let mut tx = self.begin_write().await?;
+        let row = sqlx::query(
+            "SELECT COALESCE(NULLIF(s.resolved_model, ''), NULLIF(s.model, ''), 'unknown') AS model, \
+             (SELECT COALESCE(MAX(m.seq), -1) + 1 FROM agent_message m \
+              WHERE m.tenant_id = $1 AND m.agent_id = $2) AS next \
+             FROM agent_session s WHERE s.tenant_id = $1 AND s.id = $2 \
+             AND s.workspace_id = $3 AND s.retired_at IS NULL",
+        )
+        .bind(self.tenant())
+        .bind(&monitor.agent_id.0)
+        .bind(&monitor.workspace_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(monitor_message_error)?
+        .ok_or_else(|| Error::NotFound("original monitor destination unavailable".into()))?;
+        let message = draft.message(id, &monitor.agent_id, col(&row, "next")?, created_at);
+        let envelope_sha256 = crate::agent_repo::monitor_message_provenance::envelope_digest(
+            &message,
+            &monitor.workspace_id,
+            binding,
+        )?;
+        Ok(PreparedMonitorMessage::postgres(PreparedPgMonitorMessage {
+            tx,
+            tenant: self.tenant().to_owned(),
+            expected: super::pr_monitors::captured_monitor_exists(self.tenant(), expected),
+            message,
+            draft,
+            usage_model: col(&row, "model")?,
+            workspace_id: monitor.workspace_id.clone(),
+            envelope_sha256,
+        }))
     }
 }

@@ -3,14 +3,17 @@
 //! leave their rows behind, so a Postgres statement without its tenant
 //! filter sees the decoy tenant's rows on the subject run.
 
+use intent_core::node_link::HomeStopReason;
 use intent_core::{
-    AgentId, ClientId, ContextItem, Error, HomeId, HomeState, PullRequestInfo, PullRequestStatus,
-    Workspace, WorkspaceAttention, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource,
-    WorkspaceHome, WorkspaceId, WorkspaceListFilter, WorkspaceStatus,
+    AgentId, AgentSession, AgentStatus, BrowserTabInput, BrowserTabVisibility, ClientId,
+    ContextItem, Error, HomeId, HomeState, PullRequestInfo, PullRequestStatus, TokenUsage,
+    TokenUsageTotals, Workspace, WorkspaceAttention, WorkspaceGitRoot, WorkspaceGitRootId,
+    WorkspaceGitRootSource, WorkspaceHome, WorkspaceId, WorkspaceListFilter, WorkspaceStatus,
 };
-use intent_store::Store;
+use intent_store::{RepositoryWorkspaceDeleteDisposition, Store};
+use serde_json::json;
 
-use crate::harness::parity_test;
+use crate::harness::{count_rows as count, parity_test, seed_sql as sql, TestDb};
 
 const T0: &str = "2026-01-01T00:00:00.000Z";
 const T1: &str = "2026-01-02T00:00:00.000Z";
@@ -935,6 +938,577 @@ parity_test!(workspace_context_ui_and_mcp, |store, tenant| {
     if tenant == "decoy" {
         store
             .set_workspace_mcp_server_disabled(&ws, "zeta", true)
+            .await
+            .unwrap();
+    }
+});
+
+// ---- deletion cascade, token usage and host-admitted insert ----------------
+
+fn agent(id: &str, ws: &str, tenant: &str) -> AgentSession {
+    AgentSession {
+        id: AgentId(id.into()),
+        workspace_id: wid(ws),
+        name: format!("{id} of {tenant}"),
+        model: Some("opus".into()),
+        status: AgentStatus::Idle,
+        created_at: T0.into(),
+        updated_at: T0.into(),
+        ..AgentSession::default()
+    }
+}
+
+fn machine_home(home_id: &str, node: &str) -> WorkspaceHome {
+    WorkspaceHome {
+        home_id: HomeId(home_id.into()),
+        node_id: Some(node.into()),
+        cloud_machine_id: None,
+        name: "Mac".into(),
+        state: HomeState::Attached,
+        since: T0.into(),
+        last_backup_at: None,
+        backup_warning: false,
+    }
+}
+
+/// `ws-del` (a plain folder) with a row in every table its deletion touches:
+/// agents `a1` and `a2` with their messages, payloads, queue, hooks,
+/// monitors, wake markers and recovery history; scripts, attachments, notes
+/// with their paging, comments, versions and attributions; registries,
+/// drafts, a browser tab, private desktop records, agent preferences and a
+/// moved home with a move in progress. `ws-keep` and its agent `k1` hold the
+/// rows the deletion must leave: `k1`'s recovery row naming `ws-del`, its
+/// wake markers with `ws-del`'s agents, its desktop record, and a comment of
+/// `ws-del` with no note.
+async fn seed_cascade(store: &Store, db: Option<&TestDb>, tenant: &str) {
+    let mut del = workspace("ws-del", T0);
+    del.plain_folder = true;
+    del.repository_path = Some(format!("/folders/{tenant}"));
+    store.insert_workspace(&del).await.unwrap();
+    if store.get_workspace(&wid("ws-keep")).await.is_err() {
+        store
+            .insert_workspace(&workspace("ws-keep", T0))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&agent("k1", "ws-keep", tenant))
+            .await
+            .unwrap();
+        store.ensure_client(&ClientId("c1".into())).await.unwrap();
+        // Rows of ws-del the deletion leaves: k1's recovery row, k1's desktop
+        // record and a comment with no note.
+        sql(
+            store,
+            db,
+            tenant,
+            &format!(
+                "INSERT INTO interrupted_agent ({{t}}agent_id, workspace_id, prev_status, \
+                 interrupted_at) VALUES ({{v}}'k1', 'ws-del', 'active', 'T0'); \
+                 INSERT INTO settings ({{t}}key, value) \
+                 VALUES ({{v}}'desktop.v1/request/r-keep', '{}'); \
+                 INSERT INTO comment ({{t}}id, thread_id, note_id, workspace_id, kind, content, \
+                 author, author_type, anchor_json, created_at, updated_at) VALUES \
+                 ({{v}}'cm-loose', 'th', NULL, 'ws-del', 'note', 'c', 'a', 'human', '{{}}', \
+                 'T0', 'T0')",
+                json!({"workspaceId": "ws-keep", "agentId": "k1", "tenant": tenant})
+            ),
+        )
+        .await;
+    }
+    for id in ["a1", "a2"] {
+        store
+            .insert_agent_session(&agent(id, "ws-del", tenant))
+            .await
+            .unwrap();
+    }
+    let heavy = json!([{
+        "type": "tool_use", "id": "tu1", "name": "write",
+        "input": { "body": format!("{tenant} {}", "x".repeat(20_000)) },
+    }]);
+    store
+        .append_agent_message(&AgentId("a1".into()), "assistant", &heavy, T0)
+        .await
+        .unwrap();
+    store
+        .append_agent_message(
+            &AgentId("a2".into()),
+            "user",
+            &json!([{"type": "text", "text": tenant}]),
+            T0,
+        )
+        .await
+        .unwrap();
+    let owner = store.get_primary_principal().await.unwrap().id;
+    let desktop = |agent: &str, ws: &str| {
+        json!({"workspaceId": ws, "agentId": agent, "tenant": tenant}).to_string()
+    };
+    let statements = [
+        "INSERT INTO interrupted_agent ({t}agent_id, workspace_id, prev_status, interrupted_at) \
+         VALUES ({v}'a1', 'ws-del', 'active', 'T0'), ({v}'a-gone', 'ws-del', 'active', 'T0')"
+            .to_owned(),
+        format!(
+            "INSERT INTO settings ({{t}}key, value) VALUES \
+             ({{v}}'desktop.v1/request/r-del', '{}'), ({{v}}'desktop.v1/request/r-a2', '{}'), \
+             ({{v}}'workspace.agentCreationPreferences:ws-del', '{{}}')",
+            desktop("a1", "ws-del"),
+            desktop("a2", "ws-del"),
+        ),
+        "INSERT INTO agent_queue ({t}id, agent_id, position, payload, created_at) \
+         VALUES ({v}'q1', 'a1', 0, '{}', 'T0')"
+            .to_owned(),
+        "INSERT INTO hook ({t}hook_id, workspace_id, agent_id, name, code, delay_ms, state, \
+         created_at) VALUES ({v}'hk1', 'ws-del', 'a1', 'n', 'c', 1, 'scheduled', 'T0')"
+            .to_owned(),
+        "INSERT INTO pr_monitor ({t}monitor_id, workspace_id, agent_id, repo_owner, repo_name, \
+         pr_number, state, created_at, updated_at) \
+         VALUES ({v}'m1', 'ws-del', 'a1', 'o', 'r', 1, 'active', 'T0', 'T0')"
+            .to_owned(),
+        "INSERT INTO completion_wake_delivery ({t}parent_agent_id, child_agent_id, \
+         completion_identity, delivered_at) \
+         VALUES ({v}'a1', 'a2', 'c', 'T0'), ({v}'k1', 'a2', 'c', 'T0')"
+            .to_owned(),
+        "INSERT INTO advisory_wake_delivery ({t}parent_agent_id, child_agent_id, delivered_at) \
+         VALUES ({v}'a1', 'a2', 'T0'), ({v}'k1', 'a1', 'T0')"
+            .to_owned(),
+        "INSERT INTO script ({t}id, workspace_id, name, command, mode, source, created_at) \
+         VALUES ({v}'s1', 'ws-del', 'n', 'c', 'command', 'agent', 'T0')"
+            .to_owned(),
+        "INSERT INTO attachments ({t}id, workspace_id, file_name, size, uploaded_at, \
+         stored_path) VALUES ({v}'att1', 'ws-del', 'f', 1, 'T0', '/p')"
+            .to_owned(),
+        "INSERT INTO attachment_idempotency_keys ({t}workspace_id, key, attachment_id, \
+         fingerprint, created_at) VALUES ({v}'ws-del', 'k1', 'att1', 'f', 'T0')"
+            .to_owned(),
+        "INSERT INTO note ({t}id, workspace_id, title, content, created_at, updated_at) \
+         VALUES ({v}'n1', 'ws-del', 't', 'c', 'T0', 'T0')"
+            .to_owned(),
+        "INSERT INTO note ({t}id, workspace_id, title, content, created_at, updated_at, \
+         parent_id) VALUES ({v}'n2', 'ws-del', 't', 'c', 'T0', 'T0', 'n1')"
+            .to_owned(),
+        "INSERT INTO comment ({t}id, thread_id, note_id, workspace_id, kind, content, author, \
+         author_type, anchor_json, created_at, updated_at) VALUES \
+         ({v}'cm1', 'th', 'n1', 'ws-del', 'note', 'c', 'a', 'human', '{}', 'T0', 'T0')"
+            .to_owned(),
+        "INSERT INTO note_version ({t}note_id, workspace_id, v, date, author_id, author_name, \
+         author_type, title, content) VALUES ({v}'n1', 'ws-del', 1, 'T0', 'a', 'a', 'human', \
+         't', 'c')"
+            .to_owned(),
+        "INSERT INTO note_line_attribution ({t}note_id, workspace_id, computed_at, \
+         attributions_json) VALUES ({v}'n1', 'ws-del', 'T0', '[]')"
+            .to_owned(),
+        "INSERT INTO tracked_changes ({t}id, workspace_id, path, stage, status, created_at, \
+         updated_at) VALUES ({v}'tc1', 'ws-del', 'p', 'unstaged', 'modified', 'T0', 'T0')"
+            .to_owned(),
+        "INSERT INTO diffs ({t}id, workspace_id, file_path, created_at, updated_at) \
+         VALUES ({v}'d1', 'ws-del', 'p', 'T0', 'T0')"
+            .to_owned(),
+        "INSERT INTO delegation_group ({t}group_id, workspace_id, parent_agent_id, await_mode, \
+         expected_agent_ids, created_at, updated_at) \
+         VALUES ({v}'g1', 'ws-del', 'a1', 'all', '[]', 'T0', 'T0')"
+            .to_owned(),
+        "INSERT INTO task_agent_link ({t}workspace_id, note_id, task_key, task_text, agent_id, \
+         created_at) VALUES ({v}'ws-del', 'n1', 'k', 't', 'a1', 0)"
+            .to_owned(),
+        "INSERT INTO agent_metrics ({t}agent_id, workspace_id, updated_at) \
+         VALUES ({v}'a1', 'ws-del', 'T0')"
+            .to_owned(),
+        "INSERT INTO workspace_context_item ({t}workspace_id, id, ordinal, payload) \
+         VALUES ({v}'ws-del', 'ci1', 0, '{}')"
+            .to_owned(),
+        "INSERT INTO workspace_git_root ({t}id, workspace_id, path, source, created_at, \
+         updated_at) VALUES ({v}'gr1', 'ws-del', '/r', 'auto', 'T0', 'T0')"
+            .to_owned(),
+        "INSERT INTO pull_request_workspace ({t}pr_key, workspace_id, source, linked_at) \
+         VALUES ({v}'pk1', 'ws-del', 'workspace', 'T0')"
+            .to_owned(),
+        format!(
+            "INSERT INTO workspace_invite ({{t}}id, workspace_id, secret_hash, \
+             created_by_principal_id, created_at, expires_at) \
+             VALUES ({{v}}'inv1', 'ws-del', 'h', '{}', 'T0', 'T9')",
+            owner.0
+        ),
+        "INSERT INTO workspace_mcp_disabled_server ({t}workspace_id, server_id, created_at) \
+         VALUES ({v}'ws-del', 'srv', 'T0')"
+            .to_owned(),
+        "INSERT INTO draft ({t}workspace_id, agent_id, client_id, text, updated_at) \
+         VALUES ({v}'ws-del', 'a1', 'c1', 'd', 'T0')"
+            .to_owned(),
+        "INSERT INTO home_move ({t}workspace_id, home_id, node_id, name, from_home_id, \
+         from_state, from_since, started_at) \
+         VALUES ({v}'ws-del', 'h-t', 'n3', 'Mac', 'h-b', 'attached', 'T0', 'T1')"
+            .to_owned(),
+    ];
+    for stmt in &statements {
+        sql(store, db, tenant, stmt).await;
+    }
+    if db.is_some() {
+        // Retired from SQLite (dropped after startup); still a Postgres table.
+        sql(
+            store,
+            db,
+            tenant,
+            "INSERT INTO note_page_head ({t}workspace_id, note_id, instance_id, current_rev, \
+             generation) VALUES ({v}'ws-del', 'n1', 'i', 0, 'g'); \
+             INSERT INTO note_page_entry ({t}workspace_id, note_id, collection, position, value) \
+             VALUES ({v}'ws-del', 'n1', 'c', 0, 'v')",
+        )
+        .await;
+    }
+    let mut tab = BrowserTabInput {
+        tab_id: "t1".into(),
+        workspace_id: wid("ws-del"),
+        url: format!("https://{tenant}.example/"),
+        requested_url: None,
+        title: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        visibility: BrowserTabVisibility::Visible,
+        emulated_size: None,
+        displayed: None,
+    };
+    tab.displayed = Some(true);
+    store
+        .upsert_browser_tab(&ClientId("c1".into()), tab)
+        .await
+        .unwrap();
+    let ws = wid("ws-del");
+    store
+        .set_workspace_home(&ws, &machine_home("h-a", "n1"))
+        .await
+        .unwrap();
+    store
+        .switch_workspace_home(&ws, &machine_home("h-b", "n2"), T1)
+        .await
+        .unwrap();
+}
+
+parity_test!(workspace_delete_cascades, |store, tenant, db| {
+    seed_cascade(&store, db, tenant).await;
+    let ws = wid("ws-del");
+    assert_eq!(
+        store
+            .get_home_stop(&HomeId("h-a".into()))
+            .await
+            .unwrap()
+            .unwrap()
+            .reason,
+        HomeStopReason::Moved
+    );
+
+    let outcome = store.delete_workspace_with_outcome(&ws).await;
+    outcome.result.unwrap();
+    assert_eq!(
+        outcome.disposition,
+        RepositoryWorkspaceDeleteDisposition::Committed
+    );
+    let again = store.delete_workspace_with_outcome(&ws).await;
+    assert!(matches!(again.result, Err(Error::NotFound(_))));
+    assert_eq!(
+        again.disposition,
+        RepositoryWorkspaceDeleteDisposition::NoEffect
+    );
+    assert!(matches!(
+        store.delete_workspace(&ws).await,
+        Err(Error::NotFound(_))
+    ));
+
+    assert!(matches!(
+        store.get_workspace(&ws).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(store.workspace_id_ever_used(&ws).await.unwrap());
+    assert!(store
+        .plain_folder_paths()
+        .await
+        .unwrap()
+        .contains(&format!("/folders/{tenant}")));
+    for table in [
+        "agent_session",
+        "hook",
+        "pr_monitor",
+        "script",
+        "attachments",
+        "attachment_idempotency_keys",
+        "note",
+        "note_version",
+        "note_line_attribution",
+        "tracked_changes",
+        "diffs",
+        "delegation_group",
+        "task_agent_link",
+        "agent_metrics",
+        "workspace_context_item",
+        "workspace_git_root",
+        "pull_request_workspace",
+        "workspace_invite",
+        "workspace_mcp_disabled_server",
+        "draft",
+        "browser_tab",
+        "workspace_home",
+        "home_move",
+    ] {
+        assert_eq!(
+            count(&store, db, tenant, table, "workspace_id = 'ws-del'").await,
+            0,
+            "{table}"
+        );
+    }
+    if db.is_some() {
+        for table in ["note_page_head", "note_page_entry"] {
+            assert_eq!(
+                count(&store, db, tenant, table, "workspace_id = 'ws-del'").await,
+                0,
+                "{table}"
+            );
+        }
+    }
+    for (table, filter) in [
+        ("agent_message", "agent_id IN ('a1', 'a2')"),
+        ("agent_message_payload", "agent_id IN ('a1', 'a2')"),
+        ("agent_queue", "agent_id = 'a1'"),
+        ("completion_wake_delivery", "1 = 1"),
+        ("advisory_wake_delivery", "1 = 1"),
+        (
+            "settings",
+            "key = 'workspace.agentCreationPreferences:ws-del'",
+        ),
+    ] {
+        assert_eq!(count(&store, db, tenant, table, filter).await, 0, "{table}");
+    }
+    // What stays: k1 and its recovery row naming ws-del, its desktop record,
+    // the comment with no note, and the tombstone.
+    assert_eq!(
+        count(&store, db, tenant, "agent_session", "id = 'k1'").await,
+        1
+    );
+    assert_eq!(
+        count(
+            &store,
+            db,
+            tenant,
+            "interrupted_agent",
+            "workspace_id = 'ws-del'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(&store, db, tenant, "interrupted_agent", "agent_id = 'k1'").await,
+        1
+    );
+    assert_eq!(
+        count(&store, db, tenant, "settings", "key LIKE 'desktop.v1/%'").await,
+        1
+    );
+    assert_eq!(
+        count(&store, db, tenant, "comment", "workspace_id = 'ws-del'").await,
+        1
+    );
+    assert_eq!(
+        count(&store, db, tenant, "comment", "id = 'cm-loose'").await,
+        1
+    );
+    // The home retires: the current home and the move target get stops, and
+    // the moved home's stop becomes a retirement.
+    for home in ["h-a", "h-b", "h-t"] {
+        let stop = store
+            .get_home_stop(&HomeId(home.into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (stop.reason, stop.orphaned_at),
+            (HomeStopReason::Retired, None),
+            "{home}"
+        );
+    }
+    // The tab's displayed overlay goes with its row.
+    sql(
+        &store,
+        db,
+        tenant,
+        "INSERT INTO browser_tab ({t}tab_id, workspace_id, host_client_id, url, created_at, \
+         updated_at) VALUES ({v}'t1', 'ws-keep', 'c1', 'u', 'T0', 'T0')",
+    )
+    .await;
+    assert_eq!(
+        store
+            .get_browser_tab("t1")
+            .await
+            .unwrap()
+            .unwrap()
+            .displayed,
+        None
+    );
+    sql(
+        &store,
+        db,
+        tenant,
+        "DELETE FROM browser_tab WHERE {w} AND tab_id = 't1'",
+    )
+    .await;
+
+    if tenant == "decoy" {
+        // A full copy of every row the subject's deletion reaches, and a
+        // moved stop for its retirement update to reach.
+        seed_cascade(&store, db, tenant).await;
+        sql(
+            &store,
+            db,
+            tenant,
+            "INSERT INTO home_stop ({t}home_id, workspace_id, node_id, stop_id, reason, \
+             orphaned_at, recorded_at) \
+             VALUES ({v}'h-moved', 'ws-del', 'n1', 's-m', 'moved', 'T0', 'T0')",
+        )
+        .await;
+    }
+});
+
+fn usage(input: u64) -> TokenUsage {
+    TokenUsage {
+        totals: TokenUsageTotals {
+            input_tokens: input,
+            ..TokenUsageTotals::default()
+        },
+        ..TokenUsage::default()
+    }
+}
+
+parity_test!(workspace_token_usage_recompute, |store, tenant| {
+    let weight: u64 = if tenant == "decoy" { 1000 } else { 1 };
+    let mut ws = workspace("ws-u", T0);
+    ws.token_usage = Some(usage(weight));
+    store.insert_workspace(&ws).await.unwrap();
+    for id in ["u1", "u2"] {
+        store
+            .insert_agent_session(&agent(id, "ws-u", tenant))
+            .await
+            .unwrap();
+    }
+    let id = wid("ws-u");
+    let written = store
+        .update_workspace_token_usage(&id, |rows, current| {
+            let mut names: Vec<&str> = rows.iter().map(|r| r.6.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                [format!("u1 of {tenant}"), format!("u2 of {tenant}")]
+            );
+            assert_eq!(current, Some(&usage(weight)));
+            Some(usage(weight + 1))
+        })
+        .await
+        .unwrap();
+    assert_eq!(written, Some(usage(weight + 1)));
+    assert_eq!(
+        store.get_workspace(&id).await.unwrap().token_usage,
+        Some(usage(weight + 1))
+    );
+    let declined = store
+        .update_workspace_token_usage(&id, |_, current| {
+            assert_eq!(current, Some(&usage(weight + 1)));
+            None
+        })
+        .await
+        .unwrap();
+    assert_eq!(declined, None);
+    assert_eq!(
+        store.get_workspace(&id).await.unwrap().token_usage,
+        Some(usage(weight + 1))
+    );
+    assert!(matches!(
+        store
+            .update_workspace_token_usage(&wid("ws-ghost"), |_, _| Some(usage(9)))
+            .await,
+        Err(Error::NotFound(_))
+    ));
+    if tenant == "decoy" {
+        store
+            .insert_workspace(&workspace("ws-ghost", T0))
+            .await
+            .unwrap();
+        let mut reset = store.get_workspace(&id).await.unwrap();
+        reset.token_usage = Some(usage(weight));
+        store.update_workspace(&reset).await.unwrap();
+    }
+});
+
+parity_test!(workspace_insert_with_host_admission, |store, tenant| {
+    let owner = store.get_primary_principal().await.unwrap().id;
+    if store
+        .insert_principal_credential(&owner, "hash-h")
+        .await
+        .is_err()
+    {
+        panic!("credential insert failed");
+    }
+    let expected = store
+        .repository_host_authority_snapshot(&owner, Some("hash-h"))
+        .await
+        .unwrap();
+
+    let denied = store
+        .insert_workspace_with_host_admission(
+            &workspace("ws-h0", T0),
+            None,
+            &expected,
+            Some("hash-h"),
+            || Err(Error::Forbidden("retired".into())),
+        )
+        .await;
+    assert!(matches!(denied, Err(Error::Forbidden(_))));
+    assert!(matches!(
+        store.get_workspace(&wid("ws-h0")).await,
+        Err(Error::NotFound(_))
+    ));
+
+    let admitted = std::sync::atomic::AtomicBool::new(false);
+    store
+        .insert_workspace_with_host_admission(
+            &workspace("ws-h1", T0),
+            Some(true),
+            &expected,
+            Some("hash-h"),
+            || {
+                admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    assert!(admitted.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        store.get_workspace(&wid("ws-h1")).await.unwrap().title,
+        "title ws-h1"
+    );
+    assert_eq!(
+        store.workspace_auto_commit(&wid("ws-h1")).await.unwrap(),
+        Some(true)
+    );
+
+    // Changed authority refuses before the callback runs.
+    assert!(store.revoke_principal_credential("hash-h").await.unwrap());
+    let stale = store
+        .insert_workspace_with_host_admission(
+            &workspace("ws-h2", T0),
+            None,
+            &expected,
+            Some("hash-h"),
+            || panic!("admitted on changed authority"),
+        )
+        .await;
+    assert!(matches!(stale, Err(Error::Forbidden(_))));
+    assert!(matches!(
+        store.get_workspace(&wid("ws-h2")).await,
+        Err(Error::NotFound(_))
+    ));
+    if tenant == "decoy" {
+        store
+            .insert_workspace(&workspace("ws-h0", T0))
+            .await
+            .unwrap();
+        store
+            .insert_workspace(&workspace("ws-h2", T0))
             .await
             .unwrap();
     }
