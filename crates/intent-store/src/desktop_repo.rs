@@ -15,7 +15,7 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 /// state. A deleting workspace rejects new writes while other workspaces proceed.
 #[derive(Clone, Default)]
 pub(crate) struct DesktopWrites {
-    maintenance: Arc<RwLock<()>>,
+    pub(crate) maintenance: Arc<RwLock<()>>,
     scopes: Arc<Mutex<HashMap<WorkspaceId, Weak<RwLock<()>>>>>,
 }
 
@@ -34,7 +34,7 @@ impl DesktopWrites {
         gate
     }
 
-    fn enter(
+    pub(crate) fn enter(
         &self,
         workspace: &WorkspaceId,
     ) -> Result<(OwnedRwLockReadGuard<()>, OwnedRwLockReadGuard<()>)> {
@@ -68,13 +68,13 @@ const PREFIX: &str = "desktop.v1/";
 fn db(error: sqlx::Error) -> Error {
     Error::Internal(format!("desktop journal: {error}"))
 }
-fn decode(text: &str) -> Result<Value> {
+pub(crate) fn decode(text: &str) -> Result<Value> {
     serde_json::from_str(text).map_err(|e| Error::Internal(format!("desktop journal JSON: {e}")))
 }
-fn key(kind: &str, id: &str) -> String {
+pub(crate) fn key(kind: &str, id: &str) -> String {
     format!("{PREFIX}{kind}/{id}")
 }
-fn consent_key(
+pub(crate) fn consent_key(
     principal: &PrincipalId,
     workspace: &WorkspaceId,
     agent: &AgentId,
@@ -131,7 +131,7 @@ impl Store {
         generation: &str,
         remember: bool,
     ) -> Result<bool> {
-        pending_postgres!("desktop_claim_primary", self, backend => backend.desktop_claim_primary(request, binding, generation, remember).await)
+        dispatch!(self, backend => backend.desktop_claim_primary(request, binding, generation, remember).await)
     }
 
     /// Read remembered consent for exactly one principal/workspace/agent/computer.
@@ -144,7 +144,7 @@ impl Store {
         agent: &AgentId,
         computer: &str,
     ) -> Result<bool> {
-        pending_postgres!("desktop_permission", self, backend => backend.desktop_permission(principal, workspace, agent, computer).await)
+        dispatch!(self, backend => backend.desktop_permission(principal, workspace, agent, computer).await)
     }
 
     /// Persist or remove consent without changing an active session.
@@ -158,7 +158,7 @@ impl Store {
         computer: &str,
         allowed: bool,
     ) -> Result<()> {
-        pending_postgres!("desktop_set_permission", self, backend => backend.desktop_set_permission(principal, workspace, agent, computer, allowed).await)
+        dispatch!(self, backend => backend.desktop_set_permission(principal, workspace, agent, computer, allowed).await)
     }
 
     /// Journal a request before publishing its consent prompt.
@@ -171,7 +171,7 @@ impl Store {
         agent: &AgentId,
         binding: &Value,
     ) -> Result<()> {
-        pending_postgres!("desktop_insert_request", self, backend => backend.desktop_insert_request(id, workspace, agent, binding).await)
+        dispatch!(self, backend => backend.desktop_insert_request(id, workspace, agent, binding).await)
     }
 
     /// Retain only the hash of the executor's notification credential.
@@ -185,14 +185,14 @@ impl Store {
         binding: &Value,
         token_hash: &str,
     ) -> Result<()> {
-        pending_postgres!("desktop_insert_terminal", self, backend => backend.desktop_insert_terminal(id, workspace, agent, binding, token_hash).await)
+        dispatch!(self, backend => backend.desktop_insert_terminal(id, workspace, agent, binding, token_hash).await)
     }
 
     /// Read a retained credential only while its target still exists.
     /// # Errors
     /// Returns a storage error if the journal read or JSON decoding fails.
     pub async fn desktop_terminal(&self, id: &str) -> Result<Option<Value>> {
-        pending_postgres!("desktop_terminal", self, backend => backend.desktop_terminal(id).await)
+        dispatch!(self, backend => backend.desktop_terminal(id).await)
     }
 
     /// Commit the terminal request outcome and deduplication identity together.
@@ -206,7 +206,7 @@ impl Store {
         outcome: &str,
         payload: &Value,
     ) -> Result<bool> {
-        pending_postgres!("desktop_resolve_request", self, backend => backend.desktop_resolve_request(request, workspace, agent, outcome, payload).await)
+        dispatch!(self, backend => backend.desktop_resolve_request(request, workspace, agent, outcome, payload).await)
     }
 
     /// User Stop supersedes an undelivered outcome for this session only.
@@ -219,28 +219,28 @@ impl Store {
         report: Option<&str>,
         payload: Option<&Value>,
     ) -> Result<bool> {
-        pending_postgres!("desktop_record_end", self, backend => backend.desktop_record_end(session, reason, report, payload).await)
+        dispatch!(self, backend => backend.desktop_record_end(session, reason, report, payload).await)
     }
 
     /// Read a bounded batch of undelivered outcomes.
     /// # Errors
     /// Returns a storage error if the journal read or JSON decoding fails.
     pub async fn desktop_outbox(&self) -> Result<Vec<(String, WorkspaceId, AgentId, Value)>> {
-        pending_postgres!("desktop_outbox", self, backend => backend.desktop_outbox().await)
+        dispatch!(self, backend => backend.desktop_outbox().await)
     }
 
     /// Record a successful durable handoff.
     /// # Errors
     /// Returns a storage error if the journal write fails.
     pub async fn desktop_outbox_delivered(&self, id: &str) -> Result<()> {
-        pending_postgres!("desktop_outbox_delivered", self, backend => backend.desktop_outbox_delivered(id).await)
+        dispatch!(self, backend => backend.desktop_outbox_delivered(id).await)
     }
 
     /// Probe durable transcript/queue handoff before retrying an outcome.
     /// # Errors
     /// Returns a storage error if the probe fails.
     pub async fn desktop_wake_exists(&self, agent: &AgentId, id: &str) -> Result<bool> {
-        pending_postgres!("desktop_wake_exists", self, backend => backend.desktop_wake_exists(agent, id).await)
+        dispatch!(self, backend => backend.desktop_wake_exists(agent, id).await)
     }
 
     /// Restart invalidates unfinished execution and retains one correlated wake.
@@ -250,7 +250,7 @@ impl Store {
     /// # Panics
     /// The internal namespace assertion only fails if the fixed SQL prefix changes.
     pub async fn desktop_invalidate_restart(&self) -> Result<()> {
-        pending_postgres!("desktop_invalidate_restart", self, backend => backend.desktop_invalidate_restart().await)
+        dispatch!(self, backend => backend.desktop_invalidate_restart().await)
     }
 }
 

@@ -18,6 +18,8 @@ mod agent_messages;
 mod agents;
 #[path = "postgres_backend/completion_watches.rs"]
 mod completion_watches;
+#[path = "postgres_backend/desktop.rs"]
+mod desktop;
 #[path = "postgres_backend/discussions.rs"]
 mod discussions;
 #[path = "postgres_backend/harness.rs"]

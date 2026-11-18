@@ -42,7 +42,8 @@ use crate::Store;
 
 type WriteTxn<'a> = Transaction<'a, sqlx::Sqlite>;
 
-const COLUMNS: &str = "tab_id, workspace_id, host_client_id, url, requested_url, title, \
+pub(crate) const COLUMNS: &str =
+    "tab_id, workspace_id, host_client_id, url, requested_url, title, \
      owner_agent_id, owner_agent_name, visibility, emulated_width, emulated_height, \
      created_at, updated_at, closed_at";
 
@@ -52,7 +53,7 @@ const COLUMNS: &str = "tab_id, workspace_id, host_client_id, url, requested_url,
 pub(crate) struct DisplayedOverlay(Arc<RwLock<HashMap<String, bool>>>);
 
 impl DisplayedOverlay {
-    fn get(&self, tab_id: &str) -> Option<bool> {
+    pub(crate) fn get(&self, tab_id: &str) -> Option<bool> {
         self.0
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -61,7 +62,7 @@ impl DisplayedOverlay {
     }
 
     /// Remember `tab.displayed` for `tab.tab_id` (a `None` report clears it).
-    fn record(&self, tab: &BrowserTab) {
+    pub(crate) fn record(&self, tab: &BrowserTab) {
         let mut map = self.0.write().unwrap_or_else(PoisonError::into_inner);
         match tab.displayed {
             Some(displayed) => {
@@ -73,7 +74,7 @@ impl DisplayedOverlay {
         }
     }
 
-    fn forget(&self, tab_id: &str) {
+    pub(crate) fn forget(&self, tab_id: &str) {
         self.0
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -112,9 +113,9 @@ pub(crate) async fn workspace_tab_ids(
 }
 
 /// A stored row including its tombstone marker.
-struct StoredTab {
-    tab: BrowserTab,
-    closed: bool,
+pub(crate) struct StoredTab {
+    pub(crate) tab: BrowserTab,
+    pub(crate) closed: bool,
 }
 
 impl Store {
@@ -125,7 +126,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_browser_tabs(&self, id: &WorkspaceId) -> Result<Vec<BrowserTab>> {
-        pending_postgres!("list_browser_tabs", self, backend => backend.list_browser_tabs(id).await)
+        dispatch!(self, backend => backend.list_browser_tabs(id).await)
     }
 
     /// Every open tab hosted by `host`, across workspaces, oldest first.
@@ -134,7 +135,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_browser_tabs_by_host(&self, host: &ClientId) -> Result<Vec<BrowserTab>> {
-        pending_postgres!("list_browser_tabs_by_host", self, backend => backend.list_browser_tabs_by_host(host).await)
+        dispatch!(self, backend => backend.list_browser_tabs_by_host(host).await)
     }
 
     /// One open tab by id, or `None` (tombstoned rows count as absent).
@@ -143,7 +144,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_browser_tab(&self, tab_id: &str) -> Result<Option<BrowserTab>> {
-        pending_postgres!("get_browser_tab", self, backend => backend.get_browser_tab(tab_id).await)
+        dispatch!(self, backend => backend.get_browser_tab(tab_id).await)
     }
 
     /// Host-reported upsert (`browser.upsertTab`): insert a new row hosted by
@@ -165,7 +166,7 @@ impl Store {
         host: &ClientId,
         input: BrowserTabInput,
     ) -> Result<BrowserTabUpsertOutcome> {
-        pending_postgres!("upsert_browser_tab", self, backend => backend.upsert_browser_tab(host, input).await)
+        dispatch!(self, backend => backend.upsert_browser_tab(host, input).await)
     }
 
     /// Host-reported close (`browser.removeTab`): delete the row outright and
@@ -182,7 +183,7 @@ impl Store {
         host: &ClientId,
         tab_id: &str,
     ) -> Result<Option<BrowserTab>> {
-        pending_postgres!("remove_browser_tab", self, backend => backend.remove_browser_tab(host, tab_id).await)
+        dispatch!(self, backend => backend.remove_browser_tab(host, tab_id).await)
     }
 
     /// Daemon-side close of a tab whose host may be offline (a viewer / agent
@@ -195,7 +196,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn close_browser_tab(&self, tab_id: &str) -> Result<Option<BrowserTab>> {
-        pending_postgres!("close_browser_tab", self, backend => backend.close_browser_tab(tab_id).await)
+        dispatch!(self, backend => backend.close_browser_tab(tab_id).await)
     }
 
     /// Claim migration (REV-2 Model 3 & 5): an agent `claimTab` on a tab
@@ -218,7 +219,7 @@ impl Store {
         new_host: &ClientId,
         owner_agent_id: Option<&AgentId>,
     ) -> Result<Option<(BrowserTab, serde_json::Value)>> {
-        pending_postgres!("reassign_browser_tab_host", self, backend => backend.reassign_browser_tab_host(tab_id, new_host, owner_agent_id).await)
+        dispatch!(self, backend => backend.reassign_browser_tab_host(tab_id, new_host, owner_agent_id).await)
     }
 
     /// Driving-client switch (REV-2 Model 10, `workspace.setBrowserClient`):
@@ -237,7 +238,7 @@ impl Store {
         id: &WorkspaceId,
         new_host: &ClientId,
     ) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
-        pending_postgres!("reassign_claimed_browser_tabs", self, backend => backend.reassign_claimed_browser_tabs(id, new_host).await)
+        dispatch!(self, backend => backend.reassign_claimed_browser_tabs(id, new_host).await)
     }
 
     /// Superseded-host rehome (intent-hq/intent#8045): every **open** row
@@ -262,7 +263,7 @@ impl Store {
         old_hosts: &[ClientId],
         still_movable: &(dyn Fn(&ClientId) -> bool + Send + Sync),
     ) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
-        pending_postgres!("reassign_browser_tabs_from_hosts", self, backend => backend.reassign_browser_tabs_from_hosts(new_host, old_hosts, still_movable).await)
+        dispatch!(self, backend => backend.reassign_browser_tabs_from_hosts(new_host, old_hosts, still_movable).await)
     }
 
     /// Host snapshot reconciliation (`browser.syncTabs`, REV-2 Model 6), one
@@ -286,7 +287,7 @@ impl Store {
         host: &ClientId,
         snapshot: Vec<BrowserTabInput>,
     ) -> Result<BrowserTabSyncResult> {
-        pending_postgres!("sync_browser_tabs", self, backend => backend.sync_browser_tabs(host, snapshot).await)
+        dispatch!(self, backend => backend.sync_browser_tabs(host, snapshot).await)
     }
 }
 
@@ -775,7 +776,7 @@ async fn delete_row(conn: &mut SqliteConnection, tab_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn reject_foreign_host(tab: &BrowserTab, host: &ClientId) -> Result<()> {
+pub(crate) fn reject_foreign_host(tab: &BrowserTab, host: &ClientId) -> Result<()> {
     if tab.host_client_id == *host {
         return Ok(());
     }
@@ -790,7 +791,7 @@ fn reject_foreign_host(tab: &BrowserTab, host: &ClientId) -> Result<()> {
 /// would leave the old workspace's subscribers with a ghost tab. A report
 /// naming another workspace is rejected as invalid params (in a sync, the
 /// whole snapshot is rolled back) and the row stays untouched.
-fn reject_workspace_move(tab: &BrowserTab, input: &BrowserTabInput) -> Result<()> {
+pub(crate) fn reject_workspace_move(tab: &BrowserTab, input: &BrowserTabInput) -> Result<()> {
     if tab.workspace_id == input.workspace_id {
         return Ok(());
     }
@@ -800,7 +801,7 @@ fn reject_workspace_move(tab: &BrowserTab, input: &BrowserTabInput) -> Result<()
     )))
 }
 
-fn reject_tombstone(stored: &StoredTab) -> Result<()> {
+pub(crate) fn reject_tombstone(stored: &StoredTab) -> Result<()> {
     if !stored.closed {
         return Ok(());
     }
@@ -810,7 +811,7 @@ fn reject_tombstone(stored: &StoredTab) -> Result<()> {
     )))
 }
 
-fn new_tab(host: &ClientId, input: BrowserTabInput) -> BrowserTab {
+pub(crate) fn new_tab(host: &ClientId, input: BrowserTabInput) -> BrowserTab {
     let now = now_iso();
     let BrowserTabInput {
         tab_id,
