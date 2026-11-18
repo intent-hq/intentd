@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use crate::{enum_to_db, Store};
 
-const EVENT_COLUMNS: &str = "id, workspace_id, timestamp, event_type, actor, session_id, \
+pub(crate) const EVENT_COLUMNS: &str =
+    "id, workspace_id, timestamp, event_type, actor, session_id, \
     correlation_id, parent_event_id, metadata_json, data_json";
 
 /// Max rows removed per retention DELETE statement. Each chunk is its own
@@ -21,6 +22,49 @@ const EVENT_COLUMNS: &str = "id, workspace_id, timestamp, event_type, actor, ses
 /// between chunks and concurrent writers stay responsive (the old
 /// single-statement full-table-scan sweep held the pool 2–3.5s on a 1.2GB DB).
 pub(crate) const RETENTION_DELETE_CHUNK: i64 = 1000;
+
+/// Event-type prefixes the ephemeral retention sweep removes
+/// ([`Store::delete_ephemeral_events_before`]):
+/// - agent:stream:* — streaming chunks
+/// - file:* — file watcher events (finding F4: 87% of event table)
+/// - host:exec:* — streaming command output
+pub(crate) const EPHEMERAL_TYPE_PREFIXES: &[&str] = &[
+    intent_core::events::AGENT_STREAM_PREFIX,
+    "file:",
+    "host:exec:",
+];
+
+/// Exact event types the ephemeral retention sweep removes.
+///
+/// `terminal:data` (live PTY output) and `script:output` (script PTY output
+/// chunks, monorepo#620; exact type, not a `script:` prefix, so
+/// `script:state` survives) are now published transient (broadcast-only,
+/// never persisted) at the emit site, as are the `host:exec:stdout`/`stderr`
+/// chunks; they stay listed so rows persisted by older daemon versions still
+/// age out.
+///
+/// The rest are high-churn state-notification families (spec P3: 20k+ rows
+/// each on the dev seat, never previously swept). Every consumer takes these
+/// from the live `events.subscribe` bus and rehydrates current state from its
+/// authoritative table (`workspace`, `draft`, `agent_session`,
+/// `event_subscription`, `settings` rows) — nothing reads them back from the persisted log by type,
+/// so a 72h window loses no history that matters. Exact types only: their
+/// lifecycle siblings (`workspace:created/deleted/archived`, `agent:created/
+/// deleted/completed/failed`, `agent:queue:processing`, ...) remain audit
+/// history and are never swept.
+pub(crate) const EPHEMERAL_EVENT_TYPES: &[&str] = &[
+    intent_core::events::TERMINAL_DATA,
+    intent_core::events::SCRIPT_OUTPUT,
+    intent_core::events::WORKSPACE_UPDATED,
+    intent_core::events::DRAFT_CHANGED,
+    intent_core::events::AGENT_STATUS_CHANGED,
+    intent_core::events::AGENT_IDLE,
+    intent_core::events::AGENT_SUBSCRIPTIONS_CHANGED,
+    intent_core::events::SETTINGS_CHANGED,
+    intent_core::events::WORKSPACE_TOKEN_USAGE_CHANGED,
+    // queue-egress: allow — retention sweep deletes rows by type; no entry leaves the daemon
+    intent_core::events::AGENT_QUEUE_UPDATED,
+];
 
 /// Input to [`Store::insert_event`]: an event without its id. The repository
 /// mints a `UUIDv7` `id` and returns the persisted [`Event`].
@@ -76,7 +120,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_event(&self, ev: &NewEvent) -> Result<Event> {
-        pending_postgres!("insert_event", self, backend => backend.insert_event(ev).await)
+        dispatch!(self, backend => backend.insert_event(ev).await)
     }
 
     /// Batch-insert multiple events in a single transaction, preserving order.
@@ -87,7 +131,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {
-        pending_postgres!("insert_events", self, backend => backend.insert_events(events).await)
+        dispatch!(self, backend => backend.insert_events(events).await)
     }
 
     /// Run a filtered event query (newest-first). See [`EventQuery`].
@@ -96,7 +140,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<Event>> {
-        pending_postgres!("query_events", self, backend => backend.query_events(q).await)
+        dispatch!(self, backend => backend.query_events(q).await)
     }
 
     /// Retention/compaction sweep (§10.2 / finding F4): delete high-volume
@@ -121,7 +165,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if a chunked delete fails.
     pub async fn delete_ephemeral_events_before(&self, cutoff: &str) -> Result<u64> {
-        pending_postgres!("delete_ephemeral_events_before", self, backend => backend.delete_ephemeral_events_before(cutoff).await)
+        dispatch!(self, backend => backend.delete_ephemeral_events_before(cutoff).await)
     }
 
     /// Retention sweep for `agent:tool:call` events (87% of live data on the
@@ -137,7 +181,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if a chunked delete fails.
     pub async fn delete_tool_call_events_before(&self, cutoff: &str) -> Result<u64> {
-        pending_postgres!("delete_tool_call_events_before", self, backend => backend.delete_tool_call_events_before(cutoff).await)
+        dispatch!(self, backend => backend.delete_tool_call_events_before(cutoff).await)
     }
 
     /// Most-recent events for a workspace regardless of type (newest first).
@@ -150,7 +194,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         limit: i64,
     ) -> Result<Vec<Event>> {
-        pending_postgres!("events_by_workspace", self, backend => backend.events_by_workspace(workspace_id, limit).await)
+        dispatch!(self, backend => backend.events_by_workspace(workspace_id, limit).await)
     }
 
     /// Most-recent events of a single `event_type` for a workspace.
@@ -164,7 +208,7 @@ impl Store {
         event_type: &str,
         limit: i64,
     ) -> Result<Vec<Event>> {
-        pending_postgres!("events_by_type", self, backend => backend.events_by_type(workspace_id, event_type, limit).await)
+        dispatch!(self, backend => backend.events_by_type(workspace_id, event_type, limit).await)
     }
 }
 
@@ -428,53 +472,11 @@ impl crate::SqliteStore {
     }
 
     pub async fn delete_ephemeral_events_before(&self, cutoff: &str) -> Result<u64> {
-        // High-volume event families eligible for retention sweep:
-        // - agent:stream:* — streaming chunks
-        // - file:* — file watcher events (finding F4: 87% of event table)
-        // - terminal:data — live PTY output
-        // - host:exec:* — streaming command output
-        // - script:output — script PTY output chunks (monorepo#620: same
-        //   live-output shape as terminal:data; was leaking pre-fix and
-        //   dominated the event table on long-lived daemons). Exact type,
-        //   not a `script:` prefix, so `script:state` (lifecycle) survives.
-        //
-        // `terminal:data`, `script:output`, and the `host:exec:stdout`/
-        // `host:exec:stderr` chunks are now published transient
-        // (broadcast-only, never persisted) at the emit site; their arms here
-        // stay so rows persisted by older daemon versions still age out.
         let mut removed = 0;
-        removed += self
-            .delete_type_prefix_before(intent_core::events::AGENT_STREAM_PREFIX, cutoff)
-            .await?;
-        removed += self.delete_type_prefix_before("file:", cutoff).await?;
-        removed += self
-            .delete_exact_type_before(intent_core::events::TERMINAL_DATA, cutoff)
-            .await?;
-        removed += self.delete_type_prefix_before("host:exec:", cutoff).await?;
-        removed += self
-            .delete_exact_type_before(intent_core::events::SCRIPT_OUTPUT, cutoff)
-            .await?;
-        // High-churn state-notification families (spec P3: 20k+ rows each on
-        // the dev seat, never previously swept). Every consumer takes these
-        // from the live `events.subscribe` bus and rehydrates current state
-        // from its authoritative table (workspace/draft/agent_session/
-        // event_subscription/settings rows) — nothing reads them back from
-        // the persisted log by type, so a 72h window loses no history that
-        // matters. Exact types only: their lifecycle siblings
-        // (`workspace:created/deleted/archived`, `agent:created/deleted/
-        // completed/failed`, `agent:queue:processing`, ...) remain audit
-        // history and are never swept.
-        for event_type in [
-            intent_core::events::WORKSPACE_UPDATED,
-            intent_core::events::DRAFT_CHANGED,
-            intent_core::events::AGENT_STATUS_CHANGED,
-            intent_core::events::AGENT_IDLE,
-            intent_core::events::AGENT_SUBSCRIPTIONS_CHANGED,
-            intent_core::events::SETTINGS_CHANGED,
-            intent_core::events::WORKSPACE_TOKEN_USAGE_CHANGED,
-            // queue-egress: allow — retention sweep deletes rows by type; no entry leaves the daemon
-            intent_core::events::AGENT_QUEUE_UPDATED,
-        ] {
+        for prefix in EPHEMERAL_TYPE_PREFIXES {
+            removed += self.delete_type_prefix_before(prefix, cutoff).await?;
+        }
+        for event_type in EPHEMERAL_EVENT_TYPES {
             removed += self.delete_exact_type_before(event_type, cutoff).await?;
         }
         Ok(removed)
@@ -601,7 +603,7 @@ impl crate::SqliteStore {
 /// the final byte. Returns `None` when no valid bound exists — empty or
 /// non-ASCII prefixes, or a final byte of 0x7F (incrementing would leave
 /// ASCII) — so callers with arbitrary input can fall back safely.
-fn prefix_upper_bound(prefix: &str) -> Option<String> {
+pub(crate) fn prefix_upper_bound(prefix: &str) -> Option<String> {
     if prefix.is_empty() || !prefix.is_ascii() {
         return None;
     }
@@ -616,7 +618,7 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 
 /// Escape LIKE wildcards so a prefix is matched literally (paired with
 /// `ESCAPE '\'` in the query).
-fn escape_like(s: &str) -> String {
+pub(crate) fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")

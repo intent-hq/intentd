@@ -86,7 +86,7 @@ const QUALIFIED_MONITOR: &str =
 /// the JSON compat functions parse into, rejects them, so such a document
 /// would read as malformed; `SQLite` JSON1 accepts it. Only the NUL
 /// characters are lost. `col` is a plain column reference.
-fn nul_free(sql: &str) -> String {
+pub(super) fn nul_free(sql: &str) -> String {
     const MARK: &str = "NUL_FREE(";
     let mut out = String::with_capacity(sql.len());
     let mut rest = sql;

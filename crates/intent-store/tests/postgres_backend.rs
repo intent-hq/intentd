@@ -24,6 +24,8 @@ mod completion_watches;
 mod desktop;
 #[path = "postgres_backend/discussions.rs"]
 mod discussions;
+#[path = "postgres_backend/events.rs"]
+mod events;
 #[path = "postgres_backend/harness.rs"]
 mod harness;
 #[path = "postgres_backend/hooks.rs"]
