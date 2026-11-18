@@ -139,10 +139,11 @@ rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "GUARDED_FEATURE: a different feature must pass, got $rc: $out"
 
-# This repo's shipped binaries must be clean, for test-hooks and for the
-# test-only Postgres backend.
+# This repo's shipped binaries must be clean, for test-hooks, for the
+# test-only Postgres backend and for intent-store's test-only SQLite pools.
 "$check" >/dev/null || fail "this repo: check-test-hooks-feature.sh failed"
 GUARDED_FEATURE=postgres "$check" >/dev/null || fail "this repo: postgres reaches a shipped binary"
+GUARDED_FEATURE=test-support "$check" >/dev/null || fail "this repo: test-support reaches a shipped binary"
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures test(s) failed" >&2

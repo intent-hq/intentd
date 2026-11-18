@@ -8,7 +8,9 @@
 #
 # GUARDED_FEATURE names another test-only feature to guard the same way
 # (default test-hooks). CI also runs it for `postgres`: intent-store's
-# multi-tenant Postgres backend is tested in CI and never shipped.
+# multi-tenant Postgres backend is tested in CI and never shipped, and for
+# `test-support`: intent-store compiles its raw SQLite pools
+# (`Store::read_pool` / `write_pool`) only under it.
 #
 # The graph is `cargo tree -e normal,build,features --target all`: normal and
 # build edges for every target platform, with dev-dependencies left out of

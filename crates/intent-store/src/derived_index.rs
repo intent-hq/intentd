@@ -340,7 +340,7 @@ pub async fn repair_derived_indexes(
                     status.applied, status.expected
                 )));
             }
-            check_integrity(diagnostic.read_pool()).await.map_err(|e| {
+            check_integrity(diagnostic.pool()).await.map_err(|e| {
                 Error::Internal(format!(
                     "{e}; nothing was changed. Copy the whole data folder before \
                      attempting any recovery"

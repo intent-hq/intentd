@@ -175,10 +175,10 @@ async fn row_level_security_policies_work_with_the_guard_mode() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "write_pool is not yet supported on the Postgres store")]
-async fn an_unported_method_panics_instead_of_touching_sqlite() {
+#[should_panic(expected = "write_pool is SQLite-only and has no Postgres equivalent")]
+async fn a_sqlite_only_method_panics_instead_of_touching_sqlite() {
     let Some(db) = test_db(false).await else {
-        panic!("write_pool is not yet supported on the Postgres store (no test database)");
+        panic!("write_pool is SQLite-only and has no Postgres equivalent (no test database)");
     };
     let a = open(&db, "tenant-a").await;
     let _ = a.write_pool();

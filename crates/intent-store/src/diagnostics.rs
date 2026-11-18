@@ -35,8 +35,16 @@ impl DiagnosticStore {
     }
 
     /// `SQLite` enforces read-only access even for queries supplied by callers.
+    /// Tests and `test-support` builds only: release builds read through the
+    /// methods below.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn read_pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// The read-only pool, for the store's own checks (`derived_index`).
+    pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 

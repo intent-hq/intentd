@@ -19,7 +19,12 @@
 //!    `sqlite_only!` (no Postgres meaning), each with a reason. Postgres
 //!    fails loudly on them, so only the files in `SQLITE_ONLY_CALLERS`,
 //!    which run on a `SQLite` store alone, may call one; a new caller must
-//!    prove the same or the method needs a Postgres version.
+//!    prove the same or the method needs a Postgres version. The methods in
+//!    `TEST_ONLY_SQLITE_ONLY` (the raw pools) are exempt from that caller
+//!    list instead: their forwarder must be gated to tests
+//!    (`cfg(any(test, feature = "test-support"))`), so only test code can
+//!    call them and the release-graph guard keeps `test-support` out of the
+//!    shipped daemon.
 //!
 //! Rule 1 runs twice: on the text, and on the statement parsed by sqlparser
 //! (`support/postgres_ast.rs`), which sees CTE scope, comments, strings and
@@ -994,6 +999,41 @@ const SQLITE_ONLY_CALLERS: &[(&str, &str)] = &[
     ),
 ];
 
+/// `sqlite_only!` methods any test code may call: the raw `SQLite` pools.
+/// Their `Store` forwarders compile only under `TEST_GATE`, so the compiler,
+/// not `SQLITE_ONLY_CALLERS`, keeps them out of production code
+/// (`scripts/check-test-hooks-feature.sh` with `GUARDED_FEATURE=test-support`
+/// keeps the feature out of the intentd release graph).
+const TEST_ONLY_SQLITE_ONLY: &[&str] = &["read_pool", "write_pool"];
+
+const TEST_GATE: &str = r#"#[cfg(any(test, feature = "test-support"))]"#;
+
+/// Whether the function holding `sqlite_only!(panic "name"` or
+/// `sqlite_only!("name"` in `text` carries `TEST_GATE` among the attributes
+/// and doc comments right above its `fn`.
+fn sqlite_only_forwarder_is_test_gated(text: &str, name: &str) -> bool {
+    let at = [
+        format!("sqlite_only!(panic \"{name}\""),
+        format!("sqlite_only!(\"{name}\""),
+    ]
+    .iter()
+    .find_map(|marker| text.find(marker.as_str()));
+    let Some(at) = at else {
+        return false;
+    };
+    let head = &text[..at];
+    let Some(fn_at) = head.rfind("fn ") else {
+        return false;
+    };
+    let line_start = head[..fn_at].rfind('\n').map_or(0, |i| i + 1);
+    head[..line_start]
+        .lines()
+        .rev()
+        .map(str::trim)
+        .take_while(|line| line.starts_with("#[") || line.starts_with("///"))
+        .any(|line| line == TEST_GATE)
+}
+
 fn may_call_sqlite_only(rel: &str) -> bool {
     (rel.starts_with("intent-store/src/") && !rel.starts_with("intent-store/src/postgres/"))
         || SQLITE_ONLY_CALLERS.iter().any(|(file, _)| *file == rel)
@@ -1034,6 +1074,30 @@ fn sqlite_only_methods_match_the_list_and_stay_off_postgres() {
     let pending: BTreeSet<String> = pending_in_source().into_iter().map(|(_, m)| m).collect();
     let both: Vec<_> = marked.intersection(&pending).collect();
     assert!(both.is_empty(), "both pending and SQLite-only: {both:?}");
+
+    let mut sources = Vec::new();
+    rust_files(&src(), &mut sources);
+    let texts: Vec<String> = sources
+        .iter()
+        .map(|f| std::fs::read_to_string(f).expect("read"))
+        .collect();
+    for name in TEST_ONLY_SQLITE_ONLY {
+        assert!(
+            marked.contains(*name),
+            "TEST_ONLY_SQLITE_ONLY names {name}, which is not a sqlite_only! method"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| sqlite_only_forwarder_is_test_gated(t, name)),
+            "the Store::{name} forwarder must carry {TEST_GATE}: TEST_ONLY_SQLITE_ONLY \
+             methods skip the caller list because only test code can compile a call"
+        );
+    }
+    let marked: BTreeSet<String> = marked
+        .into_iter()
+        .filter(|m| !TEST_ONLY_SQLITE_ONLY.contains(&m.as_str()))
+        .collect();
 
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
@@ -1093,4 +1157,31 @@ fn the_sqlite_only_rule_catches_new_callers() {
         [concat!("x.rs: ::", "optimize)")]
     );
     assert!(sqlite_only_calls("x.rs", "Store::optimize_plan(&store)", &methods).is_empty());
+}
+
+#[test]
+fn the_test_gate_rule_needs_the_cfg_on_the_forwarder() {
+    // Built with concat! so this file does not itself mark a method.
+    let gated = concat!(
+        "    /// Borrow it.\n",
+        "    #[cfg(any(test, feature = \"test-support\"))]\n",
+        "    #[must_use]\n",
+        "    pub fn pool(&self) -> &P {\n",
+        "        sqlite_only!(panic \"pool\", self, b => b.pool())\n",
+        "    }\n",
+    );
+    assert!(sqlite_only_forwarder_is_test_gated(gated, "pool"));
+    let ungated = gated.replace(TEST_GATE, "#[inline]");
+    assert!(!sqlite_only_forwarder_is_test_gated(&ungated, "pool"));
+    // A gate on an earlier item, separated by code, does not count.
+    let elsewhere = concat!(
+        "    #[cfg(any(test, feature = \"test-support\"))]\n",
+        "    pub fn other(&self) {}\n",
+        "\n",
+        "    pub fn pool(&self) -> &P {\n",
+        "        sqlite_only!(panic \"pool\", self, b => b.pool())\n",
+        "    }\n",
+    );
+    assert!(!sqlite_only_forwarder_is_test_gated(elsewhere, "pool"));
+    assert!(!sqlite_only_forwarder_is_test_gated(gated, "other"));
 }
