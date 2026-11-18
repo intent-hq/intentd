@@ -112,192 +112,53 @@ const NON_TENANT_TABLES: &[(&str, &str)] = &[(
     "applied-migration ledger written by postgres::migrate, one per schema",
 )];
 
-/// Which bytes of `sql` are SQL code rather than quoted text or comments:
-/// single-quoted strings (`''` escapes), `E'..'` strings (backslash escapes),
-/// dollar-quoted strings (`$tag$..$tag$`), double-quoted identifiers, `--`
-/// comments and nested `/* */` comments.
-fn code_mask(sql: &str) -> Vec<bool> {
-    let b = sql.as_bytes();
-    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-    let mut code = vec![true; b.len()];
-    let mut i = 0;
-    while i < b.len() {
-        let start = i;
-        match b[i] {
-            b'\'' => {
-                let escapes =
-                    i > 0 && (b[i - 1] == b'e' || b[i - 1] == b'E') && (i < 2 || !ident(b[i - 2]));
-                i += 1;
-                while i < b.len() {
-                    if escapes && b[i] == b'\\' {
-                        i += 2;
-                    } else if b[i] == b'\'' {
-                        if b.get(i + 1) == Some(&b'\'') {
-                            i += 2;
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'"' {
-                        if b.get(i + 1) == Some(&b'"') {
-                            i += 2;
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                let mut nest = 0usize;
-                while i < b.len() {
-                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
-                        nest += 1;
-                        i += 2;
-                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
-                        nest -= 1;
-                        i += 2;
-                        if nest == 0 {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'$' if (i == 0 || !ident(b[i - 1]))
-                && b.get(i + 1)
-                    .is_some_and(|&c| c == b'$' || c.is_ascii_alphabetic() || c == b'_') =>
-            {
-                let tag_end = sql[i + 1..].find('$').map(|e| i + 1 + e);
-                match tag_end {
-                    Some(e) if b[i + 1..e].iter().all(|&c| ident(c)) => {
-                        let tag = &sql[i..=e];
-                        i = sql[e + 1..]
-                            .find(tag)
-                            .map_or(b.len(), |k| e + 1 + k + tag.len());
-                    }
-                    _ => i += 1,
-                }
-            }
-            _ => i += 1,
-        }
-        // A quoted region or comment spans at least two bytes.
-        if i > start + 1 {
-            code[start..i.min(b.len())]
-                .iter_mut()
-                .for_each(|c| *c = false);
-        }
-    }
-    code
-}
-
-/// `sql` with every quoted string and comment replaced by spaces of the same
-/// length, so nothing inside them can look like SQL to the checks below and
-/// byte offsets stay the same.
-fn blank_noncode(sql: &str) -> String {
-    let code = code_mask(sql);
-    let bytes: Vec<u8> = sql
-        .bytes()
-        .zip(code)
-        .map(|(b, is_code)| if is_code { b } else { b' ' })
-        .collect();
-    // Whole quoted regions are blanked, so the code bytes left stay valid UTF-8.
-    String::from_utf8(bytes).unwrap_or_else(|_| sql.to_owned())
-}
-
-/// One `WITH` definition: its name and the byte range of its body, from the
-/// opening to the closing parenthesis.
-struct Cte {
-    name: String,
-    open: usize,
-    close: usize,
-}
-
-/// The names a `WITH` statement defines (`with a as (`, `, b as (`), with
-/// where each body starts and ends, and whether the statement is recursive.
-fn ctes(sql: &str) -> (Vec<Cte>, bool) {
-    let head = sql.trim_start();
-    let Some(rest) = head.strip_prefix("with ") else {
-        return (Vec::new(), false);
-    };
-    let recursive = rest.trim_start().starts_with("recursive ");
-    let mut words = Vec::new();
-    let mut start = None;
-    for (i, c) in sql.char_indices() {
-        match (c.is_whitespace(), start) {
-            (true, Some(s)) => {
-                words.push((s, &sql[s..i]));
-                start = None;
-            }
-            (false, None) => start = Some(i),
-            _ => {}
-        }
-    }
-    if let Some(s) = start {
-        words.push((s, &sql[s..]));
-    }
-    let mut out = Vec::new();
-    for i in 1..words.len().saturating_sub(2) {
-        let opens = words[i + 1].1 == "as" && words[i + 2].1.starts_with('(');
-        let after = words[i - 1].1;
-        if !(opens && (after == "with" || after == "recursive" || after.ends_with(','))) {
+/// The names a marker comment declares as a query's own `WITH` subqueries:
+/// `// tenant-lint: not-tables a b — <reason>`, on one of the three lines
+/// above the literal's first line (`line` is 1-based). The tenant rule
+/// skips those names in that query only, and each must be defined there
+/// (`a as (`), so a stale marker cannot hide a table. Every real table in
+/// the query is still checked.
+fn declared_subqueries(text: &str, line: usize, sql: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    for k in 1..=3 {
+        let Some(i) = line.checked_sub(1 + k) else {
+            break;
+        };
+        let Some(rest) = lines
+            .get(i)
+            .and_then(|l| l.trim().strip_prefix("// tenant-lint: not-tables "))
+        else {
             continue;
+        };
+        let (names, reason) = rest
+            .split_once(" — ")
+            .expect("tenant-lint marker needs ` — <reason>`");
+        assert!(
+            !reason.trim().is_empty(),
+            "tenant-lint marker needs a reason"
+        );
+        let names: Vec<String> = names.split_whitespace().map(str::to_lowercase).collect();
+        for name in &names {
+            assert!(
+                sql.contains(&format!("{name} as (")),
+                "tenant-lint marker names `{name}`, which this query does not define"
+            );
         }
-        let open = words[i + 2].0;
-        // The caller blanked strings and comments, so every parenthesis here
-        // is SQL code.
-        let (mut depth, mut close) = (0usize, sql.len());
-        for (j, &b) in sql.as_bytes().iter().enumerate().skip(open) {
-            if b == b'(' {
-                depth += 1;
-            } else if b == b')' {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    close = j;
-                    break;
-                }
-            }
-        }
-        let name = words[i].1.trim_start_matches(',').to_owned();
-        out.push(Cte { name, open, close });
+        return names;
     }
-    (out, recursive)
-}
-
-/// Whether the reference at `at` to `table` names a `WITH` definition that is
-/// in scope there: after its body, or anywhere inside it for a recursive
-/// statement. Inside a non-recursive body the name is still the real table.
-fn is_cte_ref(ctes: &(Vec<Cte>, bool), table: &str, at: usize) -> bool {
-    let (defs, recursive) = ctes;
-    defs.iter()
-        .any(|c| c.name == table && (at > c.close || (*recursive && at > c.open)))
+    Vec::new()
 }
 
 /// The violations in one SQL literal (lower-cased).
 fn violations(sql: &str) -> Vec<String> {
-    let blanked = blank_noncode(sql);
-    let sql = blanked.as_str();
-    let ctes = ctes(sql);
+    violations_skipping(sql, &[])
+}
+
+/// [`violations`], treating the `skip` names as the query's own subqueries.
+fn violations_skipping(sql: &str, skip: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for r in table_refs(sql) {
-        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) || is_cte_ref(&ctes, &r.table, r.at)
-        {
+        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) || skip.contains(&r.table) {
             continue;
         }
         let ok = if r.keyword == "INTO" {
@@ -337,7 +198,9 @@ fn every_postgres_query_is_filtered_by_the_bound_tenant() {
                 continue;
             }
             checked += 1;
-            for v in violations(&lit.to_lowercase()) {
+            let sql = lit.to_lowercase();
+            let skip = declared_subqueries(&text, line, &sql);
+            for v in violations_skipping(&sql, &skip) {
                 findings.push(format!(
                     "{}:{line}: {v} is not filtered by tenant_id = $n",
                     file.display()
@@ -376,46 +239,26 @@ fn the_tenant_rule_catches_unscoped_shapes() {
     assert!(
         violations("update settings set value = $3 where tenant_id = $1 and key = $2").is_empty()
     );
-    // A WITH name is not a table, but the tables inside its body still are.
-    assert!(violations(
-        "with c as (select id from note where tenant_id = $1), d as (select id from c) \
-         select id from d"
+    // A marker skips only the names it declares; real tables stay checked.
+    let declared = ["c".to_owned()];
+    assert!(violations_skipping(
+        "with c as (select id from note where tenant_id = $1) select id from c",
+        &declared
     )
     .is_empty());
     assert_eq!(
-        violations(
-            "with c as (select id from note where id = $2), d as (select id from c) \
-             select id from d"
+        violations_skipping(
+            "with c as (select id from note where id = $2) select id from c",
+            &declared
         ),
         ["FROM note"]
     );
-    // Inside its own non-recursive body, a WITH name is still the real table.
+    let text = "x\n// tenant-lint: not-tables c — own subquery\nlet q = f(\n\"with c as (...";
     assert_eq!(
-        violations("with note as (select id from note n) select id from note"),
-        ["FROM note"]
+        declared_subqueries(text, 4, "with c as (select 1) select * from c"),
+        ["c"]
     );
-    // A parenthesis in quoted text does not end the body early.
-    assert_eq!(
-        violations("with note as (select ')' as marker, id from note n) select id from note"),
-        ["FROM note"]
-    );
-    // Comments, dollar quotes, E-strings and quoted names hide parentheses too.
-    for sql in [
-        "with note as (select /* ) */ id from note n) select id from note",
-        "with note as (select /* a /* ) */ b */ id from note n) select id from note",
-        "with note as (select $q$)$q$ as m, id from note n) select id from note",
-        "with note as (select E'\\')' as m, id from note n) select id from note",
-        "with note as (select id as \")\" from note n) select id from note",
-    ] {
-        assert_eq!(violations(sql), ["FROM note"], "{sql}");
-    }
-    // Quoted text cannot declare a WITH name either (this used to panic).
-    assert_eq!(
-        violations("with c as (select ', note as (' as marker) select id from note"),
-        ["FROM note"]
-    );
-    // A table that shares no name with a WITH clause is still checked.
-    assert!(!violations("with c as (select 1) select id from note").is_empty());
+    assert!(declared_subqueries("a\nb\nc\nd", 4, "select 1").is_empty());
 }
 
 /// The functions in `text` that write without the tenant's writer lock:
