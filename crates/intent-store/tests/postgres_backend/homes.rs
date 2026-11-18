@@ -372,7 +372,10 @@ parity_test!(home_moves_begin_progress_and_switch, |store, tenant| {
         (HomeState::Moving, T1)
     );
     assert_eq!(store.get_home_move(&ws).await.unwrap(), Some(mv.clone()));
-    assert_eq!(store.list_home_moves().await.unwrap(), [mv.clone()]);
+    assert_eq!(
+        store.list_home_moves().await.unwrap(),
+        std::slice::from_ref(&mv)
+    );
     assert_eq!(
         store.get_shown_workspace_home(&ws).await.unwrap(),
         Some(shown_before.clone()),
