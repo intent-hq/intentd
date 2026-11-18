@@ -404,6 +404,23 @@ pub(crate) fn classify_probe(status: Option<u16>) -> ProbeOutcome {
     }
 }
 
+/// Working directory for every `unsloth` child: `~/.unsloth/studio`, created
+/// on demand. The CLI stats `<cwd>/unsloth_compiled_cache` at startup and
+/// crashes on an unreadable inherited cwd (a daemon started from `/root` via
+/// sudo). Falls back to `home` when the studio dir cannot be created, and to
+/// the inherited cwd when no home is known.
+fn child_working_dir(home: Option<&Path>) -> Option<PathBuf> {
+    let home = home?;
+    let studio = home.join(".unsloth").join("studio");
+    match std::fs::create_dir_all(&studio) {
+        Ok(()) => Some(studio),
+        Err(e) => {
+            tracing::warn!(dir = %studio.display(), "cannot create unsloth studio dir, running unsloth from home: {e}");
+            Some(home.to_path_buf())
+        }
+    }
+}
+
 /// Path of the opencode auth config `unsloth start opencode --no-launch`
 /// generates, under `home`:
 /// `~/.unsloth/studio/auth/agents/opencode/opencode.json`.
@@ -527,8 +544,8 @@ struct ManagedServer {
     repo_id: String,
     /// The resolved endpoint, once minted+ready. `None` while starting.
     endpoint: Option<UnslothEndpoint>,
-    /// Rolling tail of the child's combined stdout/stderr for diagnostics.
-    output_tail: Arc<Mutex<std::collections::VecDeque<String>>>,
+    /// The child's combined stdout/stderr, kept for diagnostics.
+    output_tail: Arc<Mutex<OutputCapture>>,
     /// The stdout/stderr drain tasks, kept so [`Self::tail`] can await them
     /// (post-kill the pipes hit EOF and the drains terminate promptly) —
     /// snapshotting without waiting races the child's final output and can
@@ -562,16 +579,42 @@ impl ManagedServer {
         self.child.as_ref().and_then(tokio::process::Child::id)
     }
 
-    /// Snapshot the retained output tail as one newline-joined string. Waits
-    /// (bounded) for the drain tasks first so a fast-exiting child's final
-    /// lines are captured — call only after the child is dead.
-    async fn tail(&mut self) -> String {
+    /// Snapshot the first Python exception line and the retained output tail
+    /// (newline-joined). Waits (bounded) for the drain tasks first so a
+    /// fast-exiting child's final lines are captured — call only after the
+    /// child is dead.
+    async fn tail(&mut self) -> (Option<String>, String) {
         for task in self.drain_tasks.drain(..) {
             let _ = tokio::time::timeout(DRAIN_SETTLE_TIMEOUT, task).await;
         }
-        let tail = self.output_tail.lock().unwrap();
-        tail.iter().cloned().collect::<Vec<_>>().join("\n")
+        let capture = self.output_tail.lock().unwrap();
+        let tail = capture.tail.iter().cloned().collect::<Vec<_>>().join("\n");
+        (capture.first_exception.clone(), tail)
     }
+}
+
+/// Child output kept for startup diagnostics: a rolling tail plus the first
+/// Python exception line. Python prints a chained traceback root cause
+/// first, so a long traceback pushes it out of the tail and leaves only a
+/// generic wrapper such as "Uvicorn server failed before startup completed".
+#[derive(Default)]
+struct OutputCapture {
+    tail: std::collections::VecDeque<String>,
+    first_exception: Option<String>,
+}
+
+/// Whether `line` is the final line of a Python traceback
+/// (`pkg.module.SomeError: message`), unindented and not inside a rich box.
+fn is_python_exception_line(line: &str) -> bool {
+    let Some((name, _)) = line.split_once(": ") else {
+        return false;
+    };
+    let ident = name.rsplit('.').next().unwrap_or(name);
+    (ident.ends_with("Error") || ident.ends_with("Exception"))
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
 }
 
 /// Resolver seam for the `unsloth` CLI binary. The argument is the
@@ -991,7 +1034,8 @@ impl UnslothServerManager {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 return Err(stop_requested_error());
             }
-            let server = Self::start_server(&binary, repo_id, &quant, port)?;
+            let cwd = child_working_dir(self.config.home_dir.as_deref());
+            let server = Self::start_server(&binary, repo_id, &quant, port, cwd.as_deref())?;
             self.set_identity(Some(ServerIdentity {
                 repo_id: server.repo_id.clone(),
                 pid: server.pid(),
@@ -1039,12 +1083,16 @@ impl UnslothServerManager {
                 if let Some(child) = failed.child.as_mut() {
                     kill_server_child(child).await;
                 }
-                let tail = redact_key_material(&failed.tail().await);
+                let (cause, tail) = failed.tail().await;
+                let tail = redact_key_material(&tail);
                 if tail.is_empty() {
                     Err(failure.error)
                 } else {
+                    let cause = cause
+                        .map(|c| format!("\ncause: {}", redact_key_material(&c)))
+                        .unwrap_or_default();
                     Err(Error::Internal(format!(
-                        "{}\nserver output tail:\n{tail}",
+                        "{}{cause}\nserver output tail:\n{tail}",
                         failure.error
                     )))
                 }
@@ -1122,9 +1170,18 @@ impl UnslothServerManager {
     /// Spawn `unsloth run --model <repo>:<quant> --disable-tools -p <port>`
     /// as its own process-group leader with captured output. `port` is the
     /// resolved listen port (the configured one, or a picked free one when
-    /// the configured port was busy).
-    fn start_server(binary: &Path, repo_id: &str, quant: &str, port: u16) -> Result<ManagedServer> {
+    /// the configured port was busy). `cwd` comes from [`child_working_dir`].
+    fn start_server(
+        binary: &Path,
+        repo_id: &str,
+        quant: &str,
+        port: u16,
+        cwd: Option<&Path>,
+    ) -> Result<ManagedServer> {
         let mut cmd = Command::new(binary);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         cmd.arg("run")
             .arg("--model")
             .arg(run_model_arg(repo_id, quant))
@@ -1143,7 +1200,7 @@ impl UnslothServerManager {
 
         // Drain stdout/stderr into a rolling tail so a startup failure has a
         // diagnosable trace (and the pipes never fill up and stall the child).
-        let output_tail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let output_tail = Arc::new(Mutex::new(OutputCapture::default()));
         let mut drain_tasks = Vec::new();
         if let Some(stdout) = child.stdout.take() {
             drain_tasks.push(intent_core::spawn_daemon(drain_into_tail(
@@ -1222,7 +1279,7 @@ impl UnslothServerManager {
             child: None,
             repo_id: repo_id.to_string(),
             endpoint: None,
-            output_tail: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            output_tail: Arc::new(Mutex::new(OutputCapture::default())),
             drain_tasks: Vec::new(),
             started_at: Instant::now(),
             port,
@@ -1394,6 +1451,9 @@ impl UnslothServerManager {
         timeout: Duration,
     ) -> std::result::Result<UnslothEndpoint, StartupFailure> {
         let mut cmd = Command::new(binary);
+        if let Some(cwd) = child_working_dir(self.config.home_dir.as_deref()) {
+            cmd.current_dir(cwd);
+        }
         cmd.arg("start")
             .arg("opencode")
             .arg("--no-launch")
@@ -1715,17 +1775,20 @@ async fn probe_status(client: &reqwest::Client, url: &str, api_key: Option<&str>
 }
 
 /// Drain an async reader line-by-line into a bounded rolling tail.
-async fn drain_into_tail<R>(reader: R, tail: Arc<Mutex<std::collections::VecDeque<String>>>)
+async fn drain_into_tail<R>(reader: R, tail: Arc<Mutex<OutputCapture>>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let mut tail = tail.lock().unwrap();
-        if tail.len() >= OUTPUT_TAIL_LINES {
-            tail.pop_front();
+        let mut capture = tail.lock().unwrap();
+        if capture.first_exception.is_none() && is_python_exception_line(&line) {
+            capture.first_exception = Some(line.clone());
         }
-        tail.push_back(line);
+        if capture.tail.len() >= OUTPUT_TAIL_LINES {
+            capture.tail.pop_front();
+        }
+        capture.tail.push_back(line);
     }
 }
 
@@ -1818,6 +1881,31 @@ mod tests {
     }"#;
 
     // --- quant selection ---
+
+    #[test]
+    fn python_exception_line_detection() {
+        for line in [
+            "PermissionError: [Errno 13] Permission denied: '/root/x'",
+            "RuntimeError: Uvicorn server failed before startup completed",
+            "huggingface_hub.errors.RepositoryNotFoundError: 404 Client Error",
+            "torch.OutOfMemoryException: CUDA out of memory",
+        ] {
+            assert!(is_python_exception_line(line), "should match: {line}");
+        }
+        for line in [
+            "  File \"/x/run.py\", line 2614, in run_server",
+            "    raise RuntimeError(\"boom\")",
+            "ERROR:    Application startup failed. Exiting.",
+            "Traceback (most recent call last):",
+            "│ RuntimeError: inside a rich traceback box",
+            "PermissionError",
+            "Some Error: free text with a space in the name",
+            "{\"level\": \"info\", \"event\": \"ValueError: in json\"}",
+            "",
+        ] {
+            assert!(!is_python_exception_line(line), "should not match: {line}");
+        }
+    }
 
     #[test]
     fn default_quant_variant_matches_cli_defaults() {
@@ -2161,8 +2249,9 @@ mod tests {
                 .replace('\'', "");
             let run = run_behavior.map_or_else(|| "sleep 300".to_string(), str::to_string);
             let script = format!(
-                "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n  run) {run} ;;\n  start) mkdir -p '{cfg}' && cat > '{cfg}/opencode.json' <<'EOF'\n{config}\nEOF\n  ;;\nesac\n",
+                "#!/bin/sh\necho \"$@\" >> '{log}'\necho \"$1 $(pwd -P)\" >> '{cwd_log}'\ncase \"$1\" in\n  run) {run} ;;\n  start) mkdir -p '{cfg}' && cat > '{cfg}/opencode.json' <<'EOF'\n{config}\nEOF\n  ;;\nesac\n",
                 log = log.display(),
+                cwd_log = dir.join("cwd.log").display(),
                 cfg = cfg_dir.display(),
             );
             let path = dir.join("unsloth");
@@ -2797,6 +2886,74 @@ mod tests {
         /// `kill(pid, 0)` liveness probe via nix.
         unsafe fn libc_kill_probe(pid: u32) -> bool {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_ok()
+        }
+
+        /// The unsloth CLI stats `<cwd>/unsloth_compiled_cache` at startup and
+        /// crashes when the daemon's own cwd is unreadable (a daemon started
+        /// from `/root` via sudo), so every child runs from the studio dir.
+        #[tokio::test]
+        async fn unsloth_children_run_from_the_studio_directory() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(&home).expect("create home");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary = write_stub_binary(dir.path(), &home, port, None);
+            let mgr = UnslothServerManager::with_config(test_config(binary, home.clone(), port));
+            mgr.ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .expect("startup resolves endpoint");
+
+            let studio = home
+                .join(".unsloth/studio")
+                .canonicalize()
+                .expect("studio directory created");
+            let studio = studio.display();
+            let cwd_log = std::fs::read_to_string(dir.path().join("cwd.log")).unwrap_or_default();
+            assert!(
+                cwd_log.contains(&format!("run {studio}\n")),
+                "server ran from the studio dir: {cwd_log}"
+            );
+            assert!(
+                cwd_log.contains(&format!("start {studio}\n")),
+                "auth mint ran from the studio dir: {cwd_log}"
+            );
+            mgr.shutdown().await;
+        }
+
+        /// A long traceback pushes the root exception out of the retained
+        /// tail, leaving only the generic uvicorn wrapper; the error must
+        /// still name the root cause.
+        #[tokio::test]
+        async fn child_exit_during_startup_surfaces_root_cause_beyond_the_tail() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let binary = write_stub_binary(
+                dir.path(),
+                dir.path(),
+                1,
+                Some(
+                    r#"echo 'Traceback (most recent call last):' >&2; echo "PermissionError: [Errno 13] Permission denied: '/root/unsloth_compiled_cache'" >&2; i=0; while [ $i -lt 60 ]; do echo "  frame $i" >&2; i=$((i+1)); done; echo 'RuntimeError: Uvicorn server failed before startup completed' >&2; exit 1"#,
+                ),
+            );
+            let mgr =
+                UnslothServerManager::with_config(test_config(binary, dir.path().to_path_buf(), 1));
+            let err = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            let (headline, tail) = msg
+                .split_once("server output tail:")
+                .expect("tail attached");
+            assert!(
+                headline.contains(
+                    "cause: PermissionError: [Errno 13] Permission denied: '/root/unsloth_compiled_cache'"
+                ),
+                "root cause in the headline: {msg}"
+            );
+            assert!(
+                !tail.contains("PermissionError"),
+                "the root cause really fell out of the tail: {msg}"
+            );
         }
 
         #[tokio::test]
