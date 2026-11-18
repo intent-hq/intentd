@@ -5,6 +5,9 @@
 //!   stands in for the rowid where `SQLite` leaves ties in scan order.
 //! - `SQLite` compares `repo_owner` / `repo_name` under `COLLATE NOCASE`; here
 //!   the comparison is `lower()`, the expression the identity indexes use.
+//!   `lower()` may also fold non-ASCII letters, which NOCASE does not; forge
+//!   slugs are ASCII, so results differ only for slugs that name no real
+//!   repository. An ASCII-only fold here would disagree with those indexes.
 //! - The rate-limit pause fragments are the `SQLite` ones with `strpos` for
 //!   `instr`, `left` for `substr(x, 1, n)` (Postgres rejects a negative
 //!   length) and `sqlite_julianday` for `strftime('%s', …)`.
