@@ -719,16 +719,28 @@ impl PgStore {
         original_token_hash: Option<&str>,
     ) -> Result<RepositoryHostAuthoritySnapshot> {
         let mut tx = self.begin_repository_snapshot().await?;
-        let person = self.authority_principal(&mut tx, principal_id).await?;
-        let primary_principal = self.primary_authority(&mut tx).await?;
-        let host_member = self.host_member_authority(&mut tx, principal_id).await?;
-        let credential = self
-            .credential_authority(&mut tx, original_token_hash)
+        let snapshot = self
+            .read_host_authority_snapshot(&mut tx, principal_id, original_token_hash)
             .await?;
-        let host_authorization_generation = self.host_generation(&mut tx).await?;
-        let principal_revocation_generation =
-            self.revocation_generation(&mut tx, principal_id).await?;
         tx.commit().await.map_err(authority_error)?;
+        Ok(snapshot)
+    }
+
+    /// The host authority as `conn` sees it. Inside a writer transaction
+    /// no revocation can commit until that transaction ends.
+    pub(super) async fn read_host_authority_snapshot(
+        &self,
+        conn: &mut PgConnection,
+        principal_id: &PrincipalId,
+        original_token_hash: Option<&str>,
+    ) -> Result<RepositoryHostAuthoritySnapshot> {
+        let person = self.authority_principal(conn, principal_id).await?;
+        let primary_principal = self.primary_authority(conn).await?;
+        let host_member = self.host_member_authority(conn, principal_id).await?;
+        let credential = self.credential_authority(conn, original_token_hash).await?;
+        let host_authorization_generation = self.host_generation(conn).await?;
+        let principal_revocation_generation =
+            self.revocation_generation(conn, principal_id).await?;
         Ok(RepositoryHostAuthoritySnapshot {
             principal_id: principal_id.clone(),
             principal: person,

@@ -3593,7 +3593,7 @@ fn monitor_message_error(error: impl std::fmt::Display) -> Error {
 impl PreparedPgMonitorMessage {
     pub(crate) async fn finish(self) -> Result<Option<AgentMessage>> {
         let Self {
-            mut tx,
+            tx,
             tenant,
             expected,
             message,
@@ -3602,6 +3602,8 @@ impl PreparedPgMonitorMessage {
             workspace_id,
             envelope_sha256,
         } = self;
+        // Typed so the writer-lock lint sees the lock this message holds.
+        let mut tx: WriteTx = tx;
         if expected
             .fetch_optional(&mut *tx)
             .await

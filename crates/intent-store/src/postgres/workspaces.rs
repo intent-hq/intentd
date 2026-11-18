@@ -299,9 +299,10 @@ impl PgStore {
             .await
     }
 
-    /// As on `SQLite`: the original host authority is compared under the
-    /// lifecycle writer, and `admit` runs once the writer lock is held,
-    /// just before the insert.
+    /// As on `SQLite`: the original host authority is compared and `admit`
+    /// runs once the tenant writer lock is held, just before the insert, so
+    /// a credential revocation or host-member removal (which take that
+    /// lock) cannot commit in between.
     async fn insert_workspace_inner(
         &self,
         ws: &Workspace,
@@ -313,18 +314,6 @@ impl PgStore {
         )>,
     ) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
-        let admit = match admission {
-            Some((expected, token_hash, admit)) => {
-                let actual = self
-                    .repository_host_authority_snapshot(&expected.principal_id, token_hash)
-                    .await?;
-                if actual != *expected {
-                    return Err(Error::Forbidden("Repository checkout unavailable".into()));
-                }
-                Some(admit)
-            }
-            None => None,
-        };
         let columns = ws_repo::WORKSPACE_COLUMNS;
         let sql = format!(
             "INSERT INTO workspace (tenant_id, {columns}, auto_commit_enabled) VALUES \
@@ -334,7 +323,13 @@ impl PgStore {
         );
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
         let mut tx = self.begin_write().await?;
-        if let Some(admit) = admit {
+        if let Some((expected, token_hash, admit)) = admission {
+            let actual = self
+                .read_host_authority_snapshot(&mut tx, &expected.principal_id, token_hash)
+                .await?;
+            if actual != *expected {
+                return Err(Error::Forbidden("Repository checkout unavailable".into()));
+            }
             admit()?;
         }
         sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))

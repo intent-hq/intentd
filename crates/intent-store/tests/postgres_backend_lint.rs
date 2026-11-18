@@ -365,8 +365,16 @@ fn writers_without_lock(text: &str) -> Vec<String> {
                 .any(|w| l.starts_with(w))
                 && !NON_TENANT_TABLES.iter().any(|(t, _)| l.contains(t))
         });
-        // `&mut WriteTx` can only come from begin_write().
-        let locked = chunk.contains("begin_write()") || chunk.contains("&mut WriteTx");
+        // A WriteTx, borrowed or owned, can only come from begin_write().
+        let locked = chunk.contains("begin_write()")
+            || [
+                "&mut WriteTx",
+                "&mut super::WriteTx",
+                ": WriteTx",
+                ": super::WriteTx",
+            ]
+            .iter()
+            .any(|t| chunk.contains(t));
         if writes && !locked {
             let name = chunk[3..]
                 .split(|c: char| !(c.is_alphanumeric() || c == '_'))
@@ -406,6 +414,16 @@ fn the_writer_lock_rule_catches_unlocked_writes() {
         sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
     let read = r#"async fn c(&self) { let tx = self.begin().await?;
         sqlx::query("SELECT x FROM t WHERE tenant_id = $1"); }"#;
+    // An owned WriteTx (parameter or typed binding) also proves the lock.
+    let owned = r#"async fn d(mut tx: super::WriteTx) {
+        sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
+    let bound = r#"async fn e(self) { let mut tx: WriteTx = self.tx;
+        sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
+    let mentioned = r#"async fn f(&self) { // not a WriteTx
+        sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
+    assert!(writers_without_lock(owned).is_empty());
+    assert!(writers_without_lock(bound).is_empty());
+    assert_eq!(writers_without_lock(mentioned), ["f"]);
     assert!(writers_without_lock(locked).is_empty());
     assert!(writers_without_lock(read).is_empty());
     assert_eq!(writers_without_lock(unlocked), ["b"]);
