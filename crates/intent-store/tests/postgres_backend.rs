@@ -175,20 +175,13 @@ async fn row_level_security_policies_work_with_the_guard_mode() {
 }
 
 #[tokio::test]
-async fn an_unported_method_reports_an_error_instead_of_touching_sqlite() {
+#[should_panic(expected = "write_pool is not yet supported on the Postgres store")]
+async fn an_unported_method_panics_instead_of_touching_sqlite() {
     let Some(db) = test_db(false).await else {
-        return;
+        panic!("write_pool is not yet supported on the Postgres store (no test database)");
     };
     let a = open(&db, "tenant-a").await;
-    let err = a
-        .delete_workspace(&intent_core::WorkspaceId("ws-1".into()))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("delete_workspace is not yet supported on the Postgres store"),
-        "{err}"
-    );
+    let _ = a.write_pool();
 }
 
 #[tokio::test]

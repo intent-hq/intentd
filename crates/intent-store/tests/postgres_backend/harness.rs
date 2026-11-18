@@ -328,27 +328,27 @@ pub async fn tenant_rows(admin: &PgPool, tenant: &str) -> Vec<(String, String)> 
 /// `{v}` the tenant value on Postgres, `{w}` the tenant filter; Postgres runs
 /// it through the admin pool, which the leak trap does not apply to.
 pub async fn seed_sql(store: &Store, db: Option<&TestDb>, tenant: &str, stmt: &str) {
-    match db {
-        Some(db) => {
-            let stmt = stmt
-                .replace("{t}", "tenant_id, ")
-                .replace("{v}", &format!("'{tenant}', "))
-                .replace("{w}", &format!("tenant_id = '{tenant}'"));
-            sqlx::raw_sql(sqlx::AssertSqlSafe(stmt))
-                .execute(&db.admin)
-                .await
-                .expect("setup statement");
-        }
-        None => {
-            let stmt = stmt
-                .replace("{t}", "")
-                .replace("{v}", "")
-                .replace("{w}", "1 = 1");
-            sqlx::raw_sql(sqlx::AssertSqlSafe(stmt))
-                .execute(store.write_pool())
-                .await
-                .expect("setup statement");
-        }
+    let (column, value, filter) = if db.is_some() {
+        (
+            "tenant_id, ".to_owned(),
+            format!("'{tenant}', "),
+            format!("tenant_id = '{tenant}'"),
+        )
+    } else {
+        (String::new(), String::new(), "1 = 1".to_owned())
+    };
+    let stmt = stmt
+        .replace("{t}", &column)
+        .replace("{v}", &value)
+        .replace("{w}", &filter);
+    let query = sqlx::raw_sql(sqlx::AssertSqlSafe(stmt));
+    if let Some(db) = db {
+        query.execute(&db.admin).await.expect("setup statement");
+    } else {
+        query
+            .execute(store.write_pool())
+            .await
+            .expect("setup statement");
     }
 }
 
