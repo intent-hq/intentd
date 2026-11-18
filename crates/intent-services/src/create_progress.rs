@@ -114,7 +114,12 @@ fn refresh_fetch_percent(phase: &str, percent: u32) -> u32 {
 /// unchanged); `Milestone` frames carry an already-unified percent and go
 /// through [`CreateProgress::milestone`].
 enum CacheFrame {
-    Clone(&'static str, u32, String),
+    Clone(
+        &'static str,
+        u32,
+        String,
+        Option<crate::clone_ops::CloneTransfer>,
+    ),
     Milestone(&'static str, u32, String),
 }
 
@@ -149,26 +154,33 @@ impl CacheEnsurePump {
         use intent_git::repo_cache::CacheEnsureEvent as Ev;
         match ev {
             Ev::CloneChunk(text) => {
-                let frames = self.clone_parser.parse(&text);
                 if self.refresh_fetch {
-                    frames
+                    return self
+                        .clone_parser
+                        .parse(&text)
                         .into_iter()
                         .map(|(phase, pct, msg)| {
                             CacheFrame::Milestone("cache", refresh_fetch_percent(phase, pct), msg)
                         })
-                        .collect()
-                } else {
-                    frames
-                        .into_iter()
-                        .map(|(phase, pct, msg)| CacheFrame::Clone(phase, pct, msg))
-                        .collect()
+                        .collect();
                 }
+                // Line by line, so each receiving frame pairs with its own
+                // download counters.
+                let mut out = Vec::new();
+                for line in text.split_inclusive(['\r', '\n']) {
+                    let transfer = crate::clone_ops::parse_transfer(line);
+                    for (phase, pct, msg) in self.clone_parser.parse(line) {
+                        let transfer = transfer.filter(|_| phase == "receiving");
+                        out.push(CacheFrame::Clone(phase, pct, msg, transfer));
+                    }
+                }
+                out
             }
             Ev::SubmoduleChunk(text) => self
                 .sub_parser
                 .parse(&text)
                 .into_iter()
-                .map(|(phase, pct, msg)| CacheFrame::Clone(phase, pct, msg))
+                .map(|(phase, pct, msg)| CacheFrame::Clone(phase, pct, msg, None))
                 .collect(),
             // Refresh step boundaries: coarse milestones so a warm-cache
             // refresh moves even when its steps stream nothing. Percents
@@ -247,8 +259,10 @@ pub(crate) fn cache_ensure_reporter(
         while let Some(ev) = rx.recv().await {
             for frame in pump.handle(ev) {
                 match frame {
-                    CacheFrame::Clone(phase, pct, msg) => {
-                        reporter.clone_progress(phase, pct, &msg).await;
+                    CacheFrame::Clone(phase, pct, msg, transfer) => {
+                        reporter
+                            .clone_progress(phase, pct, &msg, transfer.as_ref())
+                            .await;
                     }
                     CacheFrame::Milestone(phase, pct, msg) => {
                         reporter.milestone(phase, pct, &msg).await;
@@ -297,7 +311,7 @@ pub(crate) fn submodule_hydration_reporter(
 
 struct ProgressState {
     last_percent: u32,
-    last_frame: Option<(String, u32, String)>,
+    last_frame: Option<(String, u32, String, Option<clone_ops::CloneTransfer>)>,
     done: bool,
 }
 
@@ -350,13 +364,28 @@ impl CreateProgress {
     /// a frame identical to the previous one is skipped; frames after the
     /// terminal done are dropped.
     pub(crate) async fn milestone(&self, phase: &str, percent: u32, message: &str) {
+        self.emit(phase, percent, message, None).await;
+    }
+
+    async fn emit(
+        &self,
+        phase: &str,
+        percent: u32,
+        message: &str,
+        transfer: Option<&clone_ops::CloneTransfer>,
+    ) {
         let percent = {
             let mut st = self.state.lock().unwrap();
             if st.done {
                 return;
             }
             let pct = percent.min(100).max(st.last_percent);
-            let key = (phase.to_string(), pct, message.to_string());
+            let key = (
+                phase.to_string(),
+                pct,
+                message.to_string(),
+                transfer.copied(),
+            );
             if st.last_frame.as_ref() == Some(&key) {
                 return;
             }
@@ -367,13 +396,14 @@ impl CreateProgress {
         clone_ops::publish(
             &self.bus,
             &self.workspace_id,
-            clone_ops::progress_event(
+            clone_ops::progress_event_with_transfer(
                 &self.workspace_id,
                 &self.request_id,
                 phase,
                 percent,
                 message,
                 Some(&self.progress_id),
+                transfer,
             ),
         )
         .await;
@@ -385,16 +415,24 @@ impl CreateProgress {
     /// (message rephrased to match) — on the unified scale the clone
     /// finishing (85%) is not "complete"; only the create's own terminal
     /// frame carries `complete 100`.
-    pub(crate) async fn clone_progress(&self, phase: &str, percent: u32, message: &str) {
+    /// `transfer` carries a receiving frame's download counters.
+    pub(crate) async fn clone_progress(
+        &self,
+        phase: &str,
+        percent: u32,
+        message: &str,
+        transfer: Option<&clone_ops::CloneTransfer>,
+    ) {
         let (unified_phase, message) = if phase == "complete" {
             ("checkout", "Repository cloned")
         } else {
             (phase, message)
         };
-        self.milestone(
+        self.emit(
             unified_phase,
             clone_overall_percent(phase, percent),
             message,
+            transfer,
         )
         .await;
     }
@@ -547,13 +585,47 @@ mod tests {
         ));
         assert_eq!(frames.len(), 1);
         match &frames[0] {
-            CacheFrame::Clone(phase, pct, msg) => {
+            CacheFrame::Clone(phase, pct, msg, _) => {
                 assert_eq!(*phase, "receiving");
                 assert_eq!(*pct, 42);
                 assert_eq!(msg, "Receiving objects: 42%");
             }
             CacheFrame::Milestone(..) => panic!("cache-miss chunk must stay a Clone frame"),
         }
+    }
+
+    /// The onboarding clone is a cache-miss clone: its receiving frames carry
+    /// git's download counters, line by line, while other phases carry none.
+    #[test]
+    fn cache_pump_cache_miss_clone_carries_transfer_on_receiving_only() {
+        let mut pump = CacheEnsurePump::new();
+        let frames = pump.handle(Ev::CloneChunk(
+            "Receiving objects:  10% (10/100)\rReceiving objects:  42% (42/100), 2.00 MiB | 1.00 MiB/s\rResolving deltas:  50% (5/10)\r"
+                .to_string(),
+        ));
+        let summary: Vec<_> = frames
+            .iter()
+            .map(|frame| match frame {
+                CacheFrame::Clone(phase, pct, _, transfer) => (*phase, *pct, *transfer),
+                CacheFrame::Milestone(..) => panic!("cache-miss chunk must stay a Clone frame"),
+            })
+            .collect();
+        let transfer = |received, bytes: Option<u64>, rate: Option<u64>| {
+            Some(crate::clone_ops::CloneTransfer {
+                received_objects: received,
+                total_objects: 100,
+                received_bytes: bytes,
+                bytes_per_second: rate,
+            })
+        };
+        assert_eq!(
+            summary,
+            vec![
+                ("receiving", 10, transfer(10, None, None)),
+                ("receiving", 42, transfer(42, Some(2 << 20), Some(1 << 20))),
+                ("resolving", 50, None),
+            ]
+        );
     }
 
     #[test]
@@ -589,7 +661,7 @@ mod tests {
                         }
                         last = pct;
                     }
-                    CacheFrame::Clone(phase, pct, _) => {
+                    CacheFrame::Clone(phase, pct, _, _) => {
                         panic!("refresh-fetch chunk leaked a Clone frame: {phase} {pct}%")
                     }
                 }
@@ -640,7 +712,7 @@ mod tests {
         ));
         assert_eq!(frames.len(), 1);
         match &frames[0] {
-            CacheFrame::Clone(phase, pct, msg) => {
+            CacheFrame::Clone(phase, pct, msg, _) => {
                 assert_eq!(*phase, "receiving");
                 assert_eq!(*pct, 42);
                 assert_eq!(msg, "Receiving objects: 42%");
