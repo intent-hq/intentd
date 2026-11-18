@@ -1678,20 +1678,26 @@ async fn owner_queue_permit_blocks_revoke_until_dropped() {
         let store = store.clone();
         async move { store.revoke_principal_credential("k").await }
     });
-    let mut waiting = false;
-    for _ in 0..250 {
-        waiting = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
-        )
-        .fetch_one(&db.admin)
-        .await
-        .unwrap();
-        if waiting {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(waiting, "the revoke queues on the writer lock");
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+                )
+                .fetch_one(&db.admin)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                // timing-guard: poll interval; Postgres emits no event when a lock wait starts.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
+    .await
+    .expect("the revoke queues on the writer lock");
     assert!(!revoke.is_finished(), "revoke waits for the permit");
     drop(held);
     assert!(tokio::time::timeout(
