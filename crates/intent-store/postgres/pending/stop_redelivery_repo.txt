@@ -1,4 +1,0 @@
-clear_stop_redeliveries
-clear_stop_redelivery
-load_all_stop_redeliveries
-set_stop_redelivery
