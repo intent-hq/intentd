@@ -275,8 +275,9 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     }
     case 'session/prompt': {
       const text = promptText(msg.params);
-      // A specialist's role reminder leads its prompts.
-      const command = text.replace(/^\[Role Reminder: [^\]]*\]\s*/, '');
+      // A specialist's role reminder leads its prompts: only echo-raw and
+      // wsapi/wsapi-tool read the command after it.
+      const command = text.replace(/^\[Role Reminder: [\s\S]*?\]\n\n/, '');
       const earlier = currentSession ? readHistory(currentSession) ?? [] : [];
       if (currentSession) fs.writeFileSync(sessionFile(currentSession), JSON.stringify([...earlier, text]));
       const recall = currentSession && text.match(/recall (\S[^\n]*)$/);

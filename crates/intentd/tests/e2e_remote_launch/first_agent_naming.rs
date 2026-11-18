@@ -105,7 +105,7 @@ async fn the_first_agent_on_an_orchestrator_names_itself_and_the_workspace() {
             "{label}: {created}"
         );
 
-        id += 100;
+        id += 1_000;
         let raw = reply_containing(&mut rpc_ws, (&ws_id, &agent_id), "raw: ", id).await;
         assert!(
             raw.contains("ws.workspace.setAgentName"),
@@ -122,13 +122,15 @@ async fn the_first_agent_on_an_orchestrator_names_itself_and_the_workspace() {
             "{label}: the title instruction names a call the agent has: {raw}"
         );
         assert!(!raw.contains("set_workspace_title"), "{label}: {raw}");
+        // Past the ids the reply poll used.
+        id += 1_000;
         first.get_or_insert((ws_id, agent_id));
     }
     let (ws_id, agent_id) = first.unwrap();
 
     ok(
         &mut rpc_ws,
-        900,
+        10_000,
         "agent.sendMessage",
         json!({
             "workspaceId": ws_id,
@@ -137,10 +139,10 @@ async fn the_first_agent_on_an_orchestrator_names_itself_and_the_workspace() {
         }),
     )
     .await;
-    reply_containing(&mut rpc_ws, (&ws_id, &agent_id), "turn-naming", 910).await;
+    reply_containing(&mut rpc_ws, (&ws_id, &agent_id), "turn-naming", 10_001).await;
     let got = ok(
         &mut rpc_ws,
-        390,
+        20_000,
         "agent.get",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
@@ -158,7 +160,7 @@ async fn the_first_agent_on_an_orchestrator_names_itself_and_the_workspace() {
 
     let workspace = ok(
         &mut rpc_ws,
-        400,
+        20_001,
         "workspace.get",
         json!({ "workspaceId": ws_id }),
     )
@@ -169,7 +171,7 @@ async fn the_first_agent_on_an_orchestrator_names_itself_and_the_workspace() {
     );
     let agent = ok(
         &mut rpc_ws,
-        401,
+        20_002,
         "agent.get",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )

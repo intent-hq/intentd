@@ -67,11 +67,8 @@ impl Harness for V2_9 {
         PREVIOUS.snapshot_line(json)
     }
 
-    // The live turn envelope (`latest()`) still named the retired
-    // `set_workspace_title` tool; title naming now goes through the same
-    // `workspace_api` tool as agent naming.
     fn naming_tool_reference(&self, provider_id: &str) -> &'static str {
-        PREVIOUS.agent_naming_tool_reference(provider_id)
+        PREVIOUS.naming_tool_reference(provider_id)
     }
 
     fn agent_naming_tool_reference(&self, provider_id: &str) -> &'static str {
@@ -83,24 +80,7 @@ impl Harness for V2_9 {
         agent_tool_reference: Option<&str>,
         workspace_tool_reference: Option<&str>,
     ) -> String {
-        let mut instructions = Vec::new();
-        if let Some(tool_reference) = agent_tool_reference {
-            instructions.push(format!(
-                "This agent still has a generated name. Early in your first turn, call \
-                 `ws.workspace.setAgentName` through {tool_reference} with a short 1\u{2013}5 word \
-                 task-specific name. Do this independently of workspace title naming and in \
-                 parallel with information-gathering."
-            ));
-        }
-        if let Some(tool_reference) = workspace_tool_reference {
-            instructions.push(format!(
-                "This workspace needs a title. As your first action, call \
-                 `ws.workspace.setTitle` through {tool_reference} with a short 3\u{2013}5 word \
-                 sentence-case title describing the task. This can be called in parallel with \
-                 information-gathering."
-            ));
-        }
-        format!("<system>\n{}\n</system>", instructions.join("\n"))
+        PREVIOUS.naming_nudge(agent_tool_reference, workspace_tool_reference)
     }
 
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String {

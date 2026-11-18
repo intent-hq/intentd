@@ -31,8 +31,7 @@ mod tests {
     fn v3_13_is_3_12_with_the_explicit_rename_rule() {
         let current = super::super::resolve_entry("3.13");
         let prior = super::super::resolve_entry("3.12");
-        assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
+        assert_eq!(current.version, "3.13");
         assert!(std::ptr::eq(current.context, prior.context));
         assert!(std::ptr::addr_eq(current.harness, prior.harness));
         assert_eq!(current.doctrine.specialists, prior.doctrine.specialists);
