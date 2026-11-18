@@ -504,7 +504,7 @@ jobs:
             exit 0
           fi
           source_root="$RUNNER_TEMP/app-guide-checker"
-          git init -q "$source_root"
+          git init -q -b main "$source_root"
           git -C "$source_root" remote add origin https://github.com/intent-hq/intent.git
           git -C "$source_root" fetch -q --depth=1 --filter=blob:none origin main </dev/null
           git -C "$source_root" show FETCH_HEAD:scripts/check-app-guide-sources.mjs >"$RUNNER_TEMP/check-app-guide-sources.mjs"

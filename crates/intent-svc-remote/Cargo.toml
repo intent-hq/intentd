@@ -1,6 +1,6 @@
 [package]
 name = "intent-svc-remote"
-version = "0.11.246"
+version = "0.11.247"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,15 +8,15 @@ license.workspace = true
 description = "Remote agent runtime for intentd: the backend connector to exposed machines and journal ingestion"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.246" }
-intent-core = { path = "../intent-core", version = "0.11.246" }
-intent-store = { path = "../intent-store", version = "0.11.246" }
-intent-transport = { path = "../intent-transport", version = "0.11.246" }
-intent-acp = { path = "../intent-acp", version = "0.11.246" }
-intent-git = { path = "../intent-git", version = "0.11.246" }
-intent-providers = { path = "../intent-providers", version = "0.11.246" }
-intent-nodes = { path = "../intent-nodes", version = "0.11.246" }
-intent-pty = { path = "../intent-pty", version = "0.11.246" }
+intent-services = { path = "../intent-services", version = "0.11.247" }
+intent-core = { path = "../intent-core", version = "0.11.247" }
+intent-store = { path = "../intent-store", version = "0.11.247" }
+intent-transport = { path = "../intent-transport", version = "0.11.247" }
+intent-acp = { path = "../intent-acp", version = "0.11.247" }
+intent-git = { path = "../intent-git", version = "0.11.247" }
+intent-providers = { path = "../intent-providers", version = "0.11.247" }
+intent-nodes = { path = "../intent-nodes", version = "0.11.247" }
+intent-pty = { path = "../intent-pty", version = "0.11.247" }
 base64 = { workspace = true }
 serde = { workspace = true }
 git2 = { workspace = true }
@@ -33,9 +33,9 @@ libc = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.11.246", features = ["test-hooks"] }
+intent-services = { path = "../intent-services", version = "0.11.247", features = ["test-hooks"] }
 # Tests seed and inspect SQLite through the test-only raw pools.
-intent-store = { path = "../intent-store", version = "0.11.246", features = ["test-support"] }
+intent-store = { path = "../intent-store", version = "0.11.247", features = ["test-support"] }
 intentd-test-support = { path = "../intentd-test-support" }
 socket2 = "0.6"
 sqlx = { workspace = true }

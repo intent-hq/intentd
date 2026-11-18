@@ -1,6 +1,6 @@
 [package]
 name = "intent-svc-transfer"
-version = "0.11.246"
+version = "0.11.247"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,12 +8,12 @@ license.workspace = true
 description = "Workspace transfer (plan, export, import) for intentd, built on intent-services"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.246" }
-intent-core = { path = "../intent-core", version = "0.11.246" }
-intent-store = { path = "../intent-store", version = "0.11.246" }
-intent-git = { path = "../intent-git", version = "0.11.246" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.246" }
-intent-providers = { path = "../intent-providers", version = "0.11.246" }
+intent-services = { path = "../intent-services", version = "0.11.247" }
+intent-core = { path = "../intent-core", version = "0.11.247" }
+intent-store = { path = "../intent-store", version = "0.11.247" }
+intent-git = { path = "../intent-git", version = "0.11.247" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.247" }
+intent-providers = { path = "../intent-providers", version = "0.11.247" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 reqwest = { workspace = true }
@@ -27,10 +27,10 @@ uuid = { workspace = true }
 zip = { version = "9.4.2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-intent-services = { path = "../intent-services", version = "0.11.246", features = ["test-hooks"] }
-intent-providers = { path = "../intent-providers", version = "0.11.246", features = ["test-support"] }
+intent-services = { path = "../intent-services", version = "0.11.247", features = ["test-hooks"] }
+intent-providers = { path = "../intent-providers", version = "0.11.247", features = ["test-support"] }
 # Tests seed and inspect SQLite through the test-only raw pools.
-intent-store = { path = "../intent-store", version = "0.11.246", features = ["test-support"] }
+intent-store = { path = "../intent-store", version = "0.11.247", features = ["test-support"] }
 intent-test-macros = { path = "../intent-test-macros" }
 intentd-test-support = { path = "../intentd-test-support" }
 sqlx.workspace = true
