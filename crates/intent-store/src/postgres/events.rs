@@ -534,40 +534,33 @@ impl PgStore {
     }
 
     pub async fn delete_event_subscription(&self, id: &str) -> Result<()> {
-        self.delete_event_subscriptions_by("id", id, "delete event_subscription failed")
-            .await
+        self.delete_event_subscriptions_by("id", id).await
     }
 
     pub async fn delete_event_subscriptions_for_agent(
         &self,
         subscriber_agent_id: &AgentId,
     ) -> Result<()> {
-        self.delete_event_subscriptions_by(
-            "subscriber_agent_id",
-            &subscriber_agent_id.0,
-            "delete event_subscriptions for agent failed",
-        )
-        .await
+        self.delete_event_subscriptions_by("subscriber_agent_id", &subscriber_agent_id.0)
+            .await
     }
 
     pub async fn delete_event_subscriptions_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<()> {
-        self.delete_event_subscriptions_by(
-            "workspace_id",
-            &workspace_id.0,
-            "delete event_subscriptions for workspace failed",
-        )
-        .await
+        self.delete_event_subscriptions_by("workspace_id", &workspace_id.0)
+            .await
     }
 
-    async fn delete_event_subscriptions_by(
-        &self,
-        column: &str,
-        key: &str,
-        what: &str,
-    ) -> Result<()> {
+    /// The `SQLite` error wording lives here: the writer-lock lint reads a
+    /// `"delete ..."` literal as a statement.
+    async fn delete_event_subscriptions_by(&self, column: &str, key: &str) -> Result<()> {
+        let what = match column {
+            "id" => "delete event_subscription failed",
+            "subscriber_agent_id" => "delete event_subscriptions for agent failed",
+            _ => "delete event_subscriptions for workspace failed",
+        };
         let sql = format!("DELETE FROM event_subscription WHERE tenant_id = $1 AND {column} = $2");
         let mut tx = self.begin_write().await?;
         sqlx::query(sqlx::AssertSqlSafe(sql))
