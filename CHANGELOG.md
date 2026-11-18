@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.240] - 2026-11-18
+
+### 🚀 Features
+
+- *(store)* Port usage and metrics store methods to Postgres ([#3485](https://github.com/intent-hq/intentd/pull/3485))
+- *(store)* Port the PR monitor store methods to Postgres ([#3486](https://github.com/intent-hq/intentd/pull/3486))
+- *(store)* Port completion watch, delegation group and stop redelivery store methods to Postgres ([#3487](https://github.com/intent-hq/intentd/pull/3487))
+- *(store)* Port owner_queue_permit to Postgres ([#3489](https://github.com/intent-hq/intentd/pull/3489))
+- *(store)* Port desktop and browser tab store methods to Postgres ([#3490](https://github.com/intent-hq/intentd/pull/3490))
+
+### 🐛 Bug Fixes
+
+- Start after an unclean shutdown whose pidfile pid was reused ([#3482](https://github.com/intent-hq/intentd/pull/3482))
+- *(harness)* Harness 3.14 asks for the workspace title through workspace_api ([#3491](https://github.com/intent-hq/intentd/pull/3491))
+
+### 📚 Documentation
+
+- *(guide)* Note the notch dock and machine rail are on by default ([#3492](https://github.com/intent-hq/intentd/pull/3492))
+- Drop desktop Browser access from the assistant app guide ([#3497](https://github.com/intent-hq/intentd/pull/3497))
+
+
 ## [0.11.239] - 2026-11-18
 
 ### 🚀 Features
