@@ -1,6 +1,0 @@
-get_attachment
-get_attachment_by_idempotency_key
-insert_attachment
-insert_attachment_with_idempotency_key
-list_attachments
-sweep_expired_attachment_idempotency_keys

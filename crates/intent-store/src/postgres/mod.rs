@@ -20,6 +20,7 @@ pub use sqlx::postgres::PgPool;
 
 mod agent_messages;
 mod agents;
+mod attachments;
 mod browser_tabs;
 mod clients;
 mod comments;

@@ -16,6 +16,8 @@
 mod agent_messages;
 #[path = "postgres_backend/agents.rs"]
 mod agents;
+#[path = "postgres_backend/attachments.rs"]
+mod attachments;
 #[path = "postgres_backend/clients.rs"]
 mod clients;
 #[path = "postgres_backend/completion_watches.rs"]
