@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.246] - 2026-11-18
+
+### 📚 Documentation
+
+- Describe settings font picker search ([#3516](https://github.com/intent-hq/intentd/pull/3516))
+
+
 ## [0.11.245] - 2026-11-18
 
 ### 🚀 Features
