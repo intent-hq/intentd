@@ -242,9 +242,12 @@ on by default. Turn it off to center that content within an **800 px** limit.
 Narrower panels still use the available width, and aurora still covers the full
 panel. The chat pane's **More** menu also offers **Full width**, **Chat aurora**,
 and **Collapse tool activity** beside **Font**. These shortcuts change the same
-Appearance preferences for all chats on this device.
+Appearance preferences for all chats on this device. **Collapse tool activity**
+groups back-to-back tool calls and thinking steps into one expandable row. Starting
+with the desktop release that turns it on by default, it is on unless the user turned
+it off; a user who turned it off keeps it off.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/ChatAppearanceSettings.svelte; src/lib/components/chat/ChatContentLane.svelte; src/features/layout/tab-types/AgentViewSettingsDropdown.svelte. Test-build behavior pending its frontend release. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/ChatAppearanceSettings.svelte; src/store/renderer/slices/user-preferences/user-preferences-slice.ts (collapseToolRuns default); src/lib/components/chat/ChatContentLane.svelte; src/features/layout/tab-types/AgentViewSettingsDropdown.svelte. Test-build behavior pending its frontend release. -->
 
 When asked about the **Notch dock**, its switch is in
 **Settings → Appearance → Notch dock**. Starting with the desktop release that turns
@@ -522,7 +525,7 @@ finding the QR control.
 
 ## Find work on another device
 
-<!-- Labs (machine rail, desktop app only): describe when asked, and label it Labs.
+<!-- Machine rail (desktop app only): describe when asked.
 With the rail enabled, a machine's update, startup, and connection recovery screen
 leaves the rail available to switch to another machine. Each machine keeps its own
 tabs and drafts. Desktop release notes and app update progress belong to the app;
@@ -1019,11 +1022,12 @@ rail is hidden, **Cmd+1–9** (**Ctrl+1–9** on Windows/Linux) also uses this
 Home/workspace numbering. User-customized shortcuts take precedence over these
 defaults.
 
-<!-- Labs (device rail): describe only when explicitly asked about the device rail
-or when developing or testing it, and say it is Labs. In the desktop app,
-Settings → Advanced → Labs → Machine rail shows the machines kept in this window.
-Starting with the desktop release that turns it on by default, the rail is on unless
-the user turned it off; a user who turned it off keeps it off.
+<!-- Machine rail (desktop app only): describe when asked about the device rail.
+The rail shows the machines kept in this window. Its switch is
+Settings → Appearance → Machine rail, starting with the desktop release that moves it
+out of Labs; until then it is Settings → Advanced → Labs → Machine rail and is a Labs
+feature. Starting with the desktop release that turns it on by default, the rail is on
+unless the user turned it off; a user who turned it off keeps it off.
 Frame windows require the frontend release containing intent-hq/cloudlands-fe#4691.
 Until that release, the window's own machine stays first in the rail and cannot be
 moved or removed; describe the behavior below only with that release.
@@ -1044,7 +1048,7 @@ Cmd+1–9 (Ctrl+1–9 on Windows/Linux) selects devices in displayed rail order:
 guest hosts, as displayed. Cmd+Alt+1–9 (Ctrl+Alt+1–9 on Windows/Linux) continues
 to select Home/workspace tabs using the numbering above whether the rail is visible
 or hidden. User-customized shortcuts take precedence. -->
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/machine-rail/MachineRail.svelte; src/main/machine-rail.ts; src/main/machine-rail-state.ts; src/main/frames.ts; src/main/frame-sessions.ts; src/main/window.ts (saved frames). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/machine-rail/MachineRail.svelte; src/lib/components/settings/MachineRailSettings.svelte; src/main/machine-rail.ts; src/main/machine-rail-state.ts; src/main/frames.ts; src/main/frame-sessions.ts; src/main/window.ts (saved frames). -->
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/AgentCard.svelte (toggle-pinned menu item); packages/cloudlands-fe/src/lib/components/workspace/{WorkspaceAgentsList.svelte,workspace-agents-list-utils.ts}; packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update pinned). -->
 
