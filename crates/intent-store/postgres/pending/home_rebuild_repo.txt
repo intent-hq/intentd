@@ -1,3 +1,0 @@
-finish_home_rebuild
-home_rebuild_of
-remove_cloud_machine

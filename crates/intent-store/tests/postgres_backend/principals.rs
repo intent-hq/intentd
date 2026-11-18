@@ -7,12 +7,14 @@
 //! by the decoy after its own probes, and rows the subject's writes reach
 //! are put back in their pre-write state at the end of the decoy run.
 
+use intent_core::node_link::HomeStopReason;
 use intent_core::{
-    AgentId, AgentSession, Error, HostInvite, HostRole, Principal, PrincipalId, PrincipalIdentity,
-    Workspace, WorkspaceId, WorkspaceInvite, WorkspaceRole, WorkspaceStatus,
+    AgentId, AgentSession, Error, HomeId, HomeState, HostInvite, HostRole, Principal, PrincipalId,
+    PrincipalIdentity, Workspace, WorkspaceHome, WorkspaceId, WorkspaceInvite, WorkspaceRole,
+    WorkspaceStatus,
 };
 use intent_store::{
-    AgentQueueRow, CollaboratorAddOutcome, HostInviteJoinOutcome, HostJoinCredential,
+    AgentQueueRow, CollaboratorAddOutcome, HomeMove, HostInviteJoinOutcome, HostJoinCredential,
     InviteInsertOutcome, InviteJoinOutcome, Store,
 };
 use serde_json::json;
@@ -1714,3 +1716,190 @@ async fn owner_queue_permit_blocks_revoke_until_dropped() {
         .unwrap()
         .is_none());
 }
+
+fn machine_home(home_id: &str, node: &str) -> WorkspaceHome {
+    WorkspaceHome {
+        home_id: HomeId(home_id.into()),
+        node_id: Some(node.into()),
+        cloud_machine_id: None,
+        name: "Mac".into(),
+        state: HomeState::Attached,
+        since: T1.into(),
+        last_backup_at: None,
+        backup_warning: false,
+    }
+}
+
+/// `ws-ar`'s home on `n-ar` and a move of it to `h-ar2` on `n-ar2`.
+async fn home_moving(store: &Store) {
+    let ws = wid("ws-ar");
+    store
+        .set_workspace_home(&ws, &machine_home("h-ar", "n-ar"))
+        .await
+        .unwrap();
+    let target = machine_home("h-ar2", "n-ar2");
+    assert!(store
+        .begin_home_move(&HomeMove {
+            workspace_id: ws,
+            target,
+            from_home_id: HomeId("h-ar".into()),
+            from_state: HomeState::Attached,
+            from_since: T1.into(),
+            pushed: false,
+            started_at: T2.into(),
+        })
+        .await
+        .unwrap());
+}
+
+parity_test!(
+    workspace_archive_detaches_guests_and_ends_the_home,
+    |store, tenant, db| {
+        let primary = store.get_primary_principal().await.unwrap().id;
+        for id in ["ws-ar", "ws-opt", "ws-ret", "ws-auto"] {
+            workspace(&store, id, tenant).await;
+        }
+        let ar = wid("ws-ar");
+        let alice = person("alice", gh(601), tenant, T1);
+        let carol = person("carol", gh(603), tenant, T1);
+        store.upsert_principal(&alice).await.unwrap();
+        store.upsert_principal(&carol).await.unwrap();
+        host_member(&store, &primary, "hi-carol-ar", &carol).await;
+        for p in ["alice", "carol"] {
+            assert!(store
+                .add_workspace_member(&ar, &pid(p), WorkspaceRole::Collaborator)
+                .await
+                .unwrap());
+        }
+        for (id, expires) in [("inv-ar", FAR), ("inv-ar-old", "2020-01-01T00:00:00.000Z")] {
+            let mut open = invite(id, &primary, None, expires);
+            open.workspace_id = ar.clone();
+            store.insert_workspace_invite(&open).await.unwrap();
+        }
+        home_moving(&store).await;
+
+        let sweep = store
+            .archive_workspace_detaching_guests(&ar, T3)
+            .await
+            .unwrap();
+        assert_eq!(sweep.removed_collaborators, [pid("alice")]);
+        assert_eq!(sweep.revoked_invites, 1);
+        assert_eq!(sweep.member_count, 2);
+        let archived = store.get_workspace(&ar).await.unwrap();
+        assert!(archived.archived);
+        assert_eq!(archived.status, WorkspaceStatus::Archived);
+        assert_eq!(archived.archived_at.as_deref(), Some(T3));
+        assert_eq!(
+            store
+                .list_workspace_members(&ar)
+                .await
+                .unwrap()
+                .iter()
+                .map(|m| m.principal_id.as_str())
+                .collect::<Vec<_>>(),
+            [primary.as_str(), "carol"]
+        );
+        assert!(store
+            .list_open_workspace_invites(&ar)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.get_workspace_home(&ar).await.unwrap(), None);
+        assert_eq!(store.get_home_move(&ar).await.unwrap(), None);
+        let stops = store.list_workspace_home_stops(&ar).await.unwrap();
+        assert_eq!(
+            stops
+                .iter()
+                .map(|s| (s.home_id.as_str(), s.node_id.as_str(), s.reason))
+                .collect::<Vec<_>>(),
+            [
+                ("h-ar", "n-ar", HomeStopReason::Retired),
+                ("h-ar2", "n-ar2", HomeStopReason::Retired)
+            ]
+        );
+        assert!(!store
+            .home_stop_discards_push(&HomeId("h-ar".into()))
+            .await
+            .unwrap());
+        assert!(store
+            .home_stop_discards_push(&HomeId("h-ar2".into()))
+            .await
+            .unwrap());
+        assert!(matches!(
+            store
+                .archive_workspace_detaching_guests(&wid("ws-missing"), T3)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+
+        let opt = wid("ws-opt");
+        store
+            .set_workspace_auto_archive_disabled(&opt, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .archive_workspace_detaching_guests_unless_auto_archive_disabled(&opt, T3)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!store.get_workspace(&opt).await.unwrap().archived);
+        let manual = store
+            .archive_workspace_detaching_guests(&opt, T3)
+            .await
+            .unwrap();
+        assert!(manual.removed_collaborators.is_empty());
+        assert!(store.get_workspace(&opt).await.unwrap().archived);
+        let auto = store
+            .archive_workspace_detaching_guests_unless_auto_archive_disabled(&wid("ws-auto"), T3)
+            .await
+            .unwrap()
+            .expect("not opted out");
+        assert_eq!(auto.revoked_invites, 0);
+        assert!(store.get_workspace(&wid("ws-auto")).await.unwrap().archived);
+
+        let ret = wid("ws-ret");
+        store
+            .archive_workspace_detaching_guests(&ret, T3)
+            .await
+            .unwrap();
+        assert!(store.retire_workspace_if_archived(&ret, T4).await.unwrap());
+        assert!(matches!(
+            store.archive_workspace_detaching_guests(&ret, T4).await,
+            Err(Error::WorkspaceRetired { .. })
+        ));
+        assert!(matches!(
+            store
+                .archive_workspace_detaching_guests_unless_auto_archive_disabled(&ret, T4)
+                .await,
+            Err(Error::WorkspaceRetired { .. })
+        ));
+
+        if tenant == "decoy" {
+            workspace(&store, "ws-missing", tenant).await;
+            home_moving(&store).await;
+            decoy_sql(
+                db,
+                tenant,
+                "UPDATE workspace_invite SET revoked_at = NULL WHERE {w} AND id = 'inv-ar'",
+            )
+            .await;
+            decoy_sql(
+                db,
+                tenant,
+                "UPDATE workspace SET archived = 0, status = 'active' \
+                 WHERE {w} AND id IN ('ws-ar', 'ws-opt', 'ws-auto')",
+            )
+            .await;
+            decoy_sql(
+                db,
+                tenant,
+                "INSERT INTO workspace_member (tenant_id, workspace_id, principal_id, role, \
+                 added_at) VALUES ('decoy', 'ws-ar', 'alice', 'collaborator', \
+                 '2026-02-01T00:00:01.000Z')",
+            )
+            .await;
+        }
+    }
+);

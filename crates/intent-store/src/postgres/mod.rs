@@ -27,6 +27,7 @@ mod completion_watches;
 mod desktop;
 mod discussions;
 mod events;
+mod homes;
 mod hooks;
 mod idempotency;
 mod mcp_oauth;

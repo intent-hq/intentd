@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use intent_core::{
     now_iso, Error, HostInvite, HostMember, HostMembershipState, HostRole, Principal,
     PrincipalCredential, PrincipalId, PrincipalIdentity, Result, WorkspaceId, WorkspaceInvite,
-    WorkspaceMember, WorkspaceMembership, WorkspaceRole, CHIEF_WORKSPACE_ID,
+    WorkspaceMember, WorkspaceMembership, WorkspaceRole, WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::postgres::{PgConnection, PgRow, Postgres};
 use sqlx::{Row, Transaction};
@@ -24,12 +24,12 @@ use crate::host_membership_repo::{
     HostInviteJoinOutcome, HostMemberRemoval, HostMembersSnapshot, OwnerQueuePermit,
 };
 use crate::principal_repo::{
-    map_owner_violation, principal_identity_columns, CollaboratorAddOutcome,
+    map_owner_violation, principal_identity_columns, ArchivedGuestSweep, CollaboratorAddOutcome,
     EffectiveWorkspaceMember, InviteInsertOutcome, InviteJoinOutcome, WorkspaceAuthorFallback,
     WorkspaceGuestCount, CREDENTIAL_COLUMNS, INVITE_COLUMNS, MEMBER_COLUMNS, PRINCIPAL_COLUMNS,
     PRINCIPAL_UPSERT_SET,
 };
-use crate::{enum_from_db, HostJoinCredential};
+use crate::{enum_from_db, enum_to_db, HostJoinCredential};
 
 /// [`PRINCIPAL_COLUMNS`] qualified by the alias `p`.
 const P_COLUMNS: &str = "p.id, p.github_user_id, p.login, p.display_name, p.avatar_url, \
@@ -1460,6 +1460,138 @@ impl PgStore {
             .rows_affected();
         tx.commit().await.map_err(db)?;
         Ok(revoked > 0)
+    }
+
+    pub async fn archive_workspace_detaching_guests(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+    ) -> Result<ArchivedGuestSweep> {
+        self.archive_workspace_detaching_guests_inner(id, archived_at, false)
+            .await?
+            .ok_or_else(|| Error::Internal("manual archive refused".into()))
+    }
+
+    pub async fn archive_workspace_detaching_guests_unless_auto_archive_disabled(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+    ) -> Result<Option<ArchivedGuestSweep>> {
+        self.archive_workspace_detaching_guests_inner(id, archived_at, true)
+            .await
+    }
+
+    async fn archive_workspace_detaching_guests_inner(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+        respect_auto_archive_opt_out: bool,
+    ) -> Result<Option<ArchivedGuestSweep>> {
+        let tenant = self.tenant();
+        let mut tx = self.begin_write().await?;
+        // Read under the writer lock with the flip below, so a concurrent
+        // `workspace.retire` cannot land in between: a retired row is never
+        // flipped back to Archived.
+        let state: Option<(bool, bool)> = sqlx::query_as(
+            "SELECT status = $3, auto_archive_disabled <> 0 FROM workspace \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant)
+        .bind(&id.0)
+        .bind(enum_to_db(&WorkspaceStatus::Retired)?)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("read archive status failed: {e}")))?;
+        if state.is_some_and(|(retired, _)| retired) {
+            return Err(Error::WorkspaceRetired {
+                workspace_id: id.0.clone(),
+            });
+        }
+        if respect_auto_archive_opt_out && state.is_some_and(|(_, opted_out)| opted_out) {
+            return Ok(None);
+        }
+        let flipped = sqlx::query(
+            "UPDATE workspace SET status = $3, archived = 1, archived_at = $4, updated_at = $4 \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant)
+        .bind(&id.0)
+        .bind(enum_to_db(&WorkspaceStatus::Archived)?)
+        .bind(archived_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("archive workspace failed: {e}")))?;
+        if flipped.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        // The workspace's home ends with the archive (node-link.md
+        // "Home final stop"): its stop is recorded in this write.
+        super::homes::retire_workspace_home(&mut tx, tenant, id, archived_at, false).await?;
+        let removed_collaborators: Vec<PrincipalId> = sqlx::query_scalar::<_, String>(
+            "SELECT principal_id FROM workspace_member m \
+             WHERE m.tenant_id = $1 AND m.workspace_id = $2 AND m.role <> 'owner' \
+             AND NOT EXISTS(SELECT 1 FROM host_member h \
+                 WHERE h.tenant_id = $1 AND h.principal_id = m.principal_id) \
+             ORDER BY m.added_at COLLATE \"C\", m.principal_id COLLATE \"C\"",
+        )
+        .bind(tenant)
+        .bind(&id.0)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("archive guest listing failed: {e}")))?
+        .into_iter()
+        .map(PrincipalId)
+        .collect();
+        let deleted = sqlx::query(
+            "DELETE FROM workspace_member AS m \
+             WHERE m.tenant_id = $1 AND m.workspace_id = $2 AND m.role <> 'owner' \
+             AND NOT EXISTS(SELECT 1 FROM host_member h \
+                 WHERE h.tenant_id = $1 AND h.principal_id = m.principal_id)",
+        )
+        .bind(tenant)
+        .bind(&id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("archive guest detach failed: {e}")))?;
+        if usize::try_from(deleted.rows_affected()).ok() != Some(removed_collaborators.len()) {
+            return Err(Error::Internal(format!(
+                "archive guest detach removed {} rows, expected {}",
+                deleted.rows_affected(),
+                removed_collaborators.len()
+            )));
+        }
+        let revoke_sql = format!(
+            "UPDATE workspace_invite AS i SET revoked_at = $3 \
+             WHERE i.tenant_id = $1 AND i.workspace_id = $2 AND {}",
+            invite_open(3)
+        );
+        let revoked = sqlx::query(sqlx::AssertSqlSafe(revoke_sql))
+            .bind(tenant)
+            .bind(&id.0)
+            .bind(archived_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("archive invite revoke failed: {e}")))?;
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT CASE WHEN s.workspace_id = $3 THEN s.direct_count \
+                 ELSE s.non_host_count + h.member_count END \
+             FROM workspace_sharing_summary s CROSS JOIN host_membership_state h \
+             WHERE s.tenant_id = $1 AND s.workspace_id = $2 AND h.tenant_id = $1 AND h.id = 1",
+        )
+        .bind(tenant)
+        .bind(&id.0)
+        .bind(CHIEF_WORKSPACE_ID)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("archive member count failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("archive workspace commit failed: {e}")))?;
+        Ok(Some(ArchivedGuestSweep {
+            removed_collaborators,
+            revoked_invites: revoked.rows_affected(),
+            member_count: u64::try_from(remaining).unwrap_or(0),
+        }))
     }
 
     pub async fn redeem_workspace_invite(

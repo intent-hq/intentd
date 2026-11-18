@@ -28,6 +28,8 @@ mod discussions;
 mod events;
 #[path = "postgres_backend/harness.rs"]
 mod harness;
+#[path = "postgres_backend/homes.rs"]
+mod homes;
 #[path = "postgres_backend/hooks.rs"]
 mod hooks;
 #[path = "postgres_backend/idempotency.rs"]
