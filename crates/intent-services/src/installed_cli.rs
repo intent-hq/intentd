@@ -662,10 +662,14 @@ fn codex_api_key_home(home: &Path, provider_ref: &str) -> PathBuf {
 /// key signs in again. Failures leave the launch to report the login error.
 fn prepare_codex_api_key_home(codex_home: &Path, key: &str) {
     use sha2::{Digest, Sha256};
-    let digest: String = Sha256::digest(key.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    use std::fmt::Write as _;
+    let digest =
+        Sha256::digest(key.as_bytes())
+            .iter()
+            .fold(String::with_capacity(64), |mut hex, b| {
+                let _ = write!(hex, "{b:02x}");
+                hex
+            });
     let result = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(codex_home)?;
         #[cfg(unix)]
