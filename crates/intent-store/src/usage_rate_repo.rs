@@ -58,7 +58,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn add_usage_rate(&self, bucket_utc: &str, delta: &UsageRateDelta) -> Result<()> {
-        pending_postgres!("add_usage_rate", self, backend => backend.add_usage_rate(bucket_utc, delta).await)
+        dispatch!(self, backend => backend.add_usage_rate(bucket_utc, delta).await)
     }
 
     /// List the `usage_rate_minutely` rows with `bucket_utc >= since`,
@@ -69,7 +69,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_usage_rate_since(&self, since: &str) -> Result<Vec<UsageRateRow>> {
-        pending_postgres!("list_usage_rate_since", self, backend => backend.list_usage_rate_since(since).await)
+        dispatch!(self, backend => backend.list_usage_rate_since(since).await)
     }
 
     /// Retention sweep: delete minute buckets with `bucket_utc <= cutoff`
@@ -82,7 +82,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_usage_rate_before(&self, cutoff: &str) -> Result<u64> {
-        pending_postgres!("delete_usage_rate_before", self, backend => backend.delete_usage_rate_before(cutoff).await)
+        dispatch!(self, backend => backend.delete_usage_rate_before(cutoff).await)
     }
 }
 
