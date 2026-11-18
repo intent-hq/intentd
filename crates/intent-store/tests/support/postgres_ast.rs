@@ -2,18 +2,28 @@
 //!
 //! For every SELECT level, each table in FROM or JOIN that is not a CTE in
 //! scope needs a `tenant_id = $n` (or `<alias>.tenant_id = $n`, either
-//! operand order) conjunct in that level's WHERE or in its own JOIN's ON.
-//! An INSERT's column list includes `tenant_id`. An UPDATE or DELETE target
-//! needs the filter in its WHERE; SET lists and ON CONFLICT targets do not
-//! count. Subqueries anywhere in a statement are checked as their own level.
+//! operand order) conjunct in that level's WHERE, or in the ON of a join
+//! that drops its unmatched rows (the right side of a LEFT JOIN, either
+//! side of an inner join, the left side of a RIGHT JOIN; never a FULL
+//! JOIN side). An INSERT's column list includes `tenant_id`, and so does its
+//! ON CONFLICT target. An UPDATE or DELETE target needs the filter in its
+//! WHERE; SET lists do not count. Subqueries anywhere in a statement are
+//! checked as their own level. A CTE name is in scope after its body, and
+//! in every sibling body under WITH RECURSIVE; an UPDATE or DELETE target is
+//! always the real table. A statement or table shape the rule does not
+//! model is a violation, not a pass.
+//!
+//! Limit: the rule sees placeholders, not what is bound to them. It
+//! requires every tenant filter in a statement to use the same `$n`; that
+//! the tenant is bound there is for the Postgres parity tests to show.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, FromTable, Insert, JoinConstraint, JoinOperator, ObjectName, Query,
-    Select, SetExpr, Statement, TableAlias, TableFactor, TableObject, TableWithJoins,
-    UpdateTableFromKind, Value, Visit, Visitor,
+    BinaryOperator, ConflictTarget, Expr, FromTable, Insert, JoinConstraint, JoinOperator,
+    ObjectName, OnConflictAction, OnInsert, Query, Select, SetExpr, Statement, TableAlias,
+    TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -24,8 +34,9 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>, String> {
 
 /// Fillers tried, in order, for a `format!` hole that no const resolves:
 /// an expression, nothing (an optional clause), an identifier, a subquery
-/// body, a VALUES row and an operator. A filler names no table, so it
-/// cannot hide one.
+/// body, a VALUES row and an operator. A filler names no table, but it does
+/// stand in for the hole's runtime text, which the rule never sees here:
+/// that text is checked through its own literals, where it has any.
 const FILLERS: &[&str] = &["true", "", "x", "select 1", "($1)", "="];
 
 /// Schemas of the Postgres system catalogs, which hold no tenant rows.
@@ -101,9 +112,15 @@ pub fn violations(stmts: &[Statement], exempt: &[&str]) -> Vec<String> {
     let mut rule = Rule {
         exempt,
         out: Vec::new(),
+        params: BTreeSet::new(),
     };
     for s in stmts {
+        rule.params.clear();
         rule.statement(s, &Scope::new());
+        if rule.params.len() > 1 {
+            let params: Vec<_> = rule.params.iter().map(String::as_str).collect();
+            rule.out.push(format!("TENANT PARAMS {}", params.join(" ")));
+        }
     }
     rule.out
 }
@@ -114,9 +131,18 @@ type Scope = BTreeSet<String>;
 struct Rule<'a> {
     exempt: &'a [&'a str],
     out: Vec<String>,
+    /// The placeholders the current statement's tenant filters use.
+    params: BTreeSet<String>,
 }
 
-/// A table this level reads, with the JOIN ON clauses that may hold its filter.
+/// The tables a level reads, and the table shapes it does not model.
+#[derive(Default)]
+struct Refs<'a> {
+    tables: Vec<TableRef<'a>>,
+    unsupported: Vec<String>,
+}
+
+/// A table this level reads, with the JOIN ON clauses that can filter it.
 struct TableRef<'a> {
     keyword: &'static str,
     /// The table an UPDATE or DELETE changes: always a real table, even
@@ -133,9 +159,9 @@ impl Rule<'_> {
             Statement::Query(q) => self.query(q, scope),
             Statement::Insert(i) => self.insert(i, scope),
             Statement::Update(u) => {
-                let mut refs = Vec::new();
-                table_refs(&u.table, "UPDATE", &[], &mut refs);
-                if let Some(r) = refs.first_mut() {
+                let mut refs = Refs::default();
+                table_refs(&u.table, "UPDATE", &mut refs);
+                if let Some(r) = refs.tables.first_mut() {
                     r.target = true;
                 }
                 if let Some(
@@ -143,29 +169,35 @@ impl Rule<'_> {
                 ) = &u.from
                 {
                     for t in from {
-                        table_refs(t, "FROM", &[], &mut refs);
+                        table_refs(t, "FROM", &mut refs);
                     }
                 }
                 self.check(refs, u.selection.as_ref(), scope);
                 self.nested(u, scope);
             }
             Statement::Delete(d) => {
-                let mut refs = Vec::new();
+                let mut refs = Refs::default();
                 let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &d.from;
                 for t in from {
-                    table_refs(t, "FROM", &[], &mut refs);
+                    table_refs(t, "FROM", &mut refs);
                 }
-                for r in &mut refs {
+                for r in &mut refs.tables {
                     r.target = true;
                 }
                 for t in d.using.iter().flatten() {
-                    table_refs(t, "USING", &[], &mut refs);
+                    table_refs(t, "USING", &mut refs);
                 }
                 self.check(refs, d.selection.as_ref(), scope);
                 self.nested(d, scope);
             }
-            other => self.nested(other, scope),
+            other => self.unsupported(&other.to_string()),
         }
+    }
+
+    /// A shape the rule does not model: reported, so it cannot pass unseen.
+    fn unsupported(&mut self, sql: &str) {
+        let head: Vec<&str> = sql.split_whitespace().take(2).collect();
+        self.out.push(format!("UNSUPPORTED {}", head.join(" ")));
     }
 
     fn insert(&mut self, i: &Insert, scope: &Scope) {
@@ -177,6 +209,22 @@ impl Rule<'_> {
             if !has_tenant && !self.is_exempt(name) {
                 self.out.push(format!("INTO {}", display_name(name)));
             }
+            // A conflict target without tenant_id matches other tenants'
+            // rows. `ON CONFLICT DO NOTHING` with no target only skips.
+            if let Some(OnInsert::OnConflict(c)) = &i.on {
+                let scoped = match &c.conflict_target {
+                    Some(ConflictTarget::Columns { columns, .. }) => columns
+                        .iter()
+                        .any(|c| c.value.eq_ignore_ascii_case("tenant_id")),
+                    Some(ConflictTarget::OnConstraint(_)) => false,
+                    None => matches!(c.action, OnConflictAction::DoNothing),
+                };
+                if !scoped && !self.is_exempt(name) {
+                    self.out.push(format!("ON CONFLICT {}", display_name(name)));
+                }
+            }
+        } else {
+            self.unsupported(&i.to_string());
         }
         self.nested(i, scope);
     }
@@ -184,13 +232,18 @@ impl Rule<'_> {
     fn query(&mut self, q: &Query, scope: &Scope) {
         let mut scope = scope.clone();
         if let Some(with) = &q.with {
+            // WITH RECURSIVE makes every sibling visible in every body; a
+            // plain WITH shows each name only after its own body.
+            if with.recursive {
+                scope.extend(
+                    with.cte_tables
+                        .iter()
+                        .map(|c| c.alias.name.value.to_lowercase()),
+                );
+            }
             for cte in &with.cte_tables {
-                let name = cte.alias.name.value.to_lowercase();
-                if with.recursive {
-                    scope.insert(name.clone());
-                }
                 self.query(&cte.query, &scope);
-                scope.insert(name);
+                scope.insert(cte.alias.name.value.to_lowercase());
             }
         }
         self.set_expr(&q.body, &scope);
@@ -209,14 +262,32 @@ impl Rule<'_> {
             SetExpr::Insert(s) | SetExpr::Update(s) | SetExpr::Delete(s) | SetExpr::Merge(s) => {
                 self.statement(s, scope);
             }
-            other => self.nested(other, scope),
+            SetExpr::Values(v) => self.nested(v, scope),
+            // `TABLE note`: every row of the table, no filter possible.
+            SetExpr::Table(t) => {
+                let name = t.table_name.as_ref().map(|n| n.value.to_lowercase());
+                let cte =
+                    t.schema_name.is_none() && name.as_ref().is_some_and(|n| scope.contains(n));
+                let system = t
+                    .schema_name
+                    .as_ref()
+                    .is_some_and(|s| SYSTEM_SCHEMAS.contains(&s.value.to_lowercase().as_str()));
+                let exempt = t.schema_name.is_none()
+                    && name.as_deref().is_some_and(|n| self.exempt.contains(&n));
+                if !(cte || system || exempt) {
+                    self.out.push(format!(
+                        "FROM {}",
+                        t.to_string().to_lowercase().trim_start_matches("table ")
+                    ));
+                }
+            }
         }
     }
 
     fn select(&mut self, s: &Select, scope: &Scope) {
-        let mut refs = Vec::new();
+        let mut refs = Refs::default();
         for t in &s.from {
-            table_refs(t, "FROM", &[], &mut refs);
+            table_refs(t, "FROM", &mut refs);
         }
         self.check(refs, s.selection.as_ref(), scope);
         self.nested(s, scope);
@@ -224,8 +295,11 @@ impl Rule<'_> {
 
     /// Checks each table against the level's WHERE and its own JOIN ONs.
     /// A one-part name that a CTE in scope defines is that CTE.
-    fn check(&mut self, refs: Vec<TableRef<'_>>, selection: Option<&Expr>, scope: &Scope) {
-        for r in refs {
+    fn check(&mut self, refs: Refs<'_>, selection: Option<&Expr>, scope: &Scope) {
+        for u in &refs.unsupported {
+            self.unsupported(u);
+        }
+        for r in refs.tables {
             let cte = !r.target
                 && r.name.0.len() == 1
                 && last_ident(r.name).is_some_and(|n| scope.contains(&n));
@@ -236,8 +310,10 @@ impl Rule<'_> {
                 || last_ident(r.name).unwrap_or_default(),
                 |a| a.name.value.to_lowercase(),
             );
-            let ok =
-                has_filter(selection, &alias) || r.on.iter().any(|on| has_filter(Some(on), &alias));
+            let param = tenant_param(selection, &alias)
+                .or_else(|| r.on.iter().find_map(|on| tenant_param(Some(on), &alias)));
+            let ok = param.is_some();
+            self.params.extend(param);
             if !ok {
                 self.out
                     .push(format!("{} {}", r.keyword, display_name(r.name)));
@@ -267,42 +343,65 @@ impl Rule<'_> {
 }
 
 /// The tables of one FROM item: its relation, its joins, and the tables of
-/// parenthesized joins, each with the ON clauses that apply to it.
-fn table_refs<'a>(
-    t: &'a TableWithJoins,
-    keyword: &'static str,
-    outer_on: &[&'a Expr],
-    out: &mut Vec<TableRef<'a>>,
-) {
-    relation(&t.relation, keyword, outer_on.to_vec(), out);
+/// parenthesized joins. Each join's ON is attached to the tables on the
+/// side or sides whose unmatched rows that join drops.
+fn table_refs<'a>(t: &'a TableWithJoins, keyword: &'static str, out: &mut Refs<'a>) {
+    let start = out.tables.len();
+    relation(&t.relation, keyword, out);
     for j in &t.joins {
-        let mut on = outer_on.to_vec();
-        on.extend(join_on(&j.join_operator));
-        relation(&j.relation, "JOIN", on, out);
+        let right = out.tables.len();
+        relation(&j.relation, "JOIN", out);
+        let (filters_left, filters_right) = filtered_sides(&j.join_operator);
+        if let Some(on) = join_on(&j.join_operator) {
+            let left_side = start..right;
+            let right_side = right..out.tables.len();
+            for (i, r) in out.tables.iter_mut().enumerate().skip(start) {
+                if (filters_left && left_side.contains(&i))
+                    || (filters_right && right_side.contains(&i))
+                {
+                    r.on.push(on);
+                }
+            }
+        }
     }
 }
 
-fn relation<'a>(
-    f: &'a TableFactor,
-    keyword: &'static str,
-    on: Vec<&'a Expr>,
-    out: &mut Vec<TableRef<'a>>,
-) {
+fn relation<'a>(f: &'a TableFactor, keyword: &'static str, out: &mut Refs<'a>) {
     match f {
-        // `json_each($2)`, `generate_series(..)`: a function, not a table.
-        TableFactor::Table { args: Some(_), .. } => {}
-        TableFactor::Table { name, alias, .. } => out.push(TableRef {
+        // Subqueries and table functions (`json_each($2)`,
+        // `generate_series(..)`) name no table at this level;
+        // `Rule::nested` checks the subqueries.
+        TableFactor::Table { args: Some(_), .. }
+        | TableFactor::Derived { .. }
+        | TableFactor::TableFunction { .. }
+        | TableFactor::Function { .. }
+        | TableFactor::UNNEST { .. }
+        | TableFactor::JsonTable { .. } => {}
+        TableFactor::Table { name, alias, .. } => out.tables.push(TableRef {
             keyword,
             target: false,
             name,
             alias: alias.as_ref(),
-            on,
+            on: Vec::new(),
         }),
         TableFactor::NestedJoin {
             table_with_joins, ..
-        } => table_refs(table_with_joins, keyword, &on, out),
-        // Derived tables are subqueries, found by `Rule::nested`.
-        _ => {}
+        } => table_refs(table_with_joins, keyword, out),
+        // PIVOT, MATCH_RECOGNIZE and the like: not modelled.
+        other => out.unsupported.push(other.to_string()),
+    }
+}
+
+/// Which sides of a join lose their unmatched rows: (left, right).
+fn filtered_sides(op: &JoinOperator) -> (bool, bool) {
+    match op {
+        JoinOperator::Join(_)
+        | JoinOperator::Inner(_)
+        | JoinOperator::CrossJoin(_)
+        | JoinOperator::StraightJoin(_) => (true, true),
+        JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => (false, true),
+        JoinOperator::Right(_) | JoinOperator::RightOuter(_) => (true, false),
+        _ => (false, false),
     }
 }
 
@@ -332,8 +431,9 @@ fn join_on(op: &JoinOperator) -> Option<&Expr> {
     }
 }
 
-/// Whether a top-level AND conjunct of `e` is `tenant_id = $n` for `alias`.
-fn has_filter(e: Option<&Expr>, alias: &str) -> bool {
+/// The placeholder of a top-level AND conjunct of `e` that is
+/// `tenant_id = $n` for `alias`.
+fn tenant_param(e: Option<&Expr>, alias: &str) -> Option<String> {
     let mut stack: Vec<&Expr> = e.into_iter().collect();
     while let Some(e) = stack.pop() {
         match e {
@@ -351,15 +451,17 @@ fn has_filter(e: Option<&Expr>, alias: &str) -> bool {
                 op: BinaryOperator::Eq,
                 right,
             } => {
-                let pair = |col: &Expr, val: &Expr| is_tenant_column(col, alias) && is_param(val);
-                if pair(left, right) || pair(right, left) {
-                    return true;
+                let pair = |col: &Expr, val: &Expr| {
+                    is_tenant_column(col, alias).then(|| param(val)).flatten()
+                };
+                if let Some(p) = pair(left, right).or_else(|| pair(right, left)) {
+                    return Some(p);
                 }
             }
             _ => {}
         }
     }
-    false
+    None
 }
 
 fn is_tenant_column(e: &Expr, alias: &str) -> bool {
@@ -375,11 +477,14 @@ fn is_tenant_column(e: &Expr, alias: &str) -> bool {
     }
 }
 
-fn is_param(e: &Expr) -> bool {
+fn param(e: &Expr) -> Option<String> {
     match e {
-        Expr::Value(v) => matches!(&v.value, Value::Placeholder(p) if p.starts_with('$')),
-        Expr::Nested(inner) => is_param(inner),
-        _ => false,
+        Expr::Value(v) => match &v.value {
+            Value::Placeholder(p) if p.starts_with('$') => Some(p.clone()),
+            _ => None,
+        },
+        Expr::Nested(inner) => param(inner),
+        _ => None,
     }
 }
 

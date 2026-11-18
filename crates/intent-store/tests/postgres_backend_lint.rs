@@ -598,6 +598,15 @@ fn the_parsed_tenant_rule_catches_unscoped_shapes() {
         "with c as (select ', note as (' as marker) select id from note",
         &["FROM note"],
     );
+    // Under WITH RECURSIVE every sibling name is visible in every body.
+    ok(
+        "with recursive a as (select id from b), b as (select id from note where tenant_id = $1) \
+        select id from a",
+    );
+    bad(
+        "with recursive a as (select id from b), b as (select id from note) select id from a",
+        &["FROM note"],
+    );
     // A CTE is in scope only after its body, and in the statement it heads.
     bad(
         "with a as (select id from b), b as (select id from note where tenant_id = $1) \
@@ -622,6 +631,91 @@ fn the_parsed_tenant_rule_catches_unscoped_shapes() {
     bad(
         "delete from note n using task t where n.tenant_id = $1 and t.id = n.id",
         &["USING task"],
+    );
+    // A join's ON filters only a side whose unmatched rows it drops.
+    ok(
+        "select n.id from note n join task t on n.tenant_id = $1 and t.tenant_id = $1 \
+        and t.note_id = n.id",
+    );
+    ok(
+        "select n.id from note n left join task t on t.tenant_id = $1 and t.note_id = n.id \
+        where n.tenant_id = $1",
+    );
+    bad(
+        "select n.id from note n left join task t on n.tenant_id = $1 and t.tenant_id = $1 \
+         and t.note_id = n.id",
+        &["FROM note"],
+    );
+    bad(
+        "select t.id from note n right join task t on t.tenant_id = $1 and t.note_id = n.id \
+         where n.tenant_id = $1",
+        &["JOIN task"],
+    );
+    ok(
+        "select t.id from note n right join task t on n.tenant_id = $1 and t.note_id = n.id \
+        where t.tenant_id = $1",
+    );
+    bad(
+        "select n.id from note n full join task t on n.tenant_id = $1 and t.tenant_id = $1 \
+         and t.note_id = n.id",
+        &["FROM note", "JOIN task"],
+    );
+    bad(
+        "select n.id from pg_catalog.pg_class c full outer join public.note n \
+         on n.tenant_id = $1 and false",
+        &["JOIN public.note"],
+    );
+    // The same holds for the ON of a join around a parenthesized group.
+    ok(
+        "select n.id from note n left join (task t join hook h on h.tenant_id = $1 \
+        and h.id = t.id) on t.tenant_id = $1 where n.tenant_id = $1",
+    );
+    bad(
+        "select n.id from note n right join (task t join hook h on h.id = t.id) \
+         on t.tenant_id = $1 and h.tenant_id = $1 where n.tenant_id = $1",
+        &["JOIN task", "JOIN hook"],
+    );
+    // Shapes the rule does not model fail instead of passing.
+    bad(
+        "select id from task where tenant_id = $1 and id in (table note)",
+        &["FROM note"],
+    );
+    for sql in [
+        "merge into note n using task t on t.id = n.id when matched then delete",
+        "truncate note",
+    ] {
+        let v = ast_violations(sql);
+        assert!(
+            v.len() == 1 && v[0].starts_with("UNSUPPORTED "),
+            "{sql}: {v:?}"
+        );
+    }
+    // An ON CONFLICT target must include tenant_id.
+    bad(
+        "insert into settings (tenant_id, key, value) values ($1, $2, $3) \
+         on conflict (key) do update set value = excluded.value",
+        &["ON CONFLICT settings"],
+    );
+    bad(
+        "insert into settings (tenant_id, key) values ($1, $2) \
+         on conflict on constraint settings_pkey do nothing",
+        &["ON CONFLICT settings"],
+    );
+    ok(
+        "insert into settings (tenant_id, key, value) values ($1, $2, $3) \
+        on conflict (tenant_id, key) do update set value = excluded.value",
+    );
+    ok("insert into settings (tenant_id, key) values ($1, $2) on conflict do nothing");
+    // Every tenant filter in a statement uses the same placeholder.
+    bad(
+        "select n.id from note n join task t on t.tenant_id = $2 and t.id = n.id \
+         where n.tenant_id = $1",
+        &["TENANT PARAMS $1 $2"],
+    );
+    bad(
+        "select id from task where tenant_id = $1 \
+         and id in (select id from note where tenant_id = $3)",
+        &["TENANT PARAMS $1 $3"],
     );
     // Schema tables and the system catalogs are exempt; any other
     // schema-qualified name is checked.
