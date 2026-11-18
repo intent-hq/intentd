@@ -20,6 +20,28 @@ const TARGET_LIVE: &str = "EXISTS(SELECT 1 FROM agent_session a JOIN workspace w
      AND a.id = sqlite_json_extract(s.value, '$.agentId') \
      AND w.id = sqlite_json_extract(s.value, '$.workspaceId'))";
 
+/// As `desktop_repo::delete_desktop_scope`: every private desktop record of
+/// `workspace`, or only `agent`'s when given.
+pub(super) async fn delete_desktop_scope(
+    tx: &mut WriteTx,
+    tenant: &str,
+    workspace: &WorkspaceId,
+    agent: Option<&AgentId>,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM settings WHERE tenant_id = $1 AND key LIKE 'desktop.v1/%' \
+         AND sqlite_json_extract(value, '$.workspaceId') = $2 \
+         AND ($3::text IS NULL OR sqlite_json_extract(value, '$.agentId') = $3)",
+    )
+    .bind(tenant)
+    .bind(workspace.as_str())
+    .bind(agent.map(AgentId::as_str))
+    .execute(&mut **tx)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
 impl PgStore {
     async fn desktop_insert(&self, tx: &mut WriteTx, key: &str, record: &Value) -> Result<()> {
         let principal = record["principalId"].as_str();

@@ -163,7 +163,7 @@ impl Store {
         token_hash: Option<&str>,
         admit: impl FnOnce() -> Result<()> + Send,
     ) -> Result<()> {
-        pending_postgres!("insert_workspace_with_host_admission", self, backend => backend.insert_workspace_with_host_admission(ws, auto_commit, expected, token_hash, admit).await)
+        dispatch!(self, backend => backend.insert_workspace_with_host_admission(ws, auto_commit, expected, token_hash, admit).await)
     }
 
     /// Fetch a single workspace by id, or `NotFound`.
@@ -354,7 +354,7 @@ impl Store {
     where
         F: FnOnce(&[AgentUsageRow], Option<&TokenUsage>) -> Option<TokenUsage>,
     {
-        pending_postgres!("update_workspace_token_usage", self, backend => backend.update_workspace_token_usage(workspace_id, compute).await)
+        dispatch!(self, backend => backend.update_workspace_token_usage(workspace_id, compute).await)
     }
 
     /// Scoped, conditional attention write (monorepo#1481): set ONLY the
@@ -481,7 +481,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
-        pending_postgres!("delete_workspace", self, backend => backend.delete_workspace(id).await)
+        dispatch!(self, backend => backend.delete_workspace(id).await)
     }
 
     /// Run the same deletion once, retaining facts before projecting its result.
@@ -495,7 +495,7 @@ impl Store {
         &self,
         id: &WorkspaceId,
     ) -> RepositoryWorkspaceDeleteOutcome {
-        pending_postgres!(panic "delete_workspace_with_outcome", self, backend => backend.delete_workspace_with_outcome(id).await)
+        dispatch!(self, backend => backend.delete_workspace_with_outcome(id).await)
     }
 
     /// The folder of every plain-folder workspace the store knows (PROTOCOL

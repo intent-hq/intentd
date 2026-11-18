@@ -23,7 +23,7 @@ pub use review_context_enrollment::{
     ReviewContextEnrollment, ReviewContextEnrollmentIntent, ReviewContextOwnerKey,
 };
 
-mod prepared_monitor_message;
+pub(crate) mod prepared_monitor_message;
 pub use prepared_monitor_message::PreparedMonitorMessage;
 pub(crate) mod monitor_message_provenance;
 pub use monitor_message_provenance::MonitorMessageProvenance;
@@ -2771,7 +2771,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
     ) -> Result<bool> {
-        pending_postgres!("delete_agent_session", self, backend => backend.delete_agent_session(workspace_id, id).await)
+        dispatch!(self, backend => backend.delete_agent_session(workspace_id, id).await)
     }
 }
 

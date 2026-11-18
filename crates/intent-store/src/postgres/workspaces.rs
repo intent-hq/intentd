@@ -3,18 +3,19 @@
 //! `workspace_home_repo.rs`, `workspace_context_repo.rs`,
 //! `workspace_ui_context_repo.rs` and `workspace_mcp_repo.rs`.
 //!
-//! The `SQLite` versions bracket repository writes with the process-local
-//! repository lifecycle observer. A Postgres store never installs one
-//! (`install_repository_lifecycle_observer` is not ported), so those
-//! brackets have nothing to notify and are left out here.
+//! Workspace inserts and deletes take the repository lifecycle bracket as on
+//! `SQLite`; the other writers here predate the Postgres lifecycle domain and
+//! leave it out.
 //!
 //! Text ordering uses `COLLATE "C"` to match `SQLite`'s byte order.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use intent_core::{
     now_iso, AgentId, CheckoutMode, ClientId, ContextItem, Error, HomeId, HomeState,
-    PullRequestInfo, PullRequestStatus, PullRequestWorkspace, Result, Workspace,
+    PullRequestInfo, PullRequestStatus, PullRequestWorkspace, Result, TokenUsage, Workspace,
     WorkspaceAttention, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource,
     WorkspaceHome, WorkspaceId, WorkspaceListFilter, WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
@@ -23,8 +24,30 @@ use sqlx::Row;
 
 use super::{db, PgStore};
 use crate::workspace_git_root_repo as roots;
-use crate::workspace_repo::{self as ws_repo, PullRequestLink, WorkspaceContentClock};
-use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db};
+use crate::workspace_repo::{
+    self as ws_repo, PullRequestLink, RepositoryWorkspaceDeleteDisposition,
+    RepositoryWorkspaceDeleteOutcome, WorkspaceContentClock,
+};
+use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow};
+
+/// The `workspace_id` children `SQLite` deletes explicitly after notes'
+/// comments, in its order; the others cascade from the workspace row.
+const WORKSPACE_CHILD_TABLES: [&str; 14] = [
+    "note_version",
+    "note_line_attribution",
+    "note",
+    "tracked_changes",
+    "diffs",
+    "delegation_group",
+    "task_agent_link",
+    "agent_metrics",
+    "workspace_context_item",
+    "workspace_git_root",
+    "pull_request_workspace",
+    "workspace_invite",
+    "workspace_mcp_disabled_server",
+    "draft",
+];
 
 const HOME_COLUMNS: &str = "workspace_id, home_id, node_id, cloud_machine_id, name, state, \
     since, last_backup_at, backup_failing_since";
@@ -255,6 +278,53 @@ impl PgStore {
         ws: &Workspace,
         auto_commit: Option<bool>,
     ) -> Result<()> {
+        type NoAdmission<'a> = (
+            &'a crate::RepositoryHostAuthoritySnapshot,
+            Option<&'a str>,
+            fn() -> Result<()>,
+        );
+        self.insert_workspace_inner(ws, auto_commit, None::<NoAdmission<'_>>)
+            .await
+    }
+
+    pub async fn insert_workspace_with_host_admission(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+        expected: &crate::RepositoryHostAuthoritySnapshot,
+        token_hash: Option<&str>,
+        admit: impl FnOnce() -> Result<()> + Send,
+    ) -> Result<()> {
+        self.insert_workspace_inner(ws, auto_commit, Some((expected, token_hash, admit)))
+            .await
+    }
+
+    /// As on `SQLite`: the original host authority is compared under the
+    /// lifecycle writer, and `admit` runs once the writer lock is held,
+    /// just before the insert.
+    async fn insert_workspace_inner(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+        admission: Option<(
+            &crate::RepositoryHostAuthoritySnapshot,
+            Option<&str>,
+            impl FnOnce() -> Result<()> + Send,
+        )>,
+    ) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let admit = match admission {
+            Some((expected, token_hash, admit)) => {
+                let actual = self
+                    .repository_host_authority_snapshot(&expected.principal_id, token_hash)
+                    .await?;
+                if actual != *expected {
+                    return Err(Error::Forbidden("Repository checkout unavailable".into()));
+                }
+                Some(admit)
+            }
+            None => None,
+        };
         let columns = ws_repo::WORKSPACE_COLUMNS;
         let sql = format!(
             "INSERT INTO workspace (tenant_id, {columns}, auto_commit_enabled) VALUES \
@@ -262,7 +332,11 @@ impl PgStore {
              $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, \
              $34, $35, $36, $37, $38, $39, $40, $41)"
         );
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
         let mut tx = self.begin_write().await?;
+        if let Some(admit) = admit {
+            admit()?;
+        }
         sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(self.tenant())
             .bind(&ws.id.0)
@@ -308,7 +382,8 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("workspace insert failed: {e}")))?;
-        tx.commit().await.map_err(db)
+        tx.commit().await.map_err(db)?;
+        lifecycle.settle_after_retirement().await
     }
 
     pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<Workspace> {
@@ -653,6 +728,227 @@ impl PgStore {
             return Err(not_found(id));
         }
         Ok(changed)
+    }
+
+    pub async fn update_workspace_token_usage<F>(
+        &self,
+        workspace_id: &WorkspaceId,
+        compute: F,
+    ) -> Result<Option<TokenUsage>>
+    where
+        F: FnOnce(&[AgentUsageRow], Option<&TokenUsage>) -> Option<TokenUsage>,
+    {
+        let mut tx = self.begin_write().await?;
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT token_usage FROM workspace WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(self.tenant())
+        .bind(&workspace_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let Some(stored) = stored else {
+            return Err(not_found(workspace_id));
+        };
+        // As on SQLite, a malformed stored snapshot decodes to None.
+        let current: Option<TokenUsage> = stored.and_then(|s| serde_json::from_str(&s).ok());
+        let usage_rows = self.agent_usage_rows(&mut tx, workspace_id).await?;
+        let Some(new_usage) = compute(&usage_rows, current.as_ref()) else {
+            tx.commit().await.map_err(db)?;
+            return Ok(None);
+        };
+        let json = serde_json::to_string(&new_usage)
+            .map_err(|e| Error::Internal(format!("encode token_usage failed: {e}")))?;
+        let updated = sqlx::query(
+            "UPDATE workspace SET token_usage = $3 WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(self.tenant())
+        .bind(&workspace_id.0)
+        .bind(json)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if updated == 0 {
+            return Err(not_found(workspace_id));
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(Some(new_usage))
+    }
+
+    pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+        self.delete_workspace_with_outcome(id).await.result
+    }
+
+    pub async fn delete_workspace_with_outcome(
+        &self,
+        id: &WorkspaceId,
+    ) -> RepositoryWorkspaceDeleteOutcome {
+        let mut disposition = RepositoryWorkspaceDeleteDisposition::Unknown;
+        let committed = Arc::new(AtomicBool::new(false));
+        let result = self
+            .delete_workspace_observed(id, &mut disposition, committed.clone())
+            .await;
+        if committed.load(Ordering::Acquire) {
+            disposition = RepositoryWorkspaceDeleteDisposition::Committed;
+        }
+        RepositoryWorkspaceDeleteOutcome {
+            result,
+            disposition,
+        }
+    }
+
+    /// The `SQLite` deletion in one writer-locked transaction: no bounded
+    /// batches, so a failure leaves the workspace untouched.
+    async fn delete_workspace_observed(
+        &self,
+        id: &WorkspaceId,
+        disposition: &mut RepositoryWorkspaceDeleteDisposition,
+        committed: Arc<AtomicBool>,
+    ) -> Result<()> {
+        // Held through the commit, as on SQLite: no private desktop write of
+        // this workspace can start meanwhile.
+        let _desktop_deletion = self.desktop_writes.delete(id).await;
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut tx = self.begin_write().await?;
+        if !self.workspace_exists(&mut tx, id).await? {
+            *disposition = RepositoryWorkspaceDeleteDisposition::NoEffect;
+            return Err(not_found(id));
+        }
+        let agents: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM agent_session WHERE tenant_id = $1 AND workspace_id = $2 \
+             ORDER BY row_seq",
+        )
+        .bind(self.tenant())
+        .bind(&id.0)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        let agents: Vec<AgentId> = agents.into_iter().map(AgentId).collect();
+        // SQLite begins the workspace here and each agent in its own nested
+        // deletion; this one transaction owns all of them.
+        let keys: Vec<crate::RepositoryLifecycleKey> =
+            std::iter::once(crate::RepositoryLifecycleKey::Workspace(id.clone()))
+                .chain(agents.iter().cloned().map(crate::RepositoryLifecycleKey::Agent))
+                .collect();
+        lifecycle.begin(&keys)?;
+        // A started transaction finishes its commit and overlay eviction even
+        // if the caller is cancelled.
+        let store = self.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            let result = store.delete_workspace_rows(tx, &id, &agents).await;
+            if result.is_ok() {
+                committed.store(true, Ordering::Release);
+            }
+            lifecycle.finish(result).await
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("delete workspace task failed: {e}")))?
+    }
+
+    async fn delete_workspace_rows(
+        &self,
+        mut tx: super::WriteTx,
+        id: &WorkspaceId,
+        agents: &[AgentId],
+    ) -> Result<()> {
+        let tenant = self.tenant();
+        let exec = |sql: &'static str| {
+            sqlx::query(sql).bind(tenant.to_owned()).bind(id.0.clone())
+        };
+        // Recovery history of this workspace, except a row naming a live
+        // session of another workspace.
+        exec(
+            "DELETE FROM interrupted_agent i WHERE i.tenant_id = $1 AND i.workspace_id = $2 \
+             AND NOT EXISTS (SELECT 1 FROM agent_session s WHERE s.tenant_id = $1 \
+               AND s.id = i.agent_id AND s.workspace_id <> $2)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        super::desktop::delete_desktop_scope(&mut tx, tenant, id, None).await?;
+        for agent in agents {
+            super::agents::delete_workspace_session(&mut tx, tenant, id, agent).await?;
+        }
+        // No workspace foreign key. Retry keys go before attachments (their
+        // key is NO ACTION), and a foreign workspace's key blocks deletion.
+        for sql in [
+            "DELETE FROM script WHERE tenant_id = $1 AND workspace_id = $2",
+            "DELETE FROM attachment_idempotency_keys k WHERE k.tenant_id = $1 \
+             AND k.workspace_id = $2 AND EXISTS (SELECT 1 FROM attachments a \
+               WHERE a.tenant_id = $1 AND a.id = k.attachment_id AND a.workspace_id = $2)",
+            "DELETE FROM attachments WHERE tenant_id = $1 AND workspace_id = $2",
+            "UPDATE note SET parent_id = NULL \
+             WHERE tenant_id = $1 AND workspace_id = $2 AND parent_id IS NOT NULL",
+            "DELETE FROM note_page_entry WHERE tenant_id = $1 AND workspace_id = $2",
+            "DELETE FROM note_page_head WHERE tenant_id = $1 AND workspace_id = $2",
+            // Comments with no note stay, as on SQLite.
+            "DELETE FROM comment WHERE tenant_id = $1 AND workspace_id = $2 \
+             AND note_id IS NOT NULL",
+        ] {
+            exec(sql).execute(&mut *tx).await.map_err(db)?;
+        }
+        for table in WORKSPACE_CHILD_TABLES {
+            let sql = format!("DELETE FROM {table} WHERE tenant_id = $1 AND workspace_id = $2");
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(tenant)
+                .bind(&id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        let tab_ids: Vec<String> = sqlx::query_scalar(
+            "DELETE FROM browser_tab WHERE tenant_id = $1 AND workspace_id = $2 RETURNING tab_id",
+        )
+        .bind(tenant)
+        .bind(&id.0)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        sqlx::query("DELETE FROM settings WHERE tenant_id = $1 AND key = $2")
+            .bind(tenant)
+            .bind(crate::settings_repo::agent_creation_preferences_key(id))
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        // A plain-folder row's folder outlives the row on the tombstone.
+        let plain_folder_path: Option<String> = sqlx::query_scalar(
+            "SELECT repository_path FROM workspace WHERE tenant_id = $1 AND id = $2 \
+             AND plain_folder = 1 AND repository_path <> ''",
+        )
+        .bind(tenant)
+        .bind(&id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?
+        .flatten();
+        let now = now_iso();
+        super::homes::retire_workspace_home(&mut tx, tenant, id, &now, true).await?;
+        let deleted = exec("DELETE FROM workspace WHERE tenant_id = $1 AND id = $2")
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        if deleted == 0 {
+            return Err(not_found(id));
+        }
+        sqlx::query(
+            "INSERT INTO deleted_workspace_id (tenant_id, id, deleted_at, plain_folder_path) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, id) DO UPDATE SET \
+             deleted_at = excluded.deleted_at, plain_folder_path = excluded.plain_folder_path",
+        )
+        .bind(tenant)
+        .bind(&id.0)
+        .bind(&now)
+        .bind(plain_folder_path)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        self.browser_tab_displayed
+            .forget_all(tab_ids.iter().map(String::as_str));
+        Ok(())
     }
 
     pub async fn plain_folder_paths(&self) -> Result<Vec<String>> {

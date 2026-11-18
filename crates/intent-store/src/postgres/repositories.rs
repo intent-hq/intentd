@@ -97,7 +97,7 @@ impl PgStore {
         ))
     }
 
-    async fn repository_lifecycle_write(&self) -> Result<LifecycleWrite> {
+    pub(super) async fn repository_lifecycle_write(&self) -> Result<LifecycleWrite> {
         self.repository_lifecycle_domain()?.write().await
     }
 

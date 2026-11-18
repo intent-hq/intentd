@@ -137,6 +137,19 @@ fn bind_captured(mut query: PgQuery, expected: &QualifiedPrMonitor) -> PgQuery {
     query
 }
 
+/// `pr_monitor_repo::captured_monitor_exists`: the captured row, still active
+/// and unchanged.
+pub(crate) fn captured_monitor_exists(tenant: &str, expected: &QualifiedPrMonitor) -> PgQuery {
+    let sql = format!(
+        "SELECT monitor_id FROM pr_monitor WHERE tenant_id = $1 AND state = 'active' AND {}",
+        captured_columns(2)
+    );
+    bind_captured(
+        sqlx::query(sqlx::AssertSqlSafe(sql)).bind(tenant.to_owned()),
+        expected,
+    )
+}
+
 /// A prepared monitor write holding the tenant's writer lock until it
 /// finishes, like `SQLite`'s reserved `BEGIN IMMEDIATE` writer.
 pub(crate) struct PreparedPgWrite {

@@ -8,7 +8,7 @@
 //! key and trigger tenant-scoped.
 //!
 //! Release builds never enable this feature. Methods not ported yet go
-//! through `pending_postgres!` and return [`unported`] errors.
+//! through `pending_postgres!` and panic ([`unported_panic`]).
 
 use std::sync::Arc;
 
@@ -17,6 +17,8 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, Postgres};
 use sqlx::Transaction;
 
 pub use sqlx::postgres::PgPool;
+
+pub(crate) use agents::PreparedPgMonitorMessage;
 
 mod agent_messages;
 mod agents;
@@ -520,14 +522,7 @@ pub(crate) fn db(e: impl std::fmt::Display) -> Error {
     Error::Internal(format!("postgres: {e}"))
 }
 
-/// The error a not-yet-ported `Store` method returns on Postgres.
-pub(crate) fn unported(method: &'static str) -> Error {
-    Error::Internal(format!(
-        "{method} is not yet supported on the Postgres store"
-    ))
-}
-
-/// For the few not-yet-ported methods that do not return `Result`.
+/// What a not-yet-ported `Store` method does on Postgres.
 #[track_caller]
 pub(crate) fn unported_panic(method: &'static str) -> ! {
     panic!("{method} is not yet supported on the Postgres store")

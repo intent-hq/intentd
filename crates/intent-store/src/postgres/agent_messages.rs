@@ -192,7 +192,7 @@ fn scope_filter(scope: &AgentListRowScope) -> (&'static str, Option<&str>) {
 
 /// Upsert one message's prepared payload rows inside the caller's write
 /// transaction; a pre-staged row with the same key is overwritten.
-async fn insert_payload_rows(
+pub(super) async fn insert_payload_rows(
     tx: &mut WriteTx,
     tenant: &str,
     message_id: &str,
@@ -245,7 +245,7 @@ async fn upsert_payload(
 }
 
 #[expect(clippy::too_many_arguments)]
-async fn insert_message_row(
+pub(super) async fn insert_message_row(
     tx: &mut WriteTx,
     tenant: &str,
     id: &str,

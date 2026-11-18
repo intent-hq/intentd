@@ -1,2 +1,0 @@
-delete_agent_session
-prepare_monitor_message
