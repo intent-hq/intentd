@@ -112,30 +112,82 @@ const NON_TENANT_TABLES: &[(&str, &str)] = &[(
     "applied-migration ledger written by postgres::migrate, one per schema",
 )];
 
-/// Names a `WITH` statement defines (`with a as (`, `, b as (`). A reference
-/// to one is not a table; the tables inside its body are checked as usual.
-fn cte_names(sql: &str) -> Vec<String> {
-    if !sql.trim_start().starts_with("with ") {
-        return Vec::new();
-    }
-    let words: Vec<&str> = sql.split_whitespace().collect();
-    let mut out = Vec::new();
-    for i in 1..words.len().saturating_sub(2) {
-        let opens = words[i + 1] == "as" && words[i + 2].starts_with('(');
-        let after = words[i - 1];
-        if opens && (after == "with" || after == "recursive" || after.ends_with(',')) {
-            out.push(words[i].trim_start_matches(',').to_owned());
+/// One `WITH` definition: its name and the byte range of its body, from the
+/// opening to the closing parenthesis.
+struct Cte {
+    name: String,
+    open: usize,
+    close: usize,
+}
+
+/// The names a `WITH` statement defines (`with a as (`, `, b as (`), with
+/// where each body starts and ends, and whether the statement is recursive.
+fn ctes(sql: &str) -> (Vec<Cte>, bool) {
+    let head = sql.trim_start();
+    let Some(rest) = head.strip_prefix("with ") else {
+        return (Vec::new(), false);
+    };
+    let recursive = rest.trim_start().starts_with("recursive ");
+    let mut words = Vec::new();
+    let mut start = None;
+    for (i, c) in sql.char_indices() {
+        match (c.is_whitespace(), start) {
+            (true, Some(s)) => {
+                words.push((s, &sql[s..i]));
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
         }
     }
-    out
+    if let Some(s) = start {
+        words.push((s, &sql[s..]));
+    }
+    let mut out = Vec::new();
+    for i in 1..words.len().saturating_sub(2) {
+        let opens = words[i + 1].1 == "as" && words[i + 2].1.starts_with('(');
+        let after = words[i - 1].1;
+        if !(opens && (after == "with" || after == "recursive" || after.ends_with(','))) {
+            continue;
+        }
+        let open = words[i + 2].0;
+        let mut depth = 0usize;
+        let mut close = sql.len();
+        for (j, b) in sql.bytes().enumerate().skip(open) {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = j;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let name = words[i].1.trim_start_matches(',').to_owned();
+        out.push(Cte { name, open, close });
+    }
+    (out, recursive)
+}
+
+/// Whether the reference at `at` to `table` names a `WITH` definition that is
+/// in scope there: after its body, or anywhere inside it for a recursive
+/// statement. Inside a non-recursive body the name is still the real table.
+fn is_cte_ref(ctes: &(Vec<Cte>, bool), table: &str, at: usize) -> bool {
+    let (defs, recursive) = ctes;
+    defs.iter()
+        .any(|c| c.name == table && (at > c.close || (*recursive && at > c.open)))
 }
 
 /// The violations in one SQL literal (lower-cased).
 fn violations(sql: &str) -> Vec<String> {
-    let ctes = cte_names(sql);
+    let ctes = ctes(sql);
     let mut out = Vec::new();
     for r in table_refs(sql) {
-        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) || ctes.contains(&r.table) {
+        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) || is_cte_ref(&ctes, &r.table, r.at)
+        {
             continue;
         }
         let ok = if r.keyword == "INTO" {
@@ -225,6 +277,11 @@ fn the_tenant_rule_catches_unscoped_shapes() {
             "with c as (select id from note where id = $2), d as (select id from c) \
              select id from d"
         ),
+        ["FROM note"]
+    );
+    // Inside its own non-recursive body, a WITH name is still the real table.
+    assert_eq!(
+        violations("with note as (select id from note n) select id from note"),
         ["FROM note"]
     );
     // A table that shares no name with a WITH clause is still checked.
