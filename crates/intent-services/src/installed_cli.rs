@@ -130,8 +130,19 @@ impl InstalledContext {
         let Some(profile) = profile else {
             return self;
         };
-        profile.apply_to_map(&mut self.env);
         let cli = self.runtime.cli();
+        // A Codex API key profile signs in in its own home (resolved against
+        // this host's home, as a node does for a remote launch).
+        let profile = if cli == InstalledCli::Codex {
+            Arc::new(
+                (*profile)
+                    .clone()
+                    .with_codex_api_key_home(self.home().as_deref()),
+            )
+        } else {
+            profile
+        };
+        profile.apply_to_map(&mut self.env);
         // A profile that selects its own Codex home also selects the custom
         // credential names that home's config declares, so the isolated model
         // probe, fingerprint and redaction use the same names as runs. Bounded
@@ -167,6 +178,14 @@ impl InstalledContext {
         self.context_key = None;
         self.profile = Some(profile);
         self
+    }
+
+    /// Whether the applied profile is a Codex API key profile, which the
+    /// adapter signs in with the key at launch.
+    pub fn signs_in_with_codex_api_key(&self) -> bool {
+        self.profile
+            .as_ref()
+            .is_some_and(|p| p.signs_in_with_codex_api_key())
     }
 
     /// The applied profile, if any.

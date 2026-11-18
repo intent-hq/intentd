@@ -28,6 +28,12 @@ use serde_json::{json, Map, Value};
 /// ones (keys compared ignoring ASCII case).
 pub const ACCOUNT_DIR_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
 
+/// What the Codex ACP adapter runs when its Codex home has no login: its
+/// `api-key` method, which reads `CODEX_API_KEY` from the launch environment.
+/// Codex itself ignores a key that is only in the environment.
+pub const CODEX_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
+const DEFAULT_AUTH_REQUEST: &str = "DEFAULT_AUTH_REQUEST";
+
 fn is_account_dir_key(key: &str) -> bool {
     ACCOUNT_DIR_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key))
 }
@@ -140,9 +146,92 @@ impl ProfileEnv {
     pub fn secret_values(&self) -> Vec<String> {
         self.entries
             .iter()
+            .filter(|(k, _)| k != DEFAULT_AUTH_REQUEST)
             .filter_map(|(_, v)| v.clone())
             .filter(|v| !v.is_empty())
             .collect()
+    }
+
+    /// A Codex profile that sets a non-empty `CODEX_API_KEY` and no
+    /// `CODEX_HOME`, resolved where the provider runs (`home` is that host's
+    /// home): the overlay gains `CODEX_HOME=<home>/.intent/codex-api-key/
+    /// <profile id>-<key digest>` (created) and `DEFAULT_AUTH_REQUEST`, so
+    /// the adapter signs that home in with the key and never touches the
+    /// user's `~/.codex` login. A changed key gets a new home, so a stale
+    /// login never wins. Launch-only: never saved. Any other profile, or no
+    /// home, is returned unchanged.
+    #[must_use]
+    pub fn with_codex_api_key_home(mut self, home: Option<&Path>) -> Self {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        let (Some(home), Some(key)) = (home, self.codex_api_key()) else {
+            return self;
+        };
+        if self.controls_ignoring_case("CODEX_HOME") || self.signs_in_with_codex_api_key() {
+            return self;
+        }
+        let digest = Sha256::digest(key.as_bytes()).iter().take(8).fold(
+            String::with_capacity(16),
+            |mut hex, b| {
+                let _ = write!(hex, "{b:02x}");
+                hex
+            },
+        );
+        let id = self
+            .provider_ref
+            .split_once('@')
+            .map_or(self.provider_ref.as_str(), |(_, id)| id)
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        let codex_home = home
+            .join(".intent")
+            .join("codex-api-key")
+            .join(format!("{id}-{digest}"));
+        if let Err(e) = create_private_dir(&codex_home) {
+            tracing::warn!("could not create the Codex home of an API key profile: {e}");
+        }
+        self.entries.push((
+            "CODEX_HOME".to_owned(),
+            Some(codex_home.to_string_lossy().into_owned()),
+        ));
+        self.entries.push((
+            DEFAULT_AUTH_REQUEST.to_owned(),
+            Some(CODEX_API_KEY_AUTH_REQUEST.to_owned()),
+        ));
+        self
+    }
+
+    /// Whether [`Self::with_codex_api_key_home`] applied: the adapter signs
+    /// this profile in with its key at launch.
+    #[must_use]
+    pub fn signs_in_with_codex_api_key(&self) -> bool {
+        self.entries.iter().any(|(k, v)| {
+            k == DEFAULT_AUTH_REQUEST && v.as_deref() == Some(CODEX_API_KEY_AUTH_REQUEST)
+        })
+    }
+
+    fn codex_api_key(&self) -> Option<&str> {
+        if !self.provider_ref.starts_with("codex@") {
+            return None;
+        }
+        self.entries
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("CODEX_API_KEY"))
+            .find_map(|(_, v)| v.as_deref())
+            .filter(|v| !v.is_empty())
+    }
+
+    fn controls_ignoring_case(&self, key: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(key))
     }
 
     /// Apply the overlay to a resolved environment map.
@@ -252,6 +341,16 @@ impl ProfileEnv {
     }
 }
 
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 impl std::fmt::Debug for ProfileEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProfileEnv")
@@ -267,6 +366,80 @@ impl std::fmt::Debug for ProfileEnv {
 
 #[cfg(test)]
 mod tests {
+
+    fn codex(entries: &[(&str, Option<&str>)]) -> ProfileEnv {
+        ProfileEnv::new(
+            "codex@work/1",
+            "f1",
+            entries
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.map(str::to_owned)))
+                .collect(),
+        )
+    }
+
+    fn value<'a>(profile: &'a ProfileEnv, key: &str) -> Option<&'a str> {
+        profile
+            .entries()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v)
+    }
+
+    #[test]
+    fn codex_api_key_profile_gets_a_home_per_key_and_the_api_key_sign_in() {
+        let home = tempfile::tempdir().unwrap();
+        let one = codex(&[("CODEX_API_KEY", Some("sk-one")), ("OPENAI_API_KEY", None)])
+            .with_codex_api_key_home(Some(home.path()));
+        let path = std::path::PathBuf::from(value(&one, "CODEX_HOME").unwrap());
+        assert!(path.starts_with(home.path().join(".intent/codex-api-key")));
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("work-1-"));
+        assert!(path.is_dir());
+        assert_eq!(
+            value(&one, "DEFAULT_AUTH_REQUEST"),
+            Some(CODEX_API_KEY_AUTH_REQUEST)
+        );
+        assert!(one.signs_in_with_codex_api_key());
+        assert!(!one
+            .secret_values()
+            .contains(&CODEX_API_KEY_AUTH_REQUEST.to_owned()));
+        let again =
+            codex(&[("CODEX_API_KEY", Some("sk-one"))]).with_codex_api_key_home(Some(home.path()));
+        assert_eq!(value(&again, "CODEX_HOME"), value(&one, "CODEX_HOME"));
+        let two =
+            codex(&[("CODEX_API_KEY", Some("sk-two"))]).with_codex_api_key_home(Some(home.path()));
+        assert_ne!(value(&two, "CODEX_HOME"), value(&one, "CODEX_HOME"));
+        // Applying it twice changes nothing.
+        let twice = one.clone().with_codex_api_key_home(Some(home.path()));
+        assert_eq!(twice.entries().count(), one.entries().count());
+    }
+
+    #[test]
+    fn other_profiles_are_left_as_saved() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = ProfileEnv::new(
+            "claude-code@p",
+            "f1",
+            vec![("CODEX_API_KEY".into(), Some("sk".into()))],
+        );
+        for profile in [
+            claude,
+            codex(&[("CODEX_ACCESS_TOKEN", Some("a.b.c"))]),
+            codex(&[("CODEX_API_KEY", Some(""))]),
+            codex(&[("CODEX_API_KEY", Some("sk")), ("CODEX_HOME", Some("/x"))]),
+        ] {
+            let before = profile.entries().count();
+            let after = profile.clone().with_codex_api_key_home(Some(home.path()));
+            assert_eq!(after.entries().count(), before);
+            assert!(!after.signs_in_with_codex_api_key());
+        }
+        assert!(!home.path().join(".intent").exists());
+    }
+
     use super::*;
 
     fn sample() -> ProfileEnv {

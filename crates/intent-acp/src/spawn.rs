@@ -2177,6 +2177,28 @@ mod captured_env_tests {
     }
 
     #[test]
+    fn codex_api_key_home_beats_a_captured_login_shell_codex_home() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let profile = work_profile(vec![("CODEX_API_KEY".into(), Some("sk-work".into()))])
+            .with_codex_api_key_home(Some(home.path()));
+        let mut opts = SpawnOptions::new(provider);
+        opts.profile_env = Some(&profile);
+        let captured = BTreeMap::from([("CODEX_HOME".to_string(), "/personal/.codex".to_string())]);
+        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
+        let codex_home = env_value(&cmd, "CODEX_HOME").unwrap();
+        assert!(
+            std::path::Path::new(&codex_home)
+                .starts_with(home.path().join(".intent/codex-api-key")),
+            "{codex_home}"
+        );
+        assert_eq!(
+            env_value(&cmd, "DEFAULT_AUTH_REQUEST").as_deref(),
+            Some(crate::profile_env::CODEX_API_KEY_AUTH_REQUEST)
+        );
+    }
+
+    #[test]
     fn profile_unset_removes_captured_and_inherited_credentials() {
         let provider = intent_providers::find_provider("auggie").unwrap();
         let captured_name = absent_var_name();
