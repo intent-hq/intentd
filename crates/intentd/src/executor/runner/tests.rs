@@ -10,6 +10,8 @@ use super::*;
 use crate::executor::storage::Storage;
 
 mod forge;
+#[cfg(unix)]
+mod profile_parity;
 mod shared;
 
 const PROVIDER: &str = "mock";
