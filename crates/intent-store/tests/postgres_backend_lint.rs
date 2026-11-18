@@ -112,6 +112,101 @@ const NON_TENANT_TABLES: &[(&str, &str)] = &[(
     "applied-migration ledger written by postgres::migrate, one per schema",
 )];
 
+/// Which bytes of `sql` are SQL code rather than quoted text or comments:
+/// single-quoted strings (`''` escapes), `E'..'` strings (backslash escapes),
+/// dollar-quoted strings (`$tag$..$tag$`), double-quoted identifiers, `--`
+/// comments and nested `/* */` comments.
+fn code_mask(sql: &str) -> Vec<bool> {
+    let b = sql.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut code = vec![true; b.len()];
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        match b[i] {
+            b'\'' => {
+                let escapes =
+                    i > 0 && (b[i - 1] == b'e' || b[i - 1] == b'E') && (i < 2 || !ident(b[i - 2]));
+                i += 1;
+                while i < b.len() {
+                    if escapes && b[i] == b'\\' {
+                        i += 2;
+                    } else if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'"' {
+                        if b.get(i + 1) == Some(&b'"') {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut nest = 0usize;
+                while i < b.len() {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        nest += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        nest -= 1;
+                        i += 2;
+                        if nest == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'$' if (i == 0 || !ident(b[i - 1]))
+                && b.get(i + 1)
+                    .is_some_and(|&c| c == b'$' || c.is_ascii_alphabetic() || c == b'_') =>
+            {
+                let tag_end = sql[i + 1..].find('$').map(|e| i + 1 + e);
+                match tag_end {
+                    Some(e) if b[i + 1..e].iter().all(|&c| ident(c)) => {
+                        let tag = &sql[i..=e];
+                        i = sql[e + 1..]
+                            .find(tag)
+                            .map_or(b.len(), |k| e + 1 + k + tag.len());
+                    }
+                    _ => i += 1,
+                }
+            }
+            _ => i += 1,
+        }
+        // A quoted region or comment spans at least two bytes.
+        if i > start + 1 {
+            code[start..i.min(b.len())]
+                .iter_mut()
+                .for_each(|c| *c = false);
+        }
+    }
+    code
+}
+
 /// One `WITH` definition: its name and the byte range of its body, from the
 /// opening to the closing parenthesis.
 struct Cte {
@@ -143,6 +238,7 @@ fn ctes(sql: &str) -> (Vec<Cte>, bool) {
     if let Some(s) = start {
         words.push((s, &sql[s..]));
     }
+    let code = code_mask(sql);
     let mut out = Vec::new();
     for i in 1..words.len().saturating_sub(2) {
         let opens = words[i + 1].1 == "as" && words[i + 2].1.starts_with('(');
@@ -151,20 +247,13 @@ fn ctes(sql: &str) -> (Vec<Cte>, bool) {
             continue;
         }
         let open = words[i + 2].0;
-        // Parentheses inside quoted text or a `--` comment do not count.
-        let bytes = sql.as_bytes();
+        // Only parentheses in SQL code count, not in strings or comments.
         let (mut depth, mut close) = (0usize, sql.len());
-        let (mut in_string, mut in_comment) = (false, false);
-        for (j, &b) in bytes.iter().enumerate().skip(open) {
-            if in_comment {
-                in_comment = b != b'\n';
-            } else if b == b'\'' {
-                in_string = !in_string;
-            } else if in_string {
-                // Quoted text: no comment or parenthesis starts here.
-            } else if b == b'-' && bytes.get(j + 1) == Some(&b'-') {
-                in_comment = true;
-            } else if b == b'(' {
+        for (j, &b) in sql.as_bytes().iter().enumerate().skip(open) {
+            if !code[j] {
+                continue;
+            }
+            if b == b'(' {
                 depth += 1;
             } else if b == b')' {
                 depth -= 1;
@@ -297,6 +386,16 @@ fn the_tenant_rule_catches_unscoped_shapes() {
         violations("with note as (select ')' as marker, id from note n) select id from note"),
         ["FROM note"]
     );
+    // Comments, dollar quotes, E-strings and quoted names hide parentheses too.
+    for sql in [
+        "with note as (select /* ) */ id from note n) select id from note",
+        "with note as (select /* a /* ) */ b */ id from note n) select id from note",
+        "with note as (select $q$)$q$ as m, id from note n) select id from note",
+        "with note as (select E'\\')' as m, id from note n) select id from note",
+        "with note as (select id as \")\" from note n) select id from note",
+    ] {
+        assert_eq!(violations(sql), ["FROM note"], "{sql}");
+    }
     // A table that shares no name with a WITH clause is still checked.
     assert!(!violations("with c as (select 1) select id from note").is_empty());
 }
