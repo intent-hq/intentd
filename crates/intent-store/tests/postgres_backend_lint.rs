@@ -112,12 +112,34 @@ const NON_TENANT_TABLES: &[(&str, &str)] = &[(
     "applied-migration ledger written by postgres::migrate, one per schema",
 )];
 
+/// Every table the Postgres migrations create.
+fn schema_tables() -> BTreeSet<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/migrations");
+    let mut out = BTreeSet::new();
+    for entry in std::fs::read_dir(&dir).expect("read postgres/migrations") {
+        let sql = std::fs::read_to_string(entry.unwrap().path())
+            .unwrap()
+            .to_lowercase();
+        for (at, _) in sql.match_indices("create table ") {
+            let rest = sql[at + "create table ".len()..].trim_start();
+            let rest = rest.strip_prefix("if not exists ").unwrap_or(rest);
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            out.insert(name);
+        }
+    }
+    out
+}
+
 /// The names a marker comment declares as a query's own `WITH` subqueries:
 /// `// tenant-lint: not-tables a b — <reason>`, on one of the three lines
 /// above the literal's first line (`line` is 1-based). The tenant rule
 /// skips those names in that query only, and each must be defined there
-/// (`a as (`), so a stale marker cannot hide a table. Every real table in
-/// the query is still checked.
+/// (`a as (`) and must not be a real table, so a marker cannot hide one.
+/// Every real table in the query is still checked.
+#[track_caller]
 fn declared_subqueries(text: &str, line: usize, sql: &str) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
     for k in 1..=3 {
@@ -138,7 +160,12 @@ fn declared_subqueries(text: &str, line: usize, sql: &str) -> Vec<String> {
             "tenant-lint marker needs a reason"
         );
         let names: Vec<String> = names.split_whitespace().map(str::to_lowercase).collect();
+        let tables = schema_tables();
         for name in &names {
+            assert!(
+                !tables.contains(name),
+                "tenant-lint marker names the real table `{name}`; rename the subquery"
+            );
             assert!(
                 sql.contains(&format!("{name} as (")),
                 "tenant-lint marker names `{name}`, which this query does not define"
@@ -259,6 +286,18 @@ fn the_tenant_rule_catches_unscoped_shapes() {
         ["c"]
     );
     assert!(declared_subqueries("a\nb\nc\nd", 4, "select 1").is_empty());
+}
+
+#[test]
+#[should_panic(expected = "names the real table `note`")]
+fn a_marker_cannot_name_a_real_table() {
+    // A subquery named after a table would hide that table's own reads.
+    let text = "x\n// tenant-lint: not-tables note — own subquery\nlet q = f(\n\"with note...";
+    declared_subqueries(
+        text,
+        4,
+        "with note as (select id from note n) select id from note",
+    );
 }
 
 /// The functions in `text` that write without the tenant's writer lock:
