@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.243] - 2026-11-18
+
+### 🚀 Features
+
+- *(store)* Port workspace home stop, rebuild, move and archive store methods to Postgres ([#3505](https://github.com/intent-hq/intentd/pull/3505))
+- *(store)* Port repository lifecycle, authority, selection, known repo and transfer store methods to Postgres ([#3508](https://github.com/intent-hq/intentd/pull/3508))
+- *(store)* Port attachment, diff and tracked change store methods to Postgres ([#3506](https://github.com/intent-hq/intentd/pull/3506))
+- *(store)* Port subscription projections and migration status to Postgres, mark SQLite-only maintenance methods ([#3507](https://github.com/intent-hq/intentd/pull/3507))
+
+### 🐛 Bug Fixes
+
+- *(services)* Start unsloth from its studio dir and surface the root cause ([#3499](https://github.com/intent-hq/intentd/pull/3499))
+
+### 📚 Documentation
+
+- *(guide)* Move the machine rail out of Labs and note tool activity collapse default ([#3501](https://github.com/intent-hq/intentd/pull/3501))
+
+
 ## [0.11.242] - 2026-11-18
 
 ### 🚀 Features
