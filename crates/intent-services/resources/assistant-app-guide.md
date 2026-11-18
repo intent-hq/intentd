@@ -434,7 +434,12 @@ with its saved login, on disk. **API key** saves an Anthropic key (optionally a 
 endpoint); **Token** saves a `claude setup-token` token, or a Codex access token
 (ChatGPT Business or Enterprise only). After **Create**, Intent runs a test prompt and
 shows **Key works** or **Key was rejected**. These kinds also unset inherited
-credentials that would otherwise win. **Advanced** is the raw editor: a name and
+credentials that would otherwise win. Pending frontend release (not in current builds):
+**API key** is also offered for Codex and saves an OpenAI API key (OpenAI Platform → API
+keys); Intent signs Codex in with it in a folder of its own on the machine that runs the
+agent (`~/.intent/codex-api-key/`), so the user's own Codex login is never changed. On an
+orchestrator, **API key** and **Token** check only the key's format before **Create**,
+because an orchestrator runs no test prompt. **Advanced** is the raw editor: a name and
 environment variables (literal values, **Empty value**, or **Unset**; no shell
 expansion). Use `CODEX_HOME` or `CLAUDE_CONFIG_DIR` to choose an account folder; there
 only, a leading `~` or `~/` means the provider host user's home folder (`~user` stays
@@ -590,8 +595,14 @@ orchestrator checks only git (no Node.js), shows each provider card as **Runs on
 machines** with no install or sign-in step, and keeps **Let's go** disabled with a link to
 **Settings → Machines** while its machine list is empty (an orchestrator shows **Settings → Machines**
 and reads that list without the Labs **Remote agents** switch; if the list can't be read,
-onboarding does not block).
-<!-- Sources: packages/cloudlands-fe/src/features/onboarding/{steps/OnboardingAgentMachinesNotice.svelte,utils/onboarding-agent-machines.ts,utils/resolve-onboarding-model.ts,messages/ProviderCard.svelte}; packages/cloudlands-fe/src/store/renderer/slices/host-requirements/host-requirements-selectors.ts. -->
+onboarding does not block). Also pending: on an orchestrator, onboarding and **Settings →
+Providers** offer only Claude Code and Codex (another provider stays listed while it is
+turned on), and onboarding has five steps: after the provider, **Connect <provider>** asks
+for **Subscription token** (`claude setup-token`) or **API key** for Claude Code, or
+**ChatGPT access token** or **API key** for Codex. **Continue** is enabled once the pasted
+value has the right format; it saves a profile and makes it the provider's default. The
+orchestrator keeps it and sends it to a machine only when an agent starts there.
+<!-- Sources: packages/cloudlands-fe/src/features/onboarding/{steps/OnboardingAgentMachinesNotice.svelte,steps/OnboardingConnectStep.svelte,utils/onboarding-agent-machines.ts,utils/onboarding-steps.ts,utils/resolve-onboarding-model.ts,messages/ProviderCard.svelte}; packages/cloudlands-fe/src/lib/components/settings/ProviderSelector.svelte; packages/cloudlands-fe/src/store/renderer/slices/host-requirements/host-requirements-selectors.ts. -->
 Switching a machine to orchestrator removes it from the backends that used
 it to run agents; pair with it again to use it as a backend. Homes are part of
 orchestrator mode: on an orchestrator a git workspace
