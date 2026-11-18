@@ -41,7 +41,7 @@ fn attachment(id: &str, ws: &str, tenant: &str, uploaded_at: &str) -> Attachment
         id: id.into(),
         workspace_id: wid(ws),
         file_name: format!("{tenant}-{id}.png"),
-        mime_type: (id.len() % 2 == 0).then(|| "image/png".into()),
+        mime_type: id.len().is_multiple_of(2).then(|| "image/png".into()),
         size: i64::try_from(tenant.len()).unwrap(),
         uploaded_at: uploaded_at.into(),
         stored_path: format!(".intent/attachments/{tenant}-{id}.png"),
@@ -49,7 +49,7 @@ fn attachment(id: &str, ws: &str, tenant: &str, uploaded_at: &str) -> Attachment
 }
 
 #[track_caller]
-fn assert_not_found<T: std::fmt::Debug>(result: intent_core::Result<T>) {
+fn assert_not_found<T: std::fmt::Debug>(result: &intent_core::Result<T>) {
     assert!(
         matches!(result, Err(Error::NotFound(_))),
         "expected NotFound, got {result:?}"
@@ -57,7 +57,7 @@ fn assert_not_found<T: std::fmt::Debug>(result: intent_core::Result<T>) {
 }
 
 parity_test!(attachments_insert_get_and_list, |store, tenant| {
-    assert_not_found(store.get_attachment("missing").await);
+    assert_not_found(&store.get_attachment("missing").await);
     assert!(store
         .list_attachments(&wid("ws-empty"))
         .await
@@ -148,7 +148,7 @@ parity_test!(
             matches!(refused, Err(Error::InvalidParams(_))),
             "{refused:?}"
         );
-        assert_not_found(store.get_attachment("att-k2").await);
+        assert_not_found(&store.get_attachment("att-k2").await);
 
         // The same key in another workspace is a separate binding.
         let w2 = attachment("att-w2", "ws-2", tenant, T1);

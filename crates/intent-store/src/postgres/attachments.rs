@@ -9,7 +9,7 @@ use sqlx::postgres::PgRow;
 use sqlx::Row;
 use uuid::Uuid;
 
-use super::{db, PgStore};
+use super::{db, PgStore, WriteTx};
 use crate::attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 use crate::diffs_repo::{DiffRow, NewDiff};
 use crate::tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
@@ -60,11 +60,7 @@ fn row_to_tracked_change(r: &PgRow) -> TrackedChangeRow {
     }
 }
 
-async fn insert_attachment_row(
-    tx: &mut super::WriteTx,
-    tenant: &str,
-    a: &AttachmentRecord,
-) -> Result<()> {
+async fn insert_attachment_row(tx: &mut WriteTx, tenant: &str, a: &AttachmentRecord) -> Result<()> {
     sqlx::query(
         "INSERT INTO attachments \
          (tenant_id, id, workspace_id, file_name, mime_type, size, uploaded_at, stored_path) \
