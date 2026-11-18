@@ -207,6 +207,20 @@ fn code_mask(sql: &str) -> Vec<bool> {
     code
 }
 
+/// `sql` with every quoted string and comment replaced by spaces of the same
+/// length, so nothing inside them can look like SQL to the checks below and
+/// byte offsets stay the same.
+fn blank_noncode(sql: &str) -> String {
+    let code = code_mask(sql);
+    let bytes: Vec<u8> = sql
+        .bytes()
+        .zip(code)
+        .map(|(b, is_code)| if is_code { b } else { b' ' })
+        .collect();
+    // Whole quoted regions are blanked, so the code bytes left stay valid UTF-8.
+    String::from_utf8(bytes).unwrap_or_else(|_| sql.to_owned())
+}
+
 /// One `WITH` definition: its name and the byte range of its body, from the
 /// opening to the closing parenthesis.
 struct Cte {
@@ -238,7 +252,6 @@ fn ctes(sql: &str) -> (Vec<Cte>, bool) {
     if let Some(s) = start {
         words.push((s, &sql[s..]));
     }
-    let code = code_mask(sql);
     let mut out = Vec::new();
     for i in 1..words.len().saturating_sub(2) {
         let opens = words[i + 1].1 == "as" && words[i + 2].1.starts_with('(');
@@ -247,16 +260,14 @@ fn ctes(sql: &str) -> (Vec<Cte>, bool) {
             continue;
         }
         let open = words[i + 2].0;
-        // Only parentheses in SQL code count, not in strings or comments.
+        // The caller blanked strings and comments, so every parenthesis here
+        // is SQL code.
         let (mut depth, mut close) = (0usize, sql.len());
         for (j, &b) in sql.as_bytes().iter().enumerate().skip(open) {
-            if !code[j] {
-                continue;
-            }
             if b == b'(' {
                 depth += 1;
             } else if b == b')' {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     close = j;
                     break;
@@ -280,6 +291,8 @@ fn is_cte_ref(ctes: &(Vec<Cte>, bool), table: &str, at: usize) -> bool {
 
 /// The violations in one SQL literal (lower-cased).
 fn violations(sql: &str) -> Vec<String> {
+    let blanked = blank_noncode(sql);
+    let sql = blanked.as_str();
     let ctes = ctes(sql);
     let mut out = Vec::new();
     for r in table_refs(sql) {
@@ -396,6 +409,11 @@ fn the_tenant_rule_catches_unscoped_shapes() {
     ] {
         assert_eq!(violations(sql), ["FROM note"], "{sql}");
     }
+    // Quoted text cannot declare a WITH name either (this used to panic).
+    assert_eq!(
+        violations("with c as (select ', note as (' as marker) select id from note"),
+        ["FROM note"]
+    );
     // A table that shares no name with a WITH clause is still checked.
     assert!(!violations("with c as (select 1) select id from note").is_empty());
 }
