@@ -5,8 +5,8 @@
 // Usage: node vcr.mjs <version>
 //
 // Env: VERCEL_TEAM_ID (team_...), VCR_INTENT_NODE_IMAGE (vcr.vercel.com/<team>/<project>/<repo>),
-// and VERCEL_TOKEN or the job's GitHub OIDC grant (id-token: write) for a
-// Vercel OIDC policy with VCR read-write access. Without the variables, or
+// and VERCEL_TOKEN (a Vercel access token for the team), else the job's GitHub
+// OIDC grant (id-token: write) for a Vercel OIDC policy with VCR read-write access. Without the variables, or
 // while Vercel refuses the OIDC exchange (no policy yet), it warns and succeeds.
 //
 // Only the exact version tag is written, never latest/alpha/beta, and an
