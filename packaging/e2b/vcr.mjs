@@ -13,7 +13,7 @@
 // existing version tag is never moved or deleted: sandboxes pin by digest, so
 // a version already on VCR keeps its first build, which must become Ready.
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { platformDigest } from './layers.mjs';
@@ -159,7 +159,9 @@ export async function publish({
       log(`::warning::${target} already holds an earlier build of ${tag} (${expected}); GHCR now holds ${digest}. Keeping it: VCR version tags are never moved.`);
     } else if (!existing) {
       const authfile = join(authDir, 'auth.json');
-      run('skopeo', ['login', '--authfile', authfile, '--username', config.team, '--password-stdin', config.registry], { input: token });
+      // Not skopeo login: it checks the credential on /v2/, which VCR refuses
+      // (HTTP 404) for a token scoped to one project; the copy only needs the repository.
+      writeFileSync(authfile, JSON.stringify({ auths: { [config.registry]: { auth: Buffer.from(`${config.team}:${token}`).toString('base64') } } }), { mode: 0o600 });
       run('skopeo', ['copy', '--authfile', authfile, '--retry-times', '3', '--preserve-digests', `docker://${IMAGE_REPO}@${digest}`, `docker://${target}`]);
       log(`Copied ${IMAGE_REPO}@${digest} to ${target}`);
     } else {

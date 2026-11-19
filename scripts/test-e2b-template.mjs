@@ -596,7 +596,10 @@ describe('vercel registry', () => {
       logs,
       deps: {
         fetch: api.fetch,
-        run: (command, args, { input } = {}) => runs.push({ command, args, input }),
+        run: (command, args, { input } = {}) => {
+          const at = args.indexOf('--authfile');
+          runs.push({ command, args, input, auth: at >= 0 ? JSON.parse(readFileSync(args[at + 1], 'utf8')) : undefined });
+        },
         sleep: async ms => { clock += ms; },
         now: () => clock,
         log: line => logs.push(line),
@@ -671,12 +674,14 @@ describe('vercel registry', () => {
     const h = harness({ tags: [404, tagBody('preparing'), tagBody('preparing'), tagBody('ready')] });
     const result = await publish({ env: ENV, version: '0.11.250', ...h.deps });
     assert.deepEqual(result, { target: `${IMAGE}:0.11.250`, digest: AMD64, copied: true });
-    const [login, copy] = h.runs;
-    assert.deepEqual(login.args.filter(arg => !arg.startsWith('/')), ['login', '--authfile', '--username', 'team_abc', '--password-stdin', 'vcr.vercel.com']);
-    assert.equal(login.input, 'vcp_secret');
-    assert.ok(h.runs.every(run => run.command === 'skopeo' && !run.args.includes('vcp_secret')));
+    // No skopeo login: it checks the credential on /v2/, which a project-scoped
+    // token cannot read (HTTP 404); the copy only touches the repository.
+    assert.equal(h.runs.length, 1);
+    const [copy] = h.runs;
+    assert.equal(copy.command, 'skopeo');
+    assert.ok(!copy.args.some(arg => arg.includes('vcp_secret')));
+    assert.deepEqual(copy.auth, { auths: { 'vcr.vercel.com': { auth: Buffer.from('team_abc:vcp_secret').toString('base64') } } });
     assert.deepEqual(copy.args.slice(-3), ['--preserve-digests', `docker://ghcr.io/intent-hq/intent-node@${AMD64}`, `docker://${IMAGE}:0.11.250`]);
-    assert.equal(h.runs.length, 2);
     const api = h.calls.filter(call => call.url.startsWith('https://api.vercel.com/v1/'));
     assert.ok(api.every(call => call.init.headers.Authorization === 'Bearer vcp_secret'));
     assert.match(api[0].url, /projectId=intent-images&teamId=team_abc/);
