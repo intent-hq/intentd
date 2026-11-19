@@ -28,17 +28,17 @@
 //!    shipped daemon.
 //!
 //! Rules 1 and 2 find SQL by use (`support/sql_uses.rs`): the text that
-//! reaches a sqlx call, followed through locals, consts and helpers. They
-//! check it parsed by sqlparser (`support/postgres_ast.rs`), which sees CTE
-//! scope, comments, strings and parenthesized joins as Postgres does. A
-//! `format!` template is parsed with its `{CONST}` holes resolved from
-//! `const` strings in `src/` and its other holes filled with text that
-//! names no table. A statement that does not parse, or a sqlx argument the
-//! lint cannot follow, fails unless `postgres/tenant-lint-unparsed.txt`
-//! lists it with a reason.
-//!
-//! Limit: text appended at runtime (`push_str`, a `format!` argument) is
-//! checked only where it reaches a sqlx call on its own.
+//! reaches a sqlx call, followed through locals, consts, helpers and
+//! appended text. They check it parsed by sqlparser
+//! (`support/postgres_ast.rs`), which sees CTE scope, comments, strings and
+//! parenthesized joins as Postgres does. A `format!` template is checked in
+//! every combination of its holes' alternatives. A statement that does not
+//! parse, or a sqlx argument or hole the lint cannot follow, fails unless
+//! `postgres/tenant-lint-unparsed.txt` lists it with a reason. A string
+//! literal that parses as a statement but reaches no sqlx call fails too
+//! (orphan SQL), so SQL the follower misses cannot pass unseen.
+//! `TRANSFER_PREDICATES` (repositories.rs), spliced in at run time, is
+//! checked on its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -48,6 +48,7 @@ mod postgres_ast;
 #[path = "support/sql_uses.rs"]
 mod sql_uses;
 use sql_uses::{rust_files, Index, Sql};
+use syn::{Expr, Lit};
 
 fn src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -81,7 +82,9 @@ fn postgres_index() -> Index {
     };
     let postgres = src().join("postgres");
     // `nul_free` expands `NUL_FREE(col)` into an expression on `col`.
-    Index::new(&read(&postgres, None), &read(&src(), Some(&postgres))).with_rewriter("nul_free")
+    Index::new(&read(&postgres, None), &read(&src(), Some(&postgres)))
+        .with_rewriter("nul_free")
+        .with_listed(unparsed_listed().keys())
 }
 
 fn unparsed_list() -> PathBuf {
@@ -91,12 +94,7 @@ fn unparsed_list() -> PathBuf {
 /// The key a source is listed under: its file name and the first 80
 /// characters of its text (or Rust expression) with whitespace collapsed.
 fn unparsed_key(file: &Path, text: &str) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!(
-        "{} | {}",
-        file.file_name().unwrap().to_string_lossy(),
-        flat.chars().take(80).collect::<String>()
-    )
+    sql_uses::list_key(file, text)
 }
 
 /// `postgres/tenant-lint-unparsed.txt`: `<file> | <prefix> — <reason>` per
@@ -124,67 +122,131 @@ fn unparsed_listed() -> BTreeMap<String, String> {
 struct Report {
     /// Statements that parse: tenant violations.
     tenant: Vec<String>,
-    /// Texts that do not parse and sqlx arguments the lint cannot follow,
-    /// not listed in `tenant-lint-unparsed.txt`.
+    /// Texts that do not parse, and sqlx arguments or holes the lint cannot
+    /// follow, not listed in `tenant-lint-unparsed.txt`.
     unparsed: Vec<String>,
-    /// Functions that run a write without the writer lock.
+    /// Sinks that run a write without the writer lock.
     unlocked: BTreeSet<String>,
+    /// `DEFERRED_WRITES` entries that excused an unlocked write.
+    deferred_used: BTreeSet<&'static str>,
+    /// Literals that parse as a statement but reach no sqlx call.
+    orphans: Vec<String>,
     /// The allowlist keys that matched.
     listed_used: BTreeSet<String>,
     parsed: usize,
 }
 
+/// `None` when `key` is listed (and marks it used), else the key.
+fn unlisted(
+    listed: &BTreeMap<String, String>,
+    used: &mut BTreeSet<String>,
+    key: String,
+) -> Option<String> {
+    if listed.contains_key(&key) {
+        used.insert(key);
+        None
+    } else {
+        Some(key)
+    }
+}
+
+/// Functions that build a write and hand it, with the `WriteTx` from their
+/// `begin_write()`, to a caller that runs it on that transaction. The lint
+/// cannot see that executor, so it trusts these, with why.
+const DEFERRED_WRITES: &[(&str, &str)] = &[
+    (
+        "prepare_monitor_insert",
+        "returns PreparedPgWrite { tx, query }; PreparedPgWrite runs the query on that tx",
+    ),
+    (
+        "prepare_monitor_replace",
+        "returns PreparedPgWrite { tx, query }; PreparedPgWrite runs the query on that tx",
+    ),
+    (
+        "prepare_monitor_cancel",
+        "returns PreparedPgWrite { tx, query }; PreparedPgWrite runs the query on that tx",
+    ),
+];
+
+const LIST_IT: &str = "in postgres/tenant-lint-unparsed.txt";
+
 fn check(index: &Index, listed: &BTreeMap<String, String>) -> Report {
     let exempt = non_tenant_tables();
     let mut report = Report::default();
-    let mut seen = BTreeSet::new();
-    for u in index.uses() {
+    let mut tenant = BTreeSet::new();
+    let mut unparsed = BTreeSet::new();
+    let mut parsed = BTreeSet::new();
+    let uses = index.uses();
+    for u in &uses {
         for s in &u.sources {
-            let first = seen.insert((s.file.clone(), s.line, s.column));
-            let at = format!("{}:{}", s.file.display(), s.line);
-            let (text, parsed) = match &s.sql {
-                Sql::Text { text, .. } => (text, postgres_ast::parse_pieces(&s.sql.pieces())),
-                Sql::Unresolved(expr) => (expr, Err(String::new())),
-            };
-            let stmts = match parsed {
-                Ok(stmts) => stmts,
-                Err(e) => {
-                    let key = unparsed_key(&s.file, text);
-                    if listed.contains_key(&key) {
-                        report.listed_used.insert(key);
-                    } else if first {
-                        let why = match &s.sql {
-                            Sql::Text { .. } => format!("does not parse ({e})"),
-                            Sql::Unresolved(_) => {
-                                format!("runs SQL the lint cannot follow (`{text}`)")
-                            }
-                        };
-                        report.unparsed.push(format!(
-                            "{at}: {why}; fix it or list `{key} — <reason>` \
-                             in postgres/tenant-lint-unparsed.txt"
+            let at = format!("{}:{}", s.file.display(), s.start.line);
+            for exp in s.expansions() {
+                let mut blocked = false;
+                for (file, line, expr) in &exp.unresolved {
+                    let key = unparsed_key(file, expr);
+                    if let Some(key) = unlisted(listed, &mut report.listed_used, key) {
+                        blocked = true;
+                        unparsed.insert(format!(
+                            "{}:{line}: runs SQL the lint cannot follow (`{expr}`); \
+                             fix it or list `{key} — <reason>` {LIST_IT}",
+                            file.display()
                         ));
                     }
+                }
+                if blocked {
                     continue;
                 }
-            };
-            if first {
-                report.parsed += 1;
-                for v in postgres_ast::violations(&stmts, &exempt) {
-                    report
-                        .tenant
-                        .push(format!("{at}: {v} is not filtered by tenant_id = $n"));
+                match postgres_ast::parse_pieces(&exp.pieces) {
+                    Ok(stmts) => {
+                        parsed.insert((s.file.clone(), s.start));
+                        for v in postgres_ast::violations(&stmts, &exempt) {
+                            tenant.insert(format!("{at}: {v} is not filtered by tenant_id = $n"));
+                        }
+                        let writes = postgres_ast::written_tables(&stmts)
+                            .into_iter()
+                            .any(|t| !exempt.contains(&t.as_str()));
+                        let deferred = DEFERRED_WRITES.iter().find(|(f, _)| *f == u.function);
+                        if let (true, Some((f, _)), Some(_)) = (writes, deferred, &u.lock_problem) {
+                            report.deferred_used.insert(f);
+                        }
+                        if let (true, None, Some(why)) = (writes, deferred, &u.lock_problem) {
+                            report.unlocked.insert(format!(
+                                "{}:{}: {} ({why})",
+                                u.file.display(),
+                                u.line,
+                                u.function
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        let key = unparsed_key(&s.file, s.text());
+                        if let Some(key) = unlisted(listed, &mut report.listed_used, key) {
+                            unparsed.insert(format!(
+                                "{at}: does not parse ({e}); fix it or list \
+                                 `{key} — <reason>` {LIST_IT}"
+                            ));
+                        }
+                    }
                 }
-            }
-            let writes = postgres_ast::written_tables(&stmts)
-                .into_iter()
-                .any(|t| !exempt.contains(&t.as_str()));
-            if writes && !u.locked {
-                report
-                    .unlocked
-                    .insert(format!("{}: {}", u.file.display(), u.function));
             }
         }
     }
+    for (file, line, value) in index.unreached_literals(&uses) {
+        if !postgres_ast::is_statement(&value) {
+            continue;
+        }
+        let key = unparsed_key(&file, &value);
+        if let Some(key) = unlisted(listed, &mut report.listed_used, key) {
+            report.orphans.push(format!(
+                "{}:{line}: SQL that no sqlx call runs; run it through sqlx, remove it, \
+                 or list `{key} — <reason>` {LIST_IT}",
+                file.display()
+            ));
+        }
+    }
+    report.tenant = tenant.into_iter().collect();
+    report.unparsed = unparsed.into_iter().collect();
+    report.parsed = parsed.len();
     report
 }
 
@@ -194,6 +256,7 @@ fn every_postgres_statement_parses_and_is_filtered_by_the_bound_tenant() {
     let report = check(&postgres_index(), &listed);
     let mut findings = report.tenant;
     findings.extend(report.unparsed);
+    findings.extend(report.orphans);
     for key in listed.keys().filter(|k| !report.listed_used.contains(*k)) {
         findings.push(format!(
             "postgres/tenant-lint-unparsed.txt: `{key}` matches no unparsed statement; remove it"
@@ -210,9 +273,15 @@ fn every_postgres_statement_parses_and_is_filtered_by_the_bound_tenant() {
 #[test]
 fn every_postgres_write_takes_the_tenant_writer_lock() {
     let report = check(&postgres_index(), &unparsed_listed());
+    for (f, _) in DEFERRED_WRITES {
+        assert!(
+            report.deferred_used.contains(f),
+            "DEFERRED_WRITES names {f}, which runs no unlocked write; remove it"
+        );
+    }
     assert!(
         report.unlocked.is_empty(),
-        "these Postgres functions write without begin_write() or a WriteTx:\n{}",
+        "these Postgres writes do not run on the tenant's WriteTx:\n{}",
         report.unlocked.into_iter().collect::<Vec<_>>().join("\n")
     );
 }
@@ -528,10 +597,18 @@ fn templates_parse_with_consts_and_fillers() {
     assert!(parse_template("delete note failed: {e}", &none).is_err());
 }
 
+/// [`check`] on in-memory source files.
+fn check_files(files: &[(&str, &str)]) -> Report {
+    let files: Vec<(PathBuf, String)> = files
+        .iter()
+        .map(|(p, s)| (PathBuf::from(p), (*s).to_owned()))
+        .collect();
+    check(&Index::new(&files, &[]), &BTreeMap::new())
+}
+
 /// [`check`] on one in-memory source file named `x.rs`.
 fn check_source(source: &str) -> Report {
-    let index = Index::new(&[(PathBuf::from("x.rs"), source.to_owned())], &[]);
-    check(&index, &BTreeMap::new())
+    check_files(&[("x.rs", source)])
 }
 
 /// The texts (or unresolved expressions) that reach a sqlx call in `source`.
@@ -545,6 +622,15 @@ fn texts_by_use(source: &str) -> BTreeSet<String> {
             Sql::Text { text, .. } => text,
             Sql::Unresolved(expr) => format!("UNRESOLVED {expr}"),
         })
+        .collect()
+}
+
+/// The tenant findings without their `file:line: ` prefix.
+fn tenant_findings(report: &Report) -> Vec<&str> {
+    report
+        .tenant
+        .iter()
+        .map(|f| f.split(": ").nth(1).unwrap_or(f))
         .collect()
 }
 
@@ -616,13 +702,15 @@ fn sql_is_found_where_sqlx_runs_it() {
     .into_iter()
     .map(str::to_owned)
     .collect();
-    // Unused SQL-looking strings (UNUSED, error text) are not statements.
     assert_eq!(texts_by_use(source), want);
     let report = check_source(source);
     assert_eq!(report.tenant, Vec::<String>::new());
-    assert_eq!(report.parsed, 10);
     assert_eq!(report.unparsed.len(), 1, "{:?}", report.unparsed);
-    assert!(report.unparsed[0].contains("cannot follow"));
+    assert_eq!(report.parsed, 10, "{:?}", report.unparsed);
+    assert!(report.unparsed[0].contains("cannot follow (`self . sql`)"));
+    // The unused statement is orphan SQL; error text is not SQL at all.
+    assert_eq!(report.orphans.len(), 1, "{:?}", report.orphans);
+    assert!(report.orphans[0].starts_with("x.rs:4: "));
 }
 
 #[test]
@@ -640,18 +728,12 @@ fn sql_that_does_not_parse_or_scope_is_reported() {
     );
     assert_eq!(report.unparsed.len(), 2, "{:?}", report.unparsed);
     assert!(report.unparsed.iter().all(|f| f.contains("does not parse")));
-    let tenant: Vec<&str> = report
-        .tenant
-        .iter()
-        .map(|f| f.split_once(": ").unwrap().1)
-        .collect();
     assert_eq!(
-        tenant,
-        [
-            "FROM task is not filtered by tenant_id = $n",
-            "FROM task is not filtered by tenant_id = $n",
-            "FROM note is not filtered by tenant_id = $n",
-        ]
+        tenant_findings(&report),
+        ["FROM task is not filtered by tenant_id = $n"; 2]
+            .into_iter()
+            .chain(["FROM note is not filtered by tenant_id = $n"])
+            .collect::<Vec<_>>()
     );
     // A listed statement passes, and its key counts as used.
     let index = Index::new(
@@ -668,13 +750,179 @@ fn sql_that_does_not_parse_or_scope_is_reported() {
     assert!(report.listed_used.contains(&key));
 }
 
+/// Each probe hides an unscoped or unfollowable statement; the lint must
+/// report it, not pass it.
+#[test]
+fn the_lint_fails_closed_on_every_probe() {
+    let unscoped = |source: &str, want: &str| {
+        let report = check_source(source);
+        assert_eq!(
+            tenant_findings(&report),
+            [format!("{want} is not filtered by tenant_id = $n").as_str()],
+            "{source}\n{:?}",
+            report.unparsed
+        );
+    };
+    let unfollowed = |source: &str, expr: &str| {
+        let report = check_source(source);
+        assert!(
+            report
+                .unparsed
+                .iter()
+                .any(|f| f.contains("cannot follow (`") && f.contains(expr)),
+            "{source}\n{:?}",
+            report.unparsed
+        );
+    };
+    // Executor methods given the statement, in method and path form.
+    unscoped(
+        r#"async fn f(mut tx: WriteTx) { (&mut *tx).execute("DELETE FROM note WHERE id = $1").await; }"#,
+        "FROM note",
+    );
+    unscoped(
+        r#"async fn f(mut tx: WriteTx) { tx.fetch_all("SELECT id FROM note").await; }"#,
+        "FROM note",
+    );
+    unscoped(
+        r#"async fn f(mut tx: WriteTx) { sqlx::Executor::execute(&mut *tx, "DELETE FROM task").await; }"#,
+        "FROM task",
+    );
+    // Every alternative of a hole is checked.
+    unscoped(
+        r#"fn f(flag: bool) {
+            let sub = if flag { "select id from task" } else { "select 1" };
+            sqlx::query(&format!("select id from note where tenant_id = $1 and id in ({sub})"));
+        }"#,
+        "FROM task",
+    );
+    // Appended text and builder pushes are part of the statement.
+    unscoped(
+        r#"fn f() {
+            let mut sql = String::from("select id from note where tenant_id = $1");
+            sql.push_str(" and id in (select id from task)");
+            sqlx::query(&sql);
+        }"#,
+        "FROM task",
+    );
+    unscoped(
+        r#"fn f() {
+            let mut qb = sqlx::QueryBuilder::new("select id from note where tenant_id = $1");
+            qb.push(" union select id from task");
+        }"#,
+        "FROM task",
+    );
+    unscoped(
+        r#"fn f(args: A) { sqlx::QueryBuilder::with_arguments("select id from task", args); }"#,
+        "FROM task",
+    );
+    // Aliased and bare sink names.
+    unscoped(
+        r#"use sqlx::query as q; fn f() { q("select id from task"); }"#,
+        "FROM task",
+    );
+    unscoped(r#"fn f() { query!("select id from task"); }"#, "FROM task");
+    // A qualified helper resolves in its own module.
+    let report = check_files(&[
+        (
+            "x.rs",
+            r#"fn sql() -> &'static str { "select id from note where tenant_id = $1" }
+            fn f() { sqlx::query(sql()); sqlx::query(other::sql()); }"#,
+        ),
+        (
+            "other.rs",
+            r#"pub fn sql() -> &'static str { "select id from task" }"#,
+        ),
+    ]);
+    assert_eq!(
+        tenant_findings(&report),
+        ["FROM task is not filtered by tenant_id = $n"]
+    );
+    // Holes and sinks the walk cannot follow.
+    unfollowed(
+        r#"fn f(&self) { sqlx::query(&format!("select n.id from note n {} where n.tenant_id = $1", self.join)); }"#,
+        "self . join",
+    );
+    unfollowed(
+        r#"fn f() {
+            let cols = vec!["id", "title"].join(", ");
+            sqlx::query(&format!("select {cols} from note where tenant_id = $1"));
+        }"#,
+        r#"vec ! ["id" , "title"] . join (", ")"#,
+    );
+    unfollowed(
+        r#"fn f(o: Option<&str>) {
+            let order = o.unwrap_or("id");
+            sqlx::query(&format!("select id from note where tenant_id = $1 order by {order}"));
+        }"#,
+        r#"o . unwrap_or ("id")"#,
+    );
+    unfollowed(
+        r#"async fn f(p: P) {
+            tokio::select! { r = sqlx::query("select id from task").fetch_one(&p) => {} }
+        }"#,
+        "tokio :: select !",
+    );
+    unfollowed(
+        r#"macro_rules! m { () => { sqlx::query("select id from task") }; }"#,
+        "sqlx :: query",
+    );
+    unfollowed(
+        r#"fn f() { ["select id from task where tenant_id = $1"].iter().map(sqlx::query); }"#,
+        "sqlx :: query",
+    );
+    unfollowed(
+        r#"fn f() {
+            let run = |s: &str| sqlx::query(s);
+            ["select id from task where tenant_id = $1"].iter().map(run);
+        }"#,
+        "s",
+    );
+    // An unresolved hole is listed by its expression.
+    let index = Index::new(
+        &[(
+            PathBuf::from("x.rs"),
+            r#"fn f(&self) { sqlx::query(&format!("select n.id from note n where n.tenant_id = $1 {}", self.order)); }"#
+                .to_owned(),
+        )],
+        &[],
+    );
+    let key = unparsed_key(Path::new("x.rs"), "self . order");
+    let report = check(
+        &index,
+        &BTreeMap::from([(key.clone(), "order by".to_owned())]),
+    );
+    assert!(report.unparsed.is_empty(), "{:?}", report.unparsed);
+    assert!(report.listed_used.contains(&key));
+}
+
+#[test]
+fn orphan_sql_fails_the_lint() {
+    let report = check_source(
+        r#"fn f() {
+            let reached = "DELETE FROM note WHERE tenant_id = $1";
+            sqlx::query(reached);
+            let orphan = "DELETE FROM task WHERE tenant_id = $1";
+            let prose = "delete note failed";
+        }
+        #[cfg(test)]
+        mod tests {
+            fn t() { let fixture = "DELETE FROM hook"; }
+        }"#,
+    );
+    assert_eq!(report.orphans.len(), 1, "{:?}", report.orphans);
+    assert!(report.orphans[0].starts_with("x.rs:4: "));
+}
+
 #[test]
 fn the_writer_lock_rule_catches_unlocked_writes() {
     let unlocked = |source: &str| -> Vec<String> {
         check_source(source)
             .unlocked
             .into_iter()
-            .map(|f| f.trim_start_matches("x.rs: ").to_owned())
+            .map(|f| {
+                let f = f.split(": ").nth(1).unwrap_or(&f).to_owned();
+                f.split(" (").next().unwrap_or(&f).to_owned()
+            })
             .collect()
     };
     let locked = r#"async fn a(&self) { let tx = self.begin_write().await?;
@@ -689,29 +937,115 @@ fn the_writer_lock_rule_catches_unlocked_writes() {
     let bound = r#"async fn e(self) { let mut tx: WriteTx = self.tx;
         sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
     let borrowed = r#"async fn g(tx: &mut WriteTx) {
-        sqlx::query("INSERT INTO t (tenant_id) VALUES ($1)"); }"#;
+        sqlx::query("INSERT INTO t (tenant_id) VALUES ($1)").execute(&mut **tx); }"#;
     let shared = r#"async fn h(tx: &WriteTx) {
         sqlx::query("INSERT INTO t (tenant_id) VALUES ($1)"); }"#;
     let mentioned = r#"async fn f(&self) { // not a WriteTx
         sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
-    // A data-modifying CTE writes; so does SQL a helper runs for a caller.
+    // A data-modifying CTE writes.
     let cte = r#"async fn i(&self) { sqlx::query("WITH d AS (DELETE FROM t \
         WHERE tenant_id = $1 RETURNING id) SELECT id FROM d"); }"#;
-    let helper = r#"async fn j(&self) { let tx = self.begin_write().await?;
+    // A helper's executor counts when every caller passes the WriteTx.
+    let helper = r#"async fn j(&self) { let mut tx = self.begin_write().await?;
         run(&mut tx, "DELETE FROM t WHERE tenant_id = $1").await; }
-        async fn run(conn: &mut PgConnection, sql: &str) { sqlx::query(sql); }"#;
+        async fn run(conn: &mut PgConnection, sql: &str) { sqlx::query(sql).execute(conn).await; }"#;
+    let helper_unlocked = format!(
+        "{helper}\nasync fn k(&self) {{ let mut c = self.pool.acquire().await?;
+        run(&mut c, \"DELETE FROM t WHERE tenant_id = $1\").await; }}"
+    );
     // The migration ledger has no tenant to lock.
     let ledger = r#"async fn k(&self) {
         sqlx::query("INSERT INTO intent_schema_migrations (version) VALUES ($1)"); }"#;
-    for ok in [locked, read, owned, bound, borrowed, ledger] {
+    // The lock taken after the write, a write on the pool next to a held
+    // lock, a write in a spawned task, and a lock that is not the executor.
+    let after = r#"async fn l(&self) { let q = sqlx::query("DELETE FROM t WHERE tenant_id = $1");
+        let tx = self.begin_write().await?; }"#;
+    let pool = r#"async fn m(&self) { let tx = self.begin_write().await?;
+        sqlx::query("DELETE FROM t WHERE tenant_id = $1").execute(&self.pool).await; }"#;
+    let spawned = r#"async fn n(&self) { let mut tx = self.begin_write().await?;
+        tokio::spawn(async move {
+            sqlx::query("DELETE FROM t WHERE tenant_id = $1").execute(&mut *tx).await
+        }); }"#;
+    let beside = r#"async fn del(conn: &mut PgConnection, _w: &mut WriteTx) {
+        sqlx::query("DELETE FROM t WHERE tenant_id = $1").execute(conn).await; }"#;
+    for ok in [locked, read, owned, bound, borrowed, ledger, helper] {
         assert_eq!(unlocked(ok), Vec::<String>::new(), "{ok}");
     }
     assert_eq!(unlocked(begin), ["b"]);
     assert_eq!(unlocked(shared), ["h"]);
     assert_eq!(unlocked(mentioned), ["f"]);
     assert_eq!(unlocked(cte), ["i"]);
-    assert_eq!(unlocked(helper), ["run"]);
+    assert_eq!(unlocked(&helper_unlocked), ["run"]);
+    assert_eq!(unlocked(after), ["l"]);
+    assert_eq!(unlocked(pool), ["m"]);
+    assert_eq!(unlocked(spawned), ["n"]);
+    assert_eq!(unlocked(beside), ["del"]);
     assert_eq!(unlocked(&format!("{locked}\n{read}\n{begin}")), ["b"]);
+}
+
+/// `(table, predicate)` of `TRANSFER_PREDICATES` in repositories.rs.
+fn transfer_predicates() -> Vec<(String, String)> {
+    let path = src().join("postgres/repositories.rs");
+    let file = syn::parse_file(&std::fs::read_to_string(path).expect("read")).expect("parse");
+    let mut out = Vec::new();
+    for item in &file.items {
+        let syn::Item::Const(item_const) = item else {
+            continue;
+        };
+        if item_const.ident != "TRANSFER_PREDICATES" {
+            continue;
+        }
+        let Expr::Reference(reference) = &*item_const.expr else {
+            continue;
+        };
+        let Expr::Array(array) = &*reference.expr else {
+            continue;
+        };
+        let text = |e: &Expr| match e {
+            Expr::Lit(syn::ExprLit {
+                lit: Lit::Str(value),
+                ..
+            }) => value.value(),
+            _ => String::new(),
+        };
+        for pair in &array.elems {
+            let Expr::Tuple(tuple) = pair else { continue };
+            out.push((text(&tuple.elems[0]), text(&tuple.elems[1])));
+        }
+    }
+    out
+}
+
+/// The tenant violations of a transfer read of `table` scoped by
+/// `predicate`, as `transfer_table_stats` and the snapshot build it.
+fn predicate_violations(table: &str, predicate: &str) -> Vec<String> {
+    let sql = format!("SELECT 1 FROM \"{table}\" WHERE tenant_id = $1 AND ({predicate})");
+    match postgres_ast::parse(&sql) {
+        Ok(stmts) => postgres_ast::violations(&stmts, &non_tenant_tables()),
+        Err(e) => vec![format!("does not parse: {e}")],
+    }
+}
+
+#[test]
+fn every_transfer_predicate_is_scoped() {
+    let predicates = transfer_predicates();
+    assert!(predicates.len() > 10, "found no TRANSFER_PREDICATES");
+    let findings: Vec<String> = predicates
+        .iter()
+        .flat_map(|(t, p)| {
+            predicate_violations(t, p)
+                .into_iter()
+                .map(move |v| format!("{t}: {v}"))
+        })
+        .collect();
+    assert!(findings.is_empty(), "{findings:#?}");
+    assert_eq!(
+        predicate_violations(
+            "agent_message",
+            "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = $2)"
+        ),
+        ["FROM agent_session"]
+    );
 }
 
 fn pending_dir() -> PathBuf {

@@ -3,3 +3,14 @@
 # One per line: <file> | <first 80 characters, whitespace collapsed> — <reason>
 mod.rs | stmts . iter () . enumerate () . skip (start) — runs the migration files' statements; postgres_tenant_schema_lint checks them
 repositories.rs | transfer_predicates () ? . enumerate () . map (| (i , (table , predicate)) | { l — UNION ALL of one count per table, each `WHERE tenant_id = $1 AND (<predicate>)`; the predicates come from transfer_predicates()
+agent_messages.rs | column — the preview column chosen by role just above: last_assistant_preview or last_user_preview
+events.rs | f . sql — Filters::push appends ` AND <column> <op> $n` clauses and ORDER BY/LIMIT; every fragment is a literal in this file and binds through Filters::arg
+note_search.rs | query . sql () — SearchQuery::sql renders the tsquery expression from to_tsquery($3[i]) terms; it names no table
+pr_monitors.rs | COLUMNS . split (',') . chain (TARGET_COLUMNS . split (',')) . map (str :: trim) — `<column> IS NOT DISTINCT FROM $n` for each pr_monitor column const
+repositories.rs | columns . iter () . map (| (c , _) | format ! ("\"{c}\"")) . collect :: < Vec < — quoted column names of the transfer table, read from information_schema by transfer_columns
+repositories.rs | columns . iter () . enumerate () . map (| (i , (_ , ty)) | format ! ("${}::{ty}" — `$n::<type>` placeholders for the transfer table's columns
+repositories.rs | columns . iter () . map (| (c , _) | format ! ("\"{c}\" = excluded.\"{c}\"")) . — ON CONFLICT DO UPDATE SET list over the transfer table's columns
+repositories.rs | transfer_predicates () ? — TRANSFER_PREDICATES table names and predicates; every_transfer_predicate_is_scoped checks each
+scripts.rs | placeholders . join (", ") — VALUES rows `($1, $n, ...)` of bind placeholders, one per script
+agent_messages.rs | query . sql () — SearchQuery::sql renders the tsquery expression from to_tsquery($3[i]) terms; it names no table
+repositories.rs | INSERT INTO "{table}" (tenant_id, {names}) VALUES ($1, {placeholders}){conflict} — transfer import: tenant_id leads the column list and binds $1; table names come from TRANSFER_TABLES, columns from transfer_columns

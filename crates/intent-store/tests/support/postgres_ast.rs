@@ -110,6 +110,49 @@ pub fn violations(stmts: &[Statement], exempt: &[&str]) -> Vec<String> {
     rule.out
 }
 
+/// Whether `text` is a statement (SELECT, INSERT, UPDATE, DELETE, WITH,
+/// MERGE, TRUNCATE), read as is or as a `format!` string with its holes
+/// filled.
+pub fn is_statement(text: &str) -> bool {
+    let dml = |stmts: Vec<Statement>| {
+        stmts.iter().any(|s| {
+            matches!(
+                s,
+                Statement::Query(_)
+                    | Statement::Insert(_)
+                    | Statement::Update(_)
+                    | Statement::Delete(_)
+                    | Statement::Merge(_)
+                    | Statement::Truncate(_)
+            )
+        })
+    };
+    let head = text.trim_start().to_lowercase();
+    let keyword = [
+        "select", "insert", "update", "delete", "with", "merge", "truncate",
+    ]
+    .iter()
+    .any(|k| head.trim_start_matches(['(', ' ']).starts_with(k));
+    if !keyword {
+        return false;
+    }
+    if parse(text).is_ok_and(dml) {
+        return true;
+    }
+    if !text.contains('{') {
+        return false;
+    }
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('{') {
+        pieces.push(Some(rest[..at].to_owned()));
+        pieces.push(None);
+        rest = rest[at..].find('}').map_or("", |end| &rest[at + end + 1..]);
+    }
+    pieces.push(Some(rest.to_owned()));
+    parse_pieces(&pieces).is_ok_and(dml)
+}
+
 /// The tables the statements write (INSERT, UPDATE, DELETE, also inside a
 /// data-modifying CTE), with MERGE and TRUNCATE as `merge` and `truncate`.
 /// Names are lower-cased, unqualified ones bare.
