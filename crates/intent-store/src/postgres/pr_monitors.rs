@@ -1052,7 +1052,8 @@ impl PgStore {
              FROM pr_monitor WHERE tenant_id = $1 AND agent_id = ANY($2) AND state = 'active' \
              ORDER BY created_at COLLATE \"C\", row_seq"
         );
-        let mut tx = self.begin().await?;
+        // Sessions, hooks and monitors of every chunk come from one snapshot.
+        let mut tx = self.begin_read_snapshot().await?;
         for chunk in ids.chunks(IDS_PER_STATEMENT) {
             let chunk: Vec<&str> = chunk.iter().map(|id| id.0.as_str()).collect();
             let rows = sqlx::query(sqlx::AssertSqlSafe(session_sql.as_str()))
@@ -1061,6 +1062,8 @@ impl PgStore {
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| internal("subscription agent projection failed", e))?;
+            super::read_seam::probe::between(self.tenant(), "get_subscription_agent_projections")
+                .await;
             let mut batch = HashMap::with_capacity(rows.len());
             for row in rows {
                 let session = match super::agents::map_summary(&row) {

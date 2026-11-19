@@ -3456,7 +3456,13 @@ impl PgStore {
         if session.trim().is_empty() || session.len() > 256 || session.contains('\0') {
             return Err(unavailable());
         }
-        let mut tx = self.begin().await.map_err(|_| unavailable())?;
+        // The enrollment and the private-session check come from one
+        // snapshot: an enrollment written in between must not turn "none"
+        // into "unavailable".
+        let mut tx = self
+            .begin_read_snapshot()
+            .await
+            .map_err(|_| unavailable())?;
         let row: Option<(String, i64)> = sqlx::query_as(
             "SELECT e.owner_key, e.version FROM review_context_enrollment e \
              JOIN agent_session s ON s.tenant_id = $1 AND s.id = e.agent_id \
@@ -3471,6 +3477,7 @@ impl PgStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| unavailable())?;
+        super::read_seam::probe::between(self.tenant(), "get_review_context_enrollment").await;
         let Some((key, version)) = row else {
             let private: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM review_context_private_family \

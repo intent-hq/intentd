@@ -55,25 +55,6 @@ use crate::{
     RepositoryLifecycleObserver, RepositoryPendingDeleteGuard,
 };
 
-impl PgStore {
-    /// A read-only transaction with one snapshot for all its statements.
-    async fn begin_repository_snapshot(&self) -> Result<Transaction<'static, Postgres>> {
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .await
-            .map_err(db)?;
-        if self.options.rls_guard {
-            sqlx::query("SELECT set_config('intent.tenant_id', $1, true)")
-                .bind(self.tenant())
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
-        }
-        Ok(tx)
-    }
-}
-
 // ---- repository lifecycle ----------------------------------------------------
 
 fn session_of(binding: &RepositoryInitializationBinding) -> &String {
@@ -713,7 +694,7 @@ impl PgStore {
         principal_id: &PrincipalId,
         original_token_hash: Option<&str>,
     ) -> Result<RepositoryHostAuthoritySnapshot> {
-        let mut tx = self.begin_repository_snapshot().await?;
+        let mut tx = self.begin_read_snapshot().await?;
         let snapshot = self
             .read_host_authority_snapshot(&mut tx, principal_id, original_token_hash)
             .await?;
@@ -751,7 +732,7 @@ impl PgStore {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<RepositoryWorkspaceAuthoritySnapshot> {
-        let mut tx = self.begin_repository_snapshot().await?;
+        let mut tx = self.begin_read_snapshot().await?;
         let workspace = self.workspace_authority(&mut tx, workspace_id).await?;
         let host_authorization_generation = self.host_generation(&mut tx).await?;
         tx.commit().await.map_err(authority_error)?;
@@ -768,7 +749,7 @@ impl PgStore {
         principal_id: &PrincipalId,
         original_token_hash: Option<&str>,
     ) -> Result<RepositoryAuthoritySnapshot> {
-        let mut tx = self.begin_repository_snapshot().await?;
+        let mut tx = self.begin_read_snapshot().await?;
         let snapshot = self
             .read_authority_snapshot(&mut tx, workspace_id, principal_id, original_token_hash)
             .await?;
@@ -935,7 +916,7 @@ impl PgStore {
         let domain = self.repository_lifecycle_domain()?;
         let _serial = domain.write().await?;
         let mut tx = self
-            .begin_repository_snapshot()
+            .begin_read_snapshot()
             .await
             .map_err(|_| selection::error())?;
         let snapshot = self.selection_read_at(&domain, root, &mut tx).await?;
@@ -1017,7 +998,7 @@ impl PgStore {
         }
         let mut lifecycle = domain.write().await?;
         let mut read = self
-            .begin_repository_snapshot()
+            .begin_read_snapshot()
             .await
             .map_err(|_| selection::error())?;
         let current = self
@@ -1440,7 +1421,7 @@ impl PgStore {
         Transaction<'static, Postgres>,
         Vec<(String, Vec<serde_json::Value>)>,
     )> {
-        let mut tx = self.begin_repository_snapshot().await?;
+        let mut tx = self.begin_read_snapshot().await?;
         let columns = self.transfer_columns(&mut tx).await?;
         let mut out = Vec::new();
         for (table, predicate) in transfer_predicates()? {

@@ -642,7 +642,9 @@ impl PgStore {
                  ORDER BY created_at COLLATE \"C\" DESC, id COLLATE \"C\" DESC LIMIT $6"
             )
         };
-        let mut tx = self.begin().await?;
+        // The page's keys and rows come from one snapshot, so a row archived
+        // in between cannot shorten the page.
+        let mut tx = self.begin_read_snapshot().await?;
         let mut keys: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(keys_sql))
             .bind(self.tenant())
             .bind(ws.as_str())
@@ -653,6 +655,7 @@ impl PgStore {
             .fetch_all(&mut *tx)
             .await
             .map_err(list_db)?;
+        super::read_seam::probe::between(self.tenant(), "script_summary_page").await;
         let more = keys.len() > options.limit;
         keys.truncate(options.limit);
         let ids: Vec<&str> = keys.iter().map(|(_, id)| id.as_str()).collect();

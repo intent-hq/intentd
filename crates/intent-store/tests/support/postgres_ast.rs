@@ -169,6 +169,46 @@ struct Writes {
     tables: Vec<String>,
 }
 
+/// The functions the statements call, anywhere in them (`SELECT f($1)`,
+/// `FROM f($1)`, inside a CTE or a subquery). Names are lower-cased,
+/// unqualified ones bare.
+pub fn called_functions(stmts: &[Statement]) -> Vec<String> {
+    let mut calls = Calls::default();
+    for s in stmts {
+        let _ = s.visit(&mut calls);
+    }
+    calls.names
+}
+
+#[derive(Default)]
+struct Calls {
+    names: Vec<String>,
+}
+
+impl Visitor for Calls {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if let Expr::Function(f) = e {
+            self.names.push(display_name(&f.name));
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+        match t {
+            TableFactor::Function { name, .. }
+            | TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            } => self.names.push(display_name(name)),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 impl Visitor for Writes {
     type Break = ();
 
