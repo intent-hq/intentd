@@ -1620,6 +1620,21 @@ fn run_git_os(
     run_git_os_streamed(dir, args, token, timeout, None)
 }
 
+/// `git -C <dir>` with the optional token helper. Progress parsing and error
+/// attribution read git's English text, so messages are never localized.
+fn cache_git_command(dir: &Path, token: Option<&str>) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).env("LC_ALL", "C");
+    // Offer the resolved token as an extra github.com-scoped credential
+    // helper, appended after any configured helpers (see `crate::auth`). The
+    // helper reads the secret from the environment — argv carries no token.
+    if let Some(token) = crate::auth::usable_token(token) {
+        cmd.arg("-c").arg(token_helper_config());
+        cmd.env(TOKEN_ENV, token);
+    }
+    cmd
+}
+
 /// [`run_git_os`] with an optional per-chunk output callback: when set, the
 /// child's stdout is piped alongside stderr and both streams invoke
 /// `on_chunk` once per `\r`/`\n`-delimited chunk as they arrive (git emits
@@ -1633,15 +1648,7 @@ fn run_git_os_streamed(
     timeout: Duration,
     on_chunk: Option<ProgressChunkFn>,
 ) -> Result<()> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir);
-    // Offer the resolved token as an extra github.com-scoped credential
-    // helper, appended after any configured helpers (see `crate::auth`). The
-    // helper reads the secret from the environment — argv carries no token.
-    if let Some(token) = crate::auth::usable_token(token) {
-        cmd.arg("-c").arg(token_helper_config());
-        cmd.env(TOKEN_ENV, token);
-    }
+    let mut cmd = cache_git_command(dir, token);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1860,6 +1867,18 @@ mod tests {
         add_submodule, allow_file_submodules, commit_file, commit_gitlink_bump, commit_super_index,
         init_repo, TempDir,
     };
+
+    /// Progress and error attribution parse git's English output, so a
+    /// localized git (`LANG=fr_FR` …) must not translate it.
+    #[test]
+    fn cache_git_command_forces_english_messages() {
+        let cmd = cache_git_command(Path::new("/tmp/x"), None);
+        let lc_all = cmd
+            .get_envs()
+            .find(|(k, _)| k.to_str() == Some("LC_ALL"))
+            .and_then(|(_, v)| v);
+        assert_eq!(lc_all, Some(std::ffi::OsStr::new("C")));
+    }
 
     /// Fixture superproject with one submodule at `sub/` (child committed at
     /// `c.txt` = "sub one"). Returns `(superproject, child)`.
