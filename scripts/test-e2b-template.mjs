@@ -654,6 +654,19 @@ describe('vercel registry', () => {
     assert.equal(h.runs.length, 0);
     assert.equal(h.calls.length, 0);
   });
+  it('warns and succeeds when Vercel refuses the OIDC exchange (no policy yet)', async () => {
+    const h = harness({ exchange: () => new Response('no matching policy', { status: 403 }) });
+    const env = { VERCEL_TEAM_ID: 'team_abc', VCR_INTENT_NODE_IMAGE: IMAGE, ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example/t', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'r' };
+    assert.deepEqual(await publish({ env, version: '0.11.250', ...h.deps }), { skipped: true });
+    assert.match(h.logs.join('\n'), /::warning::.*OIDC policy/);
+    assert.equal(h.runs.length, 0);
+    const transient = harness({ exchange: () => new Response('', { status: 503 }) });
+    await assert.rejects(publish({ env, version: '0.11.250', ...transient.deps }), /HTTP 503/);
+  });
+  it('fails when an explicit VERCEL_TOKEN is refused', async () => {
+    const h = harness({ tags: [401] });
+    await assert.rejects(publish({ env: ENV, version: '0.11.250', ...h.deps }), /HTTP 401/);
+  });
   it('copies the amd64 image by digest to the version tag, then waits for Ready', async () => {
     const h = harness({ tags: [404, tagBody('preparing'), tagBody('preparing'), tagBody('ready')] });
     const result = await publish({ env: ENV, version: '0.11.250', ...h.deps });

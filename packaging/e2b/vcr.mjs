@@ -6,8 +6,8 @@
 //
 // Env: VERCEL_TEAM_ID (team_...), VCR_INTENT_NODE_IMAGE (vcr.vercel.com/<team>/<project>/<repo>),
 // and VERCEL_TOKEN or the job's GitHub OIDC grant (id-token: write) for a
-// Vercel OIDC policy with VCR read-write access. Without the variables it
-// warns and succeeds.
+// Vercel OIDC policy with VCR read-write access. Without the variables, or
+// while Vercel refuses the OIDC exchange (no policy yet), it warns and succeeds.
 //
 // Only the exact version tag is written, never latest/alpha/beta, and an
 // existing version tag is never moved or deleted: sandboxes pin by digest, so
@@ -64,7 +64,8 @@ export async function vercelToken(env, team, fetch = globalThis.fetch) {
   });
   if (!response.ok) {
     const body = await response.text().catch(() => '');
-    throw new Error(redact(`Vercel OIDC token exchange failed: HTTP ${response.status} ${body}. Check the team's VCR OIDC policy matches intent-hq/intentd and grants read-write access to the project`, idToken));
+    const refused = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
+    throw Object.assign(new Error(redact(`Vercel OIDC token exchange failed: HTTP ${response.status} ${body}. Check the team's VCR OIDC policy matches intent-hq/intentd and grants read-write access to the project`, idToken)), { refused });
   }
   const { access_token: token } = await response.json();
   if (!token) throw new Error('Vercel OIDC token exchange returned no access_token');
@@ -131,7 +132,17 @@ export async function publish({
   const target = vcrTarget(config, version);
   const tag = target.slice(config.image.length + 1);
   const digest = await platformDigest(`${IMAGE_REPO}:${tag}`, fetch);
-  const { token, oidc } = await vercelToken(env, config.team, fetch);
+  // Until the team has a VCR OIDC policy, Vercel refuses the exchange: warn,
+  // like the unconfigured case. An explicit VERCEL_TOKEN that fails is fatal.
+  let auth;
+  try {
+    auth = await vercelToken(env, config.team, fetch);
+  } catch (error) {
+    if (!error.refused) throw error;
+    log(`::warning::Not copying intent-node to Vercel Container Registry: ${error.message}. See docs/RELEASING.md in intent-hq/intent.`);
+    return { skipped: true };
+  }
+  const { token, oidc } = auth;
   if (oidc) log(`::add-mask::${token}`);
   const authDir = mkdtempSync(join(tmpdir(), 'vcr-auth-'));
   try {
