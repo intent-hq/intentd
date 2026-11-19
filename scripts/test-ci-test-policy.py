@@ -178,16 +178,22 @@ CARGO_VALUE_FLAGS = {"-p", "--package", "--test", "--target", "--features", "-F"
                      "--bench", "-j", "--jobs", "--manifest-path", "--profile", "--target-dir",
                      "--message-format", "--color", "--config", "-Z", "--exclude",
                      # cargo nextest run
-                     "-E", "--filterset", "--retries", "--test-threads", "-j", "--partition",
+                     "-E", "--filterset", "--filter-expr", "--retries", "--test-threads", "--partition",
                      "--status-level", "--final-status-level", "--failure-output", "--success-output",
-                     "--no-tests", "--run-ignored", "--cargo-profile", "--build-jobs", "--tool-config-file"}
+                     "--no-tests", "--run-ignored", "--cargo-profile", "--build-jobs", "--tool-config-file",
+                     "-P", "--max-fail", "--show-progress", "--config-file", "--stress-count",
+                     "--stress-duration", "--message-format-version"}
+# nextest flags that select fewer tests than the named targets hold: an audited
+# step using one could silently run nothing the policy checks, so it is rejected.
+NARROWING_FLAGS = {"-E", "--filterset", "--filter-expr", "--partition", "--run-ignored",
+                   "--ignore-default-filter"}
 LIBTEST_VALUE_FLAGS = {"--test-threads", "--skip", "--format", "--color", "--logfile", "-Z", "--shuffle-seed"}
 
 
 def cargo_test_selection(words):
     """Parse the words after `cargo test` into the targets and names it selects."""
     selection = {"packages": [], "lib": False, "bins": [], "tests": [], "all": set(),
-                 "workspace": False, "filters": [], "exact": False, "listed": []}
+                 "workspace": False, "filters": [], "exact": False, "listed": [], "narrowing": []}
     libtest, index = False, 0
     while index < len(words):
         word = words[index]
@@ -196,6 +202,8 @@ def cargo_test_selection(words):
             libtest = True
             continue
         flag, equals, value = word.partition("=")
+        if not libtest and flag in NARROWING_FLAGS:
+            selection["narrowing"].append(flag)
         if flag in (LIBTEST_VALUE_FLAGS if libtest else CARGO_VALUE_FLAGS):
             if not equals:
                 value = words[index] if index < len(words) else ""
@@ -339,6 +347,8 @@ def step_selections(run):
 
 def selection_violations(selection, crates, root):
     errors, targets = [], []
+    for flag in selection.get("narrowing", []):
+        errors.append(f"narrows its tests with {flag}; name the targets or tests instead")
     packages = sorted(crates) if selection["workspace"] else selection["packages"]
     for package in packages:
         crate = crates.get(package)
@@ -1164,6 +1174,24 @@ class NamedTestTests(unittest.TestCase):
         (selection,) = step_selections("cargo nextest run -p intent-store --test missing_binary\n")
         self.assertIn("names no test target missing_binary in intent-store",
                       selection_violations(selection, crate_targets(ROOT), ROOT))
+        for flags in ("-P ci --max-fail 3 --show-progress none --config-file x.toml --stress-count 2",
+                      "--stress-duration 1m --message-format-version 0.1 -j 4"):
+            with self.subTest(flags=flags):
+                (selection,) = step_selections(
+                    f"cargo nextest run -p intent-store {flags} --test postgres_backend\n")
+                self.assertEqual((selection["filters"], selection["narrowing"]), ([], []))
+                self.assertEqual(selection_violations(selection, crate_targets(ROOT), ROOT), [])
+
+    def test_nextest_steps_that_narrow_their_targets_are_rejected(self):
+        base = "cargo nextest run -p intent-store --features postgres --test postgres_backend"
+        for extra, flag in (("-E 'test(/x/)'", "-E"), ("--filterset=all()", "--filterset"),
+                            ("--partition count:1/2", "--partition"), ("--run-ignored only", "--run-ignored"),
+                            ("--ignore-default-filter", "--ignore-default-filter")):
+            with self.subTest(flag=flag):
+                workflow = copy.deepcopy(self.workflow)
+                self.step(workflow, "store-postgres", "Postgres backend tests")["run"] = f"{base} {extra}"
+                self.assertIn(f"store-postgres: Postgres backend tests: narrows its tests with {flag}; "
+                              "name the targets or tests instead", named_test_violations(workflow))
 
     def test_removing_any_named_test_fails_its_step(self):
         real = target_fns

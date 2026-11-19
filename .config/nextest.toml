@@ -145,9 +145,12 @@ slow-timeout = { period = "180s", terminate-after = 3 }
 # and pr_monitors, mostly waiting for database creation) and the bounded-delete
 # tests in about 25s. A test that blocks on a lock or a pool connection (a tenant
 # name shared between two tests once did) never finishes: terminate it after
-# 2 x 60s, about 3x the slowest test, instead of the 180s default. Runs outside
-# nextest (plain `cargo test`) get no limit, so run these through
-# `make test-select FEATURES=intent-store/postgres`. Scoped to the one binary by
+# 2 x 60s, about 3x the slowest test, instead of the 180s default. Plain
+# `cargo test` has no per-test limit, so run them under nextest (as CI's
+# store-postgres job does): INTENT_STORE_TEST_PG_URL=... cargo nextest run
+# -p intent-store --features postgres --test postgres_backend (once the
+# monorepo's FEATURES knob lands: make test-select FEATURES=intent-store/postgres
+# E='binary_id(=intent-store::postgres_backend)'). Scoped to the one binary by
 # exact id: script_ops' liveness guard accepts binary-wide slow-timeout
 # overrides only for binaries outside intent-svc-runtime.
 [[profile.default.overrides]]
