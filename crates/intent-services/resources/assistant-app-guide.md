@@ -1014,12 +1014,17 @@ describe these bindings only when explicitly asked or testing this change. -->
 Use **Cmd+Alt+1–9** (**Ctrl+Alt+1–9** on Windows/Linux) to select **Home**
 or a workspace tab: **1** opens Home, **2–8** open the first seven workspace
 tabs in displayed order, and **9** opens the last workspace tab. When the device
-rail is hidden, **Cmd+1–9** (**Ctrl+1–9** on Windows/Linux) also uses this
+rail is turned off, **Cmd+1–9** (**Ctrl+1–9** on Windows/Linux) also uses this
 Home/workspace numbering. User-customized shortcuts take precedence over these
 defaults.
 
 <!-- Machine rail (desktop app only): describe when asked about the device rail.
-The rail shows the machines kept in this window. Its switch is
+The rail shows the machines kept in this window. Hiding a one-machine rail requires
+the frontend release containing intent-hq/cloudlands-fe#4777; until then the rail
+shows even with one machine. With that release, the rail shows only while the window
+holds two or more machines. With one machine the rail is hidden and the title bar shows
+the machine status menu; picking another machine there adds it to the window and
+the rail appears. The rail's switch is
 Settings → Appearance → Machine rail, starting with the desktop release that moves it
 out of Labs; until then it is Settings → Advanced → Labs → Machine rail and is a Labs
 feature. Starting with the desktop release that turns it on by default, the rail is on

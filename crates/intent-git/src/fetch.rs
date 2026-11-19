@@ -381,18 +381,12 @@ fn fetch_refspec_with_timeout(
     run_fetch(worktree_path, remote, refspec, token, timeout).map_err(FetchFailure::into_internal)
 }
 
-fn run_fetch(
-    worktree_path: &Path,
-    remote: &str,
-    refspec: &str,
-    token: Option<&str>,
-    timeout: Duration,
-) -> std::result::Result<(), FetchFailure> {
-    // `git -C <path>` so the child cwd is not this crate's cwd (parity with the
-    // reference TS handler); `GIT_TERMINAL_PROMPT=0` turns any credential prompt
-    // into a fast error rather than a hidden hang.
+/// `git -C <path>` (so the child cwd is not this crate's cwd, parity with the
+/// reference TS handler) with the optional token helper. `LC_ALL=C` keeps
+/// git's messages English for [`classify_fetch_error`].
+fn fetch_command(worktree_path: &Path, token: Option<&str>) -> Command {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(worktree_path);
+    cmd.arg("-C").arg(worktree_path).env("LC_ALL", "C");
     // Offer the resolved token as an extra credential helper scoped to
     // github.com HTTPS only, consulted *ahead* of the configured helpers
     // (which stay reachable behind it) so an OS-default helper holding a stale
@@ -408,6 +402,19 @@ fn run_fetch(
         }
         cmd.env(TOKEN_ENV, token);
     }
+    cmd
+}
+
+fn run_fetch(
+    worktree_path: &Path,
+    remote: &str,
+    refspec: &str,
+    token: Option<&str>,
+    timeout: Duration,
+) -> std::result::Result<(), FetchFailure> {
+    // `GIT_TERMINAL_PROMPT=0` turns any credential prompt into a fast error
+    // rather than a hidden hang.
+    let mut cmd = fetch_command(worktree_path, token);
     // Own process group, so a timeout kill also reaps the transport
     // (`ssh`, `git-remote-https`) instead of orphaning it.
     #[cfg(unix)]
@@ -486,6 +493,18 @@ mod tests {
     use crate::auth::token_helper_config;
     use crate::testutil::{commit_file, init_repo};
     use git2::Repository;
+
+    /// `classify_fetch_error` matches git's English text, so a localized git
+    /// (`LANG=fr_FR` …) must not translate it.
+    #[test]
+    fn fetch_command_forces_english_messages() {
+        let cmd = fetch_command(Path::new("/tmp/x"), None);
+        let lc_all = cmd
+            .get_envs()
+            .find(|(k, _)| k.to_str() == Some("LC_ALL"))
+            .and_then(|(_, v)| v);
+        assert_eq!(lc_all, Some(std::ffi::OsStr::new("C")));
+    }
 
     #[test]
     fn workspace_base_refreshes_selected_remote_without_changing_source() {
