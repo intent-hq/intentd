@@ -1300,8 +1300,9 @@ changing the filter, repository or tab also clears it.
 Right-click a repository or local folder in the Home sidebar and choose **New
 workspace** to start one there. For a GitHub repository, **Hide** removes it from the
 sidebar. For a local folder, **Delete** (app v2.338.0 and later) removes it from Intent's
-folder list (files on disk stay) and moves it to **Hidden** if it still has
-workspaces; earlier versions and collaborators see **Hide** instead. A hidden
+folder list (files on disk stay) and from the sidebar; its workspaces stay under **All
+repos**, and it returns when the folder is added again or gets a new workspace. Earlier
+versions and collaborators see **Hide** instead. A hidden
 repository's workspaces still show under **All repos**. Hidden repositories move to a
 collapsed **Hidden** section at the bottom of the sidebar; right-click one there and
 choose **Unhide** to bring it back. A hidden repository also comes back when a new
