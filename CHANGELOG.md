@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.250] - 2026-11-19
+
+### 🐛 Bug Fixes
+
+- *(clone)* Run clone and repo-cache git with English messages ([#3528](https://github.com/intent-hq/intentd/pull/3528))
+
+### 📚 Documentation
+
+- *(guide)* Describe the hidden single-machine rail ([#3532](https://github.com/intent-hq/intentd/pull/3532))
+
+### 🧪 Testing
+
+- *(store)* Find Postgres SQL by use and make the parsed tenant rule the only one ([#3527](https://github.com/intent-hq/intentd/pull/3527))
+- *(store)* Add a concurrency suite for the Postgres tenant writer lock ([#3529](https://github.com/intent-hq/intentd/pull/3529))
+
+
 ## [0.11.249] - 2026-11-19
 
 ### 🚀 Features
