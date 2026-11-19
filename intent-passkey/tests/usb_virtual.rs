@@ -210,3 +210,29 @@ async fn usb_cancel_while_waiting_for_the_pin() {
     let next = client.call("h", "hello", json!({})).await;
     assert_eq!(next["result"]["transports"]["usb"], true);
 }
+
+#[tokio::test]
+async fn usb_uses_the_key_the_user_touches() {
+    let idle = SoftKey::new("1111", 8).untouched();
+    let chosen = SoftKey::new("4321", 8);
+    let mut client = Client::start(LibWebAuthn::with_usb_devices(vec![
+        idle.device(),
+        chosen.device(),
+    ]));
+
+    client
+        .send("c", "create", create_params("usb", ORIGIN, RP_ID))
+        .await;
+    let (created, _) = run_with_pins(&mut client, "c", &["4321"]).await;
+    assert!(created["result"].is_object(), "{created}");
+    assert_eq!((idle.credential_count(), chosen.credential_count()), (0, 1));
+
+    let mut get = get_params("usb", ORIGIN, RP_ID);
+    get["allowCredentials"] = json!([{ "id": created["result"]["credentialId"] }]);
+    client.send("g", "get", get).await;
+    let (asserted, _) = run_with_pins(&mut client, "g", &["4321"]).await;
+    assert_eq!(
+        asserted["result"]["credentialId"], created["result"]["credentialId"],
+        "{asserted}"
+    );
+}

@@ -28,6 +28,7 @@ const PIN_INVALID: u8 = 0x31;
 const PIN_BLOCKED: u8 = 0x32;
 const PIN_AUTH_INVALID: u8 = 0x33;
 const PIN_REQUIRED: u8 = 0x36;
+const USER_ACTION_TIMEOUT: u8 = 0x2F;
 
 const AAGUID: [u8; 16] = *b"intent-test-key!";
 
@@ -49,6 +50,7 @@ struct State {
     credentials: Vec<Credential>,
     pending_assertions: VecDeque<Value>,
     outbox: VecDeque<HidMessage>,
+    touchable: bool,
 }
 
 /// Shared handle so tests can inspect the key while libwebauthn drives it.
@@ -142,7 +144,15 @@ impl SoftKey {
             credentials: Vec::new(),
             pending_assertions: VecDeque::new(),
             outbox: VecDeque::new(),
+            touchable: true,
         })))
+    }
+
+    /// A key the user never touches: requests that need presence time out.
+    #[must_use]
+    pub fn untouched(self) -> Self {
+        self.0.lock().unwrap().touchable = false;
+        self
     }
 
     pub fn device(&self) -> HidDevice {
@@ -264,6 +274,13 @@ impl SoftKey {
             .ok_or(INVALID_PARAMETER)?
             .to_owned();
         let user = get(request, 3).ok_or(INVALID_PARAMETER)?;
+        if !state.touchable {
+            return Err(USER_ACTION_TIMEOUT);
+        }
+        // CTAP 2.0 selection: a zero-length pinAuth waits for a touch, then fails.
+        if bytes(get(request, 8)).is_some_and(|auth| auth.is_empty()) {
+            return Err(PIN_INVALID);
+        }
         let uv = Self::check_uv(state, request, &client_data_hash, 8)?;
         if !uv {
             return Err(PIN_REQUIRED);
@@ -367,6 +384,9 @@ impl SoftKey {
             .and_then(|options| get_text(options, "up"))
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        if up && !state.touchable {
+            return Err(USER_ACTION_TIMEOUT);
+        }
         let uv = Self::check_uv(state, request, &client_data_hash, 6)?;
         let matching: Vec<Credential> = state
             .credentials

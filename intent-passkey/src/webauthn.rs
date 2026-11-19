@@ -18,7 +18,7 @@ use libwebauthn::transport::{Channel, ChannelSettings, Device as _};
 use libwebauthn::webauthn::{PlatformError, WebAuthn, WebAuthnError};
 use libwebauthn::UvUpdate;
 use serde_json::{json, Value};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, warn};
 
 use crate::authenticator::{Authenticator, CeremonyIo};
@@ -30,6 +30,7 @@ use crate::protocol::{
 
 const KNOWN_TRANSPORTS: [&str; 5] = ["usb", "nfc", "ble", "hybrid", "internal"];
 const DEVICE_POLL: Duration = Duration::from_millis(500);
+const SELECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// libwebauthn's RP ID validation backed by the compiled-in public suffix list, so
 /// the sidecar does not depend on a distro `publicsuffix-list` package.
@@ -67,17 +68,33 @@ impl LibWebAuthn {
         }
     }
 
-    async fn first_usb_device(&self, io: &mut CeremonyIo) -> Result<HidDevice, PasskeyError> {
+    async fn list_usb(&self) -> Vec<HidDevice> {
+        match &self.usb {
+            UsbSource::Fixed(devices) => devices.clone(),
+            UsbSource::System => list_devices().await.unwrap_or_else(|error| {
+                warn!(%error, "listing security keys failed");
+                Vec::new()
+            }),
+        }
+    }
+
+    /// Waits for a security key. With several keys, all of them blink and the one
+    /// the user touches is used (as browsers do); the others are cancelled.
+    async fn select_usb_device(&self, io: &mut CeremonyIo) -> Result<HidDevice, PasskeyError> {
         io.status(Status::TouchKey);
         loop {
-            let devices = match &self.usb {
-                UsbSource::Fixed(devices) => devices.clone(),
-                UsbSource::System => list_devices().await.unwrap_or_else(|error| {
-                    warn!(%error, "listing security keys failed");
-                    Vec::new()
-                }),
+            let mut devices = self.list_usb().await;
+            let chosen = match devices.len() {
+                0 => None,
+                1 => devices.pop(),
+                _ => {
+                    tokio::select! {
+                        chosen = touched_device(devices) => chosen,
+                        reason = io.stopped() => return Err(reason.error()),
+                    }
+                }
             };
-            if let Some(device) = devices.into_iter().next() {
+            if let Some(device) = chosen {
                 return Ok(device);
             }
             tokio::select! {
@@ -86,6 +103,42 @@ impl LibWebAuthn {
             }
         }
     }
+}
+
+/// Blinks every key and returns the first one touched, or `None` when no key was.
+async fn touched_device(devices: Vec<HidDevice>) -> Option<HidDevice> {
+    let (handle_tx, mut handle_rx) = mpsc::unbounded_channel();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, device) in devices.iter().cloned().enumerate() {
+        let handle_tx = handle_tx.clone();
+        tasks.spawn(async move {
+            let mut device = device;
+            let Ok(mut channel) = device.channel(ChannelSettings::default()).await else {
+                return None;
+            };
+            let _ = handle_tx.send(channel.get_handle());
+            match channel
+                .blink_and_wait_for_user_presence(SELECTION_TIMEOUT)
+                .await
+            {
+                Ok(true) => Some(index),
+                Ok(false) | Err(_) => None,
+            }
+        });
+    }
+    drop(handle_tx);
+    let mut chosen = None;
+    while let Some(result) = tasks.join_next().await {
+        if let Ok(Some(index)) = result {
+            chosen = Some(index);
+            break;
+        }
+    }
+    while let Ok(handle) = handle_rx.try_recv() {
+        handle.cancel_ongoing_operation().await;
+    }
+    while tasks.join_next().await.is_some() {}
+    chosen.and_then(|index| devices.into_iter().nth(index))
 }
 
 fn error(code: ErrorCode, message: impl Into<String>) -> PasskeyError {
@@ -520,7 +573,7 @@ impl LibWebAuthn {
         mut io: CeremonyIo,
     ) -> Result<CreateResult, PasskeyError> {
         let request = prepare_create(params).await?;
-        let mut device = self.first_usb_device(&mut io).await?;
+        let mut device = self.select_usb_device(&mut io).await?;
         let mut channel = device
             .channel(ChannelSettings::default())
             .await
@@ -559,7 +612,7 @@ impl LibWebAuthn {
         mut io: CeremonyIo,
     ) -> Result<GetResult, PasskeyError> {
         let request = prepare_get(params).await?;
-        let mut device = self.first_usb_device(&mut io).await?;
+        let mut device = self.select_usb_device(&mut io).await?;
         let mut channel = device
             .channel(ChannelSettings::default())
             .await
