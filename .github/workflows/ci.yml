@@ -2895,7 +2895,7 @@ jobs:
           cp packaging/libexec/intent-passkey.LGPL-2.1.txt passkey-dist/
           file passkey-dist/intent-passkey-*
           printf '%s\n' '{"id":"1","method":"hello"}' |
-            "passkey-dist/intent-passkey-$(uname -m)-unknown-linux-gnu" --stdio | grep -q '"protocol":1'
+            "passkey-dist/intent-passkey-$(uname -m)-unknown-linux-gnu" --stdio | grep '"protocol":1' >/dev/null
       - uses: actions/upload-artifact@v7
         with:
           name: intent-passkey-linux
