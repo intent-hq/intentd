@@ -86,14 +86,9 @@ fn session_of(binding: &RepositoryInitializationBinding) -> &String {
 
 impl PgStore {
     pub(crate) fn repository_lifecycle_domain(&self) -> Result<Arc<LifecycleDomain>> {
-        let options = self.pool.connect_options();
-        crate::repository_lifecycle::postgres_domain(format!(
-            "{}:{}/{:?}/{:?}#{}",
-            options.get_host(),
-            options.get_port(),
-            options.get_database(),
-            options.get_socket(),
-            self.tenant()
+        crate::repository_lifecycle::postgres_domain(super::tenant_registry::tenant_key(
+            &self.pool,
+            &self.tenant,
         ))
     }
 

@@ -74,6 +74,12 @@ impl DisplayedOverlay {
         }
     }
 
+    /// Whether both handles are the same overlay.
+    #[cfg(all(feature = "postgres", feature = "test-support"))]
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub(crate) fn forget(&self, tab_id: &str) {
         self.0
             .write()
