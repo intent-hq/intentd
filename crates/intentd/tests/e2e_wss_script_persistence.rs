@@ -637,6 +637,7 @@ async fn was_running_service_restarts_after_daemon_kill_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "auto",
+            // timing-guard: the long-lived service process, not a wait
             "command": "sleep 3600",
             "mode": "service",
             "autoStart": true,
