@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.248] - 2026-11-19
+
+### 🔧 Refactor
+
+- *(store)* Compile the raw SQLite pools only for tests ([#3522](https://github.com/intent-hq/intentd/pull/3522))
+
+### 📚 Documentation
+
+- *(guide)* Point agent settings to the Agent defaults Advanced section ([#3523](https://github.com/intent-hq/intentd/pull/3523))
+
+
 ## [0.11.247] - 2026-11-18
 
 ### 📚 Documentation
