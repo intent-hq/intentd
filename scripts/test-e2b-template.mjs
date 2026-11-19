@@ -673,10 +673,20 @@ describe('vercel registry', () => {
     assert.equal((await publish({ env: ENV, version: '0.11.250', ...h.deps })).copied, false);
     assert.equal(h.runs.length, 0);
   });
-  it('never moves a version tag that holds another image', async () => {
-    const h = harness({ tags: [tagBody('ready', digest('d'))] });
-    await assert.rejects(publish({ env: ENV, version: '0.11.250', ...h.deps }), /already holds .* tags are never moved/);
+  it('keeps a version tag that holds an earlier build of the version, so a re-run succeeds', async () => {
+    const h = harness({ tags: [tagBody('preparing', digest('d')), tagBody('ready', digest('d'))] });
+    assert.deepEqual(await publish({ env: ENV, version: '0.11.250', ...h.deps }), { target: `${IMAGE}:0.11.250`, digest: digest('d'), copied: false });
     assert.equal(h.runs.length, 0);
+    assert.match(h.logs.join('\n'), /::warning::.*earlier build.*never moved/);
+  });
+  it('fails with the recovery steps when the kept image is not usable', async () => {
+    const h = harness({ tags: [tagBody('errored', digest('d'))] });
+    await assert.rejects(publish({ env: ENV, version: '0.11.250', ...h.deps }), /errored.*vercel vcr image delete/s);
+    assert.equal(h.runs.length, 0);
+  });
+  it('retries transient errors on the first tag lookup', async () => {
+    const h = harness({ tags: [503, 429, 404, tagBody('ready')] });
+    assert.equal((await publish({ env: ENV, version: '0.11.250', ...h.deps })).copied, true);
   });
   it('fails when the pushed digest differs from the GHCR amd64 digest', async () => {
     const h = harness({ tags: [404, tagBody('ready', digest('d'))] });
@@ -706,7 +716,7 @@ describe('vercel registry', () => {
     assert.ok(h.calls.every(call => (call.init.method ?? 'GET') === 'GET' || !call.url.includes('/v1/vcr/')));
   });
   it('revokes an OIDC token when it is done, even after a failure', async () => {
-    const h = harness({ tags: [tagBody('ready', digest('d'))] });
+    const h = harness({ tags: [tagBody('errored', digest('d'))] });
     const env = { VERCEL_TEAM_ID: 'team_abc', VCR_INTENT_NODE_IMAGE: IMAGE, ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example/t', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'r' };
     await assert.rejects(publish({ env, version: '0.11.250', ...h.deps }));
     assert.ok(h.calls.some(call => call.url.endsWith('/login/oauth/token/revoke')));

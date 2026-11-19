@@ -10,7 +10,8 @@
 // warns and succeeds.
 //
 // Only the exact version tag is written, never latest/alpha/beta, and an
-// existing version tag is never moved or deleted: sandboxes pin by digest.
+// existing version tag is never moved or deleted: sandboxes pin by digest, so
+// a version already on VCR keeps its first build, which must become Ready.
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -104,7 +105,10 @@ export async function waitReady({ config, tag, digest, token, fetch, sleep, now,
     if (image && !image.retry) {
       if (image.manifestDigest !== digest) throw new Error(`VCR ${config.repository}:${tag} digest ${image.manifestDigest} does not match the GHCR linux/amd64 digest ${digest}`);
       if (image.status === 'ready') return image;
-      if (image.status !== 'preparing') throw new Error(`VCR ${config.repository}:${tag} is ${image.status} (kind ${image.kind}): not usable by Vercel Sandbox`);
+      if (image.status !== 'preparing') {
+        throw new Error(`VCR ${config.repository}:${tag} is ${image.status} (kind ${image.kind}): not usable by Vercel Sandbox. `
+          + `Delete it (vercel vcr image delete ${config.repository} ${image.imageId} --project ${config.project}), then re-run`);
+      }
       last = image.status;
     } else {
       last = image?.retry ?? 'not found';
@@ -131,12 +135,18 @@ export async function publish({
   if (oidc) log(`::add-mask::${token}`);
   const authDir = mkdtempSync(join(tmpdir(), 'vcr-auth-'));
   try {
-    const existing = await getTag(config, tag, token, fetch);
-    if (existing?.retry) throw new Error(`VCR tag lookup failed: ${existing.retry}`);
-    if (existing && existing.manifestDigest !== digest) {
-      throw new Error(`${target} already holds ${existing.manifestDigest}, not the GHCR linux/amd64 image ${digest}; tags are never moved`);
+    let existing = await getTag(config, tag, token, fetch);
+    for (let attempt = 1; existing?.retry && attempt < 5; attempt++) {
+      await sleep(intervalMs);
+      existing = await getTag(config, tag, token, fetch);
     }
-    if (!existing) {
+    if (existing?.retry) throw new Error(`VCR tag lookup failed: ${existing.retry}`);
+    // A re-run rebuilds the GHCR image with a new digest; the version's
+    // earlier build stays on VCR, since tags are never moved.
+    const expected = existing?.manifestDigest ?? digest;
+    if (existing && expected !== digest) {
+      log(`::warning::${target} already holds an earlier build of ${tag} (${expected}); GHCR now holds ${digest}. Keeping it: VCR version tags are never moved.`);
+    } else if (!existing) {
       const authfile = join(authDir, 'auth.json');
       run('skopeo', ['login', '--authfile', authfile, '--username', config.team, '--password-stdin', config.registry], { input: token });
       run('skopeo', ['copy', '--authfile', authfile, '--retry-times', '3', '--preserve-digests', `docker://${IMAGE_REPO}@${digest}`, `docker://${target}`]);
@@ -144,13 +154,13 @@ export async function publish({
     } else {
       log(`${target} already holds ${digest}`);
     }
-    await waitReady({ config, tag, digest, token, fetch, sleep, now, log, timeoutMs, intervalMs });
-    log(`${target} is Ready (${digest})`);
+    await waitReady({ config, tag, digest: expected, token, fetch, sleep, now, log, timeoutMs, intervalMs });
+    log(`${target} is Ready (${expected})`);
     const { body } = await api(config, '', token, fetch);
     if (body?.repository?.public !== true) {
       log(`::warning::The VCR repository ${config.image} is not public, so other Vercel teams cannot start sandboxes from it. Make it public with vercel vcr update ${config.repository} --public.`);
     }
-    return { target, digest, copied: !existing };
+    return { target, digest: expected, copied: !existing };
   } finally {
     rmSync(authDir, { recursive: true, force: true });
     if (oidc && !(await revokeToken(token, fetch))) log('::warning::Could not revoke the Vercel access token; it expires on its own.');
