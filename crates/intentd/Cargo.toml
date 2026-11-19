@@ -167,7 +167,7 @@ intent-nodes = { path = "../intent-nodes", features = ["northflank-fake", "agent
 # only through intent-store (intent-store/tests/sqlx_dependency_lint.rs).
 sqlx = { workspace = true }
 uuid = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.11.248", features = ["repository-test-fixtures"] }
+intent-services = { path = "../intent-services", version = "0.11.248", features = ["repository-test-fixtures", "test-hooks"] }
 intent-acp = { path = "../intent-acp", version = "0.11.248" }
 intent-providers = { path = "../intent-providers", version = "0.11.248", features = ["test-support"] }
 intent-core = { path = "../intent-core", version = "0.11.248" }

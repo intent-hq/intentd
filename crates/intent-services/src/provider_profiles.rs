@@ -1438,7 +1438,7 @@ fn native_session_binding(stored: &intent_core::AgentSession) -> Option<&str> {
 /// and `~` in an account directory expands against `home` here, before
 /// account-home lookup, isolation and fingerprinting, so every path agrees.
 /// `None` keeps values as typed (a remote node expands against its own home).
-fn overlay_from(
+pub(crate) fn overlay_from(
     reference: &str,
     base: &str,
     doc: EnvDoc,

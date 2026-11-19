@@ -3264,6 +3264,22 @@ fn spawn_unsloth_status_publisher(
     status_tx
 }
 
+/// The overlay a local agent launch of `provider_id` runs a resolved profile
+/// with: a Codex API key profile signs in in its own home under `home`. The
+/// machine-side counterpart is the node runner's `node_profile`; the parity
+/// test in `intentd`'s executor runner tests keeps the two in step.
+pub(crate) fn local_launch_profile(
+    provider_id: &str,
+    profile: Arc<intent_acp::ProfileEnv>,
+    home: Option<&Path>,
+) -> Arc<intent_acp::ProfileEnv> {
+    if provider_id == "codex" {
+        Arc::new((*profile).clone().with_codex_api_key_home(home))
+    } else {
+        profile
+    }
+}
+
 impl AgentManager {
     /// Wire a manager over the services surface and a concrete event sink, with
     /// a global concurrency `cap`.
@@ -12438,12 +12454,8 @@ impl AgentManager {
         // the command is built, so a login-shell `CODEX_HOME` never fills in
         // over it.
         let profile_env = profile_env.map(|profile| {
-            if resolved.provider.id == "codex" {
-                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-                Arc::new((*profile).clone().with_codex_api_key_home(home.as_deref()))
-            } else {
-                profile
-            }
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            local_launch_profile(resolved.provider.id, profile, home.as_deref())
         });
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.profile_env = profile_env.as_deref();
