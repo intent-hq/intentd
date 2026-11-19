@@ -49,7 +49,7 @@ parity_test!(
             .insert_node_invite(&invite(tenant), &secret)
             .await
             .unwrap();
-        let all = handles(&store, db, tenant, 1).await;
+        let all = handles(&store, db, tenant).await;
         let owned = tenant.to_owned();
         let outcomes = race(&all, WRITERS, |writer, store| {
             let credential = credential(&owned, writer);

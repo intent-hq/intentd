@@ -91,7 +91,7 @@ parity_test!(
     versioned_note_edits_across_handles_retry_on_conflict,
     |store, tenant, db| {
         store.insert_note(&note("cas", tenant)).await.unwrap();
-        let all = handles(&store, db, tenant, 1).await;
+        let all = handles(&store, db, tenant).await;
         let id = NoteId("cas".into());
         let cas_id = id.clone();
         let conflicts = race(&all, WRITERS, |writer, store| {

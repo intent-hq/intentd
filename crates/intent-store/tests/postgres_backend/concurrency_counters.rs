@@ -67,7 +67,7 @@ parity_test!(
         let record = node(tenant);
         let initial = lease(&record);
         store.enroll_node(&record, &initial).await.unwrap();
-        let all = handles(&store, db, tenant, 1).await;
+        let all = handles(&store, db, tenant).await;
         let owner = initial.owner.clone();
         let mut issued = race(&all, WRITERS, |_, store| {
             let owner = owner.clone();

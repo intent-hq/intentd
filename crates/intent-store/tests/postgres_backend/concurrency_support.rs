@@ -19,20 +19,17 @@ use crate::harness::{open_trapped, TestDb};
 /// Concurrent writers per race.
 pub const WRITERS: usize = 8;
 
-/// Handles for this run's tenant. On Postgres, `store` plus `extra` more
-/// opens: each open has its own process-local gates (note lanes, desktop
+/// Two handles for this run's tenant. On Postgres, `store` and a second
+/// open: each open has its own process-local gates (note lanes, desktop
 /// write gate), so only the database (the writer lock and row locks) orders
-/// writes between them, as between two daemons. On `SQLite` the extras are
-/// clones of `store`: one file has one writer.
-pub async fn handles(store: &Store, db: Option<&TestDb>, tenant: &str, extra: usize) -> Vec<Store> {
-    let mut all = vec![store.clone()];
-    for _ in 0..extra {
-        all.push(match db {
-            Some(db) => open_trapped(db, tenant).await,
-            None => store.clone(),
-        });
-    }
-    all
+/// writes between them, as between two daemons. On `SQLite` the second is a
+/// clone of `store`: one file has one writer.
+pub async fn handles(store: &Store, db: Option<&TestDb>, tenant: &str) -> Vec<Store> {
+    let second = match db {
+        Some(db) => open_trapped(db, tenant).await,
+        None => store.clone(),
+    };
+    vec![store.clone(), second]
 }
 
 /// Runs `writers` tasks that start together; task `i` gets handle

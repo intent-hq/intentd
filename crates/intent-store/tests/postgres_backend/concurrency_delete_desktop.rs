@@ -112,7 +112,7 @@ parity_test!(
             .insert_agent_session(&session("a-kept", KEPT, tenant))
             .await
             .unwrap();
-        let all = handles(&store, db, tenant, 1).await;
+        let all = handles(&store, db, tenant).await;
         let owned = tenant.to_owned();
         let tasks = WRITERS * 2 + 1;
         let outcomes = race(&all, tasks, |task, store| {
@@ -133,16 +133,52 @@ parity_test!(
 
         assert!(matches!(outcomes[0], Outcome::Deleted));
         // Raw rows: `desktop_terminal` hides a record whose workspace is
-        // gone, so it cannot show one that outlived the delete.
-        let doomed_rows = count_rows(
-            &store,
-            db,
-            tenant,
-            "settings",
-            &format!("key LIKE 'desktop.v1/%' AND value LIKE '%\"workspaceId\":\"{DOOMED}\"%'"),
-        )
-        .await;
-        assert_eq!(doomed_rows, 0, "a desktop record outlived its workspace");
+        // gone, so it cannot show one that outlived the delete. The kept
+        // workspace's count is the positive control: it proves the pattern
+        // matches the stored records, so the zero is not vacuous.
+        let rows_of = |workspace: &'static str| {
+            let filter = format!(
+                "key LIKE 'desktop.v1/%' AND value LIKE '%\"workspaceId\":\"{workspace}\"%'"
+            );
+            let store = store.clone();
+            async move { count_rows(&store, db, tenant, "settings", &filter).await }
+        };
+        let kept_writes = (1..tasks).filter(|&t| target(t).0 == KEPT).count() * PER_WRITER;
+        assert_eq!(kept_writes, 48, "8 kept writers x {PER_WRITER} writes");
+        assert_eq!(
+            rows_of(KEPT).await,
+            i64::try_from(kept_writes).unwrap(),
+            "the row pattern matches every kept record"
+        );
+        assert_eq!(
+            rows_of(DOOMED).await,
+            0,
+            "a desktop record outlived its workspace"
+        );
+        // How the doomed writes ended varies run to run; print it, do not
+        // assert it.
+        let (mut removed, mut not_found, mut forbidden) = (0, 0, 0);
+        for outcome in outcomes
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(t, _)| target(*t).0 == DOOMED)
+        {
+            if let (_, Outcome::Wrote(results)) = outcome {
+                for result in results {
+                    match result {
+                        Ok(()) => removed += 1,
+                        Err(Error::NotFound(_)) => not_found += 1,
+                        Err(Error::Forbidden(_)) => forbidden += 1,
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[{tenant}] doomed writes: {removed} committed then removed, \
+             {not_found} NotFound, {forbidden} Forbidden"
+        );
         for (task, outcome) in outcomes.iter().enumerate().skip(1) {
             let Outcome::Wrote(results) = outcome else {
                 panic!("task {task} is a writer");

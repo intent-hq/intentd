@@ -48,7 +48,7 @@ parity_test!(
             .insert_agent_session(&session("q-agent", tenant))
             .await
             .unwrap();
-        let all = handles(&store, db, tenant, 1).await;
+        let all = handles(&store, db, tenant).await;
         let owned = tenant.to_owned();
         let refused: Vec<Vec<String>> = race(&all, WRITERS, |writer, store| {
             let tenant = owned.clone();
