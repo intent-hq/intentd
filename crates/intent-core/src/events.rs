@@ -463,7 +463,8 @@ pub const DRAFT_CHANGED: &str = "draft:changed";
 
 // Streaming `git.clone` events (new in intentd; PROTOCOL §5.6 / §6.5). The
 // `git.clone` method returns `{ requestId }` promptly, then the daemon streams
-// `git:clone:progress` frames (`data: { requestId, phase, percent, message }`)
+// `git:clone:progress` frames (`data: { requestId, phase, percent, message,
+// transfer? }`; `transfer` carries git's download counters on `receiving`)
 // as parsed from `git clone --progress` stderr, followed by a terminal
 // `git:clone:done` (`data: { requestId, ok, error? }`), all correlated by
 // `requestId`. Payloads never carry the source URL / credentials.
