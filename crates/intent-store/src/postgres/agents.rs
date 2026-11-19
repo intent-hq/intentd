@@ -3664,6 +3664,9 @@ impl PreparedPgMonitorMessage {
 }
 
 impl PgStore {
+    /// A bounded, resumable delete (see `purge`): a short transaction
+    /// records it, bounded batches drain the agent's heavy children, and one
+    /// final transaction deletes the rest, the session row and the record.
     pub async fn delete_agent_session(
         &self,
         workspace_id: &WorkspaceId,
@@ -3682,13 +3685,40 @@ impl PgStore {
         .await
         .map_err(db)?;
         if !exists {
+            // A record a stopped delete left has nothing more to do.
+            super::purge::clear_agent_purge(&mut tx, self.tenant(), workspace_id, id).await?;
+            tx.commit().await.map_err(db)?;
             return Ok(false);
         }
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
-        let removed = delete_session_rows(&mut tx, self.tenant(), workspace_id, id, true).await?;
+        super::purge::record_purge(
+            &mut tx,
+            self.tenant(),
+            super::purge::PurgeKind::Agent,
+            workspace_id,
+            Some(id),
+        )
+        .await?;
         tx.commit().await.map_err(db)?;
-        lifecycle.settle_after_retirement().await?;
-        Ok(removed > 0)
+        // As on SQLite, the bounded sweep does not hold lifecycle
+        // serialization; the bracket stays owned through completion.
+        lifecycle.release_serialization();
+        // A recorded purge finishes even if the caller is cancelled.
+        let store = self.clone();
+        let workspace_id = workspace_id.clone();
+        let id = id.clone();
+        intent_core::caller::spawn_with_current_caller(async move {
+            store.purge_agent_children(&id).await?;
+            let mut tx = store.begin_write().await?;
+            let removed =
+                delete_session_rows(&mut tx, store.tenant(), &workspace_id, &id, true).await?;
+            super::purge::clear_agent_purge(&mut tx, store.tenant(), &workspace_id, &id).await?;
+            tx.commit().await.map_err(db)?;
+            lifecycle.settle_after_retirement().await?;
+            Ok(removed > 0)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("delete agent task failed: {e}")))?
     }
 
     pub async fn prepare_monitor_message(

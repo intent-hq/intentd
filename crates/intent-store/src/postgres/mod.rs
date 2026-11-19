@@ -67,6 +67,7 @@ mod notes;
 pub(crate) mod pr_monitors;
 mod presence_focus;
 mod principals;
+mod purge;
 mod repositories;
 mod script_monitors;
 mod scripts;
@@ -74,6 +75,11 @@ mod settings;
 mod tenant_registry;
 mod usage_metrics;
 mod workspaces;
+
+/// Test seams for the bounded workspace and agent deletes.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use purge::probe as delete_probe;
 
 /// Postgres schema migrations, separate from the `SQLite` ones.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./postgres/migrations");

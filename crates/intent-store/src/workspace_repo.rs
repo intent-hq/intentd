@@ -57,6 +57,16 @@ pub enum RepositoryWorkspaceDeleteDisposition {
     Unknown,
 }
 
+/// A delete that started and did not finish; see [`Store::pending_deletes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDelete {
+    Workspace(WorkspaceId),
+    Agent {
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    },
+}
+
 /// Original result and independent Store-phase facts from the same operation.
 /// A later ownership/worker error does not erase an already acknowledged commit.
 #[derive(Debug)]
@@ -484,6 +494,19 @@ impl Store {
         dispatch!(self, backend => backend.delete_workspace(id).await)
     }
 
+    /// Workspace and agent deletes that started and did not finish: on
+    /// Postgres, a bounded delete stopped part-way (a crash, a failed batch)
+    /// leaves its workspace or agent half-purged until it is deleted again,
+    /// as `SQLite` does; re-issuing the full delete (service teardown
+    /// included) finishes it. Always empty on `SQLite`, which keeps no record.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Internal` if the database read fails.
+    pub async fn pending_deletes(&self) -> Result<Vec<PendingDelete>> {
+        dispatch!(self, backend => backend.pending_deletes().await)
+    }
+
     /// Run the same deletion once, retaining facts before projecting its result.
     ///
     /// `NoEffect` is only the original initial absent observation. A later
@@ -830,6 +853,13 @@ impl Store {
 }
 
 impl crate::SqliteStore {
+    /// `SQLite` records no delete, so none is pending (see
+    /// [`Store::pending_deletes`]).
+    #[expect(clippy::unused_async, reason = "same signature as the Postgres store")]
+    pub(crate) async fn pending_deletes(&self) -> Result<Vec<PendingDelete>> {
+        Ok(Vec::new())
+    }
+
     pub async fn workspace_content_clocks(
         &self,
         workspace_ids: &[WorkspaceId],

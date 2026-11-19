@@ -61,6 +61,22 @@ impl DesktopWrites {
         let scope = self.scope(workspace).write_owned().await;
         (maintenance, scope)
     }
+
+    /// The workspace's own teardown gate: while held, its desktop writes are
+    /// refused and other workspaces' proceed. Postgres holds it across a
+    /// bounded delete's batches and takes [`Self::maintenance_read`] only
+    /// around the final transaction, always in this order, so a waiting
+    /// `desktop_invalidate_restart` never queues behind a long drain.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn delete_scope(&self, workspace: &WorkspaceId) -> OwnedRwLockWriteGuard<()> {
+        self.scope(workspace).write_owned().await
+    }
+
+    /// Excludes `desktop_invalidate_restart` while held.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn maintenance_read(&self) -> OwnedRwLockReadGuard<()> {
+        self.maintenance.clone().read_owned().await
+    }
 }
 
 #[cfg(test)]
