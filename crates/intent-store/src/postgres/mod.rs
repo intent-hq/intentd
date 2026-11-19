@@ -67,6 +67,7 @@ mod notes;
 pub(crate) mod pr_monitors;
 mod presence_focus;
 mod principals;
+mod purge;
 mod repositories;
 mod script_monitors;
 mod scripts;
@@ -74,6 +75,11 @@ mod settings;
 mod tenant_registry;
 mod usage_metrics;
 mod workspaces;
+
+/// Test seams for the bounded workspace and agent deletes.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use purge::probe as delete_probe;
 
 /// Postgres schema migrations, separate from the `SQLite` ones.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./postgres/migrations");
@@ -783,7 +789,8 @@ impl PgStore {
 
 impl crate::Store {
     /// Open the store for one tenant on a migrated database, creating the
-    /// tenant's seed rows on first use (`intent_provision_tenant`).
+    /// tenant's seed rows on first use (`intent_provision_tenant`), and
+    /// start finishing any delete the tenant left part-way.
     ///
     /// Every open of one tenant in this process shares its process-local
     /// gates (`tenant_registry`), including the writer slot (see the
@@ -818,6 +825,16 @@ impl crate::Store {
             .await
             .map_err(db)?;
         tx.commit().await.map_err(db)?;
+        // A delete a crash or failed batch left part-way finishes in the
+        // background (see `purge`); the open does not wait for it.
+        if store.has_pending_deletes().await? {
+            let resumer = store.clone();
+            tokio::spawn(async move {
+                if let Err(e) = resumer.resume_deletes().await {
+                    tracing::warn!(tenant = resumer.tenant(), "unfinished deletes remain: {e}");
+                }
+            });
+        }
         Ok(Self {
             backend: crate::Backend::Postgres(store),
         })

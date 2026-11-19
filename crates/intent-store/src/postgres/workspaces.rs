@@ -60,6 +60,24 @@ where
         .map_err(|e| Error::Internal(format!("column {name}: {e}")))
 }
 
+/// A workspace's agent ids, in creation order.
+async fn workspace_agents(
+    tx: &mut super::WriteTx,
+    tenant: &str,
+    id: &WorkspaceId,
+) -> Result<Vec<AgentId>> {
+    let agents: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM agent_session WHERE tenant_id = $1 AND workspace_id = $2 \
+         ORDER BY row_seq",
+    )
+    .bind(tenant)
+    .bind(&id.0)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db)?;
+    Ok(agents.into_iter().map(AgentId).collect())
+}
+
 fn not_found(id: &WorkspaceId) -> Error {
     Error::NotFound(format!("workspace {id}"))
 }
@@ -793,35 +811,28 @@ impl PgStore {
         }
     }
 
-    /// The `SQLite` deletion in one writer-locked transaction: no bounded
-    /// batches, so a failure leaves the workspace untouched.
+    /// The `SQLite` deletion as a bounded, resumable purge (see `purge`): a
+    /// short transaction records it, bounded batches drain the heavy child
+    /// tables, and one final transaction deletes the rest and the record.
     async fn delete_workspace_observed(
         &self,
         id: &WorkspaceId,
         disposition: &mut RepositoryWorkspaceDeleteDisposition,
         committed: Arc<AtomicBool>,
     ) -> Result<()> {
-        // Held through the commit, as on SQLite: no private desktop write of
-        // this workspace can start meanwhile.
-        let _desktop_deletion = self.desktop_writes.delete(id).await;
+        // Held through the final commit, as on SQLite: no private desktop
+        // write of this workspace can start meanwhile. It moves into the
+        // purge task, so a cancelled caller does not release it early.
+        let desktop_deletion = self.desktop_writes.delete(id).await;
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut tx = self.begin_write().await?;
         if !self.workspace_exists(&mut tx, id).await? {
             *disposition = RepositoryWorkspaceDeleteDisposition::NoEffect;
             return Err(not_found(id));
         }
-        let agents: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM agent_session WHERE tenant_id = $1 AND workspace_id = $2 \
-             ORDER BY row_seq",
-        )
-        .bind(self.tenant())
-        .bind(&id.0)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db)?;
-        let agents: Vec<AgentId> = agents.into_iter().map(AgentId).collect();
+        let agents = workspace_agents(&mut tx, self.tenant(), id).await?;
         // SQLite begins the workspace here and each agent in its own nested
-        // deletion; this one transaction owns all of them.
+        // deletion; this one bracket owns all of them.
         let keys: Vec<crate::RepositoryLifecycleKey> =
             std::iter::once(crate::RepositoryLifecycleKey::Workspace(id.clone()))
                 .chain(
@@ -832,12 +843,32 @@ impl PgStore {
                 )
                 .collect();
         lifecycle.begin(&keys)?;
-        // A started transaction finishes its commit and overlay eviction even
-        // if the caller is cancelled.
+        super::purge::record_purge(
+            &mut tx,
+            self.tenant(),
+            super::purge::PurgeKind::Workspace,
+            id,
+            None,
+        )
+        .await?;
+        tx.commit().await.map_err(db)?;
+        // As on SQLite, the bounded sweep does not hold lifecycle
+        // serialization; the bracket stays owned through completion.
+        lifecycle.release_serialization();
+        // A recorded purge finishes its batches, final commit and overlay
+        // eviction even if the caller is cancelled.
         let store = self.clone();
         let id = id.clone();
-        tokio::spawn(async move {
-            let result = store.delete_workspace_rows(tx, &id, &agents).await;
+        intent_core::caller::spawn_with_current_caller(async move {
+            let _desktop_deletion = desktop_deletion;
+            let result = async {
+                store.purge_workspace_children(&id, &agents).await?;
+                let mut tx = store.begin_write().await?;
+                // Sessions created since the purge began go too.
+                let agents = workspace_agents(&mut tx, store.tenant(), &id).await?;
+                store.delete_workspace_rows(tx, &id, &agents).await
+            }
+            .await;
             if result.is_ok() {
                 committed.store(true, Ordering::Release);
             }
@@ -943,6 +974,7 @@ impl PgStore {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+        super::purge::clear_workspace_purges(&mut tx, tenant, id).await?;
         tx.commit().await.map_err(db)?;
         self.browser_tab_displayed
             .forget_all(tab_ids.iter().map(String::as_str));
