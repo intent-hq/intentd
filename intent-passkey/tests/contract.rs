@@ -118,9 +118,12 @@ async fn malformed_requests_get_error_codes() {
         .await;
     assert_eq!(error_code(&bad_base64), "Unknown");
 
-    for (id, method) in [("5", "device.list"), ("6", "device.delete")] {
+    for (id, method, params) in [
+        ("5", "device.list", json!({})),
+        ("6", "device.delete", json!({ "credentialId": "AAAA" })),
+    ] {
         assert_eq!(
-            error_code(&client.call(id, method, json!({})).await),
+            error_code(&client.call(id, method, params).await),
             "NotSupported"
         );
     }

@@ -4,7 +4,19 @@ use tracing_subscriber::EnvFilter;
 
 #[cfg(target_os = "linux")]
 async fn run() -> std::io::Result<()> {
-    let backend = intent_passkey::webauthn::LibWebAuthn::default();
+    use intent_passkey::device::{
+        Device, DeviceConfig, LockScreenProcesses, PamPin, WithDevice, PAM_SERVICE,
+    };
+    let device = DeviceConfig::system().and_then(|config| {
+        PamPin::current_user(PAM_SERVICE)
+            .map(|pin| Device::new(config, pin, LockScreenProcesses))
+            .map_err(|error| tracing::warn!(%error, "device passkeys are off"))
+            .ok()
+    });
+    let backend = WithDevice {
+        other: intent_passkey::webauthn::LibWebAuthn::default(),
+        device,
+    };
     intent_passkey::server::serve(backend, tokio::io::stdin(), tokio::io::stdout()).await
 }
 

@@ -13,10 +13,13 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use zeroize::Zeroize;
 
-use crate::authenticator::{Authenticator, CeremonyControl, CeremonyIo, StopReason};
+use crate::authenticator::{
+    device_unsupported, Authenticator, CeremonyControl, CeremonyIo, StopReason,
+};
 use crate::protocol::{
-    BluetoothState, CeremonyRef, CeremonyScope, ChooseParams, CreateParams, ErrorCode, GetParams,
-    HelloResult, PasskeyError, PinParams, Transport, Transports, PROTOCOL_VERSION,
+    BluetoothState, CeremonyRef, CeremonyScope, ChooseParams, CreateParams, DeviceDeleteParams,
+    ErrorCode, GetParams, HelloResult, PasskeyError, PinParams, Transport, Transports,
+    PROTOCOL_VERSION,
 };
 use crate::rpid;
 
@@ -91,15 +94,12 @@ fn admit<A: Authenticator>(auth: &A, scope: &impl CeremonyScope) -> Result<(), P
         ));
     }
     match scope.transport() {
-        Transport::Device => Err(PasskeyError::new(
-            ErrorCode::NotSupported,
-            "device passkeys are not available yet",
-        )),
+        Transport::Device if !auth.device_supported() => Err(device_unsupported()),
         Transport::Usb if !auth.usb_supported() => Err(PasskeyError::new(
             ErrorCode::NotSupported,
             "security keys are not supported on this system",
         )),
-        Transport::Usb | Transport::Hybrid => Ok(()),
+        Transport::Usb | Transport::Hybrid | Transport::Device => Ok(()),
     }
 }
 
@@ -183,14 +183,28 @@ impl<A: Authenticator> Server<A> {
                 });
                 respond(&self.out, Some(&id), result);
             }
-            "device.list" | "device.delete" => respond(
-                &self.out,
-                Some(&id),
-                Err(PasskeyError::new(
-                    ErrorCode::NotSupported,
-                    "device passkeys are not available yet",
-                )),
-            ),
+            "device.list" => {
+                let auth = Arc::clone(&self.auth);
+                let out = self.out.clone();
+                tokio::spawn(async move {
+                    let result = auth
+                        .device_list()
+                        .await
+                        .map(|credentials| json!({ "credentials": credentials }));
+                    respond(&out, Some(&id), result);
+                });
+            }
+            "device.delete" => match parse_params::<DeviceDeleteParams>(envelope.params) {
+                Ok(params) => {
+                    let auth = Arc::clone(&self.auth);
+                    let out = self.out.clone();
+                    tokio::spawn(async move {
+                        let result = auth.device_delete(params.credential_id).await;
+                        respond(&out, Some(&id), result.map(|()| json!({})));
+                    });
+                }
+                Err(error) => respond(&self.out, Some(&id), Err(error)),
+            },
             _ => respond(
                 &self.out,
                 Some(&id),
@@ -222,7 +236,7 @@ impl<A: Authenticator> Server<A> {
                 transports: Transports {
                     hybrid: bluetooth != BluetoothState::Missing,
                     usb: auth.usb_supported(),
-                    device: false,
+                    device: auth.device_supported(),
                 },
                 bluetooth,
             };

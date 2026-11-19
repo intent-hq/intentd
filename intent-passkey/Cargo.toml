@@ -11,7 +11,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/intent-hq/intentd"
-description = "WebAuthn sidecar for the Intent browser panel (phone QR and USB security keys)"
+description = "WebAuthn sidecar for the Intent browser panel (phone QR, USB security keys and device passkeys)"
 publish = false
 
 [lints.rust]
@@ -35,8 +35,16 @@ url = "2.5"
 zeroize = { version = "1.8", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+argon2 = { version = "0.5", features = ["zeroize"] }
+ciborium = "0.2"
 dbus = "0.9"
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core", "zeroize"] }
 libwebauthn = "=0.11.0"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+pam-client2 = { version = "0.5.6", default-features = false }
+rand = "0.8"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
@@ -44,12 +52,10 @@ tokio = { version = "1", features = ["test-util"] }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
-ciborium = "0.2"
 hmac = "0.12"
 libwebauthn = { version = "=0.11.0", features = ["virt"] }
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
-rand = "0.8"
-sha2 = "0.10"
+tempfile = "3"
 
 [profile.release]
 strip = true

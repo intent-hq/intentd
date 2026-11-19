@@ -289,6 +289,9 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
         wrong_pin: bool,
+        /// Device only: the PIN changed, so this asks once for the previous PIN.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        old_pin: bool,
     },
     ChooseAccount {
         accounts: Vec<Account>,
@@ -339,4 +342,22 @@ pub struct PinParams {
 pub struct ChooseParams {
     pub ceremony: String,
     pub index: usize,
+}
+
+/// One `device.list` entry. Times are milliseconds since the Unix epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceCredential {
+    pub credential_id: Bytes,
+    pub rp_id: String,
+    pub user_name: String,
+    pub user_display_name: String,
+    pub created_at: u64,
+    pub last_used_at: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceDeleteParams {
+    pub credential_id: Bytes,
 }
