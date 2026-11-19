@@ -273,7 +273,9 @@ fn build_clone_command(
     cmd.arg(url)
         .arg(target_path)
         .env("GIT_LFS_SKIP_SMUDGE", GIT_LFS_SKIP_SMUDGE)
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // The progress parser and error classifier read git's English text.
+        .env("LC_ALL", "C");
     cmd
 }
 
@@ -1330,6 +1332,25 @@ mod tests {
         // Wire spellings match the clone failure taxonomy (PROTOCOL §9.1).
         assert_eq!(C::RepoNotFound.as_str(), "repo-not-found");
         assert_eq!(C::AccessDenied.as_str(), "access-denied");
+    }
+
+    /// Phase, percent and error classification parse git's English output,
+    /// so a localized git (`LANG=fr_FR` …) must not translate it.
+    #[test]
+    fn build_clone_command_forces_english_messages() {
+        let cmd = build_clone_command(
+            "https://github.com/acme/repo.git",
+            Path::new("/tmp/x"),
+            None,
+            None,
+            true,
+        );
+        let lc_all = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.to_str() == Some("LC_ALL"))
+            .and_then(|(_, v)| v);
+        assert_eq!(lc_all, Some(std::ffi::OsStr::new("C")));
     }
 
     /// Regression for monorepo#825: a usable token is offered to the clone
