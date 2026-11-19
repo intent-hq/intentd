@@ -8,7 +8,7 @@ license.workspace = true
 description = "SourceControl trait + GitHubSourceControl (PR/issue/review/check-run/mergeability)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.250" }
+intent-core = { workspace = true }
 octocrab = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

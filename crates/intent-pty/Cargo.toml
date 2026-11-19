@@ -9,7 +9,7 @@ description = "Unified PTY host for terminals and scripts: scrollback, multi-cli
 
 [dependencies]
 anyhow.workspace = true
-intent-core = { path = "../intent-core", version = "0.11.250" }
+intent-core = { workspace = true }
 nix.workspace = true
 portable-pty.workspace = true
 tokio.workspace = true

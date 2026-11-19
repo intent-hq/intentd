@@ -8,7 +8,7 @@ license.workspace = true
 description = "Node provider contracts, static host adapter, E2B sandbox client, Northflank and Agent37 adapters"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.250" }
+intent-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
