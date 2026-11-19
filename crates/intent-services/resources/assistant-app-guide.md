@@ -1019,8 +1019,10 @@ Home/workspace numbering. User-customized shortcuts take precedence over these
 defaults.
 
 <!-- Machine rail (desktop app only): describe when asked about the device rail.
-The rail shows the machines kept in this window, and only while the window holds
-two or more machines. With one machine the rail is hidden and the title bar shows
+The rail shows the machines kept in this window. Hiding a one-machine rail requires
+the frontend release containing intent-hq/cloudlands-fe#4777; until then the rail
+shows even with one machine. With that release, the rail shows only while the window
+holds two or more machines. With one machine the rail is hidden and the title bar shows
 the machine status menu; picking another machine there adds it to the window and
 the rail appears. Its switch is
 Settings → Appearance → Machine rail, starting with the desktop release that moves it
