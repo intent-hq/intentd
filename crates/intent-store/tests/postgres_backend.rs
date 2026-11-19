@@ -22,8 +22,20 @@ mod attachments;
 mod clients;
 #[path = "postgres_backend/completion_watches.rs"]
 mod completion_watches;
+#[path = "postgres_backend/concurrency_claims.rs"]
+mod concurrency_claims;
+#[path = "postgres_backend/concurrency_counters.rs"]
+mod concurrency_counters;
+#[path = "postgres_backend/concurrency_delete_desktop.rs"]
+mod concurrency_delete_desktop;
+#[path = "postgres_backend/concurrency_note_lanes.rs"]
+mod concurrency_note_lanes;
 #[path = "postgres_backend/concurrency_pool.rs"]
 mod concurrency_pool;
+#[path = "postgres_backend/concurrency_queue_order.rs"]
+mod concurrency_queue_order;
+#[path = "postgres_backend/concurrency_support.rs"]
+mod concurrency_support;
 #[path = "postgres_backend/desktop.rs"]
 mod desktop;
 #[path = "postgres_backend/discussions.rs"]
