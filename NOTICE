@@ -18,6 +18,16 @@ Copyright (c) 2020 Tailscale Inc & contributors, licensed under the
 BSD 3-Clause License. The full license text ships alongside the binary
 as libexec/tailcat.LICENSE.
 
+Linux release archives also bundle libexec/intent-passkey, built from
+intent-passkey/ in this repository. It statically links libwebauthn and pxp
+(https://github.com/linux-credentials/libwebauthn), Copyright the
+libwebauthn authors, licensed under the GNU Lesser General Public License,
+version 2.1 or later. The complete source of intent-passkey, with its
+Cargo.lock, is in this repository, so you can modify these libraries and
+rebuild the binary with `cargo build --release --manifest-path
+intent-passkey/Cargo.toml`. The LGPL text is at
+https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+
 Third-party text:
 
 Agent guidance for inline visuals (crates/intent-services/resources/

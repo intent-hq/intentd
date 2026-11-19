@@ -217,6 +217,10 @@ jobs:
           *) echo "no tailcat mapping for target '${{ join(matrix.targets, ' ') }}'" >&2; exit 1 ;;
         esac
         ls -l "$dest"
+    - name: Stage intent-passkey sidecar binary (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: ./scripts/build-intent-passkey.sh "${{ join(matrix.targets, ' ') }}"
     - name: Install dist (Unix)
       if: runner.os != 'Windows'
       shell: bash

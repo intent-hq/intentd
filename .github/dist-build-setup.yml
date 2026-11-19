@@ -170,6 +170,15 @@
       *) echo "no tailcat mapping for target '${{ join(matrix.targets, ' ') }}'" >&2; exit 1 ;;
     esac
     ls -l "$dest"
+# Build the intent-passkey WebAuthn sidecar (intent-passkey/, its own Cargo
+# workspace) for this Linux leg's CPU and stage it into packaging/libexec/ next
+# to tailcat, with its LGPL text. It links glibc, libdbus and libudev
+# dynamically (the script header says why it is not musl). CI's `passkey` job
+# runs the same script on every PR, x86_64 native and aarch64 cross.
+- name: Stage intent-passkey sidecar binary (Linux)
+  if: runner.os == 'Linux'
+  shell: bash
+  run: ./scripts/build-intent-passkey.sh "${{ join(matrix.targets, ' ') }}"
 # Main and release builds share compiler entries through the self-hosted sccache.
 - name: Configure the self-hosted compiler cache
   shell: bash
