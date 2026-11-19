@@ -77,6 +77,14 @@ async fn usb_create_and_get_round_trip() {
         .any(|e| e["event"] == "status" && e["state"] == "touch-key"));
     assert!(events.iter().all(|e| e["ceremony"] == "c1"));
 
+    // WebAuthn L3 §5.8.1.2 key order; main uses these bytes verbatim.
+    assert_eq!(
+        String::from_utf8(decode(&result["clientDataJSON"])).unwrap(),
+        format!(
+            r#"{{"type":"webauthn.create","challenge":{},"origin":"{ORIGIN}","crossOrigin":false}}"#,
+            create_params("usb", ORIGIN, RP_ID)["challenge"]
+        )
+    );
     let data = client_data(result);
     assert_eq!(data["type"], "webauthn.create");
     assert_eq!(data["origin"], ORIGIN);
@@ -110,7 +118,13 @@ async fn usb_create_and_get_round_trip() {
     let (asserted, _) = run_with_pins(&mut client, "g1", &["4321"]).await;
     let assertion = &asserted["result"];
     assert_eq!(assertion["credentialId"], credential_id, "{asserted}");
-    assert_eq!(client_data(assertion)["type"], "webauthn.get");
+    assert_eq!(
+        String::from_utf8(decode(&assertion["clientDataJSON"])).unwrap(),
+        format!(
+            r#"{{"type":"webauthn.get","challenge":{},"origin":"{ORIGIN}","crossOrigin":false}}"#,
+            get_params("usb", ORIGIN, RP_ID)["challenge"]
+        )
+    );
     let mut signed = decode(&assertion["authenticatorData"]);
     signed.extend(Sha256::digest(decode(&assertion["clientDataJSON"])));
     let signature = Signature::from_der(&decode(&assertion["signature"])).unwrap();

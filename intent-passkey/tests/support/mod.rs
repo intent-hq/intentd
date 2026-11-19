@@ -97,6 +97,7 @@ pub fn create_params(transport: &str, origin: &str, rp_id: &str) -> Value {
     json!({
         "transport": transport,
         "origin": origin,
+        "crossOrigin": false,
         "rpId": rp_id,
         "challenge": "Y2hhbGxlbmdlLWNoYWxsZW5nZS1jaGFsbGVuZ2U",
         "rp": { "id": rp_id, "name": "Example" },
@@ -114,6 +115,7 @@ pub fn get_params(transport: &str, origin: &str, rp_id: &str) -> Value {
     json!({
         "transport": transport,
         "origin": origin,
+        "crossOrigin": false,
         "rpId": rp_id,
         "challenge": "Z2V0LWNoYWxsZW5nZS1nZXQtY2hhbGxlbmdl",
         "allowCredentials": [],

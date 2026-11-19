@@ -108,6 +108,7 @@ pub trait CeremonyScope {
     fn transport(&self) -> Transport;
     fn origin(&self) -> &str;
     fn top_origin(&self) -> Option<&str>;
+    fn cross_origin(&self) -> bool;
     fn rp_id(&self) -> &str;
     fn timeout_ms(&self) -> Option<u64>;
 }
@@ -118,6 +119,9 @@ pub struct CreateParams {
     pub transport: Transport,
     pub origin: String,
     pub top_origin: Option<String>,
+    /// From main; v1 rejects `true` (no passkeys in cross-origin frames).
+    #[serde(default)]
+    pub cross_origin: bool,
     pub rp_id: String,
     pub challenge: Bytes,
     pub rp: RpEntity,
@@ -139,6 +143,9 @@ pub struct GetParams {
     pub transport: Transport,
     pub origin: String,
     pub top_origin: Option<String>,
+    /// From main; v1 rejects `true` (no passkeys in cross-origin frames).
+    #[serde(default)]
+    pub cross_origin: bool,
     pub rp_id: String,
     pub challenge: Bytes,
     #[serde(default)]
@@ -158,6 +165,9 @@ macro_rules! impl_scope {
             }
             fn top_origin(&self) -> Option<&str> {
                 self.top_origin.as_deref()
+            }
+            fn cross_origin(&self) -> bool {
+                self.cross_origin
             }
             fn rp_id(&self) -> &str {
                 &self.rp_id

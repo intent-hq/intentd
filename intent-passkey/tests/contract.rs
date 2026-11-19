@@ -198,6 +198,13 @@ async fn rp_id_must_match_the_origin() {
         error_code(&client.call("f", "get", framed).await),
         "NotAllowed"
     );
+
+    let mut cross = create_params("usb", "https://example.com", "example.com");
+    cross["crossOrigin"] = json!(true);
+    assert_eq!(
+        error_code(&client.call("x", "create", cross).await),
+        "NotAllowed"
+    );
 }
 
 #[tokio::test]

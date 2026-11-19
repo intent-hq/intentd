@@ -84,6 +84,12 @@ fn lock(slot: &ActiveSlot) -> std::sync::MutexGuard<'_, Option<Active>> {
 /// Checks shared by `create` and `get` before a ceremony may start.
 fn admit<A: Authenticator>(auth: &A, scope: &impl CeremonyScope) -> Result<(), PasskeyError> {
     rpid::check(scope.origin(), scope.top_origin(), scope.rp_id())?;
+    if scope.cross_origin() {
+        return Err(PasskeyError::new(
+            ErrorCode::NotAllowed,
+            "passkeys in cross-origin frames are not supported",
+        ));
+    }
     match scope.transport() {
         Transport::Device => Err(PasskeyError::new(
             ErrorCode::NotSupported,
