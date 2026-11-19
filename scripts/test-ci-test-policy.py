@@ -176,7 +176,11 @@ def crate_targets(root):
 
 CARGO_VALUE_FLAGS = {"-p", "--package", "--test", "--target", "--features", "-F", "--bin", "--example",
                      "--bench", "-j", "--jobs", "--manifest-path", "--profile", "--target-dir",
-                     "--message-format", "--color", "--config", "-Z", "--exclude"}
+                     "--message-format", "--color", "--config", "-Z", "--exclude",
+                     # cargo nextest run
+                     "-E", "--filterset", "--retries", "--test-threads", "-j", "--partition",
+                     "--status-level", "--final-status-level", "--failure-output", "--success-output",
+                     "--no-tests", "--run-ignored", "--cargo-profile", "--build-jobs", "--tool-config-file"}
 LIBTEST_VALUE_FLAGS = {"--test-threads", "--skip", "--format", "--color", "--logfile", "-Z", "--shuffle-seed"}
 
 
@@ -296,7 +300,7 @@ def shell_selections(run):
                 if len(words) == 1:
                     scalars = {**scalars, name: words[0]}
                     continue
-            cargo = re.search(r"\bcargo\s+test\b", line)
+            cargo = re.search(r"\bcargo\s+(?:test|nextest\s+run)\b", line)
             if cargo:
                 selections.append(cargo_test_selection(command_words(line[cargo.end():], raw)))
                 continue
@@ -1148,6 +1152,18 @@ class NamedTestTests(unittest.TestCase):
                     for name in INCIDENT_3205_DELETED]
         self.assertEqual(named_test_violations(workflow), expected)
         self.assertTrue(set(expected).issubset(violations(workflow, "1")))
+
+    def test_nextest_steps_are_parsed_like_cargo_test(self):
+        # store-postgres moved to `cargo nextest run` so nextest's per-test
+        # slow-timeout applies; its named targets must stay audited.
+        (selection,) = step_selections(
+            "cargo nextest run -p intent-store --features postgres --retries 0 --test-threads 4 "
+            "--no-tests fail --profile ci --test postgres_backend\n")
+        self.assertEqual((selection["packages"], selection["tests"], selection["filters"]),
+                         (["intent-store"], ["postgres_backend"], []))
+        (selection,) = step_selections("cargo nextest run -p intent-store --test missing_binary\n")
+        self.assertIn("names no test target missing_binary in intent-store",
+                      selection_violations(selection, crate_targets(ROOT), ROOT))
 
     def test_removing_any_named_test_fails_its_step(self):
         real = target_fns
