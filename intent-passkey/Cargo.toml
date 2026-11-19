@@ -1,0 +1,56 @@
+# A standalone workspace on purpose: libwebauthn links libdbus and libudev, so
+# keeping it out of the daemon workspace keeps those system libraries off every
+# intentd build host. CI's `passkey` job runs its gates; the release stages the
+# binary into the Linux daemon archives (scripts/build-intent-passkey.sh).
+[workspace]
+
+[package]
+name = "intent-passkey"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/intent-hq/intentd"
+description = "WebAuthn sidecar for the Intent browser panel (phone QR and USB security keys)"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Same permanent allow as the daemon workspace.
+too_many_lines = "allow"
+
+[dependencies]
+base64 = "0.22"
+psl = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+zeroize = { version = "1.8", features = ["serde"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = "0.9"
+libwebauthn = "=0.11.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+ciborium = "0.2"
+hmac = "0.12"
+libwebauthn = { version = "=0.11.0", features = ["virt"] }
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+rand = "0.8"
+sha2 = "0.10"
+
+[profile.release]
+strip = true
+lto = "thin"
