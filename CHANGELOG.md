@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.251] - 2026-11-19
+
+### 🐛 Bug Fixes
+
+- *(store)* Share per-tenant process state across Postgres opens ([#3533](https://github.com/intent-hq/intentd/pull/3533))
+- *(store)* Stop one tenant's writers from starving the shared Postgres pool ([#3531](https://github.com/intent-hq/intentd/pull/3531))
+
+### 📚 Documentation
+
+- Describe the recent-agent switcher in the assistant app guide ([#3538](https://github.com/intent-hq/intentd/pull/3538))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(deps)* Inherit internal crates from workspace dependencies ([#3534](https://github.com/intent-hq/intentd/pull/3534))
+
+
 ## [0.11.250] - 2026-11-19
 
 ### 🐛 Bug Fixes
