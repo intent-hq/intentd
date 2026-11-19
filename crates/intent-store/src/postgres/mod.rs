@@ -615,7 +615,10 @@ pub const WRITER_LOCK_SQL: &str =
 
 fn is_lock_timeout(e: &sqlx::Error) -> bool {
     // 55P03 lock_not_available: `lock_timeout` expired.
-    matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"))
+    let sqlx::Error::Database(d) = e else {
+        return false;
+    };
+    d.code().as_deref() == Some("55P03")
 }
 
 fn writer_busy(tenant: &str, waited: Duration) -> Error {
