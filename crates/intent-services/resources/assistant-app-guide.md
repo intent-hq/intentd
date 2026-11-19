@@ -1658,7 +1658,9 @@ tab to open its default
 content: **Agents** opens the main agent, **Context** the Spec, **Changes** the
 changes list, and **Files** a root README (otherwise the first root file, then a
 file inside a folder). **Browsers** opens the first browser in its list; **Shells**
-opens the first terminal, creating one when none exists. A click in the collapsed
+opens the first terminal, creating one when none exists. A green dot on **Browsers**
+means the workspace has open browser tabs; on **Shells**, open terminals or a running
+script. A click in the collapsed
 rail opens the section's default content immediately. With one pane selected,
 arrow keys select a section without opening main content. With multiple panes
 selected, arrow keys move focus without changing the selection. The focus ring
