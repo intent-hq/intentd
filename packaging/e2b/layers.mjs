@@ -47,6 +47,18 @@ export async function refDigest(ref, fetch = globalThis.fetch) {
   return `${parsed.registry}/${parsed.repository}@${digest}`;
 }
 
+// The digest of the linux/amd64 image itself: the index entry when the ref is
+// an index (buildx adds an attestation), else the ref's own manifest.
+export async function platformDigest(ref, fetch = globalThis.fetch) {
+  const parsed = parseRef(ref);
+  const manifest = await (await client(parsed, fetch))(`/manifests/${parsed.reference}`, MANIFEST_TYPES);
+  const digest = manifest.manifests
+    ? manifest.manifests.find(m => m.platform?.os === 'linux' && m.platform?.architecture === 'amd64')?.digest
+    : manifest.digest;
+  if (!/^sha256:[0-9a-f]{64}$/.test(digest ?? '')) throw new Error(`${ref} has no linux/amd64 image digest`);
+  return digest;
+}
+
 // The linux/amd64 image's layers: compressed blob digest and size, and the
 // step that made each. Hosts pull by blob digest, so that is what compares.
 export async function imageLayers(ref, fetch = globalThis.fetch) {

@@ -14,6 +14,9 @@ on:
       latest:
         required: false
         type: boolean
+    secrets:
+      VERCEL_TOKEN:
+        required: false
 
 # Layer cache: every build reads the previous image's inline build cache
 # (--cache-from) and pushes its own (--cache-to type=inline), so a release
@@ -127,6 +130,7 @@ jobs:
         run: node layers.mjs "$LOCAL_IMAGE:baseline" "$LOCAL_IMAGE:pr-$PR_NUMBER" --budget-mb "$LAYER_BUDGET_MB"
 
       - name: Push the image
+        id: push
         if: steps.plan.outputs.push == 'true'
         working-directory: packaging/e2b
         env:
@@ -158,6 +162,24 @@ jobs:
             echo "Pushed $tag"
             echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
           done
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
           if [ -n "$previous" ]; then
             node layers.mjs "$previous" "$REF" || echo "::warning::Could not compare the layers with the previous latest image."
           fi
+
+      # The version tag only (never latest), copied by digest from GHCR, then
+      # polled until Vercel Sandbox can use it. Fail-soft without the variables.
+      - name: Copy the image to the Vercel registry
+        if: steps.push.outputs.pushed == 'true'
+        working-directory: packaging/e2b
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          VERCEL_TEAM_ID: ${{ vars.VERCEL_TEAM_ID }}
+          VCR_INTENT_NODE_IMAGE: ${{ vars.VCR_INTENT_NODE_IMAGE }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          # Unconfigured, vcr.mjs warns and succeeds; nothing to install for it.
+          if [ -n "$VERCEL_TEAM_ID" ] && [ -n "$VCR_INTENT_NODE_IMAGE" ] && ! command -v skopeo >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq skopeo
+          fi
+          node vcr.mjs "$VERSION"
