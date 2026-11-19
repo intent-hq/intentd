@@ -658,7 +658,10 @@ async fn was_running_service_restarts_after_daemon_kill_over_wss() {
     );
     let listed = wss_rpc(&mut ws, 4, "script.list", json!({ "workspaceId": ws_id })).await;
     let entry = &listed["scripts"].as_array().expect("scripts array")[0];
-    assert_eq!(entry["runtime"]["status"], "running", "on list too: {entry}");
+    assert_eq!(
+        entry["runtime"]["status"], "running",
+        "on list too: {entry}"
+    );
     drop(ws);
     stop(child); // Kill again while the restored service runs.
 
