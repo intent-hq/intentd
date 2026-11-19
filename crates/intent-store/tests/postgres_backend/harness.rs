@@ -292,7 +292,10 @@ pub async fn open_with(db: &TestDb, tenant: &str, rls_guard: bool) -> Store {
     Store::open_postgres(
         db.app.clone(),
         TenantId::new(tenant).unwrap(),
-        PostgresOptions { rls_guard },
+        PostgresOptions {
+            rls_guard,
+            ..PostgresOptions::default()
+        },
     )
     .await
     .expect("open tenant store")

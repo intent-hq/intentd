@@ -471,7 +471,7 @@ impl PgStore {
 }
 
 async fn rollback(tx: WriteTx) -> std::result::Result<(), sqlx::Error> {
-    tx.0.rollback().await
+    tx.rollback().await
 }
 
 // ---- repository authority ----------------------------------------------------

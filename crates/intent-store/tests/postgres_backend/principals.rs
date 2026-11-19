@@ -1644,8 +1644,8 @@ parity_test!(
     }
 );
 
-/// The permit holds the tenant writer lock: a revoke waits for it, and
-/// dropping the permit (a rollback in sqlx's drop) lets the revoke finish.
+/// The permit holds the tenant writer lock (and the store's writer slot): a
+/// revoke waits for it, and dropping the permit (a rollback in sqlx's drop) lets the revoke finish.
 #[tokio::test]
 async fn owner_queue_permit_blocks_revoke_until_dropped() {
     use std::time::Duration;
@@ -1683,17 +1683,8 @@ async fn owner_queue_permit_blocks_revoke_until_dropped() {
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         async {
-            loop {
-                let waiting: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
-                )
-                .fetch_one(&db.admin)
-                .await
-                .unwrap();
-                if waiting {
-                    break;
-                }
-                // timing-guard: poll interval; Postgres emits no event when a lock wait starts.
+            while store.postgres_writers_waiting() == 0 {
+                // timing-guard: poll interval; the store emits no event when a writer queues.
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         },
