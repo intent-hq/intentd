@@ -1024,7 +1024,7 @@ the frontend release containing intent-hq/cloudlands-fe#4777; until then the rai
 shows even with one machine. With that release, the rail shows only while the window
 holds two or more machines. With one machine the rail is hidden and the title bar shows
 the machine status menu; picking another machine there adds it to the window and
-the rail appears. Its switch is
+the rail appears. The rail's switch is
 Settings → Appearance → Machine rail, starting with the desktop release that moves it
 out of Labs; until then it is Settings → Advanced → Labs → Machine rail and is a Labs
 feature. Starting with the desktop release that turns it on by default, the rail is on
