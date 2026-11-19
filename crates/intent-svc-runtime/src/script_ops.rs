@@ -1053,9 +1053,9 @@ impl ScriptManager {
     /// registry with a fresh idle state (runtime state is never persisted,
     /// except the stored-on-write `was_running` marker — the script was
     /// running when the previous daemon process stopped). A marked service
-    /// starts automatically only when `auto_start` is enabled; otherwise it
-    /// stays `idle` with `previouslyRunning: true` (the restore-tab
-    /// affordance). A failed automatic launch retains that idle marker.
+    /// starts again automatically, whatever its `auto_start`; a failed launch
+    /// leaves it `idle` with `previouslyRunning: true` (the restore-tab
+    /// affordance).
     /// A marked command-mode script hydrates as a terminal
     /// `exited` with [`EXIT_CODE_UNOBSERVABLE`] and
     /// [`LOST_AT_DAEMON_STOP_ERROR`] — its run is gone and nothing can be
@@ -1118,11 +1118,7 @@ impl ScriptManager {
                 loaded += 1;
                 let marked = was_running.contains(&(def.workspace_id.clone(), def.id.clone()));
                 let lost = marked && def.mode == ScriptMode::Command;
-                if marked
-                    && def.mode == ScriptMode::Service
-                    && def.auto_start == Some(true)
-                    && def.archived_at.is_none()
-                {
+                if marked && def.mode == ScriptMode::Service && def.archived_at.is_none() {
                     restore.push(key.clone());
                 }
                 let mut state = if lost {
@@ -1166,7 +1162,7 @@ impl ScriptManager {
         // prevent other services (or the daemon itself) from starting.
         for (ws, id) in restore {
             if let Err(error) = self.start_with_restore(&ws, &id, true).await {
-                tracing::warn!(workspace = %ws, script = %id, %error, "restore auto-start script failed");
+                tracing::warn!(workspace = %ws, script = %id, %error, "restore previously running service failed");
             }
         }
         Ok(loaded)
@@ -3269,7 +3265,7 @@ impl ScriptManager {
                 return;
             };
             if restoring {
-                tracing::warn!(workspace = %ws, script = %script_id, error = %err, "restore auto-start script failed");
+                tracing::warn!(workspace = %ws, script = %script_id, error = %err, "restore previously running service failed");
                 m.state = ScriptRuntimeState {
                     previously_running: m.state.previously_running,
                     run_id: m.state.run_id.clone(),
@@ -4988,7 +4984,7 @@ mod tests {
         assert_eq!(svc2.hydrate_scripts().await.expect("re-hydrate"), 0);
     }
 
-    /// Boot restores only auto-start services that were actually running;
+    /// Boot restores services that were actually running;
     /// repeated hydration must not launch another supervisor or process.
     #[intent_test_macros::daemon_test]
     async fn hydrate_restores_running_autostart_service_once() {
@@ -5249,18 +5245,18 @@ mod tests {
         );
     }
 
+    /// The restore does not need `autoStart`; a failed one keeps the marker.
     #[intent_test_macros::daemon_test]
-    async fn hydrate_autostart_failure_preserves_idle_marker() {
+    async fn hydrate_restore_failure_preserves_idle_marker() {
         // Exercise both cwd validation and PTY spawn failure, before a process runs.
         for spawn_failure in [false, true] {
             let mut h = harness_with_worktree(true).await;
             let id = seed_legacy_script(
                 &h,
                 ScriptCreateParams {
-                    name: "auto-start".into(),
+                    name: "svc".into(),
                     command: SERVICE_CMD.into(),
                     mode: ScriptMode::Service,
-                    auto_start: Some(true),
                     cwd: (!spawn_failure).then(|| "../escape".into()),
                     ..Default::default()
                 },
@@ -5304,70 +5300,12 @@ mod tests {
         }
     }
 
-    /// A service running when the daemon dies hydrates as `idle` with
-    /// `previouslyRunning: true` (the stored-on-write `was_running` marker),
-    /// and the marker persists across repeated restarts until the script is
-    /// stopped.
-    #[intent_test_macros::daemon_test]
-    async fn service_running_at_daemon_death_hydrates_previously_running() {
-        let h = harness().await;
-        let mut sub = subscribe(&h);
-        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
-        h.services
-            .script_start(h.ws.clone(), id.clone())
-            .await
-            .expect("start");
-        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
-
-        // Simulate a daemon death (no stop ran): a fresh Services over the
-        // same store hydrates the marker as `previouslyRunning: true`.
-        let store = h.services.store().clone();
-        let svc2 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
-        assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
-        let st = svc2
-            .script_status(h.ws.clone(), id.clone())
-            .await
-            .expect("status");
-        assert_eq!(st["status"], "idle");
-        assert_eq!(st["previouslyRunning"], true, "marker surfaced: {st}");
-
-        // The marker survives another restart untouched.
-        let svc3 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
-        assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 1);
-        let st = svc3
-            .script_status(h.ws.clone(), id.clone())
-            .await
-            .expect("status");
-        assert_eq!(st["previouslyRunning"], true, "marker persists: {st}");
-
-        // A real stop (running process) durably clears it.
-        h.services
-            .script_stop(h.ws.clone(), id.clone())
-            .await
-            .expect("stop");
-        assert!(
-            store
-                .list_was_running_script_ids()
-                .await
-                .expect("list")
-                .is_empty(),
-            "stop clears the marker"
-        );
-        let svc4 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
-        assert_eq!(svc4.hydrate_scripts().await.expect("hydrate"), 1);
-        let st = svc4.script_status(h.ws.clone(), id).await.expect("status");
-        assert!(
-            st.get("previouslyRunning").is_none(),
-            "post-stop hydration carries no marker: {st}"
-        );
-    }
-
     /// Regression (monorepo#4952): the `was_running` marker must be durable
     /// before `script.status` can report `running`. Park `mark_running` in
     /// front of the marker write: while parked the status is not `running`
     /// and the marker is unset; once released both flip, and a fresh
     /// `Services` over the same store (a simulated daemon death right after a
-    /// client observed `running`) hydrates `previouslyRunning: true`.
+    /// client observed `running`) restores the service.
     #[intent_test_macros::daemon_test]
     async fn was_running_marker_is_durable_before_status_reports_running() {
         let h = harness().await;
@@ -5423,9 +5361,14 @@ mod tests {
             .script_status(h.ws.clone(), id.clone())
             .await
             .expect("status");
-        assert_eq!(st["status"], "idle");
-        assert_eq!(st["previouslyRunning"], true, "marker surfaced: {st}");
+        assert!(
+            st["status"] == "starting" || st["status"] == "running",
+            "marker restored the service: {st}"
+        );
 
+        svc2.script_stop(h.ws.clone(), id.clone())
+            .await
+            .expect("stop restored");
         services.script_stop(h.ws.clone(), id).await.expect("stop");
     }
 
@@ -5453,7 +5396,13 @@ mod tests {
             workspace_id: Some(h.ws.0.clone()),
             ..Default::default()
         });
+        // Refuse the boot restore so the script stays idle with its marker.
+        svc2.pty().kill_all_sync();
         assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
+        await_state(&mut sub2, LIVENESS, |v| {
+            v["data"]["status"] == "idle" && v["data"]["previouslyRunning"] == true
+        })
+        .await;
 
         // Dismiss: stop the hydrated (idle, not running) script.
         let v = svc2
@@ -5803,6 +5752,10 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
+        await_state(&mut sub2, LIVENESS, |v| {
+            v["data"]["status"] == "idle" && v["data"]["previouslyRunning"] == true
+        })
+        .await;
         svc2.script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
@@ -5812,8 +5765,16 @@ mod tests {
             vec![(h.ws.as_str().to_string(), id.clone())],
             "service semantics unchanged: the marker survives a launch failure"
         );
-        let svc3 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
+        let bus3 = EventBus::new(store.clone());
+        let svc3 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
+            .with_event_bus(bus3.clone());
+        let mut sub3 = bus3.subscribe(SubscriptionFilter {
+            event_types: vec!["script:*".to_string()],
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        });
         assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 1);
+        await_state(&mut sub3, LIVENESS, |v| v["data"]["status"] == "idle").await;
         let st = svc3.script_status(h.ws.clone(), id).await.expect("status");
         assert_eq!(st["status"], "idle", "{st}");
         assert_eq!(st["previouslyRunning"], true, "{st}");
