@@ -736,6 +736,10 @@ describe('vercel registry workflow contract', () => {
     assert.ok(steps.indexOf('Push the image') < steps.indexOf('Copy the image to the Vercel registry'));
     assert.match(step, /node vcr\.mjs "\$VERSION"/);
   });
+  it('installs skopeo only when the copy is configured, so the warning path cannot fail', () => {
+    assert.match(step, /if \[ -n "\$VERCEL_TEAM_ID" \] && \[ -n "\$VCR_INTENT_NODE_IMAGE" \] && ! command -v skopeo/);
+    assert.ok(step.indexOf('apt-get install') < step.indexOf('node vcr.mjs'));
+  });
   it('passes the credential through env only, from variables and an optional secret', () => {
     assert.match(step, /VERCEL_TEAM_ID: \$\{\{ vars\.VERCEL_TEAM_ID \}\}/);
     assert.match(step, /VCR_INTENT_NODE_IMAGE: \$\{\{ vars\.VCR_INTENT_NODE_IMAGE \}\}/);

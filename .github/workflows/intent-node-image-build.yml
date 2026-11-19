@@ -178,5 +178,8 @@ jobs:
           VCR_INTENT_NODE_IMAGE: ${{ vars.VCR_INTENT_NODE_IMAGE }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
-          command -v skopeo >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq skopeo; }
+          # Unconfigured, vcr.mjs warns and succeeds; nothing to install for it.
+          if [ -n "$VERCEL_TEAM_ID" ] && [ -n "$VCR_INTENT_NODE_IMAGE" ] && ! command -v skopeo >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq skopeo
+          fi
           node vcr.mjs "$VERSION"
