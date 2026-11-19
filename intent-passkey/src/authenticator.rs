@@ -36,6 +36,21 @@ pub struct CeremonyIo {
     stop: watch::Receiver<Option<StopReason>>,
 }
 
+/// See [`CeremonyIo::stop_signal`].
+#[derive(Clone)]
+pub struct StopSignal(watch::Receiver<Option<StopReason>>);
+
+impl StopSignal {
+    /// # Errors
+    /// The stop reason's error once the ceremony must stop.
+    pub fn check(&self) -> Result<(), PasskeyError> {
+        match *self.0.borrow() {
+            Some(reason) => Err(reason.error()),
+            None => Ok(()),
+        }
+    }
+}
+
 /// The server's handles to a running ceremony's [`CeremonyIo`].
 pub struct CeremonyControl {
     pub pins: mpsc::Sender<Zeroizing<String>>,
@@ -84,10 +99,13 @@ impl CeremonyIo {
     /// # Errors
     /// When the ceremony must stop.
     pub fn ensure_running(&self) -> Result<(), PasskeyError> {
-        match *self.stop.borrow() {
-            Some(reason) => Err(reason.error()),
-            None => Ok(()),
-        }
+        self.stop_signal().check()
+    }
+
+    /// A handle that checks for a stop from another task or a blocking thread.
+    #[must_use]
+    pub fn stop_signal(&self) -> StopSignal {
+        StopSignal(self.stop.clone())
     }
 
     /// Resolves when the ceremony must stop.

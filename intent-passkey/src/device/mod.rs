@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rand::RngCore as _;
 use zeroize::Zeroizing;
 
-use crate::authenticator::{device_unsupported, Authenticator, CeremonyIo};
+use crate::authenticator::{device_unsupported, Authenticator, CeremonyIo, StopSignal};
 use crate::protocol::{
     Account, BluetoothState, Bytes, CreateExtensionOutputs, CreateParams, CreateResult, CredProps,
     DeviceCredential, ErrorCode, Event, GetParams, GetResult, PasskeyError, PinKind, Status,
@@ -159,15 +159,21 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
             .map_err(|error| task_failed(&error))?
     }
 
-    /// Loads the store, applies `change` and saves it, under the write lock.
+    /// Loads the store, applies `change` and saves it, under the write lock. With
+    /// `stop`, a stopped ceremony writes nothing: the check runs at the commit
+    /// point, after every wait.
     async fn update<T: Send + 'static>(
         self: &Arc<Self>,
+        stop: Option<StopSignal>,
         change: impl FnOnce(Option<StoreFile>) -> Result<(StoreFile, T), PasskeyError> + Send + 'static,
     ) -> Result<T, PasskeyError> {
         let _guard = self.writes.lock().await;
         let inner = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let (file, value) = change(inner.store.load()?)?;
+            if let Some(stop) = &stop {
+                stop.check()?;
+            }
             inner.store.save(&file)?;
             Ok(value)
         })
@@ -256,7 +262,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
             .await?;
             io.ensure_running()?;
             let file = self
-                .update(move |existing| match existing {
+                .update(Some(io.stop_signal()), move |existing| match existing {
                     None => {
                         let file = StoreFile::new(wrap);
                         Ok((file.clone(), file))
@@ -312,7 +318,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
         };
         io.ensure_running()?;
         let file = self
-            .update(move |existing| {
+            .update(Some(io.stop_signal()), move |existing| {
                 let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
                 if !file.same_wrap(&old_wrap) {
                     return Err(not_allowed("the passkey store changed; try again"));
@@ -377,19 +383,37 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
         };
         drop(master);
         io.ensure_running()?;
-        self.update(move |existing| {
-            let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
-            if !file.same_wrap(&wrap) {
-                return Err(not_allowed("the passkey store changed; try again"));
-            }
-            // One discoverable credential per site and user, as on other authenticators.
-            file.credentials.retain(|existing| {
-                existing.rp_id != credential.rp_id || existing.user_id != credential.user_id
-            });
-            file.credentials.push(credential);
-            Ok((file, ()))
-        })
-        .await?;
+        let replaced = self
+            .update(Some(io.stop_signal()), move |existing| {
+                let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
+                if !file.same_wrap(&wrap) {
+                    return Err(not_allowed("the passkey store changed; try again"));
+                }
+                // One discoverable credential per site and user, as on other authenticators.
+                let (replaced, kept) = std::mem::take(&mut file.credentials).into_iter().partition(
+                    |existing: &StoredCredential| {
+                        existing.rp_id == credential.rp_id && existing.user_id == credential.user_id
+                    },
+                );
+                file.credentials = kept;
+                file.credentials.push(credential);
+                Ok((file, replaced))
+            })
+            .await?;
+        if let Err(stopped) = io.ensure_running() {
+            // Cancelled after the commit point: the site never gets this passkey,
+            // so put the store back as it was.
+            let new_id = Bytes(credential_id.clone());
+            self.update(None, move |existing| {
+                let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
+                file.credentials
+                    .retain(|credential| credential.credential_id != new_id);
+                file.credentials.extend(replaced);
+                Ok((file, ()))
+            })
+            .await?;
+            return Err(stopped);
+        }
 
         let auth_data = keys::create_auth_data(&params.rp_id, &credential_id, &pair.cose);
         Ok(CreateResult {
@@ -473,7 +497,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
         let now = self.now();
         let touched = credential_id.clone();
         let saved = self
-            .update(move |existing| {
+            .update(Some(io.stop_signal()), move |existing| {
                 let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
                 if let Some(credential) = file
                     .credentials
@@ -485,6 +509,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
                 Ok((file, ()))
             })
             .await;
+        io.ensure_running()?;
         if let Err(error) = saved {
             tracing::warn!(%error, "could not record the passkey's last use");
         }
@@ -521,7 +546,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
         if self.load().await?.is_none() {
             return Ok(());
         }
-        self.update(move |existing| {
+        self.update(None, move |existing| {
             let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
             file.credentials
                 .retain(|credential| credential.credential_id != credential_id);
