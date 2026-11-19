@@ -2908,7 +2908,7 @@ jobs:
       - name: Protocol and USB security key tests
         run: cargo test --locked --manifest-path intent-passkey/Cargo.toml
       - name: Licenses (cargo-deny)
-        run: cargo deny --manifest-path intent-passkey/Cargo.toml check --config deny.toml licenses
+        run: cargo deny --manifest-path intent-passkey/Cargo.toml --config deny.toml check licenses
 
   gate:
     name: CI Gate
