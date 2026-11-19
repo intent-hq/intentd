@@ -1061,7 +1061,6 @@ impl ScriptManager {
         workspace_id: &WorkspaceId,
         def: &Script,
     ) -> Result<Option<Value>> {
-        let key = (workspace_id.clone(), def.id.clone());
         // Spellings of "unset" (empty env, empty or "." cwd) do not count as a change.
         fn launch_shape(def: &Script) -> Script {
             Script {
@@ -1073,6 +1072,7 @@ impl ScriptManager {
                 ..def.clone()
             }
         }
+        let key = (workspace_id.clone(), def.id.clone());
         let only_auto_start = self.scripts.lock().unwrap().get(&key).is_some_and(|old| {
             old.def.auto_start != def.auto_start
                 && old.def.archived_at.is_none()
