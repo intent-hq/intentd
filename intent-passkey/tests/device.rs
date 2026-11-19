@@ -158,12 +158,15 @@ async fn ceremony(
     }
 }
 
-/// The next `pin-needed`, skipping the `{}` answers to `pin` requests.
+/// The next `pin-needed`, skipping status events and the `{}` answers to `pin`.
 async fn next_prompt(client: &mut Client) -> Value {
     loop {
         let line = client.next().await;
         if line["event"] == "pin-needed" {
             return line;
+        }
+        if line["event"] == "status" {
+            continue;
         }
         assert_eq!(line["result"], json!({}), "unexpected line: {line}");
     }
@@ -550,7 +553,48 @@ async fn a_changed_pin_asks_once_for_the_old_pin_and_rewraps() {
     assert_eq!(error_code(&failed), "NotAllowed");
     let prompts = pin_prompts(&events);
     assert_eq!(prompts[1]["oldPin"], true);
+    assert_eq!(prompts[1]["attemptsLeft"], 10);
     assert_eq!(salt(&rig), first_salt, "nothing re-wrapped");
+
+    // Wrong old PINs are an offline-style oracle: they add up under the same
+    // limit although PAM accepts the new PIN each time, and wait like any PIN.
+    for (round, left) in (2..6).zip([9, 8, 7, 6]) {
+        let (failed, events) = ceremony(
+            &mut client,
+            &format!("w{round}"),
+            "get",
+            get_params("device", ORIGIN, RP),
+            &["55667788", "4321"],
+            0,
+        )
+        .await;
+        assert_eq!(error_code(&failed), "NotAllowed");
+        let prompts = pin_prompts(&events);
+        assert_eq!(prompts[0]["attemptsLeft"], left);
+        assert_eq!(prompts[1]["attemptsLeft"], left);
+    }
+    client
+        .send("w6", "get", get_params("device", ORIGIN, RP))
+        .await;
+    let prompt = next_prompt(&mut client).await;
+    assert_eq!(prompt["retryAfterMs"], 30_000);
+    rig.advance(30_000);
+    client
+        .send(
+            "w6-1",
+            "pin",
+            json!({ "ceremony": "w6", "pin": "55667788" }),
+        )
+        .await;
+    let prompt = next_prompt(&mut client).await;
+    assert_eq!(prompt["oldPin"], true);
+    assert_eq!(prompt["attemptsLeft"], 5);
+    assert!(prompt.get("retryAfterMs").is_none());
+    client
+        .send("w6-x", "cancel", json!({ "ceremony": "w6" }))
+        .await;
+    let (cancelled, _) = client.response("w6").await;
+    assert_eq!(error_code(&cancelled), "Abort");
 
     let (assertion, events) = ceremony(
         &mut client,
@@ -563,7 +607,7 @@ async fn a_changed_pin_asks_once_for_the_old_pin_and_rewraps() {
     .await;
     let prompts = pin_prompts(&events);
     assert_eq!(prompts.len(), 2);
-    assert_eq!(prompts[0]["attemptsLeft"], 9);
+    assert_eq!(prompts[0]["attemptsLeft"], 5);
     assert!(prompts[0].get("oldPin").is_none());
     assert_eq!(prompts[1]["oldPin"], true);
     check_get(&assertion["result"], &credential_id, "ada");

@@ -175,15 +175,16 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
         .map_err(|error| task_failed(&error))?
     }
 
-    /// Asks for the PIN until PAM accepts it, under the attempt limit.
-    async fn confirm_pin(
-        self: &Arc<Self>,
+    /// Sends `pin-needed` until a PIN arrives while the attempt limit allows a
+    /// try; a PIN sent during the wait is ignored and the prompt repeats.
+    async fn ask_limited(
+        &self,
         io: &mut CeremonyIo,
+        wrong_pin: bool,
+        old_pin: bool,
     ) -> Result<Zeroizing<String>, PasskeyError> {
-        let mut wrong_pin = false;
         loop {
-            let gate = self.limiter().gate(self.now());
-            let (attempts_left, retry_after_ms) = match gate {
+            let (attempts_left, retry_after_ms) = match self.limiter().gate(self.now()) {
                 Gate::Locked => return Err(locked()),
                 Gate::Open { attempts_left } => (attempts_left, None),
                 Gate::Wait {
@@ -197,12 +198,23 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
                     attempts_left: Some(attempts_left),
                     retry_after_ms,
                     wrong_pin,
-                    old_pin: false,
+                    old_pin,
                 })
                 .await?;
-            if pin.is_empty() || !matches!(self.limiter().gate(self.now()), Gate::Open { .. }) {
-                continue;
+            if !pin.is_empty() && matches!(self.limiter().gate(self.now()), Gate::Open { .. }) {
+                return Ok(pin);
             }
+        }
+    }
+
+    /// Asks for the PIN until PAM accepts it, under the attempt limit.
+    async fn confirm_pin(
+        self: &Arc<Self>,
+        io: &mut CeremonyIo,
+    ) -> Result<Zeroizing<String>, PasskeyError> {
+        let mut wrong_pin = false;
+        loop {
+            let pin = self.ask_limited(io, wrong_pin, false).await?;
             let inner = Arc::clone(self);
             let (pin, verified) = tokio::task::spawn_blocking(move || {
                 let verified = inner.pin.verify(&pin);
@@ -210,8 +222,9 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
             })
             .await
             .map_err(|error| task_failed(&error))?;
+            // The counter resets only once the store unlocks (see `unlock`), so
+            // wrong old PINs add up even though PAM accepts the new one.
             if verified? {
-                self.limiter().succeeded();
                 return Ok(pin);
             }
             self.limiter().failed(self.now());
@@ -248,6 +261,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
                     Some(_) => Err(not_allowed("the passkey store changed; try again")),
                 })
                 .await?;
+            self.limiter().succeeded();
             return Ok((file, master));
         };
         let (file, pin, unlocked) = blocking(move || {
@@ -256,7 +270,10 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
         })
         .await?;
         match unlocked {
-            Ok(master) => Ok((file, master)),
+            Ok(master) => {
+                self.limiter().succeeded();
+                Ok((file, master))
+            }
             Err(UnlockError::Damaged(detail)) => Err(store::damaged(detail)),
             Err(UnlockError::WrongPin) => self.rewrap(io, file, pin).await,
         }
@@ -268,19 +285,9 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
         file: StoreFile,
         new_pin: Zeroizing<String>,
     ) -> Result<(StoreFile, MasterKey), PasskeyError> {
-        let attempts_left = match self.limiter().gate(self.now()) {
-            Gate::Locked => return Err(locked()),
-            Gate::Open { attempts_left } | Gate::Wait { attempts_left, .. } => attempts_left,
-        };
-        let old_pin = io
-            .ask_pin(Event::PinNeeded {
-                kind: PinKind::Device,
-                attempts_left: Some(attempts_left),
-                retry_after_ms: None,
-                wrong_pin: false,
-                old_pin: true,
-            })
-            .await?;
+        // The old PIN is checked only against the Argon2id wrap (no PAM, no
+        // faillock), so it goes through the same limit as any PIN.
+        let old_pin = self.ask_limited(io, false, true).await?;
         let kdf = self.kdf;
         let old_wrap = file.wrap();
         let unlocked = blocking(move || match file.unlock(&old_pin) {
@@ -309,6 +316,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
                 Ok((file.clone(), file))
             })
             .await?;
+        self.limiter().succeeded();
         tracing::info!("device passkeys re-wrapped for the new PIN");
         Ok((file, master))
     }
