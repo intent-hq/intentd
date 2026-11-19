@@ -1062,15 +1062,21 @@ impl ScriptManager {
         def: &Script,
     ) -> Result<Option<Value>> {
         let key = (workspace_id.clone(), def.id.clone());
+        // Spellings of "unset" (empty env, empty or "." cwd) do not count as a change.
+        fn launch_shape(def: &Script) -> Script {
+            Script {
+                auto_start: None,
+                updated_at: None,
+                last_run: None,
+                env: def.env.clone().filter(|env| !env.is_empty()),
+                cwd: def.cwd.clone().filter(|cwd| !cwd.is_empty() && cwd != "."),
+                ..def.clone()
+            }
+        }
         let only_auto_start = self.scripts.lock().unwrap().get(&key).is_some_and(|old| {
             old.def.auto_start != def.auto_start
                 && old.def.archived_at.is_none()
-                && Script {
-                    auto_start: old.def.auto_start,
-                    updated_at: old.def.updated_at.clone(),
-                    last_run: old.def.last_run.clone(),
-                    ..def.clone()
-                } == old.def
+                && launch_shape(def) == launch_shape(&old.def)
         });
         if !only_auto_start {
             return Ok(None);
@@ -1169,14 +1175,13 @@ impl ScriptManager {
                 loaded += 1;
                 let marked = was_running.contains(&(def.workspace_id.clone(), def.id.clone()));
                 let lost = marked && def.mode == ScriptMode::Command;
-                if def.mode == ScriptMode::Service && def.archived_at.is_none() {
-                    if marked {
-                        restore.push((key.clone(), true));
-                    } else if def.auto_start == Some(true)
-                        && def.purpose == intent_core::ScriptPurpose::Saved
-                    {
-                        restore.push((key.clone(), false));
-                    }
+                if def.mode == ScriptMode::Service
+                    && def.archived_at.is_none()
+                    && (marked
+                        || (def.auto_start == Some(true)
+                            && def.purpose == intent_core::ScriptPurpose::Saved))
+                {
+                    restore.push((key.clone(), marked));
                 }
                 let mut state = if lost {
                     ScriptRuntimeState {
@@ -1217,23 +1222,28 @@ impl ScriptManager {
         // Only newly hydrated entries are eligible. Launch through the normal
         // supervisor after releasing the registry lock; one failure must not
         // prevent other services (or the daemon itself) from starting.
-        let mut archived: HashMap<WorkspaceId, bool> = HashMap::new();
-        for ((ws, id), restoring) in restore {
-            let is_archived = if let Some(known) = archived.get(&ws) {
+        // (archived, runs on a home) per workspace. A home's autoStart scripts
+        // start when its checkout is set up, never at orchestrator boot.
+        let mut workspaces: HashMap<WorkspaceId, (bool, bool)> = HashMap::new();
+        for ((ws, id), marked) in restore {
+            let (archived, on_home) = if let Some(known) = workspaces.get(&ws) {
                 *known
             } else {
-                let known = self
-                    .store
-                    .get_workspace(&ws)
-                    .await
-                    .map_or(true, |workspace| workspace.archived);
-                archived.insert(ws.clone(), known);
-                known
+                let archived = match self.store.get_workspace(&ws).await {
+                    Ok(workspace) => workspace.archived,
+                    Err(error) => {
+                        tracing::warn!(workspace = %ws, %error, "boot start: workspace lookup failed; skipping its services");
+                        true
+                    }
+                };
+                let on_home = self.runs_on_home(&ws).await.unwrap_or(true);
+                workspaces.insert(ws.clone(), (archived, on_home));
+                (archived, on_home)
             };
-            if is_archived {
+            if archived || (on_home && !marked) {
                 continue;
             }
-            if let Err(error) = self.start_with_restore(&ws, &id, restoring).await {
+            if let Err(error) = self.start_with_restore(&ws, &id, true).await {
                 tracing::warn!(workspace = %ws, script = %id, %error, "boot start of service failed");
             }
         }
@@ -2146,8 +2156,13 @@ impl ScriptManager {
         let m = guard
             .get_mut(&key)
             .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
-        // A stop/upsert racing boot hydration must not be undone by restoration.
-        if restoring && (m.stopped_by_user || m.state.previously_running != Some(true)) {
+        // A stop, upsert, autoStart toggle-off or archive racing boot hydration
+        // must not be undone by the boot start.
+        if restoring
+            && (m.stopped_by_user
+                || m.def.archived_at.is_some()
+                || (m.state.previously_running != Some(true) && m.def.auto_start != Some(true)))
+        {
             return Ok(json!({ "ok": true, "scriptId": script_id }));
         }
         if matches!(

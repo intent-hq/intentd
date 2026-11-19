@@ -46,7 +46,7 @@ impl Launch {
 impl ScriptManager {
     /// Whether `ws`'s home runs run on its home: an orchestrator serving
     /// homes, with the workspace's home on a machine or a cloud entry.
-    async fn runs_on_home(&self, ws: &WorkspaceId) -> Result<bool> {
+    pub(super) async fn runs_on_home(&self, ws: &WorkspaceId) -> Result<bool> {
         let Some(svc) = &self.owner_services else {
             return Ok(false);
         };
