@@ -70,6 +70,7 @@ fn map_row(row: &SqliteRow, now: time::OffsetDateTime) -> Result<(WorkspaceId, W
             since: row.try_get("since").map_err(db)?,
             last_backup_at: get("last_backup_at")?,
             backup_warning: warning(failing.as_deref(), now),
+            setup: None,
         },
     ))
 }

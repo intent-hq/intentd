@@ -599,6 +599,11 @@ pub struct WorkspaceHome {
     /// `true` once backups have failed for 15 minutes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub backup_warning: bool,
+    /// Opening the home checkout on its machine (nodes.md "Opening the
+    /// home"). Never stored: the backend keeps it in memory and adds it when
+    /// it serves the home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<crate::remote_launch::RemoteSetupStatus>,
 }
 
 /// [`WorkspaceHome::state`].

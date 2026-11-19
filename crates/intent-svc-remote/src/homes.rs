@@ -14,14 +14,15 @@ use intent_core::machines::{
 use intent_core::node_link::{
     HomeOpen, HomeOpenOutcome, HomeOpenReply, HomePushReply, HomeRestore, HomeStopAck,
     HomeStopOutcome, HomeStopReason, HomeStopRecord, JournalBody, JournalRecord, LinkFrame,
-    PreparedCheckout, RecordOwner, HOMES_PROTOCOL,
+    PreparedCheckout, RecordOwner, SetupState, HOMES_PROTOCOL,
 };
 use intent_core::placement::{AgentPlacement, PlacementUnavailable, PlacementUnavailableReason};
-use intent_core::remote_launch::RemotePlacementView;
+use intent_core::remote_launch::{RemotePlacementView, RemoteSetupState};
 use intent_core::{Error, HomeId, HomeState, Result, WorkspaceHome, WorkspaceId};
 use intent_git::hub::AgentRef;
 use intent_git::node_git::{self, AgentRemote};
 use intent_services::feature_api::Services;
+use intent_services::home_setup::HomeSetupFinished;
 use intent_transport::node_link::NodeLink;
 
 use crate::connector::Shared;
@@ -119,6 +120,7 @@ pub(crate) async fn machine_candidate(svc: &Services, node_id: &str) -> Candidat
         since: intent_core::now_iso(),
         last_backup_at: None,
         backup_warning: false,
+        setup: None,
     })
 }
 
@@ -446,9 +448,38 @@ pub(crate) async fn open_home(svc: &Services, workspace_id: &WorkspaceId) -> Res
     if home.state == HomeState::Moving {
         return Ok(());
     }
-    let reply = send_open(svc, workspace_id, &home.home_id, &node_id, None).await?;
-    settle_open(svc, workspace_id, &home.home_id, reply).await
+    // nodes.md "Opening the home": a home whose open failed reports again.
+    if svc.home_setups().reopening(workspace_id, &home.home_id) {
+        svc.publish_workspace_home_changed(workspace_id).await;
+    }
+    let opened = match send_open(svc, workspace_id, &home.home_id, &node_id, None).await {
+        Ok(reply) => settle_open(svc, workspace_id, &home.home_id, reply).await,
+        Err(error) => Err(error),
+    };
+    if opened.is_ok() && svc.home_setups().opened(workspace_id, &home.home_id) {
+        svc.publish_workspace_home_changed(workspace_id).await;
+    }
+    if let Err(error) = &opened {
+        let reason = match error {
+            Error::Internal(message) => message
+                .strip_prefix(OPEN_FAILED_PREFIX)
+                .unwrap_or(message)
+                .to_owned(),
+            other => other.to_string(),
+        };
+        if svc
+            .home_setups()
+            .open_failed(workspace_id, &home.home_id, &reason)
+        {
+            svc.publish_workspace_home_changed(workspace_id).await;
+        }
+    }
+    opened
 }
+
+/// How [`settle_open`] starts the error of a `homeOpen` the machine
+/// answered `failed`; the rest is the machine's `error`.
+const OPEN_FAILED_PREFIX: &str = "the home did not open: ";
 
 /// The hub's `home/head` and `home/wip`, which a new home restores (a
 /// move's target, or a rebuilt cloud home); `None` without a `home/head`.
@@ -595,7 +626,7 @@ pub(crate) async fn settle_open(
             Ok(())
         }
         HomeOpenOutcome::Failed => Err(Error::Internal(format!(
-            "the home did not open: {}",
+            "{OPEN_FAILED_PREFIX}{}",
             reply.error.unwrap_or_default()
         ))),
     }
@@ -673,6 +704,10 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
     let Some(svc) = shared.services() else {
         return;
     };
+    if record_setup(svc, home_id, &record) {
+        svc.publish_workspace_home_changed(&record.workspace_id)
+            .await;
+    }
     match &record.body {
         JournalBody::HomePushed { .. } => {
             match svc
@@ -726,6 +761,37 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
         _ => {
             tracing::debug!(home = %home_id, seq = record.seq.0, "remote machine: home record not used yet");
         }
+    }
+}
+
+/// Keep a home's `setupStarted` or `setupFinished` `record` as its
+/// `setup` (nodes.md "Opening the home"); whether that changed it.
+fn record_setup(svc: &Services, home_id: &HomeId, record: &JournalRecord) -> bool {
+    let setups = svc.home_setups();
+    match &record.body {
+        JournalBody::SetupStarted { started_at } => {
+            setups.setup_started(&record.workspace_id, home_id, started_at)
+        }
+        JournalBody::SetupFinished {
+            state,
+            exit_code,
+            error,
+            finished_at,
+        } => setups.setup_finished(
+            &record.workspace_id,
+            home_id,
+            HomeSetupFinished {
+                state: match state {
+                    SetupState::Completed => RemoteSetupState::Completed,
+                    SetupState::Failed => RemoteSetupState::Failed,
+                    SetupState::Skipped => RemoteSetupState::Skipped,
+                },
+                exit_code: *exit_code,
+                error: error.clone(),
+                finished_at: finished_at.clone(),
+            },
+        ),
+        _ => false,
     }
 }
 
@@ -1063,6 +1129,7 @@ mod tests {
                         since: intent_core::now_iso(),
                         last_backup_at: None,
                         backup_warning: false,
+                        setup: None,
                     },
                 )
                 .await
