@@ -1176,10 +1176,12 @@ cancelled; completion notices remain in the agent conversation. An automatic
 background update waits for running one-off (command) scripts to finish, for up
 to 90 minutes, before restarting; long-running service scripts do not delay it.
 A service script that was running when Intent stopped starts again when Intent
-restarts; a service you stopped stays stopped. To have a service start whenever
-Intent starts, open its **…** menu in the sidebar **Scripts** list and turn on
-**Start automatically**; it does not stop a running service. Those services are
-listed first, with their names in color. They do not start in an archived workspace.
+restarts. To have a service start whenever Intent starts, open its **…** menu in the
+sidebar **Scripts** list and turn on **Start automatically**; it does not stop a
+running service. Those services are listed first, with their names in color. They
+start even if you stopped them, so turn **Start automatically** off to keep one
+stopped. Other services you stopped stay stopped. Nothing starts in an archived
+workspace.
 
 To delete a saved script, open its **…** menu in the sidebar **Scripts** list or in
 the script panel and choose **Delete script**, or use **Delete script** beside its
