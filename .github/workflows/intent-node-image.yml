@@ -12,6 +12,12 @@
 # - On pull requests that touch the image: build and smoke-test a local
 #   intent-node:pr-<number> from the newest release. Nothing is pushed.
 #
+# Release and manual runs then copy the version tag (never latest) to Vercel
+# Container Registry for Vercel Sandbox (packaging/e2b/vcr.mjs): the
+# VERCEL_TEAM_ID and VCR_INTENT_NODE_IMAGE variables pick the target, and the
+# job's GitHub OIDC token (a Vercel VCR OIDC policy) or a VERCEL_TOKEN secret
+# authenticates. Without the variables the copy is skipped with a warning.
+#
 # Pushes use the workflow's GITHUB_TOKEN (packages: write). Fail-soft: when
 # GHCR refuses the token (the package is not linked to this repository, or the
 # organization blocks it), the run logs a warning and succeeds. GHCR creates the
@@ -51,6 +57,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     concurrency:
       group: intent-node-image-release
       cancel-in-progress: false
@@ -59,6 +66,8 @@ jobs:
     with:
       version: ${{ inputs.version }}
       latest: ${{ inputs.latest || false }}
+    secrets:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
   # A new push supersedes the PR's image, so it cancels the older run.
   pull-request:

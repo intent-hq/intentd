@@ -6,7 +6,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { compareLayers, imageLayers, parseRef, refDigest, report } from '../packaging/e2b/layers.mjs';
+import { compareLayers, imageLayers, parseRef, platformDigest, refDigest, report } from '../packaging/e2b/layers.mjs';
+import { publish, vcrConfig, vcrTarget, vercelToken, waitReady } from '../packaging/e2b/vcr.mjs';
 import {
   APT_PACKAGES,
   BASE_IMAGE,
@@ -546,5 +547,195 @@ describe('layers', () => {
     const text = report('old', 'new', result);
     assert.match(text, /0\.0 MB of 0\.0 MB compressed; 1 of 3 layers/);
     assert.match(text, /\| 3 \| 0\.0 MB \| yes \| `tar \\\| x` \|/);
+  });
+});
+
+describe('vercel registry', () => {
+  const digest = c => `sha256:${c.repeat(64)}`;
+  const AMD64 = digest('a');
+  const IMAGE = 'vcr.vercel.com/sutterhill/intent-images/intent-node';
+  const ENV = { VERCEL_TEAM_ID: 'team_abc', VCR_INTENT_NODE_IMAGE: IMAGE, VERCEL_TOKEN: 'vcp_secret' };
+  const tagBody = (status, manifestDigest = AMD64) => ({ tag: { tag: '0.11.250', imageId: 'image_1', kind: 'manifest', manifestDigest, status } });
+
+  // GHCR (anonymous) plus the Vercel API. `tags` is the sequence of answers to
+  // the tag lookups: a body, or a number for an HTTP error status.
+  function vercel({ tags = [], repository = { public: true }, exchange } = {}) {
+    const calls = [];
+    const fetch = async (url, init = {}) => {
+      const method = init.method ?? 'GET';
+      calls.push({ method, url: String(url), init });
+      const { host, pathname } = new URL(url);
+      if (host === 'ghcr.io' && pathname === '/token') return Response.json({ token: 't' });
+      if (host === 'ghcr.io' && pathname === '/v2/intent-hq/intent-node/manifests/0.11.250') {
+        return Response.json({ manifests: [
+          { digest: digest('b'), platform: { os: 'unknown', architecture: 'unknown' } },
+          { digest: AMD64, platform: { os: 'linux', architecture: 'amd64' } },
+        ] }, { headers: { 'docker-content-digest': digest('c') } });
+      }
+      if (host === 'oidc.example') return Response.json({ value: 'github-oidc' });
+      if (pathname === '/login/oauth/token') return exchange ? exchange(init) : Response.json({ access_token: 'vca_oidc' });
+      if (pathname === '/login/oauth/token/revoke') return new Response('');
+      if (pathname === '/v1/vcr/repository/intent-node') return Response.json({ repository: { name: 'intent-node', ...repository } });
+      if (pathname === '/v1/vcr/repository/intent-node/tags/0.11.250') {
+        const next = tags.length > 1 ? tags.shift() : tags[0];
+        if (typeof next === 'number') return new Response('nope', { status: next });
+        return Response.json(next);
+      }
+      return new Response('', { status: 404 });
+    };
+    return { calls, fetch };
+  }
+  function harness(options) {
+    const api = vercel(options);
+    const runs = [];
+    const logs = [];
+    let clock = 0;
+    return {
+      ...api,
+      runs,
+      logs,
+      deps: {
+        fetch: api.fetch,
+        run: (command, args, { input } = {}) => runs.push({ command, args, input }),
+        sleep: async ms => { clock += ms; },
+        now: () => clock,
+        log: line => logs.push(line),
+        timeoutMs: 60_000,
+        intervalMs: 10_000,
+      },
+    };
+  }
+
+  it('reads the target from repository variables and is fail-soft without them', () => {
+    assert.deepEqual(vcrConfig(ENV), {
+      team: 'team_abc', image: IMAGE, registry: 'vcr.vercel.com', teamSlug: 'sutterhill', project: 'intent-images', repository: 'intent-node',
+    });
+    assert.match(vcrConfig({}).skip, /VERCEL_TEAM_ID and VCR_INTENT_NODE_IMAGE repository variables are not set/);
+    assert.match(vcrConfig({ VCR_INTENT_NODE_IMAGE: IMAGE }).skip, /VERCEL_TEAM_ID/);
+    assert.throws(() => vcrConfig({ ...ENV, VERCEL_TEAM_ID: 'sutterhill' }), /team ID/);
+    assert.throws(() => vcrConfig({ ...ENV, VCR_INTENT_NODE_IMAGE: `${IMAGE}:latest` }), /without a tag/);
+    assert.throws(() => vcrConfig({ ...ENV, VCR_INTENT_NODE_IMAGE: 'ghcr.io/a/b/c' }), /vcr\.vercel\.com/);
+  });
+  it('tags only the exact version, never latest, alpha or beta', () => {
+    const config = vcrConfig(ENV);
+    assert.equal(vcrTarget(config, 'v0.11.250'), `${IMAGE}:0.11.250`);
+    for (const tag of ['latest', 'alpha', 'beta', '', '0.11']) assert.throws(() => vcrTarget(config, tag));
+  });
+  it('resolves the linux/amd64 image of the GHCR index, not the index', async () => {
+    const { fetch } = vercel();
+    assert.equal(await platformDigest('ghcr.io/intent-hq/intent-node:0.11.250', fetch), AMD64);
+  });
+  it('uses VERCEL_TOKEN, else exchanges the GitHub OIDC token, else refuses', async () => {
+    const { fetch, calls } = vercel();
+    assert.deepEqual(await vercelToken(ENV, 'team_abc', fetch), { token: 'vcp_secret', oidc: false });
+    const oidcEnv = { ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example/token?x=1', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'req' };
+    assert.deepEqual(await vercelToken(oidcEnv, 'team_abc', fetch), { token: 'vca_oidc', oidc: true });
+    assert.equal(calls[0].init.headers.Authorization, 'Bearer req');
+    const body = new URLSearchParams(calls[1].init.body);
+    assert.equal(body.get('subject_token'), 'github-oidc');
+    assert.equal(body.get('team_id_or_slug'), 'team_abc');
+    await assert.rejects(vercelToken({}, 'team_abc', fetch), /id-token: write/);
+  });
+  it('keeps the token out of exchange errors', async () => {
+    const { fetch } = vercel({ exchange: () => new Response('no policy for github-oidc', { status: 403 }) });
+    const oidcEnv = { ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example/token', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'req' };
+    await assert.rejects(vercelToken(oidcEnv, 'team_abc', fetch), error => {
+      assert.match(error.message, /HTTP 403/);
+      assert.match(error.message, /OIDC policy/);
+      assert.doesNotMatch(error.message, /github-oidc/);
+      return true;
+    });
+  });
+
+  it('warns and succeeds without the credential', async () => {
+    const h = harness();
+    assert.deepEqual(await publish({ env: {}, version: '0.11.250', ...h.deps }), { skipped: true });
+    assert.match(h.logs.join('\n'), /::warning::.*VERCEL_TEAM_ID/);
+    assert.equal(h.runs.length, 0);
+    assert.equal(h.calls.length, 0);
+  });
+  it('copies the amd64 image by digest to the version tag, then waits for Ready', async () => {
+    const h = harness({ tags: [404, tagBody('preparing'), tagBody('preparing'), tagBody('ready')] });
+    const result = await publish({ env: ENV, version: '0.11.250', ...h.deps });
+    assert.deepEqual(result, { target: `${IMAGE}:0.11.250`, digest: AMD64, copied: true });
+    const [login, copy] = h.runs;
+    assert.deepEqual(login.args.filter(arg => !arg.startsWith('/')), ['login', '--authfile', '--username', 'team_abc', '--password-stdin', 'vcr.vercel.com']);
+    assert.equal(login.input, 'vcp_secret');
+    assert.ok(h.runs.every(run => run.command === 'skopeo' && !run.args.includes('vcp_secret')));
+    assert.deepEqual(copy.args.slice(-3), ['--preserve-digests', `docker://ghcr.io/intent-hq/intent-node@${AMD64}`, `docker://${IMAGE}:0.11.250`]);
+    assert.equal(h.runs.length, 2);
+    const api = h.calls.filter(call => call.url.startsWith('https://api.vercel.com/v1/'));
+    assert.ok(api.every(call => call.init.headers.Authorization === 'Bearer vcp_secret'));
+    assert.match(api[0].url, /projectId=intent-images&teamId=team_abc/);
+  });
+  it('skips the copy when the tag already holds the same image (re-runs, backfills)', async () => {
+    const h = harness({ tags: [tagBody('ready')] });
+    assert.equal((await publish({ env: ENV, version: '0.11.250', ...h.deps })).copied, false);
+    assert.equal(h.runs.length, 0);
+  });
+  it('never moves a version tag that holds another image', async () => {
+    const h = harness({ tags: [tagBody('ready', digest('d'))] });
+    await assert.rejects(publish({ env: ENV, version: '0.11.250', ...h.deps }), /already holds .* tags are never moved/);
+    assert.equal(h.runs.length, 0);
+  });
+  it('fails when the pushed digest differs from the GHCR amd64 digest', async () => {
+    const h = harness({ tags: [404, tagBody('ready', digest('d'))] });
+    await assert.rejects(publish({ env: ENV, version: '0.11.250', ...h.deps }), /digest .* does not match/);
+  });
+  for (const status of ['errored', 'unoptimized', null]) {
+    it(`fails when VCR reports ${status}`, async () => {
+      const h = harness({ tags: [404, tagBody('preparing'), tagBody(status)] });
+      await assert.rejects(publish({ env: ENV, version: '0.11.250', ...h.deps }), /not usable by Vercel Sandbox/);
+    });
+  }
+  it('fails when the image is not Ready in time, and on refused API calls', async () => {
+    const h = harness({ tags: [404, tagBody('preparing')] });
+    await assert.rejects(publish({ env: ENV, version: '0.11.250', ...h.deps }), /not Ready after 60s.*preparing/);
+    const refused = harness({ tags: [404, 403] });
+    await assert.rejects(publish({ env: ENV, version: '0.11.250', ...refused.deps }), /HTTP 403/);
+  });
+  it('retries transient API errors while it waits', async () => {
+    const config = vcrConfig(ENV);
+    const h = harness({ tags: [503, 429, tagBody('ready')] });
+    assert.equal((await waitReady({ config, tag: '0.11.250', digest: AMD64, token: 't', ...h.deps })).status, 'ready');
+  });
+  it('warns, without changing it, when the repository is private', async () => {
+    const h = harness({ tags: [tagBody('ready')], repository: { public: false } });
+    await publish({ env: ENV, version: '0.11.250', ...h.deps });
+    assert.match(h.logs.join('\n'), /::warning::.*not public/);
+    assert.ok(h.calls.every(call => (call.init.method ?? 'GET') === 'GET' || !call.url.includes('/v1/vcr/')));
+  });
+  it('revokes an OIDC token when it is done, even after a failure', async () => {
+    const h = harness({ tags: [tagBody('ready', digest('d'))] });
+    const env = { VERCEL_TEAM_ID: 'team_abc', VCR_INTENT_NODE_IMAGE: IMAGE, ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example/t', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'r' };
+    await assert.rejects(publish({ env, version: '0.11.250', ...h.deps }));
+    assert.ok(h.calls.some(call => call.url.endsWith('/login/oauth/token/revoke')));
+  });
+});
+
+describe('vercel registry workflow contract', () => {
+  const workflow = readFileSync(join(ROOT, '.github/workflows/intent-node-image.yml'), 'utf8');
+  const build = readFileSync(join(ROOT, '.github/workflows/intent-node-image-build.yml'), 'utf8');
+  const steps = build.split('\n    steps:\n')[1];
+  const job = name => workflow.split(`\n  ${name}:\n`)[1].split(/\n  [\w-]+:\n/)[0];
+  const step = steps.split('- name: Copy the image to the Vercel registry')[1] ?? '';
+  it('copies only after GHCR accepted the push', () => {
+    assert.match(steps, /- name: Push the image\n\s+id: push/);
+    assert.match(steps, /echo "pushed=true" >> "\$GITHUB_OUTPUT"/);
+    assert.match(step, /if: steps\.push\.outputs\.pushed == 'true'/);
+    assert.ok(steps.indexOf('Push the image') < steps.indexOf('Copy the image to the Vercel registry'));
+    assert.match(step, /node vcr\.mjs "\$VERSION"/);
+  });
+  it('passes the credential through env only, from variables and an optional secret', () => {
+    assert.match(step, /VERCEL_TEAM_ID: \$\{\{ vars\.VERCEL_TEAM_ID \}\}/);
+    assert.match(step, /VCR_INTENT_NODE_IMAGE: \$\{\{ vars\.VCR_INTENT_NODE_IMAGE \}\}/);
+    assert.match(step, /VERCEL_TOKEN: \$\{\{ secrets\.VERCEL_TOKEN \}\}/);
+    assert.match(build, /secrets:\n\s+VERCEL_TOKEN:\n\s+required: false/);
+    assert.equal(build.match(/secrets\.VERCEL_TOKEN/g).length, 1);
+  });
+  it('gives only release and manual runs the OIDC grant and the token', () => {
+    assert.match(job('release'), /permissions:\n\s+contents: read\n\s+packages: write\n\s+id-token: write/);
+    assert.match(job('release'), /VERCEL_TOKEN: \$\{\{ secrets\.VERCEL_TOKEN \}\}/);
+    assert.doesNotMatch(job('pull-request'), /id-token|VERCEL_TOKEN/);
   });
 });
