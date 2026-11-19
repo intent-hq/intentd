@@ -553,8 +553,7 @@ impl PgStore {
             .await
     }
 
-    /// The `SQLite` error wording lives here: the writer-lock lint reads a
-    /// `"delete ..."` literal as a statement.
+    /// Deletes the tenant's event subscriptions whose `column` is `key`.
     async fn delete_event_subscriptions_by(&self, column: &str, key: &str) -> Result<()> {
         let what = match column {
             "id" => "delete event_subscription failed",
