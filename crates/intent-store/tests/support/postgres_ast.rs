@@ -37,7 +37,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>, String> {
 /// body, a VALUES row and an operator. A filler names no table, but it does
 /// stand in for the hole's runtime text, which the rule never sees here:
 /// that text is checked through its own literals, where it has any.
-const FILLERS: &[&str] = &["true", "", "x", "select 1", "($1)", "="];
+const FILLERS: &[&str] = &["true", "", "x", "select 1", "($1)", "=", "x = x"];
 
 /// Schemas of the Postgres system catalogs, which hold no tenant rows.
 const SYSTEM_SCHEMAS: &[&str] = &["pg_catalog", "information_schema"];

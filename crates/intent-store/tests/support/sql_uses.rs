@@ -136,6 +136,9 @@ impl From<proc_macro2::LineColumn> for Pos {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Source {
     pub file: PathBuf,
+    /// The function the text or expression is written in; empty for a
+    /// const.
+    pub function: String,
     pub start: Pos,
     pub end: Pos,
     pub sql: Sql,
@@ -145,15 +148,28 @@ pub struct Source {
 pub enum Sql {
     /// A literal, or a `format!` template when `template` is set. `args`
     /// holds every alternative of each hole by name (positional holes are
-    /// `0`, `1`, ...); `appends` the alternatives of each appended text.
+    /// `0`, `1`, ...); `appends` the text appended later, each with the
+    /// branch it is appended in.
     Text {
         text: String,
         template: bool,
         args: BTreeMap<String, Vec<Source>>,
-        appends: Vec<Vec<Source>>,
+        appends: Vec<Append>,
     },
     /// An expression the walk cannot follow, as Rust tokens.
     Unresolved(String),
+}
+
+/// Which arm of an `if`, `match` or loop an append runs in:
+/// `(construct, arm, arms)`. A loop's arm 0 runs its body, arm 1 skips it;
+/// an `if` without `else` has an empty arm 1.
+pub type Guard = Vec<(usize, usize, usize)>;
+
+/// Text appended to a bound name, in the branch `guard`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Append {
+    pub guard: Guard,
+    pub alts: Vec<Source>,
 }
 
 impl Sql {
@@ -167,12 +183,21 @@ impl Sql {
     }
 }
 
+/// An expression the walk cannot follow, where it is written.
+#[derive(Clone, Debug)]
+pub struct Unfollowed {
+    pub file: PathBuf,
+    pub function: String,
+    pub start: Pos,
+    pub expr: String,
+}
+
 /// One way a source reads at run time: text pieces with `None` for an
-/// unresolved part, and those parts as `(file, line, expression)`.
+/// unresolved part, and those parts.
 #[derive(Clone, Debug, Default)]
 pub struct Expansion {
     pub pieces: Vec<Option<String>>,
-    pub unresolved: Vec<(PathBuf, usize, String)>,
+    pub unresolved: Vec<Unfollowed>,
 }
 
 impl Expansion {
@@ -192,14 +217,21 @@ impl Source {
         }
     }
 
-    /// Every combination of hole and append alternatives, up to
-    /// [`MAX_EXPANSIONS`].
+    /// The ways this source reads: every combination of hole and append
+    /// alternatives while there are at most [`MAX_EXPANSIONS`]; past that,
+    /// each hole and append varies alone with the others at their first
+    /// alternative, so every alternative is still seen.
     pub fn expansions(&self) -> Vec<Expansion> {
         let (text, template, args, appends) = match &self.sql {
             Sql::Unresolved(expr) => {
                 return vec![Expansion {
                     pieces: vec![None],
-                    unresolved: vec![(self.file.clone(), self.start.line, expr.clone())],
+                    unresolved: vec![Unfollowed {
+                        file: self.file.clone(),
+                        function: self.function.clone(),
+                        start: self.start,
+                        expr: expr.clone(),
+                    }],
                 }];
             }
             Sql::Text {
@@ -209,63 +241,148 @@ impl Source {
                 appends,
             } => (text, *template, args, appends),
         };
-        let mut acc = vec![Expansion::default()];
-        let text_piece = |acc: &mut Vec<Expansion>, t: &str| {
-            for e in acc.iter_mut() {
-                e.pieces.push(Some(t.to_owned()));
-            }
+        let fixed = |t: String| {
+            vec![Expansion {
+                pieces: vec![Some(t)],
+                unresolved: Vec::new(),
+            }]
         };
+        let mut head: Vec<Vec<Expansion>> = Vec::new();
+        let slots = &mut head;
         if template {
             for piece in split_format(text) {
                 match piece {
-                    Ok(t) => text_piece(&mut acc, &t),
+                    Ok(t) => slots.push(fixed(t)),
                     Err(hole) => {
                         let missing = [Source {
                             sql: Sql::Unresolved(hole.clone()),
                             ..self.clone()
                         }];
                         let alts = args.get(&hole).map_or(&missing[..], Vec::as_slice);
-                        acc = product(&acc, alts);
+                        slots.push(alternatives(alts));
                     }
                 }
             }
         } else {
-            text_piece(&mut acc, text);
+            slots.push(fixed(text.clone()));
         }
-        for alts in appends {
-            acc = product(&acc, alts);
+        let mut out = Vec::new();
+        for choice in branch_choices(appends) {
+            let mut slots = head.clone();
+            for a in appends {
+                if a.guard
+                    .iter()
+                    .all(|(id, arm, _)| choice.get(id) == Some(arm))
+                {
+                    slots.push(alternatives(&a.alts));
+                }
+            }
+            out.extend(combine(&slots));
         }
-        acc
+        out
     }
 
     /// This source and every source inside it (holes, appends).
     pub fn walk<'a>(&'a self, out: &mut Vec<&'a Source>) {
         out.push(self);
         if let Sql::Text { args, appends, .. } = &self.sql {
-            for s in args.values().chain(appends).flatten() {
+            for s in args.values().flatten() {
+                s.walk(out);
+            }
+            for s in appends.iter().flat_map(|a| &a.alts) {
                 s.walk(out);
             }
         }
     }
 }
 
-fn product(acc: &[Expansion], alts: &[Source]) -> Vec<Expansion> {
-    if alts.is_empty() {
-        let none = Expansion {
-            pieces: vec![None],
-            unresolved: vec![(PathBuf::new(), 0, "<no text>".to_owned())],
-        };
-        return acc.iter().map(|a| a.join(&none)).collect();
+/// One arm per branch construct the appends sit in: every combination
+/// while there are at most [`MAX_EXPANSIONS`], else each construct varied
+/// alone with the others at arm 0.
+fn branch_choices(appends: &[Append]) -> Vec<BTreeMap<usize, usize>> {
+    let arms: BTreeMap<usize, usize> = appends
+        .iter()
+        .flat_map(|a| a.guard.iter().map(|(id, _, n)| (*id, *n)))
+        .collect();
+    let total = arms
+        .values()
+        .try_fold(1usize, |t, n| t.checked_mul(*n))
+        .unwrap_or(usize::MAX);
+    let base: BTreeMap<usize, usize> = arms.keys().map(|id| (*id, 0)).collect();
+    if total <= MAX_EXPANSIONS {
+        let mut out = vec![base];
+        for (id, n) in &arms {
+            out = out
+                .into_iter()
+                .flat_map(|c| {
+                    (0..*n).map(move |k| {
+                        let mut c = c.clone();
+                        c.insert(*id, k);
+                        c
+                    })
+                })
+                .collect();
+        }
+        return out;
     }
-    let mut out = Vec::new();
-    for a in acc {
-        for alt in alts {
-            for e in alt.expansions() {
-                if out.len() == MAX_EXPANSIONS {
-                    return out;
-                }
-                out.push(a.join(&e));
-            }
+    let mut out = vec![base.clone()];
+    for (id, n) in &arms {
+        for k in 1..*n {
+            let mut c = base.clone();
+            c.insert(*id, k);
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The expansions of each alternative; an empty set is unresolved.
+fn alternatives(alts: &[Source]) -> Vec<Expansion> {
+    let out: Vec<Expansion> = alts.iter().flat_map(Source::expansions).collect();
+    if out.is_empty() {
+        return vec![Expansion {
+            pieces: vec![None],
+            unresolved: vec![Unfollowed {
+                file: PathBuf::new(),
+                function: String::new(),
+                start: Pos { line: 0, column: 0 },
+                expr: "<no text>".to_owned(),
+            }],
+        }];
+    }
+    out
+}
+
+/// Joins one expansion per slot: every combination while there are at
+/// most [`MAX_EXPANSIONS`], else each slot varied alone.
+fn combine(slots: &[Vec<Expansion>]) -> Vec<Expansion> {
+    let total = slots
+        .iter()
+        .try_fold(1usize, |n, s| n.checked_mul(s.len()))
+        .unwrap_or(usize::MAX);
+    let join = |pick: &[usize]| {
+        slots
+            .iter()
+            .zip(pick)
+            .fold(Expansion::default(), |acc, (s, &k)| acc.join(&s[k]))
+    };
+    if total <= MAX_EXPANSIONS {
+        let mut out = vec![Expansion::default()];
+        for s in slots {
+            out = out
+                .iter()
+                .flat_map(|a| s.iter().map(move |e| a.join(e)))
+                .collect();
+        }
+        return out;
+    }
+    let base = vec![0; slots.len()];
+    let mut out = vec![join(&base)];
+    for (i, s) in slots.iter().enumerate() {
+        for k in 1..s.len() {
+            let mut pick = base.clone();
+            pick[i] = k;
+            out.push(join(&pick));
         }
     }
     out
@@ -307,6 +424,35 @@ pub fn split_format(s: &str) -> Vec<Result<String, String>> {
     out
 }
 
+/// A string literal no sink reaches.
+pub struct Unreached {
+    pub file: PathBuf,
+    pub function: String,
+    pub line: usize,
+    pub value: String,
+}
+
+/// Why a sink does not run under the tenant's writer lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LockProblem {
+    /// The executor is not visible and no lock is held before the sink.
+    Hidden,
+    /// The sink runs on this executor, which is not the `WriteTx`.
+    Executor(String),
+    /// The sink runs in a spawned task.
+    Spawned,
+}
+
+impl std::fmt::Display for LockProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hidden => write!(f, "has no WriteTx or begin_write() before it"),
+            Self::Executor(e) => write!(f, "runs on `{e}`, not the WriteTx"),
+            Self::Spawned => write!(f, "runs in a spawned task"),
+        }
+    }
+}
+
 /// One sink: where it runs and every text it can run.
 pub struct Use {
     pub file: PathBuf,
@@ -315,7 +461,7 @@ pub struct Use {
     pub sources: Vec<Source>,
     /// Why the sink does not run under the tenant's writer lock, if so.
     /// Only a write needs the lock; the caller decides that.
-    pub lock_problem: Option<String>,
+    pub lock_problem: Option<LockProblem>,
 }
 
 /// A binding of a local name, where it is made. A `let` (or `for`,
@@ -324,6 +470,9 @@ pub struct Use {
 struct Local {
     pos: Pos,
     is_let: bool,
+    /// The binding holds a `WriteTx`: a typed `WriteTx` binding, or a value
+    /// whose chain root is `begin_write()` in every branch.
+    tx: bool,
     binding: Binding,
 }
 
@@ -350,10 +499,10 @@ struct FnFacts {
     integers: BTreeSet<String>,
     locals: BTreeMap<String, Vec<Local>>,
     /// Text appended to a bound name (`push_str`, `push`, `+=`, `write!`).
-    appends: BTreeMap<String, Vec<Expr>>,
+    appends: BTreeMap<String, Vec<(Expr, Guard)>>,
     returns: Vec<Expr>,
-    /// Bindings that hold a `WriteTx`.
-    write_tx: BTreeSet<String>,
+    /// Parameters that hold a `WriteTx`.
+    tx_params: BTreeSet<String>,
     /// Where the function first holds the writer lock: a `WriteTx`
     /// parameter (the start), a typed `WriteTx` binding or `begin_write()`.
     lock_from: Option<Pos>,
@@ -398,6 +547,7 @@ struct ExecLink {
 
 struct Literal {
     file: usize,
+    function: String,
     start: Pos,
     end: Pos,
     value: String,
@@ -420,6 +570,8 @@ pub struct Index {
     sinks: Vec<Sink>,
     links: Vec<ExecLink>,
     literals: Vec<Literal>,
+    /// The branch constructs counted so far (ids for [`Guard`]s).
+    constructs: usize,
     /// `use sqlx::query as q`: the alias names per file.
     aliases: BTreeMap<usize, BTreeSet<String>>,
 }
@@ -444,6 +596,7 @@ impl Index {
                 let mut lits = Literals {
                     index: &mut index,
                     file: id,
+                    function: String::new(),
                 };
                 lits.visit_file(&file);
             }
@@ -490,7 +643,7 @@ impl Index {
                 self.attach_appends(name, s.function, &mut sources);
             }
             if sources.is_empty() {
-                sources.push(self.source(f.file, &s.arg, Sql::Unresolved(tokens(&s.arg))));
+                sources.push(self.src(s.function, &s.arg, Sql::Unresolved(tokens(&s.arg))));
             }
             let mut keys = BTreeSet::new();
             sources.retain(|x| keys.insert(x.clone()));
@@ -505,9 +658,8 @@ impl Index {
         out
     }
 
-    /// String literals outside `#[cfg(test)]` items that no sink reaches,
-    /// as `(file, line, value)`.
-    pub fn unreached_literals(&self, uses: &[Use]) -> Vec<(PathBuf, usize, String)> {
+    /// String literals outside `#[cfg(test)]` items that no sink reaches.
+    pub fn unreached_literals(&self, uses: &[Use]) -> Vec<Unreached> {
         let mut reached: Vec<&Source> = Vec::new();
         for u in uses {
             for s in &u.sources {
@@ -522,13 +674,18 @@ impl Index {
                     .iter()
                     .any(|s| &s.file == file && s.start <= l.start && l.end <= s.end)
             })
-            .map(|l| (self.files[l.file].clone(), l.start.line, l.value.clone()))
+            .map(|l| Unreached {
+                file: self.files[l.file].clone(),
+                function: l.function.clone(),
+                line: l.start.line,
+                value: l.value.clone(),
+            })
             .collect()
     }
 
-    fn lock_problem(&self, s: &Sink) -> Option<String> {
+    fn lock_problem(&self, s: &Sink) -> Option<LockProblem> {
         if s.in_spawn {
-            return Some("runs in a spawned task".to_owned());
+            return Some(LockProblem::Spawned);
         }
         let f = &self.fns[s.function];
         let mut executors: Vec<&Expr> = s.executor.iter().collect();
@@ -547,12 +704,12 @@ impl Index {
         }
         if executors.is_empty() {
             let held = f.lock_from.is_some_and(|b| b < s.pos);
-            return (!held).then(|| "has no WriteTx or begin_write() before it".to_owned());
+            return (!held).then_some(LockProblem::Hidden);
         }
         executors
             .into_iter()
             .find(|e| !self.lock_derived(e, s.function, 0))
-            .map(|e| format!("runs on `{}`, not the WriteTx", tokens(e)))
+            .map(|e| LockProblem::Executor(tokens(e)))
     }
 
     /// Whether an executor expression derives from a `WriteTx`.
@@ -567,14 +724,20 @@ impl Index {
             return false;
         };
         let facts = &self.fns[at];
-        if facts.write_tx.contains(&name) {
-            return true;
-        }
-        if let Some(bindings) = facts.locals.get(&name) {
-            return bindings.iter().all(|l| match &l.binding {
-                Binding::Value(v) => self.lock_derived(v, at, depth + 1),
-                _ => false,
+        let used: Pos = path.span().start().into();
+        let before: Vec<&Local> = facts
+            .locals
+            .get(&name)
+            .map(|ls| ls.iter().filter(|l| l.pos < used).collect())
+            .unwrap_or_default();
+        if !before.is_empty() {
+            let from = before.iter().rposition(|l| l.is_let).unwrap_or(0);
+            return before[from..].iter().all(|l| {
+                l.tx || matches!(&l.binding, Binding::Value(v) if self.lock_derived(v, at, depth + 1))
             });
+        }
+        if facts.tx_params.contains(&name) {
+            return true;
         }
         let Some(index) = facts
             .params
@@ -615,16 +778,18 @@ impl Index {
         let Some(appends) = self.fns[at].appends.get(name) else {
             return;
         };
-        let resolved: Vec<Vec<Source>> = appends
+        let resolved: Vec<Append> = appends
             .iter()
-            .map(|a| {
+            .map(|(a, guard)| {
                 let mut alts = Vec::new();
                 self.resolve(a, at, 1, &mut BTreeSet::new(), &mut alts);
                 if alts.is_empty() {
-                    let file = self.fns[at].file;
-                    alts.push(self.source(file, a, Sql::Unresolved(tokens(a))));
+                    alts.push(self.src(at, a, Sql::Unresolved(tokens(a))));
                 }
-                alts
+                Append {
+                    guard: guard.clone(),
+                    alts,
+                }
             })
             .collect();
         for s in sources {
@@ -765,7 +930,7 @@ impl Index {
     ) {
         let file = self.fns[at].file;
         let unresolved = |out: &mut Vec<Source>, e: &Expr| {
-            out.push(self.source(file, e, Sql::Unresolved(tokens(e))));
+            out.push(self.src(at, e, Sql::Unresolved(tokens(e))));
         };
         if depth > MAX_DEPTH {
             return unresolved(out, e);
@@ -775,18 +940,18 @@ impl Index {
             && !matches!(e, Expr::Lit(_))
             && self
                 .listed
-                .contains(&list_key(&self.files[file], &tokens(e)))
+                .contains(&list_key(&self.files[file], &self.fns[at].name, &tokens(e)))
         {
             return unresolved(out, e);
         }
-        if is_integer(e, &self.fns[at]) {
-            return out.push(self.source(file, e, Sql::plain("1".to_owned())));
+        if is_integer(e, &self.fns[at], 0) {
+            return out.push(self.src(at, e, Sql::plain("1".to_owned())));
         }
         match e {
             Expr::Lit(syn::ExprLit {
                 lit: Lit::Str(s), ..
             }) => {
-                out.push(self.source(file, e, Sql::plain(s.value())));
+                out.push(self.src(at, e, Sql::plain(s.value())));
             }
             Expr::Macro(m) => {
                 let name = last_segment(&m.mac.path);
@@ -802,8 +967,8 @@ impl Index {
                         ) => {
                             let text = s.value();
                             let holes = self.format_args(lit, &text, &args, at, next, seen);
-                            out.push(self.source(
-                                file,
+                            out.push(self.src(
+                                at,
                                 lit,
                                 Sql::Text {
                                     text,
@@ -820,6 +985,40 @@ impl Index {
                 }
             }
             Expr::Reference(r) => self.resolve(&r.expr, at, next, seen, out),
+            Expr::Cast(c) => self.resolve(&c.expr, at, next, seen, out),
+            // `head + &tail`: the two texts joined.
+            Expr::Binary(b) if matches!(b.op, BinOp::Add(_)) => {
+                let mut parts = BTreeMap::new();
+                for (k, side) in [&b.left, &b.right].into_iter().enumerate() {
+                    let mut alts = Vec::new();
+                    self.resolve(side, at, next, &mut seen.clone(), &mut alts);
+                    if alts.is_empty() {
+                        alts.push(self.src(at, side, Sql::Unresolved(tokens(side))));
+                    }
+                    parts.insert(k.to_string(), alts);
+                }
+                out.push(self.src(
+                    at,
+                    e,
+                    Sql::Text {
+                        text: "{0}{1}".to_owned(),
+                        template: true,
+                        args: parts,
+                        appends: Vec::new(),
+                    },
+                ));
+            }
+            // `f.sql` of a local that gained text: that text.
+            Expr::Field(fe) if matches!(&*fe.base, Expr::Path(p) if p.path.get_ident().is_some_and(|i| self.fns[at].appends.contains_key(&i.to_string()))) =>
+            {
+                let Expr::Path(base) = &*fe.base else {
+                    return unresolved(out, e);
+                };
+                let name = base.path.segments[0].ident.to_string();
+                let start = out.len();
+                out.push(self.src(at, e, Sql::plain(String::new())));
+                self.attach_appends(&name, at, &mut out[start..]);
+            }
             Expr::Paren(p) => self.resolve(&p.expr, at, next, seen, out),
             Expr::Group(g) => self.resolve(&g.expr, at, next, seen, out),
             Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
@@ -897,7 +1096,7 @@ impl Index {
                 }
                 if module.as_deref() == Some("String") && (name == "new" || name == "with_capacity")
                 {
-                    return out.push(self.source(file, e, Sql::plain(String::new())));
+                    return out.push(self.src(at, e, Sql::plain(String::new())));
                 }
                 let type_path = module.as_deref().is_some_and(|m| {
                     m.starts_with(|ch: char| ch.is_ascii_uppercase()) && m != "Self"
@@ -1032,8 +1231,7 @@ impl Index {
             let mut found = Vec::new();
             self.resolve(&expr, at, depth, &mut seen.clone(), &mut found);
             if found.is_empty() {
-                let mut missing =
-                    self.source(self.fns[at].file, lit, Sql::Unresolved(tokens(&expr)));
+                let mut missing = self.src(at, lit, Sql::Unresolved(tokens(&expr)));
                 missing.end = missing.start;
                 found.push(missing);
             }
@@ -1060,14 +1258,14 @@ impl Index {
                     match p {
                         Ok(e) => self.resolve(e, f, depth, seen, out),
                         Err(e) => {
-                            out.push(self.source(self.fns[f].file, e, Sql::Unresolved(tokens(e))));
+                            out.push(self.src(f, e, Sql::Unresolved(tokens(e))));
                         }
                     }
                 }
             }
             Binding::Element { iter, path } => {
                 let Some(items) = self.elements(iter, file, 0) else {
-                    return out.push(self.source(file, iter, Sql::Unresolved(tokens(iter))));
+                    return out.push(self.src(at, iter, Sql::Unresolved(tokens(iter))));
                 };
                 for item in items {
                     let mut parts = Vec::new();
@@ -1075,11 +1273,7 @@ impl Index {
                     for (p, f) in parts {
                         match p {
                             Ok(e) => self.resolve(e, f, depth, seen, out),
-                            Err(e) => out.push(self.source(
-                                self.fns[f].file,
-                                e,
-                                Sql::Unresolved(tokens(e)),
-                            )),
+                            Err(e) => out.push(self.src(f, e, Sql::Unresolved(tokens(e)))),
                         }
                     }
                 }
@@ -1225,10 +1419,20 @@ impl Index {
         }
     }
 
+    /// A source written in function `at`.
+    fn src(&self, at: usize, e: &impl Spanned, sql: Sql) -> Source {
+        Source {
+            function: self.fns[at].name.clone(),
+            ..self.source(self.fns[at].file, e, sql)
+        }
+    }
+
+    /// A source written outside a function (a const).
     fn source(&self, file: usize, e: &impl Spanned, sql: Sql) -> Source {
         let span = e.span();
         Source {
             file: self.files[file].clone(),
+            function: String::new(),
             start: span.start().into(),
             end: span.end().into(),
             sql,
@@ -1236,37 +1440,55 @@ impl Index {
     }
 }
 
-/// Whether `e` is an integer: a literal, arithmetic, a length, a cast, or
-/// a parameter of an integer type.
-fn is_integer(e: &Expr, f: &FnFacts) -> bool {
+/// Whether `e` is an integer: a literal, arithmetic on integers, a length,
+/// a cast to an integer type, or a parameter or local of one.
+fn is_integer(e: &Expr, f: &FnFacts, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let next = depth + 1;
     match strip(e) {
         Expr::Lit(syn::ExprLit {
             lit: Lit::Int(_), ..
-        })
-        | Expr::Cast(_) => true,
+        }) => true,
+        Expr::Cast(c) => is_integer_type(&c.ty),
         Expr::Binary(b) => {
-            let text = |e: &Expr| {
-                matches!(
-                    strip(e),
-                    Expr::Lit(syn::ExprLit {
-                        lit: Lit::Str(_),
-                        ..
-                    }) | Expr::Macro(_)
-                )
-            };
             matches!(
                 b.op,
                 BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_) | BinOp::Rem(_)
-            ) && !text(&b.left)
-                && !text(&b.right)
+            ) && is_integer(&b.left, f, next)
+                && is_integer(&b.right, f, next)
         }
         Expr::MethodCall(m) => {
             m.args.is_empty() && ["len", "count"].contains(&m.method.to_string().as_str())
         }
-        Expr::Path(p) => p
-            .path
-            .get_ident()
-            .is_some_and(|i| f.integers.contains(&i.to_string())),
+        Expr::Path(p) => p.path.get_ident().is_some_and(|i| {
+            let name = i.to_string();
+            f.integers.contains(&name)
+                || f.locals.get(&name).is_some_and(|ls| {
+                    ls.iter()
+                        .all(|l| matches!(&l.binding, Binding::Value(v) if is_integer(v, f, next)))
+                })
+        }),
+        _ => false,
+    }
+}
+
+/// Whether every value `e` can take comes from `begin_write()`, through
+/// `.await`, `?`, method calls on it, blocks and every branch.
+fn is_begin_write(e: &Expr) -> bool {
+    match strip(e) {
+        Expr::Try(t) => is_begin_write(&t.expr),
+        Expr::Await(a) => is_begin_write(&a.base),
+        Expr::MethodCall(m) => m.method == "begin_write" || is_begin_write(&m.receiver),
+        Expr::Block(b) => tail(&b.block).is_some_and(is_begin_write),
+        Expr::If(i) => {
+            tail(&i.then_branch).is_some_and(is_begin_write)
+                && i.else_branch
+                    .as_ref()
+                    .is_some_and(|(_, e)| is_begin_write(e))
+        }
+        Expr::Match(m) => !m.arms.is_empty() && m.arms.iter().all(|a| is_begin_write(&a.body)),
         _ => false,
     }
 }
@@ -1295,17 +1517,17 @@ fn visible(locals: &[Local], used: Pos) -> Vec<&Local> {
     before[from..].to_vec()
 }
 
-/// The key an allowlist lists a text or expression under: its file name
-/// and its first 80 characters with whitespace collapsed.
-pub fn list_key(file: &Path, text: &str) -> String {
+/// The key an allowlist lists a text or expression under: its file name,
+/// the function it is written in, and its first 80 characters with
+/// whitespace collapsed.
+pub fn list_key(file: &Path, function: &str, text: &str) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!(
-        "{} | {}",
-        file.file_name()
-            .map(|f| f.to_string_lossy())
-            .unwrap_or_default(),
-        flat.chars().take(80).collect::<String>().trim_end()
-    )
+    let name = file
+        .file_name()
+        .map(|f| f.to_string_lossy())
+        .unwrap_or_default();
+    let head: String = flat.chars().take(80).collect();
+    format!("{name}::{function} | {}", head.trim_end())
 }
 
 /// `e` without references, parentheses and groups.
@@ -1399,10 +1621,21 @@ fn tuple_idents(p: &Pat, path: &mut Vec<usize>, out: &mut Vec<(String, Vec<usize
     }
 }
 
+/// Whether an item is compiled only for tests: `#[cfg(test)]`, or an
+/// `any(..)`/`all(..)` that names `test`. `cfg(not(test))` is not.
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs
-        .iter()
-        .any(|a| a.path().is_ident("cfg") && tokens(&a.meta).replace(' ', "").contains("(test"))
+    fn test_only(m: &syn::Meta) -> bool {
+        match m {
+            syn::Meta::Path(p) => p.is_ident("test"),
+            syn::Meta::List(l) if l.path.is_ident("any") || l.path.is_ident("all") => l
+                .parse_args_with(Punctuated::<syn::Meta, Token![,]>::parse_terminated)
+                .is_ok_and(|ms| ms.iter().any(test_only)),
+            _ => false,
+        }
+    }
+    attrs.iter().any(|a| {
+        a.path().is_ident("cfg") && a.parse_args::<syn::Meta>().is_ok_and(|m| test_only(&m))
+    })
 }
 
 fn mentions_sqlx(ts: &TokenStream) -> bool {
@@ -1445,6 +1678,16 @@ impl<'ast> Visit<'ast> for Aliases {
 struct Literals<'i> {
     index: &'i mut Index,
     file: usize,
+    /// The function being walked.
+    function: String,
+}
+
+impl Literals<'_> {
+    fn in_fn(&mut self, name: String, walk: impl FnOnce(&mut Self)) {
+        let outer = std::mem::replace(&mut self.function, name);
+        walk(self);
+        self.function = outer;
+    }
 }
 
 impl<'ast> Visit<'ast> for Literals<'_> {
@@ -1456,13 +1699,21 @@ impl<'ast> Visit<'ast> for Literals<'_> {
 
     fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
         if !has_cfg_test(&f.attrs) {
-            visit::visit_item_fn(self, f);
+            self.in_fn(f.sig.ident.to_string(), |me| visit::visit_item_fn(me, f));
         }
     }
 
     fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
         if !has_cfg_test(&f.attrs) {
-            visit::visit_impl_item_fn(self, f);
+            self.in_fn(f.sig.ident.to_string(), |me| {
+                visit::visit_impl_item_fn(me, f);
+            });
+        }
+    }
+
+    fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+        if !has_cfg_test(&c.attrs) {
+            self.in_fn(c.ident.to_string(), |me| visit::visit_item_const(me, c));
         }
     }
 
@@ -1470,6 +1721,7 @@ impl<'ast> Visit<'ast> for Literals<'_> {
 
     fn visit_lit_str(&mut self, l: &'ast syn::LitStr) {
         self.index.literals.push(Literal {
+            function: self.function.clone(),
             file: self.file,
             start: l.span().start().into(),
             end: l.span().end().into(),
@@ -1510,7 +1762,7 @@ impl Items<'_> {
                     let name = pat_ident(&t.pat);
                     if let Some(n) = &name {
                         if is_write_tx(&t.ty) {
-                            facts.write_tx.insert(n.clone());
+                            facts.tx_params.insert(n.clone());
                             facts.lock_from = Some(Pos { line: 0, column: 0 });
                         }
                         if is_integer_type(&t.ty) {
@@ -1528,6 +1780,7 @@ impl Items<'_> {
             index: self.index,
             id,
             spawn_depth: 0,
+            guard: Guard::new(),
         }
         .visit_block(block);
     }
@@ -1603,6 +1856,8 @@ struct Body<'i> {
     id: usize,
     /// Inside the arguments of a `spawn` call.
     spawn_depth: usize,
+    /// The branch arms around the current expression.
+    guard: Guard,
 }
 
 impl Body<'_> {
@@ -1633,15 +1888,35 @@ impl Body<'_> {
     }
 
     fn bind(&mut self, name: String, pos: Pos, is_let: bool, binding: Binding) {
+        let tx = matches!(&binding, Binding::Value(v) if is_begin_write(v));
         self.facts().locals.entry(name).or_default().push(Local {
             pos,
             is_let,
+            tx,
             binding,
         });
     }
 
     fn append(&mut self, name: String, e: Expr) {
-        self.facts().appends.entry(name).or_default().push(e);
+        let guard = self.guard.clone();
+        self.facts()
+            .appends
+            .entry(name)
+            .or_default()
+            .push((e, guard));
+    }
+
+    /// A new branch construct with `arms` arms.
+    fn construct(&mut self) -> usize {
+        self.index.constructs += 1;
+        self.index.constructs
+    }
+
+    /// Walks `walk` inside arm `arm` of construct `id`.
+    fn in_arm(&mut self, id: usize, arm: usize, arms: usize, walk: impl FnOnce(&mut Self)) {
+        self.guard.push((id, arm, arms));
+        walk(self);
+        self.guard.pop();
     }
 
     /// The sink call at the root of a method chain (`sqlx::query(..).bind(..)`),
@@ -1700,20 +1975,13 @@ impl<'ast> Visit<'ast> for Body<'_> {
     fn visit_item(&mut self, _: &'ast syn::Item) {}
 
     fn visit_local(&mut self, l: &'ast syn::Local) {
-        if let Pat::Type(t) = &l.pat {
-            if is_write_tx(&t.ty) {
-                if let Some(n) = pat_ident(&l.pat) {
-                    self.facts().write_tx.insert(n);
-                    self.lock_at(l.span().start().into());
-                }
-            }
+        let typed_tx = matches!(&l.pat, Pat::Type(t) if is_write_tx(&t.ty));
+        if typed_tx {
+            self.lock_at(l.span().start().into());
         }
         if let Some(init) = &l.init {
             let init_expr = &*init.expr;
             if let Some(name) = pat_ident(&l.pat) {
-                if tokens(init_expr).contains("begin_write") {
-                    self.facts().write_tx.insert(name.clone());
-                }
                 if let Expr::Closure(c) = init_expr {
                     let span = (c.span().start().into(), c.span().end().into());
                     self.facts().closures.push((name.clone(), span.0, span.1));
@@ -1731,7 +1999,17 @@ impl<'ast> Visit<'ast> for Body<'_> {
                     self.facts().sink_names.push((name.clone(), pos));
                 }
                 let b = Binding::Value(init_expr.clone());
-                self.bind(name, l.span().end().into(), true, b);
+                self.bind(name.clone(), l.span().end().into(), true, b);
+                if typed_tx {
+                    if let Some(last) = self
+                        .facts()
+                        .locals
+                        .get_mut(&name)
+                        .and_then(|v| v.last_mut())
+                    {
+                        last.tx = true;
+                    }
+                }
             } else {
                 let mut names = Vec::new();
                 tuple_idents(&l.pat, &mut Vec::new(), &mut names);
@@ -1747,6 +2025,35 @@ impl<'ast> Visit<'ast> for Body<'_> {
         visit::visit_local(self, l);
     }
 
+    fn visit_expr_if(&mut self, i: &'ast syn::ExprIf) {
+        let id = self.construct();
+        self.visit_expr(&i.cond);
+        self.in_arm(id, 0, 2, |me| me.visit_block(&i.then_branch));
+        if let Some((_, els)) = &i.else_branch {
+            self.in_arm(id, 1, 2, |me| me.visit_expr(els));
+        }
+    }
+
+    fn visit_expr_match(&mut self, m: &'ast syn::ExprMatch) {
+        let id = self.construct();
+        self.visit_expr(&m.expr);
+        let arms = m.arms.len();
+        for (k, arm) in m.arms.iter().enumerate() {
+            self.in_arm(id, k, arms, |me| me.visit_arm(arm));
+        }
+    }
+
+    fn visit_expr_while(&mut self, w: &'ast syn::ExprWhile) {
+        let id = self.construct();
+        self.visit_expr(&w.cond);
+        self.in_arm(id, 0, 2, |me| me.visit_block(&w.body));
+    }
+
+    fn visit_expr_loop(&mut self, l: &'ast syn::ExprLoop) {
+        let id = self.construct();
+        self.in_arm(id, 0, 2, |me| me.visit_block(&l.body));
+    }
+
     fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
         let mut names = Vec::new();
         tuple_idents(&f.pat, &mut Vec::new(), &mut names);
@@ -1757,7 +2064,9 @@ impl<'ast> Visit<'ast> for Body<'_> {
             };
             self.bind(name, f.span().start().into(), true, b);
         }
-        visit::visit_expr_for_loop(self, f);
+        self.visit_expr(&f.expr);
+        let id = self.construct();
+        self.in_arm(id, 0, 2, |me| me.visit_block(&f.body));
     }
 
     fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {

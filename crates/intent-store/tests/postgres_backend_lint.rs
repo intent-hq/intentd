@@ -41,13 +41,14 @@
 //! checked on its own.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 #[path = "support/postgres_ast.rs"]
 mod postgres_ast;
 #[path = "support/sql_uses.rs"]
 mod sql_uses;
-use sql_uses::{rust_files, Index, Sql};
+use sql_uses::{list_key, rust_files, Index, LockProblem, Sql};
 use syn::{Expr, Lit};
 
 fn src() -> PathBuf {
@@ -91,12 +92,6 @@ fn unparsed_list() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/tenant-lint-unparsed.txt")
 }
 
-/// The key a source is listed under: its file name and the first 80
-/// characters of its text (or Rust expression) with whitespace collapsed.
-fn unparsed_key(file: &Path, text: &str) -> String {
-    sql_uses::list_key(file, text)
-}
-
 /// `postgres/tenant-lint-unparsed.txt`: `<file> | <prefix> — <reason>` per
 /// line; `#` lines are comments.
 fn unparsed_listed() -> BTreeMap<String, String> {
@@ -128,7 +123,7 @@ struct Report {
     /// Sinks that run a write without the writer lock.
     unlocked: BTreeSet<String>,
     /// `DEFERRED_WRITES` entries that excused an unlocked write.
-    deferred_used: BTreeSet<&'static str>,
+    deferred_used: BTreeSet<String>,
     /// Literals that parse as a statement but reach no sqlx call.
     orphans: Vec<String>,
     /// The allowlist keys that matched.
@@ -136,60 +131,136 @@ struct Report {
     parsed: usize,
 }
 
-/// `None` when `key` is listed (and marks it used), else the key.
-fn unlisted(
-    listed: &BTreeMap<String, String>,
-    used: &mut BTreeSet<String>,
-    key: String,
-) -> Option<String> {
-    if listed.contains_key(&key) {
-        used.insert(key);
-        None
-    } else {
-        Some(key)
+/// The allowlist, and which keys matched at which sites.
+struct Listed<'a> {
+    keys: &'a BTreeMap<String, String>,
+    sites: BTreeMap<String, BTreeSet<(PathBuf, usize)>>,
+}
+
+impl Listed<'_> {
+    /// `None` when `key` is listed (and records the site), else the key.
+    fn unlisted(&mut self, key: String, file: &Path, line: usize) -> Option<String> {
+        if self.keys.contains_key(&key) {
+            self.sites
+                .entry(key)
+                .or_default()
+                .insert((file.to_owned(), line));
+            None
+        } else {
+            Some(key)
+        }
     }
 }
 
 /// Functions that build a write and hand it, with the `WriteTx` from their
-/// `begin_write()`, to a caller that runs it on that transaction. The lint
-/// cannot see that executor, so it trusts these, with why.
-const DEFERRED_WRITES: &[(&str, &str)] = &[
+/// `begin_write()`, to a caller that runs it on that transaction, as
+/// `(file, function, why)`. The lint cannot see that executor, so it
+/// excuses these only where no executor is visible.
+const DEFERRED_WRITES: &[(&str, &str, &str)] = &[
     (
+        "pr_monitors.rs",
         "prepare_monitor_insert",
         "returns PreparedPgWrite { tx, query }; PreparedPgWrite runs the query on that tx",
     ),
     (
+        "pr_monitors.rs",
         "prepare_monitor_replace",
         "returns PreparedPgWrite { tx, query }; PreparedPgWrite runs the query on that tx",
     ),
     (
+        "pr_monitors.rs",
         "prepare_monitor_cancel",
         "returns PreparedPgWrite { tx, query }; PreparedPgWrite runs the query on that tx",
     ),
 ];
 
+/// Consts the lint does not follow because a test of their own checks
+/// them, as `(file, const, test)`; their literals are not orphans.
+const CHECKED_ELSEWHERE: &[(&str, &str, &str)] = &[(
+    "repositories.rs",
+    "TRANSFER_PREDICATES",
+    "every_transfer_predicate_is_scoped",
+)];
+
 const LIST_IT: &str = "in postgres/tenant-lint-unparsed.txt";
 
-fn check(index: &Index, listed: &BTreeMap<String, String>) -> Report {
+/// Every table the Postgres migrations create.
+fn schema_tables() -> BTreeSet<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/migrations");
+    let mut out = BTreeSet::new();
+    for entry in std::fs::read_dir(&dir).expect("read postgres/migrations") {
+        let sql = std::fs::read_to_string(entry.expect("entry").path())
+            .expect("read migration")
+            .to_lowercase();
+        for (at, _) in sql.match_indices("create table ") {
+            let rest = sql[at + "create table ".len()..].trim_start();
+            let rest = rest.strip_prefix("if not exists ").unwrap_or(rest);
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// The `FROM`/`JOIN`/`INTO`/`UPDATE <table>` of a text that names a table
+/// in `tables`, if any: an SQL fragment.
+fn names_a_table(text: &str, tables: &BTreeSet<String>) -> Option<String> {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    // As in SQL: INTO after INSERT, UPDATE with a SET after it.
+    (0..words.len().saturating_sub(1)).find_map(|i| {
+        let (kw, table) = (words[i], words[i + 1]);
+        let shaped = match kw {
+            "from" | "join" => true,
+            "into" => i > 0 && words[i - 1] == "insert",
+            "update" => words[i + 2..].contains(&"set"),
+            _ => false,
+        };
+        (shaped && tables.contains(table)).then(|| format!("{} {table}", kw.to_uppercase()))
+    })
+}
+
+fn check(
+    index: &Index,
+    listed: &BTreeMap<String, String>,
+    deferred: &[(&str, &str, &str)],
+    tables: &BTreeSet<String>,
+) -> Report {
     let exempt = non_tenant_tables();
     let mut report = Report::default();
+    let mut list = Listed {
+        keys: listed,
+        sites: BTreeMap::new(),
+    };
     let mut tenant = BTreeSet::new();
     let mut unparsed = BTreeSet::new();
     let mut parsed = BTreeSet::new();
     let uses = index.uses();
     for u in &uses {
+        let file_name = u.file.file_name().map(|f| f.to_string_lossy().into_owned());
+        let excuse = deferred
+            .iter()
+            .find(|(f, n, _)| Some(*f) == file_name.as_deref() && *n == u.function);
         for s in &u.sources {
             let at = format!("{}:{}", s.file.display(), s.start.line);
             for exp in s.expansions() {
                 let mut blocked = false;
-                for (file, line, expr) in &exp.unresolved {
-                    let key = unparsed_key(file, expr);
-                    if let Some(key) = unlisted(listed, &mut report.listed_used, key) {
+                for x in &exp.unresolved {
+                    let key = list_key(&x.file, &x.function, &x.expr);
+                    if let Some(key) = list.unlisted(key, &x.file, x.start.line) {
                         blocked = true;
                         unparsed.insert(format!(
-                            "{}:{line}: runs SQL the lint cannot follow (`{expr}`); \
+                            "{}:{}: runs SQL the lint cannot follow (`{}`); \
                              fix it or list `{key} — <reason>` {LIST_IT}",
-                            file.display()
+                            x.file.display(),
+                            x.start.line,
+                            x.expr
                         ));
                     }
                 }
@@ -205,22 +276,24 @@ fn check(index: &Index, listed: &BTreeMap<String, String>) -> Report {
                         let writes = postgres_ast::written_tables(&stmts)
                             .into_iter()
                             .any(|t| !exempt.contains(&t.as_str()));
-                        let deferred = DEFERRED_WRITES.iter().find(|(f, _)| *f == u.function);
-                        if let (true, Some((f, _)), Some(_)) = (writes, deferred, &u.lock_problem) {
-                            report.deferred_used.insert(f);
-                        }
-                        if let (true, None, Some(why)) = (writes, deferred, &u.lock_problem) {
-                            report.unlocked.insert(format!(
-                                "{}:{}: {} ({why})",
-                                u.file.display(),
-                                u.line,
-                                u.function
-                            ));
+                        match (writes, excuse, &u.lock_problem) {
+                            (true, Some((_, f, _)), Some(LockProblem::Hidden)) => {
+                                report.deferred_used.insert((*f).to_owned());
+                            }
+                            (true, _, Some(why)) => {
+                                report.unlocked.insert(format!(
+                                    "{}:{}: {} ({why})",
+                                    u.file.display(),
+                                    u.line,
+                                    u.function
+                                ));
+                            }
+                            _ => {}
                         }
                     }
                     Err(e) => {
-                        let key = unparsed_key(&s.file, s.text());
-                        if let Some(key) = unlisted(listed, &mut report.listed_used, key) {
+                        let key = list_key(&s.file, &s.function, s.text());
+                        if let Some(key) = list.unlisted(key, &s.file, s.start.line) {
                             unparsed.insert(format!(
                                 "{at}: does not parse ({e}); fix it or list \
                                  `{key} — <reason>` {LIST_IT}"
@@ -231,19 +304,45 @@ fn check(index: &Index, listed: &BTreeMap<String, String>) -> Report {
             }
         }
     }
-    for (file, line, value) in index.unreached_literals(&uses) {
-        if !postgres_ast::is_statement(&value) {
+    for r in index.unreached_literals(&uses) {
+        let file_name = r.file.file_name().map(|f| f.to_string_lossy().into_owned());
+        if CHECKED_ELSEWHERE
+            .iter()
+            .any(|(f, c, _)| Some(*f) == file_name.as_deref() && *c == r.function)
+        {
             continue;
         }
-        let key = unparsed_key(&file, &value);
-        if let Some(key) = unlisted(listed, &mut report.listed_used, key) {
+        let what = if postgres_ast::is_statement(&r.value) {
+            "SQL that no sqlx call runs".to_owned()
+        } else if let Some(table) = names_a_table(&r.value, tables) {
+            format!("an SQL fragment ({table}) that no sqlx call runs")
+        } else {
+            continue;
+        };
+        let key = list_key(&r.file, &r.function, &r.value);
+        if let Some(key) = list.unlisted(key, &r.file, r.line) {
             report.orphans.push(format!(
-                "{}:{line}: SQL that no sqlx call runs; run it through sqlx, remove it, \
-                 or list `{key} — <reason>` {LIST_IT}",
-                file.display()
+                "{}:{}: {what}; run it through sqlx, remove it, or list \
+                 `{key} — <reason>` {LIST_IT}",
+                r.file.display(),
+                r.line
             ));
         }
     }
+    for (key, sites) in &list.sites {
+        if sites.len() > 1 {
+            let at: Vec<String> = sites
+                .iter()
+                .map(|(f, l)| format!("{}:{l}", f.display()))
+                .collect();
+            unparsed.insert(format!(
+                "`{key}` in {LIST_IT} matches {} sites ({}); a key must name one site",
+                sites.len(),
+                at.join(", ")
+            ));
+        }
+    }
+    report.listed_used = list.sites.into_keys().collect();
     report.tenant = tenant.into_iter().collect();
     report.unparsed = unparsed.into_iter().collect();
     report.parsed = parsed.len();
@@ -253,7 +352,12 @@ fn check(index: &Index, listed: &BTreeMap<String, String>) -> Report {
 #[test]
 fn every_postgres_statement_parses_and_is_filtered_by_the_bound_tenant() {
     let listed = unparsed_listed();
-    let report = check(&postgres_index(), &listed);
+    let report = check(
+        &postgres_index(),
+        &listed,
+        DEFERRED_WRITES,
+        &schema_tables(),
+    );
     let mut findings = report.tenant;
     findings.extend(report.unparsed);
     findings.extend(report.orphans);
@@ -272,10 +376,15 @@ fn every_postgres_statement_parses_and_is_filtered_by_the_bound_tenant() {
 
 #[test]
 fn every_postgres_write_takes_the_tenant_writer_lock() {
-    let report = check(&postgres_index(), &unparsed_listed());
-    for (f, _) in DEFERRED_WRITES {
+    let report = check(
+        &postgres_index(),
+        &unparsed_listed(),
+        DEFERRED_WRITES,
+        &schema_tables(),
+    );
+    for (_, f, _) in DEFERRED_WRITES {
         assert!(
-            report.deferred_used.contains(f),
+            report.deferred_used.contains(*f),
             "DEFERRED_WRITES names {f}, which runs no unlocked write; remove it"
         );
     }
@@ -597,13 +706,26 @@ fn templates_parse_with_consts_and_fillers() {
     assert!(parse_template("delete note failed: {e}", &none).is_err());
 }
 
+/// The tables unit cases treat as the schema.
+fn unit_tables() -> BTreeSet<String> {
+    ["note", "task", "hook", "settings"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
 /// [`check`] on in-memory source files.
 fn check_files(files: &[(&str, &str)]) -> Report {
     let files: Vec<(PathBuf, String)> = files
         .iter()
         .map(|(p, s)| (PathBuf::from(p), (*s).to_owned()))
         .collect();
-    check(&Index::new(&files, &[]), &BTreeMap::new())
+    check(
+        &Index::new(&files, &[]),
+        &BTreeMap::new(),
+        &[],
+        &unit_tables(),
+    )
 }
 
 /// [`check`] on one in-memory source file named `x.rs`.
@@ -682,7 +804,7 @@ fn sql_is_found_where_sqlx_runs_it() {
             async fn prose(&self) -> Error {
                 let what = "delete note failed";
                 tracing::warn!("select failed: {what}");
-                Error::Internal(format!("update hook set failed: {what}"))
+                Error::Internal(format!("update hook state failed: {what}"))
             }
         }
     "#;
@@ -743,9 +865,9 @@ fn sql_that_does_not_parse_or_scope_is_reported() {
         )],
         &[],
     );
-    let key = unparsed_key(Path::new("x.rs"), "selec 1");
+    let key = list_key(Path::new("x.rs"), "f", "selec 1");
     let listed = BTreeMap::from([(key.clone(), "spike".to_owned())]);
-    let report = check(&index, &listed);
+    let report = check(&index, &listed, &[], &unit_tables());
     assert!(report.unparsed.is_empty());
     assert!(report.listed_used.contains(&key));
 }
@@ -886,13 +1008,166 @@ fn the_lint_fails_closed_on_every_probe() {
         )],
         &[],
     );
-    let key = unparsed_key(Path::new("x.rs"), "self . order");
+    let key = list_key(Path::new("x.rs"), "f", "self . order");
     let report = check(
         &index,
         &BTreeMap::from([(key.clone(), "order by".to_owned())]),
+        &[],
+        &unit_tables(),
     );
     assert!(report.unparsed.is_empty(), "{:?}", report.unparsed);
     assert!(report.listed_used.contains(&key));
+}
+
+/// Regression cases from the second review: each hides an unscoped
+/// statement, a write off the lock, or a fragment, and must be reported.
+#[test]
+fn the_lint_fails_closed_on_the_second_review_probes() {
+    let unscoped = |source: &str, want: &str| {
+        let report = check_source(source);
+        assert!(
+            tenant_findings(&report)
+                .contains(&format!("{want} is not filtered by tenant_id = $n").as_str()),
+            "{source}\n{:?}\n{:?}",
+            report.tenant,
+            report.unparsed
+        );
+    };
+    // A local's field that gained text is that text (Filters::sql).
+    unscoped(
+        r#"fn f() {
+            let mut f = Filters::default();
+            f.push(" AND id IN (SELECT id FROM task)");
+            let sql = format!("SELECT id FROM note WHERE tenant_id = $1{}", f.sql);
+            sqlx::query(&sql);
+        }"#,
+        "FROM task",
+    );
+    // Past the cap each hole still shows every alternative.
+    unscoped(
+        r#"fn f() {
+            for a in ["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "(select id from task)"] {
+                for b in ["true", "true", "true", "true", "true", "true", "true", "true", "true"] {
+                    sqlx::query(&format!("select {a} from note where tenant_id = $1 and {b}"));
+                }
+            }
+        }"#,
+        "FROM task",
+    );
+    // A hole with 65 alternatives (a 65-arm match) shows each of them.
+    let arms = (0..64).fold(String::new(), |mut out, i| {
+        let _ = write!(out, "{i} => \"true\", ");
+        out
+    });
+    unscoped(
+        &format!(
+            "fn f(k: u8) {{ let c = match k {{ {arms}_ => \"id in (select id from task)\" }}; \
+             sqlx::query(&format!(\"select id from note where tenant_id = $1 and {{c}}\")); }}"
+        ),
+        "FROM task",
+    );
+    // A cast and a `+` of texts are followed as text.
+    unscoped(
+        r#"fn f() {
+            let clause = " and id in (select id from task)";
+            sqlx::query(&format!("select id from note where tenant_id = $1{}", clause as &str));
+        }"#,
+        "FROM task",
+    );
+    unscoped(
+        r#"fn f() {
+            let head = "select id from note where tenant_id = $1".to_owned();
+            let tail = " union select id from task";
+            sqlx::query(&(head + &tail));
+        }"#,
+        "FROM task",
+    );
+    // A key that matches two sites fails.
+    let index = Index::new(
+        &[(
+            PathBuf::from("x.rs"),
+            r#"fn f(&self) {
+                sqlx::query(&format!("select id from note where tenant_id = $1 {}", self.order));
+                sqlx::query(&format!("select id from task where tenant_id = $1 {}", self.order));
+            }"#
+            .to_owned(),
+        )],
+        &[],
+    );
+    let key = list_key(Path::new("x.rs"), "f", "self . order");
+    let report = check(
+        &index,
+        &BTreeMap::from([(key, "order by".to_owned())]),
+        &[],
+        &unit_tables(),
+    );
+    assert!(
+        report
+            .unparsed
+            .iter()
+            .any(|f| f.contains("matches 2 sites")),
+        "{:?}",
+        report.unparsed
+    );
+    // cfg(not(test)) code is production code; cfg(any(test, ..)) is not.
+    let report = check_source(
+        r#"#[cfg(not(test))]
+        fn f() { let s = "DELETE FROM note WHERE tenant_id = $1"; }
+        #[cfg(any(test, feature = "test-support"))]
+        fn g() { let s = "DELETE FROM hook"; }"#,
+    );
+    assert_eq!(report.orphans.len(), 1, "{:?}", report.orphans);
+    assert!(report.orphans[0].starts_with("x.rs:2: "));
+}
+
+#[test]
+fn unreached_fragments_that_name_a_table_fail() {
+    let report = check_source(
+        r#"fn f() {
+            let mut sql = String::from("select id from note where tenant_id = $1");
+            sql.push_str(" and id in (select id from note where tenant_id = $1)");
+            sqlx::query(&sql);
+            let stray = " UNION SELECT id FROM task";
+            let prose = "insert note failed";
+        }"#,
+    );
+    assert_eq!(report.orphans.len(), 1, "{:?}", report.orphans);
+    assert!(report.orphans[0].starts_with("x.rs:5: an SQL fragment (FROM task)"));
+}
+
+#[test]
+fn the_writer_lock_follows_the_transaction_binding() {
+    let unlocked = |source: &str, deferred: &[(&str, &str, &str)]| -> Vec<String> {
+        let index = Index::new(&[(PathBuf::from("x.rs"), source.to_owned())], &[]);
+        check(&index, &BTreeMap::new(), deferred, &unit_tables())
+            .unlocked
+            .into_iter()
+            .collect()
+    };
+    // Only a binding whose every branch is begin_write() holds the lock.
+    let branch = r#"async fn g(&self, flag: bool) {
+        let mut tx = if flag { self.begin_write().await? } else { self.begin().await? };
+        sqlx::query("DELETE FROM t WHERE tenant_id = $1").execute(&mut *tx).await; }"#;
+    // A later binding of the same name that is not a WriteTx hides it.
+    let shadow = r#"async fn h(&self) {
+        let mut tx = self.begin_write().await?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM t WHERE tenant_id = $1").execute(&mut *tx).await; }"#;
+    let both = r#"async fn k(&self, flag: bool) {
+        let mut tx = if flag { self.begin_write().await? } else { self.begin_write().await.map_err(db)? };
+        sqlx::query("DELETE FROM t WHERE tenant_id = $1").execute(&mut *tx).await; }"#;
+    assert_eq!(unlocked(branch, &[]).len(), 1);
+    assert_eq!(unlocked(shadow, &[]).len(), 1);
+    assert!(unlocked(both, &[]).is_empty());
+    // DEFERRED_WRITES excuses a hidden executor, not a visible one.
+    let deferred = [("x.rs", "p", "hands the query and tx to its caller")];
+    let hidden = r#"async fn p(&self) {
+        let q = sqlx::query("DELETE FROM t WHERE tenant_id = $1");
+        let tx = self.begin_write().await?; }"#;
+    let visible = r#"async fn p(&self) {
+        sqlx::query("DELETE FROM t WHERE tenant_id = $1").execute(&self.pool).await; }"#;
+    assert!(unlocked(hidden, &deferred).is_empty());
+    assert_eq!(unlocked(visible, &deferred).len(), 1);
 }
 
 #[test]
