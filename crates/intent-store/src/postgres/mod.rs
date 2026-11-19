@@ -587,6 +587,14 @@ impl Default for WriterSlot {
     }
 }
 
+impl WriterSlot {
+    /// Whether both handles are the same slot.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.permit, &other.permit) && Arc::ptr_eq(&self.waiting, &other.waiting)
+    }
+}
+
 /// Counts one writer in [`WriterSlot::waiting`] while it lives.
 struct Waiting(Arc<AtomicUsize>);
 
@@ -819,8 +827,9 @@ impl crate::Store {
 
 impl crate::Store {
     /// Writers of this Postgres store's tenant, through any of its stores in
-    /// this process, waiting for the writer slot or the tenant writer lock; 0 on `SQLite`. For tests that need a writer to be
-    /// queued before they go on.
+    /// this process, waiting for the writer slot or the tenant writer lock;
+    /// 0 on `SQLite`. For tests that need a writer to be queued before they
+    /// go on.
     #[doc(hidden)]
     #[must_use]
     pub fn postgres_writers_waiting(&self) -> usize {

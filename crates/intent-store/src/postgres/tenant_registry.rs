@@ -11,6 +11,18 @@
 //!
 //! The registry holds weak references: the state lives while any store for
 //! the tenant does, and the next open after the last one drops starts fresh.
+//! A `NoteWriteLock` or a writer's slot permit can outlive every store; the
+//! next open then gets a fresh lane and slot. Such a stale note lock cannot
+//! write through the new store (`NoteWriteLock::ensure_covers` rejects it).
+//!
+//! The key is the server address and database as the pool reaches them, so
+//! it is only as precise as the connect options:
+//! - It excludes the user and `search_path`. Every tenant lives in one
+//!   shared schema today; a store per schema would need them in the key.
+//! - One database reached under two host names (`localhost` and
+//!   `127.0.0.1`) gets two entries, and so two sets of gates. Give every
+//!   pool for a database the same address.
+//!
 //! This only covers one process; gates across daemons need database-visible
 //! state.
 
@@ -79,31 +91,53 @@ impl crate::Store {
         else {
             return None;
         };
+        // Name every field, with no `..`: a new `PgStore` field does not
+        // compile here until it is listed as per-open (`_`) or as a gate
+        // below that must come from the tenant's `TenantState`.
+        let super::PgStore {
+            pool: _,
+            tenant: _,
+            options: _,
+            note_write_lanes,
+            task_event_baselines,
+            task_events_enabled,
+            browser_tab_displayed,
+            desktop_writes,
+            writer_slot,
+            tenant_state,
+        } = a;
+        // A gate is shared when both stores hold the same one and it is the
+        // one in this store's registry entry.
         Some([
             (
                 "note_write_lanes",
-                Arc::ptr_eq(&a.note_write_lanes, &b.note_write_lanes),
+                Arc::ptr_eq(note_write_lanes, &b.note_write_lanes)
+                    && Arc::ptr_eq(note_write_lanes, &tenant_state.note_write_lanes),
             ),
             (
                 "task_event_baselines",
-                Arc::ptr_eq(&a.task_event_baselines, &b.task_event_baselines),
+                Arc::ptr_eq(task_event_baselines, &b.task_event_baselines)
+                    && Arc::ptr_eq(task_event_baselines, &tenant_state.task_event_baselines),
             ),
             (
                 "task_events_enabled",
-                Arc::ptr_eq(&a.task_events_enabled, &b.task_events_enabled),
+                Arc::ptr_eq(task_events_enabled, &b.task_events_enabled)
+                    && Arc::ptr_eq(task_events_enabled, &tenant_state.task_events_enabled),
             ),
             (
                 "browser_tab_displayed",
-                a.browser_tab_displayed.same_as(&b.browser_tab_displayed),
+                browser_tab_displayed.same_as(&b.browser_tab_displayed)
+                    && browser_tab_displayed.same_as(&tenant_state.browser_tab_displayed),
             ),
             (
                 "desktop_writes",
-                Arc::ptr_eq(&a.desktop_writes.maintenance, &b.desktop_writes.maintenance),
+                desktop_writes.same_as(&b.desktop_writes)
+                    && desktop_writes.same_as(&tenant_state.desktop_writes),
             ),
             (
                 "writer_slot",
-                Arc::ptr_eq(&a.writer_slot.permit, &b.writer_slot.permit)
-                    && Arc::ptr_eq(&a.writer_slot.waiting, &b.writer_slot.waiting),
+                writer_slot.same_as(&b.writer_slot)
+                    && writer_slot.same_as(&tenant_state.writer_slot),
             ),
         ])
     }

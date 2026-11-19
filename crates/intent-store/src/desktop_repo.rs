@@ -20,6 +20,14 @@ pub(crate) struct DesktopWrites {
 }
 
 impl DesktopWrites {
+    /// Whether both handles are the same gates: maintenance and every
+    /// workspace scope.
+    #[cfg(all(feature = "postgres", feature = "test-support"))]
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.maintenance, &other.maintenance)
+            && Arc::ptr_eq(&self.scopes, &other.scopes)
+    }
+
     fn scope(&self, workspace: &WorkspaceId) -> Arc<RwLock<()>> {
         let mut scopes = self
             .scopes
