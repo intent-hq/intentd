@@ -2851,11 +2851,70 @@ jobs:
       - name: Postgres backend tests
         run: cargo test -p intent-store --features postgres --test postgres_backend --test postgres_backend_lint --test postgres_tenant_schema_lint
 
+  # intent-passkey (the WebAuthn sidecar, its own Cargo workspace under
+  # intent-passkey/) links libdbus and libudev, so it stays out of the daemon
+  # workspace and gets its gates here: format, Clippy, the protocol and USB
+  # (virtual HID key) tests, the license policy, and the release build script
+  # for both Linux arches (x86_64 native, aarch64 cross via multiarch), which
+  # dist-build-setup.yml runs for the release archives. A GitHub-hosted runner,
+  # because the apt installs need passwordless sudo. Gated like store-postgres.
+  passkey:
+    if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
+    needs: [route, release-fast-path]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16 (PR 187 env-passed inputs, PR 186 install retry)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+      - uses: ./.github/actions/cargo-tools
+        with:
+          tools: cargo-deny
+      - name: Build release binaries (x86_64 native, aarch64 cross)
+        run: |
+          set -euo pipefail
+          mkdir -p passkey-dist
+          for leg in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            ./scripts/build-intent-passkey.sh "$leg"
+            arch=${leg%%-*}
+            install -m 0755 packaging/libexec/intent-passkey "passkey-dist/intent-passkey-$arch-unknown-linux-gnu"
+          done
+          cp packaging/libexec/intent-passkey.LGPL-2.1.txt passkey-dist/
+          file passkey-dist/intent-passkey-*
+          printf '%s\n' '{"id":"1","method":"hello"}' |
+            "passkey-dist/intent-passkey-$(uname -m)-unknown-linux-gnu" --stdio | grep -q '"protocol":1'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: intent-passkey-linux
+          path: passkey-dist/
+          retention-days: 14
+      - name: Format check
+        run: cargo fmt --check --manifest-path intent-passkey/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path intent-passkey/Cargo.toml --all-targets -- -D warnings
+      - name: Protocol and USB security key tests
+        run: cargo test --locked --manifest-path intent-passkey/Cargo.toml
+      - name: Licenses (cargo-deny)
+        run: cargo deny --manifest-path intent-passkey/Cargo.toml check --config deny.toml licenses
+
   gate:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, macos-cross-lint, build, windows, coverage-e2e, coverage-all, coverage-changed, pr-title, docs-pr-scope, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths, store-postgres]
+    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, macos-cross-lint, build, windows, coverage-e2e, coverage-all, coverage-changed, pr-title, docs-pr-scope, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths, store-postgres, passkey]
     steps:
       - name: Check results
         run: |
@@ -2900,6 +2959,7 @@ jobs:
               optional install-ps1 "${{ needs.install-ps1.result }}"
               optional pi-session-paths "${{ needs.pi-session-paths.result }}"
               "$slow" store-postgres "${{ needs.store-postgres.result }}"
+              "$slow" passkey "${{ needs.passkey.result }}"
               ;;
             merge_group)
               require route "${{ needs.route.result }}"
@@ -2923,6 +2983,7 @@ jobs:
               optional install-ps1 "${{ needs.install-ps1.result }}"
               require pi-session-paths "${{ needs.pi-session-paths.result }}"
               require store-postgres "${{ needs.store-postgres.result }}"
+              require passkey "${{ needs.passkey.result }}"
               ;;
             push)
               # Release-metadata and superseded pushes skip the Windows
@@ -2963,6 +3024,7 @@ jobs:
               require install-ps1 "${{ needs.install-ps1.result }}"
               require pi-session-paths "${{ needs.pi-session-paths.result }}"
               optional store-postgres "${{ needs.store-postgres.result }}"
+              optional passkey "${{ needs.passkey.result }}"
               ;;
             *) exit 1 ;;
           esac

@@ -593,6 +593,8 @@ is_inert() {
   case "$1" in
     *.md | LICENSE | NOTICE | .gitignore | deny.toml | release-plz.toml | dist-workspace.toml) return 0 ;;
     .github/* | docs/*) return 0 ;;
+    # The passkey sidecar is its own Cargo workspace; CI's `passkey` job tests it.
+    intent-passkey/* | scripts/build-intent-passkey.sh) return 0 ;;
   esac
   return 1
 }

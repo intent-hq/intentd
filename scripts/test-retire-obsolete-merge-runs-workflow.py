@@ -204,7 +204,7 @@ print('HTTP/2.0 ' + str(response.status) + ' response\n' + headers + '\n' + json
             'route', 'pr-static', 'release-fast-path', 'supersede', 'cache-smoke',
             'daemon-lifecycle', 'check', 'windows-cross-lint', 'macos-cross-lint', 'build', 'windows', 'coverage-e2e', 'coverage-all',
             'coverage-changed', 'pr-title', 'docs-pr-scope', 'conflict-markers', 'monorepo-consumer-checks',
-            'deb-packaging', 'release-scripts', 'install-ps1', 'pi-session-paths', 'store-postgres'})
+            'deb-packaging', 'release-scripts', 'install-ps1', 'pi-session-paths', 'store-postgres', 'passkey'})
         commands = '\n'.join(s.get('run', '') for s in ci['jobs']['release-scripts']['steps'])
         self.assertIn('python3 -B scripts/test-hosted-runners.py', commands)
         for test in ('test-retire-obsolete-merge-runs.py', 'test-retire-obsolete-merge-runs-caller.py',

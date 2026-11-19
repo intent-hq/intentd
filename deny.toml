@@ -36,4 +36,10 @@ exceptions = [
     # crate is consumed unmodified as a dependency. `option-ext` is pulled in
     # by `dirs-sys` (via `directories`).
     { name = "option-ext", allow = ["MPL-2.0"] },
+    # intent-passkey (its own workspace, checked by CI's `passkey` job) links the
+    # linux-credentials WebAuthn stack. LGPL-2.1-or-later is met because the
+    # binary's full source is public and users can rebuild it; NOTICE carries
+    # the notice.
+    { name = "libwebauthn", allow = ["LGPL-2.1-or-later"] },
+    { name = "pxp", allow = ["LGPL-2.1-or-later"] },
 ]

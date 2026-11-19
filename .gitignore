@@ -4,6 +4,9 @@ lcov.info
 coverage-summary.txt
 /packaging/libexec/tailcat
 /packaging/libexec/tailcat.exe
+/packaging/libexec/intent-passkey
+/packaging/libexec/intent-passkey.LGPL-2.1.txt
+/intent-passkey/target
 
 # Python bytecode caches: never tracked (scripts/check-no-python-cache.sh fails CI on one).
 __pycache__/

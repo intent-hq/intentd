@@ -304,6 +304,10 @@ jobs:
           esac
           ls -l "$dest"
         shell: "bash"
+      - name: "Stage intent-passkey sidecar binary (Linux)"
+        if: "runner.os == 'Linux'"
+        run: "./scripts/build-intent-passkey.sh \"${{ join(matrix.targets, ' ') }}\""
+        shell: "bash"
       - name: Configure the self-hosted compiler cache
         shell: bash
         env:

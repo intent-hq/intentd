@@ -52,14 +52,14 @@ WORKFLOW_LINT_STEPS = (
     "make lint-workflows",
 )
 REQUIRED = {
-    "pull_request": ALWAYS_REQUIRED | WINDOWS_LINT_JOBS | MACOS_LINT_JOBS | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts", "store-postgres"},
-    "merge_group": ALWAYS_REQUIRED | RUNTIME | WINDOWS_LINT_JOBS | {"cache-smoke", "daemon-lifecycle", "check", "build", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks", "store-postgres"},
+    "pull_request": ALWAYS_REQUIRED | WINDOWS_LINT_JOBS | MACOS_LINT_JOBS | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts", "store-postgres", "passkey"},
+    "merge_group": ALWAYS_REQUIRED | RUNTIME | WINDOWS_LINT_JOBS | {"cache-smoke", "daemon-lifecycle", "check", "build", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks", "store-postgres", "passkey"},
     "push": ALWAYS_REQUIRED | RUNTIME | WINDOWS_JOBS | {"build"},
 }
 PR_METADATA = {"pr-title", "docs-pr-scope", "conflict-markers"}
 # Release-metadata PRs (release-fast-path reports fast_path=true) skip these
 # slow jobs; the queue still requires them (intentd#2493).
-FAST_PATH_SKIPS = {"check", "windows-cross-lint", "macos-cross-lint", "coverage-changed", "store-postgres"}
+FAST_PATH_SKIPS = {"check", "windows-cross-lint", "macos-cross-lint", "coverage-changed", "store-postgres", "passkey"}
 # release-scripts tests only scripts/ and .github/, which a release-metadata
 # diff cannot touch, so both a fast-path PR and a release push skip it. The
 # queue always runs it, and so does every other PR and push.
