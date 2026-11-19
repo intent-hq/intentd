@@ -2138,11 +2138,30 @@ impl ScriptManager {
         if self.is_live(workspace_id, script_id)? {
             return Ok(self.start_reply(workspace_id, script_id));
         }
+        // Decide before admission: a skipped boot start must leave no admitted run.
+        if restoring
+            && !self
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&(workspace_id.clone(), script_id.to_owned()))
+                .is_some_and(Self::boot_start_eligible)
+        {
+            return Ok(json!({ "ok": true, "scriptId": script_id }));
+        }
         self.finish_previous_locked(workspace_id, script_id).await;
         self.prepare_launch(workspace_id, script_id).await?;
         let publication = self.locks.publication_lock(script_id);
         let _publishing = publication.lock().await;
         self.start_inner(workspace_id, script_id, restoring)
+    }
+
+    /// A stop, upsert, autoStart toggle-off or archive racing boot hydration
+    /// must not be undone by the boot start.
+    fn boot_start_eligible(m: &ManagedScript) -> bool {
+        !m.stopped_by_user
+            && m.def.archived_at.is_none()
+            && (m.state.previously_running == Some(true) || m.def.auto_start == Some(true))
     }
 
     fn start_inner(
@@ -2156,13 +2175,7 @@ impl ScriptManager {
         let m = guard
             .get_mut(&key)
             .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
-        // A stop, upsert, autoStart toggle-off or archive racing boot hydration
-        // must not be undone by the boot start.
-        if restoring
-            && (m.stopped_by_user
-                || m.def.archived_at.is_some()
-                || (m.state.previously_running != Some(true) && m.def.auto_start != Some(true)))
-        {
+        if restoring && !Self::boot_start_eligible(m) {
             return Ok(json!({ "ok": true, "scriptId": script_id }));
         }
         if matches!(
@@ -5156,6 +5169,52 @@ mod tests {
             edited["status"], "idle",
             "command edit replaces the run: {edited}"
         );
+    }
+
+    /// A boot start cancelled by a stop, toggle-off or archive that won the
+    /// race must not admit a run: a later manual start still launches.
+    #[intent_test_macros::daemon_test]
+    async fn cancelled_boot_start_does_not_block_a_manual_start() {
+        for cancel in ["stop", "toggle-off"] {
+            let h = harness().await;
+            let mut sub = subscribe(&h);
+            let id = create(
+                &h,
+                ScriptCreateParams {
+                    name: "svc".into(),
+                    command: SERVICE_CMD.into(),
+                    mode: ScriptMode::Service,
+                    auto_start: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let mgr = h.services.script_manager();
+            {
+                let mut scripts = mgr.scripts.lock().unwrap();
+                let m = scripts.get_mut(&(h.ws.clone(), id.clone())).unwrap();
+                if cancel == "stop" {
+                    m.stopped_by_user = true;
+                } else {
+                    m.def.auto_start = Some(false);
+                }
+            }
+            mgr.start_with_restore(&h.ws, &id, true).await.unwrap();
+            let idle = mgr.status(&h.ws, &id).unwrap();
+            assert_eq!(
+                idle["status"], "idle",
+                "{cancel}: boot start skipped: {idle}"
+            );
+            h.services
+                .script_start(h.ws.clone(), id.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{cancel}: manual start refused: {e}"));
+            await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+            h.services
+                .script_stop(h.ws.clone(), id)
+                .await
+                .expect("cleanup");
+        }
     }
 
     /// Boot restores services that were actually running;
