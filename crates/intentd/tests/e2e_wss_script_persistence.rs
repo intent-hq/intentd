@@ -1186,3 +1186,170 @@ async fn durable_command_evidence_survives_daemon_restart_over_wss() {
     );
     drop(ws);
 }
+
+/// A committed repo whose `.intent/config.json` declares one `autoStart`
+/// service, so the workspace's scripts exist before its setup finishes.
+fn create_auto_start_repo() -> tempfile::TempDir {
+    let repo = create_test_repo();
+    let repo_path = repo.path();
+    std::fs::create_dir_all(repo_path.join(".intent")).expect("mkdir .intent");
+    std::fs::write(
+        repo_path.join(".intent/config.json"),
+        json!({
+            "scripts": [
+                { "name": "auto-svc", "command": "sleep 3600", "mode": "service", "autoStart": true },
+                { "name": "manual-svc", "command": "sleep 3600", "mode": "service" },
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write repo config");
+    for args in [&["add", "."][..], &["commit", "-m", "scripts"][..]] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .stdout(Stdio::null())
+            .status()
+            .expect("git spawn");
+        assert!(status.success(), "git {args:?} failed");
+    }
+    repo
+}
+
+/// Poll `script.list` until the script named `name` matches `pred`; returns
+/// its row.
+async fn await_listed<S, F>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    ws_id: &str,
+    name: &str,
+    mut pred: F,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: FnMut(&Value) -> bool,
+{
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
+    let mut id = id_base;
+    loop {
+        let listed = wss_rpc(ws, id, "script.list", json!({ "workspaceId": ws_id })).await;
+        let row = listed["scripts"]
+            .as_array()
+            .expect("scripts array")
+            .iter()
+            .find(|row| row["name"] == name)
+            .cloned();
+        if let Some(row) = row.filter(|row| pred(row)) {
+            return row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out awaiting script {name}, last list: {listed}"
+        );
+        id += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn is_live(status: &Value) -> bool {
+    matches!(status.as_str(), Some("starting" | "running" | "restarting"))
+}
+
+/// `autoStart` means "runs while the workspace is active" for a local
+/// workspace: the service starts when the workspace's setup finishes, stays
+/// stopped after a user stop and an archive, and starts again on unarchive.
+/// A saved service without `autoStart` never starts on its own.
+#[tokio::test]
+async fn auto_start_service_follows_local_workspace_lifecycle_over_wss() {
+    let data_dir_guard = scratch_dir("autostart");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let repo_guard = create_auto_start_repo();
+    let repo_path = repo_guard.path().to_path_buf();
+
+    let (child, port, cfg) = boot(&data_dir).await;
+    let mut ws = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut ws,
+        1,
+        "workspace.create",
+        json!({
+            "title": "autostart-lifecycle",
+            "repositoryPath": repo_path.to_string_lossy(),
+            "setupScript": "true",
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Setup finishes: the autoStart service starts with no client start.
+    let row = await_listed(&mut ws, 100, &ws_id, "auto-svc", |row| {
+        row["runtime"]["status"] == "running"
+    })
+    .await;
+    let auto_id = row["id"].as_str().expect("script id").to_string();
+    let manual = await_listed(&mut ws, 300, &ws_id, "manual-svc", |_| true).await;
+    assert_eq!(
+        manual["runtime"]["status"], "idle",
+        "a service without autoStart stays idle: {manual}"
+    );
+
+    // A user stop holds through archive: archive starts nothing.
+    let stopped = wss_rpc(
+        &mut ws,
+        2,
+        "script.stop",
+        json!({ "workspaceId": ws_id, "scriptId": auto_id }),
+    )
+    .await;
+    assert_eq!(stopped["ok"], json!(true));
+    await_status(&mut ws, 400, &ws_id, &auto_id, |st| !is_live(&st["status"])).await;
+    let archived = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.archive",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(archived["workspace"]["archived"], json!(true));
+    let st = wss_rpc(
+        &mut ws,
+        4,
+        "script.status",
+        json!({ "workspaceId": ws_id, "scriptId": auto_id }),
+    )
+    .await;
+    assert!(!is_live(&st["status"]), "archive starts nothing: {st}");
+
+    // Unarchive: the workspace is active again, so the service runs.
+    let unarchived = wss_rpc(
+        &mut ws,
+        5,
+        "workspace.unarchive",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(unarchived["workspace"]["archived"], json!(false));
+    await_status(&mut ws, 600, &ws_id, &auto_id, |st| {
+        st["status"] == "running"
+    })
+    .await;
+    let manual = await_listed(&mut ws, 800, &ws_id, "manual-svc", |_| true).await;
+    assert_eq!(
+        manual["runtime"]["status"], "idle",
+        "unarchive starts only autoStart scripts: {manual}"
+    );
+
+    let _ = wss_rpc(
+        &mut ws,
+        6,
+        "script.stop",
+        json!({ "workspaceId": ws_id, "scriptId": auto_id }),
+    )
+    .await;
+    drop(ws);
+    stop(child);
+}

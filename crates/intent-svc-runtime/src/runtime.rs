@@ -273,7 +273,7 @@ impl RuntimePort for RuntimeFeature {
         })
     }
 
-    fn start_home_auto_start<'a>(
+    fn start_auto_start<'a>(
         &'a self,
         svc: &'a Services,
         workspace_id: intent_core::WorkspaceId,
@@ -282,10 +282,10 @@ impl RuntimePort for RuntimeFeature {
         Box::pin(async move {
             match mgr.start_auto_start(&workspace_id).await {
                 Ok(started) => {
-                    tracing::info!(workspace = %workspace_id, started, "home autoStart scripts started");
+                    tracing::info!(workspace = %workspace_id, started, "autoStart scripts started");
                 }
                 Err(error) => {
-                    tracing::warn!(workspace = %workspace_id, %error, "could not start the home's autoStart scripts");
+                    tracing::warn!(workspace = %workspace_id, %error, "could not start the autoStart scripts");
                 }
             }
         })
