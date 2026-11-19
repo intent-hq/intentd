@@ -335,6 +335,15 @@ impl StoreDir {
         self.write_atomic(STORE_FILE, &bytes)
     }
 
+    /// Removes the store file (a store whose creation was cancelled).
+    pub fn remove(&self) -> Result<(), PasskeyError> {
+        match fs::remove_file(self.path(STORE_FILE)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error(&error)),
+        }
+    }
+
     /// Writes `name` through a temporary file, `fsync` and `rename`.
     pub fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<(), PasskeyError> {
         self.ensure()?;

@@ -87,8 +87,8 @@ struct Inner<P, L> {
     pin: P,
     screen: L,
     limiter: Mutex<Limiter>,
-    /// Serializes read-modify-write of the store file.
-    writes: tokio::sync::Mutex<()>,
+    /// Serializes read-modify-write of the store file (held on a blocking thread).
+    writes: Mutex<()>,
 }
 
 /// The device authenticator. Answers only `transport: "device"`; see [`WithDevice`].
@@ -117,7 +117,7 @@ impl<P: PinVerifier, L: ScreenLock> Device<P, L> {
             pin,
             screen,
             limiter: Mutex::new(limiter),
-            writes: tokio::sync::Mutex::new(()),
+            writes: Mutex::new(()),
         });
         tokio::spawn(watch_screen(Arc::downgrade(&inner), config.screen_poll));
         Self { inner }
@@ -160,21 +160,33 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
     }
 
     /// Loads the store, applies `change` and saves it, under the write lock. With
-    /// `stop`, a stopped ceremony writes nothing: the check runs at the commit
-    /// point, after every wait.
+    /// `stop`, a stopped ceremony leaves the store as it was: the check runs right
+    /// before the save, and a stop that came during the save restores the
+    /// previous file. Lock, save and restore all run on one blocking thread, so
+    /// they finish even when the server drops the ceremony future.
     async fn update<T: Send + 'static>(
         self: &Arc<Self>,
         stop: Option<StopSignal>,
         change: impl FnOnce(Option<StoreFile>) -> Result<(StoreFile, T), PasskeyError> + Send + 'static,
     ) -> Result<T, PasskeyError> {
-        let _guard = self.writes.lock().await;
         let inner = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            let (file, value) = change(inner.store.load()?)?;
-            if let Some(stop) = &stop {
-                stop.check()?;
-            }
+            let _guard = inner.writes.lock().unwrap_or_else(PoisonError::into_inner);
+            let before = inner.store.load()?;
+            let (file, value) = change(before.clone())?;
+            let Some(stop) = stop else {
+                inner.store.save(&file)?;
+                return Ok(value);
+            };
+            stop.check()?;
             inner.store.save(&file)?;
+            if let Err(stopped) = stop.check() {
+                match &before {
+                    Some(previous) => inner.store.save(previous)?,
+                    None => inner.store.remove()?,
+                }
+                return Err(stopped);
+            }
             Ok(value)
         })
         .await
@@ -383,37 +395,19 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
         };
         drop(master);
         io.ensure_running()?;
-        let replaced = self
-            .update(Some(io.stop_signal()), move |existing| {
-                let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
-                if !file.same_wrap(&wrap) {
-                    return Err(not_allowed("the passkey store changed; try again"));
-                }
-                // One discoverable credential per site and user, as on other authenticators.
-                let (replaced, kept) = std::mem::take(&mut file.credentials).into_iter().partition(
-                    |existing: &StoredCredential| {
-                        existing.rp_id == credential.rp_id && existing.user_id == credential.user_id
-                    },
-                );
-                file.credentials = kept;
-                file.credentials.push(credential);
-                Ok((file, replaced))
-            })
-            .await?;
-        if let Err(stopped) = io.ensure_running() {
-            // Cancelled after the commit point: the site never gets this passkey,
-            // so put the store back as it was.
-            let new_id = Bytes(credential_id.clone());
-            self.update(None, move |existing| {
-                let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
-                file.credentials
-                    .retain(|credential| credential.credential_id != new_id);
-                file.credentials.extend(replaced);
-                Ok((file, ()))
-            })
-            .await?;
-            return Err(stopped);
-        }
+        self.update(Some(io.stop_signal()), move |existing| {
+            let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
+            if !file.same_wrap(&wrap) {
+                return Err(not_allowed("the passkey store changed; try again"));
+            }
+            // One discoverable credential per site and user, as on other authenticators.
+            file.credentials.retain(|existing| {
+                existing.rp_id != credential.rp_id || existing.user_id != credential.user_id
+            });
+            file.credentials.push(credential);
+            Ok((file, ()))
+        })
+        .await?;
 
         let auth_data = keys::create_auth_data(&params.rp_id, &credential_id, &pair.cose);
         Ok(CreateResult {
