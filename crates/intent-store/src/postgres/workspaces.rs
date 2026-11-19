@@ -62,8 +62,12 @@ where
 
 /// Settle the brackets of sessions a workspace delete removed that were
 /// created after it began.
-async fn settle_all(brackets: Vec<crate::repository_lifecycle::LifecycleWrite>) -> Result<()> {
+async fn settle_all(
+    tenant: &str,
+    brackets: Vec<crate::repository_lifecycle::LifecycleWrite>,
+) -> Result<()> {
     for bracket in brackets {
+        super::purge::probe::late_settlement(tenant)?;
         bracket.settle_after_retirement().await?;
     }
     Ok(())
@@ -898,13 +902,16 @@ impl PgStore {
             let _desktop_scope = desktop_scope;
             let mut late = Vec::new();
             let result = store.finish_workspace_delete(&id, agents, &mut late).await;
-            let result = match result {
-                Ok(()) => settle_all(late).await,
-                Err(e) => Err(e),
-            };
+            // The final transaction committed: record it before settling the
+            // late sessions' brackets, whose failure is still returned
+            // (`Committed` with an error, like a failed main settlement).
             if result.is_ok() {
                 committed.store(true, Ordering::Release);
             }
+            let result = match result {
+                Ok(()) => settle_all(store.tenant(), late).await,
+                Err(e) => Err(e),
+            };
             lifecycle.finish(result).await
         })
         .await

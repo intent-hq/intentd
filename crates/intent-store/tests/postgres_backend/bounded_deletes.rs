@@ -732,3 +732,41 @@ async fn sqlite_has_no_pending_deletes() {
     let (store, _dir) = sqlite_store().await;
     assert!(store.pending_deletes().await.unwrap().is_empty());
 }
+
+/// The final transaction committed, so a failed lifecycle settlement of a
+/// session created during the purge still reports `Committed`, with the
+/// settlement's error.
+#[tokio::test]
+async fn a_failed_late_session_settlement_still_reports_the_commit() {
+    const SUBJECT: &str = "bd-late-settle";
+    let Some((db, decoy)) = with_decoy().await else {
+        return;
+    };
+    let store = open_trapped(&db, SUBJECT).await;
+    seed(&db, &store, SUBJECT).await;
+    let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    probe(SUBJECT, |p| {
+        p.pause_after_first_batch = std::sync::Mutex::new(Some((entered.clone(), release.clone())));
+        p.fail_late_settlement = true;
+    });
+
+    let deleting = spawn_delete(&store);
+    until_paused(&entered).await;
+    store.insert_agent_session(&agent("a3", WS)).await.unwrap();
+    release.notify_one();
+
+    let outcome = deleting.await.unwrap();
+    delete_probe::set(SUBJECT, None);
+    assert!(
+        matches!(&outcome.result, Err(Error::Internal(m)) if m.contains("late settlement")),
+        "{:?}",
+        outcome.result
+    );
+    assert_eq!(
+        outcome.disposition,
+        RepositoryWorkspaceDeleteDisposition::Committed
+    );
+    assert_eq!(count(&db, SUBJECT, "agent_session", "id = 'a3'").await, 0);
+    assert_workspace_gone(&db, &store, SUBJECT).await;
+    assert_decoy_untouched(&db, &decoy).await;
+}

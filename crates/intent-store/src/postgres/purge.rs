@@ -351,6 +351,9 @@ pub mod probe {
         /// Fail the purge, as a crash would stop it, after this many
         /// non-empty batches.
         pub fail_after_batches: Option<usize>,
+        /// Fail the lifecycle settlement of a session created during a
+        /// workspace purge, after the final commit.
+        pub fail_late_settlement: bool,
     }
 
     impl DeleteProbe {
@@ -414,10 +417,19 @@ pub mod probe {
         }
         Ok(())
     }
+
+    pub(crate) fn late_settlement(tenant: &str) -> Result<()> {
+        if get(tenant).is_some_and(|p| p.fail_late_settlement) {
+            return Err(Error::Internal(
+                "delete probe: late settlement failed".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(any(test, feature = "test-support")))]
-mod probe {
+pub(super) mod probe {
     use intent_core::Result;
 
     pub(super) fn batch_rows(_tenant: &str) -> i64 {
@@ -426,6 +438,11 @@ mod probe {
 
     #[expect(clippy::unused_async, reason = "same signature as the test probe")]
     pub(super) async fn after_batch(_tenant: &str, _sql: &str, _rows: u64) -> Result<()> {
+        Ok(())
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "same signature as the test probe")]
+    pub(crate) fn late_settlement(_tenant: &str) -> Result<()> {
         Ok(())
     }
 }
