@@ -1498,12 +1498,13 @@ selected, even if another conversation, file, or note is open. Notifications for
 other workspaces can still appear. The workspace's agent status and conversation
 notices remain available.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; src/lib/components/chat/failure-transcript.ts; src/shared/provider-catalog.ts; src/store/renderer/slices/agent-availability/sagas/provider-availability-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; src/lib/components/chat/failure-transcript.ts; src/shared/provider-catalog.ts; src/store/renderer/slices/agent-availability/sagas/provider-availability-saga.ts; src/lib/components/ui/toast/AgentFailureToast.svelte; messages/en.json. -->
 
 In the existing conversation, the current failure shows one card: **Response
 failed** with the first line of the error, or **Sign-in required** with the CLI
-login command to copy. For an agent on the daemon host, **Log in** runs that
-command in Intent's terminal. Open **Details** to inspect the full technical
+login command to copy. For an agent on the daemon host, **Run in terminal** (the
+terminal icon beside the command) runs it in Intent's terminal; the failure
+notification offers the same icon. Open **Details** to inspect the full technical
 error, then **Copy details** to copy it. Choose **Retry** when offered. A failed message stays
 in the queue below the card; a retry is not scheduled on its own. Inspect that
 message and use its available controls before sending another copy. Active work
