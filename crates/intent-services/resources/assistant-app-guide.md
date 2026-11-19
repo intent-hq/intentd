@@ -1769,9 +1769,10 @@ chat it opens beside the conversation.
 
 ## Review and commit workspace changes
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/sidebar/{SidebarChangesPanel,FileChangesSection,CommitDrawer,CommitsTimeline,HistoryBoundary,SecondaryRootChangesView,PRSection,WorkspacePullRequests,SidebarPrList}.svelte. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/sidebar/{SidebarChangesPanel,FileChangesSection,CommitDrawer,CommitsTimeline,HistoryBoundary,SecondaryRootChangesView,PRSection,WorkspacePullRequests,SidebarPrList}.svelte; src/features/file-tracking/components/diff/DiffViewer.svelte. -->
 
 In the workspace sidebar, open **Changes** to review files and commit history.
+Intent may skip the inline diff for a large file or extensive rewrite.
 Owners can toggle **Auto-commit** beside the file summary. **Unstaged** and
 **Staged** appear when they contain files; **Stage all** and **Unstage all** sit
 in their section headers. After staging files, open **Commit** to enter a message.
