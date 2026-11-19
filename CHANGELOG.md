@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.252] - 2026-11-19
+
+### 📚 Documentation
+
+- Note Intent OS in-app web links in the app guide ([#3541](https://github.com/intent-hq/intentd/pull/3541))
+
+
 ## [0.11.251] - 2026-11-19
 
 ### 🐛 Bug Fixes
