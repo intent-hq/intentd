@@ -118,11 +118,12 @@ pub struct PostgresOptions {
 /// transaction it then holds. See [`PgStore::begin_write`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterLimits {
-    /// The total time a writer waits for its tenant's writer slot and lock
-    /// before it fails with [`Error::StoreBusy`].
+    /// The total time a writer waits for its tenant's writer slot, a pool
+    /// connection and the lock before it fails with [`Error::StoreBusy`].
     pub wait_budget: Duration,
-    /// `lock_timeout` for one attempt at the writer lock. Between attempts
-    /// the writer gives its connection back to the pool.
+    /// `lock_timeout` for one attempt at the writer lock (between attempts
+    /// the writer gives its connection back to the pool), and for any other
+    /// lock a writer transaction waits on once it holds the writer lock.
     pub lock_attempt: Duration,
     /// `statement_timeout` for each statement of a writer transaction, so a
     /// runaway statement cannot hold the tenant lock indefinitely.
@@ -162,10 +163,16 @@ fn next_lock_attempt(
     } else {
         retry_backoff(attempts)
     };
-    let left = limits.wait_budget.checked_sub(waited + pause)?;
-    // `lock_timeout = 0` means "wait forever": never send it.
+    let timeout = lock_timeout_left(limits, waited + pause)?;
+    Some((pause, timeout))
+}
+
+/// `lock_attempt`, cut to what the budget has left after `waited`; `None`
+/// below 1 ms (`lock_timeout = 0` means "wait for ever": never send it).
+fn lock_timeout_left(limits: &WriterLimits, waited: Duration) -> Option<Duration> {
+    let left = limits.wait_budget.checked_sub(waited)?;
     let timeout = limits.lock_attempt.min(left);
-    (timeout >= Duration::from_millis(1)).then_some((pause, timeout))
+    (timeout >= Duration::from_millis(1)).then_some(timeout)
 }
 
 /// Pool sizing and timeouts for [`connect_with`]; see the module docs.
@@ -593,6 +600,19 @@ impl Drop for Waiting {
     }
 }
 
+/// Takes the tenant writer lock ($1 tenant): first sets `lock_timeout` ($2),
+/// `statement_timeout` ($3) and `idle_in_transaction_session_timeout` ($4)
+/// for the transaction (OFFSET 0 keeps the subquery from being flattened,
+/// so they apply before the lock is requested), then, once the lock is
+/// granted, resets `lock_timeout` to $5 (the target list runs in order).
+#[doc(hidden)]
+pub const WRITER_LOCK_SQL: &str =
+    "SELECT pg_advisory_xact_lock(hashtextextended('intent-writer:' || $1, 0)), \
+     set_config('lock_timeout', $5, true) \
+     FROM (SELECT set_config('lock_timeout', $2, true), \
+     set_config('statement_timeout', $3, true), \
+     set_config('idle_in_transaction_session_timeout', $4, true) OFFSET 0) AS limits";
+
 fn is_lock_timeout(e: &sqlx::Error) -> bool {
     // 55P03 lock_not_available: `lock_timeout` expired.
     matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"))
@@ -660,20 +680,25 @@ impl PgStore {
     /// 1. The writer takes the store's writer slot first, holding no
     ///    connection while it waits (see the
     ///    [pool contract](self#pool-contract)).
-    /// 2. It then checks out a connection and asks for the advisory lock
-    ///    with `lock_timeout = lock_attempt` (less if the budget has less
-    ///    left). Another process or store handle may hold it.
+    /// 2. It then checks out a connection (a checkout waits at most what the
+    ///    budget has left, even when the pool's acquire timeout is longer)
+    ///    and asks for the advisory lock with `lock_timeout = lock_attempt`,
+    ///    less if the budget has less left. Another process or store handle
+    ///    may hold it.
     /// 3. **Retry policy:** an attempt that times out rolls back, returning
     ///    the connection, pauses 25 ms doubling to at most 400 ms, and tries
     ///    again, as long as `wait_budget` has time left. Nothing has run in
     ///    the transaction yet, so a retry is always safe.
-    /// 4. Once the budget is spent (on the slot or the lock), it fails with
-    ///    [`Error::StoreBusy`]. Nothing was written: the caller may retry the
-    ///    whole operation later.
+    /// 4. Once the budget is spent (on the slot, a checkout or the lock, or
+    ///    by the time the lock is granted), it rolls back and fails with
+    ///    [`Error::StoreBusy`]. This store call wrote nothing, so
+    ///    it may be retried later.
     ///
     /// The transaction then runs with `SET LOCAL statement_timeout` and
-    /// `idle_in_transaction_session_timeout`, and keeps its `lock_timeout`
-    /// for any other lock it waits on; those failures stay `Internal`.
+    /// `idle_in_transaction_session_timeout`. Once the lock is granted,
+    /// `lock_timeout` is reset to the fixed `lock_attempt` (not the attempt's
+    /// budget-cut value) for any other lock the transaction waits on; those
+    /// failures stay `Internal`.
     pub(crate) async fn begin_write(&self) -> Result<WriteTx> {
         let limits = self.options.writer;
         let started = Instant::now();
@@ -693,22 +718,32 @@ impl PgStore {
                 return Err(writer_busy(self.tenant(), started.elapsed()));
             };
             tokio::time::sleep(pause).await;
-            let mut tx = self.begin().await?;
-            // The settings come first: OFFSET 0 keeps the subquery from
-            // being flattened, so they apply before the lock is requested.
-            let locked = sqlx::query(
-                "SELECT pg_advisory_xact_lock(hashtextextended('intent-writer:' || $1, 0)) \
-                 FROM (SELECT set_config('lock_timeout', $2, true), \
-                 set_config('statement_timeout', $3, true), \
-                 set_config('idle_in_transaction_session_timeout', $4, true) OFFSET 0) AS limits",
-            )
-            .bind(self.tenant())
-            .bind(millis(lock_timeout))
-            .bind(millis(limits.statement_timeout))
-            .bind(millis(limits.idle_in_transaction_timeout))
-            .execute(&mut *tx)
-            .await;
+            let left = limits.wait_budget.saturating_sub(started.elapsed());
+            let mut tx = tokio::time::timeout(left, self.begin())
+                .await
+                .map_err(|_| writer_busy(self.tenant(), started.elapsed()))??;
+            // The checkout may have used part of this attempt's share.
+            let Some(lock_timeout) =
+                lock_timeout_left(&limits, started.elapsed()).map(|t| t.min(lock_timeout))
+            else {
+                let _ = tx.rollback().await;
+                return Err(writer_busy(self.tenant(), started.elapsed()));
+            };
+            let locked = sqlx::query(WRITER_LOCK_SQL)
+                .bind(self.tenant())
+                .bind(millis(lock_timeout))
+                .bind(millis(limits.statement_timeout))
+                .bind(millis(limits.idle_in_transaction_timeout))
+                .bind(millis(limits.lock_attempt))
+                .execute(&mut *tx)
+                .await;
             match locked {
+                // The deadline is checked last too: a writer never starts
+                // writing after its budget, however the wait was split.
+                Ok(_) if started.elapsed() > limits.wait_budget => {
+                    let _ = tx.rollback().await;
+                    return Err(writer_busy(self.tenant(), started.elapsed()));
+                }
                 Ok(_) => return Ok(WriteTx { tx, _slot: slot }),
                 Err(e) if is_lock_timeout(&e) => {
                     let _ = tx.rollback().await;
@@ -728,6 +763,12 @@ impl PgStore {
 impl crate::Store {
     /// Open the store for one tenant on a migrated database, creating the
     /// tenant's seed rows on first use (`intent_provision_tenant`).
+    ///
+    /// Each call makes a new writer slot (see the
+    /// [pool contract](crate::postgres#pool-contract)), shared only by this
+    /// handle's clones: two opens for one tenant park up to two connections.
+    /// The per-tenant registry must own the slot (one per tenant per
+    /// process), like the other process-local gates here.
     ///
     /// # Errors
     /// `Error::Internal` when provisioning fails.

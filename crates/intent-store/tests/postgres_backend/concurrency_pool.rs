@@ -36,9 +36,13 @@ async fn open_on(pool: &PgPool, tenant: &str, writer: WriterLimits) -> Store {
 }
 
 /// Limits that never run out during a test: only the lock holder decides.
+/// One lock attempt spans the whole budget, so a waiting writer stays in the
+/// lock (never between a timed-out attempt and its retry) while observed.
 fn patient() -> WriterLimits {
+    let budget = test_timeout(Duration::from_secs(60));
     WriterLimits {
-        wait_budget: test_timeout(Duration::from_secs(60)),
+        wait_budget: budget,
+        lock_attempt: budget,
         ..WriterLimits::default()
     }
 }
@@ -348,6 +352,103 @@ async fn a_checkout_past_the_acquire_timeout_is_busy() {
     .expect("the checkout is bounded");
     assert!(matches!(read, Err(Error::StoreBusy(_))), "{read:?}");
     drop(only);
+    assert_eq!(a.get_setting("userRules").await.unwrap(), None);
+}
+
+/// [`postgres::WRITER_LOCK_SQL`] for tenant A: a 100 ms attempt, one-minute
+/// statement and idle timeouts, then a 10 minute `lock_timeout`.
+async fn run_writer_lock_sql(
+    conn: &mut sqlx::PgConnection,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(postgres::WRITER_LOCK_SQL)
+        .bind("tenant-a")
+        .bind("100")
+        .bind("60000")
+        .bind("60000")
+        .bind("600000")
+        .execute(conn)
+        .await
+}
+
+/// The lock statement waits under the attempt's `lock_timeout` and leaves
+/// the fixed one for the rest of the transaction.
+#[tokio::test]
+async fn the_lock_statement_waits_under_the_attempt_timeout_then_resets_it() {
+    let Some((_url, admin)) = migrated_db().await else {
+        return;
+    };
+    let held = hold_writer_lock(&admin, "tenant-a").await;
+    let mut tx = admin.begin().await.unwrap();
+    let waited = tokio::time::timeout(
+        test_timeout(Duration::from_secs(30)),
+        run_writer_lock_sql(&mut tx),
+    )
+    .await
+    .expect("the wait uses the attempt's 100 ms, not the reset value");
+    let code = waited
+        .expect_err("the lock is held")
+        .into_database_error()
+        .and_then(|e| e.code().map(std::borrow::Cow::into_owned));
+    assert_eq!(code.as_deref(), Some("55P03"));
+    tx.rollback().await.unwrap();
+    release_writer_lock(held, "tenant-a").await;
+
+    let mut tx = admin.begin().await.unwrap();
+    run_writer_lock_sql(&mut tx)
+        .await
+        .expect("the free lock is granted");
+    let settings: (String, String, String) = sqlx::query_as(
+        "SELECT current_setting('lock_timeout'), current_setting('statement_timeout'), \
+         current_setting('idle_in_transaction_session_timeout')",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(settings, ("10min".into(), "1min".into(), "1min".into()));
+    tx.rollback().await.unwrap();
+}
+
+/// The writer's budget also bounds its checkout, when the pool's own
+/// acquire timeout is longer: the only connection frees after the budget,
+/// and the writer is busy instead of writing late.
+#[tokio::test]
+async fn a_writer_waiting_for_a_connection_is_busy_within_its_budget() {
+    let Some((url, _admin)) = migrated_db().await else {
+        return;
+    };
+    let pool = postgres::connect_with(
+        &url,
+        PoolSettings {
+            acquire_timeout: test_timeout(Duration::from_secs(600)),
+            ..PoolSettings::new(1)
+        },
+    )
+    .await
+    .expect("connect");
+    let a = open_on(
+        &pool,
+        "tenant-a",
+        WriterLimits {
+            wait_budget: Duration::from_millis(300),
+            ..WriterLimits::default()
+        },
+    )
+    .await;
+    let only = pool.acquire().await.expect("the only connection");
+    let frees = tokio::spawn(async move {
+        // timing-guard: the connection must free after the writer's 300 ms budget, not on an event.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(only);
+    });
+    let busy = tokio::time::timeout(
+        test_timeout(Duration::from_secs(30)),
+        a.set_setting("userRules", "\"a\""),
+    )
+    .await
+    .expect("the checkout is bounded by the writer's budget");
+    assert!(matches!(busy, Err(Error::StoreBusy(_))), "{busy:?}");
+    assert_eq!(a.postgres_writers_waiting(), 0);
+    frees.await.unwrap();
     assert_eq!(a.get_setting("userRules").await.unwrap(), None);
 }
 

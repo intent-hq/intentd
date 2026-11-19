@@ -319,8 +319,9 @@ pub enum Error {
     /// The store could not start the operation in time: a Postgres writer
     /// waited longer than its budget for its tenant's writer lock (another
     /// writer of the same tenant held it), or no pool connection came free.
-    /// Nothing was written, so retrying the whole operation later is safe.
-    /// Distinct from `Internal` so callers can tell saturation from a
+    /// This store call wrote nothing, so it may be retried later; a service
+    /// operation that made several store calls may have committed earlier
+    /// ones. Distinct from `Internal` so callers can tell saturation from a
     /// failure. Surfaces as `-32603`.
     #[error("store busy: {0}")]
     StoreBusy(String),
