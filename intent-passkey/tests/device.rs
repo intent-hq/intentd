@@ -28,10 +28,11 @@ const ORIGIN: &str = "https://example.com";
 const RP: &str = "example.com";
 const START_MS: u64 = 1_800_000_000_000;
 
-struct Pam(Arc<Mutex<String>>);
+struct Pam(Arc<Mutex<String>>, Arc<AtomicU64>);
 
 impl PinVerifier for Pam {
     fn verify(&self, pin: &str) -> Result<bool, PasskeyError> {
+        std::thread::sleep(Duration::from_millis(self.1.load(Ordering::SeqCst)));
         Ok(*self.0.lock().unwrap() == pin)
     }
 }
@@ -47,6 +48,7 @@ impl ScreenLock for Screen {
 struct Rig {
     home: tempfile::TempDir,
     pin: Arc<Mutex<String>>,
+    pam_delay_ms: Arc<AtomicU64>,
     screen: Arc<AtomicBool>,
     clock: Arc<AtomicU64>,
 }
@@ -56,6 +58,7 @@ impl Rig {
         let rig = Self {
             home: tempfile::tempdir().unwrap(),
             pin: Arc::new(Mutex::new(pin.to_owned())),
+            pam_delay_ms: Arc::new(AtomicU64::new(0)),
             screen: Arc::new(AtomicBool::new(false)),
             clock: Arc::new(AtomicU64::new(START_MS)),
         };
@@ -100,7 +103,7 @@ impl Rig {
         };
         Client::start(Device::new(
             config,
-            Pam(Arc::clone(&self.pin)),
+            Pam(Arc::clone(&self.pin), Arc::clone(&self.pam_delay_ms)),
             Screen(Arc::clone(&self.screen)),
         ))
     }
@@ -721,4 +724,95 @@ async fn device_passkeys_are_off_without_the_pam_service() {
     .await;
     assert_eq!(error_code(&create), "NotSupported");
     assert!(events.is_empty());
+}
+
+/// Sends `pin` to `ceremony`, cancels it while PAM is still checking, and returns
+/// the ceremony's response.
+async fn cancel_during_pam(
+    client: &mut Client,
+    id: &str,
+    method: &str,
+    params: Value,
+    pin: &str,
+) -> Value {
+    client.send(id, method, params).await;
+    next_prompt(client).await;
+    client
+        .send(
+            &format!("{id}-pin"),
+            "pin",
+            json!({ "ceremony": id, "pin": pin }),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client
+        .send(&format!("{id}-cancel"), "cancel", json!({ "ceremony": id }))
+        .await;
+    client.response(id).await.0
+}
+
+#[tokio::test]
+async fn a_cancel_during_the_pin_check_commits_nothing() {
+    let rig = Rig::new("246810");
+    let mut client = rig.start();
+    let (created, _) = ceremony(
+        &mut client,
+        "c1",
+        "create",
+        user_params("ada", &[-7]),
+        &["246810"],
+        0,
+    )
+    .await;
+    let original = created["result"]["credentialId"].clone();
+    rig.pam_delay_ms.store(400, Ordering::SeqCst);
+
+    // A cancelled re-registration keeps the existing passkey.
+    let response = cancel_during_pam(
+        &mut client,
+        "c2",
+        "create",
+        user_params("ada", &[-7]),
+        "246810",
+    )
+    .await;
+    assert_eq!(error_code(&response), "Abort");
+
+    // A cancelled sign-in returns no assertion and records no use.
+    let response = cancel_during_pam(
+        &mut client,
+        "g1",
+        "get",
+        get_params("device", ORIGIN, RP),
+        "246810",
+    )
+    .await;
+    assert_eq!(error_code(&response), "Abort");
+    let list = client.call("l1", "device.list", json!({})).await;
+    let credentials = list["result"]["credentials"].as_array().unwrap();
+    assert_eq!(credentials.len(), 1);
+    assert_eq!(credentials[0]["credentialId"], original);
+    assert_eq!(credentials[0]["lastUsedAt"], Value::Null);
+
+    // A wrong PIN still counts when the ceremony is cancelled during its check.
+    let response = cancel_during_pam(
+        &mut client,
+        "g2",
+        "get",
+        get_params("device", ORIGIN, RP),
+        "000000",
+    )
+    .await;
+    assert_eq!(error_code(&response), "Abort");
+    rig.pam_delay_ms.store(0, Ordering::SeqCst);
+    let (_, events) = ceremony(
+        &mut client,
+        "g3",
+        "get",
+        get_params("device", ORIGIN, RP),
+        &["246810"],
+        0,
+    )
+    .await;
+    assert_eq!(pin_prompts(&events)[0]["attemptsLeft"], 9);
 }

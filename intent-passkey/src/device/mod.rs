@@ -223,8 +223,10 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
             .await
             .map_err(|error| task_failed(&error))?;
             // The counter resets only once the store unlocks (see `unlock`), so
-            // wrong old PINs add up even though PAM accepts the new one.
+            // wrong old PINs add up even though PAM accepts the new one. A wrong
+            // PIN counts even when the ceremony was cancelled meanwhile.
             if verified? {
+                io.ensure_running()?;
                 return Ok(pin);
             }
             self.limiter().failed(self.now());
@@ -252,6 +254,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
                 Ok((master, wrap))
             })
             .await?;
+            io.ensure_running()?;
             let file = self
                 .update(move |existing| match existing {
                     None => {
@@ -269,6 +272,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
             Ok((file, pin, unlocked))
         })
         .await?;
+        io.ensure_running()?;
         match unlocked {
             Ok(master) => {
                 self.limiter().succeeded();
@@ -306,6 +310,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
                 return Err(not_allowed("the previous PIN is not correct"));
             }
         };
+        io.ensure_running()?;
         let file = self
             .update(move |existing| {
                 let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
@@ -371,6 +376,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
             last_used_at: None,
         };
         drop(master);
+        io.ensure_running()?;
         self.update(move |existing| {
             let mut file = existing.ok_or_else(|| not_allowed("the passkey store is gone"))?;
             if !file.same_wrap(&wrap) {
@@ -462,6 +468,7 @@ impl<P: PinVerifier, L: ScreenLock> Inner<P, L> {
         )?;
         drop(secret);
         let user_handle = credential.user_id.clone();
+        io.ensure_running()?;
 
         let now = self.now();
         let touched = credential_id.clone();

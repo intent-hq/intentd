@@ -78,6 +78,18 @@ impl CeremonyIo {
         self.events.clone()
     }
 
+    /// The stop reason's error once main cancelled the ceremony or it timed out;
+    /// for checks after blocking work and before committing anything.
+    ///
+    /// # Errors
+    /// When the ceremony must stop.
+    pub fn ensure_running(&self) -> Result<(), PasskeyError> {
+        match *self.stop.borrow() {
+            Some(reason) => Err(reason.error()),
+            None => Ok(()),
+        }
+    }
+
     /// Resolves when the ceremony must stop.
     pub async fn stopped(&mut self) -> StopReason {
         loop {
