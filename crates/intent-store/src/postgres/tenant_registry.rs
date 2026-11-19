@@ -17,8 +17,10 @@
 //!
 //! The key is the server address and database as the pool reaches them, so
 //! it is only as precise as the connect options:
-//! - It excludes the user and `search_path`. Every tenant lives in one
-//!   shared schema today; a store per schema would need them in the key.
+//! - The database is the effective one: named, or else the user's (as
+//!   libpq does). Otherwise the user and `search_path` are left out. Every
+//!   tenant lives in one shared schema today; a store per schema would need
+//!   them in the key.
 //! - One database reached under two host names (`localhost` and
 //!   `127.0.0.1`) gets two entries, and so two sets of gates. Give every
 //!   pool for a database the same address.
@@ -29,6 +31,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+
+use sqlx::postgres::PgConnectOptions;
 
 use super::{PgPool, TenantId, WriterSlot};
 use crate::browser_tab_repo::DisplayedOverlay;
@@ -49,18 +53,32 @@ pub(crate) struct TenantState {
 
 static TENANTS: OnceLock<Mutex<HashMap<String, Weak<TenantState>>>> = OnceLock::new();
 
-/// Names one tenant in one database: host, port, database name and socket,
-/// then the tenant. The repository lifecycle domain uses the same key.
+/// Names one tenant in one database: host, port, socket and effective
+/// database name, then the tenant. The repository lifecycle domain uses the
+/// same key.
 pub(crate) fn tenant_key(pool: &PgPool, tenant: &TenantId) -> String {
-    let options = pool.connect_options();
+    key_for(&pool.connect_options(), tenant)
+}
+
+fn key_for(options: &PgConnectOptions, tenant: &TenantId) -> String {
     format!(
         "{}:{}/{:?}/{:?}#{}",
         options.get_host(),
         options.get_port(),
-        options.get_database(),
+        effective_database(options),
         options.get_socket(),
         tenant.as_str()
     )
+}
+
+/// The database a connection reaches: the one named, or else (as libpq
+/// does) the one named after the user. So `postgres://alice@host` and
+/// `postgres://bob@host` are two databases, and `postgres://alice@host` is
+/// the same one as `postgres://alice@host/alice`.
+fn effective_database(options: &PgConnectOptions) -> &str {
+    options
+        .get_database()
+        .unwrap_or_else(|| options.get_username())
 }
 
 /// The state every live store for `key` shares, created on first use.
@@ -155,8 +173,38 @@ impl crate::Store {
 
 #[cfg(test)]
 mod tests {
-    use super::tenant_state;
+    use super::{key_for, tenant_state};
+    use crate::postgres::TenantId;
+    use sqlx::postgres::PgConnectOptions;
     use std::sync::Arc;
+
+    fn key(url: &str) -> String {
+        let options: PgConnectOptions = url.parse().expect("connect URL");
+        key_for(&options, &TenantId::new("t").unwrap())
+    }
+
+    #[test]
+    fn a_url_without_a_database_keys_on_the_users_database() {
+        // Two users with no database reach two databases: theirs.
+        assert_ne!(
+            key("postgres://alice@db.test"),
+            key("postgres://bob@db.test")
+        );
+        // Naming that database is the same database.
+        assert_eq!(
+            key("postgres://alice@db.test"),
+            key("postgres://alice@db.test/alice")
+        );
+        // A named database is shared whoever connects to it.
+        assert_eq!(
+            key("postgres://alice@db.test/app"),
+            key("postgres://bob@db.test/app")
+        );
+        assert_ne!(
+            key("postgres://alice@db.test/app"),
+            key("postgres://alice@db.test/other")
+        );
+    }
 
     #[test]
     fn one_key_shares_state_until_its_last_holder_drops() {

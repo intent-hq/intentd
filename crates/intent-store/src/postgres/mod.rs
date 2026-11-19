@@ -698,7 +698,7 @@ impl PgStore {
     ///
     /// Waiting is bounded by [`WriterLimits`] (`options.writer`):
     ///
-    /// 1. The writer takes the store's writer slot first, holding no
+    /// 1. The writer takes its tenant's writer slot first, holding no
     ///    connection while it waits (see the
     ///    [pool contract](self#pool-contract)).
     /// 2. It then checks out a connection (a checkout waits at most what the
@@ -785,11 +785,10 @@ impl crate::Store {
     /// Open the store for one tenant on a migrated database, creating the
     /// tenant's seed rows on first use (`intent_provision_tenant`).
     ///
-    /// Each call makes a new writer slot (see the
-    /// [pool contract](crate::postgres#pool-contract)), shared only by this
-    /// handle's clones: two opens for one tenant park up to two connections.
-    /// The per-tenant registry must own the slot (one per tenant per
-    /// process), like the other process-local gates here.
+    /// Every open of one tenant in this process shares its process-local
+    /// gates (`tenant_registry`), including the writer slot (see the
+    /// [pool contract](crate::postgres#pool-contract)): any number of opens
+    /// for one tenant park at most one connection in the writer lock.
     ///
     /// # Errors
     /// `Error::Internal` when provisioning fails.
