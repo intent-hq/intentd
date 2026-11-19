@@ -42,33 +42,18 @@ const FILLERS: &[&str] = &["true", "", "x", "select 1", "($1)", "="];
 /// Schemas of the Postgres system catalogs, which hold no tenant rows.
 const SYSTEM_SCHEMAS: &[&str] = &["pg_catalog", "information_schema"];
 
-/// Parses a `format!` template. Each `{NAME}` hole that `resolve` knows is
-/// replaced by its text; the others try every [`FILLERS`] combination (up
-/// to four holes; more get one filler each) until one parses. The error is
-/// the first attempt's.
-pub fn parse_template(
-    sql: &str,
-    resolve: &dyn Fn(&str) -> Option<String>,
-) -> Result<Vec<Statement>, String> {
+/// Parses SQL given as pieces: `Some(text)`, or `None` for a `format!`
+/// hole the lint could not resolve. The holes try every [`FILLERS`]
+/// combination (up to four holes; more get one filler each) until one
+/// parses. The error is the first attempt's.
+pub fn parse_pieces(pieces: &[Option<String>]) -> Result<Vec<Statement>, String> {
     let mut parts = vec![String::new()];
-    let mut rest = sql;
-    while let Some(at) = rest.find('{') {
-        let Some(len) = rest[at..].find('}') else {
-            break;
-        };
-        parts.last_mut().unwrap().push_str(&rest[..at]);
-        let name = rest[at + 1..at + len].split(':').next().unwrap_or("");
-        if let Some(text) = resolve(name) {
-            let last = parts.last_mut().unwrap();
-            last.push(' ');
-            last.push_str(&text);
-            last.push(' ');
-        } else {
-            parts.push(String::new());
+    for p in pieces {
+        match p {
+            Some(text) => parts.last_mut().unwrap().push_str(text),
+            None => parts.push(String::new()),
         }
-        rest = &rest[at + len + 1..];
     }
-    parts.last_mut().unwrap().push_str(rest);
     let holes = parts.len() - 1;
     let build = |choice: &[usize]| {
         let mut out = parts[0].clone();
@@ -123,6 +108,56 @@ pub fn violations(stmts: &[Statement], exempt: &[&str]) -> Vec<String> {
         }
     }
     rule.out
+}
+
+/// The tables the statements write (INSERT, UPDATE, DELETE, also inside a
+/// data-modifying CTE), with MERGE and TRUNCATE as `merge` and `truncate`.
+/// Names are lower-cased, unqualified ones bare.
+pub fn written_tables(stmts: &[Statement]) -> Vec<String> {
+    let mut w = Writes::default();
+    for s in stmts {
+        let _ = s.visit(&mut w);
+    }
+    w.tables
+}
+
+#[derive(Default)]
+struct Writes {
+    tables: Vec<String>,
+}
+
+impl Visitor for Writes {
+    type Break = ();
+
+    fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<()> {
+        let mut refs = Refs::default();
+        match s {
+            Statement::Insert(i) => match &i.table {
+                TableObject::TableName(name) => self.tables.push(display_name(name)),
+                other => self.tables.push(other.to_string().to_lowercase()),
+            },
+            Statement::Update(u) => table_refs(&u.table, "UPDATE", &mut refs),
+            Statement::Delete(d) => {
+                let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &d.from;
+                for t in from {
+                    table_refs(t, "FROM", &mut refs);
+                }
+            }
+            Statement::Merge(_) => self.tables.push("merge".to_owned()),
+            Statement::Truncate(_) => self.tables.push("truncate".to_owned()),
+            _ => {}
+        }
+        // An UPDATE writes only its first table; the rest are joined reads.
+        let n = if matches!(s, Statement::Update(_)) {
+            1
+        } else {
+            usize::MAX
+        };
+        self.tables
+            .extend(refs.tables.iter().take(n).map(|r| display_name(r.name)));
+        self.tables.extend(refs.unsupported);
+        ControlFlow::Continue(())
+    }
 }
 
 /// CTE names visible at a point of the statement.
@@ -190,6 +225,8 @@ impl Rule<'_> {
                 self.check(refs, d.selection.as_ref(), scope);
                 self.nested(d, scope);
             }
+            // The migration ledger's own table: schema, not tenant, data.
+            Statement::CreateTable(c) if self.is_exempt(&c.name) => {}
             other => self.unsupported(&other.to_string()),
         }
     }

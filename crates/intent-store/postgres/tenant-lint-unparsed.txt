@@ -1,3 +1,5 @@
-# Postgres SQL literals the tenant lint cannot parse, so its parsed-form
-# rule skips them (the text rule still checks them). One per line:
-# <file> | <first 80 characters, whitespace collapsed> — <reason>
+# Statements the Postgres tenant lint cannot check, so it skips them: SQL
+# that does not parse, or a sqlx argument it cannot follow back to its text.
+# One per line: <file> | <first 80 characters, whitespace collapsed> — <reason>
+mod.rs | stmts . iter () . enumerate () . skip (start) — runs the migration files' statements; postgres_tenant_schema_lint checks them
+repositories.rs | transfer_predicates () ? . enumerate () . map (| (i , (table , predicate)) | { l — UNION ALL of one count per table, each `WHERE tenant_id = $1 AND (<predicate>)`; the predicates come from transfer_predicates()

@@ -1,13 +1,14 @@
 //! Source lint for the Postgres backend (`crates/intent-store/src/postgres/`).
 //!
-//! 1. Every SQL string literal there filters each table it reads or writes by
-//!    a bound tenant parameter (`tenant_id = $n`) in the same query, and
-//!    every INSERT sets `tenant_id`. One database holds every tenant, so a
+//! 1. Every statement the backend runs filters each table it reads or
+//!    writes by a bound tenant parameter (`tenant_id = $n`), and every
+//!    INSERT sets `tenant_id`. One database holds every tenant, so a
 //!    statement without the filter reads or changes other tenants' rows.
-//! 2. Every function there that writes (an SQL literal starting with
-//!    INSERT, UPDATE or DELETE) opens its transaction with `begin_write()`.
-//!    The per-tenant writer lock orders only writers that take it, so one
-//!    writer on plain `begin()` can commit between another's read and write.
+//! 2. Every function that runs a write (INSERT, UPDATE or DELETE, also
+//!    inside a data-modifying CTE) holds the tenant's writer lock: it calls
+//!    `begin_write()` or holds a `WriteTx`, owned or `&mut`. The per-tenant
+//!    writer lock orders only writers that take it, so one writer on plain
+//!    `begin()` can commit between another's read and write.
 //! 3. `postgres/pending/<module>.txt` lists exactly the `Store` methods whose
 //!    `pending_postgres!` forwarder (no Postgres implementation yet) lives in
 //!    `src/<module>.rs` or `src/<module>/`. Porting a method removes its line,
@@ -26,28 +27,27 @@
 //!    call them and the release-graph guard keeps `test-support` out of the
 //!    shipped daemon.
 //!
-//! Rule 1 runs twice: on the text, and on the statement parsed by sqlparser
-//! (`support/postgres_ast.rs`), which sees CTE scope, comments, strings and
-//! parenthesized joins as Postgres does. Both must pass. A `format!`
-//! template is parsed with its `{CONST}` holes resolved from `const` strings
-//! in `src/` and its other holes filled with text that names no table. A
-//! literal that looks like SQL but does not parse must be listed in
-//! `postgres/tenant-lint-unparsed.txt` with a reason.
+//! Rules 1 and 2 find SQL by use (`support/sql_uses.rs`): the text that
+//! reaches a sqlx call, followed through locals, consts and helpers. They
+//! check it parsed by sqlparser (`support/postgres_ast.rs`), which sees CTE
+//! scope, comments, strings and parenthesized joins as Postgres does. A
+//! `format!` template is parsed with its `{CONST}` holes resolved from
+//! `const` strings in `src/` and its other holes filled with text that
+//! names no table. A statement that does not parse, or a sqlx argument the
+//! lint cannot follow, fails unless `postgres/tenant-lint-unparsed.txt`
+//! lists it with a reason.
 //!
-//! Limit: SQL built at runtime from fragments is checked only where a
-//! literal holds the table reference.
+//! Limit: text appended at runtime (`push_str`, a `format!` argument) is
+//! checked only where it reaches a sqlx call on its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-#[path = "support/postgres_sql.rs"]
-mod postgres_sql;
-use postgres_sql::{same_level, table_refs};
 #[path = "support/postgres_ast.rs"]
 mod postgres_ast;
-#[path = "support/sql_literals.rs"]
-mod sql_literals;
-use sql_literals::{is_sql, rust_files, string_literals, unescape};
+#[path = "support/sql_uses.rs"]
+mod sql_uses;
+use sql_uses::{rust_files, Index, Sql};
 
 fn src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -59,323 +59,39 @@ const NON_TENANT_TABLES: &[(&str, &str)] = &[(
     "applied-migration ledger written by postgres::migrate, one per schema",
 )];
 
-/// Every table the Postgres migrations create.
-fn schema_tables() -> BTreeSet<String> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/migrations");
-    let mut out = BTreeSet::new();
-    for entry in std::fs::read_dir(&dir).expect("read postgres/migrations") {
-        let sql = std::fs::read_to_string(entry.unwrap().path())
-            .unwrap()
-            .to_lowercase();
-        for (at, _) in sql.match_indices("create table ") {
-            let rest = sql[at + "create table ".len()..].trim_start();
-            let rest = rest.strip_prefix("if not exists ").unwrap_or(rest);
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            out.insert(name);
-        }
-    }
-    out
+fn non_tenant_tables() -> Vec<&'static str> {
+    NON_TENANT_TABLES.iter().map(|(t, _)| *t).collect()
 }
 
-/// The names a marker comment declares as a query's own `WITH` subqueries:
-/// `// tenant-lint: not-tables a b — <reason>`, on one of the three lines
-/// above the literal's first line (`line` is 1-based). The tenant rule
-/// skips those names in that query only, and each must be defined there
-/// (`a as (`) and must not be a real table, so a marker cannot hide one.
-/// Every real table in the query is still checked.
-#[track_caller]
-fn declared_subqueries(text: &str, line: usize, sql: &str) -> Vec<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    for k in 1..=3 {
-        let Some(i) = line.checked_sub(1 + k) else {
-            break;
-        };
-        let Some(rest) = lines
-            .get(i)
-            .and_then(|l| l.trim().strip_prefix("// tenant-lint: not-tables "))
-        else {
-            continue;
-        };
-        let (names, reason) = rest
-            .split_once(" — ")
-            .expect("tenant-lint marker needs ` — <reason>`");
-        assert!(
-            !reason.trim().is_empty(),
-            "tenant-lint marker needs a reason"
-        );
-        let names: Vec<String> = names.split_whitespace().map(str::to_lowercase).collect();
-        let tables = schema_tables();
-        for name in &names {
-            assert!(
-                !tables.contains(name),
-                "tenant-lint marker names the real table `{name}`; rename the subquery"
-            );
-            assert!(
-                sql.contains(&format!("{name} as (")),
-                "tenant-lint marker names `{name}`, which this query does not define"
-            );
-        }
-        return names;
-    }
-    Vec::new()
-}
-
-/// The violations in one SQL literal (lower-cased).
-fn violations(sql: &str) -> Vec<String> {
-    violations_skipping(sql, &[])
-}
-
-/// [`violations`], treating the `skip` names as the query's own subqueries.
-fn violations_skipping(sql: &str, skip: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for r in table_refs(sql) {
-        if NON_TENANT_TABLES.iter().any(|(t, _)| *t == r.table) || skip.contains(&r.table) {
-            continue;
-        }
-        let ok = if r.keyword == "INTO" {
-            let after_insert = sql[..r.at].trim_end().ends_with("insert");
-            // The column list right after the table must start with tenant_id.
-            !after_insert
-                || sql[r.at..]
-                    .split_once('(')
-                    .is_some_and(|(_, cols)| cols.trim_start().starts_with("tenant_id"))
-        } else {
-            // The filter must be in the WHERE (or a JOIN's ON) part of the
-            // same query, not in an UPDATE's SET list.
-            let level = same_level(sql, r.at);
-            let filter = level.split_once(" where ").map_or("", |(_, w)| w);
-            let qualified = format!("{}.tenant_id = $", r.alias);
-            filter.contains(&qualified)
-                || filter.contains("tenant_id = $")
-                || (r.keyword == "JOIN" && level.contains(&qualified))
-        };
-        if !ok {
-            out.push(format!("{} {}", r.keyword, r.table));
-        }
-    }
-    out
-}
-
-#[test]
-fn every_postgres_query_is_filtered_by_the_bound_tenant() {
-    let mut files = Vec::new();
-    rust_files(&src().join("postgres"), &mut files);
-    let mut findings = Vec::new();
-    let mut checked = 0;
-    for file in files {
-        let text = std::fs::read_to_string(&file).expect("read");
-        for (line, lit) in string_literals(&text) {
-            if !is_sql(&lit) {
-                continue;
-            }
-            checked += 1;
-            let sql = lit.to_lowercase();
-            let skip = declared_subqueries(&text, line, &sql);
-            for v in violations_skipping(&sql, &skip) {
-                findings.push(format!(
-                    "{}:{line}: {v} is not filtered by tenant_id = $n",
-                    file.display()
-                ));
-            }
-        }
-    }
-    assert!(checked > 0, "found no SQL in src/postgres");
-    assert!(
-        findings.is_empty(),
-        "unscoped Postgres queries:\n{}",
-        findings.join("\n")
-    );
-}
-
-#[test]
-fn the_tenant_rule_catches_unscoped_shapes() {
-    assert!(is_sql("UPDATE hook SET state = $3 WHERE hook_id = $2"));
-    assert!(is_sql("update hook\nset state = $3 where hook_id = $2"));
-    assert!(!is_sql("update hook state failed: {e}"));
-    assert!(violations("select value from settings where tenant_id = $1 and key = $2").is_empty());
-    assert!(!violations("select value from settings where key = $1").is_empty());
-    assert!(!violations(
-        "update note set x = 1 where id in (select id from note where tenant_id = $1)"
-    )
-    .is_empty());
-    assert!(violations("insert into settings (tenant_id, key) values ($1, $2)").is_empty());
-    assert!(!violations("insert into settings (key, tenant_id) values ($1, $2)").is_empty());
-    assert!(violations("delete from settings where tenant_id = $1 and key = $2").is_empty());
-    // An ON CONFLICT target or a SET list does not stand in for the filter.
-    assert!(!violations(
-        "insert into settings (key, value) values ($1, $2) on conflict (tenant_id, key) do nothing"
-    )
-    .is_empty());
-    assert!(!violations("update settings set tenant_id = $1 where key = $2").is_empty());
-    assert!(
-        violations("update settings set value = $3 where tenant_id = $1 and key = $2").is_empty()
-    );
-    // A table right before a closing parenthesis is still a table.
-    assert_eq!(
-        violations("select id from task where tenant_id = $1 and id in (select id from note)"),
-        ["FROM note"]
-    );
-    assert!(violations(
-        "select id from task where tenant_id = $1 \
-         and id in (select id from note where tenant_id = $1)"
-    )
-    .is_empty());
-    // FROM inside a function call's arguments names no table.
-    assert!(violations(
-        "select extract(epoch from created_at), substring(name from $2) \
-         from note where tenant_id = $1"
-    )
-    .is_empty());
-    // A join inside grouping parentheses, a `(with` subquery and a
-    // parenthesis in a quoted string all leave their tables checked.
-    assert!(
-        violations("select n.id from (note n join task t on t.id = n.id) where n.id = $1")
-            .contains(&"JOIN task".to_owned())
-    );
-    assert!(violations(
-        "select id from task where tenant_id = $1 \
-         and id in (with c as (select id from note) select id from c)"
-    )
-    .contains(&"FROM note".to_owned()));
-    assert_eq!(
-        violations("select '(' || name from note where id = $1"),
-        ["FROM note"]
-    );
-    assert_eq!(
-        violations("select name -- count(\nfrom note where id = $1"),
-        ["FROM note"]
-    );
-    // A SELECT-led group is a subquery whatever word precedes it.
-    assert_eq!(
-        violations("select distinct (select id from note) from task where tenant_id = $1"),
-        ["FROM note"]
-    );
-    // A marker skips only the names it declares; real tables stay checked.
-    let declared = ["c".to_owned()];
-    assert!(violations_skipping(
-        "with c as (select id from note where tenant_id = $1) select id from c",
-        &declared
-    )
-    .is_empty());
-    assert_eq!(
-        violations_skipping(
-            "with c as (select id from note where id = $2) select id from c",
-            &declared
-        ),
-        ["FROM note"]
-    );
-    let text = "x\n// tenant-lint: not-tables c — own subquery\nlet q = f(\n\"with c as (...";
-    assert_eq!(
-        declared_subqueries(text, 4, "with c as (select 1) select * from c"),
-        ["c"]
-    );
-    assert!(declared_subqueries("a\nb\nc\nd", 4, "select 1").is_empty());
-}
-
-#[test]
-#[should_panic(expected = "names the real table `note`")]
-fn a_marker_cannot_name_a_real_table() {
-    // A subquery named after a table would hide that table's own reads.
-    let text = "x\n// tenant-lint: not-tables note — own subquery\nlet q = f(\n\"with note...";
-    declared_subqueries(
-        text,
-        4,
-        "with note as (select id from note n) select id from note",
-    );
-}
-
-/// `const NAME: &str = "..."` values in `text`. A const set to another
-/// const's path (`crate::agent_repo::X`) maps to that const's name, resolved
-/// later.
-fn str_consts(text: &str) -> BTreeMap<String, Result<String, String>> {
-    let mut out = BTreeMap::new();
-    for (at, _) in text.match_indices("const ") {
-        let rest = &text[at + "const ".len()..];
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
-            .collect();
-        let Some(value) = rest[name.len()..]
-            .trim_start()
-            .strip_prefix(": &str =")
-            .map(str::trim_start)
-        else {
-            continue;
-        };
-        if name.is_empty() {
-            continue;
-        }
-        if value.starts_with('"') {
-            if let Some((_, lit)) = string_literals(value).into_iter().next() {
-                out.insert(name, Ok(unescape(&lit)));
-            }
-        } else {
-            let path: String = value
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
-                .collect();
-            let target = path.rsplit("::").next().unwrap_or_default().to_owned();
-            out.insert(name, Err(target));
-        }
-    }
-    out
-}
-
-/// Every `&str` const in `src/`, per file and by name across the crate.
-struct Consts {
-    by_file: BTreeMap<PathBuf, BTreeMap<String, Result<String, String>>>,
-    by_name: BTreeMap<String, Vec<String>>,
-}
-
-impl Consts {
-    fn load() -> Self {
+/// The Postgres backend's functions and sinks, with the `&str` consts of
+/// the rest of `src/` for template holes.
+fn postgres_index() -> Index {
+    let read = |dir: &Path, skip: Option<&Path>| {
         let mut files = Vec::new();
-        rust_files(&src(), &mut files);
-        let mut by_file = BTreeMap::new();
-        let mut by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for file in files {
-            let consts = str_consts(&std::fs::read_to_string(&file).expect("read"));
-            for (name, value) in &consts {
-                if let Ok(v) = value {
-                    by_name.entry(name.clone()).or_default().push(v.clone());
-                }
-            }
-            by_file.insert(file, consts);
-        }
-        Self { by_file, by_name }
-    }
-
-    /// `name` in `file`, else the one crate-wide const of that name.
-    fn resolve(&self, file: &Path, name: &str) -> Option<String> {
-        let global = |n: &str| match self.by_name.get(n).map(Vec::as_slice) {
-            Some([one]) => Some(one.clone()),
-            _ => None,
-        };
-        match self.by_file.get(file).and_then(|c| c.get(name)) {
-            Some(Ok(v)) => Some(v.clone()),
-            Some(Err(target)) => global(target),
-            None => global(name),
-        }
-    }
-}
-
-/// Short prose with no SQL punctuation, such as an error message
-/// (`"delete note failed"`) that [`is_sql`] takes for a statement.
-fn looks_like_prose(sql: &str) -> bool {
-    sql.split_whitespace().count() <= 8 && !sql.contains(['$', '=', '(', '*', ',', '\''])
+        rust_files(dir, &mut files);
+        files.sort();
+        files
+            .into_iter()
+            .filter(|f| skip.is_none_or(|s| !f.starts_with(s)))
+            .map(|f| {
+                let text = std::fs::read_to_string(&f).expect("read");
+                (f, text)
+            })
+            .collect::<Vec<_>>()
+    };
+    let postgres = src().join("postgres");
+    // `nul_free` expands `NUL_FREE(col)` into an expression on `col`.
+    Index::new(&read(&postgres, None), &read(&src(), Some(&postgres))).with_rewriter("nul_free")
 }
 
 fn unparsed_list() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/tenant-lint-unparsed.txt")
 }
 
-/// The key a literal is listed under: its file name and the first 80
-/// characters of its text with whitespace collapsed.
-fn unparsed_key(file: &Path, sql: &str) -> String {
-    let flat: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+/// The key a source is listed under: its file name and the first 80
+/// characters of its text (or Rust expression) with whitespace collapsed.
+fn unparsed_key(file: &Path, text: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     format!(
         "{} | {}",
         file.file_name().unwrap().to_string_lossy(),
@@ -383,8 +99,8 @@ fn unparsed_key(file: &Path, sql: &str) -> String {
     )
 }
 
-/// `postgres/tenant-lint-unparsed.txt`: `<file> | <sql prefix> — <reason>`
-/// per line; `#` lines are comments.
+/// `postgres/tenant-lint-unparsed.txt`: `<file> | <prefix> — <reason>` per
+/// line; `#` lines are comments.
 fn unparsed_listed() -> BTreeMap<String, String> {
     let text = std::fs::read_to_string(unparsed_list()).expect("read tenant-lint-unparsed.txt");
     text.lines()
@@ -403,70 +119,120 @@ fn unparsed_listed() -> BTreeMap<String, String> {
         .collect()
 }
 
+/// What rules 1 and 2 find in an index.
+#[derive(Default)]
+struct Report {
+    /// Statements that parse: tenant violations.
+    tenant: Vec<String>,
+    /// Texts that do not parse and sqlx arguments the lint cannot follow,
+    /// not listed in `tenant-lint-unparsed.txt`.
+    unparsed: Vec<String>,
+    /// Functions that run a write without the writer lock.
+    unlocked: BTreeSet<String>,
+    /// The allowlist keys that matched.
+    listed_used: BTreeSet<String>,
+    parsed: usize,
+}
+
+fn check(index: &Index, listed: &BTreeMap<String, String>) -> Report {
+    let exempt = non_tenant_tables();
+    let mut report = Report::default();
+    let mut seen = BTreeSet::new();
+    for u in index.uses() {
+        for s in &u.sources {
+            let first = seen.insert((s.file.clone(), s.line, s.column));
+            let at = format!("{}:{}", s.file.display(), s.line);
+            let (text, parsed) = match &s.sql {
+                Sql::Text { text, .. } => (text, postgres_ast::parse_pieces(&s.sql.pieces())),
+                Sql::Unresolved(expr) => (expr, Err(String::new())),
+            };
+            let stmts = match parsed {
+                Ok(stmts) => stmts,
+                Err(e) => {
+                    let key = unparsed_key(&s.file, text);
+                    if listed.contains_key(&key) {
+                        report.listed_used.insert(key);
+                    } else if first {
+                        let why = match &s.sql {
+                            Sql::Text { .. } => format!("does not parse ({e})"),
+                            Sql::Unresolved(_) => {
+                                format!("runs SQL the lint cannot follow (`{text}`)")
+                            }
+                        };
+                        report.unparsed.push(format!(
+                            "{at}: {why}; fix it or list `{key} — <reason>` \
+                             in postgres/tenant-lint-unparsed.txt"
+                        ));
+                    }
+                    continue;
+                }
+            };
+            if first {
+                report.parsed += 1;
+                for v in postgres_ast::violations(&stmts, &exempt) {
+                    report
+                        .tenant
+                        .push(format!("{at}: {v} is not filtered by tenant_id = $n"));
+                }
+            }
+            let writes = postgres_ast::written_tables(&stmts)
+                .into_iter()
+                .any(|t| !exempt.contains(&t.as_str()));
+            if writes && !u.locked {
+                report
+                    .unlocked
+                    .insert(format!("{}: {}", u.file.display(), u.function));
+            }
+        }
+    }
+    report
+}
+
+#[test]
+fn every_postgres_statement_parses_and_is_filtered_by_the_bound_tenant() {
+    let listed = unparsed_listed();
+    let report = check(&postgres_index(), &listed);
+    let mut findings = report.tenant;
+    findings.extend(report.unparsed);
+    for key in listed.keys().filter(|k| !report.listed_used.contains(*k)) {
+        findings.push(format!(
+            "postgres/tenant-lint-unparsed.txt: `{key}` matches no unparsed statement; remove it"
+        ));
+    }
+    assert!(report.parsed > 0, "parsed no SQL in src/postgres");
+    assert!(
+        findings.is_empty(),
+        "tenant rule on Postgres SQL:\n{}",
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn every_postgres_write_takes_the_tenant_writer_lock() {
+    let report = check(&postgres_index(), &unparsed_listed());
+    assert!(
+        report.unlocked.is_empty(),
+        "these Postgres functions write without begin_write() or a WriteTx:\n{}",
+        report.unlocked.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+/// Parses a `format!` template whose holes `resolve` may know (unit tests).
+fn parse_template(
+    sql: &str,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<sqlparser::ast::Statement>, String> {
+    let pieces: Vec<Option<String>> = sql_uses::split_format(sql)
+        .into_iter()
+        .map(|p| p.or_else(|hole| resolve(&hole).ok_or(())).ok())
+        .collect();
+    postgres_ast::parse_pieces(&pieces)
+}
+
 /// The AST rule's violations in one SQL text (unit tests).
 fn ast_violations(sql: &str) -> Vec<String> {
     let stmts = postgres_ast::parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     postgres_ast::violations(&stmts, &non_tenant_tables())
-}
-
-fn non_tenant_tables() -> Vec<&'static str> {
-    NON_TENANT_TABLES.iter().map(|(t, _)| *t).collect()
-}
-
-#[test]
-fn every_postgres_query_passes_the_tenant_rule_on_its_parsed_form() {
-    let consts = Consts::load();
-    let listed = unparsed_listed();
-    let mut used = BTreeSet::new();
-    let mut files = Vec::new();
-    rust_files(&src().join("postgres"), &mut files);
-    files.sort();
-    let mut findings = Vec::new();
-    let mut parsed = 0;
-    for file in files {
-        let text = std::fs::read_to_string(&file).expect("read");
-        for (line, lit) in string_literals(&text) {
-            if !is_sql(&lit) {
-                continue;
-            }
-            let sql = unescape(&lit);
-            let resolve = |name: &str| consts.resolve(&file, name);
-            match postgres_ast::parse_template(&sql, &resolve) {
-                Ok(stmts) => {
-                    parsed += 1;
-                    for v in postgres_ast::violations(&stmts, &non_tenant_tables()) {
-                        findings.push(format!(
-                            "{}:{line}: {v} is not filtered by tenant_id = $n",
-                            file.display()
-                        ));
-                    }
-                }
-                Err(e) => {
-                    let key = unparsed_key(&file, &sql);
-                    if listed.contains_key(&key) {
-                        used.insert(key);
-                    } else if !looks_like_prose(&sql) {
-                        findings.push(format!(
-                            "{}:{line}: does not parse ({e}); fix it or list `{key} — <reason>` \
-                             in postgres/tenant-lint-unparsed.txt",
-                            file.display()
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    for key in listed.keys().filter(|k| !used.contains(*k)) {
-        findings.push(format!(
-            "postgres/tenant-lint-unparsed.txt: `{key}` matches no unparsed literal; remove it"
-        ));
-    }
-    assert!(parsed > 0, "parsed no SQL in src/postgres");
-    assert!(
-        findings.is_empty(),
-        "tenant rule on parsed Postgres SQL:\n{}",
-        findings.join("\n")
-    );
 }
 
 #[test]
@@ -737,17 +503,16 @@ fn the_parsed_tenant_rule_catches_unscoped_shapes() {
 fn templates_parse_with_consts_and_fillers() {
     let none = |_: &str| None;
     let cols = |n: &str| (n == "COLS").then(|| "id, name".to_owned());
-    let stmts = postgres_ast::parse_template("select {COLS} from note where tenant_id = $1", &cols)
-        .expect("parses");
+    let stmts =
+        parse_template("select {COLS} from note where tenant_id = $1", &cols).expect("parses");
     assert_eq!(
         stmts[0].to_string(),
         "SELECT id, name FROM note WHERE tenant_id = $1"
     );
     // A resolved const is checked in place: its tables count.
     let live = |n: &str| (n == "LIVE").then(|| "exists(select 1 from workspace)".to_owned());
-    let stmts =
-        postgres_ast::parse_template("select id from note where tenant_id = $1 and {LIVE}", &live)
-            .expect("parses");
+    let stmts = parse_template("select id from note where tenant_id = $1 and {LIVE}", &live)
+        .expect("parses");
     assert_eq!(postgres_ast::violations(&stmts, &[]), ["FROM workspace"]);
     for sql in [
         "select id from browser_tab where tenant_id = $1 and {filter} = $2 {ORDER}",
@@ -756,82 +521,165 @@ fn templates_parse_with_consts_and_fillers() {
         "insert into script (tenant_id, id) values {}",
         "update workspace set {column} = $3 where tenant_id = $1 and id = $2",
         "select id from m where tenant_id = $1 and m.sequence {comparison} $6 order by m.sequence {order}",
+        "select id from note where tenant_id = $1 and tags @> '{{a}}'",
     ] {
-        assert!(postgres_ast::parse_template(sql, &none).is_ok(), "{sql}");
+        assert!(parse_template(sql, &none).is_ok(), "{sql}");
     }
-    assert!(postgres_ast::parse_template("delete note failed: {e}", &none).is_err());
-    assert!(looks_like_prose("delete note failed: {e}"));
-    assert!(!looks_like_prose(
-        "select id from note where tenant_id = $1"
-    ));
+    assert!(parse_template("delete note failed: {e}", &none).is_err());
 }
 
-/// The functions in `text` that write without the tenant's writer lock:
-/// their text (up to the next `fn`) holds an INSERT, UPDATE or DELETE
-/// literal but no `begin_write()` call.
-fn writers_without_lock(text: &str) -> Vec<String> {
-    let starts: Vec<usize> = text
-        .match_indices("fn ")
-        .map(|(i, _)| i)
-        .filter(|&i| i == 0 || text.as_bytes()[i - 1].is_ascii_whitespace())
-        .collect();
-    let mut out = Vec::new();
-    for (k, &start) in starts.iter().enumerate() {
-        let chunk = &text[start..starts.get(k + 1).copied().unwrap_or(text.len())];
-        // Schema-level tables (the migration ledger) have no tenant to lock.
-        let writes = string_literals(chunk).iter().any(|(_, lit)| {
-            let l = lit.trim_start().to_lowercase();
-            ["insert ", "update ", "delete "]
-                .iter()
-                .any(|w| l.starts_with(w))
-                && !NON_TENANT_TABLES.iter().any(|(t, _)| l.contains(t))
-        });
-        // A WriteTx, borrowed or owned, can only come from begin_write().
-        let locked = chunk.contains("begin_write()")
-            || [
-                "&mut WriteTx",
-                "&mut super::WriteTx",
-                ": WriteTx",
-                ": super::WriteTx",
-            ]
-            .iter()
-            .any(|t| chunk.contains(t));
-        if writes && !locked {
-            let name = chunk[3..]
-                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .next()
-                .unwrap_or_default();
-            out.push(name.to_owned());
-        }
-    }
-    out
+/// [`check`] on one in-memory source file named `x.rs`.
+fn check_source(source: &str) -> Report {
+    let index = Index::new(&[(PathBuf::from("x.rs"), source.to_owned())], &[]);
+    check(&index, &BTreeMap::new())
+}
+
+/// The texts (or unresolved expressions) that reach a sqlx call in `source`.
+fn texts_by_use(source: &str) -> BTreeSet<String> {
+    let index = Index::new(&[(PathBuf::from("x.rs"), source.to_owned())], &[]);
+    index
+        .uses()
+        .into_iter()
+        .flat_map(|u| u.sources)
+        .map(|s| match s.sql {
+            Sql::Text { text, .. } => text,
+            Sql::Unresolved(expr) => format!("UNRESOLVED {expr}"),
+        })
+        .collect()
 }
 
 #[test]
-fn every_postgres_write_takes_the_tenant_writer_lock() {
-    let mut files = Vec::new();
-    rust_files(&src().join("postgres"), &mut files);
-    let findings: Vec<String> = files
-        .iter()
-        .flat_map(|file| {
-            let text = std::fs::read_to_string(file).expect("read");
-            writers_without_lock(&text)
-                .into_iter()
-                .map(move |name| format!("{}: {name}", file.display()))
-        })
-        .collect();
-    assert!(
-        findings.is_empty(),
-        "these Postgres functions write without begin_write():\n{}",
-        findings.join("\n")
+fn sql_is_found_where_sqlx_runs_it() {
+    let source = r#"
+        const COLS: &str = "id, title";
+        const BY_ID: &str = concat!("select ", "id from note where tenant_id = $1");
+        const UNUSED: &str = "select id from note";
+
+        fn fts(filters: &str) -> String {
+            format!("select id from note n where n.tenant_id = $1{filters}")
+        }
+
+        impl PgStore {
+            async fn literal(&self) {
+                sqlx::query("select id from task where tenant_id = $1");
+            }
+            async fn local(&self) {
+                let sql = format!("select {COLS} from note where tenant_id = $1");
+                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+            }
+            async fn branches(&self, human: bool) {
+                let sql = if human { "delete from a where tenant_id = $1" } else { BY_ID };
+                sqlx::query_scalar::<_, i64>(sql);
+            }
+            async fn helper_return(&self) {
+                sqlx::query_as::<_, (String,)>(&fts(""));
+            }
+            async fn caller(&self, mut tx: WriteTx) {
+                self.run(tx, "update b set x = 1 where tenant_id = $1").await;
+            }
+            async fn run(&self, tx: WriteTx, sql: &'static str) {
+                sqlx::query(sql).execute(&mut *tx);
+            }
+            async fn looped(&self) {
+                for sql in ["delete from c where tenant_id = $1", "delete from d where tenant_id = $1"] {
+                    sqlx::query(sql);
+                }
+                for (sql, what) in [("select 1 from e where tenant_id = $1", "read e failed")] {
+                    sqlx::query(sql);
+                }
+                let exec = |sql: &'static str| sqlx::query(sql).bind(1);
+                exec("select 1 from f where tenant_id = $1");
+            }
+            async fn field(&self) {
+                sqlx::query(self.sql.as_str());
+            }
+            async fn prose(&self) -> Error {
+                let what = "delete note failed";
+                tracing::warn!("select failed: {what}");
+                Error::Internal(format!("update hook set failed: {what}"))
+            }
+        }
+    "#;
+    let want: BTreeSet<String> = [
+        "select id from task where tenant_id = $1",
+        "select {COLS} from note where tenant_id = $1",
+        "delete from a where tenant_id = $1",
+        "select id from note where tenant_id = $1",
+        "select id from note n where n.tenant_id = $1{filters}",
+        "update b set x = 1 where tenant_id = $1",
+        "delete from c where tenant_id = $1",
+        "delete from d where tenant_id = $1",
+        "select 1 from e where tenant_id = $1",
+        "select 1 from f where tenant_id = $1",
+        "UNRESOLVED self . sql",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    // Unused SQL-looking strings (UNUSED, error text) are not statements.
+    assert_eq!(texts_by_use(source), want);
+    let report = check_source(source);
+    assert_eq!(report.tenant, Vec::<String>::new());
+    assert_eq!(report.parsed, 10);
+    assert_eq!(report.unparsed.len(), 1, "{:?}", report.unparsed);
+    assert!(report.unparsed[0].contains("cannot follow"));
+}
+
+#[test]
+fn sql_that_does_not_parse_or_scope_is_reported() {
+    // A const spliced into a template is checked as part of it.
+    let report = check_source(
+        r#"const BASE: &str = "select id from task";
+        async fn f(&self) {
+            sqlx::query!("selec id frm note where tenant_id = $1");
+            sqlx::query(&format!("{BASE} where id = $1"));
+            sqlx::query(&format!("{} where id = $1", BASE));
+            sqlx::query_as!(Row, "select id from note");
+            sqlx::raw_sql("select id from task where tenant_id = $1 and");
+        }"#,
     );
+    assert_eq!(report.unparsed.len(), 2, "{:?}", report.unparsed);
+    assert!(report.unparsed.iter().all(|f| f.contains("does not parse")));
+    let tenant: Vec<&str> = report
+        .tenant
+        .iter()
+        .map(|f| f.split_once(": ").unwrap().1)
+        .collect();
+    assert_eq!(
+        tenant,
+        [
+            "FROM task is not filtered by tenant_id = $n",
+            "FROM task is not filtered by tenant_id = $n",
+            "FROM note is not filtered by tenant_id = $n",
+        ]
+    );
+    // A listed statement passes, and its key counts as used.
+    let index = Index::new(
+        &[(
+            PathBuf::from("x.rs"),
+            r#"fn f() { sqlx::query("selec 1"); }"#.to_owned(),
+        )],
+        &[],
+    );
+    let key = unparsed_key(Path::new("x.rs"), "selec 1");
+    let listed = BTreeMap::from([(key.clone(), "spike".to_owned())]);
+    let report = check(&index, &listed);
+    assert!(report.unparsed.is_empty());
+    assert!(report.listed_used.contains(&key));
 }
 
 #[test]
 fn the_writer_lock_rule_catches_unlocked_writes() {
+    let unlocked = |source: &str| -> Vec<String> {
+        check_source(source)
+            .unlocked
+            .into_iter()
+            .map(|f| f.trim_start_matches("x.rs: ").to_owned())
+            .collect()
+    };
     let locked = r#"async fn a(&self) { let tx = self.begin_write().await?;
         sqlx::query("UPDATE t SET x = 1 WHERE tenant_id = $1"); }"#;
-    let unlocked = r#"async fn b(&self) { let tx = self.begin().await?;
+    let begin = r#"async fn b(&self) { let tx = self.begin().await?;
         sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
     let read = r#"async fn c(&self) { let tx = self.begin().await?;
         sqlx::query("SELECT x FROM t WHERE tenant_id = $1"); }"#;
@@ -840,18 +688,30 @@ fn the_writer_lock_rule_catches_unlocked_writes() {
         sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
     let bound = r#"async fn e(self) { let mut tx: WriteTx = self.tx;
         sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
+    let borrowed = r#"async fn g(tx: &mut WriteTx) {
+        sqlx::query("INSERT INTO t (tenant_id) VALUES ($1)"); }"#;
+    let shared = r#"async fn h(tx: &WriteTx) {
+        sqlx::query("INSERT INTO t (tenant_id) VALUES ($1)"); }"#;
     let mentioned = r#"async fn f(&self) { // not a WriteTx
         sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
-    assert!(writers_without_lock(owned).is_empty());
-    assert!(writers_without_lock(bound).is_empty());
-    assert_eq!(writers_without_lock(mentioned), ["f"]);
-    assert!(writers_without_lock(locked).is_empty());
-    assert!(writers_without_lock(read).is_empty());
-    assert_eq!(writers_without_lock(unlocked), ["b"]);
-    assert_eq!(
-        writers_without_lock(&format!("{locked}\n{read}\n{unlocked}")),
-        ["b"]
-    );
+    // A data-modifying CTE writes; so does SQL a helper runs for a caller.
+    let cte = r#"async fn i(&self) { sqlx::query("WITH d AS (DELETE FROM t \
+        WHERE tenant_id = $1 RETURNING id) SELECT id FROM d"); }"#;
+    let helper = r#"async fn j(&self) { let tx = self.begin_write().await?;
+        run(&mut tx, "DELETE FROM t WHERE tenant_id = $1").await; }
+        async fn run(conn: &mut PgConnection, sql: &str) { sqlx::query(sql); }"#;
+    // The migration ledger has no tenant to lock.
+    let ledger = r#"async fn k(&self) {
+        sqlx::query("INSERT INTO intent_schema_migrations (version) VALUES ($1)"); }"#;
+    for ok in [locked, read, owned, bound, borrowed, ledger] {
+        assert_eq!(unlocked(ok), Vec::<String>::new(), "{ok}");
+    }
+    assert_eq!(unlocked(begin), ["b"]);
+    assert_eq!(unlocked(shared), ["h"]);
+    assert_eq!(unlocked(mentioned), ["f"]);
+    assert_eq!(unlocked(cte), ["i"]);
+    assert_eq!(unlocked(helper), ["run"]);
+    assert_eq!(unlocked(&format!("{locked}\n{read}\n{begin}")), ["b"]);
 }
 
 fn pending_dir() -> PathBuf {
