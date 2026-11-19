@@ -35,7 +35,8 @@ pub(super) const PURGE_BATCH_ROWS: i64 = 500;
 /// one-shot delete's order, then the rows the session row's delete trigger
 /// (`script_monitor_owner_deleted`) or cascade would otherwise remove in
 /// one statement: script monitors and their notification jobs, queue
-/// admissions, and discussion deliveries and activity (one per discussion
+/// admissions, browser sender receipts (one per accepted user message),
+/// and discussion deliveries and activity (one per discussion
 /// message the agent was sent). `$1` tenant, `$2` agent, `$3` batch size.
 /// Left to the final transaction: at most a few rows per agent
 /// (`agent_usage_cell` per model, `interrupted_agent`,
@@ -43,7 +44,7 @@ pub(super) const PURGE_BATCH_ROWS: i64 = 500;
 /// `discussion_agent_grant` per conversation, `agent_flipped_completion` per
 /// task); `pr_monitor_message_provenance` goes with its message, batch by
 /// batch.
-const AGENT_PURGE: [&str; 12] = [
+const AGENT_PURGE: [&str; 13] = [
     "DELETE FROM agent_message_payload WHERE tenant_id = $1 \
      AND (message_id, block_ordinal, kind) IN (SELECT p.message_id, p.block_ordinal, p.kind \
        FROM agent_message_payload p WHERE p.tenant_id = $1 AND p.agent_id = $2 LIMIT $3)",
@@ -53,6 +54,9 @@ const AGENT_PURGE: [&str; 12] = [
     "DELETE FROM agent_queue WHERE tenant_id = $1 \
      AND id IN (SELECT q.id FROM agent_queue q \
        WHERE q.tenant_id = $1 AND q.agent_id = $2 LIMIT $3)",
+    "DELETE FROM agent_browser_sender WHERE tenant_id = $1 AND agent_id = $2 \
+     AND submission_id IN (SELECT s.submission_id FROM agent_browser_sender s \
+       WHERE s.tenant_id = $1 AND s.agent_id = $2 LIMIT $3)",
     "DELETE FROM hook WHERE tenant_id = $1 \
      AND hook_id IN (SELECT h.hook_id FROM hook h \
        WHERE h.tenant_id = $1 AND h.agent_id = $2 LIMIT $3)",
