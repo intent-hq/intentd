@@ -30,6 +30,8 @@ mod concurrency_counters;
 mod concurrency_delete_desktop;
 #[path = "postgres_backend/concurrency_note_lanes.rs"]
 mod concurrency_note_lanes;
+#[path = "postgres_backend/concurrency_pool.rs"]
+mod concurrency_pool;
 #[path = "postgres_backend/concurrency_queue_order.rs"]
 mod concurrency_queue_order;
 #[path = "postgres_backend/concurrency_support.rs"]

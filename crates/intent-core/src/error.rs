@@ -316,6 +316,16 @@ pub enum Error {
     #[error("source control rate limited: {0}")]
     RateLimited(String),
 
+    /// The store could not start the operation in time: a Postgres writer
+    /// waited longer than its budget for its tenant's writer lock (another
+    /// writer of the same tenant held it), or no pool connection came free.
+    /// This store call wrote nothing, so it may be retried later; a service
+    /// operation that made several store calls may have committed earlier
+    /// ones. Distinct from `Internal` so callers can tell saturation from a
+    /// failure. Surfaces as `-32603`.
+    #[error("store busy: {0}")]
+    StoreBusy(String),
+
     /// A request forwarded to an agent's provider adapter failed (JSON-RPC
     /// error, timeout, or the connection ended before or during the request),
     /// e.g. `agent.workers.stop` (PROTOCOL §5.5b). Surfaces as `-32603` with
@@ -807,6 +817,7 @@ impl Error {
             | Error::DeviceGrantUnsupported { .. }
             | Error::SourceControlUnauthorized { .. }
             | Error::RateLimited(_)
+            | Error::StoreBusy(_)
             | Error::ProviderRequest(_)
             | Error::IdentityProof(_)
             | Error::IdentityUnverifiable { .. }

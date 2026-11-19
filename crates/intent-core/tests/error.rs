@@ -25,6 +25,13 @@ fn internal_code_and_display() {
 }
 
 #[test]
+fn store_busy_code_and_display() {
+    let e = Error::StoreBusy("tenant writer lock".to_string());
+    assert_eq!(e.code(), -32603);
+    assert_eq!(e.to_string(), "store busy: tenant writer lock");
+}
+
+#[test]
 fn conflict_code_and_display_and_payload() {
     let current = json!({ "rev": 7 });
     let e = Error::Conflict {
