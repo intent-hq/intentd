@@ -380,14 +380,14 @@ screenshots of the rendered result. Product Manager never edits code: it asks
 clarifying questions, explores the code, and writes the spec in the workspace **Spec**
 note. A second Product Manager critiques the spec; after you approve it, Product
 Manager starts a top-level Developer to implement it (this uses **Top-level agent
-spawning & retirement**, on by default). Maintenance Coordinator keeps a steady
+spawning & retirement**, on by default). Maintainer keeps a steady
 pipeline of small maintenance PRs (bugs and issues, dependency and security alerts,
 CI failures and flaky tests), each reviewed and green; it never merges without the
 user's explicit permission. A new harness version
 applies to new sessions; existing sessions keep their captured behavior, and
 custom specialist instructions can override the defaults.
 
-<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/{v3.8,v3.9,v3.10}/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_8.rs,harness/v3_9.rs,harness/v3_10.rs,harness/v3_12.rs}. -->
+<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/{v3.8,v3.9,v3.10,v3.15}/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_8.rs,harness/v3_9.rs,harness/v3_10.rs,harness/v3_12.rs,harness/v3_15.rs}. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte; src/routes/(app)/settings/+page.svelte (Agent defaults Advanced disclosure). Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
