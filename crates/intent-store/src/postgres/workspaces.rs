@@ -167,6 +167,7 @@ fn map_home_row(row: &PgRow, now: time::OffsetDateTime) -> Result<(WorkspaceId, 
             since: col(row, "since")?,
             last_backup_at: col(row, "last_backup_at")?,
             backup_warning: crate::workspace_home_repo::warning(failing.as_deref(), now),
+            setup: None,
         },
     ))
 }

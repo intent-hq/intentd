@@ -74,6 +74,7 @@ impl HomeMove {
             since: home.since.clone(),
             last_backup_at: home.last_backup_at.clone(),
             backup_warning: home.backup_warning,
+            setup: None,
             ..self.target.clone()
         }
     }
@@ -99,6 +100,7 @@ fn map_row(row: &SqliteRow) -> Result<HomeMove> {
             since: started_at.clone(),
             last_backup_at: None,
             backup_warning: false,
+            setup: None,
         },
         from_home_id: HomeId(row.try_get("from_home_id").map_err(db)?),
         from_state,

@@ -1,6 +1,6 @@
 [package]
 name = "intent-store"
-version = "0.11.248"
+version = "0.11.249"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -33,7 +33,7 @@ test-support = []
 postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring-webpki"]
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.248" }
+intent-core = { path = "../intent-core", version = "0.11.249" }
 time = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
@@ -66,6 +66,11 @@ trybuild = "1"
 # default features: `recursive-protection` pulls in stacker/psm, which
 # compile C and assembly. `visitor` adds a pure-Rust derive macro.
 sqlparser = { version = "0.64", default-features = false, features = ["std", "visitor"] }
+# Postgres lint: finds the SQL each sqlx call runs by parsing `src/postgres`
+# (tests/support/sql_uses.rs). Pure Rust; `span-locations` gives line numbers.
+proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+quote = { version = "1", default-features = false }
+syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit", "clone-impls"] }
 tempfile = "3"
 tokio = { workspace = true }
 uuid = { workspace = true }

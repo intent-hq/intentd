@@ -27,6 +27,7 @@ fn home(id: &str, node: &str) -> WorkspaceHome {
         since: now_iso(),
         last_backup_at: None,
         backup_warning: false,
+        setup: None,
     }
 }
 

@@ -609,3 +609,131 @@ async fn home_runs_and_autostart_run_in_the_home_checkout() {
     // A stop is not a loss: the run carries no error.
     assert!(status.get("error").is_none(), "{status}");
 }
+
+/// nodes.md "Opening the home": a new machine home reports its open as
+/// `home.setup`, from `pending` at create to how its setup script ended,
+/// with the checkout and setup output on `workspace.get` only. A failed
+/// setup script leaves the home attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_home_reports_its_opening_until_the_setup_script_ends() {
+    if intent_providers::resolve_on_path("git").is_none() {
+        eprintln!("skipping home setup e2e: git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-home-setup-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(repo.join(".intent")).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    std::fs::write(
+        repo.join(".intent/config.json"),
+        serde_json::to_string_pretty(&json!({
+            "setupScript": "echo home-setup-ran; exit 3",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    git(&repo, &["add", "README.md", ".intent/config.json"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let branch = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let head_dir = scratch.path().join("head");
+    let (head, _, _, _) = start_backend(&head_dir, &repo).await;
+    drop(head);
+    super::orchestrator::orchestrator_config(&head_dir);
+    let (_head, port, cfg) = serve_backend(&head_dir, &[]).await;
+    let mut rpc_ws = connect(port, cfg).await;
+
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node-0");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine_with(&node_dir, &backend_id, &[]).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "Machine A"),
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    let created = loop {
+        id += 1;
+        let response = rpc(
+            &mut rpc_ws,
+            id,
+            "workspace.create",
+            json!({ "repositoryPath": repo.to_string_lossy(), "baseRef": branch }),
+        )
+        .await;
+        if response.get("error").is_none() {
+            break response["result"]["workspace"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never became a home: {response}"
+        );
+        // timing-guard: retry while the new machine finishes its first bind
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let ws_id = created["id"].as_str().unwrap().to_owned();
+    // Recorded as opening; the open itself runs in the background.
+    assert_eq!(created["home"]["state"], "attached", "{created}");
+    let opening = created["home"]["setup"]["state"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        ["pending", "running", "failed"].contains(&opening),
+        "a new home reports its opening: {created}"
+    );
+
+    let deadline = tokio::time::Instant::now() + wait();
+    let home = loop {
+        id += 1;
+        let got = ok(
+            &mut rpc_ws,
+            id,
+            "workspace.get",
+            json!({ "workspaceId": ws_id }),
+        )
+        .await;
+        let workspace = got.get("workspace").unwrap_or(&got).clone();
+        if workspace["home"]["setup"]["state"] == "failed" {
+            break workspace["home"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the home's setup never finished: {workspace}"
+        );
+        // timing-guard: poll while the machine runs the home's setup
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let setup = &home["setup"];
+    assert_eq!(setup["exitCode"], 3, "{home}");
+    assert!(setup["startedAt"].is_string(), "{home}");
+    assert!(setup["finishedAt"].is_string(), "{home}");
+    assert!(
+        setup["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("home-setup-ran"),
+        "the setup output is on the detail read: {home}"
+    );
+    assert_eq!(
+        home["state"], "attached",
+        "a failed setup leaves the home attached"
+    );
+
+    // List rows carry the state without the output.
+    id += 1;
+    let list = ok(&mut rpc_ws, id, "workspace.list", json!({})).await;
+    let rows = list
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .or_else(|| list.as_array())
+        .unwrap();
+    let row = rows.iter().find(|row| row["id"] == ws_id.as_str()).unwrap();
+    assert_eq!(row["home"]["setup"]["state"], "failed", "{row}");
+    assert!(row["home"]["setup"].get("output").is_none(), "{row}");
+}

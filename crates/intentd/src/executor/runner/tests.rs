@@ -10,6 +10,8 @@ use super::*;
 use crate::executor::storage::Storage;
 
 mod forge;
+#[cfg(unix)]
+mod profile_parity;
 mod shared;
 
 const PROVIDER: &str = "mock";
@@ -87,6 +89,12 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         eprintln!("skipping node runner test: node not on PATH");
         return None;
     };
+    Some(harness_with(node, max_agents, args))
+}
+
+/// [`harness`] with the fixture provider run by `node`. Tests that never
+/// start a provider (profile resolution) pass any path and never skip.
+fn harness_with(node: PathBuf, max_agents: u32, args: &[&str]) -> Harness {
     let script = format!(
         "{}/tests/fixtures/node-test-agent.mjs",
         env!("CARGO_MANIFEST_DIR")
@@ -133,7 +141,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         },
     });
     let home = dir.path().join("home");
-    Some(Harness {
+    Harness {
         runner,
         admission,
         storage,
@@ -141,7 +149,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         auth_failures,
         home,
         _dir: dir,
-    })
+    }
 }
 
 fn launch(id: &str) -> LaunchCommand {

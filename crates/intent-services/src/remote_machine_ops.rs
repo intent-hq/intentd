@@ -364,6 +364,11 @@ impl Services {
             return Ok(());
         };
         self.store.set_workspace_home(workspace_id, &home).await?;
+        // A machine's home reports its open as `setup` (nodes.md "Opening
+        // the home"); a cloud home's start is its `starting` state.
+        if home.node_id.is_some() {
+            self.home_setups.opening(workspace_id, &home.home_id);
+        }
         self.publish_workspace_home_changed(workspace_id).await;
         let opener = self.clone();
         let workspace_id = workspace_id.clone();
@@ -379,6 +384,14 @@ impl Services {
             }
         });
         Ok(())
+    }
+
+    /// How far each workspace home's opening has got (nodes.md "Opening the
+    /// home"). A change the caller makes is announced with
+    /// [`Self::publish_workspace_home_changed`].
+    #[must_use]
+    pub fn home_setups(&self) -> &crate::home_setup::HomeSetups {
+        &self.home_setups
     }
 
     /// Show `notice` (nodes.md "Moving the home" step 4: the agent now works
@@ -526,7 +539,12 @@ impl Services {
     /// existing `workspace:updated` with `changes: { home }`.
     pub async fn publish_workspace_home_changed(&self, workspace_id: &WorkspaceId) {
         let home = match self.store.get_shown_workspace_home(workspace_id).await {
-            Ok(home) => home,
+            Ok(mut home) => {
+                if let Some(home) = home.as_mut() {
+                    self.home_setups.attach(workspace_id, home, false);
+                }
+                home
+            }
             Err(error) => {
                 tracing::warn!(workspace = %workspace_id, %error, "could not read the workspace's home to announce it");
                 return;

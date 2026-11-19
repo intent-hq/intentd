@@ -25,7 +25,6 @@ impl PgStore {
         // Select the index of the winner, not its JSON: a jsonb round trip
         // would reorder its keys, and the object from the caller goes out on
         // the wire as given.
-        // tenant-lint: not-tables candidates scopes access permitted — the WITH subqueries of this query; each real table read inside them is filtered by tenant
         let row: Option<(Option<i64>,)> = sqlx::query_as(
             "WITH candidates AS (SELECT e.key::bigint AS ord, e.value AS target, \
                  sqlite_json_extract(e.value, '$.workspaceId') AS workspace_id, \

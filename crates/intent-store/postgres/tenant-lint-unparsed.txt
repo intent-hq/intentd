@@ -1,3 +1,24 @@
-# Postgres SQL literals the tenant lint cannot parse, so its parsed-form
-# rule skips them (the text rule still checks them). One per line:
-# <file> | <first 80 characters, whitespace collapsed> — <reason>
+# Statements, sqlx arguments, format! holes and fragments the Postgres tenant
+# lint cannot check, each with why it is safe. One per line, one site each:
+# <file>::<function> | <first 80 characters, whitespace collapsed> — <reason>
+mod.rs::migrate_locked | stmts . iter () . enumerate () . skip (start) — runs the migration files' statements; postgres_tenant_schema_lint checks them
+repositories.rs::transfer_table_stats | transfer_predicates () ? . enumerate () . map (| (i , (table , predicate)) | { l — UNION ALL of one count per table, each `WHERE tenant_id = $1 AND (<predicate>)`; every_transfer_predicate_is_scoped checks the predicates
+repositories.rs::transfer_rows | transfer_predicates () ? — TRANSFER_PREDICATES table names and predicates; every_transfer_predicate_is_scoped checks each
+agent_messages.rs::append_agent_message_inner | column — SET target only: the preview column chosen by role just above, last_assistant_preview or last_user_preview
+note_search.rs::note_fts_positions | query . sql () — SearchQuery::sql renders the tsquery expression from to_tsquery($3[i]) terms; it names no table
+note_search.rs::search_notes_fts | query . sql () — SearchQuery::sql renders the tsquery expression from to_tsquery($3[i]) terms; it names no table
+agent_messages.rs::search_agent_messages_fts | query . sql () — SearchQuery::sql renders the tsquery expression from to_tsquery($3[i]) terms; it names no table
+pr_monitors.rs::captured_columns | COLUMNS . split (',') . chain (TARGET_COLUMNS . split (',')) . map (str :: trim) — `<column> IS NOT DISTINCT FROM $n` for each pr_monitor column const
+repositories.rs::column_list | columns . iter () . map (| (c , _) | format ! ("\"{c}\"")) . collect :: < Vec < — quoted column names of a transfer table, read from information_schema by transfer_columns
+repositories.rs::transfer_import_rows | columns . iter () . map (| (c , _) | format ! ("\"{c}\"")) . collect :: < Vec < — quoted column names of the transfer table, read from information_schema by transfer_columns
+repositories.rs::transfer_import_rows | columns . iter () . enumerate () . map (| (i , (_ , ty)) | format ! ("${}::{ty}" — `$n::<type>` placeholders for the transfer table's columns
+repositories.rs::transfer_import_rows | columns . iter () . map (| (c , _) | format ! ("\"{c}\" = excluded.\"{c}\"")) . — ON CONFLICT DO UPDATE SET list over the transfer table's columns
+scripts.rs::replace_scripts | placeholders . join (", ") — VALUES rows `($1, $n, ...)` of bind placeholders, one per script
+events.rs::query_events | combinations: SELECT {EVENT_COLUMNS} FROM event WHERE tenant_id = $1{} — each optional filter pushes one independent AND clause (its own if arm); every arm and hole is checked against the base query
+pr_monitors.rs::load_non_cancelled_pr_monitor_list_entries | combinations: SELECT workspace_id, repo_owner, repo_name, pr_number, state, crea — snapshot_scalars("snapshot") builds JSON column reads; its helper holes take every caller's arguments, and each is checked alone
+pr_monitors.rs::load_workspace_pr_monitor_reads | combinations: SELECT monitor_id, agent_id, workspace_id, repo_owner, repo_name, — snapshot_scalars builds JSON column reads; its helper holes take every caller's arguments, and each is checked alone
+pr_monitors.rs::update_pr_monitor_poll | combinations: UPDATE pr_monitor SET last_snapshot = $2, baseline_snapshot = $3, — pause_preserving_last_error builds a CASE over bind placeholders; its helper holes take every caller's arguments, and each is checked alone
+pr_monitors.rs::annotate_active_pr_monitors_pause | combinations: UPDATE pr_monitor SET last_error = CASE WHEN last_error IS NULL OR — pause_deadline_secs/row_pause build expressions over bind placeholders; their helper holes take every caller's arguments, and each is checked alone
+pr_monitors.rs::clear_active_pr_monitors_pause | combinations: UPDATE pr_monitor SET last_error = NULLIF(rtrim(left(last_error, s — pause_deadline_secs/row_pause build expressions over bind placeholders; their helper holes take every caller's arguments, and each is checked alone
+pr_monitors.rs::adopt_pr_monitor | combinations: UPDATE pr_monitor SET agent_id = $2, last_snapshot = $3, baseline_ — pause_preserving_last_error builds a CASE over bind placeholders; its helper holes take every caller's arguments, and each is checked alone
+pr_monitors.rs::rearm_legacy_pr_monitor | combinations: UPDATE pr_monitor SET agent_id = $2, last_snapshot = $3, baseline_ — pause_preserving_last_error builds a CASE over bind placeholders; its helper holes take every caller's arguments, and each is checked alone

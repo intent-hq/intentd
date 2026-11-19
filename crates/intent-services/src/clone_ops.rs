@@ -292,7 +292,13 @@ enum ProgressSink {
 }
 
 impl ProgressSink {
-    async fn progress(&self, phase: &str, percent: u32, message: &str) {
+    async fn progress(
+        &self,
+        phase: &str,
+        percent: u32,
+        message: &str,
+        transfer: Option<&CloneTransfer>,
+    ) {
         match self {
             ProgressSink::Legacy {
                 bus,
@@ -302,12 +308,16 @@ impl ProgressSink {
                 publish(
                     bus,
                     ws,
-                    progress_event(ws, request_id, phase, percent, message, None),
+                    progress_event_with_transfer(
+                        ws, request_id, phase, percent, message, None, transfer,
+                    ),
                 )
                 .await;
             }
             ProgressSink::Create(reporter) => {
-                reporter.clone_progress(phase, percent, message).await;
+                reporter
+                    .clone_progress(phase, percent, message, transfer)
+                    .await;
             }
         }
     }
@@ -353,7 +363,8 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
     };
 
     // Initial "starting" frame (parity with the FE's first tick).
-    sink.progress("starting", 0, "Starting clone...").await;
+    sink.progress("starting", 0, "Starting clone...", None)
+        .await;
 
     // Ensure a target-parent exists so `git clone` doesn't fail on a fresh
     // workspace path. Not fatal if it already exists.
@@ -415,7 +426,8 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
 
     match wait_result {
         Ok(Ok(status)) if status.success() => {
-            sink.progress("complete", 100, "Clone complete!").await;
+            sink.progress("complete", 100, "Clone complete!", None)
+                .await;
             sink.done(true, None, None).await;
             Ok(())
         }
@@ -521,7 +533,7 @@ where
     let mut reader = BufReader::new(stderr);
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     let mut parser = SubmoduleAwareParser::for_clone();
-    let mut last_frame: Option<(String, u32, String)> = None;
+    let mut last_frame: Option<FrameKey> = None;
     let mut tail: String = String::new();
     loop {
         buf.clear();
@@ -532,18 +544,14 @@ where
             Ok(n) => n,
         };
         let text = String::from_utf8_lossy(&buf[..n]);
+        let transfer = parse_transfer(&text);
         for (phase, percent, message) in parser.parse(&text) {
-            // Message-aware dedup: submodule frames advance by message
-            // ("Cloning submodules (N/M)") even when the aggregate percent
-            // holds still, and per-phase percents never move backwards.
-            let key = (phase.to_string(), percent, message.clone());
-            let emit = match &last_frame {
-                Some((lp, lpct, lmsg)) => *lp != key.0 || *lmsg != key.2 || percent > *lpct,
-                None => true,
-            };
-            if emit {
+            let transfer = transfer.filter(|_| phase == "receiving");
+            let key = FrameKey::new(phase, percent, &message, transfer);
+            if key.supersedes(last_frame.as_ref()) {
                 last_frame = Some(key);
-                sink.progress(phase, percent, &message).await;
+                sink.progress(phase, percent, &message, transfer.as_ref())
+                    .await;
             }
         }
         // Keep a bounded tail (~4KiB) of stderr for error messages.
@@ -555,6 +563,136 @@ where
     } else {
         Some(tail.trim().to_string())
     }
+}
+
+/// Dedup key for streamed frames. Submodule frames advance by message
+/// ("Cloning submodules (N/M)") even when the aggregate percent holds still,
+/// receiving frames advance by transfer counters (git's ~1 s rate redraws),
+/// and per-phase percents never move backwards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FrameKey {
+    phase: &'static str,
+    percent: u32,
+    message: String,
+    transfer: Option<CloneTransfer>,
+}
+
+impl FrameKey {
+    pub(crate) fn new(
+        phase: &'static str,
+        percent: u32,
+        message: &str,
+        transfer: Option<CloneTransfer>,
+    ) -> Self {
+        Self {
+            phase,
+            percent,
+            message: message.to_string(),
+            transfer,
+        }
+    }
+
+    pub(crate) fn supersedes(&self, last: Option<&FrameKey>) -> bool {
+        let Some(last) = last else { return true };
+        if self.phase != last.phase || self.message != last.message {
+            return true;
+        }
+        match self.percent.cmp(&last.percent) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => self.transfer != last.transfer,
+            std::cmp::Ordering::Less => false,
+        }
+    }
+}
+
+/// Download counters from git's receiving line, e.g.
+/// "Receiving objects:  45% (1234/2743), 12.34 MiB | 5.67 MiB/s" (PROTOCOL
+/// §6.5 `transfer`). The byte fields are `None` until git prints its
+/// throughput suffix (about one second into the download).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CloneTransfer {
+    pub(crate) received_objects: u64,
+    pub(crate) total_objects: u64,
+    pub(crate) received_bytes: Option<u64>,
+    pub(crate) bytes_per_second: Option<u64>,
+}
+
+impl CloneTransfer {
+    fn to_json(self) -> serde_json::Value {
+        let mut value = json!({
+            "receivedObjects": self.received_objects,
+            "totalObjects": self.total_objects,
+        });
+        let obj = value.as_object_mut().unwrap();
+        if let Some(bytes) = self.received_bytes {
+            obj.insert("receivedBytes".to_string(), json!(bytes));
+        }
+        if let Some(rate) = self.bytes_per_second {
+            obj.insert("bytesPerSecond".to_string(), json!(rate));
+        }
+        value
+    }
+}
+
+/// Parse the last "Receiving objects:" line in `text` into a
+/// [`CloneTransfer`]. `None` for any other line or a line without a valid
+/// `(received/total)` counter.
+pub(crate) fn parse_transfer(text: &str) -> Option<CloneTransfer> {
+    const LABEL: &str = "Receiving objects:";
+    let line = text
+        .split(['\r', '\n'])
+        .rfind(|line| line.contains(LABEL))?;
+    let rest = &line[line.find(LABEL)? + LABEL.len()..];
+    let open = rest.find('(')?;
+    let close = open + rest[open..].find(')')?;
+    let (received, total) = rest[open + 1..close].split_once('/')?;
+    let received_objects: u64 = received.trim().parse().ok()?;
+    let total_objects: u64 = total.trim().parse().ok()?;
+    if total_objects == 0 {
+        return None;
+    }
+    let suffix = rest[close + 1..].trim_start_matches(',').trim();
+    let (received_bytes, bytes_per_second) = match suffix.split_once('|') {
+        Some((size, rate)) => {
+            let rate = rate.split(',').next().unwrap_or_default().trim();
+            match (
+                parse_git_bytes(size.trim()),
+                rate.strip_suffix("/s").and_then(parse_git_bytes),
+            ) {
+                (Some(size), Some(rate)) => (Some(size), Some(rate)),
+                _ => (None, None),
+            }
+        }
+        None => (None, None),
+    };
+    Some(CloneTransfer {
+        received_objects,
+        total_objects,
+        received_bytes,
+        bytes_per_second,
+    })
+}
+
+/// Parse git's `strbuf_humanise_bytes` output ("12.34 MiB", "768 bytes").
+fn parse_git_bytes(text: &str) -> Option<u64> {
+    let (number, unit) = text.split_once(' ')?;
+    let scale: u64 = match unit.trim() {
+        "GiB" => 1 << 30,
+        "MiB" => 1 << 20,
+        "KiB" => 1 << 10,
+        "byte" | "bytes" => 1,
+        _ => return None,
+    };
+    let (whole, frac) = number.split_once('.').unwrap_or((number, ""));
+    let whole: u64 = whole.parse().ok()?;
+    let frac_value = if frac.is_empty() {
+        0
+    } else {
+        let digits = u32::try_from(frac.len()).ok()?;
+        let frac: u64 = frac.parse().ok()?;
+        frac.checked_mul(scale)? / 10u64.checked_pow(digits)?
+    };
+    whole.checked_mul(scale)?.checked_add(frac_value)
 }
 
 /// Drop the front of `tail` so at most ~[`STDERR_TAIL_MAX`] bytes remain,
@@ -905,16 +1043,40 @@ pub(crate) fn progress_event(
     message: &str,
     progress_id: Option<&str>,
 ) -> NewEvent {
+    progress_event_with_transfer(
+        workspace_id,
+        request_id,
+        phase,
+        percent,
+        message,
+        progress_id,
+        None,
+    )
+}
+
+/// [`progress_event`] plus the optional `transfer` download counters
+/// (present only on `receiving` frames parsed from git's stderr).
+pub(crate) fn progress_event_with_transfer(
+    workspace_id: &WorkspaceId,
+    request_id: &str,
+    phase: &str,
+    percent: u32,
+    message: &str,
+    progress_id: Option<&str>,
+    transfer: Option<&CloneTransfer>,
+) -> NewEvent {
     let mut data = json!({
         "requestId": request_id,
         "phase": phase,
         "percent": percent,
         "message": message,
     });
+    let obj = data.as_object_mut().unwrap();
     if let Some(pid) = progress_id {
-        data.as_object_mut()
-            .unwrap()
-            .insert("progressId".to_string(), json!(pid));
+        obj.insert("progressId".to_string(), json!(pid));
+    }
+    if let Some(transfer) = transfer {
+        obj.insert("transfer".to_string(), transfer.to_json());
     }
     NewEvent {
         workspace_id: workspace_id.clone(),
@@ -1000,6 +1162,8 @@ pub(crate) fn target_exists_non_empty(target_path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MIB: u64 = 1 << 20;
 
     #[test]
     fn derive_default_target_strips_dot_git() {
@@ -1497,6 +1661,109 @@ mod tests {
         let uf = parser.parse("Updating files:  60% (3/5)");
         assert_eq!(uf[0].0, "checkout");
         assert_eq!(uf[0].1, 60);
+    }
+
+    #[test]
+    fn parse_transfer_reads_git_receiving_counters() {
+        let t = |received_objects, total_objects, received_bytes, bytes_per_second| CloneTransfer {
+            received_objects,
+            total_objects,
+            received_bytes,
+            bytes_per_second,
+        };
+        // Before git's first throughput sample: counts only.
+        assert_eq!(
+            parse_transfer("Receiving objects:   1% (28/2743)"),
+            Some(t(28, 2743, None, None))
+        );
+        assert_eq!(
+            parse_transfer("Receiving objects:  45% (1234/2743), 12.34 MiB | 5.67 MiB/s"),
+            Some(t(
+                1234,
+                2743,
+                Some(12 * MIB + 34 * MIB / 100),
+                Some(5 * MIB + 67 * MIB / 100)
+            ))
+        );
+        assert_eq!(
+            parse_transfer("Receiving objects: 100% (8/8), 1.50 KiB | 768.00 KiB/s, done."),
+            Some(t(8, 8, Some(1536), Some(768 * 1024)))
+        );
+        assert_eq!(
+            parse_transfer("Receiving objects:  90% (9/10), 2.01 GiB | 0 bytes/s"),
+            Some(t(9, 10, Some(2 * (1 << 30) + (1 << 30) / 100), Some(0)))
+        );
+        assert_eq!(
+            parse_transfer("Receiving objects:  50% (1/2), 1 byte | 1 byte/s"),
+            Some(t(1, 2, Some(1), Some(1)))
+        );
+        // A malformed or unknown-unit suffix keeps the counts and drops bytes.
+        assert_eq!(
+            parse_transfer("Receiving objects:  45% (10/22), 3.00 PiB | ??"),
+            Some(t(10, 22, None, None))
+        );
+    }
+
+    #[test]
+    fn parse_transfer_ignores_other_lines() {
+        assert_eq!(parse_transfer("Resolving deltas:  45% (10/22)"), None);
+        assert_eq!(
+            parse_transfer("Checking out files: 100% (1/1), done."),
+            None
+        );
+        assert_eq!(parse_transfer("Receiving objects:  45%"), None);
+        assert_eq!(parse_transfer("Receiving objects:  45% (x/22)"), None);
+        assert_eq!(parse_transfer("Receiving objects:   0% (0/0)"), None);
+    }
+
+    #[test]
+    fn progress_event_carries_transfer_only_when_present() {
+        let ws = WorkspaceId::new();
+        let plain = progress_event(&ws, "r1", "resolving", 10, "Resolving deltas: 10%", None);
+        assert!(plain.data.get("transfer").is_none());
+        let transfer = CloneTransfer {
+            received_objects: 5,
+            total_objects: 10,
+            received_bytes: Some(2048),
+            bytes_per_second: None,
+        };
+        let ev = progress_event_with_transfer(
+            &ws,
+            "r1",
+            "receiving",
+            50,
+            "Receiving objects: 50%",
+            Some("pid"),
+            Some(&transfer),
+        );
+        assert_eq!(
+            ev.data["transfer"],
+            json!({ "receivedObjects": 5, "totalObjects": 10, "receivedBytes": 2048 })
+        );
+        assert_eq!(ev.data["progressId"], "pid");
+    }
+
+    /// git redraws its receiving line about once a second with a new rate
+    /// even when the percent holds still: those redraws must reach the
+    /// client, while exact repeats stay deduped.
+    #[test]
+    fn stream_frame_key_emits_rate_only_changes() {
+        let transfer = |rate| {
+            Some(CloneTransfer {
+                received_objects: 5,
+                total_objects: 10,
+                received_bytes: Some(100),
+                bytes_per_second: Some(rate),
+            })
+        };
+        let first = FrameKey::new("receiving", 50, "Receiving objects: 50%", transfer(10));
+        assert!(first.supersedes(None));
+        let same = first.clone();
+        assert!(!same.supersedes(Some(&first)));
+        let rate_moved = FrameKey::new("receiving", 50, "Receiving objects: 50%", transfer(20));
+        assert!(rate_moved.supersedes(Some(&first)));
+        let lower = FrameKey::new("receiving", 40, "Receiving objects: 50%", transfer(10));
+        assert!(!lower.supersedes(Some(&first)));
     }
 
     /// A recursive clone stream: superproject phases pass through untouched;
