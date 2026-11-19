@@ -962,6 +962,9 @@ impl ScriptManager {
             updated_at,
             remote_author,
         };
+        if let Some(value) = self.update_auto_start_only(&workspace_id, &def).await? {
+            return Ok(value);
+        }
         if self
             .scripts
             .lock()
@@ -1047,6 +1050,53 @@ impl ScriptManager {
         self.emit_changed_locked(&workspace_id, &def.id, change)
             .await;
         Ok(serde_json::to_value(def).unwrap_or_else(|_| json!({})))
+    }
+
+    /// An upsert that changes only `autoStart` updates the definition in
+    /// place, so a live run, its marker and its last run are kept. `None`
+    /// when anything else changed (the caller replaces the definition).
+    /// Caller holds the definition lock.
+    async fn update_auto_start_only(
+        &self,
+        workspace_id: &WorkspaceId,
+        def: &Script,
+    ) -> Result<Option<Value>> {
+        let key = (workspace_id.clone(), def.id.clone());
+        let only_auto_start = self.scripts.lock().unwrap().get(&key).is_some_and(|old| {
+            old.def.auto_start != def.auto_start
+                && old.def.archived_at.is_none()
+                && Script {
+                    auto_start: old.def.auto_start,
+                    updated_at: old.def.updated_at.clone(),
+                    last_run: old.def.last_run.clone(),
+                    ..def.clone()
+                } == old.def
+        });
+        if !only_auto_start {
+            return Ok(None);
+        }
+        let updated_at = def.updated_at.clone().unwrap_or_else(now_iso);
+        if !self
+            .store
+            .set_script_auto_start(workspace_id.as_str(), &def.id, def.auto_start, &updated_at)
+            .await?
+        {
+            return Ok(None);
+        }
+        let publication = self.locks.publication_lock(&def.id);
+        let _publishing = publication.lock().await;
+        let value = {
+            let mut scripts = self.scripts.lock().unwrap();
+            let Some(m) = scripts.get_mut(&key) else {
+                return Ok(None);
+            };
+            m.def.auto_start = def.auto_start;
+            m.def.updated_at = Some(updated_at);
+            serde_json::to_value(&m.def).unwrap_or_else(|_| json!({}))
+        };
+        self.emit_changed_locked(workspace_id, &def.id, "updated")
+            .await;
+        Ok(Some(value))
     }
 
     /// Boot-time hydration: load every persisted definition into the runtime
@@ -5005,6 +5055,93 @@ mod tests {
 
         // Hydration is idempotent — already-registered ids are untouched.
         assert_eq!(svc2.hydrate_scripts().await.expect("re-hydrate"), 0);
+    }
+
+    /// An upsert that changes only `autoStart` keeps the live run: same
+    /// process, marker kept, definition updated. Any other change still
+    /// replaces the run.
+    #[intent_test_macros::daemon_test]
+    async fn autostart_only_upsert_keeps_running_service() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let params = ScriptCreateParams {
+            name: "svc".into(),
+            command: SERVICE_CMD.into(),
+            mode: ScriptMode::Service,
+            ..Default::default()
+        };
+        let id = create(&h, params.clone()).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let before = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+
+        let toggled = h
+            .services
+            .script_create(
+                h.ws.clone(),
+                ScriptCreateParams {
+                    auto_start: Some(true),
+                    script_id: Some(id.clone()),
+                    ..params.clone()
+                },
+            )
+            .await
+            .expect("toggle");
+        assert_eq!(toggled["autoStart"], true);
+        let after = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        assert_eq!(after["status"], "running", "run kept: {after}");
+        assert_eq!(after["pid"], before["pid"], "same process: {after}");
+        let listed = h.services.script_list(h.ws.clone()).await.unwrap();
+        assert_eq!(listed["scripts"][0]["autoStart"], true, "{listed}");
+        let store = h.services.store().clone();
+        assert_eq!(
+            store.list_was_running_script_ids().await.unwrap(),
+            vec![(h.ws.to_string(), id.clone())],
+            "boot restore marker kept"
+        );
+        assert_eq!(
+            store
+                .get_script_in_workspace(&h.ws, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .auto_start,
+            Some(true),
+            "persisted"
+        );
+
+        h.services
+            .script_create(
+                h.ws.clone(),
+                ScriptCreateParams {
+                    command: format!("{SERVICE_CMD} # edited"),
+                    auto_start: Some(true),
+                    script_id: Some(id.clone()),
+                    ..params
+                },
+            )
+            .await
+            .expect("edit");
+        let edited = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            edited["status"], "idle",
+            "command edit replaces the run: {edited}"
+        );
     }
 
     /// Boot restores services that were actually running;
