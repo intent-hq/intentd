@@ -779,7 +779,7 @@ impl PgStore {
         };
         // As on SQLite, a malformed stored snapshot decodes to None.
         let current: Option<TokenUsage> = stored.and_then(|s| serde_json::from_str(&s).ok());
-        let usage_rows = self.agent_usage_rows(&mut tx, workspace_id).await?;
+        let usage_rows = self.agent_usage_rows(&mut tx, workspace_id, None).await?;
         let Some(new_usage) = compute(&usage_rows, current.as_ref()) else {
             tx.commit().await.map_err(db)?;
             return Ok(None);

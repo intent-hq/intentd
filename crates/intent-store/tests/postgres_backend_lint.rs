@@ -27,6 +27,13 @@
 //!    call them and the release-graph guard keeps `test-support` out of the
 //!    shipped daemon.
 //!
+//! 5. A function that runs more than one statement on one plain `begin()`
+//!    transaction, directly or through helpers it passes the transaction
+//!    to, uses `begin_read_snapshot()` instead, so its statements see one
+//!    commit as a `SQLite` read transaction does; `MULTI_READ_ALLOWED`
+//!    names the exceptions with a reason. Each statement counts once, so
+//!    one statement run in a loop is not seen.
+//!
 //! Rules 1 and 2 find SQL by use (`support/sql_uses.rs`): the text that
 //! reaches a sqlx call, followed through locals, consts, helpers and
 //! appended text. They check it parsed by sqlparser
@@ -181,6 +188,17 @@ const DEFERRED_WRITES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Plain `begin()` transactions allowed to run more than one statement
+/// without one snapshot, as `(file, function, why)`. Rule 5 sends every
+/// other one to `begin_read_snapshot()`.
+const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[(
+    "repositories.rs",
+    "transfer_table_stats",
+    "reads the transfer tables' columns from pg_catalog, then sums one aggregate of \
+     tenant rows; the catalog read only names the columns, so its commit cannot tear \
+     the aggregate",
+)];
+
 /// Consts the lint does not follow because a test of their own checks
 /// them, as `(file, const, test)`; their literals are not orphans.
 const CHECKED_ELSEWHERE: &[(&str, &str, &str)] = &[(
@@ -218,9 +236,15 @@ fn schema_tables() -> BTreeSet<String> {
 /// needs the writer lock for it as for a plain INSERT.
 fn writing_functions() -> BTreeSet<String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/migrations");
+    // In migration order, so a later `CREATE OR REPLACE` wins.
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("read postgres/migrations")
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    paths.sort();
     let mut bodies = BTreeMap::new();
-    for entry in std::fs::read_dir(&dir).expect("read postgres/migrations") {
-        let sql = std::fs::read_to_string(entry.expect("entry").path())
+    for path in paths {
+        let sql = std::fs::read_to_string(path)
             .expect("read migration")
             .to_lowercase();
         bodies.extend(function_bodies(&sql));
@@ -1434,6 +1458,8 @@ fn the_writer_lock_rule_catches_unlocked_writes() {
         sqlx::query("SELECT intent_provision_tenant($1)").execute(&mut *tx).await; }"#;
     let provision_from = r#"async fn r(&self) { let mut tx = self.begin().await?;
         sqlx::query("SELECT * FROM intent_provision_tenant($1)").execute(&mut *tx).await; }"#;
+    let provision_schema = r#"async fn t(&self) { let mut tx = self.begin().await?;
+        sqlx::query("SELECT public.intent_provision_tenant($1)").execute(&mut *tx).await; }"#;
     let pure = r#"async fn s(&self) { let mut tx = self.begin().await?;
         sqlx::query("SELECT intent_now_iso() FROM t WHERE tenant_id = $1").execute(&mut *tx).await; }"#;
     for ok in [
@@ -1460,6 +1486,7 @@ fn the_writer_lock_rule_catches_unlocked_writes() {
     assert_eq!(unlocked(beside), ["del"]);
     assert_eq!(unlocked(provision), ["o"]);
     assert_eq!(unlocked(provision_from), ["r"]);
+    assert_eq!(unlocked(provision_schema), ["t"]);
     assert_eq!(unlocked(&format!("{locked}\n{read}\n{begin}")), ["b"]);
 }
 
@@ -1878,4 +1905,103 @@ fn writing_functions_come_from_the_migrations() {
     assert_eq!(names, ["a", "b", "c"]);
     assert!(!body_writes(&bodies[0].1) && body_writes(&bodies[1].1) && !body_writes(&bodies[2].1));
     assert!(calls(&bodies[0].1, "b") && !calls(&bodies[2].1, "b"));
+}
+
+/// Rule 5: a read of more than one statement takes one snapshot.
+fn multi_statement_reads(
+    index: &Index,
+    allowed: &[(&str, &str, &str)],
+) -> (Vec<String>, BTreeSet<String>) {
+    let mut found = Vec::new();
+    let mut used = BTreeSet::new();
+    for tx in index.multi_statement_reads() {
+        let file = tx
+            .file
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned());
+        if let Some((_, f, _)) = allowed
+            .iter()
+            .find(|(a, f, _)| Some(*a) == file.as_deref() && *f == tx.function)
+        {
+            used.insert((*f).to_owned());
+            continue;
+        }
+        found.push(format!(
+            "{}:{}: {} runs {} statements on one plain begin() ({}); use begin_read_snapshot()",
+            tx.file.display(),
+            tx.line,
+            tx.function,
+            tx.sinks.len(),
+            tx.sinks.join(", ")
+        ));
+    }
+    (found, used)
+}
+
+#[test]
+fn every_multi_statement_read_takes_one_snapshot() {
+    let (found, used) = multi_statement_reads(&postgres_index(), MULTI_READ_ALLOWED);
+    for (_, f, _) in MULTI_READ_ALLOWED {
+        assert!(
+            used.contains(*f),
+            "MULTI_READ_ALLOWED names {f}, which runs no multi-statement plain read; remove it"
+        );
+    }
+    assert!(
+        found.is_empty(),
+        "these Postgres reads run more than one statement without one snapshot:\n{}",
+        found.join("\n")
+    );
+}
+
+#[test]
+fn multi_statement_plain_reads_need_one_snapshot() {
+    let found = |source: &str, allowed: &[(&str, &str, &str)]| -> Vec<String> {
+        let index = Index::new(&[(PathBuf::from("x.rs"), source.to_owned())], &[]);
+        multi_statement_reads(&index, allowed)
+            .0
+            .into_iter()
+            .map(|f| {
+                f.split(": ")
+                    .nth(1)
+                    .unwrap_or(&f)
+                    .split(' ')
+                    .next()
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect()
+    };
+    let one = r#"async fn a(&self) { let mut tx = self.begin().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    let two = r#"async fn b(&self) { let mut tx = self.begin().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    let snapshot = r#"async fn c(&self) { let mut tx = self.begin_read_snapshot().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    let write = r#"async fn d(&self) { let mut tx = self.begin_write().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    // Helpers count toward the transaction their caller passes them, as a
+    // method or a free function, through `map_err` on the begin().
+    let helpers = r#"async fn e(&self) { let mut tx = self.begin().await.map_err(db)?;
+        self.first(&mut tx).await; second(&mut tx).await; }
+        async fn first(&self, conn: &mut PgConnection) {
+            sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(conn).await; }
+        async fn second(c: &mut PgConnection) {
+            sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *c).await; }"#;
+    // Two transactions of one statement each are two reads, not one.
+    let separate = r#"async fn f(&self) {
+        let mut tx = self.begin().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        let mut tx = self.begin().await?;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    for ok in [one, snapshot, write, separate] {
+        assert_eq!(found(ok, &[]), Vec::<String>::new(), "{ok}");
+    }
+    assert_eq!(found(two, &[]), ["b"]);
+    assert_eq!(found(helpers, &[]), ["e"]);
+    let allowed = [("x.rs", "b", "why")];
+    assert!(found(two, &allowed).is_empty());
 }

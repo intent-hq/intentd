@@ -13,6 +13,10 @@
 use std::time::Duration;
 
 use intent_core::discussion::{DiscussionAuthor, DiscussionTarget, DEFAULT_CONVERSATION};
+use intent_core::nodes::{
+    LeaseOwner, LeaseState, NodeArch, NodeAssignment, NodeCapacity, NodeCheckpoint, NodeCounter,
+    NodeKind, NodeLease, NodeOs, NodePath, NodeRecord, NodeState,
+};
 use intent_core::script_lists::ScriptListOptions;
 use intent_core::{
     AgentId, AgentSession, Error, PrincipalId, Script, ScriptMode, ScriptPurpose, Workspace,
@@ -242,7 +246,7 @@ async fn agent_access_reads_the_conversation_and_grant_from_one_snapshot() {
          VALUES ('{{t}}', '{WS}', 'c1', 'agent-a'); {DELETE_C1}"
     );
     let reader = store.clone();
-    let allowed = read_across_write(&db, tenant, "agent_access_in", &write, async move {
+    let allowed = read_across_write(&db, tenant, "discussion_agent_access", &write, async move {
         reader
             .discussion_agent_access(&ws(), "c1", &aid("agent-a"))
             .await
@@ -389,6 +393,224 @@ async fn script_summary_page_reads_keys_and_rows_from_one_snapshot() {
         .map(|row| row["name"].as_str().unwrap())
         .collect();
     assert_eq!(names.len(), 2, "both keys keep their rows: {names:?}");
+}
+
+#[tokio::test]
+async fn discussion_conversation_reads_its_fallback_chain_from_one_snapshot() {
+    let Some(db) = trapped_db().await else {
+        return;
+    };
+    let tenant = "snap-conversation";
+    let store = open_trapped(&db, tenant).await;
+    workspace(&store).await;
+    exec(
+        &db.admin,
+        format!(
+            "INSERT INTO discussion_conversation (tenant_id, id, workspace_id, kind, \
+             participants_json, created_at) VALUES ('{tenant}', 'p1', '{WS}', 'direct', '[]', '{T0}')"
+        ),
+    )
+    .await;
+    // The private conversation is deleted after the workspace-conversation
+    // lookup missed: on READ COMMITTED the fallback read finds nothing.
+    let write = "DELETE FROM discussion_conversation WHERE tenant_id = '{t}' AND id = 'p1'";
+    let reader = store.clone();
+    let found = read_across_write(&db, tenant, "discussion_conversation", write, async move {
+        reader.discussion_conversation(&ws(), "p1").await
+    })
+    .await
+    .expect("p1 existed as of the snapshot");
+    assert_eq!((found.id.as_str(), found.kind.as_str()), ("p1", "direct"));
+}
+
+#[tokio::test]
+async fn discussion_conversations_read_the_page_and_default_from_one_snapshot() {
+    let Some(db) = trapped_db().await else {
+        return;
+    };
+    let tenant = "snap-conversations";
+    let store = open_trapped(&db, tenant).await;
+    workspace(&store).await;
+    let me = primary(&db, tenant).await;
+    // The default conversation is renamed after the page was read.
+    let write = format!(
+        "INSERT INTO workspace_discussion_conversation (tenant_id, workspace_id, id, name, created_at) \
+         VALUES ('{{t}}', '{WS}', 'default', 'renamed', '{T0}')"
+    );
+    let reader = store.clone();
+    let page = read_across_write(
+        &db,
+        tenant,
+        "discussion_conversations",
+        &write,
+        async move { reader.discussion_conversations(&ws(), &me, None, 10).await },
+    )
+    .await
+    .unwrap();
+    assert_eq!(page["conversations"][0]["id"], DEFAULT_CONVERSATION);
+    assert!(
+        page["conversations"][0]["name"].is_null(),
+        "default as of the page's snapshot: {page}"
+    );
+}
+
+/// A ready node lease and agent `agent-n` placed on it with `repo-a`.
+async fn placed_agent(store: &Store, tenant: &str) -> NodeAssignment {
+    workspace(store).await;
+    agent(store, "agent-n").await;
+    let record = NodeRecord {
+        id: "node-a".into(),
+        head_id: "head-1".into(),
+        node_identity: "identity-node-a".into(),
+        name: format!("{tenant} node"),
+        kind: NodeKind::Static,
+        os: NodeOs::Linux,
+        arch: NodeArch::X86_64,
+        state: NodeState::Offline,
+        draining: false,
+        capacity: NodeCapacity {
+            max_agents: 4,
+            reserved_agents: 0,
+            memory_budget_bytes: 1 << 30,
+            used_memory_bytes: 0,
+            exclusive_reserved: false,
+        },
+        version: "1.0.0".into(),
+        endpoint: Some("wss://node.example:443/node".into()),
+        certificate_sha256: Some("a".repeat(64)),
+        last_seen_at: None,
+    };
+    let initial = NodeLease {
+        owner: LeaseOwner {
+            head_id: record.head_id.clone(),
+            node_id: record.id.clone(),
+            node_identity: record.node_identity.clone(),
+            lease_id: "lease-a".into(),
+            incarnation: "00000000-0000-4000-8000-000000000003".into(),
+        },
+        state: LeaseState::Acquiring,
+        created_at: T0.into(),
+        last_seen_at: None,
+        ack_seq: NodeCounter(0),
+        link_generation: NodeCounter(0),
+        release_requested: false,
+        fence: None,
+    };
+    store.enroll_node(&record, &initial).await.unwrap();
+    let ready = store
+        .record_node_welcome(&initial.owner, NodeOs::Linux, NodeArch::X86_64, 4, "1.0.0")
+        .await
+        .unwrap();
+    store
+        .assign_node_run(&NodeAssignment {
+            agent_id: aid("agent-n"),
+            workspace_id: ws(),
+            owner: ready.owner,
+            run_id: "00000000-0000-4000-8100-000000000003".into(),
+            assignment_epoch: NodeCounter(1),
+            repo_keys: vec!["repo-a".into()],
+            node_path: Some(NodePath("/checkout".into())),
+            active: true,
+            tombstoned: false,
+            inherited_checkpoint_id: None,
+            merge_target_agent_id: None,
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn node_repo_authorization_reads_lease_and_assignment_from_one_snapshot() {
+    let Some(db) = trapped_db().await else {
+        return;
+    };
+    let tenant = "snap-node-repo";
+    let store = open_trapped(&db, tenant).await;
+    let placed = placed_agent(&store, tenant).await;
+    // In one commit the lease loses its dispatch authority and the
+    // assignment gains repo-b: repo-b was never granted under a live lease.
+    let write = "UPDATE node_lease SET record_json = jsonb_set(record_json::jsonb, \
+         '{releaseRequested}', 'true')::text WHERE tenant_id = '{t}' AND id = 'lease-a'; \
+         UPDATE node_assignment SET record_json = jsonb_set(record_json::jsonb, '{repoKeys}', \
+         '[\"repo-a\", \"repo-b\"]')::text WHERE tenant_id = '{t}' AND agent_id = 'agent-n'";
+    let reader = store.clone();
+    let expected = placed.clone();
+    let result = read_across_write(&db, tenant, "authorize_node_repo", write, async move {
+        reader.authorize_node_repo(&expected, "repo-b").await
+    })
+    .await;
+    assert!(
+        matches!(result, Err(Error::NotFound(_))),
+        "repo-b granted on a torn read: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn node_checkpoint_reads_assignment_and_checkpoint_from_one_snapshot() {
+    let Some(db) = trapped_db().await else {
+        return;
+    };
+    let tenant = "snap-node-checkpoint";
+    let store = open_trapped(&db, tenant).await;
+    let placed = placed_agent(&store, tenant).await;
+    let committed = NodeCheckpoint {
+        id: "10000000-0000-4000-8000-000000000001".into(),
+        agent_id: placed.agent_id.clone(),
+        workspace_id: placed.workspace_id.clone(),
+        owner: placed.owner.clone(),
+        run_id: placed.run_id.clone(),
+        assignment_epoch: placed.assignment_epoch,
+        capture_revision: NodeCounter(1),
+        journal_seq: NodeCounter(0),
+        manifest_sha256: "c".repeat(64),
+        captured_at: T0.into(),
+        committed_at: String::new(),
+    };
+    store.next_node_capture_revision(&placed).await.unwrap();
+    // A checkpoint commits after the assignment was read.
+    let write = async {
+        store.commit_node_checkpoint(&committed).await.unwrap();
+    };
+    let reader = store.clone();
+    let current = read_across(tenant, "current_node_checkpoint", write, async move {
+        reader.current_node_checkpoint(&aid("agent-n"), &ws()).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(current, None, "checkpoint committed after the snapshot");
+    assert!(store
+        .current_node_checkpoint(&aid("agent-n"), &ws())
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn workspace_usage_reads_sessions_and_cells_from_one_snapshot() {
+    let Some(db) = trapped_db().await else {
+        return;
+    };
+    let tenant = "snap-usage";
+    let store = open_trapped(&db, tenant).await;
+    workspace(&store).await;
+    agent(&store, "agent-u").await;
+    // A usage cell lands after the session rows were read.
+    let write = "INSERT INTO agent_usage_cell (tenant_id, agent_id, model, input_tokens) \
+                 VALUES ('{t}', 'agent-u', 'm1', 5)";
+    let reader = store.clone();
+    let rows = read_across_write(
+        &db,
+        tenant,
+        "get_workspace_agent_usage_data",
+        write,
+        async move { reader.get_workspace_agent_usage_data(&ws()).await },
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].5.is_empty(), "cell committed after the snapshot");
+    let fresh = store.get_workspace_agent_usage_data(&ws()).await.unwrap();
+    assert_eq!(fresh[0].5.len(), 1);
 }
 
 /// A store for `tenant` with a short writer wait, so a held writer lock

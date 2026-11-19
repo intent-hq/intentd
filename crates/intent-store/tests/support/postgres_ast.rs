@@ -170,8 +170,8 @@ struct Writes {
 }
 
 /// The functions the statements call, anywhere in them (`SELECT f($1)`,
-/// `FROM f($1)`, inside a CTE or a subquery). Names are lower-cased,
-/// unqualified ones bare.
+/// `FROM f($1)`, inside a CTE or a subquery). Names are lower-cased and
+/// without their schema (`public.f` is `f`), as the migrations define them.
 pub fn called_functions(stmts: &[Statement]) -> Vec<String> {
     let mut calls = Calls::default();
     for s in stmts {
@@ -190,7 +190,7 @@ impl Visitor for Calls {
 
     fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
         if let Expr::Function(f) = e {
-            self.names.push(display_name(&f.name));
+            self.names.push(bare_name(&f.name));
         }
         ControlFlow::Continue(())
     }
@@ -202,7 +202,7 @@ impl Visitor for Calls {
                 name,
                 args: Some(_),
                 ..
-            } => self.names.push(display_name(name)),
+            } => self.names.push(bare_name(name)),
             _ => {}
         }
         ControlFlow::Continue(())
@@ -613,6 +613,12 @@ fn last_ident(name: &ObjectName) -> Option<String> {
         .last()
         .and_then(|p| p.as_ident())
         .map(|i| i.value.to_lowercase())
+}
+
+/// [`display_name`] without a schema qualifier.
+fn bare_name(name: &ObjectName) -> String {
+    let full = display_name(name);
+    full.rsplit('.').next().unwrap_or(&full).to_owned()
 }
 
 fn display_name(name: &ObjectName) -> String {
