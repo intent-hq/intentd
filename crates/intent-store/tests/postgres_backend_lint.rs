@@ -27,6 +27,13 @@
 //!    call them and the release-graph guard keeps `test-support` out of the
 //!    shipped daemon.
 //!
+//! 5. A function that runs more than one statement on one plain `begin()`
+//!    transaction, directly or through helpers it passes the transaction
+//!    to, uses `begin_read_snapshot()` instead, so its statements see one
+//!    commit as a `SQLite` read transaction does; `MULTI_READ_ALLOWED`
+//!    names the exceptions with a reason. Each statement counts once, so
+//!    one statement run in a loop is not seen.
+//!
 //! Rules 1 and 2 find SQL by use (`support/sql_uses.rs`): the text that
 //! reaches a sqlx call, followed through locals, consts, helpers and
 //! appended text. They check it parsed by sqlparser
@@ -181,6 +188,17 @@ const DEFERRED_WRITES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Plain `begin()` transactions allowed to run more than one statement
+/// without one snapshot, as `(file, function, why)`. Rule 5 sends every
+/// other one to `begin_read_snapshot()`.
+const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[(
+    "repositories.rs",
+    "transfer_table_stats",
+    "reads the transfer tables' columns from pg_catalog, then sums one aggregate of \
+     tenant rows; the catalog read only names the columns, so its commit cannot tear \
+     the aggregate",
+)];
+
 /// Consts the lint does not follow because a test of their own checks
 /// them, as `(file, const, test)`; their literals are not orphans.
 const CHECKED_ELSEWHERE: &[(&str, &str, &str)] = &[(
@@ -210,6 +228,94 @@ fn schema_tables() -> BTreeSet<String> {
         }
     }
     out
+}
+
+/// The functions the migrations define whose body writes (INSERT INTO,
+/// UPDATE .. SET, DELETE FROM), or calls a function that does. A statement
+/// that calls one writes (`SELECT intent_provision_tenant($1)`), so rule 2
+/// needs the writer lock for it as for a plain INSERT.
+fn writing_functions() -> BTreeSet<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/migrations");
+    // In migration order, so a later `CREATE OR REPLACE` wins.
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("read postgres/migrations")
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    paths.sort();
+    let mut bodies = BTreeMap::new();
+    for path in paths {
+        let sql = std::fs::read_to_string(path)
+            .expect("read migration")
+            .to_lowercase();
+        bodies.extend(function_bodies(&sql));
+    }
+    let mut writing: BTreeSet<String> = bodies
+        .iter()
+        .filter(|(_, body)| body_writes(body))
+        .map(|(name, _)| name.clone())
+        .collect();
+    // Callers of writing functions write too.
+    loop {
+        let more: Vec<String> = bodies
+            .iter()
+            .filter(|(name, body)| {
+                !writing.contains(*name) && writing.iter().any(|w| calls(body, w))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if more.is_empty() {
+            return writing;
+        }
+        writing.extend(more);
+    }
+}
+
+/// `(name, body)` of each `CREATE [OR REPLACE] FUNCTION` in lower-cased
+/// migration SQL; the body is the text between its `$$` quotes.
+fn function_bodies(sql: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = sql;
+    while let Some(at) = rest.find("create ") {
+        rest = &rest[at + "create ".len()..];
+        let head = rest.trim_start();
+        let head = head.strip_prefix("or replace ").unwrap_or(head);
+        let Some(head) = head.strip_prefix("function ") else {
+            continue;
+        };
+        let name: String = head
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        let name = name.rsplit('.').next().unwrap_or(&name).to_owned();
+        let Some(open) = head.find("$$") else { break };
+        let body = &head[open + 2..];
+        let Some(close) = body.find("$$") else { break };
+        out.push((name, body[..close].to_owned()));
+        rest = &body[close + 2..];
+    }
+    out
+}
+
+fn body_writes(body: &str) -> bool {
+    let words: Vec<&str> = body
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.windows(2).enumerate().any(|(i, w)| match w {
+        ["insert", "into"] | ["delete", "from"] => true,
+        ["update", _] => words[i + 1..].iter().take(4).any(|x| *x == "set"),
+        _ => false,
+    })
+}
+
+/// Whether `body` calls function `name`.
+fn calls(body: &str, name: &str) -> bool {
+    body.match_indices(name).any(|(at, _)| {
+        let before = body[..at].chars().next_back();
+        let after = body[at + name.len()..].trim_start();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_') && after.starts_with('(')
+    })
 }
 
 /// The `FROM`/`JOIN`/`INTO`/`UPDATE <table>` of a text that names a table
@@ -254,6 +360,7 @@ fn check(
     let mut tenant = BTreeSet::new();
     let mut unparsed = BTreeSet::new();
     let mut parsed = BTreeSet::new();
+    let writing = writing_functions();
     let uses = index.uses();
     for u in &uses {
         let file_name = u.file.file_name().map(|f| f.to_string_lossy().into_owned());
@@ -299,7 +406,10 @@ fn check(
                         }
                         let writes = postgres_ast::written_tables(&stmts)
                             .into_iter()
-                            .any(|t| !exempt.contains(&t.as_str()));
+                            .any(|t| !exempt.contains(&t.as_str()))
+                            || postgres_ast::called_functions(&stmts)
+                                .iter()
+                                .any(|f| writing.contains(f));
                         match (writes, excuse, &u.lock_problem) {
                             (true, Some((_, f, _)), Some(LockProblem::Hidden)) if u.takes_lock => {
                                 report.deferred_used.insert((*f).to_owned());
@@ -1341,7 +1451,28 @@ fn the_writer_lock_rule_catches_unlocked_writes() {
         }); }"#;
     let beside = r#"async fn del(conn: &mut PgConnection, _w: &mut WriteTx) {
         sqlx::query("DELETE FROM t WHERE tenant_id = $1").execute(conn).await; }"#;
-    for ok in [locked, read, owned, bound, borrowed, ledger, helper] {
+    // Calling a function whose body writes is a write; a pure one is not.
+    let provision = r#"async fn o(&self) { let mut tx = self.begin().await?;
+        sqlx::query("SELECT intent_provision_tenant($1)").execute(&mut *tx).await; }"#;
+    let provision_locked = r#"async fn q(&self) { let mut tx = self.begin_write().await?;
+        sqlx::query("SELECT intent_provision_tenant($1)").execute(&mut *tx).await; }"#;
+    let provision_from = r#"async fn r(&self) { let mut tx = self.begin().await?;
+        sqlx::query("SELECT * FROM intent_provision_tenant($1)").execute(&mut *tx).await; }"#;
+    let provision_schema = r#"async fn t(&self) { let mut tx = self.begin().await?;
+        sqlx::query("SELECT public.intent_provision_tenant($1)").execute(&mut *tx).await; }"#;
+    let pure = r#"async fn s(&self) { let mut tx = self.begin().await?;
+        sqlx::query("SELECT intent_now_iso() FROM t WHERE tenant_id = $1").execute(&mut *tx).await; }"#;
+    for ok in [
+        locked,
+        read,
+        owned,
+        bound,
+        borrowed,
+        ledger,
+        helper,
+        provision_locked,
+        pure,
+    ] {
         assert_eq!(unlocked(ok), Vec::<String>::new(), "{ok}");
     }
     assert_eq!(unlocked(begin), ["b"]);
@@ -1353,6 +1484,9 @@ fn the_writer_lock_rule_catches_unlocked_writes() {
     assert_eq!(unlocked(pool), ["m"]);
     assert_eq!(unlocked(spawned), ["n"]);
     assert_eq!(unlocked(beside), ["del"]);
+    assert_eq!(unlocked(provision), ["o"]);
+    assert_eq!(unlocked(provision_from), ["r"]);
+    assert_eq!(unlocked(provision_schema), ["t"]);
     assert_eq!(unlocked(&format!("{locked}\n{read}\n{begin}")), ["b"]);
 }
 
@@ -1751,4 +1885,123 @@ fn the_test_gate_rule_needs_the_cfg_on_the_forwarder() {
     );
     assert!(!sqlite_only_forwarder_is_test_gated(elsewhere, "pool"));
     assert!(!sqlite_only_forwarder_is_test_gated(gated, "other"));
+}
+
+#[test]
+fn writing_functions_come_from_the_migrations() {
+    let writing = writing_functions();
+    // Writes seed rows; a trigger function writes its side tables.
+    assert!(writing.contains("intent_provision_tenant"), "{writing:?}");
+    // Pure helpers do not write.
+    for pure in ["intent_now_iso", "sqlite_json_extract"] {
+        assert!(!writing.contains(pure), "{pure} does not write");
+    }
+    let sql = "create or replace function public.a() returns void language sql as $$ \
+               select b(1) $$; create function b(x int) returns void language plpgsql as $$ \
+               begin update t set y = 1; end $$; create function c() returns int as $$ \
+               select 1 from updates $$;";
+    let bodies = function_bodies(sql);
+    let names: Vec<&str> = bodies.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["a", "b", "c"]);
+    assert!(!body_writes(&bodies[0].1) && body_writes(&bodies[1].1) && !body_writes(&bodies[2].1));
+    assert!(calls(&bodies[0].1, "b") && !calls(&bodies[2].1, "b"));
+}
+
+/// Rule 5: a read of more than one statement takes one snapshot.
+fn multi_statement_reads(
+    index: &Index,
+    allowed: &[(&str, &str, &str)],
+) -> (Vec<String>, BTreeSet<String>) {
+    let mut found = Vec::new();
+    let mut used = BTreeSet::new();
+    for tx in index.multi_statement_reads() {
+        let file = tx
+            .file
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned());
+        if let Some((_, f, _)) = allowed
+            .iter()
+            .find(|(a, f, _)| Some(*a) == file.as_deref() && *f == tx.function)
+        {
+            used.insert((*f).to_owned());
+            continue;
+        }
+        found.push(format!(
+            "{}:{}: {} runs {} statements on one plain begin() ({}); use begin_read_snapshot()",
+            tx.file.display(),
+            tx.line,
+            tx.function,
+            tx.sinks.len(),
+            tx.sinks.join(", ")
+        ));
+    }
+    (found, used)
+}
+
+#[test]
+fn every_multi_statement_read_takes_one_snapshot() {
+    let (found, used) = multi_statement_reads(&postgres_index(), MULTI_READ_ALLOWED);
+    for (_, f, _) in MULTI_READ_ALLOWED {
+        assert!(
+            used.contains(*f),
+            "MULTI_READ_ALLOWED names {f}, which runs no multi-statement plain read; remove it"
+        );
+    }
+    assert!(
+        found.is_empty(),
+        "these Postgres reads run more than one statement without one snapshot:\n{}",
+        found.join("\n")
+    );
+}
+
+#[test]
+fn multi_statement_plain_reads_need_one_snapshot() {
+    let found = |source: &str, allowed: &[(&str, &str, &str)]| -> Vec<String> {
+        let index = Index::new(&[(PathBuf::from("x.rs"), source.to_owned())], &[]);
+        multi_statement_reads(&index, allowed)
+            .0
+            .into_iter()
+            .map(|f| {
+                f.split(": ")
+                    .nth(1)
+                    .unwrap_or(&f)
+                    .split(' ')
+                    .next()
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect()
+    };
+    let one = r#"async fn a(&self) { let mut tx = self.begin().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    let two = r#"async fn b(&self) { let mut tx = self.begin().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    let snapshot = r#"async fn c(&self) { let mut tx = self.begin_read_snapshot().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    let write = r#"async fn d(&self) { let mut tx = self.begin_write().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    // Helpers count toward the transaction their caller passes them, as a
+    // method or a free function, through `map_err` on the begin().
+    let helpers = r#"async fn e(&self) { let mut tx = self.begin().await.map_err(db)?;
+        self.first(&mut tx).await; second(&mut tx).await; }
+        async fn first(&self, conn: &mut PgConnection) {
+            sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(conn).await; }
+        async fn second(c: &mut PgConnection) {
+            sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *c).await; }"#;
+    // Two transactions of one statement each are two reads, not one.
+    let separate = r#"async fn f(&self) {
+        let mut tx = self.begin().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        let mut tx = self.begin().await?;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    for ok in [one, snapshot, write, separate] {
+        assert_eq!(found(ok, &[]), Vec::<String>::new(), "{ok}");
+    }
+    assert_eq!(found(two, &[]), ["b"]);
+    assert_eq!(found(helpers, &[]), ["e"]);
+    let allowed = [("x.rs", "b", "why")];
+    assert!(found(two, &allowed).is_empty());
 }

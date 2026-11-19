@@ -1479,9 +1479,11 @@ impl PgStore {
         expected: &NodeAssignment,
         repo_key: &str,
     ) -> Result<()> {
-        let mut tx = self.begin().await?;
+        // The lease and the assignment come from one snapshot.
+        let mut tx = self.begin_read_snapshot().await?;
         let current_lease = self.lease(&mut tx, &expected.owner).await?;
         dispatchable(&current_lease)?;
+        super::read_seam::probe::between(self.tenant(), "authorize_node_repo").await;
         let current = self
             .assignment(&mut tx, &expected.agent_id)
             .await?
@@ -1654,7 +1656,8 @@ impl PgStore {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<NodeCheckpoint>> {
-        let mut tx = self.begin().await?;
+        // The assignment and its checkpoint come from one snapshot.
+        let mut tx = self.begin_read_snapshot().await?;
         let record = self
             .assignment(&mut tx, agent_id)
             .await?
@@ -1662,6 +1665,7 @@ impl PgStore {
         if record.workspace_id != *workspace_id {
             return Err(Error::NotFound("assignment workspace".into()));
         }
+        super::read_seam::probe::between(self.tenant(), "current_node_checkpoint").await;
         let current = self.current_checkpoint(&mut tx, agent_id).await?;
         tx.commit().await.map_err(db)?;
         Ok(current)

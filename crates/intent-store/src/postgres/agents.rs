@@ -1495,17 +1495,27 @@ impl PgStore {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentUsageRow>> {
-        let mut tx = self.begin().await?;
-        let rows = self.agent_usage_rows(&mut tx, workspace_id).await?;
+        // Sessions, usage cells and the rest come from one snapshot.
+        let mut tx = self.begin_read_snapshot().await?;
+        let rows = self
+            .agent_usage_rows(
+                &mut tx,
+                workspace_id,
+                Some("get_workspace_agent_usage_data"),
+            )
+            .await?;
         tx.commit().await.map_err(db)?;
         Ok(rows)
     }
 
     /// `fetch_agent_usage_rows` in `agent_repo.rs`, on the caller's connection.
+    /// A reader names itself in `probe` for the test seam that pauses it
+    /// after the session read; writers pass `None`.
     pub(super) async fn agent_usage_rows(
         &self,
         conn: &mut PgConnection,
         workspace_id: &WorkspaceId,
+        probe: Option<&'static str>,
     ) -> Result<Vec<AgentUsageRow>> {
         let session_rows = sqlx::query(
             "SELECT id, name, COALESCE(NULLIF(resolved_model, ''), model) AS model, \
@@ -1529,6 +1539,9 @@ impl PgStore {
                 Vec::new(),
                 col::<Option<String>>(row, "name")?.unwrap_or_default(),
             ));
+        }
+        if let Some(reader) = probe {
+            super::read_seam::probe::between(self.tenant(), reader).await;
         }
         let by_agent: HashMap<String, usize> = result
             .iter()
@@ -3456,7 +3469,13 @@ impl PgStore {
         if session.trim().is_empty() || session.len() > 256 || session.contains('\0') {
             return Err(unavailable());
         }
-        let mut tx = self.begin().await.map_err(|_| unavailable())?;
+        // The enrollment and the private-session check come from one
+        // snapshot: an enrollment written in between must not turn "none"
+        // into "unavailable".
+        let mut tx = self
+            .begin_read_snapshot()
+            .await
+            .map_err(|_| unavailable())?;
         let row: Option<(String, i64)> = sqlx::query_as(
             "SELECT e.owner_key, e.version FROM review_context_enrollment e \
              JOIN agent_session s ON s.tenant_id = $1 AND s.id = e.agent_id \
@@ -3471,6 +3490,7 @@ impl PgStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| unavailable())?;
+        super::read_seam::probe::between(self.tenant(), "get_review_context_enrollment").await;
         let Some((key, version)) = row else {
             let private: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM review_context_private_family \

@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::Row;
 
+use super::read_seam::probe::between;
 use super::{db, PgStore, WriteTx};
 use crate::discussion_activity_repo::DiscussionActivityReceipt;
 use crate::discussion_agent_repo::DiscussionDelivery;
@@ -140,6 +141,18 @@ async fn read_conversation(
     ws: &WorkspaceId,
     id: &str,
 ) -> Result<DiscussionConversation> {
+    read_conversation_probed(c, tenant, ws, id, None).await
+}
+
+/// [`read_conversation`]; a reader names itself in `probe` for the test seam
+/// that pauses it after the workspace-conversation lookup misses.
+async fn read_conversation_probed(
+    c: &mut PgConnection,
+    tenant: &str,
+    ws: &WorkspaceId,
+    id: &str,
+    probe: Option<&'static str>,
+) -> Result<DiscussionConversation> {
     if let Some(row) = sqlx::query(
         "SELECT name, created_at, deleted_at FROM workspace_discussion_conversation \
          WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3",
@@ -162,6 +175,9 @@ async fn read_conversation(
             participants: vec![],
             created_at: col(&row, "created_at")?,
         });
+    }
+    if let Some(reader) = probe {
+        between(tenant, reader).await;
     }
     if id == DEFAULT_CONVERSATION {
         let created_at: String =
@@ -220,11 +236,34 @@ async fn agent_access_in(
     conversation: &str,
     agent: &AgentId,
 ) -> Result<bool> {
+    Ok(
+        workspace_conversation_in(c, tenant, ws, conversation).await?
+            && agent_grant_in(c, tenant, ws, conversation, agent).await?,
+    )
+}
+
+/// Whether `conversation` is a live workspace conversation of `ws`.
+async fn workspace_conversation_in(
+    c: &mut PgConnection,
+    tenant: &str,
+    ws: &WorkspaceId,
+    conversation: &str,
+) -> Result<bool> {
     match read_conversation(c, tenant, ws, conversation).await {
-        Ok(found) if found.kind == "workspace" => {}
-        Ok(_) | Err(Error::NotFound(_)) => return Ok(false),
-        Err(error) => return Err(error),
+        Ok(found) => Ok(found.kind == "workspace"),
+        Err(Error::NotFound(_)) => Ok(false),
+        Err(error) => Err(error),
     }
+}
+
+/// Whether live agent `agent` holds a grant on `conversation`.
+async fn agent_grant_in(
+    c: &mut PgConnection,
+    tenant: &str,
+    ws: &WorkspaceId,
+    conversation: &str,
+    agent: &AgentId,
+) -> Result<bool> {
     sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM discussion_agent_grant g \
          JOIN agent_session a ON a.tenant_id = $1 AND a.id = g.agent_id AND a.workspace_id = g.workspace_id \
@@ -586,8 +625,16 @@ impl PgStore {
         ws: &WorkspaceId,
         id: &str,
     ) -> Result<DiscussionConversation> {
-        let mut tx = self.begin().await?;
-        let found = read_conversation(&mut tx, self.tenant(), ws, id).await?;
+        // `read_conversation` falls back to another table when one has no row.
+        let mut tx = self.begin_read_snapshot().await?;
+        let found = read_conversation_probed(
+            &mut tx,
+            self.tenant(),
+            ws,
+            id,
+            Some("discussion_conversation"),
+        )
+        .await?;
         tx.commit().await.map_err(db)?;
         Ok(found)
     }
@@ -653,7 +700,8 @@ impl PgStore {
         let cursor = before
             .filter(|id| *id != DEFAULT_CONVERSATION)
             .unwrap_or("~");
-        let mut tx = self.begin().await?;
+        // The page and the default conversation come from one snapshot.
+        let mut tx = self.begin_read_snapshot().await?;
         let rows = sqlx::query(
             "SELECT * FROM (\
              SELECT c.id, c.workspace_id, c.kind, c.participants_json, c.created_at, NULL::text AS name \
@@ -673,6 +721,7 @@ impl PgStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
+        between(self.tenant(), "discussion_conversations").await;
         let mut conversations = Vec::new();
         if before.is_none() {
             match read_conversation(&mut tx, self.tenant(), ws, DEFAULT_CONVERSATION).await {
@@ -1107,7 +1156,9 @@ impl PgStore {
         before: Option<&str>,
         limit: u32,
     ) -> Result<Value> {
-        let mut tx = self.begin().await?;
+        // The granted ids and their conversations come from one snapshot: a
+        // conversation deleted in between would otherwise fail the page.
+        let mut tx = self.begin_read_snapshot().await?;
         let ids: Vec<String> = sqlx::query_scalar(
             "SELECT g.conversation_id FROM discussion_agent_grant g \
              JOIN agent_session a ON a.tenant_id = $1 AND a.id = g.agent_id AND a.workspace_id = g.workspace_id \
@@ -1123,6 +1174,7 @@ impl PgStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
+        between(self.tenant(), "discussion_agent_conversations").await;
         let has_more = ids.len() > limit as usize;
         let mut conversations = vec![];
         for id in ids.into_iter().take(limit as usize) {
@@ -1138,8 +1190,13 @@ impl PgStore {
         conversation: &str,
         agent: &AgentId,
     ) -> Result<bool> {
-        let mut tx = self.begin().await?;
-        let allowed = agent_access_in(&mut tx, self.tenant(), ws, conversation, agent).await?;
+        // The conversation and the grant come from one snapshot.
+        let tenant = self.tenant();
+        let mut tx = self.begin_read_snapshot().await?;
+        let allowed = workspace_conversation_in(&mut tx, tenant, ws, conversation).await? && {
+            between(tenant, "discussion_agent_access").await;
+            agent_grant_in(&mut tx, tenant, ws, conversation, agent).await?
+        };
         tx.commit().await.map_err(db)?;
         Ok(allowed)
     }
@@ -1533,8 +1590,10 @@ impl PgStore {
         actor: &DiscussionActor,
     ) -> Result<DiscussionReactionState> {
         let tenant = self.tenant();
-        let mut tx = self.begin().await?;
+        // The access check and the state come from one snapshot.
+        let mut tx = self.begin_read_snapshot().await?;
         authorize(&mut tx, tenant, ws, conversation, actor).await?;
+        between(tenant, "discussion_actor_reaction_state").await;
         let result = reaction_state(&mut tx, tenant, ws, conversation, message_id, actor).await?;
         tx.commit().await.map_err(db)?;
         Ok(result)

@@ -68,6 +68,7 @@ pub(crate) mod pr_monitors;
 mod presence_focus;
 mod principals;
 mod purge;
+mod read_seam;
 mod repositories;
 mod script_monitors;
 mod scripts;
@@ -80,6 +81,11 @@ mod workspaces;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use purge::probe as delete_probe;
+
+/// Test seam that pauses a multi-statement read between its statements.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use read_seam::probe as read_probe;
 
 /// Postgres schema migrations, separate from the `SQLite` ones.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./postgres/migrations");
@@ -677,14 +683,49 @@ impl PgStore {
 
     /// Every operation runs in one transaction bound to this store's tenant.
     /// A checkout past the pool's acquire timeout is [`Error::StoreBusy`].
+    ///
+    /// Plain `begin()` runs at READ COMMITTED: each statement sees the
+    /// commits made before it started. Use it for writes (through
+    /// [`Self::begin_write`]) and for reads of one statement; a read of more
+    /// than one statement takes [`Self::begin_read_snapshot`].
     pub(crate) async fn begin(&self) -> Result<Transaction<'static, Postgres>> {
-        let mut tx = self.pool.begin().await.map_err(|e| match e {
+        let tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| self.checkout_error(e))?;
+        self.bind_tenant(tx).await
+    }
+
+    /// A read-only transaction whose statements all see one snapshot
+    /// (`REPEATABLE READ`, taken at its first statement), bound to this
+    /// store's tenant. `SQLite` reads that run more than one statement on one
+    /// read connection see one WAL snapshot; this is the Postgres match, so
+    /// a check and the data it guards, or keys and the rows they page, come
+    /// from the same commit. A read-only snapshot never fails to serialize.
+    pub(crate) async fn begin_read_snapshot(&self) -> Result<Transaction<'static, Postgres>> {
+        let tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .await
+            .map_err(|e| self.checkout_error(e))?;
+        self.bind_tenant(tx).await
+    }
+
+    fn checkout_error(&self, e: sqlx::Error) -> Error {
+        match e {
             sqlx::Error::PoolTimedOut => Error::StoreBusy(format!(
                 "no postgres connection came free within {} ms",
                 self.pool.options().get_acquire_timeout().as_millis()
             )),
             e => db(e),
-        })?;
+        }
+    }
+
+    async fn bind_tenant(
+        &self,
+        mut tx: Transaction<'static, Postgres>,
+    ) -> Result<Transaction<'static, Postgres>> {
         if self.options.rls_guard {
             sqlx::query("SELECT set_config('intent.tenant_id', $1, true)")
                 .bind(self.tenant())
@@ -797,7 +838,8 @@ impl crate::Store {
     /// for one tenant park at most one connection in the writer lock.
     ///
     /// # Errors
-    /// `Error::Internal` when provisioning fails.
+    /// `Error::Internal` when provisioning fails; `Error::StoreBusy` when the
+    /// tenant's writer lock stays held past the writer wait budget.
     pub async fn open_postgres(
         pool: PgPool,
         tenant: TenantId,
@@ -817,7 +859,9 @@ impl crate::Store {
             writer_slot: shared.writer_slot.clone(),
             tenant_state: shared,
         };
-        let mut tx = store.begin().await?;
+        // Provisioning writes the tenant's seed rows, so it runs under the
+        // writer lock like every other write (the lint sees the call as one).
+        let mut tx = store.begin_write().await?;
         sqlx::query("SELECT intent_provision_tenant($1)")
             .bind(store.tenant())
             .execute(&mut *tx)

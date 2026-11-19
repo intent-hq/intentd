@@ -18,8 +18,7 @@ use std::fmt::Write as _;
 use intent_core::{
     AgentId, AgentListRowScope, AgentMessage, AgentSession, Error, Result, WorkspaceId,
 };
-use sqlx::postgres::{PgConnection, PgRow, Postgres};
-use sqlx::Transaction;
+use sqlx::postgres::{PgConnection, PgRow};
 use uuid::Uuid;
 
 use super::agents::map_session;
@@ -305,23 +304,6 @@ async fn update_session_previews(
 }
 
 impl PgStore {
-    /// A read-only transaction with one snapshot for all its statements.
-    async fn begin_read_snapshot(&self) -> Result<Transaction<'static, Postgres>> {
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .await
-            .map_err(db)?;
-        if self.options.rls_guard {
-            sqlx::query("SELECT set_config('intent.tenant_id', $1, true)")
-                .bind(self.tenant())
-                .execute(&mut *tx)
-                .await
-                .map_err(db)?;
-        }
-        Ok(tx)
-    }
-
     pub async fn search_agent_messages_fts(
         &self,
         match_expr: &str,

@@ -481,6 +481,17 @@ pub struct Use {
     pub takes_lock: bool,
 }
 
+/// A plain `begin()` transaction that runs more than one sink.
+pub struct PlainTx {
+    pub file: PathBuf,
+    /// The function that opens it.
+    pub function: String,
+    /// Where it is bound.
+    pub line: usize,
+    /// `function:line` of each sink it runs.
+    pub sinks: Vec<String>,
+}
+
 /// A binding of a local name, where it is made. A `let` (or `for`,
 /// closure parameter) shadows earlier bindings; an assignment adds one.
 #[derive(Clone)]
@@ -817,6 +828,115 @@ impl Index {
             any = true;
         }
         any
+    }
+
+    /// Plain `begin()` transactions that run more than one sink, directly
+    /// or through helpers they pass the transaction to. Each sink counts
+    /// once however often it runs, so a single sink in a loop is not seen.
+    pub fn multi_statement_reads(&self) -> Vec<PlainTx> {
+        let mut by_origin: BTreeMap<(usize, Pos), BTreeSet<(usize, Pos)>> = BTreeMap::new();
+        for s in self.sinks.iter().filter(|s| !s.in_spawn) {
+            if s.candidate {
+                let mut sources = Vec::new();
+                self.resolve(&s.arg, s.function, 0, &mut BTreeSet::new(), &mut sources);
+                if !sources.iter().any(|x| matches!(x.sql, Sql::Text { .. })) {
+                    continue;
+                }
+            }
+            let f = &self.fns[s.function];
+            let mut executors: Vec<&Expr> = s.executor.iter().collect();
+            for l in self.links.iter().filter(|l| l.function == s.function) {
+                let hit = match &l.target {
+                    LinkTarget::Sink(p) => *p == s.pos,
+                    LinkTarget::Name(n) => f.sink_names.iter().any(|(m, p)| m == n && *p == s.pos),
+                    LinkTarget::Closure(c) => f
+                        .closures
+                        .iter()
+                        .any(|(name, a, b)| name == c && *a <= s.pos && s.pos <= *b),
+                };
+                if hit {
+                    executors.push(&l.executor);
+                }
+            }
+            let mut origins = BTreeSet::new();
+            for e in executors {
+                self.plain_origins(e, s.function, 0, &mut origins);
+            }
+            for o in origins {
+                by_origin.entry(o).or_default().insert((s.function, s.pos));
+            }
+        }
+        by_origin
+            .into_iter()
+            .filter(|(_, sinks)| sinks.len() > 1)
+            .map(|((at, pos), sinks)| PlainTx {
+                file: self.files[self.fns[at].file].clone(),
+                function: self.fns[at].name.clone(),
+                line: pos.line,
+                sinks: sinks
+                    .into_iter()
+                    .map(|(f, p)| format!("{}:{}", self.fns[f].name, p.line))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The plain `begin()` bindings an executor expression can come from,
+    /// as `(function, binding position)`: through locals, and parameters
+    /// through every caller's argument.
+    fn plain_origins(
+        &self,
+        executor: &Expr,
+        at: usize,
+        depth: usize,
+        out: &mut BTreeSet<(usize, Pos)>,
+    ) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        let Expr::Path(path) = strip_executor(executor) else {
+            return;
+        };
+        let Some(name) = path.path.get_ident().map(ToString::to_string) else {
+            return;
+        };
+        let facts = &self.fns[at];
+        let used: Pos = path.span().start().into();
+        let before: Vec<&Local> = facts
+            .locals
+            .get(&name)
+            .map(|ls| ls.iter().filter(|l| l.pos < used).collect())
+            .unwrap_or_default();
+        if !before.is_empty() {
+            let from = before.iter().rposition(|l| l.is_let).unwrap_or(0);
+            for l in &before[from..] {
+                if let Binding::Value(v) = &l.binding {
+                    if is_plain_begin(v) {
+                        out.insert((at, l.pos));
+                    } else {
+                        self.plain_origins(v, at, depth + 1, out);
+                    }
+                }
+            }
+            return;
+        }
+        let Some(index) = facts
+            .params
+            .iter()
+            .position(|q| q.as_deref() == Some(&name))
+        else {
+            return;
+        };
+        for call in self.callers(at) {
+            let arg_at = if !call.method && facts.has_self {
+                index + 1
+            } else {
+                index
+            };
+            if let Some(arg) = call.args.get(arg_at) {
+                self.plain_origins(arg, call.caller, depth + 1, out);
+            }
+        }
     }
 
     fn callers(&self, f: usize) -> impl Iterator<Item = &CallSite> {
@@ -1544,6 +1664,17 @@ fn is_begin_write(e: &Expr) -> bool {
                     .is_some_and(|(_, e)| is_begin_write(e))
         }
         Expr::Match(m) => !m.arms.is_empty() && m.arms.iter().all(|a| is_begin_write(&a.body)),
+        _ => false,
+    }
+}
+
+/// Whether `e` is a plain `begin()` transaction (not `begin_write()` or
+/// `begin_read_snapshot()`), through `.await`, `?` and method calls on it.
+fn is_plain_begin(e: &Expr) -> bool {
+    match strip(e) {
+        Expr::Try(t) => is_plain_begin(&t.expr),
+        Expr::Await(a) => is_plain_begin(&a.base),
+        Expr::MethodCall(m) => m.method == "begin" || is_plain_begin(&m.receiver),
         _ => false,
     }
 }
