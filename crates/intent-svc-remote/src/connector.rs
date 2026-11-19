@@ -1703,16 +1703,37 @@ impl Shared {
         let Some(services) = &self.services else {
             return;
         };
-        if services.home_setups().output(
+        match services.home_setups().output(
             &home.workspace_id,
             &home.home_id,
             seq,
             data,
             std::time::Instant::now(),
         ) {
-            services
-                .publish_workspace_home_changed(&home.workspace_id)
-                .await;
+            intent_services::home_setup::OutputAnnounce::Now => {
+                services
+                    .publish_workspace_home_changed(&home.workspace_id)
+                    .await;
+            }
+            intent_services::home_setup::OutputAnnounce::After(delay) => {
+                // One trailing announcement, so the last output is not left
+                // unannounced until the next state change.
+                let services = services.clone();
+                let home = home.clone();
+                intent_core::spawn_daemon(async move {
+                    tokio::time::sleep(delay).await;
+                    if services.home_setups().flush_output(
+                        &home.workspace_id,
+                        &home.home_id,
+                        std::time::Instant::now(),
+                    ) {
+                        services
+                            .publish_workspace_home_changed(&home.workspace_id)
+                            .await;
+                    }
+                });
+            }
+            intent_services::home_setup::OutputAnnounce::No => {}
         }
     }
 

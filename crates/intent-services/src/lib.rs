@@ -17952,6 +17952,7 @@ impl Services {
                     publish_event(bus.as_ref(), workspace_deleted_event(&id)).await;
                     // The delete retired the workspace's home: its machine
                     // gets the stop now (or after its next bind).
+                    services.home_setups.forget(&id);
                     services
                         .ports
                         .remote_launch()
@@ -39168,6 +39169,7 @@ impl Services {
             };
             // The archive retired the workspace's home: its machine gets
             // the stop now (or after its next bind).
+            this.home_setups.forget(&id);
             this.ports.remote_launch().send_home_stops(&this, &id).await;
             if automatic {
                 match this

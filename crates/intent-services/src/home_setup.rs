@@ -29,23 +29,69 @@ pub struct HomeSetupFinished {
 struct Entry {
     home_id: HomeId,
     status: RemoteSetupStatus,
-    /// The open itself failed (not the setup script): the next open at the
-    /// machine's bind makes the checkout again, so it reports again.
-    open_failed: bool,
+    /// How the open went, beyond `status`.
+    open: Open,
     output: String,
     truncated: bool,
     published: Option<Instant>,
+    /// A trailing announcement of throttled output is scheduled.
+    trailing: bool,
+}
+
+/// How a home's open went, beyond its `status`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Open {
+    /// Opened (or opening) as usual.
+    Normal,
+    /// The open itself failed (not the setup script). The machine may still
+    /// have made the checkout (its reply was lost), so its setup records
+    /// still apply; the next open at the machine's bind reports again.
+    Failed,
+    /// Opened again after a failed open, and no output has come since: a
+    /// `ready` answer then means the machine already held the checkout.
+    Reopened,
+    /// Taken as ready after a reopen answered `ready` with no output: setup
+    /// records that still come move it on.
+    AssumedReady,
 }
 
 impl Entry {
     fn is(&self, home_id: &HomeId) -> bool {
         &self.home_id == home_id
     }
+
+    /// Whether the machine's setup records may still move this entry on:
+    /// not once a setup it reported has finished.
+    fn takes_records(&self) -> bool {
+        matches!(
+            self.status.state,
+            RemoteSetupState::Pending | RemoteSetupState::Running
+        ) || matches!(self.open, Open::Failed | Open::AssumedReady)
+    }
+
+    fn set(&mut self, status: RemoteSetupStatus) {
+        self.status = status;
+        self.open = Open::Normal;
+    }
+}
+
+/// When to announce kept output (see [`HomeSetups::output`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputAnnounce {
+    /// Now.
+    Now,
+    /// After this delay, then call [`HomeSetups::flush_output`].
+    After(Duration),
+    /// Not now: an announcement is already scheduled, or the output was
+    /// dropped.
+    No,
 }
 
 /// Every home's opening this backend lifetime has seen, by workspace.
 /// Shared across `Services` clones. Each change returns whether the home's
-/// `setup` changed, so the caller announces it.
+/// `setup` changed, so the caller announces it. Memory stays bounded: one
+/// entry per workspace, a ready home keeps no output, and a deleted or
+/// archived workspace's entry is forgotten.
 #[derive(Clone, Default)]
 pub struct HomeSetups(Arc<Mutex<HashMap<WorkspaceId, Entry>>>);
 
@@ -56,6 +102,20 @@ impl HomeSetups {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn with<T>(
+        &self,
+        workspace_id: &WorkspaceId,
+        home_id: &HomeId,
+        default: T,
+        f: impl FnOnce(&mut Entry) -> T,
+    ) -> T {
+        let mut map = self.lock();
+        match map.get_mut(workspace_id).filter(|e| e.is(home_id)) {
+            Some(entry) => f(entry),
+            None => default,
+        }
+    }
+
     /// `home_id` is being opened for the first time (a new home at
     /// `workspace.create`): `pending`, with no output yet.
     pub fn opening(&self, workspace_id: &WorkspaceId, home_id: &HomeId) {
@@ -64,52 +124,70 @@ impl HomeSetups {
             Entry {
                 home_id: home_id.clone(),
                 status: RemoteSetupStatus::pending(),
-                open_failed: false,
+                open: Open::Normal,
                 output: String::new(),
                 truncated: false,
                 published: None,
+                trailing: false,
             },
         );
     }
 
     /// The home is opened again (at its machine's bind). Only a home whose
-    /// open failed goes back to `pending`: one whose checkout exists runs
-    /// nothing again.
+    /// open failed goes back to `pending`.
     #[must_use = "true when the home's setup changed: announce it"]
     pub fn reopening(&self, workspace_id: &WorkspaceId, home_id: &HomeId) -> bool {
-        let mut map = self.lock();
-        let Some(entry) = map.get_mut(workspace_id).filter(|e| e.is(home_id)) else {
-            return false;
-        };
-        if !entry.open_failed {
-            return false;
-        }
-        entry.status = RemoteSetupStatus::pending();
-        entry.open_failed = false;
-        entry.output.clear();
-        entry.truncated = false;
-        true
+        self.with(workspace_id, home_id, false, |entry| {
+            if entry.open != Open::Failed {
+                return false;
+            }
+            entry.set(RemoteSetupStatus::pending());
+            entry.open = Open::Reopened;
+            entry.output.clear();
+            entry.truncated = false;
+            true
+        })
     }
 
-    /// The machine could not open the home (or could not be reached):
-    /// `failed` with `error`, while it was `pending`.
+    /// The machine answered the open `ready`. A first open's setup records
+    /// follow. A reopen that saw no checkout output found the checkout the
+    /// machine already held, which runs nothing again: the home is ready
+    /// (setup records that still come move it on).
+    #[must_use = "true when the home's setup changed: announce it"]
+    pub fn opened(&self, workspace_id: &WorkspaceId, home_id: &HomeId) -> bool {
+        self.with(workspace_id, home_id, false, |entry| {
+            if entry.open != Open::Reopened || entry.status.state != RemoteSetupState::Pending {
+                return false;
+            }
+            entry.set(RemoteSetupStatus {
+                state: RemoteSetupState::Completed,
+                finished_at: Some(intent_core::now_iso()),
+                ..RemoteSetupStatus::pending()
+            });
+            entry.open = Open::AssumedReady;
+            entry.output = String::new();
+            entry.truncated = false;
+            true
+        })
+    }
+
+    /// The machine could not open the home (or could not be reached, or its
+    /// answer was lost): `failed` with `error`, while it was `pending`.
     #[must_use = "true when the home's setup changed: announce it"]
     pub fn open_failed(&self, workspace_id: &WorkspaceId, home_id: &HomeId, error: &str) -> bool {
-        let mut map = self.lock();
-        let Some(entry) = map.get_mut(workspace_id).filter(|e| e.is(home_id)) else {
-            return false;
-        };
-        if entry.status.state != RemoteSetupState::Pending {
-            return false;
-        }
-        entry.status = RemoteSetupStatus {
-            state: RemoteSetupState::Failed,
-            error: Some(RemoteSetupStatus::capped_error(error)),
-            finished_at: Some(intent_core::now_iso()),
-            ..RemoteSetupStatus::pending()
-        };
-        entry.open_failed = true;
-        true
+        self.with(workspace_id, home_id, false, |entry| {
+            if entry.status.state != RemoteSetupState::Pending {
+                return false;
+            }
+            entry.set(RemoteSetupStatus {
+                state: RemoteSetupState::Failed,
+                error: Some(RemoteSetupStatus::capped_error(error)),
+                finished_at: Some(intent_core::now_iso()),
+                ..RemoteSetupStatus::pending()
+            });
+            entry.open = Open::Failed;
+            true
+        })
     }
 
     /// The checkout exists and the setup script started (`setupStarted`).
@@ -121,22 +199,21 @@ impl HomeSetups {
         home_id: &HomeId,
         started_at: &str,
     ) -> bool {
-        let mut map = self.lock();
-        let Some(entry) = map.get_mut(workspace_id).filter(|e| e.is(home_id)) else {
-            return false;
-        };
-        if entry.status.state != RemoteSetupState::Pending {
-            return false;
-        }
-        entry.status = RemoteSetupStatus {
-            state: RemoteSetupState::Running,
-            started_at: Some(started_at.to_owned()),
-            ..RemoteSetupStatus::pending()
-        };
-        true
+        self.with(workspace_id, home_id, false, |entry| {
+            if !entry.takes_records() || entry.status.state == RemoteSetupState::Running {
+                return false;
+            }
+            entry.set(RemoteSetupStatus {
+                state: RemoteSetupState::Running,
+                started_at: Some(started_at.to_owned()),
+                ..RemoteSetupStatus::pending()
+            });
+            true
+        })
     }
 
     /// The setup finished (`setupFinished`): completed, skipped or failed.
+    /// A ready home drops its output.
     #[must_use = "true when the home's setup changed: announce it"]
     pub fn setup_finished(
         &self,
@@ -144,32 +221,41 @@ impl HomeSetups {
         home_id: &HomeId,
         finished: HomeSetupFinished,
     ) -> bool {
-        let mut map = self.lock();
-        let Some(entry) = map.get_mut(workspace_id).filter(|e| e.is(home_id)) else {
-            return false;
-        };
-        let started_at = match entry.status.state {
-            RemoteSetupState::Pending => None,
-            RemoteSetupState::Running => entry.status.started_at.clone(),
-            _ => return false,
-        };
-        entry.status = RemoteSetupStatus {
-            state: finished.state,
-            exit_code: finished.exit_code,
-            error: finished
-                .error
-                .as_deref()
-                .map(RemoteSetupStatus::capped_error),
-            started_at,
-            finished_at: Some(finished.finished_at),
-            ..RemoteSetupStatus::pending()
-        };
-        true
+        self.with(workspace_id, home_id, false, |entry| {
+            if !entry.takes_records() {
+                return false;
+            }
+            let started_at = (entry.status.state == RemoteSetupState::Running)
+                .then(|| entry.status.started_at.clone())
+                .flatten();
+            let ready = matches!(
+                finished.state,
+                RemoteSetupState::Completed | RemoteSetupState::Skipped
+            );
+            entry.set(RemoteSetupStatus {
+                state: finished.state,
+                exit_code: finished.exit_code,
+                error: finished
+                    .error
+                    .as_deref()
+                    .map(RemoteSetupStatus::capped_error),
+                started_at,
+                finished_at: Some(finished.finished_at),
+                ..RemoteSetupStatus::pending()
+            });
+            if ready {
+                entry.output = String::new();
+                entry.truncated = false;
+            }
+            true
+        })
     }
 
-    /// Keep a `setupOutput` chunk (`seq` 0 starts the output over). Whether
-    /// to announce it now: at most once every [`OUTPUT_PUBLISH_EVERY`].
-    #[must_use = "true when the home's setup changed: announce it"]
+    /// Keep a `setupOutput` chunk (`seq` 0 starts the output over), and say
+    /// when to announce it: at most once every [`OUTPUT_PUBLISH_EVERY`],
+    /// with one trailing announcement for output that arrives in between.
+    /// A ready home keeps no output.
+    #[must_use = "announce the output as it says"]
     pub fn output(
         &self,
         workspace_id: &WorkspaceId,
@@ -177,31 +263,65 @@ impl HomeSetups {
         seq: u64,
         data: &str,
         now: Instant,
-    ) -> bool {
-        let mut map = self.lock();
-        let Some(entry) = map.get_mut(workspace_id).filter(|e| e.is(home_id)) else {
-            return false;
-        };
-        if seq == 0 {
-            entry.output.clear();
-            entry.truncated = false;
-        }
-        entry.output.push_str(data);
-        if entry.output.len() > OUTPUT_TAIL_BYTES {
-            let mut cut = entry.output.len() - OUTPUT_TAIL_BYTES;
-            while !entry.output.is_char_boundary(cut) {
-                cut += 1;
+    ) -> OutputAnnounce {
+        self.with(workspace_id, home_id, OutputAnnounce::No, |entry| {
+            if matches!(
+                entry.status.state,
+                RemoteSetupState::Completed | RemoteSetupState::Skipped
+            ) && entry.open != Open::AssumedReady
+            {
+                return OutputAnnounce::No;
             }
-            entry.output.drain(..cut);
-            entry.truncated = true;
-        }
-        let due = entry
-            .published
-            .is_none_or(|at| now.duration_since(at) >= OUTPUT_PUBLISH_EVERY);
-        if due {
+            if entry.open == Open::Reopened {
+                entry.open = Open::Normal;
+            }
+            if seq == 0 {
+                entry.output.clear();
+                entry.truncated = false;
+            }
+            entry.output.push_str(data);
+            if entry.output.len() > OUTPUT_TAIL_BYTES {
+                let mut cut = entry.output.len() - OUTPUT_TAIL_BYTES;
+                while !entry.output.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                entry.output.drain(..cut);
+                entry.truncated = true;
+            }
+            if entry.trailing {
+                return OutputAnnounce::No;
+            }
+            match entry.published.map(|at| now.duration_since(at)) {
+                Some(since) if since < OUTPUT_PUBLISH_EVERY => {
+                    entry.trailing = true;
+                    OutputAnnounce::After(OUTPUT_PUBLISH_EVERY.saturating_sub(since))
+                }
+                _ => {
+                    entry.published = Some(now);
+                    OutputAnnounce::Now
+                }
+            }
+        })
+    }
+
+    /// The trailing announcement [`OutputAnnounce::After`] scheduled is
+    /// due: whether to announce (the home is still this one).
+    #[must_use = "true when the home's setup output should be announced"]
+    pub fn flush_output(&self, workspace_id: &WorkspaceId, home_id: &HomeId, now: Instant) -> bool {
+        self.with(workspace_id, home_id, false, |entry| {
+            if !entry.trailing {
+                return false;
+            }
+            entry.trailing = false;
             entry.published = Some(now);
-        }
-        due
+            true
+        })
+    }
+
+    /// Forget the workspace's home opening: the workspace was deleted or
+    /// archived.
+    pub fn forget(&self, workspace_id: &WorkspaceId) {
+        self.lock().remove(workspace_id);
     }
 
     /// The home's `setup`, with its output on a detail read.
@@ -350,15 +470,22 @@ mod tests {
         let setups = HomeSetups::default();
         setups.opening(&ws, &home);
         let start = Instant::now();
-        assert!(setups.output(&ws, &home, 0, "Fetching\n", start));
-        assert!(!setups.output(
-            &ws,
-            &home,
-            1,
-            "Checking out\n",
-            start + Duration::from_secs(1)
-        ));
-        assert!(setups.output(&ws, &home, 2, "Done\n", start + Duration::from_secs(2)));
+        let at = |secs| start + Duration::from_secs(secs);
+        assert_eq!(
+            setups.output(&ws, &home, 0, "Fetching\n", start),
+            OutputAnnounce::Now
+        );
+        // Output within 2 s schedules one trailing announcement.
+        assert_eq!(
+            setups.output(&ws, &home, 1, "Checking out\n", at(1)),
+            OutputAnnounce::After(Duration::from_secs(1))
+        );
+        assert_eq!(
+            setups.output(&ws, &home, 2, "Done\n", at(1)),
+            OutputAnnounce::No
+        );
+        assert!(setups.flush_output(&ws, &home, at(2)));
+        assert!(!setups.flush_output(&ws, &home, at(2)), "flushed once");
         assert_eq!(setups.status(&ws, &home, false).unwrap().output, None);
         let detail = setups.status(&ws, &home, true).unwrap();
         assert_eq!(
@@ -367,11 +494,96 @@ mod tests {
         );
         assert_eq!(detail.output_truncated, None);
         // seq 0 starts over.
-        let _ = setups.output(&ws, &home, 0, "again\n", start + Duration::from_secs(9));
+        assert_eq!(
+            setups.output(&ws, &home, 0, "again\n", at(9)),
+            OutputAnnounce::Now
+        );
         assert_eq!(
             setups.status(&ws, &home, true).unwrap().output.as_deref(),
             Some("again\n")
         );
+    }
+
+    #[test]
+    fn a_ready_home_keeps_no_output() {
+        let (ws, home) = ids();
+        let setups = HomeSetups::default();
+        setups.opening(&ws, &home);
+        let _ = setups.output(&ws, &home, 0, "lots of output\n", Instant::now());
+        assert!(setups.setup_finished(&ws, &home, finished(RemoteSetupState::Completed, Some(0))));
+        assert_eq!(
+            setups.status(&ws, &home, true).unwrap().output.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            setups.output(&ws, &home, 9, "late\n", Instant::now()),
+            OutputAnnounce::No
+        );
+        assert_eq!(
+            setups.status(&ws, &home, true).unwrap().output.as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn a_lost_open_reply_still_takes_the_machines_setup_records() {
+        let (ws, home) = ids();
+        let setups = HomeSetups::default();
+        setups.opening(&ws, &home);
+        // The link dropped before the reply, but the machine made the checkout.
+        assert!(setups.open_failed(&ws, &home, "node-link-closed"));
+        assert!(setups.setup_started(&ws, &home, "t"));
+        assert_eq!(state(&setups, &ws, &home), Some(RemoteSetupState::Running));
+        assert!(setups.setup_finished(&ws, &home, finished(RemoteSetupState::Completed, Some(0))));
+        assert_eq!(
+            state(&setups, &ws, &home),
+            Some(RemoteSetupState::Completed)
+        );
+        // The next bind's reopen does not go back to pending.
+        assert!(!setups.reopening(&ws, &home));
+    }
+
+    #[test]
+    fn a_reopen_answered_ready_for_a_held_checkout_is_ready() {
+        let (ws, home) = ids();
+        let setups = HomeSetups::default();
+        setups.opening(&ws, &home);
+        assert!(setups.open_failed(&ws, &home, "node-link-closed"));
+        assert!(setups.reopening(&ws, &home));
+        // The machine held the checkout: ready at once, no output, no records.
+        assert!(setups.opened(&ws, &home));
+        assert_eq!(
+            state(&setups, &ws, &home),
+            Some(RemoteSetupState::Completed)
+        );
+        // Records that still come (a replay of the first open's) move it on.
+        assert!(setups.setup_finished(&ws, &home, finished(RemoteSetupState::Failed, Some(1))));
+        assert_eq!(state(&setups, &ws, &home), Some(RemoteSetupState::Failed));
+    }
+
+    #[test]
+    fn a_reopen_that_makes_the_checkout_again_waits_for_its_setup() {
+        let (ws, home) = ids();
+        let setups = HomeSetups::default();
+        setups.opening(&ws, &home);
+        assert!(setups.open_failed(&ws, &home, "node-checkout-failed: fetch"));
+        assert!(setups.reopening(&ws, &home));
+        let _ = setups.output(&ws, &home, 0, "Fetching\n", Instant::now());
+        assert!(!setups.opened(&ws, &home));
+        assert_eq!(state(&setups, &ws, &home), Some(RemoteSetupState::Pending));
+        // A first open's ready answer waits for the records too.
+        setups.opening(&ws, &home);
+        assert!(!setups.opened(&ws, &home));
+        assert_eq!(state(&setups, &ws, &home), Some(RemoteSetupState::Pending));
+    }
+
+    #[test]
+    fn a_forgotten_workspace_has_no_setup() {
+        let (ws, home) = ids();
+        let setups = HomeSetups::default();
+        setups.opening(&ws, &home);
+        setups.forget(&ws);
+        assert_eq!(setups.status(&ws, &home, true), None);
     }
 
     #[test]

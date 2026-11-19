@@ -456,6 +456,9 @@ pub(crate) async fn open_home(svc: &Services, workspace_id: &WorkspaceId) -> Res
         Ok(reply) => settle_open(svc, workspace_id, &home.home_id, reply).await,
         Err(error) => Err(error),
     };
+    if opened.is_ok() && svc.home_setups().opened(workspace_id, &home.home_id) {
+        svc.publish_workspace_home_changed(workspace_id).await;
+    }
     if let Err(error) = &opened {
         let reason = match error {
             Error::Internal(message) => message
