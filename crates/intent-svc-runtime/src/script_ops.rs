@@ -1052,10 +1052,11 @@ impl ScriptManager {
     /// Boot-time hydration: load every persisted definition into the runtime
     /// registry with a fresh idle state (runtime state is never persisted,
     /// except the stored-on-write `was_running` marker — the script was
-    /// running when the previous daemon process stopped). A marked service
-    /// starts again automatically, whatever its `auto_start`; a failed launch
-    /// leaves it `idle` with `previouslyRunning: true` (the restore-tab
-    /// affordance).
+    /// running when the previous daemon process stopped). In an unarchived
+    /// workspace, a marked service starts again automatically, whatever its
+    /// `auto_start`; a failed launch leaves it `idle` with
+    /// `previouslyRunning: true` (the restore-tab affordance). A saved
+    /// `auto_start` service starts too, even when it was not running.
     /// A marked command-mode script hydrates as a terminal
     /// `exited` with [`EXIT_CODE_UNOBSERVABLE`] and
     /// [`LOST_AT_DAEMON_STOP_ERROR`] — its run is gone and nothing can be
@@ -1118,8 +1119,14 @@ impl ScriptManager {
                 loaded += 1;
                 let marked = was_running.contains(&(def.workspace_id.clone(), def.id.clone()));
                 let lost = marked && def.mode == ScriptMode::Command;
-                if marked && def.mode == ScriptMode::Service && def.archived_at.is_none() {
-                    restore.push(key.clone());
+                if def.mode == ScriptMode::Service && def.archived_at.is_none() {
+                    if marked {
+                        restore.push((key.clone(), true));
+                    } else if def.auto_start == Some(true)
+                        && def.purpose == intent_core::ScriptPurpose::Saved
+                    {
+                        restore.push((key.clone(), false));
+                    }
                 }
                 let mut state = if lost {
                     ScriptRuntimeState {
@@ -1160,9 +1167,25 @@ impl ScriptManager {
         // Only newly hydrated entries are eligible. Launch through the normal
         // supervisor after releasing the registry lock; one failure must not
         // prevent other services (or the daemon itself) from starting.
-        for (ws, id) in restore {
-            if let Err(error) = self.start_with_restore(&ws, &id, true).await {
-                tracing::warn!(workspace = %ws, script = %id, %error, "restore previously running service failed");
+        let mut archived: HashMap<WorkspaceId, bool> = HashMap::new();
+        for ((ws, id), restoring) in restore {
+            let is_archived = match archived.get(&ws) {
+                Some(known) => *known,
+                None => {
+                    let known = self
+                        .store
+                        .get_workspace(&ws)
+                        .await
+                        .map_or(true, |workspace| workspace.archived);
+                    archived.insert(ws.clone(), known);
+                    known
+                }
+            };
+            if is_archived {
+                continue;
+            }
+            if let Err(error) = self.start_with_restore(&ws, &id, restoring).await {
+                tracing::warn!(workspace = %ws, script = %id, %error, "boot start of service failed");
             }
         }
         Ok(loaded)
@@ -4946,7 +4969,7 @@ mod tests {
                 cwd: Some("web".into()),
                 env: Some(env),
                 category: Some("dev".into()),
-                auto_start: Some(true),
+                auto_start: Some(false),
                 ..Default::default()
             },
         )
@@ -4970,7 +4993,7 @@ mod tests {
         assert_eq!(entry["cwd"], "web");
         assert_eq!(entry["env"]["PORT"], "3000");
         assert_eq!(entry["category"], "dev");
-        assert_eq!(entry["autoStart"], true);
+        assert_eq!(entry["autoStart"], false);
         assert_eq!(
             entry["runtime"]["status"], "idle",
             "runtime state starts fresh, never persisted"
@@ -5087,7 +5110,6 @@ mod tests {
                     name: "auto-start".into(),
                     command: SERVICE_CMD.into(),
                     mode: ScriptMode::Service,
-                    auto_start: Some(true),
                     ..Default::default()
                 },
             )
@@ -5201,47 +5223,88 @@ mod tests {
         }
     }
 
+    /// `autoStart` means "run while the workspace is active": boot starts it
+    /// even after a user stop. A plain service the user stopped stays idle,
+    /// and an archived workspace starts nothing.
     #[intent_test_macros::daemon_test]
-    async fn hydrate_leaves_explicitly_stopped_autostart_service_idle() {
+    async fn hydrate_starts_autostart_services_in_active_workspaces() {
         let mut h = harness().await;
         let mut sub = subscribe(&h);
-        let id = create(
-            &h,
-            ScriptCreateParams {
-                name: "auto-start".into(),
-                command: SERVICE_CMD.into(),
-                mode: ScriptMode::Service,
-                auto_start: Some(true),
-                ..Default::default()
-            },
-        )
-        .await;
-        h.services
-            .script_start(h.ws.clone(), id.clone())
-            .await
-            .expect("start");
-        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
-        h.services
-            .script_stop(h.ws.clone(), id.clone())
-            .await
-            .expect("user stop");
+        let mut ids = Vec::new();
+        for (name, auto_start) in [("auto-start", Some(true)), ("plain", None)] {
+            let id = create(
+                &h,
+                ScriptCreateParams {
+                    name: name.into(),
+                    command: SERVICE_CMD.into(),
+                    mode: ScriptMode::Service,
+                    auto_start,
+                    ..Default::default()
+                },
+            )
+            .await;
+            h.services
+                .script_start(h.ws.clone(), id.clone())
+                .await
+                .expect("start");
+            await_state(&mut sub, LIVENESS, |v| {
+                v["data"]["scriptId"] == id.as_str() && v["data"]["status"] == "running"
+            })
+            .await;
+            h.services
+                .script_stop(h.ws.clone(), id.clone())
+                .await
+                .expect("user stop");
+            ids.push(id);
+        }
+        let (auto_id, plain_id) = (ids[0].clone(), ids[1].clone());
         h.services.shutdown_pty_sessions().await;
-        assert!(h
-            .services
-            .store()
+        let store = h.services.store().clone();
+        assert!(store
             .list_was_running_script_ids()
             .await
             .unwrap()
             .is_empty());
-        h.services =
-            crate::test_runtime::with_runtime(Services::new_isolated(h.services.store().clone()));
-        assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
-        let state = h.services.script_status(h.ws.clone(), id).await.unwrap();
-        assert_eq!(state["status"], "idle", "user stop respected: {state}");
-        assert!(state.get("previouslyRunning").is_none(), "{state}");
+
+        h.services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
+        assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 2);
+        let auto = h
+            .services
+            .script_status(h.ws.clone(), auto_id.clone())
+            .await
+            .unwrap();
+        assert!(
+            auto["status"] == "starting" || auto["status"] == "running",
+            "autoStart starts at boot: {auto}"
+        );
+        let plain = h
+            .services
+            .script_status(h.ws.clone(), plain_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(plain["status"], "idle", "user stop respected: {plain}");
+        assert!(plain.get("previouslyRunning").is_none(), "{plain}");
+        h.services
+            .script_stop(h.ws.clone(), auto_id.clone())
+            .await
+            .expect("stop autoStart");
+        h.services.shutdown_pty_sessions().await;
+
+        store
+            .archive_workspace_detaching_guests(&h.ws, &now_iso())
+            .await
+            .expect("archive");
+        h.services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
+        assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 2);
+        let auto = h
+            .services
+            .script_status(h.ws.clone(), auto_id)
+            .await
+            .unwrap();
+        assert_eq!(auto["status"], "idle", "archived workspace: {auto}");
         assert!(
             h.services.pty().list_scope(h.ws.as_str()).is_empty(),
-            "no process launched"
+            "no process launched in an archived workspace"
         );
     }
 

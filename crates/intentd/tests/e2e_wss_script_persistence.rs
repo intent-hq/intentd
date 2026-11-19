@@ -517,7 +517,7 @@ async fn scripts_survive_daemon_restart_over_wss() {
             "cwd": "web",
             "env": { "PORT": "3000" },
             "category": "dev",
-            "autoStart": true,
+            "autoStart": false,
             "scriptId": "persist-1",
         }),
     )
@@ -546,7 +546,7 @@ async fn scripts_survive_daemon_restart_over_wss() {
     assert_eq!(entry["env"]["PORT"], "3000");
     assert_eq!(entry["mode"], "service");
     assert_eq!(entry["category"], "dev");
-    assert_eq!(entry["autoStart"], true);
+    assert_eq!(entry["autoStart"], false);
     assert_eq!(entry["source"], "user");
     assert_eq!(entry["runtime"]["status"], "idle");
     assert!(
@@ -587,6 +587,7 @@ async fn scripts_survive_daemon_restart_over_wss() {
 /// A service running when the daemon is killed starts again on the next boot
 /// without `autoStart` (the stored-on-write `was_running` marker, PROTOCOL
 /// §5.8): it reaches `running` with a new process and no `previouslyRunning`.
+/// An `autoStart` service that never ran starts at boot too.
 /// It is restored again after a second kill, and a user `script.stop` keeps it
 /// stopped across yet another restart.
 #[tokio::test]
@@ -629,6 +630,21 @@ async fn was_running_service_restarts_after_daemon_kill_over_wss() {
     )
     .await;
     assert_eq!(script["id"], "marker-1");
+    let auto = wss_rpc(
+        &mut ws,
+        50,
+        "script.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "auto",
+            "command": "sleep 3600",
+            "mode": "service",
+            "autoStart": true,
+            "scriptId": "auto-1",
+        }),
+    )
+    .await;
+    assert_eq!(auto["id"], "auto-1");
     let started = wss_rpc(
         &mut ws,
         3,
@@ -656,8 +672,18 @@ async fn was_running_service_restarts_after_daemon_kill_over_wss() {
         st.get("previouslyRunning").is_none(),
         "restore consumes the marker: {st}"
     );
+    // An autoStart service starts at boot even though it never ran.
+    await_status(&mut ws, 300, &ws_id, "auto-1", |st| {
+        st["status"] == json!("running")
+    })
+    .await;
     let listed = wss_rpc(&mut ws, 4, "script.list", json!({ "workspaceId": ws_id })).await;
-    let entry = &listed["scripts"].as_array().expect("scripts array")[0];
+    let entry = listed["scripts"]
+        .as_array()
+        .expect("scripts array")
+        .iter()
+        .find(|s| s["id"] == "marker-1")
+        .expect("marker-1 listed");
     assert_eq!(
         entry["runtime"]["status"], "running",
         "on list too: {entry}"
