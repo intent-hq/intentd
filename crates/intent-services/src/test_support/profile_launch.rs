@@ -2,20 +2,16 @@
 //! parity test in `intentd` (`executor::runner::tests::profile_parity`).
 //!
 //! A profile's launch overlay is derived twice: here on the daemon host
-//! (resolution with the daemon's home, then [`InstalledContext::with_profile`]
+//! (resolution with the daemon's home, then `InstalledContext::with_profile`
 //! for probes and quick actions and the agent launch's own derivation), and on
 //! a paired machine (resolution without a home, the node wire, then the node
 //! runner's `node_profile`). These seams expose the local half through the
 //! production functions, so the parity test compares the real code paths.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use intent_acp::ProfileEnv;
-use intent_providers::installed_cli::InstalledCli;
 
-use crate::installed_cli::InstalledContext;
 use crate::provider_profiles::{overlay_from, EnvDoc, StoredEnv};
 
 /// A saved profile's overlay as the daemon resolves it for a launch:
@@ -51,7 +47,7 @@ pub fn resolve_saved_profile(
 pub struct LocalProfileLaunch {
     /// The overlay a local agent launch hands to `SpawnOptions.profile_env`.
     pub agent: ProfileEnv,
-    /// The overlay [`InstalledContext::with_profile`] applied (probes,
+    /// The overlay `InstalledContext::with_profile` applied (probes,
     /// quick actions, model catalogs).
     pub installed: ProfileEnv,
     /// The Codex folder the installed context runs Codex in (Codex only).
@@ -72,7 +68,14 @@ pub fn local_profile_launch(
     home: &Path,
     bin: &Path,
 ) -> LocalProfileLaunch {
+    use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    use intent_providers::installed_cli::InstalledCli;
+
+    use crate::installed_cli::InstalledContext;
+
     let cli = match provider_id {
         "codex" => InstalledCli::Codex,
         "claude-code" => InstalledCli::Claude,
