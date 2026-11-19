@@ -1219,17 +1219,16 @@ impl ScriptManager {
         // prevent other services (or the daemon itself) from starting.
         let mut archived: HashMap<WorkspaceId, bool> = HashMap::new();
         for ((ws, id), restoring) in restore {
-            let is_archived = match archived.get(&ws) {
-                Some(known) => *known,
-                None => {
-                    let known = self
-                        .store
-                        .get_workspace(&ws)
-                        .await
-                        .map_or(true, |workspace| workspace.archived);
-                    archived.insert(ws.clone(), known);
-                    known
-                }
+            let is_archived = if let Some(known) = archived.get(&ws) {
+                *known
+            } else {
+                let known = self
+                    .store
+                    .get_workspace(&ws)
+                    .await
+                    .map_or(true, |workspace| workspace.archived);
+                archived.insert(ws.clone(), known);
+                known
             };
             if is_archived {
                 continue;
