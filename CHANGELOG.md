@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.249] - 2026-11-19
+
+### 🚀 Features
+
+- *(clone)* Stream git download counters on receiving progress frames ([#3521](https://github.com/intent-hq/intentd/pull/3521))
+- *(homes)* Report a workspace home's opening as home.setup ([#3525](https://github.com/intent-hq/intentd/pull/3525))
+
+### 🧪 Testing
+
+- *(profiles)* Keep local and machine profile launches in step ([#3524](https://github.com/intent-hq/intentd/pull/3524))
+
+
 ## [0.11.248] - 2026-11-19
 
 ### 🔧 Refactor
