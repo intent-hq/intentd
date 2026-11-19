@@ -14,10 +14,16 @@
 //!
 //! So once a delete reports success, the store is exactly as the one-shot
 //! delete left it. Meanwhile, as on `SQLite` (`delete_in_bounded_batches`),
-//! the workspace or agent stays visible with part of its children gone. A
-//! record left by a crash or a failed batch is finished by
-//! [`PgStore::resume_deletes`], which `Store::open_postgres` starts when
-//! the tenant has one. Every step is idempotent and filters by tenant.
+//! the workspace or agent stays visible with part of its children gone.
+//!
+//! Resuming: a delete stopped part-way (a crash, a failed batch) keeps its
+//! record, and its workspace or agent stays half-purged, as on `SQLite`,
+//! until it is deleted again: the next `delete_workspace` or
+//! `delete_agent_session` for it drains what is left (every step is
+//! idempotent) and finishes. The store does not finish it on its own: that
+//! would skip the service teardown (events, worktree and script cleanup,
+//! home stops) that a delete call runs. [`PgStore::pending_deletes`] lists
+//! the records, for a service to re-issue those deletes.
 
 use super::{db, PgStore};
 use intent_core::{AgentId, Error, Result, WorkspaceId};
@@ -26,8 +32,18 @@ use intent_core::{AgentId, Error, Result, WorkspaceId};
 pub(super) const PURGE_BATCH_ROWS: i64 = 500;
 
 /// One agent's heavy children, deleted before its session row, in the
-/// one-shot delete's order. `$1` tenant, `$2` agent, `$3` batch size.
-const AGENT_PURGE: [&str; 7] = [
+/// one-shot delete's order, then the rows the session row's delete trigger
+/// (`script_monitor_owner_deleted`) or cascade would otherwise remove in
+/// one statement: script monitors and their notification jobs, queue
+/// admissions, and discussion deliveries and activity (one per discussion
+/// message the agent was sent). `$1` tenant, `$2` agent, `$3` batch size.
+/// Left to the final transaction: at most a few rows per agent
+/// (`agent_usage_cell` per model, `interrupted_agent`,
+/// `agent_stop_redelivery`, `remote_agent`, `review_context_enrollment`,
+/// `discussion_agent_grant` per conversation, `agent_flipped_completion` per
+/// task); `pr_monitor_message_provenance` goes with its message, batch by
+/// batch.
+const AGENT_PURGE: [&str; 12] = [
     "DELETE FROM agent_message_payload WHERE tenant_id = $1 \
      AND (message_id, block_ordinal, kind) IN (SELECT p.message_id, p.block_ordinal, p.kind \
        FROM agent_message_payload p WHERE p.tenant_id = $1 AND p.agent_id = $2 LIMIT $3)",
@@ -51,10 +67,38 @@ const AGENT_PURGE: [&str; 7] = [
      AND (parent_agent_id, child_agent_id) IN (SELECT d.parent_agent_id, d.child_agent_id \
        FROM advisory_wake_delivery d WHERE d.tenant_id = $1 \
        AND (d.parent_agent_id = $2 OR d.child_agent_id = $2) LIMIT $3)",
+    "DELETE FROM script_monitor WHERE tenant_id = $1 \
+     AND id IN (SELECT sm.id FROM script_monitor sm \
+       WHERE sm.tenant_id = $1 AND sm.agent_id = $2 LIMIT $3)",
+    "DELETE FROM script_notification_job WHERE tenant_id = $1 \
+     AND wake_id IN (SELECT j.wake_id FROM script_notification_job j \
+       WHERE j.tenant_id = $1 AND j.agent_id = $2 LIMIT $3)",
+    "DELETE FROM agent_queue_admission WHERE tenant_id = $1 \
+     AND id IN (SELECT qa.id FROM agent_queue_admission qa \
+       WHERE qa.tenant_id = $1 AND qa.agent_id = $2 LIMIT $3)",
+    "DELETE FROM discussion_agent_delivery WHERE tenant_id = $1 AND agent_id = $2 \
+     AND message_id IN (SELECT dd.message_id FROM discussion_agent_delivery dd \
+       WHERE dd.tenant_id = $1 AND dd.agent_id = $2 LIMIT $3)",
+    "DELETE FROM discussion_agent_activity WHERE tenant_id = $1 AND agent_id = $2 \
+     AND message_id IN (SELECT da.message_id FROM discussion_agent_activity da \
+       WHERE da.tenant_id = $1 AND da.agent_id = $2 LIMIT $3)",
 ];
 
 /// A workspace's heavy children, after its agents', in the one-shot
-/// delete's order. `$1` tenant, `$2` workspace, `$3` batch size. Rows the
+/// delete's order. The final transaction still deletes the rest in one go:
+/// its explicit statements (recovery history, desktop records, browser
+/// tabs, MCP disables, agent preferences, the session rows) and what
+/// cascades from the workspace and session rows without a drain here, all
+/// at most a few rows per workspace, agent, conversation or message: the
+/// per-agent rows listed at [`AGENT_PURGE`], `browser_tab`,
+/// `discussion_conversation`, `workspace_discussion_conversation` and
+/// `discussion_participant` (per conversation), `discussion_reaction` (with
+/// its message, batch by batch), `home_move`, `home_rebuild`,
+/// `workspace_home`, `workspace_invite_seat`, `workspace_member`,
+/// `workspace_metrics`, `workspace_sharing_summary` and
+/// `workspace_ui_context`. The workspace row's delete trigger
+/// (`script_monitor_workspace_deleted`) finds no script monitor, job or
+/// admission left: every one names an agent of the workspace, drained above. `$1` tenant, `$2` workspace, `$3` batch size. Rows the
 /// one-shot delete keeps stay: comments with no note, and an attachment
 /// another workspace's retry key still names (the final transaction then
 /// fails on it, as the one-shot delete does).
@@ -256,88 +300,31 @@ impl PgStore {
         }
     }
 
-    /// Whether this tenant has an unfinished delete.
-    pub(super) async fn has_pending_deletes(&self) -> Result<bool> {
-        let mut tx = self.begin().await?;
-        let pending: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM delete_purge WHERE tenant_id = $1)")
-                .bind(self.tenant())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(db)?;
-        tx.commit().await.map_err(db)?;
-        Ok(pending)
-    }
-
-    /// Finish every delete a crash or a failed batch left part-way, oldest
-    /// first, by running it again. A record whose workspace or agent is
-    /// already gone is dropped. A delete that fails again keeps its record
-    /// for the next open; the others still run. Returns the records handled.
-    ///
-    /// # Errors
-    /// The first failure, after every record was tried.
-    pub(super) async fn resume_deletes(&self) -> Result<usize> {
+    /// Deletes that recorded themselves and did not finish, oldest first.
+    pub(crate) async fn pending_deletes(&self) -> Result<Vec<crate::PendingDelete>> {
         let mut tx = self.begin().await?;
         let records: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT kind, workspace_id, agent_id FROM delete_purge \
-             WHERE tenant_id = $1 ORDER BY started_at, kind DESC",
+             WHERE tenant_id = $1 ORDER BY started_at, kind DESC, workspace_id, agent_id",
         )
         .bind(self.tenant())
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
         tx.commit().await.map_err(db)?;
-        let mut first_error = None;
-        for (kind, workspace, agent) in &records {
-            let workspace = WorkspaceId(workspace.clone());
-            let outcome = if kind == "workspace" {
-                match self.delete_workspace(&workspace).await {
-                    Err(Error::NotFound(_)) => self.drop_purge_record(kind, &workspace, "").await,
-                    other => other,
-                }
-            } else {
-                match self
-                    .delete_agent_session(&workspace, &AgentId(agent.clone()))
-                    .await
-                {
-                    Ok(false) => self.drop_purge_record(kind, &workspace, agent).await,
-                    other => other.map(drop),
-                }
-            };
-            if let Err(e) = outcome {
-                tracing::warn!(
-                    tenant = self.tenant(),
-                    kind = kind.as_str(),
-                    workspace = workspace.as_str(),
-                    agent = agent.as_str(),
-                    "resuming an unfinished delete failed: {e}"
-                );
-                first_error.get_or_insert(e);
-            }
-        }
-        first_error.map_or(Ok(records.len()), Err)
-    }
-
-    /// Drop the record of a delete whose workspace or agent is gone.
-    async fn drop_purge_record(
-        &self,
-        kind: &str,
-        workspace: &WorkspaceId,
-        agent: &str,
-    ) -> Result<()> {
-        let mut tx = self.begin_write().await?;
-        sqlx::query(
-            "DELETE FROM delete_purge \
-             WHERE tenant_id = $1 AND kind = $2 AND workspace_id = $3 AND agent_id = $4",
-        )
-        .bind(self.tenant())
-        .bind(kind)
-        .bind(&workspace.0)
-        .bind(agent)
-        .execute(&mut *tx)
-        .await
-        .map_err(db)?;
-        tx.commit().await.map_err(db)
+        records
+            .into_iter()
+            .map(|(kind, workspace, agent)| match kind.as_str() {
+                "workspace" => Ok(crate::PendingDelete::Workspace(WorkspaceId(workspace))),
+                "agent" => Ok(crate::PendingDelete::Agent {
+                    workspace_id: WorkspaceId(workspace),
+                    agent_id: AgentId(agent),
+                }),
+                other => Err(Error::Internal(format!(
+                    "unknown delete_purge kind {other:?}"
+                ))),
+            })
+            .collect()
     }
 }
 

@@ -17,3 +17,9 @@ CREATE TABLE IF NOT EXISTS delete_purge (
     started_at text NOT NULL,
     PRIMARY KEY (tenant_id, kind, workspace_id, agent_id)
 );
+
+-- The agent-scoped purge batches seek these; the tables had no index
+-- leading with the agent.
+CREATE INDEX IF NOT EXISTS idx_agent_queue_admission_agent ON agent_queue_admission (tenant_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_discussion_agent_delivery_agent ON discussion_agent_delivery (tenant_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_discussion_agent_activity_agent ON discussion_agent_activity (tenant_id, agent_id);

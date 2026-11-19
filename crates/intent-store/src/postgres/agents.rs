@@ -3685,6 +3685,9 @@ impl PgStore {
         .await
         .map_err(db)?;
         if !exists {
+            // A record a stopped delete left has nothing more to do.
+            super::purge::clear_agent_purge(&mut tx, self.tenant(), workspace_id, id).await?;
+            tx.commit().await.map_err(db)?;
             return Ok(false);
         }
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
