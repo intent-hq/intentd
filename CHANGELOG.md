@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.253] - 2026-11-19
+
+### 🐛 Bug Fixes
+
+- *(store)* Bounded, resumable workspace and agent deletes on Postgres ([#3543](https://github.com/intent-hq/intentd/pull/3543))
+
+
 ## [0.11.252] - 2026-11-19
 
 ### 📚 Documentation
