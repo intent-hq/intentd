@@ -622,7 +622,13 @@ Switching a machine to orchestrator removes it from the backends that used
 it to run agents; pair with it again to use it as a backend. Homes are part of
 orchestrator mode: on an orchestrator a git workspace
 gets a **home**, a machine that holds its files, terminals and scripts, shown as
-**Home: <machine>** under the workspace title (hover it for the last backup). When the
+**Home: <machine>** under the workspace title (hover it for the last backup). Right after
+the workspace is created, a banner shows **Setting up home on <machine>…** with its step
+(**Preparing checkout**, then **Running setup**) until the home is ready. If the checkout
+fails, the banner says so with the reason, and Intent tries again when the machine
+reconnects (or use **Move home…**); if the setup script fails, files, terminals and scripts
+still work. **Show output** shows the checkout and setup output, and the X dismisses a
+failure. When the
 home has been offline for a minute, a banner in the workspace and a **Home unavailable**
 marker on its Home card say so: chats, notes and script logs keep working, and file, diff
 and terminal panels show the reason instead. **Wait** tries to reconnect it. **Move home…**
@@ -638,7 +644,7 @@ was deleted while paused is rebuilt from its last backup at its next use, with a
 the workspace. While the home is unavailable, moving or starting, **Start** and **Restart**
 for scripts are off (hover one for the reason) and **Stop** still works; a file that could
 not open because of the home shows that reason and opens again once the home is back.
-<!-- Sources: packages/cloudlands-fe/src/features/workspace-home/{workspace-home.ts,workspace-home-copy.ts,workspace-home-saga.ts,components/MoveHomeDialog.svelte,components/WorkspaceHomeBanner.svelte}; packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/intentd/crates/intent-svc-remote/src/{home_move.rs,cloud/home.rs}. -->
+<!-- Sources: packages/cloudlands-fe/src/features/workspace-home/{workspace-home.ts,workspace-home-copy.ts,workspace-home-saga.ts,components/MoveHomeDialog.svelte,components/WorkspaceHomeBanner.svelte}; packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/features/workspace-home/components/WorkspaceHomeBannerHost.svelte; packages/intentd/crates/intent-services/src/home_setup.rs; packages/intentd/crates/intent-svc-remote/src/{home_move.rs,cloud/home.rs,homes.rs}. -->
 Agents see each machine's name and
 platform, and look up its providers, sign-in status and models when they need them.
 A Default with **Use on remote machines** turned on in **Settings → Providers** is
