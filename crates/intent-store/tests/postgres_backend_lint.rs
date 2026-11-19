@@ -38,7 +38,14 @@
 //! literal that parses as a statement but reaches no sqlx call fails too
 //! (orphan SQL), so SQL the follower misses cannot pass unseen.
 //! `TRANSFER_PREDICATES` (repositories.rs), spliced in at run time, is
-//! checked on its own.
+//! checked on its own. A string literal no sqlx call reaches that names a
+//! schema table after FROM, JOIN, INSERT INTO or UPDATE..SET fails as an
+//! SQL fragment.
+//!
+//! Limits of that fragment check: it reads the word right after the
+//! keyword, so a table later in a comma list (`FROM (SELECT 1) s, task t`)
+//! is not seen; the statement checks still see it once the text reaches a
+//! sqlx call.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -48,7 +55,7 @@ use std::path::{Path, PathBuf};
 mod postgres_ast;
 #[path = "support/sql_uses.rs"]
 mod sql_uses;
-use sql_uses::{list_key, rust_files, Index, LockProblem, Sql};
+use sql_uses::{list_key, rust_files, Index, LockProblem, Pos, Sql, MAX_EXPANSIONS};
 use syn::{Expr, Lit};
 
 fn src() -> PathBuf {
@@ -134,17 +141,17 @@ struct Report {
 /// The allowlist, and which keys matched at which sites.
 struct Listed<'a> {
     keys: &'a BTreeMap<String, String>,
-    sites: BTreeMap<String, BTreeSet<(PathBuf, usize)>>,
+    sites: BTreeMap<String, BTreeSet<(PathBuf, Pos)>>,
 }
 
 impl Listed<'_> {
     /// `None` when `key` is listed (and records the site), else the key.
-    fn unlisted(&mut self, key: String, file: &Path, line: usize) -> Option<String> {
+    fn unlisted(&mut self, key: String, file: &Path, at: Pos) -> Option<String> {
         if self.keys.contains_key(&key) {
             self.sites
                 .entry(key)
                 .or_default()
-                .insert((file.to_owned(), line));
+                .insert((file.to_owned(), at));
             None
         } else {
             Some(key)
@@ -210,16 +217,22 @@ fn schema_tables() -> BTreeSet<String> {
 fn names_a_table(text: &str, tables: &BTreeSet<String>) -> Option<String> {
     let lower = text.to_lowercase();
     let words: Vec<&str> = lower
-        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
         .filter(|w| !w.is_empty())
         .collect();
-    // As in SQL: INTO after INSERT, UPDATE with a SET after it.
+    // As in SQL: INTO after INSERT, UPDATE with a SET after it; FROM and
+    // UPDATE may say ONLY; a name may carry a schema (`public.task`).
     (0..words.len().saturating_sub(1)).find_map(|i| {
-        let (kw, table) = (words[i], words[i + 1]);
+        let kw = words[i];
+        let mut at = i + 1;
+        if matches!(kw, "from" | "update") && words[at] == "only" {
+            at += 1;
+        }
+        let table = words.get(at)?.rsplit('.').next()?;
         let shaped = match kw {
             "from" | "join" => true,
             "into" => i > 0 && words[i - 1] == "insert",
-            "update" => words[i + 2..].contains(&"set"),
+            "update" => words[at..].contains(&"set"),
             _ => false,
         };
         (shaped && tables.contains(table)).then(|| format!("{} {table}", kw.to_uppercase()))
@@ -249,11 +262,22 @@ fn check(
             .find(|(f, n, _)| Some(*f) == file_name.as_deref() && *n == u.function);
         for s in &u.sources {
             let at = format!("{}:{}", s.file.display(), s.start.line);
-            for exp in s.expansions() {
+            let expansions = s.expansions();
+            if let Some(n) = expansions.iter().map(|e| e.capped).max().filter(|n| *n > 0) {
+                let key = list_key(&s.file, &s.function, &format!("combinations: {}", s.text()));
+                if let Some(key) = list.unlisted(key, &s.file, s.start) {
+                    unparsed.insert(format!(
+                        "{at}: {} combinations (more than {MAX_EXPANSIONS}); each hole was checked \
+                         alone; split the statement or list `{key} — <reason>` {LIST_IT}",
+                        if n == usize::MAX { "too many".to_owned() } else { n.to_string() }
+                    ));
+                }
+            }
+            for exp in expansions {
                 let mut blocked = false;
                 for x in &exp.unresolved {
                     let key = list_key(&x.file, &x.function, &x.expr);
-                    if let Some(key) = list.unlisted(key, &x.file, x.start.line) {
+                    if let Some(key) = list.unlisted(key, &x.file, x.start) {
                         blocked = true;
                         unparsed.insert(format!(
                             "{}:{}: runs SQL the lint cannot follow (`{}`); \
@@ -277,7 +301,7 @@ fn check(
                             .into_iter()
                             .any(|t| !exempt.contains(&t.as_str()));
                         match (writes, excuse, &u.lock_problem) {
-                            (true, Some((_, f, _)), Some(LockProblem::Hidden)) => {
+                            (true, Some((_, f, _)), Some(LockProblem::Hidden)) if u.takes_lock => {
                                 report.deferred_used.insert((*f).to_owned());
                             }
                             (true, _, Some(why)) => {
@@ -293,7 +317,7 @@ fn check(
                     }
                     Err(e) => {
                         let key = list_key(&s.file, &s.function, s.text());
-                        if let Some(key) = list.unlisted(key, &s.file, s.start.line) {
+                        if let Some(key) = list.unlisted(key, &s.file, s.start) {
                             unparsed.insert(format!(
                                 "{at}: does not parse ({e}); fix it or list \
                                  `{key} — <reason>` {LIST_IT}"
@@ -312,20 +336,21 @@ fn check(
         {
             continue;
         }
-        let what = if postgres_ast::is_statement(&r.value) {
+        let value = index.fill_consts(&r.file, &r.value);
+        let what = if postgres_ast::is_statement(&value) {
             "SQL that no sqlx call runs".to_owned()
-        } else if let Some(table) = names_a_table(&r.value, tables) {
+        } else if let Some(table) = names_a_table(&value, tables) {
             format!("an SQL fragment ({table}) that no sqlx call runs")
         } else {
             continue;
         };
         let key = list_key(&r.file, &r.function, &r.value);
-        if let Some(key) = list.unlisted(key, &r.file, r.line) {
+        if let Some(key) = list.unlisted(key, &r.file, r.start) {
             report.orphans.push(format!(
                 "{}:{}: {what}; run it through sqlx, remove it, or list \
                  `{key} — <reason>` {LIST_IT}",
                 r.file.display(),
-                r.line
+                r.start.line
             ));
         }
     }
@@ -333,7 +358,7 @@ fn check(
         if sites.len() > 1 {
             let at: Vec<String> = sites
                 .iter()
-                .map(|(f, l)| format!("{}:{l}", f.display()))
+                .map(|(f, p)| format!("{}:{}:{}", f.display(), p.line, p.column))
                 .collect();
             unparsed.insert(format!(
                 "`{key}` in {LIST_IT} matches {} sites ({}); a key must name one site",
@@ -1043,7 +1068,7 @@ fn the_lint_fails_closed_on_the_second_review_probes() {
         }"#,
         "FROM task",
     );
-    // Past the cap each hole still shows every alternative.
+    // Every alternative of each hole is checked.
     unscoped(
         r#"fn f() {
             for a in ["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "(select id from task)"] {
@@ -1054,8 +1079,8 @@ fn the_lint_fails_closed_on_the_second_review_probes() {
         }"#,
         "FROM task",
     );
-    // A hole with 65 alternatives (a 65-arm match) shows each of them.
-    let arms = (0..64).fold(String::new(), |mut out, i| {
+    // A hole with MAX_EXPANSIONS + 1 alternatives (match arms) shows each.
+    let arms = (0..MAX_EXPANSIONS).fold(String::new(), |mut out, i| {
         let _ = write!(out, "{i} => \"true\", ");
         out
     });
@@ -1120,6 +1145,75 @@ fn the_lint_fails_closed_on_the_second_review_probes() {
     assert!(report.orphans[0].starts_with("x.rs:2: "));
 }
 
+/// Regression cases from the third review.
+#[test]
+fn the_lint_reports_capped_statements_and_shaped_fragments() {
+    // A statement past the cap is a listable finding.
+    let arms = (0..MAX_EXPANSIONS).fold(String::new(), |mut out, i| {
+        let _ = write!(out, "{i} => \"true\", ");
+        out
+    });
+    let report = check_source(&format!(
+        "fn f(k: u8) {{ let c = match k {{ {arms}_ => \"false\" }}; \
+         sqlx::query(&format!(\"select id from note where tenant_id = $1 and {{c}}\")); }}"
+    ));
+    assert!(
+        report
+            .unparsed
+            .iter()
+            .any(|f| f.contains(&format!("{} combinations", MAX_EXPANSIONS + 1))),
+        "{:?}",
+        report.unparsed
+    );
+    // Within the cap every combination is checked: true/true is unscoped.
+    let nine = r#"["tenant_id = $1", "tenant_id = $1", "tenant_id = $1", "tenant_id = $1",
+        "tenant_id = $1", "tenant_id = $1", "tenant_id = $1", "tenant_id = $1", "true"]"#;
+    let report = check_source(&format!(
+        "fn f() {{ for a in {nine} {{ for b in {nine} {{ \
+         sqlx::query(&format!(\"select id from note where {{a}} and {{b}}\")); }} }} }}"
+    ));
+    assert_eq!(
+        tenant_findings(&report),
+        ["FROM note is not filtered by tenant_id = $n"],
+        "{:?}",
+        report.unparsed
+    );
+    // Fragments: concat! of literals, a {CONST} hole, ONLY and a schema.
+    let report = check_source(
+        r#"const TASK: &str = "task";
+        fn f() {
+            let a = concat!(" UNION SELECT id ", "FROM task");
+            let b = " UNION SELECT id FROM {TASK}";
+            let c = " UNION SELECT id FROM ONLY public.task";
+        }"#,
+    );
+    assert_eq!(report.orphans.len(), 3, "{:?}", report.orphans);
+    // Two listed sites on one line still count as two.
+    let index = Index::new(
+        &[(
+            PathBuf::from("x.rs"),
+            r#"fn f(&self) { sqlx::query(&format!("select id from note where tenant_id = $1 {}", self.order)); sqlx::query(&format!("select id from note where tenant_id = $1 {}", self.order)); }"#
+                .to_owned(),
+        )],
+        &[],
+    );
+    let key = list_key(Path::new("x.rs"), "f", "self . order");
+    let report = check(
+        &index,
+        &BTreeMap::from([(key, "order by".to_owned())]),
+        &[],
+        &unit_tables(),
+    );
+    assert!(
+        report
+            .unparsed
+            .iter()
+            .any(|f| f.contains("matches 2 sites")),
+        "{:?}",
+        report.unparsed
+    );
+}
+
 #[test]
 fn unreached_fragments_that_name_a_table_fail() {
     let report = check_source(
@@ -1166,8 +1260,12 @@ fn the_writer_lock_follows_the_transaction_binding() {
         let tx = self.begin_write().await?; }"#;
     let visible = r#"async fn p(&self) {
         sqlx::query("DELETE FROM t WHERE tenant_id = $1").execute(&self.pool).await; }"#;
+    // A deferred function still takes the lock; only the executor hides.
+    let lockless = r#"async fn p(&self) {
+        let q = sqlx::query("DELETE FROM t WHERE tenant_id = $1"); }"#;
     assert!(unlocked(hidden, &deferred).is_empty());
     assert_eq!(unlocked(visible, &deferred).len(), 1);
+    assert_eq!(unlocked(lockless, &deferred).len(), 1);
 }
 
 #[test]

@@ -103,7 +103,7 @@ const INTEGER_TYPES: &[&str] = &[
 const MAX_DEPTH: usize = 48;
 
 /// The most combinations of hole alternatives checked per statement.
-pub const MAX_EXPANSIONS: usize = 64;
+pub const MAX_EXPANSIONS: usize = 256;
 
 pub fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read dir") {
@@ -198,6 +198,9 @@ pub struct Unfollowed {
 pub struct Expansion {
     pub pieces: Vec<Option<String>>,
     pub unresolved: Vec<Unfollowed>,
+    /// When the statement has more than [`MAX_EXPANSIONS`] combinations
+    /// and its parts were varied one at a time: how many there were.
+    pub capped: usize,
 }
 
 impl Expansion {
@@ -205,6 +208,7 @@ impl Expansion {
         let mut out = self.clone();
         out.pieces.extend(other.pieces.iter().cloned());
         out.unresolved.extend(other.unresolved.iter().cloned());
+        out.capped = out.capped.max(other.capped);
         out
     }
 }
@@ -232,6 +236,7 @@ impl Source {
                         start: self.start,
                         expr: expr.clone(),
                     }],
+                    capped: 0,
                 }];
             }
             Sql::Text {
@@ -245,6 +250,7 @@ impl Source {
             vec![Expansion {
                 pieces: vec![Some(t)],
                 unresolved: Vec::new(),
+                capped: 0,
             }]
         };
         let mut head: Vec<Vec<Expansion>> = Vec::new();
@@ -267,7 +273,8 @@ impl Source {
             slots.push(fixed(text.clone()));
         }
         let mut out = Vec::new();
-        for choice in branch_choices(appends) {
+        let (choices, capped) = branch_choices(appends);
+        for choice in choices {
             let mut slots = head.clone();
             for a in appends {
                 if a.guard
@@ -277,7 +284,10 @@ impl Source {
                     slots.push(alternatives(&a.alts));
                 }
             }
-            out.extend(combine(&slots));
+            out.extend(combine(&slots).into_iter().map(|mut e| {
+                e.capped = e.capped.max(capped);
+                e
+            }));
         }
         out
     }
@@ -299,7 +309,7 @@ impl Source {
 /// One arm per branch construct the appends sit in: every combination
 /// while there are at most [`MAX_EXPANSIONS`], else each construct varied
 /// alone with the others at arm 0.
-fn branch_choices(appends: &[Append]) -> Vec<BTreeMap<usize, usize>> {
+fn branch_choices(appends: &[Append]) -> (Vec<BTreeMap<usize, usize>>, usize) {
     let arms: BTreeMap<usize, usize> = appends
         .iter()
         .flat_map(|a| a.guard.iter().map(|(id, _, n)| (*id, *n)))
@@ -323,7 +333,7 @@ fn branch_choices(appends: &[Append]) -> Vec<BTreeMap<usize, usize>> {
                 })
                 .collect();
         }
-        return out;
+        return (out, 0);
     }
     let mut out = vec![base.clone()];
     for (id, n) in &arms {
@@ -333,7 +343,7 @@ fn branch_choices(appends: &[Append]) -> Vec<BTreeMap<usize, usize>> {
             out.push(c);
         }
     }
-    out
+    (out, total)
 }
 
 /// The expansions of each alternative; an empty set is unresolved.
@@ -348,6 +358,7 @@ fn alternatives(alts: &[Source]) -> Vec<Expansion> {
                 start: Pos { line: 0, column: 0 },
                 expr: "<no text>".to_owned(),
             }],
+            capped: 0,
         }];
     }
     out
@@ -384,6 +395,9 @@ fn combine(slots: &[Vec<Expansion>]) -> Vec<Expansion> {
             pick[i] = k;
             out.push(join(&pick));
         }
+    }
+    for e in &mut out {
+        e.capped = e.capped.max(total);
     }
     out
 }
@@ -428,7 +442,7 @@ pub fn split_format(s: &str) -> Vec<Result<String, String>> {
 pub struct Unreached {
     pub file: PathBuf,
     pub function: String,
-    pub line: usize,
+    pub start: Pos,
     pub value: String,
 }
 
@@ -462,6 +476,9 @@ pub struct Use {
     /// Why the sink does not run under the tenant's writer lock, if so.
     /// Only a write needs the lock; the caller decides that.
     pub lock_problem: Option<LockProblem>,
+    /// The function takes the writer lock somewhere: a `WriteTx`
+    /// parameter or binding, or a `begin_write()` call.
+    pub takes_lock: bool,
 }
 
 /// A binding of a local name, where it is made. A `let` (or `for`,
@@ -610,6 +627,43 @@ impl Index {
         index
     }
 
+    /// `text` with each `{NAME}` hole that names a `&str` const of one
+    /// value (seen from `file`) replaced by that value.
+    pub fn fill_consts(&self, file: &Path, text: &str) -> String {
+        let Some(id) = self.files.iter().position(|f| f == file) else {
+            return text.to_owned();
+        };
+        let mut out = String::new();
+        for piece in split_format(text) {
+            match piece {
+                Ok(t) => out.push_str(&t),
+                Err(hole) => {
+                    let mut found = Vec::new();
+                    for (f, _, v) in self.consts_named(id, None, &hole) {
+                        self.resolve_const(*f, v, 0, &mut found);
+                    }
+                    if let [Source {
+                        sql:
+                            Sql::Text {
+                                text,
+                                template: false,
+                                ..
+                            },
+                        ..
+                    }] = found.as_slice()
+                    {
+                        out.push_str(text);
+                    } else {
+                        out.push('{');
+                        out.push_str(&hole);
+                        out.push('}');
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Follows calls to `name` into their first argument; see `rewriters`.
     #[must_use]
     pub fn with_rewriter(mut self, name: &str) -> Self {
@@ -653,6 +707,7 @@ impl Index {
                 line: s.pos.line,
                 sources,
                 lock_problem: self.lock_problem(s),
+                takes_lock: f.lock_from.is_some(),
             });
         }
         out
@@ -677,7 +732,7 @@ impl Index {
             .map(|l| Unreached {
                 file: self.files[l.file].clone(),
                 function: l.function.clone(),
-                line: l.start.line,
+                start: l.start,
                 value: l.value.clone(),
             })
             .collect()
@@ -1729,11 +1784,33 @@ impl<'ast> Visit<'ast> for Literals<'_> {
         });
     }
 
+    /// `concat!` of literals is one value; other macro bodies that parse
+    /// as expressions are walked.
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
-        if let Ok(args) = m.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
-            for a in &args {
-                self.visit_expr(a);
-            }
+        let Ok(args) = m.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) else {
+            return;
+        };
+        let parts: Option<Vec<String>> = args
+            .iter()
+            .map(|a| match a {
+                Expr::Lit(syn::ExprLit {
+                    lit: Lit::Str(s), ..
+                }) => Some(s.value()),
+                _ => None,
+            })
+            .collect();
+        if let (true, Some(parts)) = (m.path.is_ident("concat"), parts) {
+            self.index.literals.push(Literal {
+                function: self.function.clone(),
+                file: self.file,
+                start: m.span().start().into(),
+                end: m.span().end().into(),
+                value: parts.concat(),
+            });
+            return;
+        }
+        for a in &args {
+            self.visit_expr(a);
         }
     }
 }
