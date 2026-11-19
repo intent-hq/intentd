@@ -1498,26 +1498,27 @@ selected, even if another conversation, file, or note is open. Notifications for
 other workspaces can still appear. The workspace's agent status and conversation
 notices remain available.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; src/lib/components/chat/failure-transcript.ts; src/shared/provider-catalog.ts; src/store/renderer/slices/agent-availability/sagas/provider-availability-saga.ts; messages/en.json. -->
 
-In the existing conversation, **Couldn't complete this response** summarizes a
-stopped response. Open **Details** to inspect the technical error, then **Copy
-details** to copy it. **Needs attention** means action is needed; choose **Retry**
-when offered. **Queued** means a message is in the queue, not that a retry is
-scheduled. Inspect that message and use its available controls before sending
-another copy. Active work keeps its normal **Thinking** or activity status; do not
-infer a retry from that status alone. Controls depend on the conversation's state
-and your access.
+In the existing conversation, the current failure shows one card: **Response
+failed** with the first line of the error, or **Sign-in required** with the CLI
+login command to copy. For an agent on the daemon host, **Log in** runs that
+command in Intent's terminal. Open **Details** to inspect the full technical
+error, then **Copy details** to copy it. Choose **Retry** when offered. A failed message stays
+in the queue below the card; a retry is not scheduled on its own. Inspect that
+message and use its available controls before sending another copy. Active work
+keeps its normal **Thinking** or activity status; do not infer a retry from that
+status alone. Controls depend on the conversation's state and your access.
 
 For one queued message, use **Edit**, **Send now**, or **Remove** in the queue
 header. While editing, **Save** and **Cancel** stay beside the message. With
 several queued messages, each message has its own controls; the header offers bulk actions.
 
-Earlier failures may appear as **1 recorded failure** or **N recorded failures**.
-Expand that label to inspect the saved errors and timestamps and use **Copy
-details**. These are counts of recorded notices, not total attempts or proof that
-all failures belong to the same request. A historical notice alone does not mean
-the agent is still failing; check the current status and latest response.
+Earlier failures appear in place as a quiet **Response failed** row. Expand it to
+inspect the saved errors and timestamps and use **Copy details**. Consecutive
+failures share one row; it does not count attempts or prove that they belong to
+the same request. A historical row alone does not mean the agent is still failing;
+check the current status and latest response.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/agent_ops.rs (agent_resolve_blocker_op, clear_daemon_stall_blocker_after_success); packages/cloudlands-fe/src/shared/utils/agent-attention.ts. -->
 
