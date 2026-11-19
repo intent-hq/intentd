@@ -27,7 +27,8 @@
 //!   behind another process's lock, holds one connection, not the pool, and
 //!   other tenants keep theirs. Size the pool for the tenants that write at
 //!   once plus read headroom; past that, checkouts wait up to the acquire
-//!   timeout. The slot belongs to the store handle and its clones.
+//!   timeout. The slot is per tenant, shared by every store for it in this
+//!   process (`tenant_registry`).
 //! - **Writer waits are bounded** by [`WriterLimits`]: see
 //!   [`PgStore::begin_write`] for the lock timeout and retry policy, and the
 //!   statement and idle-in-transaction timeouts a writer transaction runs
@@ -70,6 +71,7 @@ mod repositories;
 mod script_monitors;
 mod scripts;
 mod settings;
+mod tenant_registry;
 mod usage_metrics;
 mod workspaces;
 
@@ -566,10 +568,11 @@ impl std::ops::DerefMut for WriteTx {
     }
 }
 
-/// The store's writer slot: one permit, taken before a writer checks out a
+/// The tenant's writer slot, shared by every store for the tenant in this
+/// process (`tenant_registry`): one permit, taken before a writer checks out a
 /// connection (see the [pool contract](self#pool-contract)).
 #[derive(Clone)]
-struct WriterSlot {
+pub(crate) struct WriterSlot {
     permit: Arc<tokio::sync::Semaphore>,
     /// Writers waiting for the slot or the lock, for tests to observe.
     waiting: Arc<AtomicUsize>,
@@ -634,7 +637,7 @@ pub(crate) struct PgStore {
     tenant: TenantId,
     options: PostgresOptions,
     /// Per-note content-write locks; see `note_write_lock`. Process-local,
-    /// like `SQLite`'s: they order writers within this store.
+    /// shared by every open of this tenant (`tenant_registry`).
     note_write_lanes: Arc<crate::note_write_lock::NoteWriteLanes>,
     task_event_baselines: Arc<crate::TaskEventBaselines>,
     task_events_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -644,6 +647,13 @@ pub(crate) struct PgStore {
     desktop_writes: crate::desktop_repo::DesktopWrites,
     /// See the [pool contract](self#pool-contract).
     writer_slot: WriterSlot,
+    /// Keeps the gates above registered for the next open of this tenant;
+    /// see `tenant_registry`. Held, not read, outside tests.
+    #[cfg_attr(
+        not(feature = "test-support"),
+        expect(dead_code, reason = "held so the registry entry stays live")
+    )]
+    tenant_state: Arc<tenant_registry::TenantState>,
 }
 
 impl PgStore {
@@ -780,16 +790,19 @@ impl crate::Store {
         tenant: TenantId,
         options: PostgresOptions,
     ) -> Result<Self> {
+        // Every open of this tenant in this process shares one set of gates.
+        let shared = tenant_registry::tenant_state(tenant_registry::tenant_key(&pool, &tenant));
         let store = PgStore {
             pool,
             tenant,
             options,
-            note_write_lanes: Arc::default(),
-            task_event_baselines: Arc::default(),
-            task_events_enabled: Arc::default(),
-            browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
-            desktop_writes: crate::desktop_repo::DesktopWrites::default(),
-            writer_slot: WriterSlot::default(),
+            note_write_lanes: Arc::clone(&shared.note_write_lanes),
+            task_event_baselines: Arc::clone(&shared.task_event_baselines),
+            task_events_enabled: Arc::clone(&shared.task_events_enabled),
+            browser_tab_displayed: shared.browser_tab_displayed.clone(),
+            desktop_writes: shared.desktop_writes.clone(),
+            writer_slot: shared.writer_slot.clone(),
+            tenant_state: shared,
         };
         let mut tx = store.begin().await?;
         sqlx::query("SELECT intent_provision_tenant($1)")
@@ -805,8 +818,8 @@ impl crate::Store {
 }
 
 impl crate::Store {
-    /// Writers of this Postgres store waiting for its writer slot or the
-    /// tenant writer lock; 0 on `SQLite`. For tests that need a writer to be
+    /// Writers of this Postgres store's tenant, through any of its stores in
+    /// this process, waiting for the writer slot or the tenant writer lock; 0 on `SQLite`. For tests that need a writer to be
     /// queued before they go on.
     #[doc(hidden)]
     #[must_use]

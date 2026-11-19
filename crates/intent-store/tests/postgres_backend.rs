@@ -22,6 +22,8 @@ mod attachments;
 mod clients;
 #[path = "postgres_backend/completion_watches.rs"]
 mod completion_watches;
+#[path = "postgres_backend/concurrency_handles.rs"]
+mod concurrency_handles;
 #[path = "postgres_backend/concurrency_pool.rs"]
 mod concurrency_pool;
 #[path = "postgres_backend/desktop.rs"]
