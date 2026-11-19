@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.254] - 2026-11-19
+
+### 🐛 Bug Fixes
+
+- *(store)* Consistent multi-read snapshots and provisioning under the writer lock ([#3547](https://github.com/intent-hq/intentd/pull/3547))
+
+### 📚 Documentation
+
+- Describe the redesigned failed-response states ([#3550](https://github.com/intent-hq/intentd/pull/3550))
+
+
 ## [0.11.253] - 2026-11-19
 
 ### 🐛 Bug Fixes
