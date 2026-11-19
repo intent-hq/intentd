@@ -8,7 +8,7 @@ license.workspace = true
 description = "ContextEngine implementation (AuggieContextEngine) + discovery"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.250" }
+intent-core = { workspace = true }
 async-trait = "0.1"
 tokio = { workspace = true }
 directories = { workspace = true }

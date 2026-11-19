@@ -38,20 +38,20 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 directories = { workspace = true }
 
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.250", optional = true }
-intent-core = { path = "../intent-core", version = "0.11.250" }
-intent-store = { path = "../intent-store", version = "0.11.250" }
-intent-services = { path = "../intent-services", version = "0.11.250" }
+intent-sourcecontrol = { workspace = true, optional = true }
+intent-core = { workspace = true }
+intent-store = { workspace = true }
+intent-services = { workspace = true }
 zeroize = "1.9"
-intent-app = { path = "../intent-app", version = "0.11.250" }
-intent-acp = { path = "../intent-acp", version = "0.11.250" }
-intent-providers = { path = "../intent-providers", version = "0.11.250" }
-intent-git = { path = "../intent-git", version = "0.11.250" }
-intent-context = { path = "../intent-context", version = "0.11.250" }
-intent-transport = { path = "../intent-transport", version = "0.11.250" }
-intent-nodes = { path = "../intent-nodes", version = "0.11.250" }
-intent-pty = { path = "../intent-pty", version = "0.11.250" }
-intent-js = { path = "../intent-js", version = "0.11.250", optional = true }
+intent-app = { workspace = true }
+intent-acp = { workspace = true }
+intent-providers = { workspace = true }
+intent-git = { workspace = true }
+intent-context = { workspace = true }
+intent-transport = { workspace = true }
+intent-nodes = { workspace = true }
+intent-pty = { workspace = true }
+intent-js = { workspace = true, optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
@@ -167,21 +167,21 @@ intent-nodes = { path = "../intent-nodes", features = ["northflank-fake", "agent
 # only through intent-store (intent-store/tests/sqlx_dependency_lint.rs).
 sqlx = { workspace = true }
 uuid = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.11.250", features = ["repository-test-fixtures", "test-hooks"] }
-intent-acp = { path = "../intent-acp", version = "0.11.250" }
-intent-providers = { path = "../intent-providers", version = "0.11.250", features = ["test-support"] }
-intent-core = { path = "../intent-core", version = "0.11.250" }
+intent-services = { workspace = true, features = ["repository-test-fixtures", "test-hooks"] }
+intent-acp = { workspace = true }
+intent-providers = { workspace = true, features = ["test-support"] }
+intent-core = { workspace = true }
 # Tests seed and inspect SQLite through the test-only raw pools.
-intent-store = { path = "../intent-store", version = "0.11.250", features = ["test-support"] }
+intent-store = { workspace = true, features = ["test-support"] }
 # `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice
 # never touches the network (no `LINEAR_API_KEY`, no GraphQL call).
-intent-linear = { path = "../intent-linear", version = "0.11.250" }
+intent-linear = { workspace = true }
 # `uds_sentry.rs` injects a stub `SentryEngine` so the `sentry.*` e2e slice
 # never touches the network (no token, no REST call).
-intent-sentry = { path = "../intent-sentry", version = "0.11.250" }
+intent-sentry = { workspace = true }
 # `e2e_wss_voice_transcribe.rs` injects a stub `VoiceEngine` so the
 # `voice.transcribe` e2e slice never touches the network (no key, no HTTP).
-intent-voice = { path = "../intent-voice", version = "0.4.1" }
+intent-voice = { workspace = true }
 async-trait = "0.1"
 tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
@@ -196,7 +196,7 @@ chrono = "0.4"
 ctor = "1.0.10"
 tempfile = "3"
 zip = { version = "9.4.2", default-features = false, features = ["deflate"] }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.250" }
+intent-sourcecontrol = { workspace = true }
 # `e2e_pty_job_control.rs` boots the daemon inside a real PTY session as a
 # member of a background process group (intent-hq/intent#4231 hazard class).
 portable-pty = { workspace = true }

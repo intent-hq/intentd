@@ -8,15 +8,15 @@ license.workspace = true
 description = "Scripts, hooks, terminals, browser tabs and sandboxes for intentd, built on intent-services"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.250" }
-intent-core = { path = "../intent-core", version = "0.11.250" }
-intent-store = { path = "../intent-store", version = "0.11.250" }
-intent-git = { path = "../intent-git", version = "0.11.250" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.250" }
-intent-providers = { path = "../intent-providers", version = "0.11.250" }
-intent-acp = { path = "../intent-acp", version = "0.11.250" }
-intent-js = { path = "../intent-js", version = "0.11.250" }
-intent-pty = { path = "../intent-pty", version = "0.11.250" }
+intent-services = { workspace = true }
+intent-core = { workspace = true }
+intent-store = { workspace = true }
+intent-git = { workspace = true }
+intent-sourcecontrol = { workspace = true }
+intent-providers = { workspace = true }
+intent-acp = { workspace = true }
+intent-js = { workspace = true }
+intent-pty = { workspace = true }
 base64 = { workspace = true }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 croner = "4.0.0"
@@ -35,10 +35,10 @@ libc = { workspace = true }
 nix = { workspace = true, features = ["signal", "process", "fs"] }
 
 [dev-dependencies]
-intent-services = { path = "../intent-services", version = "0.11.250", features = ["test-hooks", "repository-test-fixtures"] }
-intent-providers = { path = "../intent-providers", version = "0.11.250", features = ["test-support"] }
-intent-store = { path = "../intent-store", version = "0.11.250", features = ["test-support"] }
-intent-acp = { path = "../intent-acp", version = "0.11.250", features = ["test-hooks"] }
+intent-services = { workspace = true, features = ["test-hooks", "repository-test-fixtures"] }
+intent-providers = { workspace = true, features = ["test-support"] }
+intent-store = { workspace = true, features = ["test-support"] }
+intent-acp = { workspace = true, features = ["test-hooks"] }
 intent-test-macros = { path = "../intent-test-macros" }
 intentd-test-support = { path = "../intentd-test-support" }
 sqlx.workspace = true

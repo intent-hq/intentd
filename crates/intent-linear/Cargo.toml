@@ -8,7 +8,7 @@ license.workspace = true
 description = "LinearEngine + DTOs for the linear.* surface (typed GraphQL over reqwest)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.250" }
+intent-core = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

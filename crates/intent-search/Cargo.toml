@@ -8,7 +8,7 @@ license.workspace = true
 description = "BE-owned search.*: ripgrep-equivalent content/path search + store adapters (§14)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.250" }
+intent-core = { workspace = true }
 grep = { workspace = true }
 ignore = { workspace = true }
 globset = { workspace = true }

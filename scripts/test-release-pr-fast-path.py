@@ -134,6 +134,60 @@ class MetadataTests(Fixture):
         self.replace('Cargo.lock', 'checksum = "abc"', 'checksum = "def"')
         self.classify(False)
 
+    def inherit_core(self):
+        # The current layout: intentd inherits intent-core from the root
+        # [workspace.dependencies], where releases rewrite its version.
+        self.write('Cargo.toml', '[workspace]\nmembers = ["crates/*"]\n\n[workspace.dependencies]\n'
+                   'intent-core = { path = "crates/intent-core", version = "0.9.134" }\n'
+                   'external = { version = "0.9.134" }\n')
+        self.replace('crates/intentd/Cargo.toml', 'intent-core = { path = "../intent-core", version = "0.9.134" }',
+                     'intent-core = { workspace = true, features = ["extra"] }')
+        self.base = self.commit()
+
+    def test_workspace_dependency_release(self):
+        self.inherit_core()
+        self.bump()
+        self.replace('Cargo.toml', 'version = "0.9.134" }\nexternal', 'version = "0.9.135" }\nexternal')
+        self.classify(True)
+
+    def test_workspace_dependency_wrong_version_rejected(self):
+        self.inherit_core()
+        self.bump()
+        self.replace('Cargo.toml', 'version = "0.9.134" }\nexternal', 'version = "0.9.136" }\nexternal')
+        self.classify(False)
+
+    def test_workspace_external_dependency_version_rejected(self):
+        self.inherit_core()
+        self.bump()
+        self.replace('Cargo.toml', 'version = "0.9.134" }\nexternal = { version = "0.9.134" }',
+                     'version = "0.9.135" }\nexternal = { version = "0.9.135" }')
+        self.classify(False)
+
+    def test_workspace_dependency_features_rejected(self):
+        self.inherit_core()
+        self.bump()
+        self.replace('Cargo.toml', 'path = "crates/intent-core", version = "0.9.134"',
+                     'path = "crates/intent-core", version = "0.9.135", features = ["x"]')
+        self.classify(False)
+
+    def test_inherited_member_features_rejected(self):
+        self.inherit_core()
+        self.bump()
+        self.replace('Cargo.toml', 'version = "0.9.134" }\nexternal', 'version = "0.9.135" }\nexternal')
+        self.replace('crates/intentd/Cargo.toml', 'features = ["extra"]', 'features = ["extra", "more"]')
+        self.classify(False)
+
+    def test_workspace_dependency_release_with_unrelated_root_edit_rejected(self):
+        self.inherit_core()
+        self.bump()
+        self.replace('Cargo.toml', 'version = "0.9.134" }\nexternal', 'version = "0.9.135" }\nexternal')
+        self.replace('Cargo.toml', 'members = ["crates/*"]\n', 'members = ["crates/*"]\n\n[profile.dev]\ndebug = false\n')
+        self.classify(False)
+
+    def test_root_manifest_without_bump_rejected(self):
+        self.write('Cargo.toml', '[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n')
+        self.classify(False)
+
     def test_added_file_rejected(self):
         self.bump()
         self.write('crates/new/Cargo.toml', '[package]\nname = "new"\nversion = "0.9.135"\n')

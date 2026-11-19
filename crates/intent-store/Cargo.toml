@@ -33,7 +33,7 @@ test-support = []
 postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring-webpki"]
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.250" }
+intent-core = { workspace = true }
 time = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }

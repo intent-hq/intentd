@@ -15,7 +15,7 @@ description = "Provider registry, launch arg/env assembly, model-tier and capabi
 test-support = []
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.250" }
+intent-core = { workspace = true }
 serde_json = { workspace = true }
 node-semver = "2.2.0"
 tracing.workspace = true

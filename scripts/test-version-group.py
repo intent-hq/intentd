@@ -11,11 +11,16 @@ release-plz 0.3.162's dependent-package pass ignores version_group.
 
 Checks, per group:
   lockstep   every member has the same package version, and every path
-             dependency on a member (any crate, any [target.*] table) pins that
-             version (bare, "^" or "=").
+             dependency on a member (any crate, any [target.*] table, and the
+             root [workspace.dependencies]) pins that version (bare, "^" or "=").
   precision  a member's path dependency on a release-managed crate outside the
-             group is major-only (e.g. "0"), so that crate's patch and minor
-             releases never trigger the group-blind dependent bump.
+             group, direct or inherited with `workspace = true`, is major-only
+             (e.g. "0"), so that crate's patch and minor releases never trigger
+             the group-blind dependent bump.
+  inherit    no crates/*/Cargo.toml carries a versioned path dependency on a
+             member: it inherits the root [workspace.dependencies] entry with
+             `workspace = true`, so a release rewrites one root line per crate
+             instead of member lines that feature PRs also edit (intentd#3524).
 
 Run:  python3 -S scripts/test-version-group.py [-v]       # unit tests + this tree
       python3 -S scripts/test-version-group.py --rev REV  # check a commit
@@ -33,7 +38,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CHECKS = ("lockstep", "precision")
+CHECKS = ("lockstep", "precision", "inherit")
 DEPENDENCY_KEYS = ("dependencies", "dev-dependencies", "build-dependencies")
 GIT_ENV = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
 
@@ -59,18 +64,30 @@ class Tree:
         return sorted(p for p in listing.splitlines() if p.count("/") == 2 and p.endswith("/Cargo.toml"))
 
 
-def path_dependencies(doc):
-    """(table label, package name, requirement) for each versioned path dependency.
+def workspace_path_dependencies(workspace):
+    """{alias: (package name, requirement)} for each versioned root [workspace.dependencies] path entry."""
+    entries = workspace.get("workspace", {}).get("dependencies", {})
+    return {alias: (spec.get("package", alias), spec["version"]) for alias, spec in entries.items()
+            if isinstance(spec, dict) and "path" in spec and "version" in spec}
+
+
+def path_dependencies(doc, inherited=None):
+    """(table label, package name, requirement, is_inherited) for each versioned path dependency.
 
     Covers the same tables as dependency_tables() in release-pr-fast-path.py:
     top-level and per-[target.*] dependencies, dev- and build-dependencies.
+    A `workspace = true` entry resolves through `inherited`
+    (workspace_path_dependencies()).
     """
+    inherited = inherited or {}
     sections = [("", doc), *((f"target.{t}.", s) for t, s in doc.get("target", {}).items())]
     for prefix, section in sections:
         for key in DEPENDENCY_KEYS:
             for name, spec in section.get(key, {}).items():
                 if isinstance(spec, dict) and "path" in spec and "version" in spec:
-                    yield f"[{prefix}{key}]", spec.get("package", name), spec["version"]
+                    yield f"[{prefix}{key}]", spec.get("package", name), spec["version"], False
+                elif isinstance(spec, dict) and spec.get("workspace") is True and name in inherited:
+                    yield f"[{prefix}{key}]", *inherited[name], True
 
 
 def bare(requirement):
@@ -113,11 +130,21 @@ def version_group_errors(tree, only=CHECKS):
         if "lockstep" in only and not lockstep:
             listing = ", ".join(f"{m}={v}" for m, v in sorted(versions.items()))
             errors.append(f"{group}: members disagree on version ({listing})")
+        inherited = workspace_path_dependencies(workspace)
+        for dep, requirement in sorted(inherited.values()):
+            if "lockstep" in only and lockstep and dep in versions and bare(requirement) != versions[dep]:
+                errors.append(f"{group}: Cargo.toml pins {dep} {requirement} in [workspace.dependencies], "
+                              f"expected {versions[dep]}")
         for name, (path, doc) in sorted(crates.items()):
-            for table, dep, requirement in path_dependencies(doc):
-                if "lockstep" in only and lockstep and dep in versions and bare(requirement) != versions[dep]:
+            for table, dep, requirement, is_inherited in path_dependencies(doc, inherited):
+                if "lockstep" in only and lockstep and not is_inherited and dep in versions \
+                        and bare(requirement) != versions[dep]:
                     errors.append(f"{group}: {path} pins {dep} {requirement} in {table}, "
                                   f"expected {versions[dep]}")
+                if "inherit" in only and not is_inherited and dep in versions:
+                    errors.append(f"{group}: {path} pins {dep} {requirement} in {table}; inherit the root "
+                                  f"[workspace.dependencies] entry instead ({dep} = {{ workspace = true }}, "
+                                  "plus its features) so releases do not rewrite this line (intentd#3524)")
                 managed = {**defaults, **policies.get(dep, {})}.get("release", True)
                 major = (bare(requirement) or requirement).split(".")[0]
                 if "precision" in only and name in versions and dep not in versions and managed \
@@ -132,12 +159,17 @@ class VersionGroupTests(unittest.TestCase):
     def test_repository_version_groups_are_in_lockstep(self):
         self.assertEqual(version_group_errors(Tree(ROOT)), [])
 
-    def fixture(self, versions, pin="1.0.0", sitter_req="0", extra="", workspace_release=False):
+    def fixture(self, versions, pin="1.0.0", sitter_req="0", extra="", workspace_release=False,
+                member_pin=False, sitter_inherited=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
+        shared = f'core = {{ path = "crates/core", version = "{pin}" }}\n'
+        if sitter_inherited:
+            shared += f'sitter = {{ path = "crates/sitter", version = "{sitter_req}" }}\n'
         (root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/*"]\n\n'
-                                         '[workspace.package]\nversion = "1.0.0"\n')
+                                         '[workspace.package]\nversion = "1.0.0"\n\n'
+                                         f'[workspace.dependencies]\n{shared}')
         (root / "release-plz.toml").write_text(
             f'[workspace]\nrelease = {str(workspace_release).lower()}\n\n'
             + "".join(f'[[package]]\nname = "{n}"\nrelease = true\nversion_group = "daemon"\n\n' for n in versions)
@@ -147,8 +179,10 @@ class VersionGroupTests(unittest.TestCase):
             crate.mkdir(parents=True)
             deps = ""
             if name == "daemon":
-                deps = (f'[dependencies]\ncore = {{ path = "../core", version = "{pin}" }}\n'
-                        f'sitter = {{ path = "../sitter", version = "{sitter_req}" }}\n'
+                core = f'{{ path = "../core", version = "{pin}" }}' if member_pin else '{ workspace = true }'
+                sitter = ('{ workspace = true }' if sitter_inherited
+                          else f'{{ path = "../sitter", version = "{sitter_req}" }}')
+                deps = (f'[dependencies]\ncore = {core}\nsitter = {sitter}\n'
                         'voice = { path = "../voice", version = "0.4.1" }\n'
                         'test-support = { path = "../test-support" }\n' + extra)
             version = "{ workspace = true }" if version == "workspace" else f'"{version}"'
@@ -157,6 +191,18 @@ class VersionGroupTests(unittest.TestCase):
 
     def test_lockstep_group_passes_and_unmanaged_crates_are_ignored(self):
         self.assertEqual(version_group_errors(self.fixture({"daemon": "1.0.0", "core": "1.0.0"})), [])
+
+    def test_member_pin_on_group_member_must_inherit(self):
+        tree = self.fixture({"daemon": "1.0.0", "core": "1.0.0"}, member_pin=True)
+        errors = version_group_errors(tree)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("crates/daemon/Cargo.toml pins core 1.0.0 in [dependencies]; inherit the root", errors[0])
+        self.assertEqual(version_group_errors(tree, only=("lockstep", "precision")), [])
+
+    def test_stale_member_pin_is_reported(self):
+        tree = self.fixture({"daemon": "1.0.1", "core": "1.0.1"}, pin="1.0.0", member_pin=True)
+        self.assertIn("daemon: crates/daemon/Cargo.toml pins core 1.0.0 in [dependencies], expected 1.0.1",
+                      version_group_errors(tree, only=("lockstep",)))
 
     def test_caret_and_exact_operator_pins_are_lockstep(self):
         for pin in ("^1.0.0", "=1.0.0"):
@@ -174,12 +220,13 @@ class VersionGroupTests(unittest.TestCase):
 
     def test_stale_internal_pin_is_reported(self):
         errors = version_group_errors(self.fixture({"daemon": "1.0.1", "core": "1.0.1"}, pin="1.0.0"))
-        self.assertEqual(errors, ["daemon: crates/daemon/Cargo.toml pins core 1.0.0 in [dependencies], "
+        self.assertEqual(errors, ["daemon: Cargo.toml pins core 1.0.0 in [workspace.dependencies], "
                                   "expected 1.0.1"])
 
     def test_stale_target_table_pin_is_reported(self):
         extra = '[target.\'cfg(windows)\'.dependencies]\ncore2 = { package = "core", path = "../core", version = "1.0.0" }\n'
-        errors = version_group_errors(self.fixture({"daemon": "1.0.1", "core": "1.0.1"}, pin="1.0.1", extra=extra))
+        tree = self.fixture({"daemon": "1.0.1", "core": "1.0.1"}, pin="1.0.1", extra=extra)
+        errors = version_group_errors(tree, only=("lockstep",))
         self.assertEqual(errors, ["daemon: crates/daemon/Cargo.toml pins core 1.0.0 in "
                                   "[target.cfg(windows).dependencies], expected 1.0.1"])
 
@@ -192,6 +239,14 @@ class VersionGroupTests(unittest.TestCase):
                 self.assertEqual(len(errors), 1, errors)
                 self.assertIn(f'requires sitter "{requirement}" in [dependencies]; use major-only ("0")', errors[0])
                 self.assertEqual(version_group_errors(tree, only=("lockstep",)), [])
+
+    def test_non_major_inherited_pin_on_managed_crate_outside_group_is_reported(self):
+        tree = self.fixture({"daemon": "1.0.0", "core": "1.0.0"}, sitter_req="0.1.5", sitter_inherited=True)
+        errors = version_group_errors(tree)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('requires sitter "0.1.5" in [dependencies]; use major-only ("0")', errors[0])
+        tree = self.fixture({"daemon": "1.0.0", "core": "1.0.0"}, sitter_inherited=True)
+        self.assertEqual(version_group_errors(tree), [])
 
     def test_crates_released_by_workspace_default_are_managed(self):
         errors = version_group_errors(self.fixture({"daemon": "1.0.0", "core": "1.0.0"}, workspace_release=True))

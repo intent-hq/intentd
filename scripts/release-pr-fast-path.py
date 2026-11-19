@@ -2,7 +2,8 @@
 """Recognize release-plz metadata without executing anything from the PR.
 
 Each crate may advance independently. Only package versions and exact matching
-local dependency versions may change; external dependencies, features, sources,
+local dependency versions (in crates/*/Cargo.toml and the root
+[workspace.dependencies]) may change; external dependencies, features, sources,
 checksums, file modes and code remain unchanged. Unknown shapes fail closed.
 """
 import copy
@@ -56,7 +57,7 @@ def matches(base, head, exact_parent=False):
         meta, path = change.split('\t')
         old_mode, new_mode, _, _, status = meta.lstrip(':').split()
         require(status == 'M' and old_mode == new_mode == '100644', f'not a regular-file modification: {path}')
-        require(path in ('CHANGELOG.md', 'Cargo.lock') or re.fullmatch(r'crates/[^/]+/Cargo\.toml', path), f'disallowed file: {path}')
+        require(path in ('CHANGELOG.md', 'Cargo.lock', 'Cargo.toml') or re.fullmatch(r'crates/[^/]+/Cargo\.toml', path), f'disallowed file: {path}')
         paths.append(path)
 
     crate_paths = [p for p in git('ls-tree', '-r', '--name-only', base, '--', 'crates').splitlines() if re.fullmatch(r'crates/[^/]+/Cargo\.toml', p)]
@@ -94,6 +95,22 @@ def matches(base, head, exact_parent=False):
                 if dep.get('version') == b:
                     dep['version'] = a
         require(norm == old, f'non-release manifest change: {path}')
+
+    if 'Cargo.toml' in paths:
+        # Members inherit internal crates from the root [workspace.dependencies]
+        # (intentd#3524), so a release rewrites their versions there.
+        old, norm = manifest(base, 'Cargo.toml'), manifest(head, 'Cargo.toml')
+        for alias, dep in norm.get('workspace', {}).get('dependencies', {}).items():
+            if not isinstance(dep, dict) or not isinstance(dep.get('path'), str):
+                continue
+            target = posixpath.normpath(posixpath.join(dep['path'], 'Cargo.toml'))
+            package = dep.get('package', alias)
+            if target != names.get(package) or package not in bumps or 'git' in dep or 'registry' in dep:
+                continue
+            a, b = bumps[package]
+            if dep.get('version') == b:
+                dep['version'] = a
+        require(norm == old, 'non-release workspace manifest change: Cargo.toml')
 
     # Every bumped workspace package recorded in the base lockfile must carry
     # its new version in the head lockfile, whether or not Cargo.lock is in
