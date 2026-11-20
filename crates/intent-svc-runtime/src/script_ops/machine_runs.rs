@@ -428,15 +428,19 @@ impl MachineRuns {
     }
 
     /// [`Self::stop`] only while `place`'s run is live: a run that ended
-    /// meanwhile keeps its entry. Returns the state after the stop, or
-    /// `None` when there was nothing live to stop.
+    /// meanwhile keeps its entry. Its monitor is cancelled with `reason`.
+    /// Returns the state after the stop, or `None` when there was nothing
+    /// live to stop.
     ///
     /// # Errors
     ///
     /// `InvalidParams` when `place` has no machine run.
-    pub(crate) async fn stop_live(&self, place: &RunPlace) -> Result<Option<ScriptRuntimeState>> {
-        self.stop_because(place, "the run was stopped", StopWhen::Live)
-            .await
+    pub(crate) async fn stop_live(
+        &self,
+        place: &RunPlace,
+        reason: &str,
+    ) -> Result<Option<ScriptRuntimeState>> {
+        self.stop_because(place, reason, StopWhen::Live).await
     }
 
     /// The places of `workspace_id`'s live machine runs.

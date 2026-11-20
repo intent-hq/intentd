@@ -312,9 +312,17 @@ async fn stop_live_stops_live_runs_and_keeps_ended_ones() {
 
     assert_eq!(runs.live_in(&ws()), vec![place(&live)]);
     assert!(runs.live_in(&WorkspaceId::from("ws-2")).is_empty());
-    assert!(runs.stop_live(&place(&ended)).await.unwrap().is_none());
+    assert!(runs
+        .stop_live(&place(&ended), "archived")
+        .await
+        .unwrap()
+        .is_none());
     // Unacknowledged: settled after the bounded wait.
-    let stopped = runs.stop_live(&place(&live)).await.unwrap().unwrap();
+    let stopped = runs
+        .stop_live(&place(&live), "archived")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stopped.status, ScriptStatus::Idle);
     assert!(runs.live_in(&ws()).is_empty());
     let entries = runs.entries(&ws(), "s1");

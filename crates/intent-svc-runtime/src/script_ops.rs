@@ -2021,7 +2021,10 @@ impl ScriptManager {
                     if !archived {
                         return;
                     }
-                    if let Err(e) = runs.stop_live(&place).await {
+                    if let Err(e) = runs
+                        .stop_live(&place, "cancelled by workspace archive")
+                        .await
+                    {
                         tracing::warn!(
                             workspace = %place.workspace_id,
                             script = %place.script_id,
