@@ -32,9 +32,20 @@ class Probe:
             os.close(fd)
 
     def exit_status(self):
-        if not select.select([self.status], [], [], 5)[0]:
-            raise AssertionError('provider did not report exit status')
-        return os.read(self.status, 4)
+        # The owner may write the frame in pieces ('0', '07\n'); read to b'\n'.
+        frame = b''
+        deadline = time.monotonic() + 5
+        while not frame.endswith(b'\n'):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([self.status], [], [], remaining)[0]:
+                raise AssertionError(f'provider did not report exit status: {frame!r}')
+            chunk = os.read(self.status, 4 - len(frame))
+            if not chunk:
+                raise AssertionError(f'status pipe closed before newline: {frame!r}')
+            frame += chunk
+            if len(frame) >= 4 and not frame.endswith(b'\n'):
+                raise AssertionError(f'malformed exit status: {frame!r}')
+        return frame
 
     def cleanup(self, cancel=False):
         if cancel:
