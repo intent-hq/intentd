@@ -37,10 +37,10 @@ use crate::Services;
 const BASELINE: &str = "3.9";
 /// The harness under test.
 const CANDIDATE: &str = intent_core::CURRENT_HARNESS_VERSION;
-/// The release the candidate replaces, reported for reference only (3.13:
-/// the released 3.10 context cuts, 3.11's inline visuals and the
-/// explicit-rename Workspace Title rule). The gate stays on [`BASELINE`].
-const PREVIOUS: &str = "3.13";
+/// The release the candidate replaces, reported for reference only (3.14:
+/// 3.13's doctrine and context with the `workspace_api` title instruction).
+/// The gate stays on [`BASELINE`].
+const PREVIOUS: &str = "3.14";
 /// The newest harness may carry at most this share of the baseline on the
 /// realistic fixture.
 const REALISTIC_MAX_RATIO: f64 = 0.5;
