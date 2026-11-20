@@ -359,7 +359,7 @@ Use `ws.browser.docs("capture")` or `ws.browser.docs("examples")` for detailed u
 
 ## Inline visuals
 
-Intent desktop v2.253.0 and later renders completed assistant `ws-block:html`
+Intent desktop renders completed assistant `ws-block:html`
 fences as interactive visuals in chat. For a request such as “visualize how
 seasons work,” use this format to explain the mechanism with linked diagrams and
 controls. Image generation is appropriate when the user asks for a bitmap image;
