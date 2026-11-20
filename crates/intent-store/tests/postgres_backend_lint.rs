@@ -40,9 +40,13 @@
 //!    helper the lint follows, `commit`, `rollback` or `drop` (into a
 //!    struct, an Option, a return or a closure), fails unless
 //!    `BEGIN_ESCAPE_ALLOWED` names it, as the lint could not count its
-//!    statements. Limits: iterator closures (`.map`, `for_each`) are not
-//!    loops, and a helper reached only through a trait object or a
-//!    function pointer is not followed.
+//!    statements; so does one bound by any pattern but a name (`let
+//!    Ok(tx) = .. else`). A helper is followed by parameter, also for
+//!    escapes, and a statement counts once per chain of calls reaching it.
+//!    Limits: iterator closures (`.map`, `for_each`) are not loops, a
+//!    helper reached only through a trait object or a function pointer is
+//!    not followed, and an allowlist entry covers every read in its
+//!    function.
 //!
 //! Rules 1 and 2 find SQL by use (`support/sql_uses.rs`): the text that
 //! reaches a sqlx call, followed through locals, consts, helpers and
@@ -215,12 +219,20 @@ const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[(
 
 /// Plain `begin()` transactions allowed to leave the lint's view, as
 /// `(file, function, why)`.
-const BEGIN_ESCAPE_ALLOWED: &[(&str, &str, &str)] = &[(
-    "mod.rs",
-    "begin_write",
-    "wraps the transaction in WriteTx once it holds the writer lock; every WriteTx \
-     is a write transaction, which rule 2 checks",
-)];
+const BEGIN_ESCAPE_ALLOWED: &[(&str, &str, &str)] = &[
+    (
+        "mod.rs",
+        "begin_write",
+        "wraps the transaction in WriteTx once it holds the writer lock; every WriteTx \
+         is a write transaction, which rule 2 checks",
+    ),
+    (
+        "mod.rs",
+        "bind_tenant",
+        "returns the transaction it binds to the tenant to begin() and \
+         begin_read_snapshot(), whose callers the lint checks",
+    ),
+];
 
 /// Consts the lint does not follow because a test of their own checks
 /// them, as `(file, const, test)`; their literals are not orphans.
@@ -1943,9 +1955,16 @@ fn writing_functions_come_from_the_migrations() {
 /// An allowlist key: `(file name, function)`.
 type AllowKey = (String, String);
 
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map_or_else(String::new, |f| f.to_string_lossy().into_owned())
+/// An allowlist file: the path under `src/postgres/` (`mod.rs` is the
+/// top module only), else the file name.
+fn allow_file(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    match text.rfind("src/postgres/") {
+        Some(i) => text[i + "src/postgres/".len()..].to_owned(),
+        None => path
+            .file_name()
+            .map_or_else(String::new, |f| f.to_string_lossy().into_owned()),
+    }
 }
 
 /// Splits findings into those `allowed` names and the rest; returns the
@@ -1957,7 +1976,7 @@ fn apply_allowed(
     let mut found = Vec::new();
     let mut used = BTreeSet::new();
     for (file, function, message) in findings {
-        let key = (file_name(&file), function);
+        let key = (allow_file(&file), function);
         if allowed.iter().any(|(a, f, _)| *a == key.0 && *f == key.1) {
             used.insert(key);
         } else {
@@ -1985,13 +2004,21 @@ fn multi_statement_reads(
         .multi_statement_reads()
         .into_iter()
         .map(|tx| {
-            let on = match tx.kind {
-                TxKind::Begin => "one plain begin()",
-                TxKind::Connection => "one acquired connection, outside any transaction",
-                TxKind::Pool => "the pool, each on its own connection",
+            let (on, fix) = match tx.kind {
+                TxKind::Begin => ("one plain begin()", "use begin_read_snapshot()"),
+                TxKind::Connection => (
+                    "one acquired connection, outside any transaction",
+                    "use begin_read_snapshot() (a read) or begin_write() (a write), or list \
+                     it in MULTI_READ_ALLOWED with a reason",
+                ),
+                TxKind::Pool => (
+                    "the pool, each on its own connection",
+                    "use begin_read_snapshot() (a read) or begin_write() (a write), or list \
+                     it in MULTI_READ_ALLOWED with a reason (a retry loop of one statement)",
+                ),
             };
             let message = format!(
-                "{}:{}: {} runs {} statements on {on} ({}); use begin_read_snapshot()",
+                "{}:{}: {} runs {} statements on {on} ({}); {fix}",
                 tx.file.display(),
                 tx.line,
                 tx.function,
@@ -2271,4 +2298,79 @@ fn a_statement_in_a_loop_runs_more_than_once() {
     let per_pass = r#"async fn o(&self) { loop { let mut tx = self.begin().await?;
         sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await; } }"#;
     assert_eq!(reads(per_pass), Vec::<String>::new());
+}
+
+#[test]
+fn review_shapes_of_rule5_are_caught() {
+    let q = r#"sqlx::query("SELECT x FROM t WHERE tenant_id = $1")"#;
+    let two = |head: &str, ex: &str| {
+        format!(
+            "async fn f(&self) {{ {head} {q}.fetch_all({ex}).await; {q}.fetch_all({ex}).await; }}"
+        )
+    };
+    // `let .. else` (any pattern but a name) does not bind it: it fails.
+    let let_else = two(
+        "let Ok(mut tx) = self.begin().await else { return };",
+        "&mut *tx",
+    );
+    assert_eq!(escapes(&let_else), ["x.rs f"]);
+    // One helper called twice runs two statements.
+    let twice = format!(
+        "async fn f(&self) {{ let mut tx = self.begin().await?; h(&mut tx).await; h(&mut tx).await; }}
+         async fn h(c: &mut PgConnection) {{ {q}.fetch_all(c).await; }}"
+    );
+    assert_eq!(reads(&twice), ["x.rs f"]);
+    // A snapshot shadowing `tx` in an inner block does not hide the outer one.
+    let shadowed = format!(
+        "async fn f(&self) {{ let mut tx = self.begin().await?; {q}.fetch_all(&mut *tx).await;
+         {{ let mut tx = self.begin_read_snapshot().await?; {q}.fetch_all(&mut *tx).await; }}
+         {q}.fetch_all(&mut *tx).await; }}"
+    );
+    assert_eq!(reads(&shadowed), ["x.rs f"]);
+    // A closure written before a loop and called in it.
+    let closure_loop = format!(
+        "async fn f(&self, v: Vec<i64>) {{ let mut tx = self.begin().await?;
+         let mut run = || {q}.fetch_all(&mut *tx); for i in v {{ run().await; }} }}"
+    );
+    assert_eq!(reads(&closure_loop), ["x.rs f"]);
+    // Pools by clone and by a `read_pool` field.
+    assert_eq!(reads(&two("let p = self.pool.clone();", "&p")), ["x.rs f"]);
+    assert_eq!(reads(&two("", "&self.read_pool")), ["x.rs f"]);
+    // Moves by assignment, and through helpers that keep or return it.
+    for source in [
+        "async fn f(&mut self) { let tx = self.begin().await?; self.tx = tx; }",
+        "async fn f(&self, slot: &mut Option<Tx>) { let tx = self.begin().await?; *slot = tx; }",
+        "async fn f(&self) { let tx = self.begin().await?; let h = Holder::new(tx); }
+         fn new(tx: Tx) -> Self { Self { tx } }",
+        "async fn f(&self) { let tx = self.begin().await?; let mut tx = identity(tx); }
+         fn identity(tx: Tx) -> Tx { tx }",
+    ] {
+        assert_eq!(escapes(source).len(), 1, "{source}");
+    }
+}
+
+#[test]
+fn rule5_messages_and_keys_fit_the_finding() {
+    let q = r#"sqlx::query("INSERT INTO t (tenant_id) VALUES ($1)")"#;
+    let pool = format!(
+        "async fn f(&self) {{ {q}.execute(&self.pool).await; {q}.execute(&self.pool).await; }}"
+    );
+    let index = Index::new(&[(PathBuf::from("x.rs"), pool)], &[]);
+    let (found, _) = multi_statement_reads(&index, &[]);
+    assert!(found[0].contains("begin_write()"), "{found:?}");
+    assert!(found[0].contains("MULTI_READ_ALLOWED"), "{found:?}");
+    // Keys are paths under src/postgres, so `mod.rs` is the top module only.
+    let read = r#"async fn b(&self) { let mut tx = self.begin().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    let sources = [("src/postgres/sub/mod.rs", read)];
+    let (found, _) = rule5(multi_statement_reads, &sources, &[("mod.rs", "b", "why")]);
+    assert_eq!(found.len(), 1);
+    let (found, used) = rule5(
+        multi_statement_reads,
+        &sources,
+        &[("sub/mod.rs", "b", "why")],
+    );
+    assert!(found.is_empty());
+    assert!(used.contains(&("sub/mod.rs".to_owned(), "b".to_owned())));
 }
