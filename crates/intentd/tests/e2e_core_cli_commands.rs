@@ -269,6 +269,8 @@ case "$1" in
     printf 'key-%s' $$ > "$key"
     ;;
   serve)
+    d=$(dirname "$0")
+    [ -f "$d/tailcat-delay" ] && sleep "$(cat "$d/tailcat-delay")" # // timing-guard: a tunnel still starting, for the re-install test
     printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
     exec sleep 600
     ;;
@@ -683,6 +685,35 @@ async fn pair_yes_turns_the_tunnel_on_for_a_loopback_only_listener() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stderr.contains("Tailcat tunnel enabled"), "{stderr}");
     assert!(!stdout.contains("&tc="), "{stdout}");
+}
+
+/// A re-install: remote access and the tunnel are saved on, and the daemon
+/// has just restarted, so its tunnel is still coming up. The installer pairs
+/// right away with `--yes` and no `--tunnel` (re-installs keep saved
+/// choices); pairing must wait for that tunnel instead of failing with no
+/// dialable route. One run, no retries.
+#[tokio::test]
+async fn pair_waits_for_a_saved_tunnel_that_is_still_starting() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+    std::fs::write(data_dir.join("tailcat-delay"), "3").expect("seed tailcat delay");
+    let child = spawn_daemon_both_tunneled(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let output = run_pair(&data_dir, &["--yes"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "pair --yes must wait for the saved tunnel: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let url = labeled_value(&stdout, "URL:").expect("URL line");
+    assert!(url.contains("&tc=tc-"), "{url}");
 }
 
 /// One-shot `intentd call <method>` against the daemon in `data_dir`,

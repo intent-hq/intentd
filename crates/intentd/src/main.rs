@@ -1355,9 +1355,8 @@ fn pair_wants_tunnel(tunnel_flag: bool, tunnel_enabled: bool, loopback_only: boo
 /// `--yes` (or an unattended run) keeps the saved `server.bindAddress`
 /// (default: loopback) and turns the tunnel on per [`pair_wants_tunnel`];
 /// otherwise a consent prompt, then the tunnel question (defaulting the same
-/// way) and the address picker pre-checked with the saved addresses. Returns
-/// whether this run turned the tunnel on, so the caller waits for its route.
-async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow::Result<bool> {
+/// way) and the address picker pre-checked with the saved addresses.
+async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow::Result<()> {
     let tunnel_enabled = current_bool_setting(socket, "server.tunnel.enabled").await?;
     let current = current_bind_addresses(socket).await;
     let loopback_only = current.iter().all(std::net::IpAddr::is_loopback);
@@ -1366,9 +1365,8 @@ async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow
         enable_wss_listener(socket, &[]).await?;
         if wants_tunnel && !tunnel_enabled {
             enable_tunnel_for_pairing(socket).await?;
-            return Ok(true);
         }
-        return Ok(false);
+        return Ok(());
     }
     if !confirm_enable_wss()? {
         anyhow::bail!(
@@ -1382,16 +1380,24 @@ async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow
     let tunnel_only = current_bool_setting(socket, "server.tunnel.only").await?;
     let selection = prompt_listen_targets(&current, wants_tunnel, tunnel_only)?;
     let changes = listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only);
-    enable_wss_listener(socket, &changes).await?;
-    Ok(selection.tailcat && !tunnel_enabled)
+    enable_wss_listener(socket, &changes).await
 }
 
-/// `--tunnel` with the listener already up: no picker runs, so turn the
-/// tunnel on directly. With the listener down the enable flow handles it.
-async fn enable_requested_tunnel(socket: &Path) -> anyhow::Result<()> {
-    if current_bool_setting(socket, "server.wsApi.enabled").await?
-        && !current_bool_setting(socket, "server.tunnel.enabled").await?
+/// With the listener already up no picker runs, so turn the tunnel on
+/// directly when [`pair_wants_tunnel`] says so: `--tunnel`, or — for an
+/// unattended `--yes` — a loopback-only bind with no other route to pair
+/// over. With the listener down the enable flow handles it.
+async fn enable_requested_tunnel(socket: &Path, opts: PairOptions) -> anyhow::Result<()> {
+    if !current_bool_setting(socket, "server.wsApi.enabled").await?
+        || current_bool_setting(socket, "server.tunnel.enabled").await?
     {
+        return Ok(());
+    }
+    let loopback_only = current_bind_addresses(socket)
+        .await
+        .iter()
+        .all(std::net::IpAddr::is_loopback);
+    if opts.tunnel || (opts.yes && loopback_only) {
         enable_tunnel_for_pairing(socket).await?;
     }
     Ok(())
@@ -1452,18 +1458,18 @@ async fn fetch_pairing_result(
     opts: PairOptions,
     listener_down: fn(&Value) -> bool,
 ) -> anyhow::Result<Value> {
-    if opts.tunnel {
-        enable_requested_tunnel(socket).await?;
+    if opts.tunnel || opts.yes {
+        enable_requested_tunnel(socket, opts).await?;
     }
     let mut response = rpc_call(socket, method, json!({})).await?;
-    let mut tunnel_turned_on = false;
     if listener_down(&response) {
-        tunnel_turned_on = enable_listener_for_pairing(socket, opts).await?;
+        enable_listener_for_pairing(socket, opts).await?;
         response = rpc_call(socket, method, json!({})).await?;
     }
-    if opts.tunnel || tunnel_turned_on {
-        response = await_tunnel_route(socket, method, response, listener_down).await?;
-    }
+    // Always: a saved tunnel may still be coming up after a restart (a
+    // re-install pairs right after restarting the daemon); this returns at
+    // once when the tunnel is off or its route is already there.
+    response = await_tunnel_route(socket, method, response, listener_down).await?;
     if let Some(error) = response.get("error") {
         anyhow::bail!("{method} failed: {}", rpc_error_text(error));
     }
