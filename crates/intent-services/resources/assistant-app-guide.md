@@ -304,6 +304,13 @@ including when viewing another machine.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/DockLabSettings.svelte; src/main/dock-lab.ts; src/main/dock-window-menu.ts; src/main/window-backend.ts. Test-build behavior pending its frontend release. -->
 
+Starting with the desktop release that expands the Notch workspace list, the dock
+keeps your three most recent human conversations visible when available, even if
+all are more than 24 hours old. **Show older** expands the list to show up to five
+workspace rows when there is room; scroll to reach the rest.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/store/renderer/slices/hud/hud-selectors.ts; src/features/hud/components/{AdaptiveDockShell.svelte,DockOverview.svelte,dock-shell-geometry.ts}. -->
+
 Starting with the desktop release that enables capture editing by default, stopping
 a screen recording from the Notch dock opens the capture editor. Click a finished
 recording tile in the dock composer to reopen it. Screenshot tiles and their **Edit**
