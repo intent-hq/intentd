@@ -3787,6 +3787,61 @@ mod tests {
             .collect()
     }
 
+    /// The binary ids of a nextest override filter that selects only whole,
+    /// exactly named binaries: `binary_id(=a) | binary_id(=b)`. `None` for any
+    /// other shape.
+    fn exact_override_binary_ids(filter: &str) -> Option<Vec<&str>> {
+        filter
+            .split('|')
+            .map(|term| {
+                let id = term.trim().strip_prefix("binary_id(=")?.strip_suffix(')')?;
+                (!id.is_empty() && !id.contains(['(', ')', '&', '|', '/', ' '])).then_some(id)
+            })
+            .collect()
+    }
+
+    /// Whether a `slow-timeout` override filter may select `script_ops` tests:
+    /// anything but an exact test-name list without `script_ops::` names or an
+    /// exact list of binaries outside this crate.
+    fn may_govern_script_ops(filter: &str) -> bool {
+        if let Some(names) = exact_override_test_names(filter) {
+            return names.iter().any(|name| name.starts_with("script_ops::"));
+        }
+        exact_override_binary_ids(filter).is_none_or(|ids| {
+            ids.iter().any(|id| {
+                *id == env!("CARGO_PKG_NAME")
+                    || id
+                        .strip_prefix(env!("CARGO_PKG_NAME"))
+                        .is_some_and(|rest| rest.starts_with("::"))
+            })
+        })
+    }
+
+    #[test]
+    fn only_exact_names_or_other_binaries_escape_the_script_ops_budget() {
+        for outside in [
+            "binary_id(=intent-store::postgres_backend)",
+            "binary_id(=intent-store::postgres_backend) | binary_id(=intent-app)",
+            "binary_id(=intent-services) & (test(=a::b) | test(=c))",
+            "binary_id(=intent-svc-runtime-extra)",
+        ] {
+            assert!(!may_govern_script_ops(outside), "{outside}");
+        }
+        for governing in [
+            "binary_id(=intent-svc-runtime)",
+            "binary_id(=intent-store::postgres_backend) | binary_id(=intent-svc-runtime)",
+            "binary_id(=intent-svc-runtime::integration)",
+            "binary_id(/intent-store/)",
+            "binary_id(=intent-store) & test(/x/)",
+            "binary_id(=intent-store) | test(=script_ops::x)",
+            "binary_id(=)",
+            "test(=script_ops::liveness)",
+            "package(intent-store)",
+        ] {
+            assert!(may_govern_script_ops(governing), "{governing}");
+        }
+    }
+
     #[test]
     fn exact_override_test_names_accepts_only_exact_name_lists() {
         assert_eq!(
@@ -3812,8 +3867,9 @@ mod tests {
     /// before nextest's `slow-timeout` kill (`period × terminate-after`) from
     /// the real `.config/nextest.toml`, so the two numbers cannot drift apart
     /// silently. A `[[profile.default.overrides]]` entry may set `slow-timeout`
-    /// only for an exact list of named tests outside `script_ops` (see
-    /// [`exact_override_test_names`]), so the `[profile.default]` budget is the
+    /// only for an exact list of named tests outside `script_ops` or of
+    /// binaries outside this crate (see [`may_govern_script_ops`]), so the
+    /// `[profile.default]` budget is the
     /// one that applies here; any broader override fails loudly so the test can
     /// be taught which override governs this module.
     #[test]
@@ -3850,10 +3906,7 @@ mod tests {
             .unwrap_or_default();
         let governing: Vec<&String> = overrides_with_slow_timeout
             .iter()
-            .filter(|filter| {
-                exact_override_test_names(filter)
-                    .is_none_or(|names| names.iter().any(|name| name.starts_with("script_ops::")))
-            })
+            .filter(|filter| may_govern_script_ops(filter))
             .collect();
         assert!(
             governing.is_empty(),

@@ -139,6 +139,24 @@ threads-required = 'num-test-threads'
 priority = 100
 slow-timeout = { period = "180s", terminate-after = 3 }
 
+# The Postgres store tests (intent-store --features postgres, binary
+# postgres_backend) each create and migrate a fresh database on a local server.
+# On a shared 8-thread run all 180 pass, the slowest in 38s (concurrency_handles
+# and pr_monitors, mostly waiting for database creation) and the bounded-delete
+# tests in about 25s. A test that blocks on a lock or a pool connection (a tenant
+# name shared between two tests once did) never finishes: terminate it after
+# 2 x 60s, about 3x the slowest test, instead of the 180s default. Plain
+# `cargo test` has no per-test limit, so run them under nextest (as CI's
+# store-postgres job does): INTENT_STORE_TEST_PG_URL=... cargo nextest run
+# -p intent-store --features postgres --test postgres_backend (once the
+# monorepo's FEATURES knob lands: make test-select FEATURES=intent-store/postgres
+# E='binary_id(=intent-store::postgres_backend)'). Scoped to the one binary by
+# exact id: script_ops' liveness guard accepts binary-wide slow-timeout
+# overrides only for binaries outside intent-svc-runtime.
+[[profile.default.overrides]]
+filter = 'binary_id(=intent-store::postgres_backend)'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 # Long wall-clock tests (>= 20s under coverage): the installer's literal 60s
 # crash-window replay (66s), a hook scheduled at the 60s delayMs minimum (68s),
 # a ~30s watch-retention wait, and two 20s screenshot outer-deadline timeouts.
