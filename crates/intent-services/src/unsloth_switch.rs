@@ -47,6 +47,12 @@ impl Services {
             return Ok(metadata);
         };
         let session = self.store.get_agent_session_summary(agent_id).await?;
+        // A remote agent runs on its machine's own server.
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return Ok(metadata);
+        }
         let settings = self.effective_settings();
         let provider = crate::agent_session::resolve_base_provider_id(
             session.provider.as_deref(),
@@ -60,16 +66,15 @@ impl Services {
         }
         // A live child already on its model takes the turn without asking
         // the server for a model.
-        if manager
-            .spawned_identity(agent_id)
-            .is_some_and(|(_, model)| model.as_deref() == Some(requested.as_str()))
-        {
+        if manager.live_child_runs_model(agent_id, &requested) {
             return Ok(metadata);
         }
+        // Only agents running on the served model lose it.
         let others: Vec<AgentId> = manager
             .agents_with_provider("unsloth")
             .into_iter()
-            .filter(|id| id != agent_id)
+            .filter(|(id, model)| id != agent_id && model.as_deref() == Some(current.as_str()))
+            .map(|(id, _)| id)
             .collect();
         if others.is_empty() {
             return Ok(metadata);

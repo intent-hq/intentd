@@ -3742,15 +3742,18 @@ impl AgentManager {
         self.agents_with_provider(provider_id).len()
     }
 
-    /// Currently-tracked agents spawned under the given provider id. Keyed on
-    /// the selection, not the command: an `unsloth` agent runs `opencode`.
-    pub(crate) fn agents_with_provider(&self, provider_id: &str) -> Vec<AgentId> {
+    /// Currently-tracked agents spawned under the given base provider id,
+    /// with the model each was spawned on. Keyed on the selection, not the
+    /// command: an `unsloth` agent runs `opencode`.
+    pub(crate) fn agents_with_provider(&self, provider_id: &str) -> Vec<(AgentId, Option<String>)> {
         self.handles
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, h)| h.spawned_selection == provider_id)
-            .map(|(id, _)| id.clone())
+            .filter(|(_, h)| {
+                intent_providers::base_provider_id(&h.spawned_selection) == provider_id
+            })
+            .map(|(id, h)| (id.clone(), h.spawned_model.clone()))
             .collect()
     }
 
@@ -11296,6 +11299,15 @@ impl AgentManager {
             .unwrap()
             .get(agent_id)
             .map(|h| (h.spawned_provider.clone(), h.spawned_model.clone()))
+    }
+
+    /// Whether `agent_id` has a live child spawned on `model`, which its next
+    /// turn reuses without asking a model server for anything.
+    pub(crate) fn live_child_runs_model(&self, agent_id: &AgentId, model: &str) -> bool {
+        let mut handles = self.handles.lock().unwrap();
+        handles.get_mut(agent_id).is_some_and(|handle| {
+            handle.spawned_model.as_deref() == Some(model) && handle.execution.runtime.is_alive()
+        })
     }
 
     fn handle_is_live(&self, agent_id: &AgentId) -> bool {

@@ -848,7 +848,7 @@ impl UnslothServerManager {
         pid_is_alive(identity.pid?).then_some(identity.repo_id)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_owned_server_for_test(&self, repo_id: &str) {
         self.set_identity(Some(ServerIdentity {
             repo_id: repo_id.to_string(),
@@ -858,7 +858,7 @@ impl UnslothServerManager {
         }));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_adopted_server_for_test(&self, repo_id: &str) {
         self.set_identity(Some(ServerIdentity {
             repo_id: repo_id.to_string(),
