@@ -1449,10 +1449,9 @@ mod find_provider_binary_tests {
         // Assert against the single discovery snapshot rather than re-resolving
         // npx (no test mutates process-global PATH anymore — monorepo#628 —
         // but the snapshot assertion stays robust regardless).
-        assert_eq!(
-            cc.installed,
-            cc.resolved_path.is_some() && cc.secondary_binary.as_ref().is_some_and(|s| s.resolved)
-        );
+        // A missing `claude` CLI is replaced by Intent's bundled copy, so npx
+        // alone decides `installed`.
+        assert_eq!(cc.installed, cc.resolved_path.is_some());
         if let Some(path) = &cc.resolved_path {
             assert!(path
                 .file_name()
@@ -1492,11 +1491,9 @@ mod find_provider_binary_tests {
             Some(crate::config::CODEX_ACP_NPX_PACKAGE)
         );
         assert!(!codex.has_npx_fallback);
-        assert_eq!(
-            codex.installed,
-            codex.resolved_path.is_some()
-                && codex.secondary_binary.as_ref().is_some_and(|s| s.resolved)
-        );
+        // A missing `codex` CLI is replaced by Intent's bundled copy, so npx
+        // alone decides `installed`.
+        assert_eq!(codex.installed, codex.resolved_path.is_some());
         if let Some(path) = &codex.resolved_path {
             assert!(path
                 .file_name()

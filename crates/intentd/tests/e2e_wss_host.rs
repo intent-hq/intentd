@@ -1709,7 +1709,10 @@ async fn host_provider_discovery_over_wss() {
                 p["secondaryResolved"].is_boolean(),
                 "provider.secondaryResolved must be boolean: {p}"
             );
-            if p["installed"] == true {
+            // Codex / Claude Code run Intent's bundled CLI when theirs is
+            // missing, so only other dual-binary providers need it resolved.
+            let bundled_cli = matches!(p["id"].as_str(), Some("codex" | "claude-code"));
+            if p["installed"] == true && !bundled_cli {
                 assert_eq!(
                     p["secondaryResolved"], true,
                     "installed dual-binary providers must have the secondary resolved: {p}"
