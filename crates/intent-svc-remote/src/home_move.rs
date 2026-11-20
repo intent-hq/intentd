@@ -313,7 +313,7 @@ async fn steps(svc: &Services, home_move: &HomeMove) -> Result<()> {
                 let workspace_id = workspace_id.clone();
                 intent_core::spawn_daemon(async move {
                     svc.feature_runtime()
-                        .start_home_auto_start(&svc, workspace_id)
+                        .start_auto_start(&svc, workspace_id)
                         .await;
                 });
             }

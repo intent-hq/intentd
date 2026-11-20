@@ -2255,6 +2255,47 @@ impl Services {
         self.orchestrator_mode()
     }
 
+    /// Whether `id`'s `autoStart` scripts may start now: the workspace is
+    /// not archived, retired, deleted or in a pending-delete grace window.
+    ///
+    /// # Errors
+    ///
+    /// The store's error reading the workspace.
+    #[doc(hidden)]
+    pub async fn workspace_accepts_auto_start(&self, id: &WorkspaceId) -> Result<bool> {
+        let ws = self.store.get_workspace(id).await?;
+        if ws.archived || ws.is_retired() || ws.status == WorkspaceStatus::Deleted {
+            return Ok(false);
+        }
+        let pending = self
+            .pending_workspace_deletes
+            .deadline(&delete_grace::PendingDeleteSubject::Workspace(id.clone()))?;
+        Ok(pending.is_none())
+    }
+
+    /// Start `id`'s saved `autoStart` scripts in the background (scripts.md
+    /// "autoStart"). `after_local_setup` skips a workspace whose home is on
+    /// a machine: that home starts them when its own setup finishes.
+    pub(crate) fn kick_auto_start(&self, id: &WorkspaceId, after_local_setup: bool) {
+        let this = self.clone();
+        let id = id.clone();
+        let _ = self.store_tasks.spawn_draining(async move {
+            if after_local_setup && this.workspace_homes() {
+                match this.store.get_workspace_home(&id).await {
+                    Ok(Some(home)) if home.node_id.is_some() || home.cloud_machine_id.is_some() => {
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(workspace = %id, %error, "autoStart: workspace home read failed");
+                        return;
+                    }
+                }
+            }
+            this.ports.runtime().start_auto_start(&this, id).await;
+        });
+    }
+
     /// Whether this daemon may run agents on its own host: the "This
     /// computer" row of the ordered machine list. `false` on an
     /// orchestrator.
@@ -23352,6 +23393,7 @@ impl WorkspaceApi for Services {
                             )
                         })
                         .await;
+                        services.kick_auto_start(&ws.id, true);
                     }
                     let mut initial_agent = None;
                     let mut notice = None;
@@ -23532,6 +23574,7 @@ impl WorkspaceApi for Services {
                     }
                     let bus_for_setup = self.event_bus.clone();
                     let setup_states = self.workspace_setup_states.clone();
+                    let services_for_setup = self.clone();
                     if let (Some(worktree_path_buf), Some(script)) =
                         (setup_worktree, effective_setup_script)
                     {
@@ -23584,6 +23627,9 @@ impl WorkspaceApi for Services {
                                 ),
                             )
                             .await;
+                            if ran_script && exit_code == Some(0) {
+                                services_for_setup.kick_auto_start(&workspace_id, true);
+                            }
                         });
                     }
                     Ok(WorkspaceCreateResult {
@@ -35899,6 +35945,10 @@ impl Services {
             changes["autoUnarchive"] = stamp;
         }
         publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
+        // A revive's fresh checkout never ran setup, so nothing autoStarts.
+        if matches!(outcome, Some(UnarchiveOutcome::Unarchived)) {
+            self.kick_auto_start(&ws.id, false);
+        }
         Ok((ws, outcome))
     }
 
@@ -39306,6 +39356,13 @@ impl Services {
                 let cancelled_hooks = std::mem::take(&mut sweep.cancelled_hooks);
                 let cancelled_monitors = std::mem::take(&mut sweep.cancelled_monitors);
                 this.notify_owners_of_archived_watches(&id, cancelled_hooks, cancelled_monitors)
+                    .await;
+                // Stop the workspace's running scripts (scripts.md
+                // "autoStart"): outside the fence, before the archive script,
+                // and only while the row is still archived.
+                this.ports
+                    .runtime()
+                    .stop_archived_workspace_scripts(&this, &id)
                     .await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
                 // authoritative wire shape without a follow-up `workspace.get`,

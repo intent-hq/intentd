@@ -247,6 +247,16 @@ pub(crate) struct ScriptLocks {
     pub(crate) monitor_dispatched: Arc<tokio::sync::Notify>,
 }
 
+/// Who asked for a start: a client, the boot restore of a was-running
+/// script, or an `autoStart` trigger. Daemon starts launch only in an
+/// active workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartKind {
+    Client,
+    Restore,
+    AutoStart,
+}
+
 impl ScriptLocks {
     /// Whether `workspace_id` is being deleted.
     pub(crate) fn is_closing(&self, workspace_id: &WorkspaceId) -> bool {
@@ -1243,7 +1253,7 @@ impl ScriptManager {
             if archived || (on_home && !marked) {
                 continue;
             }
-            if let Err(error) = self.start_with_restore(&ws, &id, true).await {
+            if let Err(error) = self.start_as(&ws, &id, StartKind::Restore).await {
                 tracing::warn!(workspace = %ws, script = %id, %error, "boot start of service failed");
             }
         }
@@ -1938,6 +1948,39 @@ impl ScriptManager {
         // Wait out every `script.create` admitted before the mark: its new
         // id is committed and registered before the snapshot below.
         drop(self.locks.create_admission(workspace_id).write().await);
+        closing.unsettled = self
+            .stop_live_scripts(workspace_id, "cancelled by workspace deletion", false)
+            .await;
+        if let Some(park) = &self.parks.workspace_closed {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+        closing
+    }
+
+    /// The workspace was archived: stop every running script with
+    /// `script.stop` semantics (scripts.md "autoStart"), so nothing keeps
+    /// running and no was-running marker survives for boot to restore.
+    pub(crate) async fn stop_for_archive(&self, workspace_id: &WorkspaceId) {
+        let unsettled = self
+            .stop_live_scripts(workspace_id, "cancelled by workspace archive", true)
+            .await;
+        if !unsettled.is_empty() {
+            tracing::warn!(workspace = %workspace_id, ?unsettled, "scripts still live after workspace archive");
+        }
+    }
+
+    /// Stop each live or admitted script of `workspace_id` under its
+    /// definition lock; returns the ids still live or admitted after the
+    /// stop. With `while_archived` the loop ends once the row is no longer
+    /// archived, so an unarchive that wins the race keeps its scripts.
+    /// Best-effort: a failed stop is logged and the rest still stop.
+    async fn stop_live_scripts(
+        &self,
+        workspace_id: &WorkspaceId,
+        reason: &'static str,
+        while_archived: bool,
+    ) -> Vec<String> {
         let ids: Vec<String> = self
             .scripts
             .lock()
@@ -1946,41 +1989,42 @@ impl ScriptManager {
             .filter(|(ws, _)| ws == workspace_id)
             .map(|(_, id)| id.clone())
             .collect();
+        let mut unsettled = Vec::new();
         for id in ids {
             let lock = self.locks.definition_lock(&id);
             let _guard = lock.lock().await;
-            let running = self
-                .scripts
-                .lock()
-                .unwrap()
-                .get(&(workspace_id.clone(), id.clone()))
-                .is_some_and(|m| self.entry_is_live_or_admitted(m));
-            if !running {
+            let live = |mgr: &Self| {
+                mgr.scripts
+                    .lock()
+                    .unwrap()
+                    .get(&(workspace_id.clone(), id.clone()))
+                    .is_some_and(|m| mgr.entry_is_live_or_admitted(m))
+            };
+            if !live(self) {
                 continue;
             }
+            if while_archived
+                && !self
+                    .store
+                    .get_workspace(workspace_id)
+                    .await
+                    .is_ok_and(|row| row.archived)
+            {
+                break;
+            }
             if let Err(e) = self
-                .stop_inner_reason(workspace_id, &id, true, "cancelled by workspace deletion")
+                .stop_inner_reason(workspace_id, &id, true, reason)
                 .await
             {
-                tracing::warn!(workspace = %workspace_id, script = %id, error = %e, "script stop during workspace delete failed");
+                tracing::warn!(workspace = %workspace_id, script = %id, error = %e, reason, "workspace script stop failed");
             }
             // Still under this script's lock: a failed stop, or a result
             // that could not be persisted, leaves it live or admitted.
-            if self
-                .scripts
-                .lock()
-                .unwrap()
-                .get(&(workspace_id.clone(), id.clone()))
-                .is_some_and(|m| self.entry_is_live_or_admitted(m))
-            {
-                closing.unsettled.push(id);
+            if live(self) {
+                unsettled.push(id);
             }
         }
-        if let Some(park) = &self.parks.workspace_closed {
-            park.entered.notify_one();
-            park.release.notified().await;
-        }
-        closing
+        unsettled
     }
 
     /// `script.status`: the script's runtime state. Scoped to `workspace_id`.
@@ -2089,8 +2133,23 @@ impl ScriptManager {
     /// happen synchronously, before replying, so status observes `starting`.
     /// The supervisor publishes `starting` before the first running/exit state.
     pub(crate) async fn start(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
-        self.start_with_restore(workspace_id, script_id, false)
+        self.start_as(workspace_id, script_id, StartKind::Client)
             .await
+    }
+
+    /// A daemon-initiated `autoStart` start (scripts.md "autoStart"): as
+    /// [`Self::start`], but nothing launches unless the workspace is still
+    /// active when the script's definition lock is held. `None` when it
+    /// did not launch for that reason.
+    pub(crate) async fn start_auto(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+    ) -> Result<Option<Value>> {
+        let reply = self
+            .start_as(workspace_id, script_id, StartKind::AutoStart)
+            .await?;
+        Ok((!reply.is_null()).then_some(reply))
     }
 
     fn start_reply(&self, ws: &WorkspaceId, id: &str) -> Value {
@@ -2103,14 +2162,16 @@ impl ScriptManager {
         reply
     }
 
-    async fn start_with_restore(
+    async fn start_as(
         &self,
         workspace_id: &WorkspaceId,
         script_id: &str,
-        restoring: bool,
+        kind: StartKind,
     ) -> Result<Value> {
         self.ensure_known(workspace_id, script_id).await?;
-        if self.is_live(workspace_id, script_id)? {
+        // A daemon start never trusts a lock-free "live" reading: an archive
+        // stop may hold the lock and end that run, so it re-checks under it.
+        if kind == StartKind::Client && self.is_live(workspace_id, script_id)? {
             return Ok(self.start_reply(workspace_id, script_id));
         }
         // A home run's machine is dialed first: an unreachable home fails
@@ -2119,7 +2180,7 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
-        self.spawn_admission(async move { mgr.start_owned(&ws, &id, restoring).await })
+        self.spawn_admission(async move { mgr.start_owned(&ws, &id, kind).await })
             .await
             .map_err(|e| Error::Internal(format!("script start admission failed: {e}")))?
     }
@@ -2128,18 +2189,28 @@ impl ScriptManager {
         &self,
         workspace_id: &WorkspaceId,
         script_id: &str,
-        restoring: bool,
+        kind: StartKind,
     ) -> Result<Value> {
         self.signal_admission_wait();
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
         self.require_admission(workspace_id, script_id).await?;
         self.require_launch_open_locked(workspace_id).await?;
+        // Under the definition lock an archive's stop also takes: a daemon
+        // start either launches before the archive commits (and the archive
+        // then stops it) or sees the archived row and launches nothing.
+        if kind != StartKind::Client {
+            if let Some(svc) = &self.owner_services {
+                if !svc.workspace_accepts_auto_start(workspace_id).await? {
+                    return Ok(Value::Null);
+                }
+            }
+        }
         if self.is_live(workspace_id, script_id)? {
             return Ok(self.start_reply(workspace_id, script_id));
         }
         // Decide before admission: a skipped boot start must leave no admitted run.
-        if restoring
+        if kind == StartKind::Restore
             && !self
                 .scripts
                 .lock()
@@ -2153,7 +2224,7 @@ impl ScriptManager {
         self.prepare_launch(workspace_id, script_id).await?;
         let publication = self.locks.publication_lock(script_id);
         let _publishing = publication.lock().await;
-        self.start_inner(workspace_id, script_id, restoring)
+        self.start_inner(workspace_id, script_id, kind == StartKind::Restore)
     }
 
     /// A stop, upsert, autoStart toggle-off or archive racing boot hydration
@@ -5252,7 +5323,7 @@ mod tests {
                     m.def.auto_start = Some(false);
                 }
             }
-            mgr.start_with_restore(&h.ws, &id, true).await.unwrap();
+            mgr.start_as(&h.ws, &id, StartKind::Restore).await.unwrap();
             let idle = mgr.status(&h.ws, &id).unwrap();
             assert_eq!(
                 idle["status"], "idle",

@@ -938,13 +938,25 @@ pub trait RuntimePort: Send + Sync + 'static {
         Box::pin(async {})
     }
 
-    /// `workspace_id`'s home made a new checkout and finished its setup:
-    /// start the home run of each saved `autoStart` script. A no-op by
-    /// default.
-    fn start_home_auto_start<'a>(
+    /// `workspace_id` became active with a ready checkout (its local setup
+    /// or its home's setup finished, or it was unarchived): start the home
+    /// run of each saved `autoStart` script. A no-op by default.
+    fn start_auto_start<'a>(
         &'a self,
         svc: &'a Services,
         workspace_id: WorkspaceId,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (svc, workspace_id);
+        Box::pin(async {})
+    }
+
+    /// `workspace_id` was archived: stop each of its running scripts with
+    /// `script.stop` semantics while the row stays archived. A no-op by
+    /// default.
+    fn stop_archived_workspace_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
     ) -> BoxFuture<'a, ()> {
         let _ = (svc, workspace_id);
         Box::pin(async {})
