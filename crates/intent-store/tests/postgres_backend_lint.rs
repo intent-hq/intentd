@@ -2348,6 +2348,21 @@ fn review_shapes_of_rule5_are_caught() {
          {q}.fetch_all(&mut *tx).await; {q}.fetch_all(&mut *tx).await; }}"
     );
     assert_eq!(reads(&inner_assign), ["x.rs f"]);
+    // A declaration without a value scopes a later assignment to it.
+    let deferred = format!(
+        "async fn f(&self) {{ let mut tx; {{ tx = self.begin().await?; }}
+         {q}.fetch_all(&mut *tx).await; {q}.fetch_all(&mut *tx).await; }}"
+    );
+    assert_eq!(reads(&deferred), ["x.rs f"]);
+    // A `Self::` helper is followed like a method: returning the
+    // transaction is an escape in the helper.
+    let self_helper = format!(
+        "impl S {{ async fn f(&self) {{ let tx = self.begin().await?;
+         let mut tx = Self::identity(tx);
+         {q}.fetch_all(&mut *tx).await; {q}.fetch_all(&mut *tx).await; }}
+         fn identity(tx: Tx) -> Tx {{ tx }} }}"
+    );
+    assert_eq!(escapes(&self_helper), ["x.rs identity"]);
     // A pool-typed parameter no indexed caller passes is a pool itself.
     let pool_param = format!(
         "async fn f(pool: &PgPool) {{ {q}.fetch_all(pool).await; {q}.fetch_all(pool).await; }}"

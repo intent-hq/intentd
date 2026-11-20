@@ -587,6 +587,8 @@ struct FnFacts {
     tx_params: BTreeSet<String>,
     /// Parameters of a pool type (`PgPool`, `Pool<..>`).
     pool_params: BTreeSet<String>,
+    /// `let name;` without a value: where, and the block it is in.
+    declared: BTreeMap<String, Vec<(Pos, (Pos, Pos))>>,
     /// Where the function first holds the writer lock: a `WriteTx`
     /// parameter (the start), a typed `WriteTx` binding or `begin_write()`.
     lock_from: Option<Pos>,
@@ -1087,7 +1089,19 @@ impl Index {
             })
             .unwrap_or_default();
         let from = before.iter().rposition(|l| l.is_let).unwrap_or(0);
-        before.get(from..).unwrap_or_default().to_vec()
+        let mut seen: Vec<&Local> = before.get(from..).unwrap_or_default().to_vec();
+        // A later `let name;` shadows them: only its assignments count.
+        let declared = self.fns[at].declared.get(name).and_then(|ds| {
+            ds.iter()
+                .rev()
+                .find(|(p, sc)| *p < used && sc.0 <= used && used <= sc.1)
+        });
+        if let Some((d, _)) = declared {
+            if seen.first().is_none_or(|l| !l.is_let || l.pos < *d) {
+                seen.retain(|l| l.pos > *d);
+            }
+        }
+        seen
     }
 
     /// Whether `pos` in function `at` sits in a loop that does not also
@@ -1139,11 +1153,15 @@ impl Index {
                 let helper = f.arg_uses.iter().find(|u| u.0 == *pos).is_some_and(
                     |(_, module, callee, method)| {
                         let named = self.fns_named(f.file, module.as_deref(), callee, *method);
-                        // `Type::f` must be a function of module `Type`.
-                        let in_module = module.as_deref().is_none_or(|m| {
-                            ["self", "Self", "super", "crate"].contains(&m)
-                                || named.iter().any(|&n| self.in_module(self.fns[n].file, m))
-                        });
+                        // `Self::f` must be in this file, `Type::f` in module
+                        // `Type`, as `callers` follows them.
+                        let in_module = match module.as_deref() {
+                            None | Some("super" | "crate") => true,
+                            Some("Self" | "self") => {
+                                named.iter().any(|&n| self.fns[n].file == f.file)
+                            }
+                            Some(m) => named.iter().any(|&n| self.in_module(self.fns[n].file, m)),
+                        };
                         !f.closures.iter().any(|(c, _, _)| c == callee)
                             && !named.is_empty()
                             && in_module
@@ -1205,11 +1223,7 @@ impl Index {
                 };
                 for &f in callees {
                     let facts = &self.fns[f];
-                    if call
-                        .module
-                        .as_ref()
-                        .is_some_and(|m| !self.in_module(facts.file, m))
-                    {
+                    if !self.reaches(call, f) {
                         continue;
                     }
                     for (index, param) in facts.params.iter().enumerate() {
@@ -1243,12 +1257,20 @@ impl Index {
 
     fn callers(&self, f: usize) -> impl Iterator<Item = &CallSite> {
         let callee = &self.fns[f];
-        self.calls.iter().filter(move |c| {
-            c.name == callee.name
-                && c.module
-                    .as_ref()
-                    .is_none_or(|m| self.in_module(callee.file, m))
-        })
+        self.calls
+            .iter()
+            .filter(move |c| c.name == callee.name && self.reaches(c, f))
+    }
+
+    /// Whether `call`'s path can name function `f`: no module, `Self::` or
+    /// `self::` from `f`'s own file, or a module `f`'s file is.
+    fn reaches(&self, call: &CallSite, f: usize) -> bool {
+        let file = self.fns[f].file;
+        match call.module.as_deref() {
+            None => true,
+            Some("Self" | "self") => self.fns[call.caller].file == file,
+            Some(m) => self.in_module(file, m),
+        }
     }
 
     fn attach_appends(&self, name: &str, at: usize, sources: &mut [Source]) {
@@ -2496,15 +2518,23 @@ impl Body<'_> {
         let scope = if is_let {
             here
         } else {
-            self.index.fns[self.id]
-                .locals
+            let visible = |at: Pos, scope: (Pos, Pos)| at < pos && scope.0 <= pos && pos <= scope.1;
+            let facts = &self.index.fns[self.id];
+            let bound = facts.locals.get(&name).and_then(|ls| {
+                ls.iter()
+                    .rev()
+                    .find(|l| l.is_let && visible(l.pos, l.scope))
+                    .map(|l| (l.pos, l.scope))
+            });
+            let declared = facts
+                .declared
                 .get(&name)
-                .and_then(|ls| {
-                    ls.iter()
-                        .rev()
-                        .find(|l| l.is_let && l.pos < pos && l.scope.0 <= pos && pos <= l.scope.1)
-                })
-                .map_or(here, |l| l.scope)
+                .and_then(|ds| ds.iter().rev().find(|(at, sc)| visible(*at, *sc)).copied());
+            bound
+                .into_iter()
+                .chain(declared)
+                .max()
+                .map_or(here, |(_, sc)| sc)
         };
         self.facts().locals.entry(name).or_default().push(Local {
             pos,
@@ -2614,6 +2644,17 @@ impl<'ast> Visit<'ast> for Body<'_> {
         let typed_tx = matches!(&l.pat, Pat::Type(t) if is_write_tx(&t.ty));
         if typed_tx {
             self.lock_at(l.span().start().into());
+        }
+        if l.init.is_none() {
+            if let Some(name) = pat_ident(&l.pat) {
+                let here = self.scopes.last().copied().unwrap_or_default();
+                let at = l.span().end().into();
+                self.facts()
+                    .declared
+                    .entry(name)
+                    .or_default()
+                    .push((at, here));
+            }
         }
         if let Some(init) = &l.init {
             let init_expr = &*init.expr;
