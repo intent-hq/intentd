@@ -96,6 +96,17 @@ const EXECUTOR_PASS_THROUGH: &[&str] = &["as_mut", "conn", "deref_mut", "borrow_
 
 const SPAWNS: &[&str] = &["spawn", "spawn_blocking", "spawn_local"];
 
+/// Calls that hand back the transaction an argument opens
+/// (`timeout(d, self.begin())`).
+const BEGIN_PASS_THROUGH: &[&str] = &["timeout"];
+
+/// Methods and fields that name a connection pool (`self.pool()`,
+/// `self.read_pool`), also through `.clone()`.
+const POOL_METHODS: &[&str] = &["pool", "read_pool", "write_pool"];
+
+/// Methods that end a transaction where it is bound.
+const TX_END_METHODS: &[&str] = &["commit", "rollback"];
+
 const INTEGER_TYPES: &[&str] = &[
     "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
 ];
@@ -117,7 +128,7 @@ pub fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// A line (1-based) and column in a source file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pos {
     pub line: usize,
     pub column: usize,
@@ -481,15 +492,59 @@ pub struct Use {
     pub takes_lock: bool,
 }
 
-/// A plain `begin()` transaction that runs more than one sink.
+/// What runs a read's statements outside one snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TxKind {
+    /// A plain `begin()` transaction (READ COMMITTED).
+    Begin,
+    /// A connection checked out with `acquire()`: each statement commits
+    /// on its own.
+    Connection,
+    /// The pool: each statement on whatever connection it checks out.
+    Pool,
+}
+
+/// A plain `begin()` transaction, acquired connection or pool that runs
+/// more than one sink, or one sink in a loop.
 pub struct PlainTx {
     pub file: PathBuf,
-    /// The function that opens it.
+    /// The function that opens it (for the pool, that names it).
     pub function: String,
-    /// Where it is bound.
+    /// Where it is bound (for the pool, the function's start).
     pub line: usize,
-    /// `function:line` of each sink it runs.
+    pub kind: TxKind,
+    /// `function:line` of each sink it runs, `(in a loop)` when it runs
+    /// more than once.
     pub sinks: Vec<String>,
+}
+
+/// A plain `begin()` transaction the lint cannot count statements for.
+pub struct Escape {
+    pub file: PathBuf,
+    pub function: String,
+    pub line: usize,
+    /// What the function does with it.
+    pub what: String,
+}
+
+/// A source span, as `(start, end)`.
+type Span = (Pos, Pos);
+
+/// Where an executor comes from, as `(kind, function, binding position)`.
+type Origin = (TxKind, usize, Pos);
+
+/// The call sites between an opener and a sink, as `(caller, call)`,
+/// outermost first.
+type Via = Vec<(usize, Pos)>;
+
+/// An executor use [`Index::tx_origins`] follows back to its origin.
+struct Reach {
+    /// The function it is used in, and where (a sink or a call site).
+    at: usize,
+    used_at: Pos,
+    /// It runs more than once in a function between.
+    repeated: bool,
+    via: Via,
 }
 
 /// A binding of a local name, where it is made. A `let` (or `for`,
@@ -502,6 +557,8 @@ struct Local {
     /// whose chain root is `begin_write()` in every branch.
     tx: bool,
     binding: Binding,
+    /// The block the binding is made in: it is not seen outside it.
+    scope: (Pos, Pos),
 }
 
 /// What a local name is bound to.
@@ -531,6 +588,10 @@ struct FnFacts {
     returns: Vec<Expr>,
     /// Parameters that hold a `WriteTx`.
     tx_params: BTreeSet<String>,
+    /// Parameters of a pool type (`PgPool`, `Pool<..>`).
+    pool_params: BTreeSet<String>,
+    /// `let name;` without a value: where, and the block it is in.
+    declared: BTreeMap<String, Vec<(Pos, Span)>>,
     /// Where the function first holds the writer lock: a `WriteTx`
     /// parameter (the start), a typed `WriteTx` binding or `begin_write()`.
     lock_from: Option<Pos>,
@@ -538,6 +599,22 @@ struct FnFacts {
     closures: Vec<(String, Pos, Pos)>,
     /// `let name = <sink call chain>`: the sink's position.
     sink_names: Vec<(String, Pos)>,
+    /// Where the function's signature starts.
+    start: Pos,
+    /// Every argument-less `.begin()` call (its method name's position).
+    begins: Vec<Pos>,
+    /// The `.begin()` calls a `let` or an assignment binds.
+    bound_begins: BTreeSet<Pos>,
+    /// The spans of loops: `while` and `loop` whole, a `for` loop's body.
+    loops: Vec<(Pos, Pos)>,
+    /// Every use of a single-identifier path.
+    idents: Vec<(String, Pos)>,
+    /// Identifier uses that keep a transaction in view: an executor, the
+    /// receiver of `commit`/`rollback`, `drop`'s argument, or a `let`
+    /// (or assignment) that renames or reborrows it.
+    tx_ok: BTreeSet<Pos>,
+    /// Identifier uses passed to a call: `(use, module, callee, method)`.
+    arg_uses: Vec<(Pos, Option<String>, String, bool)>,
 }
 
 struct CallSite {
@@ -547,6 +624,8 @@ struct CallSite {
     caller: usize,
     method: bool,
     args: Vec<Expr>,
+    /// Where the call starts.
+    pos: Pos,
 }
 
 struct Sink {
@@ -830,11 +909,13 @@ impl Index {
         any
     }
 
-    /// Plain `begin()` transactions that run more than one sink, directly
-    /// or through helpers they pass the transaction to. Each sink counts
-    /// once however often it runs, so a single sink in a loop is not seen.
+    /// Plain `begin()` transactions, acquired connections and pools that
+    /// run more than one sink, directly or through helpers they are passed
+    /// to, or one sink in a loop (in the opener, outside the loop, or in a
+    /// helper). A sink counts once per chain of call sites that reaches it
+    /// from the opener, so a helper called twice counts twice.
     pub fn multi_statement_reads(&self) -> Vec<PlainTx> {
-        let mut by_origin: BTreeMap<(usize, Pos), BTreeSet<(usize, Pos)>> = BTreeMap::new();
+        let mut by_origin: BTreeMap<Origin, BTreeMap<(usize, Pos, Via), bool>> = BTreeMap::new();
         for s in self.sinks.iter().filter(|s| !s.in_spawn) {
             if s.candidate {
                 let mut sources = Vec::new();
@@ -858,68 +939,112 @@ impl Index {
                     executors.push(&l.executor);
                 }
             }
-            let mut origins = BTreeSet::new();
+            let mut origins = BTreeMap::new();
             for e in executors {
-                self.plain_origins(e, s.function, 0, &mut origins);
+                let start = Reach {
+                    at: s.function,
+                    used_at: s.pos,
+                    repeated: false,
+                    via: Vec::new(),
+                };
+                self.tx_origins(e, start, 0, &mut origins);
             }
-            for o in origins {
-                by_origin.entry(o).or_default().insert((s.function, s.pos));
+            for ((o, via), repeated) in origins {
+                let seen = by_origin.entry(o).or_default();
+                *seen.entry((s.function, s.pos, via)).or_default() |= repeated;
             }
         }
         by_origin
             .into_iter()
-            .filter(|(_, sinks)| sinks.len() > 1)
-            .map(|((at, pos), sinks)| PlainTx {
+            .filter(|(_, sinks)| sinks.len() > 1 || sinks.values().any(|r| *r))
+            .map(|((kind, at, pos), sinks)| PlainTx {
                 file: self.files[self.fns[at].file].clone(),
                 function: self.fns[at].name.clone(),
-                line: pos.line,
+                line: if kind == TxKind::Pool {
+                    self.fns[at].start.line
+                } else {
+                    pos.line
+                },
+                kind,
                 sinks: sinks
                     .into_iter()
-                    .map(|(f, p)| format!("{}:{}", self.fns[f].name, p.line))
+                    .map(|((f, p, via), repeated)| {
+                        let looped = if repeated { " (in a loop)" } else { "" };
+                        let from = via
+                            .first()
+                            .map(|(c, cp)| format!(" via {}:{}", self.fns[*c].name, cp.line))
+                            .unwrap_or_default();
+                        format!("{}:{}{from}{looped}", self.fns[f].name, p.line)
+                    })
                     .collect(),
             })
             .collect()
     }
 
-    /// The plain `begin()` bindings an executor expression can come from,
-    /// as `(function, binding position)`: through locals, and parameters
-    /// through every caller's argument.
-    fn plain_origins(
+    /// Where an executor expression used as `reach` describes can come
+    /// from: a plain `begin()` or `acquire()` binding, through locals, and
+    /// parameters through every caller's argument; or a pool. Each origin,
+    /// with the call sites between, maps to whether the use runs more than
+    /// once in it: inside a loop that does not hold the binding, or a loop
+    /// in a function between.
+    fn tx_origins(
         &self,
         executor: &Expr,
-        at: usize,
+        reach: Reach,
         depth: usize,
-        out: &mut BTreeSet<(usize, Pos)>,
+        out: &mut BTreeMap<(Origin, Via), bool>,
     ) {
         if depth > MAX_DEPTH {
             return;
         }
-        let Expr::Path(path) = strip_executor(executor) else {
+        let Reach {
+            at,
+            used_at,
+            repeated,
+            via,
+        } = reach;
+        let e = strip_executor(executor);
+        if is_pool(e) {
+            let r = repeated || self.in_loop(at, used_at, None);
+            let key = ((TxKind::Pool, at, Pos::default()), via);
+            *out.entry(key).or_default() |= r;
+            return;
+        }
+        let Expr::Path(path) = e else {
             return;
         };
         let Some(name) = path.path.get_ident().map(ToString::to_string) else {
             return;
         };
-        let facts = &self.fns[at];
         let used: Pos = path.span().start().into();
-        let before: Vec<&Local> = facts
-            .locals
-            .get(&name)
-            .map(|ls| ls.iter().filter(|l| l.pos < used).collect())
-            .unwrap_or_default();
-        if !before.is_empty() {
-            let from = before.iter().rposition(|l| l.is_let).unwrap_or(0);
-            for l in &before[from..] {
+        let visible = self.in_scope(&name, used, at);
+        if !visible.is_empty() {
+            for l in visible {
                 if let Binding::Value(v) = &l.binding {
-                    if is_plain_begin(v) {
-                        out.insert((at, l.pos));
+                    let kind = if is_plain_begin(v) {
+                        Some(TxKind::Begin)
+                    } else if is_acquire(v) {
+                        Some(TxKind::Connection)
                     } else {
-                        self.plain_origins(v, at, depth + 1, out);
+                        None
+                    };
+                    if let Some(kind) = kind {
+                        let r = repeated || self.in_loop(at, used_at, Some(l.pos));
+                        *out.entry(((kind, at, l.pos), via.clone())).or_default() |= r;
+                    } else {
+                        let next = Reach {
+                            at,
+                            used_at,
+                            repeated,
+                            via: via.clone(),
+                        };
+                        self.tx_origins(v, next, depth + 1, out);
                     }
                 }
             }
             return;
         }
+        let facts = &self.fns[at];
         let Some(index) = facts
             .params
             .iter()
@@ -927,6 +1052,13 @@ impl Index {
         else {
             return;
         };
+        let r = repeated || self.in_loop(at, used_at, None);
+        // A pool parameter no indexed caller passes is a pool of its own.
+        if facts.pool_params.contains(&name) && self.callers(at).next().is_none() {
+            let key = ((TxKind::Pool, at, Pos::default()), via);
+            *out.entry(key).or_default() |= r;
+            return;
+        }
         for call in self.callers(at) {
             let arg_at = if !call.method && facts.has_self {
                 index + 1
@@ -934,19 +1066,214 @@ impl Index {
                 index
             };
             if let Some(arg) = call.args.get(arg_at) {
-                self.plain_origins(arg, call.caller, depth + 1, out);
+                let mut via = via.clone();
+                via.insert(0, (call.caller, call.pos));
+                let next = Reach {
+                    at: call.caller,
+                    used_at: call.pos,
+                    repeated: r,
+                    via,
+                };
+                self.tx_origins(arg, next, depth + 1, out);
+            }
+        }
+    }
+
+    /// The bindings of local `name` a use at `used` in function `at` can
+    /// see: made before it in a block holding it, from the last `let` on.
+    fn in_scope(&self, name: &str, used: Pos, at: usize) -> Vec<&Local> {
+        let before: Vec<&Local> = self.fns[at]
+            .locals
+            .get(name)
+            .map(|ls| {
+                ls.iter()
+                    .filter(|l| l.pos < used && l.scope.0 <= used && used <= l.scope.1)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let from = before.iter().rposition(|l| l.is_let).unwrap_or(0);
+        let mut seen: Vec<&Local> = before.get(from..).unwrap_or_default().to_vec();
+        // A later `let name;` shadows them: only its assignments count.
+        let declared = self.fns[at].declared.get(name).and_then(|ds| {
+            ds.iter()
+                .rev()
+                .find(|(p, sc)| *p < used && sc.0 <= used && used <= sc.1)
+        });
+        if let Some((d, _)) = declared {
+            if seen.first().is_none_or(|l| !l.is_let || l.pos < *d) {
+                seen.retain(|l| l.pos > *d);
+            }
+        }
+        seen
+    }
+
+    /// Whether `pos` in function `at` sits in a loop that does not also
+    /// hold `binding`.
+    /// A sink in a closure counts where the closure is called.
+    fn in_loop(&self, at: usize, pos: Pos, binding: Option<Pos>) -> bool {
+        let f = &self.fns[at];
+        let looped = |pos: Pos| {
+            f.loops.iter().any(|(a, b)| {
+                *a <= pos && pos <= *b && binding.is_none_or(|p| !(*a <= p && p <= *b))
+            })
+        };
+        looped(pos)
+            || f.closures
+                .iter()
+                .filter(|(_, a, b)| *a <= pos && pos <= *b)
+                .any(|(name, _, _)| {
+                    self.calls
+                        .iter()
+                        .any(|c| c.caller == at && !c.method && c.name == *name && looped(c.pos))
+                })
+    }
+
+    /// Plain `begin()` transactions whose statements the lint cannot count:
+    /// a `.begin()` no `let` or assignment binds (through `.await`, `?`,
+    /// methods on it and [`BEGIN_PASS_THROUGH`] calls), and a binding moved
+    /// anywhere but an executor, a helper the index has, `commit`,
+    /// `rollback`, `drop` or another binding.
+    pub fn begin_escapes(&self) -> Vec<Escape> {
+        let params = self.plain_params();
+        let mut out = Vec::new();
+        for (at, f) in self.fns.iter().enumerate() {
+            let escape = |line: usize, what: String| Escape {
+                file: self.files[f.file].clone(),
+                function: f.name.clone(),
+                line,
+                what,
+            };
+            for b in f.begins.iter().filter(|b| !f.bound_begins.contains(b)) {
+                out.push(escape(
+                    b.line,
+                    "calls begin() where no `let name =` binds the transaction".to_owned(),
+                ));
+            }
+            for (name, pos) in &f.idents {
+                if f.tx_ok.contains(pos) || !self.holds_plain_begin(name, *pos, at, &params) {
+                    continue;
+                }
+                let helper = f.arg_uses.iter().find(|u| u.0 == *pos).is_some_and(
+                    |(_, module, callee, method)| {
+                        let named = self.fns_named(f.file, module.as_deref(), callee, *method);
+                        // `Self::f` must be in this file, `Type::f` in module
+                        // `Type`, as `callers` follows them.
+                        let in_module = match module.as_deref() {
+                            None | Some("super" | "crate") => true,
+                            Some("Self" | "self") => {
+                                named.iter().any(|&n| self.fns[n].file == f.file)
+                            }
+                            Some(m) => named.iter().any(|&n| self.in_module(self.fns[n].file, m)),
+                        };
+                        !f.closures.iter().any(|(c, _, _)| c == callee)
+                            && !named.is_empty()
+                            && in_module
+                    },
+                );
+                if !helper {
+                    out.push(escape(
+                        pos.line,
+                        format!(
+                            "moves its plain begin() transaction `{name}` where the lint \
+                             does not follow it (a struct, Option, field, return or closure)"
+                        ),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `name` used at `used` in function `at` holds a plain
+    /// `begin()` transaction: a local bound to one (or renaming one), or a
+    /// parameter in `params` ([`Self::plain_params`]).
+    fn holds_plain_begin(
+        &self,
+        name: &str,
+        used: Pos,
+        at: usize,
+        params: &BTreeSet<(usize, String)>,
+    ) -> bool {
+        let visible = self.in_scope(name, used, at);
+        if visible.is_empty() {
+            return params.contains(&(at, name.to_owned()));
+        }
+        // A binding is made before its use, so renames end.
+        visible.iter().any(|l| {
+            let Binding::Value(v) = &l.binding else {
+                return false;
+            };
+            is_plain_begin(v)
+                || executor_ident(v)
+                    .is_some_and(|(n, p)| p < used && self.holds_plain_begin(&n, p, at, params))
+        })
+    }
+
+    /// The parameters, as `(function, name)`, some caller passes a plain
+    /// `begin()` transaction, directly or through other such parameters
+    /// (to a fixed point).
+    fn plain_params(&self) -> BTreeSet<(usize, String)> {
+        let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (i, f) in self.fns.iter().enumerate() {
+            by_name.entry(f.name.as_str()).or_default().push(i);
+        }
+        let mut set = BTreeSet::new();
+        loop {
+            let mut changed = false;
+            for call in &self.calls {
+                let Some(callees) = by_name.get(call.name.as_str()) else {
+                    continue;
+                };
+                for &f in callees {
+                    let facts = &self.fns[f];
+                    if !self.reaches(call, f) {
+                        continue;
+                    }
+                    for (index, param) in facts.params.iter().enumerate() {
+                        let Some(param) = param else { continue };
+                        let key = (f, param.clone());
+                        if set.contains(&key) {
+                            continue;
+                        }
+                        let arg_at = if !call.method && facts.has_self {
+                            index + 1
+                        } else {
+                            index
+                        };
+                        let passes = call
+                            .args
+                            .get(arg_at)
+                            .and_then(executor_ident)
+                            .is_some_and(|(n, p)| self.holds_plain_begin(&n, p, call.caller, &set));
+                        if passes {
+                            set.insert(key);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                return set;
             }
         }
     }
 
     fn callers(&self, f: usize) -> impl Iterator<Item = &CallSite> {
         let callee = &self.fns[f];
-        self.calls.iter().filter(move |c| {
-            c.name == callee.name
-                && c.module
-                    .as_ref()
-                    .is_none_or(|m| self.in_module(callee.file, m))
-        })
+        self.calls
+            .iter()
+            .filter(move |c| c.name == callee.name && self.reaches(c, f))
+    }
+
+    /// Whether `call`'s path can name function `f`: no module, `Self::` or
+    /// `self::` from `f`'s own file, or a module `f`'s file is.
+    fn reaches(&self, call: &CallSite, f: usize) -> bool {
+        let file = self.fns[f].file;
+        match call.module.as_deref() {
+            None => true,
+            Some("Self" | "self") => self.fns[call.caller].file == file,
+            Some(m) => self.in_module(file, m),
+        }
     }
 
     fn attach_appends(&self, name: &str, at: usize, sources: &mut [Source]) {
@@ -1675,12 +2002,76 @@ fn is_plain_begin(e: &Expr) -> bool {
         Expr::Try(t) => is_plain_begin(&t.expr),
         Expr::Await(a) => is_plain_begin(&a.base),
         Expr::MethodCall(m) => m.method == "begin" || is_plain_begin(&m.receiver),
+        Expr::Call(c) if is_begin_pass_through(c) => c.args.iter().any(is_plain_begin),
         _ => false,
     }
 }
 
 /// `(module, name)` of a path: `other::f` is `(Some("other"), "f")`;
 /// `self`, `super` and `crate` name no module.
+/// Whether `c` is a [`BEGIN_PASS_THROUGH`] call.
+fn is_begin_pass_through(c: &syn::ExprCall) -> bool {
+    matches!(&*c.func, Expr::Path(p) if BEGIN_PASS_THROUGH.contains(&last_segment(&p.path).as_str()))
+}
+
+/// The `.begin()` calls `e` evaluates to (each method name's position),
+/// through `.await`, `?`, methods on it and [`BEGIN_PASS_THROUGH`] calls.
+fn begin_calls(e: &Expr, out: &mut Vec<Pos>) {
+    match strip(e) {
+        Expr::Try(t) => begin_calls(&t.expr, out),
+        Expr::Await(a) => begin_calls(&a.base, out),
+        Expr::MethodCall(m) if m.method == "begin" && m.args.is_empty() => {
+            out.push(m.method.span().start().into());
+        }
+        Expr::MethodCall(m) => begin_calls(&m.receiver, out),
+        Expr::Call(c) if is_begin_pass_through(c) => {
+            for a in &c.args {
+                begin_calls(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `e` is a connection checked out with `acquire()`, through
+/// `.await`, `?` and method calls on it.
+fn is_acquire(e: &Expr) -> bool {
+    match strip(e) {
+        Expr::Try(t) => is_acquire(&t.expr),
+        Expr::Await(a) => is_acquire(&a.base),
+        Expr::MethodCall(m) => m.method == "acquire" || is_acquire(&m.receiver),
+        _ => false,
+    }
+}
+
+/// Whether an executor (already stripped) names a pool: a `pool` field or
+/// a [`POOL_METHODS`] call.
+fn is_pool(e: &Expr) -> bool {
+    match e {
+        Expr::Field(f) => matches!(&f.member,
+            syn::Member::Named(n) if POOL_METHODS.contains(&n.to_string().as_str())),
+        Expr::MethodCall(m) if m.args.is_empty() && m.method == "clone" => {
+            is_pool(strip_executor(&m.receiver))
+        }
+        Expr::MethodCall(m) => {
+            m.args.is_empty() && POOL_METHODS.contains(&m.method.to_string().as_str())
+        }
+        _ => false,
+    }
+}
+
+/// The identifier an expression names once `&`, `*` and executor
+/// conversions are stripped, with its position.
+fn executor_ident(e: &Expr) -> Option<(String, Pos)> {
+    match strip_executor(e) {
+        Expr::Path(p) => p
+            .path
+            .get_ident()
+            .map(|i| (i.to_string(), p.span().start().into())),
+        _ => None,
+    }
+}
+
 fn split_path(p: &syn::Path) -> (Option<String>, String) {
     let segs: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
     let name = segs.last().cloned().unwrap_or_default();
@@ -1764,6 +2155,19 @@ fn is_write_tx(ty: &Type) -> bool {
         Type::Path(p) => last_segment(&p.path) == "WriteTx",
         Type::Reference(r) => r.mutability.is_some() && is_write_tx(&r.elem),
         Type::Paren(p) => is_write_tx(&p.elem),
+        _ => false,
+    }
+}
+
+/// Whether `ty` is a pool, through references: `PgPool` or `Pool<..>`.
+fn is_pool_type(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(r) => is_pool_type(&r.elem),
+        Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "PgPool" || s.ident == "Pool"),
         _ => false,
     }
 }
@@ -1961,6 +2365,7 @@ impl Items<'_> {
         let mut facts = FnFacts {
             file: self.file,
             name: sig.ident.to_string(),
+            start: sig.span().start().into(),
             ..FnFacts::default()
         };
         for input in &sig.inputs {
@@ -1976,6 +2381,9 @@ impl Items<'_> {
                         if is_integer_type(&t.ty) {
                             facts.integers.insert(n.clone());
                         }
+                        if is_pool_type(&t.ty) {
+                            facts.pool_params.insert(n.clone());
+                        }
                     }
                     facts.params.push(name);
                 }
@@ -1989,6 +2397,7 @@ impl Items<'_> {
             id,
             spawn_depth: 0,
             guard: Guard::new(),
+            scopes: Vec::new(),
         }
         .visit_block(block);
     }
@@ -2066,6 +2475,8 @@ struct Body<'i> {
     spawn_depth: usize,
     /// The branch arms around the current expression.
     guard: Guard,
+    /// The spans of the blocks around the current expression.
+    scopes: Vec<(Pos, Pos)>,
 }
 
 impl Body<'_> {
@@ -2097,12 +2508,55 @@ impl Body<'_> {
 
     fn bind(&mut self, name: String, pos: Pos, is_let: bool, binding: Binding) {
         let tx = matches!(&binding, Binding::Value(v) if is_begin_write(v));
+        let whole = (
+            Pos::default(),
+            Pos {
+                line: usize::MAX,
+                column: usize::MAX,
+            },
+        );
+        let here = self.scopes.last().copied().unwrap_or(whole);
+        // An assignment updates the binding it assigns to, in that one's
+        // block, not the block the assignment sits in.
+        let scope = if is_let {
+            here
+        } else {
+            let visible = |at: Pos, scope: (Pos, Pos)| at < pos && scope.0 <= pos && pos <= scope.1;
+            let facts = &self.index.fns[self.id];
+            let bound = facts.locals.get(&name).and_then(|ls| {
+                ls.iter()
+                    .rev()
+                    .find(|l| l.is_let && visible(l.pos, l.scope))
+                    .map(|l| (l.pos, l.scope))
+            });
+            let declared = facts
+                .declared
+                .get(&name)
+                .and_then(|ds| ds.iter().rev().find(|(at, sc)| visible(*at, *sc)).copied());
+            bound
+                .into_iter()
+                .chain(declared)
+                .max()
+                .map_or(here, |(_, sc)| sc)
+        };
         self.facts().locals.entry(name).or_default().push(Local {
             pos,
             is_let,
             tx,
             binding,
+            scope,
         });
+    }
+
+    /// A `let` or assignment of `e`: the `.begin()` calls it binds, and a
+    /// transaction it renames or reborrows stays in view.
+    fn bound(&mut self, e: &Expr) {
+        let mut begins = Vec::new();
+        begin_calls(e, &mut begins);
+        let ok = executor_ident(e).map(|(_, p)| p);
+        let f = self.facts();
+        f.bound_begins.extend(begins);
+        f.tx_ok.extend(ok);
     }
 
     fn append(&mut self, name: String, e: Expr) {
@@ -2182,14 +2636,35 @@ impl Body<'_> {
 impl<'ast> Visit<'ast> for Body<'_> {
     fn visit_item(&mut self, _: &'ast syn::Item) {}
 
+    fn visit_block(&mut self, b: &'ast syn::Block) {
+        self.scopes
+            .push((b.span().start().into(), b.span().end().into()));
+        visit::visit_block(self, b);
+        self.scopes.pop();
+    }
+
     fn visit_local(&mut self, l: &'ast syn::Local) {
         let typed_tx = matches!(&l.pat, Pat::Type(t) if is_write_tx(&t.ty));
         if typed_tx {
             self.lock_at(l.span().start().into());
         }
+        if l.init.is_none() {
+            if let Some(name) = pat_ident(&l.pat) {
+                let here = self.scopes.last().copied().unwrap_or_default();
+                let at = l.span().end().into();
+                self.facts()
+                    .declared
+                    .entry(name)
+                    .or_default()
+                    .push((at, here));
+            }
+        }
         if let Some(init) = &l.init {
             let init_expr = &*init.expr;
             if let Some(name) = pat_ident(&l.pat) {
+                // A `begin()` under any other pattern (`let Ok(tx) = ..
+                // else`, a tuple) is not bound: it fails as an escape.
+                self.bound(init_expr);
                 if let Expr::Closure(c) = init_expr {
                     let span = (c.span().start().into(), c.span().end().into());
                     self.facts().closures.push((name.clone(), span.0, span.1));
@@ -2252,12 +2727,16 @@ impl<'ast> Visit<'ast> for Body<'_> {
     }
 
     fn visit_expr_while(&mut self, w: &'ast syn::ExprWhile) {
+        let span = (w.span().start().into(), w.span().end().into());
+        self.facts().loops.push(span);
         let id = self.construct();
         self.visit_expr(&w.cond);
         self.in_arm(id, 0, 2, |me| me.visit_block(&w.body));
     }
 
     fn visit_expr_loop(&mut self, l: &'ast syn::ExprLoop) {
+        let span = (l.span().start().into(), l.span().end().into());
+        self.facts().loops.push(span);
         let id = self.construct();
         self.in_arm(id, 0, 2, |me| me.visit_block(&l.body));
     }
@@ -2273,11 +2752,23 @@ impl<'ast> Visit<'ast> for Body<'_> {
             self.bind(name, f.span().start().into(), true, b);
         }
         self.visit_expr(&f.expr);
+        let span = (f.body.span().start().into(), f.body.span().end().into());
+        self.facts().loops.push(span);
         let id = self.construct();
         self.in_arm(id, 0, 2, |me| me.visit_block(&f.body));
     }
 
     fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+        // Only an assignment to a local renames a transaction; one to a
+        // field or through `*` moves it out of view.
+        if let Expr::Path(p) = &*a.left {
+            if p.path.get_ident().is_some() {
+                self.bound(&a.right);
+                // The name assigned to is a binding, not a use.
+                let pos = p.span().start().into();
+                self.facts().tx_ok.insert(pos);
+            }
+        }
         if let Expr::Path(p) = &*a.left {
             if let Some(name) = p.path.get_ident() {
                 let right = Binding::Value((*a.right).clone());
@@ -2309,6 +2800,25 @@ impl<'ast> Visit<'ast> for Body<'_> {
         if name == "begin_write" {
             self.lock_at(m.span().start().into());
         }
+        if name == "begin" && m.args.is_empty() {
+            let pos = m.method.span().start().into();
+            self.facts().begins.push(pos);
+        }
+        let exec = EXEC_METHODS.contains(&name.as_str());
+        if exec || TX_END_METHODS.contains(&name.as_str()) {
+            if let Some((_, p)) = executor_ident(&m.receiver) {
+                self.facts().tx_ok.insert(p);
+            }
+        }
+        for a in &m.args {
+            if let Some((_, p)) = executor_ident(a) {
+                if exec {
+                    self.facts().tx_ok.insert(p);
+                } else {
+                    self.facts().arg_uses.push((p, None, name.clone(), true));
+                }
+            }
+        }
         if let Expr::Path(p) = &*m.receiver {
             if let (Some(recv), Some(arg)) = (p.path.get_ident(), m.args.first()) {
                 match name.as_str() {
@@ -2338,6 +2848,7 @@ impl<'ast> Visit<'ast> for Body<'_> {
             caller,
             method: true,
             args: m.args.iter().cloned().collect(),
+            pos: m.span().start().into(),
         });
         visit::visit_expr_method_call(self, m);
     }
@@ -2354,11 +2865,24 @@ impl<'ast> Visit<'ast> for Body<'_> {
             if let (Some(ex), Some(arg)) = (c.args.first(), c.args.get(1)) {
                 self.sink(pos, arg.clone(), Some(ex.clone()), false);
             }
+            if let Some((_, p)) = c.args.first().and_then(executor_ident) {
+                self.facts().tx_ok.insert(p);
+            }
         } else if self.index.is_sink_path(self.file(), &p.path) {
             if let Some(arg) = c.args.first() {
                 self.sink(pos, arg.clone(), None, false);
             }
         } else {
+            for a in &c.args {
+                if let Some((_, p)) = executor_ident(a) {
+                    if name == "drop" {
+                        self.facts().tx_ok.insert(p);
+                    } else {
+                        let use_ = (p, module.clone(), name.clone(), false);
+                        self.facts().arg_uses.push(use_);
+                    }
+                }
+            }
             let caller = self.id;
             self.index.calls.push(CallSite {
                 module,
@@ -2366,6 +2890,7 @@ impl<'ast> Visit<'ast> for Body<'_> {
                 caller,
                 method: false,
                 args: c.args.iter().cloned().collect(),
+                pos,
             });
         }
         let spawn = SPAWNS.contains(&name.as_str());
@@ -2378,6 +2903,10 @@ impl<'ast> Visit<'ast> for Body<'_> {
 
     /// A sink function used as a value (`.map(sqlx::query)`).
     fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+        if let Some(i) = p.path.get_ident() {
+            let use_ = (i.to_string(), p.span().start().into());
+            self.facts().idents.push(use_);
+        }
         if p.path.segments.len() > 1 && self.index.is_sink_path(self.file(), &p.path) {
             let pos = p.span().start().into();
             self.sink(pos, Expr::Verbatim(p.to_token_stream()), None, false);

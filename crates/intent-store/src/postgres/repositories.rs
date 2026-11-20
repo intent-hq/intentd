@@ -1355,8 +1355,10 @@ impl PgStore {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<TransferTableStat>> {
-        let mut tx = self.begin().await?;
+        // One snapshot: the column read and the aggregate see one commit.
+        let mut tx = self.begin_read_snapshot().await?;
         let columns = self.transfer_columns(&mut tx).await?;
+        super::read_seam::probe::between(self.tenant(), "transfer_table_stats").await;
         let sql = transfer_predicates()?
             .enumerate()
             .map(|(i, (table, predicate))| {
