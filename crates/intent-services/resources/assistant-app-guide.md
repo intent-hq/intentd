@@ -1144,14 +1144,16 @@ Codex and other providers do not report background tasks.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_manager,agent_session,agent_ops}.rs. -->
 
-In desktop agent chat, use the screenshot button beside **+** to capture the
+In desktop agent chat, use the camera button beside **+** to capture the
 screen and attach it to your draft. On macOS, hover over the button or press
 **Up Arrow** while it is focused to choose **Full screen**, **Window**, or
-**Region**. Intent remembers the selected mode while that prompt is open. You can
-remove the image before sending. If macOS denies capture, allow screen recording
-for Intent in System Settings.
+**Region**. Intent remembers the selected mode while that prompt is open. The
+screenshot editor opens after capture. Draw boxes, arrows, or freehand marks, add
+text, blur sensitive details, or crop, then choose **Save changes**. Use **Attach**
+to keep the original or the trash button to discard the capture. If macOS denies
+capture, allow screen recording for Intent in System Settings.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/ChatPanel.svelte; src/lib/components/chat/input/SimpleRichInput.svelte; src/features/hud/components/DockComposerCapturePicker.svelte. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/ChatPanel.svelte; src/lib/components/chat/input/{SimpleRichInput,ChatScreenshotEditor}.svelte; src/features/hud/components/DockComposerCapturePicker.svelte; src/features/hud/media-editor/screenshot/DockScreenshotEditorWindow.svelte. -->
 
 PNG, JPEG, GIF, and WebP attachments may be resized or re-encoded for provider
 delivery; original attachments and their displayed previews are unchanged. SVG and
