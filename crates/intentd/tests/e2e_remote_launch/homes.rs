@@ -40,7 +40,9 @@ pub(super) async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -
 /// opened the home of `ws_id`: its setup finished (`skipped` without a
 /// setup script). The checkout's `HEAD` is no signal: `git worktree add`
 /// sets it before its own `reset --hard` writes the files and the index,
-/// so a test's git command there races the machine's.
+/// so a test's git command there races the machine's. Only for a new
+/// workspace's first open in this backend run: the setup state is kept in
+/// the backend's memory and is not set for a moved home.
 pub(super) async fn opened_home(
     rpc_ws: &mut common::TlsWs,
     id: &mut i64,

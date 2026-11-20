@@ -276,21 +276,19 @@ async fn moving_the_home_carries_its_work_to_another_machine_and_stops_the_old_o
     let new_home = home["homeId"].as_str().unwrap().to_owned();
     assert_ne!(new_home, old_home);
     assert_eq!(home["name"], "Machine B");
-    // The new home has A's commit and its uncommitted work.
+    // The new home has A's commit and its uncommitted work. `HEAD` is set
+    // before `git worktree add` writes the files and the wip is restored,
+    // so wait for the files too.
     let b_dir = s.b_dir.clone();
-    let moved = until("the home checkout on B", || {
-        home_checkout(&b_dir, &new_home)
-            .filter(|work| try_rev(work, "HEAD").as_deref() == Some(kept.as_str()))
+    let read = |work: &Path, file: &str| std::fs::read_to_string(work.join(file)).ok();
+    until("the home checkout on B with A's work", || {
+        home_checkout(&b_dir, &new_home).filter(|work| {
+            try_rev(work, "HEAD").as_deref() == Some(kept.as_str())
+                && read(work, "kept.txt").as_deref() == Some("kept\n")
+                && read(work, "dirty.txt").as_deref() == Some("left uncommitted\n")
+        })
     })
     .await;
-    assert_eq!(
-        std::fs::read_to_string(moved.join("kept.txt")).unwrap(),
-        "kept\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(moved.join("dirty.txt")).unwrap(),
-        "left uncommitted\n"
-    );
     // A got its moved stop: its last push lands on orphaned refs, then its
     // checkout goes.
     let (a_dir, mirror, ws_id) = (s.a_dir.clone(), s.mirror.clone(), s.ws_id.clone());
