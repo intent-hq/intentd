@@ -129,15 +129,24 @@ def edit_breakdown(text, old, new):
     else:
         inner = indent + "    "
         if len(inner + alternatives) > MAX_WIDTH:
-            raise Mismatch(f"{BREAKDOWN}: the admitted versions no longer fit one line; wrap them by hand")
+            # rustfmt then puts each further alternative on its own line.
+            alternatives = f"\n{inner}    | ".join(versions + [quoted(new)])
         call = f"{indent}matches!(\n{inner}harness_version,\n{inner}{alternatives}\n{indent})"
     text = text[:match.start()] + call + text[match.end():]
 
     text = sub_once(rf"^( *)assert!\(harness_records_prompt_breakdown\({re.escape(quoted(old))}\)\);\n",
                     rf"\g<0>\g<1>assert!(harness_records_prompt_breakdown({quoted(new)}));\n",
                     text, f"{BREAKDOWN}: assert!(harness_records_prompt_breakdown({quoted(old)}))", re.M)
-    # The not-admitted sample names the version after the current one.
-    return text.replace(f"{quoted(new)}, \"4.0\"", f"{quoted(next_minor(new))}, \"4.0\"", 1)
+    # The not-admitted samples must not include the new version.
+    samples = re.search(r"for version in \[(.*?)\]", text, re.S)
+    if not samples:
+        raise Mismatch(f"{BREAKDOWN}: the not-admitted `for version in [...]` samples not found")
+    if quoted(new) in samples.group(1):
+        replacement = quoted(next_minor(new))
+        if replacement in samples.group(1):
+            raise Mismatch(f"{BREAKDOWN}: the not-admitted samples already name {replacement}")
+        text = text[:samples.start(1)] + samples.group(1).replace(quoted(new), replacement) + text[samples.end(1):]
+    return text
 
 
 def edit_budget(text, old):
