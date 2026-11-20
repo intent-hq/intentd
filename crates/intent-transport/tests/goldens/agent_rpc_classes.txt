@@ -169,8 +169,8 @@ read gitRoot.list
 read github.authStatus
 read github.branches.list
 read github.branches.listCached
-mutating github.cancelAuth
-mutating github.connect
+forbidden-to-agent github.cancelAuth
+forbidden-to-agent github.connect
 read github.getReviewThreads
 read github.getUser
 forbidden-to-agent github.identityProof.create
@@ -195,7 +195,7 @@ read github.repos.get
 read github.repos.list
 read github.repos.search
 mutating github.resolveThread
-mutating github.revoke
+forbidden-to-agent github.revoke
 mutating github.unresolveThread
 read github.users.search
 mutating hook.cancel
@@ -216,7 +216,7 @@ read host.executionContext
 read host.findApp
 read host.findBinary
 forbidden-to-agent host.invite.create
-read host.invite.list
+forbidden-to-agent host.invite.list
 forbidden-to-agent host.invite.revoke
 read host.invite.searchAccounts
 read host.listDirectory
@@ -253,7 +253,7 @@ mutating linear.updateIssue
 read linear.viewer
 forbidden-to-agent mcp.oauth.delete
 forbidden-to-agent mcp.oauth.get
-read mcp.oauth.list
+forbidden-to-agent mcp.oauth.list
 forbidden-to-agent mcp.oauth.set
 mutating mcp.servers.create
 mutating mcp.servers.delete
@@ -361,7 +361,7 @@ read search.inFiles
 read search.messages
 read search.notes
 forbidden-to-agent secret.dismiss
-mutating secret.forget
+forbidden-to-agent secret.forget
 read secret.list
 forbidden-to-agent secret.provide
 mutating sentry.assignIssue
@@ -380,7 +380,7 @@ forbidden-to-agent settings.reset
 forbidden-to-agent settings.update
 read skill.list
 read sourceControl.authStatus
-mutating sourceControl.cancelAuth
+forbidden-to-agent sourceControl.cancelAuth
 read sourceControl.checkout.branches
 mutating sourceControl.checkout.capture
 read sourceControl.checkout.project
@@ -388,10 +388,10 @@ read sourceControl.checkout.projects
 mutating sourceControl.checkout.release
 read sourceControl.checkout.repoConfig
 mutating sourceControl.checkout.warm
-mutating sourceControl.connect
+forbidden-to-agent sourceControl.connect
 read sourceControl.getUser
 read sourceControl.gitlab.childGit.get
-mutating sourceControl.gitlab.childGit.set
+forbidden-to-agent sourceControl.gitlab.childGit.set
 forbidden-to-agent sourceControl.identityProof.create
 forbidden-to-agent sourceControl.identityProof.delete
 mutating sourceControl.read.capture
@@ -403,7 +403,7 @@ read sourceControl.read.list
 mutating sourceControl.read.release
 mutating sourceControl.read.releaseScoped
 read sourceControl.read.resolveKnownRepository
-mutating sourceControl.revoke
+forbidden-to-agent sourceControl.revoke
 mutating specialist.create
 mutating specialist.delete
 mutating specialist.edit
@@ -471,7 +471,7 @@ mutating workspace.import.chunk
 mutating workspace.import.commit
 mutating workspace.initializeRepository
 forbidden-to-agent workspace.invite.create
-read workspace.invite.list
+forbidden-to-agent workspace.invite.list
 forbidden-to-agent workspace.invite.revoke
 read workspace.list
 read workspace.localChanges

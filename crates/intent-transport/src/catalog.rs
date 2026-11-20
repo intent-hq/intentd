@@ -1121,6 +1121,8 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
     ),
     ("executor.mint", "Mints an executor credential."),
     ("executor.revoke", "Revokes an executor credential."),
+    ("github.cancelAuth", "Drives a forge sign-in flow."),
+    ("github.connect", "Connects a forge credential."),
     (
         "github.identityProof.create",
         "Creates a forge identity proof.",
@@ -1129,6 +1131,7 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
         "github.identityProof.delete",
         "Deletes a forge identity proof.",
     ),
+    ("github.revoke", "Revokes a forge credential."),
     ("host.exec", "Owner shell surface; agents use ws.host."),
     (
         "host.execStream",
@@ -1147,6 +1150,10 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
         "Mints a host invite (access administration).",
     ),
     (
+        "host.invite.list",
+        "Returns live invite links (access credentials).",
+    ),
+    (
         "host.invite.revoke",
         "Revokes a host invite (access administration).",
     ),
@@ -1160,6 +1167,7 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
     ("identity.select", "Switches the account credential."),
     ("mcp.oauth.delete", "Deletes stored MCP OAuth credentials."),
     ("mcp.oauth.get", "Reads stored MCP OAuth credentials."),
+    ("mcp.oauth.list", "Lists stored MCP OAuth credentials."),
     ("mcp.oauth.set", "Writes stored MCP OAuth credentials."),
     ("pairing.getInfo", "Returns pairing credentials."),
     ("pairing.getSelfInfo", "Returns pairing credentials."),
@@ -1171,6 +1179,7 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
     ("remoteMachines.add", "Stores a remote machine credential."),
     ("remoteMachines.claim", "Redeems a remote machine invite."),
     ("secret.dismiss", "Answers a secret request."),
+    ("secret.forget", "Deletes a stored secret."),
     (
         "secret.provide",
         "Answers a secret request with a secret value.",
@@ -1185,6 +1194,15 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
         "settings.update",
         "Changes agent features, approval or safety settings.",
     ),
+    ("sourceControl.cancelAuth", "Drives a forge sign-in flow."),
+    (
+        "sourceControl.connect",
+        "Connects a forge credential (a PAT would ride the card).",
+    ),
+    (
+        "sourceControl.gitlab.childGit.set",
+        "Changes which credential child git uses.",
+    ),
     (
         "sourceControl.identityProof.create",
         "Creates a forge identity proof.",
@@ -1193,6 +1211,7 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
         "sourceControl.identityProof.delete",
         "Deletes a forge identity proof.",
     ),
+    ("sourceControl.revoke", "Revokes a forge credential."),
     ("system.gitCredential", "Returns a git credential."),
     (
         "terminal.write",
@@ -1201,6 +1220,10 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
     (
         "workspace.invite.create",
         "Mints a workspace invite (access administration).",
+    ),
+    (
+        "workspace.invite.list",
+        "Returns live invite links (access credentials).",
     ),
     (
         "workspace.invite.revoke",

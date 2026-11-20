@@ -34,6 +34,9 @@ const MAX_REPORT_BYTES: usize = 12_000;
 const MAX_ITEM_RESULT_BYTES: usize = 2_000;
 /// Wait for one approved call. A call still running is reported `unknown`.
 const APPROVED_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Wall-clock bound on one approval run; calls past it are skipped. Clients
+/// wait a little longer than this for `agent.resolveRpcProposal`.
+const APPROVAL_RUN_BUDGET: Duration = Duration::from_secs(600);
 /// Headroom left in the eval budget for encoding the tool result.
 const BUDGET_MARGIN: Duration = Duration::from_millis(1_500);
 
@@ -393,6 +396,33 @@ impl Services {
         Ok(out)
     }
 
+    /// Guard for plain `agent.resolveProposal` on an `rpc-call` card: it may
+    /// only be dismissed there (dropping the held calls); applying it would
+    /// record "applied" with nothing run.
+    pub(crate) fn guard_plain_rpc_resolution(
+        &self,
+        proposal_id: &str,
+        outcome: &str,
+    ) -> Result<()> {
+        let held = self.rpc_proposals.lock().contains_key(proposal_id);
+        if !held && !proposal_id.starts_with("rpc-") {
+            return Ok(());
+        }
+        if outcome == intent_core::PROPOSAL_OUTCOME_APPLIED {
+            return Err(Error::InvalidParams(
+                "rpc-call proposals are approved with agent.resolveRpcProposal".into(),
+            ));
+        }
+        let mut registry = self.rpc_proposals.lock();
+        if registry.get(proposal_id).is_some_and(|h| h.running) {
+            return Err(Error::Conflict {
+                current: json!({ "proposalId": proposal_id, "state": "running" }),
+            });
+        }
+        registry.remove(proposal_id);
+        Ok(())
+    }
+
     /// `agent.resolveRpcProposal` (owner only).
     pub(crate) async fn agent_resolve_rpc_proposal_op(
         &self,
@@ -480,7 +510,6 @@ impl Services {
         };
         let items = self.run_approved(&agent_id, calls).await;
         let report = approved_report(&items);
-        self.rpc_proposals.lock().remove(&proposal_id);
         let resolved = self
             .resolve_proposal_with_detail_cap(
                 workspace_id,
@@ -492,6 +521,9 @@ impl Services {
                 MAX_REPORT_BYTES + 256,
             )
             .await;
+        // Removed only now: a concurrent approve or reject keeps seeing
+        // `running` until the resolution (and its report) is recorded.
+        self.rpc_proposals.lock().remove(&proposal_id);
         let outcome = match resolved {
             Ok(v) => v["outcome"].clone(),
             Err(e) => {
@@ -546,6 +578,7 @@ impl Services {
         let surface = self.agent_rpc_surface().ok();
         let mut items = Vec::with_capacity(calls.len());
         let mut stopped = false;
+        let deadline = tokio::time::Instant::now() + APPROVAL_RUN_BUDGET;
         for (index, call) in calls.into_iter().enumerate() {
             let mut item =
                 json!({ "index": index, "backend": call.backend, "method": call.method });
@@ -566,15 +599,20 @@ impl Services {
                 continue;
             };
             let class = surface.classify(&call.method);
+            let wait = APPROVED_CALL_TIMEOUT
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            if wait.is_zero() {
+                item["status"] = json!("skipped");
+                stopped = true;
+                items.push(item);
+                continue;
+            }
             let outcome = match refusal_for(surface.as_ref(), &call.method, class) {
                 Some(refusal) => Err((false, refusal)),
-                None => tokio::time::timeout(
-                    APPROVED_CALL_TIMEOUT,
-                    surface.call(call.method.clone(), call.params),
-                )
-                .await
-                .map_err(|_| (true, timeout_error(&call.method, APPROVED_CALL_TIMEOUT)))
-                .and_then(|r| r.map_err(|e| (false, e))),
+                None => tokio::time::timeout(wait, surface.call(call.method.clone(), call.params))
+                    .await
+                    .map_err(|_| (true, timeout_error(&call.method, wait)))
+                    .and_then(|r| r.map_err(|e| (false, e))),
             };
             match outcome {
                 Ok(result) => {

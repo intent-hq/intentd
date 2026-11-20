@@ -28,7 +28,9 @@ const READ_CODE: &str = r"
     const forbidden = {};
     for (const m of ['agent.resolveProposal', 'agent.respondPermission', 'agent.resolveRpcProposal',
                      'secret.provide', 'secret.dismiss', 'settings.update', 'settings.reset',
-                     'pairing.getInfo', 'server.rotateToken', 'executor.mint', 'browser.exec', 'terminal.write']) {
+                     'pairing.getInfo', 'server.rotateToken', 'executor.mint', 'browser.exec', 'terminal.write',
+                     'workspace.invite.list', 'host.invite.list', 'mcp.oauth.list',
+                     'sourceControl.connect', 'github.connect', 'secret.forget']) {
         forbidden[m] = await ws.rpc.call(m, {});
     }
     const refusedBatch = await ws.rpc.batch([
@@ -443,6 +445,18 @@ async fn assistant_rpc_reads_refusals_and_approvals_over_wss() {
         .as_str()
         .expect("id")
         .to_string();
+    // Plain agent.resolveProposal must never mark held calls applied.
+    let plain = wss_rpc_envelope(
+        &mut ws,
+        3900,
+        "agent.resolveProposal",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID, "agentId": assistant,
+            "proposalId": single_id, "outcome": "applied",
+        }),
+    )
+    .await;
+    assert_eq!(plain["error"]["code"], -32602, "{plain}");
     let rejected = resolve(&mut ws, 4000, &assistant, &single_id, "reject").await;
     assert_eq!(rejected["outcome"], "dismissed", "{rejected}");
     assert!(!archived(&mut ws, 4200, &keep).await, "reject runs nothing");

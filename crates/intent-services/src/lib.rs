@@ -31002,6 +31002,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
+            self.guard_plain_rpc_resolution(&proposal_id, &outcome)?;
             self.agent_resolve_proposal_op(
                 workspace_id,
                 agent_id,
