@@ -1203,7 +1203,7 @@ terminal being open. If setup stays running, inspect its last output before
 retrying. Include that output, the Intent version, and the operating system when
 reporting the problem.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/lib/components/workspace/WorkspaceShellList.svelte (Start automatically toggle, ordering); src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend sources: packages/intentd/crates/intent-svc-runtime/src/script_monitor.rs; packages/intentd/crates/intent-svc-runtime/src/script_ops.rs (boot restore of running services); packages/intentd/crates/intent-svc-runtime/src/script_ops/home_runs.rs (autoStart); packages/intentd/crates/intentd/src/main.rs (staged update restart watcher). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/lib/components/workspace/WorkspaceShellList.svelte (Start automatically toggle, ordering); src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend sources: packages/intentd/crates/intent-svc-runtime/src/script_monitor.rs; packages/intentd/crates/intent-svc-runtime/src/script_ops.rs (boot restore of running services); packages/intentd/crates/intent-svc-runtime/src/script_ops/home_runs.rs (autoStart); packages/intentd/crates/intent-svc-runtime/src/script_ops/machine_runs.rs (remote agents' runs, stopped on archive); packages/intentd/crates/intentd/src/main.rs (staged update restart watcher). -->
 
 Script lists show unarchived scripts; use **Load more** when offered to see the
 next page. Open a script to view available output; use **Edit command** to inspect
@@ -1228,7 +1228,8 @@ Scripts with **Start automatically** on (also set by agents, or under `scripts` 
 the repository's `.intent/config.json`) also start when workspace setup finishes
 (not after a failed setup script) and when the workspace is unarchived, but not in
 a workspace being deleted. A running script is not started twice. Archiving a
-workspace stops all of its running scripts.
+workspace stops all of its running scripts, including those remote agents started
+on their machines.
 
 To delete a saved script, open its **…** menu in the sidebar **Scripts** list or in
 the script panel and choose **Delete script**, or use **Delete script** beside its

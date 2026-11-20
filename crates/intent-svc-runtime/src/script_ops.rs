@@ -1989,12 +1989,57 @@ impl ScriptManager {
     /// The workspace was archived: stop every running script with
     /// `script.stop` semantics (scripts.md "autoStart"), so nothing keeps
     /// running and no was-running marker survives for boot to restore.
+    /// Remote agents' machine runs are stopped too.
     pub(crate) async fn stop_for_archive(&self, workspace_id: &WorkspaceId) {
         let unsettled = self
             .stop_live_scripts(workspace_id, "cancelled by workspace archive", true)
             .await;
         if !unsettled.is_empty() {
             tracing::warn!(workspace = %workspace_id, ?unsettled, "scripts still live after workspace archive");
+        }
+        self.stop_machine_runs_while_archived(workspace_id).await;
+    }
+
+    /// Stop each live machine run of `workspace_id` as the app's
+    /// `script.stop({ remoteAgentId })` does, while the row is still
+    /// archived. The stops run at once, so an unreachable machine delays the
+    /// archive by one bounded stop wait, not one per run.
+    async fn stop_machine_runs_while_archived(&self, workspace_id: &WorkspaceId) {
+        let Some(runs) = self.machine_runs() else {
+            return;
+        };
+        let stops: Vec<_> = runs
+            .live_in(workspace_id)
+            .into_iter()
+            .map(|place| {
+                let (runs, store) = (runs.clone(), self.store.clone());
+                intent_core::caller::spawn_with_current_caller(async move {
+                    let archived = store
+                        .get_workspace(&place.workspace_id)
+                        .await
+                        .is_ok_and(|row| row.archived);
+                    if !archived {
+                        return;
+                    }
+                    if let Err(e) = runs
+                        .stop_live(&place, "cancelled by workspace archive")
+                        .await
+                    {
+                        tracing::warn!(
+                            workspace = %place.workspace_id,
+                            script = %place.script_id,
+                            agent = %place.agent_id,
+                            error = %e,
+                            "machine run stop failed on workspace archive"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for stop in stops {
+            if let Err(e) = stop.await {
+                tracing::warn!(workspace = %workspace_id, error = %e, "machine run stop task failed on workspace archive");
+            }
         }
     }
 
