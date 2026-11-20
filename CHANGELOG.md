@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.258] - 2026-11-20
+
+### 📚 Documentation
+
+- *(assistant)* Describe default dock capture editing ([#3579](https://github.com/intent-hq/intentd/pull/3579))
+- Describe collapsed tool activity on iOS ([#3578](https://github.com/intent-hq/intentd/pull/3578))
+
+### 🧪 Testing
+
+- *(store)* Harden the Postgres multi-statement-read lint ([#3574](https://github.com/intent-hq/intentd/pull/3574))
+
+
 ## [0.11.257] - 2026-11-20
 
 ### 🚀 Features
