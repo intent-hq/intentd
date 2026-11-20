@@ -66,7 +66,7 @@ printf '%s\n' "$*" >>"$FAKE_STATE/calls"
 case "$*" in
   "settings daemon.mode") printf 'daemon.mode = %s\n' "$(cat "$FAKE_STATE/mode" 2>/dev/null || echo regular)" ;;
   "pair --node --tunnel --yes") echo 'URL:         intent://node?v=1&host=&port=5181&fp=FP&invite=ni-1&secret=s&tc=tc-fake' ;;
-  "pair --yes --tunnel") echo 'URL:         intent://pair?v=1&host=&port=5180&token=T&fp=FP&tc=tc-fake' ;;
+  "pair --yes --tunnel" | "pair --tunnel") echo 'URL:         intent://pair?v=1&host=&port=5180&token=T&fp=FP&tc=tc-fake' ;;
 esac
 exit 0
 "#;
@@ -292,6 +292,27 @@ fn the_pair_option_pairs_a_full_install_once_the_daemon_is_up() {
     );
     let off = apply(&pwsh, "", false, "up", None);
     assert!(off.calls.is_empty(), "{:?}", off.calls);
+}
+
+#[test]
+fn the_pair_option_on_a_console_asks_through_intentd_pair() {
+    let Some(pwsh) = pwsh() else { return };
+    let body = format!(
+        "$installMode = 'full'\n$installModeExplicit = $true\n$verdict = 'up'\n$interactive = $true\n$pair = $true\n$existingInstall = $false\n{}",
+        ps_region("daemon-mode-apply")
+    );
+    let outcome = run(&pwsh, &body, &[], None);
+    assert_eq!(
+        outcome.calls.last().map(String::as_str),
+        Some("pair --tunnel"),
+        "a person answers the tunnel and address questions: {}",
+        outcome.output
+    );
+    assert!(
+        outcome.output.contains("intent://pair?"),
+        "{}",
+        outcome.output
+    );
 }
 
 #[test]

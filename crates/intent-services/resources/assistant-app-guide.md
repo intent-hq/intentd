@@ -559,6 +559,9 @@ If connected elsewhere, use **Settings → Machines**, then the local machine's
 **Connect** action, and return to **Mobile**. The QR controls remain visible but
 disabled when **Enable Remote Access** is off, data is loading, or no running listener
 port is available. Explain the required enablement; do not silently change it.
+Turning on **Enable Remote Access** also turns on the Tailcat tunnel and keeps listening on
+loopback only, unless the user chose other networks under **Advanced → Available Networks**
+before; those choices, tunnel included, are kept.
 For a generation error, inspect the displayed connection/listener error. TLS and
 tunnel switches are not visibility requirements: do not suggest toggling them to
 reveal the controls. Local pairing grants access to that machine; do not offer it
@@ -722,7 +725,11 @@ explaining missing work or changing host settings. **Mobile** follows the active
 connection and its permissions; do not describe a remote connection's QR as belonging
 to the local desktop. To pair the local machine, connect to it first. For intentd
 running in WSL on the same Windows PC, add a machine with host `localhost`;
-`intentd pair --host localhost` in WSL prints the port and token. Enabling access,
+`intentd pair --host localhost` in WSL prints the port and token. When `intentd pair`
+turns access on, it asks whether to turn on the Tailcat tunnel, then which addresses to
+accept connections on; `--yes` and the installers' unattended runs take the defaults. A
+first install defaults to the tunnel on and loopback only; re-running the installer keeps
+the tunnel and addresses already saved. Enabling access,
 changing listening addresses, and configuring a tunnel are separate choices from
 displaying pairing information. Read current state and respect the user's requested scope.
 

@@ -269,6 +269,8 @@ case "$1" in
     printf 'key-%s' $$ > "$key"
     ;;
   serve)
+    d=$(dirname "$0")
+    [ -f "$d/tailcat-delay" ] && sleep "$(cat "$d/tailcat-delay")" # // timing-guard: a tunnel still starting, for the re-install test
     printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
     exec sleep 600
     ;;
@@ -636,7 +638,7 @@ async fn pair_tunnel_yes_pairs_a_fresh_node_through_the_tunnel() {
 
 /// A fresh full install (listener off, loopback bind) pairs over the tunnel
 /// by default too, with no node hint. A saved tunnel `false` with a LAN bind
-/// is kept.
+/// is kept, so a re-install defaults to what was set before.
 #[tokio::test]
 async fn pair_yes_turns_the_tunnel_on_for_a_loopback_only_listener() {
     let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
@@ -683,6 +685,35 @@ async fn pair_yes_turns_the_tunnel_on_for_a_loopback_only_listener() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stderr.contains("Tailcat tunnel enabled"), "{stderr}");
     assert!(!stdout.contains("&tc="), "{stdout}");
+}
+
+/// A re-install: remote access and the tunnel are saved on, and the daemon
+/// has just restarted, so its tunnel is still coming up. The installer pairs
+/// right away with `--yes` and no `--tunnel` (re-installs keep saved
+/// choices); pairing must wait for that tunnel instead of failing with no
+/// dialable route. One run, no retries.
+#[tokio::test]
+async fn pair_waits_for_a_saved_tunnel_that_is_still_starting() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+    std::fs::write(data_dir.join("tailcat-delay"), "3").expect("seed tailcat delay");
+    let child = spawn_daemon_both_tunneled(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let output = run_pair(&data_dir, &["--yes"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "pair --yes must wait for the saved tunnel: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let url = labeled_value(&stdout, "URL:").expect("URL line");
+    assert!(url.contains("&tc=tc-"), "{url}");
 }
 
 /// One-shot `intentd call <method>` against the daemon in `data_dir`,
@@ -1074,8 +1105,9 @@ async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
     }
 }
 
-/// Run `intentd pair --select-endpoints` with `input` piped to stdin (the
-/// picker reads one selection line, so a piped run works without a TTY).
+/// Run `intentd pair --select-endpoints` with `input` piped to stdin: one
+/// line for the tunnel question, then one for the address picker, so a piped
+/// run works without a TTY.
 fn run_select_endpoints(data_dir: &Path, input: &str) -> std::process::Output {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_intentd"))
@@ -1137,7 +1169,7 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
     // array-shape e2e would be machine-dependent. The persisted array shape
     // is unit-covered (bind_addresses_value) and the daemon's array handling
     // by #1431.
-    let output = run_select_endpoints(&data_dir, "none\n");
+    let output = run_select_endpoints(&data_dir, "\nnone\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -1156,9 +1188,15 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
         "loopback must not be a selectable row: {stderr}"
     );
     assert!(
-        stderr.contains("https://github.com/tailscale/tailcat"),
-        "tailcat picker entry should carry the explanatory note with the \
-         project URL: {stderr}"
+        stderr.contains("Turn on the Tailcat tunnel? [y/N]")
+            && stderr.contains("https://github.com/tailscale/tailcat"),
+        "the tunnel question comes first, defaults to the current (off) \
+         state and carries the project URL: {stderr}"
+    );
+    assert!(
+        stderr.find("Turn on the Tailcat tunnel?")
+            < stderr.find("Where should the daemon accept connections?"),
+        "the tunnel question precedes the address picker: {stderr}"
     );
     assert!(
         stderr.contains("listening on 127.0.0.1"),
@@ -1266,6 +1304,59 @@ async fn daemon_binds_loopback_alongside_a_specific_bind() {
     }
 }
 
+/// A configured address that is not on this machine (a Tailscale address
+/// before Tailscale connects) does not stop the listener: loopback — and so
+/// the tailcat tunnel — keeps serving, and status advertises only what is
+/// actually bound. 192.0.2.1 (TEST-NET-1) is never assigned to an interface.
+#[tokio::test]
+async fn daemon_serves_loopback_when_a_configured_address_is_absent() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"192.0.2.1\"\n",
+    )
+    .expect("seed config.toml with an absent address");
+    let child = spawn_daemon_both(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    let (port, status) = loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("call")
+            .arg("system.status")
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run intentd call system.status");
+        let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+        if let Some(port) = status.as_ref().and_then(|s| s["port"].as_u64()) {
+            break (
+                u16::try_from(port).expect("valid TCP port"),
+                status.expect("status parsed"),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WSS listener never came up with an absent configured address"
+        );
+        // timing-guard: poll interval until system.status reports the listener port
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        status["localIps"],
+        serde_json::json!(["127.0.0.1"]),
+        "only the bound addresses are advertised"
+    );
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .unwrap_or_else(|e| panic!("127.0.0.1:{port} must accept connections: {e}"));
+}
+
 #[tokio::test]
 async fn pair_select_endpoints_unchanged_selection_writes_nothing() {
     let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
@@ -1288,7 +1379,7 @@ async fn pair_select_endpoints_unchanged_selection_writes_nothing() {
 
     // Plain Enter keeps the pre-checked set (= the persisted set): nothing
     // is written and the command says so.
-    let output = run_select_endpoints(&data_dir, "\n");
+    let output = run_select_endpoints(&data_dir, "\n\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -1328,7 +1419,7 @@ async fn pair_select_endpoints_unchanged_selection_still_enables_listener() {
     };
     await_socket(&mut daemon, &socket).await;
 
-    let output = run_select_endpoints(&data_dir, "\n");
+    let output = run_select_endpoints(&data_dir, "\n\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -1376,7 +1467,7 @@ async fn pair_select_endpoints_reprompts_on_invalid_input() {
 
     // An out-of-range token re-prompts; the follow-up plain Enter keeps the
     // persisted set. EOF right after a bad token (no second line) fails.
-    let output = run_select_endpoints(&data_dir, "999\n\n");
+    let output = run_select_endpoints(&data_dir, "\n999\n\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -1391,7 +1482,7 @@ async fn pair_select_endpoints_reprompts_on_invalid_input() {
         "second read keeps the persisted set: {stderr}"
     );
 
-    let output = run_select_endpoints(&data_dir, "999\n");
+    let output = run_select_endpoints(&data_dir, "\n999\n");
     assert!(
         !output.status.success(),
         "EOF before a valid selection must fail"
