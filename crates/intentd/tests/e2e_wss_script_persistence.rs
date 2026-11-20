@@ -517,7 +517,7 @@ async fn scripts_survive_daemon_restart_over_wss() {
             "cwd": "web",
             "env": { "PORT": "3000" },
             "category": "dev",
-            "autoStart": true,
+            "autoStart": false,
             "scriptId": "persist-1",
         }),
     )
@@ -546,7 +546,7 @@ async fn scripts_survive_daemon_restart_over_wss() {
     assert_eq!(entry["env"]["PORT"], "3000");
     assert_eq!(entry["mode"], "service");
     assert_eq!(entry["category"], "dev");
-    assert_eq!(entry["autoStart"], true);
+    assert_eq!(entry["autoStart"], false);
     assert_eq!(entry["source"], "user");
     assert_eq!(entry["runtime"]["status"], "idle");
     assert!(
@@ -584,14 +584,14 @@ async fn scripts_survive_daemon_restart_over_wss() {
     stop(child);
 }
 
-/// A service running when the daemon is killed hydrates on the next boot as
-/// `idle` with `previouslyRunning: true` (the stored-on-write `was_running`
-/// marker, PROTOCOL §5.8) on both `script.list` and `script.status`; the
-/// marker survives a second restart, and `script.stop` on the non-running
-/// hydrated script (the FE dismiss affordance) returns ok and durably clears
-/// it across yet another restart.
+/// A service running when the daemon is killed starts again on the next boot
+/// without `autoStart` (the stored-on-write `was_running` marker, PROTOCOL
+/// §5.8): it reaches `running` with a new process and no `previouslyRunning`.
+/// An `autoStart` service that never ran starts at boot too.
+/// It is restored again after a second kill, and a user `script.stop` keeps it
+/// stopped across yet another restart.
 #[tokio::test]
-async fn was_running_marker_survives_daemon_kill_over_wss() {
+async fn was_running_service_restarts_after_daemon_kill_over_wss() {
     let data_dir_guard = scratch_dir("marker");
     let data_dir = data_dir_guard.path().to_path_buf();
     let repo_guard = create_test_repo();
@@ -630,6 +630,22 @@ async fn was_running_marker_survives_daemon_kill_over_wss() {
     )
     .await;
     assert_eq!(script["id"], "marker-1");
+    let auto = wss_rpc(
+        &mut ws,
+        50,
+        "script.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "auto",
+            // timing-guard: the long-lived service process, not a wait
+            "command": "sleep 3600",
+            "mode": "service",
+            "autoStart": true,
+            "scriptId": "auto-1",
+        }),
+    )
+    .await;
+    assert_eq!(auto["id"], "auto-1");
     let started = wss_rpc(
         &mut ws,
         3,
@@ -645,26 +661,56 @@ async fn was_running_marker_survives_daemon_kill_over_wss() {
     drop(ws);
     stop(child); // SIGKILL — the running service never sees a stop.
 
-    // Boot #2: hydrated idle with previouslyRunning on status and list.
+    // Boot #2: restored to running on its own, with a new process.
     let (child, port, cfg) = boot(&data_dir).await;
     let mut ws = connect_ws(port, cfg).await;
-    let st = wss_rpc(
+    let st = await_status(&mut ws, 100, &ws_id, "marker-1", |st| {
+        st["status"] == json!("running")
+    })
+    .await;
+    assert!(st["pid"].as_u64().is_some(), "restored process: {st}");
+    assert!(
+        st.get("previouslyRunning").is_none(),
+        "restore consumes the marker: {st}"
+    );
+    // An autoStart service starts at boot even though it never ran.
+    await_status(&mut ws, 300, &ws_id, "auto-1", |st| {
+        st["status"] == json!("running")
+    })
+    .await;
+    let listed = wss_rpc(&mut ws, 4, "script.list", json!({ "workspaceId": ws_id })).await;
+    let entry = listed["scripts"]
+        .as_array()
+        .expect("scripts array")
+        .iter()
+        .find(|s| s["id"] == "marker-1")
+        .expect("marker-1 listed");
+    assert_eq!(
+        entry["runtime"]["status"], "running",
+        "on list too: {entry}"
+    );
+    drop(ws);
+    stop(child); // Kill again while the restored service runs.
+
+    // Boot #3: restored again; a user stop then clears the marker.
+    let (child, port, cfg) = boot(&data_dir).await;
+    let mut ws = connect_ws(port, cfg).await;
+    await_status(&mut ws, 200, &ws_id, "marker-1", |st| {
+        st["status"] == json!("running")
+    })
+    .await;
+    let stopped = wss_rpc(
         &mut ws,
-        4,
-        "script.status",
+        5,
+        "script.stop",
         json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
     )
     .await;
-    assert_eq!(st["status"], "idle", "hydrates idle: {st}");
-    assert_eq!(st["previouslyRunning"], true, "marker surfaced: {st}");
-    let listed = wss_rpc(&mut ws, 5, "script.list", json!({ "workspaceId": ws_id })).await;
-    let entry = &listed["scripts"].as_array().expect("scripts array")[0];
-    assert_eq!(entry["runtime"]["previouslyRunning"], true, "on list too");
+    assert_eq!(stopped["ok"], json!(true));
     drop(ws);
-    stop(child); // Kill again without touching the script.
+    stop(child);
 
-    // Boot #3: the marker persists across repeated restarts; dismissing via
-    // script.stop on the non-running script returns ok and clears it.
+    // Boot #4: an explicitly stopped service stays stopped.
     let (child, port, cfg) = boot(&data_dir).await;
     let mut ws = connect_ws(port, cfg).await;
     let st = wss_rpc(
@@ -674,41 +720,7 @@ async fn was_running_marker_survives_daemon_kill_over_wss() {
         json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
     )
     .await;
-    assert_eq!(st["previouslyRunning"], true, "marker persists: {st}");
-    let stopped = wss_rpc(
-        &mut ws,
-        7,
-        "script.stop",
-        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
-    )
-    .await;
-    assert_eq!(stopped["ok"], json!(true), "dismiss is ok, not an error");
-    let st = wss_rpc(
-        &mut ws,
-        8,
-        "script.status",
-        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
-    )
-    .await;
-    assert_eq!(st["status"], "idle");
-    assert!(
-        st.get("previouslyRunning").is_none(),
-        "dismiss drops the marker: {st}"
-    );
-    drop(ws);
-    stop(child);
-
-    // Boot #4: the clear was durable.
-    let (child, port, cfg) = boot(&data_dir).await;
-    let mut ws = connect_ws(port, cfg).await;
-    let st = wss_rpc(
-        &mut ws,
-        9,
-        "script.status",
-        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
-    )
-    .await;
-    assert_eq!(st["status"], "idle");
+    assert_eq!(st["status"], "idle", "user stop respected: {st}");
     assert!(
         st.get("previouslyRunning").is_none(),
         "cleared marker stays cleared across restart: {st}"
@@ -1173,4 +1185,182 @@ async fn durable_command_evidence_survives_daemon_restart_over_wss() {
         "retained"
     );
     drop(ws);
+}
+
+/// A committed repo whose `.intent/config.json` declares one `autoStart`
+/// service, so the workspace's scripts exist before its setup finishes.
+fn create_auto_start_repo() -> tempfile::TempDir {
+    let repo = create_test_repo();
+    let repo_path = repo.path();
+    std::fs::create_dir_all(repo_path.join(".intent")).expect("mkdir .intent");
+    std::fs::write(
+        repo_path.join(".intent/config.json"),
+        json!({
+            "scripts": [
+                { "name": "auto-svc", "command": "tail -f /dev/null", "mode": "service", "autoStart": true },
+                { "name": "manual-svc", "command": "tail -f /dev/null", "mode": "service" },
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write repo config");
+    for args in [&["add", "."][..], &["commit", "-m", "scripts"][..]] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .stdout(Stdio::null())
+            .status()
+            .expect("git spawn");
+        assert!(status.success(), "git {args:?} failed");
+    }
+    repo
+}
+
+/// Poll `script.list` until the script named `name` matches `pred`; returns
+/// its row.
+async fn await_listed<S, F>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    ws_id: &str,
+    name: &str,
+    mut pred: F,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: FnMut(&Value) -> bool,
+{
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
+    let mut id = id_base;
+    loop {
+        let listed = wss_rpc(ws, id, "script.list", json!({ "workspaceId": ws_id })).await;
+        let row = listed["scripts"]
+            .as_array()
+            .expect("scripts array")
+            .iter()
+            .find(|row| row["name"] == name)
+            .cloned();
+        if let Some(row) = row.filter(|row| pred(row)) {
+            return row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out awaiting script {name}, last list: {listed}"
+        );
+        id += 1;
+        // timing-guard: poll interval between script.list reads; the deadline above bounds the wait
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn is_live(status: &Value) -> bool {
+    matches!(status.as_str(), Some("starting" | "running" | "restarting"))
+}
+
+/// `autoStart` means "runs while the workspace is active" for a local
+/// workspace: the service starts when the workspace's setup finishes, archive
+/// stops every running script, and unarchive starts the autoStart one again.
+/// A saved service without `autoStart` never starts on its own.
+#[tokio::test]
+async fn auto_start_service_follows_local_workspace_lifecycle_over_wss() {
+    let data_dir_guard = scratch_dir("autostart");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let repo_guard = create_auto_start_repo();
+    let repo_path = repo_guard.path().to_path_buf();
+
+    let (child, port, cfg) = boot(&data_dir).await;
+    let mut ws = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut ws,
+        1,
+        "workspace.create",
+        json!({
+            "title": "autostart-lifecycle",
+            "repositoryPath": repo_path.to_string_lossy(),
+            "setupScript": "true",
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Setup finishes: the autoStart service starts with no client start.
+    let row = await_listed(&mut ws, 100, &ws_id, "auto-svc", |row| {
+        row["runtime"]["status"] == "running"
+    })
+    .await;
+    let auto_id = row["id"].as_str().expect("script id").to_string();
+    let manual = await_listed(&mut ws, 300, &ws_id, "manual-svc", |_| true).await;
+    assert_eq!(
+        manual["runtime"]["status"], "idle",
+        "a service without autoStart stays idle: {manual}"
+    );
+
+    // Archive stops every running script, autoStart or not.
+    let manual_id = manual["id"].as_str().expect("script id").to_string();
+    let started = wss_rpc(
+        &mut ws,
+        2,
+        "script.start",
+        json!({ "workspaceId": ws_id, "scriptId": manual_id }),
+    )
+    .await;
+    assert_eq!(started["ok"], json!(true));
+    await_status(&mut ws, 400, &ws_id, &manual_id, |st| {
+        st["status"] == "running"
+    })
+    .await;
+    let archived = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.archive",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(archived["workspace"]["archived"], json!(true));
+    for (n, id) in [(4, &auto_id), (5, &manual_id)] {
+        let st = wss_rpc(
+            &mut ws,
+            n,
+            "script.status",
+            json!({ "workspaceId": ws_id, "scriptId": id }),
+        )
+        .await;
+        assert!(!is_live(&st["status"]), "archive stopped {id}: {st}");
+        assert!(
+            st.get("previouslyRunning").is_none(),
+            "no was-running marker for boot to restore: {st}"
+        );
+    }
+
+    // Unarchive: the workspace is active again, so only autoStart runs.
+    let unarchived = wss_rpc(
+        &mut ws,
+        6,
+        "workspace.unarchive",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(unarchived["workspace"]["archived"], json!(false));
+    await_status(&mut ws, 600, &ws_id, &auto_id, |st| {
+        st["status"] == "running"
+    })
+    .await;
+    let manual = await_listed(&mut ws, 800, &ws_id, "manual-svc", |_| true).await;
+    assert!(
+        !is_live(&manual["runtime"]["status"]),
+        "unarchive starts only autoStart scripts: {manual}"
+    );
+
+    let _ = wss_rpc(
+        &mut ws,
+        7,
+        "script.stop",
+        json!({ "workspaceId": ws_id, "scriptId": auto_id }),
+    )
+    .await;
+    drop(ws);
+    stop(child);
 }

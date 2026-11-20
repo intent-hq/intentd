@@ -945,3 +945,56 @@ async fn archived_script_remove_by_known_id_after_restart() {
         );
     }
 }
+
+/// Daemon starts launch nothing in an archived workspace, checked under the
+/// definition lock: an `autoStart` trigger and the boot restore of a
+/// was-running service both leave the script idle, while a client
+/// `script.start` still runs it (scripts.md "autoStart").
+#[intent_test_macros::daemon_test]
+async fn daemon_starts_refuse_an_archived_workspace() {
+    let h = harness().await;
+    let id = create(
+        &h,
+        ScriptCreateParams {
+            name: "auto svc".into(),
+            command: SERVICE_CMD.into(),
+            mode: ScriptMode::Service,
+            auto_start: Some(true),
+            purpose: Some(intent_core::ScriptPurpose::Saved),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mgr = h.services.script_manager();
+    h.services
+        .store()
+        .archive_workspace_detaching_guests(&h.ws, &now_iso())
+        .await
+        .expect("archive row");
+
+    assert_eq!(mgr.start_auto_start(&h.ws).await.expect("auto start"), 0);
+    assert!(
+        mgr.start_auto(&h.ws, &id).await.expect("start_auto").is_none(),
+        "the in-lock gate refuses a start admitted before the archive"
+    );
+    mgr.scripts
+        .lock()
+        .unwrap()
+        .get_mut(&(h.ws.clone(), id.clone()))
+        .unwrap()
+        .state
+        .previously_running = Some(true);
+    mgr.start_as(&h.ws, &id, StartKind::Restore)
+        .await
+        .expect("restore");
+    assert_eq!(
+        mgr.status(&h.ws, &id).expect("status")["status"],
+        json!("idle"),
+        "no daemon start launched in the archived workspace"
+    );
+
+    let mut sub = subscribe(&h);
+    mgr.start(&h.ws, &id).await.expect("client start");
+    await_state(&mut sub, LIVENESS, |s| s["data"]["status"] == "running").await;
+    mgr.stop(&h.ws, &id).await.expect("stop");
+}

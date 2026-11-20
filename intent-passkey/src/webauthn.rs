@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, warn};
 
-use crate::authenticator::{Authenticator, CeremonyIo};
+use crate::authenticator::{device_unsupported, Authenticator, CeremonyIo};
 use crate::protocol::{
     Account, BluetoothState, Bytes, CreateExtensionOutputs, CreateParams, CreateResult, CredProps,
     CredentialDescriptor, ErrorCode, GetParams, GetResult, PasskeyError, PinKind, Status,
@@ -359,6 +359,17 @@ async fn prepare_get(params: &GetParams) -> Result<GetAssertionRequest, PasskeyE
                 other => error(ErrorCode::Security, other.to_string()),
             }
         })
+}
+
+/// The `clientDataJSON` bytes for a `create`, built the same way for every
+/// transport (libwebauthn's builder, after its origin and RP ID checks).
+pub(crate) async fn create_client_data(params: &CreateParams) -> Result<String, PasskeyError> {
+    Ok(prepare_create(params).await?.client_data_json())
+}
+
+/// The `clientDataJSON` bytes for a `get`; see [`create_client_data`].
+pub(crate) async fn get_client_data(params: &GetParams) -> Result<String, PasskeyError> {
+    Ok(prepare_get(params).await?.client_data_json())
 }
 
 /// Turns a channel UX update into events; answers PIN requests through `io`.
@@ -714,10 +725,7 @@ impl Authenticator for LibWebAuthn {
         match params.transport {
             Transport::Usb => self.create_usb(&params, io).await,
             Transport::Hybrid => Self::create_hybrid(&params, io).await,
-            Transport::Device => Err(error(
-                ErrorCode::NotSupported,
-                "device passkeys are not available yet",
-            )),
+            Transport::Device => Err(device_unsupported()),
         }
     }
 
@@ -725,10 +733,7 @@ impl Authenticator for LibWebAuthn {
         match params.transport {
             Transport::Usb => self.get_usb(&params, io).await,
             Transport::Hybrid => Self::get_hybrid(&params, io).await,
-            Transport::Device => Err(error(
-                ErrorCode::NotSupported,
-                "device passkeys are not available yet",
-            )),
+            Transport::Device => Err(device_unsupported()),
         }
     }
 }

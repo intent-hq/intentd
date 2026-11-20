@@ -433,6 +433,7 @@ Parameters:
 Namespaces (index — full signatures in API below):
   ws.help(namespace?) — index or namespace docs
   ws.workspace.* — info, title, status message
+  ws.rpc.* — any daemon JSON-RPC (preferred; changes need approval)
   ws.app.* — agents, chats, mcp, proposal, settings, specialists, ui, workspaces
   ws.app.question.* — ask the user structured questions
   ws.note.* — notes; the spec is note id "spec"
@@ -468,6 +469,11 @@ API:
   ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposalId, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
   ws.workspace.applyProposal(proposalIdOrIdempotencyKey, { userRequested: true, title?, initialPrompt? }) → { ok, proposalId, outcome, workspace, initialAgent?, overrides?, alreadyResolved?, resolveWarning? }  // Apply one of YOUR OWN pending sibling-workspace proposals on the user's explicit chat instruction (`userRequested: true` is a required attestation). Creates exactly the workspace the proposal card would — `workspace` is `{ id, title, branch?, path?, link, markdownLink }` (share `markdownLink` to point the user at it); the stored idempotencyKey is reused, so agent Apply, card Apply and card Retry converge on one workspace — and marks the card applied. `title` / `initialPrompt` optionally override those two proposal fields (the result's `overrides` names them); repository, baseRef and specialist stay locked to the proposal. A proposal emitted in the CURRENT turn is pending only at turn end, so end your turn and wait for the user's instruction first. An already-applied id returns `alreadyResolved: true` without creating again; a dismissed one is refused; address a resolved proposal by proposalId — the idempotencyKey only matches while pending. Foreground top-level agents only.
 
+  ws.rpc.info({ backend? }?) → { backend, daemonVersion, protocolVersion, source, protocolDocs, docsNote, cli }  // Assistant only. Your default realm is the local backend: the daemon that owns this Assistant workspace. Returns its `intentd --version`, the protocol version and version-pinned doc links (intentd source at `v<daemonVersion>`; the protocol docs track the monorepo pin). Pass `backend` (an id from backends()) to read another backend's version. Read these docs for a method's params before calling it.
+  ws.rpc.methods({ prefix?, class?, backend? }?) → { backend, count, methods: [{ method, class, summary, doc? }] }  // Assistant only. Every method this daemon dispatches, tagged `read`, `mutating`, `forbidden-to-agent` or `unsupported-on-agent-path`, with a one-line summary and its protocol doc page. Filter with `prefix` (e.g. "workspace.") or `class`; `backend` lists another backend's methods.
+  ws.rpc.call(method, params?, { backend?, title? }?) → { ok, backend, method, result } | { ok: false, error: { code, message, data? } } | { ok, status: "pending-approval", proposalId }  // Assistant only. Call any daemon JSON-RPC method as the owner, the same way the desktop app does — prefer this over the older ws.app.* wrappers. A `read` runs now and returns its result or the JSON-RPC error (never thrown). A `mutating` (or unknown) method does NOT run: it shows the user an approval card with the exact params and returns `pending-approval`; end your turn, and a `proposal_resolved` notice reports the result on a later turn. Forbidden and connection-stateful methods are refused. `backend` defaults to "local"; pass an id from ws.rpc.backends() to call another backend through the user's desktop app (same approval rules; the local daemon's classification wins). `intentd call <method> --params '<json>'` is the equivalent CLI form used in docs; never run it.
+  ws.rpc.backends() → { backends: [{ id, name, local, reachable?, daemonVersion?, reporters?: [{ clientId, device, online, lastSeenAt }] }] }  // Assistant only. The backends you can call: this one (`local`) plus every backend the user's desktop apps reported. A remote backend is reached through an online app that holds its credential; if none is online, tell the user which machine to open (the `device` names). Call remote backends only when the user asks or after you suggest it, and label every result by backend.
+  ws.rpc.batch([{ method, params?, backend? }], { title? }?) → { ok, status: "pending-approval", proposalId, calls }  // Assistant only. Hold several calls (e.g. one `workspace.archive` per id) behind ONE approval card. On approval the daemon runs them in order and stops at the first failure; the notice reports each call as done, failed, unknown or skipped. A batch with any forbidden method is refused before a card is shown. Use call() for reads.
   ws.app.agents.list({ workspaceId?, includeCompleted?, limit?, cursor? }?) → { threads, total, returned, nextCursor? }  // Assistant workspace only. Lists readable agent threads across app workspaces; metadata only, no transcript content. Defaults to 50 threads, max 200.
   ws.app.agents.readConversation(workspaceId, agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }?) → { workspaceId, workspaceTitle, agentId, agentName, totalMessages, returnedMessages, startTurn, endTurn, includeToolCalls, taskNoteId?, messages }  // Assistant workspace only. Reads a bounded cross-workspace agent conversation. Defaults to last 20 messages, max 100, and excludes tool-call blocks unless `includeToolCalls=true`.
     Safe usage: list first, then read only the relevant thread slices with `lastN` or `startTurn`/`endTurn`; keep `includeToolCalls` false unless the user explicitly needs raw tool-call details. Served under the slim projection: oversized tool/image block bodies arrive truncated (`inputTruncated`/`outputTruncated`) with stable block ids — hydrate one in full with `ws.app.agents.getMessageBlock`.
@@ -1114,6 +1120,7 @@ pub(crate) fn workspace_api_description_for_bridge(
                 let line = line.trim_start();
                 !line.starts_with("ws.workspace.proposeSibling(")
                     && !line.starts_with("ws.workspace.applyProposal(")
+                    && !line.starts_with("ws.rpc.")
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -1660,6 +1667,7 @@ mod tests {
     const BINDINGS_APP_QUESTION: &str = include_str!("bindings/app/question.rs");
     const BINDINGS_APP_AGENTS: &str = include_str!("bindings/app/agents.rs");
     const BINDINGS_APP_CHATS: &str = include_str!("bindings/app/chats.rs");
+    const BINDINGS_RPC: &str = include_str!("bindings/rpc.rs");
     const BINDINGS_APP_MCP: &str = include_str!("bindings/app/mcp.rs");
     const BINDINGS_APP_SETTINGS: &str = include_str!("bindings/app/settings.rs");
     const BINDINGS_APP_SPECIALISTS: &str = include_str!("bindings/app/specialists.rs");
@@ -1709,6 +1717,7 @@ mod tests {
             "app.specialists" => Some(BINDINGS_APP_SPECIALISTS),
             "app.ui" => Some(BINDINGS_APP_UI),
             "app.workspaces" => Some(BINDINGS_APP_WORKSPACES),
+            "rpc" => Some(BINDINGS_RPC),
             _ => None,
         }
     }

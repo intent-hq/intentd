@@ -1270,7 +1270,7 @@ async fn monitor_restore_failure_keeps_legacy_marker_and_compact_failure() {
         .set_script_was_running(h.ws.as_str(), &id, true)
         .await
         .unwrap();
-    mgr.start_with_restore(&h.ws, &id, true).await.unwrap();
+    mgr.start_as(&h.ws, &id, StartKind::Restore).await.unwrap();
     let watch = mgr
         .monitor(&h.ws, &owner, &id, json!({"ttlMs":60000}))
         .await

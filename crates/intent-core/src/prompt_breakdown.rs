@@ -11,12 +11,13 @@ use serde_json::{json, Value};
 pub const FIRST_BREAKDOWN_HARNESS_VERSION: (u32, u32) = (3, 10);
 
 /// Recording belongs to the 3.10 context surfaces, not every numerically
-/// later harness: 3.10 (eval-only), 3.12, which releases them, and 3.13 and
-/// 3.14, which keep them. Released 3.11 only corrects visual guidance and records
-/// none. Admit future versions explicitly.
+/// later harness: 3.10 (eval-only), 3.12, which releases them, and each
+/// later version listed here, which keeps them. Released 3.11 only corrects
+/// visual guidance and records none. Admit future versions explicitly
+/// (`make new-harness-version` keeps the current version's admission).
 #[must_use]
 pub fn harness_records_prompt_breakdown(harness_version: &str) -> bool {
-    matches!(harness_version, "3.10" | "3.12" | "3.13" | "3.14")
+    matches!(harness_version, "3.10" | "3.12" | "3.13" | "3.14" | "3.15")
 }
 
 /// Display estimate for `chars`: `ceil(chars / 4)`. Not a provider token
@@ -227,11 +228,12 @@ mod tests {
         assert!(harness_records_prompt_breakdown("3.12"));
         assert!(harness_records_prompt_breakdown("3.13"));
         assert!(harness_records_prompt_breakdown("3.14"));
+        assert!(harness_records_prompt_breakdown("3.15"));
         assert!(harness_records_prompt_breakdown(
             crate::CURRENT_HARNESS_VERSION
         ));
         for version in [
-            "3.9", "3.11", "3.15", "4.0", "garbage", "3", " 3.10", "3.12 ",
+            "3.9", "3.11", "3.16", "4.0", "garbage", "3", " 3.10", "3.12 ",
         ] {
             assert!(!harness_records_prompt_breakdown(version), "{version}");
         }

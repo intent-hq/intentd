@@ -38,6 +38,10 @@
 
 #![cfg(unix)]
 
+#[path = "e2e_wss_chief_workspace/assistant_rpc.rs"]
+mod assistant_rpc;
+#[path = "e2e_wss_chief_workspace/assistant_rpc_remote.rs"]
+mod assistant_rpc_remote;
 #[path = "e2e_wss_chief_workspace/chat_management.rs"]
 mod chat_management;
 use crate::common;

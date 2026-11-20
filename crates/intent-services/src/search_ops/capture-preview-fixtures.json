@@ -1,0 +1,279 @@
+[
+  {
+    "name": "ordinary-screenshot-empty-edits",
+    "content": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[{\"image\":1,\"attachment_id\":\"first\",\"size\":[32,32],\"scale\":1,\"marks\":[]}]}\n```\n\nReview screenshot",
+    "metadata": {
+      "type": "dock_screen_evidence",
+      "version": 1,
+      "images": [
+        {
+          "index": 0,
+          "id": "shot",
+          "attachment_id": "first",
+          "raw": null,
+          "width": 32,
+          "height": 32,
+          "display_scale": 1,
+          "captured_at": "2026-11-20T12:00:00Z",
+          "marks": []
+        }
+      ],
+      "context": {
+        "workspace": "synthetic-workspace",
+        "agent": "synthetic-agent",
+        "app_url": "intent://local/workspace/synthetic-workspace"
+      },
+      "edited_captures": []
+    },
+    "expected": "Review screenshot"
+  },
+  {
+    "name": "edited-recording",
+    "content": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[]}\n```\n\n[Edited capture outputs]\n[{\"id\":\"recording-1\",\"kind\":\"recording\",\"video\":\"highlights\",\"voice\":\"audio\",\"transcript\":null,\"marks\":[{\"n\":1,\"id\":\"mark-1\",\"at_ms\":1200,\"kind\":\"box\",\"label\":\"Box\",\"note\":\"\",\"context\":{\"selector\":null,\"text\":null,\"url\":null},\"geometry\":{\"kind\":\"rect\",\"x\":10,\"y\":10,\"w\":40,\"h\":40}}],\"video_attachment_id\":\"video-1\",\"frames\":[{\"mark_id\":\"mark-1\",\"attachment_id\":\"frame-1\"}],\"kept_ms\":[{\"startMs\":200,\"endMs\":3200}]}]\n\nReview recording",
+    "metadata": {
+      "type": "dock_screen_evidence",
+      "version": 1,
+      "images": [],
+      "context": {
+        "workspace": "synthetic-workspace",
+        "agent": "synthetic-agent",
+        "app_url": "intent://local/workspace/synthetic-workspace"
+      },
+      "edited_captures": [
+        {
+          "id": "recording-1",
+          "kind": "recording",
+          "video": "highlights",
+          "voice": "audio",
+          "transcript": null,
+          "marks": [
+            {
+              "n": 1,
+              "id": "mark-1",
+              "at_ms": 1200,
+              "kind": "box",
+              "label": "Box",
+              "note": "",
+              "context": {
+                "selector": null,
+                "text": null,
+                "url": null
+              },
+              "geometry": {
+                "kind": "rect",
+                "x": 10,
+                "y": 10,
+                "w": 40,
+                "h": 40
+              }
+            }
+          ],
+          "video_attachment_id": "video-1",
+          "frames": [
+            {
+              "mark_id": "mark-1",
+              "attachment_id": "frame-1"
+            }
+          ],
+          "kept_ms": [
+            {
+              "startMs": 200,
+              "endMs": 3200
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "Review recording"
+  },
+  {
+    "name": "singleton-ordinary",
+    "content": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[{\"image\":1,\"attachment_id\":\"first\",\"size\":[32,32],\"scale\":1,\"marks\":[]}]}\n```\n\nReview screenshot",
+    "metadata": {
+      "mergedMessageMetadata": [
+        {
+          "type": "dock_screen_evidence",
+          "version": 1,
+          "images": [
+            {
+              "index": 0,
+              "id": "shot",
+              "attachment_id": "first",
+              "raw": null,
+              "width": 32,
+              "height": 32,
+              "display_scale": 1,
+              "captured_at": "2026-11-20T12:00:00Z",
+              "marks": []
+            }
+          ],
+          "context": {
+            "workspace": "synthetic-workspace",
+            "agent": "synthetic-agent",
+            "app_url": "intent://local/workspace/synthetic-workspace"
+          },
+          "edited_captures": []
+        }
+      ]
+    },
+    "expected": "Review screenshot"
+  },
+  {
+    "name": "singleton-recording",
+    "content": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[]}\n```\n\n[Edited capture outputs]\n[{\"id\":\"recording-1\",\"kind\":\"recording\",\"video\":\"highlights\",\"voice\":\"audio\",\"transcript\":null,\"marks\":[{\"n\":1,\"id\":\"mark-1\",\"at_ms\":1200,\"kind\":\"box\",\"label\":\"Box\",\"note\":\"\",\"context\":{\"selector\":null,\"text\":null,\"url\":null},\"geometry\":{\"kind\":\"rect\",\"x\":10,\"y\":10,\"w\":40,\"h\":40}}],\"video_attachment_id\":\"video-1\",\"frames\":[{\"mark_id\":\"mark-1\",\"attachment_id\":\"frame-1\"}],\"kept_ms\":[{\"startMs\":200,\"endMs\":3200}]}]\n\nReview recording",
+    "metadata": {
+      "mergedMessageMetadata": [
+        {
+          "type": "dock_screen_evidence",
+          "version": 1,
+          "images": [],
+          "context": {
+            "workspace": "synthetic-workspace",
+            "agent": "synthetic-agent",
+            "app_url": "intent://local/workspace/synthetic-workspace"
+          },
+          "edited_captures": [
+            {
+              "id": "recording-1",
+              "kind": "recording",
+              "video": "highlights",
+              "voice": "audio",
+              "transcript": null,
+              "marks": [
+                {
+                  "n": 1,
+                  "id": "mark-1",
+                  "at_ms": 1200,
+                  "kind": "box",
+                  "label": "Box",
+                  "note": "",
+                  "context": {
+                    "selector": null,
+                    "text": null,
+                    "url": null
+                  },
+                  "geometry": {
+                    "kind": "rect",
+                    "x": 10,
+                    "y": 10,
+                    "w": 40,
+                    "h": 40
+                  }
+                }
+              ],
+              "video_attachment_id": "video-1",
+              "frames": [
+                {
+                  "mark_id": "mark-1",
+                  "attachment_id": "frame-1"
+                }
+              ],
+              "kept_ms": [
+                {
+                  "startMs": 200,
+                  "endMs": 3200
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "Review recording"
+  },
+  {
+    "name": "literal-no-metadata",
+    "content": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[{\"image\":1,\"attachment_id\":\"first\",\"size\":[32,32],\"scale\":1,\"marks\":[]}]}\n```\n\nReview screenshot",
+    "metadata": null,
+    "expected": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[{\"image\":1,\"attachment_id\":\"first\",\"size\":[32,32],\"scale\":1,\"marks\":[]}]}\n```\n\nReview screenshot"
+  },
+  {
+    "name": "mixed-ordinary",
+    "content": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[{\"image\":1,\"attachment_id\":\"first\",\"size\":[32,32],\"scale\":1,\"marks\":[]}]}\n```\n\nReview screenshot",
+    "metadata": {
+      "mergedMessageMetadata": [
+        {},
+        {
+          "type": "dock_screen_evidence",
+          "version": 1,
+          "images": [
+            {
+              "index": 0,
+              "id": "shot",
+              "attachment_id": "first",
+              "raw": null,
+              "width": 32,
+              "height": 32,
+              "display_scale": 1,
+              "captured_at": "2026-11-20T12:00:00Z",
+              "marks": []
+            }
+          ],
+          "context": {
+            "workspace": "synthetic-workspace",
+            "agent": "synthetic-agent",
+            "app_url": "intent://local/workspace/synthetic-workspace"
+          },
+          "edited_captures": []
+        }
+      ]
+    },
+    "expected": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[{\"image\":1,\"attachment_id\":\"first\",\"size\":[32,32],\"scale\":1,\"marks\":[]}]}\n```\n\nReview screenshot"
+  },
+  {
+    "name": "malformed-edited",
+    "content": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[{\"image\":1,\"attachment_id\":\"first\",\"size\":[32,32],\"scale\":1,\"marks\":[]}]}\n```\n\n[Edited capture outputs]\n{bad}\n\nUser text",
+    "metadata": {
+      "type": "dock_screen_evidence",
+      "version": 1,
+      "images": [
+        {
+          "index": 0,
+          "id": "shot",
+          "attachment_id": "first",
+          "raw": null,
+          "width": 32,
+          "height": 32,
+          "display_scale": 1,
+          "captured_at": "2026-11-20T12:00:00Z",
+          "marks": []
+        }
+      ],
+      "context": {
+        "workspace": "synthetic-workspace",
+        "agent": "synthetic-agent",
+        "app_url": "intent://local/workspace/synthetic-workspace"
+      },
+      "edited_captures": []
+    },
+    "expected": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[{\"image\":1,\"attachment_id\":\"first\",\"size\":[32,32],\"scale\":1,\"marks\":[]}]}\n```\n\n[Edited capture outputs]\n{bad}\n\nUser text"
+  },
+  {
+    "name": "image-only",
+    "content": "[Screen evidence: screenshots lead the attached images in this order; [[mark:n]] in the message refers to mark n; [[clip:n]] and [[clip:n:end]] mark where recording n started and stopped while the user was speaking]\n```json\n{\"type\":\"dock_screen_evidence\",\"version\":1,\"images\":[{\"image\":1,\"attachment_id\":\"first\",\"size\":[32,32],\"scale\":1,\"marks\":[]}]}\n```",
+    "metadata": {
+      "type": "dock_screen_evidence",
+      "version": 1,
+      "images": [
+        {
+          "index": 0,
+          "id": "shot",
+          "attachment_id": "first",
+          "raw": null,
+          "width": 32,
+          "height": 32,
+          "display_scale": 1,
+          "captured_at": "2026-11-20T12:00:00Z",
+          "marks": []
+        }
+      ],
+      "context": {
+        "workspace": "synthetic-workspace",
+        "agent": "synthetic-agent",
+        "app_url": "intent://local/workspace/synthetic-workspace"
+      },
+      "edited_captures": []
+    },
+    "expected": ""
+  }
+]

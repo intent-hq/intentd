@@ -29,6 +29,9 @@ pub const DEFAULT_PORT: u16 = 5181;
 pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// No-pong deadline before a client is terminated (`HEARTBEAT_TIMEOUT_MS`).
 pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often a running listener retries an address that was not available
+/// when it started (a Tailscale address before Tailscale is up).
+const SKIPPED_ADDRESS_RETRY: Duration = Duration::from_secs(10);
 
 /// The shared, clonable start future (`io::Error` boxed in `Arc` so it is
 /// `Clone` for the `Shared` combinator).
@@ -39,6 +42,8 @@ type StartFuture = Shared<BoxFuture<'static, Result<u16, Arc<io::Error>>>>;
 /// (`server.bindAddress` may list several; monorepo#3314).
 pub(crate) struct RunningHandles {
     pub accept_tasks: Vec<JoinHandle<()>>,
+    /// Retries of addresses not available at start ([`bind_all`]).
+    pub retry_tasks: Vec<JoinHandle<()>>,
     pub heartbeat_task: JoinHandle<()>,
     pub shutdown_txs: Vec<oneshot::Sender<()>>,
 }
@@ -120,7 +125,7 @@ impl WsInner {
             self.external_stop_generation.load(Ordering::SeqCst) != generation
                 || assignment.as_ref().is_some_and(|a| (a.cancelled)())
         };
-        let (listeners, port) = select_port(first, last, cancelled, |port| {
+        let ((listeners, skipped), port) = select_port(first, last, cancelled, |port| {
             bind_all(&self.bind_addresses, port)
         })
         .await
@@ -147,6 +152,10 @@ impl WsInner {
                 tracing::info!(address = %addr.ip(), port, "intentd WSS listening");
             }
         }
+        *self.bound.lock().expect("ws bound set poisoned") = listeners
+            .iter()
+            .filter_map(|l| l.local_addr().ok().map(|a| a.ip()))
+            .collect();
         let mut accept_tasks = Vec::with_capacity(listeners.len());
         let mut shutdown_txs = Vec::with_capacity(listeners.len());
         for listener in listeners {
@@ -156,6 +165,10 @@ impl WsInner {
             ));
             shutdown_txs.push(shutdown_tx);
         }
+        let retry_tasks = skipped
+            .into_iter()
+            .map(|addr| tokio::spawn(self.clone().retry_skipped(addr, port, generation)))
+            .collect();
         let heartbeat_task = tokio::spawn(self.clone().heartbeat_loop());
         // REV-2: `client:*` events for the shared registry (no-op when the
         // UDS listener already spawned the publisher).
@@ -169,10 +182,40 @@ impl WsInner {
         st.start_task = None;
         st.running = Some(RunningHandles {
             accept_tasks,
+            retry_tasks,
             heartbeat_task,
             shutdown_txs,
         });
         Ok(port)
+    }
+
+    /// Keep trying an address that was not available at start, and serve it
+    /// on the running listener's port once it binds. Ends when the listener
+    /// stops (its generation moves on) or the address is served.
+    async fn retry_skipped(self: Arc<Self>, addr: IpAddr, port: u16, generation: u64) {
+        loop {
+            tokio::time::sleep(SKIPPED_ADDRESS_RETRY).await;
+            let Ok(listener) = bind_listener(addr, port).await else {
+                continue;
+            };
+            let mut st = self.state.lock().await;
+            if self.external_stop_generation.load(Ordering::SeqCst) != generation
+                || st.shutting_down
+            {
+                return;
+            }
+            let Some(running) = st.running.as_mut() else {
+                return;
+            };
+            tracing::info!(address = %addr, port, "intentd WSS listening");
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            running.accept_tasks.push(tokio::spawn(
+                self.clone().accept_loop(listener, shutdown_rx),
+            ));
+            running.shutdown_txs.push(shutdown_tx);
+            self.bound.lock().expect("ws bound set poisoned").push(addr);
+            return;
+        }
     }
 
     /// Graceful shutdown in the canonical order (port of `stop()`): bump the
@@ -194,9 +237,17 @@ impl WsInner {
         if let Some(task) = start_task {
             let _ = task.await;
         }
+        self.bound.lock().expect("ws bound set poisoned").clear();
         if let Some(mut running) = running {
-            // (1) stop the heartbeat.
+            // (1) stop the heartbeat and any skipped-address retries.
             running.heartbeat_task.abort();
+            // Join them too: a retry may hold a freshly bound socket while it
+            // waits for the state lock, and that socket must be closed before
+            // stop returns so the next start cannot hit `EADDRINUSE`.
+            for task in running.retry_tasks.drain(..) {
+                task.abort();
+                let _ = task.await;
+            }
             // (2)+(3) close every client with 1001; the connection loop drops
             // its subscriptions when it exits.
             let handles: Vec<_> = {
@@ -286,7 +337,15 @@ where
     ))
 }
 
-async fn bind_all(addresses: &[IpAddr], mut port: u16) -> io::Result<(Vec<TcpListener>, u16)> {
+/// Bind every address on one port. A specific address that is not on any
+/// interface right now (a Tailscale address while Tailscale is down) is
+/// skipped and returned, so the others — loopback, which the tunnel forwards
+/// to — keep serving; the caller retries the skipped ones. Fails when nothing
+/// else is left to serve.
+async fn bind_all(
+    addresses: &[IpAddr],
+    mut port: u16,
+) -> io::Result<((Vec<TcpListener>, Vec<IpAddr>), u16)> {
     if addresses.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -294,14 +353,32 @@ async fn bind_all(addresses: &[IpAddr], mut port: u16) -> io::Result<(Vec<TcpLis
         ));
     }
     let mut listeners = Vec::with_capacity(addresses.len());
+    let mut skipped = Vec::new();
+    let mut skip_error = None;
     for addr in addresses {
-        let listener = bind_listener(*addr, port)
-            .await
-            .map_err(|e| io::Error::new(e.kind(), format!("bind {addr}:{port}: {e}")))?;
+        let listener = match bind_listener(*addr, port).await {
+            Ok(listener) => listener,
+            Err(e)
+                if e.kind() == io::ErrorKind::AddrNotAvailable
+                    && !addr.is_loopback()
+                    && !addr.is_unspecified() =>
+            {
+                tracing::warn!(
+                    "WSS listener skips {addr} for now: not available on this machine ({e})"
+                );
+                skip_error = Some(io::Error::new(e.kind(), format!("bind {addr}:{port}: {e}")));
+                skipped.push(*addr);
+                continue;
+            }
+            Err(e) => return Err(io::Error::new(e.kind(), format!("bind {addr}:{port}: {e}"))),
+        };
         port = listener.local_addr()?.port();
         listeners.push(listener);
     }
-    Ok((listeners, port))
+    match skip_error {
+        Some(error) if listeners.is_empty() => Err(error),
+        _ => Ok(((listeners, skipped), port)),
+    }
 }
 
 /// Bind one TCP listener at `addr:port`. An IPv6-unspecified (`::`) bind is
@@ -418,6 +495,23 @@ mod tests {
         assert_eq!(attempts, 1);
     }
 
+    /// A Tailscale address saved in `server.bindAddress` is gone while
+    /// Tailscale is down (e.g. at login, before it connects): the listener
+    /// still serves loopback — and so the tailcat tunnel — instead of failing.
+    #[tokio::test]
+    async fn an_absent_specific_address_does_not_stop_the_listener() {
+        let absent = IpAddr::from([192, 0, 2, 1]);
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        let ((listeners, skipped), port) = bind_all(&[absent, loopback], 0).await.unwrap();
+        assert_eq!(skipped, vec![absent]);
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].local_addr().unwrap().ip(), loopback);
+        assert_ne!(port, 0);
+        // With nothing else left to serve, the absent address still fails.
+        let error = bind_all(&[absent], 0).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+    }
+
     #[tokio::test]
     async fn partial_bind_is_released_before_advancing() {
         let first = IpAddr::from([127, 0, 0, 1]);
@@ -442,7 +536,7 @@ mod tests {
             .expect("partial first listener released");
         drop(released);
         let addresses = [first, second];
-        let (listeners, port) =
+        let ((listeners, _), port) =
             select_port(busy, u16::MAX, || false, |port| bind_all(&addresses, port))
                 .await
                 .unwrap();

@@ -2482,6 +2482,10 @@ jobs:
         run: python3 -I -B scripts/check-test-scripts-wired.py
       - name: Test the unrun test-suite check
         run: python3 -I -B scripts/test-check-test-scripts-wired.py
+      # Runs the bump on a copy of the real Rust files, so a layout change
+      # that breaks one of its anchors fails on that PR.
+      - name: Test the harness version bump (make new-harness-version)
+        run: python3 -I -B scripts/test-new-harness-version.py
       - name: Test obsolete merge-run policy and workflow integration (offline)
         run: |
           python3 -I -B scripts/test-retire-obsolete-merge-runs.py
@@ -2809,6 +2813,10 @@ jobs:
   # backend tests against Postgres 18 (PlanetScale Neki's major version).
   # GitHub-hosted for the service container. Release-metadata PRs skip it
   # like the other slow jobs; the queue always runs it.
+  # The tests run under nextest, so .config/nextest.toml's postgres_backend
+  # override terminates a hung test after 2 x 60s (plain `cargo test` has no
+  # per-test limit and held the job to its 30-minute timeout) and the default
+  # profile's single retry applies, as in the other test jobs.
   store-postgres:
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
     needs: [route, release-fast-path]
@@ -2844,15 +2852,18 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: clippy
+      - uses: ./.github/actions/cargo-tools
+        with:
+          tools: nextest
       - name: Fetch locked crates (retries crates.io network errors)
         run: python3 -I -B scripts/fetch-locked-crates.py
       - name: Clippy (postgres feature)
         run: cargo clippy -p intent-store --features postgres --all-targets -- -D warnings
       - name: Postgres backend tests
-        run: cargo test -p intent-store --features postgres --test postgres_backend --test postgres_backend_lint --test postgres_tenant_schema_lint
+        run: cargo nextest run -p intent-store --features postgres --test postgres_backend --test postgres_backend_lint --test postgres_tenant_schema_lint
 
   # intent-passkey (the WebAuthn sidecar, its own Cargo workspace under
-  # intent-passkey/) links libdbus and libudev, so it stays out of the daemon
+  # intent-passkey/) links libdbus, libudev and libpam, so it stays out of the daemon
   # workspace and gets its gates here: format, Clippy, the protocol and USB
   # (virtual HID key) tests, the license policy, and the release build script
   # for both Linux arches (x86_64 native, aarch64 cross via multiarch), which

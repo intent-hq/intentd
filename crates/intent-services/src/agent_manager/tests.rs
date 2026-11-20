@@ -31610,3 +31610,5 @@ fn resolve_provider_launch_matches_the_local_precedence() {
         Err(Error::NotFound(_))
     ));
 }
+
+mod pending_delete_sweep;

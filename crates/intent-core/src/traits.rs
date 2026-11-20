@@ -2725,6 +2725,76 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.resolveRpcProposal`: the owner approves (`decision:
+    /// "approve"`, the daemon runs the held calls in order) or rejects
+    /// (`"reject"`, nothing runs) an Assistant `rpc-call` proposal, then
+    /// resolves it like `agent.resolveProposal`.
+    fn agent_resolve_rpc_proposal(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        proposal_id: String,
+        decision: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, proposal_id, decision);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_resolve_rpc_proposal not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `backends.report` from an owner app connection bound to `client_id`
+    /// (`device` is its machine name). Replaces that app's list.
+    fn backends_report(
+        &self,
+        client_id: crate::ClientId,
+        device: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (client_id, device, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::backends_report not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.rpc.info()` / `ws.rpc.methods()` for the Assistant: `what` is
+    /// `"info"` or `"methods"`; `args` carries the binding's options.
+    fn agent_rpc_describe(
+        &self,
+        workspace_id: WorkspaceId,
+        what: String,
+        args: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, what, args);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_rpc_describe not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.rpc.call()` / `ws.rpc.batch()` for the Assistant. A single read
+    /// runs now within `budget`; a mutating call or any batch is held for
+    /// the user's approval and answers `{ status: "pending-approval" }`
+    /// with an `rpc-call` proposal card.
+    fn agent_rpc_call(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        request: crate::agent_rpc::AgentRpcRequest,
+        budget: std::time::Duration,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, request, budget);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_rpc_call not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.markSeen`: persist the per-conversation seen marker
     /// (`message_id` — the newest transcript message the user has seen) on
     /// the agent session and emit `agent:updated` (PROTOCOL §5.5). Monotonic:

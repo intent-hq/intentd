@@ -27,7 +27,12 @@ pub(crate) const PROPOSAL_KINDS: &[&str] = &[
     "settings-change",
     "specialist-edit",
     "bulk-op",
+    "rpc-call",
 ];
+
+/// Kinds only the daemon emits: `ws.rpc` holds the calls itself, so
+/// `ws.app.proposal.show` refuses to render one.
+const DAEMON_ONLY_KINDS: &[&str] = &["rpc-call"];
 
 pub(crate) fn dispatch(
     _api: &Arc<dyn WorkspaceApi>,
@@ -123,6 +128,16 @@ fn show(args: &Value) -> Result<Value, String> {
         .get("proposal")
         .ok_or_else(|| "`proposal` is required".to_string())?;
 
+    if proposal
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|k| DAEMON_ONLY_KINDS.contains(&k))
+    {
+        return Err(
+            "Invalid proposal: `rpc-call` cards come only from ws.rpc.call / ws.rpc.batch"
+                .to_string(),
+        );
+    }
     if !is_valid_proposal(proposal) {
         return Err("Invalid proposal: must have `kind` (one of workspace-create, workspace-transfer, settings-change, specialist-edit, bulk-op), `preview.title`, and `payload`".to_string());
     }

@@ -2,7 +2,7 @@
 //! test, tenant stores, and [`parity_test!`] for running one test body on
 //! both backends.
 
-use intent_store::postgres::{self, PgPool, PostgresOptions, TenantId};
+use intent_store::postgres::{self, PgPool, PostgresOptions, TenantId, WriterLimits};
 use intent_store::Store;
 use std::fmt::Write as _;
 
@@ -46,6 +46,8 @@ pub async fn exec(pool: &PgPool, sql: String) {
 pub struct TestDb {
     pub admin: PgPool,
     pub app: PgPool,
+    /// The database's URL, as the admin connects to it.
+    pub url: String,
 }
 
 pub async fn test_db(rls_guard: bool) -> Option<TestDb> {
@@ -125,10 +127,14 @@ async fn finish_test_db(url: String, admin: PgPool, rls_guard: bool) -> Option<T
                 Ok(())
             })
         })
-        .connect(&url)
+        // Vanilla Postgres ignores Neki's single-shard mode; on, the suite
+        // proves every store transaction still runs under it.
+        .connect_with(postgres::single_shard_options(
+            postgres::connect_options(&url).expect("parse the test url"),
+        ))
         .await
         .expect("connect app pool");
-    Some(TestDb { admin, app })
+    Some(TestDb { admin, app, url })
 }
 
 fn with_database(url: &str, name: &str) -> String {
@@ -461,3 +467,63 @@ macro_rules! parity_test {
     };
 }
 pub(crate) use parity_test;
+
+/// Take `tenant`'s writer lock (its `tenant_writer` row lock) in an open
+/// transaction on `admin`, as another daemon or store handle would. It is
+/// held until the transaction ends (commit, rollback or drop).
+pub async fn hold_writer_lock(
+    admin: &PgPool,
+    tenant: &str,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = admin.begin().await.expect("admin transaction");
+    let long = std::time::Duration::from_secs(600);
+    let limits = WriterLimits {
+        wait_budget: long,
+        lock_attempt: long,
+        statement_timeout: long,
+        idle_in_transaction_timeout: long,
+    };
+    postgres::lock_tenant_writer(&mut tx, tenant, long, &limits)
+        .await
+        .expect("take the writer lock");
+    tx
+}
+
+/// Sessions of `admin`'s database waiting for a tenant's `tenant_writer`
+/// row lock, as `(pid, xact_start)`.
+/// `pg_stat_activity` spans the server, where other tests run in their own
+/// databases.
+pub async fn writer_lock_waiters(admin: &PgPool) -> Vec<(i32, String)> {
+    sqlx::query_as(
+        "SELECT pid, xact_start::text FROM pg_stat_activity \
+         WHERE wait_event_type = 'Lock' AND datname = current_database() \
+         AND query LIKE '%FROM tenant_writer%' ORDER BY 1",
+    )
+    .fetch_all(admin)
+    .await
+    .expect("list lock waiters")
+}
+
+/// Whether `tenant`'s writer lock is free right now, tried without waiting.
+/// Panics when the tenant has no lock row (nothing to be free or held).
+pub async fn writer_lock_is_free(admin: &PgPool, tenant: &str) -> bool {
+    let mut tx = admin.begin().await.expect("admin transaction");
+    let tried = sqlx::query("SELECT 1 FROM tenant_writer WHERE tenant_id = $1 FOR UPDATE NOWAIT")
+        .bind(tenant)
+        .fetch_optional(&mut *tx)
+        .await;
+    tx.rollback().await.expect("roll back the probe");
+    match tried {
+        Ok(Some(_)) => true,
+        Ok(None) => panic!("tenant {tenant} has no writer lock row"),
+        Err(e)
+            if e.as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref()
+                == Some("55P03") =>
+        {
+            false
+        }
+        Err(e) => panic!("probe the writer lock: {e}"),
+    }
+}

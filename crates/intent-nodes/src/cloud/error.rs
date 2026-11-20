@@ -39,6 +39,10 @@ pub enum CloudErrorKind {
     /// The provider has no room for the machine where the entry asks
     /// (Agent37 `no_capacity`); it never places it elsewhere.
     NoCapacity,
+    /// The machine's session reached the provider's longest session (the
+    /// Vercel plan cap): it cannot be kept alive longer, and must be
+    /// stopped and resumed for a new session.
+    SessionCap,
     /// Any other HTTP refusal; [`CloudError::status`] says which.
     Api,
     Other,

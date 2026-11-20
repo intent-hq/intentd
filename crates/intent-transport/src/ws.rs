@@ -394,6 +394,10 @@ pub(crate) struct WsInner {
     /// `WsOptions::locality_override`.
     pub locality_is_local: bool,
     pub bind_addresses: Vec<IpAddr>,
+    /// The addresses the running listener actually serves: `bind_addresses`
+    /// minus any not available yet (see `lifecycle::bind_all`), which join
+    /// once a retry binds them. Empty while stopped.
+    pub bound: Mutex<Vec<IpAddr>>,
     pub base_port: u16,
     /// Pinned SHA-256 cert fingerprint; `None` in insecure mode (no TLS cert).
     pub fingerprint: Option<String>,
@@ -474,6 +478,7 @@ impl WsApiServer {
             // local/remote (§5.14).
             locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
             bind_addresses: options.bind_addresses.clone(),
+            bound: Mutex::new(Vec::new()),
             base_port: options.base_port,
             fingerprint: Some(tls.fingerprint256.clone()),
             heartbeat_interval: options.heartbeat_interval,
@@ -523,6 +528,7 @@ impl WsApiServer {
             auth_enabled: false,
             locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
             bind_addresses: options.bind_addresses.clone(),
+            bound: Mutex::new(Vec::new()),
             base_port: options.base_port,
             fingerprint: None,
             heartbeat_interval: options.heartbeat_interval,
@@ -566,6 +572,7 @@ impl WsApiServer {
             auth_enabled: tls.is_some() && options.auth_enabled,
             locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
             bind_addresses: options.bind_addresses.clone(),
+            bound: Mutex::new(Vec::new()),
             base_port: options.base_port,
             fingerprint: tls.map(|t| t.fingerprint256.clone()),
             heartbeat_interval: options.heartbeat_interval,
@@ -719,6 +726,22 @@ impl WsApiServer {
     /// The bound port, or `None` when not currently running.
     pub async fn bound_port(&self) -> Option<u16> {
         self.inner.state.lock().await.port
+    }
+
+    /// The addresses the running listener serves right now — the configured
+    /// set minus any not yet available on this machine (a Tailscale address
+    /// before Tailscale is up). Empty while stopped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bound-set mutex is poisoned.
+    #[must_use]
+    pub fn bound_addresses(&self) -> Vec<IpAddr> {
+        self.inner
+            .bound
+            .lock()
+            .expect("ws bound set poisoned")
+            .clone()
     }
 
     /// The number of currently-connected WebSocket clients (the `/health` count).

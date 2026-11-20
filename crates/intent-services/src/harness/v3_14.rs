@@ -387,8 +387,7 @@ mod tests {
     fn v3_14_is_3_13_with_the_workspace_api_title_instruction() {
         let current = super::super::resolve_entry("3.14");
         let prior = super::super::resolve_entry("3.13");
-        assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
+        assert_eq!(current.version, "3.14");
         assert!(std::ptr::eq(current.context, prior.context));
         assert!(std::ptr::eq(current.doctrine, prior.doctrine));
         assert_eq!((current.default_features)(), (prior.default_features)());

@@ -2,6 +2,7 @@
 # Generated from crates/intent-transport/src/catalog.rs; do not hand-edit. Regenerate:
 #   INTENTD_UPDATE_GOLDENS=1 cargo test -p intent-transport --lib catalog::tests::method_catalog_matches_golden
 fastpath agent.workers.subscribe
+fastpath backends.report
 fastpath browser.closeTab
 fastpath browser.exec
 fastpath browser.listTabs
@@ -62,6 +63,7 @@ notification sourceControl.read.invalidated
 notification sourceControl.read.retired
 notification workspace.repositoryContext.retired
 notification workspace.repositorySelection.retired
+reverse backends.relayCall
 reverse browser.exec
 reverse desktop.control
 reverse host.openExternal
@@ -111,10 +113,12 @@ router agent.replaceMessages
 router agent.reportToParent
 router agent.resolveInterrupted
 router agent.resolveProposal
+router agent.resolveRpcProposal
 router agent.respondPermission
 router agent.restore
 router agent.retire
 router agent.retry
+router agent.rpcMethods
 router agent.sendMessage
 router agent.sendQueuedMessageNow
 router agent.sendQueuedMessagesNow

@@ -108,6 +108,30 @@ impl ReverseClientIdentity {
             == Some(true)
     }
 
+    /// Whether this identity advertised `capabilities.backendRelay` (`1` or
+    /// `true`): it sends `backends.report` and serves `backends.relayCall`.
+    #[must_use]
+    pub fn backend_relay(&self) -> bool {
+        match self.capabilities.get("backendRelay") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Number(n)) => n.as_u64().is_some_and(|v| v >= 1),
+            _ => false,
+        }
+    }
+
+    /// The machine name shown for this client: pretty hostname, hostname,
+    /// then the hello `name`, then the client id.
+    #[must_use]
+    pub fn device_name(&self) -> String {
+        self.host
+            .pretty_hostname
+            .clone()
+            .or_else(|| self.host.hostname.clone())
+            .or_else(|| self.name.clone())
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| self.client_id.as_str().to_string())
+    }
+
     /// `{ clientId, name?, capabilities }` — the `client:connected` /
     /// `client:disconnected` event payload.
     #[must_use]
@@ -657,6 +681,46 @@ impl PrimaryReverseRegistry {
             client_id: identity.client_id.clone(),
             name: identity.name.clone(),
         })
+    }
+
+    /// The newest live connection of `client_id` that may relay the
+    /// Assistant's calls: bound to the host owner (administrator) and
+    /// advertising `capabilities.backendRelay`. `None` when the client has
+    /// no such connection right now.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn relay_channel(&self, client_id: &ClientId) -> Option<ReverseChannel> {
+        let state = self.inner.lock();
+        state
+            .entries
+            .iter()
+            .filter(|e| e.has_client(client_id) && e.channel.is_administrator())
+            .filter(|e| {
+                e.identity
+                    .as_ref()
+                    .is_some_and(ReverseClientIdentity::backend_relay)
+            })
+            .max_by_key(|e| e.hello_seq)
+            .map(|e| e.channel.clone())
+    }
+
+    /// The identity of `client_id`'s newest hello'd live connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn client_identity(&self, client_id: &ClientId) -> Option<ReverseClientIdentity> {
+        let state = self.inner.lock();
+        state
+            .entries
+            .iter()
+            .filter(|e| e.has_client(client_id))
+            .max_by_key(|e| e.hello_seq)
+            .and_then(|e| e.identity.clone())
     }
 
     /// Live hello'd connections grouped by `clientId`, ordered by each

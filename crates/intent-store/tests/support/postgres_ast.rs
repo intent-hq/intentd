@@ -110,6 +110,26 @@ pub fn violations(stmts: &[Statement], exempt: &[&str]) -> Vec<String> {
     rule.out
 }
 
+/// Whether `sql` (a rendered SET statement) sets a `__neki.` setting to
+/// a literal.
+fn is_neki_setting(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    let Some(rest) = lower.strip_prefix("set __neki.") else {
+        return false;
+    };
+    let Some((name, value)) = rest.split_once('=') else {
+        return false;
+    };
+    let value = value.trim();
+    name.trim()
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && value.len() >= 2
+        && value.starts_with('\'')
+        && value.ends_with('\'')
+        && !value[1..value.len() - 1].contains('\'')
+}
+
 /// Whether `text` is a statement (SELECT, INSERT, UPDATE, DELETE, WITH,
 /// MERGE, TRUNCATE), read as is or as a `format!` string with its holes
 /// filled.
@@ -310,6 +330,9 @@ impl Rule<'_> {
             }
             // The migration ledger's own table: schema, not tenant, data.
             Statement::CreateTable(c) if self.is_exempt(&c.name) => {}
+            // A Neki session setting (`SET __neki.tx_mode = ...`): it reads
+            // and writes no table. Any other SET stays unsupported.
+            Statement::Set(_) if is_neki_setting(&s.to_string()) => {}
             other => self.unsupported(&other.to_string()),
         }
     }

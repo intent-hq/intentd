@@ -657,30 +657,21 @@ async fn file_get_attachment_fetches_a_large_file_in_pieces() {
     answering.abort();
 }
 
-/// The machine copies a file of exactly the 200 MiB cap and refuses a larger
-/// one from head's first answer (an older backend still serves it), with
-/// `attachment-exceeds-cap` naming the size and the cap: it asks for no more pieces and writes nothing.
+/// The machine accepts a file of exactly the 200 MiB cap (it asks for the
+/// next piece) and refuses a larger one from head's first answer (an older
+/// backend still serves it), with `attachment-exceeds-cap` naming the size
+/// and the cap: it asks for no more pieces and writes nothing. Copying a
+/// file in pieces is proved by `file_get_attachment_fetches_a_large_file_in_pieces`; here
+/// the at-cap copy stops at its second piece so the test streams 4 MiB, not
+/// 200 MiB.
 #[tokio::test]
 async fn file_get_attachment_enforces_the_size_cap() {
     use base64::Engine as _;
     use intent_core::remote_launch::workspace_api::MAX_LINK_ATTACHMENT_CHUNK_BYTES;
     use intent_services::feature_api::file_ops::ATTACHMENT_COPY_MAX_BYTES as CAP;
-    use sha2::{Digest as _, Sha256};
     let chunk = usize::try_from(MAX_LINK_ATTACHMENT_CHUNK_BYTES).unwrap();
     let zeros = base64::engine::general_purpose::STANDARD.encode(vec![0u8; chunk]);
-    let mut hasher = Sha256::new();
-    let block = vec![0u8; chunk];
-    for _ in 0..CAP / MAX_LINK_ATTACHMENT_CHUNK_BYTES {
-        hasher.update(&block);
-    }
-    hasher.update(&block[..usize::try_from(CAP % MAX_LINK_ATTACHMENT_CHUNK_BYTES).unwrap()]);
-    let digest = hasher
-        .finalize()
-        .iter()
-        .fold(String::new(), |mut hex, byte| {
-            let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
-            hex
-        });
+    let stop = "test-stop: no more pieces";
     let dir = tempfile::tempdir().unwrap();
     let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
     let head = HeadLink::default();
@@ -697,45 +688,47 @@ async fn file_get_attachment_enforces_the_size_cap() {
             let id = args["attachmentId"].as_str().unwrap_or_default().to_owned();
             let size = if id == "att-over" { CAP + 1 } else { CAP };
             let offset = args["offset"].as_u64().unwrap();
-            let length = (size - offset).min(MAX_LINK_ATTACHMENT_CHUNK_BYTES);
-            let data = if length == MAX_LINK_ATTACHMENT_CHUNK_BYTES {
-                zeros.clone()
-            } else {
-                base64::engine::general_purpose::STANDARD.encode(vec![
-                    0u8;
-                    usize::try_from(length)
-                        .unwrap()
-                ])
-            };
-            let mut answer = json!({
+            if offset > 0 {
+                request
+                    .respond(LinkOutcome::Err(LinkRpcError {
+                        code: -32602,
+                        message: stop.into(),
+                        data: None,
+                    }))
+                    .await
+                    .unwrap();
+                continue;
+            }
+            let answer = json!({
                 "fileName": format!("{id}.bin"),
                 "size": size,
                 "uploadedAt": "2026-11-09T00:00:00Z",
                 "offset": offset,
-                "data": data,
+                "data": zeros,
+                "sha256": "0".repeat(64),
             });
-            if offset == 0 {
-                answer["sha256"] = json!(digest);
-            }
             request.respond(LinkOutcome::Ok(answer)).await.unwrap();
         }
     });
 
-    let copied = ok_json(
-        call(
-            &server,
-            r#"return JSON.stringify(await ws.file.getAttachment("att-cap"));"#,
-        )
-        .await,
+    let accepted = call(&server, r#"return await ws.file.getAttachment("att-cap");"#).await;
+    assert!(
+        accepted.0 && accepted.1.contains(stop) && !accepted.1.contains("attachment-exceeds-cap"),
+        "{accepted:?}"
     );
-    assert_eq!(copied["size"], json!(CAP));
+    let offsets: Vec<u64> = std::iter::from_fn(|| asked.try_recv().ok())
+        .map(|args| args["offset"].as_u64().unwrap())
+        .collect();
     assert_eq!(
-        std::fs::metadata(dir.path().join(".intent/attachments/att-cap.bin"))
-            .unwrap()
-            .len(),
-        CAP
+        offsets,
+        [0, MAX_LINK_ATTACHMENT_CHUNK_BYTES],
+        "a file at the cap passes the check and is copied on"
     );
-    while asked.try_recv().is_ok() {}
+    let left: Vec<_> = std::fs::read_dir(dir.path().join(".intent/attachments"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, [".gitignore"], "the stopped copy is removed");
 
     let refused = call(
         &server,

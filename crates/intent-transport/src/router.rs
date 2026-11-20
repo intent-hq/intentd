@@ -3615,6 +3615,19 @@ async fn agent_methods(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.rpcMethods" => {
+            let methods = crate::agent_rpc::agent_rpc_methods();
+            Ok(json!({ "count": methods.len(), "methods": methods }))
+        }
+        "agent.resolveRpcProposal" => {
+            let agent_id = require_agent_id(params)?;
+            let proposal_id = require_str_param(params, "proposalId")?;
+            let decision = require_str_param(params, "decision")?;
+            let ws = require_ws_note(params)?;
+            api.agent_resolve_rpc_proposal(ws, agent_id, proposal_id, decision)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "agent.markSeen" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;

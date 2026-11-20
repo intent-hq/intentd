@@ -22,7 +22,7 @@ use intent_core::machines::{
 };
 use intent_core::remote_launch::PlacementError;
 use intent_core::{now_iso, Error, Result};
-use intent_nodes::cloud::{CloudProvider, InstanceState, ListInstances};
+use intent_nodes::cloud::{CloudErrorKind, CloudProvider, InstanceState, ListInstances};
 use intent_services::feature_api::Services;
 
 use super::config::{self, Provider};
@@ -124,6 +124,9 @@ fn since(iso: Option<&str>) -> Duration {
 pub(crate) struct Activity {
     last_busy: Instant,
     last_renew: Option<Instant>,
+    /// The provider refused to keep the session alive longer (its session
+    /// cap): pause and resume at the next idle moment.
+    capped: bool,
 }
 
 impl Activity {
@@ -131,6 +134,7 @@ impl Activity {
         Self {
             last_busy: Instant::now(),
             last_renew: Some(Instant::now()),
+            capped: false,
         }
     }
 
@@ -145,6 +149,14 @@ impl Activity {
 
     pub(super) fn renewed(&mut self) {
         self.last_renew = Some(Instant::now());
+    }
+
+    pub(super) fn cap(&mut self) {
+        self.capped = true;
+    }
+
+    pub(super) fn is_capped(&self) -> bool {
+        self.capped
     }
 }
 
@@ -340,7 +352,12 @@ pub(crate) async fn resume(
                 set_state(svc, feature, &row.id, CloudSandboxState::Running).await;
             }
             feature.cloud.unpark(&row.id);
-            feature.cloud.touch(&row.id);
+            if resumed || restarted {
+                // A new session: the provider's session cap starts again.
+                feature.cloud.touch_new_session(&row.id);
+            } else {
+                feature.cloud.touch(&row.id);
+            }
             Ok(resumed || restarted)
         }
         Err(error) if error.is_not_found() => Err(Resumed::Lost),
@@ -770,7 +787,8 @@ async fn check(
             let last_active = node.as_ref().map(|node| node.shared_ref().last_activity());
             let activity = feature.cloud.activity(&row.id, busy, last_active);
             // A provider without a lease has nothing to renew: only the
-            // idle pause below stops it. Only E2B caps a continuous run.
+            // idle pause below stops it. E2B caps a continuous run; Vercel
+            // refuses a renewal past its session cap.
             let lease = client.has_lease();
             if lease
                 && activity
@@ -788,8 +806,9 @@ async fn check(
                 return;
             }
             let idle = activity.last_busy.elapsed() >= clock.minutes(saved.idle_pause_minutes);
-            let capped = client.caps_run()
-                && since(cloud.running_since.as_deref()) >= clock.minutes(RUN_CAP_MINUTES);
+            let capped = activity.capped
+                || (client.caps_run()
+                    && since(cloud.running_since.as_deref()) >= clock.minutes(RUN_CAP_MINUTES));
             if idle || capped {
                 spawn_pause(
                     svc,
@@ -831,6 +850,13 @@ async fn renew(
         .await
     {
         Ok(()) => feature.cloud.renewed(&row.id),
+        // The session cannot outlive the provider's cap: a planned pause
+        // and resume at the next idle moment starts a new one.
+        Err(error) if error.kind() == CloudErrorKind::SessionCap => {
+            tracing::info!(machine = %row.id, "cloud machine: the session reached the provider's cap; pausing and resuming when idle");
+            feature.cloud.renewed(&row.id);
+            feature.cloud.cap(&row.id);
+        }
         Err(error) if error.is_not_found() => match lookup(svc, client, cloud).await {
             // E2B paused it itself (its timeout ran out while this backend
             // was away): a demand resumes it.

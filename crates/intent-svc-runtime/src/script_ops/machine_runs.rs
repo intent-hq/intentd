@@ -84,6 +84,17 @@ pub(crate) struct RunPlace {
     pub agent_id: AgentId,
 }
 
+/// Which runs a stop acts on.
+#[derive(Debug, Clone, Copy)]
+enum StopWhen<'a> {
+    /// Any run: a run that is not live is dismissed (its entry removed).
+    Always,
+    /// Only a live run: an ended run keeps its entry and `lastRun`.
+    Live,
+    /// Only while the monitor with this id still watches the live run.
+    Watched(&'a str),
+}
+
 /// How a process's run ended, for the monitor's final-line check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ending {
@@ -411,27 +422,57 @@ impl MachineRuns {
     /// `InvalidParams` when `place` has no machine run.
     pub(crate) async fn stop(&self, place: &RunPlace) -> Result<ScriptRuntimeState> {
         Ok(self
-            .stop_because(place, "the run was stopped", None)
+            .stop_because(place, "the run was stopped", StopWhen::Always)
             .await?
             .unwrap_or_default())
     }
 
+    /// [`Self::stop`] only while `place`'s run is live: a run that ended
+    /// meanwhile keeps its entry. Its monitor is cancelled with `reason`.
+    /// Returns the state after the stop, or `None` when there was nothing
+    /// live to stop.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidParams` when `place` has no machine run.
+    pub(crate) async fn stop_live(
+        &self,
+        place: &RunPlace,
+        reason: &str,
+    ) -> Result<Option<ScriptRuntimeState>> {
+        self.stop_because(place, reason, StopWhen::Live).await
+    }
+
+    /// The places of `workspace_id`'s live machine runs.
+    pub(crate) fn live_in(&self, workspace_id: &WorkspaceId) -> Vec<RunPlace> {
+        lock(&self.inner.runs)
+            .iter()
+            .filter(|(place, run)| &place.workspace_id == workspace_id && is_live(&run.state))
+            .map(|(place, _)| place.clone())
+            .collect()
+    }
+
     /// [`Self::stop`], settling the run's monitor as cancelled with `reason`.
-    /// With `watched`, only while that monitor still watches the live run:
-    /// otherwise nothing is stopped and the result is `None`.
+    /// Unless `when` is [`StopWhen::Always`], a run it does not cover is
+    /// left as it is and the result is `None`.
     async fn stop_because(
         &self,
         place: &RunPlace,
         reason: &str,
-        watched: Option<&str>,
+        when: StopWhen<'_>,
     ) -> Result<Option<ScriptRuntimeState>> {
         let (live, link, spawn_id, cancelled) = {
             let mut runs = lock(&self.inner.runs);
             let run = runs.get_mut(place).ok_or_else(|| no_run(place))?;
-            if let Some(id) = watched {
-                if !is_live(&run.state) || run.monitor.as_ref().is_none_or(|m| m.id != id) {
-                    return Ok(None);
+            let covered = match when {
+                StopWhen::Always => true,
+                StopWhen::Live => is_live(&run.state),
+                StopWhen::Watched(id) => {
+                    is_live(&run.state) && run.monitor.as_ref().is_some_and(|m| m.id == id)
                 }
+            };
+            if !covered {
+                return Ok(None);
             }
             if is_live(&run.state) {
                 run.stopping = true;
@@ -463,6 +504,12 @@ impl MachineRuns {
             // Unacknowledged within the wait: the machine stops it once
             // the link drops; settle it here so the run is not left live.
             if self.spawn_of(place).as_deref() == Some(spawn_id.as_str()) {
+                tracing::warn!(
+                    workspace = %place.workspace_id,
+                    script = %place.script_id,
+                    agent = %place.agent_id,
+                    "machine run: the machine did not acknowledge the stop; settled here"
+                );
                 self.settle(place, &spawn_id, None, None, Ending::StreamGap)
                     .await;
             }
@@ -497,7 +544,7 @@ impl MachineRuns {
         }
         self.link(place).await?;
         if self.state(place).as_ref().is_some_and(is_live) {
-            self.stop_because(place, "the run was restarted", None)
+            self.stop_because(place, "the run was restarted", StopWhen::Always)
                 .await?;
         }
         self.start(place, def).await
@@ -1409,7 +1456,7 @@ impl MachineRuns {
         // Another decision may have ended the monitor (or its run) since it
         // was found: then its run, or a successor, is never stopped.
         let stopped = self
-            .stop_because(&place, "the run was stopped", Some(monitor_id))
+            .stop_because(&place, "the run was stopped", StopWhen::Watched(monitor_id))
             .await?
             .is_some();
         Ok(Some(

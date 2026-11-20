@@ -1,6 +1,6 @@
 [package]
 name = "intent-providers"
-version = "0.11.254"
+version = "0.11.259"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true

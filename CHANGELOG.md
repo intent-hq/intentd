@@ -2,6 +2,75 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.259] - 2026-11-20
+
+### 🐛 Bug Fixes
+
+- Hide owned capture metadata from search previews ([#3581](https://github.com/intent-hq/intentd/pull/3581))
+
+
+## [0.11.258] - 2026-11-20
+
+### 📚 Documentation
+
+- *(assistant)* Describe default dock capture editing ([#3579](https://github.com/intent-hq/intentd/pull/3579))
+- Describe collapsed tool activity on iOS ([#3578](https://github.com/intent-hq/intentd/pull/3578))
+
+### 🧪 Testing
+
+- *(store)* Harden the Postgres multi-statement-read lint ([#3574](https://github.com/intent-hq/intentd/pull/3574))
+
+
+## [0.11.257] - 2026-11-20
+
+### 🚀 Features
+
+- *(scripts)* Make new-harness-version mints a harness version in one step ([#3572](https://github.com/intent-hq/intentd/pull/3572))
+- *(assistant)* Ws.rpc generic daemon RPC with approval cards ([#3561](https://github.com/intent-hq/intentd/pull/3561))
+- *(pair)* Ask about the Tailcat tunnel first; keep saved choices on re-install ([#3566](https://github.com/intent-hq/intentd/pull/3566))
+- *(cloud)* Vercel Sandbox cloud machine provider ([#3560](https://github.com/intent-hq/intentd/pull/3560))
+- *(scripts)* Stop remote agents' machine runs on workspace archive ([#3573](https://github.com/intent-hq/intentd/pull/3573))
+- *(assistant)* Ws.rpc reaches remote backends through owner desktop apps ([#3570](https://github.com/intent-hq/intentd/pull/3570))
+
+### 🐛 Bug Fixes
+
+- *(store)* Shard-routable tenant writer lock and Neki single-shard transactions ([#3559](https://github.com/intent-hq/intentd/pull/3559))
+- *(test)* Read the probe-owner status frame up to its newline ([#3568](https://github.com/intent-hq/intentd/pull/3568))
+- *(test)* Stop the size-cap test streaming 200 MiB through a 30 s budget ([#3576](https://github.com/intent-hq/intentd/pull/3576))
+
+### 📚 Documentation
+
+- *(guide)* The Setting up home banner while a workspace home opens ([#3537](https://github.com/intent-hq/intentd/pull/3537))
+- *(guide)* Name v2.359.0 for removing deleted local folders from the sidebar ([#3564](https://github.com/intent-hq/intentd/pull/3564))
+- *(guide)* Auto-start scripts show a lightning bolt ([#3571](https://github.com/intent-hq/intentd/pull/3571))
+
+
+## [0.11.256] - 2026-11-20
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Register a repo-config bootstrap atomically ([#3565](https://github.com/intent-hq/intentd/pull/3565))
+
+
+## [0.11.255] - 2026-11-20
+
+### 🚀 Features
+
+- *(specialists)* Rename Maintenance Coordinator to Maintainer (harness 3.15) ([#3553](https://github.com/intent-hq/intentd/pull/3553))
+- *(scripts)* Restart running and autoStart services after a daemon restart ([#3549](https://github.com/intent-hq/intentd/pull/3549))
+- *(services)* Finish pending Postgres deletes on startup ([#3551](https://github.com/intent-hq/intentd/pull/3551))
+- *(scripts)* Run autoStart scripts while a local workspace is active ([#3558](https://github.com/intent-hq/intentd/pull/3558))
+
+### 📚 Documentation
+
+- *(guide)* Describe Delete removing local folders from the Home sidebar ([#3544](https://github.com/intent-hq/intentd/pull/3544))
+- *(browser)* Document listTools and callTool WebMCP actions ([#3546](https://github.com/intent-hq/intentd/pull/3546))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(store-postgres)* Run Postgres store tests under nextest with a per-test timeout ([#3548](https://github.com/intent-hq/intentd/pull/3548))
+
+
 ## [0.11.254] - 2026-11-19
 
 ### 🐛 Bug Fixes

@@ -63,6 +63,9 @@ pub fn dispatch_diagnostic_owner() -> Option<std::process::ExitCode> {
 
 mod acp_adapter;
 mod agent_locks;
+mod agent_rpc;
+mod agent_rpc_backends;
+pub use agent_rpc::RPC_CALL_PROPOSAL_KIND;
 mod agent_manager;
 mod agent_ops;
 mod agent_resources;
@@ -138,6 +141,7 @@ pub mod home_setup;
 pub mod host_exec;
 pub mod host_exec_stream;
 mod installed_cli;
+mod pending_delete_sweep;
 mod workspace_mutations;
 
 mod github_ops;
@@ -386,6 +390,7 @@ pub use agent_manager::{
 pub use agent_ops::StartupResumeCandidates;
 pub use agent_session::SuspendOverlapQuery;
 pub use agent_subscriptions::StartupCompletionRecovery;
+pub use pending_delete_sweep::PendingDeleteSweep;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
 // The individual watcher families are constructed only by `WatcherRegistry`
@@ -1291,6 +1296,13 @@ pub struct Services {
     /// Held as `Arc<OnceLock>` so the control can be attached after the `api`
     /// Arc is built (composition-root wiring, §5.12). Shared across clones.
     server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
+    /// The Assistant's generic daemon RPC surface (`ws.rpc.*`), attached at
+    /// the composition root like `server_control`. Shared across clones.
+    agent_rpc: Arc<OnceLock<Arc<dyn intent_core::agent_rpc::AgentRpcSurface>>>,
+    /// Assistant `rpc-call` proposals held for the user's approval.
+    rpc_proposals: Arc<agent_rpc::RpcProposalRegistry>,
+    /// Backends owner apps reported for the Assistant (`backends.report`).
+    backend_reports: Arc<agent_rpc_backends::BackendReports>,
     /// Rebuilds an open invite's `intent://invite?…` link for
     /// `workspace.invite.list` (multiplayer w4). Attached after
     /// the `api` Arc like `server_control` (the transport owns the pairing
@@ -1914,6 +1926,9 @@ impl Services {
             scripts_running_state: Arc::new(workspace_status::ScriptsRunningState::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
+            agent_rpc: Arc::new(OnceLock::new()),
+            rpc_proposals: Arc::new(agent_rpc::RpcProposalRegistry::default()),
+            backend_reports: Arc::new(agent_rpc_backends::BackendReports::default()),
             invite_links: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2251,6 +2266,47 @@ impl Services {
     #[must_use]
     pub fn workspace_homes(&self) -> bool {
         self.orchestrator_mode()
+    }
+
+    /// Whether `id`'s `autoStart` scripts may start now: the workspace is
+    /// not archived, retired, deleted or in a pending-delete grace window.
+    ///
+    /// # Errors
+    ///
+    /// The store's error reading the workspace.
+    #[doc(hidden)]
+    pub async fn workspace_accepts_auto_start(&self, id: &WorkspaceId) -> Result<bool> {
+        let ws = self.store.get_workspace(id).await?;
+        if ws.archived || ws.is_retired() || ws.status == WorkspaceStatus::Deleted {
+            return Ok(false);
+        }
+        let pending = self
+            .pending_workspace_deletes
+            .deadline(&delete_grace::PendingDeleteSubject::Workspace(id.clone()))?;
+        Ok(pending.is_none())
+    }
+
+    /// Start `id`'s saved `autoStart` scripts in the background (scripts.md
+    /// "autoStart"). `after_local_setup` skips a workspace whose home is on
+    /// a machine: that home starts them when its own setup finishes.
+    pub(crate) fn kick_auto_start(&self, id: &WorkspaceId, after_local_setup: bool) {
+        let this = self.clone();
+        let id = id.clone();
+        let _ = self.store_tasks.spawn_draining(async move {
+            if after_local_setup && this.workspace_homes() {
+                match this.store.get_workspace_home(&id).await {
+                    Ok(Some(home)) if home.node_id.is_some() || home.cloud_machine_id.is_some() => {
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(workspace = %id, %error, "autoStart: workspace home read failed");
+                        return;
+                    }
+                }
+            }
+            this.ports.runtime().start_auto_start(&this, id).await;
+        });
     }
 
     /// Whether this daemon may run agents on its own host: the "This
@@ -23350,6 +23406,7 @@ impl WorkspaceApi for Services {
                             )
                         })
                         .await;
+                        services.kick_auto_start(&ws.id, true);
                     }
                     let mut initial_agent = None;
                     let mut notice = None;
@@ -23530,6 +23587,7 @@ impl WorkspaceApi for Services {
                     }
                     let bus_for_setup = self.event_bus.clone();
                     let setup_states = self.workspace_setup_states.clone();
+                    let services_for_setup = self.clone();
                     if let (Some(worktree_path_buf), Some(script)) =
                         (setup_worktree, effective_setup_script)
                     {
@@ -23582,6 +23640,9 @@ impl WorkspaceApi for Services {
                                 ),
                             )
                             .await;
+                            if ran_script && exit_code == Some(0) {
+                                services_for_setup.kick_auto_start(&workspace_id, true);
+                            }
                         });
                     }
                     Ok(WorkspaceCreateResult {
@@ -30944,6 +31005,55 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_resolve_rpc_proposal(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        proposal_id: String,
+        decision: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
+            self.agent_resolve_rpc_proposal_op(workspace_id, agent_id, proposal_id, decision)
+                .await
+        })
+    }
+
+    fn backends_report(
+        &self,
+        client_id: intent_core::ClientId,
+        device: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.backends_report_op(&client_id, device, &params) })
+    }
+
+    fn agent_rpc_describe(
+        &self,
+        workspace_id: WorkspaceId,
+        what: String,
+        args: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_rpc_describe_op(&workspace_id, &what, &args)
+                .await
+        })
+    }
+
+    fn agent_rpc_call(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        request: intent_core::agent_rpc::AgentRpcRequest,
+        budget: std::time::Duration,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_rpc_call_op(workspace_id, agent_id, request, budget)
+                .await
+        })
+    }
+
     fn agent_resolve_proposal(
         &self,
         workspace_id: WorkspaceId,
@@ -30956,15 +31066,22 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
-            self.agent_resolve_proposal_op(
-                workspace_id,
-                agent_id,
-                proposal_id,
-                outcome,
-                detail,
-                created_workspace_id,
-            )
-            .await
+            let claimed = self.guard_plain_rpc_resolution(&proposal_id, &outcome)?;
+            let resolved = self
+                .agent_resolve_proposal_op(
+                    workspace_id,
+                    agent_id.clone(),
+                    proposal_id.clone(),
+                    outcome,
+                    detail,
+                    created_workspace_id,
+                )
+                .await;
+            if claimed {
+                self.settle_dismissed_rpc_proposal(&agent_id, &proposal_id, resolved.is_ok())
+                    .await;
+            }
+            resolved
         })
     }
 
@@ -35897,6 +36014,10 @@ impl Services {
             changes["autoUnarchive"] = stamp;
         }
         publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
+        // A revive's fresh checkout never ran setup, so nothing autoStarts.
+        if matches!(outcome, Some(UnarchiveOutcome::Unarchived)) {
+            self.kick_auto_start(&ws.id, false);
+        }
         Ok((ws, outcome))
     }
 
@@ -39304,6 +39425,13 @@ impl Services {
                 let cancelled_hooks = std::mem::take(&mut sweep.cancelled_hooks);
                 let cancelled_monitors = std::mem::take(&mut sweep.cancelled_monitors);
                 this.notify_owners_of_archived_watches(&id, cancelled_hooks, cancelled_monitors)
+                    .await;
+                // Stop the workspace's running scripts (scripts.md
+                // "autoStart"): outside the fence, before the archive script,
+                // and only while the row is still archived.
+                this.ports
+                    .runtime()
+                    .stop_archived_workspace_scripts(&this, &id)
                     .await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
                 // authoritative wire shape without a follow-up `workspace.get`,

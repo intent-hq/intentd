@@ -8,6 +8,7 @@
 pub use intent_core::Result;
 pub use intent_services::Services;
 
+pub use agent_rpc::LoopbackAgentRpc;
 pub use auth::{
     generate_token, get_or_create_token, hash_token, AsyncTokenStore, FileTokenStore, TokenStore,
 };
@@ -58,8 +59,10 @@ fn disable_node_compile_cache() {
 }
 
 mod accept_backoff;
+pub mod agent_rpc;
 mod agent_workers;
 pub mod auth;
+mod backends;
 pub(crate) mod browser;
 pub mod catalog;
 mod client;

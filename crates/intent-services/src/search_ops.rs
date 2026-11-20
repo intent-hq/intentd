@@ -4,6 +4,8 @@
 //! `search.inFiles` `opts` object. The ripgrep-equivalent walk/search itself
 //! lives in `intent-search`; this module owns only the services-layer glue.
 
+pub(crate) mod capture_preview;
+
 use std::path::PathBuf;
 
 use intent_core::{Error, Event, Result, RetrieveResult, WorkspaceId};
@@ -294,6 +296,27 @@ pub(crate) fn message_text(content: &Value) -> String {
     }
 }
 
+// Only the first text block can own a leading envelope; later blocks may quote it.
+fn capture_preview_text(content: &Value, metadata: Option<&Value>) -> String {
+    match content {
+        Value::String(text) => capture_preview::visible_capture_text(text, metadata).to_owned(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .enumerate()
+            .map(|(index, text)| {
+                if index == 0 {
+                    capture_preview::visible_capture_text(text, metadata)
+                } else {
+                    text
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        other => message_text(other),
+    }
+}
+
 /// Map ranked FTS hits ([`Store::search_agent_messages_fts`]) into
 /// `search.messages` wire matches: the preview windows onto the first
 /// raw-query token occurring in the extracted text, and the wire `score`
@@ -307,7 +330,14 @@ pub(crate) fn message_fts_matches(
         .map(|hit| MessageMatch {
             agent_id: hit.agent_id,
             message_id: hit.message_id,
-            preview: fts_preview(&message_text(&hit.content), raw_query),
+            preview: {
+                let text = if hit.role == "user" {
+                    capture_preview_text(&hit.content, hit.metadata.as_ref())
+                } else {
+                    message_text(&hit.content)
+                };
+                fts_preview(&text, raw_query)
+            },
             score: Some(-hit.rank),
             workspace_id: hit.workspace_id,
             agent_name: hit.agent_name,

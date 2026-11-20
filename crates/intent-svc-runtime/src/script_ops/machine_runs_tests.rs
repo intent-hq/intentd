@@ -295,6 +295,45 @@ async fn stop_waits_for_the_ack_and_a_second_stop_dismisses_the_run() {
     );
 }
 
+/// The archive's stop: only live runs of the workspace are listed and
+/// stopped; a run that already ended keeps its entry and `lastRun`.
+#[tokio::test]
+async fn stop_live_stops_live_runs_and_keeps_ended_ones() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let (live, ended) = (AgentId::new(), AgentId::new());
+    let def = script(ScriptMode::Command, "make");
+    runs.start(&place(&ended), &def).await.unwrap();
+    let start = last_start(&rec);
+    frame(&runs, started(&start)).await;
+    frame(&runs, exited(&start, Some(0), None)).await;
+    runs.start(&place(&live), &def).await.unwrap();
+    frame(&runs, started(&last_start(&rec))).await;
+
+    assert_eq!(runs.live_in(&ws()), vec![place(&live)]);
+    assert!(runs.live_in(&WorkspaceId::from("ws-2")).is_empty());
+    assert!(runs
+        .stop_live(&place(&ended), "archived")
+        .await
+        .unwrap()
+        .is_none());
+    // Unacknowledged: settled after the bounded wait.
+    let stopped = runs
+        .stop_live(&place(&live), "archived")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.status, ScriptStatus::Idle);
+    assert!(runs.live_in(&ws()).is_empty());
+    let entries = runs.entries(&ws(), "s1");
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    let kept = entries
+        .iter()
+        .find(|e| e["remoteAgentId"] == ended.as_str())
+        .unwrap();
+    assert_eq!(kept["lastRun"]["outcome"], "succeeded", "{kept}");
+}
+
 #[tokio::test]
 async fn a_lost_link_settles_live_runs_and_monitors_wake_their_agent() {
     let rec = Arc::new(Recorded::default());

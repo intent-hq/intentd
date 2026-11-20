@@ -42,4 +42,6 @@ exceptions = [
     # the notice.
     { name = "libwebauthn", allow = ["LGPL-2.1-or-later"] },
     { name = "pxp", allow = ["LGPL-2.1-or-later"] },
+    # intent-passkey's PAM binding (device passkeys), consumed unmodified.
+    { name = "pam-client2", allow = ["MPL-2.0"] },
 ]

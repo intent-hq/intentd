@@ -27,7 +27,7 @@ use intent_store::postgres::{PostgresOptions, TenantId};
 use intent_store::Store;
 use intentd_test_support::test_timeout;
 
-use crate::harness::{exec, open_trapped, trapped_db, TestDb};
+use crate::harness::{exec, hold_writer_lock, open_trapped, trapped_db, TestDb};
 
 const T0: &str = "2026-01-01T00:00:00.000Z";
 const WS: &str = "ws-snap";
@@ -632,12 +632,7 @@ async fn provisioning_waits_for_the_tenant_writer_lock() {
     };
     let tenant = "snap-provision-lock";
     // Another process holds the tenant's writer lock.
-    let mut holder = db.admin.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('intent-writer:' || $1, 0))")
-        .bind(tenant)
-        .execute(&mut *holder)
-        .await
-        .unwrap();
+    let holder = hold_writer_lock(&db.admin, tenant).await;
     let blocked = open_quick(&db, tenant, Duration::from_millis(400)).await;
     assert!(
         matches!(blocked, Err(Error::StoreBusy(_))),
@@ -700,4 +695,42 @@ async fn concurrent_provisioning_of_one_tenant_seeds_it_once() {
         .unwrap();
         assert_eq!(n, 1, "{table} seeded once");
     }
+}
+
+#[tokio::test]
+async fn transfer_table_stats_reads_its_columns_and_aggregate_from_one_snapshot() {
+    let Some(db) = trapped_db().await else {
+        return;
+    };
+    let tenant = "snap-transfer-stats";
+    let store = open_trapped(&db, tenant).await;
+    workspace(&store).await;
+    let count = |stats: &[intent_core::transfer::TransferTableStat]| {
+        stats
+            .iter()
+            .find(|s| s.name == "workspace_discussion_conversation")
+            .map(|s| s.row_count)
+            .expect("conversation table is a transfer table")
+    };
+    let before = count(&store.transfer_table_stats(&ws()).await.unwrap());
+    // A conversation commits between the column read and the aggregate.
+    let write = format!(
+        "INSERT INTO workspace_discussion_conversation \
+         (tenant_id, workspace_id, id, name, created_at) \
+         VALUES ('{{t}}', '{WS}', 'c-gap', 'gap', '{T0}')"
+    );
+    let reader = store.clone();
+    let stats = read_across_write(&db, tenant, "transfer_table_stats", &write, async move {
+        reader.transfer_table_stats(&ws()).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        count(&stats),
+        before,
+        "aggregate read after the column read's snapshot"
+    );
+    // A fresh read sees the write.
+    let after = count(&store.transfer_table_stats(&ws()).await.unwrap());
+    assert_eq!(after, before + 1);
 }

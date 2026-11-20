@@ -28433,6 +28433,99 @@ mod search_adapters {
     }
 
     #[intent_test_macros::daemon_test]
+    async fn messages_search_projects_owned_capture_before_preview_without_changing_storage() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        let agent = insert_session(&store, &ws, "capture-agent", &[]).await;
+        let prefix = format!(
+            "{}\n```json\n{}\n```",
+            crate::search_ops::capture_preview::SCREEN_HEADER,
+            json!({"type":"dock_screen_evidence","version":1,"images":[{"image":1,"size":[32,32],"scale":1,"marks":[]}],"padding":"x".repeat(300)})
+        );
+        let text = format!("{prefix}\n\nDeploy this visible request");
+        let metadata = json!({"type":"dock_screen_evidence"});
+        let row = store
+            .append_agent_message_with_metadata(
+                &agent,
+                "user",
+                &json!(text),
+                Some(&metadata),
+                &intent_core::now_iso(),
+            )
+            .await
+            .unwrap();
+        let ordinary = "Deploy ordinary literal [Edited capture outputs]";
+        store
+            .append_agent_message(&agent, "user", &json!(ordinary), &intent_core::now_iso())
+            .await
+            .unwrap();
+        let svc = Services::new_isolated(store.clone());
+        let result = svc
+            .search_messages(Some(ws), "Deploy".into(), None, None, Some(10), None, None)
+            .await
+            .unwrap();
+        let matches = result["matches"].as_array().unwrap();
+        let own = matches.iter().find(|m| m["messageId"] == row.id).unwrap();
+        assert_eq!(own["preview"], "Deploy this visible request");
+        assert!(matches.iter().any(|m| m["preview"] == ordinary));
+        let stored = store.get_agent_messages(&agent, None).await.unwrap();
+        assert!(stored
+            .iter()
+            .any(|m| m.id == row.id && m.content == json!(text)));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn messages_search_capture_preview_metadata_budget_covers_both_envelopes() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        let agent = insert_session(&store, &ws, "large-capture-agent", &[]).await;
+        let body = json!({"type":"dock_screen_evidence","version":1,
+            "images":[],"producerExtension":"x".repeat(150_000)});
+        let edited = json!([{"id":"recording","kind":"recording","video":"full",
+            "voice":"transcript","transcript":"界".repeat(100_000),"marks":[],
+            "video_attachment_id":"video","frames":[],"kept_ms":[{"startMs":0,"endMs":1000}]}]);
+        let metadata = json!({"type":"dock_screen_evidence","context":"z".repeat(150_000),
+            "edited_captures":edited});
+        assert!(metadata.to_string().len() > 262_144);
+        assert!(edited.to_string().len() > 262_144);
+        assert!(
+            body.to_string().encode_utf16().count() < 262_144
+                && edited.to_string().encode_utf16().count() < 262_144
+        );
+        let content = json!([{ "type":"text","text":format!(
+            "{}\n```json\n{body}\n```\n\n[Edited capture outputs]\n{edited}\n\nDeploy the visible request",
+            crate::search_ops::capture_preview::SCREEN_HEADER)},
+            {"type":"text","text":"and preserve this second text block"}]);
+        let row = store
+            .append_agent_message_with_metadata(
+                &agent,
+                "user",
+                &content,
+                Some(&metadata),
+                &intent_core::now_iso(),
+            )
+            .await
+            .unwrap();
+        let svc = Services::new_isolated(store.clone());
+        let result = svc
+            .search_messages(Some(ws), "Deploy".into(), None, None, Some(10), None, None)
+            .await
+            .unwrap();
+        let found = result["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["messageId"] == row.id)
+            .unwrap();
+        assert_eq!(
+            found["preview"],
+            "Deploy the visible request and preserve this second text block"
+        );
+        let stored = store.get_agent_messages(&agent, None).await.unwrap();
+        assert!(stored
+            .iter()
+            .any(|message| message.id == row.id && message.content == content));
+    }
+
+    #[intent_test_macros::daemon_test]
     async fn messages_search_filters_by_role() {
         let (_tmp, store, ws) = store_with_ws().await;
         insert_session(

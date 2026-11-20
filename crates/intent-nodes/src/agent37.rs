@@ -77,7 +77,7 @@ pub mod fake_api;
 #[cfg(any(test, feature = "agent37-fake"))]
 pub mod fake_server;
 #[cfg(test)]
-mod fields;
+pub(crate) mod fields;
 #[cfg(test)]
 mod live_tests;
 #[cfg(test)]

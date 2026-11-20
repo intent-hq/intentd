@@ -86,6 +86,9 @@ const UNGATED_AT_SERVICE_LAYER: &[(&str, &str)] = &[
     // No gate: daemon-wide per-agent memory read; no-manager early
     // return `{ sampledAt: null, totalBytes: null, agents: [] }`.
     ("agent.memoryUsage", "ok"),
+    // No gate: static method catalog with agent-path classes; no
+    // workspace or agent data.
+    ("agent.rpcMethods", "ok"),
     // No gate: process-wide stack sampler.
     ("debug.sampleStacks", "ok"),
     // No gate: no-manager early return `{ running: false }`.
@@ -197,6 +200,11 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             "agent.resolveProposal",
             json!({ "workspaceId": ws, "agentId": "a1", "proposalId": "p1", "outcome": "reject" }),
         ),
+        (
+            "agent.resolveRpcProposal",
+            json!({ "workspaceId": ws, "agentId": "a1", "proposalId": "p1", "decision": "reject" }),
+        ),
+        ("agent.rpcMethods", json!({})),
         (
             "agent.wakeOrCreate",
             json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),

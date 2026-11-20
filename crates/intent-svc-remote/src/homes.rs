@@ -754,7 +754,7 @@ pub(crate) async fn ingest(shared: &Shared, record: JournalRecord) {
             // the daemon: no client asked for it.
             intent_core::spawn_daemon(async move {
                 svc.feature_runtime()
-                    .start_home_auto_start(&svc, workspace_id)
+                    .start_auto_start(&svc, workspace_id)
                     .await;
             });
         }

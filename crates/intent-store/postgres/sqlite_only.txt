@@ -3,6 +3,7 @@
 activate_incremental_vacuum — SQLite auto_vacuum/VACUUM; Postgres autovacuum manages space
 freelist_count — SQLite PRAGMA freelist_count; Postgres has no freelist
 incremental_vacuum_chunk — SQLite PRAGMA incremental_vacuum; Postgres autovacuum manages space
+inject_pending_delete — test-only (cfg test / test-support); fakes the delete_purge record SQLite never keeps, for the services pending-delete sweep tests
 optimize — SQLite PRAGMA optimize; Postgres autoanalyze keeps planner statistics
 page_size — SQLite PRAGMA page_size, only to size the freelist backlog
 read_pool — test-only raw SQLite pool (cfg test / test-support); tests seed, inspect and fault-inject SQLite directly

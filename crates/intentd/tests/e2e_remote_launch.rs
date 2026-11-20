@@ -53,6 +53,7 @@ mod node_invite;
 mod orchestrator;
 mod orchestrator_switch;
 mod push_on_commit;
+mod script_archive;
 mod secrets;
 mod sub_agents;
 

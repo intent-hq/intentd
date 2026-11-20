@@ -1,11 +1,11 @@
 [package]
 name = "intent-nodes"
-version = "0.11.254"
+version = "0.11.259"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
-description = "Node provider contracts, static host adapter, E2B sandbox client, Northflank and Agent37 adapters"
+description = "Node provider contracts, static host adapter, E2B sandbox client, Northflank, Agent37 and Vercel adapters"
 
 [dependencies]
 intent-core = { workspace = true }
@@ -31,6 +31,9 @@ time = { workspace = true }
 agent37-fake = []
 # The shared fake Northflank API, for the e2e suites. Never in a shipped build.
 northflank-fake = []
+# The shared fake Vercel Sandbox API and its server, for the e2e suites.
+# Never in a shipped build.
+vercel-fake = []
 
 [dev-dependencies]
 intentd-test-support = { path = "../intentd-test-support" }

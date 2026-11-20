@@ -1046,6 +1046,21 @@ async fn process_captured_frame(
                 None => true,
             };
         }
+        if let Some(req) = crate::backends::classify(value) {
+            let identity = reverse_guard
+                .bound_client_id()
+                .and_then(|id| reverse_guard.registry()?.client_identity(&id));
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                crate::backends::handle(req, api.as_ref(), identity),
+            )
+            .await;
+            return match frame {
+                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                None => true,
+            };
+        }
         if let Some(req) = drafts::classify(value) {
             let frame = panic_guard::guard_frame(
                 &method,

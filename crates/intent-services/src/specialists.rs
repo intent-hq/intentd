@@ -278,6 +278,23 @@ pub(crate) const EMBEDDED_BUNDLED_V3_10: &[(&str, &str)] = &[
     ),
 ];
 
+/// The v3.15 embedded specialist bundle: the v3.10 set with the Maintenance
+/// Coordinator renamed to Maintainer. Its id stays `maintenance-coordinator`
+/// so saved choices and delegations keep resolving.
+pub(crate) const EMBEDDED_BUNDLED_V3_15: &[(&str, &str)] = &[
+    EMBEDDED_BUNDLED_V3_10[0],
+    EMBEDDED_BUNDLED_V3_10[1],
+    EMBEDDED_BUNDLED_V3_10[2],
+    EMBEDDED_BUNDLED_V3_10[3],
+    EMBEDDED_BUNDLED_V3_10[4],
+    EMBEDDED_BUNDLED_V3_10[5],
+    EMBEDDED_BUNDLED_V3_10[6],
+    (
+        "maintenance-coordinator",
+        include_str!("../resources/specialists/v3.15/maintenance-coordinator.md"),
+    ),
+];
+
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
 /// base tier: no shipped specialist survives the replacement.
 const EMPTY_BUNDLE: &[(&str, &str)] = &[];
@@ -2454,8 +2471,8 @@ mod tests {
         assert_eq!(def["name"], "File Implementor");
     }
 
-    /// A 3.10-pinned session resolves the bundled Maintenance Coordinator, and
-    /// so does the current floor since 3.12 released the 3.10 bundle.
+    /// A 3.10-pinned session resolves the bundled Maintenance Coordinator
+    /// under its old name; the current floor resolves the same id.
     #[test]
     fn v3_10_session_resolves_the_maintenance_coordinator() {
         let empty = TempSpecialistsDir::new();
@@ -2471,9 +2488,10 @@ mod tests {
             .is_some_and(|d| d.starts_with("Keeps a steady pipeline")));
         assert!(def.get("model").is_none_or(Value::is_null));
         assert!(def.get("codingAgent").is_none_or(Value::is_null));
-        assert!(service_over(&empty)
+        let current = service_over(&empty)
             .resolve("maintenance-coordinator", None)
-            .is_some());
+            .expect("current floor resolves");
+        assert_eq!(current["name"], "Maintainer");
     }
 
     /// Role-based orchestrator resolution (§18.4): an explicit

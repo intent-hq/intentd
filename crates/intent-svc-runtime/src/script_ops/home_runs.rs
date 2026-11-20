@@ -46,7 +46,7 @@ impl Launch {
 impl ScriptManager {
     /// Whether `ws`'s home runs run on its home: an orchestrator serving
     /// homes, with the workspace's home on a machine or a cloud entry.
-    async fn runs_on_home(&self, ws: &WorkspaceId) -> Result<bool> {
+    pub(super) async fn runs_on_home(&self, ws: &WorkspaceId) -> Result<bool> {
         let Some(svc) = &self.owner_services else {
             return Ok(false);
         };
@@ -159,15 +159,22 @@ impl ScriptManager {
         svc.feature_remote_launch_port().connect_home(svc, ws).await
     }
 
-    /// The workspace's home made a new checkout and finished its setup:
-    /// start the home run of every saved `autoStart` script (nodes.md
-    /// "Workspace homes"). Returns how many started; one failure does not
-    /// keep the others from starting.
+    /// The workspace became active with a ready checkout (its local setup
+    /// or its home's setup finished, or it was unarchived): start the home
+    /// run of every saved, unarchived `autoStart` script (scripts.md
+    /// "autoStart"). Nothing starts in an archived, retired or deleting
+    /// workspace; a live script is left as it is. Returns how many started;
+    /// one failure does not keep the others from starting.
     ///
     /// # Errors
     ///
-    /// The store's error listing the scripts.
+    /// The store's error reading the workspace or listing the scripts.
     pub(crate) async fn start_auto_start(&self, ws: &WorkspaceId) -> Result<usize> {
+        if let Some(svc) = &self.owner_services {
+            if !svc.workspace_accepts_auto_start(ws).await? {
+                return Ok(0);
+            }
+        }
         // Listing first registers the repository's configured scripts, as
         // the first list of a new workspace does.
         self.list(ws).await?;
@@ -186,10 +193,11 @@ impl ScriptManager {
             .collect();
         let mut started = 0;
         for id in ids {
-            match self.start(ws, &id).await {
-                Ok(_) => started += 1,
+            match self.start_auto(ws, &id).await {
+                Ok(Some(_)) => started += 1,
+                Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(workspace = %ws, script = %id, %error, "home autoStart script did not start");
+                    tracing::warn!(workspace = %ws, script = %id, %error, "autoStart script did not start");
                 }
             }
         }

@@ -242,6 +242,23 @@ impl Store {
         dispatch!(self, backend => backend.set_script_was_running(workspace_id, id, was_running).await)
     }
 
+    /// Change only a definition's `autoStart` (and `updatedAt`), leaving the
+    /// was-running marker and last run untouched. Returns whether a row in
+    /// `workspace_id` changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn set_script_auto_start(
+        &self,
+        workspace_id: &str,
+        id: &str,
+        auto_start: Option<bool>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.set_script_auto_start(workspace_id, id, auto_start, updated_at).await)
+    }
+
     /// `(workspace_id, id)` pairs of scripts still carrying the was-running
     /// marker — the boot-time hydration read behind the `previouslyRunning`
     /// runtime field. Workspace-qualified because the same client-supplied id
@@ -596,6 +613,26 @@ impl crate::SqliteStore {
             .await
             .map_err(|e| Error::Internal(format!("set script was_running failed: {e}")))?;
         Ok(())
+    }
+
+    pub async fn set_script_auto_start(
+        &self,
+        workspace_id: &str,
+        id: &str,
+        auto_start: Option<bool>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        sqlx::query(
+            "UPDATE script SET auto_start = ?, updated_at = ? WHERE id = ? AND workspace_id = ?",
+        )
+        .bind(auto_start.map(i64::from))
+        .bind(updated_at)
+        .bind(id)
+        .bind(workspace_id)
+        .execute(self.write_pool())
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .map_err(|e| Error::Internal(format!("set script auto_start failed: {e}")))
     }
 
     pub async fn list_was_running_script_ids(&self) -> Result<Vec<(String, String)>> {

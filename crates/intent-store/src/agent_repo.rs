@@ -116,7 +116,7 @@ pub(crate) fn search_messages_fts_sql(
         filters.push_str(" AND c.role = ?");
     }
     format!(
-        "SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
+        "SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.metadata, m.created_at, \
                 s.workspace_id, s.name AS agent_name, top.adjusted_rank \
          FROM ( \
              SELECT agent_message_fts.rowid AS msg_rowid, \
@@ -6309,12 +6309,19 @@ const PREFER_WORKSPACE_BOOST: f64 = 1.0;
 /// still wins.
 const ARCHIVED_WORKSPACE_PENALTY: f64 = 1.0;
 
+/// Bounded provenance hydration for selected search hits. Screen and Edited
+/// envelopes each allow 262144 UTF-16 units (up to 768 KiB UTF-8); leave
+/// room for both and the owner wrapper.
+/// Oversized or malformed metadata leaves the raw preview unchanged.
+pub(crate) const MESSAGE_PREVIEW_METADATA_MAX_BYTES: usize = 2_097_152;
+
 /// One `search.messages` hit from [`Store::search_agent_messages_fts`]: the
 /// message/agent ids and result-row context (owning workspace, agent display
 /// name, role, decoded content, timestamp) plus the adjusted bm25 rank
 /// (lower = more relevant).
 #[derive(Debug, Clone)]
 pub struct MessageFtsMatch {
+    pub metadata: Option<serde_json::Value>,
     pub message_id: String,
     pub agent_id: String,
     pub workspace_id: String,
@@ -7193,6 +7200,9 @@ impl crate::SqliteStore {
                         Error::Internal(format!("decode message content failed: {e}"))
                     })?;
                 Ok(MessageFtsMatch {
+                    metadata: col::<Option<String>>(row, "metadata")?
+                        .filter(|raw| raw.len() <= MESSAGE_PREVIEW_METADATA_MAX_BYTES)
+                        .and_then(|raw| serde_json::from_str(&raw).ok()),
                     message_id: col(row, "message_id")?,
                     agent_id: col(row, "agent_id")?,
                     workspace_id: col(row, "workspace_id")?,
