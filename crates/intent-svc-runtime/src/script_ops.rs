@@ -1765,8 +1765,13 @@ impl ScriptManager {
                             {
                                 let mut registry = self.scripts.lock().unwrap();
                                 for script in scripts {
+                                    let key = (workspace_id.clone(), script.id.clone());
+                                    debug_assert!(
+                                        !registry.contains_key(&key),
+                                        "a bootstrapped script was registered before its bootstrap"
+                                    );
                                     registry
-                                        .entry((workspace_id.clone(), script.id.clone()))
+                                        .entry(key)
                                         .or_insert_with(|| ManagedScript {
                                             def: script,
                                             state: ScriptRuntimeState::default(),
