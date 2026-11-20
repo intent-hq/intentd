@@ -29,6 +29,10 @@
 //!   once plus read headroom; past that, checkouts wait up to the acquire
 //!   timeout. The slot is per tenant, shared by every store for it in this
 //!   process (`tenant_registry`).
+//! - **Single-shard mode** ([`PoolSettings::single_shard`], for Neki sharded
+//!   by `tenant_id`) is a startup option of every connection, so a
+//!   transaction that reaches a second shard fails instead of running
+//!   across shards.
 //! - **Writer waits are bounded** by [`WriterLimits`]: see
 //!   [`PgStore::begin_write`] for the lock timeout and retry policy, and the
 //!   statement and idle-in-transaction timeouts a writer transaction runs
@@ -197,6 +201,14 @@ pub struct PoolSettings {
     pub acquire_timeout: Duration,
     /// The longest [`connect_with`] waits for its first connection.
     pub connect_timeout: Duration,
+    /// Open every connection in `PlanetScale` Neki's single-shard mode
+    /// (`__neki.tx_mode = 'single'`, a startup option; see
+    /// [`single_shard_options`]), so Neki rejects a statement that would
+    /// take a transaction to a second shard instead of running it across
+    /// shards (Neki's default, `multi`). Turn it on for a Neki database
+    /// sharded by `tenant_id`: a store's transactions touch one tenant, so
+    /// one shard. [`migrate`] switches its own connection back to `multi`.
+    pub single_shard: bool,
 }
 
 impl PoolSettings {
@@ -206,6 +218,7 @@ impl PoolSettings {
             max_connections,
             acquire_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
+            single_shard: false,
         }
     }
 }
@@ -224,6 +237,15 @@ pub fn connect_options(url: &str) -> Result<PgConnectOptions> {
     with_bundled_root_cert(url)?
         .parse::<PgConnectOptions>()
         .map_err(|e| Error::InvalidParams(format!("invalid postgres url: {e}")))
+}
+
+/// `options` with Neki's single-shard mode as a startup option, so every
+/// connection starts in it and no transaction can leave it: Neki refuses to
+/// change `__neki.tx_mode` inside a transaction. Vanilla Postgres accepts
+/// the setting and ignores it. For pools built without [`connect_with`].
+#[must_use]
+pub fn single_shard_options(options: PgConnectOptions) -> PgConnectOptions {
+    options.options([("__neki.tx_mode", "single")])
 }
 
 fn with_bundled_root_cert(url: &str) -> Result<String> {
@@ -269,7 +291,11 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool> {
 /// `Error::InvalidParams` for a bad URL; `Error::Internal` when the first
 /// connection fails or takes longer than `settings.connect_timeout`.
 pub async fn connect_with(url: &str, settings: PoolSettings) -> Result<PgPool> {
-    let connecting = pool_options(settings).connect_with(connect_options(url)?);
+    let mut options = connect_options(url)?;
+    if settings.single_shard {
+        options = single_shard_options(options);
+    }
+    let connecting = pool_options(settings).connect_with(options);
     match tokio::time::timeout(settings.connect_timeout, connecting).await {
         Ok(pool) => pool.map_err(|e| Error::Internal(format!("postgres connect failed: {e}"))),
         Err(_) => Err(Error::Internal(format!(
@@ -323,6 +349,12 @@ pub async fn migrate_replaying_each_statement(pool: &PgPool) -> Result<()> {
 
 async fn migrate_with(pool: &PgPool, replay: bool) -> Result<()> {
     let mut conn = pool.acquire().await.map_err(db)?.detach();
+    // Schema changes span every shard: undo a single-shard pool's startup
+    // mode on this detached connection, which is closed at the end.
+    sqlx::query(MULTI_SHARD_SQL)
+        .execute(&mut conn)
+        .await
+        .map_err(db)?;
     sqlx::query("SELECT pg_advisory_lock(hashtextextended('intent-schema-migrations', 0))")
         .execute(&mut conn)
         .await
@@ -623,18 +655,74 @@ impl Drop for Waiting {
     }
 }
 
-/// Takes the tenant writer lock ($1 tenant): first sets `lock_timeout` ($2),
-/// `statement_timeout` ($3) and `idle_in_transaction_session_timeout` ($4)
-/// for the transaction (OFFSET 0 keeps the subquery from being flattened,
-/// so they apply before the lock is requested), then, once the lock is
-/// granted, resets `lock_timeout` to $5 (the target list runs in order).
+/// Sets `lock_timeout` ($1), `statement_timeout` ($2) and
+/// `idle_in_transaction_session_timeout` ($3) for the transaction, before
+/// the writer asks for the lock.
+const WRITER_LIMITS_SQL: &str = "SELECT set_config('lock_timeout', $1, true), \
+     set_config('statement_timeout', $2, true), \
+     set_config('idle_in_transaction_session_timeout', $3, true)";
+
+/// The tenant writer lock ($1 tenant): a row lock on the tenant's
+/// `tenant_writer` row. It names `tenant_id`, so Neki routes it to the
+/// tenant's shard (an advisory lock reads no table and carries no shard key).
+/// No row: the tenant has not written since the table was added.
 #[doc(hidden)]
-pub const WRITER_LOCK_SQL: &str =
-    "SELECT pg_advisory_xact_lock(hashtextextended('intent-writer:' || $1, 0)), \
-     set_config('lock_timeout', $5, true) \
-     FROM (SELECT set_config('lock_timeout', $2, true), \
-     set_config('statement_timeout', $3, true), \
-     set_config('idle_in_transaction_session_timeout', $4, true) OFFSET 0) AS limits";
+pub const WRITER_LOCK_SQL: &str = "SELECT 1 FROM tenant_writer WHERE tenant_id = $1 FOR UPDATE";
+
+/// Seeds the tenant's `tenant_writer` row ($1). On a conflict with a
+/// concurrent seed it waits for that transaction, under `lock_timeout`.
+const WRITER_SEED_SQL: &str =
+    "INSERT INTO tenant_writer (tenant_id) VALUES ($1) ON CONFLICT (tenant_id) DO NOTHING";
+
+/// Resets `lock_timeout` ($1) once the writer holds the lock.
+const WRITER_RESET_SQL: &str = "SELECT set_config('lock_timeout', $1, true)";
+
+/// Neki's default, cross-shard mode, for [`migrate`]'s connection (a
+/// session setting: Neki refuses it inside a transaction); see
+/// [`PoolSettings::single_shard`].
+const MULTI_SHARD_SQL: &str = "SET __neki.tx_mode = 'multi'";
+
+/// Takes `tenant`'s writer lock in the transaction on `conn`: sets the
+/// writer limits (`lock_timeout` = `attempt` for this attempt), seeds the
+/// tenant's lock row if it has none, locks it, then resets `lock_timeout`
+/// to `limits.lock_attempt` for the rest of the transaction. A wait past
+/// `attempt` fails with SQLSTATE 55P03.
+///
+/// # Errors
+/// The failed statement's error.
+#[doc(hidden)]
+pub async fn lock_tenant_writer(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    attempt: Duration,
+    limits: &WriterLimits,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query(WRITER_LIMITS_SQL)
+        .bind(millis(attempt))
+        .bind(millis(limits.statement_timeout))
+        .bind(millis(limits.idle_in_transaction_timeout))
+        .execute(&mut *conn)
+        .await?;
+    let locked = sqlx::query(WRITER_LOCK_SQL)
+        .bind(tenant)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if locked.is_none() {
+        sqlx::query(WRITER_SEED_SQL)
+            .bind(tenant)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query(WRITER_LOCK_SQL)
+            .bind(tenant)
+            .fetch_one(&mut *conn)
+            .await?;
+    }
+    sqlx::query(WRITER_RESET_SQL)
+        .bind(millis(limits.lock_attempt))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
 
 fn is_lock_timeout(e: &sqlx::Error) -> bool {
     // 55P03 lock_not_available: `lock_timeout` expired.
@@ -750,7 +838,8 @@ impl PgStore {
     ///    [pool contract](self#pool-contract)).
     /// 2. It then checks out a connection (a checkout waits at most what the
     ///    budget has left, even when the pool's acquire timeout is longer)
-    ///    and asks for the advisory lock with `lock_timeout = lock_attempt`,
+    ///    and asks for the tenant's row lock (`tenant_writer`, see
+    ///    [`lock_tenant_writer`]) with `lock_timeout = lock_attempt`,
     ///    less if the budget has less left. Another process or store handle
     ///    may hold it.
     /// 3. **Retry policy:** an attempt that times out rolls back, returning
@@ -797,22 +886,15 @@ impl PgStore {
                 let _ = tx.rollback().await;
                 return Err(writer_busy(self.tenant(), started.elapsed()));
             };
-            let locked = sqlx::query(WRITER_LOCK_SQL)
-                .bind(self.tenant())
-                .bind(millis(lock_timeout))
-                .bind(millis(limits.statement_timeout))
-                .bind(millis(limits.idle_in_transaction_timeout))
-                .bind(millis(limits.lock_attempt))
-                .execute(&mut *tx)
-                .await;
+            let locked = lock_tenant_writer(&mut tx, self.tenant(), lock_timeout, &limits).await;
             match locked {
                 // The deadline is checked last too: a writer never starts
                 // writing after its budget, however the wait was split.
-                Ok(_) if started.elapsed() > limits.wait_budget => {
+                Ok(()) if started.elapsed() > limits.wait_budget => {
                     let _ = tx.rollback().await;
                     return Err(writer_busy(self.tenant(), started.elapsed()));
                 }
-                Ok(_) => return Ok(WriteTx { tx, _slot: slot }),
+                Ok(()) => return Ok(WriteTx { tx, _slot: slot }),
                 Err(e) if is_lock_timeout(&e) => {
                     let _ = tx.rollback().await;
                     attempts += 1;
@@ -846,7 +928,40 @@ impl crate::Store {
         options: PostgresOptions,
     ) -> Result<Self> {
         // Every open of this tenant in this process shares one set of gates.
-        let shared = tenant_registry::tenant_state(tenant_registry::tenant_key(&pool, &tenant));
+        let key = tenant_registry::tenant_key(&pool, &tenant);
+        Self::open_postgres_keyed(pool, tenant, options, key).await
+    }
+
+    /// Test-only: [`Self::open_postgres`] as if from another process named
+    /// `process`: the store gets its own process-local gates (writer slot,
+    /// note lanes and the rest), shared only with opens for the same
+    /// `process`, so only the database orders its writes against other
+    /// opens of the tenant, as between two daemons.
+    ///
+    /// # Errors
+    /// As [`Self::open_postgres`].
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn open_postgres_as_process(
+        pool: PgPool,
+        tenant: TenantId,
+        options: PostgresOptions,
+        process: &str,
+    ) -> Result<Self> {
+        let key = format!(
+            "{}@process:{process}",
+            tenant_registry::tenant_key(&pool, &tenant)
+        );
+        Self::open_postgres_keyed(pool, tenant, options, key).await
+    }
+
+    async fn open_postgres_keyed(
+        pool: PgPool,
+        tenant: TenantId,
+        options: PostgresOptions,
+        key: String,
+    ) -> Result<Self> {
+        let shared = tenant_registry::tenant_state(key);
         let store = PgStore {
             pool,
             tenant,

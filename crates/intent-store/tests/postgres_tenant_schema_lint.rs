@@ -34,6 +34,10 @@ const SQLITE_BASELINE_LAST: u32 = 196;
 /// every query on them filters `tenant_id` from the btree primary key instead.
 const GIN_EXCEPTIONS: &[&str] = &["agent_message_search_tsv", "note_search_tsv"];
 
+/// Tables keyed by the tenant alone (`PRIMARY KEY (tenant_id)`): one row
+/// per tenant. Every other table's key leads with `tenant_id` and has more.
+const ONE_ROW_PER_TENANT: &[&str] = &["tenant_writer"];
+
 fn store_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
@@ -103,7 +107,8 @@ fn check_tables(file: &str, sql: &str, out: &mut Findings) -> usize {
     let mut from = 0;
     while let Some(pos) = upper[from..].find("CREATE TABLE ") {
         let start = from + pos;
-        let name = word_after(&sql[start..], "CREATE TABLE")
+        let name = word_after(&sql[start..], "CREATE TABLE IF NOT EXISTS")
+            .or_else(|| word_after(&sql[start..], "CREATE TABLE"))
             .unwrap_or("?")
             .to_owned();
         let open = start + sql[start..].find('(').expect("table body");
@@ -116,7 +121,9 @@ fn check_tables(file: &str, sql: &str, out: &mut Findings) -> usize {
                 &format!("table {name}: first column must be `tenant_id text NOT NULL`"),
             );
         }
-        if !body.contains("PRIMARY KEY (tenant_id,") {
+        let one_row_per_tenant =
+            ONE_ROW_PER_TENANT.contains(&name.as_str()) && body.contains("PRIMARY KEY (tenant_id)");
+        if !body.contains("PRIMARY KEY (tenant_id,") && !one_row_per_tenant {
             out.fail(
                 file,
                 &format!("table {name}: primary key must lead with tenant_id"),
@@ -406,4 +413,20 @@ fn the_text_search_rule_catches_custom_objects() {
     ] {
         assert!(!text_search_violations(bad).is_empty(), "{bad}");
     }
+}
+
+#[test]
+fn only_listed_tables_may_be_keyed_by_the_tenant_alone() {
+    let table = |name: &str| {
+        format!("CREATE TABLE IF NOT EXISTS {name} (\n    tenant_id text NOT NULL,\n    PRIMARY KEY (tenant_id)\n);\n")
+    };
+    let mut listed = Findings::default();
+    check_tables("x.sql", &table("tenant_writer"), &mut listed);
+    assert!(listed.0.is_empty(), "{:?}", listed.0);
+    let mut other = Findings::default();
+    check_tables("x.sql", &table("settings_cache"), &mut other);
+    assert_eq!(
+        other.0,
+        ["x.sql: table settings_cache: primary key must lead with tenant_id"]
+    );
 }

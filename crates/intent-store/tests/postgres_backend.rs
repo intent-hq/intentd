@@ -80,6 +80,10 @@ mod settings;
 mod usage_metrics;
 #[path = "postgres_backend/workspaces.rs"]
 mod workspaces;
+#[path = "postgres_backend/writer_lock.rs"]
+mod writer_lock;
+#[path = "support/writer_race.rs"]
+mod writer_race;
 
 use harness::{empty_db, exec, open, open_trapped, open_with, test_db, trapped_db};
 use intent_store::postgres::{self, TenantId};

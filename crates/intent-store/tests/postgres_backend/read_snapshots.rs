@@ -27,7 +27,7 @@ use intent_store::postgres::{PostgresOptions, TenantId};
 use intent_store::Store;
 use intentd_test_support::test_timeout;
 
-use crate::harness::{exec, open_trapped, trapped_db, TestDb};
+use crate::harness::{exec, hold_writer_lock, open_trapped, trapped_db, TestDb};
 
 const T0: &str = "2026-01-01T00:00:00.000Z";
 const WS: &str = "ws-snap";
@@ -632,12 +632,7 @@ async fn provisioning_waits_for_the_tenant_writer_lock() {
     };
     let tenant = "snap-provision-lock";
     // Another process holds the tenant's writer lock.
-    let mut holder = db.admin.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('intent-writer:' || $1, 0))")
-        .bind(tenant)
-        .execute(&mut *holder)
-        .await
-        .unwrap();
+    let holder = hold_writer_lock(&db.admin, tenant).await;
     let blocked = open_quick(&db, tenant, Duration::from_millis(400)).await;
     assert!(
         matches!(blocked, Err(Error::StoreBusy(_))),
