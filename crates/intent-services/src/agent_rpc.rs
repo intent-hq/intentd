@@ -403,37 +403,40 @@ impl Services {
         &self,
         proposal_id: &str,
         outcome: &str,
-    ) -> Result<()> {
-        let held = self.rpc_proposals.lock().contains_key(proposal_id);
-        if !held && !proposal_id.starts_with("rpc-") {
-            return Ok(());
+    ) -> Result<bool> {
+        let mut registry = self.rpc_proposals.lock();
+        let held = registry.get_mut(proposal_id);
+        if held.is_none() && !proposal_id.starts_with("rpc-") {
+            return Ok(false);
         }
         if outcome == intent_core::PROPOSAL_OUTCOME_APPLIED {
             return Err(Error::InvalidParams(
                 "rpc-call proposals are approved with agent.resolveRpcProposal".into(),
             ));
         }
-        if self
-            .rpc_proposals
-            .lock()
-            .get(proposal_id)
-            .is_some_and(|h| h.running)
-        {
+        let Some(held) = held else {
+            return Ok(false);
+        };
+        if held.running {
             return Err(Error::Conflict {
                 current: json!({ "proposalId": proposal_id, "state": "running" }),
             });
         }
-        Ok(())
+        // Claim the entry in the same critical section as the check, so a
+        // concurrent approval sees `running` until the dismissal settles.
+        held.running = true;
+        Ok(true)
     }
 
-    /// Drop the held calls of an `rpc-call` card once a plain
-    /// `agent.resolveProposal` dismissal is recorded (never before, so a
-    /// failed dismissal leaves the card approvable). A run in progress keeps
-    /// its entry.
-    pub(crate) fn drop_dismissed_rpc_proposal(&self, proposal_id: &str) {
+    /// Settle a dismissal claimed by [`Self::guard_plain_rpc_resolution`]:
+    /// drop the held calls once it is recorded, or release the claim when it
+    /// failed so the card stays approvable.
+    pub(crate) fn settle_dismissed_rpc_proposal(&self, proposal_id: &str, recorded: bool) {
         let mut registry = self.rpc_proposals.lock();
-        if registry.get(proposal_id).is_some_and(|h| !h.running) {
+        if recorded {
             registry.remove(proposal_id);
+        } else if let Some(held) = registry.get_mut(proposal_id) {
+            held.running = false;
         }
     }
 

@@ -31002,21 +31002,21 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
-            self.guard_plain_rpc_resolution(&proposal_id, &outcome)?;
+            let claimed = self.guard_plain_rpc_resolution(&proposal_id, &outcome)?;
             let resolved = self
                 .agent_resolve_proposal_op(
                     workspace_id,
                     agent_id,
                     proposal_id.clone(),
-                    outcome.clone(),
+                    outcome,
                     detail,
                     created_workspace_id,
                 )
-                .await?;
-            if outcome == intent_core::PROPOSAL_OUTCOME_DISMISSED {
-                self.drop_dismissed_rpc_proposal(&proposal_id);
+                .await;
+            if claimed {
+                self.settle_dismissed_rpc_proposal(&proposal_id, resolved.is_ok());
             }
-            Ok(resolved)
+            resolved
         })
     }
 
