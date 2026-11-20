@@ -425,7 +425,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
     );
     assert_eq!(
         listed["providerKinds"],
-        json!(["e2b", "northflank", "agent37"])
+        json!(["e2b", "northflank", "agent37", "vercel"])
     );
 
     let saved = ok(
