@@ -1938,6 +1938,39 @@ impl ScriptManager {
         // Wait out every `script.create` admitted before the mark: its new
         // id is committed and registered before the snapshot below.
         drop(self.locks.create_admission(workspace_id).write().await);
+        closing.unsettled = self
+            .stop_live_scripts(workspace_id, "cancelled by workspace deletion", false)
+            .await;
+        if let Some(park) = &self.parks.workspace_closed {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+        closing
+    }
+
+    /// The workspace was archived: stop every running script with
+    /// `script.stop` semantics (scripts.md "autoStart"), so nothing keeps
+    /// running and no was-running marker survives for boot to restore.
+    pub(crate) async fn stop_for_archive(&self, workspace_id: &WorkspaceId) {
+        let unsettled = self
+            .stop_live_scripts(workspace_id, "cancelled by workspace archive", true)
+            .await;
+        if !unsettled.is_empty() {
+            tracing::warn!(workspace = %workspace_id, ?unsettled, "scripts still live after workspace archive");
+        }
+    }
+
+    /// Stop each live or admitted script of `workspace_id` under its
+    /// definition lock; returns the ids still live or admitted after the
+    /// stop. With `while_archived` the loop ends once the row is no longer
+    /// archived, so an unarchive that wins the race keeps its scripts.
+    /// Best-effort: a failed stop is logged and the rest still stop.
+    async fn stop_live_scripts(
+        &self,
+        workspace_id: &WorkspaceId,
+        reason: &'static str,
+        while_archived: bool,
+    ) -> Vec<String> {
         let ids: Vec<String> = self
             .scripts
             .lock()
@@ -1946,41 +1979,42 @@ impl ScriptManager {
             .filter(|(ws, _)| ws == workspace_id)
             .map(|(_, id)| id.clone())
             .collect();
+        let mut unsettled = Vec::new();
         for id in ids {
             let lock = self.locks.definition_lock(&id);
             let _guard = lock.lock().await;
-            let running = self
-                .scripts
-                .lock()
-                .unwrap()
-                .get(&(workspace_id.clone(), id.clone()))
-                .is_some_and(|m| self.entry_is_live_or_admitted(m));
-            if !running {
+            let live = |mgr: &Self| {
+                mgr.scripts
+                    .lock()
+                    .unwrap()
+                    .get(&(workspace_id.clone(), id.clone()))
+                    .is_some_and(|m| mgr.entry_is_live_or_admitted(m))
+            };
+            if !live(self) {
                 continue;
             }
+            if while_archived
+                && !self
+                    .store
+                    .get_workspace(workspace_id)
+                    .await
+                    .is_ok_and(|row| row.archived)
+            {
+                break;
+            }
             if let Err(e) = self
-                .stop_inner_reason(workspace_id, &id, true, "cancelled by workspace deletion")
+                .stop_inner_reason(workspace_id, &id, true, reason)
                 .await
             {
-                tracing::warn!(workspace = %workspace_id, script = %id, error = %e, "script stop during workspace delete failed");
+                tracing::warn!(workspace = %workspace_id, script = %id, error = %e, reason, "workspace script stop failed");
             }
             // Still under this script's lock: a failed stop, or a result
             // that could not be persisted, leaves it live or admitted.
-            if self
-                .scripts
-                .lock()
-                .unwrap()
-                .get(&(workspace_id.clone(), id.clone()))
-                .is_some_and(|m| self.entry_is_live_or_admitted(m))
-            {
-                closing.unsettled.push(id);
+            if live(self) {
+                unsettled.push(id);
             }
         }
-        if let Some(park) = &self.parks.workspace_closed {
-            park.entered.notify_one();
-            park.release.notified().await;
-        }
-        closing
+        unsettled
     }
 
     /// `script.status`: the script's runtime state. Scoped to `workspace_id`.

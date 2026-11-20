@@ -950,6 +950,18 @@ pub trait RuntimePort: Send + Sync + 'static {
         Box::pin(async {})
     }
 
+    /// `workspace_id` was archived: stop each of its running scripts with
+    /// `script.stop` semantics while the row stays archived. A no-op by
+    /// default.
+    fn stop_archived_workspace_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (svc, workspace_id);
+        Box::pin(async {})
+    }
+
     /// Machine `node_id`'s link ended: every live machine run on it is lost
     /// with `reason` (`remote-script-lost: …`).
     fn machine_link_lost<'a>(

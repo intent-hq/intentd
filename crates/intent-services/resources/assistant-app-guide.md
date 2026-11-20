@@ -1185,8 +1185,9 @@ workspace.
 
 Scripts with **Start automatically** on (also set by agents, or under `scripts` in
 the repository's `.intent/config.json`) also start when workspace setup finishes
-(not after a failed setup script) and when the workspace is unarchived. Deleting
-workspaces start nothing, and a running script is not started twice.
+(not after a failed setup script) and when the workspace is unarchived, but not in
+a workspace being deleted. A running script is not started twice. Archiving a
+workspace stops all of its running scripts.
 
 To delete a saved script, open its **…** menu in the sidebar **Scripts** list or in
 the script panel and choose **Delete script**, or use **Delete script** beside its

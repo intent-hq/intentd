@@ -39354,6 +39354,13 @@ impl Services {
                 let cancelled_monitors = std::mem::take(&mut sweep.cancelled_monitors);
                 this.notify_owners_of_archived_watches(&id, cancelled_hooks, cancelled_monitors)
                     .await;
+                // Stop the workspace's running scripts (scripts.md
+                // "autoStart"): outside the fence, before the archive script,
+                // and only while the row is still archived.
+                this.ports
+                    .runtime()
+                    .stop_archived_workspace_scripts(&this, &id)
+                    .await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
                 // authoritative wire shape without a follow-up `workspace.get`,
                 // and persist it through the scoped monotonic write

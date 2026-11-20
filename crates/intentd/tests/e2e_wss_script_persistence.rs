@@ -1197,8 +1197,8 @@ fn create_auto_start_repo() -> tempfile::TempDir {
         repo_path.join(".intent/config.json"),
         json!({
             "scripts": [
-                { "name": "auto-svc", "command": "sleep 3600", "mode": "service", "autoStart": true },
-                { "name": "manual-svc", "command": "sleep 3600", "mode": "service" },
+                { "name": "auto-svc", "command": "tail -f /dev/null", "mode": "service", "autoStart": true },
+                { "name": "manual-svc", "command": "tail -f /dev/null", "mode": "service" },
             ]
         })
         .to_string(),
@@ -1248,6 +1248,7 @@ where
             "timed out awaiting script {name}, last list: {listed}"
         );
         id += 1;
+        // timing-guard: poll interval between script.list reads; the deadline above bounds the wait
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -1257,8 +1258,8 @@ fn is_live(status: &Value) -> bool {
 }
 
 /// `autoStart` means "runs while the workspace is active" for a local
-/// workspace: the service starts when the workspace's setup finishes, stays
-/// stopped after a user stop and an archive, and starts again on unarchive.
+/// workspace: the service starts when the workspace's setup finishes, archive
+/// stops every running script, and unarchive starts the autoStart one again.
 /// A saved service without `autoStart` never starts on its own.
 #[tokio::test]
 async fn auto_start_service_follows_local_workspace_lifecycle_over_wss() {
@@ -1297,16 +1298,20 @@ async fn auto_start_service_follows_local_workspace_lifecycle_over_wss() {
         "a service without autoStart stays idle: {manual}"
     );
 
-    // A user stop holds through archive: archive starts nothing.
-    let stopped = wss_rpc(
+    // Archive stops every running script, autoStart or not.
+    let manual_id = manual["id"].as_str().expect("script id").to_string();
+    let started = wss_rpc(
         &mut ws,
         2,
-        "script.stop",
-        json!({ "workspaceId": ws_id, "scriptId": auto_id }),
+        "script.start",
+        json!({ "workspaceId": ws_id, "scriptId": manual_id }),
     )
     .await;
-    assert_eq!(stopped["ok"], json!(true));
-    await_status(&mut ws, 400, &ws_id, &auto_id, |st| !is_live(&st["status"])).await;
+    assert_eq!(started["ok"], json!(true));
+    await_status(&mut ws, 400, &ws_id, &manual_id, |st| {
+        st["status"] == "running"
+    })
+    .await;
     let archived = wss_rpc(
         &mut ws,
         3,
@@ -1315,19 +1320,25 @@ async fn auto_start_service_follows_local_workspace_lifecycle_over_wss() {
     )
     .await;
     assert_eq!(archived["workspace"]["archived"], json!(true));
-    let st = wss_rpc(
-        &mut ws,
-        4,
-        "script.status",
-        json!({ "workspaceId": ws_id, "scriptId": auto_id }),
-    )
-    .await;
-    assert!(!is_live(&st["status"]), "archive starts nothing: {st}");
+    for (n, id) in [(4, &auto_id), (5, &manual_id)] {
+        let st = wss_rpc(
+            &mut ws,
+            n,
+            "script.status",
+            json!({ "workspaceId": ws_id, "scriptId": id }),
+        )
+        .await;
+        assert!(!is_live(&st["status"]), "archive stopped {id}: {st}");
+        assert!(
+            st.get("previouslyRunning").is_none(),
+            "no was-running marker for boot to restore: {st}"
+        );
+    }
 
-    // Unarchive: the workspace is active again, so the service runs.
+    // Unarchive: the workspace is active again, so only autoStart runs.
     let unarchived = wss_rpc(
         &mut ws,
-        5,
+        6,
         "workspace.unarchive",
         json!({ "workspaceId": ws_id }),
     )
@@ -1338,14 +1349,14 @@ async fn auto_start_service_follows_local_workspace_lifecycle_over_wss() {
     })
     .await;
     let manual = await_listed(&mut ws, 800, &ws_id, "manual-svc", |_| true).await;
-    assert_eq!(
-        manual["runtime"]["status"], "idle",
+    assert!(
+        !is_live(&manual["runtime"]["status"]),
         "unarchive starts only autoStart scripts: {manual}"
     );
 
     let _ = wss_rpc(
         &mut ws,
-        6,
+        7,
         "script.stop",
         json!({ "workspaceId": ws_id, "scriptId": auto_id }),
     )

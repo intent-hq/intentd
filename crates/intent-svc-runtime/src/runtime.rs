@@ -291,6 +291,15 @@ impl RuntimePort for RuntimeFeature {
         })
     }
 
+    fn stop_archived_workspace_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a intent_core::WorkspaceId,
+    ) -> BoxFuture<'a, ()> {
+        let mgr = svc.script_manager();
+        Box::pin(async move { mgr.stop_for_archive(workspace_id).await })
+    }
+
     fn machine_link_lost<'a>(
         &'a self,
         svc: &'a Services,
