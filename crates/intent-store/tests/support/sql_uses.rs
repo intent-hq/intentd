@@ -585,6 +585,8 @@ struct FnFacts {
     returns: Vec<Expr>,
     /// Parameters that hold a `WriteTx`.
     tx_params: BTreeSet<String>,
+    /// Parameters of a pool type (`PgPool`, `Pool<..>`).
+    pool_params: BTreeSet<String>,
     /// Where the function first holds the writer lock: a `WriteTx`
     /// parameter (the start), a typed `WriteTx` binding or `begin_write()`.
     lock_from: Option<Pos>,
@@ -1046,6 +1048,12 @@ impl Index {
             return;
         };
         let r = repeated || self.in_loop(at, used_at, None);
+        // A pool parameter no indexed caller passes is a pool of its own.
+        if facts.pool_params.contains(&name) && self.callers(at).next().is_none() {
+            let key = ((TxKind::Pool, at, Pos::default()), via);
+            *out.entry(key).or_default() |= r;
+            return;
+        }
         for call in self.callers(at) {
             let arg_at = if !call.method && facts.has_self {
                 index + 1
@@ -2126,6 +2134,19 @@ fn is_write_tx(ty: &Type) -> bool {
     }
 }
 
+/// Whether `ty` is a pool, through references: `PgPool` or `Pool<..>`.
+fn is_pool_type(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(r) => is_pool_type(&r.elem),
+        Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "PgPool" || s.ident == "Pool"),
+        _ => false,
+    }
+}
+
 fn is_integer_type(ty: &Type) -> bool {
     match ty {
         Type::Path(p) => p
@@ -2335,6 +2356,9 @@ impl Items<'_> {
                         if is_integer_type(&t.ty) {
                             facts.integers.insert(n.clone());
                         }
+                        if is_pool_type(&t.ty) {
+                            facts.pool_params.insert(n.clone());
+                        }
                     }
                     facts.params.push(name);
                 }
@@ -2459,13 +2483,29 @@ impl Body<'_> {
 
     fn bind(&mut self, name: String, pos: Pos, is_let: bool, binding: Binding) {
         let tx = matches!(&binding, Binding::Value(v) if is_begin_write(v));
-        let scope = self.scopes.last().copied().unwrap_or((
+        let whole = (
             Pos::default(),
             Pos {
                 line: usize::MAX,
                 column: usize::MAX,
             },
-        ));
+        );
+        let here = self.scopes.last().copied().unwrap_or(whole);
+        // An assignment updates the binding it assigns to, in that one's
+        // block, not the block the assignment sits in.
+        let scope = if is_let {
+            here
+        } else {
+            self.index.fns[self.id]
+                .locals
+                .get(&name)
+                .and_then(|ls| {
+                    ls.iter()
+                        .rev()
+                        .find(|l| l.is_let && l.pos < pos && l.scope.0 <= pos && pos <= l.scope.1)
+                })
+                .map_or(here, |l| l.scope)
+        };
         self.facts().locals.entry(name).or_default().push(Local {
             pos,
             is_let,

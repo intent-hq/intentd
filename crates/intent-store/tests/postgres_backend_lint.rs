@@ -2341,6 +2341,18 @@ fn review_shapes_of_rule5_are_caught() {
          let mut run = || {q}.fetch_all(&mut *tx); for i in v {{ run().await; }} }}"
     );
     assert_eq!(reads(&closure_loop), ["x.rs f"]);
+    // An assignment in an inner block keeps the outer binding's scope.
+    let inner_assign = format!(
+        "async fn f(&self) {{ let mut tx = self.begin_read_snapshot().await?;
+         {{ tx = self.begin().await?; }}
+         {q}.fetch_all(&mut *tx).await; {q}.fetch_all(&mut *tx).await; }}"
+    );
+    assert_eq!(reads(&inner_assign), ["x.rs f"]);
+    // A pool-typed parameter no indexed caller passes is a pool itself.
+    let pool_param = format!(
+        "async fn f(pool: &PgPool) {{ {q}.fetch_all(pool).await; {q}.fetch_all(pool).await; }}"
+    );
+    assert_eq!(reads(&pool_param), ["x.rs f"]);
     // Pools by clone and by a `read_pool` field.
     assert_eq!(reads(&two("let p = self.pool.clone();", "&p")), ["x.rs f"]);
     assert_eq!(reads(&two("", "&self.read_pool")), ["x.rs f"]);
