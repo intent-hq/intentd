@@ -79,6 +79,45 @@ const GATE_CODE: &str = r"
     return { rpcGate: true, type: typeof ws.rpc, raw };
 ";
 
+/// Phase 3 parity: the bindings `ws.rpc` replaced, as an Assistant sub-agent
+/// (which keeps them) still calls them.
+const PARITY_OLD_CODE: &str = r"
+    const listed = await ws.app.workspaces.list();
+    const id = listed.find(w => w.title === 'RPC parity').id;
+    const got = await ws.app.workspaces.get(id);
+    const settings = await ws.app.settings.list({ includeValues: false });
+    const specialists = await ws.app.specialists.list();
+    const one = await ws.app.specialists.get(specialists[0].id);
+    const mcp = await ws.app.mcp.listServers();
+    return { parityOld: true, id, title: got.title, settings: settings.length,
+        specialists: specialists.map(s => s.id).sort(), one: one.id,
+        mcp: (mcp.servers || []).length, crossWorkspace: typeof ws.crossWorkspace.listSiblings };
+";
+
+/// The same reads through `ws.rpc` as the top-level Assistant, plus the
+/// stubs that now stand in for the replaced bindings.
+const PARITY_NEW_CODE: &str = r"
+    const listed = await ws.rpc.call('workspace.list', {});
+    const id = listed.result.workspaces.find(w => w.title === 'RPC parity').id;
+    const got = await ws.rpc.call('workspace.get', { workspaceId: id });
+    const settings = await ws.rpc.call('settings.list');
+    const specialists = await ws.rpc.call('specialist.list');
+    const one = await ws.rpc.call('specialist.get', { id: specialists.result.specialists[0].id });
+    const mcp = await ws.rpc.call('mcp.servers.list');
+    const stubs = {};
+    for (const path of ['app.workspaces.get', 'app.workspaces.bulkArchive', 'app.settings.list',
+                        'app.specialists.get', 'app.mcp.listServers', 'crossWorkspace.search']) {
+        const parts = path.split('.');
+        const fn = parts.slice(0, -1).reduce((o, k) => o[k], ws)[parts[parts.length - 1]];
+        stubs[path] = await Promise.resolve().then(() => fn('x')).then(() => 'ran', e => String(e));
+    }
+    const workspace = got.result.workspace || got.result;
+    const specialist = one.result.specialist || one.result;
+    return { parityNew: true, id, title: workspace.title, settings: settings.result.settings.length,
+        specialists: specialists.result.specialists.map(s => s.id).sort(), one: specialist.id,
+        mcp: mcp.result.servers.length, stubs, kept: typeof ws.app.workspaces.list };
+";
+
 async fn start(data_dir: &Path) -> (Daemon, Ws) {
     let script = gate("Assistant ws.rpc").expect("mock ACP agent");
     let rule = |keyword: &str, code: &str| {
@@ -99,6 +138,8 @@ async fn start(data_dir: &Path) -> (Daemon, Ws) {
             rule("RPC_BATCH", BATCH_CODE),
             rule("RPC_SINGLE", SINGLE_CODE),
             rule("RPC_GATE", GATE_CODE),
+            rule("RPC_PARITY_OLD", PARITY_OLD_CODE),
+            rule("RPC_PARITY_NEW", PARITY_NEW_CODE),
         ],
     })
     .to_string();
@@ -499,4 +540,54 @@ async fn assistant_rpc_is_top_level_assistant_only_over_wss() {
     .await;
     assert_eq!(probe["type"], "object", "{probe}");
     assert_eq!(probe["raw"]["ok"]["ok"], true, "{probe}");
+}
+
+#[tokio::test]
+async fn assistant_rpc_replaces_the_older_bindings_over_wss() {
+    if gate("Assistant ws.rpc parity").is_none() {
+        return;
+    }
+    let data_dir = temp_data_dir();
+    let (_daemon, mut ws) = start(data_dir.path()).await;
+    create_workspace(&mut ws, 1, "RPC parity").await;
+    let helper = create_agent(&mut ws, 2, CHIEF_WORKSPACE_ID, "Assistant helper", true).await;
+    let top = create_agent(&mut ws, 3, CHIEF_WORKSPACE_ID, "Assistant", false).await;
+
+    let old = run_tool(
+        &mut ws,
+        100,
+        CHIEF_WORKSPACE_ID,
+        &helper,
+        "RPC_PARITY_OLD",
+        "parityOld",
+    )
+    .await;
+    let new = run_tool(
+        &mut ws,
+        1000,
+        CHIEF_WORKSPACE_ID,
+        &top,
+        "RPC_PARITY_NEW",
+        "parityNew",
+    )
+    .await;
+    for field in ["id", "title", "settings", "specialists", "one", "mcp"] {
+        assert_eq!(old[field], new[field], "{field}: {old} vs {new}");
+    }
+    assert_eq!(old["title"], "RPC parity", "{old}");
+    assert_eq!(
+        old["crossWorkspace"], "function",
+        "sub-agents keep ws.crossWorkspace: {old}"
+    );
+    assert_eq!(
+        new["kept"], "function",
+        "ws.app.workspaces.list stays: {new}"
+    );
+    for (path, stub) in new["stubs"].as_object().expect("stubs") {
+        let stub = stub.as_str().unwrap_or_default();
+        assert!(
+            stub.contains(&format!("ws.{path} is retired for the Assistant: use ")),
+            "{path}: {stub}"
+        );
+    }
 }

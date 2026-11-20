@@ -1105,6 +1105,19 @@ pub fn plain_folder_description(desc: &str) -> String {
     out
 }
 
+/// Surviving top-level Assistant doc lines that name a binding `ws.rpc`
+/// replaced (`bindings::rpc::REPLACED_BY_RPC`).
+const ASSISTANT_RPC_XREF_REWRITES: &[(&str, &str)] = &[
+    (
+        "Read listServers first,",
+        "Read it with `ws.rpc.call(\"mcp.servers.list\")` first,",
+    ),
+    (
+        "`ws.crossWorkspace.search` covers the other workspaces.",
+        "`ws.app.workspaces.search` covers the other workspaces.",
+    ),
+];
+
 pub(crate) fn workspace_api_description_for_bridge(
     is_chief: bool,
     features: &AgentFeaturesSettings,
@@ -1112,7 +1125,14 @@ pub(crate) fn workspace_api_description_for_bridge(
 ) -> Cow<'static, str> {
     let base = workspace_api_description(is_chief, features);
     if !is_sub_agent {
-        return base;
+        if !is_chief {
+            return base;
+        }
+        let mut out = prune_doc_lines(&base, super::bindings::rpc::documents_replaced_binding);
+        for (from, to) in ASSISTANT_RPC_XREF_REWRITES {
+            out = out.replace(from, to);
+        }
+        return Cow::Owned(out);
     }
     Cow::Owned(
         base.lines()

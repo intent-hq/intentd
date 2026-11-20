@@ -186,17 +186,24 @@ async fn assistant_mcp_configuration_roundtrip_over_wss() {
     ]);
     let code = format!(
         r"
-        const before = await ws.app.mcp.listServers();
+        const rpcResult = async (method, params) => {{
+            const reply = await ws.rpc.call(method, params);
+            if (!reply.ok) throw new Error(JSON.stringify(reply.error));
+            return reply.result;
+        }};
+        const listServers = () => rpcResult('mcp.servers.list', {{}});
+        const getServerStatus = (serverId) => rpcResult('mcp.servers.getStatus', {{ serverId }});
+        const before = await listServers();
         const created = await ws.app.mcp.createServer({config});
-        const listed = await ws.app.mcp.listServers();
+        const listed = await listServers();
         const config = JSON.parse(JSON.stringify(listed.servers.find(s => s.id === created.server.id)));
         config.name = 'Assistant fixture updated';
         config.headers['X-Replace'] = {replacement};
         delete config.env.DROP_ME;
         const updated = await ws.app.mcp.updateServer(config.id, config);
-        const running = await ws.app.mcp.getServerStatus(config.id);
+        const running = await getServerStatus(config.id);
         const disabled = await ws.app.mcp.setServerEnabled(config.id, false);
-        const disabledList = await ws.app.mcp.listServers();
+        const disabledList = await listServers();
         const enabled = await ws.app.mcp.setServerEnabled(config.id, true);
         const stopped = await ws.app.mcp.setServerEnabled(config.id, false);
         const savedDisabled = await ws.app.mcp.createServer({{
@@ -204,22 +211,22 @@ async fn assistant_mcp_configuration_roundtrip_over_wss() {
             transport: 'http', url: {url}, enabled: false,
         }});
         const stdioCreated = await ws.app.mcp.createServer({stdio_config});
-        const workingStdio = (await ws.app.mcp.listServers()).servers.find(s => s.id === stdioCreated.server.id);
+        const workingStdio = (await listServers()).servers.find(s => s.id === stdioCreated.server.id);
         const spawnFailed = await ws.app.mcp.updateServer(workingStdio.id, {{
             ...workingStdio, command: {missing_command},
         }});
-        const spawnStatus = await ws.app.mcp.getServerStatus(workingStdio.id);
+        const spawnStatus = await getServerStatus(workingStdio.id);
         const handshakeFailed = await ws.app.mcp.updateServer(workingStdio.id, {{
             ...workingStdio, args: {rejecting_args},
         }});
-        const handshakeStatus = await ws.app.mcp.getServerStatus(workingStdio.id);
+        const handshakeStatus = await getServerStatus(workingStdio.id);
         const stdioRecovered = await ws.app.mcp.updateServer(workingStdio.id, workingStdio);
-        const recoveredStatus = await ws.app.mcp.getServerStatus(workingStdio.id);
+        const recoveredStatus = await getServerStatus(workingStdio.id);
         const stdioStopped = await ws.app.mcp.setServerEnabled(stdioCreated.server.id, false);
-        const stdioConfig = (await ws.app.mcp.listServers()).servers.find(s => s.id === stdioCreated.server.id);
+        const stdioConfig = (await listServers()).servers.find(s => s.id === stdioCreated.server.id);
         stdioConfig.name = 'Updated while disabled';
         const stdioUpdated = await ws.app.mcp.updateServer(stdioConfig.id, stdioConfig);
-        const finalList = await ws.app.mcp.listServers();
+        const finalList = await listServers();
         return {{ mcpConfiguration: true, before, created, listed, updated,
             running, disabled, disabledList, enabled, stopped, savedDisabled,
             stdioCreated, spawnFailed, spawnStatus, handshakeFailed, handshakeStatus,

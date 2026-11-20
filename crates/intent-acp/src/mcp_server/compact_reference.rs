@@ -336,6 +336,7 @@ impl CompactReference {
             .iter()
             .flat_map(|desc| namespaces_of(desc))
             .filter(|ns| !CHIEF_OMITTED_NAMESPACES.contains(&ns.key))
+            .filter(|ns| inputs.is_sub_agent || ns.key != "crossWorkspace")
         {
             match namespaces.iter_mut().find(|ns| ns.key == extra.key) {
                 Some(ns) => {

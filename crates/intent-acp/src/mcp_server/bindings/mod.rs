@@ -173,6 +173,7 @@ pub fn prelude_for_workspace(
         prelude.push_str(app::chats::PRELUDE);
         if !is_sub_agent {
             prelude.push_str(rpc::PRELUDE);
+            prelude.push_str(&rpc::replaced_prelude());
         }
     }
     prelude.push_str(suggest::guard_prelude());
