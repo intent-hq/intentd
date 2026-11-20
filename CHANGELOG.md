@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.255] - 2026-11-20
+
+### 🚀 Features
+
+- *(specialists)* Rename Maintenance Coordinator to Maintainer (harness 3.15) ([#3553](https://github.com/intent-hq/intentd/pull/3553))
+- *(scripts)* Restart running and autoStart services after a daemon restart ([#3549](https://github.com/intent-hq/intentd/pull/3549))
+- *(services)* Finish pending Postgres deletes on startup ([#3551](https://github.com/intent-hq/intentd/pull/3551))
+- *(scripts)* Run autoStart scripts while a local workspace is active ([#3558](https://github.com/intent-hq/intentd/pull/3558))
+
+### 📚 Documentation
+
+- *(guide)* Describe Delete removing local folders from the Home sidebar ([#3544](https://github.com/intent-hq/intentd/pull/3544))
+- *(browser)* Document listTools and callTool WebMCP actions ([#3546](https://github.com/intent-hq/intentd/pull/3546))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(store-postgres)* Run Postgres store tests under nextest with a per-test timeout ([#3548](https://github.com/intent-hq/intentd/pull/3548))
+
+
 ## [0.11.254] - 2026-11-19
 
 ### 🐛 Bug Fixes
