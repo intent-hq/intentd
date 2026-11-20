@@ -2,6 +2,7 @@
 //! served only for a top-level agent in the Assistant workspace; the services
 //! layer re-checks the workspace and holds mutating calls for approval.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use intent_core::agent_rpc::{AgentRpcCallSpec, AgentRpcRequest};
@@ -20,6 +21,77 @@ pub(crate) const PRELUDE: &str = r"
         batch: (calls, opts) => host({ method: 'rpc.batch', args: { ...(opts || {}), calls } }),
     };
 ";
+
+/// Older Assistant bindings that `ws.rpc` fully replaces, with the call to
+/// use instead. The top-level Assistant gets a stub for each that throws the
+/// pointer, and its docs omit them; sub-agents (no `ws.rpc`) keep them.
+/// Bindings the versioned Assistant prompts teach, whose results have no RPC
+/// equivalent (`workspaces.list` / `search`, the slim `agents.*` and `chats.*`
+/// reads), or whose cards do more than an RPC card (archive / delete show
+/// titles, allow deselecting and continue past a failure), stay.
+pub(crate) const REPLACED_BY_RPC: &[(&str, &str)] = &[
+    (
+        "app.workspaces.get",
+        r#"ws.rpc.call("workspace.get", { workspaceId })"#,
+    ),
+    ("app.mcp.listServers", r#"ws.rpc.call("mcp.servers.list")"#),
+    (
+        "app.mcp.getServerStatus",
+        r#"ws.rpc.call("mcp.servers.getStatus", { serverId })"#,
+    ),
+    ("app.settings.list", r#"ws.rpc.call("settings.list")"#),
+    (
+        "app.settings.get",
+        r#"ws.rpc.call("settings.get", { path })"#,
+    ),
+    ("app.specialists.list", r#"ws.rpc.call("specialist.list")"#),
+    (
+        "app.specialists.get",
+        r#"ws.rpc.call("specialist.get", { id })"#,
+    ),
+    (
+        "crossWorkspace.listSiblings",
+        "ws.app.workspaces.list() (ws.crossWorkspace is repo-scoped)",
+    ),
+    (
+        "crossWorkspace.listNotes",
+        r#"ws.rpc.call("note.list", { workspaceId })"#,
+    ),
+    (
+        "crossWorkspace.readNote",
+        r#"ws.rpc.call("note.get", { workspaceId, noteId })"#,
+    ),
+    ("crossWorkspace.search", "ws.app.workspaces.search(query)"),
+];
+
+/// Whether a `ws.*` doc line documents a [`REPLACED_BY_RPC`] binding (or the
+/// `ws.crossWorkspace` index entry).
+pub(crate) fn documents_replaced_binding(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("ws.") else {
+        return false;
+    };
+    rest.starts_with("crossWorkspace.")
+        || REPLACED_BY_RPC
+            .iter()
+            .any(|(path, _)| rest.strip_prefix(path).is_some_and(|r| r.starts_with('(')))
+}
+
+/// JS run after every namespace prelude for the top-level Assistant: each
+/// replaced binding becomes a stub that throws its `ws.rpc` pointer.
+pub(crate) fn replaced_prelude() -> String {
+    let mut js =
+        String::from("\n    globalThis.ws = globalThis.ws || {};\n    ws.crossWorkspace = {};\n");
+    for (path, use_instead) in REPLACED_BY_RPC {
+        let (ns, name) = path.rsplit_once('.').unwrap_or(("", path));
+        let message = format!("ws.{path} is retired for the Assistant: use {use_instead}");
+        let _ = writeln!(
+            js,
+            "    if (ws.{ns}) ws.{ns}.{name} = async () => {{ throw new Error({}); }};",
+            Value::String(message)
+        );
+    }
+    js
+}
 
 /// Refusal for a frame from outside the Assistant's top-level bridge.
 pub(crate) const RPC_ASSISTANT_ONLY: &str =
@@ -115,4 +187,80 @@ async fn call(
     )
     .await
     .map_err(map_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::tools::workspace_api_description_for_bridge;
+    use super::*;
+    use intent_core::settings_file::AgentFeaturesSettings;
+
+    fn doc_lines(is_sub_agent: bool) -> Vec<String> {
+        workspace_api_description_for_bridge(true, &AgentFeaturesSettings::default(), is_sub_agent)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn every_replaced_binding_is_documented_and_hidden_only_from_the_top_level_assistant() {
+        let sub = doc_lines(true);
+        let top = doc_lines(false);
+        for (path, _) in REPLACED_BY_RPC {
+            let line = format!("  ws.{path}(");
+            assert!(
+                sub.iter().any(|l| l.starts_with(&line)),
+                "{path} undocumented"
+            );
+            assert!(
+                !top.iter().any(|l| l.starts_with(&line)),
+                "{path} still shown"
+            );
+        }
+        let top = top.join("\n");
+        assert!(!top.contains("ws.crossWorkspace"), "{top}");
+        assert!(!top.contains("listServers first"), "{top}");
+        assert!(top.contains("  ws.app.workspaces.list("));
+        assert!(top.contains("  ws.app.agents.readConversation("));
+    }
+
+    #[test]
+    fn only_the_assistant_agent_bridge_gets_the_stubs() {
+        let features = AgentFeaturesSettings::default();
+        let chief = WorkspaceId::chief();
+        let marker = "is retired for the Assistant";
+        assert!(
+            super::super::prelude_for_agent_bridge(&features, false, &chief, false)
+                .contains(marker)
+        );
+        for (is_sub_agent, workspace) in [(true, &chief), (false, &WorkspaceId::new())] {
+            assert!(!super::super::prelude_for_agent_bridge(
+                &features,
+                is_sub_agent,
+                workspace,
+                false
+            )
+            .contains(marker));
+        }
+        // Hooks load this prelude; their saved code keeps the older bindings.
+        assert!(
+            !super::super::prelude_for_workspace(&features, false, &chief, false).contains(marker)
+        );
+    }
+
+    #[test]
+    fn each_stub_throws_its_pointer() {
+        let js = replaced_prelude();
+        for (path, use_instead) in REPLACED_BY_RPC {
+            let (ns, name) = path.rsplit_once('.').expect("namespaced path");
+            assert!(
+                js.contains(&format!("ws.{ns}.{name} = async () =>")),
+                "{path}"
+            );
+            let message = Value::String(format!(
+                "ws.{path} is retired for the Assistant: use {use_instead}"
+            ));
+            assert!(js.contains(&message.to_string()), "{path}");
+        }
+    }
 }

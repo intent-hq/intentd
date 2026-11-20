@@ -118,12 +118,15 @@ fn unavailable_stubs_still_refuse() {
 /// Installed for listing but out of the map: the stubs above; on a
 /// non-Assistant bridge the `ws.app.*` management bindings, whose dispatch
 /// refuses outside the Assistant workspace (`ws.app.question` is the
-/// exception); and on the Assistant the namespaces its docs omit.
+/// exception); and on the Assistant the namespaces its docs omit and the
+/// bindings `ws.rpc` replaced (stubs on its own bridge).
 fn listed(path: &str, is_chief: bool) -> bool {
     let namespace = path.split('.').next().unwrap_or_default();
     !UNAVAILABLE_STUBS.contains(&path)
         && (is_chief || !path.starts_with("app.") || path.starts_with("app.question."))
         && !(is_chief && CHIEF_OMITTED_NAMESPACES.contains(&namespace))
+        && !(is_chief
+            && crate::mcp_server::bindings::rpc::documents_replaced_binding(&format!("ws.{path}(")))
 }
 
 /// The drift test (brief M1): the map names every installed binding and

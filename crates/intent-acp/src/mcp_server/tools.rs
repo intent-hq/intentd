@@ -1105,6 +1105,19 @@ pub fn plain_folder_description(desc: &str) -> String {
     out
 }
 
+/// Surviving top-level Assistant doc lines that name a binding `ws.rpc`
+/// replaced (`bindings::rpc::REPLACED_BY_RPC`).
+const ASSISTANT_RPC_XREF_REWRITES: &[(&str, &str)] = &[
+    (
+        "Read listServers first,",
+        "Read it with `ws.rpc.call(\"mcp.servers.list\")` first,",
+    ),
+    (
+        "`ws.crossWorkspace.search` covers the other workspaces.",
+        "`ws.app.workspaces.search` covers the other workspaces.",
+    ),
+];
+
 pub(crate) fn workspace_api_description_for_bridge(
     is_chief: bool,
     features: &AgentFeaturesSettings,
@@ -1112,7 +1125,14 @@ pub(crate) fn workspace_api_description_for_bridge(
 ) -> Cow<'static, str> {
     let base = workspace_api_description(is_chief, features);
     if !is_sub_agent {
-        return base;
+        if !is_chief {
+            return base;
+        }
+        let mut out = prune_doc_lines(&base, super::bindings::rpc::documents_replaced_binding);
+        for (from, to) in ASSISTANT_RPC_XREF_REWRITES {
+            out = out.replace(from, to);
+        }
+        return Cow::Owned(out);
     }
     Cow::Owned(
         base.lines()
@@ -2863,10 +2883,11 @@ mod tests {
     #[test]
     fn help_namespace_returns_verbatim_doc_segments() {
         let features = all_gates_open();
-        for (is_chief, desc) in [
-            (false, WORKSPACE_API_DESCRIPTION),
-            (true, WORKSPACE_API_DESCRIPTION_CHIEF),
-        ] {
+        for is_chief in [false, true] {
+            // The top-level Assistant's help is cut from its bridge docs,
+            // which drop the bindings `ws.rpc` replaced.
+            let bridge = super::workspace_api_description_for_bridge(is_chief, &features, false);
+            let desc: &str = &bridge;
             for ns in index_namespaces(desc) {
                 let docs = help_namespace(is_chief, &features, false, &ns)
                     .unwrap_or_else(|e| panic!("chief={is_chief}: help({ns}) errored: {e}"));
@@ -3974,13 +3995,15 @@ const run = async (s, out) => {{
         let features = all_gates_open();
         for is_chief in [false, true] {
             let got = workspace_api_description_with_model_options(is_chief, &features, &[], false);
+            // The top-level Assistant's docs drop the bindings `ws.rpc`
+            // replaced, so only the project variant stays borrowed.
             assert!(
-                matches!(got, Cow::Borrowed(_)),
+                is_chief || matches!(got, Cow::Borrowed(_)),
                 "no options must not reassemble"
             );
             assert_eq!(
                 &*got,
-                &*workspace_api_description(is_chief, &features),
+                &*super::workspace_api_description_for_bridge(is_chief, &features, false),
                 "chief={is_chief}: empty options changed the description"
             );
         }

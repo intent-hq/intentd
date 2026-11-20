@@ -17178,7 +17178,7 @@ mod mcp_callback {
 
         let code = format!(
             r#"
-            const r = await ws.app.workspaces.bulkDelete(["{}", "{}"]);
+            const r = await host({{ method: "app.workspaces.bulkDelete", args: {{ ids: ["{}", "{}"] }} }});
             return {{ ok: r.ok }};
         "#,
             ws1.0, ws2.0
