@@ -397,7 +397,7 @@ impl Services {
     }
 
     /// Guard for plain `agent.resolveProposal` on an `rpc-call` card: it may
-    /// only be dismissed there (dropping the held calls); applying it would
+    /// only be dismissed there (the caller then drops the held calls); applying it would
     /// record "applied" with nothing run.
     pub(crate) fn guard_plain_rpc_resolution(
         &self,
@@ -413,14 +413,28 @@ impl Services {
                 "rpc-call proposals are approved with agent.resolveRpcProposal".into(),
             ));
         }
-        let mut registry = self.rpc_proposals.lock();
-        if registry.get(proposal_id).is_some_and(|h| h.running) {
+        if self
+            .rpc_proposals
+            .lock()
+            .get(proposal_id)
+            .is_some_and(|h| h.running)
+        {
             return Err(Error::Conflict {
                 current: json!({ "proposalId": proposal_id, "state": "running" }),
             });
         }
-        registry.remove(proposal_id);
         Ok(())
+    }
+
+    /// Drop the held calls of an `rpc-call` card once a plain
+    /// `agent.resolveProposal` dismissal is recorded (never before, so a
+    /// failed dismissal leaves the card approvable). A run in progress keeps
+    /// its entry.
+    pub(crate) fn drop_dismissed_rpc_proposal(&self, proposal_id: &str) {
+        let mut registry = self.rpc_proposals.lock();
+        if registry.get(proposal_id).is_some_and(|h| !h.running) {
+            registry.remove(proposal_id);
+        }
     }
 
     /// `agent.resolveRpcProposal` (owner only).
