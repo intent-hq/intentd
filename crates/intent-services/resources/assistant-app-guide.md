@@ -440,15 +440,16 @@ custom specialist instructions can override the defaults.
 
 **Secret requests.** Off by default. Open **Agent defaults**
 (`/settings?tab=agent-behavior#global-instructions`), expand **Advanced** if it is shown,
-and turn on **Secret requests** under **Agent features**; **Host command execution**
-must also be on. It applies to top-level workspace agents created afterwards, not to
-sub-agents, background hooks or Assistant chat. When such an agent asks for a secret such as an API key, a masked
-card appears above the message box after its turn ends; **Hide** collapses it to a
-"Secret requested" chip, and the user can provide or dismiss it. The value is not
-put in the chat: Intent holds it in daemon memory and passes it only to that agent's
-`ws.host.exec` commands that name it, redacting exact copies from their output. It is
-dropped when the daemon restarts, the agent is deleted or retired, or its workspace
-is archived; the agent then has to ask again.
+and turn on **Secret requests**, directly under **Host command execution** in **Agent
+features**; it stays off and unavailable while Host command execution is off. It applies
+to top-level workspace agents created afterwards, not to sub-agents, background hooks or
+Assistant chat. When such an agent asks for a secret such as an API key, a masked card
+appears above the message box after its turn ends; **Hide** collapses it to a "Secret
+requested" chip without losing a typed value, and the user can provide or dismiss it. The
+value is not put in the chat: Intent holds it in daemon memory and passes it only to that
+agent's `ws.host.exec` commands that name it, redacting exact copies from their output. It
+is dropped when the daemon restarts, the agent is deleted or retired, or its workspace is
+archived; the agent then has to ask again.
 
 **Disable a provider.** In **Settings → Providers**, choose **Disable** from its
 ⋯ menu, including for the default provider or one used by saved models or
