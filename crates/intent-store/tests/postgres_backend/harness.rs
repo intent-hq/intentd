@@ -46,6 +46,8 @@ pub async fn exec(pool: &PgPool, sql: String) {
 pub struct TestDb {
     pub admin: PgPool,
     pub app: PgPool,
+    /// The database's URL, as the admin connects to it.
+    pub url: String,
 }
 
 pub async fn test_db(rls_guard: bool) -> Option<TestDb> {
@@ -125,10 +127,14 @@ async fn finish_test_db(url: String, admin: PgPool, rls_guard: bool) -> Option<T
                 Ok(())
             })
         })
-        .connect(&url)
+        // Vanilla Postgres ignores Neki's single-shard mode; on, the suite
+        // proves every store transaction still runs under it.
+        .connect_with(postgres::single_shard_options(
+            postgres::connect_options(&url).expect("parse the test url"),
+        ))
         .await
         .expect("connect app pool");
-    Some(TestDb { admin, app })
+    Some(TestDb { admin, app, url })
 }
 
 fn with_database(url: &str, name: &str) -> String {
@@ -294,9 +300,6 @@ pub async fn open_with(db: &TestDb, tenant: &str, rls_guard: bool) -> Store {
         TenantId::new(tenant).unwrap(),
         PostgresOptions {
             rls_guard,
-            // Vanilla Postgres ignores the guard; on, the suite proves every
-            // transaction still runs with it.
-            single_shard: true,
             ..PostgresOptions::default()
         },
     )
@@ -486,14 +489,15 @@ pub async fn hold_writer_lock(
     tx
 }
 
-/// Sessions of `admin`'s database waiting for a lock (here: a writer
-/// waiting for a tenant's `tenant_writer` row), as `(pid, xact_start)`.
+/// Sessions of `admin`'s database waiting for a tenant's `tenant_writer`
+/// row lock, as `(pid, xact_start)`.
 /// `pg_stat_activity` spans the server, where other tests run in their own
 /// databases.
 pub async fn writer_lock_waiters(admin: &PgPool) -> Vec<(i32, String)> {
     sqlx::query_as(
         "SELECT pid, xact_start::text FROM pg_stat_activity \
-         WHERE wait_event_type = 'Lock' AND datname = current_database() ORDER BY 1",
+         WHERE wait_event_type = 'Lock' AND datname = current_database() \
+         AND query LIKE '%FROM tenant_writer%' ORDER BY 1",
     )
     .fetch_all(admin)
     .await
@@ -501,6 +505,7 @@ pub async fn writer_lock_waiters(admin: &PgPool) -> Vec<(i32, String)> {
 }
 
 /// Whether `tenant`'s writer lock is free right now, tried without waiting.
+/// Panics when the tenant has no lock row (nothing to be free or held).
 pub async fn writer_lock_is_free(admin: &PgPool, tenant: &str) -> bool {
     let mut tx = admin.begin().await.expect("admin transaction");
     let tried = sqlx::query("SELECT 1 FROM tenant_writer WHERE tenant_id = $1 FOR UPDATE NOWAIT")
@@ -509,7 +514,8 @@ pub async fn writer_lock_is_free(admin: &PgPool, tenant: &str) -> bool {
         .await;
     tx.rollback().await.expect("roll back the probe");
     match tried {
-        Ok(_) => true,
+        Ok(Some(_)) => true,
+        Ok(None) => panic!("tenant {tenant} has no writer lock row"),
         Err(e)
             if e.as_database_error()
                 .and_then(sqlx::error::DatabaseError::code)

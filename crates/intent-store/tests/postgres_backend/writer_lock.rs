@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use intent_store::postgres::{PostgresOptions, TenantId, WriterLimits};
+use intent_store::postgres::{self, PoolSettings, PostgresOptions, TenantId, WriterLimits};
 use intent_store::Store;
 use intentd_test_support::test_timeout;
 
@@ -14,7 +14,6 @@ use crate::writer_race::race_increments;
 
 fn options() -> PostgresOptions {
     PostgresOptions {
-        single_shard: true,
         writer: WriterLimits {
             wait_budget: test_timeout(Duration::from_secs(60)),
             ..WriterLimits::default()
@@ -105,58 +104,39 @@ async fn the_writer_lock_row_is_per_tenant() {
     a.set_setting("userRules", "\"a\"").await.unwrap();
 }
 
-/// With `single_shard`, every store transaction runs in Neki's single-shard
-/// mode: a session setting made before `BEGIN` (Neki refuses it inside a
-/// transaction), so it is still set on the connection afterwards.
+/// A pool with `single_shard` opens every connection in Neki's single-shard
+/// mode (a startup option, so no transaction can leave it); `migrate` still
+/// runs on such a pool, switching its own connection back to `multi`.
 #[tokio::test]
-async fn single_shard_stores_put_their_connections_in_single_shard_mode() {
+async fn single_shard_pools_open_connections_in_single_shard_mode() {
     let Some(db) = test_db(false).await else {
         return;
     };
-    let mode = |pool: sqlx::PgPool| async move {
-        sqlx::query_scalar::<_, Option<String>>("SELECT current_setting('__neki.tx_mode', true)")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-    };
-    let url_pool = |single: bool| {
-        let app = db.app.clone();
-        async move {
-            let options = app.connect_options().as_ref().clone();
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .connect_with(options)
-                .await
-                .unwrap();
-            let store = Store::open_postgres(
-                pool.clone(),
-                TenantId::new(if single { "mode-single" } else { "mode-multi" }).unwrap(),
-                PostgresOptions {
-                    single_shard: single,
-                    ..options_without_guard()
-                },
-            )
+    for (single, tenant) in [(true, "mode-single"), (false, "mode-multi")] {
+        let pool = postgres::connect_with(
+            &db.url,
+            PoolSettings {
+                single_shard: single,
+                ..PoolSettings::new(1)
+            },
+        )
+        .await
+        .unwrap();
+        postgres::migrate(&pool).await.expect("migrate on the pool");
+        let store = Store::open_postgres(pool.clone(), TenantId::new(tenant).unwrap(), options())
             .await
             .unwrap();
-            store.set_setting("userRules", "\"x\"").await.unwrap();
-            assert_eq!(
-                store.get_setting("userRules").await.unwrap().as_deref(),
-                Some("\"x\"")
-            );
-            pool
+        store.set_setting("userRules", "\"x\"").await.unwrap();
+        let mode: Option<String> =
+            sqlx::query_scalar("SELECT current_setting('__neki.tx_mode', true)")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        if single {
+            assert_eq!(mode.as_deref(), Some("single"));
+        } else {
+            assert_ne!(mode.as_deref(), Some("single"));
         }
-    };
-    let single = url_pool(true).await;
-    assert_eq!(mode(single.clone()).await.as_deref(), Some("single"));
-    single.close().await;
-    let multi = url_pool(false).await;
-    assert_ne!(mode(multi.clone()).await.as_deref(), Some("single"));
-    multi.close().await;
-}
-
-fn options_without_guard() -> PostgresOptions {
-    PostgresOptions {
-        single_shard: false,
-        ..options()
+        pool.close().await;
     }
 }

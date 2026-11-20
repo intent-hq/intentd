@@ -7,6 +7,11 @@
 -- `tenant_id` routes to the tenant's shard like every other statement of the
 -- transaction.
 --
+-- No overlap period with the advisory lock: release builds never enable the
+-- postgres feature, so no deployed daemon takes the old lock. Once Postgres
+-- stores ship, a lock change like this one needs one release that takes
+-- both locks.
+--
 -- The store seeds a tenant's row on its first write (`INSERT ... ON
 -- CONFLICT DO NOTHING`, then the lock), so existing tenants need no
 -- backfill. Postgres only; no SQLite counterpart (SQLite has one writer per

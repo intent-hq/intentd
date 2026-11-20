@@ -20,8 +20,9 @@
 //!   read-then-write increment is lost;
 //! - a writer-lock wait past `lock_timeout` fails with SQLSTATE 55P03
 //!   through the router, so a store writer retries and ends in `StoreBusy`;
-//! - with `PostgresOptions::single_shard`, a transaction that reaches a
-//!   second tenant's shard fails instead of running across shards.
+//! - in single-shard mode (`PoolSettings::single_shard`), a transaction
+//!   that reaches a second tenant's shard fails instead of running across
+//!   shards.
 #![cfg(feature = "postgres")]
 
 #[path = "support/writer_race.rs"]
@@ -113,8 +114,14 @@ fn neki_url(var: &str) -> Option<String> {
 }
 
 /// Runs `body` on a pool of `connections` whose `search_path` is a fresh
-/// schema on the Neki database at `url`, then drops the schema.
-async fn in_fresh_schema<F, Fut>(url: &str, connections: u32, body: F) -> Result<(), String>
+/// schema on the Neki database at `url` (in single-shard mode when
+/// `single_shard`), then drops the schema.
+async fn in_fresh_schema<F, Fut>(
+    url: &str,
+    connections: u32,
+    single_shard: bool,
+    body: F,
+) -> Result<(), String>
 where
     F: FnOnce(PgPool) -> Fut,
     Fut: Future<Output = Result<(), String>>,
@@ -144,7 +151,14 @@ where
                 Ok(())
             })
         })
-        .connect_with(postgres::connect_options(url).map_err(|e| e.to_string())?)
+        .connect_with({
+            let options = postgres::connect_options(url).map_err(|e| e.to_string())?;
+            if single_shard {
+                postgres::single_shard_options(options)
+            } else {
+                options
+            }
+        })
         .await;
     let outcome = match pool {
         Ok(pool) => {
@@ -165,7 +179,7 @@ async fn migrations_and_tenant_round_trip_run_on_neki() {
     let Some(url) = neki_url("INTENT_STORE_NEKI_URL") else {
         return;
     };
-    in_fresh_schema(&url, 2, round_trip)
+    in_fresh_schema(&url, 2, false, round_trip)
         .await
         .expect("migrations and tenant round trip on Neki");
 }
@@ -181,16 +195,13 @@ async fn writers_of_one_tenant_exclude_each_other_on_sharded_neki() {
         return;
     };
     let connections = u32::try_from(writer_race::PROCESSES).expect("small") + 1;
-    in_fresh_schema(&url, connections, |pool| async move {
+    in_fresh_schema(&url, connections, true, |pool| async move {
         postgres::migrate(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
         // A patient budget: the race measures lost updates, not latency
         // (40 serialized writer transactions over the network).
-        let mut options = PostgresOptions {
-            single_shard: true,
-            ..PostgresOptions::default()
-        };
+        let mut options = PostgresOptions::default();
         options.writer.wait_budget = std::time::Duration::from_secs(120);
         let tenant = format!("neki-race-{}", uuid::Uuid::new_v4().simple());
         let outcome = writer_race::race_increments(&pool, &tenant, options).await?;
@@ -211,7 +222,7 @@ async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki
     let Some(url) = neki_url("INTENT_STORE_NEKI_SHARDED_URL") else {
         return;
     };
-    in_fresh_schema(&url, 2, |pool| async move {
+    in_fresh_schema(&url, 2, true, |pool| async move {
         postgres::migrate(&pool).await.map_err(|e| e.to_string())?;
         let run = uuid::Uuid::new_v4().simple().to_string();
         let first = format!("neki-shard-0-{run}");
@@ -231,14 +242,7 @@ async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki
         }
         let mut rejected = Vec::new();
         for other in &others {
-            let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-            sqlx::query(postgres::SINGLE_SHARD_SQL)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| format!("set single-shard mode: {e}"))?;
-            let mut tx = sqlx::Connection::begin(&mut *conn)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
             sqlx::query(postgres::WRITER_LOCK_SQL)
                 .bind(&first)
                 .fetch_one(&mut *tx)
@@ -251,7 +255,11 @@ async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki
             let _ = tx.rollback().await;
             match second {
                 Ok(_) => {}
-                Err(e) => rejected.push(format!("{other}: {e}")),
+                // A lock wait or a lost connection is not a shard rejection.
+                Err(sqlx::Error::Database(e)) if e.code().as_deref() != Some("55P03") => {
+                    rejected.push(format!("{other}: {:?} {e}", e.code()));
+                }
+                Err(e) => return Err(format!("lock {other}: {e}")),
             }
         }
         let shards: i64 = sqlx::query_scalar("SELECT count(*) FROM __neki.list_shards()")
@@ -302,14 +310,13 @@ async fn a_held_writer_lock_times_out_as_55p03_and_store_busy_on_neki() {
     let Some(url) = neki_url("INTENT_STORE_NEKI_SHARDED_URL") else {
         return;
     };
-    in_fresh_schema(&url, 3, |pool| async move {
+    in_fresh_schema(&url, 3, true, |pool| async move {
         use std::time::Duration;
         postgres::migrate(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
         let tenant = format!("neki-timeout-{}", uuid::Uuid::new_v4().simple());
         let quick = PostgresOptions {
-            single_shard: true,
             writer: postgres::WriterLimits {
                 wait_budget: Duration::from_millis(1500),
                 lock_attempt: Duration::from_millis(300),
@@ -336,7 +343,7 @@ async fn a_held_writer_lock_times_out_as_55p03_and_store_busy_on_neki() {
             .map_err(|e| format!("hold the writer lock: {e}"))?;
 
         let mut waiter = pool.begin().await.map_err(|e| e.to_string())?;
-        let waited = postgres::lock_tenant_writer(
+        let second_attempt = postgres::lock_tenant_writer(
             &mut waiter,
             &tenant,
             Duration::from_millis(200),
@@ -344,7 +351,7 @@ async fn a_held_writer_lock_times_out_as_55p03_and_store_busy_on_neki() {
         )
         .await;
         let _ = waiter.rollback().await;
-        let code = match waited {
+        let code = match second_attempt {
             Ok(()) => {
                 let _ = holder.rollback().await;
                 return Err("a second transaction took the held writer lock".into());

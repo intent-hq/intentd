@@ -29,6 +29,10 @@
 //!   once plus read headroom; past that, checkouts wait up to the acquire
 //!   timeout. The slot is per tenant, shared by every store for it in this
 //!   process (`tenant_registry`).
+//! - **Single-shard mode** ([`PoolSettings::single_shard`], for Neki sharded
+//!   by `tenant_id`) is a startup option of every connection, so a
+//!   transaction that reaches a second shard fails instead of running
+//!   across shards.
 //! - **Writer waits are bounded** by [`WriterLimits`]: see
 //!   [`PgStore::begin_write`] for the lock timeout and retry policy, and the
 //!   statement and idle-in-transaction timeouts a writer transaction runs
@@ -123,19 +127,6 @@ pub struct PostgresOptions {
     /// security guard the store tests install. Production stores leave it
     /// off: their isolation is the tenant filter in every statement.
     pub rls_guard: bool,
-    /// Run every transaction in Neki's single-shard mode
-    /// (`__neki.tx_mode = 'single'`), so `PlanetScale` Neki rejects a
-    /// statement that would take the transaction to a second shard instead
-    /// of running it across shards (Neki's default, `multi`). Turn it on for
-    /// a Neki database sharded by `tenant_id`: a store's transactions touch
-    /// one tenant, so one shard. Vanilla Postgres accepts the setting and
-    /// ignores it.
-    ///
-    /// Neki refuses to change the mode inside a transaction, so the store
-    /// sets it on the connection (a session setting) before each `BEGIN`.
-    /// It stays set when the connection returns to the pool: give every
-    /// store on a pool the same value.
-    pub single_shard: bool,
     /// How long writers wait for the tenant writer lock, and the limits a
     /// writer transaction runs under.
     pub writer: WriterLimits,
@@ -210,6 +201,14 @@ pub struct PoolSettings {
     pub acquire_timeout: Duration,
     /// The longest [`connect_with`] waits for its first connection.
     pub connect_timeout: Duration,
+    /// Open every connection in `PlanetScale` Neki's single-shard mode
+    /// (`__neki.tx_mode = 'single'`, a startup option; see
+    /// [`single_shard_options`]), so Neki rejects a statement that would
+    /// take a transaction to a second shard instead of running it across
+    /// shards (Neki's default, `multi`). Turn it on for a Neki database
+    /// sharded by `tenant_id`: a store's transactions touch one tenant, so
+    /// one shard. [`migrate`] switches its own connection back to `multi`.
+    pub single_shard: bool,
 }
 
 impl PoolSettings {
@@ -219,6 +218,7 @@ impl PoolSettings {
             max_connections,
             acquire_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
+            single_shard: false,
         }
     }
 }
@@ -237,6 +237,15 @@ pub fn connect_options(url: &str) -> Result<PgConnectOptions> {
     with_bundled_root_cert(url)?
         .parse::<PgConnectOptions>()
         .map_err(|e| Error::InvalidParams(format!("invalid postgres url: {e}")))
+}
+
+/// `options` with Neki's single-shard mode as a startup option, so every
+/// connection starts in it and no transaction can leave it: Neki refuses to
+/// change `__neki.tx_mode` inside a transaction. Vanilla Postgres accepts
+/// the setting and ignores it. For pools built without [`connect_with`].
+#[must_use]
+pub fn single_shard_options(options: PgConnectOptions) -> PgConnectOptions {
+    options.options([("__neki.tx_mode", "single")])
 }
 
 fn with_bundled_root_cert(url: &str) -> Result<String> {
@@ -282,7 +291,11 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool> {
 /// `Error::InvalidParams` for a bad URL; `Error::Internal` when the first
 /// connection fails or takes longer than `settings.connect_timeout`.
 pub async fn connect_with(url: &str, settings: PoolSettings) -> Result<PgPool> {
-    let connecting = pool_options(settings).connect_with(connect_options(url)?);
+    let mut options = connect_options(url)?;
+    if settings.single_shard {
+        options = single_shard_options(options);
+    }
+    let connecting = pool_options(settings).connect_with(options);
     match tokio::time::timeout(settings.connect_timeout, connecting).await {
         Ok(pool) => pool.map_err(|e| Error::Internal(format!("postgres connect failed: {e}"))),
         Err(_) => Err(Error::Internal(format!(
@@ -336,6 +349,12 @@ pub async fn migrate_replaying_each_statement(pool: &PgPool) -> Result<()> {
 
 async fn migrate_with(pool: &PgPool, replay: bool) -> Result<()> {
     let mut conn = pool.acquire().await.map_err(db)?.detach();
+    // Schema changes span every shard: undo a single-shard pool's startup
+    // mode on this detached connection, which is closed at the end.
+    sqlx::query(MULTI_SHARD_SQL)
+        .execute(&mut conn)
+        .await
+        .map_err(db)?;
     sqlx::query("SELECT pg_advisory_lock(hashtextextended('intent-schema-migrations', 0))")
         .execute(&mut conn)
         .await
@@ -658,10 +677,10 @@ const WRITER_SEED_SQL: &str =
 /// Resets `lock_timeout` ($1) once the writer holds the lock.
 const WRITER_RESET_SQL: &str = "SELECT set_config('lock_timeout', $1, true)";
 
-/// Neki's single-shard transaction guard, a session setting (Neki refuses
-/// it inside a transaction); see [`PostgresOptions::single_shard`].
-#[doc(hidden)]
-pub const SINGLE_SHARD_SQL: &str = "SET __neki.tx_mode = 'single'";
+/// Neki's default, cross-shard mode, for [`migrate`]'s connection (a
+/// session setting: Neki refuses it inside a transaction); see
+/// [`PoolSettings::single_shard`].
+const MULTI_SHARD_SQL: &str = "SET __neki.tx_mode = 'multi'";
 
 /// Takes `tenant`'s writer lock in the transaction on `conn`: sets the
 /// writer limits (`lock_timeout` = `attempt` for this attempt), seeds the
@@ -758,7 +777,12 @@ impl PgStore {
     /// [`Self::begin_write`]) and for reads of one statement; a read of more
     /// than one statement takes [`Self::begin_read_snapshot`].
     pub(crate) async fn begin(&self) -> Result<Transaction<'static, Postgres>> {
-        self.begin_with(None).await
+        let tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| self.checkout_error(e))?;
+        self.bind_tenant(tx).await
     }
 
     /// A read-only transaction whose statements all see one snapshot
@@ -768,34 +792,11 @@ impl PgStore {
     /// a check and the data it guards, or keys and the rows they page, come
     /// from the same commit. A read-only snapshot never fails to serialize.
     pub(crate) async fn begin_read_snapshot(&self) -> Result<Transaction<'static, Postgres>> {
-        self.begin_with(Some("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
-            .await
-    }
-
-    /// Checks out a connection and begins a transaction on it with
-    /// `statement` (plain `BEGIN` when `None`), bound to this store's
-    /// tenant. With [`PostgresOptions::single_shard`] the connection is put
-    /// in Neki's single-shard mode first: Neki refuses to change
-    /// `__neki.tx_mode` inside a transaction, so it is a session `SET`
-    /// before `BEGIN`, made again for every transaction.
-    async fn begin_with(
-        &self,
-        statement: Option<&'static str>,
-    ) -> Result<Transaction<'static, Postgres>> {
-        let mut conn = self
+        let tx = self
             .pool
-            .acquire()
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .await
             .map_err(|e| self.checkout_error(e))?;
-        if self.options.single_shard {
-            sqlx::query(SINGLE_SHARD_SQL)
-                .execute(&mut *conn)
-                .await
-                .map_err(db)?;
-        }
-        let tx = Transaction::begin(conn, statement.map(sqlx::SqlSafeStr::into_sql_str))
-            .await
-            .map_err(db)?;
         self.bind_tenant(tx).await
     }
 
