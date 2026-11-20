@@ -1086,8 +1086,9 @@ need attention. A dimmed card is on a machine that is not connected: choosing it
 connects, opens that machine's window and then the item. The list keeps the 30
 most recent items, is shared by every window, is not synced to other devices,
 and drops items of a forgotten machine, of a deleted or archived workspace, and
-browser or terminal tabs that were closed. Terminals in the terminal drawer are
-not listed. It works in the composer, terminals and the browser panel. Rebind it
+browser or terminal tabs that were closed. A closed browser tab that an agent
+opened stays hidden in the background, so it stays listed and choosing it
+brings it back. Terminals in the terminal drawer are not listed. It works in the composer, terminals and the browser panel. Rebind it
 as **Switch to Recent Tab** in **Settings → Input and shortcuts → Keyboard
 shortcuts**.
 
