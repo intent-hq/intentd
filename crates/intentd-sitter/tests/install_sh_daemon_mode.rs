@@ -581,6 +581,39 @@ fn the_pair_option_pairs_a_full_install_and_shows_the_link_without_a_terminal() 
 }
 
 #[test]
+fn the_pair_option_on_a_terminal_asks_through_intentd_pair() {
+    // Enter at the mode, service and auto-resume questions, then `intentd
+    // pair` reads the terminal for its tunnel and address questions.
+    let run = run_install(Terminal::Answers("\n\n\nn\n"), &["--pair"], &[], None);
+    assert!(run.output.status.success(), "{}", run.describe());
+    assert!(
+        run.position("status") < run.position("pair --tunnel"),
+        "pairs once the daemon answers\n{}",
+        run.describe()
+    );
+    assert!(
+        !run.calls
+            .iter()
+            .any(|c| c.starts_with("pair") && c.contains("--yes")),
+        "a person answers, so no unattended defaults\n{}",
+        run.describe()
+    );
+    assert_eq!(
+        fs::read_to_string(run.state.join("pair-selection"))
+            .unwrap()
+            .trim(),
+        "n",
+        "intentd pair reads the terminal\n{}",
+        run.describe()
+    );
+    assert!(
+        run.stdout().contains(&format!("URL:         {PAIR_URI}")),
+        "{}",
+        run.describe()
+    );
+}
+
+#[test]
 fn without_the_pair_option_a_full_install_pairs_nothing() {
     let run = run_install(
         Terminal::None,

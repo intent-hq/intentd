@@ -37,8 +37,10 @@
 # an orchestrator that holds the workspaces and runs every agent on other
 # machines. A
 # node install sets daemon.mode=node and turns the Tailcat tunnel on, restarts
-# the daemon, then runs `intentd pair --node --tunnel` (the interface picker on a
-# console, a tunnel-only link without one) and ends with the QR code and the
+# the daemon, then runs `intentd pair --node --tunnel` (on a console it asks
+# whether to turn the Tailcat tunnel on, default yes, then which addresses to
+# accept connections on, default loopback plus Tailscale; without one it takes
+# those defaults) and ends with the QR code and the
 # intent:// link. A non-interactive node install sets the task up unless told
 # not to. An orchestrator install sets daemon.mode=orchestrator, restarts the
 # daemon and pairs like a full install, on a fresh install only: a re-install
@@ -48,8 +50,9 @@
 # <value>, on direct runs) forces an answer.
 #
 # A full or orchestrator install can end by pairing, so the link a desktop app needs is on
-# screen: once the task's daemon answers, it runs `intentd pair --yes --tunnel`
-# and shows its QR code and intent://pair link. $env:INTENTD_PAIR = '1' (or
+# screen: once the task's daemon answers, it runs `intentd pair --tunnel` (the
+# same tunnel and address questions on a console, `--yes` with their defaults
+# without one) and shows its QR code and intent://pair link. $env:INTENTD_PAIR = '1' (or
 # -Pair, on direct runs) turns it on.
 #
 # $env:INTENTD_SERVICE_NAME overrides the task name (testing).
@@ -780,10 +783,10 @@ if ($serviceMode -eq 'yes') {
         }
     }
     # The pair option (full and orchestrator installs): pair through the
-    # tunnel, unattended.
+    # tunnel, asking on a console and unattended without one.
     if ($pair -and $installMode -ne 'node' -and $verdict -eq 'up') {
         Write-Host 'install.ps1: pairing - the link below adds this computer to the Intent desktop app'
-        & $dest pair --yes --tunnel
+        if ($interactive) { & $dest pair --tunnel } else { & $dest pair --yes --tunnel }
         if ($LASTEXITCODE -ne 0) {
             Write-Warning 'install.ps1: pairing did not finish - run it again with: intentd pair --tunnel'
         }

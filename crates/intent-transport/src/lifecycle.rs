@@ -294,14 +294,31 @@ async fn bind_all(addresses: &[IpAddr], mut port: u16) -> io::Result<(Vec<TcpLis
         ));
     }
     let mut listeners = Vec::with_capacity(addresses.len());
+    let mut skipped = None;
     for addr in addresses {
-        let listener = bind_listener(*addr, port)
-            .await
-            .map_err(|e| io::Error::new(e.kind(), format!("bind {addr}:{port}: {e}")))?;
+        let listener = match bind_listener(*addr, port).await {
+            Ok(listener) => listener,
+            // A specific address not on any interface right now (a Tailscale
+            // IP while Tailscale is down) is skipped, so the other addresses —
+            // loopback, which the tunnel forwards to — keep serving.
+            Err(e)
+                if e.kind() == io::ErrorKind::AddrNotAvailable
+                    && !addr.is_loopback()
+                    && !addr.is_unspecified() =>
+            {
+                tracing::warn!("WSS listener skips {addr}: not available on this machine ({e})");
+                skipped = Some(io::Error::new(e.kind(), format!("bind {addr}:{port}: {e}")));
+                continue;
+            }
+            Err(e) => return Err(io::Error::new(e.kind(), format!("bind {addr}:{port}: {e}"))),
+        };
         port = listener.local_addr()?.port();
         listeners.push(listener);
     }
-    Ok((listeners, port))
+    match skipped {
+        Some(error) if listeners.is_empty() => Err(error),
+        _ => Ok((listeners, port)),
+    }
 }
 
 /// Bind one TCP listener at `addr:port`. An IPv6-unspecified (`::`) bind is
@@ -416,6 +433,22 @@ mod tests {
         stop.await.unwrap();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(attempts, 1);
+    }
+
+    /// A Tailscale address saved in `server.bindAddress` is gone while
+    /// Tailscale is down (e.g. at login, before it connects): the listener
+    /// still serves loopback — and so the tailcat tunnel — instead of failing.
+    #[tokio::test]
+    async fn an_absent_specific_address_does_not_stop_the_listener() {
+        let absent = IpAddr::from([192, 0, 2, 1]);
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        let (listeners, port) = bind_all(&[absent, loopback], 0).await.unwrap();
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].local_addr().unwrap().ip(), loopback);
+        assert_ne!(port, 0);
+        // With nothing else left to serve, the absent address still fails.
+        let error = bind_all(&[absent], 0).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
     }
 
     #[tokio::test]

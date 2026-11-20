@@ -290,6 +290,7 @@ async fn run_pair_until_success(data_dir: &Path, args: &[&str]) -> std::process:
     loop {
         let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
             .arg("pair")
+            .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
             .args(args)
             .env("INTENTD_DATA_DIR", data_dir)
             .stdin(Stdio::null())
@@ -441,6 +442,7 @@ async fn pair_without_listener_non_tty_requires_yes_flag() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
+        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .env("INTENTD_DATA_DIR", &data_dir)
         .stdin(Stdio::null())
         .output()
@@ -511,6 +513,7 @@ async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
+        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .arg("--yes")
         .env("INTENTD_DATA_DIR", &data_dir)
         .stdin(Stdio::null())
@@ -555,6 +558,7 @@ async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
     // and fails the same way on the missing route.
     let output2 = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
+        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .env("INTENTD_DATA_DIR", &data_dir)
         .stdin(Stdio::null())
         .output()
@@ -635,10 +639,10 @@ async fn pair_tunnel_yes_pairs_a_fresh_node_through_the_tunnel() {
 }
 
 /// A fresh full install (listener off, loopback bind) pairs over the tunnel
-/// by default too, with no node hint. A saved tunnel `false` with a LAN bind
-/// is kept.
+/// by default too, with no node hint. Turning remote access on brings the
+/// tunnel with it even over a saved tunnel `false` and a LAN bind.
 #[tokio::test]
-async fn pair_yes_turns_the_tunnel_on_for_a_loopback_only_listener() {
+async fn pair_yes_turns_the_tunnel_on_with_remote_access() {
     let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
     let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
@@ -665,7 +669,7 @@ async fn pair_yes_turns_the_tunnel_on_for_a_loopback_only_listener() {
         "regular"
     );
 
-    // Saved off with a LAN bind, then a fresh listener: `--yes` keeps it off.
+    // Saved off with a LAN bind, then a fresh listener: `--yes` turns it on.
     for (path, value) in [
         ("server.tunnel.enabled", "false"),
         ("server.wsApi.enabled", "false"),
@@ -681,8 +685,8 @@ async fn pair_yes_turns_the_tunnel_on_for_a_loopback_only_listener() {
     let output = run_pair(&data_dir, &["--yes"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stderr.contains("Tailcat tunnel enabled"), "{stderr}");
-    assert!(!stdout.contains("&tc="), "{stdout}");
+    assert!(stderr.contains("Tailcat tunnel enabled"), "{stderr}");
+    assert!(stdout.contains("&tc=tc-"), "{stdout}");
 }
 
 /// One-shot `intentd call <method>` against the daemon in `data_dir`,
@@ -707,6 +711,7 @@ fn call_json(data_dir: &Path, method: &str) -> serde_json::Value {
 fn run_pair(data_dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
+        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .args(args)
         .env("INTENTD_DATA_DIR", data_dir)
         .stdin(Stdio::null())
@@ -877,6 +882,7 @@ async fn pair_fails_when_daemon_down() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
+        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .env("INTENTD_DATA_DIR", &data_dir)
         .output()
         .expect("run intentd pair");
@@ -992,6 +998,7 @@ async fn pair_rotate_uses_daemon_authority_not_cli_env() {
     let output = loop {
         let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
             .arg("pair")
+            .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
             .arg("--rotate")
             .env("INTENTD_DATA_DIR", &data_dir)
             .env("INTENTD_AUTH_TOKEN", "cli-only-env-token-not-the-daemons")
@@ -1049,6 +1056,7 @@ async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
     for extra in [&[][..], &["--host", "localhost"][..]] {
         let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
             .arg("pair")
+            .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
             .arg("--rotate")
             .args(extra)
             .env("INTENTD_DATA_DIR", &data_dir)
@@ -1074,12 +1082,14 @@ async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
     }
 }
 
-/// Run `intentd pair --select-endpoints` with `input` piped to stdin (the
-/// picker reads one selection line, so a piped run works without a TTY).
+/// Run `intentd pair --select-endpoints` with `input` piped to stdin: one
+/// line for the tunnel question, then one for the address picker, so a piped
+/// run works without a TTY.
 fn run_select_endpoints(data_dir: &Path, input: &str) -> std::process::Output {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
+        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .arg("--select-endpoints")
         .env("INTENTD_DATA_DIR", data_dir)
         .stdin(Stdio::piped())
@@ -1137,7 +1147,7 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
     // array-shape e2e would be machine-dependent. The persisted array shape
     // is unit-covered (bind_addresses_value) and the daemon's array handling
     // by #1431.
-    let output = run_select_endpoints(&data_dir, "none\n");
+    let output = run_select_endpoints(&data_dir, "\nnone\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -1156,9 +1166,15 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
         "loopback must not be a selectable row: {stderr}"
     );
     assert!(
-        stderr.contains("https://github.com/tailscale/tailcat"),
-        "tailcat picker entry should carry the explanatory note with the \
-         project URL: {stderr}"
+        stderr.contains("Turn on the Tailcat tunnel? [y/N]")
+            && stderr.contains("https://github.com/tailscale/tailcat"),
+        "the tunnel question comes first, defaults to the current (off) \
+         state and carries the project URL: {stderr}"
+    );
+    assert!(
+        stderr.find("Turn on the Tailcat tunnel?")
+            < stderr.find("Where should the daemon accept connections?"),
+        "the tunnel question precedes the address picker: {stderr}"
     );
     assert!(
         stderr.contains("listening on 127.0.0.1"),
@@ -1288,7 +1304,7 @@ async fn pair_select_endpoints_unchanged_selection_writes_nothing() {
 
     // Plain Enter keeps the pre-checked set (= the persisted set): nothing
     // is written and the command says so.
-    let output = run_select_endpoints(&data_dir, "\n");
+    let output = run_select_endpoints(&data_dir, "\n\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -1328,7 +1344,7 @@ async fn pair_select_endpoints_unchanged_selection_still_enables_listener() {
     };
     await_socket(&mut daemon, &socket).await;
 
-    let output = run_select_endpoints(&data_dir, "\n");
+    let output = run_select_endpoints(&data_dir, "\n\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -1376,7 +1392,7 @@ async fn pair_select_endpoints_reprompts_on_invalid_input() {
 
     // An out-of-range token re-prompts; the follow-up plain Enter keeps the
     // persisted set. EOF right after a bad token (no second line) fails.
-    let output = run_select_endpoints(&data_dir, "999\n\n");
+    let output = run_select_endpoints(&data_dir, "\n999\n\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -1391,7 +1407,7 @@ async fn pair_select_endpoints_reprompts_on_invalid_input() {
         "second read keeps the persisted set: {stderr}"
     );
 
-    let output = run_select_endpoints(&data_dir, "999\n");
+    let output = run_select_endpoints(&data_dir, "\n999\n");
     assert!(
         !output.status.success(),
         "EOF before a valid selection must fail"

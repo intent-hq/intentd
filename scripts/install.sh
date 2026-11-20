@@ -41,8 +41,10 @@
 # Intent here (the default), as a node that only runs agents for another
 # Intent, or as an orchestrator that holds the workspaces and runs every agent
 # on other machines. A node install sets daemon.mode=node and turns the Tailcat tunnel
-# on, restarts the daemon, then runs `intentd pair --node --tunnel` — the interface
-# picker on a terminal, a tunnel-only link without one — and ends with the QR
+# on, restarts the daemon, then runs `intentd pair --node --tunnel` — on a terminal
+# it asks whether to turn the Tailcat tunnel on (default yes), then which
+# addresses to accept connections on (default loopback plus Tailscale); without
+# one it takes those defaults — and ends with the QR
 # code and the intent://node link. An unattended node install sets the service up
 # unless told not to. An orchestrator install sets daemon.mode=orchestrator,
 # restarts the daemon and pairs like a full install, on a fresh install only:
@@ -53,9 +55,10 @@
 #   INTENTD_DAEMON_MODE=full|node|orchestrator  (or --daemon-mode=<value>, on direct runs)
 #
 # A full or orchestrator install can end by pairing, so the link a desktop app needs is on
-# screen: once the service's daemon answers, it runs `intentd pair --yes
-# --tunnel` (the Tailcat tunnel, so the link works from any network) and
-# shows its QR code and intent://pair link. Off by default:
+# screen: once the service's daemon answers, it runs `intentd pair --tunnel`
+# (the Tailcat tunnel, so the link works from any network) — asking the same
+# tunnel and address questions on a terminal, `--yes` with their defaults
+# without one — and shows its QR code and intent://pair link. Off by default:
 #
 #   INTENTD_PAIR=1  (or --pair, on direct runs)
 #
@@ -466,16 +469,21 @@ run_pair() {
 }
 
 # The pair option for a full or orchestrator install: once the daemon
-# answers, pair through the Tailcat tunnel unattended. A failure is a
-# warning; the daemon is installed and running either way.
+# answers, pair through the Tailcat tunnel. On a terminal `intentd pair` asks
+# whether to turn the tunnel on (default yes), then which addresses to accept
+# connections on (default loopback plus Tailscale); otherwise, or for a
+# program reading the link marker, it takes those defaults unattended. A
+# failure is a warning; the daemon is installed and running either way.
 apply_pair() {
   [ "$pair" = "yes" ] && [ "$daemon_mode" != "node" ] || return 0
   info "pairing — the link below adds this computer to the Intent desktop app"
-  if run_pair --yes --tunnel; then
-    paired="yes"
+  if [ "$link_marker" != "yes" ] && (exec </dev/tty) 2>/dev/null; then
+    "$install_dir/intentd" pair --tunnel </dev/tty && paired="yes"
   else
-    warn "pairing did not finish — run it again with: intentd pair --tunnel"
+    run_pair --yes --tunnel && paired="yes"
   fi
+  [ "$paired" = "yes" ] \
+    || warn "pairing did not finish — run it again with: intentd pair --tunnel"
 }
 
 # The commands that finish node setup by hand, for any path that cannot.
@@ -533,9 +541,9 @@ To finish by hand: intentd settings daemon.mode orchestrator && intentd restart"
 
 # Apply the daemon-mode answer once the daemon is up (runs after
 # verify_daemon). Node: daemon.mode node and the tunnel on, a restart (the
-# mode applies at the next start), then the normal pairing flow — the
-# interface picker with the tunnel pre-checked on a terminal, a tunnel-only
-# link without one — which prints the QR code and the intent:// link. An
+# mode applies at the next start), then the normal pairing flow — the tunnel
+# question (default yes) and the address picker on a terminal, their
+# defaults without one — which prints the QR code and the intent:// link. An
 # explicit full answer switches a node back to regular; an orchestrator stays
 # one (warn_mode_kept). The unasked default
 # writes nothing. Failures are warnings that name the commands to finish by
