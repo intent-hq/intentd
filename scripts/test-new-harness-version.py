@@ -103,6 +103,8 @@ class RealTree(unittest.TestCase):
         created = self.read(f"{bump.HARNESS_DIR}/{bump.module(self.new)}.rs")
         self.assertIn(f"version: {new},", created)
         self.assertIn(f"super::{bump.module(self.old)}::ENTRY.doctrine", created)
+        self.assertNotIn("ENTRY.default_features", created)
+        self.assertNotIn("ENTRY.feature_labels", created)
         self.assertIn("assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);", created)
         self.assertTrue(all(len(line) <= bump.MAX_WIDTH for line in created.split("\n")))
 
@@ -158,6 +160,16 @@ class Layout(unittest.TestCase):
         self.assertTrue(out.startswith(f'    matches!(\n        harness_version,\n        {alternatives} | "3.19"\n    )\n'))
         with self.assertRaisesRegex(bump.Mismatch, "wrap them by hand"):
             bump.edit_breakdown(out, "3.19", "3.20")
+
+    def test_admission_wraps_past_the_call_width(self):
+        def admission(count):
+            alternatives = " | ".join(f'"3.{i}"' for i in range(10, 10 + count))
+            return f"    matches!(harness_version, {alternatives})\n" \
+                   f'        assert!(harness_records_prompt_breakdown("3.{9 + count}"));\n'
+        self.assertIn('matches!(harness_version, "3.10" | "3.11" | "3.12" | "3.13" | "3.14")',
+                      bump.edit_breakdown(admission(4), "3.13", "3.14"))
+        self.assertIn('    matches!(\n        harness_version,\n        "3.10" | "3.11" | "3.12" | "3.13" | "3.14" | "3.15"\n    )',
+                      bump.edit_breakdown(admission(5), "3.14", "3.15"))
 
     def test_mod_line_sorts_as_a_string(self):
         text = "use x;\npub(crate) mod v3_15;\npub(crate) mod v3_9;\n\nstatic REGISTRY: &[&HarnessEntry] = &[\n    &v3_9::ENTRY,\n    &v3_15::ENTRY,\n];\n"

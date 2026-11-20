@@ -43,6 +43,8 @@ HARNESS_DIR = "crates/intent-services/src/harness"
 HARNESS_MOD = HARNESS_DIR + "/mod.rs"
 GUIDANCE_LISTS = ("REPOSITORY_GUIDANCE_HARNESS_VERSIONS", "REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS")
 MAX_WIDTH = 100
+# rustfmt fn_call_width: longer call arguments go one per line.
+CALL_WIDTH = 60
 VERSION = re.compile(r"^(\d+)\.(\d+)$")
 
 
@@ -122,7 +124,7 @@ def edit_breakdown(text, old, new):
         raise Mismatch(f"{BREAKDOWN}: harness_records_prompt_breakdown does not end with {quoted(old)}")
     alternatives = " | ".join(versions + [quoted(new)])
     one_line = f"{indent}matches!(harness_version, {alternatives})"
-    if len(one_line) <= MAX_WIDTH:
+    if len(one_line) <= MAX_WIDTH and len(f"harness_version, {alternatives}") <= CALL_WIDTH:
         call = one_line
     else:
         inner = indent + "    "
@@ -175,8 +177,26 @@ def edit_previous_module(text, old):
     return new
 
 
-def new_module(old, new):
+def entry_field(text, old, field):
+    """FROM's own value for a field. default_features and feature_labels are
+    only read in tests, so reading them through FROM's ENTRY would leave
+    their `expect(dead_code)` unfulfilled: copy the value instead."""
+    entry = re.search(r"static ENTRY: HarnessEntry = HarnessEntry \{\n(.*?)\n\};", text, re.S)
+    value = entry and re.search(rf"^\s*{field}: (.+),$", entry.group(1), re.M)
+    if not value:
+        raise Mismatch(f"{module(old)}.rs: no `{field}:` in its ENTRY")
+    value = value.group(1)
+    if ".ENTRY." in value:
+        raise Mismatch(f"{module(old)}.rs: `{field}` reads another ENTRY; give it its own value first")
+    if re.fullmatch(r"[A-Za-z_]\w*", value):
+        value = f"super::{module(old)}::{value}"
+    return value
+
+
+def new_module(old, new, previous_text):
     prior = f"super::{module(old)}::ENTRY"
+    default_features = entry_field(previous_text, old, "default_features")
+    feature_labels = entry_field(previous_text, old, "feature_labels")
     return f'''//! Harness {new}: {old} with no changes yet. Override here only what {new}
 //! changes; every other surface stays {old}'s.
 
@@ -187,8 +207,8 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {{
     harness: {prior}.harness,
     doctrine: {prior}.doctrine,
     context: {prior}.context,
-    default_features: {prior}.default_features,
-    feature_labels: {prior}.feature_labels,
+    default_features: {default_features},
+    feature_labels: {feature_labels},
 }};
 
 #[cfg(test)]
@@ -246,7 +266,7 @@ def plan(root, old, new, docs):
         root / BUDGET: edit_budget(read(BUDGET), old),
         root / HARNESS_MOD: edit_harness_mod(read(HARNESS_MOD), old, new),
         root / previous: edit_previous_module(read(previous), old),
-        new_path: new_module(old, new),
+        new_path: new_module(old, new, read(previous)),
     }
     if docs is not None:
         if not docs.is_file():
