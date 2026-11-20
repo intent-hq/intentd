@@ -37,10 +37,8 @@ pub(crate) async fn dispatch(
         return Err(format!("host: {RPC_ASSISTANT_ONLY}"));
     }
     match method {
-        "info" | "methods" => api
-            .agent_rpc_describe(workspace_id.clone(), method.to_string(), args.clone())
-            .await
-            .map_err(map_err),
+        "info" => describe(api, workspace_id, "info", args).await,
+        "methods" => describe(api, workspace_id, "methods", args).await,
         "call" => {
             let rpc_method = opt_str(args, "method")
                 .filter(|m| !m.trim().is_empty())
@@ -60,7 +58,9 @@ pub(crate) async fn dispatch(
             let calls = args
                 .get("calls")
                 .and_then(Value::as_array)
-                .ok_or_else(|| "calls must be an array of { method, params?, backend? }".to_string())?
+                .ok_or_else(|| {
+                    "calls must be an array of { method, params?, backend? }".to_string()
+                })?
                 .iter()
                 .enumerate()
                 .map(|(i, c)| {
@@ -77,6 +77,17 @@ pub(crate) async fn dispatch(
         }
         other => Err(format!("host: unknown method `rpc.{other}`")),
     }
+}
+
+async fn describe(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    what: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    api.agent_rpc_describe(workspace_id.clone(), what.to_string(), args.clone())
+        .await
+        .map_err(map_err)
 }
 
 async fn call(

@@ -34,7 +34,12 @@ fn agent_rpc_classes_match_golden() {
         return;
     }
     let actual = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}. Generate it with:\n  {REGENERATE}", path.display()))
+        .unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e}. Generate it with:\n  {REGENERATE}",
+                path.display()
+            )
+        })
         .replace("\r\n", "\n");
     assert!(
         actual == expected,
@@ -112,7 +117,11 @@ fn spec_named_methods_are_forbidden() {
         "settings.reset",
         "terminal.write",
     ] {
-        assert_eq!(agent_rpc_class(method), AgentRpcClass::ForbiddenToAgent, "{method}");
+        assert_eq!(
+            agent_rpc_class(method),
+            AgentRpcClass::ForbiddenToAgent,
+            "{method}"
+        );
         let err = refusal(method, agent_rpc_class(method)).expect("refused");
         assert_eq!(err.code, -32003);
         assert_eq!(err.data_code(), Some("forbidden-to-agent"));
@@ -131,7 +140,12 @@ fn spec_named_methods_are_forbidden() {
 
 #[test]
 fn connection_stateful_methods_are_unsupported() {
-    for method in ["client.hello", "events.subscribe", "agent.subscribe", "drafts.get"] {
+    for method in [
+        "client.hello",
+        "events.subscribe",
+        "agent.subscribe",
+        "drafts.get",
+    ] {
         assert_eq!(
             agent_rpc_class(method),
             AgentRpcClass::UnsupportedOnAgentPath,
@@ -141,5 +155,8 @@ fn connection_stateful_methods_are_unsupported() {
         assert_eq!(err.data_code(), Some("unsupported-on-agent-path"));
     }
     assert_eq!(agent_rpc_class("system.status"), AgentRpcClass::Read);
-    assert_eq!(agent_rpc_class("workspace.archive"), AgentRpcClass::Mutating);
+    assert_eq!(
+        agent_rpc_class("workspace.archive"),
+        AgentRpcClass::Mutating
+    );
 }

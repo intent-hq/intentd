@@ -433,7 +433,7 @@ Parameters:
 Namespaces (index — full signatures in API below):
   ws.help(namespace?) — index or namespace docs
   ws.workspace.* — info, title, status message
-  ws.rpc.* — call any daemon JSON-RPC method (preferred; changes need the user's approval)
+  ws.rpc.* — any daemon JSON-RPC (preferred; changes need approval)
   ws.app.* — agents, chats, mcp, proposal, settings, specialists, ui, workspaces
   ws.app.question.* — ask the user structured questions
   ws.note.* — notes; the spec is note id "spec"
@@ -1699,7 +1699,6 @@ mod tests {
             ("terminal", BINDINGS_TERMINAL),
             ("mcp", BINDINGS_MCP),
             ("file", BINDINGS_FILE),
-            ("rpc", BINDINGS_RPC),
         ]
     }
 
@@ -1717,6 +1716,7 @@ mod tests {
             "app.specialists" => Some(BINDINGS_APP_SPECIALISTS),
             "app.ui" => Some(BINDINGS_APP_UI),
             "app.workspaces" => Some(BINDINGS_APP_WORKSPACES),
+            "rpc" => Some(BINDINGS_RPC),
             _ => None,
         }
     }

@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::agent_rpc::{
-    AgentRpcClass, AgentRpcError, AgentRpcRequest, AgentRpcSurface,
-    AGENT_RPC_INTERNAL_CODE, LOCAL_BACKEND_ID,
+    AgentRpcClass, AgentRpcError, AgentRpcRequest, AgentRpcSurface, AGENT_RPC_INTERNAL_CODE,
+    LOCAL_BACKEND_ID,
 };
 use intent_core::{AgentId, Error, Result, WorkspaceId};
 use serde_json::{json, Value};
@@ -50,6 +50,13 @@ struct Held {
     agent_id: AgentId,
     calls: Vec<HeldCall>,
     running: bool,
+}
+
+/// What an approval does once the registry was consulted.
+enum Step {
+    Run(Vec<HeldCall>),
+    Reject,
+    Missing,
 }
 
 /// Proposals held for the user's approval, keyed by proposal id. In memory
@@ -120,13 +127,13 @@ impl Services {
     }
 
     /// `ws.rpc.info()` and `ws.rpc.methods()`.
-    pub(crate) async fn agent_rpc_describe_op(
+    pub(crate) fn agent_rpc_describe_op(
         &self,
-        workspace_id: WorkspaceId,
+        workspace_id: &WorkspaceId,
         what: &str,
         args: &Value,
     ) -> Result<Value> {
-        Self::require_assistant(&workspace_id)?;
+        Self::require_assistant(workspace_id)?;
         let surface = self.agent_rpc_surface()?;
         match what {
             "info" => {
@@ -157,7 +164,9 @@ impl Services {
                     .collect();
                 Ok(json!({ "count": rows.len(), "methods": rows }))
             }
-            other => Err(Error::InvalidParams(format!("unknown ws.rpc view `{other}`"))),
+            other => Err(Error::InvalidParams(format!(
+                "unknown ws.rpc view `{other}`"
+            ))),
         }
     }
 
@@ -170,8 +179,8 @@ impl Services {
         budget: Duration,
     ) -> Result<Value> {
         Self::require_assistant(&workspace_id)?;
-        let agent_id = agent_id
-            .ok_or_else(|| Error::Forbidden("ws.rpc needs a calling agent".into()))?;
+        let agent_id =
+            agent_id.ok_or_else(|| Error::Forbidden("ws.rpc needs a calling agent".into()))?;
         let surface = self.agent_rpc_surface()?;
         if request.calls.is_empty() {
             return Err(Error::InvalidParams("at least one call is required".into()));
@@ -185,7 +194,9 @@ impl Services {
         for (index, call) in request.calls.iter().enumerate() {
             let method = call.method.trim();
             if method.is_empty() {
-                return Err(Error::InvalidParams(format!("call {index}: method is required")));
+                return Err(Error::InvalidParams(format!(
+                    "call {index}: method is required"
+                )));
             }
             let backend = call
                 .backend
@@ -241,7 +252,13 @@ impl Services {
                 .run_read(surface.as_ref(), &agent_id, call, class, budget)
                 .await);
         }
-        self.hold_for_approval(surface.as_ref(), workspace_id, agent_id, request, held)
+        self.hold_for_approval(
+            surface.as_ref(),
+            workspace_id,
+            &agent_id,
+            request.title.as_deref(),
+            &held,
+        )
     }
 
     async fn run_read(
@@ -280,9 +297,9 @@ impl Services {
         &self,
         surface: &dyn AgentRpcSurface,
         workspace_id: WorkspaceId,
-        agent_id: AgentId,
-        request: AgentRpcRequest,
-        held: Vec<(HeldCall, AgentRpcClass)>,
+        agent_id: &AgentId,
+        title: Option<&str>,
+        held: &[(HeldCall, AgentRpcClass)],
     ) -> Result<Value> {
         let proposal_id = format!("rpc-{}", uuid::Uuid::new_v4());
         let backend_name = surface.local_backend_name();
@@ -300,19 +317,16 @@ impl Services {
                 })
             })
             .collect();
-        let title = request
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|t| t.chars().take(200).collect::<String>())
-            .unwrap_or_else(|| {
+        let title = title.map(str::trim).filter(|t| !t.is_empty()).map_or_else(
+            || {
                 if held.len() == 1 {
                     format!("Run {}", held[0].0.method)
                 } else {
                     format!("Run {} daemon calls", held.len())
                 }
-            });
+            },
+            |t| t.chars().take(200).collect::<String>(),
+        );
         let summary = if held.len() == 1 {
             format!("On {backend_name}.")
         } else {
@@ -345,8 +359,14 @@ impl Services {
                 },
             );
         }
-        for (call, class) in &held {
-            audit(&agent_id, &call.backend, &call.method, *class, "pending-approval");
+        for (call, class) in held {
+            audit(
+                agent_id,
+                &call.backend,
+                &call.method,
+                *class,
+                "pending-approval",
+            );
         }
         let reply = json!({
             "ok": true,
@@ -405,11 +425,6 @@ impl Services {
             .pending_proposals()
             .iter()
             .any(|p| p.proposal_id == proposal_id);
-        enum Step {
-            Run(Vec<HeldCall>),
-            Reject,
-            Missing,
-        }
         let step = {
             let mut registry = self.rpc_proposals.lock();
             match registry.get_mut(&proposal_id) {
@@ -532,7 +547,8 @@ impl Services {
         let mut items = Vec::with_capacity(calls.len());
         let mut stopped = false;
         for (index, call) in calls.into_iter().enumerate() {
-            let mut item = json!({ "index": index, "backend": call.backend, "method": call.method });
+            let mut item =
+                json!({ "index": index, "backend": call.backend, "method": call.method });
             if stopped {
                 item["status"] = json!("skipped");
                 items.push(item);
@@ -644,4 +660,3 @@ fn approved_report(items: &[Value]) -> String {
     text.truncate(end);
     text
 }
-

@@ -133,7 +133,10 @@ fn show(args: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .is_some_and(|k| DAEMON_ONLY_KINDS.contains(&k))
     {
-        return Err("Invalid proposal: `rpc-call` cards come only from ws.rpc.call / ws.rpc.batch".to_string());
+        return Err(
+            "Invalid proposal: `rpc-call` cards come only from ws.rpc.call / ws.rpc.batch"
+                .to_string(),
+        );
     }
     if !is_valid_proposal(proposal) {
         return Err("Invalid proposal: must have `kind` (one of workspace-create, workspace-transfer, settings-change, specialist-edit, bulk-op), `preview.title`, and `payload`".to_string());

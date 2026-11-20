@@ -256,7 +256,7 @@ fn decode_reply(mut reply: Value) -> Result<Value, AgentRpcError> {
             data: error.get("data").cloned(),
         });
     }
-    Ok(reply.get_mut("result").map(Value::take).unwrap_or(Value::Null))
+    Ok(reply.get_mut("result").map_or(Value::Null, Value::take))
 }
 
 impl AgentRpcSurface for LoopbackAgentRpc {

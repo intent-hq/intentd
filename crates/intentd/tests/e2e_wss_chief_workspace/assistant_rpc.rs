@@ -133,7 +133,13 @@ async fn rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
     response["result"].clone()
 }
 
-async fn create_agent(ws: &mut Ws, id: i64, workspace_id: &str, name: &str, background: bool) -> String {
+async fn create_agent(
+    ws: &mut Ws,
+    id: i64,
+    workspace_id: &str,
+    name: &str,
+    background: bool,
+) -> String {
     let created = rpc(
         ws,
         id,
@@ -144,7 +150,10 @@ async fn create_agent(ws: &mut Ws, id: i64, workspace_id: &str, name: &str, back
         }),
     )
     .await;
-    created["agent"]["id"].as_str().expect("agent id").to_string()
+    created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string()
 }
 
 async fn create_workspace(ws: &mut Ws, id: i64, title: &str) -> String {
@@ -155,16 +164,32 @@ async fn create_workspace(ws: &mut Ws, id: i64, title: &str) -> String {
         json!({ "title": title, "branch": "main", "skipWorktree": true }),
     )
     .await;
-    created["workspace"]["id"].as_str().expect("workspace id").to_string()
+    created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string()
 }
 
 async fn archived(ws: &mut Ws, id: i64, workspace_id: &str) -> bool {
-    let got = rpc(ws, id, "workspace.get", json!({ "workspaceId": workspace_id })).await;
+    let got = rpc(
+        ws,
+        id,
+        "workspace.get",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
     got["workspace"]["archived"] == true || got["workspace"]["status"] == "archived"
 }
 
 /// Send `prompt`, then return the full JSON tool result whose `key` is true.
-async fn run_tool(ws: &mut Ws, id: i64, workspace_id: &str, agent_id: &str, prompt: &str, key: &str) -> Value {
+async fn run_tool(
+    ws: &mut Ws,
+    id: i64,
+    workspace_id: &str,
+    agent_id: &str,
+    prompt: &str,
+    key: &str,
+) -> Value {
     let sent = rpc(
         ws,
         id,
@@ -173,39 +198,55 @@ async fn run_tool(ws: &mut Ws, id: i64, workspace_id: &str, agent_id: &str, prom
     )
     .await;
     assert_eq!(sent["success"], true);
-    let blocks: Vec<(String, String)> = poll_conversation(ws, id + 1, agent_id, prompt, |messages| {
-        let found: Vec<(String, String)> = messages
-            .as_array()?
-            .iter()
+    let mut checked = std::collections::HashSet::new();
+    let mut next_id = id + 1;
+    for _ in 0..120 {
+        next_id += 1;
+        let conversation = rpc(
+            ws,
+            next_id,
+            "agent.getConversation",
+            json!({ "agentId": agent_id }),
+        )
+        .await;
+        let blocks: Vec<(String, String)> = conversation["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
             .flat_map(|m| {
                 m["contentBlocks"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .filter(|b| b["type"] == "tool_result")
-                    .filter_map(|b| Some((m["id"].as_str()?.to_string(), b["id"].as_str()?.to_string())))
+                    .filter_map(|b| {
+                        Some((m["id"].as_str()?.to_string(), b["id"].as_str()?.to_string()))
+                    })
                     .collect::<Vec<_>>()
             })
             .collect();
-        (!found.is_empty()).then_some(found)
-    })
-    .await;
-    for _ in 0..80 {
-        for (offset, (message_id, block_id)) in blocks.iter().enumerate() {
+        for (message_id, block_id) in blocks {
+            if !checked.insert((message_id.clone(), block_id.clone())) {
+                continue;
+            }
+            next_id += 1;
             let full = rpc(
                 ws,
-                id + 200 + i64::try_from(offset).unwrap_or(0),
+                next_id,
                 "agent.getMessageBlock",
                 json!({ "agentId": agent_id, "messageId": message_id, "blockId": block_id }),
             )
             .await;
-            let text = full["block"]["output"][0]["text"].as_str().unwrap_or_default();
+            let text = full["block"]["output"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
             if let Ok(value) = serde_json::from_str::<Value>(text) {
                 if value[key] == true {
                     return value;
                 }
             }
         }
+        // timing-guard: poll interval while the tool result block persists.
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!("no {key} tool result");
@@ -226,10 +267,14 @@ async fn resolve(ws: &mut Ws, id: i64, agent_id: &str, proposal_id: &str, decisi
         )
         .await;
         if response["error"]["code"] == -32005 {
+            // timing-guard: poll interval until the turn records the card as pending.
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
         }
-        assert!(response.get("error").is_none(), "resolveRpcProposal: {response}");
+        assert!(
+            response.get("error").is_none(),
+            "resolveRpcProposal: {response}"
+        );
         return response["result"].clone();
     }
     panic!("proposal {proposal_id} never became pending");
@@ -262,7 +307,15 @@ async fn assistant_rpc_reads_refusals_and_approvals_over_wss() {
     let assistant = create_agent(&mut ws, 4, CHIEF_WORKSPACE_ID, "RPC Assistant", false).await;
 
     // Reads, discovery and refusals.
-    let read = run_tool(&mut ws, 100, CHIEF_WORKSPACE_ID, &assistant, "RPC_READ", "rpcRead").await;
+    let read = run_tool(
+        &mut ws,
+        100,
+        CHIEF_WORKSPACE_ID,
+        &assistant,
+        "RPC_READ",
+        "rpcRead",
+    )
+    .await;
     let version = env!("CARGO_PKG_VERSION");
     assert_eq!(read["info"]["daemonVersion"], version, "{read}");
     assert_eq!(read["info"]["backend"]["id"], "local");
@@ -287,33 +340,62 @@ async fn assistant_rpc_reads_refusals_and_approvals_over_wss() {
         json!({ "status": "read", "archive": "mutating", "hello": "unsupported-on-agent-path", "resolve": "forbidden-to-agent" })
     );
     // `system.status` has no ws.* binding; it is a fast path served over the loopback.
-    assert_eq!(read["status"], json!({ "ok": true, "version": version, "backend": "local" }));
+    assert_eq!(
+        read["status"],
+        json!({ "ok": true, "version": version, "backend": "local" })
+    );
     let listed = read["listed"].as_array().expect("workspace titles");
     for title in ["RPC stale one", "RPC stale two", "RPC keep"] {
         assert!(listed.iter().any(|t| t == title), "{listed:?}");
     }
     assert_eq!(read["hello"]["ok"], false);
-    assert_eq!(read["hello"]["error"]["data"]["code"], "unsupported-on-agent-path");
+    assert_eq!(
+        read["hello"]["error"]["data"]["code"],
+        "unsupported-on-agent-path"
+    );
     assert_eq!(read["invalid"]["ok"], false);
-    assert_eq!(read["invalid"]["error"]["code"], -32602, "{}", read["invalid"]);
+    assert_eq!(
+        read["invalid"]["error"]["code"], -32602,
+        "{}",
+        read["invalid"]
+    );
     assert_eq!(read["remote"]["error"]["data"]["code"], "unknown-backend");
     for (method, refused) in read["forbidden"].as_object().expect("forbidden map") {
         assert_eq!(refused["ok"], false, "{method}: {refused}");
         assert_eq!(refused["error"]["code"], -32003, "{method}: {refused}");
-        assert_eq!(refused["error"]["data"]["code"], "forbidden-to-agent", "{method}");
+        assert_eq!(
+            refused["error"]["data"]["code"], "forbidden-to-agent",
+            "{method}"
+        );
     }
     assert_eq!(read["refusedBatch"]["ok"], false);
     assert_eq!(read["refusedBatch"]["index"], 1);
     assert!(read["refusedBatch"].get("proposalId").is_none());
-    assert!(read["showRpcCard"].as_str().is_some_and(|e| e.contains("rpc-call")));
+    assert!(read["showRpcCard"]
+        .as_str()
+        .is_some_and(|e| e.contains("rpc-call")));
 
     // Batch: one card, nothing runs until approved, stop at first failure.
-    let batch = run_tool(&mut ws, 1000, CHIEF_WORKSPACE_ID, &assistant, "RPC_BATCH", "rpcBatch").await;
+    let batch = run_tool(
+        &mut ws,
+        1000,
+        CHIEF_WORKSPACE_ID,
+        &assistant,
+        "RPC_BATCH",
+        "rpcBatch",
+    )
+    .await;
     let pending = &batch["pending"];
     assert_eq!(pending["status"], "pending-approval", "{batch}");
     assert_eq!(pending["calls"], 3);
-    let proposal_id = pending["proposalId"].as_str().expect("proposal id").to_string();
-    assert!(!archived(&mut ws, 2000, &stale_one).await, "nothing runs before approval");
+    let proposal_id = pending["proposalId"]
+        .as_str()
+        .expect("proposal id")
+        .to_string();
+    assert!(
+        !archived(&mut ws, 2000, &stale_one).await,
+        "nothing runs before approval"
+    );
     let approved = resolve(&mut ws, 2100, &assistant, &proposal_id, "approve").await;
     assert_eq!(approved["outcome"], "applied", "{approved}");
     let statuses: Vec<&str> = approved["items"]
@@ -324,21 +406,43 @@ async fn assistant_rpc_reads_refusals_and_approvals_over_wss() {
         .collect();
     assert_eq!(statuses, ["done", "failed", "skipped"], "{approved}");
     assert!(archived(&mut ws, 2300, &stale_one).await);
-    assert!(!archived(&mut ws, 2301, &stale_two).await, "skipped after the failure");
+    assert!(
+        !archived(&mut ws, 2301, &stale_two).await,
+        "skipped after the failure"
+    );
     let applied = notice(&mut ws, 2400, &assistant, &proposal_id).await;
     assert_eq!(applied["metadata"]["outcome"], "applied");
-    let text = applied["contentBlocks"][0]["text"].as_str().unwrap_or_default();
-    assert!(text.contains("Archive stale workspaces") && text.contains("\"skipped\""), "{text}");
+    let text = applied["contentBlocks"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("Archive stale workspaces") && text.contains("\"skipped\""),
+        "{text}"
+    );
     let again = resolve(&mut ws, 2600, &assistant, &proposal_id, "approve").await;
     assert_eq!(again["outcome"], "applied", "idempotent: {again}");
 
     // Single mutating call: self-approval is refused; Reject runs nothing.
-    let single = run_tool(&mut ws, 3000, CHIEF_WORKSPACE_ID, &assistant, "RPC_SINGLE", "rpcSingle").await;
+    let single = run_tool(
+        &mut ws,
+        3000,
+        CHIEF_WORKSPACE_ID,
+        &assistant,
+        "RPC_SINGLE",
+        "rpcSingle",
+    )
+    .await;
     assert_eq!(single["pending"]["status"], "pending-approval", "{single}");
     for key in ["selfApprove", "selfResolve"] {
-        assert_eq!(single[key]["error"]["data"]["code"], "forbidden-to-agent", "{single}");
+        assert_eq!(
+            single[key]["error"]["data"]["code"], "forbidden-to-agent",
+            "{single}"
+        );
     }
-    let single_id = single["pending"]["proposalId"].as_str().expect("id").to_string();
+    let single_id = single["pending"]["proposalId"]
+        .as_str()
+        .expect("id")
+        .to_string();
     let rejected = resolve(&mut ws, 4000, &assistant, &single_id, "reject").await;
     assert_eq!(rejected["outcome"], "dismissed", "{rejected}");
     assert!(!archived(&mut ws, 4200, &keep).await, "reject runs nothing");
@@ -358,13 +462,27 @@ async fn assistant_rpc_is_top_level_assistant_only_over_wss() {
     let sub = create_agent(&mut ws, 3, CHIEF_WORKSPACE_ID, "Assistant helper", true).await;
     let top = create_agent(&mut ws, 4, CHIEF_WORKSPACE_ID, "Assistant", false).await;
 
-    for (base, workspace_id, agent_id) in [(100, ordinary_ws.as_str(), &ordinary), (1000, CHIEF_WORKSPACE_ID, &sub)] {
+    for (base, workspace_id, agent_id) in [
+        (100, ordinary_ws.as_str(), &ordinary),
+        (1000, CHIEF_WORKSPACE_ID, &sub),
+    ] {
         let probe = run_tool(&mut ws, base, workspace_id, agent_id, "RPC_GATE", "rpcGate").await;
         assert_eq!(probe["type"], "undefined", "{probe}");
         let err = probe["raw"]["err"].as_str().unwrap_or_default();
-        assert!(err.contains("only available to the top-level Assistant"), "{probe}");
+        assert!(
+            err.contains("only available to the top-level Assistant"),
+            "{probe}"
+        );
     }
-    let probe = run_tool(&mut ws, 2000, CHIEF_WORKSPACE_ID, &top, "RPC_GATE", "rpcGate").await;
+    let probe = run_tool(
+        &mut ws,
+        2000,
+        CHIEF_WORKSPACE_ID,
+        &top,
+        "RPC_GATE",
+        "rpcGate",
+    )
+    .await;
     assert_eq!(probe["type"], "object", "{probe}");
     assert_eq!(probe["raw"]["ok"]["ok"], true, "{probe}");
 }

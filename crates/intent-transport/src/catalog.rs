@@ -1063,34 +1063,97 @@ pub(crate) fn member_may_call(method: &str) -> bool {
 /// or safety settings; owner-only transport surfaces that have their own
 /// agent tools.
 pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
-    ("agent.dismissQuestions", "Answers the user's pending question cards."),
+    (
+        "agent.dismissQuestions",
+        "Answers the user's pending question cards.",
+    ),
     ("agent.resolveProposal", "Answers an approval card."),
-    ("agent.resolveRpcProposal", "Approves the Assistant's own held calls."),
+    (
+        "agent.resolveRpcProposal",
+        "Approves the Assistant's own held calls.",
+    ),
     ("agent.respondPermission", "Answers a permission prompt."),
-    ("browser.closeTab", "Owner browser surface; agents use ws.browser."),
-    ("browser.exec", "Owner browser surface; agents use ws.browser."),
-    ("browser.listTabs", "Owner browser surface; agents use ws.browser."),
-    ("browser.navigateTab", "Owner browser surface; agents use ws.browser."),
-    ("browser.removeTab", "Owner browser surface; agents use ws.browser."),
-    ("browser.syncTabs", "Owner browser surface; agents use ws.browser."),
-    ("browser.upsertTab", "Owner browser surface; agents use ws.browser."),
+    (
+        "browser.closeTab",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.exec",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.listTabs",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.navigateTab",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.removeTab",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.syncTabs",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.upsertTab",
+        "Owner browser surface; agents use ws.browser.",
+    ),
     ("cloudMachines.configure", "Stores a provider API key."),
-    ("desktop.getState", "Owner desktop-control surface; agents use ws.desktop."),
-    ("desktop.respondPermission", "Answers a desktop-control consent prompt."),
-    ("desktop.revoke", "Owner desktop-control surface; agents use ws.desktop."),
+    (
+        "desktop.getState",
+        "Owner desktop-control surface; agents use ws.desktop.",
+    ),
+    (
+        "desktop.respondPermission",
+        "Answers a desktop-control consent prompt.",
+    ),
+    (
+        "desktop.revoke",
+        "Owner desktop-control surface; agents use ws.desktop.",
+    ),
     ("desktop.setPermission", "Grants desktop-control consent."),
-    ("executor.invite.create", "Mints a node invite (access administration)."),
+    (
+        "executor.invite.create",
+        "Mints a node invite (access administration).",
+    ),
     ("executor.mint", "Mints an executor credential."),
     ("executor.revoke", "Revokes an executor credential."),
-    ("github.identityProof.create", "Creates a forge identity proof."),
-    ("github.identityProof.delete", "Deletes a forge identity proof."),
+    (
+        "github.identityProof.create",
+        "Creates a forge identity proof.",
+    ),
+    (
+        "github.identityProof.delete",
+        "Deletes a forge identity proof.",
+    ),
     ("host.exec", "Owner shell surface; agents use ws.host."),
-    ("host.execStream", "Owner shell surface; agents use ws.host."),
-    ("host.execStream.cancel", "Owner shell surface; agents use ws.host."),
-    ("host.execStream.write", "Owner shell surface; agents use ws.host."),
-    ("host.invite.create", "Mints a host invite (access administration)."),
-    ("host.invite.revoke", "Revokes a host invite (access administration)."),
-    ("host.members.remove", "Removes a host member (access administration)."),
+    (
+        "host.execStream",
+        "Owner shell surface; agents use ws.host.",
+    ),
+    (
+        "host.execStream.cancel",
+        "Owner shell surface; agents use ws.host.",
+    ),
+    (
+        "host.execStream.write",
+        "Owner shell surface; agents use ws.host.",
+    ),
+    (
+        "host.invite.create",
+        "Mints a host invite (access administration).",
+    ),
+    (
+        "host.invite.revoke",
+        "Revokes a host invite (access administration).",
+    ),
+    (
+        "host.members.remove",
+        "Removes a host member (access administration).",
+    ),
     ("identity.cancelAuth", "Drives a sign-in flow."),
     ("identity.connect", "Connects an account credential."),
     ("identity.revoke", "Revokes an account credential."),
@@ -1108,20 +1171,53 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
     ("remoteMachines.add", "Stores a remote machine credential."),
     ("remoteMachines.claim", "Redeems a remote machine invite."),
     ("secret.dismiss", "Answers a secret request."),
-    ("secret.provide", "Answers a secret request with a secret value."),
+    (
+        "secret.provide",
+        "Answers a secret request with a secret value.",
+    ),
     ("server.pairingInfo", "Returns pairing credentials."),
     ("server.rotateToken", "Rotates the access token."),
-    ("settings.reset", "Changes agent features, approval or safety settings."),
-    ("settings.update", "Changes agent features, approval or safety settings."),
-    ("sourceControl.identityProof.create", "Creates a forge identity proof."),
-    ("sourceControl.identityProof.delete", "Deletes a forge identity proof."),
+    (
+        "settings.reset",
+        "Changes agent features, approval or safety settings.",
+    ),
+    (
+        "settings.update",
+        "Changes agent features, approval or safety settings.",
+    ),
+    (
+        "sourceControl.identityProof.create",
+        "Creates a forge identity proof.",
+    ),
+    (
+        "sourceControl.identityProof.delete",
+        "Deletes a forge identity proof.",
+    ),
     ("system.gitCredential", "Returns a git credential."),
-    ("terminal.write", "Raw terminal input; agents use ws.terminal."),
-    ("workspace.invite.create", "Mints a workspace invite (access administration)."),
-    ("workspace.invite.revoke", "Revokes a workspace invite (access administration)."),
-    ("workspace.members.add", "Adds a workspace member (access administration)."),
-    ("workspace.members.remove", "Removes a workspace member (access administration)."),
-    ("workspace.members.setRole", "Changes a member role (access administration)."),
+    (
+        "terminal.write",
+        "Raw terminal input; agents use ws.terminal.",
+    ),
+    (
+        "workspace.invite.create",
+        "Mints a workspace invite (access administration).",
+    ),
+    (
+        "workspace.invite.revoke",
+        "Revokes a workspace invite (access administration).",
+    ),
+    (
+        "workspace.members.add",
+        "Adds a workspace member (access administration).",
+    ),
+    (
+        "workspace.members.remove",
+        "Removes a workspace member (access administration).",
+    ),
+    (
+        "workspace.members.setRole",
+        "Changes a member role (access administration).",
+    ),
 ];
 
 /// Connection-stateful methods the agent path cannot serve (`-32601`,

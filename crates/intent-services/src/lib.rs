@@ -30974,7 +30974,7 @@ impl WorkspaceApi for Services {
         what: String,
         args: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_rpc_describe_op(workspace_id, &what, &args).await })
+        Box::pin(async move { self.agent_rpc_describe_op(&workspace_id, &what, &args) })
     }
 
     fn agent_rpc_call(

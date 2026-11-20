@@ -17,8 +17,8 @@ fn disable_node_compile_cache() {
 }
 
 pub mod agent_configs;
-pub mod agent_rpc;
 pub(crate) mod agent_logs;
+pub mod agent_rpc;
 pub mod agent_runtime;
 pub mod agent_tmp;
 pub mod ansi;
