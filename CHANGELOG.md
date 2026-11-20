@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.257] - 2026-11-20
+
+### 🚀 Features
+
+- *(scripts)* Make new-harness-version mints a harness version in one step ([#3572](https://github.com/intent-hq/intentd/pull/3572))
+- *(assistant)* Ws.rpc generic daemon RPC with approval cards ([#3561](https://github.com/intent-hq/intentd/pull/3561))
+- *(pair)* Ask about the Tailcat tunnel first; keep saved choices on re-install ([#3566](https://github.com/intent-hq/intentd/pull/3566))
+- *(cloud)* Vercel Sandbox cloud machine provider ([#3560](https://github.com/intent-hq/intentd/pull/3560))
+- *(scripts)* Stop remote agents' machine runs on workspace archive ([#3573](https://github.com/intent-hq/intentd/pull/3573))
+- *(assistant)* Ws.rpc reaches remote backends through owner desktop apps ([#3570](https://github.com/intent-hq/intentd/pull/3570))
+
+### 🐛 Bug Fixes
+
+- *(store)* Shard-routable tenant writer lock and Neki single-shard transactions ([#3559](https://github.com/intent-hq/intentd/pull/3559))
+- *(test)* Read the probe-owner status frame up to its newline ([#3568](https://github.com/intent-hq/intentd/pull/3568))
+- *(test)* Stop the size-cap test streaming 200 MiB through a 30 s budget ([#3576](https://github.com/intent-hq/intentd/pull/3576))
+
+### 📚 Documentation
+
+- *(guide)* The Setting up home banner while a workspace home opens ([#3537](https://github.com/intent-hq/intentd/pull/3537))
+- *(guide)* Name v2.359.0 for removing deleted local folders from the sidebar ([#3564](https://github.com/intent-hq/intentd/pull/3564))
+- *(guide)* Auto-start scripts show a lightning bolt ([#3571](https://github.com/intent-hq/intentd/pull/3571))
+
+
 ## [0.11.256] - 2026-11-20
 
 ### 🐛 Bug Fixes
