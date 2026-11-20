@@ -696,3 +696,41 @@ async fn concurrent_provisioning_of_one_tenant_seeds_it_once() {
         assert_eq!(n, 1, "{table} seeded once");
     }
 }
+
+#[tokio::test]
+async fn transfer_table_stats_reads_its_columns_and_aggregate_from_one_snapshot() {
+    let Some(db) = trapped_db().await else {
+        return;
+    };
+    let tenant = "snap-transfer-stats";
+    let store = open_trapped(&db, tenant).await;
+    workspace(&store).await;
+    let count = |stats: &[intent_core::transfer::TransferTableStat]| {
+        stats
+            .iter()
+            .find(|s| s.name == "workspace_discussion_conversation")
+            .map(|s| s.row_count)
+            .expect("conversation table is a transfer table")
+    };
+    let before = count(&store.transfer_table_stats(&ws()).await.unwrap());
+    // A conversation commits between the column read and the aggregate.
+    let write = format!(
+        "INSERT INTO workspace_discussion_conversation \
+         (tenant_id, workspace_id, id, name, created_at) \
+         VALUES ('{{t}}', '{WS}', 'c-gap', 'gap', '{T0}')"
+    );
+    let reader = store.clone();
+    let stats = read_across_write(&db, tenant, "transfer_table_stats", &write, async move {
+        reader.transfer_table_stats(&ws()).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        count(&stats),
+        before,
+        "aggregate read after the column read's snapshot"
+    );
+    // A fresh read sees the write.
+    let after = count(&store.transfer_table_stats(&ws()).await.unwrap());
+    assert_eq!(after, before + 1);
+}

@@ -30,9 +30,19 @@
 //! 5. A function that runs more than one statement on one plain `begin()`
 //!    transaction, directly or through helpers it passes the transaction
 //!    to, uses `begin_read_snapshot()` instead, so its statements see one
-//!    commit as a `SQLite` read transaction does; `MULTI_READ_ALLOWED`
-//!    names the exceptions with a reason. Each statement counts once, so
-//!    one statement run in a loop is not seen.
+//!    commit as a `SQLite` read transaction does. A statement in a loop
+//!    (one that does not open the transaction) counts as more than one. So
+//!    do statements on the pool (`self.pool`, `self.pool()`) or on one
+//!    `acquire()`d connection, which each commit on their own.
+//!    `MULTI_READ_ALLOWED` names the exceptions with a reason, by file and
+//!    function. A `.begin()` follows `.await`, `?` and `timeout(..)`; one
+//!    no `let` binds, or whose binding moves anywhere but an executor, a
+//!    helper the lint follows, `commit`, `rollback` or `drop` (into a
+//!    struct, an Option, a return or a closure), fails unless
+//!    `BEGIN_ESCAPE_ALLOWED` names it, as the lint could not count its
+//!    statements. Limits: iterator closures (`.map`, `for_each`) are not
+//!    loops, and a helper reached only through a trait object or a
+//!    function pointer is not followed.
 //!
 //! Rules 1 and 2 find SQL by use (`support/sql_uses.rs`): the text that
 //! reaches a sqlx call, followed through locals, consts, helpers and
@@ -62,7 +72,7 @@ use std::path::{Path, PathBuf};
 mod postgres_ast;
 #[path = "support/sql_uses.rs"]
 mod sql_uses;
-use sql_uses::{list_key, rust_files, Index, LockProblem, Pos, Sql, MAX_EXPANSIONS};
+use sql_uses::{list_key, rust_files, Index, LockProblem, Pos, Sql, TxKind, MAX_EXPANSIONS};
 use syn::{Expr, Lit};
 
 fn src() -> PathBuf {
@@ -193,15 +203,23 @@ const DEFERRED_WRITES: &[(&str, &str, &str)] = &[
 /// the lock, because writing that row is how the lock is taken.
 const WRITER_LOCK_TAKER: (&str, &str, &str) = ("mod.rs", "lock_tenant_writer", "tenant_writer");
 
-/// Plain `begin()` transactions allowed to run more than one statement
-/// without one snapshot, as `(file, function, why)`. Rule 5 sends every
-/// other one to `begin_read_snapshot()`.
+/// Reads allowed to run more than one statement without one snapshot (on
+/// a plain `begin()`, an acquired connection or the pool), as `(file,
+/// function, why)`. Rule 5 sends every other one to `begin_read_snapshot()`.
 const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[(
-    "repositories.rs",
-    "transfer_table_stats",
-    "reads the transfer tables' columns from pg_catalog, then sums one aggregate of \
-     tenant rows; the catalog read only names the columns, so its commit cannot tear \
-     the aggregate",
+    "mod.rs",
+    "migrate_with",
+    "schema migration, not a tenant read: runs DDL on one detached connection under the \
+     migration advisory lock, and each step records its own progress so a crash resumes",
+)];
+
+/// Plain `begin()` transactions allowed to leave the lint's view, as
+/// `(file, function, why)`.
+const BEGIN_ESCAPE_ALLOWED: &[(&str, &str, &str)] = &[(
+    "mod.rs",
+    "begin_write",
+    "wraps the transaction in WriteTx once it holds the writer lock; every WriteTx \
+     is a write transaction, which rule 2 checks",
 )];
 
 /// Consts the lint does not follow because a test of their own checks
@@ -1922,71 +1940,165 @@ fn writing_functions_come_from_the_migrations() {
     assert!(calls(&bodies[0].1, "b") && !calls(&bodies[2].1, "b"));
 }
 
+/// An allowlist key: `(file name, function)`.
+type AllowKey = (String, String);
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |f| f.to_string_lossy().into_owned())
+}
+
+/// Splits findings into those `allowed` names and the rest; returns the
+/// rest and the keys used.
+fn apply_allowed(
+    findings: Vec<(PathBuf, String, String)>,
+    allowed: &[(&str, &str, &str)],
+) -> (Vec<String>, BTreeSet<AllowKey>) {
+    let mut found = Vec::new();
+    let mut used = BTreeSet::new();
+    for (file, function, message) in findings {
+        let key = (file_name(&file), function);
+        if allowed.iter().any(|(a, f, _)| *a == key.0 && *f == key.1) {
+            used.insert(key);
+        } else {
+            found.push(message);
+        }
+    }
+    (found, used)
+}
+
+/// The `allowed` entries no finding used, as messages.
+fn stale_entries(allowed: &[(&str, &str, &str)], used: &BTreeSet<AllowKey>) -> Vec<String> {
+    allowed
+        .iter()
+        .filter(|(a, f, _)| !used.contains(&((*a).to_owned(), (*f).to_owned())))
+        .map(|(a, f, _)| format!("{a} {f}"))
+        .collect()
+}
+
 /// Rule 5: a read of more than one statement takes one snapshot.
 fn multi_statement_reads(
     index: &Index,
     allowed: &[(&str, &str, &str)],
-) -> (Vec<String>, BTreeSet<String>) {
-    let mut found = Vec::new();
-    let mut used = BTreeSet::new();
-    for tx in index.multi_statement_reads() {
-        let file = tx
-            .file
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned());
-        if let Some((_, f, _)) = allowed
-            .iter()
-            .find(|(a, f, _)| Some(*a) == file.as_deref() && *f == tx.function)
-        {
-            used.insert((*f).to_owned());
-            continue;
-        }
-        found.push(format!(
-            "{}:{}: {} runs {} statements on one plain begin() ({}); use begin_read_snapshot()",
-            tx.file.display(),
-            tx.line,
-            tx.function,
-            tx.sinks.len(),
-            tx.sinks.join(", ")
-        ));
-    }
-    (found, used)
+) -> (Vec<String>, BTreeSet<AllowKey>) {
+    let findings = index
+        .multi_statement_reads()
+        .into_iter()
+        .map(|tx| {
+            let on = match tx.kind {
+                TxKind::Begin => "one plain begin()",
+                TxKind::Connection => "one acquired connection, outside any transaction",
+                TxKind::Pool => "the pool, each on its own connection",
+            };
+            let message = format!(
+                "{}:{}: {} runs {} statements on {on} ({}); use begin_read_snapshot()",
+                tx.file.display(),
+                tx.line,
+                tx.function,
+                tx.sinks.len(),
+                tx.sinks.join(", ")
+            );
+            (tx.file, tx.function, message)
+        })
+        .collect();
+    apply_allowed(findings, allowed)
+}
+
+/// Rule 5: a plain `begin()` transaction stays where the lint can count
+/// its statements.
+fn begin_escapes(
+    index: &Index,
+    allowed: &[(&str, &str, &str)],
+) -> (Vec<String>, BTreeSet<AllowKey>) {
+    let findings = index
+        .begin_escapes()
+        .into_iter()
+        .map(|e| {
+            let message = format!(
+                "{}:{}: {} {}; bind it with `let mut tx = self.begin_read_snapshot().await?` \
+                 (a read) or `self.begin_write()` (a write) and pass helpers `&mut tx`",
+                e.file.display(),
+                e.line,
+                e.function,
+                e.what
+            );
+            (e.file, e.function, message)
+        })
+        .collect();
+    apply_allowed(findings, allowed)
 }
 
 #[test]
 fn every_multi_statement_read_takes_one_snapshot() {
     let (found, used) = multi_statement_reads(&postgres_index(), MULTI_READ_ALLOWED);
-    for (_, f, _) in MULTI_READ_ALLOWED {
-        assert!(
-            used.contains(*f),
-            "MULTI_READ_ALLOWED names {f}, which runs no multi-statement plain read; remove it"
-        );
-    }
     assert!(
         found.is_empty(),
         "these Postgres reads run more than one statement without one snapshot:\n{}",
         found.join("\n")
     );
+    let stale = stale_entries(MULTI_READ_ALLOWED, &used);
+    assert!(
+        stale.is_empty(),
+        "MULTI_READ_ALLOWED names functions that run no multi-statement read; remove them:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn every_plain_begin_is_bound_where_its_statements_are_counted() {
+    let (found, used) = begin_escapes(&postgres_index(), BEGIN_ESCAPE_ALLOWED);
+    assert!(
+        found.is_empty(),
+        "these plain begin() transactions leave the lint's view:\n{}",
+        found.join("\n")
+    );
+    let stale = stale_entries(BEGIN_ESCAPE_ALLOWED, &used);
+    assert!(
+        stale.is_empty(),
+        "BEGIN_ESCAPE_ALLOWED names functions whose begin() does not escape; remove them:\n{}",
+        stale.join("\n")
+    );
+}
+
+/// `file function` of each finding over `sources`, and the allowlist keys
+/// used.
+type Rule5Check = fn(&Index, &[(&str, &str, &str)]) -> (Vec<String>, BTreeSet<AllowKey>);
+
+fn rule5(
+    check: Rule5Check,
+    sources: &[(&str, &str)],
+    allowed: &[(&str, &str, &str)],
+) -> (Vec<String>, BTreeSet<AllowKey>) {
+    let files: Vec<(PathBuf, String)> = sources
+        .iter()
+        .map(|(f, s)| (PathBuf::from(f), (*s).to_owned()))
+        .collect();
+    let (found, used) = check(&Index::new(&files, &[]), allowed);
+    let names = found
+        .into_iter()
+        .map(|f| {
+            let (file, rest) = f.split_once(':').unwrap_or(("", &f));
+            let function = rest
+                .split(": ")
+                .nth(1)
+                .and_then(|r| r.split(' ').next())
+                .unwrap_or("");
+            format!("{file} {function}")
+        })
+        .collect();
+    (names, used)
+}
+
+fn reads(source: &str) -> Vec<String> {
+    rule5(multi_statement_reads, &[("x.rs", source)], &[]).0
+}
+
+fn escapes(source: &str) -> Vec<String> {
+    rule5(begin_escapes, &[("x.rs", source)], &[]).0
 }
 
 #[test]
 fn multi_statement_plain_reads_need_one_snapshot() {
-    let found = |source: &str, allowed: &[(&str, &str, &str)]| -> Vec<String> {
-        let index = Index::new(&[(PathBuf::from("x.rs"), source.to_owned())], &[]);
-        multi_statement_reads(&index, allowed)
-            .0
-            .into_iter()
-            .map(|f| {
-                f.split(": ")
-                    .nth(1)
-                    .unwrap_or(&f)
-                    .split(' ')
-                    .next()
-                    .unwrap_or("")
-                    .to_owned()
-            })
-            .collect()
-    };
     let one = r#"async fn a(&self) { let mut tx = self.begin().await?;
         sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
     let two = r#"async fn b(&self) { let mut tx = self.begin().await?;
@@ -2013,10 +2125,150 @@ fn multi_statement_plain_reads_need_one_snapshot() {
         let mut tx = self.begin().await?;
         sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
     for ok in [one, snapshot, write, separate] {
-        assert_eq!(found(ok, &[]), Vec::<String>::new(), "{ok}");
+        assert_eq!(reads(ok), Vec::<String>::new(), "{ok}");
     }
-    assert_eq!(found(two, &[]), ["b"]);
-    assert_eq!(found(helpers, &[]), ["e"]);
+    assert_eq!(reads(two), ["x.rs b"]);
+    assert_eq!(reads(helpers), ["x.rs e"]);
     let allowed = [("x.rs", "b", "why")];
-    assert!(found(two, &allowed).is_empty());
+    assert!(rule5(multi_statement_reads, &[("x.rs", two)], &allowed)
+        .0
+        .is_empty());
+}
+
+#[test]
+fn a_begin_is_followed_through_call_arguments() {
+    let timeout = r#"async fn g(&self) {
+        let mut tx = tokio::time::timeout(d, self.begin()).await.map_err(busy)??;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    assert_eq!(reads(timeout), ["x.rs g"]);
+    assert_eq!(escapes(timeout), Vec::<String>::new());
+    let one = r#"async fn h(&self) {
+        let mut tx = timeout(d, self.begin()).await??;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    assert_eq!(reads(one), Vec::<String>::new());
+}
+
+#[test]
+fn a_begin_the_lint_cannot_count_fails() {
+    // The transaction reaches no `let`, or its binding moves somewhere the
+    // lint does not follow: a struct, an Option, a return, a closure.
+    let caught = [
+        r"async fn wrapper(&self) -> Result<Tx> { self.begin().await }",
+        r"async fn wrapped(&self) -> Result<Tx> { Ok(self.begin().await?) }",
+        r"async fn optional(&self) { let tx = Some(self.begin().await?); }",
+        r"async fn field(&self) { let h = Holder { tx: self.begin().await? }; }",
+        r"async fn moved(&self) { let tx = self.begin().await?; let h = Holder { tx }; }",
+        r"async fn some(&self) { let tx = self.begin().await?; let o = Some(tx); }",
+        r"async fn returned(&self) -> Result<Tx> { let tx = self.begin().await?; Ok(tx) }",
+        r"async fn pushed(&self) { let tx = self.begin().await?; v.push(tx); }",
+        r#"async fn closure(&self) { let mut tx = self.begin().await?;
+            let run = |c: &mut PgConnection| sqlx::query("SELECT 1").fetch_all(c);
+            run(&mut tx).await; }"#,
+        r"async fn handed(&self) { run(self.begin().await?).await; }",
+        r"async fn alias(&self) { let tx = self.begin().await?; let c = tx; let o = Some(c); }",
+    ];
+    for source in caught {
+        assert_eq!(escapes(source).len(), 1, "{source}");
+    }
+    // Bound by `let` (or an assignment), used as an executor, passed to a
+    // helper the lint follows, committed, rolled back or dropped.
+    let fine = r#"async fn fine(&self) {
+        let mut tx = self.begin().await.map_err(db)?;
+        sqlx::query("SELECT 1 FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+        self.helper(&mut tx).await; helper(tx.as_mut()).await;
+        let c = &mut *tx; helper(c).await;
+        tx.commit().await?;
+        let mut tx = timeout(d, self.begin()).await??;
+        tx.rollback().await?;
+        let mut tx; tx = self.begin().await?; drop(tx); }
+        async fn helper(&self, c: &mut PgConnection) {}
+        async fn helper(c: &mut PgConnection) {}"#;
+    assert_eq!(escapes(fine), Vec::<String>::new());
+    // Not a plain begin().
+    let other = r"async fn other(&self) { let tx = self.begin_write().await?; Ok(tx) }";
+    assert_eq!(escapes(other), Vec::<String>::new());
+    let allowed = [("x.rs", "wrapper", "why")];
+    let (found, used) = rule5(begin_escapes, &[("x.rs", caught[0])], &allowed);
+    assert!(found.is_empty());
+    assert!(used.contains(&("x.rs".to_owned(), "wrapper".to_owned())));
+}
+
+#[test]
+fn statements_outside_a_transaction_count_as_one_read() {
+    let pool = r#"async fn p(&self) {
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&self.pool).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&self.pool).await; }"#;
+    let pool_method = r#"async fn q(&self) { let pool = self.pool();
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(pool).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(pool).await; }"#;
+    let conn = r#"async fn r(&self) {
+        let mut conn = self.pool.acquire().await.map_err(db)?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *conn).await;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *conn).await; }"#;
+    let via_helpers = r#"async fn s(&self) { first(&self.pool).await; second(&self.pool).await; }
+        async fn first(p: &PgPool) {
+            sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(p).await; }
+        async fn second(p: &PgPool) {
+            sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(p).await; }"#;
+    assert_eq!(reads(pool), ["x.rs p"]);
+    assert_eq!(reads(pool_method), ["x.rs q"]);
+    assert_eq!(reads(conn), ["x.rs r"]);
+    assert_eq!(reads(via_helpers), ["x.rs s"]);
+    let one_each = r#"async fn t(&self) {
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&self.pool).await;
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *conn).await;
+        let mut tx = self.begin().await?;
+        sqlx::query("SELECT z FROM v WHERE tenant_id = $1").fetch_all(&mut *tx).await; }"#;
+    assert_eq!(reads(one_each), Vec::<String>::new());
+}
+
+#[test]
+fn the_multi_read_allowlist_is_keyed_by_file_and_function() {
+    let two = |f: &str| {
+        format!(
+            r#"async fn {f}(&self) {{ let mut tx = self.begin().await?;
+            sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await;
+            sqlx::query("SELECT y FROM u WHERE tenant_id = $1").fetch_all(&mut *tx).await; }}"#
+        )
+    };
+    let (x, y) = (two("b"), two("b"));
+    let sources = [("x.rs", x.as_str()), ("y.rs", y.as_str())];
+    // An entry for one file does not cover the same name in another.
+    let allowed = [("x.rs", "b", "why")];
+    let (found, used) = rule5(multi_statement_reads, &sources, &allowed);
+    assert_eq!(found, ["y.rs b"]);
+    assert!(stale_entries(&allowed, &used).is_empty());
+    // An entry whose file runs no such read is stale, even when another
+    // file's function of that name is allowed.
+    let allowed = [("x.rs", "b", "why"), ("z.rs", "b", "why")];
+    let (_, used) = rule5(multi_statement_reads, &sources, &allowed);
+    assert_eq!(stale_entries(&allowed, &used), ["z.rs b"]);
+}
+
+#[test]
+fn a_statement_in_a_loop_runs_more_than_once() {
+    let looped = r#"async fn l(&self, ids: &[i64]) { let mut tx = self.begin().await?;
+        for id in ids {
+            sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await; } }"#;
+    let while_loop = r#"async fn w(&self) { let mut tx = self.begin().await?;
+        while more {
+            sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await; } }"#;
+    let helper_in_loop = r#"async fn m(&self) { let mut tx = self.begin().await?;
+        loop { self.page(&mut tx).await; } }
+        async fn page(&self, c: &mut PgConnection) {
+            sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(c).await; }"#;
+    let helper_loops = r#"async fn n(&self) { let mut tx = self.begin().await?;
+        self.pages(&mut tx).await; }
+        async fn pages(&self, c: &mut PgConnection) { for _ in 0..2 {
+            sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *c).await; } }"#;
+    assert_eq!(reads(looped), ["x.rs l"]);
+    assert_eq!(reads(while_loop), ["x.rs w"]);
+    assert_eq!(reads(helper_in_loop), ["x.rs m"]);
+    assert_eq!(reads(helper_loops), ["x.rs n"]);
+    // A transaction opened in each pass runs one statement.
+    let per_pass = r#"async fn o(&self) { loop { let mut tx = self.begin().await?;
+        sqlx::query("SELECT x FROM t WHERE tenant_id = $1").fetch_all(&mut *tx).await; } }"#;
+    assert_eq!(reads(per_pass), Vec::<String>::new());
 }
