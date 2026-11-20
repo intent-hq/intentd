@@ -663,9 +663,10 @@ available there; hover an icon for its name. Cloud entries show a cloud icon, a 
 while the entry is ready, and Linux. A badge appears only while a machine is being made available
 (**Exposing**) or for a problem (unreachable, revoked, update required, key rejected), and the
 version only when the machine's intentd is older than the app expects. Pending frontend release
-(not in current builds): hover or focus a saved machine or node name to see its operating
-system above a list of available AI providers. Switched-off providers are hidden, and offline
-or unknown machines show no icons, except a machine the backend runs agents on: while idle (disconnected) it still
+(not in current builds): hover or focus a saved machine or node name to see the
+**Operating system** and **Providers** sections when those details are available.
+Switched-off providers are hidden, and offline or unknown machines show no icons, except
+a machine the backend runs agents on: while idle (disconnected) it still
 shows the providers from its last report, or **Needs Node.js** when some providers would run once Node.js is installed (they fetch their adapter through `npx`; hover it for which ones), else **No providers ready**. **Add machine** opens **Set up a new machine** (when cloud machines can be added, it
 is the first item of a menu next to **Add cloud**; the machine rail's **Add machine** opens
 it too), which offers **Paste an intent:// link**, **Enter connection details** (host, port and access
