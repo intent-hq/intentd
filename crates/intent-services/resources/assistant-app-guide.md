@@ -102,12 +102,13 @@ snapshots, not local access.
 An agent author's name or avatar opens that agent beside the discussion. If the
 agent is unavailable, the app reports that it cannot open the reference. Sending
 in an existing discussion preserves its message row while confirmation arrives; failed messages can be
-retried without consuming a newer draft. Discussion composers support text,
-references and images. Paste, drop or use the image button to attach PNG, JPEG,
-GIF or WebP images; each shows as a removable thumbnail until you send. Click an
-image in the thread to view it full size. Agents addressed in the discussion can
-open these images. File attachments are not supported, and older app versions may
-not show images. The discussion and
+retried without consuming a newer draft. Discussion composers support text and
+references. With a desktop version that includes discussion image sharing, paste,
+drop or use the image button to attach PNG, JPEG, GIF or WebP images; each shows
+as a removable thumbnail until you send. Click an image in the thread to view it
+full size. Agents addressed in the discussion can open these images. Without
+that version, the composer has no image button and sent images appear as text.
+File attachments are not supported. The discussion and
 agent-chat @ menus have different recipient and delivery rules. Sending a message
 with a selected agent in a workspace-wide discussion explicitly addresses that agent.
 
@@ -1715,11 +1716,12 @@ Use the icon tabs above the expanded sidebar's content panel to switch sections.
 They share available width up to a compact limit, then stay grouped at the left.
 Hover over an icon for its section name; scroll the row horizontally when space
 is tight. Faded edges show where more tabs are hidden and clear when you reach
-that end. **People** comes first in the expanded row and collapsed rail. In a
-workspace with other people, **People** opens above **Agents** until you choose a
-section; otherwise **Agents** opens. Your selected section is remembered, and older
-app versions may differ. The **Agents** tab shows the main agent's avatar, or a
-robot while no main agent is available.
+that end. **Agents** opens by default; your selected section is remembered. With
+a desktop version that opens **People** first, **People** comes first in the
+expanded row and collapsed rail, and in a workspace with other people it opens
+above **Agents** until you choose a section. Otherwise **People** follows
+**Agents**. The **Agents** tab shows the main agent's avatar, or a robot while no
+main agent is available.
 A token-usage total appears beside **Agents** once tokens have been used. It
 excludes cached tokens; its details list cached context as a separate row.
 The workspace status image appears as a compact thumbnail in **Context**; click
