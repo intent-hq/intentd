@@ -1185,7 +1185,7 @@ to 90 minutes, before restarting; long-running service scripts do not delay it.
 A service script that was running when Intent stopped starts again when Intent
 restarts. To have a service start whenever Intent starts, open its **…** menu in the
 sidebar **Scripts** list and turn on **Start automatically**; it does not stop a
-running service. Those services are listed first, with their names in color and a lightning bolt. They
+running service. Those services are listed first, with their names in color and followed by a lightning bolt icon. They
 start even if you stopped them, so turn **Start automatically** off to keep one
 stopped. Other services you stopped stay stopped. Nothing starts in an archived
 workspace.
