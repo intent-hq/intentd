@@ -31006,7 +31006,7 @@ impl WorkspaceApi for Services {
             let resolved = self
                 .agent_resolve_proposal_op(
                     workspace_id,
-                    agent_id,
+                    agent_id.clone(),
                     proposal_id.clone(),
                     outcome,
                     detail,
@@ -31014,7 +31014,8 @@ impl WorkspaceApi for Services {
                 )
                 .await;
             if claimed {
-                self.settle_dismissed_rpc_proposal(&proposal_id, resolved.is_ok());
+                self.settle_dismissed_rpc_proposal(&agent_id, &proposal_id, resolved.is_ok())
+                    .await;
             }
             resolved
         })

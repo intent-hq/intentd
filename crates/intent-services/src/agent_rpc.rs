@@ -431,12 +431,34 @@ impl Services {
     /// Settle a dismissal claimed by [`Self::guard_plain_rpc_resolution`]:
     /// drop the held calls once it is recorded, or release the claim when it
     /// failed so the card stays approvable.
-    pub(crate) fn settle_dismissed_rpc_proposal(&self, proposal_id: &str, recorded: bool) {
+    pub(crate) async fn settle_dismissed_rpc_proposal(
+        &self,
+        agent_id: &AgentId,
+        proposal_id: &str,
+        recorded: bool,
+    ) {
+        // A failed dismissal may still have committed its outcome (the
+        // resolution is written before the pending list), so consult the
+        // durable record before reopening the held calls.
+        let durable = recorded || self.proposal_outcome(agent_id, proposal_id).await.is_some();
         let mut registry = self.rpc_proposals.lock();
-        if recorded {
+        if durable {
             registry.remove(proposal_id);
         } else if let Some(held) = registry.get_mut(proposal_id) {
             held.running = false;
+        }
+    }
+
+    /// The persisted outcome of `proposal_id`, if any. A failed read counts
+    /// as resolved (fail closed: never reopen calls on an unknown state).
+    async fn proposal_outcome(&self, agent_id: &AgentId, proposal_id: &str) -> Option<String> {
+        match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => session
+                .proposal_resolutions()
+                .get(proposal_id)
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            Err(_) => Some("unknown".to_string()),
         }
     }
 
@@ -504,6 +526,19 @@ impl Services {
             }
         };
         let calls = match step {
+            // Re-check the durable record after claiming: a plain dismissal
+            // may have committed between the pending read and the claim.
+            Step::Run(_)
+                if self
+                    .proposal_outcome(&agent_id, &proposal_id)
+                    .await
+                    .is_some() =>
+            {
+                self.rpc_proposals.lock().remove(&proposal_id);
+                return self
+                    .resolve_missing_rpc_proposal(workspace_id, agent_id, proposal_id, false)
+                    .await;
+            }
             Step::Run(calls) => calls,
             Step::Missing => {
                 return self
