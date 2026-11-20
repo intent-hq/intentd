@@ -507,6 +507,16 @@ impl Store {
         dispatch!(self, backend => backend.pending_deletes().await)
     }
 
+    /// Test seam for the services startup sweep: `SQLite` records no delete,
+    /// so a test adds the record a stopped Postgres delete would have left.
+    /// [`Self::pending_deletes`] lists it while its workspace or agent row
+    /// exists, as the Postgres record lives until its delete finishes.
+    /// `SQLite` only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_pending_delete(&self, record: PendingDelete) {
+        sqlite_only!(panic "inject_pending_delete", self, backend => backend.inject_pending_delete(record));
+    }
+
     /// Run the same deletion once, retaining facts before projecting its result.
     ///
     /// `NoEffect` is only the original initial absent observation. A later
@@ -855,9 +865,39 @@ impl Store {
 impl crate::SqliteStore {
     /// `SQLite` records no delete, so none is pending (see
     /// [`Store::pending_deletes`]).
+    #[cfg(not(any(test, feature = "test-support")))]
     #[expect(clippy::unused_async, reason = "same signature as the Postgres store")]
     pub(crate) async fn pending_deletes(&self) -> Result<Vec<PendingDelete>> {
         Ok(Vec::new())
+    }
+
+    /// Test builds: the records [`Store::inject_pending_delete`] added for
+    /// this database whose workspace or agent row still exists (a finished
+    /// delete drops its Postgres record in its final transaction).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn pending_deletes(&self) -> Result<Vec<PendingDelete>> {
+        let injected = injected_pending_deletes::for_store(self)?;
+        let mut pending = Vec::with_capacity(injected.len());
+        for record in injected {
+            let exists = match &record {
+                PendingDelete::Workspace(id) => self.get_workspace(id).await.map(|_| ()),
+                PendingDelete::Agent { agent_id, .. } => self
+                    .get_agent_session_with_transcript(agent_id)
+                    .await
+                    .map(|_| ()),
+            };
+            match exists {
+                Ok(()) => pending.push(record),
+                Err(Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(pending)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn inject_pending_delete(&self, record: PendingDelete) {
+        injected_pending_deletes::push(self, record);
     }
 
     pub async fn workspace_content_clocks(
@@ -2559,5 +2599,47 @@ mod row_mapper_tests {
             missing.is_empty(),
             "WORKSPACE_COLUMNS lists columns map_workspace_row never reads: {missing:?}"
         );
+    }
+}
+
+/// Records [`Store::inject_pending_delete`] added, per database. Kept off
+/// `SqliteStore` so test-support builds keep its size (service futures that
+/// hold a `Store` have stack budgets). Keyed by the database's lifecycle
+/// domain, which every store handle of one database file shares; held
+/// weakly, so a dropped database's records go with it.
+#[cfg(any(test, feature = "test-support"))]
+mod injected_pending_deletes {
+    use std::sync::{Arc, Mutex, Weak};
+
+    use intent_core::{Error, Result};
+
+    use crate::repository_lifecycle::LifecycleDomain;
+    use crate::PendingDelete;
+
+    type Records = Vec<(Weak<LifecycleDomain>, PendingDelete)>;
+
+    static RECORDS: Mutex<Records> = Mutex::new(Vec::new());
+
+    fn domain(store: &crate::SqliteStore) -> &Arc<LifecycleDomain> {
+        &store.repository_lifecycle
+    }
+
+    pub(super) fn push(store: &crate::SqliteStore, record: PendingDelete) {
+        if let Ok(mut records) = RECORDS.lock() {
+            records.retain(|(owner, _)| owner.strong_count() > 0);
+            records.push((Arc::downgrade(domain(store)), record));
+        }
+    }
+
+    pub(super) fn for_store(store: &crate::SqliteStore) -> Result<Vec<PendingDelete>> {
+        let domain = domain(store);
+        let records = RECORDS
+            .lock()
+            .map_err(|_| Error::Internal("injected pending deletes poisoned".into()))?;
+        Ok(records
+            .iter()
+            .filter(|(owner, _)| std::ptr::eq(owner.as_ptr(), Arc::as_ptr(domain)))
+            .map(|(_, record)| record.clone())
+            .collect())
     }
 }

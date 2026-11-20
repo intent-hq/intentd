@@ -138,6 +138,7 @@ pub mod home_setup;
 pub mod host_exec;
 pub mod host_exec_stream;
 mod installed_cli;
+mod pending_delete_sweep;
 mod workspace_mutations;
 
 mod github_ops;
@@ -386,6 +387,7 @@ pub use agent_manager::{
 pub use agent_ops::StartupResumeCandidates;
 pub use agent_session::SuspendOverlapQuery;
 pub use agent_subscriptions::StartupCompletionRecovery;
+pub use pending_delete_sweep::PendingDeleteSweep;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
 // The individual watcher families are constructed only by `WatcherRegistry`
