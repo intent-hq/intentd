@@ -2744,6 +2744,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `backends.report` from an owner app connection bound to `client_id`
+    /// (`device` is its machine name). Replaces that app's list.
+    fn backends_report(
+        &self,
+        client_id: crate::ClientId,
+        device: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (client_id, device, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::backends_report not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `ws.rpc.info()` / `ws.rpc.methods()` for the Assistant: `what` is
     /// `"info"` or `"methods"`; `args` carries the binding's options.
     fn agent_rpc_describe(

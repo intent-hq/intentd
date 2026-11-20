@@ -19,6 +19,7 @@ use intent_core::agent_rpc::{
 use intent_core::{AgentId, Error, Result, WorkspaceId};
 use serde_json::{json, Value};
 
+use crate::agent_rpc_backends::{relay_outcome_unknown, Target};
 use crate::Services;
 
 /// The proposal kind of an Assistant RPC approval card.
@@ -43,6 +44,7 @@ const BUDGET_MARGIN: Duration = Duration::from_millis(1_500);
 #[derive(Debug, Clone)]
 struct HeldCall {
     backend: String,
+    backend_name: String,
     method: String,
     params: Value,
 }
@@ -129,8 +131,8 @@ impl Services {
         }
     }
 
-    /// `ws.rpc.info()` and `ws.rpc.methods()`.
-    pub(crate) fn agent_rpc_describe_op(
+    /// `ws.rpc.info()`, `ws.rpc.methods()` and `ws.rpc.backends()`.
+    pub(crate) async fn agent_rpc_describe_op(
         &self,
         workspace_id: &WorkspaceId,
         what: &str,
@@ -138,36 +140,73 @@ impl Services {
     ) -> Result<Value> {
         Self::require_assistant(workspace_id)?;
         let surface = self.agent_rpc_surface()?;
-        match what {
-            "info" => {
-                let version = surface.daemon_version();
-                Ok(json!({
-                    "backend": {
-                        "id": LOCAL_BACKEND_ID,
-                        "name": surface.local_backend_name(),
-                        "local": true,
-                    },
-                    "daemonVersion": version,
-                    "protocolVersion": surface.protocol_version(),
-                    "source": format!("https://github.com/intent-hq/intentd/tree/v{version}"),
-                    "protocolDocs": "https://github.com/intent-hq/intent/tree/main/docs/protocol",
-                    "docsNote": "The protocol docs track the monorepo's intentd pin, not this exact release; the intentd source at v<daemonVersion> is the exact match.",
-                    "cli": "intentd call <method> --params '<json>' is the equivalent CLI form used in docs. Do not run it; use ws.rpc.call.",
-                }))
+        let surface = surface.as_ref();
+        if what == "backends" {
+            return Ok(self.backends_view(surface));
+        }
+        let budget = Duration::from_millis(
+            args.get("budgetMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(25_000),
+        )
+        .saturating_sub(BUDGET_MARGIN);
+        let target =
+            match self.resolve_backend(surface, args.get("backend").and_then(Value::as_str)) {
+                Ok(target) => target,
+                Err(error) => return Ok(json!({ "ok": false, "error": rpc_error_value(&error) })),
+            };
+        match (what, &target) {
+            ("info", Target::Local) => Ok(info_view(
+                &json!({ "id": LOCAL_BACKEND_ID, "name": surface.local_backend_name(), "local": true }),
+                &surface.daemon_version(),
+                &surface.protocol_version(),
+            )),
+            ("info", Target::Remote(backend)) => {
+                match Self::relay(surface, backend, "system.status", json!({}), budget).await {
+                    Ok(status) => Ok(info_view(
+                        &json!({ "id": backend.id, "name": backend.name, "local": false }),
+                        status["version"].as_str().unwrap_or_default(),
+                        status["protocolVersion"].as_str().unwrap_or_default(),
+                    )),
+                    Err(error) => Ok(
+                        json!({ "ok": false, "backend": backend.id, "error": rpc_error_value(&error) }),
+                    ),
+                }
             }
-            "methods" => {
+            ("methods", _) => {
+                let rows: Vec<Value> = match &target {
+                    Target::Local => surface
+                        .methods()
+                        .into_iter()
+                        .map(|row| serde_json::to_value(row).unwrap_or(Value::Null))
+                        .collect(),
+                    Target::Remote(backend) => {
+                        match Self::relay(surface, backend, "agent.rpcMethods", json!({}), budget)
+                            .await
+                        {
+                            Ok(reply) => reply["methods"].as_array().cloned().unwrap_or_default(),
+                            Err(error) => {
+                                return Ok(
+                                    json!({ "ok": false, "backend": backend.id, "error": rpc_error_value(&error) }),
+                                )
+                            }
+                        }
+                    }
+                };
                 let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
                 let class = args.get("class").and_then(Value::as_str);
-                let rows: Vec<Value> = surface
-                    .methods()
+                let rows: Vec<Value> = rows
                     .into_iter()
-                    .filter(|row| row.method.starts_with(prefix))
-                    .filter(|row| class.is_none_or(|c| row.class.as_str() == c))
-                    .map(|row| serde_json::to_value(row).unwrap_or(Value::Null))
+                    .filter(|row| {
+                        row["method"]
+                            .as_str()
+                            .is_some_and(|m| m.starts_with(prefix))
+                    })
+                    .filter(|row| class.is_none_or(|c| row["class"] == c))
                     .collect();
-                Ok(json!({ "count": rows.len(), "methods": rows }))
+                Ok(json!({ "backend": target.id(), "count": rows.len(), "methods": rows }))
             }
-            other => Err(Error::InvalidParams(format!(
+            (other, _) => Err(Error::InvalidParams(format!(
                 "unknown ws.rpc view `{other}`"
             ))),
         }
@@ -194,6 +233,11 @@ impl Services {
             )));
         }
         let mut held = Vec::with_capacity(request.calls.len());
+        // One deadline for the whole request: classification lookups and the
+        // final read share the eval budget instead of each getting all of it.
+        let started = tokio::time::Instant::now();
+        let class_deadline = started + budget.saturating_sub(BUDGET_MARGIN);
+        let mut remote_classes = HashMap::new();
         for (index, call) in request.calls.iter().enumerate() {
             let method = call.method.trim();
             if method.is_empty() {
@@ -201,24 +245,19 @@ impl Services {
                     "call {index}: method is required"
                 )));
             }
-            let backend = call
-                .backend
-                .clone()
-                .filter(|b| !b.is_empty())
-                .unwrap_or_else(|| LOCAL_BACKEND_ID.to_string());
-            if backend != LOCAL_BACKEND_ID {
-                return Ok(json!({
-                    "ok": false,
-                    "index": index,
-                    "backend": backend,
-                    "method": method,
-                    "error": rpc_error_value(&AgentRpcError::coded(
-                        -32602,
-                        "unknown-backend",
-                        format!("unknown backend `{backend}`: only the local backend (`{LOCAL_BACKEND_ID}`) is available"),
-                    )),
-                }));
-            }
+            let target = match self.resolve_backend(surface.as_ref(), call.backend.as_deref()) {
+                Ok(target) => target,
+                Err(error) => {
+                    return Ok(json!({
+                        "ok": false,
+                        "index": index,
+                        "backend": call.backend,
+                        "method": method,
+                        "error": rpc_error_value(&error),
+                    }))
+                }
+            };
+            let backend = target.id().to_string();
             let params = match &call.params {
                 Value::Null => json!({}),
                 Value::Object(_) => call.params.clone(),
@@ -228,7 +267,14 @@ impl Services {
                     )))
                 }
             };
-            let class = surface.classify(method);
+            let class = Self::class_for(
+                surface.as_ref(),
+                &target,
+                method,
+                class_deadline,
+                &mut remote_classes,
+            )
+            .await;
             if let Some(refusal) = refusal_for(surface.as_ref(), method, class) {
                 audit(&agent_id, &backend, method, class, "refused");
                 return Ok(json!({
@@ -240,9 +286,26 @@ impl Services {
                     "error": rpc_error_value(&refusal),
                 }));
             }
+            let backend_name = match &target {
+                Target::Local => surface.local_backend_name(),
+                Target::Remote(b) => b.name.clone(),
+            };
+            // A remote call needs an online relay before a card is shown.
+            if let Target::Remote(remote) = &target {
+                if let Err(error) = Self::pick_relay(surface.as_ref(), remote) {
+                    return Ok(json!({
+                        "ok": false,
+                        "index": index,
+                        "backend": backend,
+                        "method": method,
+                        "error": rpc_error_value(&error),
+                    }));
+                }
+            }
             held.push((
                 HeldCall {
                     backend,
+                    backend_name,
                     method: method.to_string(),
                     params,
                 },
@@ -251,8 +314,9 @@ impl Services {
         }
         if !request.batch && held[0].1 == AgentRpcClass::Read {
             let (call, class) = held.remove(0);
+            let remaining = budget.saturating_sub(started.elapsed());
             return Ok(self
-                .run_read(surface.as_ref(), &agent_id, call, class, budget)
+                .run_read(surface.as_ref(), &agent_id, call, class, remaining)
                 .await);
         }
         self.hold_for_approval(
@@ -276,9 +340,8 @@ impl Services {
         let outcome = if wait.is_zero() {
             Err(timeout_error(&call.method, wait))
         } else {
-            tokio::time::timeout(wait, surface.call(call.method.clone(), call.params))
+            self.call_on(surface, &call.backend, &call.method, call.params, wait)
                 .await
-                .unwrap_or_else(|_| Err(timeout_error(&call.method, wait)))
         };
         let mut out = json!({ "backend": call.backend, "method": call.method });
         match outcome {
@@ -305,14 +368,17 @@ impl Services {
         held: &[(HeldCall, AgentRpcClass)],
     ) -> Result<Value> {
         let proposal_id = format!("rpc-{}", uuid::Uuid::new_v4());
-        let backend_name = surface.local_backend_name();
         let calls_json: Vec<Value> = held
             .iter()
             .enumerate()
             .map(|(index, (call, class))| {
                 json!({
                     "index": index,
-                    "backend": { "id": call.backend, "name": backend_name, "local": true },
+                    "backend": {
+                        "id": call.backend,
+                        "name": call.backend_name,
+                        "local": call.backend == LOCAL_BACKEND_ID,
+                    },
                     "method": call.method,
                     "class": class.as_str(),
                     "summary": surface.summary(&call.method).unwrap_or_default(),
@@ -330,10 +396,17 @@ impl Services {
             },
             |t| t.chars().take(200).collect::<String>(),
         );
-        let summary = if held.len() == 1 {
-            format!("On {backend_name}.")
+        let mut backends: Vec<&str> = held.iter().map(|(c, _)| c.backend_name.as_str()).collect();
+        backends.dedup();
+        let place = if backends.len() == 1 {
+            format!("On {}", backends[0])
         } else {
-            format!("On {backend_name}, in order. Stops at the first failure.")
+            format!("On {} backends", backends.len())
+        };
+        let summary = if held.len() == 1 {
+            format!("{place}.")
+        } else {
+            format!("{place}, in order. Stops at the first failure.")
         };
         let proposal = json!({
             "kind": RPC_CALL_PROPOSAL_KIND,
@@ -661,10 +734,20 @@ impl Services {
             }
             let outcome = match refusal_for(surface.as_ref(), &call.method, class) {
                 Some(refusal) => Err((false, refusal)),
-                None => tokio::time::timeout(wait, surface.call(call.method.clone(), call.params))
+                None => self
+                    .call_on(
+                        surface.as_ref(),
+                        &call.backend,
+                        &call.method,
+                        call.params,
+                        wait,
+                    )
                     .await
-                    .map_err(|_| (true, timeout_error(&call.method, wait)))
-                    .and_then(|r| r.map_err(|e| (false, e))),
+                    .map_err(|e| {
+                        let unknown =
+                            e.data_code() == Some("agent-rpc-timeout") || relay_outcome_unknown(&e);
+                        (unknown, e)
+                    }),
             };
             match outcome {
                 Ok(result) => {
@@ -688,6 +771,37 @@ impl Services {
         }
         items
     }
+}
+
+impl Services {
+    /// Run one call on `backend` (local loopback or relay) within `wait`.
+    async fn call_on(
+        &self,
+        surface: &dyn AgentRpcSurface,
+        backend: &str,
+        method: &str,
+        params: Value,
+        wait: Duration,
+    ) -> std::result::Result<Value, AgentRpcError> {
+        match self.resolve_backend(surface, Some(backend))? {
+            Target::Local => tokio::time::timeout(wait, surface.call(method.to_string(), params))
+                .await
+                .unwrap_or_else(|_| Err(timeout_error(method, wait))),
+            Target::Remote(remote) => Self::relay(surface, &remote, method, params, wait).await,
+        }
+    }
+}
+
+fn info_view(backend: &Value, version: &str, protocol_version: &str) -> Value {
+    json!({
+        "backend": backend,
+        "daemonVersion": version,
+        "protocolVersion": protocol_version,
+        "source": format!("https://github.com/intent-hq/intentd/tree/v{version}"),
+        "protocolDocs": "https://github.com/intent-hq/intent/tree/main/docs/protocol",
+        "docsNote": "The protocol docs track the monorepo's intentd pin, not this exact release; the intentd source at v<daemonVersion> is the exact match.",
+        "cli": "intentd call <method> --params '<json>' is the equivalent CLI form used in docs. Do not run it; use ws.rpc.call.",
+    })
 }
 
 fn refusal_for(

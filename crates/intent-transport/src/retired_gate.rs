@@ -212,6 +212,7 @@ pub(crate) const RETIRED_UNGATED_METHODS: &[&str] = &[
     "agent.listUserMessages",
     "agent.memoryUsage",
     "agent.pendingPermissions",
+    "agent.rpcMethods",
     "agent.subscribe",
     "agent.summary",
     "agent.unsubscribe",

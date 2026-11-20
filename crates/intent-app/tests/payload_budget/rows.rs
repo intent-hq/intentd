@@ -559,6 +559,11 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 ),
             ],
         ),
+        fixed(
+            "agent.rpcMethods",
+            "The compiled method catalog with one class per method; it does not grow with daemon state.",
+            vec![v("default", json!({}), Fixed("/methods"))],
+        ),
         row(
             "agent.summary",
             vec![v("default", wa.clone(), Bytes(1024))],

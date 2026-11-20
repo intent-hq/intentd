@@ -51,6 +51,7 @@ agent.respondPermission
 agent.restore
 agent.retire
 agent.retry
+agent.rpcMethods
 agent.sendMessage
 agent.sendQueuedMessageNow
 agent.sendQueuedMessagesNow
@@ -65,6 +66,7 @@ agent.wakeOrCreate
 agent.workers.list
 agent.workers.stop
 agent.workers.subscribe
+backends.report
 browser.closeTab
 browser.exec
 browser.listTabs

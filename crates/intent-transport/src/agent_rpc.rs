@@ -28,6 +28,7 @@ const PROTOCOL_DOC_FILE_URL: &str = "https://github.com/intent-hq/intent/blob/ma
 const NAMESPACE_DOCS: &[(&str, &str)] = &[
     ("accept-changes", "methods/workspace.md"),
     ("agent", "methods/agents.md"),
+    ("backends", "methods/agents.md"),
     ("browser", "methods/files-terminal-browser.md"),
     ("client", "methods/client-hello.md"),
     ("cloudMachines", "methods/nodes.md"),
@@ -161,6 +162,12 @@ pub struct LoopbackAgentRpc {
     server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     limiter: RpcLimiter,
     daemon_version: String,
+    reverse_registry: Option<Arc<crate::reverse::PrimaryReverseRegistry>>,
+}
+
+/// The `data.code` of a relay that failed before or while delivering.
+fn relay_error(code: &str, message: impl Into<String>) -> AgentRpcError {
+    AgentRpcError::coded(AGENT_RPC_INTERNAL_CODE, code, message)
 }
 
 impl LoopbackAgentRpc {
@@ -182,7 +189,19 @@ impl LoopbackAgentRpc {
             server_pairing_info,
             limiter,
             daemon_version: daemon_version.into(),
+            reverse_registry: None,
         }
+    }
+
+    /// Relay remote-backend calls through owner apps on `registry`
+    /// (`backends.relayCall`).
+    #[must_use]
+    pub fn with_reverse_registry(
+        mut self,
+        registry: Arc<crate::reverse::PrimaryReverseRegistry>,
+    ) -> Self {
+        self.reverse_registry = Some(registry);
+        self
     }
 
     #[cfg(any(unix, windows))]
@@ -292,7 +311,64 @@ impl AgentRpcSurface for LoopbackAgentRpc {
             self.run(method, params).await
         })
     }
+
+    fn local_fingerprint(&self) -> Option<String> {
+        self.control.as_ref()?.status().fingerprint
+    }
+
+    fn relay_online(&self, client_id: &str) -> bool {
+        self.reverse_registry.as_ref().is_some_and(|registry| {
+            registry
+                .relay_channel(&intent_core::ClientId::from(client_id))
+                .is_some()
+        })
+    }
+
+    fn relay_call(
+        &self,
+        client_id: String,
+        backend_id: String,
+        method: String,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'_, Result<Value, AgentRpcError>> {
+        Box::pin(async move {
+            let channel = self
+                .reverse_registry
+                .as_ref()
+                .and_then(|r| r.relay_channel(&intent_core::ClientId::from(client_id.as_str())))
+                .ok_or_else(|| {
+                    relay_error("no-relay-online", "the reporting app is not connected")
+                })?;
+            let request = json!({
+                "backendId": backend_id,
+                "method": method,
+                "params": params,
+                "timeoutMs": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            });
+            match channel.request(RELAY_METHOD, request, timeout).await {
+                Ok(reply) => decode_reply(reply),
+                Err(e) if e.timed_out => Err(relay_error(
+                    "relay-timeout",
+                    format!("`{method}` relayed to backend `{backend_id}` did not answer in time; it may still run"),
+                )),
+                // The app answered with a transport-level error of its own.
+                Err(e) if e.code != 0 => Err(AgentRpcError {
+                    code: e.code,
+                    message: e.message,
+                    data: e.data,
+                }),
+                Err(_) => Err(relay_error(
+                    "relay-disconnected",
+                    format!("the app relaying `{method}` to backend `{backend_id}` disconnected; the call may have run"),
+                )),
+            }
+        })
+    }
 }
+
+/// The daemon→client reverse RPC that relays one call to another backend.
+pub const RELAY_METHOD: &str = "backends.relayCall";
 
 #[cfg(test)]
 mod tests;

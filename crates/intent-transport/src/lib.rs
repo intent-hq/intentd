@@ -62,6 +62,7 @@ mod accept_backoff;
 pub mod agent_rpc;
 mod agent_workers;
 pub mod auth;
+mod backends;
 pub(crate) mod browser;
 pub mod catalog;
 mod client;
