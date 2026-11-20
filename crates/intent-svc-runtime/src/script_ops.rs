@@ -1748,33 +1748,53 @@ impl ScriptManager {
                                 } else {
                                     Vec::new()
                                 };
-                            for script in scripts {
-                                let id = script.id.clone();
-                                let lock = self.locks.definition_lock(&id);
-                                let _guard = lock.lock().await;
-                                let publication = self.locks.publication_lock(&id);
-                                let _publishing = publication.lock().await;
-                                self.scripts.lock().unwrap().insert(
-                                    (workspace_id.clone(), script.id.clone()),
-                                    ManagedScript {
-                                        def: script,
-                                        state: ScriptRuntimeState::default(),
-                                        pty_id: None,
-                                        monitor_attempt: None,
-                                        stopped_by_user: false,
-                                        supervisor: None,
-                                        generation: next_generation(),
-                                        lost_at_daemon_stop: false,
-                                        running_at_shutdown: false,
-                                        run_reserved: None,
-                                        run_id: None,
-                                        run_generation: None,
-                                        cancellation: None,
-                                        pending_result: None,
-                                    },
-                                );
-                                self.emit_changed_locked(workspace_id, &id, "created").await;
+                            // Register the whole set at once: a list that
+                            // skips the bootstrap lock (the autoStart kick runs
+                            // one alongside a client's first list) must never
+                            // see a partial set. Each new id's locks stay held
+                            // until its `created` event is out.
+                            let ids: Vec<String> = scripts.iter().map(|s| s.id.clone()).collect();
+                            let mut held = Vec::with_capacity(ids.len() * 2);
+                            for id in &ids {
+                                held.push(self.locks.definition_lock(id).lock_owned().await);
+                                held.push(self.locks.publication_lock(id).lock_owned().await);
                             }
+                            {
+                                let mut registry = self.scripts.lock().unwrap();
+                                for script in scripts {
+                                    registry
+                                        .entry((workspace_id.clone(), script.id.clone()))
+                                        .or_insert_with(|| ManagedScript {
+                                            def: script,
+                                            state: ScriptRuntimeState::default(),
+                                            pty_id: None,
+                                            monitor_attempt: None,
+                                            stopped_by_user: false,
+                                            supervisor: None,
+                                            generation: next_generation(),
+                                            lost_at_daemon_stop: false,
+                                            running_at_shutdown: false,
+                                            run_reserved: None,
+                                            run_id: None,
+                                            run_generation: None,
+                                            cancellation: None,
+                                            pending_result: None,
+                                        });
+                                }
+                            }
+                            for (index, id) in ids.iter().enumerate() {
+                                self.emit_changed_locked(workspace_id, id, "created").await;
+                                if let Some(park) = self
+                                    .parks
+                                    .bootstrap_registered
+                                    .as_ref()
+                                    .filter(|_| index == 0)
+                                {
+                                    park.entered.notify_one();
+                                    park.release.notified().await;
+                                }
+                            }
+                            drop(held);
                             if !serialize {
                                 return Ok(Value::Null);
                             }

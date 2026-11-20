@@ -53,6 +53,8 @@ pub struct ScriptParks {
     pub admission_wait: Option<Arc<tokio::sync::Notify>>,
     /// Parks a first-use list before its atomic bootstrap claim.
     pub bootstrap_persist: Option<Arc<SupervisePark>>,
+    /// Parks a first-use list after it published its first bootstrapped script.
+    pub bootstrap_registered: Option<Arc<SupervisePark>>,
     pub monitor_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
     /// Parks before process admission; cancellation must prevent the spawn.
     pub before_spawn: Option<Arc<SupervisePark>>,
