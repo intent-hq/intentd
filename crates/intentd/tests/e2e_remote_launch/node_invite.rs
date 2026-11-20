@@ -26,7 +26,6 @@ async fn pair_node(data_dir: &Path, args: &[&str]) -> std::process::Output {
     loop {
         let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
             .args(["pair", "--node"])
-            .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
             .args(args)
             .env("INTENTD_DATA_DIR", data_dir)
             .stdin(Stdio::null())

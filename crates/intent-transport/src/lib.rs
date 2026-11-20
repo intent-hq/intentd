@@ -34,8 +34,7 @@ pub use router::handle_message;
 pub use rpc_limit::RpcLimiter;
 pub use server::{
     advertised_hosts, collect_bind_interfaces, collect_local_ips, collect_local_ipv6s,
-    collect_tailscale_ips, tailscale_ipv4s_from, MachineRoutesResolver, PairingSnapshot,
-    ServerPairingInfo,
+    MachineRoutesResolver, PairingSnapshot, ServerPairingInfo,
 };
 pub use tls::{
     ensure_tls_certificate, generate_certificate, inspect_cert, CertStatus, TlsCertificate,

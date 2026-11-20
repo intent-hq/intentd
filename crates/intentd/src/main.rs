@@ -254,12 +254,13 @@ enum Command {
     /// are disabled, offers to enable them on the spot (persisting
     /// `server.wsApi.enabled = true` via `settings.update`, which also starts
     /// the listener) — interactively via a [Y/n] prompt, then a Tailcat
-    /// tunnel [Y/n] prompt (default yes), then a multi-select bind-address
-    /// picker pre-checked with this machine's Tailscale addresses on a
-    /// loopback-only setup (persisted to `server.bindAddress`: a single IP as
-    /// a string, several as a list), or unattended with `--yes` (the same
-    /// defaults: tunnel on, loopback plus Tailscale addresses);
-    /// non-interactive runs without `--yes` refuse instead. `--host` names
+    /// tunnel prompt (default yes with `--tunnel` or a loopback-only bind,
+    /// otherwise the saved choice), then a multi-select bind-address picker
+    /// pre-checked with the saved addresses (persisted to
+    /// `server.bindAddress`: a single IP as a string, several as a list), or
+    /// unattended with `--yes` (the same defaults; the saved bind is kept,
+    /// loopback on a fresh install); non-interactive runs without `--yes`
+    /// refuse instead. `--host` names
     /// the address clients dial instead, which also pairs a loopback-only
     /// daemon (e.g. `--host localhost` for the Windows app and a daemon in
     /// WSL).
@@ -272,8 +273,9 @@ enum Command {
         svg: Option<PathBuf>,
         /// Enable external connections without prompting when they are
         /// disabled (persists `server.wsApi.enabled = true`) with the
-        /// interactive defaults: the Tailcat tunnel on, and a loopback-only
-        /// bind widened to this machine's Tailscale addresses.
+        /// interactive defaults: the saved bind address (loopback on a fresh
+        /// install), and the Tailcat tunnel on with `--tunnel` or a
+        /// loopback-only bind, otherwise as saved.
         #[arg(long, short = 'y')]
         yes: bool,
         /// Re-run ONLY the endpoint selection: ask the Tailcat tunnel
@@ -999,40 +1001,6 @@ fn parse_yes_no(input: &str, default: bool) -> Result<bool, String> {
     }
 }
 
-/// Whether a first-time enable adds this machine's Tailscale addresses to
-/// the default bind; `INTENTD_PAIR_BIND_TAILSCALE=0` (or `false`/`no`/`off`)
-/// keeps it loopback only.
-fn bind_tailscale_by_default() -> bool {
-    !std::env::var("INTENTD_PAIR_BIND_TAILSCALE").is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        )
-    })
-}
-
-/// The bind set a first-time enable defaults to: a loopback-only (or empty)
-/// saved set gains this machine's `tailscale` addresses
-/// ([`intent_transport::collect_tailscale_ips`]), so the default is loopback
-/// plus the tailnet and never a LAN or the internet. Any other saved set is
-/// kept as is. Pure over its input so the rule is unit-testable.
-fn default_bind_addresses(
-    current: &[std::net::IpAddr],
-    tailscale: &[std::net::Ipv4Addr],
-) -> Vec<std::net::IpAddr> {
-    let mut addrs = current.to_vec();
-    if !current.iter().all(std::net::IpAddr::is_loopback) {
-        return addrs;
-    }
-    for ip in tailscale {
-        let ip = std::net::IpAddr::V4(*ip);
-        if !addrs.contains(&ip) {
-            addrs.push(ip);
-        }
-    }
-    addrs
-}
-
 /// Map the picker selection to the `settings.update` changes it implies,
 /// diffed against the current state so unchanged values are not rewritten:
 /// - the chosen addresses → `server.bindAddress` (a tailcat-only selection
@@ -1373,37 +1341,34 @@ async fn enable_tunnel_for_pairing(socket: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Enable external connections for pairing when the listener is down —
-/// turning remote access on, which brings the tailcat tunnel with it by
-/// default. `--yes` (or an unattended run) binds the default set
-/// ([`default_bind_addresses`]: a loopback-only saved set gains this
-/// machine's Tailscale addresses) and then turns the tunnel on; otherwise a
-/// consent prompt, then the tunnel question (default yes) and the address
-/// picker pre-checked with the same default set. Returns whether this run
-/// turned the tunnel on, so the caller waits for its route.
+/// Whether turning remote access on for pairing should also turn the tunnel
+/// on (the default answer of the tunnel question, and what `--yes` does):
+/// `--tunnel` always does — the installers pass it on a first install; so
+/// does a listener bound to loopback only, which offers no route another
+/// device could dial. A saved LAN bind keeps its saved tunnel choice, so a
+/// re-install defaults to what was set on the machine before.
+fn pair_wants_tunnel(tunnel_flag: bool, tunnel_enabled: bool, loopback_only: bool) -> bool {
+    tunnel_enabled || tunnel_flag || loopback_only
+}
+
+/// Enable external connections for pairing when the listener is down.
+/// `--yes` (or an unattended run) keeps the saved `server.bindAddress`
+/// (default: loopback) and turns the tunnel on per [`pair_wants_tunnel`];
+/// otherwise a consent prompt, then the tunnel question (defaulting the same
+/// way) and the address picker pre-checked with the saved addresses. Returns
+/// whether this run turned the tunnel on, so the caller waits for its route.
 async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow::Result<bool> {
     let tunnel_enabled = current_bool_setting(socket, "server.tunnel.enabled").await?;
     let current = current_bind_addresses(socket).await;
-    let tailscale = if bind_tailscale_by_default() {
-        intent_transport::collect_tailscale_ips()
-    } else {
-        Vec::new()
-    };
-    let defaults = default_bind_addresses(&current, &tailscale);
+    let loopback_only = current.iter().all(std::net::IpAddr::is_loopback);
+    let wants_tunnel = pair_wants_tunnel(opts.tunnel, tunnel_enabled, loopback_only);
     if opts.yes {
-        let changes = if same_addr_set(&defaults, &current) {
-            Vec::new()
-        } else {
-            vec![json!({
-                "path": "server.bindAddress",
-                "value": bind_addresses_value(&defaults),
-            })]
-        };
-        enable_wss_listener(socket, &changes).await?;
-        if !tunnel_enabled {
+        enable_wss_listener(socket, &[]).await?;
+        if wants_tunnel && !tunnel_enabled {
             enable_tunnel_for_pairing(socket).await?;
+            return Ok(true);
         }
-        return Ok(!tunnel_enabled);
+        return Ok(false);
     }
     if !confirm_enable_wss()? {
         anyhow::bail!(
@@ -1412,10 +1377,10 @@ async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow
              config.toml"
         );
     }
-    // Pre-checked from the default set; an unchanged selection writes
+    // Pre-checked from the saved state; an unchanged selection writes
     // nothing so the stored shapes stay untouched.
     let tunnel_only = current_bool_setting(socket, "server.tunnel.only").await?;
-    let selection = prompt_listen_targets(&defaults, true, tunnel_only)?;
+    let selection = prompt_listen_targets(&current, wants_tunnel, tunnel_only)?;
     let changes = listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only);
     enable_wss_listener(socket, &changes).await?;
     Ok(selection.tailcat && !tunnel_enabled)
@@ -10729,46 +10694,14 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn default_bind_addresses_add_tailscale_to_a_loopback_only_set() {
-        let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let lan: std::net::IpAddr = "192.168.1.5".parse().unwrap();
-        let ts: std::net::IpAddr = "100.101.102.103".parse().unwrap();
-        let ifaces = [
-            ("lo".to_string(), std::net::Ipv4Addr::LOCALHOST),
-            ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
-            (
-                "tailscale0".to_string(),
-                std::net::Ipv4Addr::new(100, 101, 102, 103),
-            ),
-        ];
-        let tailnet = [std::net::Ipv4Addr::new(100, 101, 102, 103)];
-        // Fresh (empty or loopback-only): loopback plus the tailnet, never
-        // the LAN.
-        assert_eq!(default_bind_addresses(&[], &tailnet), vec![ts]);
-        assert_eq!(default_bind_addresses(&[lo], &tailnet), vec![lo, ts]);
-        // A saved set that already reaches past loopback is kept.
-        assert_eq!(default_bind_addresses(&[lan], &tailnet), vec![lan]);
-        // No Tailscale address: loopback only.
-        assert_eq!(
-            default_bind_addresses(&[], &[]),
-            Vec::<std::net::IpAddr>::new()
-        );
-
-        // The picker pre-checks exactly the tailnet row on a fresh install.
-        let defaults = default_bind_addresses(&[], &tailnet);
-        let choices = build_bind_choices(&ifaces);
-        let checked = listen_default_indices(&choices, &defaults, false);
-        assert_eq!(checked.len(), 1);
-        assert_eq!(choices[checked[0]].addr, ts);
-        // Enter then writes the tailnet address and turns the tunnel on.
-        let sel = selection(&choices, &checked, true);
-        assert_eq!(
-            listen_selection_changes(&sel, &[], false, false),
-            vec![
-                json!({ "path": "server.bindAddress", "value": "100.101.102.103" }),
-                json!({ "path": "server.tunnel.enabled", "value": true }),
-            ]
-        );
+    fn pair_wants_tunnel_keeps_a_saved_lan_choice() {
+        // First install (--tunnel), or nothing but loopback to dial: on.
+        assert!(pair_wants_tunnel(true, false, false));
+        assert!(pair_wants_tunnel(false, false, true));
+        // A re-install keeps what was saved: on stays on, a LAN bind with
+        // the tunnel off stays off.
+        assert!(pair_wants_tunnel(false, true, false));
+        assert!(!pair_wants_tunnel(false, false, false));
     }
 
     #[test]

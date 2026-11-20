@@ -536,8 +536,9 @@ If connected elsewhere, use **Settings → Machines**, then the local machine's
 **Connect** action, and return to **Mobile**. The QR controls remain visible but
 disabled when **Enable Remote Access** is off, data is loading, or no running listener
 port is available. Explain the required enablement; do not silently change it.
-Turning on **Enable Remote Access** also turns on the Tailcat tunnel; the user can turn
-the tunnel off afterwards.
+Turning on **Enable Remote Access** also turns on the Tailcat tunnel and keeps listening on
+loopback only, unless the user chose other networks under **Advanced → Available Networks**
+before; those choices, tunnel included, are kept.
 For a generation error, inspect the displayed connection/listener error. TLS and
 tunnel switches are not visibility requirements: do not suggest toggling them to
 reveal the controls. Local pairing grants access to that machine; do not offer it
@@ -592,9 +593,8 @@ Settings → Advanced → Labs). With it on, the install cards also offer
 command): sign in (SSH agent, key file or password; nothing is saved), confirm an unknown
 host key, and the app installs, starts, pairs and adds the machine. On a computer that
 already runs intentd it never reinstalls, restarts or changes its role: it starts a
-stopped daemon, pairs it (which may turn on remote connections and the Tailcat tunnel, and
-add the machine's Tailscale addresses to a loopback-only listener; the wizard says so)
-and adds it. On **Install a node**, a full backend keeps its role and also
+stopped daemon, pairs it (which may turn on remote connections and the Tailcat tunnel; the
+wizard says so) and adds it. On **Install a node**, a full backend keeps its role and also
 becomes a node (a backend set to run no agents itself gets an error). A node set up from
 the Install cards is made available without the "Make available" prompt. A server may need
 `sudo loginctl enable-linger <user>` so intentd keeps running after logout (the wizard
@@ -696,9 +696,10 @@ connection and its permissions; do not describe a remote connection's QR as belo
 to the local desktop. To pair the local machine, connect to it first. For intentd
 running in WSL on the same Windows PC, add a machine with host `localhost`;
 `intentd pair --host localhost` in WSL prints the port and token. When `intentd pair`
-turns access on, it asks whether to turn on the Tailcat tunnel (default yes), then which
-addresses to accept connections on (default loopback plus the machine's Tailscale
-addresses); `--yes` and the installers' unattended runs take those defaults. Enabling access,
+turns access on, it asks whether to turn on the Tailcat tunnel, then which addresses to
+accept connections on; `--yes` and the installers' unattended runs take the defaults. A
+first install defaults to the tunnel on and loopback only; re-running the installer keeps
+the tunnel and addresses already saved. Enabling access,
 changing listening addresses, and configuring a tunnel are separate choices from
 displaying pairing information. Read current state and respect the user's requested scope.
 

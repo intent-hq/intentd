@@ -290,7 +290,6 @@ async fn run_pair_until_success(data_dir: &Path, args: &[&str]) -> std::process:
     loop {
         let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
             .arg("pair")
-            .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
             .args(args)
             .env("INTENTD_DATA_DIR", data_dir)
             .stdin(Stdio::null())
@@ -442,7 +441,6 @@ async fn pair_without_listener_non_tty_requires_yes_flag() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
-        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .env("INTENTD_DATA_DIR", &data_dir)
         .stdin(Stdio::null())
         .output()
@@ -513,7 +511,6 @@ async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
-        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .arg("--yes")
         .env("INTENTD_DATA_DIR", &data_dir)
         .stdin(Stdio::null())
@@ -558,7 +555,6 @@ async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
     // and fails the same way on the missing route.
     let output2 = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
-        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .env("INTENTD_DATA_DIR", &data_dir)
         .stdin(Stdio::null())
         .output()
@@ -639,10 +635,10 @@ async fn pair_tunnel_yes_pairs_a_fresh_node_through_the_tunnel() {
 }
 
 /// A fresh full install (listener off, loopback bind) pairs over the tunnel
-/// by default too, with no node hint. Turning remote access on brings the
-/// tunnel with it even over a saved tunnel `false` and a LAN bind.
+/// by default too, with no node hint. A saved tunnel `false` with a LAN bind
+/// is kept, so a re-install defaults to what was set before.
 #[tokio::test]
-async fn pair_yes_turns_the_tunnel_on_with_remote_access() {
+async fn pair_yes_turns_the_tunnel_on_for_a_loopback_only_listener() {
     let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
     let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
@@ -669,7 +665,7 @@ async fn pair_yes_turns_the_tunnel_on_with_remote_access() {
         "regular"
     );
 
-    // Saved off with a LAN bind, then a fresh listener: `--yes` turns it on.
+    // Saved off with a LAN bind, then a fresh listener: `--yes` keeps it off.
     for (path, value) in [
         ("server.tunnel.enabled", "false"),
         ("server.wsApi.enabled", "false"),
@@ -685,8 +681,8 @@ async fn pair_yes_turns_the_tunnel_on_with_remote_access() {
     let output = run_pair(&data_dir, &["--yes"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stderr.contains("Tailcat tunnel enabled"), "{stderr}");
-    assert!(stdout.contains("&tc=tc-"), "{stdout}");
+    assert!(!stderr.contains("Tailcat tunnel enabled"), "{stderr}");
+    assert!(!stdout.contains("&tc="), "{stdout}");
 }
 
 /// One-shot `intentd call <method>` against the daemon in `data_dir`,
@@ -711,7 +707,6 @@ fn call_json(data_dir: &Path, method: &str) -> serde_json::Value {
 fn run_pair(data_dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
-        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .args(args)
         .env("INTENTD_DATA_DIR", data_dir)
         .stdin(Stdio::null())
@@ -882,7 +877,6 @@ async fn pair_fails_when_daemon_down() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
-        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .env("INTENTD_DATA_DIR", &data_dir)
         .output()
         .expect("run intentd pair");
@@ -998,7 +992,6 @@ async fn pair_rotate_uses_daemon_authority_not_cli_env() {
     let output = loop {
         let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
             .arg("pair")
-            .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
             .arg("--rotate")
             .env("INTENTD_DATA_DIR", &data_dir)
             .env("INTENTD_AUTH_TOKEN", "cli-only-env-token-not-the-daemons")
@@ -1056,7 +1049,6 @@ async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
     for extra in [&[][..], &["--host", "localhost"][..]] {
         let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
             .arg("pair")
-            .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
             .arg("--rotate")
             .args(extra)
             .env("INTENTD_DATA_DIR", &data_dir)
@@ -1089,7 +1081,6 @@ fn run_select_endpoints(data_dir: &Path, input: &str) -> std::process::Output {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
-        .env("INTENTD_PAIR_BIND_TAILSCALE", "0")
         .arg("--select-endpoints")
         .env("INTENTD_DATA_DIR", data_dir)
         .stdin(Stdio::piped())
