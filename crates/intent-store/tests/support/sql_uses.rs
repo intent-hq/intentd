@@ -527,6 +527,9 @@ pub struct Escape {
     pub what: String,
 }
 
+/// A source span, as `(start, end)`.
+type Span = (Pos, Pos);
+
 /// Where an executor comes from, as `(kind, function, binding position)`.
 type Origin = (TxKind, usize, Pos);
 
@@ -588,7 +591,7 @@ struct FnFacts {
     /// Parameters of a pool type (`PgPool`, `Pool<..>`).
     pool_params: BTreeSet<String>,
     /// `let name;` without a value: where, and the block it is in.
-    declared: BTreeMap<String, Vec<(Pos, (Pos, Pos))>>,
+    declared: BTreeMap<String, Vec<(Pos, Span)>>,
     /// Where the function first holds the writer lock: a `WriteTx`
     /// parameter (the start), a typed `WriteTx` binding or `begin_write()`.
     lock_from: Option<Pos>,
