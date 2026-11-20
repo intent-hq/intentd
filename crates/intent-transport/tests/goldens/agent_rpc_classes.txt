@@ -52,6 +52,7 @@ forbidden-to-agent agent.respondPermission
 mutating agent.restore
 mutating agent.retire
 mutating agent.retry
+read agent.rpcMethods
 mutating agent.sendMessage
 mutating agent.sendQueuedMessageNow
 mutating agent.sendQueuedMessagesNow
@@ -66,6 +67,7 @@ mutating agent.wakeOrCreate
 read agent.workers.list
 mutating agent.workers.stop
 unsupported-on-agent-path agent.workers.subscribe
+forbidden-to-agent backends.report
 forbidden-to-agent browser.closeTab
 forbidden-to-agent browser.exec
 forbidden-to-agent browser.listTabs

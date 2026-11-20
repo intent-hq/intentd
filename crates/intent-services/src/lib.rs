@@ -64,6 +64,7 @@ pub fn dispatch_diagnostic_owner() -> Option<std::process::ExitCode> {
 mod acp_adapter;
 mod agent_locks;
 mod agent_rpc;
+mod agent_rpc_backends;
 pub use agent_rpc::RPC_CALL_PROPOSAL_KIND;
 mod agent_manager;
 mod agent_ops;
@@ -1300,6 +1301,8 @@ pub struct Services {
     agent_rpc: Arc<OnceLock<Arc<dyn intent_core::agent_rpc::AgentRpcSurface>>>,
     /// Assistant `rpc-call` proposals held for the user's approval.
     rpc_proposals: Arc<agent_rpc::RpcProposalRegistry>,
+    /// Backends owner apps reported for the Assistant (`backends.report`).
+    backend_reports: Arc<agent_rpc_backends::BackendReports>,
     /// Rebuilds an open invite's `intent://invite?…` link for
     /// `workspace.invite.list` (multiplayer w4). Attached after
     /// the `api` Arc like `server_control` (the transport owns the pairing
@@ -1925,6 +1928,7 @@ impl Services {
             server_control: Arc::new(OnceLock::new()),
             agent_rpc: Arc::new(OnceLock::new()),
             rpc_proposals: Arc::new(agent_rpc::RpcProposalRegistry::default()),
+            backend_reports: Arc::new(agent_rpc_backends::BackendReports::default()),
             invite_links: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
@@ -31016,13 +31020,25 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn backends_report(
+        &self,
+        client_id: intent_core::ClientId,
+        device: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.backends_report_op(&client_id, device, &params) })
+    }
+
     fn agent_rpc_describe(
         &self,
         workspace_id: WorkspaceId,
         what: String,
         args: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_rpc_describe_op(&workspace_id, &what, &args) })
+        Box::pin(async move {
+            self.agent_rpc_describe_op(&workspace_id, &what, &args)
+                .await
+        })
     }
 
     fn agent_rpc_call(

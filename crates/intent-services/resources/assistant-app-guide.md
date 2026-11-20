@@ -208,6 +208,13 @@ wrappers:
 
 If the user rejects a card, nothing ran; do not resubmit it unless they ask.
 
+To work on the user's other machines, call `ws.rpc.backends()`: it lists every backend the
+user's desktop apps know, and which app can reach it now. Pass a backend's `id` as
+`{ backend }` to `ws.rpc.info`, `ws.rpc.methods`, `ws.rpc.call` or a batch item. Only call
+other backends when the user asks or agrees, and label every result by backend. When a
+backend is unreachable, name the machine the user should open (the `device` in its
+reporters) instead of dropping it.
+
 <!-- Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/rpc.rs; packages/intentd/crates/intent-services/src/agent_rpc.rs; packages/intentd/crates/intent-transport/src/{agent_rpc.rs,catalog.rs}; packages/cloudlands-fe/src/lib/components/chat/proposals. -->
 
 ## Finding things

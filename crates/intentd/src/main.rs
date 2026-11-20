@@ -3489,14 +3489,17 @@ async fn cmd_serve_owned(
     let system_control: Arc<dyn SystemControl> = control.clone();
     // The Assistant's `ws.rpc` runs calls over an in-process connection with
     // the UDS semantics, so it sees exactly what the desktop app sees.
-    services.attach_agent_rpc(Arc::new(intent_transport::LoopbackAgentRpc::new(
-        &api,
-        bus.clone(),
-        Some(system_control.clone()),
-        pairing_info.clone(),
-        rpc_limiter.clone(),
-        env!("CARGO_PKG_VERSION"),
-    )));
+    services.attach_agent_rpc(Arc::new(
+        intent_transport::LoopbackAgentRpc::new(
+            &api,
+            bus.clone(),
+            Some(system_control.clone()),
+            pairing_info.clone(),
+            rpc_limiter.clone(),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_reverse_registry(reverse_registry.clone()),
+    ));
     // Best-effort work waits for application readiness, not the early status
     // socket. Failed/stopped attempts never launch resume or metadata work.
     let repository_metadata_prewarm = {

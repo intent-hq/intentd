@@ -35,7 +35,7 @@ pub const FORBIDDEN_ERROR_MESSAGE: &str = "Forbidden";
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 316 canonical methods routed through the per-namespace dispatch matches in
+/// These are the 317 canonical methods routed through the per-namespace dispatch matches in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -93,6 +93,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "agent.restore",
     "agent.retire",
     "agent.retry",
+    "agent.rpcMethods",
     "agent.sendMessage",
     "agent.sendQueuedMessageNow",
     "agent.sendQueuedMessagesNow",
@@ -508,7 +509,7 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 55 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 56 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`, `server.rs`, `invite.rs`, `presence.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
@@ -517,6 +518,7 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 #[cfg(test)]
 pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "agent.workers.subscribe",
+    "backends.report",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -595,6 +597,7 @@ pub(crate) const NOTIFICATIONS: &[&str] = &[
 /// echoes the client's result back to the original caller.
 #[cfg(test)]
 pub(crate) const REVERSE_METHODS: &[&str] = &[
+    "backends.relayCall",
     "browser.exec",
     "desktop.control",
     "host.openExternal",
@@ -1073,6 +1076,10 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
         "Approves the Assistant's own held calls.",
     ),
     ("agent.respondPermission", "Answers a permission prompt."),
+    (
+        "backends.report",
+        "Only owner apps report their own backends.",
+    ),
     (
         "browser.closeTab",
         "Owner browser surface; agents use ws.browser.",
@@ -1560,6 +1567,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     mutation("agent.restore", "Restores a retired agent."),
     mutation("agent.retire", "Retires an agent."),
     mutation("agent.retry", "Retries a failed turn."),
+    bounded("agent.rpcMethods", "This daemon's agent classes for the Assistant's ws.rpc."),
     mutation("agent.sendMessage", "Sends a message and starts a turn."),
     mutation("agent.sendQueuedMessageNow", "Promotes a queued message."),
     mutation("agent.sendQueuedMessagesNow", "Sends the queue as one batch."),
@@ -1574,6 +1582,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     bounded("agent.workers.list", "Background workers of one agent."),
     mutation("agent.workers.stop", "Stops a background worker."),
     subscription("agent.workers.subscribe", "Registers a worker subscription; the seq-0 snapshot is listed in SNAPSHOT_CHANNELS."),
+    mutation("backends.report", "An owner app reports the backends it holds credentials for (no tokens)."),
     mutation("browser.closeTab", "Closes a tab."),
     mutation("browser.exec", "Reverse RPC that drives the client browser."),
     bounded("browser.listTabs", "Browser tab registry."),

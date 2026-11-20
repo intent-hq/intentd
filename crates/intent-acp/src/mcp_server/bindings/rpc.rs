@@ -13,8 +13,9 @@ use super::{map_err, opt_str, EvalBudget};
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.rpc = {
-        info: () => host({ method: 'rpc.info', args: {} }),
+        info: (opts) => host({ method: 'rpc.info', args: opts || {} }),
         methods: (opts) => host({ method: 'rpc.methods', args: typeof opts === 'string' ? { prefix: opts } : (opts || {}) }),
+        backends: () => host({ method: 'rpc.backends', args: {} }),
         call: (method, params, opts) => host({ method: 'rpc.call', args: { ...(opts || {}), method, params: params ?? {} } }),
         batch: (calls, opts) => host({ method: 'rpc.batch', args: { ...(opts || {}), calls } }),
     };
@@ -37,8 +38,9 @@ pub(crate) async fn dispatch(
         return Err(format!("host: {RPC_ASSISTANT_ONLY}"));
     }
     match method {
-        "info" => describe(api, workspace_id, "info", args).await,
-        "methods" => describe(api, workspace_id, "methods", args).await,
+        "info" => describe(api, workspace_id, "info", args, eval_budget).await,
+        "methods" => describe(api, workspace_id, "methods", args, eval_budget).await,
+        "backends" => describe(api, workspace_id, "backends", args, eval_budget).await,
         "call" => {
             let rpc_method = opt_str(args, "method")
                 .filter(|m| !m.trim().is_empty())
@@ -84,8 +86,16 @@ async fn describe(
     workspace_id: &WorkspaceId,
     what: &str,
     args: &Value,
+    eval_budget: EvalBudget,
 ) -> Result<Value, String> {
-    api.agent_rpc_describe(workspace_id.clone(), what.to_string(), args.clone())
+    let mut args = if args.is_object() {
+        args.clone()
+    } else {
+        serde_json::json!({})
+    };
+    args["budgetMs"] =
+        serde_json::json!(u64::try_from(eval_budget.remaining().as_millis()).unwrap_or(u64::MAX));
+    api.agent_rpc_describe(workspace_id.clone(), what.to_string(), args)
         .await
         .map_err(map_err)
 }

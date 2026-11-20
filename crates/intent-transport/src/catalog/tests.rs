@@ -87,6 +87,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("presence.rs", "presence."),
         ("presence.rs", "note.presence."),
         ("agent_workers.rs", "agent.workers."),
+        ("backends.rs", "backends."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
@@ -674,6 +675,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.respondPermission",
     "agent.restore",
     "agent.retire",
+    "agent.rpcMethods",
     "agent.setModel",
     "agent.stop",
     "agent.subscribe",
@@ -683,6 +685,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.workers.list",
     "agent.workers.stop",
     "agent.workers.subscribe",
+    "backends.report",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -1396,7 +1399,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "agent.reportToParent",
     "agent.resolveProposal",
     "agent.resolveRpcProposal",
+    "agent.rpcMethods",
     "agent.wakeOrCreate",
+    "backends.report",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -1856,6 +1861,8 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "agent.replaceMessages",
         "agent.reportToParent",
         "agent.resolveRpcProposal",
+        "agent.rpcMethods",
+        "backends.report",
         "cloudMachines.configure",
         "cloudMachines.remove",
         "debug.sampleStacks",
