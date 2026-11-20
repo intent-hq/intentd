@@ -248,6 +248,14 @@ impl CloudState {
         }
     }
 
+    /// The provider refused to renew the machine's session: pause and
+    /// resume it at its next idle moment.
+    fn cap(&self, machine_id: &str) {
+        if let Some(entry) = crate::lock(&self.activity).get_mut(machine_id) {
+            entry.cap();
+        }
+    }
+
     fn forget_activity(&self, machine_id: &str) {
         crate::lock(&self.activity).remove(machine_id);
     }

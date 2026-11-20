@@ -435,12 +435,16 @@ pub const CLOUD_PROVIDER_NORTHFLANK_NAME: &str = "Northflank";
 /// The Agent37 cloud machine provider (listed in `providerKinds`).
 pub const CLOUD_PROVIDER_AGENT37: &str = "agent37";
 pub const CLOUD_PROVIDER_AGENT37_NAME: &str = "Agent37";
+/// The Vercel Sandbox cloud machine provider (listed in `providerKinds`).
+pub const CLOUD_PROVIDER_VERCEL: &str = "vercel";
+pub const CLOUD_PROVIDER_VERCEL_NAME: &str = "Vercel";
 /// The providers this backend can configure, in the order clients offer
 /// them (`cloudMachines.list` `providerKinds`).
-pub const CLOUD_PROVIDER_KINDS: [&str; 3] = [
+pub const CLOUD_PROVIDER_KINDS: [&str; 4] = [
     CLOUD_PROVIDER_E2B,
     CLOUD_PROVIDER_NORTHFLANK,
     CLOUD_PROVIDER_AGENT37,
+    CLOUD_PROVIDER_VERCEL,
 ];
 
 /// The display name of cloud provider `kind`, for messages.
@@ -449,6 +453,7 @@ pub fn cloud_provider_name(kind: &str) -> &'static str {
     match kind {
         CLOUD_PROVIDER_NORTHFLANK => CLOUD_PROVIDER_NORTHFLANK_NAME,
         CLOUD_PROVIDER_AGENT37 => CLOUD_PROVIDER_AGENT37_NAME,
+        CLOUD_PROVIDER_VERCEL => CLOUD_PROVIDER_VERCEL_NAME,
         _ => CLOUD_PROVIDER_E2B_NAME,
     }
 }
@@ -467,7 +472,8 @@ fn legacy_entry() -> String {
 }
 
 /// A cloud sandbox size, `<vCPU>x<GiB>`. Each provider offers some of
-/// them: [`Self::E2B`], [`Self::NORTHFLANK`], [`Self::AGENT37`].
+/// them: [`Self::E2B`], [`Self::NORTHFLANK`], [`Self::AGENT37`],
+/// [`Self::VERCEL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CloudMachineSize {
     #[serde(rename = "2x4")]
@@ -498,6 +504,9 @@ impl CloudMachineSize {
     pub const E2B: [Self; 4] = [Self::S2x4, Self::S4x8, Self::S8x16, Self::S16x32];
     /// The sizes an Agent37 entry offers, smallest first.
     pub const AGENT37: [Self; 4] = [Self::S2x4, Self::S4x8, Self::S4x16, Self::S4x32];
+    /// The sizes a Vercel entry offers, smallest first: Vercel gives 2 GiB
+    /// per vCPU, and its Pro plan at most 8 vCPUs.
+    pub const VERCEL: [Self; 3] = [Self::S2x4, Self::S4x8, Self::S8x16];
     /// The size new sandboxes use unless the owner picks another.
     pub const DEFAULT: Self = Self::S4x8;
 
@@ -587,7 +596,8 @@ impl CloudMachineSize {
         })
     }
 
-    /// `CloudMachineSizeInfo` of an Agent37 entry: no plan of either kind.
+    /// `CloudMachineSizeInfo` of an Agent37 or Vercel entry: no plan of
+    /// either kind.
     #[must_use]
     pub fn bare_info_json(self) -> serde_json::Value {
         serde_json::json!({

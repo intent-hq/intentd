@@ -10,7 +10,7 @@ use intent_core::machines::{
 };
 use intent_core::machines::{
     CloudMachineSize, ExposedMachine, CLOUD_PROVIDER_AGENT37, CLOUD_PROVIDER_E2B,
-    CLOUD_PROVIDER_KINDS, CLOUD_PROVIDER_NORTHFLANK,
+    CLOUD_PROVIDER_KINDS, CLOUD_PROVIDER_NORTHFLANK, CLOUD_PROVIDER_VERCEL,
 };
 use intent_core::{now_iso, Error, Result, WorkspaceId};
 use intent_nodes::cloud::SecretString;
@@ -52,7 +52,7 @@ fn provider_param(params: &Value) -> Result<Option<String>> {
             Ok(Some(provider.clone()))
         }
         Some(_) => Err(Error::InvalidParams(
-            "provider must be \"e2b\", \"northflank\" or \"agent37\"".into(),
+            "provider must be \"e2b\", \"northflank\", \"agent37\" or \"vercel\"".into(),
         )),
     }
 }
@@ -145,6 +145,52 @@ fn agent37_params(params: &Value) -> Result<Agent37Params> {
     })
 }
 
+/// The Vercel-only `configure` members (`projectId` and `image` are shared
+/// with Northflank, with Vercel's own rules).
+#[derive(Default)]
+struct VercelParams {
+    team_id: Option<String>,
+    project_id: Option<String>,
+    image: Option<String>,
+}
+
+impl VercelParams {
+    fn scope_given(&self) -> bool {
+        self.team_id.is_some() || self.project_id.is_some()
+    }
+}
+
+fn vercel_params(params: &Value) -> Result<VercelParams> {
+    let text = |name: &str, valid: fn(&str) -> bool, rule: &str| match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if valid(value) => Ok(Some(value.clone())),
+        Some(_) => Err(Error::InvalidParams(format!("{name} must be {rule}"))),
+    };
+    let image = match params.get("image") {
+        Some(Value::String(image)) if image.is_empty() => {
+            Some(intent_nodes::vercel::DEFAULT_IMAGE.to_owned())
+        }
+        _ => text(
+            "image",
+            intent_nodes::vercel::valid_image,
+            "a Vercel Container Registry repository without a tag: <team>/<project>/<repository>, or <repository>",
+        )?,
+    };
+    Ok(VercelParams {
+        team_id: text(
+            "teamId",
+            intent_nodes::vercel::valid_team_id,
+            "a Vercel team id: team_ and then 1-64 letters or digits",
+        )?,
+        project_id: text(
+            "projectId",
+            intent_nodes::vercel::valid_project_id,
+            "a Vercel project id: prj_ and then 1-64 letters or digits",
+        )?,
+        image,
+    })
+}
+
 fn northflank_params(params: &Value) -> Result<NorthflankParams> {
     let project_id = match params.get("projectId") {
         None | Some(Value::Null) => None,
@@ -216,9 +262,11 @@ fn disk_param(params: &Value, kind: &str) -> Result<Option<u32>> {
             ))
         }),
         CLOUD_PROVIDER_AGENT37 => range_param(params, "diskGiB", 4, 100),
-        _ => Err(Error::InvalidParams(
-            "diskGiB is a Northflank or Agent37 setting; an E2B entry has none".into(),
-        )),
+        _ => Err(Error::InvalidParams(format!(
+            "diskGiB is a Northflank or Agent37 setting; a{} {} entry has none",
+            if kind == CLOUD_PROVIDER_E2B { "n" } else { "" },
+            intent_core::machines::cloud_provider_name(kind)
+        ))),
     }
 }
 
@@ -272,9 +320,10 @@ fn range_param(params: &Value, name: &str, min: u32, max: u32) -> Result<Option<
 /// The validated `configure` params. `api_key` is never echoed.
 struct ConfigureParams {
     provider: Option<String>,
-    northflank: NorthflankParams,
     agent37: Agent37Params,
-    /// `diskGiB` as sent; checked against the entry's provider later.
+    /// The members whose rules depend on the entry's provider, as sent
+    /// (`projectId`, `plans`, `image`, `teamId`, `diskGiB`): checked once
+    /// the provider is known.
     raw: Value,
     cloud_machine_id: Option<String>,
     name: Option<String>,
@@ -289,7 +338,6 @@ struct ConfigureParams {
 
 fn configure_params(params: &Value) -> Result<ConfigureParams> {
     let provider = provider_param(params)?;
-    let northflank = northflank_params(params)?;
     let agent37 = agent37_params(params)?;
     let api_key = match params.get("apiKey") {
         None | Some(Value::Null) => None,
@@ -345,11 +393,19 @@ fn configure_params(params: &Value) -> Result<ConfigureParams> {
             "give apiKey or apiKeyFrom, not both".into(),
         ));
     }
+    let raw = ["projectId", "plans", "image", "teamId", "diskGiB"]
+        .into_iter()
+        .map(|name| {
+            (
+                name.to_owned(),
+                params.get(name).cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect();
     Ok(ConfigureParams {
         provider,
-        northflank,
         agent37,
-        raw: json!({ "diskGiB": params.get("diskGiB").cloned().unwrap_or(Value::Null) }),
+        raw: Value::Object(raw),
         cloud_machine_id: entry_param(params, "cloudMachineId")?,
         name,
         api_key_from,
@@ -428,6 +484,18 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
     );
     let northflank = kind == CLOUD_PROVIDER_NORTHFLANK;
     let agent37 = kind == CLOUD_PROVIDER_AGENT37;
+    let vercel = kind == CLOUD_PROVIDER_VERCEL;
+    let given = |name: &str| params.raw.get(name).is_some_and(|v| !v.is_null());
+    let nf = if northflank {
+        northflank_params(&params.raw)?
+    } else {
+        NorthflankParams::default()
+    };
+    let vc = if vercel {
+        vercel_params(&params.raw)?
+    } else {
+        VercelParams::default()
+    };
     let disk_gib = disk_param(&params.raw, &kind)?;
     let tag = |error: Error| {
         intent_core::machines::with_cloud_provider(
@@ -441,9 +509,19 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
             "templateProject is an E2B setting; a {provider_name} entry has none"
         )));
     }
-    if !northflank && params.northflank.any() {
+    if !northflank && given("plans") {
         return Err(Error::InvalidParams(format!(
-            "projectId, plans and image are Northflank settings; a {provider_name} entry has none"
+            "plans is a Northflank setting; a {provider_name} entry has none"
+        )));
+    }
+    if !northflank && !vercel && (given("projectId") || given("image")) {
+        return Err(Error::InvalidParams(format!(
+            "projectId and image are Northflank or Vercel settings; a {provider_name} entry has none"
+        )));
+    }
+    if !vercel && given("teamId") {
+        return Err(Error::InvalidParams(format!(
+            "teamId is a Vercel setting; a {provider_name} entry has none"
         )));
     }
     if !agent37 && params.agent37.any() {
@@ -454,6 +532,7 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
     let offered: &[CloudMachineSize] = match kind.as_str() {
         CLOUD_PROVIDER_NORTHFLANK => &CloudMachineSize::NORTHFLANK,
         CLOUD_PROVIDER_AGENT37 => &CloudMachineSize::AGENT37,
+        CLOUD_PROVIDER_VERCEL => &CloudMachineSize::VERCEL,
         _ => &CloudMachineSize::E2B,
     };
     if let Some(size) = params.size.filter(|size| !offered.contains(size)) {
@@ -468,9 +547,14 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
         )));
     }
     let creating = saved.is_none();
-    if creating && northflank && params.northflank.project_id.is_none() {
+    if creating && northflank && nf.project_id.is_none() {
         return Err(Error::InvalidParams(
             "a new Northflank entry needs projectId".into(),
+        ));
+    }
+    if creating && vercel && (vc.team_id.is_none() || vc.project_id.is_none()) {
+        return Err(Error::InvalidParams(
+            "a new Vercel entry needs teamId and projectId".into(),
         ));
     }
     if creating && entries.len() >= MAX_CLOUD_MACHINE_ENTRIES {
@@ -519,9 +603,12 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
     };
     let mut next = saved.clone().unwrap_or_else(|| {
         if northflank {
-            ProviderConfig::new_northflank(
+            ProviderConfig::new_northflank(&name, nf.project_id.as_deref().unwrap_or_default())
+        } else if vercel {
+            ProviderConfig::new_vercel(
                 &name,
-                params.northflank.project_id.as_deref().unwrap_or_default(),
+                vc.team_id.as_deref().unwrap_or_default(),
+                vc.project_id.as_deref().unwrap_or_default(),
             )
         } else if agent37 {
             ProviderConfig::new_agent37(&name)
@@ -530,33 +617,53 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
         }
     });
     next.name.clone_from(&name);
-    if let (Some(id), Some(project)) = (&id, &params.northflank.project_id) {
-        let changed = saved
+    let moved = saved.as_ref().is_some_and(|saved| {
+        let nf_moved = saved
+            .northflank
             .as_ref()
-            .and_then(|saved| saved.northflank.as_ref())
-            .is_some_and(|nf| nf.project_id != *project);
-        if changed {
-            let rows = entry_rows(svc, id).await?;
-            let starting = feature.cloud.starts_in_flight(id);
-            if !rows.is_empty() || !starting.is_empty() {
-                return Err(crate::methods::in_use(&name, rows.len() + starting.len()));
-            }
+            .zip(nf.project_id.as_ref())
+            .is_some_and(|(old, project)| old.project_id != *project);
+        let vc_moved = saved.vercel.as_ref().is_some_and(|old| {
+            vc.team_id.as_ref().is_some_and(|team| old.team_id != *team)
+                || vc
+                    .project_id
+                    .as_ref()
+                    .is_some_and(|project| old.project_id != *project)
+        });
+        nf_moved || vc_moved
+    });
+    if let (Some(id), true) = (&id, moved) {
+        let rows = entry_rows(svc, id).await?;
+        let starting = feature.cloud.starts_in_flight(id);
+        if !rows.is_empty() || !starting.is_empty() {
+            return Err(crate::methods::in_use(&name, rows.len() + starting.len()));
         }
     }
-    if let Some(nf) = next.northflank.as_mut() {
-        if let Some(project) = &params.northflank.project_id {
-            nf.project_id.clone_from(project);
+    if let Some(saved_nf) = next.northflank.as_mut() {
+        if let Some(project) = &nf.project_id {
+            saved_nf.project_id.clone_from(project);
         }
-        if let Some(plans) = &params.northflank.plans {
+        if let Some(plans) = &nf.plans {
             for (size, plan) in plans {
-                nf.plans.insert(size.id().to_owned(), plan.clone());
+                saved_nf.plans.insert(size.id().to_owned(), plan.clone());
             }
         }
-        if let Some(image) = &params.northflank.image {
-            nf.image.clone_from(image);
+        if let Some(image) = &nf.image {
+            saved_nf.image.clone_from(image);
         }
         if let Some(disk) = disk_gib {
-            nf.disk_gib = disk;
+            saved_nf.disk_gib = disk;
+        }
+    }
+    if let Some(saved_vc) = next.vercel.as_mut() {
+        if let Some(team) = &vc.team_id {
+            saved_vc.team_id.clone_from(team);
+        }
+        if let Some(project) = &vc.project_id {
+            saved_vc.project_id.clone_from(project);
+        }
+        if let Some(image) = &vc.image {
+            saved_vc.image.clone_from(image);
         }
     }
     if let Some(a37) = next.agent37.as_mut() {
@@ -602,12 +709,7 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
     // template manifest, never from probing templates with the key; they
     // are read whenever the call can change the template.
     if northflank {
-        let check = creating
-            || params.validate_only
-            || given.is_some()
-            || params.northflank.project_id.is_some()
-            || params.northflank.plans.is_some()
-            || params.northflank.image.is_some();
+        let check = creating || params.validate_only || given.is_some() || nf.any();
         if check {
             check_northflank(&mut next, key.clone())
                 .await
@@ -617,6 +719,16 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
     } else if agent37 {
         if creating || params.validate_only || given.is_some() {
             check_agent37(key.clone()).await.map_err(tag)?;
+            config::note_outcome(&mut next, None);
+        }
+    } else if vercel {
+        if creating
+            || params.validate_only
+            || given.is_some()
+            || vc.scope_given()
+            || vc.image.is_some()
+        {
+            check_vercel(&next, key.clone()).await.map_err(tag)?;
             config::note_outcome(&mut next, None);
         }
     } else if given.is_some() || params.validate_only {
@@ -724,6 +836,27 @@ async fn check_agent37(key: SecretString) -> Result<()> {
         return Err(config::agent37_image_missing(&image));
     }
     client.check_key().await.map_err(to_error)?;
+    Ok(())
+}
+
+/// The tests a Vercel entry passes before it is saved, in order: the
+/// sandbox list of its project, which tests the token, the team and the
+/// project and is what the reaper needs, then the image tag.
+async fn check_vercel(next: &ProviderConfig, key: SecretString) -> Result<()> {
+    use intent_nodes::cloud::CloudProvider as _;
+    let Some(settings) = next.vercel.as_ref() else {
+        return Ok(());
+    };
+    let kind = CLOUD_PROVIDER_VERCEL;
+    let client = config::vercel_client(settings, key)?;
+    let to_error = |error: intent_nodes::cloud::CloudError| {
+        config::to_error(&error, config::Phase::Other, kind)
+    };
+    client.check_key().await.map_err(to_error)?;
+    let image = intent_nodes::vercel::image_ref(&settings.image, config::intentd_version());
+    if !client.image_ready(&image).await.map_err(to_error)? {
+        return Err(config::vercel_image_missing(&image));
+    }
     Ok(())
 }
 

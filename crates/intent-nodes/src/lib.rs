@@ -7,6 +7,7 @@ pub mod cloud;
 pub mod e2b;
 pub mod journal;
 pub mod northflank;
+pub mod vercel;
 use std::{future::Future, pin::Pin};
 
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;

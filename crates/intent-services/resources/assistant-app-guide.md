@@ -661,15 +661,19 @@ notice in the chat.
 <!-- Labs (remote agents): describe only when the user asks about cloud machines,
 and say it is Labs. The backend can start its own machines from a saved cloud entry:
 an E2B entry (API key) starts a sandbox, a Northflank entry (API token and project id)
-starts a Northflank service with its own disk, and an Agent37 entry (API key) starts an
-Agent37 instance. Northflank machines offer sizes 2x4, 4x8 and 8x16; the region is the
+starts a Northflank service with its own disk, an Agent37 entry (API key) starts an
+Agent37 instance, and a Vercel entry (access token, team id and project id) starts a
+Vercel sandbox in that project. Northflank machines offer sizes 2x4, 4x8 and 8x16; the region is the
 project's. An Agent37 entry picks Standard (a sandbox, US only) or Full VM (its own
 kernel and Docker, about 2.5 times the price, in the US, the EU or Mumbai), sizes 2x4,
 4x8, 4x16 and 4x32, and a disk; when the region has no room, the start fails and says
-so, and nothing starts in another region. Cloud machines have no sign-in, so only a
+so, and nothing starts in another region. Vercel machines offer sizes 2x4, 4x8 and
+8x16 (larger sizes need a Vercel plan that allows them) and run in the project's region;
+Vercel ends a session after the plan's longest session (24 hours on Pro, 45 minutes on
+Hobby), so the backend stops and resumes such a machine when it is idle. Cloud machines have no sign-in, so only a
 profile or Default marked for remote machines that sends an API key runs there. An
 idle cloud machine pauses. A paused E2B sandbox resumes with its memory, and so does
-an Agent37 machine usually; a paused Northflank machine, or an Agent37 machine that
+an Agent37 machine usually; a paused Northflank or Vercel machine, or an Agent37 machine that
 Agent37 had to start again, resumes from its disk only: the checkout, uncommitted changes and
 home folder stay, while running processes, terminals and scripts stop, and software
 installed outside the home folder may be gone. The agent is told this at its next turn.
@@ -986,7 +990,7 @@ a message says it no longer exists.
 
 <!-- Labs (remote agents): describe only when the user asks about remote agents,
 and say it is Labs. The card's **Start on** defaults to where the proposing agent
-runs: the backend, its remote machine, or a new cloud machine (E2B, Northflank or Agent37)
+runs: the backend, its remote machine, or a new cloud machine (E2B, Northflank, Agent37 or Vercel)
 from the same entry.
 The user can change it before **Create workspace**; an offline machine shows a
 warning. An agent applying its own proposal uses that default, and a machine
