@@ -11,7 +11,8 @@
 # The local targets need neither cargo nor the monorepo: test-release-scripts
 # runs the scripts/test-* commands of ci.yml's release-scripts job, skipping
 # suites that need CI-only tooling (scripts/release-scripts-local.py), and
-# lint-workflows runs the pinned actionlint like ci.yml's release-scripts job.
+# lint-workflows runs the pinned actionlint like ci.yml's release-scripts job;
+# new-harness-version makes the routine edits of a harness version bump.
 
 MONOREPO_ROOT := ../..
 FORWARDED_TARGETS := check test test-changed test-select test-stress gate list-tests coverage-changed fmt clippy check-windows check-macos lint-sources
@@ -21,7 +22,7 @@ FORWARDED_TARGETS := check test test-changed test-select test-stress gate list-t
 MONOREPO_PRESENT := $(and $(wildcard $(MONOREPO_ROOT)/Makefile),$(shell grep -Eqs '^[[:space:]]*path[[:space:]]*=[[:space:]]*packages/intentd[[:space:]]*$$' $(MONOREPO_ROOT)/.gitmodules && echo yes))
 
 .DEFAULT_GOAL := help
-.PHONY: help test-release-scripts lint-workflows $(FORWARDED_TARGETS)
+.PHONY: help test-release-scripts lint-workflows new-harness-version $(FORWARDED_TARGETS)
 
 help:
 	@echo "intentd Makefile: forwards the Rust gate targets to the intent monorepo root Makefile."
@@ -39,12 +40,18 @@ help:
 	@echo "    that need CI-only tooling (exit 1 only on a real failure)."
 	@echo "  lint-workflows — run the pinned actionlint with shellcheck over .github/workflows,"
 	@echo "    as ci.yml's release-scripts job does (needs actionlint + shellcheck)."
+	@echo "  new-harness-version FROM=3.15 TO=3.16 [DRY_RUN=1] — register harness TO as a copy of"
+	@echo "    the current FROM (every routine bump edit, plus the monorepo protocol docs when present)."
 
 test-release-scripts:
 	python3 scripts/release-scripts-local.py
 
 lint-workflows:
 	@bash scripts/lint-workflows.sh
+
+new-harness-version:
+	@if [ -z "$(FROM)" ] || [ -z "$(TO)" ]; then echo "usage: make new-harness-version FROM=3.15 TO=3.16 [DRY_RUN=1]" >&2; exit 2; fi
+	@python3 -I -B scripts/new-harness-version.py --from "$(FROM)" --to "$(TO)" $(if $(MONOREPO_PRESENT),--docs "$(MONOREPO_ROOT)/docs/protocol/methods/agents.md") $(if $(DRY_RUN),--dry-run)
 
 ifneq ($(MONOREPO_PRESENT),)
 # One shared prerequisite preserves MAKECMDGOALS and deduplicates root work,
