@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.259] - 2026-11-20
+
+### 🐛 Bug Fixes
+
+- Hide owned capture metadata from search previews ([#3581](https://github.com/intent-hq/intentd/pull/3581))
+
+
 ## [0.11.258] - 2026-11-20
 
 ### 📚 Documentation
