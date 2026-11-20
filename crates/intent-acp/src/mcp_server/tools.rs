@@ -2883,10 +2883,11 @@ mod tests {
     #[test]
     fn help_namespace_returns_verbatim_doc_segments() {
         let features = all_gates_open();
-        for (is_chief, desc) in [
-            (false, WORKSPACE_API_DESCRIPTION),
-            (true, WORKSPACE_API_DESCRIPTION_CHIEF),
-        ] {
+        for is_chief in [false, true] {
+            // The top-level Assistant's help is cut from its bridge docs,
+            // which drop the bindings `ws.rpc` replaced.
+            let bridge = super::workspace_api_description_for_bridge(is_chief, &features, false);
+            let desc: &str = &bridge;
             for ns in index_namespaces(desc) {
                 let docs = help_namespace(is_chief, &features, false, &ns)
                     .unwrap_or_else(|e| panic!("chief={is_chief}: help({ns}) errored: {e}"));
@@ -3994,13 +3995,15 @@ const run = async (s, out) => {{
         let features = all_gates_open();
         for is_chief in [false, true] {
             let got = workspace_api_description_with_model_options(is_chief, &features, &[], false);
+            // The top-level Assistant's docs drop the bindings `ws.rpc`
+            // replaced, so only the project variant stays borrowed.
             assert!(
-                matches!(got, Cow::Borrowed(_)),
+                is_chief || matches!(got, Cow::Borrowed(_)),
                 "no options must not reassemble"
             );
             assert_eq!(
                 &*got,
-                &*workspace_api_description(is_chief, &features),
+                &*super::workspace_api_description_for_bridge(is_chief, &features, false),
                 "chief={is_chief}: empty options changed the description"
             );
         }
