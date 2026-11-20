@@ -517,7 +517,7 @@ async fn scripts_survive_daemon_restart_over_wss() {
             "cwd": "web",
             "env": { "PORT": "3000" },
             "category": "dev",
-            "autoStart": true,
+            "autoStart": false,
             "scriptId": "persist-1",
         }),
     )
@@ -546,7 +546,7 @@ async fn scripts_survive_daemon_restart_over_wss() {
     assert_eq!(entry["env"]["PORT"], "3000");
     assert_eq!(entry["mode"], "service");
     assert_eq!(entry["category"], "dev");
-    assert_eq!(entry["autoStart"], true);
+    assert_eq!(entry["autoStart"], false);
     assert_eq!(entry["source"], "user");
     assert_eq!(entry["runtime"]["status"], "idle");
     assert!(
@@ -584,14 +584,14 @@ async fn scripts_survive_daemon_restart_over_wss() {
     stop(child);
 }
 
-/// A service running when the daemon is killed hydrates on the next boot as
-/// `idle` with `previouslyRunning: true` (the stored-on-write `was_running`
-/// marker, PROTOCOL §5.8) on both `script.list` and `script.status`; the
-/// marker survives a second restart, and `script.stop` on the non-running
-/// hydrated script (the FE dismiss affordance) returns ok and durably clears
-/// it across yet another restart.
+/// A service running when the daemon is killed starts again on the next boot
+/// without `autoStart` (the stored-on-write `was_running` marker, PROTOCOL
+/// §5.8): it reaches `running` with a new process and no `previouslyRunning`.
+/// An `autoStart` service that never ran starts at boot too.
+/// It is restored again after a second kill, and a user `script.stop` keeps it
+/// stopped across yet another restart.
 #[tokio::test]
-async fn was_running_marker_survives_daemon_kill_over_wss() {
+async fn was_running_service_restarts_after_daemon_kill_over_wss() {
     let data_dir_guard = scratch_dir("marker");
     let data_dir = data_dir_guard.path().to_path_buf();
     let repo_guard = create_test_repo();
@@ -630,6 +630,22 @@ async fn was_running_marker_survives_daemon_kill_over_wss() {
     )
     .await;
     assert_eq!(script["id"], "marker-1");
+    let auto = wss_rpc(
+        &mut ws,
+        50,
+        "script.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "auto",
+            // timing-guard: the long-lived service process, not a wait
+            "command": "sleep 3600",
+            "mode": "service",
+            "autoStart": true,
+            "scriptId": "auto-1",
+        }),
+    )
+    .await;
+    assert_eq!(auto["id"], "auto-1");
     let started = wss_rpc(
         &mut ws,
         3,
@@ -645,26 +661,56 @@ async fn was_running_marker_survives_daemon_kill_over_wss() {
     drop(ws);
     stop(child); // SIGKILL — the running service never sees a stop.
 
-    // Boot #2: hydrated idle with previouslyRunning on status and list.
+    // Boot #2: restored to running on its own, with a new process.
     let (child, port, cfg) = boot(&data_dir).await;
     let mut ws = connect_ws(port, cfg).await;
-    let st = wss_rpc(
+    let st = await_status(&mut ws, 100, &ws_id, "marker-1", |st| {
+        st["status"] == json!("running")
+    })
+    .await;
+    assert!(st["pid"].as_u64().is_some(), "restored process: {st}");
+    assert!(
+        st.get("previouslyRunning").is_none(),
+        "restore consumes the marker: {st}"
+    );
+    // An autoStart service starts at boot even though it never ran.
+    await_status(&mut ws, 300, &ws_id, "auto-1", |st| {
+        st["status"] == json!("running")
+    })
+    .await;
+    let listed = wss_rpc(&mut ws, 4, "script.list", json!({ "workspaceId": ws_id })).await;
+    let entry = listed["scripts"]
+        .as_array()
+        .expect("scripts array")
+        .iter()
+        .find(|s| s["id"] == "marker-1")
+        .expect("marker-1 listed");
+    assert_eq!(
+        entry["runtime"]["status"], "running",
+        "on list too: {entry}"
+    );
+    drop(ws);
+    stop(child); // Kill again while the restored service runs.
+
+    // Boot #3: restored again; a user stop then clears the marker.
+    let (child, port, cfg) = boot(&data_dir).await;
+    let mut ws = connect_ws(port, cfg).await;
+    await_status(&mut ws, 200, &ws_id, "marker-1", |st| {
+        st["status"] == json!("running")
+    })
+    .await;
+    let stopped = wss_rpc(
         &mut ws,
-        4,
-        "script.status",
+        5,
+        "script.stop",
         json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
     )
     .await;
-    assert_eq!(st["status"], "idle", "hydrates idle: {st}");
-    assert_eq!(st["previouslyRunning"], true, "marker surfaced: {st}");
-    let listed = wss_rpc(&mut ws, 5, "script.list", json!({ "workspaceId": ws_id })).await;
-    let entry = &listed["scripts"].as_array().expect("scripts array")[0];
-    assert_eq!(entry["runtime"]["previouslyRunning"], true, "on list too");
+    assert_eq!(stopped["ok"], json!(true));
     drop(ws);
-    stop(child); // Kill again without touching the script.
+    stop(child);
 
-    // Boot #3: the marker persists across repeated restarts; dismissing via
-    // script.stop on the non-running script returns ok and clears it.
+    // Boot #4: an explicitly stopped service stays stopped.
     let (child, port, cfg) = boot(&data_dir).await;
     let mut ws = connect_ws(port, cfg).await;
     let st = wss_rpc(
@@ -674,41 +720,7 @@ async fn was_running_marker_survives_daemon_kill_over_wss() {
         json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
     )
     .await;
-    assert_eq!(st["previouslyRunning"], true, "marker persists: {st}");
-    let stopped = wss_rpc(
-        &mut ws,
-        7,
-        "script.stop",
-        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
-    )
-    .await;
-    assert_eq!(stopped["ok"], json!(true), "dismiss is ok, not an error");
-    let st = wss_rpc(
-        &mut ws,
-        8,
-        "script.status",
-        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
-    )
-    .await;
-    assert_eq!(st["status"], "idle");
-    assert!(
-        st.get("previouslyRunning").is_none(),
-        "dismiss drops the marker: {st}"
-    );
-    drop(ws);
-    stop(child);
-
-    // Boot #4: the clear was durable.
-    let (child, port, cfg) = boot(&data_dir).await;
-    let mut ws = connect_ws(port, cfg).await;
-    let st = wss_rpc(
-        &mut ws,
-        9,
-        "script.status",
-        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
-    )
-    .await;
-    assert_eq!(st["status"], "idle");
+    assert_eq!(st["status"], "idle", "user stop respected: {st}");
     assert!(
         st.get("previouslyRunning").is_none(),
         "cleared marker stays cleared across restart: {st}"

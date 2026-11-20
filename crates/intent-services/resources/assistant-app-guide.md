@@ -1162,7 +1162,7 @@ terminal being open. If setup stays running, inspect its last output before
 retrying. Include that output, the Intent version, and the operating system when
 reporting the problem.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/lib/components/workspace/WorkspaceShellList.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend sources: packages/intentd/crates/intent-svc-runtime/src/script_monitor.rs; packages/intentd/crates/intentd/src/main.rs (staged update restart watcher). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/lib/components/workspace/WorkspaceShellList.svelte (Start automatically toggle, ordering); src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend sources: packages/intentd/crates/intent-svc-runtime/src/script_monitor.rs; packages/intentd/crates/intent-svc-runtime/src/script_ops.rs (boot restore of running services); packages/intentd/crates/intentd/src/main.rs (staged update restart watcher). -->
 
 Script lists show unarchived scripts; use **Load more** when offered to see the
 next page. Open a script to view available output; use **Edit command** to inspect
@@ -1175,6 +1175,13 @@ only active monitors and disappear when they finish, trigger, expire, or are
 cancelled; completion notices remain in the agent conversation. An automatic
 background update waits for running one-off (command) scripts to finish, for up
 to 90 minutes, before restarting; long-running service scripts do not delay it.
+A service script that was running when Intent stopped starts again when Intent
+restarts. To have a service start whenever Intent starts, open its **…** menu in the
+sidebar **Scripts** list and turn on **Start automatically**; it does not stop a
+running service. Those services are listed first, with their names in color. They
+start even if you stopped them, so turn **Start automatically** off to keep one
+stopped. Other services you stopped stay stopped. Nothing starts in an archived
+workspace.
 
 To delete a saved script, open its **…** menu in the sidebar **Scripts** list or in
 the script panel and choose **Delete script**, or use **Delete script** beside its
@@ -1657,7 +1664,9 @@ tab to open its default
 content: **Agents** opens the main agent, **Context** the Spec, **Changes** the
 changes list, and **Files** a root README (otherwise the first root file, then a
 file inside a folder). **Browsers** opens the first browser in its list; **Shells**
-opens the first terminal, creating one when none exists. A click in the collapsed
+opens the first terminal, creating one when none exists. A grey dot on **Browsers**
+means the workspace has open browser tabs; on **Shells**, open terminals or a running
+script. A click in the collapsed
 rail opens the section's default content immediately. With one pane selected,
 arrow keys select a section without opening main content. With multiple panes
 selected, arrow keys move focus without changing the selection. The focus ring
