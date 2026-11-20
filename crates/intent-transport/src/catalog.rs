@@ -35,7 +35,7 @@ pub const FORBIDDEN_ERROR_MESSAGE: &str = "Forbidden";
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 315 canonical methods routed through the per-namespace dispatch matches in
+/// These are the 316 canonical methods routed through the per-namespace dispatch matches in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -88,6 +88,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "agent.reportToParent",
     "agent.resolveInterrupted",
     "agent.resolveProposal",
+    "agent.resolveRpcProposal",
     "agent.respondPermission",
     "agent.restore",
     "agent.retire",
@@ -1050,6 +1051,215 @@ pub(crate) fn member_may_call(method: &str) -> bool {
     collaborator_may_call(method) || MEMBER_METHODS.contains(&canonical_method(method))
 }
 
+/// Methods the Assistant's generic `ws.rpc` path refuses even with the
+/// user's approval (`-32003`, `data.code: "forbidden-to-agent"`). Each entry
+/// is `(canonical method, reason)`. The golden
+/// `tests/goldens/agent_rpc_classes.txt` freezes every method's agent class,
+/// so a new method is classified explicitly.
+///
+/// Rules: credential and access administration; anything that answers a
+/// prompt, approval, permission or secret request (the Assistant must never
+/// approve its own actions); anything that changes agent features, approval
+/// or safety settings; owner-only transport surfaces that have their own
+/// agent tools.
+pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
+    (
+        "agent.dismissQuestions",
+        "Answers the user's pending question cards.",
+    ),
+    ("agent.resolveProposal", "Answers an approval card."),
+    (
+        "agent.resolveRpcProposal",
+        "Approves the Assistant's own held calls.",
+    ),
+    ("agent.respondPermission", "Answers a permission prompt."),
+    (
+        "browser.closeTab",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.exec",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.listTabs",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.navigateTab",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.removeTab",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.syncTabs",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    (
+        "browser.upsertTab",
+        "Owner browser surface; agents use ws.browser.",
+    ),
+    ("cloudMachines.configure", "Stores a provider API key."),
+    (
+        "desktop.getState",
+        "Owner desktop-control surface; agents use ws.desktop.",
+    ),
+    (
+        "desktop.respondPermission",
+        "Answers a desktop-control consent prompt.",
+    ),
+    (
+        "desktop.revoke",
+        "Owner desktop-control surface; agents use ws.desktop.",
+    ),
+    ("desktop.setPermission", "Grants desktop-control consent."),
+    (
+        "executor.invite.create",
+        "Mints a node invite (access administration).",
+    ),
+    ("executor.mint", "Mints an executor credential."),
+    ("executor.revoke", "Revokes an executor credential."),
+    ("github.cancelAuth", "Drives a forge sign-in flow."),
+    ("github.connect", "Connects a forge credential."),
+    (
+        "github.identityProof.create",
+        "Creates a forge identity proof.",
+    ),
+    (
+        "github.identityProof.delete",
+        "Deletes a forge identity proof.",
+    ),
+    ("github.revoke", "Revokes a forge credential."),
+    ("host.exec", "Owner shell surface; agents use ws.host."),
+    (
+        "host.execStream",
+        "Owner shell surface; agents use ws.host.",
+    ),
+    (
+        "host.execStream.cancel",
+        "Owner shell surface; agents use ws.host.",
+    ),
+    (
+        "host.execStream.write",
+        "Owner shell surface; agents use ws.host.",
+    ),
+    (
+        "host.invite.create",
+        "Mints a host invite (access administration).",
+    ),
+    (
+        "host.invite.list",
+        "Returns live invite links (access credentials).",
+    ),
+    (
+        "host.invite.revoke",
+        "Revokes a host invite (access administration).",
+    ),
+    (
+        "host.members.remove",
+        "Removes a host member (access administration).",
+    ),
+    ("identity.cancelAuth", "Drives a sign-in flow."),
+    ("identity.connect", "Connects an account credential."),
+    ("identity.revoke", "Revokes an account credential."),
+    ("identity.select", "Switches the account credential."),
+    ("mcp.oauth.delete", "Deletes stored MCP OAuth credentials."),
+    ("mcp.oauth.get", "Reads stored MCP OAuth credentials."),
+    ("mcp.oauth.list", "Lists stored MCP OAuth credentials."),
+    ("mcp.oauth.set", "Writes stored MCP OAuth credentials."),
+    ("pairing.getInfo", "Returns pairing credentials."),
+    ("pairing.getSelfInfo", "Returns pairing credentials."),
+    ("principal.revokeSelf", "Revokes a principal credential."),
+    ("providers.profiles.create", "Stores provider credentials."),
+    ("providers.profiles.update", "Stores provider credentials."),
+    ("push.createLink", "Mints a push credential."),
+    ("push.revokeLink", "Revokes a push credential."),
+    ("remoteMachines.add", "Stores a remote machine credential."),
+    ("remoteMachines.claim", "Redeems a remote machine invite."),
+    ("secret.dismiss", "Answers a secret request."),
+    ("secret.forget", "Deletes a stored secret."),
+    (
+        "secret.provide",
+        "Answers a secret request with a secret value.",
+    ),
+    ("server.pairingInfo", "Returns pairing credentials."),
+    ("server.rotateToken", "Rotates the access token."),
+    (
+        "settings.reset",
+        "Changes agent features, approval or safety settings.",
+    ),
+    (
+        "settings.update",
+        "Changes agent features, approval or safety settings.",
+    ),
+    ("sourceControl.cancelAuth", "Drives a forge sign-in flow."),
+    (
+        "sourceControl.connect",
+        "Connects a forge credential (a PAT would ride the card).",
+    ),
+    (
+        "sourceControl.gitlab.childGit.set",
+        "Changes which credential child git uses.",
+    ),
+    (
+        "sourceControl.identityProof.create",
+        "Creates a forge identity proof.",
+    ),
+    (
+        "sourceControl.identityProof.delete",
+        "Deletes a forge identity proof.",
+    ),
+    ("sourceControl.revoke", "Revokes a forge credential."),
+    ("system.gitCredential", "Returns a git credential."),
+    (
+        "terminal.write",
+        "Raw terminal input; agents use ws.terminal.",
+    ),
+    (
+        "workspace.invite.create",
+        "Mints a workspace invite (access administration).",
+    ),
+    (
+        "workspace.invite.list",
+        "Returns live invite links (access credentials).",
+    ),
+    (
+        "workspace.invite.revoke",
+        "Revokes a workspace invite (access administration).",
+    ),
+    (
+        "workspace.members.add",
+        "Adds a workspace member (access administration).",
+    ),
+    (
+        "workspace.members.remove",
+        "Removes a workspace member (access administration).",
+    ),
+    (
+        "workspace.members.setRole",
+        "Changes a member role (access administration).",
+    ),
+];
+
+/// Connection-stateful methods the agent path cannot serve (`-32601`,
+/// `data.code: "unsupported-on-agent-path"`), on top of every
+/// [`PayloadClass::Subscription`] method and every `*.subscribe` /
+/// `*.unsubscribe` channel. Each entry is `(canonical method, reason)`.
+pub const AGENT_UNSUPPORTED_METHODS: &[(&str, &str)] = &[
+    ("client.hello", "Binds a client connection."),
+    ("drafts.clear", "Needs a client.hello binding."),
+    ("drafts.get", "Needs a client.hello binding."),
+    ("drafts.set", "Needs a client.hello binding."),
+    ("invite.accept", "Unauthenticated invite endpoint only."),
+    ("invite.challenge", "Unauthenticated invite endpoint only."),
+    ("invite.inspect", "Unauthenticated invite endpoint only."),
+    ("invite.prove", "Unauthenticated invite endpoint only."),
+    ("note.presence.update", "Connection presence lease."),
+    ("presence.update", "Connection presence lease."),
+];
+
 /// The reported `daemonMode` (`client.hello` `server.daemonMode`, the
 /// `host.status` and `pairing.getInfo` results): the running process's mode,
 /// so `serve --node` reports `node` whatever `daemon.mode` says.
@@ -1345,6 +1555,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     mutation("agent.reportToParent", "Posts a report to the parent agent."),
     mutation("agent.resolveInterrupted", "Resumes or dismisses an interrupted agent."),
     mutation("agent.resolveProposal", "Applies or rejects an agent proposal."),
+    mutation("agent.resolveRpcProposal", "Approves (runs) or rejects the Assistant's held daemon calls."),
     mutation("agent.respondPermission", "Answers a permission prompt."),
     mutation("agent.restore", "Restores a retired agent."),
     mutation("agent.retire", "Retires an agent."),

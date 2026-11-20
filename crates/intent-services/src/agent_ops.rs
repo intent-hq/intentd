@@ -12192,6 +12192,32 @@ impl Services {
         detail: Option<String>,
         created_workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
+        self.resolve_proposal_with_detail_cap(
+            workspace_id,
+            agent_id,
+            proposal_id,
+            outcome,
+            detail,
+            created_workspace_id,
+            MAX_DETAIL_LEN,
+        )
+        .await
+    }
+
+    /// [`Services::agent_resolve_proposal_op`] with a daemon-chosen `detail`
+    /// cap: the Assistant's approved `rpc-call` proposals report bounded
+    /// per-call results, which exceed the caller-supplied cap.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn resolve_proposal_with_detail_cap(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        proposal_id: String,
+        outcome: String,
+        detail: Option<String>,
+        created_workspace_id: Option<WorkspaceId>,
+        max_detail: usize,
+    ) -> Result<Value> {
         // The id is matched VERBATIM against the recorded pending entries —
         // recording preserves `applyToolCallId` / `preview.title` exactly as
         // proposed (including any incidental whitespace), so normalizing here
@@ -12213,9 +12239,9 @@ impl Services {
         let detail = detail
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty());
-        if detail.as_ref().is_some_and(|d| d.len() > MAX_DETAIL_LEN) {
+        if detail.as_ref().is_some_and(|d| d.len() > max_detail) {
             return Err(Error::InvalidParams(format!(
-                "detail exceeds maximum length of {MAX_DETAIL_LEN}"
+                "detail exceeds maximum length of {max_detail}"
             )));
         }
         // Serialize with the pending-proposals writers (turn-end recording,

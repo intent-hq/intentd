@@ -63,6 +63,8 @@ pub fn dispatch_diagnostic_owner() -> Option<std::process::ExitCode> {
 
 mod acp_adapter;
 mod agent_locks;
+mod agent_rpc;
+pub use agent_rpc::RPC_CALL_PROPOSAL_KIND;
 mod agent_manager;
 mod agent_ops;
 mod agent_resources;
@@ -1293,6 +1295,11 @@ pub struct Services {
     /// Held as `Arc<OnceLock>` so the control can be attached after the `api`
     /// Arc is built (composition-root wiring, §5.12). Shared across clones.
     server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
+    /// The Assistant's generic daemon RPC surface (`ws.rpc.*`), attached at
+    /// the composition root like `server_control`. Shared across clones.
+    agent_rpc: Arc<OnceLock<Arc<dyn intent_core::agent_rpc::AgentRpcSurface>>>,
+    /// Assistant `rpc-call` proposals held for the user's approval.
+    rpc_proposals: Arc<agent_rpc::RpcProposalRegistry>,
     /// Rebuilds an open invite's `intent://invite?…` link for
     /// `workspace.invite.list` (multiplayer w4). Attached after
     /// the `api` Arc like `server_control` (the transport owns the pairing
@@ -1916,6 +1923,8 @@ impl Services {
             scripts_running_state: Arc::new(workspace_status::ScriptsRunningState::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
+            agent_rpc: Arc::new(OnceLock::new()),
+            rpc_proposals: Arc::new(agent_rpc::RpcProposalRegistry::default()),
             invite_links: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
@@ -30992,6 +31001,43 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_resolve_rpc_proposal(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        proposal_id: String,
+        decision: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
+            self.agent_resolve_rpc_proposal_op(workspace_id, agent_id, proposal_id, decision)
+                .await
+        })
+    }
+
+    fn agent_rpc_describe(
+        &self,
+        workspace_id: WorkspaceId,
+        what: String,
+        args: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_rpc_describe_op(&workspace_id, &what, &args) })
+    }
+
+    fn agent_rpc_call(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        request: intent_core::agent_rpc::AgentRpcRequest,
+        budget: std::time::Duration,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_rpc_call_op(workspace_id, agent_id, request, budget)
+                .await
+        })
+    }
+
     fn agent_resolve_proposal(
         &self,
         workspace_id: WorkspaceId,
@@ -31004,15 +31050,22 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
-            self.agent_resolve_proposal_op(
-                workspace_id,
-                agent_id,
-                proposal_id,
-                outcome,
-                detail,
-                created_workspace_id,
-            )
-            .await
+            let claimed = self.guard_plain_rpc_resolution(&proposal_id, &outcome)?;
+            let resolved = self
+                .agent_resolve_proposal_op(
+                    workspace_id,
+                    agent_id.clone(),
+                    proposal_id.clone(),
+                    outcome,
+                    detail,
+                    created_workspace_id,
+                )
+                .await;
+            if claimed {
+                self.settle_dismissed_rpc_proposal(&agent_id, &proposal_id, resolved.is_ok())
+                    .await;
+            }
+            resolved
         })
     }
 

@@ -111,6 +111,7 @@ router agent.replaceMessages
 router agent.reportToParent
 router agent.resolveInterrupted
 router agent.resolveProposal
+router agent.resolveRpcProposal
 router agent.respondPermission
 router agent.restore
 router agent.retire

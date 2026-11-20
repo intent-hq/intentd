@@ -41,6 +41,7 @@ pub(crate) const RETIRED_GATED_METHODS: &[&str] = &[
     "agent.reportToParent",
     "agent.resolveInterrupted",
     "agent.resolveProposal",
+    "agent.resolveRpcProposal",
     "agent.respondPermission",
     "agent.restore",
     "agent.retire",

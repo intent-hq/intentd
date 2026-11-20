@@ -198,6 +198,10 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             json!({ "workspaceId": ws, "agentId": "a1", "proposalId": "p1", "outcome": "reject" }),
         ),
         (
+            "agent.resolveRpcProposal",
+            json!({ "workspaceId": ws, "agentId": "a1", "proposalId": "p1", "decision": "reject" }),
+        ),
+        (
             "agent.wakeOrCreate",
             json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
         ),

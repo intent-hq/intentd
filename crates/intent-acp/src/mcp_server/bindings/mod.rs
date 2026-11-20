@@ -35,6 +35,7 @@ pub(crate) mod mcp;
 pub(crate) mod note;
 pub(crate) mod pr;
 pub(crate) mod primitive;
+pub(crate) mod rpc;
 pub(crate) mod script;
 pub(crate) mod search;
 pub(crate) mod secret;
@@ -170,6 +171,9 @@ pub fn prelude_for_workspace(
     if workspace_id.is_chief() {
         prelude.push_str(app::mcp::PRELUDE);
         prelude.push_str(app::chats::PRELUDE);
+        if !is_sub_agent {
+            prelude.push_str(rpc::PRELUDE);
+        }
     }
     prelude.push_str(suggest::guard_prelude());
     prelude
@@ -521,6 +525,19 @@ async fn dispatch_binding(
         return file::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("rpc.") {
+        return rpc::dispatch(
+            api,
+            workspace_id,
+            caller_agent_id,
+            is_sub_agent,
+            eval_budget,
+            rest,
+            args,
+        )
+        .await
+        .map(Some);
     }
     if let Some(rest) = method.strip_prefix("app.") {
         return app::try_dispatch(
