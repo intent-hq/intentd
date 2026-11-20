@@ -449,16 +449,18 @@ custom specialist instructions can override the defaults.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte; src/routes/(app)/settings/+page.svelte (Agent defaults Advanced disclosure). Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
-**Secret requests.** Off by default. Open **Agent defaults**
-(`/settings?tab=agent-behavior#global-instructions`), expand **Advanced** if it is shown,
-and turn on **Secret requests**, directly under **Host command execution** in **Agent
-features**; it stays off and unavailable while Host command execution is off. It applies
-to top-level workspace agents created afterwards, not to sub-agents, background hooks or
-Assistant chat. When such an agent asks for a secret such as an API key, a "Secret
-requested" card with a masked field appears above the message box after its turn ends.
-**Provide** sends the value; **Skip** declines at once and tells the agent. The down arrow
-(Hide) collapses the card to a chip without losing a typed value. The value is not put in
-the chat: Intent holds it in daemon memory and passes it only to that agent's
+**Secret requests.** On by default unless the user turned it off; a config file
+created while it was off by default may also hold it off. To check or change it, open
+**Agent defaults** (`/settings?tab=agent-behavior#global-instructions`), expand
+**Advanced** if it is shown, and find **Secret requests**, directly under **Host command
+execution** in **Agent features**; it stays off and unavailable while Host command
+execution is off. A change applies to top-level workspace agents created afterwards, not
+to existing agents, sub-agents, background hooks or Assistant chat. When such an agent
+asks for a secret such as an API key, a "Secret requested" card with a masked field
+appears above the message box after its turn ends. **Provide** sends the value; **Skip**
+declines at once and tells the agent. The down arrow (Hide) collapses the card to a chip
+without losing a typed value. The value is not put in the chat: Intent holds it in daemon
+memory and passes it only to that agent's
 `ws.host.exec` commands that name it, redacting exact copies from their output. It is
 dropped when the daemon restarts, the agent is deleted or retired, or its workspace is
 archived; the agent then has to ask again.

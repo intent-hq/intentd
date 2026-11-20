@@ -1549,7 +1549,7 @@ async fn proxied_user_mcp_servers_ride_session_new_and_call_head() {
     );
 }
 
-/// [`gates`] with secret requests on (they default to off).
+/// [`gates`] with secret requests explicitly on.
 fn secret_gates() -> Gates {
     let features = AgentFeaturesSettings {
         secret_requests: true,

@@ -307,7 +307,7 @@ API:
 
   ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root, and an omitted `cwd` defaults to the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
 
-  ws.secret.request({ name, reason }) → { ok, requestId, message }  // Ask the user for a secret (API key, token) through a masked card shown when your turn ends; the value never reaches you or the chat, so never ask for one in chat. `name`: 1-64 characters of A-Z, 0-9 and _ starting with a letter (e.g. OPENROUTER_API_KEY); `reason`: why you need it. End your turn after asking; a message tells you when the user provides or declines. Use a provided secret ONLY as `secretEnv` on ws.host.exec — an array of names (`secretEnv: ["NAME"]` sets $NAME) or an object mapping variable to name (`secretEnv: { OPENAI_API_KEY: "NAME" }`); the command gets the value in its environment and its output shows `[secret:NAME]` instead. Secrets are yours alone, held in memory, and lost when Intent restarts: on a `secret-unavailable` error, request it again. Saved scripts (ws.script.*) and background hooks (ws.hook.*) cannot request or use secrets; never print, echo or write a secret value.
+  ws.secret.request({ name, reason }) → { ok, requestId, message }  // Ask the user for a secret (API key, token) through a masked card shown when your turn ends; the value never reaches you or the chat, so never ask for one in chat. `name`: 1-64 characters of A-Z, 0-9 and _ starting with a letter (e.g. OPENROUTER_API_KEY); `reason`: why you need it. End your turn after asking; a message tells you when the user provides or declines. Use a provided secret ONLY as `secretEnv` on ws.host.exec — an array of names (`secretEnv: ["NAME"]` sets $NAME) or an object mapping variable to name (`secretEnv: { OPENAI_API_KEY: "NAME" }`); the command gets the value in its environment and its output shows `[secret:NAME]` instead. Secrets are yours alone, held in memory, and lost when Intent restarts: on a `secret-unavailable` error, request it again. Saved scripts and background hooks cannot request or use secrets; never print, echo or write a secret value.
   ws.secret.list() → { secrets, pendingRequests }  // Names of your held secrets and your requests still waiting for the user; never values.
   ws.secret.forget(name) → { ok, forgotten }  // Drop one of your held secrets.
 
@@ -2585,7 +2585,10 @@ mod tests {
     /// ratchet rather than a budget: win room back before raising it.
     // Raised from 23_500 for `ws.file.pull`, whose signature the protocol
     // docs fix (intent-hq/intent#8881); its summary is one short sentence.
-    const CONDENSED_DESCRIPTION_BUDGET: usize = 23_600;
+    // Raised from 23_600 when secret requests turned on by default
+    // (intent-hq/intent#9740): the existing opt-in `ws.secret.*` lines and
+    // the `secretEnv` option joined the default description (+476 bytes).
+    const CONDENSED_DESCRIPTION_BUDGET: usize = 24_100;
 
     /// Bytes desktop-control signatures may add on top of the rest.
     const DESKTOP_SIGNATURES_ALLOWANCE: usize = 1_500;

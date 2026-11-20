@@ -2661,7 +2661,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Secret requests",
             "Let top-level agents ask you for secrets (ws.secret.*) that Intent holds in memory and passes only to that agent's ws.host.exec calls; needs Host exec; applies to new sessions only",
             "agentFeatures",
-            false,
+            true,
         )
         .with_token_impact("~260 tokens/session"),
         boolean(
@@ -8034,7 +8034,7 @@ mod tests {
             ("agentFeatures.desktopControl", true),
             ("agentFeatures.richChatBlocks", true),
             ("agentFeatures.structuredQuestions", true),
-            ("agentFeatures.secretRequests", false),
+            ("agentFeatures.secretRequests", true),
             ("agentFeatures.attentionRequests", true),
             ("agentFeatures.stateSnapshot", true),
             ("agentFeatures.prMonitor", true),
