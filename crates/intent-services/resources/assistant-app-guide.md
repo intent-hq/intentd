@@ -1210,7 +1210,7 @@ Codex and other providers do not report background tasks.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_manager,agent_session,agent_ops}.rs. -->
 
-In desktop agent chat, use the camera button beside **+** to capture the
+In desktop agent chat, use the screenshot button beside **+** to capture the
 screen and attach it to your draft. On macOS, hover over the button or press
 **Up Arrow** while it is focused to choose **Full screen**, **Window**, or
 **Region**. Intent remembers the selected mode while that prompt is open. The
