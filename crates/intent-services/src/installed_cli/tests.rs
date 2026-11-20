@@ -2425,6 +2425,35 @@ fn profile_path_consumes_captured_shell_credentials_like_default() {
     );
 }
 
+#[tokio::test]
+async fn a_missing_cli_uses_an_existing_bundled_copy_without_installing() {
+    for cli in [InstalledCli::Codex, InstalledCli::Claude] {
+        let home = tempfile::tempdir().unwrap();
+        // Nothing bundled yet: discovery-only callers never install.
+        let err = bundled_for_missing(cli, Some(home.path()), false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("bundled"), "{err}");
+        let seeded = seed_bundled(home.path(), cli, &bundled_version(cli.provider_id()));
+        let runtime = bundled_for_missing(cli, Some(home.path()), false)
+            .await
+            .unwrap();
+        assert_eq!(runtime.path(), seeded, "{cli:?}");
+        // A launch reuses the complete copy instead of running npm.
+        let launch = bundled_for_missing(cli, Some(home.path()), true)
+            .await
+            .unwrap();
+        assert_eq!(launch.path(), seeded, "{cli:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_missing_cli_without_a_home_has_no_bundled_fallback() {
+    assert!(bundled_for_missing(InstalledCli::Codex, None, true)
+        .await
+        .is_err());
+}
+
 #[test]
 fn missing_cli_discovery_is_classified_as_cli_missing() {
     use intent_providers::installed_cli::InstalledCli;

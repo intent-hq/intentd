@@ -159,6 +159,14 @@ pub fn bundled_fallback(provider: &str, version: &str) -> Option<BundledCli> {
         .flatten()
 }
 
+/// The bundled CLI to launch when Codex or Claude Code is not installed, so
+/// onboarding needs no install step. An installed CLI always wins.
+#[must_use]
+pub fn missing_fallback(provider: &str) -> Option<BundledCli> {
+    display_name(provider)?;
+    requirement(provider)?.bundled
+}
+
 /// Codex and Claude require their adapter-derived CLI minimum at launch. The
 /// daemon first substitutes the bundled CLI for a confirmed-old installed one
 /// (`bundled_fallback`); this check guards whatever is finally launched.
@@ -306,6 +314,20 @@ mod tests {
         for required in [&codex, &claude] {
             let version = required.bundled.as_ref().unwrap().version.to_string();
             assert_eq!(required.version_ok(&version), Some(true), "{version}");
+        }
+    }
+
+    #[test]
+    fn a_missing_codex_or_claude_falls_back_to_the_bundled_cli() {
+        for provider in ["codex", "claude-code"] {
+            assert_eq!(
+                missing_fallback(provider),
+                requirement(provider).unwrap().bundled,
+                "{provider}"
+            );
+        }
+        for provider in ["opencode", "pi", "auggie"] {
+            assert_eq!(missing_fallback(provider), None, "{provider}");
         }
     }
 

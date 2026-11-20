@@ -4213,12 +4213,13 @@ impl AgentManager {
         {
             // A named profile resolves before account lookup; the spawn layer
             // applies the same overlay to the prepared command.
-            let mut context = crate::installed_cli::InstalledContext::discover_for(
+            let mut context = crate::installed_cli::InstalledContext::discover_or_bundled(
                 cli,
                 spawn_opts.profile_env.cloned().map(Arc::new),
+                true,
             )
             .await
-            .map_err(Error::InvalidInput)?;
+            .map_err(|error| Error::InvalidInput(error.message))?;
             let prepared = prepare_installed_launch(&context, &spawn_opts)?;
             let prepared = intent_core::caller::spawn_with_current_caller(async move {
                 let prepared = Arc::new(prepared);
@@ -12337,8 +12338,21 @@ impl AgentManager {
                 crate::auggie_cli::select_auggie_for_spawn(explicit.as_deref())
             })
             .await
-            .map_err(|e| Error::Internal(format!("auggie version probe task failed: {e}")))??;
-            resolved.provider_binary = Some(selected);
+            .map_err(|e| Error::Internal(format!("auggie version probe task failed: {e}")))?;
+            match (
+                selected,
+                crate::provider_cli_launch::ProviderCli::npx("auggie"),
+            ) {
+                (Ok(selected), _) => resolved.provider_binary = Some(selected),
+                // Every installed auggie is too old: run the pinned package.
+                (Err(error), Some(crate::provider_cli_launch::ProviderCli::Npx { npx, .. })) => {
+                    tracing::warn!(%error, "installed auggie is too old; launching the pinned npm package");
+                    resolved.provider_binary = None;
+                    resolved.npx_fallback_binary = Some(npx);
+                    resolved.npx_fallback_package = resolved.provider.fallback_npx_package;
+                }
+                (Err(error), _) => return Err(error),
+            }
         }
         // `agy acp` needs agy `MIN_VERSION`+; a fresh spawn updates an older
         // agy first, as the Codex/Claude minimum does at launch.

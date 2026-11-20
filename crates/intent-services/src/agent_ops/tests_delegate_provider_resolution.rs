@@ -974,8 +974,10 @@ fn auth_gate_names_each_providers_catalog_login_hint() {
         // codex's hint names the real `codex` CLI (the probe target), not
         // the non-runnable adapter fallback "codex-acp login".
         ("codex", "codex login"),
+        // opencode's real login lives under `auth`.
+        ("opencode", "opencode auth login"),
         // No catalog hint: falls back to `{command} login`.
-        ("opencode", "opencode login"),
+        ("droid", "droid login"),
     ] {
         let err = super::ensure_provider_authenticated("agent.delegate", id, Some(false))
             .expect_err("hard-false verdict must be rejected");

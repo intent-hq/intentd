@@ -82,7 +82,9 @@ fn canonical_names_are_separate_from_adapters_and_missing_is_actionable() {
             .unwrap_err();
         assert!(err.to_string().contains(cli.command()));
         assert!(err.to_string().contains("execution host"));
-        assert!(err.to_string().contains("no bundled runtime"));
+        // Launches fall back to Intent's bundled copy, so the message no
+        // longer claims a missing CLI cannot be replaced.
+        assert!(!err.to_string().contains("no bundled runtime"));
     }
     assert_eq!(
         InstalledCli::for_provider("codex"),

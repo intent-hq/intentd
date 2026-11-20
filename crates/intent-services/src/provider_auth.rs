@@ -23,7 +23,9 @@
 //! - **codex** — the real `codex` CLI with `login status` (same exit-code
 //!   semantics; the codex-acp adapter is never spawned here).
 //! - **opencode** — `opencode models`: non-zero exit ⇒ `false`; `true` iff at
-//!   least one `provider/model` line ([`crate::provider_models`]).
+//!   least one `provider/model` line ([`crate::provider_models`]). Without an
+//!   installed CLI it runs from the pinned npm package via npx
+//!   ([`crate::provider_cli_launch`]), whose free models need no account.
 //! - **droid** — ACP probe (initialize + session/new): non-empty model list ⇒
 //!   `true`; explicit auth-required error ⇒ `false`; else unknown.
 //! - **grok** — `grok models` parsed via
@@ -39,7 +41,10 @@
 //!   CLI being installed: non-empty model list ⇒ `true`; an empty list or an
 //!   auth-required error ⇒ `false`; else unknown.
 //!
-//! Not-installed providers are never probed (`authenticated: null`). The
+//! Not-installed providers are never probed (`authenticated: null`), except
+//! those that run from an npm package through npx (their own pinned package,
+//! or Intent's bundled Codex / Claude Code CLI): signed out unless the CLI
+//! confirms a sign-in, apart from opencode's readiness probe. The
 //! install gate honors `providers.paths` overrides threaded by the transport
 //! layer (monorepo#1086 — the settings live above this crate; the discovery
 //! surface threads them the same way, monorepo#1065), so a provider reachable
@@ -315,24 +320,8 @@ async fn check_provider_auth_cli_with(
         }
         "opencode" => {
             let mut cmd = probe_command(program);
-            cmd.args(auth_check_args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true);
-            match tokio::time::timeout(OPENCODE_READY_TIMEOUT, cmd.output()).await {
-                Ok(Ok(output)) if could_not_run(output.status) => CliAuthProbe::Failed,
-                Ok(Ok(output)) if !output.status.success() => CliAuthProbe::NotAuthenticated,
-                Ok(Ok(output)) => {
-                    if opencode_models_ready(&String::from_utf8_lossy(&output.stdout)) {
-                        CliAuthProbe::Authenticated
-                    } else {
-                        CliAuthProbe::NotAuthenticated
-                    }
-                }
-                Ok(Err(_)) => CliAuthProbe::Failed,
-                Err(_) => CliAuthProbe::TimedOut,
-            }
+            cmd.args(auth_check_args);
+            opencode_ready_probe(cmd, OPENCODE_READY_TIMEOUT).await
         }
         _ => {
             let mut cmd = probe_command(program);
@@ -349,6 +338,28 @@ async fn check_provider_auth_cli_with(
                 Err(_) => CliAuthProbe::TimedOut,
             }
         }
+    }
+}
+
+/// Run an `opencode models` readiness command: exit 0 with at least one
+/// `provider/model` line is ready (the free Zen models need no account).
+async fn opencode_ready_probe(mut cmd: tokio::process::Command, timeout: Duration) -> CliAuthProbe {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) if could_not_run(output.status) => CliAuthProbe::Failed,
+        Ok(Ok(output)) if !output.status.success() => CliAuthProbe::NotAuthenticated,
+        Ok(Ok(output)) => {
+            if opencode_models_ready(&String::from_utf8_lossy(&output.stdout)) {
+                CliAuthProbe::Authenticated
+            } else {
+                CliAuthProbe::NotAuthenticated
+            }
+        }
+        Ok(Err(_)) => CliAuthProbe::Failed,
+        Err(_) => CliAuthProbe::TimedOut,
     }
 }
 
@@ -1151,12 +1162,64 @@ async fn resolve_auth_status(
         }
     }
     let Some(program) = resolve_probe_binary(provider_id, override_path.as_deref()) else {
-        return AuthVerdict::default();
+        return match npx_probe(provider_id) {
+            Some(probe) => resolve_cached(provider_id, probe).await,
+            None => AuthVerdict::default(),
+        };
     };
     resolve_cached(provider_id, async {
         probe_provider(provider_id, program, override_path.as_deref(), None).await
     })
     .await
+}
+
+/// The sign-in probe for a provider with no installed CLI that still runs
+/// from an npm package through npx: its own pinned package
+/// ([`crate::provider_cli_launch`]), or Intent's bundled CLI for Codex / Claude Code.
+/// `OpenCode`'s free models need no account, so its readiness probe stands.
+/// Every other provider reports signed out unless its CLI confirms a
+/// sign-in: a first run may still be downloading, and a CLI that is not
+/// installed is rarely signed in.
+fn npx_probe(
+    provider_id: &'static str,
+) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = AuthVerdict> + Send>>> {
+    let cli = if let Some(cli) = crate::provider_cli_launch::ProviderCli::npx(provider_id) {
+        cli
+    } else {
+        let bundled = intent_providers::adapter_cli::missing_fallback(provider_id)?;
+        let npx = if provider_id == "codex" {
+            intent_providers::find_codex_npx()
+        } else {
+            intent_providers::find_npx()
+        }?;
+        crate::provider_cli_launch::ProviderCli::Npx {
+            npx,
+            package: bundled.spec(),
+        }
+    };
+    let auth_args = intent_providers::find_provider(provider_id)?
+        .auth_check_args
+        .unwrap_or_default();
+    Some(Box::pin(async move {
+        if provider_id == "opencode" {
+            let cmd = cli.command(auth_args);
+            let timeout = cli.timeout(OPENCODE_READY_TIMEOUT);
+            return AuthVerdict::plain(opencode_ready_probe(cmd, timeout).await.auth_status());
+        }
+        if auth_args.is_empty() {
+            return AuthVerdict::plain(Some(false));
+        }
+        let (program, mut args) = cli.program();
+        args.extend_from_slice(auth_args);
+        let probe = if provider_id == "claude-code" {
+            check_claude_code_auth_cli(program.as_os_str(), &args, None)
+                .await
+                .probe
+        } else {
+            check_provider_auth_cli_in(provider_id, program.as_os_str(), &args, None).await
+        };
+        AuthVerdict::plain(Some(probe == CliAuthProbe::Authenticated))
+    }))
 }
 
 /// Run `probe` single-flighted under cache key `key` and store its outcome

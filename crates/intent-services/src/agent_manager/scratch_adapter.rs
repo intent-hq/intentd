@@ -204,10 +204,13 @@ impl AgentManager {
         let spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(opts.provider.id)
         {
-            let mut context =
-                crate::installed_cli::InstalledContext::discover_for(cli, overlay.clone())
-                    .await
-                    .map_err(Error::InvalidInput)?;
+            let mut context = crate::installed_cli::InstalledContext::discover_or_bundled(
+                cli,
+                overlay.clone(),
+                true,
+            )
+            .await
+            .map_err(|error| Error::InvalidInput(error.message))?;
             let mut prepared = prepare_installed_launch(&context, &opts)?;
             context
                 .select_launch(&prepared.command, None)
