@@ -1282,6 +1282,58 @@ async fn daemon_binds_loopback_alongside_a_specific_bind() {
     }
 }
 
+/// A configured address that is not on this machine (a Tailscale address
+/// before Tailscale connects) does not stop the listener: loopback — and so
+/// the tailcat tunnel — keeps serving, and status advertises only what is
+/// actually bound. 192.0.2.1 (TEST-NET-1) is never assigned to an interface.
+#[tokio::test]
+async fn daemon_serves_loopback_when_a_configured_address_is_absent() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"192.0.2.1\"\n",
+    )
+    .expect("seed config.toml with an absent address");
+    let child = spawn_daemon_both(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    let (port, status) = loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("call")
+            .arg("system.status")
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run intentd call system.status");
+        let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+        if let Some(port) = status.as_ref().and_then(|s| s["port"].as_u64()) {
+            break (
+                u16::try_from(port).expect("valid TCP port"),
+                status.expect("status parsed"),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WSS listener never came up with an absent configured address"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        status["localIps"],
+        serde_json::json!(["127.0.0.1"]),
+        "only the bound addresses are advertised"
+    );
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .unwrap_or_else(|e| panic!("127.0.0.1:{port} must accept connections: {e}"));
+}
+
 #[tokio::test]
 async fn pair_select_endpoints_unchanged_selection_writes_nothing() {
     let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");

@@ -350,6 +350,53 @@ pub fn collect_local_ipv6s() -> Vec<String> {
     ips
 }
 
+/// This machine's Tailscale IPv4 addresses (see [`tailscale_ipv4s_from`]).
+#[must_use]
+pub fn collect_tailscale_ips() -> Vec<std::net::Ipv4Addr> {
+    let addrs: Vec<(String, std::net::IpAddr)> = if_addrs::get_if_addrs()
+        .map(|ifaces| {
+            ifaces
+                .into_iter()
+                .map(|i| (i.name.clone(), i.ip()))
+                .collect()
+        })
+        .unwrap_or_default();
+    tailscale_ipv4s_from(&addrs)
+}
+
+/// The Tailscale IPv4 addresses among `(interface name, address)` pairs: an
+/// IPv4 in the CGNAT range Tailscale assigns from (100.64.0.0/10) on an
+/// interface Tailscale names (`tailscale0` on Linux, `Tailscale` on Windows)
+/// or one that also carries Tailscale's IPv6 ULA prefix (`fd7a:115c:a1e0::/48`
+/// — the `utun*` interface on macOS). The second check keeps other utun VPNs
+/// in the same range (Cloudflare WARP) and an ISP's CGNAT WAN address out.
+/// Pure over its input so the rule is unit-testable.
+#[must_use]
+pub fn tailscale_ipv4s_from(addrs: &[(String, std::net::IpAddr)]) -> Vec<std::net::Ipv4Addr> {
+    let has_tailscale_v6 = |name: &str| {
+        addrs.iter().any(|(n, ip)| {
+            n == name
+                && matches!(ip, std::net::IpAddr::V6(v6)
+                    if v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0])
+        })
+    };
+    let mut out = Vec::new();
+    for (name, ip) in addrs {
+        let std::net::IpAddr::V4(v4) = ip else {
+            continue;
+        };
+        let [a, b, ..] = v4.octets();
+        let cgnat = a == 100 && (64..128).contains(&b);
+        if cgnat
+            && (name.to_ascii_lowercase().contains("tailscale") || has_tailscale_v6(name))
+            && !out.contains(v4)
+        {
+            out.push(*v4);
+        }
+    }
+    out
+}
+
 /// Enumerate `(interface name, IPv4)` candidates for the `intentd pair`
 /// bind-address picker: loopback included (listed first), virtual/container
 /// interfaces skipped (same prefixes as [`collect_local_ips`]), one entry per

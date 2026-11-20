@@ -999,16 +999,6 @@ fn parse_yes_no(input: &str, default: bool) -> Result<bool, String> {
     }
 }
 
-/// A Tailscale address: IPv4 in the CGNAT range Tailscale assigns from
-/// (100.64.0.0/10) on an interface Tailscale names (`tailscale0` on Linux,
-/// `Tailscale` on Windows, `utun*` on macOS). The name check keeps an ISP's
-/// CGNAT address on a WAN interface out.
-fn is_tailscale_interface(name: &str, ip: std::net::Ipv4Addr) -> bool {
-    let [a, b, ..] = ip.octets();
-    let lower = name.to_ascii_lowercase();
-    a == 100 && (64..128).contains(&b) && (lower.contains("tailscale") || lower.starts_with("utun"))
-}
-
 /// Whether a first-time enable adds this machine's Tailscale addresses to
 /// the default bind; `INTENTD_PAIR_BIND_TAILSCALE=0` (or `false`/`no`/`off`)
 /// keeps it loopback only.
@@ -1022,21 +1012,22 @@ fn bind_tailscale_by_default() -> bool {
 }
 
 /// The bind set a first-time enable defaults to: a loopback-only (or empty)
-/// saved set gains this machine's Tailscale addresses, so the default is
-/// loopback plus the tailnet and never a LAN or the internet. Any other
-/// saved set is kept as is. Pure over its input so the rule is unit-testable.
+/// saved set gains this machine's `tailscale` addresses
+/// ([`intent_transport::collect_tailscale_ips`]), so the default is loopback
+/// plus the tailnet and never a LAN or the internet. Any other saved set is
+/// kept as is. Pure over its input so the rule is unit-testable.
 fn default_bind_addresses(
     current: &[std::net::IpAddr],
-    interfaces: &[(String, std::net::Ipv4Addr)],
+    tailscale: &[std::net::Ipv4Addr],
 ) -> Vec<std::net::IpAddr> {
     let mut addrs = current.to_vec();
     if !current.iter().all(std::net::IpAddr::is_loopback) {
         return addrs;
     }
-    for (name, ip) in interfaces {
-        let ip_addr = std::net::IpAddr::V4(*ip);
-        if is_tailscale_interface(name, *ip) && !addrs.contains(&ip_addr) {
-            addrs.push(ip_addr);
+    for ip in tailscale {
+        let ip = std::net::IpAddr::V4(*ip);
+        if !addrs.contains(&ip) {
+            addrs.push(ip);
         }
     }
     addrs
@@ -1393,12 +1384,12 @@ async fn enable_tunnel_for_pairing(socket: &Path) -> anyhow::Result<()> {
 async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow::Result<bool> {
     let tunnel_enabled = current_bool_setting(socket, "server.tunnel.enabled").await?;
     let current = current_bind_addresses(socket).await;
-    let interfaces = if bind_tailscale_by_default() {
-        intent_transport::collect_bind_interfaces()
+    let tailscale = if bind_tailscale_by_default() {
+        intent_transport::collect_tailscale_ips()
     } else {
         Vec::new()
     };
-    let defaults = default_bind_addresses(&current, &interfaces);
+    let defaults = default_bind_addresses(&current, &tailscale);
     if opts.yes {
         let changes = if same_addr_set(&defaults, &current) {
             Vec::new()
@@ -5080,6 +5071,20 @@ struct WsRuntimeState {
     bind_addresses: Option<Vec<std::net::IpAddr>>,
 }
 
+/// The bind set pairing and status surfaces advertise: the addresses the
+/// running listener serves (without one that is not up yet, like Tailscale
+/// before it connects), else the configured set.
+fn advertised_bind_set(state: &WsRuntimeState) -> Option<Vec<std::net::IpAddr>> {
+    match state
+        .ws_server
+        .as_ref()
+        .map(intent_transport::WsApiServer::bound_addresses)
+    {
+        Some(bound) if !bound.is_empty() => Some(bound),
+        _ => state.bind_addresses.clone(),
+    }
+}
+
 /// Atomically check cancellation and publish the in-flight transport handle.
 /// Stop either finds this handle or its generation bump prevents publication.
 async fn publish_starting_ws_server(
@@ -5126,7 +5131,7 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
             let state = self.ws_runtime.state.lock().await;
             intent_transport::PairingSnapshot {
                 port: state.port,
-                bind_addresses: state.bind_addresses.clone(),
+                bind_addresses: advertised_bind_set(&state),
                 tc_address,
             }
         })
@@ -5184,7 +5189,7 @@ impl SystemControl for DaemonControl {
                     .ws_server
                     .as_ref()
                     .map_or(0, intent_transport::WsApiServer::client_count);
-                (port, fingerprint, clients, state.bind_addresses.clone())
+                (port, fingerprint, clients, advertised_bind_set(&state))
             } else {
                 (None, None, 0, None)
             };
@@ -10724,24 +10729,6 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn tailscale_interfaces_need_the_cgnat_range_and_a_tailscale_name() {
-        let ts = std::net::Ipv4Addr::new(100, 101, 102, 103);
-        for name in ["tailscale0", "Tailscale", "utun4"] {
-            assert!(is_tailscale_interface(name, ts), "{name}");
-        }
-        // An ISP's CGNAT address on a WAN interface is not the tailnet.
-        assert!(!is_tailscale_interface("eth0", ts));
-        // Outside 100.64.0.0/10.
-        for ip in [
-            std::net::Ipv4Addr::new(100, 63, 255, 255),
-            std::net::Ipv4Addr::new(100, 128, 0, 1),
-            std::net::Ipv4Addr::new(192, 168, 1, 5),
-        ] {
-            assert!(!is_tailscale_interface("tailscale0", ip), "{ip}");
-        }
-    }
-
-    #[test]
     fn default_bind_addresses_add_tailscale_to_a_loopback_only_set() {
         let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         let lan: std::net::IpAddr = "192.168.1.5".parse().unwrap();
@@ -10754,20 +10741,21 @@ for line in sys.stdin:
                 std::net::Ipv4Addr::new(100, 101, 102, 103),
             ),
         ];
+        let tailnet = [std::net::Ipv4Addr::new(100, 101, 102, 103)];
         // Fresh (empty or loopback-only): loopback plus the tailnet, never
         // the LAN.
-        assert_eq!(default_bind_addresses(&[], &ifaces), vec![ts]);
-        assert_eq!(default_bind_addresses(&[lo], &ifaces), vec![lo, ts]);
+        assert_eq!(default_bind_addresses(&[], &tailnet), vec![ts]);
+        assert_eq!(default_bind_addresses(&[lo], &tailnet), vec![lo, ts]);
         // A saved set that already reaches past loopback is kept.
-        assert_eq!(default_bind_addresses(&[lan], &ifaces), vec![lan]);
-        // No Tailscale interface: loopback only.
+        assert_eq!(default_bind_addresses(&[lan], &tailnet), vec![lan]);
+        // No Tailscale address: loopback only.
         assert_eq!(
-            default_bind_addresses(&[], &ifaces[..2]),
+            default_bind_addresses(&[], &[]),
             Vec::<std::net::IpAddr>::new()
         );
 
         // The picker pre-checks exactly the tailnet row on a fresh install.
-        let defaults = default_bind_addresses(&[], &ifaces);
+        let defaults = default_bind_addresses(&[], &tailnet);
         let choices = build_bind_choices(&ifaces);
         let checked = listen_default_indices(&choices, &defaults, false);
         assert_eq!(checked.len(), 1);
