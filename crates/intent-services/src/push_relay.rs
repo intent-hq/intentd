@@ -32,7 +32,7 @@ use tokio::time::Instant;
 use crate::{EventBus, Services, SubscriptionFilter};
 use client::{LinkCounts, RelayClient, RelayError};
 use proof::DaemonKey;
-use state::{Facts, IdleAgent, Notice, NoticeKind, Pending, Settled, WorkspaceState};
+use state::{Facts, IdleAgent, Notice, Pending, Settled, WorkspaceState};
 
 const KEY_ACCOUNT: &str = "push.relay.daemonKey";
 const STATE_ACCOUNT: &str = "push.relay.state";
@@ -604,7 +604,7 @@ impl Services {
             workspace,
             next.running,
             self.agent_turn_in_flight(workspace),
-            matches!(notice, Some((NoticeKind::Done, _))),
+            notice.is_some(),
         );
         if notice.is_none() && publisher.sent.get(workspace) == Some(&next) {
             return Ok(());

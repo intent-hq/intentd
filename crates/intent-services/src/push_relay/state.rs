@@ -212,26 +212,26 @@ pub(crate) fn choose_notice(
 }
 
 /// Workspaces whose agents finished while intentd's idle grace window still
-/// reports `AgentRunning`. A done notice ends `running` at once, so the phone
+/// reports `AgentRunning`. Any notice ends `running` at once, so the phone
 /// gets the alert and the end of the Live Activity together.
 #[derive(Debug, Default)]
 pub(crate) struct Settled(HashSet<WorkspaceId>);
 
 impl Settled {
     /// The `running` value to publish. A turn in flight always runs and clears
-    /// the mark; during the grace window a done notice sets it.
+    /// the mark; during the grace window a notice sets it.
     pub(crate) fn running(
         &mut self,
         workspace: &WorkspaceId,
         activity_running: bool,
         turn_in_flight: bool,
-        done: bool,
+        noticed: bool,
     ) -> bool {
         if turn_in_flight || !activity_running {
             self.0.remove(workspace);
             return turn_in_flight;
         }
-        if done {
+        if noticed {
             self.0.insert(workspace.clone());
         }
         !self.0.contains(workspace)
