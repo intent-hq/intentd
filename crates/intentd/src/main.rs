@@ -2690,6 +2690,35 @@ async fn cmd_serve_owned(
         }
     }
 
+    // Exposed machines (daemon-to-daemon remote agents) are dialed on
+    // demand; hand the feature the tailcat binary for their tailcat routes.
+    // Node mode never starts a connector. Set before the pending-delete
+    // sweep below, whose deletes send home and remote-agent final stops.
+    services.configure_remote_machines(Some(tunnel::resolve_tailcat_bin()));
+    // The hook that checks machines' git pushes into agent refs, installed
+    // fresh under the data dir; without it every such push is refused.
+    if let Err(error) = intent_git::node_git::configure_receive_hooks(&config.data_dir) {
+        tracing::error!(%error, "remote machines: could not install the git receive hook; machine pushes will be refused");
+    }
+    // Finish workspace and agent deletes a previous run stopped part-way
+    // (Postgres `delete_purge` records; none on SQLite) through the full
+    // service delete, one at a time, BEFORE every restore below (queues,
+    // stop redeliveries, resume candidates, completion watches, event
+    // subscriptions, scripts, hooks, PR monitors): the restores then only
+    // see finished deletes. Startup waits for it, however long the
+    // remaining purge takes (progress is logged); this only happens after a
+    // crash mid-delete. A failed delete keeps its record for the next start
+    // and is restored like any live workspace; a daemon stop ends the sweep
+    // between records. Daemon orchestration only (closed in node mode);
+    // best-effort.
+    if startup_error.is_none() && !bootstrap.cancellation.stopping() && !node_mode {
+        if let Err(error) = services
+            .finish_pending_deletes(|| bootstrap.cancellation.stopping())
+            .await
+        {
+            tracing::warn!(%error, "pending delete sweep failed");
+        }
+    }
     // Rehydrate persisted agent send queues (write-through `agent_queue`
     // table) into the in-memory map before any listener serves RPCs, so
     // messages queued at the previous shutdown survive the restart. This only
@@ -2891,15 +2920,6 @@ async fn cmd_serve_owned(
             }
         })
     });
-    // Exposed machines (daemon-to-daemon remote agents) are dialed on
-    // demand; hand the feature the tailcat binary for their tailcat routes.
-    // Node mode never starts a connector.
-    services.configure_remote_machines(Some(tunnel::resolve_tailcat_bin()));
-    // The hook that checks machines' git pushes into agent refs, installed
-    // fresh under the data dir; without it every such push is refused.
-    if let Err(error) = intent_git::node_git::configure_receive_hooks(&config.data_dir) {
-        tracing::error!(%error, "remote machines: could not install the git receive hook; machine pushes will be refused");
-    }
     // Machines that may still run this backend's agents reconnect on their
     // own after a restart, in the background, so a machine that is down
     // never slows the start.

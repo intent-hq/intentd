@@ -1705,7 +1705,7 @@ const SQLITE_ONLY_CALLERS: &[(&str, &str)] = &[
 /// not `SQLITE_ONLY_CALLERS`, keeps them out of production code
 /// (`scripts/check-test-hooks-feature.sh` with `GUARDED_FEATURE=test-support`
 /// keeps the feature out of the intentd release graph).
-const TEST_ONLY_SQLITE_ONLY: &[&str] = &["read_pool", "write_pool"];
+const TEST_ONLY_SQLITE_ONLY: &[&str] = &["inject_pending_delete", "read_pool", "write_pool"];
 
 const TEST_GATE: &str = r#"#[cfg(any(test, feature = "test-support"))]"#;
 
