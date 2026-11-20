@@ -6,7 +6,7 @@
 //! itself (a terminal's) as `changes:git-status`. No event shows the
 //! machine's paths.
 
-use super::homes::{home_checkout, until};
+use super::homes::opened_home;
 use super::*;
 
 /// The next `events.event` of the workspace that `accept` takes; every
@@ -106,11 +106,8 @@ async fn file_and_git_events_of_a_home_reach_the_orchestrators_clients() {
     let home_id = created["home"]["homeId"].as_str().unwrap().to_owned();
     let mirror = PathBuf::from(created["worktreePath"].as_str().unwrap());
     let base = git(&mirror, &["rev-parse", "HEAD"]);
-    let work = until("the home checkout at the base", || {
-        home_checkout(&node_dir, &home_id)
-            .filter(|work| try_rev(work, "HEAD").as_deref() == Some(base.as_str()))
-    })
-    .await;
+    let work = opened_home(&mut rpc_ws, &mut id, &ws_id, &node_dir, &home_id).await;
+    assert_eq!(try_rev(&work, "HEAD").as_deref(), Some(base.as_str()));
 
     let mut events = connect(port, cfg.clone()).await;
     id += 1;

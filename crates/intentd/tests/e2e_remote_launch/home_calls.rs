@@ -7,7 +7,7 @@
 //! a commit the home made just before, attachments are placed on the home
 //! (in pieces when large), and a lost home answers `home-unavailable`.
 
-use super::homes::{commit_on, home_checkout, until};
+use super::homes::{commit_on, opened_home, until};
 use super::*;
 use base64::Engine as _;
 
@@ -87,11 +87,8 @@ async fn files_and_git_of_a_workspace_with_a_home_run_on_the_home() {
     let home_id = created["home"]["homeId"].as_str().unwrap().to_owned();
     let mirror = PathBuf::from(created["worktreePath"].as_str().unwrap());
     let base = git(&mirror, &["rev-parse", "HEAD"]);
-    let work = until("the home checkout at the base", || {
-        home_checkout(&node_dir, &home_id)
-            .filter(|work| try_rev(work, "HEAD").as_deref() == Some(base.as_str()))
-    })
-    .await;
+    let work = opened_home(&mut rpc_ws, &mut id, &ws_id, &node_dir, &home_id).await;
+    assert_eq!(try_rev(&work, "HEAD").as_deref(), Some(base.as_str()));
 
     // A file the app writes lands in the home checkout, not the mirror.
     id += 1;

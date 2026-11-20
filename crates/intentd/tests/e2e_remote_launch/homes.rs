@@ -36,6 +36,44 @@ pub(super) async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -
     }
 }
 
+/// `home_id`'s checkout on the machine in `node_dir`, once the machine has
+/// opened the home of `ws_id`: its setup finished (`skipped` without a
+/// setup script). The checkout's `HEAD` is no signal: `git worktree add`
+/// sets it before its own `reset --hard` writes the files and the index,
+/// so a test's git command there races the machine's. Only for a new
+/// workspace's first open in this backend run: the setup state is kept in
+/// the backend's memory and is not set for a moved home.
+pub(super) async fn opened_home(
+    rpc_ws: &mut common::TlsWs,
+    id: &mut i64,
+    ws_id: &str,
+    node_dir: &Path,
+    home_id: &str,
+) -> PathBuf {
+    let deadline = tokio::time::Instant::now() + wait();
+    loop {
+        *id += 1;
+        let got = ok(
+            rpc_ws,
+            *id,
+            "workspace.get",
+            json!({ "workspaceId": ws_id }),
+        )
+        .await;
+        let setup = got["workspace"]["home"]["setup"]["state"].as_str();
+        if matches!(setup, Some("skipped" | "completed")) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the home never opened: {got}"
+        );
+        // timing-guard: poll while the machine opens the home
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    home_checkout(node_dir, home_id).expect("an opened home has its checkout")
+}
+
 pub(super) fn commit_on(work: &Path, file: &str, text: &str, message: &str) -> String {
     std::fs::write(work.join(file), text).unwrap();
     git(work, &["add", file]);
@@ -129,12 +167,8 @@ async fn a_new_workspace_gets_a_home_that_is_backed_up_and_mirrored() {
     .await;
 
     // The machine made the home checkout at the workspace's base.
-    // `.git` appears before `git worktree add` has checked anything out.
-    let work = until("the home checkout at the base", || {
-        home_checkout(&node_dir, &home_id)
-            .filter(|work| try_rev(work, "HEAD").as_deref() == Some(base.as_str()))
-    })
-    .await;
+    let work = opened_home(&mut rpc_ws, &mut id, &ws_id, &node_dir, &home_id).await;
+    assert_eq!(try_rev(&work, "HEAD").as_deref(), Some(base.as_str()));
     assert!(work.join("README.md").is_file());
 
     // A terminal opened from the app runs in the home checkout on the
