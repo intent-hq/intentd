@@ -8,8 +8,8 @@ Rust backend daemon.
 **Assistant app guide:** a user-facing change updates the affected section of
 [`crates/intent-services/resources/assistant-app-guide.md`](crates/intent-services/resources/assistant-app-guide.md)
 in the same change, merging after any frontend PR it describes. Describe current behavior
-without app version numbers (merged frontend work is not unreleased). Do not promote
-unfinished or Labs-only features as normal options. Before opening a PR,
+without app version numbers; merged behavior described this way is not unreleased. Do not
+promote unfinished or Labs-only features as normal options. Before opening a PR,
 record the affected guide section or explain why there is no user-help impact. Full rule:
 [root `AGENTS.md`](https://github.com/intent-hq/intent/blob/main/AGENTS.md).
 
