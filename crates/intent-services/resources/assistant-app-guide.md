@@ -1210,10 +1210,14 @@ Codex and other providers do not report background tasks.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_manager,agent_session,agent_ops}.rs. -->
 
-In desktop agent chat, use the screenshot button beside **+** to capture the
-screen and attach it to your draft. On macOS, hover over the button or press
-**Up Arrow** while it is focused to choose **Full screen**, **Window**, or
-**Region**. Intent remembers the selected mode while that prompt is open. The
+<!-- Main-chat screenshot markup requires the matching frontend release
+(cloudlands-fe#4867). Until it ships, describe it only when explicitly asked or
+testing the feature. For other builds, suggest pasting or attaching a screenshot. -->
+
+In desktop builds with screenshot markup in agent chat, use the screenshot
+button beside **+** to capture the screen and attach it to your draft. On macOS,
+hover over the button or press **Up Arrow** while it is focused to choose
+**Full screen**, **Window**, or **Region**. Intent remembers the mode for that prompt. The
 screenshot editor opens after capture. Draw boxes, arrows, or freehand marks, add
 text, blur sensitive details, or crop, then choose **Save changes**. Use **Attach**
 to keep the original or the trash button to discard the capture. If macOS denies
