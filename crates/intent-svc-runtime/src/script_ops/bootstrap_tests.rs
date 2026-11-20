@@ -237,6 +237,6 @@ async fn concurrent_list_never_sees_a_partial_bootstrap() {
         .unwrap()
         .unwrap();
     assert_eq!(bootstrapped["scripts"].as_array().unwrap().len(), 3);
-    let concurrent = concurrent.expect("concurrent list did not wait on the parked bootstrap").unwrap();
+    let concurrent = concurrent.expect("concurrent list blocked on the parked bootstrap").unwrap();
     assert_eq!(concurrent, bootstrapped, "concurrent list saw a partial bootstrap");
 }

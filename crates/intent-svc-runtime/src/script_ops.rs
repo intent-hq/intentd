@@ -1735,6 +1735,19 @@ impl ScriptManager {
                                     remote_author: None,
                                 })
                                 .collect();
+                            // Register the whole set at once: a list that
+                            // skips the bootstrap lock (the autoStart kick runs
+                            // one alongside a client's first list) must never
+                            // see a partial set. Each new id's locks are held
+                            // from before the commit until its `created` event
+                            // is out, so no hydrate or ensure_known registers
+                            // one of them alone in between.
+                            let ids: Vec<String> = scripts.iter().map(|s| s.id.clone()).collect();
+                            let mut held = Vec::with_capacity(ids.len() * 2);
+                            for id in &ids {
+                                held.push(self.locks.definition_lock(id).lock_owned().await);
+                                held.push(self.locks.publication_lock(id).lock_owned().await);
+                            }
                             // Persist in one batched upsert — one INSERT per
                             // script here tripped the per-dispatch statement
                             // budget (intent-hq/monorepo#1778) — then register.
@@ -1746,19 +1759,9 @@ impl ScriptManager {
                                 if self.store.bootstrap_scripts(workspace_id, &scripts).await? {
                                     scripts
                                 } else {
+                                    held.clear();
                                     Vec::new()
                                 };
-                            // Register the whole set at once: a list that
-                            // skips the bootstrap lock (the autoStart kick runs
-                            // one alongside a client's first list) must never
-                            // see a partial set. Each new id's locks stay held
-                            // until its `created` event is out.
-                            let ids: Vec<String> = scripts.iter().map(|s| s.id.clone()).collect();
-                            let mut held = Vec::with_capacity(ids.len() * 2);
-                            for id in &ids {
-                                held.push(self.locks.definition_lock(id).lock_owned().await);
-                                held.push(self.locks.publication_lock(id).lock_owned().await);
-                            }
                             {
                                 let mut registry = self.scripts.lock().unwrap();
                                 for script in scripts {
