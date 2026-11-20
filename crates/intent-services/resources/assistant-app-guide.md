@@ -208,9 +208,9 @@ wrappers:
 
 If the user rejects a card, nothing ran; do not resubmit it unless they ask.
 
-`ws.rpc` replaces these older wrappers: reading one workspace, archiving or deleting
-workspaces, reading MCP servers, settings and specialists, and `ws.crossWorkspace`.
-Calling one of them fails with the `ws.rpc` call to use instead.
+`ws.rpc` replaces these older wrappers: reading one workspace, reading MCP servers,
+settings and specialists, and `ws.crossWorkspace`. Calling one of them fails with the
+`ws.rpc` call to use instead.
 
 To work on the user's other machines, call `ws.rpc.backends()`: it lists every backend the
 user's desktop apps know, and which app can reach it now. Pass a backend's `id` as

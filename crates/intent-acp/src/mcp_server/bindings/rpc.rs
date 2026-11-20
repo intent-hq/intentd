@@ -25,29 +25,14 @@ pub(crate) const PRELUDE: &str = r"
 /// Older Assistant bindings that `ws.rpc` fully replaces, with the call to
 /// use instead. The top-level Assistant gets a stub for each that throws the
 /// pointer, and its docs omit them; sub-agents (no `ws.rpc`) keep them.
-/// Bindings the versioned Assistant prompts teach, or whose results have no
-/// RPC equivalent (`workspaces.list` / `search`, the slim `agents.*` and
-/// `chats.*` reads), stay.
+/// Bindings the versioned Assistant prompts teach, whose results have no RPC
+/// equivalent (`workspaces.list` / `search`, the slim `agents.*` and `chats.*`
+/// reads), or whose cards do more than an RPC card (archive / delete show
+/// titles, allow deselecting and continue past a failure), stay.
 pub(crate) const REPLACED_BY_RPC: &[(&str, &str)] = &[
     (
         "app.workspaces.get",
         r#"ws.rpc.call("workspace.get", { workspaceId })"#,
-    ),
-    (
-        "app.workspaces.archive",
-        r#"ws.rpc.call("workspace.archive", { workspaceId })"#,
-    ),
-    (
-        "app.workspaces.delete",
-        r#"ws.rpc.call("workspace.delete", { workspaceId })"#,
-    ),
-    (
-        "app.workspaces.bulkArchive",
-        r#"ws.rpc.batch(ids.map((workspaceId) => ({ method: "workspace.archive", params: { workspaceId } })))"#,
-    ),
-    (
-        "app.workspaces.bulkDelete",
-        r#"ws.rpc.batch(ids.map((workspaceId) => ({ method: "workspace.delete", params: { workspaceId } })))"#,
     ),
     ("app.mcp.listServers", r#"ws.rpc.call("mcp.servers.list")"#),
     (
@@ -70,11 +55,11 @@ pub(crate) const REPLACED_BY_RPC: &[(&str, &str)] = &[
     ),
     (
         "crossWorkspace.listNotes",
-        r#"ws.rpc.call("crossWorkspace.listNotes", { workspaceId, targetWorkspaceId })"#,
+        r#"ws.rpc.call("note.list", { workspaceId })"#,
     ),
     (
         "crossWorkspace.readNote",
-        r#"ws.rpc.call("crossWorkspace.readNote", { workspaceId, targetWorkspaceId, noteId })"#,
+        r#"ws.rpc.call("note.get", { workspaceId, noteId })"#,
     ),
     ("crossWorkspace.search", "ws.app.workspaces.search(query)"),
 ];
@@ -101,7 +86,7 @@ pub(crate) fn replaced_prelude() -> String {
         let message = format!("ws.{path} is retired for the Assistant: use {use_instead}");
         let _ = writeln!(
             js,
-            "    if (ws.{ns}) ws.{ns}.{name} = () => {{ throw new Error({}); }};",
+            "    if (ws.{ns}) ws.{ns}.{name} = async () => {{ throw new Error({}); }};",
             Value::String(message)
         );
     }
@@ -240,11 +225,38 @@ mod tests {
     }
 
     #[test]
+    fn only_the_assistant_agent_bridge_gets_the_stubs() {
+        let features = AgentFeaturesSettings::default();
+        let chief = WorkspaceId::chief();
+        let marker = "is retired for the Assistant";
+        assert!(
+            super::super::prelude_for_agent_bridge(&features, false, &chief, false)
+                .contains(marker)
+        );
+        for (is_sub_agent, workspace) in [(true, &chief), (false, &WorkspaceId::new())] {
+            assert!(!super::super::prelude_for_agent_bridge(
+                &features,
+                is_sub_agent,
+                workspace,
+                false
+            )
+            .contains(marker));
+        }
+        // Hooks load this prelude; their saved code keeps the older bindings.
+        assert!(
+            !super::super::prelude_for_workspace(&features, false, &chief, false).contains(marker)
+        );
+    }
+
+    #[test]
     fn each_stub_throws_its_pointer() {
         let js = replaced_prelude();
         for (path, use_instead) in REPLACED_BY_RPC {
             let (ns, name) = path.rsplit_once('.').expect("namespaced path");
-            assert!(js.contains(&format!("ws.{ns}.{name} = () =>")), "{path}");
+            assert!(
+                js.contains(&format!("ws.{ns}.{name} = async () =>")),
+                "{path}"
+            );
             let message = Value::String(format!(
                 "ws.{path} is retired for the Assistant: use {use_instead}"
             ));

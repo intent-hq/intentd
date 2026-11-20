@@ -154,6 +154,30 @@ pub fn prelude_for_workspace(
     workspace_id: &WorkspaceId,
     machine_models: bool,
 ) -> String {
+    assemble_prelude(features, is_sub_agent, workspace_id, machine_models, false)
+}
+
+/// [`prelude_for_workspace`] for an agent's own `workspace_api` bridge: the
+/// top-level Assistant also gets the stubs for bindings `ws.rpc` replaced
+/// (`rpc::REPLACED_BY_RPC`). Hooks keep the plain prelude, so saved hook code
+/// that calls an older binding keeps working.
+#[must_use]
+pub(crate) fn prelude_for_agent_bridge(
+    features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
+    workspace_id: &WorkspaceId,
+    machine_models: bool,
+) -> String {
+    assemble_prelude(features, is_sub_agent, workspace_id, machine_models, true)
+}
+
+fn assemble_prelude(
+    features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
+    workspace_id: &WorkspaceId,
+    machine_models: bool,
+    retire_replaced: bool,
+) -> String {
     let chief_features;
     let features = if workspace_id.is_chief() && features.secret_requests {
         chief_features = AgentFeaturesSettings {
@@ -173,7 +197,9 @@ pub fn prelude_for_workspace(
         prelude.push_str(app::chats::PRELUDE);
         if !is_sub_agent {
             prelude.push_str(rpc::PRELUDE);
-            prelude.push_str(&rpc::replaced_prelude());
+            if retire_replaced {
+                prelude.push_str(&rpc::replaced_prelude());
+            }
         }
     }
     prelude.push_str(suggest::guard_prelude());

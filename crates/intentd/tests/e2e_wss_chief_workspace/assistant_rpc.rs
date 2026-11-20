@@ -88,10 +88,12 @@ const PARITY_OLD_CODE: &str = r"
     const settings = await ws.app.settings.list({ includeValues: false });
     const specialists = await ws.app.specialists.list();
     const one = await ws.app.specialists.get(specialists[0].id);
+    await ws.app.mcp.createServer({ id: 'parity-mcp', name: 'Parity', transport: 'http',
+        url: 'http://127.0.0.1:9/mcp', enabled: false });
     const mcp = await ws.app.mcp.listServers();
     return { parityOld: true, id, title: got.title, settings: settings.length,
         specialists: specialists.map(s => s.id).sort(), one: one.id,
-        mcp: (mcp.servers || []).length, crossWorkspace: typeof ws.crossWorkspace.listSiblings };
+        mcp: (mcp.servers || []).map(m => m.id).sort(), crossWorkspace: typeof ws.crossWorkspace.listSiblings };
 ";
 
 /// The same reads through `ws.rpc` as the top-level Assistant, plus the
@@ -105,7 +107,7 @@ const PARITY_NEW_CODE: &str = r"
     const one = await ws.rpc.call('specialist.get', { id: specialists.result.specialists[0].id });
     const mcp = await ws.rpc.call('mcp.servers.list');
     const stubs = {};
-    for (const path of ['app.workspaces.get', 'app.workspaces.bulkArchive', 'app.settings.list',
+    for (const path of ['app.workspaces.get', 'crossWorkspace.readNote', 'app.settings.list',
                         'app.specialists.get', 'app.mcp.listServers', 'crossWorkspace.search']) {
         const parts = path.split('.');
         const fn = parts.slice(0, -1).reduce((o, k) => o[k], ws)[parts[parts.length - 1]];
@@ -115,7 +117,7 @@ const PARITY_NEW_CODE: &str = r"
     const specialist = one.result.specialist || one.result;
     return { parityNew: true, id, title: workspace.title, settings: settings.result.settings.length,
         specialists: specialists.result.specialists.map(s => s.id).sort(), one: specialist.id,
-        mcp: mcp.result.servers.length, stubs, kept: typeof ws.app.workspaces.list };
+        mcp: mcp.result.servers.map(m => m.id).sort(), stubs, kept: typeof ws.app.workspaces.list };
 ";
 
 async fn start(data_dir: &Path) -> (Daemon, Ws) {
@@ -575,6 +577,7 @@ async fn assistant_rpc_replaces_the_older_bindings_over_wss() {
         assert_eq!(old[field], new[field], "{field}: {old} vs {new}");
     }
     assert_eq!(old["title"], "RPC parity", "{old}");
+    assert_eq!(old["mcp"], json!(["parity-mcp"]), "{old}");
     assert_eq!(
         old["crossWorkspace"], "function",
         "sub-agents keep ws.crossWorkspace: {old}"
