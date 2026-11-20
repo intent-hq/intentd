@@ -592,14 +592,15 @@ fn claude_code_acp_auth_verdict(outcome: Result<Vec<Value>, ProbeError>) -> Opti
     }
 }
 
-/// opencode: native CLI — run `opencode models` and parse one
-/// `provider/model` per line (parity with the FE `opencode.ipc.ts`, which
-/// routes the same command through `host.exec`).
+/// opencode: run `opencode models` (the installed CLI, else the pinned npm
+/// package through npx, [`crate::provider_cli_launch`]) and parse one
+/// `provider/model` per line.
 pub(crate) async fn fetch_opencode_models() -> ProviderModelsFetch {
-    let Some(bin) = find_provider_binary("opencode", "opencode", None) else {
+    let Some(cli) = crate::provider_cli_launch::ProviderCli::resolve("opencode", None) else {
         return ProviderModelsFetch::unavailable("opencode", "opencode binary not found");
     };
-    match run_opencode_models_cli(bin, OPENCODE_CLI_TIMEOUT).await {
+    let timeout = cli.timeout(OPENCODE_CLI_TIMEOUT);
+    match run_opencode_models_cli(cli.command(&["models"]), timeout).await {
         Ok(stdout) => {
             let models = parse::parse_opencode_models(&stdout);
             if models.is_empty() {
@@ -612,18 +613,14 @@ pub(crate) async fn fetch_opencode_models() -> ProviderModelsFetch {
     }
 }
 
-/// Run `opencode models` with a hard timeout, returning stdout on exit 0.
-/// On timeout the `output()` future is dropped, and `kill_on_drop` reaps the
-/// child so a wedged CLI does not leak past the failed probe. The timeout is
-/// injectable for tests; production passes [`OPENCODE_CLI_TIMEOUT`]. The
-/// child runs with the enhanced PATH (binary's parent dir prepended,
-/// matching the ACP probe spawns) so anything the opencode CLI shells out to
-/// resolves in a packaged-app (minimal PATH) environment.
-async fn run_opencode_models_cli(bin: PathBuf, timeout: Duration) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new(&bin);
-    cmd.arg("models")
-        .env("PATH", intent_providers::enhanced_path(Some(&bin)))
-        .stdin(std::process::Stdio::null())
+/// Run an `opencode models` command with a hard timeout, returning stdout on
+/// exit 0. On timeout the `output()` future is dropped, and `kill_on_drop`
+/// reaps the child so a wedged CLI does not leak past the failed probe.
+async fn run_opencode_models_cli(
+    mut cmd: tokio::process::Command,
+    timeout: Duration,
+) -> Result<String, String> {
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -657,10 +654,11 @@ fn stderr_tail(stderr: &str) -> String {
 /// [`intent_providers::parse_grok_models_command_output`] (auth markers, then
 /// a JSON payload, then text rows — parity with the FE grok probe).
 pub(crate) async fn fetch_grok_models() -> ProviderModelsFetch {
-    let Some(bin) = find_provider_binary("grok", "grok", None) else {
+    let Some(cli) = crate::provider_cli_launch::ProviderCli::resolve("grok", None) else {
         return ProviderModelsFetch::unavailable("grok", "grok binary not found");
     };
-    match run_grok_models_cli(bin, GROK_CLI_TIMEOUT).await {
+    let timeout = cli.timeout(GROK_CLI_TIMEOUT);
+    match run_grok_models_cli(cli.command(&["models"]), timeout).await {
         Ok(output) => grok_fetch_outcome(
             &String::from_utf8_lossy(&output.stdout),
             output.status,
@@ -749,13 +747,10 @@ fn grok_fetch_outcome(
 /// [`GROK_CLI_TIMEOUT`]. The child runs with the enhanced PATH (binary's
 /// parent dir prepended, matching the opencode CLI and ACP probe spawns).
 async fn run_grok_models_cli(
-    bin: PathBuf,
+    mut cmd: tokio::process::Command,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
-    let mut cmd = tokio::process::Command::new(&bin);
-    cmd.arg("models")
-        .env("PATH", intent_providers::enhanced_path(Some(&bin)))
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);

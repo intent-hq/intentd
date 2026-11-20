@@ -220,6 +220,37 @@ impl InstalledContext {
         .map_err(|_| DiscoveryError::other("installed CLI discovery failed"))?
     }
 
+    /// [`Self::discover_classified`], with Intent's bundled copy standing in
+    /// for a missing CLI. With `install` (launches) it is downloaded on first
+    /// use; otherwise only a complete earlier copy counts. An installed CLI
+    /// always wins, keeping its own version checks and bundled substitution.
+    pub(crate) async fn discover_or_bundled(
+        cli: InstalledCli,
+        profile: Option<Arc<ProfileEnv>>,
+        install: bool,
+    ) -> Result<Self, DiscoveryError> {
+        let missing = match Self::discover_classified(cli, profile.clone()).await {
+            Err(error) if error.cli_missing => error,
+            found => return found,
+        };
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from);
+        let runtime = bundled_for_missing(cli, home.as_deref(), install)
+            .await
+            .map_err(|reason| DiscoveryError {
+                message: format!("{} {reason}", missing.message),
+                cli_missing: true,
+            })?;
+        tokio::task::spawn_blocking(move || {
+            Self::with_runtime(runtime).map(|c| c.with_profile(profile))
+        })
+        .await
+        .map_err(|_| DiscoveryError::other("bundled CLI discovery failed"))?
+        .map_err(DiscoveryError::other)
+    }
+
     pub async fn with_catalog_fingerprint(mut self) -> Result<Self, String> {
         tokio::task::spawn_blocking(move || {
             self.context_key = Some(context_key(self.runtime.cli(), &self.env, &self.names)?);
@@ -487,7 +518,9 @@ impl InstalledContext {
         command: &Command,
         dependency: ProbeDependency,
     ) -> bool {
-        let Ok(current) = Self::discover_for(self.runtime.cli(), self.profile.clone()).await else {
+        let Ok(current) =
+            Self::discover_or_bundled(self.runtime.cli(), self.profile.clone(), false).await
+        else {
             return false;
         };
         let Ok(mut current) = current.with_catalog_fingerprint().await else {
@@ -564,6 +597,40 @@ impl InstalledContext {
             .map_err(|_| "installed CLI changed or disappeared")?;
         Ok((identity, version))
     }
+}
+
+/// Intent's bundled CLI for a missing `cli`, under `home`: a complete
+/// earlier copy, or a fresh install when `install` is set.
+///
+/// # Errors
+/// Returns why no bundled copy is available (no pinned package, no home,
+/// not installed yet, or the install failed).
+pub(crate) async fn bundled_for_missing(
+    cli: InstalledCli,
+    home: Option<&Path>,
+    install: bool,
+) -> Result<InstalledCliRuntime, String> {
+    let bundled = intent_providers::adapter_cli::missing_fallback(cli.provider_id())
+        .ok_or("Intent has no bundled copy of this CLI.")?;
+    let root = home
+        .and_then(crate::bundled_cli::root_in)
+        .ok_or("Intent's bundled CLI needs an absolute home directory.")?;
+    if install {
+        return crate::bundled_cli::ensure(&root, cli, &bundled)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Intent could not install its bundled {}: {error}",
+                    bundled.spec()
+                )
+            });
+    }
+    let spec = bundled.spec();
+    tokio::task::spawn_blocking(move || crate::bundled_cli::existing(&root, cli, &bundled))
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| format!("Intent's bundled {spec} is not installed yet."))
 }
 
 /// Why a launch could not select a runnable CLI.

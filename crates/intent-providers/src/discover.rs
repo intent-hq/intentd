@@ -361,11 +361,15 @@ fn availability_for_with_npx(
             }
         })
     };
+    // A missing Codex / Claude Code CLI does not block a launch: Intent then
+    // installs and runs its bundled copy (`adapter_cli::missing_fallback`).
+    // `secondary_binary.resolved` still reports the real CLI.
+    let bundled_cli = crate::adapter_cli::missing_fallback(provider.id).is_some();
     let installed = gated_off.is_none()
         && installed_with_secondary(
             resolved_path.is_some() || primary_override.is_some(),
             provider.requires_secondary_binary,
-            |_| secondary_binary.as_ref().is_some_and(|s| s.resolved),
+            |_| bundled_cli || secondary_binary.as_ref().is_some_and(|s| s.resolved),
         );
     ProviderAvailability {
         id: provider.id,
@@ -1445,10 +1449,9 @@ mod find_provider_binary_tests {
         // Assert against the single discovery snapshot rather than re-resolving
         // npx (no test mutates process-global PATH anymore — monorepo#628 —
         // but the snapshot assertion stays robust regardless).
-        assert_eq!(
-            cc.installed,
-            cc.resolved_path.is_some() && cc.secondary_binary.as_ref().is_some_and(|s| s.resolved)
-        );
+        // A missing `claude` CLI is replaced by Intent's bundled copy, so npx
+        // alone decides `installed`.
+        assert_eq!(cc.installed, cc.resolved_path.is_some());
         if let Some(path) = &cc.resolved_path {
             assert!(path
                 .file_name()
@@ -1488,11 +1491,9 @@ mod find_provider_binary_tests {
             Some(crate::config::CODEX_ACP_NPX_PACKAGE)
         );
         assert!(!codex.has_npx_fallback);
-        assert_eq!(
-            codex.installed,
-            codex.resolved_path.is_some()
-                && codex.secondary_binary.as_ref().is_some_and(|s| s.resolved)
-        );
+        // A missing `codex` CLI is replaced by Intent's bundled copy, so npx
+        // alone decides `installed`.
+        assert_eq!(codex.installed, codex.resolved_path.is_some());
         if let Some(path) = &codex.resolved_path {
             assert!(path
                 .file_name()
@@ -2157,10 +2158,16 @@ mod override_aware_discovery_tests {
                         &overrides,
                         &resolve_npx,
                     );
+                    // A missing Codex CLI is replaced by Intent's bundled copy,
+                    // so npx alone makes Codex runnable; `secondary` still
+                    // reports the real CLI.
                     assert_eq!(
-                        availability.installed,
-                        npx_present && native_present,
+                        availability.installed, npx_present,
                         "native={native_present}, npx={npx_present}, override={explicit_path:?}"
+                    );
+                    assert_eq!(
+                        availability.secondary_binary.as_ref().map(|s| s.resolved),
+                        Some(native_present)
                     );
                     assert_eq!(availability.resolved_path, resolve_npx());
                     assert_eq!(
@@ -2185,8 +2192,14 @@ mod override_aware_discovery_tests {
         make_executable(&adapter);
         let overrides = |key: &str| (key == "claude-code").then(|| adapter.display().to_string());
         let availability = availability_for(claude_code_config(), None, &|_, _| None, &overrides);
-        assert!(
-            !availability.installed,
+        assert_eq!(
+            availability.installed,
+            availability.resolved_path.is_some(),
+            "a legacy adapter override cannot flip installed (npx alone does)"
+        );
+        assert_eq!(
+            availability.secondary_binary.as_ref().map(|s| s.resolved),
+            Some(false),
             "legacy adapter override cannot supply the installed CLI"
         );
         assert_ne!(availability.resolved_path.as_ref(), Some(&adapter));
@@ -2197,14 +2210,14 @@ mod override_aware_discovery_tests {
     }
 
     /// An invalid claude-code override contributes nothing: `installed`
-    /// tracks npx auto-detection exactly as before.
+    /// tracks npx auto-detection (a missing CLI runs Intent's bundled copy).
     #[test]
     fn invalid_claude_code_override_does_not_flip_installed() {
         let dir = unique_temp_dir("override-claude-code-invalid");
         let missing = dir.path().join("missing");
         let overrides = |key: &str| (key == "claude-code").then(|| missing.display().to_string());
         let availability = availability_for(claude_code_config(), None, &|_, _| None, &overrides);
-        assert!(!availability.installed);
+        assert_eq!(availability.installed, availability.resolved_path.is_some());
     }
 
     /// monorepo#1065: with nothing auto-detected, valid overrides for both

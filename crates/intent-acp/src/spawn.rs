@@ -1688,16 +1688,23 @@ mod build_command_tests {
 
     #[test]
     fn providers_without_fallback_package_do_not_use_npx() {
-        // Test that providers like auggie don't get npx fallback
-        let provider = intent_providers::find_provider("auggie").unwrap();
+        // Cursor has no npm package: it never runs through npx.
+        let provider = intent_providers::find_provider("cursor").unwrap();
         assert_eq!(
             provider.fallback_npx_package, None,
-            "auggie should not have fallback_npx_package"
+            "cursor should not have fallback_npx_package"
         );
         assert_eq!(
             provider.npx_only_package, None,
-            "auggie should not have npx_only_package"
+            "cursor should not have npx_only_package"
         );
+        // Auggie runs from its pinned npm package only when not installed.
+        let auggie = intent_providers::find_provider("auggie").unwrap();
+        assert_eq!(
+            auggie.fallback_npx_package,
+            Some(intent_providers::AUGGIE_NPX_PACKAGE)
+        );
+        assert_eq!(auggie.npx_only_package, None);
     }
 
     #[test]

@@ -64,6 +64,9 @@ fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> 
     if let Some(hint) = p.login_command_hint {
         row.insert("loginCommandHint".into(), json!(hint));
     }
+    if let Some(hint) = p.npx_login_command_hint() {
+        row.insert("npxLoginCommandHint".into(), json!(hint));
+    }
     if let Some(url) = p.login_docs_url {
         row.insert("loginDocsUrl".into(), json!(url));
     }
@@ -146,6 +149,35 @@ mod tests {
             "https://cursor.com/docs/cli/reference/authentication"
         );
         assert!(cursor.get("requiresEnvVar").is_none());
+    }
+
+    /// A provider that also runs from its npm package advertises the npx
+    /// form of its login command; installed-only providers omit it.
+    #[test]
+    fn npx_runnable_rows_carry_an_npx_login_command() {
+        let v = catalog(&|_| false);
+        assert_eq!(
+            row(&v, "opencode")["npxLoginCommandHint"],
+            format!(
+                "npx -y {} auth login",
+                intent_providers::OPENCODE_NPX_PACKAGE
+            )
+        );
+        assert_eq!(
+            row(&v, "codex")["npxLoginCommandHint"],
+            format!(
+                "npx -y {} login",
+                intent_providers::adapter_cli::missing_fallback("codex")
+                    .unwrap()
+                    .spec()
+            )
+        );
+        for id in ["unsloth", "pi", "cursor"] {
+            assert!(
+                row(&v, id).get("npxLoginCommandHint").is_none(),
+                "{id} must omit npxLoginCommandHint"
+            );
+        }
     }
 
     #[test]

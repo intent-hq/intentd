@@ -110,6 +110,9 @@ fn apply_version_fields(
     );
     if let Some(path) = path {
         row.insert("cliResolvedPath".into(), json!(path));
+    } else if intent_providers::adapter_cli::missing_fallback(id).is_some() {
+        // Launches install and run Intent's bundled CLI instead.
+        row.insert("hasNpxFallback".into(), json!(true));
     }
     if let Some(version) = version {
         row.insert("cliVersion".into(), json!(version));
@@ -228,8 +231,13 @@ mod tests {
         assert!(!missing.contains_key("cliVersion"));
         assert!(
             !missing.contains_key("cliBundledVersion"),
-            "missing CLIs are not replaced"
+            "no outdated install to warn about"
         );
+        // A missing CLI runs from Intent's bundled package through npx.
+        assert_eq!(missing["hasNpxFallback"], true);
+        let mut installed = Map::new();
+        apply_version_fields(&mut installed, "codex", &requirement, Some(path), None);
+        assert!(!installed.contains_key("hasNpxFallback"));
     }
 
     #[test]

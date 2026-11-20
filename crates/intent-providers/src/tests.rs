@@ -246,6 +246,42 @@ fn registry_field_parity() {
     assert_eq!(oc.base_args, &["acp"]);
     assert_eq!(oc.auth_check_args, Some(&["models"][..]));
     assert!(oc.model_flag.is_none());
+    // Not installed: runs from the pinned npm package, so onboarding can use
+    // its free models without an install step.
+    assert_eq!(oc.fallback_npx_package, Some(OPENCODE_NPX_PACKAGE));
+    assert_eq!(oc.login_command_hint, Some("opencode auth login"));
+    assert_eq!(
+        oc.npx_login_command_hint(),
+        Some(format!("npx -y {OPENCODE_NPX_PACKAGE} auth login"))
+    );
+    // Claude Code and Codex log in through their bundled CLI package.
+    for (id, args) in [("claude-code", "auth login"), ("codex", "login")] {
+        let bundled = crate::adapter_cli::missing_fallback(id).unwrap();
+        assert_eq!(
+            find_provider(id).unwrap().npx_login_command_hint(),
+            Some(format!("npx -y {} {args}", bundled.spec()))
+        );
+    }
+    // Every provider with a real npm package runs from it when not installed;
+    // those without one (or riding another CLI, like Unsloth) must be installed.
+    for (id, package, login) in [
+        ("auggie", AUGGIE_NPX_PACKAGE, Some("login")),
+        ("grok", GROK_NPX_PACKAGE, Some("login")),
+        ("droid", DROID_NPX_PACKAGE, None),
+    ] {
+        let provider = find_provider(id).unwrap();
+        assert_eq!(provider.fallback_npx_package, Some(package), "{id}");
+        assert_eq!(
+            provider.npx_login_command_hint(),
+            login.map(|args| format!("npx -y {package} {args}")),
+            "{id}"
+        );
+    }
+    for id in ["cursor", "cortex", "antigravity", "unsloth", "pi"] {
+        let provider = find_provider(id).unwrap();
+        assert_eq!(provider.fallback_npx_package, None, "{id}");
+        assert_eq!(provider.npx_login_command_hint(), None, "{id}");
+    }
 
     let pi = find_provider("pi").unwrap();
     assert_eq!(pi.display_name, "Pi");
@@ -300,7 +336,7 @@ fn registry_field_parity() {
         Some("https://docs.x.ai/build/enterprise#authentication")
     );
     assert_eq!(grok.npx_only_package, None);
-    assert_eq!(grok.fallback_npx_package, None);
+    assert_eq!(grok.fallback_npx_package, Some(GROK_NPX_PACKAGE));
 
     let mock = find_provider("mock").unwrap();
     assert_eq!(mock.command, "node");
@@ -321,6 +357,7 @@ fn registry_field_parity() {
     assert_eq!(unsloth.auth_check_args, None);
     assert_eq!(unsloth.npx_only_package, None);
     assert_eq!(unsloth.fallback_npx_package, None);
+    assert_eq!(unsloth.npx_login_command_hint(), None);
 }
 
 /// cortex and droid are hidden by default: gated off when their enable env
@@ -1917,4 +1954,20 @@ fn system_prompt_note_partition() {
         note.contains("Task") && note.contains("ws.agent.delegate"),
         "{note}"
     );
+}
+
+/// Codex and Claude Code are runnable whenever npx resolves, even without
+/// their CLI: launches then run Intent's bundled CLI, so the daemon's
+/// admission check must not reject them as not installed.
+#[test]
+fn codex_and_claude_code_need_only_npx_to_be_runnable() {
+    for id in ["codex", "claude-code"] {
+        let provider = find_provider(id).unwrap();
+        let npx_only = |_: &str, command: &str| {
+            (command == "npx").then(|| std::path::PathBuf::from("/usr/bin/npx"))
+        };
+        let availability =
+            crate::discover::provider_availability_with(provider, &npx_only, &|_| false, &|_| None);
+        assert!(availability.installed, "{id}");
+    }
 }

@@ -79,6 +79,21 @@ pub const CODEX_ACP_PREREQUISITE_ERROR: &str =
 /// `intent-services::provider_models`.
 pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.34";
 
+/// Pinned npm package Intent runs `opencode` from (via `npx -y`) when no
+/// opencode CLI is installed ([`ProviderConfig::fallback_npx_package`]). Its
+/// postinstall links the native binary, so never prepare it with
+/// `--ignore-scripts`. Bumping the version is a deliberate code change.
+pub const OPENCODE_NPX_PACKAGE: &str = "opencode-ai@1.19.6";
+
+/// Pinned npm packages Intent runs a provider CLI from (via `npx -y`) when it
+/// is not installed ([`ProviderConfig::fallback_npx_package`]). Bumping a
+/// version is a deliberate code change.
+pub const AUGGIE_NPX_PACKAGE: &str = "@augmentcode/auggie@1.2.2";
+/// See [`AUGGIE_NPX_PACKAGE`].
+pub const GROK_NPX_PACKAGE: &str = "@xai-official/grok@1.0.89";
+/// See [`AUGGIE_NPX_PACKAGE`].
+pub const DROID_NPX_PACKAGE: &str = "@factory/cli@1.16.0";
+
 /// Minimum `pi` CLI version the pinned [`PI_ACP_NPX_PACKAGE`] adapter
 /// requires for model-specific `get_available_thinking_levels`. Feeds the pure
 /// version-gate decision in [`crate::version_gate`]; re-check when bumping the pin.
@@ -380,6 +395,25 @@ impl ProviderConfig {
         }
     }
 
+    /// [`Self::login_command_hint`] run from the provider's npm package
+    /// (`npx -y <package> <args>`), for a provider that is not installed:
+    /// [`Self::fallback_npx_package`], or the bundled Codex / Claude Code CLI
+    /// ([`crate::adapter_cli::missing_fallback`]). `None` without a package
+    /// or a hint, or when the hint does not start with the CLI's command.
+    #[must_use]
+    pub fn npx_login_command_hint(&self) -> Option<String> {
+        let (package, command) = match self.fallback_npx_package {
+            Some(package) => (package.to_owned(), self.command),
+            None => (
+                crate::adapter_cli::missing_fallback(self.id)?.spec(),
+                crate::installed_cli::InstalledCli::for_provider(self.id)?.command(),
+            ),
+        };
+        let args = self.login_command_hint?.strip_prefix(command)?;
+        args.starts_with(' ')
+            .then(|| format!("npx -y {package}{args}"))
+    }
+
     const fn empty(id: &'static str, display_name: &'static str, command: &'static str) -> Self {
         Self {
             id,
@@ -495,6 +529,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // (intent-hq/monorepo#2763), so interrupts tear the child down and
         // the next send respawns + resumes off the persisted `acpSessionId`.
         kills_child_on_interrupt: true,
+        fallback_npx_package: Some(AUGGIE_NPX_PACKAGE),
         ..ProviderConfig::empty("auggie", "Augment Auggie", "auggie")
     },
     ProviderConfig {
@@ -627,7 +662,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::EnvConfig,
         auth_check_args: Some(&["models"]),
+        login_command_hint: Some("opencode auth login"),
         login_docs_url: Some("https://opencode.ai/docs#configure"),
+        fallback_npx_package: Some(OPENCODE_NPX_PACKAGE),
         short_name: "OpenCode",
         ..ProviderConfig::empty("opencode", "OpenCode", "opencode")
     },
@@ -707,6 +744,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // it stays one argv entry (docs.factory.ai CLI reference).
         remove_tool_flag: Some("--disabled-tools"),
         remove_tool_style: ToolRemovalStyle::CommaJoined,
+        fallback_npx_package: Some(DROID_NPX_PACKAGE),
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
     },
     ProviderConfig {
@@ -749,6 +787,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // xai-org/grok-build source: `PagerArgs.cli_disallowed_tools` vs
         // `AgentArgs`). Orchestrator restrictions on grok are prompt-only;
         // MCP-side filtering (§6.8) still covers workspace tools.
+        fallback_npx_package: Some(GROK_NPX_PACKAGE),
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
     },
     ProviderConfig {

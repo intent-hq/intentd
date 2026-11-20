@@ -485,6 +485,17 @@ links from the terminal drawer) opens in a browser panel of the workspace shown 
 current window instead. With no workspace open, it opens in a small sign-in window.
 Other link types, such as `mailto:`, are unchanged.
 
+<!-- Free OpenCode and npm runtimes: packages/cloudlands-fe/src/features/onboarding/utils/order-onboarding-providers.ts; packages/cloudlands-fe/src/features/onboarding/messages/{AgentGrid,ProviderCard}.svelte; packages/cloudlands-fe/src/store/renderer/seeders/provider-status-bridge-seeder.ts; packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/intentd/crates/intent-services/src/{provider_cli_launch,installed_cli,provider_auth}.rs; packages/intentd/crates/intent-services/src/provider_models/parse.rs; packages/intentd/crates/intent-providers/src/config.rs. -->
+Pending release: OpenCode, Claude Code, Codex and Grok need no install when Node.js
+is present (Auggie too, once enabled; see Auggie visibility below). Without their CLI, Intent runs them from npm: through npx, or for
+Claude Code and Codex through Intent's own bundled copy, downloaded at the first launch.
+Cursor, Antigravity, Pi and Unsloth still need their own install. An
+installed CLI is always used first, with its version checks and update prompts. A card
+running from npm shows **Log in**, which runs the login command through npx. OpenCode's
+free models need no account, so when onboarding finds no other provider installed,
+OpenCode comes first with a **Free** label and is selected. Its default model is a free
+one whose provider keeps no prompts. Free models change over time and have usage limits.
+
 <!-- Auggie visibility: packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/cloudlands-fe/src/features/onboarding/messages/AgentGrid.svelte; packages/cloudlands-fe/src/store/renderer/slices/provider-catalog/workspace-catalog-selectors.ts. -->
 Auggie appears in provider lists, including onboarding, only when its CLI is
 installed or it is already enabled. An enabled but missing installation stays

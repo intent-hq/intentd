@@ -272,6 +272,7 @@ mod profile_activation;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_cli;
+pub(crate) mod provider_cli_launch;
 mod provider_images;
 pub mod provider_models;
 mod provider_preparation;

@@ -541,6 +541,38 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+/// Free `OpenCode` Zen models whose providers keep no prompts and do not train
+/// on them (opencode.ai/docs/zen), best first. Re-check when the roster changes.
+const OPENCODE_NO_RETENTION_FREE_MODELS: &[&str] = &[
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/hy4-flash-free",
+    "opencode/mimo-v2.6-flash-free",
+];
+
+/// Whether `id` is one of `OpenCode` Zen's free models (no account needed).
+fn is_opencode_free_model(id: &str) -> bool {
+    id.strip_prefix("opencode/")
+        .is_some_and(|model| model.ends_with("-free") || model == "big-pickle")
+}
+
+/// Mark a no-retention model `isDefault` when every row is a free Zen model
+/// (`OpenCode` with no account). Otherwise the CLI's own order stands.
+fn mark_opencode_free_default(rows: &mut [Value]) {
+    let ids = || rows.iter().filter_map(|row| row["id"].as_str());
+    if !ids().all(is_opencode_free_model) {
+        return;
+    }
+    let Some(default) = OPENCODE_NO_RETENTION_FREE_MODELS
+        .iter()
+        .find(|preferred| ids().any(|id| id == **preferred))
+    else {
+        return;
+    };
+    if let Some(row) = rows.iter_mut().find(|row| row["id"] == *default) {
+        row["isDefault"] = json!(true);
+    }
+}
+
 /// Parse `opencode models` stdout: one `provider/model` per line; lines
 /// without a `/` (log noise, headers) are skipped. Display names follow the
 /// FE's `formatModelLabel` ("Provider Model Name").
@@ -562,6 +594,7 @@ pub(super) fn parse_opencode_models(stdout: &str) -> Vec<Value> {
         );
         rows.push(wire_row(trimmed, &name, "opencode", None));
     }
+    mark_opencode_free_default(&mut rows);
     rows
 }
 

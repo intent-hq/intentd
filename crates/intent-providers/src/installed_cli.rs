@@ -109,7 +109,11 @@ pub struct MissingInstalledCli(InstalledCli);
 
 impl std::fmt::Display for MissingInstalledCli {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Install {} on the execution host and make it available on PATH, then retry. Intent requires the installed CLI; no bundled runtime replaces a missing one.", self.0.command())
+        write!(
+            f,
+            "Install {} on the execution host and make it available on PATH, then retry.",
+            self.0.command()
+        )
     }
 }
 

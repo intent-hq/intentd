@@ -2929,8 +2929,12 @@ where
 /// enhanced-PATH scan) so a packaged app with a minimal process PATH still
 /// finds the CLI. Returns `None` when discovery fails, so callers keep
 /// their static/transcript fallbacks.
-fn resolve_auggie_bin(auggie_bin: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+fn resolve_auggie_bin(
+    auggie_bin: Option<std::path::PathBuf>,
+) -> Option<crate::provider_cli_launch::ProviderCli> {
     resolve_auggie_bin_with(auggie_bin, intent_context::discovery::find_auggie)
+        .map(crate::provider_cli_launch::ProviderCli::Installed)
+        .or_else(|| crate::provider_cli_launch::ProviderCli::npx("auggie"))
 }
 
 /// Best-effort `agent.getModels` dynamic fetch: run `auggie model list`, parse
@@ -3054,12 +3058,16 @@ const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// runs with the exec PATH (`intent_context::discovery::exec_path`) so the
 /// `.mjs` shim's `#!/usr/bin/env node` resolves in a packaged-app
 /// environment.
-async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
-    tokio::time::timeout(AUGGIE_MODELS_TIMEOUT, {
-        let mut command = tokio::process::Command::new(auggie);
+async fn auggie_output(
+    auggie: &crate::provider_cli_launch::ProviderCli,
+    args: &[&str],
+) -> Option<std::process::Output> {
+    tokio::time::timeout(auggie.timeout(AUGGIE_MODELS_TIMEOUT), {
+        let mut command = auggie.command(args);
+        if let crate::provider_cli_launch::ProviderCli::Installed(bin) = auggie {
+            command.env("PATH", intent_context::discovery::exec_path(bin));
+        }
         command
-            .args(args)
-            .env("PATH", intent_context::discovery::exec_path(auggie))
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
         // The Auggie CLI is an agent process like any other: keep it from

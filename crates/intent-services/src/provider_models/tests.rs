@@ -1142,6 +1142,58 @@ fn parse_opencode_models_nested_model_ids_keep_full_value() {
     assert_eq!(rows[0]["name"], "Bedrock Anthropic/claude 3");
 }
 
+fn opencode_default(stdout: &str) -> Option<String> {
+    let rows = parse_opencode_models(stdout);
+    let defaults: Vec<_> = rows
+        .iter()
+        .filter(|row| row.get("isDefault") == Some(&json!(true)))
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(defaults.len() <= 1, "at most one default: {defaults:?}");
+    defaults.into_iter().next()
+}
+
+#[test]
+fn opencode_free_catalog_defaults_to_a_no_retention_model() {
+    // The anonymous Zen roster (opencode 1.19.6, no account): the default is a
+    // free model whose provider keeps no prompts, not the first row.
+    let anonymous = "\
+opencode/beam-free
+opencode/big-pickle
+opencode/deepseek-v4.1-flash-free
+opencode/hy4-flash-free
+opencode/mimo-v2.6-flash-free
+opencode/nemotron-3.5-lightning-free
+";
+    assert_eq!(
+        opencode_default(anonymous).as_deref(),
+        Some("opencode/deepseek-v4.1-flash-free")
+    );
+    // The free roster changes: the next no-retention model takes over.
+    assert_eq!(
+        opencode_default("opencode/big-pickle\nopencode/hy4-flash-free\n").as_deref(),
+        Some("opencode/hy4-flash-free")
+    );
+    // No known no-retention model: no default, so the first row applies.
+    assert_eq!(
+        opencode_default("opencode/big-pickle\nopencode/beam-free\n"),
+        None
+    );
+}
+
+#[test]
+fn opencode_catalog_with_other_models_keeps_no_default() {
+    // A user with their own provider or paid models keeps the CLI's order.
+    assert_eq!(
+        opencode_default("anthropic/claude-sonnet-4\nopencode/deepseek-v4.1-flash-free\n"),
+        None
+    );
+    assert_eq!(
+        opencode_default("opencode/claude-sonnet-4-6\nopencode/deepseek-v4.1-flash-free\n"),
+        None
+    );
+}
+
 #[test]
 fn parse_opencode_models_empty_output() {
     assert!(parse_opencode_models("").is_empty());
@@ -1283,9 +1335,12 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
     );
     std::fs::write(&bin, script).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let stdout = super::run_opencode_models_cli(bin, std::time::Duration::from_secs(60))
-        .await
-        .expect("exit 0 when the child PATH carries the binary dir");
+    let stdout = super::run_opencode_models_cli(
+        crate::provider_cli_launch::ProviderCli::Installed(bin).command(&["models"]),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .expect("exit 0 when the child PATH carries the binary dir");
     assert!(stdout.contains("anthropic/claude-3"));
 }
 
@@ -1308,9 +1363,12 @@ async fn grok_models_cli_child_path_includes_binary_dir() {
     );
     std::fs::write(&bin, script).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let output = super::run_grok_models_cli(bin, std::time::Duration::from_secs(60))
-        .await
-        .expect("spawn succeeds");
+    let output = super::run_grok_models_cli(
+        crate::provider_cli_launch::ProviderCli::Installed(bin).command(&["models"]),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .expect("spawn succeeds");
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("grok-build"));
 }
@@ -1334,9 +1392,12 @@ async fn grok_cli_timeout_flows_into_attributed_warning() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let fetch = super::ProviderModelsFetch::unavailable(
         "grok",
-        super::run_grok_models_cli(bin, std::time::Duration::from_secs(5))
-            .await
-            .unwrap_err(),
+        super::run_grok_models_cli(
+            crate::provider_cli_launch::ProviderCli::Installed(bin).command(&["models"]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err(),
     );
     assert!(fetch.models.is_none());
     assert_eq!(
@@ -1774,9 +1835,12 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
 
     // Left alone, the CLI would exit 0 with no output after its sleep, so
     // the timeout error alone says the timeout cut it short.
-    let err = super::run_opencode_models_cli(bin, std::time::Duration::from_secs(5))
-        .await
-        .unwrap_err();
+    let err = super::run_opencode_models_cli(
+        crate::provider_cli_launch::ProviderCli::Installed(bin).command(&["models"]),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err, "opencode models timed out");
 
     // kill_on_drop reaps the child when the timed-out output future drops:
@@ -1816,9 +1880,12 @@ async fn opencode_timeout_flows_into_attributed_warning() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let fetch = super::ProviderModelsFetch::unavailable(
         "opencode",
-        super::run_opencode_models_cli(bin, std::time::Duration::from_secs(5))
-            .await
-            .unwrap_err(),
+        super::run_opencode_models_cli(
+            crate::provider_cli_launch::ProviderCli::Installed(bin).command(&["models"]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err(),
     );
     assert!(fetch.models.is_none());
     assert_eq!(

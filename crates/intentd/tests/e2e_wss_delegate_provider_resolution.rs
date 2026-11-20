@@ -700,7 +700,7 @@ async fn create_and_delegate_reject_hard_false_auth_verdict_over_wss() {
         "error names the provider and the auth failure: {message}"
     );
     assert!(
-        message.contains("opencode login"),
+        message.contains("opencode auth login"),
         "error names the CLI login remedy: {message}"
     );
 
@@ -726,7 +726,7 @@ async fn create_and_delegate_reject_hard_false_auth_verdict_over_wss() {
     );
     let message = error["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("not authenticated") && message.contains("opencode login"),
+        message.contains("not authenticated") && message.contains("opencode auth login"),
         "create error carries the same actionable remedy: {message}"
     );
 
