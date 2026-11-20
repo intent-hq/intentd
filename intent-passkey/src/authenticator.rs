@@ -7,8 +7,8 @@ use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    Account, BluetoothState, CreateParams, CreateResult, ErrorCode, Event, GetParams, GetResult,
-    PasskeyError, PinKind, Status,
+    Account, BluetoothState, Bytes, CreateParams, CreateResult, DeviceCredential, ErrorCode, Event,
+    GetParams, GetResult, PasskeyError, PinKind, Status,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,21 @@ pub struct CeremonyIo {
     pins: mpsc::Receiver<Zeroizing<String>>,
     choices: mpsc::Receiver<usize>,
     stop: watch::Receiver<Option<StopReason>>,
+}
+
+/// See [`CeremonyIo::stop_signal`].
+#[derive(Clone)]
+pub struct StopSignal(watch::Receiver<Option<StopReason>>);
+
+impl StopSignal {
+    /// # Errors
+    /// The stop reason's error once the ceremony must stop.
+    pub fn check(&self) -> Result<(), PasskeyError> {
+        match *self.0.borrow() {
+            Some(reason) => Err(reason.error()),
+            None => Ok(()),
+        }
+    }
 }
 
 /// The server's handles to a running ceremony's [`CeremonyIo`].
@@ -78,6 +93,21 @@ impl CeremonyIo {
         self.events.clone()
     }
 
+    /// The stop reason's error once main cancelled the ceremony or it timed out;
+    /// for checks after blocking work and before committing anything.
+    ///
+    /// # Errors
+    /// When the ceremony must stop.
+    pub fn ensure_running(&self) -> Result<(), PasskeyError> {
+        self.stop_signal().check()
+    }
+
+    /// A handle that checks for a stop from another task or a blocking thread.
+    #[must_use]
+    pub fn stop_signal(&self) -> StopSignal {
+        StopSignal(self.stop.clone())
+    }
+
     /// Resolves when the ceremony must stop.
     pub async fn stopped(&mut self) -> StopReason {
         loop {
@@ -100,13 +130,24 @@ impl CeremonyIo {
         attempts_left: Option<u32>,
         wrong_pin: bool,
     ) -> Result<Zeroizing<String>, PasskeyError> {
-        while self.pins.try_recv().is_ok() {}
-        self.emit(Event::PinNeeded {
+        self.ask_pin(Event::PinNeeded {
             kind,
             attempts_left,
             retry_after_ms: None,
             wrong_pin,
-        });
+            old_pin: false,
+        })
+        .await
+    }
+
+    /// Emits `prompt` (a `pin-needed` event) and waits for the PIN (or for the
+    /// ceremony to stop).
+    ///
+    /// # Errors
+    /// The stop reason's error when the ceremony is cancelled or times out first.
+    pub async fn ask_pin(&mut self, prompt: Event) -> Result<Zeroizing<String>, PasskeyError> {
+        while self.pins.try_recv().is_ok() {}
+        self.emit(prompt);
         let mut stop = self.stop.clone();
         tokio::select! {
             pin = self.pins.recv() => pin.ok_or_else(|| StopReason::Cancelled.error()),
@@ -165,4 +206,31 @@ pub trait Authenticator: Send + Sync + 'static {
         params: GetParams,
         io: CeremonyIo,
     ) -> impl Future<Output = Result<GetResult, PasskeyError>> + Send;
+
+    /// Whether device passkeys are set up on this system (`hello.transports.device`).
+    fn device_supported(&self) -> bool {
+        false
+    }
+
+    fn device_list(
+        &self,
+    ) -> impl Future<Output = Result<Vec<DeviceCredential>, PasskeyError>> + Send {
+        async { Err(device_unsupported()) }
+    }
+
+    fn device_delete(
+        &self,
+        credential_id: Bytes,
+    ) -> impl Future<Output = Result<(), PasskeyError>> + Send {
+        let _ = credential_id;
+        async { Err(device_unsupported()) }
+    }
+}
+
+#[must_use]
+pub fn device_unsupported() -> PasskeyError {
+    PasskeyError::new(
+        ErrorCode::NotSupported,
+        "device passkeys are not set up on this system",
+    )
 }

@@ -2859,7 +2859,7 @@ jobs:
         run: cargo nextest run -p intent-store --features postgres --test postgres_backend --test postgres_backend_lint --test postgres_tenant_schema_lint
 
   # intent-passkey (the WebAuthn sidecar, its own Cargo workspace under
-  # intent-passkey/) links libdbus and libudev, so it stays out of the daemon
+  # intent-passkey/) links libdbus, libudev and libpam, so it stays out of the daemon
   # workspace and gets its gates here: format, Clippy, the protocol and USB
   # (virtual HID key) tests, the license policy, and the release build script
   # for both Linux arches (x86_64 native, aarch64 cross via multiarch), which

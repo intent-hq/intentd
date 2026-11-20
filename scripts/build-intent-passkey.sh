@@ -5,9 +5,10 @@
 # legs are a no-op.
 #
 # Why glibc and not the daemon's musl target: libwebauthn needs libdbus (BlueZ)
-# and hidapi's hidraw backend, which links libudev. Neither has a supported
-# static musl build, and both are present on every desktop Linux that runs the
-# Intent AppImage, so the sidecar links them dynamically against glibc. The
+# and hidapi's hidraw backend, which links libudev; device passkeys check the
+# PIN through libpam. None has a supported static musl build, and all are
+# present on every desktop Linux that runs the Intent AppImage, so the sidecar
+# links them dynamically against glibc. The
 # x86_64 runner builds aarch64 with Debian multiarch (gcc cross + arm64 -dev
 # packages from ports.ubuntu.com).
 #
@@ -65,16 +66,19 @@ enable_foreign_arch() {
     sudo -n tee "/etc/apt/sources.list.d/intent-passkey-$deb_arch.sources" >/dev/null
 }
 
+# libpam0g-dev ships no pkg-config file, so look for its linker symlink.
+has_pam() { [ -e "/usr/lib/$arch-linux-gnu/libpam.so" ]; }
+
 if [ "$host_arch" = "$arch" ]; then
-  if ! pkg-config --exists dbus-1 libudev; then
-    apt_install pkg-config libdbus-1-dev libudev-dev
+  if ! pkg-config --exists dbus-1 libudev || ! has_pam; then
+    apt_install pkg-config libdbus-1-dev libudev-dev libpam0g-dev
   fi
 else
   if ! PKG_CONFIG_LIBDIR="/usr/lib/$arch-linux-gnu/pkgconfig" pkg-config --exists dbus-1 libudev ||
-    ! command -v "$arch-linux-gnu-gcc" >/dev/null; then
+    ! has_pam || ! command -v "$arch-linux-gnu-gcc" >/dev/null; then
     enable_foreign_arch
     apt_install pkg-config "gcc-${arch//_/-}-linux-gnu" "libc6-dev-$deb_arch-cross" \
-      "libdbus-1-dev:$deb_arch" "libudev-dev:$deb_arch"
+      "libdbus-1-dev:$deb_arch" "libudev-dev:$deb_arch" "libpam0g-dev:$deb_arch"
   fi
   triple_env=$(echo "$target" | tr 'a-z-' 'A-Z_')
   export PKG_CONFIG_ALLOW_CROSS=1
@@ -98,4 +102,4 @@ print(next(os.path.dirname(p["manifest_path"]) for p in meta["packages"] if p["n
 install -m 0644 "$libwebauthn_dir/COPYING" "$dest/intent-passkey.LGPL-2.1.txt"
 
 glibc_floor=$(objdump -T "$binary" | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -uV | tail -n1)
-echo "intent-passkey: staged $target build in $dest (needs $glibc_floor, libdbus-1.so.3, libudev.so.1)"
+echo "intent-passkey: staged $target build in $dest (needs $glibc_floor, libdbus-1.so.3, libudev.so.1, libpam.so.0)"
