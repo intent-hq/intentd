@@ -8,7 +8,7 @@
 //! began keeps `backupWarning` on until the home backs up again
 //! ("Continuous backup").
 
-use super::homes::{commit_on, home_checkout, until};
+use super::homes::{commit_on, opened_home};
 use super::*;
 
 /// The orchestrator's link-loss grace in this test (60 s in production).
@@ -110,7 +110,7 @@ async fn a_home_whose_link_is_lost_is_detached_and_attached_again_at_the_next_bi
     .await;
 
     // A backup, so the error names when the last one was.
-    let work = until("the home checkout", || home_checkout(&node_dir, &home_id)).await;
+    let work = opened_home(&mut rpc_ws, &mut id, &ws_id, &node_dir, &home_id).await;
     commit_on(&work, "a.txt", "a\n", "a");
     home_update(&mut events, &ws_id, |home| home["lastBackupAt"].is_string()).await;
 

@@ -7,7 +7,7 @@
 //! pushed to `home/orphaned/<orphanedAt>/{head,wip}` only, then removed,
 //! and the workspace gets a notice naming those refs.
 
-use super::homes::{commit_on, home_checkout, until};
+use super::homes::{commit_on, home_checkout, opened_home, until};
 use super::*;
 
 /// A workspace whose home is a fresh machine: the orchestrator, its
@@ -85,11 +85,8 @@ async fn homed(prefix: &str) -> Option<Homed> {
     let home_id = created["home"]["homeId"].as_str().unwrap().to_owned();
     let mirror = PathBuf::from(created["worktreePath"].as_str().unwrap());
     let base = git(&mirror, &["rev-parse", "HEAD"]);
-    let work = until("the home checkout at the base", || {
-        home_checkout(&node_dir, &home_id)
-            .filter(|work| try_rev(work, "HEAD").as_deref() == Some(base.as_str()))
-    })
-    .await;
+    let work = opened_home(&mut rpc_ws, &mut id, &ws_id, &node_dir, &home_id).await;
+    assert_eq!(try_rev(&work, "HEAD").as_deref(), Some(base.as_str()));
     Some(Homed {
         scratch,
         head_dir,
@@ -163,7 +160,30 @@ async fn archiving_a_workspace_pushes_its_home_once_more_and_removes_it() {
     })
     .await;
     assert!(!homed.work.exists());
-    // The stop was acknowledged: no stop is left for the machine.
+    // The stop is acknowledged: the machine acks after it removes the
+    // checkout, and the backend then drops the stop. The backend stays up
+    // until it has, or the ack is lost with it.
+    let db = intent_store::DiagnosticStore::open(&homed.head_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + wait();
+    loop {
+        let (left,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM home_stop WHERE node_id = ?")
+            .bind(&homed.machine.daemon_id)
+            .fetch_one(db.read_pool())
+            .await
+            .unwrap();
+        if left == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the home stop was never acknowledged"
+        );
+        // timing-guard: poll while the backend records the machine's ack
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(db);
     let id = homed.id();
     let got = ok(
         &mut homed.rpc_ws,

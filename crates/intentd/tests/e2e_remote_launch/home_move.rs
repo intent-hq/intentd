@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use nix::sys::signal::Signal;
 
-use super::homes::{commit_on, home_checkout, until};
+use super::homes::{commit_on, home_checkout, opened_home, until};
 use super::*;
 
 /// An orchestrator whose workspace's home is on machine A, with machine B
@@ -117,11 +117,8 @@ async fn two_machines(prefix: &str) -> Option<TwoMachines> {
     assert_eq!(created["home"]["nodeId"], json!(a.daemon_id));
     let mirror = PathBuf::from(created["worktreePath"].as_str().unwrap());
     let base = git(&mirror, &["rev-parse", "HEAD"]);
-    let work = until("the home checkout on A", || {
-        home_checkout(&a_dir, &home_id)
-            .filter(|work| try_rev(work, "HEAD").as_deref() == Some(base.as_str()))
-    })
-    .await;
+    let work = opened_home(&mut rpc_ws, &mut id, &ws_id, &a_dir, &home_id).await;
+    assert_eq!(try_rev(&work, "HEAD").as_deref(), Some(base.as_str()));
     let b_dir = scratch.path().join("node-b");
     std::fs::create_dir_all(&b_dir).unwrap();
     let b = start_machine_with(&b_dir, &backend_id, &[]).await;
