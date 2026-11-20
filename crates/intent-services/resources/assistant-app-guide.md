@@ -972,8 +972,8 @@ windows) are **Codebase**, **Branch**, **Setup script**, **Initial agent**, and 
 Use **+** below the prompt to add context, the paperclip to attach files, or the
 microphone to dictate. These controls are grouped on the left.
 While you dictate, the microphone becomes an orange pill with a stop icon, the
-elapsed time, and bars that move with your voice; flat bars mean no sound is
-reaching the microphone. Click the pill to stop. The chat box microphone and the
+elapsed time, and bars that move with your voice. If the bars stay flat while
+you speak, check your microphone. Click the pill to stop. The chat box microphone and the
 dock's microphone work the same way.
 **Transcribing…** stays visible while dictation is transcribed. If transcription
 fails, Intent retries up to three times and shows a toast for each retry before
