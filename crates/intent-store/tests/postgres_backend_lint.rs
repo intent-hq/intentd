@@ -188,6 +188,11 @@ const DEFERRED_WRITES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The function that takes the tenant writer lock, as `(file, function,
+/// table)`: it may write `table` (seeding the tenant's lock row) without
+/// the lock, because writing that row is how the lock is taken.
+const WRITER_LOCK_TAKER: (&str, &str, &str) = ("mod.rs", "lock_tenant_writer", "tenant_writer");
+
 /// Plain `begin()` transactions allowed to run more than one statement
 /// without one snapshot, as `(file, function, why)`. Rule 5 sends every
 /// other one to `begin_read_snapshot()`.
@@ -404,9 +409,12 @@ fn check(
                         for v in postgres_ast::violations(&stmts, &exempt) {
                             tenant.insert(format!("{at}: {v} is not filtered by tenant_id = $n"));
                         }
+                        let (taker_file, taker, seeded) = WRITER_LOCK_TAKER;
+                        let is_taker =
+                            file_name.as_deref() == Some(taker_file) && u.function == taker;
                         let writes = postgres_ast::written_tables(&stmts)
                             .into_iter()
-                            .any(|t| !exempt.contains(&t.as_str()))
+                            .any(|t| !exempt.contains(&t.as_str()) && (!is_taker || t != seeded))
                             || postgres_ast::called_functions(&stmts)
                                 .iter()
                                 .any(|f| writing.contains(f));
@@ -555,6 +563,13 @@ fn the_parsed_tenant_rule_catches_unscoped_shapes() {
 
     ok("select value from settings where tenant_id = $1 and key = $2");
     ok("select value from settings where $1 = tenant_id and key = $2");
+    // A Neki session setting touches no table; other settings stay unmodeled.
+    ok("SET __neki.tx_mode = 'single'");
+    bad("SET search_path = public", &["UNSUPPORTED SET search_path"]);
+    bad(
+        "SET __neki.tx_mode = $1",
+        &["UNSUPPORTED SET __neki.tx_mode"],
+    );
     bad(
         "select value from settings where key = $1",
         &["FROM settings"],

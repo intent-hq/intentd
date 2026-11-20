@@ -11,7 +11,7 @@ use intent_core::{ContentType, Note, NoteId, NoteMetadata, NoteVisibility, Works
 use intent_store::postgres::{PgPool, PostgresOptions, TenantId, WriterLimits};
 use intent_store::Store;
 
-use crate::harness::{open, sqlite_store, test_db};
+use crate::harness::{hold_writer_lock, open, sqlite_store, test_db, writer_lock_waiters};
 
 /// How long a second writer gets to show it is not blocked, or long enough
 /// that it would have finished had it not been blocked. No production timer
@@ -187,12 +187,7 @@ async fn writers_of_two_opens_of_one_tenant_share_one_writer_slot() {
         .unwrap();
 
     // Another daemon holds the tenant's writer lock.
-    let mut held = db.admin.acquire().await.unwrap();
-    sqlx::query("SELECT pg_advisory_lock(hashtextextended('intent-writer:' || $1, 0))")
-        .bind("tenant")
-        .execute(&mut *held)
-        .await
-        .unwrap();
+    let held = hold_writer_lock(&db.admin, "tenant").await;
     let writers: Vec<_> = [&a, &a, &b, &b]
         .into_iter()
         .enumerate()
@@ -213,23 +208,16 @@ async fn writers_of_two_opens_of_one_tenant_share_one_writer_slot() {
     let admin = db.admin.clone();
     wait_until_async("one writer waits in the lock", || {
         let admin = admin.clone();
-        async move { advisory_waiters(&admin).await >= 1 }
+        async move { lock_waiters(&admin).await >= 1 }
     })
     .await;
     assert_eq!(
-        advisory_waiters(&db.admin).await,
+        lock_waiters(&db.admin).await,
         1,
         "the tenant parks one connection in the lock, not one per open"
     );
 
-    let released: bool = sqlx::query_scalar(
-        "SELECT pg_advisory_unlock(hashtextextended('intent-writer:' || $1, 0))",
-    )
-    .bind("tenant")
-    .fetch_one(&mut *held)
-    .await
-    .unwrap();
-    assert!(released);
+    held.rollback().await.unwrap();
     for writer in writers {
         tokio::time::timeout(test_timeout(Duration::from_secs(30)), writer)
             .await
@@ -240,16 +228,9 @@ async fn writers_of_two_opens_of_one_tenant_share_one_writer_slot() {
     assert_eq!(a.postgres_writers_waiting(), 0);
 }
 
-/// Sessions of this test's database waiting for an advisory lock.
-async fn advisory_waiters(admin: &PgPool) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM pg_locks l \
-         WHERE l.locktype = 'advisory' AND NOT l.granted \
-         AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())",
-    )
-    .fetch_one(admin)
-    .await
-    .unwrap()
+/// Sessions of this test's database waiting for the writer lock.
+async fn lock_waiters(admin: &PgPool) -> usize {
+    writer_lock_waiters(admin).await.len()
 }
 
 async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {

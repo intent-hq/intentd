@@ -103,7 +103,8 @@ fn check_tables(file: &str, sql: &str, out: &mut Findings) -> usize {
     let mut from = 0;
     while let Some(pos) = upper[from..].find("CREATE TABLE ") {
         let start = from + pos;
-        let name = word_after(&sql[start..], "CREATE TABLE")
+        let name = word_after(&sql[start..], "CREATE TABLE IF NOT EXISTS")
+            .or_else(|| word_after(&sql[start..], "CREATE TABLE"))
             .unwrap_or("?")
             .to_owned();
         let open = start + sql[start..].find('(').expect("table body");
@@ -116,7 +117,8 @@ fn check_tables(file: &str, sql: &str, out: &mut Findings) -> usize {
                 &format!("table {name}: first column must be `tenant_id text NOT NULL`"),
             );
         }
-        if !body.contains("PRIMARY KEY (tenant_id,") {
+        // `(tenant_id)` alone: one row per tenant (`tenant_writer`).
+        if !body.contains("PRIMARY KEY (tenant_id,") && !body.contains("PRIMARY KEY (tenant_id)") {
             out.fail(
                 file,
                 &format!("table {name}: primary key must lead with tenant_id"),

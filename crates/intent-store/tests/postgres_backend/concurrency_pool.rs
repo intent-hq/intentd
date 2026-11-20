@@ -2,9 +2,9 @@
 //! at most one connection, lock waits are bounded and retried, a stuck
 //! writer loses the lock, and the pool's timeouts surface as `StoreBusy`.
 //!
-//! "Another holder" of a tenant's writer lock is played by an admin session
-//! that takes the same advisory lock: what another daemon, or another store
-//! handle for the tenant, looks like to this store.
+//! "Another holder" of a tenant's writer lock is played by an admin
+//! transaction that locks the tenant's `tenant_writer` row: what another
+//! daemon, or another store handle for the tenant, looks like to this store.
 
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use intent_store::postgres::{self, PgPool, PoolSettings, PostgresOptions, Tenant
 use intent_store::Store;
 use intentd_test_support::test_timeout;
 
-use super::harness::empty_db;
+use super::harness::{empty_db, hold_writer_lock, writer_lock_is_free, writer_lock_waiters};
 
 /// A migrated database: its URL and an admin pool.
 async fn migrated_db() -> Option<(String, PgPool)> {
@@ -47,45 +47,8 @@ fn patient() -> WriterLimits {
     }
 }
 
-/// Take `tenant`'s writer lock on a session of its own, as another daemon
-/// would; it is held until the returned connection unlocks or closes.
-async fn hold_writer_lock(
-    admin: &PgPool,
-    tenant: &str,
-) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
-    let mut conn = admin.acquire().await.expect("admin connection");
-    sqlx::query("SELECT pg_advisory_lock(hashtextextended('intent-writer:' || $1, 0))")
-        .bind(tenant)
-        .execute(&mut *conn)
-        .await
-        .expect("take the writer lock");
-    conn
-}
-
-async fn release_writer_lock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>, tenant: &str) {
-    let released: bool = sqlx::query_scalar(
-        "SELECT pg_advisory_unlock(hashtextextended('intent-writer:' || $1, 0))",
-    )
-    .bind(tenant)
-    .fetch_one(&mut *conn)
-    .await
-    .expect("release the writer lock");
-    assert!(released);
-}
-
-/// Sessions of this test's database waiting for an advisory lock, as
-/// `(pid, xact_start)`. `pg_locks` spans the server, where other tests run
-/// in their own databases.
-async fn advisory_waiters(admin: &PgPool) -> Vec<(i32, String)> {
-    sqlx::query_as(
-        "SELECT a.pid, a.xact_start::text FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
-         WHERE l.locktype = 'advisory' AND NOT l.granted \
-         AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
-         ORDER BY 1",
-    )
-    .fetch_all(admin)
-    .await
-    .expect("list advisory waiters")
+async fn release_writer_lock(held: sqlx::Transaction<'static, sqlx::Postgres>) {
+    held.rollback().await.expect("release the writer lock");
 }
 
 /// Poll `check` until it holds; Postgres emits no event when a lock wait
@@ -106,7 +69,7 @@ where
 }
 
 /// Audit finding 2: tenant A's writers used to check out a connection each
-/// and then wait in the advisory lock, so a burst of them behind a held lock
+/// and then wait in the writer lock, so a burst of them behind a held lock
 /// took every pooled connection and tenant B's next checkout timed out.
 #[tokio::test]
 async fn a_saturated_tenant_cannot_starve_another_tenant_on_a_small_pool() {
@@ -139,7 +102,7 @@ async fn a_saturated_tenant_cannot_starve_another_tenant_on_a_small_pool() {
     .await;
     wait_until("one of them waits in the lock", || {
         let admin = admin.clone();
-        async move { !advisory_waiters(&admin).await.is_empty() }
+        async move { !writer_lock_waiters(&admin).await.is_empty() }
     })
     .await;
 
@@ -153,13 +116,13 @@ async fn a_saturated_tenant_cannot_starve_another_tenant_on_a_small_pool() {
         .expect("tenant B gets a connection while tenant A is saturated");
     assert_eq!(read.as_deref(), Some("\"b\""));
     assert_eq!(
-        advisory_waiters(&admin).await.len(),
+        writer_lock_waiters(&admin).await.len(),
         1,
         "tenant A parks one connection in the lock, not one per writer"
     );
     assert_eq!(a.postgres_writers_waiting(), 8);
 
-    release_writer_lock(held, "tenant-a").await;
+    release_writer_lock(held).await;
     for writer in writers {
         tokio::time::timeout(test_timeout(Duration::from_secs(30)), writer)
             .await
@@ -203,12 +166,12 @@ async fn a_writer_that_cannot_get_the_lock_within_its_budget_is_busy_and_writes_
     assert!(matches!(busy, Err(Error::StoreBusy(_))), "{busy:?}");
     assert_eq!(a.postgres_writers_waiting(), 0);
     assert!(
-        advisory_waiters(&admin).await.is_empty(),
+        writer_lock_waiters(&admin).await.is_empty(),
         "a busy writer leaves no session waiting in the lock"
     );
     assert_eq!(a.get_setting("userRules").await.unwrap(), None);
 
-    release_writer_lock(held, "tenant-a").await;
+    release_writer_lock(held).await;
     a.set_setting("userRules", "\"a\"").await.unwrap();
     assert_eq!(
         a.get_setting("userRules").await.unwrap().as_deref(),
@@ -241,16 +204,16 @@ async fn a_writer_retries_the_lock_in_a_new_transaction_until_it_is_free() {
     });
     wait_until("the writer waits in the lock", || {
         let admin = admin.clone();
-        async move { !advisory_waiters(&admin).await.is_empty() }
+        async move { !writer_lock_waiters(&admin).await.is_empty() }
     })
     .await;
-    let first = advisory_waiters(&admin).await.into_iter().next();
+    let first = writer_lock_waiters(&admin).await.into_iter().next();
     let first = first.expect("the writer still waits in its first attempt");
     wait_until("the writer retries in a new transaction", || {
         let admin = admin.clone();
         let first = first.clone();
         async move {
-            advisory_waiters(&admin)
+            writer_lock_waiters(&admin)
                 .await
                 .iter()
                 .any(|w| w.1 != first.1)
@@ -259,7 +222,7 @@ async fn a_writer_retries_the_lock_in_a_new_transaction_until_it_is_free() {
     .await;
     assert!(!writer.is_finished());
 
-    release_writer_lock(held, "tenant-a").await;
+    release_writer_lock(held).await;
     tokio::time::timeout(test_timeout(Duration::from_secs(30)), writer)
         .await
         .expect("the writer finishes once the lock is free")
@@ -296,24 +259,12 @@ async fn a_writer_left_idle_in_its_transaction_loses_the_tenant_lock() {
         .await
         .unwrap()
         .expect("the primary principal owns the queue");
-    let mut other_daemon = admin.acquire().await.expect("admin connection");
-    let try_lock = "SELECT pg_try_advisory_lock(hashtextextended('intent-writer:' || $1, 0))";
-    let free_at_once: bool = sqlx::query_scalar(try_lock)
-        .bind("tenant-a")
-        .fetch_one(&mut *other_daemon)
-        .await
-        .unwrap();
-    assert!(!free_at_once, "the permit holds the tenant lock");
+    assert!(
+        !writer_lock_is_free(&admin, "tenant-a").await,
+        "the permit holds the tenant lock"
+    );
     tokio::time::timeout(test_timeout(Duration::from_secs(15)), async {
-        loop {
-            let taken: bool = sqlx::query_scalar(try_lock)
-                .bind("tenant-a")
-                .fetch_one(&mut *other_daemon)
-                .await
-                .unwrap();
-            if taken {
-                break;
-            }
+        while !writer_lock_is_free(&admin, "tenant-a").await {
             // timing-guard: poll interval; Postgres emits no event when it ends an idle session.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -355,19 +306,16 @@ async fn a_checkout_past_the_acquire_timeout_is_busy() {
     assert_eq!(a.get_setting("userRules").await.unwrap(), None);
 }
 
-/// [`postgres::WRITER_LOCK_SQL`] for tenant A: a 100 ms attempt, one-minute
-/// statement and idle timeouts, then a 10 minute `lock_timeout`.
-async fn run_writer_lock_sql(
-    conn: &mut sqlx::PgConnection,
-) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
-    sqlx::query(postgres::WRITER_LOCK_SQL)
-        .bind("tenant-a")
-        .bind("100")
-        .bind("60000")
-        .bind("60000")
-        .bind("600000")
-        .execute(conn)
-        .await
+/// [`postgres::lock_tenant_writer`] for tenant A: a 100 ms attempt,
+/// one-minute statement and idle timeouts, then a 10 minute `lock_timeout`.
+async fn run_writer_lock_sql(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    let limits = WriterLimits {
+        lock_attempt: Duration::from_secs(600),
+        statement_timeout: Duration::from_secs(60),
+        idle_in_transaction_timeout: Duration::from_secs(60),
+        ..WriterLimits::default()
+    };
+    postgres::lock_tenant_writer(conn, "tenant-a", Duration::from_millis(100), &limits).await
 }
 
 /// The lock statement waits under the attempt's `lock_timeout` and leaves
@@ -391,7 +339,7 @@ async fn the_lock_statement_waits_under_the_attempt_timeout_then_resets_it() {
         .and_then(|e| e.code().map(std::borrow::Cow::into_owned));
     assert_eq!(code.as_deref(), Some("55P03"));
     tx.rollback().await.unwrap();
-    release_writer_lock(held, "tenant-a").await;
+    release_writer_lock(held).await;
 
     let mut tx = admin.begin().await.unwrap();
     run_writer_lock_sql(&mut tx)
