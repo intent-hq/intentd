@@ -1955,3 +1955,19 @@ fn system_prompt_note_partition() {
         "{note}"
     );
 }
+
+/// Codex and Claude Code are runnable whenever npx resolves, even without
+/// their CLI: launches then run Intent's bundled CLI, so the daemon's
+/// admission check must not reject them as not installed.
+#[test]
+fn codex_and_claude_code_need_only_npx_to_be_runnable() {
+    for id in ["codex", "claude-code"] {
+        let provider = find_provider(id).unwrap();
+        let npx_only = |_: &str, command: &str| {
+            (command == "npx").then(|| std::path::PathBuf::from("/usr/bin/npx"))
+        };
+        let availability =
+            crate::discover::provider_availability_with(provider, &npx_only, &|_| false, &|_| None);
+        assert!(availability.installed, "{id}");
+    }
+}

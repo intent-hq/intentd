@@ -37,17 +37,56 @@ impl ProviderCli {
 
     /// The executable and the arguments that come before the CLI's own.
     pub(crate) fn program(&self) -> (&Path, Vec<&str>) {
+        self.program_with("-y")
+    }
+
+    /// [`Self::program`] that never downloads: npx runs the package only
+    /// from its cache and fails otherwise (`--no`). For sign-in checks, which
+    /// run on every status sweep.
+    pub(crate) fn cached_program(&self) -> (&Path, Vec<&str>) {
+        self.program_with("--no")
+    }
+
+    fn program_with(&self, install: &'static str) -> (&Path, Vec<&str>) {
         match self {
             Self::Installed(bin) => (bin, Vec::new()),
             Self::Npx { npx, package } => (
                 npx,
                 vec![
                     intent_acp::spawn::NPX_NO_WORKSPACES_ARG,
-                    "-y",
+                    install,
                     package.as_str(),
                 ],
             ),
         }
+    }
+
+    /// Whether the CLI runs without a download: always for an installed
+    /// CLI; through npx only when its package is already cached
+    /// (`npx --no --package <pkg> -- node --version`, bounded by `timeout`).
+    pub(crate) async fn runs_without_download(&self, timeout: Duration) -> bool {
+        let Self::Npx { npx, package } = self else {
+            return true;
+        };
+        let mut cmd = tokio::process::Command::new(npx);
+        cmd.args([
+            intent_acp::spawn::NPX_NO_WORKSPACES_ARG,
+            "--no",
+            "--package",
+            package.as_str(),
+            "--",
+            "node",
+            "--version",
+        ])
+        .env("PATH", intent_providers::enhanced_path(Some(npx)))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+        matches!(
+            tokio::time::timeout(timeout, cmd.status()).await,
+            Ok(Ok(status)) if status.success()
+        )
     }
 
     /// `<cli> <args>` with the enhanced PATH, so the CLI (or npx's node)
@@ -105,6 +144,21 @@ mod tests {
         // fixed-deadline: allow — an input to the timeout choice, not a wait
         let installed = Duration::from_secs(10);
         assert_eq!(cli.timeout(installed), NPX_TIMEOUT);
+    }
+
+    #[test]
+    fn sign_in_checks_never_download_through_npx() {
+        let cli = ProviderCli::Npx {
+            npx: PathBuf::from("/usr/bin/npx"),
+            package: "@xai-official/grok@1.0.89".to_owned(),
+        };
+        let (_, args) = cli.cached_program();
+        assert_eq!(
+            args,
+            ["--workspaces=false", "--no", "@xai-official/grok@1.0.89"]
+        );
+        let installed = ProviderCli::Installed(PathBuf::from("/usr/bin/grok"));
+        assert!(installed.cached_program().1.is_empty());
     }
 
     #[tokio::test]

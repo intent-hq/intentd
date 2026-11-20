@@ -1146,8 +1146,9 @@ fn age_cached_verdict_for_tests(provider_id: &str, by: Duration) {
 /// within TTL serve the cached outcome without touching the filesystem;
 /// otherwise the binary is resolved and the probe runs single-flighted
 /// (concurrent callers — forced or not — share the in-flight result).
-/// Not-installed providers short-circuit to `None` without probing or
-/// caching, so an install is picked up immediately; an uninstall — or an
+/// Not-installed providers short-circuit to `None` without probing, or run
+/// the npx probe ([`npx_probe`]) cached under its own key, so an install is
+/// picked up immediately; an uninstall — or an
 /// `override_path` change to an already-cached provider — within the
 /// TTL serves the stale cached value until expiry (accepted — the next
 /// expired or forced read reports `None`).
@@ -1162,10 +1163,16 @@ async fn resolve_auth_status(
         }
     }
     let Some(program) = resolve_probe_binary(provider_id, override_path.as_deref()) else {
-        return match npx_probe(provider_id) {
-            Some(probe) => resolve_cached(provider_id, probe).await,
-            None => AuthVerdict::default(),
+        let Some(probe) = npx_probe(provider_id) else {
+            return AuthVerdict::default();
         };
+        let key = npx_cache_key(provider_id);
+        if !force {
+            if let Some(cached) = cache().fresh(&key) {
+                return cached;
+            }
+        }
+        return resolve_cached(&key, probe).await;
     };
     resolve_cached(provider_id, async {
         probe_provider(provider_id, program, override_path.as_deref(), None).await
@@ -1175,11 +1182,12 @@ async fn resolve_auth_status(
 
 /// The sign-in probe for a provider with no installed CLI that still runs
 /// from an npm package through npx: its own pinned package
-/// ([`crate::provider_cli_launch`]), or Intent's bundled CLI for Codex / Claude Code.
-/// `OpenCode`'s free models need no account, so its readiness probe stands.
-/// Every other provider reports signed out unless its CLI confirms a
-/// sign-in: a first run may still be downloading, and a CLI that is not
-/// installed is rarely signed in.
+/// ([`crate::provider_cli_launch`]), or Intent's bundled CLI for Codex /
+/// Claude Code. It never downloads: a package not yet cached (by a launch or
+/// a Log in) is unknown, and so is a provider without an auth command
+/// (Droid). Otherwise the CLI's own tri-state verdict stands, so only an
+/// explicit logout is `false` and slow or inconclusive checks never block
+/// agent creation.
 fn npx_probe(
     provider_id: &'static str,
 ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = AuthVerdict> + Send>>> {
@@ -1201,25 +1209,42 @@ fn npx_probe(
         .auth_check_args
         .unwrap_or_default();
     Some(Box::pin(async move {
-        if provider_id == "opencode" {
-            let cmd = cli.command(auth_args);
-            let timeout = cli.timeout(OPENCODE_READY_TIMEOUT);
-            return AuthVerdict::plain(opencode_ready_probe(cmd, timeout).await.auth_status());
+        if auth_args.is_empty() || !cli.runs_without_download(CLI_AUTH_TIMEOUT).await {
+            return AuthVerdict::default();
         }
-        if auth_args.is_empty() {
-            return AuthVerdict::plain(Some(false));
-        }
-        let (program, mut args) = cli.program();
+        let (program, mut args) = cli.cached_program();
         args.extend_from_slice(auth_args);
-        let probe = if provider_id == "claude-code" {
-            check_claude_code_auth_cli(program.as_os_str(), &args, None)
-                .await
-                .probe
-        } else {
-            check_provider_auth_cli_in(provider_id, program.as_os_str(), &args, None).await
-        };
-        AuthVerdict::plain(Some(probe == CliAuthProbe::Authenticated))
+        match provider_id {
+            "opencode" => {
+                let mut cmd = probe_command(program.as_os_str());
+                cmd.args(&args);
+                AuthVerdict::plain(
+                    opencode_ready_probe(cmd, OPENCODE_READY_TIMEOUT)
+                        .await
+                        .auth_status(),
+                )
+            }
+            "claude-code" => {
+                let status = check_claude_code_auth_cli(program.as_os_str(), &args, None).await;
+                AuthVerdict {
+                    authenticated: status.probe.auth_status(),
+                    identity: status.identity,
+                    status_note: None,
+                }
+            }
+            _ => AuthVerdict::plain(
+                check_provider_auth_cli_in(provider_id, program.as_os_str(), &args, None)
+                    .await
+                    .auth_status(),
+            ),
+        }
     }))
+}
+
+/// Cache key of an npx sign-in verdict: separate from the installed CLI's,
+/// so installing the CLI is picked up at once.
+fn npx_cache_key(provider_id: &str) -> String {
+    format!("{provider_id}#npx")
 }
 
 /// Run `probe` single-flighted under cache key `key` and store its outcome

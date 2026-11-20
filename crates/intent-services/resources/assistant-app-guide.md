@@ -461,9 +461,9 @@ links from the terminal drawer) opens in a browser panel of the workspace shown 
 current window instead. With no workspace open, it opens in a small sign-in window.
 Other link types, such as `mailto:`, are unchanged.
 
-<!-- Free OpenCode: packages/cloudlands-fe/src/features/onboarding/utils/order-onboarding-providers.ts (resolveFreeOnboardingProvider); packages/cloudlands-fe/src/features/onboarding/messages/{AgentGrid,ProviderCard}.svelte; packages/cloudlands-fe/src/store/renderer/seeders/provider-status-bridge-seeder.ts (withNpxFallback); packages/intentd/crates/intent-services/src/{opencode_cli.rs,provider_models/parse.rs (mark_opencode_free_default),installed_cli.rs (discover_or_bundled),provider_auth.rs (npx_probe)}. -->
-Pending release: OpenCode, Claude Code, Codex, Auggie and Grok need no install when
-Node.js is present. Without their CLI, Intent runs them from npm: through npx, or for
+<!-- Free OpenCode and npm runtimes: packages/cloudlands-fe/src/features/onboarding/utils/order-onboarding-providers.ts; packages/cloudlands-fe/src/features/onboarding/messages/{AgentGrid,ProviderCard}.svelte; packages/cloudlands-fe/src/store/renderer/seeders/provider-status-bridge-seeder.ts; packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/intentd/crates/intent-services/src/{provider_cli_launch,installed_cli,provider_auth}.rs; packages/intentd/crates/intent-services/src/provider_models/parse.rs; packages/intentd/crates/intent-providers/src/config.rs. -->
+Pending release: OpenCode, Claude Code, Codex and Grok need no install when Node.js
+is present (Auggie too, once enabled; see Auggie visibility below). Without their CLI, Intent runs them from npm: through npx, or for
 Claude Code and Codex through Intent's own bundled copy, downloaded at the first launch.
 Cursor, Antigravity, Pi and Unsloth still need their own install. An
 installed CLI is always used first, with its version checks and update prompts. A card
