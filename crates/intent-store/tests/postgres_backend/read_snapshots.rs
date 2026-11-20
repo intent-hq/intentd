@@ -734,3 +734,71 @@ async fn transfer_table_stats_reads_its_columns_and_aggregate_from_one_snapshot(
     let after = count(&store.transfer_table_stats(&ws()).await.unwrap());
     assert_eq!(after, before + 1);
 }
+
+#[tokio::test]
+async fn browser_sender_inheritance_reads_ancestors_from_one_snapshot() {
+    let Some(db) = trapped_db().await else {
+        return;
+    };
+    let tenant = "snap-browser-sender";
+    let store = open_trapped(&db, tenant).await;
+    workspace(&store).await;
+    agent(&store, "sender-parent").await;
+    store
+        .insert_agent_session(&AgentSession {
+            id: aid("sender-child"),
+            workspace_id: ws(),
+            parent_agent_id: Some(aid("sender-parent")),
+            name: "Child".into(),
+            created_at: T0.into(),
+            updated_at: T0.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    exec(
+        &db.admin,
+        format!(
+            "INSERT INTO client (tenant_id, id, first_seen, last_seen) \
+             VALUES ('{tenant}', 'sender-client', '{T0}', '{T0}')"
+        ),
+    )
+    .await;
+    let client = intent_core::ClientId("sender-client".into());
+    store
+        .record_browser_sender(&aid("sender-parent"), "old", "001", Some(&client))
+        .await
+        .unwrap();
+    let reading = store.clone();
+    let writing = store.clone();
+    let selected = read_across(
+        tenant,
+        "preferred_browser_sender",
+        async move {
+            writing
+                .record_browser_sender(&aid("sender-parent"), "new", "002", None)
+                .await
+                .unwrap();
+        },
+        async move {
+            reading
+                .preferred_browser_sender(&aid("sender-child"), &ws())
+                .await
+                .unwrap()
+        },
+    )
+    .await;
+    assert_eq!(
+        selected,
+        Some(client),
+        "ancestor receipt as of the child read"
+    );
+    assert_eq!(
+        store
+            .preferred_browser_sender(&aid("sender-child"), &ws())
+            .await
+            .unwrap(),
+        None,
+        "a new read sees the committed unknown-device receipt"
+    );
+}

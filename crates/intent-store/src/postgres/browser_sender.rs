@@ -48,7 +48,7 @@ impl PgStore {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<ClientId>> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.begin_read_snapshot().await?;
         let mut current = agent_id.as_str().to_owned();
         let mut visited = std::collections::HashSet::new();
         let mut preferred = None;
@@ -70,6 +70,9 @@ impl PgStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(db)?;
+            if visited.len() == 1 {
+                super::read_seam::probe::between(self.tenant(), "preferred_browser_sender").await;
+            }
             let Some((parent, submission, client)) = row else {
                 break;
             };
