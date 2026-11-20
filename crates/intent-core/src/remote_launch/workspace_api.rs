@@ -128,6 +128,9 @@ pub const FORWARDED_NAMESPACES: &[&str] = &[
     "browser",
     "desktop",
     "mcp",
+    // The Assistant's generic RPC always runs on the backend that owns the
+    // Assistant workspace, wherever its agent process runs.
+    "rpc",
 ];
 
 /// The forwarded call head answers with the roots the agent's machine has,
@@ -313,6 +316,15 @@ mod tests {
     /// routing is per method, so an unknown workspace call stays refused.
     /// They ride `workspace.call` with no protocol gate: an
     /// older machine refuses them itself, an older backend refuses them.
+    /// An Assistant agent running on a machine still calls the backend that
+    /// owns the Assistant workspace: every `ws.rpc` frame goes to head.
+    #[test]
+    fn assistant_rpc_frames_are_forwarded_to_head() {
+        for method in ["rpc.info", "rpc.methods", "rpc.call", "rpc.batch"] {
+            assert_eq!(route(method), Route::Forward, "{method}");
+        }
+    }
+
     #[test]
     fn workspace_details_and_setters_are_forwarded_and_the_rest_refused() {
         assert_eq!(route("workspace.details"), Route::Forward);

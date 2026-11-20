@@ -46,6 +46,7 @@ agent.replaceMessages
 agent.reportToParent
 agent.resolveInterrupted
 agent.resolveProposal
+agent.resolveRpcProposal
 agent.respondPermission
 agent.restore
 agent.retire

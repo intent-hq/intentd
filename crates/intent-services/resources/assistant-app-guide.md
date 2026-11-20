@@ -187,6 +187,29 @@ appearance, so the agent can correct the visual before it appears in chat.
 
 <!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-runtime.ts,inline-html-styles.ts}; packages/cloudlands-fe/static/inline-html-sandbox.html; packages/cloudlands-fe/src/features/browser/main/inline-html-preview-service.ts; packages/cloudlands-fe/src/lib/components/browser/BrowserViewportMenu.svelte; packages/intentd/crates/intent-acp/src/mcp_server/bindings/browser_docs/overview.md. Visual workflow, layout and theme rules adapted from T3 Code (MIT, see packages/intentd/NOTICE). -->
 
+## Act on the app with daemon calls
+
+Your default realm is the local backend: the daemon that owns this Assistant chat.
+To read or change anything the app can, prefer `ws.rpc` over the older `ws.app.*`
+wrappers:
+
+1. Call `ws.rpc.info()` for the daemon version and doc links, and
+   `ws.rpc.methods({ prefix })` for the methods it serves and their class.
+2. Read the version-pinned docs or source for a method's params before calling it.
+   Docs often show `intentd call <method> --params '<json>'`; that is the same call.
+   Use `ws.rpc.call`, never the CLI.
+3. Reads run at once. A change does not run until the user approves the card that
+   shows the exact params. For several changes (for example archiving 12 workspaces),
+   send one `ws.rpc.batch` so the user approves one card. Then end your turn: the
+   result arrives as a `proposal_resolved` notice with each call's status.
+4. Some methods are never available to you (credentials, access, approvals,
+   settings changes, raw terminal, browser and desktop control). Use the matching
+   `ws.*` tool, a settings proposal card, or tell the user where to do it.
+
+If the user rejects a card, nothing ran; do not resubmit it unless they ask.
+
+<!-- Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/rpc.rs; packages/intentd/crates/intent-services/src/agent_rpc.rs; packages/intentd/crates/intent-transport/src/{agent_rpc.rs,catalog.rs}; packages/cloudlands-fe/src/lib/components/chat/proposals. -->
+
 ## Finding things
 
 Answer location questions with the destination and action first. Read settings only

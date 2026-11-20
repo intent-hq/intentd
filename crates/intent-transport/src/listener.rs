@@ -232,6 +232,40 @@ impl Drop for AbortWriter {
     }
 }
 
+/// Serve one in-process connection with exactly the UDS semantics (primary
+/// principal, administrator, local) and return the client half. Used by the
+/// Assistant's `ws.rpc` loopback ([`crate::agent_rpc`]). It registers with a
+/// private reverse registry, so it is never a reverse-RPC or relay target.
+#[cfg(any(unix, windows))]
+pub(crate) fn spawn_loopback_connection(
+    api: Arc<dyn WorkspaceApi>,
+    bus: EventBus,
+    control: Option<Arc<dyn SystemControl>>,
+    server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
+    limiter: RpcLimiter,
+) -> tokio::io::DuplexStream {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let (read_half, write_half) = tokio::io::split(server);
+        if let Err(e) = handle_connection(
+            read_half,
+            write_half,
+            api,
+            bus,
+            control,
+            server_pairing_info,
+            Arc::new(PrimaryReverseRegistry::new()),
+            limiter,
+            Arc::new(crate::context::ReadConnectionOwners::default()),
+        )
+        .await
+        {
+            tracing::debug!(error = %e, "agent rpc loopback connection ended");
+        }
+    });
+    client
+}
+
 /// Serve one connection: read newline-delimited frames, answer requests, push
 /// matching `events.event` notifications, and clean up all subscriptions on exit.
 /// Generic over the split stream halves so the Unix socket and Windows named
