@@ -154,6 +154,10 @@ impl Activity {
     pub(super) fn cap(&mut self) {
         self.capped = true;
     }
+
+    pub(super) fn is_capped(&self) -> bool {
+        self.capped
+    }
 }
 
 /// A cloud machine's dial gate: a parked (paused) sandbox is dialed only on
@@ -348,7 +352,12 @@ pub(crate) async fn resume(
                 set_state(svc, feature, &row.id, CloudSandboxState::Running).await;
             }
             feature.cloud.unpark(&row.id);
-            feature.cloud.touch(&row.id);
+            if resumed || restarted {
+                // A new session: the provider's session cap starts again.
+                feature.cloud.touch_new_session(&row.id);
+            } else {
+                feature.cloud.touch(&row.id);
+            }
             Ok(resumed || restarted)
         }
         Err(error) if error.is_not_found() => Err(Resumed::Lost),

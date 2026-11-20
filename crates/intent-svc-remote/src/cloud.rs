@@ -237,8 +237,23 @@ impl CloudState {
         *entry
     }
 
-    /// The machine just ran or resumed: its idle time starts now.
+    /// The machine just ran: its idle time starts now. A session cap the
+    /// provider reported stays until a new session starts.
     fn touch(&self, machine_id: &str) {
+        let mut activity = crate::lock(&self.activity);
+        let mut fresh = lifecycle::Activity::fresh();
+        if activity
+            .get(machine_id)
+            .is_some_and(lifecycle::Activity::is_capped)
+        {
+            fresh.cap();
+        }
+        activity.insert(machine_id.to_owned(), fresh);
+    }
+
+    /// The machine resumed in a new session: its idle time starts now, and
+    /// no cap applies yet.
+    fn touch_new_session(&self, machine_id: &str) {
         crate::lock(&self.activity).insert(machine_id.to_owned(), lifecycle::Activity::fresh());
     }
 

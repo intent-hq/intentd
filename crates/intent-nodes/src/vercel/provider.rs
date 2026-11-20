@@ -8,7 +8,9 @@ use reqwest::Method;
 use serde_json::json;
 use tokio::time::Instant;
 
-use super::client::{now_ms, validate_name, Call, ExtendReply, SandboxList, SessionReply};
+use super::client::{
+    now_ms, validate_name, validate_session, Call, ExtendReply, SandboxList, SessionReply,
+};
 use super::{
     VercelClient, BACKEND_ID_TAG, CLOUD_PROVIDER_VERCEL, MAX_TAGS, SNAPSHOT_EXPIRATION_MS,
 };
@@ -54,6 +56,19 @@ fn rfc3339(epoch_ms: Option<u64>) -> String {
                 .ok()
         })
         .unwrap_or_default()
+}
+
+/// `text` percent-encoded for a query value.
+fn encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b':') {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 fn gone(name: &str, status: &str) -> CloudError {
@@ -106,7 +121,7 @@ impl VercelClient {
             )
             .await?;
         if created.session.status != "running" {
-            if let Err(error) = self.wait_running(&name).await {
+            if let Err(error) = self.wait_running(&name, false).await {
                 let _ = self.delete_machine(&name).await;
                 return Err(error);
             }
@@ -119,11 +134,14 @@ impl VercelClient {
         })
     }
 
-    /// Wait until sandbox `name`'s session runs.
-    async fn wait_running(&self, name: &str) -> Result<SessionReply, CloudError> {
+    /// Wait until sandbox `name`'s session runs; with `resume`, a session
+    /// that ended meanwhile (a stop that was under way) is resumed again.
+    async fn wait_running(&self, name: &str, resume: bool) -> Result<SessionReply, CloudError> {
         let deadline = Instant::now() + self.config.ready_timeout;
+        let mut stopped = false;
         loop {
-            let current = self.sandbox(name, false).await?;
+            let current = self.sandbox(name, resume && stopped).await?;
+            stopped = current.session.status == "stopped";
             match current.session.status.as_str() {
                 "running" => return Ok(current),
                 "failed" | "aborted" => {
@@ -148,11 +166,23 @@ impl VercelClient {
         }
     }
 
-    async fn connect_machine(&self, name: &str) -> Result<Connected, CloudError> {
+    async fn connect_machine(
+        &self,
+        name: &str,
+        timeout_secs: u32,
+    ) -> Result<Connected, CloudError> {
         let mut current = self.sandbox(name, true).await?;
         let resumed = current.resumed == Some(true);
         if current.session.status != "running" {
-            current = self.wait_running(name).await?;
+            current = self.wait_running(name, true).await?;
+        }
+        // Keep the session alive past the dial, as a connect promises. At
+        // the plan's cap it cannot be: the supervisor's renewal reports
+        // that and plans the stop and resume.
+        match self.renew(name, timeout_secs).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == CloudErrorKind::SessionCap => {}
+            Err(e) => return Err(e),
         }
         Ok(Connected {
             instance: CloudInstance {
@@ -170,14 +200,16 @@ impl VercelClient {
         if current.session.status == "stopped" {
             return Ok(());
         }
+        validate_session(&current.session.id)?;
         let path = format!("/v2/sandboxes/sessions/{}/stop", current.session.id);
         self.send_json::<SessionReply>(Call::slow("stop"), Method::POST, &path, None)
             .await
             .map(drop)
     }
 
-    /// Keep the session running at least `timeout_secs` from now: extend
-    /// it by that much when it ends sooner. A stopped sandbox is not
+    /// Keep the session running at least `timeout_secs` from now: when it
+    /// ends sooner, extend it by what is missing, in whole minutes, so the
+    /// plan's cap is reached as late as possible. A stopped sandbox is not
     /// resumed: it is reported as not found, so the backend looks it up
     /// and marks it paused. Past the plan's cap, the error is
     /// [`CloudErrorKind::SessionCap`].
@@ -192,19 +224,23 @@ impl VercelClient {
             .started_at
             .unwrap_or_else(now_ms)
             .saturating_add(current.session.timeout);
-        if ends.saturating_sub(now_ms()) >= wanted {
+        let left = ends.saturating_sub(now_ms());
+        if left >= wanted {
             return Ok(());
         }
+        let duration = (wanted - left).div_ceil(60_000) * 60_000;
+        validate_session(&current.session.id)?;
         let path = format!(
             "/v2/sandboxes/sessions/{}/extend-timeout",
             current.session.id
         );
         let extended: ExtendReply = self
+            // Not sent twice: a resend after a lost answer extends twice.
             .send_json(
-                Call::new("extend-timeout"),
+                Call::new("extend-timeout").once(),
                 Method::POST,
                 &path,
-                Some(&json!({ "duration": wanted })),
+                Some(&json!({ "duration": duration })),
             )
             .await?;
         if extended.session.status == "running" {
@@ -245,7 +281,7 @@ impl VercelClient {
             .get_key_value(BACKEND_ID_TAG)
             .or_else(|| filter.tags.iter().next())
         {
-            let _ = write!(query, "&tags={key}:{value}");
+            let _ = write!(query, "&tags={}", encode(&format!("{key}:{value}")));
         }
         let wants =
             |state: InstanceState| filter.states.is_empty() || filter.states.contains(&state);
@@ -253,7 +289,7 @@ impl VercelClient {
         let mut cursor: Option<String> = None;
         loop {
             let path = match &cursor {
-                Some(next) => format!("{query}&cursor={next}"),
+                Some(next) => format!("{query}&cursor={}", encode(next)),
                 None => query.clone(),
             };
             let page: SandboxList = self.get_json(Call::new("list-sandboxes"), &path).await?;
@@ -273,23 +309,26 @@ impl VercelClient {
                 }
             }
             match page.pagination.next {
-                Some(next)
-                    if !next.is_empty()
-                        && next
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')) =>
-                {
-                    cursor = Some(next);
-                }
+                Some(next) if !next.is_empty() => cursor = Some(next),
                 _ => return Ok(found),
             }
         }
     }
 
     async fn image_ready_now(&self, image: &str) -> Result<bool, CloudError> {
-        // A registry that does not answer this team for the repository
-        // (another team's public image) cannot tell: the create is the
-        // real check, and maps a missing image to `template-missing`.
+        // The registry path needs the team slug and project: an image in
+        // the entry's own project (`<repository>:<tag>`) cannot be looked
+        // up by id. Neither can a registry that does not answer this team
+        // for the repository (another team's public image). Then the
+        // create is the real check, and maps a missing image to
+        // `template-missing`.
+        if image
+            .split(':')
+            .next()
+            .is_none_or(|repo| !repo.contains('/'))
+        {
+            return Ok(true);
+        }
         Ok(self.manifest(image).await?.unwrap_or(true))
     }
 }
@@ -303,8 +342,8 @@ impl CloudProvider for VercelClient {
         Box::pin(self.create_machine(request))
     }
 
-    fn connect<'a>(&'a self, id: &'a str, _timeout_secs: u32) -> CloudFuture<'a, Connected> {
-        Box::pin(self.connect_machine(id))
+    fn connect<'a>(&'a self, id: &'a str, timeout_secs: u32) -> CloudFuture<'a, Connected> {
+        Box::pin(self.connect_machine(id, timeout_secs))
     }
 
     fn run_command<'a>(

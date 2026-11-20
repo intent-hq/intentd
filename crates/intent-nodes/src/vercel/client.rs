@@ -414,7 +414,8 @@ impl VercelClient {
                 format!("the Vercel sandbox {name} is {}", current.session.status),
             ));
         }
-        let (command, args) = match spec.timeout {
+        let clamped = spec.timeout.map(|t| t.min(self.config.command_timeout));
+        let (command, args) = match clamped {
             // `--foreground` keeps the command in the caller's process
             // group, so a daemon it starts stays with the others.
             Some(timeout) => {
@@ -445,11 +446,7 @@ impl VercelClient {
         if let Some(cwd) = &spec.cwd {
             body["cwd"] = json!(cwd);
         }
-        let budget = spec
-            .timeout
-            .unwrap_or(self.config.command_timeout)
-            .min(self.config.command_timeout)
-            + COMMAND_GRACE;
+        let budget = clamped.unwrap_or(self.config.command_timeout) + COMMAND_GRACE;
         let path = format!("/v2/sandboxes/sessions/{}/cmd", current.session.id);
         validate_session(&current.session.id)?;
         let response = self
@@ -765,7 +762,7 @@ pub(super) fn validate_name(name: &str) -> Result<(), CloudError> {
     }
 }
 
-fn validate_session(id: &str) -> Result<(), CloudError> {
+pub(super) fn validate_session(id: &str) -> Result<(), CloudError> {
     if id_like(id) {
         Ok(())
     } else {

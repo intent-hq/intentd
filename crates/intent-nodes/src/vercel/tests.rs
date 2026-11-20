@@ -467,10 +467,13 @@ async fn keep_alive_extends_the_session_only_when_it_ends_too_soon() {
     short.timeout_secs = Some(600);
     let created = client.create(&short).await.unwrap();
 
-    // 10 minutes left, 30 wanted: extend by 30 minutes.
+    // 10 minutes left, 30 wanted: extend by the missing 20 minutes.
     client.keep_alive(&created.id, 1800).await.unwrap();
     let timeout = server.state().sandbox(&created.id).unwrap().session.timeout;
-    assert_eq!(timeout, 600_000 + 1_800_000);
+    assert!(
+        (1_800_000..=1_860_000).contains(&timeout),
+        "extended to {timeout} ms"
+    );
     let extends = |server: &FakeServer| {
         server
             .lines()
@@ -485,9 +488,11 @@ async fn keep_alive_extends_the_session_only_when_it_ends_too_soon() {
         .find(|r| r.path.contains("/extend-timeout"))
         .unwrap()
         .json();
-    assert_eq!(body, json!({ "duration": 1_800_000 }));
+    let duration = body["duration"].as_u64().unwrap();
+    assert!((1_200_000..=1_260_000).contains(&duration), "{body}");
+    assert_eq!(duration % 60_000, 0, "whole minutes");
 
-    // 40 minutes left, 30 wanted: nothing to do.
+    // 30 minutes left, 30 wanted: nothing to do.
     client.keep_alive(&created.id, 1800).await.unwrap();
     assert_eq!(extends(&server), 1);
 }
@@ -669,4 +674,78 @@ async fn transient_failures_are_retried_within_the_window() {
     assert_eq!(err.kind(), CloudErrorKind::Api);
     assert!(err.is_retryable());
     assert_eq!(err.status(), Some(503));
+}
+
+// --- review regressions ---
+
+#[tokio::test]
+async fn keep_alive_extends_only_by_what_is_missing_so_a_hobby_cap_is_not_hit_early() {
+    let server = server().await;
+    let client = client(&server);
+    server.state().max_session_ms = 45 * 60 * 1000;
+    let created = client.create(&create_request()).await.unwrap();
+    // Ten minutes into a 30-minute session: 20 minutes left, 30 wanted.
+    server
+        .state()
+        .sandbox_mut(&created.id)
+        .unwrap()
+        .session
+        .started_at -= 10 * 60 * 1000;
+    client.keep_alive(&created.id, 1800).await.unwrap();
+    let timeout = server.state().sandbox(&created.id).unwrap().session.timeout;
+    assert!(
+        (40 * 60 * 1000..=41 * 60 * 1000).contains(&timeout),
+        "extended to {timeout} ms, within the 45-minute cap"
+    );
+}
+
+#[tokio::test]
+async fn connect_keeps_a_running_session_alive_and_tolerates_the_cap() {
+    let server = server().await;
+    let client = client(&server);
+    let mut short = create_request();
+    short.timeout_secs = Some(600);
+    let created = client.create(&short).await.unwrap();
+    let connected = client.connect(&created.id, 1800).await.unwrap();
+    assert!(!connected.resumed);
+    let timeout = server.state().sandbox(&created.id).unwrap().session.timeout;
+    assert!(
+        timeout >= 1_800_000,
+        "a redial extends the session: {timeout}"
+    );
+
+    // At the cap, a connect still succeeds: the supervisor's renewal
+    // reports the cap and plans the stop and resume.
+    server.state().max_session_ms = timeout;
+    server
+        .state()
+        .sandbox_mut(&created.id)
+        .unwrap()
+        .session
+        .started_at -= 20 * 60 * 1000;
+    client.connect(&created.id, 1800).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_image_in_the_entrys_own_project_is_checked_at_the_create() {
+    let server = server().await;
+    let client = client(&server);
+    assert!(client.image_ready("intent-node:0.0.1").await.unwrap());
+    assert!(
+        !server.lines().iter().any(|l| l.starts_with("HEAD")),
+        "the registry path needs the team and project: no lookup"
+    );
+}
+
+#[tokio::test]
+async fn a_command_timeout_beyond_the_budget_is_clamped_on_both_sides() {
+    let host = Arc::new(ShellHost::default());
+    let server = FakeServer::start(VercelApi::default(), host.clone()).await;
+    let client = client(&server);
+    let created = client.create(&create_request()).await.unwrap();
+    let mut spec = ProcessSpec::new("true");
+    spec.timeout = Some(Duration::from_secs(3600));
+    client.run_command(&created, &spec).await.unwrap();
+    let seen = host.seen.lock().unwrap();
+    assert_eq!(seen[0].args[3], "10", "the client's 10 s budget, not 3600");
 }

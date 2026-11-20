@@ -1156,7 +1156,7 @@ fn vercel_error(error: &CloudError, phase: Phase) -> Error {
         let message = match limit {
             QuotaLimit::Plan => "The Vercel plan does not allow this sandbox size: pick a smaller size in Settings → Nodes, or change the Vercel plan.",
             QuotaLimit::Concurrency => "Vercel's limit on running sandboxes for this team is reached: pause another Vercel machine, or raise the limit at Vercel.",
-            QuotaLimit::Rate => "Vercel's request rate limit is reached: try again shortly.",
+            QuotaLimit::Rate => "Vercel refused for its rate limits (requests, concurrent sandboxes or vCPU allocation for the team): try again shortly, or pause another Vercel machine.",
         };
         return cloud_quota(limit.as_str(), retry_after, message);
     }
@@ -1173,13 +1173,10 @@ fn vercel_error(error: &CloudError, phase: Phase) -> Error {
             error.status(),
             format!("Vercel could not start the Intent image for this backend's version; no sandbox was left behind: {error}"),
         ),
-        other => cloud_machine_unavailable(
+        _ => cloud_machine_unavailable(
             "api-error",
             error.is_retryable(),
-            match other {
-                CloudErrorKind::Api => error.status(),
-                _ => None,
-            },
+            error.status(),
             format!("Vercel failed: {error}"),
         ),
     }
