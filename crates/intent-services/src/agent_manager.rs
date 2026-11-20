@@ -11301,15 +11301,6 @@ impl AgentManager {
             .map(|h| (h.spawned_provider.clone(), h.spawned_model.clone()))
     }
 
-    /// Whether `agent_id` has a live child spawned on `model`, which its next
-    /// turn reuses without asking a model server for anything.
-    pub(crate) fn live_child_runs_model(&self, agent_id: &AgentId, model: &str) -> bool {
-        let mut handles = self.handles.lock().unwrap();
-        handles.get_mut(agent_id).is_some_and(|handle| {
-            handle.spawned_model.as_deref() == Some(model) && handle.execution.runtime.is_alive()
-        })
-    }
-
     fn handle_is_live(&self, agent_id: &AgentId) -> bool {
         let mut handles = self.handles.lock().unwrap();
         let Some(handle) = handles.get_mut(agent_id) else {

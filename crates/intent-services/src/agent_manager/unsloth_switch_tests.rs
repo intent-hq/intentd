@@ -219,16 +219,17 @@ async fn sends_that_unload_no_one_pass() {
 }
 
 #[tokio::test]
-async fn a_live_agent_already_on_its_model_does_not_switch() {
+async fn a_live_agent_on_another_model_still_needs_confirmation() {
     let mut fx = Fixture::new().await;
     let a = fx.agent("agent-a", "Planner", MODEL_A).await;
     let b = fx.agent("agent-b", "Reviewer", MODEL_B).await;
     fx.live(&a, MODEL_A);
-    // `b` already runs on MODEL_B: its next turn reuses that process and
-    // never asks the server for a model.
+    // A live process does not prove the next turn reuses it (a model,
+    // policy or recreation change respawns it), so the gate never exempts it.
     fx.live(&b, MODEL_B);
     fx.mgr.unsloth_manager().set_owned_server_for_test(MODEL_A);
-    assert!(fx.admit(&b, MessageOrigin::User, None).await.is_ok());
+    let data = refused(fx.admit(&b, MessageOrigin::User, None).await);
+    assert_eq!(data["requestedModel"], MODEL_B);
 
     // After `agent.setModel` the next turn respawns, so it switches.
     fx.mgr

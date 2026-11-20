@@ -64,11 +64,6 @@ impl Services {
         if provider.as_deref() != Some("unsloth") || requested == current {
             return Ok(metadata);
         }
-        // A live child already on its model takes the turn without asking
-        // the server for a model.
-        if manager.live_child_runs_model(agent_id, &requested) {
-            return Ok(metadata);
-        }
         // Only agents running on the served model lose it.
         let others: Vec<AgentId> = manager
             .agents_with_provider("unsloth")
