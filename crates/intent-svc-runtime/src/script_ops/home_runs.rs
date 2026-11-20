@@ -193,8 +193,9 @@ impl ScriptManager {
             .collect();
         let mut started = 0;
         for id in ids {
-            match self.start(ws, &id).await {
-                Ok(_) => started += 1,
+            match self.start_auto(ws, &id).await {
+                Ok(Some(_)) => started += 1,
+                Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(workspace = %ws, script = %id, %error, "autoStart script did not start");
                 }

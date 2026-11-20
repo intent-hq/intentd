@@ -247,6 +247,16 @@ pub(crate) struct ScriptLocks {
     pub(crate) monitor_dispatched: Arc<tokio::sync::Notify>,
 }
 
+/// Who asked for a start: a client, the boot restore of a was-running
+/// script, or an `autoStart` trigger. Daemon starts launch only in an
+/// active workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartKind {
+    Client,
+    Restore,
+    AutoStart,
+}
+
 impl ScriptLocks {
     /// Whether `workspace_id` is being deleted.
     pub(crate) fn is_closing(&self, workspace_id: &WorkspaceId) -> bool {
@@ -1243,7 +1253,7 @@ impl ScriptManager {
             if archived || (on_home && !marked) {
                 continue;
             }
-            if let Err(error) = self.start_with_restore(&ws, &id, true).await {
+            if let Err(error) = self.start_as(&ws, &id, StartKind::Restore).await {
                 tracing::warn!(workspace = %ws, script = %id, %error, "boot start of service failed");
             }
         }
@@ -2123,8 +2133,23 @@ impl ScriptManager {
     /// happen synchronously, before replying, so status observes `starting`.
     /// The supervisor publishes `starting` before the first running/exit state.
     pub(crate) async fn start(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
-        self.start_with_restore(workspace_id, script_id, false)
+        self.start_as(workspace_id, script_id, StartKind::Client)
             .await
+    }
+
+    /// A daemon-initiated `autoStart` start (scripts.md "autoStart"): as
+    /// [`Self::start`], but nothing launches unless the workspace is still
+    /// active when the script's definition lock is held. `None` when it
+    /// did not launch for that reason.
+    pub(crate) async fn start_auto(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+    ) -> Result<Option<Value>> {
+        let reply = self
+            .start_as(workspace_id, script_id, StartKind::AutoStart)
+            .await?;
+        Ok((!reply.is_null()).then_some(reply))
     }
 
     fn start_reply(&self, ws: &WorkspaceId, id: &str) -> Value {
@@ -2137,14 +2162,16 @@ impl ScriptManager {
         reply
     }
 
-    async fn start_with_restore(
+    async fn start_as(
         &self,
         workspace_id: &WorkspaceId,
         script_id: &str,
-        restoring: bool,
+        kind: StartKind,
     ) -> Result<Value> {
         self.ensure_known(workspace_id, script_id).await?;
-        if self.is_live(workspace_id, script_id)? {
+        // A daemon start never trusts a lock-free "live" reading: an archive
+        // stop may hold the lock and end that run, so it re-checks under it.
+        if kind == StartKind::Client && self.is_live(workspace_id, script_id)? {
             return Ok(self.start_reply(workspace_id, script_id));
         }
         // A home run's machine is dialed first: an unreachable home fails
@@ -2153,7 +2180,7 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
-        self.spawn_admission(async move { mgr.start_owned(&ws, &id, restoring).await })
+        self.spawn_admission(async move { mgr.start_owned(&ws, &id, kind).await })
             .await
             .map_err(|e| Error::Internal(format!("script start admission failed: {e}")))?
     }
@@ -2162,18 +2189,28 @@ impl ScriptManager {
         &self,
         workspace_id: &WorkspaceId,
         script_id: &str,
-        restoring: bool,
+        kind: StartKind,
     ) -> Result<Value> {
         self.signal_admission_wait();
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
         self.require_admission(workspace_id, script_id).await?;
         self.require_launch_open_locked(workspace_id).await?;
+        // Under the definition lock an archive's stop also takes: a daemon
+        // start either launches before the archive commits (and the archive
+        // then stops it) or sees the archived row and launches nothing.
+        if kind != StartKind::Client {
+            if let Some(svc) = &self.owner_services {
+                if !svc.workspace_accepts_auto_start(workspace_id).await? {
+                    return Ok(Value::Null);
+                }
+            }
+        }
         if self.is_live(workspace_id, script_id)? {
             return Ok(self.start_reply(workspace_id, script_id));
         }
         // Decide before admission: a skipped boot start must leave no admitted run.
-        if restoring
+        if kind == StartKind::Restore
             && !self
                 .scripts
                 .lock()
@@ -2187,7 +2224,7 @@ impl ScriptManager {
         self.prepare_launch(workspace_id, script_id).await?;
         let publication = self.locks.publication_lock(script_id);
         let _publishing = publication.lock().await;
-        self.start_inner(workspace_id, script_id, restoring)
+        self.start_inner(workspace_id, script_id, kind == StartKind::Restore)
     }
 
     /// A stop, upsert, autoStart toggle-off or archive racing boot hydration
@@ -5286,7 +5323,7 @@ mod tests {
                     m.def.auto_start = Some(false);
                 }
             }
-            mgr.start_with_restore(&h.ws, &id, true).await.unwrap();
+            mgr.start_as(&h.ws, &id, StartKind::Restore).await.unwrap();
             let idle = mgr.status(&h.ws, &id).unwrap();
             assert_eq!(
                 idle["status"], "idle",

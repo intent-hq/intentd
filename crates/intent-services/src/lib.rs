@@ -35943,7 +35943,8 @@ impl Services {
             changes["autoUnarchive"] = stamp;
         }
         publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
-        if outcome.is_some() {
+        // A revive's fresh checkout never ran setup, so nothing autoStarts.
+        if matches!(outcome, Some(UnarchiveOutcome::Unarchived)) {
             self.kick_auto_start(&ws.id, false);
         }
         Ok((ws, outcome))
