@@ -1072,22 +1072,24 @@ Home. With no open workspace tabs, these shortcuts do nothing. Customize them in
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/recent-agents/RecentAgentSwitcher.svelte; src/features/recent-agents/RecentAgentCard.svelte; src/features/recent-agents/main/recent-agents.ipc.ts; src/shared/recent-agents.ts; src/shared/keyboard-shortcut-bindings.ts; src/store/renderer/slices/recent-agents/sagas/recent-agents-saga.ts. -->
 
-Pending frontend release (not in current builds): to jump between agents, hold
-**Option+Tab** on macOS or **Super+Tab** on Linux
-(on Intent OS the Mac Command key is Super). Windows has no default because it
-owns Alt+Tab and Win+Tab; bind one in settings. Intent shows the agents the user
-opened on this device, newest first, across every machine. A quick press and
-release returns to the previous agent. While holding the modifier, press Tab
-again to move (Shift moves back), release to open the selected agent, or press
-Esc to cancel. Each card shows the agent, its workspace, its machine and when it
-was opened; agents on the window's own machine also show whether they are
-working or need attention. A dimmed card is on a machine that is not connected:
-choosing it connects, opens that machine's window and then the agent. The list
-keeps the 30 most recent agents, is shared by every window, is not synced to
-other devices, and drops agents of a forgotten machine or of a deleted or
-archived workspace. It works in the composer, terminals and the browser panel.
-Rebind it as **Switch to Recent Agent** in **Settings → Input and shortcuts →
-Keyboard shortcuts**.
+Pending frontend release (not in current builds): to jump between agents,
+browser tabs and terminal tabs, hold **Option+Tab** on macOS or **Super+Tab** on
+Linux (on Intent OS the Mac Command key is Super). Windows has no default because
+it owns Alt+Tab and Win+Tab; bind one in settings. Intent shows the agents,
+browser tabs and panel terminals the user focused on this device in one list,
+newest first, across every machine. A quick press and release returns to the
+previous item. While holding the modifier, press Tab again to move (Shift moves
+back), release to open the selected item, or press Esc to cancel. Each card shows
+the agent, page or terminal name, its workspace, its machine and when it was
+opened; agents on the window's own machine also show whether they are working or
+need attention. A dimmed card is on a machine that is not connected: choosing it
+connects, opens that machine's window and then the item. The list keeps the 30
+most recent items, is shared by every window, is not synced to other devices,
+and drops items of a forgotten machine, of a deleted or archived workspace, and
+browser or terminal tabs that were closed. Terminals in the terminal drawer are
+not listed. It works in the composer, terminals and the browser panel. Rebind it
+as **Switch to Recent Tab** in **Settings → Input and shortcuts → Keyboard
+shortcuts**.
 
 <!-- Labs (tab groups): describe only when explicitly asked about tab groups or
 when developing or testing them, and say they are Labs. Enable Tab groups in
