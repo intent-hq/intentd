@@ -288,6 +288,14 @@ it off; a user who turned it off keeps it off.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/ChatAppearanceSettings.svelte; src/store/renderer/slices/user-preferences/user-preferences-slice.ts (collapseToolRuns default); src/lib/components/chat/ChatContentLane.svelte; src/features/layout/tab-types/AgentViewSettingsDropdown.svelte. Test-build behavior pending its frontend release. -->
 
+When asked about **Collapse tool activity** on iOS, describe it as test-build
+behavior pending its mobile release. In an agent chat, use **More (…) → Collapse
+tool activity** to change the setting for chats on this device. It is on by default.
+Consecutive calls and thinking steps share one summary. Tap it to reveal the rows,
+then tap an individual call to see its details.
+
+<!-- Sources: packages/ios/Intent/Views/Conversation/Transcript/{ConversationView,ResponseGroupView,ToolCallView}.swift; packages/ios/Intent/Presentation/MessageBlockPartitioning.swift. -->
+
 When asked about the **Notch dock**, its switch is in
 **Settings → Appearance → Notch dock**. Starting with the desktop release that turns
 it on by default, the dock is on unless the user turned it off; a user who turned it
