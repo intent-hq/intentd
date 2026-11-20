@@ -210,12 +210,20 @@ const WRITER_LOCK_TAKER: (&str, &str, &str) = ("mod.rs", "lock_tenant_writer", "
 /// Reads allowed to run more than one statement without one snapshot (on
 /// a plain `begin()`, an acquired connection or the pool), as `(file,
 /// function, why)`. Rule 5 sends every other one to `begin_read_snapshot()`.
-const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[(
-    "mod.rs",
-    "migrate_with",
-    "schema migration, not a tenant read: runs DDL on one detached connection under the \
-     migration advisory lock, and each step records its own progress so a crash resumes",
-)];
+const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[
+    (
+        "mod.rs",
+        "begin_write",
+        "not a read: sets the writer limits and takes the tenant writer lock \
+         (lock_tenant_writer) on the transaction it then returns as WriteTx",
+    ),
+    (
+        "mod.rs",
+        "migrate_with",
+        "schema migration, not a tenant read: runs DDL on one detached connection under the \
+         migration advisory lock, and each step records its own progress so a crash resumes",
+    ),
+];
 
 /// Plain `begin()` transactions allowed to leave the lint's view, as
 /// `(file, function, why)`.
