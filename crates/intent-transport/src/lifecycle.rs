@@ -241,8 +241,12 @@ impl WsInner {
         if let Some(mut running) = running {
             // (1) stop the heartbeat and any skipped-address retries.
             running.heartbeat_task.abort();
+            // Join them too: a retry may hold a freshly bound socket while it
+            // waits for the state lock, and that socket must be closed before
+            // stop returns so the next start cannot hit `EADDRINUSE`.
             for task in running.retry_tasks.drain(..) {
                 task.abort();
+                let _ = task.await;
             }
             // (2)+(3) close every client with 1001; the connection loop drops
             // its subscriptions when it exits.
