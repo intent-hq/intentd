@@ -1,6 +1,6 @@
 [package]
 name = "intent-git"
-version = "0.11.258"
+version = "0.11.259"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
