@@ -30,6 +30,7 @@ mod homes;
 mod northflank;
 mod sub_agents;
 mod teardown;
+mod vercel;
 
 const E2B_KEY: &str = "e2b_test_key_0123456789abcdef0123456789abcdef";
 /// The key of a second E2B project: its sandboxes are listed, connected
@@ -1444,7 +1445,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     let after = ok(&mut rpc_ws, 403, "cloudMachines.list", json!({})).await;
     assert_eq!(
         after,
-        json!({ "providers": [], "machines": [], "providerKinds": ["e2b", "northflank", "agent37"] }),
+        json!({ "providers": [], "machines": [], "providerKinds": ["e2b", "northflank", "agent37", "vercel"] }),
         "{after}"
     );
 

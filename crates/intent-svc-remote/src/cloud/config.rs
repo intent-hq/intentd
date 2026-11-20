@@ -1,5 +1,5 @@
-//! The saved settings of each named cloud machine entry (E2B, Northflank
-//! or Agent37), its provider client and the mapping of provider failures
+//! The saved settings of each named cloud machine entry (E2B, Northflank,
+//! Agent37 or Vercel), its provider client and the mapping of provider failures
 //! onto the documented `cloud-*` errors.
 //!
 //! Every entry is one `cloud_machine_provider` row (its id is the entry id)
@@ -16,13 +16,14 @@ use std::collections::BTreeMap;
 use intent_core::machines::{
     cloud_machine_unavailable, cloud_provider_name, cloud_quota, with_cloud_machine_id,
     with_cloud_provider, CloudMachineSize, CLOUD_E2B_LEGACY_ENTRY, CLOUD_PROVIDER_AGENT37,
-    CLOUD_PROVIDER_E2B, CLOUD_PROVIDER_E2B_NAME, CLOUD_PROVIDER_NORTHFLANK,
+    CLOUD_PROVIDER_E2B, CLOUD_PROVIDER_E2B_NAME, CLOUD_PROVIDER_NORTHFLANK, CLOUD_PROVIDER_VERCEL,
 };
 use intent_core::{now_iso, Error, Result};
 use intent_nodes::agent37::{Agent37Client, Agent37Config};
 use intent_nodes::cloud::{CloudError, CloudErrorKind, CloudProvider, QuotaLimit, SecretString};
 use intent_nodes::e2b::{E2bClient, E2bConfig};
 use intent_nodes::northflank::{NorthflankClient, NorthflankConfig, MIN_DISK_GIB};
+use intent_nodes::vercel::{VercelClient, VercelConfig};
 use intent_services::feature_api::Services;
 
 /// The E2B project that publishes the intent-node templates (Intent's).
@@ -51,6 +52,9 @@ const NORTHFLANK_REGISTRY_URL_ENV: &str = "INTENTD_NORTHFLANK_REGISTRY_URL";
 /// The Agent37 REST and exec base URLs (test seams).
 const AGENT37_API_URL_ENV: &str = "INTENTD_AGENT37_API_URL";
 const AGENT37_EXEC_URL_ENV: &str = "INTENTD_AGENT37_EXEC_URL";
+/// The Vercel REST and container registry base URLs (test seams).
+const VERCEL_API_URL_ENV: &str = "INTENTD_VERCEL_API_URL";
+const VERCEL_REGISTRY_URL_ENV: &str = "INTENTD_VERCEL_REGISTRY_URL";
 
 /// The image Northflank entries start unless the owner sets another.
 pub(crate) const DEFAULT_NORTHFLANK_IMAGE: &str = "ghcr.io/intent-hq/intent-node";
@@ -167,6 +171,26 @@ impl Agent37Settings {
     }
 }
 
+/// A Vercel entry's own settings (`CloudMachineProvider.vercel`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VercelSettings {
+    pub(crate) team_id: String,
+    pub(crate) project_id: String,
+    /// Repository without a tag; the backend appends its version.
+    pub(crate) image: String,
+}
+
+impl VercelSettings {
+    pub(crate) fn new(team_id: &str, project_id: &str) -> Self {
+        Self {
+            team_id: team_id.to_owned(),
+            project_id: project_id.to_owned(),
+            image: intent_nodes::vercel::DEFAULT_IMAGE.to_owned(),
+        }
+    }
+}
+
 /// The saved settings of one entry (`cloud_machine_provider.config_json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -181,6 +205,9 @@ pub(crate) struct ProviderConfig {
     /// Agent37 entries only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) agent37: Option<Agent37Settings>,
+    /// Vercel entries only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vercel: Option<VercelSettings>,
     /// The entry's name; settings saved before entries existed read as
     /// "E2B".
     #[serde(default = "legacy_name")]
@@ -223,6 +250,7 @@ impl ProviderConfig {
             provider: e2b_kind(),
             northflank: None,
             agent37: None,
+            vercel: None,
             name: name.to_owned(),
             retired_from: None,
             migrated: true,
@@ -265,6 +293,23 @@ impl ProviderConfig {
         config
     }
 
+    /// A new Vercel entry in team `team_id` and project `project_id`: the
+    /// published image, its three sizes.
+    pub(crate) fn new_vercel(name: &str, team_id: &str, project_id: &str) -> Self {
+        let mut config = Self::new(name);
+        CLOUD_PROVIDER_VERCEL.clone_into(&mut config.provider);
+        config.template_project = String::new();
+        config.vercel = Some(VercelSettings::new(team_id, project_id));
+        config.sizes = CloudMachineSize::VERCEL.to_vec();
+        config.sizes_verified = true;
+        config.sizes_version = Some(intentd_version().to_owned());
+        config
+    }
+
+    pub(crate) fn is_vercel(&self) -> bool {
+        self.provider == CLOUD_PROVIDER_VERCEL
+    }
+
     pub(crate) fn is_northflank(&self) -> bool {
         self.provider == CLOUD_PROVIDER_NORTHFLANK
     }
@@ -283,6 +328,8 @@ impl ProviderConfig {
             &CloudMachineSize::NORTHFLANK
         } else if self.is_agent37() {
             &CloudMachineSize::AGENT37
+        } else if self.is_vercel() {
+            &CloudMachineSize::VERCEL
         } else {
             &CloudMachineSize::E2B
         }
@@ -330,15 +377,19 @@ impl ProviderConfig {
         }
         self.is_northflank()
             || self.is_agent37()
+            || self.is_vercel()
             || !self.sizes_verified
             || self.sizes.contains(&size)
     }
 
-    /// The template (E2B, Agent37) or image (Northflank) a new sandbox of
-    /// `size` starts from, as the entry reports it.
+    /// The template (E2B, Agent37) or image (Northflank, Vercel) a new
+    /// sandbox of `size` starts from, as the entry reports it.
     pub(crate) fn template(&self, size: CloudMachineSize) -> String {
         if let Some(nf) = &self.northflank {
             return format!("{}:{}", nf.image, intentd_version());
+        }
+        if let Some(vercel) = &self.vercel {
+            return intent_nodes::vercel::image_ref(&vercel.image, intentd_version());
         }
         if self.agent37.is_some() {
             return intent_nodes::agent37::template_name(&self.start_image(size));
@@ -377,16 +428,18 @@ impl ProviderConfig {
     /// `CloudMachineProvider` on the wire for entry `id`. Never holds the
     /// key.
     pub(crate) fn to_json(&self, id: &str) -> Value {
-        let sizes: Vec<Value> = match (&self.northflank, &self.agent37) {
-            (Some(nf), _) => CloudMachineSize::NORTHFLANK
+        let sizes: Vec<Value> = if let Some(nf) = &self.northflank {
+            CloudMachineSize::NORTHFLANK
                 .into_iter()
                 .filter_map(|size| Some(size.deployment_info_json(&nf.plan(size)?)))
-                .collect(),
-            (None, Some(_)) => CloudMachineSize::AGENT37
-                .into_iter()
-                .map(CloudMachineSize::bare_info_json)
-                .collect(),
-            (None, None) => self.sizes.iter().map(|size| size.info_json()).collect(),
+                .collect()
+        } else if self.agent37.is_some() || self.vercel.is_some() {
+            self.offered_sizes()
+                .iter()
+                .map(|size| size.bare_info_json())
+                .collect()
+        } else {
+            self.sizes.iter().map(|size| size.info_json()).collect()
         };
         let mut provider = json!({
             "id": id,
@@ -401,8 +454,8 @@ impl ProviderConfig {
             "pausedDeleteDays": self.paused_delete_days,
             "configuredAt": self.configured_at,
         });
-        match (&self.northflank, &self.agent37) {
-            (Some(nf), _) => {
+        match (&self.northflank, &self.agent37, &self.vercel) {
+            (Some(nf), _, _) => {
                 provider["northflank"] = json!({
                     "projectId": nf.project_id,
                     "region": nf.region,
@@ -411,14 +464,21 @@ impl ProviderConfig {
                     "diskGiB": nf.disk_gib.max(MIN_DISK_GIB),
                 });
             }
-            (None, Some(a37)) => {
+            (None, Some(a37), _) => {
                 provider["agent37"] = json!({
                     "instanceType": a37.instance_type,
                     "region": a37.region,
                     "diskGiB": a37.disk_gib,
                 });
             }
-            (None, None) => provider["templateProject"] = json!(self.template_project),
+            (None, None, Some(vercel)) => {
+                provider["vercel"] = json!({
+                    "teamId": vercel.team_id,
+                    "projectId": vercel.project_id,
+                    "image": vercel.image,
+                });
+            }
+            (None, None, None) => provider["templateProject"] = json!(self.template_project),
         }
         if let Some(checked) = &self.checked_at {
             provider["checkedAt"] = json!(checked);
@@ -759,10 +819,28 @@ pub(crate) fn agent37_client(key: SecretString) -> Result<Agent37Client> {
         .map_err(|error| to_error(&error, Phase::Other, CLOUD_PROVIDER_AGENT37))
 }
 
+/// A Vercel client for entry settings `vercel` with `key`.
+pub(crate) fn vercel_client(vercel: &VercelSettings, key: SecretString) -> Result<VercelClient> {
+    let env = |name: &str| std::env::var(name).ok().filter(|url| !url.is_empty());
+    let defaults = VercelConfig::default();
+    let config = VercelConfig {
+        team_id: vercel.team_id.clone(),
+        project_id: vercel.project_id.clone(),
+        api_url: env(VERCEL_API_URL_ENV).unwrap_or_else(|| defaults.api_url.clone()),
+        registry_url: env(VERCEL_REGISTRY_URL_ENV).unwrap_or_else(|| defaults.registry_url.clone()),
+        ..defaults
+    };
+    VercelClient::new(key, config)
+        .map_err(|error| to_error(&error, Phase::Other, CLOUD_PROVIDER_VERCEL))
+}
+
 /// A provider client for entry `saved` with `key`.
 pub(crate) fn client(saved: &ProviderConfig, key: SecretString) -> Result<Provider> {
     if let Some(nf) = &saved.northflank {
         return Ok(std::sync::Arc::new(northflank_client(nf, key)?));
+    }
+    if let Some(vercel) = &saved.vercel {
+        return Ok(std::sync::Arc::new(vercel_client(vercel, key)?));
     }
     if saved.agent37.is_some() {
         return Ok(std::sync::Arc::new(agent37_client(key)?));
@@ -814,6 +892,8 @@ pub(crate) fn key_rejected_by(kind: &str, status: Option<u16>) -> Error {
         "Northflank rejected the saved API token: save a working token for this Northflank entry in Settings → Nodes."
     } else if kind == CLOUD_PROVIDER_AGENT37 {
         "Agent37 rejected the saved API key: save a working key for this Agent37 entry in Settings → Nodes."
+    } else if kind == CLOUD_PROVIDER_VERCEL {
+        "Vercel rejected the saved access token: save a working token for this Vercel entry in Settings → Nodes."
     } else {
         "E2B rejected the saved API key: save a working key for this E2B entry in Settings → Nodes."
     };
@@ -823,17 +903,17 @@ pub(crate) fn key_rejected_by(kind: &str, status: Option<u16>) -> Error {
     )
 }
 
-/// `project-missing`: the Northflank project does not exist or the token
-/// cannot see it.
-pub(crate) fn project_missing(status: Option<u16>) -> Error {
+/// `project-missing`: the Northflank or Vercel project does not exist or
+/// the token cannot see it.
+pub(crate) fn project_missing(kind: &str, status: Option<u16>) -> Error {
+    let message = if kind == CLOUD_PROVIDER_VERCEL {
+        "Vercel has no project with this entry's project id in its team, or the token cannot see it: check the team and project ids in Settings → Nodes."
+    } else {
+        "Northflank has no project with this entry's project id, or the token cannot see it: check the project id in Settings → Nodes."
+    };
     with_cloud_provider(
-        cloud_machine_unavailable(
-            "project-missing",
-            false,
-            status,
-            "Northflank has no project with this entry's project id, or the token cannot see it: check the project id in Settings → Nodes.",
-        ),
-        CLOUD_PROVIDER_NORTHFLANK,
+        cloud_machine_unavailable("project-missing", false, status, message),
+        kind,
     )
 }
 
@@ -844,6 +924,10 @@ pub(crate) fn permission_denied(kind: &str, action: &str, status: Option<u16>) -
     let message = if kind == CLOUD_PROVIDER_AGENT37 {
         format!(
             "Agent37 refused {action} for the saved key: its IP allowlist does not include this backend's address. Allow it at Agent37, or save another key in Settings → Nodes."
+        )
+    } else if kind == CLOUD_PROVIDER_VERCEL {
+        format!(
+            "Vercel refused {action} for the saved token: give it access to the entry's team and the sandboxes of its project, then save it in Settings → Nodes."
         )
     } else {
         format!(
@@ -902,6 +986,21 @@ pub(crate) fn agent37_image_missing(image: &str) -> Error {
     )
 }
 
+/// `template-missing` for a Vercel image whose tag does not exist.
+pub(crate) fn vercel_image_missing(image: &str) -> Error {
+    with_cloud_provider(
+        cloud_machine_unavailable(
+            "template-missing",
+            false,
+            None,
+            format!(
+                "Vercel has no image {image} for this backend's Intent version; no sandbox was started. Update Intent, or set another image."
+            ),
+        ),
+        CLOUD_PROVIDER_VERCEL,
+    )
+}
+
 /// `no-capacity`: Agent37 has no room for the entry's instance where it
 /// asked; it never places it elsewhere.
 pub(crate) fn no_capacity(detail: &str, status: Option<u16>) -> Error {
@@ -936,6 +1035,9 @@ fn provider_error(error: &CloudError, phase: Phase, kind: &str) -> Error {
     if kind == CLOUD_PROVIDER_AGENT37 {
         return agent37_error(error, phase);
     }
+    if kind == CLOUD_PROVIDER_VERCEL {
+        return vercel_error(error, phase);
+    }
     let northflank = kind == CLOUD_PROVIDER_NORTHFLANK;
     if let Some(limit) = error.quota_limit() {
         let retry_after = error.retry_after().map(|d| d.as_secs());
@@ -959,7 +1061,7 @@ fn provider_error(error: &CloudError, phase: Phase, kind: &str) -> Error {
                     error.status(),
                 )
             }
-            CloudErrorKind::ProjectMissing => return project_missing(error.status()),
+            CloudErrorKind::ProjectMissing => return project_missing(kind, error.status()),
             CloudErrorKind::NotFound if phase == Phase::Create => {
                 return cloud_machine_unavailable(
                     "template-missing",
@@ -1043,6 +1145,39 @@ fn agent37_error(error: &CloudError, phase: Phase) -> Error {
                 _ => None,
             },
             format!("Agent37 failed: {error}"),
+        ),
+    }
+}
+
+fn vercel_error(error: &CloudError, phase: Phase) -> Error {
+    let kind = CLOUD_PROVIDER_VERCEL;
+    if let Some(limit) = error.quota_limit() {
+        let retry_after = error.retry_after().map(|d| d.as_secs());
+        let message = match limit {
+            QuotaLimit::Plan => "The Vercel plan does not allow this sandbox size: pick a smaller size in Settings → Nodes, or change the Vercel plan.",
+            QuotaLimit::Concurrency => "Vercel's limit on running sandboxes for this team is reached: pause another Vercel machine, or raise the limit at Vercel.",
+            QuotaLimit::Rate => "Vercel refused for its rate limits (requests, concurrent sandboxes or vCPU allocation for the team): try again shortly, or pause another Vercel machine.",
+        };
+        return cloud_quota(limit.as_str(), retry_after, message);
+    }
+    match error.kind() {
+        CloudErrorKind::NotConfigured => not_configured(),
+        CloudErrorKind::Unauthorized => key_rejected_by(kind, error.status()),
+        CloudErrorKind::PermissionDenied => {
+            permission_denied(kind, error.action().unwrap_or("this call"), error.status())
+        }
+        CloudErrorKind::ProjectMissing => project_missing(kind, error.status()),
+        CloudErrorKind::NotFound if phase == Phase::Create => cloud_machine_unavailable(
+            "template-missing",
+            false,
+            error.status(),
+            format!("Vercel could not start the Intent image for this backend's version; no sandbox was left behind: {error}"),
+        ),
+        _ => cloud_machine_unavailable(
+            "api-error",
+            error.is_retryable(),
+            error.status(),
+            format!("Vercel failed: {error}"),
         ),
     }
 }

@@ -1,0 +1,1346 @@
+{
+  "recorded": "the real Vercel Sandbox API, by scripts/capture-vercel-fixtures.sh",
+  "image": "sutterhill/intent-images/intent-node:0.11.254",
+  "token": "fixture-vercel-token-0000000000",
+  "team": "team_fixture000000000000000",
+  "project": "prj_fixture00000000000000000000",
+  "exchanges": [
+    {
+      "name": "list-wrong-token",
+      "request": {
+        "plane": "rest",
+        "auth": "wrong",
+        "method": "GET",
+        "path": "/v2/sandboxes?project=prj_fixture00000000000000000000&limit=1"
+      },
+      "response": {
+        "status": 403,
+        "body": {
+          "error": {
+            "code": "forbidden",
+            "message": "Not authorized",
+            "invalidToken": true
+          }
+        }
+      }
+    },
+    {
+      "name": "list-wrong-team",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes?project=prj_fixture00000000000000000000&limit=1&teamId=team_000000000000000000000000"
+      },
+      "response": {
+        "status": 403,
+        "body": {
+          "error": {
+            "code": "forbidden",
+            "message": "Not authorized"
+          }
+        }
+      }
+    },
+    {
+      "name": "list-missing-project",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes?project=prj_0000000000000000000000000000&limit=1"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Could not find project: prj_0000000000000000000000000000"
+          }
+        }
+      }
+    },
+    {
+      "name": "list",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes?project=prj_fixture00000000000000000000&limit=1"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "sandboxes": [],
+          "pagination": {
+            "count": 0,
+            "next": null
+          }
+        }
+      }
+    },
+    {
+      "name": "list-page-too-large",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes?project=prj_fixture00000000000000000000&limit=51"
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "bad_request",
+            "message": "Invalid request: `limit` should be <= 50."
+          }
+        }
+      }
+    },
+    {
+      "name": "manifest",
+      "request": {
+        "plane": "registry",
+        "auth": "token",
+        "method": "HEAD",
+        "path": "/v2/sutterhill/intent-images/intent-node/manifests/0.11.254"
+      },
+      "response": {
+        "status": 200,
+        "body": null
+      }
+    },
+    {
+      "name": "manifest-missing-tag",
+      "request": {
+        "plane": "registry",
+        "auth": "token",
+        "method": "HEAD",
+        "path": "/v2/sutterhill/intent-images/intent-node/manifests/0.0.1"
+      },
+      "response": {
+        "status": 404,
+        "body": null
+      }
+    },
+    {
+      "name": "manifest-wrong-token",
+      "request": {
+        "plane": "registry",
+        "auth": "wrong",
+        "method": "HEAD",
+        "path": "/v2/sutterhill/intent-images/intent-node/manifests/0.11.254"
+      },
+      "response": {
+        "status": 403,
+        "body": null
+      }
+    },
+    {
+      "name": "create-missing-image",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v3/sandboxes",
+        "body": {
+          "projectId": "prj_fixture00000000000000000000",
+          "name": "intent-capture-sandbox",
+          "image": "sutterhill/intent-images/intent-node:0.0.1",
+          "persistent": true,
+          "resources": {
+            "vcpus": 2
+          },
+          "timeout": 1800000,
+          "tags": {
+            "intentBackendId": "intent-capture",
+            "workspaceId": "capture-workspace",
+            "agentId": "capture-agent",
+            "intentEntryId": "vercel-000000000000",
+            "intentdVersion": "0.0.0"
+          },
+          "keepLastSnapshots": {
+            "count": 1,
+            "deleteEvicted": true
+          },
+          "snapshotExpiration": 2678400000
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Image not found."
+          }
+        }
+      }
+    },
+    {
+      "name": "create-too-many-vcpus",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v3/sandboxes",
+        "body": {
+          "projectId": "prj_fixture00000000000000000000",
+          "name": "intent-capture-sandbox",
+          "image": "sutterhill/intent-images/intent-node:0.11.254",
+          "persistent": true,
+          "resources": {
+            "vcpus": 32
+          },
+          "timeout": 1800000,
+          "tags": {
+            "intentBackendId": "intent-capture",
+            "workspaceId": "capture-workspace",
+            "agentId": "capture-agent",
+            "intentEntryId": "vercel-000000000000",
+            "intentdVersion": "0.0.0"
+          },
+          "keepLastSnapshots": {
+            "count": 1,
+            "deleteEvicted": true
+          },
+          "snapshotExpiration": 2678400000
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "bad_request",
+            "message": "`resources.vcpus` should be <= 8"
+          }
+        }
+      }
+    },
+    {
+      "name": "create-in-missing-project",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v3/sandboxes",
+        "body": {
+          "projectId": "prj_0000000000000000000000000000",
+          "name": "intent-capture-sandbox",
+          "image": "sutterhill/intent-images/intent-node:0.11.254",
+          "persistent": true,
+          "resources": {
+            "vcpus": 2
+          },
+          "timeout": 1800000,
+          "tags": {
+            "intentBackendId": "intent-capture",
+            "workspaceId": "capture-workspace",
+            "agentId": "capture-agent",
+            "intentEntryId": "vercel-000000000000",
+            "intentdVersion": "0.0.0"
+          },
+          "keepLastSnapshots": {
+            "count": 1,
+            "deleteEvicted": true
+          },
+          "snapshotExpiration": 2678400000
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Could not find project: prj_0000000000000000000000000000"
+          }
+        }
+      }
+    },
+    {
+      "name": "create",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v3/sandboxes",
+        "body": {
+          "projectId": "prj_fixture00000000000000000000",
+          "name": "intent-capture-sandbox",
+          "image": "sutterhill/intent-images/intent-node:0.11.254",
+          "persistent": true,
+          "resources": {
+            "vcpus": 2
+          },
+          "timeout": 1800000,
+          "tags": {
+            "intentBackendId": "intent-capture",
+            "workspaceId": "capture-workspace",
+            "agentId": "capture-agent",
+            "intentEntryId": "vercel-000000000000",
+            "intentdVersion": "0.0.0"
+          },
+          "keepLastSnapshots": {
+            "count": 1,
+            "deleteEvicted": true
+          },
+          "snapshotExpiration": 2678400000
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "sandbox": {
+            "name": "intent-capture-sandbox",
+            "currentSessionId": "sbx_fx00000001",
+            "status": "running",
+            "statusUpdatedAt": 1794900000000,
+            "persistent": true,
+            "workloadType": "sandbox",
+            "region": "iad1",
+            "failoverRegions": [],
+            "vcpus": 2,
+            "memory": 4096,
+            "runtime": "node22",
+            "architecture": "amd64",
+            "image": "sutterhill/intent-images/intent-node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "timeout": 1800000,
+            "snapshotExpiration": 2678400000,
+            "keepLastSnapshots": {
+              "count": 1,
+              "expiration": 2678400000,
+              "deleteEvicted": true
+            },
+            "cwd": "/home/user",
+            "tags": {
+              "intentBackendId": "intent-capture",
+              "workspaceId": "capture-workspace",
+              "agentId": "capture-agent",
+              "intentEntryId": "vercel-000000000000",
+              "intentdVersion": "0.0.0"
+            },
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000
+          },
+          "session": {
+            "id": "sbx_fx00000001",
+            "runtime": "node22",
+            "architecture": "amd64",
+            "requestedAt": 1794900000000,
+            "startedAt": 1794900000000,
+            "status": "running",
+            "vcpus": 2,
+            "memory": 4096,
+            "timeout": 1800000,
+            "region": "iad1",
+            "cwd": "/home/user",
+            "workloadType": "sandbox",
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "interactivePort": 26661,
+            "sourceSandboxName": "intent-capture-sandbox",
+            "projectId": "prj_fixture00000000000000000000"
+          },
+          "routes": []
+        }
+      }
+    },
+    {
+      "name": "create-same-name",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v3/sandboxes",
+        "body": {
+          "projectId": "prj_fixture00000000000000000000",
+          "name": "intent-capture-sandbox",
+          "image": "sutterhill/intent-images/intent-node:0.11.254",
+          "persistent": true,
+          "resources": {
+            "vcpus": 2
+          },
+          "timeout": 1800000,
+          "tags": {
+            "intentBackendId": "intent-capture",
+            "workspaceId": "capture-workspace",
+            "agentId": "capture-agent",
+            "intentEntryId": "vercel-000000000000",
+            "intentdVersion": "0.0.0"
+          },
+          "keepLastSnapshots": {
+            "count": 1,
+            "deleteEvicted": true
+          },
+          "snapshotExpiration": 2678400000
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "bad_request",
+            "message": "A sandbox with the name 'intent-capture-sandbox' already exists for this project. Use GET /sandboxes/:name to resume it or delete it first."
+          }
+        }
+      }
+    },
+    {
+      "name": "get-sandbox",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes/intent-capture-sandbox?projectId=prj_fixture00000000000000000000"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "sandbox": {
+            "name": "intent-capture-sandbox",
+            "currentSessionId": "sbx_fx00000001",
+            "status": "running",
+            "statusUpdatedAt": 1794900000000,
+            "persistent": true,
+            "workloadType": "sandbox",
+            "region": "iad1",
+            "failoverRegions": [],
+            "vcpus": 2,
+            "memory": 4096,
+            "runtime": "node22",
+            "architecture": "amd64",
+            "image": "sutterhill/intent-images/intent-node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "timeout": 1800000,
+            "snapshotExpiration": 2678400000,
+            "keepLastSnapshots": {
+              "count": 1,
+              "expiration": 2678400000,
+              "deleteEvicted": true
+            },
+            "totalEgressBytes": 0,
+            "totalIngressBytes": 0,
+            "totalActiveCpuDurationMs": 0,
+            "totalDurationMs": 0,
+            "cwd": "/home/user",
+            "tags": {
+              "agentId": "capture-agent",
+              "intentBackendId": "intent-capture",
+              "intentdVersion": "0.0.0",
+              "intentEntryId": "vercel-000000000000",
+              "workspaceId": "capture-workspace"
+            },
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "expiresAt": 1794900000000
+          },
+          "session": {
+            "id": "sbx_fx00000001",
+            "runtime": "node22",
+            "architecture": "amd64",
+            "requestedAt": 1794900000000,
+            "startedAt": 1794900000000,
+            "status": "running",
+            "vcpus": 2,
+            "memory": 4096,
+            "timeout": 1800000,
+            "region": "iad1",
+            "cwd": "/home/user",
+            "workloadType": "sandbox",
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "interactivePort": 26661,
+            "sourceSandboxName": "intent-capture-sandbox",
+            "projectId": "prj_fixture00000000000000000000"
+          },
+          "routes": [],
+          "resumed": false
+        }
+      }
+    },
+    {
+      "name": "list-by-tag",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes?project=prj_fixture00000000000000000000&tags=intentBackendId:intent-capture"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "sandboxes": [
+            {
+              "name": "intent-capture-sandbox",
+              "currentSessionId": "sbx_fx00000001",
+              "status": "running",
+              "statusUpdatedAt": 1794900000000,
+              "persistent": true,
+              "workloadType": "sandbox",
+              "region": "iad1",
+              "failoverRegions": [],
+              "vcpus": 2,
+              "memory": 4096,
+              "runtime": "node22",
+              "architecture": "amd64",
+              "image": "sutterhill/intent-images/intent-node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "timeout": 1800000,
+              "snapshotExpiration": 2678400000,
+              "keepLastSnapshots": {
+                "count": 1,
+                "expiration": 2678400000,
+                "deleteEvicted": true
+              },
+              "totalEgressBytes": 0,
+              "totalIngressBytes": 0,
+              "totalActiveCpuDurationMs": 0,
+              "totalDurationMs": 0,
+              "cwd": "/home/user",
+              "tags": {
+                "agentId": "capture-agent",
+                "intentBackendId": "intent-capture",
+                "intentdVersion": "0.0.0",
+                "intentEntryId": "vercel-000000000000",
+                "workspaceId": "capture-workspace"
+              },
+              "createdAt": 1794900000000,
+              "updatedAt": 1794900000000,
+              "expiresAt": 1794900000000
+            }
+          ],
+          "pagination": {
+            "count": 1,
+            "next": null
+          }
+        }
+      }
+    },
+    {
+      "name": "command",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v2/sandboxes/sessions/sbx_fx00000001/cmd",
+        "body": {
+          "command": "/bin/sh",
+          "args": [
+            "-c",
+            "id -un; pwd; printf '%s\\n' \"$CAPTURE_VAR\"; printf 'err\\n' >&2; echo kept > marker; exit 3"
+          ],
+          "cwd": "/home/user",
+          "env": {
+            "CAPTURE_VAR": "from-env"
+          },
+          "wait": true,
+          "logs": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ndjson": [
+            {
+              "command": {
+                "id": "cmd_44e816c88fb94dd288572ccbc77c",
+                "name": "/bin/sh",
+                "args": [
+                  "-c",
+                  "id -un; pwd; printf '%s\\n' \"$CAPTURE_VAR\"; printf 'err\\n' >&2; echo kept > marker; exit 3"
+                ],
+                "cwd": "/home/user",
+                "sessionId": "sbx_fx00000001",
+                "startedAt": 1794900000000,
+                "exitCode": null
+              }
+            },
+            {
+              "data": "user\n",
+              "stream": "stdout"
+            },
+            {
+              "data": "/home/user\nfrom-env\n",
+              "stream": "stdout"
+            },
+            {
+              "data": "err\n",
+              "stream": "stderr"
+            },
+            {
+              "command": {
+                "id": "cmd_44e816c88fb94dd288572ccbc77c",
+                "name": "/bin/sh",
+                "args": [
+                  "-c",
+                  "id -un; pwd; printf '%s\\n' \"$CAPTURE_VAR\"; printf 'err\\n' >&2; echo kept > marker; exit 3"
+                ],
+                "cwd": "/home/user",
+                "sessionId": "sbx_fx00000001",
+                "startedAt": 1794900000000,
+                "exitCode": 3,
+                "durationMs": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "command-missing-binary",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v2/sandboxes/sessions/sbx_fx00000001/cmd",
+        "body": {
+          "command": "no-such-binary",
+          "args": [],
+          "wait": true,
+          "logs": true
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "executable_not_found",
+            "message": "[invalid_argument] executable file not found in $PATH: no-such-binary"
+          }
+        }
+      }
+    },
+    {
+      "name": "command-unknown-session",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v2/sandboxes/sessions/sbx_000000000000000000000000/cmd",
+        "body": {
+          "command": "/bin/sh",
+          "args": [
+            "-c",
+            "true"
+          ],
+          "cwd": "/home/user",
+          "env": {
+            "CAPTURE_VAR": "from-env"
+          },
+          "wait": true,
+          "logs": true
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Vercel Sandbox not found."
+          }
+        }
+      }
+    },
+    {
+      "name": "extend-timeout",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v2/sandboxes/sessions/sbx_fx00000001/extend-timeout",
+        "body": {
+          "duration": 1800000
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "session": {
+            "id": "sbx_fx00000001",
+            "runtime": "node22",
+            "architecture": "amd64",
+            "requestedAt": 1794900000000,
+            "startedAt": 1794900000000,
+            "status": "running",
+            "vcpus": 2,
+            "memory": 4096,
+            "timeout": 3600000,
+            "region": "iad1",
+            "cwd": "/home/user",
+            "workloadType": "sandbox",
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "interactivePort": 26661,
+            "sourceSandboxName": "intent-capture-sandbox",
+            "projectId": "prj_fixture00000000000000000000"
+          }
+        }
+      }
+    },
+    {
+      "name": "extend-timeout-past-the-cap",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v2/sandboxes/sessions/sbx_fx00000001/extend-timeout",
+        "body": {
+          "duration": 108000000
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "sandbox_timeout_invalid",
+            "message": "Failed to extend timeout: extension would exceed maximum execution timeout"
+          }
+        }
+      }
+    },
+    {
+      "name": "stop",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v2/sandboxes/sessions/sbx_fx00000001/stop"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "sandbox": {
+            "name": "intent-capture-sandbox",
+            "currentSnapshotId": "snap_fx00000002",
+            "currentSessionId": "sbx_fx00000001",
+            "status": "stopped",
+            "statusUpdatedAt": 1794900000000,
+            "persistent": true,
+            "workloadType": "sandbox",
+            "region": "iad1",
+            "failoverRegions": [],
+            "vcpus": 2,
+            "memory": 4096,
+            "runtime": "node22",
+            "architecture": "amd64",
+            "image": "sutterhill/intent-images/intent-node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "timeout": 1800000,
+            "snapshotExpiration": 2678400000,
+            "keepLastSnapshots": {
+              "count": 1,
+              "expiration": 2678400000,
+              "deleteEvicted": true
+            },
+            "totalEgressBytes": 0,
+            "totalIngressBytes": 0,
+            "totalActiveCpuDurationMs": 0,
+            "totalDurationMs": 0,
+            "cwd": "/home/user",
+            "tags": {
+              "agentId": "capture-agent",
+              "intentBackendId": "intent-capture",
+              "intentdVersion": "0.0.0",
+              "intentEntryId": "vercel-000000000000",
+              "workspaceId": "capture-workspace"
+            },
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000
+          },
+          "session": {
+            "id": "sbx_fx00000001",
+            "runtime": "node22",
+            "architecture": "amd64",
+            "requestedAt": 1794900000000,
+            "startedAt": 1794900000000,
+            "requestedStopAt": 1794900000000,
+            "stoppedAt": 1794900000000,
+            "stopReason": "requested",
+            "status": "stopped",
+            "duration": 1794900000000,
+            "vcpus": 2,
+            "memory": 4096,
+            "timeout": 3600000,
+            "region": "iad1",
+            "cwd": "/home/user",
+            "workloadType": "sandbox",
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "interactivePort": 26661,
+            "activeCpuDurationMs": 0,
+            "networkTransfer": {
+              "ingress": 3315,
+              "egress": 2617
+            },
+            "sourceSandboxName": "intent-capture-sandbox",
+            "projectId": "prj_fixture00000000000000000000"
+          },
+          "snapshot": {
+            "id": "snap_fx00000002",
+            "sourceSessionId": "sbx_fx00000001",
+            "workloadType": "sandbox",
+            "architecture": "amd64",
+            "region": "iad1",
+            "regions": [
+              "iad1"
+            ],
+            "status": "created",
+            "sizeBytes": 0,
+            "expiresAt": 1794900000000,
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "lastUsedAt": 1794900000000,
+            "creationMethod": "automatic"
+          }
+        }
+      }
+    },
+    {
+      "name": "get-stopped",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes/intent-capture-sandbox?projectId=prj_fixture00000000000000000000"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "sandbox": {
+            "name": "intent-capture-sandbox",
+            "currentSnapshotId": "snap_fx00000002",
+            "currentSessionId": "sbx_fx00000001",
+            "status": "stopped",
+            "statusUpdatedAt": 1794900000000,
+            "persistent": true,
+            "workloadType": "sandbox",
+            "region": "iad1",
+            "failoverRegions": [],
+            "vcpus": 2,
+            "memory": 4096,
+            "runtime": "node22",
+            "architecture": "amd64",
+            "image": "sutterhill/intent-images/intent-node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "timeout": 1800000,
+            "snapshotExpiration": 2678400000,
+            "keepLastSnapshots": {
+              "count": 1,
+              "expiration": 2678400000,
+              "deleteEvicted": true
+            },
+            "totalEgressBytes": 0,
+            "totalIngressBytes": 0,
+            "totalActiveCpuDurationMs": 0,
+            "totalDurationMs": 0,
+            "cwd": "/home/user",
+            "tags": {
+              "agentId": "capture-agent",
+              "intentBackendId": "intent-capture",
+              "intentdVersion": "0.0.0",
+              "intentEntryId": "vercel-000000000000",
+              "workspaceId": "capture-workspace"
+            },
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000
+          },
+          "session": {
+            "id": "sbx_fx00000001",
+            "runtime": "node22",
+            "architecture": "amd64",
+            "requestedAt": 1794900000000,
+            "startedAt": 1794900000000,
+            "requestedStopAt": 1794900000000,
+            "stoppedAt": 1794900000000,
+            "stopReason": "requested",
+            "status": "stopped",
+            "duration": 1794900000000,
+            "vcpus": 2,
+            "memory": 4096,
+            "timeout": 3600000,
+            "region": "iad1",
+            "cwd": "/home/user",
+            "workloadType": "sandbox",
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "interactivePort": 26661,
+            "activeCpuDurationMs": 0,
+            "networkTransfer": {
+              "ingress": 3315,
+              "egress": 2617
+            },
+            "sourceSandboxName": "intent-capture-sandbox",
+            "projectId": "prj_fixture00000000000000000000"
+          },
+          "routes": [],
+          "resumed": false
+        }
+      }
+    },
+    {
+      "name": "stop-stopped",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v2/sandboxes/sessions/sbx_fx00000001/stop"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "sandbox": {
+            "name": "intent-capture-sandbox",
+            "currentSnapshotId": "snap_fx00000002",
+            "currentSessionId": "sbx_fx00000001",
+            "status": "stopped",
+            "statusUpdatedAt": 1794900000000,
+            "persistent": true,
+            "workloadType": "sandbox",
+            "region": "iad1",
+            "failoverRegions": [],
+            "vcpus": 2,
+            "memory": 4096,
+            "runtime": "node22",
+            "architecture": "amd64",
+            "image": "sutterhill/intent-images/intent-node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "timeout": 1800000,
+            "snapshotExpiration": 2678400000,
+            "keepLastSnapshots": {
+              "count": 1,
+              "expiration": 2678400000,
+              "deleteEvicted": true
+            },
+            "totalEgressBytes": 0,
+            "totalIngressBytes": 0,
+            "totalActiveCpuDurationMs": 0,
+            "totalDurationMs": 0,
+            "cwd": "/home/user",
+            "tags": {
+              "agentId": "capture-agent",
+              "intentBackendId": "intent-capture",
+              "intentdVersion": "0.0.0",
+              "intentEntryId": "vercel-000000000000",
+              "workspaceId": "capture-workspace"
+            },
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000
+          },
+          "session": {
+            "id": "sbx_fx00000001",
+            "runtime": "node22",
+            "architecture": "amd64",
+            "requestedAt": 1794900000000,
+            "startedAt": 1794900000000,
+            "requestedStopAt": 1794900000000,
+            "stoppedAt": 1794900000000,
+            "stopReason": "requested",
+            "status": "stopped",
+            "duration": 1794900000000,
+            "vcpus": 2,
+            "memory": 4096,
+            "timeout": 3600000,
+            "region": "iad1",
+            "cwd": "/home/user",
+            "workloadType": "sandbox",
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "interactivePort": 26661,
+            "activeCpuDurationMs": 0,
+            "networkTransfer": {
+              "ingress": 3315,
+              "egress": 2617
+            },
+            "sourceSandboxName": "intent-capture-sandbox",
+            "projectId": "prj_fixture00000000000000000000"
+          },
+          "snapshot": {
+            "id": "snap_fx00000002",
+            "sourceSessionId": "sbx_fx00000001",
+            "workloadType": "sandbox",
+            "architecture": "amd64",
+            "region": "iad1",
+            "regions": [
+              "iad1"
+            ],
+            "status": "created",
+            "sizeBytes": 0,
+            "expiresAt": 1794900000000,
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "lastUsedAt": 1794900000000,
+            "creationMethod": "automatic"
+          }
+        }
+      }
+    },
+    {
+      "name": "command-on-stopped-session",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v2/sandboxes/sessions/sbx_fx00000001/cmd",
+        "body": {
+          "command": "/bin/sh",
+          "args": [
+            "-c",
+            "true"
+          ],
+          "cwd": "/home/user",
+          "env": {
+            "CAPTURE_VAR": "from-env"
+          },
+          "wait": true,
+          "logs": true
+        }
+      },
+      "response": {
+        "status": 410,
+        "body": {
+          "error": {
+            "code": "sandbox_stopped",
+            "message": "Sandbox has stopped execution and is no longer available"
+          }
+        }
+      }
+    },
+    {
+      "name": "extend-stopped-session",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v2/sandboxes/sessions/sbx_fx00000001/extend-timeout",
+        "body": {
+          "duration": 1800000
+        }
+      },
+      "response": {
+        "status": 410,
+        "body": {
+          "error": {
+            "code": "sandbox_stopped",
+            "message": "Sandbox has stopped execution and is no longer available"
+          }
+        }
+      }
+    },
+    {
+      "name": "resume",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes/intent-capture-sandbox?projectId=prj_fixture00000000000000000000&resume=true"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "sandbox": {
+            "name": "intent-capture-sandbox",
+            "currentSnapshotId": "snap_fx00000002",
+            "currentSessionId": "sbx_fx00000003",
+            "status": "running",
+            "statusUpdatedAt": 1794900000000,
+            "persistent": true,
+            "workloadType": "sandbox",
+            "region": "iad1",
+            "failoverRegions": [],
+            "vcpus": 2,
+            "memory": 4096,
+            "runtime": "node22",
+            "architecture": "amd64",
+            "image": "sutterhill/intent-images/intent-node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "timeout": 1800000,
+            "snapshotExpiration": 2678400000,
+            "keepLastSnapshots": {
+              "count": 1,
+              "expiration": 2678400000,
+              "deleteEvicted": true
+            },
+            "totalEgressBytes": 0,
+            "totalIngressBytes": 0,
+            "totalActiveCpuDurationMs": 0,
+            "totalDurationMs": 0,
+            "cwd": "/home/user",
+            "tags": {
+              "agentId": "capture-agent",
+              "intentBackendId": "intent-capture",
+              "intentdVersion": "0.0.0",
+              "intentEntryId": "vercel-000000000000",
+              "workspaceId": "capture-workspace"
+            },
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "expiresAt": 1794900000000
+          },
+          "session": {
+            "id": "sbx_fx00000003",
+            "runtime": "node22",
+            "architecture": "amd64",
+            "requestedAt": 1794900000000,
+            "startedAt": 1794900000000,
+            "status": "running",
+            "vcpus": 2,
+            "memory": 4096,
+            "timeout": 1800000,
+            "region": "iad1",
+            "cwd": "/home/user",
+            "sourceSnapshotId": "snap_fx00000002",
+            "workloadType": "sandbox",
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "interactivePort": 26661,
+            "sourceSandboxName": "intent-capture-sandbox",
+            "projectId": "prj_fixture00000000000000000000"
+          },
+          "routes": [
+            {
+              "url": "https://sb-7ankmky9x8x1.vercel.run",
+              "subdomain": "sb-7ankmky9x8x1",
+              "port": 26661,
+              "system": true
+            }
+          ],
+          "resumed": true
+        }
+      }
+    },
+    {
+      "name": "resume-running",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes/intent-capture-sandbox?projectId=prj_fixture00000000000000000000&resume=true"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "sandbox": {
+            "name": "intent-capture-sandbox",
+            "currentSnapshotId": "snap_fx00000002",
+            "currentSessionId": "sbx_fx00000003",
+            "status": "running",
+            "statusUpdatedAt": 1794900000000,
+            "persistent": true,
+            "workloadType": "sandbox",
+            "region": "iad1",
+            "failoverRegions": [],
+            "vcpus": 2,
+            "memory": 4096,
+            "runtime": "node22",
+            "architecture": "amd64",
+            "image": "sutterhill/intent-images/intent-node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "timeout": 1800000,
+            "snapshotExpiration": 2678400000,
+            "keepLastSnapshots": {
+              "count": 1,
+              "expiration": 2678400000,
+              "deleteEvicted": true
+            },
+            "totalEgressBytes": 0,
+            "totalIngressBytes": 0,
+            "totalActiveCpuDurationMs": 0,
+            "totalDurationMs": 0,
+            "cwd": "/home/user",
+            "tags": {
+              "agentId": "capture-agent",
+              "intentBackendId": "intent-capture",
+              "intentdVersion": "0.0.0",
+              "intentEntryId": "vercel-000000000000",
+              "workspaceId": "capture-workspace"
+            },
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "expiresAt": 1794900000000
+          },
+          "session": {
+            "id": "sbx_fx00000003",
+            "runtime": "node22",
+            "architecture": "amd64",
+            "requestedAt": 1794900000000,
+            "startedAt": 1794900000000,
+            "status": "running",
+            "vcpus": 2,
+            "memory": 4096,
+            "timeout": 1800000,
+            "region": "iad1",
+            "cwd": "/home/user",
+            "sourceSnapshotId": "snap_fx00000002",
+            "workloadType": "sandbox",
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000,
+            "interactivePort": 26661,
+            "sourceSandboxName": "intent-capture-sandbox",
+            "projectId": "prj_fixture00000000000000000000"
+          },
+          "routes": [],
+          "resumed": false
+        }
+      }
+    },
+    {
+      "name": "command-after-resume",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "POST",
+        "path": "/v2/sandboxes/sessions/sbx_fx00000003/cmd",
+        "body": {
+          "command": "/bin/sh",
+          "args": [
+            "-c",
+            "cat /home/user/marker"
+          ],
+          "cwd": "/home/user",
+          "env": {
+            "CAPTURE_VAR": "from-env"
+          },
+          "wait": true,
+          "logs": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ndjson": [
+            {
+              "command": {
+                "id": "cmd_abea7810a8254b31966b8170fd85",
+                "name": "/bin/sh",
+                "args": [
+                  "-c",
+                  "cat /home/user/marker"
+                ],
+                "cwd": "/home/user",
+                "sessionId": "sbx_fx00000003",
+                "startedAt": 1794900000000,
+                "exitCode": null
+              }
+            },
+            {
+              "data": "kept\n",
+              "stream": "stdout"
+            },
+            {
+              "command": {
+                "id": "cmd_abea7810a8254b31966b8170fd85",
+                "name": "/bin/sh",
+                "args": [
+                  "-c",
+                  "cat /home/user/marker"
+                ],
+                "cwd": "/home/user",
+                "sessionId": "sbx_fx00000003",
+                "startedAt": 1794900000000,
+                "exitCode": 0,
+                "durationMs": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "delete",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "DELETE",
+        "path": "/v2/sandboxes/intent-capture-sandbox?projectId=prj_fixture00000000000000000000&deleteOrphanSnapshots=true"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "sandbox": {
+            "name": "intent-capture-sandbox",
+            "currentSnapshotId": "snap_fx00000002",
+            "currentSessionId": "sbx_fx00000003",
+            "status": "running",
+            "statusUpdatedAt": 1794900000000,
+            "persistent": true,
+            "workloadType": "sandbox",
+            "region": "iad1",
+            "failoverRegions": [],
+            "vcpus": 2,
+            "memory": 4096,
+            "runtime": "node22",
+            "architecture": "amd64",
+            "image": "sutterhill/intent-images/intent-node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "timeout": 1800000,
+            "snapshotExpiration": 2678400000,
+            "keepLastSnapshots": {
+              "count": 1,
+              "expiration": 2678400000,
+              "deleteEvicted": true
+            },
+            "totalEgressBytes": 0,
+            "totalIngressBytes": 0,
+            "totalActiveCpuDurationMs": 0,
+            "totalDurationMs": 0,
+            "cwd": "/home/user",
+            "tags": {
+              "agentId": "capture-agent",
+              "intentBackendId": "intent-capture",
+              "intentdVersion": "0.0.0",
+              "intentEntryId": "vercel-000000000000",
+              "workspaceId": "capture-workspace"
+            },
+            "createdAt": 1794900000000,
+            "updatedAt": 1794900000000
+          }
+        }
+      }
+    },
+    {
+      "name": "delete-again",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "DELETE",
+        "path": "/v2/sandboxes/intent-capture-sandbox?projectId=prj_fixture00000000000000000000&deleteOrphanSnapshots=true"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Sandbox 'intent-capture-sandbox' not found for this project."
+          }
+        }
+      }
+    },
+    {
+      "name": "get-deleted",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes/intent-capture-sandbox?projectId=prj_fixture00000000000000000000"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Named sandbox 'intent-capture-sandbox' not found for this project."
+          }
+        }
+      }
+    },
+    {
+      "name": "resume-unknown",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes/intent-capture-missing?projectId=prj_fixture00000000000000000000&resume=true"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "Named sandbox 'intent-capture-missing' not found for this project."
+          }
+        }
+      }
+    }
+  ]
+}

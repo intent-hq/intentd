@@ -652,8 +652,8 @@ async fn create(
                 .or_else(|| a37.map(|a37| a37.disk_for(saved.size))),
             machine_type: a37.map(|a37| a37.instance_type.clone()),
             region: a37.map(|a37| a37.region.clone()),
-            vcpu: a37.map(|_| saved.size.vcpu()),
-            memory_gib: a37.map(|_| saved.size.memory_gib()),
+            vcpu: (a37.is_some() || saved.vercel.is_some()).then(|| saved.size.vcpu()),
+            memory_gib: (a37.is_some() || saved.vercel.is_some()).then(|| saved.size.memory_gib()),
         })
         .await
         .map_err(|error| match a37 {

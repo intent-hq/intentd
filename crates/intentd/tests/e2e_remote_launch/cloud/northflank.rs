@@ -713,7 +713,7 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
     );
     assert_eq!(
         listed["providerKinds"],
-        json!(["e2b", "northflank", "agent37"])
+        json!(["e2b", "northflank", "agent37", "vercel"])
     );
 
     let saved = ok(

@@ -50,7 +50,7 @@ impl<'de> de::Deserializer<'de> for Recorder<'_> {
 }
 
 /// The fields `T` reads.
-pub(super) fn fields_of<'de, T: Deserialize<'de>>() -> &'static [&'static str] {
+pub(crate) fn fields_of<'de, T: Deserialize<'de>>() -> &'static [&'static str] {
     let fields = RefCell::new(&[][..]);
     let _ = T::deserialize(Recorder(&fields));
     fields.into_inner()

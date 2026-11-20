@@ -592,7 +592,7 @@ async fn a_removed_entrys_key_stays_until_the_reaper_deletes_its_sandbox() {
     let listed = ok(&mut rpc_ws, 41, "cloudMachines.list", json!({})).await;
     assert_eq!(
         listed,
-        json!({ "providers": [], "machines": [], "providerKinds": ["e2b", "northflank", "agent37"] }),
+        json!({ "providers": [], "machines": [], "providerKinds": ["e2b", "northflank", "agent37", "vercel"] }),
         "{listed}"
     );
     let rows = provider_rows(&head_dir).await;
