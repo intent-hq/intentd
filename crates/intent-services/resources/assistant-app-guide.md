@@ -297,6 +297,16 @@ including when viewing another machine.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/DockLabSettings.svelte; src/main/dock-lab.ts; src/main/dock-window-menu.ts; src/main/window-backend.ts. Test-build behavior pending its frontend release. -->
 
+Starting with the desktop release that enables capture editing by default, stopping
+a screen recording from the Notch dock opens the capture editor. Click a finished
+recording tile in the dock composer to reopen it. Screenshot tiles and their **Edit**
+control open the screenshot editor. **Save changes** keeps edits with the draft;
+**Attach** returns the capture to the composer. Neither sends the message: use the
+composer's send action when ready. Some older recordings can be played in the editor
+but cannot be edited; follow the editor's availability message.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/hud/media-editor/open-capture-editor.ts; src/features/hud/composer/dock-composer-controller.ts; src/features/hud/components/DockComposerAttachments.svelte; src/features/hud/media-editor/{DockCaptureEditorShell.svelte,recording/DockRecordingEditor.svelte}; src/store/renderer/slices/dock-conversation/sagas/dock-evidence-saga.ts. -->
+
 When the user asks the Assistant to change a setting, `ws.app.settings.propose` shows a
 change card the user applies or discards; the card can be undone. It accepts only
 settings whose definition has `proposable: true`. Credentials, remote access and
