@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.256] - 2026-11-20
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Register a repo-config bootstrap atomically ([#3565](https://github.com/intent-hq/intentd/pull/3565))
+
+
 ## [0.11.255] - 2026-11-20
 
 ### 🚀 Features
