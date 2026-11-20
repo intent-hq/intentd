@@ -80,6 +80,24 @@
       }
     },
     {
+      "name": "list-page-too-large",
+      "request": {
+        "plane": "rest",
+        "auth": "token",
+        "method": "GET",
+        "path": "/v2/sandboxes?project=prj_fixture00000000000000000000&limit=51"
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "bad_request",
+            "message": "Invalid request: `limit` should be <= 50."
+          }
+        }
+      }
+    },
+    {
       "name": "manifest",
       "request": {
         "plane": "registry",
@@ -522,7 +540,7 @@
           "ndjson": [
             {
               "command": {
-                "id": "cmd_22b6028894b0421d827f4a4b9bb7",
+                "id": "cmd_44e816c88fb94dd288572ccbc77c",
                 "name": "/bin/sh",
                 "args": [
                   "-c",
@@ -539,16 +557,16 @@
               "stream": "stdout"
             },
             {
-              "data": "err\n",
-              "stream": "stderr"
-            },
-            {
               "data": "/home/user\nfrom-env\n",
               "stream": "stdout"
             },
             {
+              "data": "err\n",
+              "stream": "stderr"
+            },
+            {
               "command": {
-                "id": "cmd_22b6028894b0421d827f4a4b9bb7",
+                "id": "cmd_44e816c88fb94dd288572ccbc77c",
                 "name": "/bin/sh",
                 "args": [
                   "-c",
@@ -733,6 +751,7 @@
             "startedAt": 1794900000000,
             "requestedStopAt": 1794900000000,
             "stoppedAt": 1794900000000,
+            "stopReason": "requested",
             "status": "stopped",
             "duration": 1794900000000,
             "vcpus": 2,
@@ -746,7 +765,7 @@
             "interactivePort": 26661,
             "activeCpuDurationMs": 0,
             "networkTransfer": {
-              "ingress": 3260,
+              "ingress": 3315,
               "egress": 2617
             },
             "sourceSandboxName": "intent-capture-sandbox",
@@ -828,6 +847,7 @@
             "startedAt": 1794900000000,
             "requestedStopAt": 1794900000000,
             "stoppedAt": 1794900000000,
+            "stopReason": "requested",
             "status": "stopped",
             "duration": 1794900000000,
             "vcpus": 2,
@@ -841,7 +861,7 @@
             "interactivePort": 26661,
             "activeCpuDurationMs": 0,
             "networkTransfer": {
-              "ingress": 3260,
+              "ingress": 3315,
               "egress": 2617
             },
             "sourceSandboxName": "intent-capture-sandbox",
@@ -908,6 +928,7 @@
             "startedAt": 1794900000000,
             "requestedStopAt": 1794900000000,
             "stoppedAt": 1794900000000,
+            "stopReason": "requested",
             "status": "stopped",
             "duration": 1794900000000,
             "vcpus": 2,
@@ -921,7 +942,7 @@
             "interactivePort": 26661,
             "activeCpuDurationMs": 0,
             "networkTransfer": {
-              "ingress": 3260,
+              "ingress": 3315,
               "egress": 2617
             },
             "sourceSandboxName": "intent-capture-sandbox",
@@ -1070,8 +1091,8 @@
           },
           "routes": [
             {
-              "url": "https://sb-74ivriwy1jej.vercel.run",
-              "subdomain": "sb-74ivriwy1jej",
+              "url": "https://sb-7ankmky9x8x1.vercel.run",
+              "subdomain": "sb-7ankmky9x8x1",
               "port": 26661,
               "system": true
             }
@@ -1181,7 +1202,7 @@
           "ndjson": [
             {
               "command": {
-                "id": "cmd_ce14d17ad4d14379a8857467f0d9",
+                "id": "cmd_abea7810a8254b31966b8170fd85",
                 "name": "/bin/sh",
                 "args": [
                   "-c",
@@ -1199,7 +1220,7 @@
             },
             {
               "command": {
-                "id": "cmd_ce14d17ad4d14379a8857467f0d9",
+                "id": "cmd_abea7810a8254b31966b8170fd85",
                 "name": "/bin/sh",
                 "args": [
                   "-c",

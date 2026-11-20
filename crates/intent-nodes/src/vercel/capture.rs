@@ -467,6 +467,14 @@ async fn record_refusals(r: &mut Recorder, image: &str) {
     )
     .await;
     r.call("list", "token", get.clone(), &list, None).await;
+    r.call(
+        "list-page-too-large",
+        "token",
+        get.clone(),
+        &format!("/v2/sandboxes?project={project}&limit=51"),
+        None,
+    )
+    .await;
     let (repository, _) = image.rsplit_once(':').unwrap_or((image, ""));
     let missing = format!("{repository}:{MISSING_TAG}");
     r.registry("manifest", "token", image).await;

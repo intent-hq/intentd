@@ -24,8 +24,8 @@ pub const RUN_AS: &str = "user";
 /// The session timeout of a new sandbox unless the request sets one.
 const DEFAULT_TIMEOUT_SECS: u32 = 30 * 60;
 
-/// Most sandboxes one list page asks for.
-const PAGE: u32 = 100;
+/// Most sandboxes one list page asks for: Vercel's most.
+const PAGE: u32 = 50;
 
 fn invalid(message: impl Into<String>) -> CloudError {
     CloudError::new(CloudErrorKind::InvalidArgument, message)

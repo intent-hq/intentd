@@ -370,6 +370,9 @@ impl VercelApi {
         let limit = query(path, "limit")
             .and_then(|l| l.parse::<usize>().ok())
             .unwrap_or(50);
+        if limit > 50 {
+            return bad_request("Invalid request: `limit` should be <= 50.");
+        }
         let page: Vec<Value> = sandboxes.into_iter().take(limit).collect();
         Reply::ok(json!({
             "sandboxes": page,
