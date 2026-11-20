@@ -1323,6 +1323,7 @@ async fn daemon_serves_loopback_when_a_configured_address_is_absent() {
             std::time::Instant::now() < deadline,
             "WSS listener never came up with an absent configured address"
         );
+        // timing-guard: poll interval until system.status reports the listener port
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(
