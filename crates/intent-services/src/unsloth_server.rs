@@ -840,6 +840,34 @@ impl UnslothServerManager {
         *lock_ignore_poison(&self.identity) = identity;
     }
 
+    /// The model a live server the daemon started serves (or is starting
+    /// for). `None` when no server runs, its child is gone, or the server was
+    /// adopted: a model switch never stops an adopted server.
+    pub(crate) fn owned_serving_repo(&self) -> Option<String> {
+        let identity = lock_ignore_poison(&self.identity).clone()?;
+        pid_is_alive(identity.pid?).then_some(identity.repo_id)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_owned_server_for_test(&self, repo_id: &str) {
+        self.set_identity(Some(ServerIdentity {
+            repo_id: repo_id.to_string(),
+            pid: Some(std::process::id()),
+            started_at: Instant::now(),
+            port: DEFAULT_PORT,
+        }));
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_adopted_server_for_test(&self, repo_id: &str) {
+        self.set_identity(Some(ServerIdentity {
+            repo_id: repo_id.to_string(),
+            pid: None,
+            started_at: Instant::now(),
+            port: DEFAULT_PORT,
+        }));
+    }
+
     /// Snapshot the managed server's live state for `unsloth.status`; `None`
     /// when no server is running OR the last-known pid is no longer alive
     /// (a dead child not yet reaped by the next `ensure_endpoint` call —

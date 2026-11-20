@@ -3739,12 +3739,22 @@ impl AgentManager {
     /// Number of currently-tracked agents spawned with the given provider id
     /// (e.g. `"unsloth"`), for `unsloth.status`'s `attachedAgentCount`.
     pub(crate) fn count_agents_with_provider(&self, provider_id: &str) -> usize {
+        self.agents_with_provider(provider_id).len()
+    }
+
+    /// Currently-tracked agents spawned under the given base provider id,
+    /// with the model each was spawned on. Keyed on the selection, not the
+    /// command: an `unsloth` agent runs `opencode`.
+    pub(crate) fn agents_with_provider(&self, provider_id: &str) -> Vec<(AgentId, Option<String>)> {
         self.handles
             .lock()
             .unwrap()
-            .values()
-            .filter(|h| h.spawned_provider == provider_id)
-            .count()
+            .iter()
+            .filter(|(_, h)| {
+                intent_providers::base_provider_id(&h.spawned_selection) == provider_id
+            })
+            .map(|(id, h)| (id.clone(), h.spawned_model.clone()))
+            .collect()
     }
 
     /// The daemon-owned singleton Unsloth server manager, for the
@@ -26601,6 +26611,10 @@ mod quota_failover_tests;
 #[cfg(test)]
 #[path = "agent_manager/future_size_tests.rs"]
 mod future_size_tests;
+
+#[cfg(all(test, unix))]
+#[path = "agent_manager/unsloth_switch_tests.rs"]
+mod unsloth_switch_tests;
 
 /// Persistent launches under a named profile (PROTOCOL §5.54): the frozen
 /// command carries the profile over inherited and captured values, never over

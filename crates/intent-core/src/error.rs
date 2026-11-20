@@ -196,6 +196,13 @@ pub enum Error {
     #[error("{}", .0.message)]
     RemoteMachine(Box<ProviderProfileFailure>),
 
+    /// A request that needs the user's explicit confirmation before it runs
+    /// (e.g. `unsloth-model-switch-confirmation-required`). Always `-32602`;
+    /// `data` (`data.code` plus details) is passed through verbatim as
+    /// `error.data`.
+    #[error("{}", .0.message)]
+    ConfirmationRequired(Box<ProviderProfileFailure>),
+
     /// A `workspace.create` clone/provisioning step failed.
     /// Carries a machine-readable category plus a sanitized human-readable
     /// detail (git stderr tail with credentials redacted) so clients can show
@@ -794,6 +801,7 @@ impl Error {
             | Error::ModelUnavailable(_)
             | Error::MachineUpdateRequired(_)
             | Error::ContentBaseMismatch { .. }
+            | Error::ConfirmationRequired(_)
             | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
                 CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
@@ -958,6 +966,16 @@ impl Error {
             Self::InvalidParams(message) => Self::InvalidParams(format!("{message} {hint}")),
             other => other,
         }
+    }
+
+    /// Build an [`Error::ConfirmationRequired`]; `data` must carry `code`.
+    #[must_use]
+    pub fn confirmation_required(message: impl Into<String>, data: serde_json::Value) -> Self {
+        Self::ConfirmationRequired(Box::new(ProviderProfileFailure {
+            internal: false,
+            message: message.into(),
+            data,
+        }))
     }
 
     /// Build an [`Error::RemoteMachine`]; `data` must carry `code`.

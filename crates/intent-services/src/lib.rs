@@ -306,6 +306,7 @@ pub mod tool_block;
 #[cfg(test)]
 mod truncated_read_guard_tests;
 mod unsloth_server;
+mod unsloth_switch;
 mod voice_ops;
 mod workspace_branch;
 mod workspace_check_cadence;
@@ -30893,6 +30894,11 @@ impl WorkspaceApi for Services {
             // refuses the turn here, structured, before anything persists
             // (PROTOCOL §5.54), rather than as a prose spawn failure later.
             self.ensure_turn_provider_selectable(&agent_id).await?;
+            // A user send that would make the managed Unsloth server unload
+            // another agent's model needs the user's confirmation first.
+            let message_metadata = self
+                .admit_unsloth_model_switch(&agent_id, origin, message_metadata)
+                .await?;
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
