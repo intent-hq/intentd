@@ -199,3 +199,44 @@ async fn repo_config_scripts_over_the_field_caps_are_skipped() {
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].name, "ok");
 }
+
+/// A list that arrives while another first-use list is still registering
+/// the repository's scripts (the autoStart kick on workspace activation runs
+/// one) sees every bootstrapped script, never a partial set.
+#[intent_test_macros::daemon_test]
+async fn concurrent_list_never_sees_a_partial_bootstrap() {
+    let h = harness().await;
+    let repo = WorktreeDir::new();
+    std::fs::create_dir_all(repo.0.join(".intent")).unwrap();
+    std::fs::write(
+        repo.0.join(".intent/config.json"),
+        r#"{"scripts":[{"name":"a","command":"true","mode":"command"},{"name":"b","command":"true","mode":"command"},{"name":"c","command":"true","mode":"command"}]}"#,
+    )
+    .unwrap();
+    sqlx::query("UPDATE workspace SET repository_path = ? WHERE id = ?")
+        .bind(repo.0.to_str().unwrap())
+        .bind(h.ws.as_str())
+        .execute(h.services.store().write_pool())
+        .await
+        .unwrap();
+    let park = Arc::new(SupervisePark::default());
+    let mut mgr = h.services.script_manager();
+    mgr.parks.bootstrap_registered = Some(park.clone());
+    let bootstrapping = {
+        let ws = h.ws.clone();
+        intent_core::spawn_daemon(async move { mgr.list(&ws).await })
+    };
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .expect("bootstrap published its first script");
+    let concurrent = tokio::time::timeout(LIVENESS, h.services.script_list(h.ws.clone())).await;
+    park.release.notify_one();
+    let bootstrapped = tokio::time::timeout(LIVENESS, bootstrapping)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(bootstrapped["scripts"].as_array().unwrap().len(), 3);
+    let concurrent = concurrent.expect("concurrent list blocked on the parked bootstrap").unwrap();
+    assert_eq!(concurrent, bootstrapped, "concurrent list saw a partial bootstrap");
+}
