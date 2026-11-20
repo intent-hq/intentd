@@ -461,6 +461,12 @@ links from the terminal drawer) opens in a browser panel of the workspace shown 
 current window instead. With no workspace open, it opens in a small sign-in window.
 Other link types, such as `mailto:`, are unchanged.
 
+<!-- Free OpenCode: packages/cloudlands-fe/src/features/onboarding/utils/order-onboarding-providers.ts (resolveFreeOnboardingProvider); packages/cloudlands-fe/src/features/onboarding/messages/{AgentGrid,ProviderCard}.svelte. -->
+Pending frontend release: when onboarding finds no other provider installed, OpenCode
+comes first with a **Free** label. Its built-in free models need no account or API
+key. Install it from its card; once installed, it is selected. Free models change
+over time, have usage limits, and some may keep prompts for training.
+
 <!-- Auggie visibility: packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/cloudlands-fe/src/features/onboarding/messages/AgentGrid.svelte; packages/cloudlands-fe/src/store/renderer/slices/provider-catalog/workspace-catalog-selectors.ts. -->
 Auggie appears in provider lists, including onboarding, only when its CLI is
 installed or it is already enabled. An enabled but missing installation stays
