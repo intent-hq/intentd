@@ -233,6 +233,11 @@ impl Services {
             )));
         }
         let mut held = Vec::with_capacity(request.calls.len());
+        // One deadline for the whole request: classification lookups and the
+        // final read share the eval budget instead of each getting all of it.
+        let started = tokio::time::Instant::now();
+        let class_deadline = started + budget.saturating_sub(BUDGET_MARGIN);
+        let mut remote_classes = HashMap::new();
         for (index, call) in request.calls.iter().enumerate() {
             let method = call.method.trim();
             if method.is_empty() {
@@ -262,7 +267,14 @@ impl Services {
                     )))
                 }
             };
-            let class = Self::class_for(surface.as_ref(), &target, method, budget).await;
+            let class = Self::class_for(
+                surface.as_ref(),
+                &target,
+                method,
+                class_deadline,
+                &mut remote_classes,
+            )
+            .await;
             if let Some(refusal) = refusal_for(surface.as_ref(), method, class) {
                 audit(&agent_id, &backend, method, class, "refused");
                 return Ok(json!({
@@ -302,8 +314,9 @@ impl Services {
         }
         if !request.batch && held[0].1 == AgentRpcClass::Read {
             let (call, class) = held.remove(0);
+            let remaining = budget.saturating_sub(started.elapsed());
             return Ok(self
-                .run_read(surface.as_ref(), &agent_id, call, class, budget)
+                .run_read(surface.as_ref(), &agent_id, call, class, remaining)
                 .await);
         }
         self.hold_for_approval(

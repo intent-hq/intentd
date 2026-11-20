@@ -171,7 +171,7 @@ fn relay_failure(code: &str, message: impl Into<String>) -> AgentRpcError {
 pub(crate) fn relay_outcome_unknown(error: &AgentRpcError) -> bool {
     matches!(
         error.data_code(),
-        Some("relay-disconnected" | "relay-timeout")
+        Some("relay-disconnected" | "relay-timeout" | "relay-outcome-unknown")
     )
 }
 
@@ -338,12 +338,15 @@ impl Services {
     }
 
     /// D6: the local class when this daemon knows `method`; otherwise the
-    /// remote daemon's `agent.rpcMethods` class; otherwise mutating.
+    /// remote daemon's `agent.rpcMethods` class; otherwise mutating. Each
+    /// remote's classes are fetched at most once per request (`cache`, keyed
+    /// by backend id; `None` records a failed fetch), within `deadline`.
     pub(crate) async fn class_for(
         surface: &dyn AgentRpcSurface,
         target: &Target,
         method: &str,
-        budget: Duration,
+        deadline: tokio::time::Instant,
+        cache: &mut HashMap<String, Option<Value>>,
     ) -> AgentRpcClass {
         let Target::Remote(backend) = target else {
             return surface.classify(method);
@@ -351,18 +354,27 @@ impl Services {
         if surface.summary(method).is_some() {
             return surface.classify(method);
         }
-        let wait = budget.min(REMOTE_CLASS_TIMEOUT);
-        let Ok(reply) = Self::relay(surface, backend, "agent.rpcMethods", json!({}), wait).await
-        else {
-            return AgentRpcClass::Mutating;
-        };
-        let class = reply
-            .get("methods")
+        if !cache.contains_key(&backend.id) {
+            let wait = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(REMOTE_CLASS_TIMEOUT);
+            let reply = if wait.is_zero() {
+                None
+            } else {
+                Self::relay(surface, backend, "agent.rpcMethods", json!({}), wait)
+                    .await
+                    .ok()
+            };
+            cache.insert(backend.id.clone(), reply);
+        }
+        let class = cache
+            .get(&backend.id)
+            .and_then(Option::as_ref)
+            .and_then(|reply| reply.get("methods"))
             .and_then(Value::as_array)
             .and_then(|rows| rows.iter().find(|r| r["method"] == method))
-            .and_then(|r| r["class"].as_str())
-            .map(str::to_string);
-        match class.as_deref() {
+            .and_then(|r| r["class"].as_str());
+        match class {
             Some("read") => AgentRpcClass::Read,
             Some("forbidden-to-agent") => AgentRpcClass::ForbiddenToAgent,
             Some("unsupported-on-agent-path") => AgentRpcClass::UnsupportedOnAgentPath,
@@ -434,5 +446,20 @@ mod tests {
         );
         let ids: Vec<String> = reports.merged(None).into_iter().map(|b| b.id).collect();
         assert_eq!(ids, ["fp:02"]);
+    }
+
+    #[test]
+    fn a_relay_that_lost_its_reply_is_an_unknown_outcome() {
+        let coded = |code: &str| AgentRpcError::coded(-32603, code, "x");
+        for code in [
+            "relay-disconnected",
+            "relay-timeout",
+            "relay-outcome-unknown",
+        ] {
+            assert!(relay_outcome_unknown(&coded(code)), "{code}");
+        }
+        for code in ["relay-unreachable", "no-relay-online", "unknown-backend"] {
+            assert!(!relay_outcome_unknown(&coded(code)), "{code}");
+        }
     }
 }
