@@ -23217,7 +23217,8 @@ impl WorkspaceApi for Services {
                     // Provisioning is done in every mode; the remaining work
                     // (row insert, spec seed, initial agent) is fast local
                     // bookkeeping — the unified scale's last milestone before
-                    // the wrapper's terminal `complete 100` + done.
+                    // the wrapper's terminal `complete 100` + done, except a
+                    // placed initial agent's start, reported as `agent 97`.
                     if let Some(reporter) = progress.as_deref() {
                         boxed_await(|| {
                             reporter.milestone("finalizing", 95, "Finalizing workspace...")
@@ -23456,6 +23457,16 @@ impl WorkspaceApi for Services {
                         // `baseRef` (agent.create parity: worktree, else the
                         // repository path).
                         let snapshot_wp = crate::git_ops::worktree_path(&ws);
+                        // A placed initial agent (every one on an
+                        // orchestrator) starts on its machine before the
+                        // create returns: report that step (PROTOCOL §6.5
+                        // `agent`) so the wait is not shown as finalizing.
+                        if let (Some(reporter), Some(view)) =
+                            (progress.as_deref(), plan.remote.as_ref())
+                        {
+                            let message = format!("Starting agent on {}...", view.node_name);
+                            boxed_await(|| reporter.milestone("agent", 97, &message)).await;
+                        }
                         let base_error =
                             boxed_await(|| {
                                 services.pin_remote_base_commit(

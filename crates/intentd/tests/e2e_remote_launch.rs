@@ -34,6 +34,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::common;
 
 mod cloud;
+mod create_progress;
 mod file_pull;
 mod first_agent_naming;
 mod forge_fetch;
