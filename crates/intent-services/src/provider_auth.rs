@@ -344,7 +344,10 @@ async fn check_provider_auth_cli_with(
 /// Run an `opencode models` readiness command: exit 0 with at least one
 /// `provider/model` line is ready (the free Zen models need no account).
 async fn opencode_ready_probe(mut cmd: tokio::process::Command, timeout: Duration) -> CliAuthProbe {
-    cmd.stdin(std::process::Stdio::null())
+    // opencode reads project config from its working folder; the daemon's
+    // own can be unreadable (`/root`), which fails the probe as signed out.
+    cmd.current_dir(crate::provider_cli_launch::neutral_cwd())
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
