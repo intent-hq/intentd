@@ -141,7 +141,8 @@ impl TunnelSupervisor {
             Some(url) => {
                 let digest = sha2::Sha256::digest(url.as_bytes());
                 let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-                self.state_dir.join(format!("tailcat-relay-{name}.private.json"))
+                self.state_dir
+                    .join(format!("tailcat-relay-{name}.private.json"))
             }
         }
     }
@@ -333,7 +334,11 @@ async fn check_relay(url: &str) -> Result<()> {
         .await
         .map_err(|e| unreachable(format!("its map is not a DERP map: {e}")))?;
     let mut targets = Vec::new();
-    for region in map["Regions"].as_object().into_iter().flat_map(|r| r.values()) {
+    for region in map["Regions"]
+        .as_object()
+        .into_iter()
+        .flat_map(|r| r.values())
+    {
         for node in region["Nodes"].as_array().into_iter().flatten() {
             let host = [&node["IPv4"], &node["HostName"]]
                 .into_iter()
@@ -365,7 +370,9 @@ async fn check_relay(url: &str) -> Result<()> {
             Err(_) => last = format!("{host}:{port}: timed out"),
         }
     }
-    Err(unreachable(format!("no relay in its map answered ({last})")))
+    Err(unreachable(format!(
+        "no relay in its map answered ({last})"
+    )))
 }
 
 /// Build the `tailcat serve` command: JSON address output, the persisted key,

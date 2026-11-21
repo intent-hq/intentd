@@ -241,7 +241,9 @@ impl CloudGate {
         match resume(&self.svc, feature, &*client, &row).await {
             Ok(resumed) => {
                 // A relay change gives the sandbox a new tunnel address.
-                if let Ok(Some(fresh)) = self.svc.store().get_exposed_machine(&self.machine_id).await {
+                if let Ok(Some(fresh)) =
+                    self.svc.store().get_exposed_machine(&self.machine_id).await
+                {
                     let mut target = shared.target();
                     if target.tc_address != fresh.tc_address {
                         target.tc_address = fresh.tc_address;
@@ -379,10 +381,9 @@ pub(crate) async fn resume(
                         if paused {
                             set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
                         }
-                        return Err(Resumed::Refused(intent_core::machines::with_cloud_provider(
-                            error,
-                            client.kind(),
-                        )));
+                        return Err(Resumed::Refused(
+                            intent_core::machines::with_cloud_provider(error, client.kind()),
+                        ));
                     }
                 }
             }
@@ -446,8 +447,12 @@ async fn record_relay(
     }
     if let Ok(Some(row)) = svc.store().get_exposed_machine(machine_id).await {
         let live = feature.running_node(machine_id);
-        crate::methods::publish_machine(svc, &row, live.as_ref().map(crate::RemoteNode::shared_ref))
-            .await;
+        crate::methods::publish_machine(
+            svc,
+            &row,
+            live.as_ref().map(crate::RemoteNode::shared_ref),
+        )
+        .await;
     }
 }
 

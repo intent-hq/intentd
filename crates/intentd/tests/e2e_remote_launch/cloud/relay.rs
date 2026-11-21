@@ -191,7 +191,11 @@ async fn start_over(
     let machine = machine_of(&mut backend.rpc_ws, id + 10, &agent_id)
         .await
         .unwrap();
-    assert_eq!(machine["cloud"]["relayUrl"], relay.url.as_str(), "{machine}");
+    assert_eq!(
+        machine["cloud"]["relayUrl"],
+        relay.url.as_str(),
+        "{machine}"
+    );
     assert!(machine["tcAddress"].as_str().is_some(), "{machine}");
     assert!(relay.map_hits.load(Ordering::SeqCst) >= 1);
     assert!(relay.node_hits.load(Ordering::SeqCst) >= 1);
@@ -199,7 +203,10 @@ async fn start_over(
     let relay_flag = format!("--derpmap-url={}", relay.url);
     assert!(lines.iter().any(|l| l.starts_with("serve")), "{lines:?}");
     for line in &lines {
-        assert!(line.contains(&relay_flag), "tailcat ran without the relay: {line}");
+        assert!(
+            line.contains(&relay_flag),
+            "tailcat ran without the relay: {line}"
+        );
         if line.starts_with("genkey") {
             assert!(line.contains("--embed-derp-map"), "{line}");
         }
@@ -283,7 +290,11 @@ async fn a_relay_change_reaches_a_sandbox_at_its_next_resume() {
     send_and_reply(rpc_ws, agent, "over the new relay", 70).await;
     let moved = machine_of(rpc_ws, 80, &agent_id).await.unwrap();
     assert_eq!(moved["cloud"]["relayUrl"], second.url.as_str(), "{moved}");
-    assert_ne!(moved["tcAddress"].as_str().unwrap(), first_address, "{moved}");
+    assert_ne!(
+        moved["tcAddress"].as_str().unwrap(),
+        first_address,
+        "{moved}"
+    );
     assert!(second.node_hits.load(Ordering::SeqCst) >= 1);
     let lines = tailcat_lines(&log, seen);
     let relay_flag = format!("--derpmap-url={}", second.url);
@@ -293,7 +304,10 @@ async fn a_relay_change_reaches_a_sandbox_at_its_next_resume() {
             .any(|l| l.starts_with("serve") && l.contains(&relay_flag)),
         "{lines:?}"
     );
-    assert!(lines.iter().all(|l| l.contains("--derpmap-url=")), "{lines:?}");
+    assert!(
+        lines.iter().all(|l| l.contains("--derpmap-url=")),
+        "{lines:?}"
+    );
     let seen = seen + lines.len();
 
     ok(

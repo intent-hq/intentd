@@ -351,7 +351,9 @@ pub(crate) enum Moment {
 fn relay_unreachable(url: &str, moment: Moment, detail: &str) -> Error {
     let outcome = match moment {
         Moment::Start => "The sandbox was deleted; no machine was added.",
-        Moment::Resume => "The sandbox stays paused until the relay answers or the setting changes.",
+        Moment::Resume => {
+            "The sandbox stays paused until the relay answers or the setting changes."
+        }
     };
     let detail = if detail.is_empty() {
         String::new()
@@ -390,7 +392,10 @@ pub(crate) async fn ensure_relay(
     moment: Moment,
 ) -> Result<Option<String>> {
     if let Some(url) = relay {
-        if url.chars().any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control()) {
+        if url
+            .chars()
+            .any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control())
+        {
             return Err(relay_unreachable(url, moment, "it is not a valid URL"));
         }
     }
@@ -409,7 +414,8 @@ pub(crate) async fn ensure_relay(
         SecretString::new(RELAY_MARKER),
     );
     if apply {
-        spec.envs.insert("INTENT_RELAY_APPLY".to_owned(), SecretString::new("1"));
+        spec.envs
+            .insert("INTENT_RELAY_APPLY".to_owned(), SecretString::new("1"));
     }
     let ran = client.run_command(sandbox, &spec).await.map_err(|error| {
         super::config::to_error(&error, super::config::Phase::Other, client.kind())
@@ -425,7 +431,9 @@ pub(crate) async fn ensure_relay(
                 );
                 match moment {
                     Moment::Start => failed(message),
-                    Moment::Resume => cloud_machine_unavailable("bootstrap-failed", true, None, message),
+                    Moment::Resume => {
+                        cloud_machine_unavailable("bootstrap-failed", true, None, message)
+                    }
                 }
             }
         });
