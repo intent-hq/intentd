@@ -26,8 +26,12 @@ preview when no client is pinned. `listTabs` is answered by the daemon.
 
 Native tabs carry `navigationOnly: true` in `listTabs` and stay on their physical
 `hostClientId`, even after a desktop connects or the primary client changes.
-Named navigation requests never migrate tabs. A batch addressing different hosts
-fails with `browser-mixed-hosts` before executing anything. Native tabs cannot be
+Named navigation and desktop automation requests use the tab's registry host;
+they never move a tab merely to follow a new sender or driving client. A batch
+addressing different hosts fails with `browser-mixed-hosts` before executing
+anything. Explicit `claimTab` requests use the driving desktop and can rehome
+claimable desktop tabs. Other named actions in a claim batch must already live
+on that desktop or follow a claim of the same tab. Native tabs cannot be
 claimed, resized, inspected, evaluated, screenshotted, or used for capture/trace;
 these requests fail with `browser-automation-unavailable`, including mixed
 navigation/automation batches. Create a separate desktop tab for automation.

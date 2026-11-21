@@ -1147,15 +1147,15 @@ async fn pinned_workspace_browser_exec_routes_to_pinned_client_and_fails_typed_w
 
 /// REV-2 Model 5 routing over two hosts. desktop-a connects first (the
 /// default target) but desktop-b hosts the workspace's claimed tab, so
-/// desktop-b is the unpinned workspace's **driving client**: an agent
-/// `browser.exec` naming desktop-a's tab still dispatches to desktop-b
-/// (one host per workspace, no per-tab lookup). The agent-path `listTabs`
+/// desktop-b is the unpinned workspace's driving client, but an agent
+/// `browser.exec` naming desktop-a's tab dispatches to its physical host,
+/// desktop-a. The agent-path `listTabs`
 /// is answered from the registry — both hosts' tabs, decorated with
 /// `hostClientId` / `hostConnected` — and neither socket sees a reverse
 /// call. `browser.navigateTab` on the unclaimed tab routes to its physical
 /// host (desktop-a) as a `navigate` action carrying the tab's attribution.
 #[intent_test_macros::daemon_test]
-async fn agent_browser_exec_routes_to_the_claimed_tabs_host_and_list_tabs_aggregates_hosts() {
+async fn agent_browser_exec_routes_to_the_named_tabs_host_and_list_tabs_aggregates_hosts() {
     let fx = boot().await;
     let mut a = connect(fx.port).await;
     let _ = wss_rpc(&mut a, 1, "client.hello", hello("desktop-a", true)).await;
@@ -1225,9 +1225,8 @@ async fn agent_browser_exec_routes_to_the_claimed_tabs_host_and_list_tabs_aggreg
         );
     }
 
-    // (b) An agent batch — even one naming desktop-a's own tab — goes to the
-    // driving client desktop-b (host of the claimed tab), not first-connected
-    // desktop-a.
+    // A named automation request goes to the tab's physical host, desktop-a,
+    // even though desktop-b hosts the workspace's older claimed tab.
     let call = intent_core::spawn_daemon({
         let api = fx.api.clone();
         let ws_id = ws_id.clone();
@@ -1245,17 +1244,17 @@ async fn agent_browser_exec_routes_to_the_claimed_tabs_host_and_list_tabs_aggreg
         "success": true,
         "results": [{ "action": "screenshot", "success": true, "result": { "base64": "..." } }]
     });
-    let forwarded = answer_reverse(&mut b, Duration::from_secs(2), fe_result).await;
+    let forwarded = answer_reverse(&mut a, Duration::from_secs(2), fe_result).await;
     assert_eq!(forwarded["params"]["workspaceId"], ws_id.as_str());
     assert_eq!(forwarded["params"]["tabId"], "tab-a");
     assert_eq!(forwarded["params"]["agentId"], "agent-1");
     let out = call.await.expect("join").expect("ok");
     assert_eq!(out["action"], "screenshot");
     assert!(
-        try_read_text(&mut a, Duration::from_millis(200))
+        try_read_text(&mut b, Duration::from_millis(200))
             .await
             .is_none(),
-        "first-connected desktop-a is not the driving client"
+        "driving client desktop-b must not receive automation for desktop-a's tab"
     );
 
     // An unknown tabId is rejected before any dispatch.

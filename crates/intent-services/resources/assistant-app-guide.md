@@ -20,10 +20,10 @@ that it exists or present it as ready for general use. Ordinary setup or permiss
 requirements do not, by themselves, make a supported feature experimental.
 
 Multiplayer is always on: there is no switch to enable or disable it, and opening an
-invitation link joins directly without an enable step. Desktop v2.334.5 and later
-show invitation prompts in the current app window; What’s New waits until those
-dialogs close. These fixes first shipped on alpha. On older desktop versions, check
-Home if a prompt does not appear while viewing another machine. Workspace sharing, guest roles,
+invitation link joins directly without an enable step. Invitation prompts appear in
+the current app window; What’s New waits until those dialogs close. Older desktop
+versions may differ: if a prompt does not appear while viewing another machine, check
+Home. Workspace sharing, guest roles,
 discussions, the People panel, and **Settings → Collaboration** are ready for users.
 Personal device pairing is still experimental; do not introduce it in routine answers
 about settings, devices, or mobile pairing.
@@ -31,9 +31,8 @@ Sharing needs the host owner's GitHub or GitLab account connected in **Settings 
 Connections**: without one, new invitation links cannot be created and unused links
 cannot be redeemed until it is reconnected. People who already joined keep access.
 
-Starting with desktop v2.343.2 (first released on alpha), invitation prompts and
-joined workspaces use a normal app window, outside the notch. Intent opens or
-restores one when needed. Development launches of these versions do not claim
+Invitation prompts and joined workspaces use a normal app window, outside the notch.
+Intent opens or restores one when needed. Development launches do not claim
 `intent://` links. If an older development instance claimed links, reopen installed
 Intent to let it reclaim registration.
 
@@ -148,7 +147,7 @@ readiness date or advise enabling the experiment for ordinary mobile setup.
 
 ## Inline visuals
 
-Intent desktop v2.253.0 and later can show interactive visuals directly in chat.
+Intent desktop can show interactive visuals directly in chat.
 Ask an agent to visualize an explanation, comparison or changing inputs, such as
 “visualize how seasons work.” The agent uses a self-contained `ws-block:html`
 fence and checks it with the browser `previewHtml` action before showing it.
@@ -1385,11 +1384,10 @@ changing the filter, repository or tab also clears it.
 
 Right-click a repository or local folder in the Home sidebar and choose **New
 workspace** to start one there. For a GitHub repository, **Hide** removes it from the
-sidebar. For a local folder, **Delete** (app v2.338.0 and later) removes it from Intent's
-folder list (files on disk stay). From app v2.359.0, a folder that still has workspaces
-also leaves the sidebar, keeps its workspaces under **All repos**, and comes back when the
-folder is added again or gets a new workspace; v2.338.0 to v2.358.x move it to **Hidden**
-instead. Earlier versions and collaborators see **Hide** instead. A hidden
+sidebar. For a local folder, **Delete** removes it from Intent's folder list (files on
+disk stay). A folder that still has workspaces also leaves the sidebar, keeps its
+workspaces under **All repos**, and comes back when the folder is added again or gets a
+new workspace. Collaborators see **Hide** instead; older app versions may differ. A hidden
 repository's workspaces still show under **All repos**. Hidden repositories move to a
 collapsed **Hidden** section at the bottom of the sidebar; right-click one there and
 choose **Unhide** to bring it back. A hidden repository also comes back when a new
@@ -1429,8 +1427,7 @@ grouping choices keep their behavior.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceList,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga,home-set-aside-shortcut}.ts. -->
 
-**Set aside** is available in alpha builds starting with v2.262.0. Use **Set aside**
-on a Home workspace row, card or menu. List view moves it into a collapsed
+Use **Set aside** on a Home workspace row, card or menu. List view moves it into a collapsed
 **Set aside** section; board view shows it in the **Set aside** column on the right.
 The column stays hidden when empty and appears while dragging a card so you can
 drop it there to set it aside. Choose **Bring back** on its row or card, or use the
@@ -1721,6 +1718,10 @@ the primary client changes. Agents can open, show, focus, navigate and close
 their native tabs; page inspection, clicking, screenshots, viewport emulation
 and other browser automation require a separate desktop tab. Request acceptance
 does not confirm the preview is on screen; check the reported display state.
+When an agent names an existing desktop tab for a screenshot, click or other
+automation, the request goes to the desktop hosting that tab, even if you sent
+your latest message from another device. Actions for tabs on different devices
+must be sent separately; explicitly claiming a desktop tab can move it.
 
 ## Add context, run a task, and find results
 

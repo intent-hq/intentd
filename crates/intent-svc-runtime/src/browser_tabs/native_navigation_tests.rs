@@ -581,3 +581,185 @@ async fn browser_sender_precedes_focus_and_native_tabs_preserve_focus_fallback()
         "offline pin cannot use sender or focus fallback"
     );
 }
+
+#[intent_test_macros::daemon_test]
+async fn native_navigation_sender_desktop_automation_stays_on_the_named_host() {
+    use intent_core::AgentId;
+    use intent_services::feature_api::test_support::fixtures::session;
+
+    let registry = FakeRegistry::new(&[("desktop-a", None, true), ("desktop-b", None, true)]);
+    let (_tmp, _root, svc, _bus, ws) = setup(registry.clone()).await;
+    let agent = AgentId::new();
+    svc.store()
+        .insert_agent_session(&session(&agent, &ws))
+        .await
+        .unwrap();
+    register_tab(&svc, &ws, "a-existing", "desktop-a", Some(agent.as_str())).await;
+    svc.store()
+        .record_browser_sender(&agent, "from-b", "001", Some(&ClientId::from("desktop-b")))
+        .await
+        .unwrap();
+    let opened = svc
+        .browser_exec(
+            ws.clone(),
+            vec![json!({"action":"openTab","url":"https://preview.test"})],
+            None,
+            Some(agent.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opened["result"]["host"], "desktop-b");
+    // The client reports the newly opened tab. The old claimed tab still
+    // selects A as the workspace driver; naming B's tab must override that.
+    register_tab(&svc, &ws, "b-new", "desktop-b", Some(agent.as_str())).await;
+    assert_eq!(
+        svc.browser_client_target(&ws).await.unwrap(),
+        ReverseTarget::Client(ClientId::from("desktop-a"))
+    );
+    for action in ["screenshot", "evaluate", "click"] {
+        for envelope in [false, true] {
+            let mut request = json!({"action":action,"script":"1","selector":"button"});
+            if !envelope {
+                request["tabId"] = json!("b-new");
+            }
+            let result = svc
+                .browser_exec(
+                    ws.clone(),
+                    vec![request],
+                    envelope.then(|| "b-new".into()),
+                    Some(agent.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result["result"]["host"], "desktop-b",
+                "{action}, envelope={envelope}"
+            );
+        }
+    }
+    assert_eq!(
+        svc.store()
+            .get_browser_tab("a-existing")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id,
+        ClientId::from("desktop-a")
+    );
+    assert_eq!(
+        svc.store()
+            .get_browser_tab("b-new")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id,
+        ClientId::from("desktop-b")
+    );
+
+    let offline = FakeRegistry::new(&[("desktop-a", None, true), ("desktop-b", None, false)]);
+    let svc = svc.with_reverse_dispatch(offline.clone());
+    let error = svc
+        .browser_exec(
+            ws,
+            vec![json!({"action":"screenshot","tabId":"b-new"})],
+            None,
+            Some(agent),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("desktop-b"));
+    assert_eq!(
+        offline.calls.lock().unwrap()[0].2,
+        ReverseTarget::Client(ClientId::from("desktop-b")),
+        "no fallback to A for an offline named host"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_navigation_desktop_batches_validate_hosts_before_dispatch() {
+    let registry = FakeRegistry::new(&[("desktop-a", None, true), ("desktop-b", None, true)]);
+    let (_tmp, _root, svc, _bus, ws) = setup(registry.clone()).await;
+    register_tab(&svc, &ws, "on-a", "desktop-a", None).await;
+    register_tab(&svc, &ws, "on-b", "desktop-b", None).await;
+    for (actions, envelope) in [
+        (
+            vec![
+                json!({"action":"screenshot","tabId":"on-a"}),
+                json!({"action":"evaluate","tabId":"on-b","script":"1"}),
+            ],
+            None,
+        ),
+        (
+            vec![
+                json!({"action":"click","tabId":"on-b","selector":"button"}),
+                json!({"action":"screenshot"}),
+            ],
+            Some("on-a".into()),
+        ),
+        (
+            vec![
+                json!({"action":"claimTab","tabId":"on-a","width":800}),
+                json!({"action":"screenshot","tabId":"on-b"}),
+            ],
+            None,
+        ),
+        (
+            vec![
+                json!({"action":"screenshot","tabId":"on-b"}),
+                json!({"action":"claimTab","tabId":"on-b","width":800}),
+            ],
+            None,
+        ),
+    ] {
+        let count = registry.calls.lock().unwrap().len();
+        let rejected = svc
+            .browser_exec(ws.clone(), actions, envelope, None)
+            .await
+            .unwrap();
+        assert_eq!(rejected["results"][0]["errorCode"], "browser-mixed-hosts");
+        assert_eq!(
+            registry.calls.lock().unwrap().len(),
+            count,
+            "reject the entire batch before any dispatch"
+        );
+    }
+    for actions in [
+        vec![json!({"action":"claimTab","tabId":"on-b","width":800})],
+        vec![
+            json!({"action":"claimTab","tabId":"on-a","width":800}),
+            json!({"action":"claimTab","tabId":"on-b","width":800}),
+        ],
+        vec![
+            json!({"action":"claimTab","tabId":"on-b","width":800}),
+            json!({"action":"evaluate","tabId":"on-b","script":"1"}),
+        ],
+        vec![
+            json!({"action":"claimTab","tabId":"on-b","width":800}),
+            json!({"action":"screenshot","tabId":"on-a"}),
+        ],
+    ] {
+        svc.browser_exec(ws.clone(), actions, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.calls.lock().unwrap().last().unwrap().2,
+            ReverseTarget::Default,
+            "explicit claims retain the driving-client path"
+        );
+    }
+    svc.browser_exec(
+        ws,
+        vec![
+            json!({"action":"screenshot","tabId":"on-b"}),
+            json!({"action":"evaluate","tabId":"on-b","script":"1"}),
+        ],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        registry.calls.lock().unwrap().last().unwrap().2,
+        ReverseTarget::Client(ClientId::from("desktop-b"))
+    );
+}

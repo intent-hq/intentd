@@ -1120,8 +1120,9 @@ impl RuntimePort for RuntimeFeature {
     /// When an agent triggers this via the MCP `ws.browser.exec` binding
     /// there is no per-connection reverse channel to use (the caller is the
     /// daemon-hosted MCP server, not a client connection), so we route the
-    /// batch through the injected [`AgentReverseDispatch`]. The target is
-    /// the workspace's **driving client** ([`Services::driving_client_target`],
+    /// batch through the injected [`AgentReverseDispatch`]. Named tabs route
+    /// to their registry host, including desktop automation. Explicit claims
+    /// and unnamed requests instead select the workspace's **driving client** ([`Services::driving_client_target`],
     /// REV-2 rules 2–5: pin → client of an active desktop session → host of
     /// the workspace's claimed tabs → first-connected eligible client); a
     /// driving client that is offline is
@@ -1233,6 +1234,7 @@ impl RuntimePort for RuntimeFeature {
                 ));
             };
             let navigation = intent_core::browser_navigation_actions(&actions);
+            let claiming = actions.iter().any(|action| action["action"] == "claimTab");
             let native_tabs: Vec<_> = registry_tabs
                 .iter()
                 .filter(|tab| tab.navigation_only)
@@ -1252,13 +1254,13 @@ impl RuntimePort for RuntimeFeature {
                     ));
                 }
                 ReverseTarget::Client(native.host_client_id.clone())
-            } else if navigation && !registry_tabs.is_empty() {
+            } else if !claiming && !registry_tabs.is_empty() {
                 let host = &registry_tabs[0].host_client_id;
                 if registry_tabs.iter().any(|tab| &tab.host_client_id != host) {
                     return Ok(browser_tabs::navigation_failure(
                         &actions,
                         "browser-mixed-hosts",
-                        "Navigation batches must address tabs on one physical host.",
+                        "Browser batches must address tabs on one physical host.",
                     ));
                 }
                 ReverseTarget::Client(host.clone())
@@ -1318,6 +1320,34 @@ impl RuntimePort for RuntimeFeature {
                 && dispatch.resolve_navigation(&target, &workspace_id).is_ok()
             {
                 return Ok(browser_tabs::navigation_failure(&actions, "browser-automation-unavailable", "Only native navigation is available on this client; page automation requires a desktop."));
+            }
+            // Explicit claims run on the driving client and may bring tabs
+            // from other hosts there. Other actions in the same batch must
+            // already belong there or follow a claim of that particular tab.
+            // Validate the whole batch before dispatch, including actions that
+            // precede a claim: no partial execution on an incompatible host.
+            if claiming {
+                if let Ok(resolved) = dispatch.resolve(&target) {
+                    let mut claimed = std::collections::HashSet::new();
+                    for action in &actions {
+                        let Some(id) = action["tabId"].as_str().or(tab_id.as_deref()) else {
+                            continue;
+                        };
+                        if action["action"] == "claimTab" {
+                            claimed.insert(id);
+                        } else if !claimed.contains(id)
+                            && registry_tabs.iter().any(|tab| {
+                                tab.tab_id == id && tab.host_client_id != resolved.client_id
+                            })
+                        {
+                            return Ok(browser_tabs::navigation_failure(
+                                &actions,
+                                "browser-mixed-hosts",
+                                "Actions in a claim batch must address its destination host or follow a claim of that tab.",
+                            ));
+                        }
+                    }
+                }
             }
             // Claims re-home their tab after the dispatch; record which
             // client executed them (the commit re-validates the host).
