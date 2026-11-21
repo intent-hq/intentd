@@ -30,6 +30,7 @@ async fn open_on(pool: &PgPool, tenant: &str, writer: WriterLimits) -> Store {
             writer,
             ..PostgresOptions::default()
         },
+        intent_store::OrchestratorOnly::for_tests(),
     )
     .await
     .expect("open tenant store")

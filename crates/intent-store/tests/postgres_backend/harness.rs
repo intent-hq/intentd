@@ -302,6 +302,7 @@ pub async fn open_with(db: &TestDb, tenant: &str, rls_guard: bool) -> Store {
             rls_guard,
             ..PostgresOptions::default()
         },
+        intent_store::OrchestratorOnly::for_tests(),
     )
     .await
     .expect("open tenant store")

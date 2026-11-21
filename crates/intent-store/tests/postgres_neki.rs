@@ -50,6 +50,7 @@ async fn round_trip(pool: PgPool) -> Result<(), String> {
                 pool,
                 TenantId::new(tenant).map_err(|e| e.to_string())?,
                 PostgresOptions::default(),
+                intent_store::OrchestratorOnly::for_tests(),
             )
             .await
             .map_err(|e| e.to_string())
@@ -232,6 +233,7 @@ async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki
                 pool.clone(),
                 TenantId::new(tenant).map_err(|e| e.to_string())?,
                 PostgresOptions::default(),
+                intent_store::OrchestratorOnly::for_tests(),
             )
             .await
             .map_err(|e| format!("open {tenant}: {e}"))?;
@@ -329,6 +331,7 @@ async fn a_held_writer_lock_times_out_as_55p03_and_store_busy_on_neki() {
             pool.clone(),
             TenantId::new(&tenant).map_err(|e| e.to_string())?,
             quick,
+            intent_store::OrchestratorOnly::for_tests(),
         )
         .await
         .map_err(|e| format!("open: {e}"))?;

@@ -1854,12 +1854,7 @@ impl SettingsFile {
     /// Returns `Error::InvalidInput` if the file is malformed; `Error::Internal` if reading it or writing the default template fails.
     pub fn load_or_init_with_legacy(path: &Path) -> Result<(Self, LegacySettings)> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse_str_with_legacy(&text).map_err(|e| match e {
-                Error::InvalidInput(msg) => {
-                    Error::InvalidInput(format!("{}: {msg}", path.display()))
-                }
-                other => other,
-            }),
+            Ok(text) => Self::parse_file_text(path, &text),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
@@ -1882,6 +1877,33 @@ impl SettingsFile {
                 path.display()
             ))),
         }
+    }
+
+    /// Read `path` like [`SettingsFile::load_or_init`], but never create it:
+    /// `None` when the file does not exist. For startup checks that must run
+    /// before the daemon writes anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` if the file is malformed; `Error::Internal` if reading it fails.
+    pub fn load_existing(path: &Path) -> Result<Option<Self>> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse_file_text(path, &text).map(|(file, _)| Some(file)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(Error::Internal(format!(
+                "could not read config {}: {err}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// [`SettingsFile::parse_str_with_legacy`] with the file's path in the
+    /// error.
+    fn parse_file_text(path: &Path, text: &str) -> Result<(Self, LegacySettings)> {
+        Self::parse_str_with_legacy(text).map_err(|e| match e {
+            Error::InvalidInput(msg) => Error::InvalidInput(format!("{}: {msg}", path.display())),
+            other => other,
+        })
     }
 }
 
@@ -2885,6 +2907,33 @@ mod tests {
         // Second load reads the file it just wrote.
         let reloaded = SettingsFile::load_or_init(&path).expect("reload succeeds");
         assert_eq!(reloaded, SettingsFile::default());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_existing_never_creates_a_missing_file() {
+        let dir = temp_path("existing-missing");
+        let path = dir.join("config.toml");
+        assert_eq!(SettingsFile::load_existing(&path).unwrap(), None);
+        assert!(
+            !dir.exists(),
+            "neither the file nor its directory is created"
+        );
+    }
+
+    #[test]
+    fn load_existing_reads_the_daemon_mode_and_rejects_malformed_files() {
+        let dir = temp_path("existing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[daemon]\nmode = \"orchestrator\"\n").unwrap();
+        let loaded = SettingsFile::load_existing(&path)
+            .unwrap()
+            .expect("file exists");
+        assert_eq!(loaded.daemon.mode, DaemonMode::Orchestrator);
+        std::fs::write(&path, "[daemon]\nbogusKey = 1\n").unwrap();
+        let err = SettingsFile::load_existing(&path).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

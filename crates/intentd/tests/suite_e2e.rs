@@ -29,6 +29,7 @@ mod e2e_native_review_wire;
 mod e2e_node_git;
 mod e2e_node_mode;
 mod e2e_note_comment_ops_bindings;
+mod e2e_postgres_mode_guard;
 mod e2e_private_profile;
 mod e2e_remote_launch;
 mod e2e_services_agent_queue;

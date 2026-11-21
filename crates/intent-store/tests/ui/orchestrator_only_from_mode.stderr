@@ -1,0 +1,7 @@
+error[E0277]: the trait bound `OrchestratorOnly: From<DaemonMode>` is not satisfied
+ --> tests/ui/orchestrator_only_from_mode.rs:5:30
+  |
+5 |     DaemonMode::Orchestrator.into()
+  |                              ^^^^ the trait `From<DaemonMode>` is not implemented for `OrchestratorOnly`
+  |
+  = note: required for `DaemonMode` to implement `Into<OrchestratorOnly>`

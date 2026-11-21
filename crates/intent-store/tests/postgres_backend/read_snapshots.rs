@@ -622,7 +622,13 @@ async fn open_quick(db: &TestDb, tenant: &str, budget: Duration) -> intent_core:
     };
     options.writer.wait_budget = budget;
     options.writer.lock_attempt = budget.min(options.writer.lock_attempt);
-    Store::open_postgres(db.app.clone(), TenantId::new(tenant).unwrap(), options).await
+    Store::open_postgres(
+        db.app.clone(),
+        TenantId::new(tenant).unwrap(),
+        options,
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -668,6 +674,7 @@ async fn concurrent_provisioning_of_one_tenant_seeds_it_once() {
                         rls_guard: true,
                         ..PostgresOptions::default()
                     },
+                    intent_store::OrchestratorOnly::for_tests(),
                 )
                 .await
                 .map(|_| ())
