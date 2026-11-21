@@ -68,13 +68,14 @@ fn serve_with_postgres_url(args: &[&str], config_toml: Option<&str>) -> Run {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr));
+    common::hermetic_fixture_identity(&mut cmd, &data_dir);
     // The builder creates the private `gh-config` dir; snapshot after it.
     let before = snapshot(&data_dir);
     let mut child = GuardedChild::spawn(&mut cmd).expect("spawn intentd serve");
     // Both outcomes exit during startup; a daemon still up after a minute is
     // serving, which is the bug.
     let status = child
-        .wait_with_timeout(std::time::Duration::from_secs(60))
+        .wait_with_timeout(common::test_timeout(std::time::Duration::from_secs(60)))
         .expect("wait for intentd serve")
         .unwrap_or_else(|| {
             let _ = child.kill_tree();
