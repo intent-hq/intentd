@@ -546,10 +546,10 @@ Claude Code and choose **Add profile**, then a kind: **Different login**, **API 
 (Claude Code only), **Token**, or **Advanced**. **Different login** creates a new
 sign-in folder under `~/intent/profiles/` on the daemon host. **Create & sign in**
 closes the dialog and runs the sign-in in the bottom terminal; the profile row shows
-**Waiting for sign-in…**, then a **Signed in** toast. When the daemon runs on another
-machine, Codex shows a one-time device code instead of a browser sign-in; device code
-login must first be turned on in ChatGPT → **Settings → Security** (or allowed by a
-workspace admin). The folder starts without the user's usual Claude Code or Codex
+**Waiting for sign-in…**, then a **Signed in** toast. Codex signs in with a one-time
+device code (`codex login --device-auth`) instead of a browser redirect; older versions
+used the browser when the daemon ran on the same machine. Device code login must first
+be turned on in ChatGPT → **Settings → Security** (or allowed by a workspace admin). The folder starts without the user's usual Claude Code or Codex
 settings (instructions, MCP servers, skills). Later, ⋯ → **Log In** on a Different-login
 profile signs in again to the same folder. Removing that profile leaves its folder,
 with its saved login, on disk. **API key** saves an Anthropic key (optionally a custom

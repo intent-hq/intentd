@@ -255,7 +255,7 @@ fn registry_field_parity() {
         Some(format!("npx -y {OPENCODE_NPX_PACKAGE} auth login"))
     );
     // Claude Code and Codex log in through their bundled CLI package.
-    for (id, args) in [("claude-code", "auth login"), ("codex", "login")] {
+    for (id, args) in [("claude-code", "auth login"), ("codex", "login --device-auth")] {
         let bundled = crate::adapter_cli::missing_fallback(id).unwrap();
         assert_eq!(
             find_provider(id).unwrap().npx_login_command_hint(),
@@ -1203,7 +1203,7 @@ fn auth_error_message_uses_login_hint() {
     // codex's hint names the real `codex` CLI, never the `codex-acp`
     // adapter command the `{command} login` fallback would produce.
     let codex = auth_error_message("codex", false);
-    assert!(codex.contains("codex login"));
+    assert!(codex.contains("codex login --device-auth"));
     assert!(!codex.contains("codex-acp login"));
 
     // Providers without a hint fall back to `{command} login`.
@@ -1283,7 +1283,7 @@ fn auth_error_message_remote_falls_back_to_command_login() {
     // codex carries an explicit hint: the fallback would print the
     // non-runnable adapter command "codex-acp login".
     let codex = auth_error_message("codex", true);
-    assert!(codex.contains("codex login"));
+    assert!(codex.contains("codex login --device-auth"));
     assert!(!codex.contains("codex-acp login"));
 
     // claude-code carries an explicit hint (intent-hq/intent#3941): the

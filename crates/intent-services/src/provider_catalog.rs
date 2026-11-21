@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(
             row(&v, "codex")["npxLoginCommandHint"],
             format!(
-                "npx -y {} login",
+                "npx -y {} login --device-auth",
                 intent_providers::adapter_cli::missing_fallback("codex")
                     .unwrap()
                     .spec()

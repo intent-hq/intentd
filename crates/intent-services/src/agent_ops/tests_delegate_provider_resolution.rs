@@ -973,7 +973,7 @@ fn auth_gate_names_each_providers_catalog_login_hint() {
         ("grok", "grok login"),
         // codex's hint names the real `codex` CLI (the probe target), not
         // the non-runnable adapter fallback "codex-acp login".
-        ("codex", "codex login"),
+        ("codex", "codex login --device-auth"),
         // opencode's real login lives under `auth`.
         ("opencode", "opencode auth login"),
         // No catalog hint: falls back to `{command} login`.
