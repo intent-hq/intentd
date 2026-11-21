@@ -3015,8 +3015,9 @@ impl Services {
             Ok(Some(key)) if !key.trim().is_empty() => Some(key.trim().to_string()),
             Ok(_) => None,
             Err(_) => {
+                // Never fall back to the keyless free tier for a user who saved a key.
                 tracing::debug!("input.autocomplete could not read the service API key");
-                None
+                return String::new();
             }
         };
         let Some(model_id) = autocomplete_ops::resolve_model_id(service, model, api_key.is_some())

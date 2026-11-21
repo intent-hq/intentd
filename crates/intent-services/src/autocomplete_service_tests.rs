@@ -10,6 +10,7 @@ use intent_store::Store;
 use serde_json::{json, Value};
 
 use crate::autocomplete_ops::AutocompleteUpstream;
+use crate::settings::{InMemorySecretStore, SecretStore};
 use crate::test_support::mock_chat_upstream::{MockChatUpstream, MockReply};
 use crate::test_support::test_tempdir;
 use crate::{Services, SettingsRegistry};
@@ -253,4 +254,63 @@ async fn api_keys_are_redacted_in_settings_reads() {
     let listed = f.svc.settings_list().await.expect("settings.list");
     let text = listed.to_string();
     assert!(!text.contains("sk-or-secret"), "{text}");
+}
+
+/// A saved Kilo key whose `load` always fails; everything else is in memory.
+#[derive(Debug, Default)]
+struct FailingKiloKeyLoad {
+    inner: InMemorySecretStore,
+}
+
+impl SecretStore for FailingKiloKeyLoad {
+    fn load(&self, account: &str) -> intent_core::Result<Option<String>> {
+        if account == "autocomplete.kilo.apiKey" {
+            return Err(Error::Internal("injected secret load failure".into()));
+        }
+        self.inner.load(account)
+    }
+    fn store(&self, account: &str, value: &str) -> intent_core::Result<()> {
+        self.inner.store(account, value)
+    }
+    fn delete(&self, account: &str) -> intent_core::Result<()> {
+        self.inner.delete(account)
+    }
+}
+
+/// Regression (PR review): an unreadable key must not fall back to the
+/// anonymous free tier; a user who saved a key never sends text keyless.
+#[intent_test_macros::daemon_test]
+async fn unreadable_kilo_key_answers_empty_without_a_keyless_request() {
+    let dir = test_tempdir("intentd-autocomplete-");
+    let store = Store::open(&dir.path().join("db.sqlite"))
+        .await
+        .expect("open store");
+    let registry =
+        Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry"));
+    let kilo = MockChatUpstream::start(MockReply::content("x")).await;
+    let openrouter = MockChatUpstream::start(MockReply::content("x")).await;
+    let secrets = Arc::new(FailingKiloKeyLoad::default());
+    secrets
+        .inner
+        .store("autocomplete.kilo.apiKey", "sk-kilo")
+        .expect("seed the saved key");
+    let svc = Services::new_isolated(store)
+        .with_settings_registry(registry)
+        .with_secret_store(secrets.clone())
+        .with_autocomplete_upstream(AutocompleteUpstream {
+            kilo_url: kilo.url(),
+            openrouter_url: openrouter.url(),
+            timeout: ok_budget(),
+        });
+    set(
+        &svc,
+        json!([{ "path": "autocomplete.enabled", "value": true }]),
+    )
+    .await;
+    assert_eq!(
+        complete(&svc, "Fix the ").await,
+        json!({ "completion": "" })
+    );
+    assert!(kilo.requests().is_empty());
+    assert!(openrouter.requests().is_empty());
 }

@@ -220,6 +220,18 @@ fn clean_reply_cases() {
         ("quoted echo", "Fix the ", "\"Fix the build\"", "build"),
         ("unbalanced quote kept", "Say ", "\"hello", "\"hello"),
         (
+            "separate backtick spans kept",
+            "Run ",
+            "`make test` then `make check`",
+            "`make test` then `make check`",
+        ),
+        (
+            "separate double-quoted spans kept",
+            "Say ",
+            "\"foo\" or \"bar\"",
+            "\"foo\" or \"bar\"",
+        ),
+        (
             "sentence cut",
             "Fix ",
             "the build. Then deploy it.",

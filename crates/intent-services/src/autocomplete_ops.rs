@@ -270,7 +270,12 @@ fn strip_wrapping_quotes(s: &str) -> &str {
         else {
             return current;
         };
-        current = &trimmed[first.len_utf8()..trimmed.len() - last.len_utf8()];
+        let inner = &trimmed[first.len_utf8()..trimmed.len() - last.len_utf8()];
+        // `a` then `b` starts and ends with a quote but is two spans, not one.
+        if inner.contains(first) || inner.contains(last) {
+            return current;
+        }
+        current = inner;
     }
 }
 
