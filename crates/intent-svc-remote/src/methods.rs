@@ -527,7 +527,7 @@ pub(crate) async fn add_machine(
         HeadLease::open(
             store.clone(),
             &params.machine_id,
-            crate::lease::local_ownership(store),
+            crate::lease::ownership(store, &feature.tuning()),
         )
         .await
         .ok()

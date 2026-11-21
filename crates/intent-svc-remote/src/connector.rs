@@ -1823,9 +1823,7 @@ impl RemoteNode {
         services: Option<Services>,
         forge: Option<Arc<crate::forge_token::ForgeTokens>>,
     ) -> Result<Self> {
-        let ownership = crate::lease::local_ownership(&store);
-        #[cfg(test)]
-        let ownership = tuning.ownership.0.clone().unwrap_or(ownership);
+        let ownership = crate::lease::ownership(&store, &tuning);
         let lease = HeadLease::open(store, &target.id, ownership).await?;
         #[cfg(test)]
         let lease = lease.failing_ack_writes_when(tuning.fail_ack_writes.clone());
@@ -2787,30 +2785,44 @@ async fn run(
         retry = false;
         shared.cloud_refusal.send_replace(None);
         *lock(&shared.route) = Some(route);
-        if let Err(error) = lease.record_welcome(&welcome).await {
-            tracing::warn!(%error, "remote machine: could not record the welcome");
-        }
-        shared.welcome(&welcome);
-        shared.record_link(&welcome).await;
-        // Before the link is published: queue the stops of agents head no
-        // longer claims, then send every queued stop, so they precede any
-        // launch or prompt on this link.
-        #[cfg(test)]
-        if let Some(hook) = &shared.tuning.before_claim.0 {
-            hook(&shared);
-        }
-        if !claim(&shared, &welcome.running_agents).await {
+        let fenced = match lease
+            .record_welcome(&welcome, link.binding().generation)
+            .await
+        {
+            Ok(()) => false,
+            Err(error) => {
+                tracing::warn!(%error, "remote machine: could not record the welcome");
+                matches!(error, crate::lease::LinkWrite::Fenced(_))
+            }
+        };
+        let refusal = if fenced {
+            // Another process owns this link: write nothing, claim no agent
+            // and stop none.
+            Some("another backend process owns this machine's link now; nothing was received")
+        } else {
+            shared.welcome(&welcome);
+            shared.record_link(&welcome).await;
+            // Before the link is published: queue the stops of agents head no
+            // longer claims, then send every queued stop, so they precede any
+            // launch or prompt on this link.
+            #[cfg(test)]
+            if let Some(hook) = &shared.tuning.before_claim.0 {
+                hook(&shared);
+            }
             // The survivors cannot be told apart, so this link is not served:
             // their journal records would have no runtime to go to, yet be
-            // acknowledged. Close it and bind again (with backoff) until the
-            // claim succeeds; nothing was acknowledged, so the machine
-            // replays everything on the next bind.
+            // acknowledged.
+            (!claim(&shared, &welcome.running_agents).await).then_some(
+                "could not tell which of this backend's agents still run there (its agent records could not be read); nothing was received",
+            )
+        };
+        if let Some(refusal) = refusal {
+            // Close it and bind again (with backoff); nothing was
+            // acknowledged, so the machine replays everything on the next
+            // bind.
             link.close();
             shared.disconnected();
-            let failure = ConnectFailure::Local(
-                "could not tell which of this backend's agents still run there (its agent records could not be read); nothing was received"
-                    .into(),
-            );
+            let failure = ConnectFailure::Local(refusal.into());
             for waiter in waiters.drain(..) {
                 let _ = waiter.send(Err(failure.clone()));
             }
@@ -3237,11 +3249,14 @@ impl Acks {
         self.pending = 0;
         self.due = None;
         if self.persisted != Some(seq) {
-            match lease.persist_ack(seq).await {
+            match lease
+                .persist_ack(seq, Some(link.binding().generation))
+                .await
+            {
                 Ok(_) => self.persisted = Some(seq),
                 Err(error) => {
                     tracing::warn!(%error, seq = seq.0, "remote node: could not persist the journal ack; not acking");
-                    if lease.fenced() {
+                    if matches!(error, crate::lease::LinkWrite::Fenced(_)) {
                         link.close();
                     }
                     return;

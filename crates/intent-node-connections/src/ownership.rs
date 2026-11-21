@@ -11,7 +11,8 @@ use intent_core::nodes::{LeaseOwner, NodeCounter};
 use intent_core::{BoxFuture, Result};
 use intent_store::Store;
 
-/// The epoch of every [`LocalOwnership`] claim: one process owns every link.
+/// The epoch of every [`LocalOwnership`] claim: one process owns every
+/// link, so no claim is ever compared against another's epoch.
 const LOCAL_EPOCH: u64 = 1;
 
 /// A held claim on one machine link.
@@ -28,7 +29,9 @@ pub struct LinkClaim {
 /// The claim no longer holds: another process owns the link now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fenced {
+    /// The machine whose link this process no longer owns.
     pub machine_id: String,
+    /// The epoch of the claim that was fenced.
     pub epoch: u64,
 }
 

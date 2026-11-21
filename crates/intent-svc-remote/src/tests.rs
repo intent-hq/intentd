@@ -1271,12 +1271,27 @@ async fn a_rebind_never_acks_more_than_head_persisted() {
     node.shutdown();
 }
 
-/// Link ownership another process can take over: its fence fails while
-/// revoked. Claims still advance the generation through the store.
+/// Link ownership another process can take over: a claim below
+/// `owned_from` is fenced, as when another process claimed a newer
+/// generation. Claims still advance the generation through the store.
 struct Revocable {
     local: intent_node_connections::LocalOwnership,
-    revoked: std::sync::atomic::AtomicBool,
-    fences: std::sync::atomic::AtomicUsize,
+    owned_from: std::sync::atomic::AtomicU64,
+}
+
+impl Revocable {
+    fn new(store: &Store) -> Arc<Self> {
+        Arc::new(Self {
+            local: intent_node_connections::LocalOwnership::new(store.clone()),
+            owned_from: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Another process owns every generation below `generation`.
+    fn taken_until(&self, generation: NodeCounter) {
+        self.owned_from
+            .store(generation.0, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl intent_node_connections::LinkOwnership for Revocable {
@@ -1291,18 +1306,16 @@ impl intent_node_connections::LinkOwnership for Revocable {
         &'a self,
         claim: &'a intent_node_connections::LinkClaim,
     ) -> intent_core::BoxFuture<'a, Result<(), intent_node_connections::Fenced>> {
-        self.fences
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let revoked = self.revoked.load(std::sync::atomic::Ordering::SeqCst);
+        let owned = claim.generation.0 >= self.owned_from.load(std::sync::atomic::Ordering::SeqCst);
         let fenced = intent_node_connections::Fenced {
             machine_id: claim.owner.node_id.clone(),
             epoch: claim.epoch,
         };
         Box::pin(async move {
-            if revoked {
-                Err(fenced)
-            } else {
+            if owned {
                 Ok(())
+            } else {
+                Err(fenced)
             }
         })
     }
@@ -1312,51 +1325,105 @@ impl intent_node_connections::LinkOwnership for Revocable {
     }
 }
 
+/// Wait until head closes `end`'s link, failing on any ack or stop it sends
+/// first.
+async fn closed_without_writes(end: &mut NodeEnd, below: NodeCounter) {
+    tokio::time::timeout(wait(), async {
+        while let Some(event) = end.events.recv().await {
+            match event {
+                LinkEvent::Frame(LinkFrame::Ack { seq }) => {
+                    assert!(seq < below, "a fenced head acked {seq:?}");
+                }
+                LinkEvent::Frame(LinkFrame::Stop { agent_id, .. }) => {
+                    panic!("a fenced head stopped {agent_id}");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("head closes the fenced link");
+}
+
 #[tokio::test]
-async fn a_fenced_link_acks_nothing_and_is_closed() {
+async fn a_fenced_ack_is_not_written_and_closes_the_link() {
     let (mut machine, backend, bare) = exposed().await;
     bare.shutdown();
-    let ownership = Arc::new(Revocable {
-        local: intent_node_connections::LocalOwnership::new(backend.store().clone()),
-        revoked: std::sync::atomic::AtomicBool::new(false),
-        fences: std::sync::atomic::AtomicUsize::new(0),
-    });
+    let ownership = Revocable::new(backend.store());
     let mut owned = tuning();
     owned.ownership = crate::connector::OwnershipSeam(Some(ownership.clone()));
     let node = backend.bare_with(&machine, owned).await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
 
-    // While the claim holds, every durable write passes the fence.
     let mut first = machine.accept().await;
     first.replay_complete(0).await;
     first.journal(note(1, &agent, "one")).await;
     first.acked(1).await;
-    assert!(ownership.fences.load(std::sync::atomic::Ordering::SeqCst) >= 2);
-
-    // Another process takes the link: the next ack is not written, not
-    // sent, and head closes the link.
-    ownership
-        .revoked
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    first.journal(note(2, &agent, "two")).await;
-    assert_eq!(texts(&runtime, 2).await, ["one", "two"]);
-    tokio::time::timeout(wait(), async {
-        while let Some(event) = first.events.recv().await {
-            if let LinkEvent::Frame(LinkFrame::Ack { seq }) = event {
-                assert!(seq < NodeCounter(2), "a fenced head acked {seq:?}");
-            }
-        }
-    })
-    .await
-    .expect("head closes the fenced link");
     assert_eq!(backend.persisted_ack(&node).await, NodeCounter(1));
 
-    // The next dial claims a newer generation and offers only the ack it
-    // wrote, so the machine replays record 2.
-    let second = machine.accept().await;
-    assert!(second.hello.binding.generation > first.hello.binding.generation);
+    // Another process claims the next generation: this link's next ack is
+    // neither written nor sent, and head closes the link.
+    let taken = NodeCounter(first.hello.binding.generation.0 + 1);
+    ownership.taken_until(taken);
+    first.journal(note(2, &agent, "two")).await;
+    assert_eq!(texts(&runtime, 2).await, ["one", "two"]);
+    closed_without_writes(&mut first, NodeCounter(2)).await;
+    assert_eq!(backend.persisted_ack(&node).await, NodeCounter(1));
+
+    // This process claims the link back with a newer generation: the hello
+    // offers only the ack it wrote, the replay is deduplicated and acked.
+    let mut second = machine.accept().await;
+    assert!(second.hello.binding.generation >= taken);
     assert_eq!(second.hello.acked_seq, NodeCounter(1));
+    second.journal(note(2, &agent, "two")).await;
+    second.replay_complete(2).await;
+    second.acked(2).await;
+    assert_eq!(backend.persisted_ack(&node).await, NodeCounter(2));
+    node.shutdown();
+}
+
+#[tokio::test]
+async fn a_fenced_welcome_claims_and_stops_nothing() {
+    let (mut machine, backend, bare) = exposed().await;
+    bare.shutdown();
+    let ownership = Revocable::new(backend.store());
+    let mut owned = tuning();
+    owned.ownership = crate::connector::OwnershipSeam(Some(ownership.clone()));
+    // The machine runs an agent head never recorded: an owner stops it at
+    // bind; a fenced head leaves it and closes the link.
+    *machine.host.running.lock().unwrap() = vec![AgentId::new()];
+    let node = backend.bare_with(&machine, owned).await;
+    let lease_id = node.status().lease_id;
+    let stored = backend
+        .store()
+        .list_owned_node_leases(&backend.id().await)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|lease| lease.owner.lease_id == lease_id)
+        .unwrap()
+        .link_generation;
+    // Another process owns the next two generations this process claims.
+    let served_from = NodeCounter(stored.0 + 3);
+    ownership.taken_until(served_from);
+    let _runtime = node.attach(&AgentId::new(), &workspace());
+
+    let mut fenced = 0;
+    let served = loop {
+        let mut end = machine.accept().await;
+        if end.hello.binding.generation >= served_from {
+            break end;
+        }
+        closed_without_writes(&mut end, NodeCounter(1)).await;
+        fenced += 1;
+    };
+    assert!(fenced >= 1);
+    // The first generation this process owns again is served.
+    served.replay_complete(0).await;
+    served.journal(note(1, &AgentId::new(), "one")).await;
+    let mut served = served;
+    served.acked(1).await;
     node.shutdown();
 }
 

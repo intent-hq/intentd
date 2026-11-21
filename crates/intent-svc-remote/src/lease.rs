@@ -15,15 +15,48 @@ use intent_core::nodes::{
 use std::sync::{Arc, Mutex};
 
 use intent_core::{now_iso, AgentId, Error, Result};
-use intent_node_connections::{LinkClaim, LinkOwnership, LocalOwnership};
+use intent_node_connections::{Fenced, LinkClaim, LinkOwnership, LocalOwnership};
 use intent_store::Store;
 
 use crate::machine::MachineTarget;
 
 /// This backend's ownership of its machine links: the desktop's, where this
-/// process owns every link.
-pub(crate) fn local_ownership(store: &Store) -> Arc<dyn LinkOwnership> {
+/// process owns every link, unless a test replaced it.
+pub(crate) fn ownership(
+    store: &Store,
+    tuning: &crate::connector::Tuning,
+) -> Arc<dyn LinkOwnership> {
+    #[cfg(test)]
+    if let Some(ownership) = &tuning.ownership.0 {
+        return ownership.clone();
+    }
+    #[cfg(not(test))]
+    let _ = tuning;
     Arc::new(LocalOwnership::new(store.clone()))
+}
+
+/// Why a durable link write did not happen.
+#[derive(Debug)]
+pub(crate) enum LinkWrite {
+    /// Another process owns the link, or a newer dial of this one
+    /// superseded it: the link must close.
+    Fenced(Fenced),
+    Failed(Error),
+}
+
+impl std::fmt::Display for LinkWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fenced(fenced) => fenced.fmt(f),
+            Self::Failed(error) => error.fmt(f),
+        }
+    }
+}
+
+impl From<Error> for LinkWrite {
+    fn from(error: Error) -> Self {
+        Self::Failed(error)
+    }
 }
 
 /// The hello of a probe: binds `owner`'s binding at `generation` with no
@@ -117,11 +150,9 @@ pub(crate) struct HeadLease {
     owner: LeaseOwner,
     ownership: Arc<dyn LinkOwnership>,
     /// The claim of the latest dial, shared by every clone; `None` before
-    /// the first.
+    /// the first. A link's writes pass only while its generation is this
+    /// claim's: a superseded link writes nothing.
     claim: Arc<Mutex<Option<LinkClaim>>>,
-    /// Set when a write was fenced: the link must close. Cleared by the
-    /// next claim.
-    fenced: Arc<std::sync::atomic::AtomicBool>,
     /// Test seam: fail every ack write while set.
     #[cfg(test)]
     fail_ack_writes: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -159,7 +190,6 @@ impl HeadLease {
             owner: lease.owner,
             ownership,
             claim: Arc::default(),
-            fenced: Arc::default(),
             #[cfg(test)]
             fail_ack_writes: std::sync::Arc::default(),
         })
@@ -179,24 +209,21 @@ impl HeadLease {
         &self.owner
     }
 
-    /// Whether a write was fenced since the last claim: another process
-    /// owns the link, so it must close.
-    pub(crate) fn fenced(&self) -> bool {
-        self.fenced.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Check the current claim before a durable write. Before the first
-    /// claim there is nothing to check.
-    async fn fence(&self) -> Result<()> {
+    /// Check the claim before a durable write for the link bound at
+    /// `generation` (`None`: a write between links). Before the first claim
+    /// there is nothing to check.
+    async fn fence(&self, generation: Option<NodeCounter>) -> std::result::Result<(), Fenced> {
         let claim = crate::lock(&self.claim).clone();
         let Some(claim) = claim else {
             return Ok(());
         };
-        if let Err(fenced) = self.ownership.fence(&claim).await {
-            self.fenced.store(true, std::sync::atomic::Ordering::SeqCst);
-            return Err(fenced.into());
+        if generation.is_some_and(|generation| generation != claim.generation) {
+            return Err(Fenced {
+                machine_id: claim.owner.node_id,
+                epoch: claim.epoch,
+            });
         }
-        Ok(())
+        self.ownership.fence(&claim).await
     }
 
     /// The persisted journal ack.
@@ -247,7 +274,7 @@ impl HeadLease {
     /// if that fails it offers the older durable ack and its in-memory
     /// sequence skips the replayed duplicates.
     pub(crate) async fn next_hello(&self, ingested: NodeCounter) -> Result<LinkHello> {
-        let acked = match self.persist_ack(ingested).await {
+        let acked = match self.persist_ack(ingested, None).await {
             Ok(acked) => acked,
             Err(error) => {
                 tracing::warn!(%error, seq = ingested.0, "remote node: could not persist the journal ack; offering the saved one");
@@ -257,8 +284,6 @@ impl HeadLease {
         let claim = self.ownership.claim(&self.owner).await?;
         let generation = claim.generation;
         *crate::lock(&self.claim) = Some(claim);
-        self.fenced
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         let lease_agents = self.lease_agents().await?;
         let lease_homes = self.lease_homes().await?;
         Ok(LinkHello {
@@ -315,9 +340,15 @@ impl HeadLease {
         Ok(homes)
     }
 
-    /// Record what the node reported for a new link.
-    pub(crate) async fn record_welcome(&self, welcome: &LinkWelcome) -> Result<()> {
-        self.fence().await?;
+    /// Record what the node reported for the link bound at `generation`.
+    pub(crate) async fn record_welcome(
+        &self,
+        welcome: &LinkWelcome,
+        generation: NodeCounter,
+    ) -> std::result::Result<(), LinkWrite> {
+        self.fence(Some(generation))
+            .await
+            .map_err(LinkWrite::Fenced)?;
         self.store
             .record_node_welcome(
                 &self.owner,
@@ -328,18 +359,24 @@ impl HeadLease {
             )
             .await
             .map(drop)
+            .map_err(LinkWrite::Failed)
     }
 
-    /// Persist that every record up to `seq` is ingested.
-    pub(crate) async fn persist_ack(&self, seq: NodeCounter) -> Result<NodeCounter> {
+    /// Persist that every record up to `seq` is ingested, for the link bound
+    /// at `generation` (`None`: between links).
+    pub(crate) async fn persist_ack(
+        &self,
+        seq: NodeCounter,
+        generation: Option<NodeCounter>,
+    ) -> std::result::Result<NodeCounter, LinkWrite> {
         #[cfg(test)]
         if self
             .fail_ack_writes
             .load(std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(Error::Internal("injected ack write failure".into()));
+            return Err(Error::Internal("injected ack write failure".into()).into());
         }
-        self.fence().await?;
-        self.store.advance_node_lease_ack(&self.owner, seq).await
+        self.fence(generation).await.map_err(LinkWrite::Fenced)?;
+        Ok(self.store.advance_node_lease_ack(&self.owner, seq).await?)
     }
 }
