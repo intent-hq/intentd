@@ -10283,7 +10283,8 @@ impl Services {
     /// waiting period, so the deferred idle skips silently (the watch
     /// stays armed for the genuine completion). The marker clears when the
     /// period ends — genuine settlement OR a real turn start (the
-    /// `AgentManager` turn-start clear) — so a LATER monitoring-idle period
+    /// `AgentManager` delivery-turn clear; harness-wake continuations keep
+    /// the period) — so a LATER monitoring-idle period
     /// advises the SAME still-armed watch again. The advisory never
     /// consumes the watch (intent-hq/intent#4254): grouped and ungrouped
     /// watches alike stay armed (`watchStillArmed: true`) until genuine

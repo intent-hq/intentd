@@ -379,6 +379,14 @@ hourly when idle. `intentd update` always checks immediately.
 
 ## Manage Assistant chats
 
+A **Waiting** update means a delegated agent still has background checks pending;
+it is not a completion. Its completion watch stays armed for the final result.
+The agent's own continued work keeps the same waiting period; a new message or
+monitor wake can start another. Consecutive identical waiting updates share one row
+with the latest details.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/; packages/intentd/crates/intent-services/src/{agent_manager.rs,lib.rs}; packages/intentd/crates/intent-acp/src/mcp_server/tools.rs. -->
+
 A new Assistant chat names itself during its first reply; until then the chat list
 previews the first message. A name the user sets by renaming the chat is kept.
 Users can ask the Assistant to find, read, rename, or delete another Assistant chat.

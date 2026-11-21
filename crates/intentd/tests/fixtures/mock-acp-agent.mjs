@@ -40,6 +40,9 @@ let effectiveEffort = null;
 // with `promptCount > 1` proves the daemon resumed the SAME process (keep-alive)
 // rather than respawning it.
 let promptCount = 0;
+// Text of this process's first prompt: the identity the `@wake` trigger
+// directive matches against (see the harness-wake trigger below).
+let firstPromptText = null;
 // Codex 2.1.1 modes: set_mode updates local state; turn/start validates policy.
 let sandboxMode = process.env.INITIAL_AGENT_MODE || 'agent-full-access';
 function sandboxRejection(mode, allowed) {
@@ -475,6 +478,7 @@ function maybeSpawnAsyncTask(behavior, params) {
 
 async function handlePrompt(id, params) {
   promptCount += 1;
+  if (firstPromptText === null) firstPromptText = extractPromptText(params);
   // Record every prompt this child receives when MOCK_AGENT_PROMPT_LOG points
   // at a file — one JSON line per prompt ({ turn, text, blockTypes, blocks }) — so
   // e2e tests can assert exact outbound prompt assembly (e.g. the
@@ -1726,8 +1730,15 @@ if (treePidFile) {
 // file is a writer caught between create and write (a non-atomic publish),
 // not a trigger, so keep polling instead of clearing on it and losing the
 // wake for the life of the process (intent-hq/intent#4943).
+//
+// Repeatable, targeted bursts: a first line `@wake <seq> <needle>` makes the
+// trigger fire only in a process whose FIRST prompt contains `<needle>` (the
+// env is daemon-wide, so every mock child polls the same file), once per
+// distinct `<seq>` — the poll keeps running, so rewriting the file with a new
+// `<seq>` fires another burst in the same process.
 const wakeTriggerFile = process.env.MOCK_AGENT_WAKE_TRIGGER_FILE;
 if (wakeTriggerFile) {
+  let lastWakeSeq = null;
   const poll = setInterval(() => {
     let lines;
     try {
@@ -1741,7 +1752,17 @@ if (wakeTriggerFile) {
     if (lines.length === 0) {
       return; // created but not yet written
     }
-    clearInterval(poll);
+    const directive = /^@wake (\S+) (.+)$/.exec(lines[0]);
+    if (directive) {
+      const [, seq, needle] = directive;
+      if (seq === lastWakeSeq || firstPromptText === null || !firstPromptText.includes(needle)) {
+        return;
+      }
+      lastWakeSeq = seq;
+      lines = lines.slice(1);
+    } else {
+      clearInterval(poll);
+    }
     log(`wake trigger fired: emitting ${lines.length} unsolicited chunk(s)`);
     for (const line of lines) {
       const text = line === '<NEWLINE_ONLY>' ? '\n' : line;
