@@ -100,7 +100,7 @@ case "$1" in
     ;;
   serve)
     printf '{"listenAddr":"tc%s"}\n' "$(cat "$key")"
-    exec sleep 600
+    exec sleep 600 # // timing-guard: a fake sidecar serves until the daemon kills it
     ;;
 esac
 "#;
