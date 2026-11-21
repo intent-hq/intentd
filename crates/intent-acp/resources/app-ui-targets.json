@@ -223,15 +223,28 @@
     "category": "settings"
   },
   {
-    "id": "workspace-api",
+    "id": "cli-optimization",
     "tab": "token-savings",
+    "hashAliases": [
+      "cli-optimization"
+    ],
+    "scrollSelector": "#cli-optimization",
+    "highlightSelector": "[data-highlight-id=\"cli-optimization\"]",
+    "label": "Settings: CLI Optimization",
+    "route": "/settings?tab=token-savings#cli-optimization",
+    "description": "RTK/CLI optimization settings.",
+    "category": "settings"
+  },
+  {
+    "id": "workspace-api",
+    "tab": "advanced",
     "hashAliases": [
       "workspace-api"
     ],
     "scrollSelector": "#workspace-api",
     "highlightSelector": "[data-highlight-id=\"workspace-api\"]",
     "label": "Settings: Tool Output & Retention",
-    "route": "/settings?tab=token-savings#workspace-api",
+    "route": "/settings?tab=advanced#workspace-api",
     "description": "Tool output size and retention settings.",
     "category": "settings"
   },

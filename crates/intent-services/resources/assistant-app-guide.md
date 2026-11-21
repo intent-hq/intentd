@@ -264,7 +264,7 @@ Open Settings and use these sidebar labels (English labels shown):
 | Providers | AI coding CLIs and default model | `/settings?tab=providers#providers` |
 | Instructions | Instructions added to every agent's system prompt | `/settings?tab=agent-behavior#global-instructions` |
 | Connections | Integrations, MCP servers and plugins | `/settings?tab=connections#integrations` |
-| Token Savings | RTK, tool output and retention, agent features, tool approvals | `/settings?tab=token-savings#workspace-api` |
+| Token Savings | RTK, tool output and retention, agent features, tool approvals | `/settings?tab=token-savings#cli-optimization` |
 | Machines | Local machine, connected backend and saved remote connections | `/settings?tab=devices#devices` |
 | Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
 | General | Notifications, updates, external apps, GitHub link behavior | `/settings?tab=app-behavior#notifications` |
@@ -461,7 +461,7 @@ custom specialist instructions can override the defaults.
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte; src/routes/(app)/settings/+page.svelte (Agent defaults Advanced disclosure). Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
 **Secret requests.** Off by default. Open **Settings → Token Savings**
-(`/settings?tab=token-savings#workspace-api`, then **Agent features**; in earlier
+(`/settings?tab=token-savings#cli-optimization`, then **Agent features**; in earlier
 releases, **Agent defaults → Advanced**) and turn on **Secret requests**, directly under **Host command execution** in **Agent
 features**; it stays off and unavailable while Host command execution is off. It applies
 to top-level workspace agents created afterwards, not to sub-agents, background hooks or
