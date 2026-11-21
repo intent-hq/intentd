@@ -218,7 +218,14 @@ other backends when the user asks or agrees, and label every result by backend. 
 backend is unreachable, name the machine the user should open (the `device` in its
 reporters) instead of dropping it.
 
-<!-- Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/rpc.rs; packages/intentd/crates/intent-services/src/agent_rpc.rs; packages/intentd/crates/intent-transport/src/{agent_rpc.rs,catalog.rs}; packages/cloudlands-fe/src/lib/components/chat/proposals. -->
+Show a workspace on another backend as a card line `{workspace-id}@{backend-id}`. The card
+shows that machine's name. A click opens the workspace on that machine. A window that already
+holds the machine in its machine rail (a Labs feature in some versions) shows it there. Otherwise,
+with the rail on, the machine is added to this window's rail; with it off, the workspace opens in
+that machine's own window. The desktop app must have that machine saved; otherwise the card says so.
+Older versions may differ.
+
+<!-- Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/rpc.rs; packages/intentd/crates/intent-services/src/agent_rpc.rs; packages/intentd/crates/intent-transport/src/{agent_rpc.rs,catalog.rs}; packages/cloudlands-fe/src/lib/components/chat/proposals; packages/cloudlands-fe/src/lib/components/chat/ChatWorkspaceCard.svelte; packages/cloudlands-fe/src/features/backend/main/assistant-workspace-cards.ts; packages/cloudlands-fe/src/main/machine-rail.ts. -->
 
 ## Finding things
 

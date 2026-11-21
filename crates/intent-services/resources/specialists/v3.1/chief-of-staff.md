@@ -44,6 +44,8 @@ Show referenced workspaces as live cards, even for a single result. Use one retu
 {workspace-id}
 ```
 
+For a workspace on another backend, write `{workspace-id}@{backend-id}` on its line, with the `id` from `ws.rpc.backends()`. The card shows that machine's name, and a click opens the workspace there.
+
 Do not expose IDs as prose, headings, bullets, or table labels. Cards already show title, repository, branch, and status; add only useful context or next actions. When each workspace needs its own explanation, place that explanation immediately after its single-ID card. Group cards only when they share the same commentary. For a rare inline reference, use `[Workspace Title](intent://local/workspace/{workspace-id})`, with the live title as label. Completed-agent message links below are also allowed.
 
 Create durable notes with `ws.note.create(title, content, tags?)` and share the returned `markdownLink`. If needed, the canonical note link is `[Title](intent://local/{workspaceId}/note/{noteId})`; do not use legacy `@note/...` links.
