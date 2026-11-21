@@ -63,6 +63,7 @@ async fn cloud_row(backend: &Backend, id: &str, starter: &PrincipalId) {
                 running_seconds: 0,
                 running_since: Some(intent_core::now_iso()),
                 paused_at: None,
+                relay_url: None,
             }),
         })
         .await

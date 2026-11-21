@@ -36,6 +36,10 @@ const MAX_TAIL_CHARS: usize = 600;
 /// certificate and tailcat key; on a machine that keeps only its disk, a
 /// later start finds them on the disk.
 ///
+/// Before it starts intentd, it sets `server.tunnel.derpUrl` in the
+/// settings file to `INTENT_RELAY_URL` (removed when empty), so the daemon's
+/// first tunnel already uses the backend's relay.
+///
 /// Every `intentd` here and in [`MINT_SCRIPT`] runs with the same explicit
 /// data dir: without it the daemon uses its platform default
 /// (`~/.local/share/intentd`) and never reads the settings written here, so
@@ -48,6 +52,14 @@ if [ ! -f "$dir/config.toml" ]; then
   printf '[server.wsApi]\nenabled = true\n\n[server.tunnel]\nenabled = true\n' > "$dir/config.toml"
 fi
 if ! intentd call system.status >/dev/null 2>&1; then
+  awk -v url="${INTENT_RELAY_URL:-}" '
+    function put() { if (url != "") print "derpUrl = \"" url "\""; done = 1 }
+    /^[[:space:]]*\[/ { if (insec && !done) put(); insec = ($0 ~ /^[[:space:]]*\[server\.tunnel\][[:space:]]*$/) }
+    insec && /^[[:space:]]*derpUrl[[:space:]]*=/ { next }
+    { print }
+    END { if (!done) { if (!insec && url != "") print "\n[server.tunnel]"; put() } }
+  ' "$dir/config.toml" > "$dir/config.toml.new"
+  mv "$dir/config.toml.new" "$dir/config.toml"
   if command -v setsid >/dev/null 2>&1; then
     setsid nohup intentd serve >"$dir/serve.log" 2>&1 </dev/null &
   else
@@ -67,6 +79,56 @@ fi
 
 /// What [`START_SCRIPT`] prints when it started intentd.
 const STARTED: &str = "started";
+
+/// Make the running daemon's tunnel use the backend's relay, then print its
+/// `system.status`. With `INTENT_RELAY_APPLY` the tunnel is stopped and the
+/// relay saved first, so a relay that fails leaves the tunnel off, never on
+/// the previous relay. A tunnel that is not up is started (turned off, then
+/// on: a setting update that changes nothing runs no hook), which checks the
+/// relay; exit 4 means the relay check failed, 3 another failure. The daemon
+/// answers `system.status` while it starts, before it takes a settings
+/// update, so an update is retried while the daemon is not ready.
+const RELAY_SCRIPT: &str = r#"set -u
+export INTENTD_DATA_DIR="${INTENTD_DATA_DIR:-$HOME/.intent}"
+errf=$(mktemp)
+trap 'rm -f "$errf"' EXIT
+update() {
+  i=0
+  until intentd call settings.update --params "$1" >/dev/null 2>"$errf"; do
+    # A daemon that answers its status may still be starting its services.
+    i=$((i + 1))
+    if [ "$i" -ge 30 ] || ! grep -qi 'not ready' "$errf"; then
+      { grep -o '"data": *"[^"]*"' "$errf" || grep -o '"message": *"[^"]*"' "$errf"; } | head -n 1 | sed 's/^"[a-z]*": *"//; s/"$//' >&2
+      return 1
+    fi
+    sleep 1
+  done
+  return 0
+}
+if [ -n "${INTENT_RELAY_APPLY:-}" ]; then
+  update '{"changes":[{"path":"server.tunnel.enabled","value":false}]}' || exit 3
+  update "$INTENT_RELAY_PARAMS" || exit 3
+fi
+status=$(intentd call system.status 2>/dev/null) || status=""
+if ! printf '%s' "$status" | grep -q '"tcAddress"'; then
+  # An unchanged setting runs no hook: turn the tunnel off, then on.
+  update '{"changes":[{"path":"server.tunnel.enabled","value":false}]}' || exit 3
+  if ! update '{"changes":[{"path":"server.tunnel.enabled","value":true}]}'; then
+    grep -qF "$INTENT_RELAY_MARKER" "$errf" && exit 4
+    exit 3
+  fi
+  status=$(intentd call system.status 2>/dev/null) || status=""
+  if ! printf '%s' "$status" | grep -q '"tcAddress"'; then
+    echo "the tunnel started but reports no address." >&2
+    exit 3
+  fi
+fi
+printf '%s\n' "$status"
+"#;
+
+/// What a failed relay check in the sandbox's intentd says (its tunnel
+/// module's `RELAY_UNREACHABLE`).
+const RELAY_MARKER: &str = "the self-hosted relay is unreachable";
 
 /// Wait for the daemon (and its tunnel address unless a direct route is
 /// used), then mint. A mint that fails (listener not up yet) is retried; a
@@ -122,6 +184,8 @@ pub(crate) struct Minted {
     pub(crate) hosts: Vec<String>,
     pub(crate) tc_address: Option<String>,
     pub(crate) fingerprint: String,
+    /// The self-hosted relay the sandbox's tunnel uses.
+    pub(crate) relay_url: Option<String>,
 }
 
 impl std::fmt::Debug for Minted {
@@ -187,8 +251,15 @@ pub(crate) async fn run(
     client: &dyn CloudProvider,
     sandbox: &CloudInstance,
     backend: &Value,
+    relay: Option<&str>,
 ) -> Result<Minted> {
-    start_daemon(client, sandbox).await?;
+    if let Some(url) = relay {
+        check_relay_url(url, Moment::Start)?;
+    }
+    start_daemon(client, sandbox, relay).await?;
+    if relay.is_some() {
+        ensure_relay(client, sandbox, relay, false, Moment::Start).await?;
+    }
 
     let direct = std::env::var(DIRECT_HOST_ENV)
         .ok()
@@ -224,7 +295,9 @@ pub(crate) async fn run(
             tail(&minted.stderr)
         )));
     }
-    parse(&minted.stdout, direct)
+    let mut minted = parse(&minted.stdout, direct)?;
+    minted.relay_url = relay.map(str::to_owned);
+    Ok(minted)
 }
 
 /// Start intentd in `sandbox` unless it already answers. Returns whether
@@ -237,9 +310,14 @@ pub(crate) async fn run(
 pub(crate) async fn start_daemon(
     client: &dyn CloudProvider,
     sandbox: &CloudInstance,
+    relay: Option<&str>,
 ) -> Result<bool> {
     let mut start = ProcessSpec::new("/bin/sh");
     start.args = vec!["-c".into(), START_SCRIPT.into()];
+    start.envs.insert(
+        "INTENT_RELAY_URL".to_owned(),
+        SecretString::new(relay.unwrap_or_default()),
+    );
     // Up to 50 s of waiting for the new daemon, plus a provider's output
     // drain.
     start.timeout = Some(Duration::from_secs(120));
@@ -256,6 +334,137 @@ pub(crate) async fn start_daemon(
     Ok(String::from_utf8_lossy(&started.stdout)
         .lines()
         .any(|line| line.trim() == STARTED))
+}
+
+/// The backend's own `server.tunnel.derpUrl`, which every sandbox uses;
+/// `None` when empty (tailcat's default relay).
+pub(crate) fn wanted_relay(svc: &intent_services::feature_api::Services) -> Option<String> {
+    svc.settings_registry()?
+        .get("server.tunnel.derpUrl")?
+        .as_str()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+}
+
+/// When a relay step runs: it decides what a failure says happened to the
+/// sandbox.
+#[derive(Clone, Copy)]
+pub(crate) enum Moment {
+    Start,
+    Resume,
+}
+
+/// `cloud-machine-unavailable` `relay-unreachable` for `url`.
+fn relay_unreachable(url: &str, moment: Moment, detail: &str) -> Error {
+    let outcome = match moment {
+        Moment::Start => "The sandbox was deleted; no machine was added.",
+        Moment::Resume => {
+            "The sandbox stays paused until the relay answers or the setting changes."
+        }
+    };
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    };
+    match cloud_machine_unavailable(
+        "relay-unreachable",
+        true,
+        None,
+        format!(
+            "The sandbox could not use the self-hosted relay {url} set in Settings (server.tunnel.derpUrl){detail}. It never falls back to the default relay. {outcome}"
+        ),
+    ) {
+        Error::RemoteMachine(mut failure) => {
+            failure.data["relayUrl"] = json!(url);
+            Error::RemoteMachine(failure)
+        }
+        other => other,
+    }
+}
+
+/// Refuse a relay URL the sandbox scripts cannot carry, before anything is
+/// written to the sandbox.
+///
+/// # Errors
+///
+/// `cloud-machine-unavailable` `relay-unreachable`.
+pub(crate) fn check_relay_url(url: &str, moment: Moment) -> Result<()> {
+    let usable = (url.starts_with("https://") || url.starts_with("http://"))
+        && !url
+            .chars()
+            .any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control());
+    if usable {
+        Ok(())
+    } else {
+        Err(relay_unreachable(
+            url,
+            moment,
+            "it is not an http or https URL",
+        ))
+    }
+}
+
+/// Make the sandbox's tunnel use `relay` ([`RELAY_SCRIPT`]); `apply` first
+/// moves a running tunnel to it. Returns the tunnel address.
+///
+/// # Errors
+///
+/// `cloud-machine-unavailable` `relay-unreachable` when the relay check
+/// failed, `bootstrap-failed` when another step failed, or the provider error
+/// of a failed call.
+pub(crate) async fn ensure_relay(
+    client: &dyn CloudProvider,
+    sandbox: &CloudInstance,
+    relay: Option<&str>,
+    apply: bool,
+    moment: Moment,
+) -> Result<Option<String>> {
+    if let Some(url) = relay {
+        check_relay_url(url, moment)?;
+    }
+    let mut spec = ProcessSpec::new("/bin/sh");
+    spec.args = vec!["-c".into(), RELAY_SCRIPT.into()];
+    // Up to 30 s waiting for a starting daemon, three settings updates, a
+    // tunnel start (map and relay checks, a key and tailcat's address, up
+    // to about 80 s), plus a provider's output drain.
+    spec.timeout = Some(Duration::from_secs(240));
+    let params = json!({ "changes": [{ "path": "server.tunnel.derpUrl", "value": relay.unwrap_or_default() }] });
+    spec.envs.insert(
+        "INTENT_RELAY_PARAMS".to_owned(),
+        SecretString::new(params.to_string()),
+    );
+    spec.envs.insert(
+        "INTENT_RELAY_MARKER".to_owned(),
+        SecretString::new(RELAY_MARKER),
+    );
+    if apply {
+        spec.envs
+            .insert("INTENT_RELAY_APPLY".to_owned(), SecretString::new("1"));
+    }
+    let ran = client.run_command(sandbox, &spec).await.map_err(|error| {
+        super::config::to_error(&error, super::config::Phase::Other, client.kind())
+    })?;
+    if !ran.success() {
+        let why = tail(&ran.stderr);
+        if let (Some(url), 4) = (relay, ran.exit.exit_code) {
+            return Err(relay_unreachable(url, moment, &why));
+        }
+        let message = format!(
+            "the sandbox's tunnel did not start (exit {}): {why}",
+            ran.exit.exit_code
+        );
+        return Err(match moment {
+            Moment::Start => failed(message),
+            Moment::Resume => cloud_machine_unavailable("bootstrap-failed", true, None, message),
+        });
+    }
+    let status: Value = serde_json::from_slice(&ran.stdout).unwrap_or(Value::Null);
+    Ok(status["tcAddress"]
+        .as_str()
+        .filter(|address| !address.is_empty())
+        .map(str::to_owned))
 }
 
 /// Read the mint result (`{ credentialId, token, machine }`).
@@ -293,6 +502,7 @@ fn parse(stdout: &[u8], direct: Option<String>) -> Result<Minted> {
         hosts,
         tc_address,
         fingerprint,
+        relay_url: None,
     })
 }
 

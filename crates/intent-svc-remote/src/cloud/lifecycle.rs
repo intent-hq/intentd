@@ -239,7 +239,19 @@ impl CloudGate {
             return Ok(as_is);
         };
         match resume(&self.svc, feature, &*client, &row).await {
-            Ok(resumed) => Ok(Dialable { pauses, resumed }),
+            Ok(resumed) => {
+                // A relay change gives the sandbox a new tunnel address.
+                if let Ok(Some(fresh)) =
+                    self.svc.store().get_exposed_machine(&self.machine_id).await
+                {
+                    let mut target = shared.target();
+                    if target.tc_address != fresh.tc_address {
+                        target.tc_address = fresh.tc_address;
+                        shared.set_target(target);
+                    }
+                }
+                Ok(Dialable { pauses, resumed })
+            }
             Err(Resumed::Lost) => {
                 sandbox_lost(&self.svc, feature, Some(shared), &row);
                 Err(lost_failure())
@@ -326,12 +338,27 @@ pub(crate) async fn resume(
         .await
     {
         Ok(connected) => {
+            let relay = super::bootstrap::wanted_relay(svc);
+            if let Some(Err(error)) = relay
+                .as_deref()
+                .map(|url| super::bootstrap::check_relay_url(url, super::bootstrap::Moment::Resume))
+            {
+                if paused || connected.resumed {
+                    pause_after_relay_failure(svc, feature, client, &row.id, &cloud.sandbox_id)
+                        .await;
+                }
+                return Err(Resumed::Refused(
+                    intent_core::machines::with_cloud_provider(error, client.kind()),
+                ));
+            }
             // A machine that keeps only its disk runs no intentd after a
             // resume or a container restart: start it, and tell each agent
             // that ran there what it lost at its next launch.
             let mut restarted = false;
             if !client.keeps_memory() {
-                match super::bootstrap::start_daemon(client, &connected.instance).await {
+                match super::bootstrap::start_daemon(client, &connected.instance, relay.as_deref())
+                    .await
+                {
                     Ok(true) => {
                         tracing::info!(machine = %row.id, "cloud machine: intentd started again from the machine's disk");
                         disk_resumed(svc, feature, &row.id).await;
@@ -343,6 +370,50 @@ pub(crate) async fn resume(
                             set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
                         }
                         return Err(Resumed::Refused(error));
+                    }
+                }
+            }
+            // The backend's relay setting reaches the sandbox here, at each
+            // resume or restart, when it changed, or after a failed attempt
+            // (which leaves the tunnel off on a relay the row does not name).
+            // The sandbox's tunnel is moved to it and its relay checked.
+            let unsettled = relay_unsettled(&row.id, None);
+            if (relay.is_some() || cloud.relay_url.is_some() || unsettled)
+                && (relay != cloud.relay_url
+                    || paused
+                    || connected.resumed
+                    || restarted
+                    || unsettled)
+            {
+                match super::bootstrap::ensure_relay(
+                    client,
+                    &connected.instance,
+                    relay.as_deref(),
+                    true,
+                    super::bootstrap::Moment::Resume,
+                )
+                .await
+                {
+                    Ok(address) => {
+                        relay_unsettled(&row.id, Some(false));
+                        record_relay(svc, feature, &row.id, relay, address).await;
+                    }
+                    Err(error) => {
+                        relay_unsettled(&row.id, Some(true));
+                        tracing::warn!(machine = %row.id, %error, "cloud machine: the sandbox could not use the backend's relay");
+                        if paused || connected.resumed {
+                            pause_after_relay_failure(
+                                svc,
+                                feature,
+                                client,
+                                &row.id,
+                                &cloud.sandbox_id,
+                            )
+                            .await;
+                        }
+                        return Err(Resumed::Refused(
+                            intent_core::machines::with_cloud_provider(error, client.kind()),
+                        ));
                     }
                 }
             }
@@ -372,6 +443,92 @@ pub(crate) async fn resume(
                 client.kind(),
             )))
         }
+    }
+}
+
+/// The provider resumed the sandbox but it cannot use the backend's relay:
+/// pause it again so it stops billing, and park it until something asks for
+/// it. When the provider refuses the pause, the row says it runs.
+async fn pause_after_relay_failure(
+    svc: &Services,
+    feature: &RemoteFeature,
+    client: &dyn CloudProvider,
+    machine_id: &str,
+    sandbox_id: &str,
+) {
+    feature.cloud.park(machine_id);
+    feature.cloud.count_pause(machine_id);
+    match client.pause(sandbox_id).await {
+        Ok(()) => {
+            feature.cloud.forget_activity(machine_id);
+            set_state(svc, feature, machine_id, CloudSandboxState::Paused).await;
+        }
+        Err(error) => {
+            tracing::warn!(machine = %machine_id, %error, "cloud machine: the provider refused the pause after a relay failure; it stays running");
+            feature.cloud.unpark(machine_id);
+            feature.cloud.touch(machine_id);
+            set_state(svc, feature, machine_id, CloudSandboxState::Running).await;
+        }
+    }
+}
+
+/// Whether a relay step failed for `machine_id` since its last success;
+/// `set` records a new outcome first.
+fn relay_unsettled(machine_id: &str, set: Option<bool>) -> bool {
+    static UNSETTLED: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut unsettled = UNSETTLED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match set {
+        Some(true) => {
+            unsettled.insert(machine_id.to_owned());
+        }
+        Some(false) => {
+            unsettled.remove(machine_id);
+        }
+        None => {}
+    }
+    unsettled.contains(machine_id)
+}
+
+/// Record the relay cloud machine `machine_id` now uses, and its new tunnel
+/// address, and announce the row.
+async fn record_relay(
+    svc: &Services,
+    feature: &RemoteFeature,
+    machine_id: &str,
+    relay: Option<String>,
+    address: Option<String>,
+) {
+    let Ok(Some(mut row)) = svc.store().get_exposed_machine(machine_id).await else {
+        return;
+    };
+    if let Some(address) = address.filter(|address| row.tc_address.as_ref() != Some(address)) {
+        if let Err(error) = svc
+            .store()
+            .record_exposed_machine_connection(machine_id, &row.hosts, Some(&address), &now_iso())
+            .await
+        {
+            tracing::warn!(machine = %machine_id, %error, "cloud machine: could not record its tunnel address");
+        }
+    }
+    let Some(cloud) = row.cloud.as_mut() else {
+        return;
+    };
+    cloud.relay_url = relay;
+    if let Err(error) = svc.store().update_cloud_machine(machine_id, cloud).await {
+        tracing::warn!(machine = %machine_id, %error, "cloud machine: could not record its relay");
+        return;
+    }
+    if let Ok(Some(row)) = svc.store().get_exposed_machine(machine_id).await {
+        let live = feature.running_node(machine_id);
+        crate::methods::publish_machine(
+            svc,
+            &row,
+            live.as_ref().map(crate::RemoteNode::shared_ref),
+        )
+        .await;
     }
 }
 

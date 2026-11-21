@@ -817,6 +817,7 @@ fn cloud(tenant: &str, sandbox: &str) -> CloudMachine {
         running_seconds: 0,
         running_since: None,
         paused_at: None,
+        relay_url: None,
     }
 }
 

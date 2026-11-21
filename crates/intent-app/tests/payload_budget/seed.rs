@@ -916,6 +916,7 @@ pub async fn store(state: &LargeState) -> Seeded {
                     running_seconds: u64::MAX,
                     running_since: None,
                     paused_at: None,
+                    relay_url: None,
                 }),
             })
             .await

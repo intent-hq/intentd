@@ -691,7 +691,8 @@ async fn mint(
         .await
         .map(|routes| routes.fingerprint);
     let params = bootstrap::mint_params(&backend_id, &backend_name, fingerprint.as_deref());
-    bootstrap::run(&*prepared.client, created, &params).await
+    let relay = bootstrap::wanted_relay(svc);
+    bootstrap::run(&*prepared.client, created, &params, relay.as_deref()).await
 }
 
 /// Who a new sandbox's machine row is for: the agent it starts for (or a
@@ -729,6 +730,7 @@ async fn add_row(
         running_seconds: 0,
         running_since: Some(now_iso()),
         paused_at: None,
+        relay_url: minted.relay_url,
     };
     let machine_id = minted.machine_id.clone();
     crate::methods::add_machine(
