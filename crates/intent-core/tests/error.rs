@@ -32,6 +32,36 @@ fn store_busy_code_and_display() {
 }
 
 #[test]
+fn schema_mismatch_code_and_display() {
+    use intent_core::error::SchemaMismatch;
+    let missing = Error::SchemaMismatch(Box::new(SchemaMismatch {
+        applied: vec![1],
+        expected: vec![1, 2],
+        changed: vec![],
+    }));
+    assert_eq!(missing.code(), -32603);
+    assert_eq!(
+        missing.to_string(),
+        "postgres schema does not match this build: applied migrations [1], this build \
+         expects [1, 2]; run the migrate job with this build, then start the daemon"
+    );
+    let newer = Error::SchemaMismatch(Box::new(SchemaMismatch {
+        applied: vec![1, 2, 3],
+        expected: vec![1, 2],
+        changed: vec![2],
+    }));
+    let text = newer.to_string();
+    assert!(
+        text.contains("changed since they were applied: [2]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the schema is newer than this build"),
+        "{text}"
+    );
+}
+
+#[test]
 fn conflict_code_and_display_and_payload() {
     let current = json!({ "rev": 7 });
     let e = Error::Conflict {

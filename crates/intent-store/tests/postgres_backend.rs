@@ -72,6 +72,8 @@ mod principals;
 mod read_snapshots;
 #[path = "postgres_backend/repositories.rs"]
 mod repositories;
+#[path = "postgres_backend/schema_gate.rs"]
+mod schema_gate;
 #[path = "postgres_backend/script_monitors.rs"]
 mod script_monitors;
 #[path = "postgres_backend/scripts.rs"]

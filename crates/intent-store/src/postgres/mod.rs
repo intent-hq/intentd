@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use intent_core::{Error, Result};
+use intent_core::{Error, Result, SchemaMismatch};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, Postgres};
 use sqlx::Transaction;
 
@@ -330,13 +330,53 @@ fn pool_options(settings: PoolSettings) -> PgPoolOptions {
 /// The lock's connection is detached from the pool and closed at the end,
 /// so a cancelled or failed run releases the lock with its session.
 ///
+/// # The migrate job
+///
+/// Serving daemons never call this: [`Store::open_postgres`](crate::Store::open_postgres)
+/// only checks the schema ([`check_schema`]) and refuses a mismatch. One
+/// migrate job runs it before a rollout, on its own connection in Neki's
+/// cross-shard `multi` mode (a single-shard pool's startup mode is undone).
+///
+/// On `PlanetScale` Neki, native DDL runs on every shard but is **not
+/// atomic across shards**: a failed statement can leave some shards changed
+/// and others not. Re-running `migrate` is the repair, which is why every
+/// statement must be safe to run again. Other routers may also not see the
+/// DDL yet, so after the migrations (applied now or by an earlier run) the
+/// job asks this router for its applied versions (`__neki.ddl_versions()`)
+/// and waits until every router has them (`__neki.wait_for_ddl`, at most
+/// [`NEKI_DDL_WAIT`]). Vanilla Postgres has neither function, so there is
+/// nothing to wait for.
+///
 /// # Errors
 /// `Error::Internal` when a statement fails, an applied migration changed,
-/// the schema has a migration this build does not know, or the schema was
-/// migrated by the earlier sqlx migrator.
-pub async fn migrate(pool: &PgPool) -> Result<()> {
+/// the schema has a migration this build does not know, the schema was
+/// migrated by the earlier sqlx migrator, or the Neki routers did not see
+/// the DDL within [`NEKI_DDL_WAIT`] (the migrations are applied; re-run).
+pub async fn migrate(pool: &PgPool) -> Result<MigrateReport> {
     migrate_with(pool, false).await
 }
+
+/// What a [`migrate`] run did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrateReport {
+    /// Versions this run completed, ascending; empty when the schema was
+    /// already current.
+    pub applied: Vec<i64>,
+    /// The router versions the run waited for on Neki; `None` on vanilla
+    /// Postgres.
+    pub neki_ddl: Option<NekiDdlVersions>,
+}
+
+/// A Neki router's applied schema and cluster catalog versions
+/// (`__neki.ddl_versions()`), the arguments of `__neki.wait_for_ddl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NekiDdlVersions {
+    pub schema_version: i64,
+    pub cluster_version: i64,
+}
+
+/// The longest [`migrate`] waits for every Neki router to see its DDL.
+pub const NEKI_DDL_WAIT: Duration = Duration::from_secs(120);
 
 /// [`migrate`], running each statement a second time before recording its
 /// progress: what a crash between the two replays. For the store tests.
@@ -344,11 +384,11 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
 /// # Errors
 /// As [`migrate`].
 #[doc(hidden)]
-pub async fn migrate_replaying_each_statement(pool: &PgPool) -> Result<()> {
+pub async fn migrate_replaying_each_statement(pool: &PgPool) -> Result<MigrateReport> {
     migrate_with(pool, true).await
 }
 
-async fn migrate_with(pool: &PgPool, replay: bool) -> Result<()> {
+async fn migrate_with(pool: &PgPool, replay: bool) -> Result<MigrateReport> {
     let mut conn = pool.acquire().await.map_err(db)?.detach();
     // Schema changes span every shard: undo a single-shard pool's startup
     // mode on this detached connection, which is closed at the end.
@@ -360,15 +400,144 @@ async fn migrate_with(pool: &PgPool, replay: bool) -> Result<()> {
         .execute(&mut conn)
         .await
         .map_err(db)?;
-    let outcome = migrate_locked(&mut conn, replay).await;
+    let outcome = match migrate_locked(&mut conn, replay).await {
+        Ok(applied) => wait_for_neki_ddl(&mut conn)
+            .await
+            .map(|neki_ddl| MigrateReport { applied, neki_ddl }),
+        Err(e) => Err(e),
+    };
     let closed = sqlx::Connection::close(conn).await.map_err(db);
-    outcome.and(closed)
+    outcome.and_then(|report| closed.map(|()| report))
+}
+
+/// On Neki, waits until every router has the DDL this connection's router
+/// applied; `None` on vanilla Postgres, which has no `__neki` functions.
+async fn wait_for_neki_ddl(conn: &mut sqlx::PgConnection) -> Result<Option<NekiDdlVersions>> {
+    let versions: std::result::Result<(i64, i64), sqlx::Error> =
+        sqlx::query_as("SELECT schema_version, cluster_version FROM __neki.ddl_versions()")
+            .fetch_one(&mut *conn)
+            .await;
+    let (schema_version, cluster_version) = match versions {
+        Ok(versions) => versions,
+        // invalid_schema_name / undefined_function: not Neki.
+        Err(sqlx::Error::Database(e)) if matches!(e.code().as_deref(), Some("3F000" | "42883")) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(Error::Internal(format!("neki ddl_versions failed: {e}"))),
+    };
+    sqlx::query("SELECT __neki.wait_for_ddl($1, $2, make_interval(secs => $3))")
+        .bind(schema_version)
+        .bind(cluster_version)
+        .bind(NEKI_DDL_WAIT.as_secs_f64())
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            Error::Internal(format!(
+                "postgres migrations are applied, but not every Neki router saw the DDL \
+                 (schema version {schema_version}, cluster version {cluster_version}) within \
+                 {} s; re-run the migrate job: {e}",
+                NEKI_DDL_WAIT.as_secs()
+            ))
+        })?;
+    Ok(Some(NekiDdlVersions {
+        schema_version,
+        cluster_version,
+    }))
+}
+
+/// The schema gate every serving daemon passes before it writes: the
+/// schema's migration ledger must record exactly this build's migrations,
+/// each complete and unchanged. It only reads; an unmigrated schema (no
+/// ledger table) is a mismatch, not something to create.
+///
+/// A binary older than the schema (the ledger has a migration it does not
+/// know) is refused too: migrations are not checked to be
+/// backward-compatible, so a newer schema may have dropped or changed what
+/// the older binary uses. Roll out the new binary after the migrate job.
+///
+/// # Errors
+/// `Error::SchemaMismatch` on any difference; `Error::StoreBusy` when no
+/// pool connection comes free; `Error::Internal` when the ledger cannot be
+/// read.
+pub async fn check_schema(pool: &PgPool) -> Result<()> {
+    // One snapshot: a migrate job committing between the two reads must not
+    // make the ledger look half-present.
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::PoolTimedOut => Error::StoreBusy(format!(
+                "no postgres connection came free within {} ms",
+                pool.options().get_acquire_timeout().as_millis()
+            )),
+            e => db(e),
+        })?;
+    let (has_ledger,): (bool,) =
+        sqlx::query_as("SELECT to_regclass('intent_schema_migrations') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+    let ledger: Vec<(i64, Vec<u8>, bool)> = if has_ledger {
+        sqlx::query_as(
+            "SELECT version, checksum, complete FROM intent_schema_migrations ORDER BY version",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?
+    } else {
+        Vec::new()
+    };
+    tx.commit().await.map_err(db)?;
+    let embedded: Vec<(i64, &[u8])> = MIGRATOR
+        .iter()
+        .map(|m| (m.version, m.checksum.as_ref()))
+        .collect();
+    match schema_mismatch(&ledger, &embedded) {
+        None => Ok(()),
+        Some(mismatch) => Err(Error::SchemaMismatch(Box::new(mismatch))),
+    }
+}
+
+/// The ledger rows `(version, checksum, complete)` against the embedded
+/// migrations `(version, checksum)`; `None` when they match exactly.
+fn schema_mismatch(
+    ledger: &[(i64, Vec<u8>, bool)],
+    embedded: &[(i64, &[u8])],
+) -> Option<SchemaMismatch> {
+    let mut applied: Vec<i64> = ledger
+        .iter()
+        .filter(|(_, _, complete)| *complete)
+        .map(|(v, ..)| *v)
+        .collect();
+    applied.sort_unstable();
+    let mut expected: Vec<i64> = embedded.iter().map(|(v, _)| *v).collect();
+    expected.sort_unstable();
+    let changed: Vec<i64> = ledger
+        .iter()
+        .filter(|(version, checksum, complete)| {
+            *complete
+                && embedded
+                    .iter()
+                    .any(|(v, sum)| v == version && *sum != checksum.as_slice())
+        })
+        .map(|(v, ..)| *v)
+        .collect();
+    let part_way = ledger.iter().any(|(_, _, complete)| !complete);
+    if applied == expected && changed.is_empty() && !part_way {
+        return None;
+    }
+    Some(SchemaMismatch {
+        applied,
+        expected,
+        changed,
+    })
 }
 
 /// `(version, checksum, applied_statements, applied_prefix, complete)`.
 type LedgerRow = (i64, Vec<u8>, i32, Vec<u8>, bool);
 
-async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<()> {
+/// Returns the versions this run completed.
+async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<Vec<i64>> {
     // The applied-migration ledger belongs to the schema, not to a tenant.
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS intent_schema_migrations \
@@ -409,6 +578,7 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<(
             "postgres migration {version} is applied but unknown to this build"
         )));
     }
+    let mut completed = Vec::new();
     for migration in MIGRATOR.iter() {
         let version = migration.version;
         let stmts = statements(migration.sql.as_str());
@@ -483,8 +653,9 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<(
         .execute(&mut *conn)
         .await
         .map_err(db)?;
+        completed.push(version);
     }
-    Ok(())
+    Ok(completed)
 }
 
 /// Identifies the statements a part-way migration already applied.
@@ -915,6 +1086,12 @@ impl crate::Store {
     /// Open the store for one tenant on a migrated database, creating the
     /// tenant's seed rows on first use (`intent_provision_tenant`).
     ///
+    /// It never migrates. It first passes the schema gate
+    /// ([`check_schema`](crate::postgres::check_schema)): unless the
+    /// schema has exactly this build's migrations, it fails with
+    /// `Error::SchemaMismatch` having written nothing. The migrate job
+    /// ([`migrate`](crate::postgres::migrate)) runs before the daemons.
+    ///
     /// Every open of one tenant in this process shares its process-local
     /// gates (`tenant_registry`), including the writer slot (see the
     /// [pool contract](crate::postgres#pool-contract)): any number of opens
@@ -925,6 +1102,7 @@ impl crate::Store {
     /// [`OrchestratorOnly`](crate::OrchestratorOnly)).
     ///
     /// # Errors
+    /// `Error::SchemaMismatch` when the schema does not match this build;
     /// `Error::Internal` when provisioning fails; `Error::StoreBusy` when the
     /// tenant's writer lock stays held past the writer wait budget.
     pub async fn open_postgres(
@@ -981,6 +1159,10 @@ impl crate::Store {
             writer_slot: shared.writer_slot.clone(),
             tenant_state: shared,
         };
+        // The schema gate comes first: a daemon whose schema does not match
+        // its build refuses before it writes anything (no seed rows, and no
+        // later startup step such as a lease).
+        check_schema(&store.pool).await?;
         // Provisioning writes the tenant's seed rows, so it runs under the
         // writer lock like every other write (the lint sees the call as one).
         let mut tx = store.begin_write().await?;
@@ -1067,12 +1249,44 @@ impl PgStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_lock_attempt, retry_backoff, statements, with_bundled_root_cert, WriterLimits,
-        MIGRATOR,
+        next_lock_attempt, retry_backoff, schema_mismatch, statements, with_bundled_root_cert,
+        WriterLimits, MIGRATOR,
     };
     use std::time::Duration;
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[test]
+    fn the_schema_gate_passes_only_an_exact_complete_unchanged_ledger() {
+        let embedded: [(i64, &[u8]); 2] = [(1, b"a"), (2, b"b")];
+        let row = |v: i64, sum: &[u8], complete: bool| (v, sum.to_vec(), complete);
+        assert_eq!(
+            schema_mismatch(&[row(1, b"a", true), row(2, b"b", true)], &embedded),
+            None
+        );
+        let missing = schema_mismatch(&[row(1, b"a", true)], &embedded).unwrap();
+        assert_eq!((missing.applied, missing.expected), (vec![1], vec![1, 2]));
+        let empty = schema_mismatch(&[], &embedded).unwrap();
+        assert!(empty.applied.is_empty());
+        let part_way =
+            schema_mismatch(&[row(1, b"a", true), row(2, b"b", false)], &embedded).unwrap();
+        assert_eq!(part_way.applied, vec![1]);
+        let changed =
+            schema_mismatch(&[row(1, b"x", true), row(2, b"b", true)], &embedded).unwrap();
+        assert_eq!((changed.applied, changed.changed), (vec![1, 2], vec![1]));
+        let newer = schema_mismatch(
+            &[row(1, b"a", true), row(2, b"b", true), row(3, b"c", true)],
+            &embedded,
+        )
+        .unwrap();
+        assert_eq!(newer.applied, vec![1, 2, 3]);
+        // An unknown part-way version is still a newer schema.
+        assert!(schema_mismatch(
+            &[row(1, b"a", true), row(2, b"b", true), row(3, b"c", false)],
+            &embedded
+        )
+        .is_some());
+    }
 
     #[test]
     fn lock_retries_back_off_from_25_ms_doubling_to_400_ms() {

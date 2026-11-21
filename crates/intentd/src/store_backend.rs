@@ -14,6 +14,14 @@
 //! `postgres` stays out of the release graph), so `serve` then stops at the
 //! open with [`PostgresBackend::unavailable`].
 //!
+//! Startup order on Postgres: this mode guard, then the schema gate, then
+//! any tenant lease, then serving. The schema gate is part of
+//! `Store::open_postgres` (it calls `intent_store::postgres::check_schema`
+//! before it writes), so the open cannot skip it: a daemon whose schema does
+//! not match its build fails with `Error::SchemaMismatch` and writes
+//! nothing. `serve` never migrates; one migrate job
+//! (`intent_store::postgres::migrate`) runs before a rollout.
+//!
 //! A set but empty, blank or non-UTF-8 URL is an error, never "unset": a
 //! daemon meant for Postgres must not quietly open the `SQLite` store.
 //!
@@ -73,7 +81,8 @@ impl PostgresBackend {
 
     /// The open this build cannot do yet: the Postgres backend is not in any
     /// shipped build. Per-tenant composition will take `url` and the token
-    /// here instead.
+    /// here instead, and open through `Store::open_postgres`, which checks
+    /// the schema before anything else (see the module docs).
     pub fn unavailable(self) -> anyhow::Error {
         let mode = mode_name(self.mode());
         let Self { url, token, .. } = self;
