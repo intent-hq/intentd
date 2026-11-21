@@ -401,6 +401,14 @@ hourly when idle. `intentd update` always checks immediately.
 
 ## Manage Assistant chats
 
+A **Waiting** update means a delegated agent still has background checks pending;
+it is not a completion. Its completion watch stays armed for the final result.
+The agent's own continued work keeps the same waiting period; a new message or
+monitor wake can start another. Consecutive identical waiting updates share one row
+with the latest details.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/; packages/intentd/crates/intent-services/src/{agent_manager.rs,lib.rs}; packages/intentd/crates/intent-acp/src/mcp_server/tools.rs. -->
+
 A new Assistant chat names itself during its first reply; until then the chat list
 previews the first message. A name the user sets by renaming the chat is kept.
 Users can ask the Assistant to find, read, rename, or delete another Assistant chat.
@@ -460,16 +468,18 @@ custom specialist instructions can override the defaults.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte; src/routes/(app)/settings/+page.svelte (Agent defaults Advanced disclosure). Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
-**Secret requests.** Off by default. Open **Settings → Token Savings**
-(`/settings?tab=token-savings#cli-optimization`, then **Agent features**; in earlier
-releases, **Agent defaults → Advanced**) and turn on **Secret requests**, directly under **Host command execution** in **Agent
-features**; it stays off and unavailable while Host command execution is off. It applies
-to top-level workspace agents created afterwards, not to sub-agents, background hooks or
-Assistant chat. When such an agent asks for a secret such as an API key, a "Secret
-requested" card with a masked field appears above the message box after its turn ends.
-**Provide** sends the value; **Skip** declines at once and tells the agent. The down arrow
-(Hide) collapses the card to a chip without losing a typed value. The value is not put in
-the chat: Intent holds it in daemon memory and passes it only to that agent's
+**Secret requests.** On by default unless the user turned it off; a config file
+created while it was off by default may also hold it off. To check or change it, open
+**Settings → Token Savings** (`/settings?tab=token-savings#cli-optimization`; in earlier
+releases, **Agent defaults → Advanced**) and find **Secret requests**, directly under
+**Host command execution** in **Agent features**; it stays off and unavailable while Host
+command execution is off. A change applies to top-level workspace agents created
+afterwards, not to existing agents, sub-agents, background hooks or Assistant chat. When
+such an agent asks for a secret such as an API key, a "Secret requested" card with a
+masked field appears above the message box after its turn ends. **Provide** sends the
+value; **Skip** declines at once and tells the agent. The down arrow (Hide) collapses the
+card to a chip without losing a typed value. The value is not put in the chat: Intent
+holds it in daemon memory and passes it only to that agent's
 `ws.host.exec` commands that name it, redacting exact copies from their output. It is
 dropped when the daemon restarts, the agent is deleted or retired, or its workspace is
 archived; the agent then has to ask again.

@@ -136,6 +136,15 @@ fn sha256_hex(text: &str) -> String {
         })
 }
 
+/// The features of a session created before secret requests turned on by
+/// default: its snapshot has no `secretRequests` key, which reads as off.
+fn frozen_session_features() -> AgentFeaturesSettings {
+    AgentFeaturesSettings {
+        secret_requests: false,
+        ..AgentFeaturesSettings::default()
+    }
+}
+
 /// One variant's `(tool description, system prompt)`, built the way a spawn
 /// builds them for `session` on `provider`.
 pub(crate) async fn variant(
@@ -147,7 +156,7 @@ pub(crate) async fn variant(
     plain_folder: bool,
 ) -> (String, String) {
     let is_sub_agent = session.parent_agent_id.is_some();
-    let features = AgentFeaturesSettings::default();
+    let features = frozen_session_features();
     let surfaces = SessionSurfaces::new(session, provider);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
     let server = surfaces.configure(
@@ -208,7 +217,7 @@ pub(crate) fn workspace_api_surfaces_for(
         let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
         let server = surfaces.configure(
             WorkspaceMcpServer::for_agent_type(api, session.workspace_id.clone(), "interactive")
-                .with_agent_features(AgentFeaturesSettings::default())
+                .with_agent_features(frozen_session_features())
                 .with_sub_agent(session.parent_agent_id.is_some())
                 .with_remote_placement_help(placement.map(str::to_owned))
                 .with_plain_folder(plain_folder),

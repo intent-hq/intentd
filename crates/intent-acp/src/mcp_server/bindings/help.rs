@@ -52,7 +52,13 @@ pub(crate) fn dispatch(
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    let shape = |docs: String| {
+    let shape = |mut docs: String| {
+        if docs
+            .lines()
+            .any(|line| line.trim_start().starts_with("ws.agent.watch("))
+        {
+            docs.push_str("\n\nFor ws.agent.watch, the target's own out-of-turn continuation keeps the same waiting period and does not send another advisory.");
+        }
         Value::String(if plain_folder {
             plain_folder_description(&docs)
         } else {

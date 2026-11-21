@@ -326,7 +326,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
 /// Boot the daemon with the mock ACP provider + one FE subscriber connection
 /// (`agent:*` + the named extra types) and one RPC connection.
 struct Setup {
-    _daemon: Daemon,
+    daemon: Daemon,
     ws_id: String,
     sub: TlsWs,
     rpc: TlsWs,
@@ -338,14 +338,34 @@ async fn boot_daemon(
     sub_event_types: Value,
     budget: Budget,
 ) -> Setup {
+    boot_daemon_with_wake_trigger(script, behavior, sub_event_types, budget, false).await
+}
+
+/// [`boot_daemon`], optionally pointing every mock child at the
+/// `wake-trigger.txt` harness-wake trigger in the data dir
+/// (`MOCK_AGENT_WAKE_TRIGGER_FILE`; see [`write_wake_trigger`]).
+async fn boot_daemon_with_wake_trigger(
+    script: &str,
+    behavior: &str,
+    sub_event_types: Value,
+    budget: Budget,
+    wake_trigger: bool,
+) -> Setup {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let env: [(&str, &str); 3] = [
+    let trigger = data_dir
+        .join("wake-trigger.txt")
+        .to_string_lossy()
+        .into_owned();
+    let mut env: Vec<(&str, &str)> = vec![
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", behavior),
     ];
+    if wake_trigger {
+        env.push(("MOCK_AGENT_WAKE_TRIGGER_FILE", &trigger));
+    }
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
@@ -385,7 +405,7 @@ async fn boot_daemon(
     );
     let rpc = connect_ws(port, cfg).await;
     Setup {
-        _daemon: daemon,
+        daemon,
         ws_id,
         sub,
         rpc,
@@ -2983,4 +3003,260 @@ async fn monitoring_idle_advisories_leave_watch_armed_until_genuine_completion_o
             "every advisory leaves the watch armed: {advisory}"
         );
     }
+}
+
+/// Atomically publish one burst for the child matching its first prompt.
+#[track_caller]
+fn write_wake_trigger(data_dir: &Path, seq: u32, needle: &str, text: &str) {
+    let file = data_dir.join("wake-trigger.txt");
+    let tmp = file.with_extension("txt.tmp");
+    std::fs::write(&tmp, format!("@wake {seq} {needle}\n{text}\n")).expect("write wake trigger");
+    std::fs::rename(&tmp, &file).expect("publish wake trigger");
+}
+
+/// Await the child's next `agent:idle` whose reason is
+/// `harness_wake_complete` (the end of one out-of-turn burst).
+async fn await_harness_wake_idle(
+    sub: &mut TlsWs,
+    agent_id: &str,
+    deadline: tokio::time::Instant,
+) -> Value {
+    loop {
+        let idle = await_idle_event(sub, agent_id, deadline).await;
+        if idle["data"]["reason"] == "harness_wake_complete" {
+            return idle;
+        }
+    }
+}
+
+/// Three harness continuations share a waiting period. A real message opens
+/// another period, and hook dispatch still delivers one genuine completion.
+#[tokio::test]
+async fn harness_wake_turns_keep_monitoring_idle_advisory_period_over_wss() {
+    const SPAWN_GO: &str = "WATCH9_SPAWN_GO";
+    const CHILD_GO: &str = "WATCH9_CHILD_GO";
+    const POKE_GO: &str = "WATCH9_POKE_GO";
+    const ADVISORY_NEEDLE: &str = "idle but still waiting on external monitoring";
+    let Some(script) = gate("WSS harness-wake advisory period E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+
+    let spawn_js = format!(
+        "const r = await ws.agent.create('WakeChild', '{CHILD_GO} do your work', \
+         {{ model: 'default', provider: 'mock' }}); return 'spawned=' + r.ok;"
+    );
+    let child_hook_js = format!(
+        "const r = await ws.hook.schedule({{ name: 'pr-review-watch', code: {}, delayMs: 3600000 }}); \
+         return 'hooked=' + r.hook.state;",
+        json!(
+            "if (hookState === null) { return { dispatch: false, state: { armed: true } }; } \
+             return { dispatch: true, message: 'review landed' };"
+        )
+    );
+    let behavior = json!({
+        "rules": [
+            { "ifPromptContains": "[Background hook", "response": "hook wake handled" },
+            { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "wake acknowledged" },
+            { "ifPromptContains": POKE_GO, "response": "child poked" },
+            {
+                "ifPromptContains": SPAWN_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_js, "summary": "spawn the monitoring child" }
+                },
+                "emitToolBlocks": true,
+                "response": "child spawned",
+            },
+            {
+                "ifPromptContains": CHILD_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": child_hook_js, "summary": "child schedules hook" }
+                },
+                "emitToolBlocks": true,
+                "response": "child parked behind its hook",
+            },
+        ],
+    })
+    .to_string();
+    let mut setup =
+        boot_daemon_with_wake_trigger(&script, &behavior, json!(["agent:*"]), budget, true).await;
+    let ws_id = setup.ws_id.clone();
+    let data_dir = setup.daemon.data_dir.path().to_path_buf();
+
+    let parent = create_agent(&mut setup.rpc, 10, &ws_id, "WakeParent").await;
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent, "content": SPAWN_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "spawn send ok: {sent}");
+    let mut req_id = 20i64;
+    let child = await_agent_id_by_name(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        "WakeChild",
+        budget.step(60),
+    )
+    .await;
+
+    // Period 1 opens: the child idles hook-waiting and the parent hears ONE
+    // advisory.
+    let child_idle = await_idle_event(&mut setup.sub, &child, budget.step(90)).await;
+    assert!(
+        child_idle["data"]["waitingOnHooks"].is_array(),
+        "child idle is stamped hook-waiting: {child_idle}"
+    );
+    await_wake_row_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        ADVISORY_NEEDLE,
+        1,
+        budget.step(90),
+    )
+    .await;
+    await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+
+    // The child keeps working out of turn: three harness-wake bursts, each
+    // run to its terminal `harness_wake_complete` idle (still hook-waiting —
+    // the same monitoring idle that advised before the fix).
+    for seq in 1..=3 {
+        write_wake_trigger(
+            &data_dir,
+            seq,
+            CHILD_GO,
+            &format!("out-of-turn progress {seq}"),
+        );
+        let idle = await_harness_wake_idle(&mut setup.sub, &child, budget.step(30)).await;
+        assert!(
+            idle["data"]["waitingOnHooks"].is_array(),
+            "harness-wake idle {seq} is still hook-waiting: {idle}"
+        );
+    }
+    let page = conversation_page(&mut setup.rpc, req_id, &ws_id, &child).await;
+    req_id += 1;
+    assert!(
+        page.to_string().contains("out-of-turn progress 3"),
+        "the bursts streamed as harness-wake turns: {page}"
+    );
+    // Advisory delivery is async after the idle (sub-second in the
+    // incident); give a per-burst advisory time to land before counting.
+    // timing-guard: negative assertion must allow asynchronous duplicate advisory delivery after idle.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+    let advisories = wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, ADVISORY_NEEDLE).await;
+    req_id += 1;
+    assert_eq!(
+        advisories, 1,
+        "harness-wake bursts must not open a new advisory period"
+    );
+
+    // A REAL turn still ends the period: the poke's monitoring idle opens
+    // period 2 and the SAME still-armed watch advises once more.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        40,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": child, "content": POKE_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "poke send ok: {sent}");
+    await_wake_row_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        ADVISORY_NEEDLE,
+        2,
+        budget.step(90),
+    )
+    .await;
+
+    // The hook's terminal dispatch settles the child: one genuine completion.
+    let listed = wss_rpc(
+        &mut setup.rpc,
+        50,
+        "hook.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let hook_id = listed["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["name"] == "pr-review-watch" && h["state"] == "scheduled")
+        .unwrap_or_else(|| panic!("scheduled pr-review-watch hook in hook.list: {listed}"))
+        ["hookId"]
+        .as_str()
+        .expect("hookId")
+        .to_string();
+    let ran = wss_rpc(
+        &mut setup.rpc,
+        51,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": hook_id }),
+    )
+    .await;
+    assert_eq!(ran["ok"], true, "hook.runNow ok: {ran}");
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        "completed.",
+        budget.step(90),
+    )
+    .await;
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        &child,
+        0,
+        budget.step(60),
+    )
+    .await;
+    await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+
+    // Final audit: two periods → two advisories (none per burst), one
+    // genuine completion.
+    let rows = wake_rows_serialized(&mut setup.rpc, req_id, &ws_id, &parent).await;
+    assert_eq!(
+        rows.iter().filter(|r| r.contains(ADVISORY_NEEDLE)).count(),
+        2,
+        "harness-wake bursts must not re-advise within a waiting period: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.contains("completed.")).count(),
+        1,
+        "exactly one genuine completion wake: {rows:?}"
+    );
 }
