@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.264] - 2026-11-21
+
+### 🐛 Bug Fixes
+
+- Bump Codex ACP fallback to v2.8.0 ([#3562](https://github.com/intent-hq/intentd/pull/3562))
+
+### 📚 Documentation
+
+- *(app-guide)* Describe machine name tooltips ([#3603](https://github.com/intent-hq/intentd/pull/3603))
+- *(guide)* Intent OS defaults, hidden actions and in-app notifications ([#3598](https://github.com/intent-hq/intentd/pull/3598))
+
+
 ## [0.11.263] - 2026-11-21
 
 ### 🚀 Features
