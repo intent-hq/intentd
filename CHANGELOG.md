@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.262] - 2026-11-21
+
+### 🚀 Features
+
+- Turn on agent secret requests by default ([#3589](https://github.com/intent-hq/intentd/pull/3589))
+
+### 🐛 Bug Fixes
+
+- Keep monitoring-idle advisory period across harness-wake turns ([#3597](https://github.com/intent-hq/intentd/pull/3597))
+
+### 📚 Documentation
+
+- Explain screenshot markup in desktop chat ([#3592](https://github.com/intent-hq/intentd/pull/3592))
+
+
 ## [0.11.261] - 2026-11-21
 
 ### 🚀 Features
