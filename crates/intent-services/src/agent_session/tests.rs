@@ -11409,7 +11409,10 @@ fn claude_expired_oauth_maps_startup_errors_to_login_remedy() {
             "{context}: {}",
             crate::provider_auth::not_authenticated_message("claude-code")
         );
-        assert!(expected.contains("claude auth login"), "{expected}");
+        assert!(
+            expected.contains(&intent_providers::login_command("claude-code")),
+            "{expected}"
+        );
         assert!(
             matches!(mapped, intent_core::Error::InvalidParams(ref message) if message == &expected),
             "{mapped:?}"

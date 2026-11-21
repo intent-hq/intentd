@@ -56,9 +56,9 @@
 #   crates/intent-core/ (src/** or   also every crate depending on intent-core,
 #     <anything else>)               directly or transitively, as for src/**
 #                                    (dependencies read from crates/*/Cargo.toml)
-#   crates/intent-js/ (src/** or     also --lib of every crate depending on
-#     <anything else>)               intent-js directly that has a src/lib.rs
-#                                    (its library unit tests only)
+#   crates/intent-js/ or             also --lib of every crate depending on
+#     crates/intent-providers/       it directly that has a src/lib.rs
+#     (src/** or <anything else>)    (its library unit tests only)
 #   a glob in .config/e2e-test-map.txt
 #                                    also the end-to-end modules it maps to:
 #                                    -p <c> --test <s> -E 'binary_id(=<c>::<s>)&test(/^(<m>)::/)'
@@ -82,9 +82,9 @@
 # different selections run as separate `cargo nextest run` invocations and
 # crates with identical selections share one. Reverse dependencies are
 # propagated in full only from intent-core (intentd#2698), and as library unit
-# tests only from intent-js to its direct dependents; otherwise only from
-# intent-services to its feature crates and intent-app, from a feature crate
-# to intent-app, and through the end-to-end map: crates/<c>/src selects <c>'s
+# tests only from intent-js and intent-providers to their direct dependents;
+# otherwise only from intent-services to its feature crates and intent-app,
+# from a feature crate to intent-app, and through the end-to-end map: crates/<c>/src selects <c>'s
 # own tests plus any mapped end-to-end or library unit-test modules; the full
 # suite (`make test`, the merge queue) stays the complete gate.
 #
@@ -225,7 +225,16 @@ rdeps_roots="intent-core"
 # CI and failed in the merge queue. A crate that starts calling the bridge
 # must depend on intent-js, so it is covered without a map entry. The direct
 # edges are the ones check-rdeps-parity.py compares with cargo metadata.
-lib_rdeps_roots="intent-js"
+#
+# intent-providers is the provider registry. Its dependents spawn, serve and
+# gate providers from registry entries, and test that behavior in their
+# library unit tests (intent-acp's spawn, intent-services' provider catalog
+# and auth gates), so a registry change propagates the same way.
+# intentd#3577 changed only intent-providers/src, passed the changed tests
+# and PR CI, and was ejected from the merge queue twice by an intent-acp
+# library unit test. The registry facts themselves live in one golden
+# (intent-providers tests/goldens/provider_registry.json).
+lib_rdeps_roots="intent-js intent-providers"
 
 # Prints "<dependent>\t<dependency>" for each dependency between workspace
 # crates declared in crates/*/Cargo.toml: any [dependencies],

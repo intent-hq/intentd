@@ -25,6 +25,14 @@ fn summary_write_back_is_rejected() {
     trybuild::TestCases::new().compile_fail("tests/ui/agent_session_summary_*.rs");
 }
 
+/// The Postgres opener's `OrchestratorOnly` token cannot be forged, built
+/// from the public `DaemonMode` enum, or defaulted: only the intentd binary
+/// mints it (`tests/orchestrator_only_lint.rs` pins the call sites).
+#[test]
+fn orchestrator_only_token_cannot_be_forged() {
+    trybuild::TestCases::new().compile_fail("tests/ui/orchestrator_only_*.rs");
+}
+
 #[test]
 fn trybuild_cases_stay_in_this_binary() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");

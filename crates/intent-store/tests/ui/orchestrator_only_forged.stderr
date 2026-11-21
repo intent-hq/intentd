@@ -1,0 +1,5 @@
+error[E0451]: field `_sealed` of struct `OrchestratorOnly` is private
+ --> tests/ui/orchestrator_only_forged.rs:3:38
+  |
+3 |     intent_store::OrchestratorOnly { _sealed: () }
+  |                                      ^^^^^^^ private field

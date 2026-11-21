@@ -276,6 +276,7 @@ async fn every_migration_statement_survives_a_replay() {
         admin,
         TenantId::new("replayed").unwrap(),
         intent_store::postgres::PostgresOptions::default(),
+        intent_store::OrchestratorOnly::for_tests(),
     )
     .await
     .expect("open a tenant on the replayed schema");
@@ -385,6 +386,7 @@ async fn the_leak_trap_fails_unscoped_statements_and_only_those() {
         db.app.clone(),
         TenantId::new("subject").unwrap(),
         intent_store::postgres::PostgresOptions::default(),
+        intent_store::OrchestratorOnly::for_tests(),
     )
     .await;
     assert!(

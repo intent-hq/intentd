@@ -292,7 +292,12 @@ async fn cursor_provider_discovery_auth_models_and_turn_over_wss() {
     assert_eq!(cursor["canBeDisabled"], true);
     assert_eq!(cursor["supportsTestPrompt"], true);
     assert_eq!(cursor["visible"], true);
-    assert_eq!(cursor["loginCommandHint"], "cursor-agent login");
+    assert_eq!(
+        cursor["loginCommandHint"].as_str(),
+        intent_providers::find_provider("cursor")
+            .unwrap()
+            .login_command_hint
+    );
 
     // Discovery honours the override and reports the CLI version.
     let discovery = wss_rpc(&mut rpc, 2, "host.providerDiscovery", json!({})).await;

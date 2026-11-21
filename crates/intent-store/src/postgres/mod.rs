@@ -920,6 +920,10 @@ impl crate::Store {
     /// [pool contract](crate::postgres#pool-contract)): any number of opens
     /// for one tenant park at most one connection in the writer lock.
     ///
+    /// Postgres exists only in orchestrator mode: `_orchestrator` is the
+    /// proof, minted by the intentd binary once it resolved that mode (see
+    /// [`OrchestratorOnly`](crate::OrchestratorOnly)).
+    ///
     /// # Errors
     /// `Error::Internal` when provisioning fails; `Error::StoreBusy` when the
     /// tenant's writer lock stays held past the writer wait budget.
@@ -927,6 +931,7 @@ impl crate::Store {
         pool: PgPool,
         tenant: TenantId,
         options: PostgresOptions,
+        _orchestrator: crate::OrchestratorOnly,
     ) -> Result<Self> {
         // Every open of this tenant in this process shares one set of gates.
         let key = tenant_registry::tenant_key(&pool, &tenant);
@@ -948,6 +953,7 @@ impl crate::Store {
         tenant: TenantId,
         options: PostgresOptions,
         process: &str,
+        _orchestrator: crate::OrchestratorOnly,
     ) -> Result<Self> {
         let key = format!(
             "{}@process:{process}",

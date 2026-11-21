@@ -1540,18 +1540,13 @@ mod build_command_tests {
         let cmd = build_command(&opts);
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = build_args(&opts);
-        // The version is derived, not repeated: the auto-pin-acp-adapters
-        // workflow bumps only the `claude_agent_acp_version!` literal. The pin's
-        // shape is checked by intent-providers' `claude_agent_acp_pin_is_single_sourced`.
+        // The package itself is the registry golden's fact.
         assert_eq!(
             args,
             vec![
                 "--workspaces=false".to_string(),
                 "-y".to_string(),
-                format!(
-                    "@agentclientprotocol/claude-agent-acp@{}",
-                    intent_providers::CLAUDE_AGENT_ACP_VERSION
-                ),
+                provider.npx_only_package.unwrap().to_string(),
             ]
         );
     }
@@ -1686,57 +1681,33 @@ mod build_command_tests {
         );
     }
 
+    /// The npx tier needs both an npx binary and a package: with npx alone the
+    /// bare command runs. Which providers carry a package is the registry
+    /// golden's fact (intent-providers `provider_registry_golden`).
     #[test]
-    fn providers_without_fallback_package_do_not_use_npx() {
-        // Cursor has no npm package: it never runs through npx.
+    fn npx_binary_without_a_package_runs_the_bare_command() {
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
         let provider = intent_providers::find_provider("cursor").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.npx_fallback_binary = Some(&npx_path);
+        assert!(!opts.via_npx());
+        assert_eq!(opts.launch_target().0, LaunchMode::BareCommand);
         assert_eq!(
-            provider.fallback_npx_package, None,
-            "cursor should not have fallback_npx_package"
+            build_command(&opts).as_std().get_program(),
+            provider.command
         );
-        assert_eq!(
-            provider.npx_only_package, None,
-            "cursor should not have npx_only_package"
-        );
-        // Auggie runs from its pinned npm package only when not installed.
-        let auggie = intent_providers::find_provider("auggie").unwrap();
-        assert_eq!(
-            auggie.fallback_npx_package,
-            Some(intent_providers::AUGGIE_NPX_PACKAGE)
-        );
-        assert_eq!(auggie.npx_only_package, None);
-    }
 
-    #[test]
-    fn claude_code_is_npx_only_with_pinned_package() {
-        let provider = intent_providers::find_provider("claude-code").unwrap();
+        opts.npx_fallback_package = Some("example-acp@1.2.3");
+        assert!(opts.via_npx());
+        assert_eq!(opts.launch_target().0, LaunchMode::NpxFallback);
         assert_eq!(
-            provider.npx_only_package,
-            Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE),
-            "claude-code must spawn exclusively via the pinned npx package"
+            build_command(&opts).as_std().get_program(),
+            npx_path.as_os_str()
         );
-        assert_eq!(
-            provider.fallback_npx_package, None,
-            "claude-code must not have a fallback (npx is the only path)"
-        );
-    }
-
-    #[test]
-    fn codex_npx_only_package_is_pinned() {
-        let provider = intent_providers::find_provider("codex").unwrap();
-        let pkg = provider
-            .npx_only_package
-            .expect("codex should have npx_only_package configured");
-        assert_eq!(pkg, intent_providers::config::CODEX_ACP_NPX_PACKAGE);
+        let args = build_args(&opts);
         assert!(
-            pkg.starts_with("@agentclientprotocol/codex-acp@"),
-            "codex npx adapter should use the @agentclientprotocol package, got: {pkg}"
-        );
-        let version = pkg.rsplit('@').next().unwrap();
-        let parts: Vec<&str> = version.split('.').collect();
-        assert!(
-            parts.len() == 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()),
-            "codex npx adapter must be pinned to an exact semver version, got: {version}"
+            args.windows(2).any(|w| w == ["-y", "example-acp@1.2.3"]),
+            "{args:?}"
         );
     }
 

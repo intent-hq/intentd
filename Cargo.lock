@@ -2782,6 +2782,7 @@ dependencies = [
  "openssl-sys",
  "portable-pty",
  "qrcode",
+ "reqwest 0.12.28",
  "rustls",
  "rustls-pki-types",
  "serde",

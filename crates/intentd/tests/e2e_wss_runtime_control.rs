@@ -1790,12 +1790,14 @@ async fn tunnel_settings_over_wss() {
     assert_eq!(got["result"]["value"], json!(true), "{got}");
 
     // derpUrl change over WSS: persists and restarts the running sidecar
-    // (an error would surface here if the restart failed).
+    // (an error would surface here if the restart failed). The restart
+    // checks the relay first, so it must answer.
+    let relay = common::fake_relay::fake_relay().await;
     let derp = wss_rpc(
         &mut ws,
         3,
         "settings.update",
-        json!({ "changes": [{ "path": "server.tunnel.derpUrl", "value": "https://derp.example.com/map.json" }] }),
+        json!({ "changes": [{ "path": "server.tunnel.derpUrl", "value": relay.url }] }),
     )
     .await;
     assert!(
@@ -1809,10 +1811,10 @@ async fn tunnel_settings_over_wss() {
         json!({ "path": "server.tunnel.derpUrl" }),
     )
     .await;
-    assert_eq!(
-        got["result"]["value"],
-        json!("https://derp.example.com/map.json"),
-        "{got}"
+    assert_eq!(got["result"]["value"], json!(relay.url), "{got}");
+    assert!(
+        relay.node_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the restart checked the relay"
     );
 
     // The tunnel-only self-termination guard fires for a direct TCP (WSS)

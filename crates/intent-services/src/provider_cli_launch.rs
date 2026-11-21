@@ -79,6 +79,7 @@ impl ProviderCli {
             "--version",
         ])
         .env("PATH", intent_providers::enhanced_path(Some(npx)))
+        .current_dir(neutral_cwd())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -90,13 +91,15 @@ impl ProviderCli {
     }
 
     /// `<cli> <args>` with the enhanced PATH, so the CLI (or npx's node)
-    /// resolves under a packaged app's minimal PATH.
+    /// resolves under a packaged app's minimal PATH, run from
+    /// [`neutral_cwd`] rather than the daemon's own folder.
     pub(crate) fn command(&self, args: &[&str]) -> tokio::process::Command {
         let (program, prefix) = self.program();
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(prefix)
             .args(args)
-            .env("PATH", intent_providers::enhanced_path(Some(program)));
+            .env("PATH", intent_providers::enhanced_path(Some(program)))
+            .current_dir(neutral_cwd());
         cmd
     }
 
@@ -109,10 +112,45 @@ impl ProviderCli {
     }
 }
 
+/// A readable working folder for one-shot provider CLI commands: the user's
+/// home, else the temp folder. The daemon's own folder can be unreadable
+/// (`/root` under a system service), and `opencode` reads project config from
+/// its working folder, failing with `PermissionDenied` there.
+pub(crate) fn neutral_cwd() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute() && std::fs::read_dir(home).is_ok())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The daemon can run from a folder its user cannot read (`/root` under a
+    /// system service). `opencode` reads project config from its working
+    /// folder and exits 1 there, which read as "signed out" (no Enable in
+    /// Settings). Every CLI command runs from a readable folder instead.
+    #[test]
+    fn commands_run_from_a_readable_folder_not_the_daemons() {
+        for cli in [
+            ProviderCli::Installed(PathBuf::from("/usr/bin/opencode")),
+            ProviderCli::Npx {
+                npx: PathBuf::from("/usr/bin/npx"),
+                package: intent_providers::OPENCODE_NPX_PACKAGE.to_owned(),
+            },
+        ] {
+            let cmd = cli.command(&["models"]);
+            let dir = cmd
+                .as_std()
+                .get_current_dir()
+                .expect("a working folder is set");
+            assert!(std::fs::read_dir(dir).is_ok(), "{dir:?} must be readable");
+        }
+        assert!(std::fs::read_dir(neutral_cwd()).is_ok());
+    }
 
     fn stub(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);

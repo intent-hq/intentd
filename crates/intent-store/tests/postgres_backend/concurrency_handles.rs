@@ -179,12 +179,22 @@ async fn writers_of_two_opens_of_one_tenant_share_one_writer_slot() {
         ..PostgresOptions::default()
     };
     let tenant = TenantId::new("tenant").unwrap();
-    let a = Store::open_postgres(db.app.clone(), tenant.clone(), patient)
-        .await
-        .unwrap();
-    let b = Store::open_postgres(db.app.clone(), tenant, patient)
-        .await
-        .unwrap();
+    let a = Store::open_postgres(
+        db.app.clone(),
+        tenant.clone(),
+        patient,
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .unwrap();
+    let b = Store::open_postgres(
+        db.app.clone(),
+        tenant,
+        patient,
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .unwrap();
 
     // Another daemon holds the tenant's writer lock.
     let held = hold_writer_lock(&db.admin, "tenant").await;

@@ -12,6 +12,7 @@
 pub mod claude_npx;
 #[cfg(unix)]
 pub mod codex_npx;
+pub mod fake_relay;
 pub mod submodule_repo;
 #[cfg(unix)]
 pub mod uds_exchange;
@@ -669,10 +670,14 @@ pub fn hermetic_serve_command(data_dir: &Path) -> std::process::Command {
 pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
     // A sandbox daemon's shell may export the user-tier relocation; fixtures
-    // own their user tier through HOME.
+    // own their user tier through HOME. An exported config path or Postgres
+    // URL would point the fixture at the host's `config.toml` or make every
+    // non-orchestrator fixture refuse to start; a test sets either itself.
     cmd.arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
-        .env_remove("INTENTD_USER_SPECIALISTS_DIR");
+        .env_remove("INTENTD_USER_SPECIALISTS_DIR")
+        .env_remove("INTENTD_CONFIG")
+        .env_remove("INTENTD_POSTGRES_URL");
     hermetic_fixture_identity(&mut cmd, data_dir);
     cmd
 }

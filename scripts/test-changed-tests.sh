@@ -696,6 +696,69 @@ expect_ok
 expect_cov "$js_lib_rdeps" "$js_own"
 [[ "$stdout" == *"[coverage-changed] note: crates/intent-js changed; the library unit tests of the crates depending on it directly run too (alpha, intent-services)"* ]] || fail "$case_name: no lib-dependents note: $stdout"
 
+# intent-providers is the provider registry: a change to it also selects the
+# library unit tests of its direct dependents (intentd#3577 changed only
+# intent-providers/src and an intent-acp library unit test failed in the
+# merge queue). The fixture's intent-acp depends on both lib roots, so a
+# change to both selects its --lib once.
+setup_intent_providers() {
+  write crates/intent-providers/Cargo.toml $'[package]\nname = "intent-providers"'
+  write crates/intent-providers/src/lib.rs
+  write crates/intent-providers/src/config.rs
+  write crates/intent-providers/tests/provider_registry_golden.rs
+  write crates/intent-js/Cargo.toml $'[package]\nname = "intent-js"'
+  write crates/intent-js/src/lib.rs
+  write crates/intent-acp/Cargo.toml $'[package]\nname = "intent-acp"\n\n[dependencies]\nintent-js = { path = "../intent-js" }\nintent-providers = { path = "../intent-providers" }'
+  write crates/intent-acp/src/lib.rs
+  write crates/intent-acp/tests/acp_integration.rs
+  commit_all "intent-providers fixture"
+  g update-ref refs/remotes/origin/main HEAD
+}
+providers_note="[test-changed] note: crates/intent-providers changed; the library unit tests of the crates depending on it directly run too (intent-acp)"
+
+case_name="intent-providers src change selects its direct dependents' library unit tests"
+reset_repo
+setup_intent_providers
+edit crates/intent-providers/src/config.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p intent-acp --lib" "-p intent-providers --lib --bins --tests"
+[[ "$stdout" == *"$providers_note"* ]] || fail "$case_name: no lib-dependents note: $stdout"
+
+case_name="intent-providers test-only change selects only intent-providers"
+reset_repo
+setup_intent_providers
+edit crates/intent-providers/tests/provider_registry_golden.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p intent-providers --test provider_registry_golden"
+[[ "$stdout" != *"note:"* ]] || fail "$case_name: unexpected note: $stdout"
+
+case_name="intent-providers golden-only change selects only intent-providers"
+reset_repo
+setup_intent_providers
+write crates/intent-providers/tests/goldens/provider_registry.json
+commit_all "golden"
+g update-ref refs/remotes/origin/main HEAD
+edit crates/intent-providers/tests/goldens/provider_registry.json
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p intent-providers --tests"
+[[ "$stdout" != *"note:"* ]] || fail "$case_name: unexpected note: $stdout"
+
+case_name="intent-providers and intent-js changes select a shared dependent's library unit tests once"
+reset_repo
+setup_intent_providers
+edit crates/intent-providers/src/config.rs
+edit crates/intent-js/src/lib.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p intent-acp --lib" "-p intent-js -p intent-providers --lib --bins --tests"
+
 # --print-edges / --print-rdeps expose the scanner's view for
 # scripts/check-rdeps-parity.py, which compares it with cargo metadata in CI.
 fixture_edges=$'alpha\tintent-core\ndelta\talpha\ngamma\tintent-core\nintent-app\tintent-services\nintent-services\tintent-core\nintent-svc-transfer\tintent-services\nintentd\tintent-services'

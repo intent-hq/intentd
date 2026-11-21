@@ -52,9 +52,14 @@ async fn the_first_write_seeds_the_tenant_lock_row_and_a_missing_row_is_reseeded
     };
     assert_eq!(rows(db.admin.clone()).await, 0);
     // Opening provisions the tenant under the writer lock, which seeds it.
-    let store = Store::open_postgres(db.app.clone(), TenantId::new(tenant).unwrap(), options())
-        .await
-        .unwrap();
+    let store = Store::open_postgres(
+        db.app.clone(),
+        TenantId::new(tenant).unwrap(),
+        options(),
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .unwrap();
     assert_eq!(rows(db.admin.clone()).await, 1);
     // A tenant from before the table has no row: its next write adds it.
     sqlx::query("DELETE FROM tenant_writer WHERE tenant_id = $1")
@@ -85,12 +90,22 @@ async fn the_writer_lock_row_is_per_tenant() {
         },
         ..options()
     };
-    let a = Store::open_postgres(db.app.clone(), TenantId::new("lock-row-a").unwrap(), quick)
-        .await
-        .unwrap();
-    let b = Store::open_postgres(db.app.clone(), TenantId::new("lock-row-b").unwrap(), quick)
-        .await
-        .unwrap();
+    let a = Store::open_postgres(
+        db.app.clone(),
+        TenantId::new("lock-row-a").unwrap(),
+        quick,
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .unwrap();
+    let b = Store::open_postgres(
+        db.app.clone(),
+        TenantId::new("lock-row-b").unwrap(),
+        quick,
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .unwrap();
     let held = hold_writer_lock(&db.admin, "lock-row-a").await;
     assert!(!writer_lock_is_free(&db.admin, "lock-row-a").await);
     assert!(writer_lock_is_free(&db.admin, "lock-row-b").await);
@@ -123,9 +138,14 @@ async fn single_shard_pools_open_connections_in_single_shard_mode() {
         .await
         .unwrap();
         postgres::migrate(&pool).await.expect("migrate on the pool");
-        let store = Store::open_postgres(pool.clone(), TenantId::new(tenant).unwrap(), options())
-            .await
-            .unwrap();
+        let store = Store::open_postgres(
+            pool.clone(),
+            TenantId::new(tenant).unwrap(),
+            options(),
+            intent_store::OrchestratorOnly::for_tests(),
+        )
+        .await
+        .unwrap();
         store.set_setting("userRules", "\"x\"").await.unwrap();
         let mode: Option<String> =
             sqlx::query_scalar("SELECT current_setting('__neki.tx_mode', true)")

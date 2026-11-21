@@ -155,10 +155,23 @@ fn missing_binary_error() -> Error {
     Error::InvalidInput(format!("unsloth CLI not found — {UNSLOTH_INSTALL_HINT}"))
 }
 
+const SHUTTING_DOWN_ABORT: &str = "unsloth server startup aborted: daemon is shutting down";
+
 /// The error an in-flight or new `ensure_endpoint` gets when a daemon
 /// shutdown was requested mid-startup.
 fn shutting_down_error() -> Error {
-    Error::Internal("unsloth server startup aborted: daemon is shutting down".to_string())
+    Error::Internal(SHUTTING_DOWN_ABORT.to_string())
+}
+
+/// Whether `err` is a start aborted by the shutdown latch. The teardown path
+/// wraps the error's display text (`internal error: …`) before the server
+/// output tail.
+pub(crate) fn is_shutting_down_abort(err: &Error) -> bool {
+    let Error::Internal(message) = err else {
+        return false;
+    };
+    message.starts_with(SHUTTING_DOWN_ABORT)
+        || message.starts_with(&shutting_down_error().to_string())
 }
 
 /// The error an in-flight `ensure_endpoint` gets when `unsloth.stop` aborted
@@ -166,6 +179,13 @@ fn shutting_down_error() -> Error {
 /// new server).
 fn stop_requested_error() -> Error {
     Error::Internal("unsloth server startup aborted: unsloth.stop was called".to_string())
+}
+
+/// The error a start gets when the pool stopped its server (a per-model
+/// stop, a stop of every server, or an eviction) while the daemon keeps
+/// running; a later start may bring the model back.
+pub(crate) fn server_stopped_error() -> Error {
+    Error::Internal("unsloth server startup aborted: its server was stopped".to_string())
 }
 
 /// The error for an unresolvable port conflict: the configured port is busy,
@@ -854,10 +874,11 @@ impl UnslothServerManager {
         }
     }
 
-    /// Whether [`Self::shutdown`] has been requested.
-    fn is_shutting_down(&self) -> bool {
-        self.shutting_down
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// Whether [`Self::shutdown`] has been requested. `SeqCst`, paired with the
+    /// pool's flag, so a start aborted by daemon shutdown never reads the pool
+    /// as still running.
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether [`Self::stop`] has an outstanding, not-yet-consumed request.
@@ -1757,7 +1778,7 @@ impl UnslothServerManager {
     /// startup aborts at its next probe tick. [`Self::shutdown`] does the rest.
     pub(crate) fn request_shutdown(&self) {
         self.shutting_down
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Kill the managed server (daemon shutdown / explicit teardown). No-op
@@ -1768,7 +1789,7 @@ impl UnslothServerManager {
     /// at most ~one probe interval plus the startup's own cleanup kill.
     pub async fn shutdown(&self) {
         self.shutting_down
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut state = self.state.lock().await;
         if let Some(mut server) = state.take() {
             tracing::info!(repo = %server.repo_id, "shutting down managed unsloth server");

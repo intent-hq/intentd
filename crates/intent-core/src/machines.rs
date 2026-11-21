@@ -682,6 +682,10 @@ pub struct CloudMachine {
     /// wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_at: Option<String>,
+    /// The self-hosted relay map URL (`server.tunnel.derpUrl`) the sandbox's
+    /// tunnel uses; `None` for tailcat's default relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
 }
 
 impl CloudMachine {

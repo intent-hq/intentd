@@ -1673,25 +1673,25 @@ async fn host_provider_discovery_over_wss() {
         "provider.hasNpxFallback must be boolean: {p0}"
     );
 
-    // Every provider carries a boolean npxOnly, npxPackage is present iff
-    // npxOnly is true, and claude-code specifically is npx-only with the
-    // pinned package spec.
+    // npxOnly mirrors the registry, and npxPackage is the registry's npx-only
+    // package, omitted when there is none. Which providers have packages is
+    // the intent-providers registry golden's fact. hasNpxFallback is not
+    // compared: a missing Codex/Claude CLI also sets it (bundled CLI via npx).
     for p in providers {
-        assert!(
-            p["npxOnly"].is_boolean(),
-            "provider.npxOnly must be boolean: {p}"
+        let id = p["id"].as_str().unwrap();
+        let npx_only_package = intent_providers::find_provider(id)
+            .unwrap_or_else(|| panic!("discovery row for an unregistered provider: {p}"))
+            .npx_only_package;
+        assert_eq!(
+            p["npxOnly"],
+            npx_only_package.is_some(),
+            "provider.npxOnly must mirror the registry: {p}"
         );
-        if p["npxOnly"] == true {
-            assert!(
-                p["npxPackage"].is_string(),
-                "npx-only providers must carry npxPackage: {p}"
-            );
-        } else {
-            assert!(
-                p.get("npxPackage").is_none(),
-                "non-npx-only providers must omit npxPackage: {p}"
-            );
-        }
+        assert_eq!(
+            p.get("npxPackage").and_then(Value::as_str),
+            npx_only_package,
+            "provider.npxPackage must be the registry package, or omitted: {p}"
+        );
         // Secondary-binary attribution (monorepo#991): the two fields are
         // present together or not at all, and an installed dual-binary
         // provider must have its secondary resolved.
@@ -1768,19 +1768,6 @@ async fn host_provider_discovery_over_wss() {
     assert!(
         auggie.get("secondaryCommand").is_none() && auggie.get("secondaryResolved").is_none(),
         "single-binary providers must omit secondary-binary fields: {auggie}"
-    );
-    let cc = providers
-        .iter()
-        .find(|p| p["id"] == "claude-code")
-        .expect("claude-code must be in the discovery payload");
-    assert_eq!(cc["npxOnly"], true, "claude-code must be npxOnly: {cc}");
-    assert_eq!(
-        cc["npxPackage"].as_str().unwrap(),
-        format!(
-            "@agentclientprotocol/claude-agent-acp@{}",
-            intent_providers::CLAUDE_AGENT_ACP_VERSION
-        ),
-        "claude-code npxPackage must be the pinned spec: {cc}"
     );
     // Pi keeps its legacy CLI verdict. Other rows carry an optional check
     // only when their exact pinned adapter declares an underlying CLI minimum.
