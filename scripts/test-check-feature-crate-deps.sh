@@ -3,7 +3,8 @@
 # against throwaway cargo workspaces (path dependencies only, so no network)
 # that reuse this repo's crate names. The allowed layering must pass. Each
 # wrong-way edge must fail and name it: core or intent-transport depending on
-# a feature (normal, dev, build or target-specific), a feature on intent-app,
+# a feature (normal, dev, build or target-specific), the node-connection
+# service on intent-services or a feature, a feature on intent-app,
 # and a feature-to-feature edge the split plan does not list (also in the
 # reverse direction of an allowed one). Finally the check must pass on this
 # repo.
@@ -19,8 +20,9 @@ trap 'rm -rf "$tmp"' EXIT
 failures=0
 fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
 
-crates=(intent-core intent-services intent-transport intent-svc-agents intent-svc-providers
-  intent-svc-scm intent-svc-runtime intent-svc-transfer intent-svc-collab intent-app intentd)
+crates=(intent-core intent-services intent-transport intent-node-connections intent-svc-agents
+  intent-svc-providers intent-svc-scm intent-svc-runtime intent-svc-transfer intent-svc-collab
+  intent-svc-remote intent-app intentd)
 
 # new_workspace NAME [CRATE EXTRA]...: a workspace with every crate in
 # `crates`, wired as the allowed layering (core -> intent-core, transport and
@@ -42,11 +44,12 @@ new_workspace() {
   for crate in "${crates[@]}"; do
     case $crate in
       intent-core) deps='' ;;
-      intent-services) deps='intent-core' ;;
+      intent-services | intent-node-connections) deps='intent-core' ;;
+      intent-svc-remote) deps='intent-services intent-node-connections' ;;
       intent-svc-agents) deps='intent-services intent-svc-providers intent-svc-scm intent-svc-runtime' ;;
       intent-svc-transfer) deps='intent-services intent-svc-agents' ;;
       intent-svc-* | intent-transport) deps='intent-services' ;;
-      intent-app) deps='intent-services intent-svc-agents intent-svc-providers intent-svc-scm intent-svc-runtime intent-svc-transfer intent-svc-collab' ;;
+      intent-app) deps='intent-services intent-svc-agents intent-svc-providers intent-svc-scm intent-svc-runtime intent-svc-transfer intent-svc-collab intent-svc-remote' ;;
       intentd) deps='intent-app intent-transport' ;;
     esac
     mkdir -p "$ws/$crate/src"
@@ -116,6 +119,17 @@ expect_fail transport_dev intent-transport intent-svc-transfer
 new_workspace transport_target intent-transport '[target."cfg(windows)".dependencies]
 intent-svc-runtime = { path = "../intent-svc-runtime" }'
 expect_fail transport_target intent-transport intent-svc-runtime
+
+# The node-connection service sits below intent-services.
+new_workspace nc_services intent-node-connections 'intent-services = { path = "../intent-services" }'
+expect_fail nc_services intent-node-connections intent-services
+
+new_workspace nc_services_dev intent-node-connections '[dev-dependencies]
+intent-services = { path = "../intent-services" }'
+expect_fail nc_services_dev intent-node-connections intent-services
+
+new_workspace nc_feature intent-node-connections 'intent-svc-runtime = { path = "../intent-svc-runtime" }'
+expect_fail nc_feature intent-node-connections intent-svc-runtime
 
 new_workspace feature_app intent-svc-collab 'intent-app = { path = "../intent-app" }'
 expect_fail feature_app intent-svc-collab intent-app

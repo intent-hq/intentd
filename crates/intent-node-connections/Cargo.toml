@@ -1,0 +1,20 @@
+[package]
+name = "intent-node-connections"
+version = "0.11.266"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "The node-connection service for intentd: machine links, link ownership and fencing; below intent-services"
+
+[dependencies]
+intent-core = { workspace = true }
+intent-store = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+
+[lints]
+workspace = true

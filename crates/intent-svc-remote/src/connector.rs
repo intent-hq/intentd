@@ -139,6 +139,22 @@ pub(crate) struct Tuning {
     /// its record and leaving `Shared::in_grace`.
     #[cfg(test)]
     pub grace_gate: GraceGate,
+    /// Test seam: the link ownership the connector claims and fences with,
+    /// instead of this process owning every link.
+    #[cfg(test)]
+    pub ownership: OwnershipSeam,
+}
+
+/// See [`Tuning::ownership`].
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct OwnershipSeam(pub Option<Arc<dyn intent_node_connections::LinkOwnership>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for OwnershipSeam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnershipSeam")
+    }
 }
 
 /// See [`Tuning::forge_resolver`].
@@ -232,6 +248,8 @@ impl Default for Tuning {
             forge_resolver: ForgeResolver::default(),
             #[cfg(test)]
             grace_gate: GraceGate::default(),
+            #[cfg(test)]
+            ownership: OwnershipSeam::default(),
         }
     }
 }
@@ -1805,7 +1823,10 @@ impl RemoteNode {
         services: Option<Services>,
         forge: Option<Arc<crate::forge_token::ForgeTokens>>,
     ) -> Result<Self> {
-        let lease = HeadLease::open(store, &target.id).await?;
+        let ownership = crate::lease::local_ownership(&store);
+        #[cfg(test)]
+        let ownership = tuning.ownership.0.clone().unwrap_or(ownership);
+        let lease = HeadLease::open(store, &target.id, ownership).await?;
         #[cfg(test)]
         let lease = lease.failing_ack_writes_when(tuning.fail_ack_writes.clone());
         let acked = lease.acked().await?;
@@ -3210,7 +3231,8 @@ impl Acks {
     }
 
     /// Persist `seq`, then ack it. A failed persist sends no ack, so the
-    /// node keeps the records.
+    /// node keeps the records; a fenced one also closes the link, which
+    /// another process owns now.
     async fn flush(&mut self, lease: &HeadLease, link: &NodeLink, seq: NodeCounter) {
         self.pending = 0;
         self.due = None;
@@ -3219,6 +3241,9 @@ impl Acks {
                 Ok(_) => self.persisted = Some(seq),
                 Err(error) => {
                     tracing::warn!(%error, seq = seq.0, "remote node: could not persist the journal ack; not acking");
+                    if lease.fenced() {
+                        link.close();
+                    }
                     return;
                 }
             }

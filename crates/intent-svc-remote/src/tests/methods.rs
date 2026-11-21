@@ -866,7 +866,11 @@ async fn a_host_that_fails_the_bind_does_not_hide_a_valid_one() {
         .unwrap();
     for generation in 10..18 {
         let connected = crate::connect::connect(&target, &tuning().connect, None, || {
-            let hello = crate::lease::probe_hello(&owner, NodeCounter(generation));
+            let hello = crate::lease::probe_hello(
+                &owner,
+                NodeCounter(generation),
+                intent_node_connections::process_head_session(),
+            );
             async move { Ok(hello) }
         })
         .await
@@ -917,7 +921,11 @@ async fn a_host_that_stalls_the_bind_does_not_hide_a_valid_one() {
     };
     for generation in 1..5 {
         let connected = crate::connect::connect(&target, &budget, None, || {
-            let hello = crate::lease::probe_hello(&owner, NodeCounter(generation));
+            let hello = crate::lease::probe_hello(
+                &owner,
+                NodeCounter(generation),
+                intent_node_connections::process_head_session(),
+            );
             async move { Ok(hello) }
         })
         .await

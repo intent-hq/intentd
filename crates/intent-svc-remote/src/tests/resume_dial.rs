@@ -83,6 +83,7 @@ async fn dial_after_resume(
         let hello = crate::lease::probe_hello(
             &owner,
             NodeCounter(generation.fetch_add(1, Ordering::SeqCst)),
+            intent_node_connections::process_head_session(),
         );
         async move { Ok(hello) }
     })

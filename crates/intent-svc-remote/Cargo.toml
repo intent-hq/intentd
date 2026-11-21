@@ -11,6 +11,7 @@ description = "Remote agent runtime for intentd: the backend connector to expose
 intent-services = { workspace = true }
 intent-core = { workspace = true }
 intent-store = { workspace = true }
+intent-node-connections = { workspace = true }
 intent-transport = { workspace = true }
 intent-acp = { workspace = true }
 intent-git = { workspace = true }
