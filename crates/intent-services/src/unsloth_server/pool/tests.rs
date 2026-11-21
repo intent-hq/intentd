@@ -357,23 +357,37 @@ esac
         tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(30)),
             async {
-                loop {
-                    let restarted = fx
-                        .pool
-                        .ensure_endpoint(A, None, &none(), &|_, _| {})
-                        .await
-                        .expect("A restarts");
-                    let servers = running(&fx.pool).await;
-                    if servers.iter().all(|(repo, _)| repo != B) {
-                        assert!(restarted.base_url.contains("127.0.0.1:"));
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                while fx.pool.server_is_live_for_test(A) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             },
         )
         .await
-        .expect("B stopped to make room for A");
+        .expect("A's death is observed");
+
+        // Two agents retry A at once: both must go through the memory check.
+        let attached = none();
+        let (first, second) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                tokio::join!(
+                    fx.pool.ensure_endpoint(A, None, &attached, &|_, _| {}),
+                    fx.pool.ensure_endpoint(A, None, &attached, &|_, _| {}),
+                )
+            },
+        )
+        .await
+        .expect("both restarts finish");
+        assert_eq!(first.expect("A restarts"), second.expect("A restarts"));
+        assert_eq!(
+            running(&fx.pool)
+                .await
+                .into_iter()
+                .map(|(repo, _)| repo)
+                .collect::<Vec<_>>(),
+            [A.to_string()],
+            "B stopped to make room for A, and A runs once"
+        );
         assert_eq!(running(&fx.pool).await.len(), 1);
         fx.pool.shutdown().await;
     }

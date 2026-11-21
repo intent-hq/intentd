@@ -152,18 +152,19 @@ impl UnslothServerPool {
         }
     }
 
-    /// Enter `repo_id`'s entry: count a call in flight and mark it used.
-    /// Returns the calls in flight before this one.
-    fn enter(&self, repo_id: &str) -> Option<(Arc<UnslothServerManager>, InFlight, usize)> {
+    /// Join `repo_id`'s entry when its server is alive or a start that went
+    /// through admission is in flight: count this call in flight and mark the
+    /// entry used. Decided and counted under one lock, so a crashed server is
+    /// never joined: every caller for it goes through [`Self::admit`].
+    fn join(&self, repo_id: &str) -> Option<(Arc<UnslothServerManager>, InFlight)> {
         let mut servers = lock_ignore_poison(&self.servers);
         let entry = servers.get_mut(repo_id)?;
+        if entry.in_flight.load(Ordering::SeqCst) == 0 && !entry.manager.has_live_server() {
+            return None;
+        }
         entry.last_used = Instant::now();
-        let prior = entry.in_flight.fetch_add(1, Ordering::SeqCst);
-        Some((
-            entry.manager.clone(),
-            InFlight(entry.in_flight.clone()),
-            prior,
-        ))
+        entry.in_flight.fetch_add(1, Ordering::SeqCst);
+        Some((entry.manager.clone(), InFlight(entry.in_flight.clone())))
     }
 
     /// Whether `repo_id` has a running or starting server. Read-only.
@@ -310,16 +311,9 @@ impl UnslothServerPool {
         if self.is_shutting_down() {
             return Err(shutting_down_error());
         }
-        let (manager, in_flight) = match self.enter(repo_id) {
-            Some((manager, in_flight, prior)) if prior > 0 || manager.has_live_server() => {
-                (manager, in_flight)
-            }
-            // The server died: start it again through the memory check.
-            Some((manager, in_flight, _)) => {
-                drop(in_flight);
-                self.forget_if_idle(repo_id, &manager);
-                self.admit(repo_id, attached, status).await?
-            }
+        // A missing or crashed server starts through the memory check.
+        let (manager, in_flight) = match self.join(repo_id) {
+            Some(joined) => joined,
             None => self.admit(repo_id, attached, status).await?,
         };
         let result = manager
@@ -345,11 +339,13 @@ impl UnslothServerPool {
         if self.is_shutting_down() {
             return Err(shutting_down_error());
         }
-        if let Some((manager, in_flight, prior)) = self.enter(repo_id) {
-            if prior > 0 || manager.has_live_server() {
-                return Ok((manager, in_flight));
-            }
-            drop(in_flight);
+        if let Some(joined) = self.join(repo_id) {
+            return Ok(joined);
+        }
+        let dead = lock_ignore_poison(&self.servers)
+            .get(repo_id)
+            .map(|entry| entry.manager.clone());
+        if let Some(manager) = dead {
             self.forget_if_idle(repo_id, &manager);
         }
         let loads = self.loads(repo_id, attached).await;
@@ -511,6 +507,14 @@ impl UnslothServerPool {
             },
         );
         port
+    }
+
+    /// Whether `repo_id`'s server is alive (reaps a dead child).
+    #[cfg(all(test, unix))]
+    pub(crate) fn server_is_live_for_test(&self, repo_id: &str) -> bool {
+        lock_ignore_poison(&self.servers)
+            .get(repo_id)
+            .is_some_and(|entry| entry.manager.has_live_server())
     }
 
     #[cfg(all(test, unix))]
