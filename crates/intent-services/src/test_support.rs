@@ -8,6 +8,8 @@ pub mod capability_fixtures;
 #[cfg(test)]
 pub(crate) mod fake_runtime;
 pub mod fixtures;
+#[cfg(test)]
+pub(crate) mod golden_rows;
 pub mod goldens;
 pub mod large_state;
 pub mod profile_launch;

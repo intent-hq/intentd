@@ -4,6 +4,9 @@
 //! system prompt. Each row pins the bytes (length + SHA-256) of five
 //! variants joined: top-level, sub-agent, chief, top-level with remote
 //! placement text, and a plain folder with placement text (dropped there).
+//!
+//! Refresh every table here after a deliberate change with
+//! `INTENTD_UPDATE_GOLDENS=1 make test-select E='test(session_surface_goldens)'`.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -16,6 +19,7 @@ use intent_providers::ProviderConfig;
 use sha2::{Digest, Sha256};
 
 use crate::session_surfaces::SessionSurfaces;
+use crate::test_support::golden_rows::{self, Field};
 use crate::test_support::goldens::{seed_agent, setup};
 use crate::Services;
 
@@ -114,17 +118,55 @@ const RULES: &str = "# Repo rules\n\nKeep changes small.\n";
 const PLACEMENT: &str = "Remote placement (experimental): fixture machine list.\n";
 const SEPARATOR: &str = "\n\u{0}\n";
 
-/// `n` with `_` thousands separators, as the table spells it.
-fn grouped(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, digit) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push('_');
-        }
-        out.push(digit);
+const SOURCE: &str = "src/session_surface_goldens.rs";
+const UPDATE_COMMAND: &str =
+    "INTENTD_UPDATE_GOLDENS=1 make test-select E='test(session_surface_goldens)'";
+
+type Row<'a> = (&'a str, usize, &'a str, usize, &'a str);
+
+fn table_source<'a>(rows: impl IntoIterator<Item = Row<'a>>) -> String {
+    golden_rows::rows_source(rows.into_iter().map(|row| {
+        vec![
+            Field::Str(row.0),
+            Field::Count(row.1),
+            Field::Str(row.2),
+            Field::Count(row.3),
+            Field::Str(row.4),
+        ]
+    }))
+}
+
+/// Compares `actual` with `table`, or rewrites `table` under
+/// `INTENTD_UPDATE_GOLDENS=1`. On a difference, returns the ids whose row
+/// is missing or changed, and the ids of stale rows.
+fn check_table(
+    name: &str,
+    table: &[Row<'static>],
+    actual: &[(&str, usize, String, usize, String)],
+) -> Option<(Vec<String>, Vec<String>)> {
+    let actual: Vec<Row> = actual
+        .iter()
+        .map(|row| (row.0, row.1, row.2.as_str(), row.3, row.4.as_str()))
+        .collect();
+    let body = table_source(actual.iter().copied());
+    if golden_rows::updating() {
+        golden_rows::rewrite_table(SOURCE, name, &body);
+        return None;
     }
-    out
+    if body == table_source(table.iter().copied()) {
+        return None;
+    }
+    let changed = actual
+        .iter()
+        .filter(|row| table.iter().find(|r| r.0 == row.0) != Some(*row))
+        .map(|row| row.0.to_owned())
+        .collect();
+    let stale = table
+        .iter()
+        .filter(|row| actual.iter().all(|r| r.0 != row.0))
+        .map(|row| row.0.to_owned())
+        .collect();
+    Some((changed, stale))
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -324,7 +366,6 @@ const V3_10_WORKSPACE_API: &[(&str, usize, &str, usize, &str)] = &[
 async fn v3_10_workspace_api_surfaces() {
     let (_db, _dir, services, session) = fixture().await;
     let mut actual = Vec::new();
-    let mut mismatches = Vec::new();
     for provider in intent_providers::config::ACP_PROVIDERS {
         let (tool, reference) = workspace_api_surfaces_for(&services, &session, "3.10", provider);
         assert_eq!(
@@ -333,35 +374,23 @@ async fn v3_10_workspace_api_surfaces() {
             "{}: the reference lives in exactly one place",
             provider.id
         );
-        let row = (
+        actual.push((
             provider.id,
             tool.len(),
             sha256_hex(&tool),
             reference.len(),
             sha256_hex(&reference),
-        );
-        if V3_10_WORKSPACE_API.iter().find(|r| r.0 == provider.id)
-            != Some(&(row.0, row.1, row.2.as_str(), row.3, row.4.as_str()))
-        {
-            mismatches.push(provider.id);
-        }
-        actual.push(format!(
-            "    (\"{}\", {}, \"{}\", {}, \"{}\"),",
-            row.0,
-            grouped(row.1),
-            row.2,
-            grouped(row.3),
-            row.4
         ));
     }
-    assert!(
-        mismatches.is_empty() && V3_10_WORKSPACE_API.len() == actual.len(),
-        "harness 3.10 workspace_api surfaces changed for {mismatches:?}. 3.12 reuses these \
-         surfaces, so live sessions carry this text: change it only as a deliberate all-session fix \
-         or move the change to a new harness version, then paste the rows into \
-         `V3_10_WORKSPACE_API`:\n{}",
-        actual.join("\n")
-    );
+    if let Some((changed, stale)) = check_table("V3_10_WORKSPACE_API", V3_10_WORKSPACE_API, &actual)
+    {
+        panic!(
+            "harness 3.10 workspace_api surfaces changed for {changed:?} (stale rows {stale:?}). \
+             3.12 reuses these surfaces, so live sessions carry this text: move the change to a \
+             new harness version, or for a deliberate all-session fix refresh the rows with:\n\
+             {UPDATE_COMMAND}"
+        );
+    }
 }
 
 /// Every variant's surfaces for `provider` with the session stamped
@@ -434,7 +463,6 @@ pub(crate) async fn fixture() -> (
 async fn frozen_sessions_keep_tool_description_and_system_prompt() {
     let (_db, dir, services, session) = fixture().await;
     let mut actual = Vec::new();
-    let mut mismatches = Vec::new();
     for provider in intent_providers::config::ACP_PROVIDERS {
         let mut rows = Vec::new();
         for version in FROZEN_VERSIONS {
@@ -453,43 +481,39 @@ async fn frozen_sessions_keep_tool_description_and_system_prompt() {
             provider.id
         );
         let (tool_len, tool_sha, prompt_len, prompt_sha) = rows.remove(0);
-        let expected = FROZEN_SURFACES.iter().find(|row| row.0 == provider.id);
-        if expected
-            != Some(&(
-                provider.id,
-                tool_len,
-                tool_sha.as_str(),
-                prompt_len,
-                prompt_sha.as_str(),
-            ))
-        {
-            mismatches.push(provider.id);
-        }
-        actual.push(format!(
-            "    (\"{}\", {}, \"{tool_sha}\", {}, \"{prompt_sha}\"),",
-            provider.id,
-            grouped(tool_len),
-            grouped(prompt_len)
-        ));
+        actual.push((provider.id, tool_len, tool_sha, prompt_len, prompt_sha));
     }
-    let registered: Vec<&str> = intent_providers::config::ACP_PROVIDERS
-        .iter()
-        .map(|provider| provider.id)
-        .collect();
-    let stale: Vec<&str> = FROZEN_SURFACES
-        .iter()
-        .map(|row| row.0)
-        .filter(|id| !registered.contains(id))
-        .collect();
-    assert!(
-        mismatches.is_empty() && stale.is_empty(),
-        "frozen surfaces changed for {mismatches:?} (stale rows {stale:?}). A new provider \
-         adds its row. A changed row means sessions on a frozen harness see new text: \
-         gate the change on a new harness version, or update the row for a deliberate \
-         fix to every version (rerun `make test-select \
-         E='test(frozen_sessions_keep)'` and paste the rows below). Actual:\n{}",
-        actual.join("\n")
-    );
+    if let Some((changed, stale)) = check_table("FROZEN_SURFACES", FROZEN_SURFACES, &actual) {
+        panic!(
+            "frozen surfaces changed for {changed:?} (stale rows {stale:?}). A new provider \
+             adds its row. A changed row means sessions on a frozen harness see new text: \
+             gate the change on a new harness version, or for a deliberate fix to every \
+             version refresh the rows with:\n{UPDATE_COMMAND}"
+        );
+    }
+}
+
+/// The update command rewrites the tables in rustfmt's layout: rebuilding
+/// each table from its own rows leaves this file byte-identical. An update
+/// run rewrites the file under the compiled tables, so it skips this check.
+#[test]
+fn tables_regenerate_in_rustfmt_layout() {
+    if golden_rows::updating() {
+        return;
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(SOURCE);
+    let source = std::fs::read_to_string(path).expect("read this file");
+    for (name, table) in [
+        ("FROZEN_SURFACES", FROZEN_SURFACES),
+        ("V3_10_WORKSPACE_API", V3_10_WORKSPACE_API),
+    ] {
+        let body = table_source(table.iter().copied());
+        assert_eq!(
+            golden_rows::splice_table(&source, name, &body),
+            source,
+            "{name}"
+        );
+    }
 }
 
 /// The frozen versions keep the original builders for the surfaces the
