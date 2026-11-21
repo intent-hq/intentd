@@ -1,0 +1,5 @@
+error[E0277]: the trait bound `OrchestratorOnly: Default` is not satisfied
+ --> tests/ui/orchestrator_only_default.rs:3:5
+  |
+3 |     Default::default()
+  |     ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `OrchestratorOnly`

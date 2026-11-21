@@ -120,6 +120,7 @@ pub async fn race_increments(
             tenant_id.clone(),
             options,
             &format!("writer-race-{i}"),
+            intent_store::OrchestratorOnly::for_tests(),
         )
         .await
         .map_err(|e| format!("open process {i}: {e}"))?;

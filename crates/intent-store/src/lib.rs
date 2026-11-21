@@ -127,6 +127,8 @@ mod note_version_repo;
 mod note_write_connection;
 mod note_write_lock;
 pub use note_write_lock::NoteWriteLock;
+mod orchestrator_only;
+pub use orchestrator_only::OrchestratorOnly;
 mod pr_monitor_repo;
 mod presence_focus_repo;
 mod principal_repo;

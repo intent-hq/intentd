@@ -327,17 +327,8 @@ impl Config {
     ///
     /// Returns `Error::Internal` if the data directory cannot be resolved or `config.toml` cannot be read/initialized; `Error::InvalidInput` if the file is malformed.
     pub fn resolve() -> Result<Self> {
-        let data_dir = match std::env::var_os("INTENTD_DATA_DIR") {
-            Some(p) => PathBuf::from(p),
-            None => directories::ProjectDirs::from("", "", "intentd")
-                .map(|d| d.data_dir().to_path_buf())
-                .ok_or_else(|| Error::Internal("could not resolve data directory".to_string()))?,
-        };
-
-        let config_path = match std::env::var_os("INTENTD_CONFIG") {
-            Some(p) => PathBuf::from(p),
-            None => data_dir.join("config.toml"),
-        };
+        let data_dir = resolve_data_dir()?;
+        let config_path = config_path_in(&data_dir, std::env::var_os("INTENTD_CONFIG"));
 
         let settings = SettingsFile::load_or_init(&config_path)?;
 
@@ -375,6 +366,41 @@ impl Config {
     }
 }
 
+/// The data dir [`Config::resolve`] uses: `INTENTD_DATA_DIR`, else the
+/// platform default.
+fn resolve_data_dir() -> Result<PathBuf> {
+    match std::env::var_os("INTENTD_DATA_DIR") {
+        Some(p) => Ok(PathBuf::from(p)),
+        None => directories::ProjectDirs::from("", "", "intentd")
+            .map(|d| d.data_dir().to_path_buf())
+            .ok_or_else(|| Error::Internal("could not resolve data directory".to_string())),
+    }
+}
+
+/// `config.toml`'s path: the `INTENTD_CONFIG` override, else
+/// `<data_dir>/config.toml`.
+fn config_path_in(
+    data_dir: &std::path::Path,
+    override_path: Option<std::ffi::OsString>,
+) -> PathBuf {
+    override_path.map_or_else(|| data_dir.join("config.toml"), PathBuf::from)
+}
+
+/// The `config.toml` path [`Config::resolve`] reads, found without reading,
+/// creating or initializing anything (unlike `Config::resolve`, which writes
+/// the default template when the file is missing). For startup checks that
+/// must run before the daemon touches its data dir.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the data directory cannot be resolved.
+pub fn resolve_config_path() -> Result<PathBuf> {
+    Ok(config_path_in(
+        &resolve_data_dir()?,
+        std::env::var_os("INTENTD_CONFIG"),
+    ))
+}
+
 /// Effective `scripts.outputRetentionHours` for one sweep: the
 /// [`SCRIPT_OUTPUT_RETENTION_HOURS_ENV`] override when it parses to an
 /// in-range value, otherwise the live settings snapshot's value. `0` means
@@ -402,4 +428,19 @@ fn env_u32(name: &str) -> Option<u32> {
         .trim()
         .parse()
         .ok()
+}
+
+#[cfg(test)]
+mod config_path_tests {
+    use super::*;
+
+    #[test]
+    fn config_path_defaults_to_the_data_dir_and_honors_the_override() {
+        let data_dir = std::path::Path::new("/data/intentd");
+        assert_eq!(config_path_in(data_dir, None), data_dir.join("config.toml"));
+        assert_eq!(
+            config_path_in(data_dir, Some("/etc/intentd.toml".into())),
+            PathBuf::from("/etc/intentd.toml")
+        );
+    }
 }

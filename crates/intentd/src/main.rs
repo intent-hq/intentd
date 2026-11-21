@@ -49,6 +49,7 @@ mod plugin_exec;
 mod rpc_profile;
 mod shutdown;
 mod startup;
+mod store_backend;
 mod suspend;
 mod tunnel;
 use client::rpc_call;
@@ -414,9 +415,25 @@ fn main() -> ExitCode {
     {
         std::env::set_var("INTENTD_SPECIALISTS_DIR", dir);
     }
+    // Postgres runs only in orchestrator mode. Decide the store before
+    // anything writes to the data dir: tracing creates the log file, and
+    // `serve` then takes the data-dir lock and the pidfile. Single-threaded
+    // here, so the URL can leave the environment children inherit.
+    let store_backend = match &cli.command {
+        Command::Serve {
+            node, orchestrator, ..
+        } => match store_backend::choose_for_serve(mode_flag(*node, *orchestrator)) {
+            Ok(backend) => Some(backend),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => None,
+    };
     let serving = matches!(cli.command, Command::Serve { .. });
     let runtime = build_runtime();
-    let result = runtime.block_on(async_main(cli));
+    let result = runtime.block_on(async_main(cli, store_backend));
     if serving {
         shutdown::drop_runtime(runtime);
     } else {
@@ -445,7 +462,7 @@ fn build_runtime() -> tokio::runtime::Runtime {
         .expect("build tokio runtime")
 }
 
-async fn async_main(cli: Cli) -> ExitCode {
+async fn async_main(cli: Cli, store_backend: Option<store_backend::StoreBackend>) -> ExitCode {
     let command = cli.command;
     init_tracing(matches!(command, Command::Serve { .. }));
     install_panic_hook();
@@ -487,11 +504,14 @@ async fn async_main(cli: Cli) -> ExitCode {
                 // This measures the entire serve call, including startup and local
                 // destruction on return; cleanup has its own shutdown-only timer.
                 let serve = shutdown::Phase::start("serve_lifetime");
+                let store_backend =
+                    store_backend.expect("main chooses the store backend for every serve");
                 match cmd_serve(
                     mode.as_deref(),
                     insecure,
                     resume_all,
                     mode_flag(node, orchestrator),
+                    store_backend,
                 )
                 .await
                 {
@@ -2069,6 +2089,7 @@ async fn cmd_serve(
     insecure: bool,
     resume_all: bool,
     node: Option<intent_core::settings_file::DaemonMode>,
+    store_backend: store_backend::StoreBackend,
 ) -> anyhow::Result<ExitCode> {
     // Build-identity banner on entering serve so every startup records
     // which build produced it (monorepo#3649). Same identity
@@ -2121,8 +2142,13 @@ async fn cmd_serve(
     // UDS or a live pid holds the pidfile; clean a stale socket/pidfile whose
     // owner is gone. The returned guard removes our pidfile on shutdown.
     let _pidfile = acquire_single_instance(&config, Some(&datadir_lock)).await?;
-    let prepared =
-        Store::prepare_for_daemon(&config.db_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // The store open. `main` chose Postgres only in orchestrator mode, which
+    // `cmd_serve_owned` resolves again from the same flag and `config.toml`.
+    let prepared = match store_backend {
+        store_backend::StoreBackend::Sqlite => Store::prepare_for_daemon(&config.db_path)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        store_backend::StoreBackend::Postgres(postgres) => return Err(postgres.unavailable()),
+    };
     let mut bootstrap = startup::Bootstrap::new(&config);
     // A frozen sitter can send a staged-update signal as soon as our protected
     // liveness endpoint appears. Reserve its receiver before exposing that
