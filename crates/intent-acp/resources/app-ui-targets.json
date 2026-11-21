@@ -224,15 +224,41 @@
   },
   {
     "id": "workspace-api",
-    "tab": "advanced",
+    "tab": "token-savings",
     "hashAliases": [
       "workspace-api"
     ],
     "scrollSelector": "#workspace-api",
     "highlightSelector": "[data-highlight-id=\"workspace-api\"]",
     "label": "Settings: Tool Output & Retention",
-    "route": "/settings?tab=advanced#workspace-api",
+    "route": "/settings?tab=token-savings#workspace-api",
     "description": "Tool output size and retention settings.",
+    "category": "settings"
+  },
+  {
+    "id": "agent-backend",
+    "tab": "performance",
+    "hashAliases": [
+      "agent-backend"
+    ],
+    "scrollSelector": "#agent-backend",
+    "highlightSelector": "[data-highlight-id=\"agent-backend\"]",
+    "label": "Settings: Agent Backend",
+    "route": "/settings?tab=performance#agent-backend",
+    "description": "Agent backend settings.",
+    "category": "settings"
+  },
+  {
+    "id": "connection",
+    "tab": "advanced",
+    "hashAliases": [
+      "connection"
+    ],
+    "scrollSelector": "#connection",
+    "highlightSelector": "[data-highlight-id=\"connection\"]",
+    "label": "Settings: Connection",
+    "route": "/settings?tab=advanced#connection",
+    "description": "Daemon connection details.",
     "category": "settings"
   }
 ]

@@ -261,16 +261,26 @@ Open Settings and use these sidebar labels (English labels shown):
 
 | Section | What it contains | Canonical link |
 | --- | --- | --- |
-| Appearance | Theme, colors, language, fonts, and chat display | `/settings?tab=display#theme` |
-| General | Notifications, updates, external apps, GitHub link behavior | `/settings?tab=app-behavior#notifications` |
-| Input and shortcuts | Voice dictation and keyboard shortcuts | `/settings?tab=input#keyboard-shortcuts` |
-| Agent defaults | Global instructions; tool approvals and agent features under **Advanced** | `/settings?tab=agent-behavior#global-instructions` |
 | Providers | AI coding CLIs and default model | `/settings?tab=providers#providers` |
+| Instructions | Instructions added to every agent's system prompt | `/settings?tab=agent-behavior#global-instructions` |
 | Connections | Integrations, MCP servers and plugins | `/settings?tab=connections#integrations` |
+| Token Savings | RTK, tool output and retention, agent features, tool approvals | `/settings?tab=token-savings#workspace-api` |
 | Machines | Local machine, connected backend and saved remote connections | `/settings?tab=devices#devices` |
 | Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
-| Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
-| Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
+| General | Notifications, updates, external apps, GitHub link behavior | `/settings?tab=app-behavior#notifications` |
+| Appearance | Theme, colors, language, fonts, and chat display | `/settings?tab=display#theme` |
+| Performance | Animations and effects, agent backend | `/settings?tab=performance#agent-backend` |
+| Inputs | Notch, voice dictation, keyboard shortcuts, hardware | `/settings?tab=input#keyboard-shortcuts` |
+| Workspaces | Git, shell, workspace and archiving defaults | `/settings?tab=setup#git-workspace` |
+| Advanced | Labs, connection, data, reset | `/settings?tab=advanced#connection` |
+
+Starting with the desktop release that reorganizes Settings, the sidebar uses the
+labels above. Earlier releases use **Agent defaults**, **Input and shortcuts** and
+**Workspace setup**, show Token Savings and Performance settings under **Advanced**
+or **Appearance**, and put the Notch dock under **Appearance**. Old links open the
+new location.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/SettingsSidebarNav.svelte; src/routes/(app)/settings/{+page.svelte,settings-hash-tab.ts}; src/shared/app-ui-targets.ts. Test-build behavior pending its frontend release. -->
 
 Open **Settings → Appearance → Font Style → Font** and type part of a font name
 to search, regardless of case. Use the arrow keys and Enter to choose a result.
@@ -300,7 +310,8 @@ then tap an individual call to see its details.
 <!-- Sources: packages/ios/Intent/Views/Conversation/Transcript/{ConversationView,ResponseGroupView,ToolCallView}.swift; packages/ios/Intent/Presentation/MessageBlockPartitioning.swift. -->
 
 When asked about the **Notch dock**, its switch is in
-**Settings → Appearance → Notch dock**. Starting with the desktop release that turns
+**Settings → Inputs → Notch** (**Settings → Appearance → Notch dock** in earlier
+desktop releases). Starting with the desktop release that turns
 it on by default, the dock is on unless the user turned it off; a user who turned it
 off keeps it off. The switch follows changes from Settings,
 **Window → Show Intent Dock**, and the dock's **Hide** action without a refresh,
@@ -449,9 +460,9 @@ custom specialist instructions can override the defaults.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte; src/routes/(app)/settings/+page.svelte (Agent defaults Advanced disclosure). Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
-**Secret requests.** Off by default. Open **Agent defaults**
-(`/settings?tab=agent-behavior#global-instructions`), expand **Advanced** if it is shown,
-and turn on **Secret requests**, directly under **Host command execution** in **Agent
+**Secret requests.** Off by default. Open **Settings → Token Savings**
+(`/settings?tab=token-savings#workspace-api`, then **Agent features**; in earlier
+releases, **Agent defaults → Advanced**) and turn on **Secret requests**, directly under **Host command execution** in **Agent
 features**; it stays off and unavailable while Host command execution is off. It applies
 to top-level workspace agents created afterwards, not to sub-agents, background hooks or
 Assistant chat. When such an agent asks for a secret such as an API key, a "Secret
@@ -1096,7 +1107,7 @@ the terminal drawer with two or more terminals, the bracket shortcuts cycle
 drawer terminals instead. From **Home**, next opens the first workspace tab and
 previous opens the last, regardless of which workspace was selected before
 Home. With no open workspace tabs, these shortcuts do nothing. Customize them in
-**Settings → Input and shortcuts → Keyboard shortcuts**.
+**Settings → Inputs → Keyboard shortcuts**.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/recent-agents/RecentAgentSwitcher.svelte; src/features/recent-agents/RecentAgentCard.svelte; src/features/recent-agents/main/recent-agents.ipc.ts; src/shared/recent-agents.ts; src/shared/keyboard-shortcut-bindings.ts; src/store/renderer/slices/recent-agents/sagas/recent-agents-saga.ts. -->
 
@@ -1117,7 +1128,7 @@ and drops items of a forgotten machine, of a deleted or archived workspace, and
 browser or terminal tabs that were closed. A closed browser tab that an agent
 opened stays hidden in the background, so it stays listed and choosing it
 brings it back. Terminals in the terminal drawer are not listed. It works in the composer, terminals and the browser panel. Rebind it
-as **Switch to Recent Tab** in **Settings → Input and shortcuts → Keyboard
+as **Switch to Recent Tab** in **Settings → Inputs → Keyboard
 shortcuts**.
 
 <!-- Labs (tab groups): describe only when explicitly asked about tab groups or
@@ -1197,8 +1208,8 @@ agents on remote machines, do not use this setting. Codex works differently: wit
 this setting on, it edits files in the workspace freely and asks only before writing
 outside the workspace or using the network.
 
-To change the default for every chat, open **Settings → Agent defaults → Tool
-approvals** (expand **Advanced** first if it is shown): **Ask each time**, **Allow all** (the default), **Allow reads only**, or
+To change the default for every chat, open **Settings → Token Savings → Tool
+approvals** (**Agent defaults → Advanced** in earlier releases): **Ask each time**, **Allow all** (the default), **Allow reads only**, or
 **Deny all**. A chat's own setting wins. If the backend was started with the
 `INTENTD_PERMISSION_POLICY` environment variable, that value replaces this default.
 An Assistant settings card cannot change this setting.
@@ -1225,7 +1236,7 @@ app reconnects to Intent, the row returns to **Running** if fresh status shows
 the task still running. If it stays Connection lost, the agent's connection
 ended and the task has probably ended with it. An idle agent stays open while it
 has a running background task: Intent closes it only to free a process slot or
-memory, or once it has been idle about a day past **Settings → Advanced → Agent
+memory, or once it has been idle about a day past **Settings → Performance → Agent
 backend → Idle reap minutes** (10 by default; Off disables it). Agents without
 running tasks close after Idle reap minutes. Before telling the user it stopped,
 confirm independently, for example by checking whether the dev server still
@@ -1493,7 +1504,7 @@ needs to be set up again. If the script fails or runs longer than 10 minutes, th
 workspace is still archived and its card's status shows the failure.
 
 Intent can archive idle workspaces automatically. It is off by default; turn on
-**Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`)
+**Workspaces → Archive idle workspaces** (`/settings?tab=setup#git-workspace`)
 and set the number of days (7 when first turned on), or set `autoArchiveIdleAfterDays`
 (`0` = off) under `[workspace]` in `config.toml`. A workspace with no messages, note
 edits or agent activity for that long is archived, unless an agent, script, hook or
@@ -1519,7 +1530,7 @@ workspace whose folder is its own copy of the repository (CoW or Direct) can be
 purged only when nothing in it is missing from a remote: no uncommitted or untracked
 files, no stash, and no commits on any branch, submodule or nested repository that
 were not pushed (commits Intent saw merged in a pull request count as pushed).
-To purge automatically, turn on **Workspace setup → Free disk space for
+To purge automatically, turn on **Workspaces → Free disk space for
 archived workspaces** and set the number of days (7 when first turned on), or set
 `purgeArchivedAfterDays` in `config.toml`. It is off by default, runs about once an
 hour, and skips workspaces with uncommitted changes or with unpushed commits in a
@@ -1589,7 +1600,7 @@ Push the joystick to open the prompt ring. Up to three suggested prompts from th
 focused chat appear at top, top-right, and right, numbered and tinted purple. Your
 most-used prompts fill the other directions, and **Cancel** is at the bottom.
 Release on a suggestion to send it, or on a used prompt to insert it into the
-focused text box. **Settings → Hardware / Creator Micro → Prompt picker limit**
+focused text box. **Settings → Inputs → Hardware → Creator Micro → Prompt picker limit**
 sets how many used prompts appear: up to 7, fewer when chat suggestions take the
 top directions.
 
