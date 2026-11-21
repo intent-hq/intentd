@@ -143,7 +143,6 @@ mod tests {
         assert_eq!(cursor["supportsTestPrompt"], true);
         assert_eq!(cursor["supportsProfiles"], false);
         assert_eq!(cursor["visible"], true);
-        assert_eq!(cursor["loginCommandHint"], "cursor-agent login");
         assert_eq!(
             cursor["loginDocsUrl"],
             "https://cursor.com/docs/cli/reference/authentication"
@@ -151,31 +150,25 @@ mod tests {
         assert!(cursor.get("requiresEnvVar").is_none());
     }
 
-    /// A provider that also runs from its npm package advertises the npx
-    /// form of its login command; installed-only providers omit it.
+    /// Each row serves its provider's login hints, and omits an unset one
+    /// (never null). The hints themselves are the registry golden's facts
+    /// (intent-providers `provider_registry_golden`).
     #[test]
-    fn npx_runnable_rows_carry_an_npx_login_command() {
+    fn rows_serve_the_registry_login_hints() {
         let v = catalog(&|_| false);
-        assert_eq!(
-            row(&v, "opencode")["npxLoginCommandHint"],
-            format!(
-                "npx -y {} auth login",
-                intent_providers::OPENCODE_NPX_PACKAGE
-            )
-        );
-        assert_eq!(
-            row(&v, "codex")["npxLoginCommandHint"],
-            format!(
-                "npx -y {} login --device-auth",
-                intent_providers::adapter_cli::missing_fallback("codex")
-                    .unwrap()
-                    .spec()
-            )
-        );
-        for id in ["unsloth", "pi", "cursor"] {
-            assert!(
-                row(&v, id).get("npxLoginCommandHint").is_none(),
-                "{id} must omit npxLoginCommandHint"
+        for provider in intent_providers::ACP_PROVIDERS {
+            let row = row(&v, provider.id);
+            assert_eq!(
+                row.get("loginCommandHint").and_then(Value::as_str),
+                provider.login_command_hint,
+                "{}",
+                provider.id
+            );
+            assert_eq!(
+                row.get("npxLoginCommandHint").and_then(Value::as_str),
+                provider.npx_login_command_hint().as_deref(),
+                "{}",
+                provider.id
             );
         }
     }
@@ -190,7 +183,6 @@ mod tests {
         assert_eq!(auggie["command"], "auggie");
         assert_eq!(auggie["canBeDisabled"], true);
         assert_eq!(auggie["supportsTestPrompt"], true);
-        assert_eq!(auggie["loginCommandHint"], "auggie login");
         // The generic provider row's login CTA reads `loginDocsUrl`.
         assert!(auggie["loginDocsUrl"].is_string());
         assert!(auggie["authErrorPatterns"].is_array());

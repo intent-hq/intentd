@@ -580,7 +580,10 @@ async fn auth_required_surfaces_acp_auth_error() {
         .await
         .expect_err("authentication must fail");
     match err {
-        AcpError::Auth(msg) => assert!(msg.contains("auggie login"), "login hint present: {msg}"),
+        AcpError::Auth(msg) => assert!(
+            msg.contains(&intent_providers::login_command("auggie")),
+            "login hint present: {msg}"
+        ),
         other => panic!("expected AcpError::Auth, got {other:?}"),
     }
 }

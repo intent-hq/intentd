@@ -22,6 +22,41 @@ use crate::config::{
     PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
 };
 
+/// A provider CLI's launch version gate: the minimum [`cli_version_gate`]
+/// feeds [`pi_cli_gate`] / [`auggie_cli_gate`], and the requirement their
+/// user-facing reasons name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliVersionGate {
+    /// The CLI whose `--version` is probed.
+    pub command: &'static str,
+    /// Lowest accepted version.
+    pub min_version: &'static str,
+    /// Requirement text for user-facing messages; names `min_version`.
+    pub requirement: &'static str,
+}
+
+const PI_CLI_GATE: CliVersionGate = CliVersionGate {
+    command: "pi",
+    min_version: PI_CLI_MIN_VERSION,
+    requirement: PI_CLI_REQUIREMENT,
+};
+
+const AUGGIE_CLI_GATE: CliVersionGate = CliVersionGate {
+    command: "auggie",
+    min_version: AUGGIE_CLI_MIN_VERSION,
+    requirement: AUGGIE_CLI_REQUIREMENT,
+};
+
+/// The CLI version gate a provider's launch applies, if any (pi and auggie).
+#[must_use]
+pub fn cli_version_gate(provider_id: &str) -> Option<CliVersionGate> {
+    match provider_id {
+        "pi" => Some(PI_CLI_GATE),
+        "auggie" => Some(AUGGIE_CLI_GATE),
+        _ => None,
+    }
+}
+
 /// Result of probing the `pi` CLI, as fed to [`pi_cli_gate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PiCliProbe {
@@ -67,10 +102,12 @@ impl PiCliGate {
 pub fn pi_gate_reason(gate: &PiCliGate) -> Option<String> {
     match gate {
         PiCliGate::TooOld(found) => Some(format!(
-            "pi CLI {found} is too old — {PI_CLI_REQUIREMENT} is required by {PI_ACP_NPX_PACKAGE}"
+            "pi CLI {found} is too old — {} is required by {PI_ACP_NPX_PACKAGE}",
+            PI_CLI_GATE.requirement
         )),
         PiCliGate::Missing => Some(format!(
-            "pi CLI not found — {PI_CLI_REQUIREMENT} is required by {PI_ACP_NPX_PACKAGE}"
+            "pi CLI not found — {} is required by {PI_ACP_NPX_PACKAGE}",
+            PI_CLI_GATE.requirement
         )),
         PiCliGate::Ok | PiCliGate::Unknown => None,
     }
@@ -80,17 +117,22 @@ pub fn pi_gate_reason(gate: &PiCliGate) -> Option<String> {
 /// PATH, or subprocess access.
 #[must_use]
 pub fn pi_cli_gate(probe: &PiCliProbe) -> PiCliGate {
+    gate_at_least(probe, PI_CLI_GATE.min_version)
+}
+
+/// Shared pure decision: missing gates, a failed or unparseable probe is
+/// permissive, and a parsed version below `min_version` is too old.
+fn gate_at_least(probe: &PiCliProbe, min_version: &str) -> PiCliGate {
     match probe {
         PiCliProbe::Missing => PiCliGate::Missing,
         PiCliProbe::Failed => PiCliGate::Unknown,
-        PiCliProbe::Output(output) => match (
-            parse_cli_version(output),
-            parse_cli_version(PI_CLI_MIN_VERSION),
-        ) {
-            (Some(found), Some(min)) if found < min => PiCliGate::TooOld(format_version(found)),
-            (Some(_), Some(_)) => PiCliGate::Ok,
-            _ => PiCliGate::Unknown,
-        },
+        PiCliProbe::Output(output) => {
+            match (parse_cli_version(output), parse_cli_version(min_version)) {
+                (Some(found), Some(min)) if found < min => PiCliGate::TooOld(format_version(found)),
+                (Some(_), Some(_)) => PiCliGate::Ok,
+                _ => PiCliGate::Unknown,
+            }
+        }
     }
 }
 
@@ -103,13 +145,15 @@ pub fn pi_cli_gate(probe: &PiCliProbe) -> PiCliGate {
 pub fn auggie_gate_reason(gate: &PiCliGate) -> Option<String> {
     match gate {
         PiCliGate::TooOld(found) => Some(format!(
-            "auggie {found} is too old — {AUGGIE_CLI_REQUIREMENT} is required to launch an agent \
+            "auggie {found} is too old — {} is required to launch an agent \
              (the daemon passes --acp/--allow-indexing/--model/--remove-tool). Update auggie, or \
              point the daemon at a newer install via ~/.augment/auggie-path or the \
-             context.auggiePath setting."
+             context.auggiePath setting.",
+            AUGGIE_CLI_GATE.requirement
         )),
         PiCliGate::Missing => Some(format!(
-            "auggie not found — {AUGGIE_CLI_REQUIREMENT} is required to launch an agent"
+            "auggie not found — {} is required to launch an agent",
+            AUGGIE_CLI_GATE.requirement
         )),
         PiCliGate::Ok | PiCliGate::Unknown => None,
     }
@@ -121,18 +165,7 @@ pub fn auggie_gate_reason(gate: &PiCliGate) -> Option<String> {
 /// ([`AUGGIE_CLI_MIN_VERSION`]).
 #[must_use]
 pub fn auggie_cli_gate(probe: &PiCliProbe) -> PiCliGate {
-    match probe {
-        PiCliProbe::Missing => PiCliGate::Missing,
-        PiCliProbe::Failed => PiCliGate::Unknown,
-        PiCliProbe::Output(output) => match (
-            parse_cli_version(output),
-            parse_cli_version(AUGGIE_CLI_MIN_VERSION),
-        ) {
-            (Some(found), Some(min)) if found < min => PiCliGate::TooOld(format_version(found)),
-            (Some(_), Some(_)) => PiCliGate::Ok,
-            _ => PiCliGate::Unknown,
-        },
-    }
+    gate_at_least(probe, AUGGIE_CLI_GATE.min_version)
 }
 
 /// Decide the spawn-time npx gate from an `npx --version` probe (npx prints
@@ -142,18 +175,7 @@ pub fn auggie_cli_gate(probe: &PiCliProbe) -> PiCliGate {
 /// [`PiCliGate::Unknown`] and the spawn proceeds as before.
 #[must_use]
 pub fn npx_gate(probe: &PiCliProbe) -> PiCliGate {
-    match probe {
-        PiCliProbe::Missing => PiCliGate::Missing,
-        PiCliProbe::Failed => PiCliGate::Unknown,
-        PiCliProbe::Output(output) => match (
-            parse_cli_version(output),
-            parse_cli_version(NPX_MIN_NPM_VERSION),
-        ) {
-            (Some(found), Some(min)) if found < min => PiCliGate::TooOld(format_version(found)),
-            (Some(_), Some(_)) => PiCliGate::Ok,
-            _ => PiCliGate::Unknown,
-        },
-    }
+    gate_at_least(probe, NPX_MIN_NPM_VERSION)
 }
 
 /// User-facing rejection for a stale `npx` (intent-hq/intent#5725), or `None`
@@ -215,9 +237,24 @@ mod tests {
         pi_cli_gate(&PiCliProbe::Output(output.to_string()))
     }
 
+    /// Every gate's minimum parses (an unparseable one would make the gate
+    /// permanently permissive) and its requirement text names that minimum.
+    /// The values themselves are the registry golden's facts.
     #[test]
-    fn min_version_constant_parses() {
-        assert_eq!(parse_cli_version(PI_CLI_MIN_VERSION), Some((0, 81, 0)));
+    fn cli_version_gates_parse_and_name_their_minimum() {
+        let gated: Vec<_> = crate::all_provider_ids()
+            .into_iter()
+            .filter_map(cli_version_gate)
+            .collect();
+        assert!(!gated.is_empty());
+        for gate in gated {
+            assert!(parse_cli_version(gate.min_version).is_some(), "{gate:?}");
+            assert!(gate.requirement.contains(gate.min_version), "{gate:?}");
+            assert!(
+                gate.requirement.to_lowercase().contains(gate.command),
+                "{gate:?}"
+            );
+        }
     }
 
     #[test]
@@ -302,11 +339,6 @@ mod tests {
 
     fn auggie_gate_output(output: &str) -> PiCliGate {
         auggie_cli_gate(&PiCliProbe::Output(output.to_string()))
-    }
-
-    #[test]
-    fn auggie_min_version_constant_parses() {
-        assert_eq!(parse_cli_version(AUGGIE_CLI_MIN_VERSION), Some((0, 7, 0)));
     }
 
     #[test]

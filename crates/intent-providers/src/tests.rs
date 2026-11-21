@@ -176,7 +176,6 @@ fn registry_field_parity() {
     assert!(auggie.supports_authenticate && auggie.supports_set_mode);
     assert!(auggie.supports_mcp_config && auggie.supports_rules_file);
     assert!(auggie.can_be_disabled);
-    assert_eq!(auggie.login_command_hint, Some("auggie login"));
     // `auggie token print` exits 0 iff logged in; its output is the auth
     // session secret, so the probe must ride the generic exit-code arm.
     assert_eq!(auggie.auth_check_args, Some(&["token", "print"][..]));
@@ -188,13 +187,7 @@ fn registry_field_parity() {
     assert_eq!(cc.command, "claude-agent-acp");
     assert_eq!(cc.base_args, &[] as &[&str]);
     assert_eq!(cc.auth_check_args, Some(&["auth", "status"][..]));
-    // The hint must name the real `claude` CLI — the `{command} login`
-    // fallback would print the non-runnable "claude-agent-acp login"
-    // (intent-hq/intent#3941).
-    assert_eq!(cc.login_command_hint, Some("claude auth login"));
     assert!(cc.model_flag.is_none() && cc.can_be_disabled);
-    assert_eq!(cc.npx_only_package, Some(CLAUDE_AGENT_ACP_NPX_PACKAGE));
-    assert_eq!(cc.fallback_npx_package, None);
     // Providers whose client truncates, defers, or hides long MCP tool
     // descriptions get the compact `workspace_api` description +
     // system-prompt API reference: claude-code cuts at ~2k chars
@@ -228,12 +221,6 @@ fn registry_field_parity() {
 
     let codex = find_provider("codex").unwrap();
     assert_eq!(codex.auth_check_args, Some(&["login", "status"][..]));
-    assert_eq!(
-        codex.npx_only_package,
-        Some(crate::config::CODEX_ACP_NPX_PACKAGE)
-    );
-    assert_eq!(codex.fallback_npx_package, None);
-    assert!(!codex.npx_only_honors_path_override);
 
     let cortex = find_provider("cortex").unwrap();
     assert_eq!(cortex.command, "cortex-acp");
@@ -246,53 +233,12 @@ fn registry_field_parity() {
     assert_eq!(oc.base_args, &["acp"]);
     assert_eq!(oc.auth_check_args, Some(&["models"][..]));
     assert!(oc.model_flag.is_none());
-    // Not installed: runs from the pinned npm package, so onboarding can use
-    // its free models without an install step.
-    assert_eq!(oc.fallback_npx_package, Some(OPENCODE_NPX_PACKAGE));
-    assert_eq!(oc.login_command_hint, Some("opencode auth login"));
-    assert_eq!(
-        oc.npx_login_command_hint(),
-        Some(format!("npx -y {OPENCODE_NPX_PACKAGE} auth login"))
-    );
-    // Claude Code and Codex log in through their bundled CLI package.
-    for (id, args) in [
-        ("claude-code", "auth login"),
-        ("codex", "login --device-auth"),
-    ] {
-        let bundled = crate::adapter_cli::missing_fallback(id).unwrap();
-        assert_eq!(
-            find_provider(id).unwrap().npx_login_command_hint(),
-            Some(format!("npx -y {} {args}", bundled.spec()))
-        );
-    }
-    // Every provider with a real npm package runs from it when not installed;
-    // those without one (or riding another CLI, like Unsloth) must be installed.
-    for (id, package, login) in [
-        ("auggie", AUGGIE_NPX_PACKAGE, Some("login")),
-        ("grok", GROK_NPX_PACKAGE, Some("login")),
-        ("droid", DROID_NPX_PACKAGE, None),
-    ] {
-        let provider = find_provider(id).unwrap();
-        assert_eq!(provider.fallback_npx_package, Some(package), "{id}");
-        assert_eq!(
-            provider.npx_login_command_hint(),
-            login.map(|args| format!("npx -y {package} {args}")),
-            "{id}"
-        );
-    }
-    for id in ["cursor", "cortex", "antigravity", "unsloth", "pi"] {
-        let provider = find_provider(id).unwrap();
-        assert_eq!(provider.fallback_npx_package, None, "{id}");
-        assert_eq!(provider.npx_login_command_hint(), None, "{id}");
-    }
 
     let pi = find_provider("pi").unwrap();
     assert_eq!(pi.display_name, "Pi");
     assert_eq!(pi.command, "pi-acp");
     assert_eq!(pi.base_args, &[] as &[&str]);
     assert!(pi.model_flag.is_none() && pi.can_be_disabled);
-    assert_eq!(pi.npx_only_package, Some(PI_ACP_NPX_PACKAGE));
-    assert_eq!(pi.fallback_npx_package, None);
     assert_eq!(
         pi.login_docs_url,
         Some("https://pi.dev/docs/latest/quickstart")
@@ -332,14 +278,11 @@ fn registry_field_parity() {
     assert!(!grok.supports_mcp_config && grok.supports_session_mcp_servers);
     assert!(!grok.supports_rules_file);
     assert!(grok.can_be_disabled);
-    assert_eq!(grok.login_command_hint, Some("grok login"));
     assert_eq!(grok.auth_check_args, Some(&["models"][..]));
     assert_eq!(
         grok.login_docs_url,
         Some("https://docs.x.ai/build/enterprise#authentication")
     );
-    assert_eq!(grok.npx_only_package, None);
-    assert_eq!(grok.fallback_npx_package, Some(GROK_NPX_PACKAGE));
 
     let mock = find_provider("mock").unwrap();
     assert_eq!(mock.command, "node");
@@ -358,9 +301,6 @@ fn registry_field_parity() {
     assert!(!unsloth.supports_mcp_config && !unsloth.supports_session_mcp_servers);
     assert!(unsloth.can_be_disabled);
     assert_eq!(unsloth.auth_check_args, None);
-    assert_eq!(unsloth.npx_only_package, None);
-    assert_eq!(unsloth.fallback_npx_package, None);
-    assert_eq!(unsloth.npx_login_command_hint(), None);
 }
 
 /// cortex and droid are hidden by default: gated off when their enable env
@@ -465,12 +405,10 @@ fn config_option_model_partition() {
 /// the pi entry — before pi was registered it silently fell back to the
 /// default provider (auggie), which then rejected pi model ids.
 #[test]
-fn pi_resolves_in_registry_with_pinned_npx_package() {
+fn pi_resolves_in_registry() {
     assert_eq!(provider_config("pi").id, "pi");
     let pi = find_provider("pi").expect("pi is registered");
     assert_eq!(pi.command, "pi-acp");
-    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.34");
-    assert_eq!(pi.npx_only_package, Some(PI_ACP_NPX_PACKAGE));
 }
 
 #[test]
@@ -1195,18 +1133,21 @@ fn auth_error_message_uses_login_hint() {
     let msg = auth_error_message("auggie", false);
     assert_eq!(
         msg,
-        "Augment Auggie needs to be authenticated. Run \"auggie login\" in a terminal."
+        format!(
+            "Augment Auggie needs to be authenticated. Run \"{}\" in a terminal.",
+            login_command("auggie")
+        )
     );
 
     // Remote variant.
     let remote = auth_error_message("auggie", true);
     assert!(remote.contains("on the remote server"));
-    assert!(remote.contains("auggie login"));
+    assert!(remote.contains(&login_command("auggie")));
 
     // codex's hint names the real `codex` CLI, never the `codex-acp`
     // adapter command the `{command} login` fallback would produce.
     let codex = auth_error_message("codex", false);
-    assert!(codex.contains("codex login --device-auth"));
+    assert!(codex.contains(&login_command("codex")));
     assert!(!codex.contains("codex-acp login"));
 
     // Providers without a hint fall back to `{command} login`.
@@ -1286,7 +1227,7 @@ fn auth_error_message_remote_falls_back_to_command_login() {
     // codex carries an explicit hint: the fallback would print the
     // non-runnable adapter command "codex-acp login".
     let codex = auth_error_message("codex", true);
-    assert!(codex.contains("codex login --device-auth"));
+    assert!(codex.contains(&login_command("codex")));
     assert!(!codex.contains("codex-acp login"));
 
     // claude-code carries an explicit hint (intent-hq/intent#3941): the
@@ -1294,7 +1235,7 @@ fn auth_error_message_remote_falls_back_to_command_login() {
     // "claude-agent-acp login".
     let cc = auth_error_message("claude-code", true);
     assert!(cc.contains("Anthropic Claude Code"));
-    assert!(cc.contains("claude auth login"));
+    assert!(cc.contains(&login_command("claude-code")));
     assert!(!cc.contains("claude-agent-acp login"));
     assert!(cc.contains("on the remote server"));
 
@@ -1923,8 +1864,6 @@ fn cursor_registry_entry() {
     assert!(!p.requests_agent_workers);
     assert!(p.requires_env_var.is_none() && p.requires_feature_code.is_none());
     assert_eq!(p.auth_check_args, Some(&["models"][..]));
-    assert!(p.npx_only_package.is_none() && p.fallback_npx_package.is_none());
-    assert_eq!(login_command("cursor"), "cursor-agent login");
     assert!(is_provider_authentication_error(
         "cursor",
         "Authentication required. Please run 'agent login' first"

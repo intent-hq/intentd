@@ -1,0 +1,179 @@
+{
+  "note": "Generated; do not hand-edit. Regenerate: INTENTD_UPDATE_GOLDENS=1 cargo test -p intent-providers --test provider_registry_golden. {auto-pinned} marks a version the auto-pin-acp-adapters workflow owns.",
+  "providers": [
+    {
+      "id": "auggie",
+      "command": "auggie",
+      "fallbackNpxPackage": "@augmentcode/auggie@1.2.2",
+      "npxOnlyPackage": null,
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": "auggie login",
+      "npxLoginCommandHint": "npx -y @augmentcode/auggie@1.2.2 login",
+      "requiresSecondaryBinary": null,
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": {
+        "command": "auggie",
+        "minimum": "0.7.0",
+        "requirement": "auggie 0.7.0+"
+      }
+    },
+    {
+      "id": "claude-code",
+      "command": "claude-agent-acp",
+      "fallbackNpxPackage": null,
+      "npxOnlyPackage": "@agentclientprotocol/claude-agent-acp@{auto-pinned}",
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": "claude auth login",
+      "npxLoginCommandHint": "npx -y @anthropic-ai/claude-code@{auto-pinned} auth login",
+      "requiresSecondaryBinary": "claude",
+      "installedCli": "claude",
+      "cliRequirement": {
+        "command": "claude",
+        "range": "{auto-pinned}",
+        "minimum": "{auto-pinned}",
+        "bundled": "@anthropic-ai/claude-code@{auto-pinned}"
+      },
+      "cliVersionGate": null
+    },
+    {
+      "id": "codex",
+      "command": "codex-acp",
+      "fallbackNpxPackage": null,
+      "npxOnlyPackage": "@agentclientprotocol/codex-acp@{auto-pinned}",
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": "codex login --device-auth",
+      "npxLoginCommandHint": "npx -y @openai/codex@{auto-pinned} login --device-auth",
+      "requiresSecondaryBinary": "codex",
+      "installedCli": "codex",
+      "cliRequirement": {
+        "command": "codex",
+        "range": "{auto-pinned}",
+        "minimum": "{auto-pinned}",
+        "bundled": "@openai/codex@{auto-pinned}"
+      },
+      "cliVersionGate": null
+    },
+    {
+      "id": "cortex",
+      "command": "cortex-acp",
+      "fallbackNpxPackage": null,
+      "npxOnlyPackage": null,
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": null,
+      "npxLoginCommandHint": null,
+      "requiresSecondaryBinary": null,
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": null
+    },
+    {
+      "id": "opencode",
+      "command": "opencode",
+      "fallbackNpxPackage": "opencode-ai@1.19.6",
+      "npxOnlyPackage": null,
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": "opencode auth login",
+      "npxLoginCommandHint": "npx -y opencode-ai@1.19.6 auth login",
+      "requiresSecondaryBinary": null,
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": null
+    },
+    {
+      "id": "unsloth",
+      "command": "opencode",
+      "fallbackNpxPackage": null,
+      "npxOnlyPackage": null,
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": null,
+      "npxLoginCommandHint": null,
+      "requiresSecondaryBinary": "unsloth",
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": null
+    },
+    {
+      "id": "pi",
+      "command": "pi-acp",
+      "fallbackNpxPackage": null,
+      "npxOnlyPackage": "pi-acp@0.0.34",
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": null,
+      "npxLoginCommandHint": null,
+      "requiresSecondaryBinary": null,
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": {
+        "command": "pi",
+        "minimum": "0.81.0",
+        "requirement": "Pi CLI 0.81.0+"
+      }
+    },
+    {
+      "id": "droid",
+      "command": "droid",
+      "fallbackNpxPackage": "@factory/cli@1.16.0",
+      "npxOnlyPackage": null,
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": null,
+      "npxLoginCommandHint": null,
+      "requiresSecondaryBinary": null,
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": null
+    },
+    {
+      "id": "grok",
+      "command": "grok",
+      "fallbackNpxPackage": "@xai-official/grok@1.0.89",
+      "npxOnlyPackage": null,
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": "grok login",
+      "npxLoginCommandHint": "npx -y @xai-official/grok@1.0.89 login",
+      "requiresSecondaryBinary": null,
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": null
+    },
+    {
+      "id": "antigravity",
+      "command": "agy",
+      "fallbackNpxPackage": null,
+      "npxOnlyPackage": null,
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": "agy acp --login",
+      "npxLoginCommandHint": null,
+      "requiresSecondaryBinary": null,
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": null
+    },
+    {
+      "id": "cursor",
+      "command": "cursor-agent",
+      "fallbackNpxPackage": null,
+      "npxOnlyPackage": null,
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": "cursor-agent login",
+      "npxLoginCommandHint": null,
+      "requiresSecondaryBinary": null,
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": null
+    },
+    {
+      "id": "mock",
+      "command": "node",
+      "fallbackNpxPackage": null,
+      "npxOnlyPackage": null,
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": null,
+      "npxLoginCommandHint": null,
+      "requiresSecondaryBinary": null,
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": null
+    }
+  ]
+}

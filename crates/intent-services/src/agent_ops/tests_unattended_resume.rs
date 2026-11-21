@@ -65,7 +65,8 @@ async fn startup_resume_leaves_signed_out_provider_pending() {
         .expect_err("a signed-out provider must not be resumed unattended");
     let message = err.to_string();
     assert!(
-        message.contains("left pending for manual resume") && message.contains("auggie login"),
+        message.contains("left pending for manual resume")
+            && message.contains(&intent_providers::login_command("auggie")),
         "names the hold and the login remedy: {message}"
     );
     assert!(
