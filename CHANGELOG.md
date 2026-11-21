@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.265] - 2026-11-21
+
+### 🚀 Features
+
+- *(unsloth)* Run one managed server per model within a memory budget ([#3605](https://github.com/intent-hq/intentd/pull/3605))
+- Default Codex login hint to device auth ([#3606](https://github.com/intent-hq/intentd/pull/3606))
+- *(unsloth)* Let unsloth.stop stop one model's server ([#3608](https://github.com/intent-hq/intentd/pull/3608))
+
+
 ## [0.11.264] - 2026-11-21
 
 ### 🐛 Bug Fixes
