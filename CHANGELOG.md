@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.261] - 2026-11-21
+
+### 🚀 Features
+
+- *(providers)* Run providers from npm when their CLI is not installed ([#3577](https://github.com/intent-hq/intentd/pull/3577))
+- *(assistant)* Retire older bindings that ws.rpc fully replaces ([#3593](https://github.com/intent-hq/intentd/pull/3593))
+
+### 🐛 Bug Fixes
+
+- *(unsloth)* Confirm model switches that would unload other agents ([#3588](https://github.com/intent-hq/intentd/pull/3588))
+
+### 📚 Documentation
+
+- *(assistant)* Describe dock history list sizing ([#3585](https://github.com/intent-hq/intentd/pull/3585))
+- *(guide)* Describe the live dictation pill ([#3587](https://github.com/intent-hq/intentd/pull/3587))
+- *(guide)* List browser and terminal tabs in the recent switcher ([#3594](https://github.com/intent-hq/intentd/pull/3594))
+- *(secrets)* Describe the redesigned secret request card ([#3595](https://github.com/intent-hq/intentd/pull/3595))
+
+### 🧪 Testing
+
+- *(remote-launch)* Wait for the home to open and the stop ack in home e2e tests ([#3586](https://github.com/intent-hq/intentd/pull/3586))
+
+
 ## [0.11.260] - 2026-11-20
 
 ### 📚 Documentation
