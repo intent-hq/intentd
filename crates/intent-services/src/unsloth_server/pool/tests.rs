@@ -503,7 +503,7 @@ esac
         let message = err.to_string();
         assert!(!message.contains("shutting down"), "got: {message}");
         assert!(message.contains("stopped"), "got: {message}");
-        assert_eq!(running(&pool).await, [(B.to_string(), fx.ports[1])]);
+        assert_eq!(running(&pool).await, [(B.to_string(), fx.ports[0])]);
 
         drop(held);
         pool.ensure_endpoint(A, None, &none(), &|_, _| {})
