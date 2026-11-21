@@ -763,3 +763,133 @@ async fn native_navigation_desktop_batches_validate_hosts_before_dispatch() {
         ReverseTarget::Client(ClientId::from("desktop-b"))
     );
 }
+
+/// Model an earlier member connection that ordinary workspaces can use, but
+/// Chief must skip, exactly as the transport's scoped snapshot/dispatch do.
+struct ChiefClaimRegistry {
+    ordinary: Arc<FakeRegistry>,
+    chief: Arc<FakeRegistry>,
+}
+
+impl ChiefClaimRegistry {
+    fn scoped(&self, workspace: &WorkspaceId) -> &FakeRegistry {
+        if workspace.is_chief() {
+            &self.chief
+        } else {
+            &self.ordinary
+        }
+    }
+}
+
+impl AgentReverseDispatch for ChiefClaimRegistry {
+    fn is_connected(&self) -> bool {
+        self.ordinary.is_connected()
+    }
+    fn resolve(&self, target: &ReverseTarget) -> Result<ResolvedClient, ReverseDispatchError> {
+        self.ordinary.resolve(target)
+    }
+    fn connection_snapshot(
+        &self,
+        workspace: &WorkspaceId,
+        targets: &[ReverseTarget],
+    ) -> intent_core::ReverseConnectionSnapshot {
+        self.scoped(workspace)
+            .connection_snapshot(workspace, targets)
+    }
+    fn dispatch<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+        target: ReverseTarget,
+    ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
+        Box::pin(async move {
+            let workspace = WorkspaceId::from(params["workspaceId"].as_str().unwrap());
+            let registry = self.scoped(&workspace);
+            registry
+                .calls
+                .lock()
+                .unwrap()
+                .push((method.into(), params.clone(), target.clone()));
+            let host = registry.resolve(&target)?.client_id;
+            let results: Vec<_> = params["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|action| {
+                    json!({"action":action["action"],"success":true,
+                    "result":{"tabId":action["tabId"],"host":host}})
+                })
+                .collect();
+            Ok(json!({"success":true,"results":results}))
+        })
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_navigation_claim_batches_use_chief_scope() {
+    let registry = Arc::new(ChiefClaimRegistry {
+        ordinary: FakeRegistry::new(&[("desktop-a", None, true), ("desktop-b", None, true)]),
+        chief: FakeRegistry::new(&[("desktop-b", None, true)]),
+    });
+    let (_tmp, _root, svc, _bus, ordinary) = setup(registry.ordinary.clone()).await;
+    let svc = svc.with_reverse_dispatch(registry.clone());
+    assert_eq!(
+        registry
+            .resolve(&ReverseTarget::Default)
+            .unwrap()
+            .client_id
+            .as_str(),
+        "desktop-a"
+    );
+    for (workspace, host, prefix) in [
+        (WorkspaceId::chief(), "desktop-b", "chief"),
+        (ordinary, "desktop-a", "ordinary"),
+    ] {
+        let first = format!("{prefix}-first");
+        let second = format!("{prefix}-second");
+        register_tab(&svc, &workspace, &first, host, None).await;
+        register_tab(&svc, &workspace, &second, host, None).await;
+        let result = svc
+            .browser_exec(
+                workspace.clone(),
+                vec![
+                    json!({"action":"screenshot","tabId":first}),
+                    json!({"action":"claimTab","tabId":second,"width":1280}),
+                ],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["results"][0]["success"], true, "{result}");
+        assert_eq!(result["results"][0]["result"]["host"], host);
+        assert_eq!(
+            svc.store()
+                .get_browser_tab(&second)
+                .await
+                .unwrap()
+                .unwrap()
+                .host_client_id
+                .as_str(),
+            host,
+            "claim bookkeeping must use the same scoped destination as dispatch"
+        );
+    }
+    let chief = WorkspaceId::chief();
+    register_tab(&svc, &chief, "member-tab", "desktop-a", None).await;
+    let before = registry.chief.calls.lock().unwrap().len();
+    let rejected = svc
+        .browser_exec(
+            chief,
+            vec![
+                json!({"action":"screenshot","tabId":"member-tab"}),
+                json!({"action":"claimTab","tabId":"chief-second","width":1280}),
+            ],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected["results"][0]["errorCode"], "browser-mixed-hosts");
+    assert_eq!(registry.chief.calls.lock().unwrap().len(), before);
+}

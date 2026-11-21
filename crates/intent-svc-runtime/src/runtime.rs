@@ -1326,8 +1326,21 @@ impl RuntimePort for RuntimeFeature {
             // already belong there or follow a claim of that particular tab.
             // Validate the whole batch before dispatch, including actions that
             // precede a claim: no partial execution on an incompatible host.
+            // Use the same workspace authority filter as final automation
+            // dispatch: Chief excludes member connections even for Default.
+            let executed_on = if claiming {
+                dispatch
+                    .connection_snapshot(&workspace_id, std::slice::from_ref(&target))
+                    .routes
+                    .into_iter()
+                    .next()
+                    .filter(|route| route.error.is_none())
+                    .and_then(|route| route.client_id)
+            } else {
+                None
+            };
             if claiming {
-                if let Ok(resolved) = dispatch.resolve(&target) {
+                if let Some(destination) = executed_on.as_ref() {
                     let mut claimed = std::collections::HashSet::new();
                     for action in &actions {
                         let Some(id) = action["tabId"].as_str().or(tab_id.as_deref()) else {
@@ -1336,9 +1349,9 @@ impl RuntimePort for RuntimeFeature {
                         if action["action"] == "claimTab" {
                             claimed.insert(id);
                         } else if !claimed.contains(id)
-                            && registry_tabs.iter().any(|tab| {
-                                tab.tab_id == id && tab.host_client_id != resolved.client_id
-                            })
+                            && registry_tabs
+                                .iter()
+                                .any(|tab| tab.tab_id == id && &tab.host_client_id != destination)
                         {
                             return Ok(browser_tabs::navigation_failure(
                                 &actions,
@@ -1357,11 +1370,6 @@ impl RuntimePort for RuntimeFeature {
                 .filter_map(|a| a["tabId"].as_str().or(tab_id.as_deref()))
                 .map(str::to_string)
                 .collect();
-            let executed_on = if claims.is_empty() {
-                None
-            } else {
-                dispatch.resolve(&target).ok().map(|r| r.client_id)
-            };
             // Shape by *request* arity: the FE aborts a batch on the first
             // failing action, so the reply's results count can be shorter
             // than the batch (see `shape_agent_result`).

@@ -316,8 +316,14 @@ impl BrowserTabRoutingExt for Services {
         let target = self.browser_client_target(workspace_id).await?;
         let resolved = self
             .feature_reverse_dispatch()
-            .and_then(|d| d.resolve(&target).ok())
-            .map(|r| r.client_id);
+            .and_then(|d| {
+                d.connection_snapshot(workspace_id, std::slice::from_ref(&target))
+                    .routes
+                    .into_iter()
+                    .next()
+            })
+            .filter(|route| route.error.is_none())
+            .and_then(|route| route.client_id);
         Ok(match (target, resolved) {
             (_, Some(client_id)) => client_id,
             (ReverseTarget::Pinned(client_id) | ReverseTarget::Client(client_id), None) => {

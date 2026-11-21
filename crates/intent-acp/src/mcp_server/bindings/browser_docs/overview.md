@@ -30,7 +30,8 @@ Named navigation and desktop automation requests use the tab's registry host;
 they never move a tab merely to follow a new sender or driving client. A batch
 addressing different hosts fails with `browser-mixed-hosts` before executing
 anything. Explicit `claimTab` requests use the driving desktop and can rehome
-claimable desktop tabs. Other named actions in a claim batch must already live
+claimable desktop tabs. In Chief, that destination must be an administrator's
+connection, just as for automation dispatch. Other named actions in a claim batch must already live
 on that desktop or follow a claim of the same tab. Native tabs cannot be
 claimed, resized, inspected, evaluated, screenshotted, or used for capture/trace;
 these requests fail with `browser-automation-unavailable`, including mixed

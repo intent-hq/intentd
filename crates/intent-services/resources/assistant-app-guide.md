@@ -1722,6 +1722,7 @@ When an agent names an existing desktop tab for a screenshot, click or other
 automation, the request goes to the desktop hosting that tab, even if you sent
 your latest message from another device. Actions for tabs on different devices
 must be sent separately; explicitly claiming a desktop tab can move it.
+In Chief, claims use an administrator’s desktop connection.
 
 ## Add context, run a task, and find results
 
