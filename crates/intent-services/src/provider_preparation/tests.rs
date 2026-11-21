@@ -476,12 +476,13 @@ async fn no_op_and_success_dedup_then_cache_deletion_reprepare() {
 
 #[test]
 fn pi_requires_detected_cli_and_rejects_known_old_versions_but_not_unknown() {
-    use intent_providers::{pi_cli_gate, PiCliProbe};
+    use intent_providers::{cli_version_gate, pi_cli_gate, PiCliProbe};
+    let minimum = cli_version_gate("pi").unwrap().min_version;
     for (version, resolved, expected) in [
-        ("0.81.0", true, true),
-        ("0.80.0", true, false),
+        (minimum, true, true),
+        ("0.0.1", true, false),
         ("unrecognized", true, true),
-        ("0.81.0", false, false),
+        (minimum, false, false),
     ] {
         let status = crate::pi_cli::PiCliStatus {
             command: "pi".into(),

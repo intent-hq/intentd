@@ -1133,18 +1133,21 @@ fn auth_error_message_uses_login_hint() {
     let msg = auth_error_message("auggie", false);
     assert_eq!(
         msg,
-        "Augment Auggie needs to be authenticated. Run \"auggie login\" in a terminal."
+        format!(
+            "Augment Auggie needs to be authenticated. Run \"{}\" in a terminal.",
+            login_command("auggie")
+        )
     );
 
     // Remote variant.
     let remote = auth_error_message("auggie", true);
     assert!(remote.contains("on the remote server"));
-    assert!(remote.contains("auggie login"));
+    assert!(remote.contains(&login_command("auggie")));
 
     // codex's hint names the real `codex` CLI, never the `codex-acp`
     // adapter command the `{command} login` fallback would produce.
     let codex = auth_error_message("codex", false);
-    assert!(codex.contains("codex login --device-auth"));
+    assert!(codex.contains(&login_command("codex")));
     assert!(!codex.contains("codex-acp login"));
 
     // Providers without a hint fall back to `{command} login`.
@@ -1224,7 +1227,7 @@ fn auth_error_message_remote_falls_back_to_command_login() {
     // codex carries an explicit hint: the fallback would print the
     // non-runnable adapter command "codex-acp login".
     let codex = auth_error_message("codex", true);
-    assert!(codex.contains("codex login --device-auth"));
+    assert!(codex.contains(&login_command("codex")));
     assert!(!codex.contains("codex-acp login"));
 
     // claude-code carries an explicit hint (intent-hq/intent#3941): the
@@ -1232,7 +1235,7 @@ fn auth_error_message_remote_falls_back_to_command_login() {
     // "claude-agent-acp login".
     let cc = auth_error_message("claude-code", true);
     assert!(cc.contains("Anthropic Claude Code"));
-    assert!(cc.contains("claude auth login"));
+    assert!(cc.contains(&login_command("claude-code")));
     assert!(!cc.contains("claude-agent-acp login"));
     assert!(cc.contains("on the remote server"));
 

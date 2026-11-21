@@ -2575,7 +2575,13 @@ while IFS= read -r unexpected; do exit 95; done
         assert!(!droid.contains("CURSOR_API_KEY"), "{droid}");
 
         let cursor = not_authenticated_message("cursor");
-        assert!(cursor.contains("\"cursor-agent login\""), "{cursor}");
+        assert!(
+            cursor.contains(&format!(
+                "\"{}\"",
+                intent_providers::login_command("cursor")
+            )),
+            "{cursor}"
+        );
         assert!(cursor.contains("CURSOR_API_KEY"), "{cursor}");
         assert!(cursor.contains("stored"), "{cursor}");
     }

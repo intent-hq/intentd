@@ -726,7 +726,7 @@ expect_ok
 expect_cargo "-p intent-acp --lib" "-p intent-providers --lib --bins --tests"
 [[ "$stdout" == *"$providers_note"* ]] || fail "$case_name: no lib-dependents note: $stdout"
 
-case_name="intent-providers golden-only change selects only intent-providers"
+case_name="intent-providers test-only change selects only intent-providers"
 reset_repo
 setup_intent_providers
 edit crates/intent-providers/tests/provider_registry_golden.rs
@@ -734,6 +734,19 @@ run_script
 g update-ref refs/remotes/origin/main "$base_sha"
 expect_ok
 expect_cargo "-p intent-providers --test provider_registry_golden"
+[[ "$stdout" != *"note:"* ]] || fail "$case_name: unexpected note: $stdout"
+
+case_name="intent-providers golden-only change selects only intent-providers"
+reset_repo
+setup_intent_providers
+write crates/intent-providers/tests/goldens/provider_registry.json
+commit_all "golden"
+g update-ref refs/remotes/origin/main HEAD
+edit crates/intent-providers/tests/goldens/provider_registry.json
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p intent-providers --tests"
 [[ "$stdout" != *"note:"* ]] || fail "$case_name: unexpected note: $stdout"
 
 case_name="intent-providers and intent-js changes select a shared dependent's library unit tests once"

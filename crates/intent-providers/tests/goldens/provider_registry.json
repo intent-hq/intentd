@@ -42,8 +42,8 @@
       "fallbackNpxPackage": null,
       "npxOnlyPackage": "@agentclientprotocol/codex-acp@{auto-pinned}",
       "npxOnlyHonorsPathOverride": false,
-      "loginCommandHint": "codex login",
-      "npxLoginCommandHint": "npx -y @openai/codex@{auto-pinned} login",
+      "loginCommandHint": "codex login --device-auth",
+      "npxLoginCommandHint": "npx -y @openai/codex@{auto-pinned} login --device-auth",
       "requiresSecondaryBinary": "codex",
       "installedCli": "codex",
       "cliRequirement": {
