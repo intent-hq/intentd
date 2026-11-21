@@ -255,7 +255,10 @@ fn registry_field_parity() {
         Some(format!("npx -y {OPENCODE_NPX_PACKAGE} auth login"))
     );
     // Claude Code and Codex log in through their bundled CLI package.
-    for (id, args) in [("claude-code", "auth login"), ("codex", "login --device-auth")] {
+    for (id, args) in [
+        ("claude-code", "auth login"),
+        ("codex", "login --device-auth"),
+    ] {
         let bundled = crate::adapter_cli::missing_fallback(id).unwrap();
         assert_eq!(
             find_provider(id).unwrap().npx_login_command_hint(),
