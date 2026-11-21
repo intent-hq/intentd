@@ -3043,7 +3043,7 @@ impl Services {
         )
         .await;
         reply.map_or_else(String::new, |r| {
-            autocomplete_ops::clean_reply(&parsed.text, &r)
+            autocomplete_ops::clean_reply(&parsed.text, &parsed.context, &r)
         })
     }
 

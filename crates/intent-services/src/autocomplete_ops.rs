@@ -44,7 +44,7 @@ pub(crate) const KILO_KEY_PATH: &str = "autocomplete.kilo.apiKey";
 pub(crate) const OPENROUTER_KEY_PATH: &str = "autocomplete.openrouter.apiKey";
 
 /// System prompt sent with every suggestion request.
-pub(crate) const SYSTEM_PROMPT: &str = "You autocomplete the user's next chat message in a coding assistant app. You see the recent conversation (with suggested prompts) and the text the user has typed so far. Reply with ONLY the text that continues the user's message, without repeating what they typed. Finish at most the current sentence (under 20 words). If unsure, reply with nothing.";
+pub(crate) const SYSTEM_PROMPT: &str = "You autocomplete the user's next chat message in a coding assistant app. You see the recent conversation (with suggested prompts) and the text the user has typed so far. Reply with ONLY the text that continues the user's message, without repeating what they typed. If the typed text ends in the middle of a word, start with the rest of that word. If it ends with a complete word, start your reply with a single space. Finish at most the current sentence (under 20 words). If unsure, reply with nothing.";
 
 /// Upstream endpoints and timeout. Production uses [`Default`]; tests point
 /// both URLs at a local mock server and shorten the timeout.
@@ -200,11 +200,11 @@ pub(crate) fn extract_content(response: &Value) -> Option<&str> {
 ///    the start (case-insensitive),
 /// 3. cut after the first sentence end (`.`, `?` or `!` followed by
 ///    whitespace or the end of the reply),
-/// 4. cap at [`MAX_COMPLETION_CHARS`] characters.
-///
-/// Leading whitespace is otherwise kept as the model sent it (the model
-/// decides whether the continuation starts a new word).
-pub(crate) fn clean_reply(text: &str, reply: &str) -> String {
+/// 4. cap at [`MAX_COMPLETION_CHARS`] characters,
+/// 5. fix the spacing against the draft (see [`fix_leading_space`]),
+/// 6. drop junk: `""` when the reply holds a control character, or `<` / `>`
+///    while neither `context` nor `text` has any.
+pub(crate) fn clean_reply(text: &str, context: &str, reply: &str) -> String {
     let first_line = reply.split(['\n', '\r']).next().unwrap_or_default();
     let unquoted = strip_wrapping_quotes(first_line);
     let without_echo = strip_echo(text, unquoted);
@@ -212,11 +212,38 @@ pub(crate) fn clean_reply(text: &str, reply: &str) -> String {
     let sentence = cut_after_sentence(unquoted);
     let capped: String = sentence.chars().take(MAX_COMPLETION_CHARS).collect();
     let trimmed = capped.trim_end();
-    if trimmed.trim_start().is_empty() {
-        String::new()
-    } else {
-        trimmed.to_string()
+    if trimmed.trim_start().is_empty() || is_junk(text, context, trimmed.trim_start()) {
+        return String::new();
     }
+    fix_leading_space(text, trimmed)
+}
+
+/// Spacing between the draft and the suggestion (models usually omit the
+/// leading space, which glued words together):
+///
+/// - `text` ends with whitespace → drop the reply's leading whitespace;
+/// - else the reply starts with whitespace → exactly one leading space;
+/// - else → as the model gave it (it continues the current word).
+fn fix_leading_space(text: &str, reply: &str) -> String {
+    let rest = reply.trim_start();
+    if text.ends_with(char::is_whitespace) {
+        rest.to_string()
+    } else if rest.len() == reply.len() {
+        reply.to_string()
+    } else {
+        format!(" {rest}")
+    }
+}
+
+/// A reply is junk when it holds a control character, or angle brackets
+/// while neither the conversation nor the draft has any (Nemotron once answered a
+/// mid-word draft with `re>n>n>e>r>s>o>n>s>hots>`).
+fn is_junk(text: &str, context: &str, reply: &str) -> bool {
+    if reply.chars().any(char::is_control) {
+        return true;
+    }
+    let angle = |s: &str| s.contains(['<', '>']);
+    angle(reply) && !angle(context) && !angle(text)
 }
 
 /// Strip matching wrapping quote/backtick pairs (repeatedly, so a reply in

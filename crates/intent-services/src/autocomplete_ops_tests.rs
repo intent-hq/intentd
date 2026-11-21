@@ -245,21 +245,122 @@ fn clean_reply_cases() {
         ("blank first line", "Fix ", "\nsecond line", ""),
     ];
     for (name, text, reply, expected) in cases {
-        assert_eq!(clean_reply(text, reply), *expected, "{name}");
+        assert_eq!(clean_reply(text, "", reply), *expected, "{name}");
     }
 }
 
 #[test]
 fn clean_reply_caps_length_on_char_boundaries() {
     let reply = "界".repeat(MAX_COMPLETION_CHARS + 50);
-    let cleaned = clean_reply("Hi ", &reply);
+    let cleaned = clean_reply("Hi ", "", &reply);
     assert_eq!(cleaned.chars().count(), MAX_COMPLETION_CHARS);
 }
 
 #[test]
 fn clean_reply_handles_multibyte_case_folding() {
-    assert_eq!(clean_reply("ÉTÉ ", "été chaud"), "chaud");
-    assert_eq!(clean_reply("İ", "i̇x"), "i̇x");
+    assert_eq!(clean_reply("ÉTÉ ", "", "été chaud"), "chaud");
+    assert_eq!(clean_reply("İ", "", "i̇x"), "i̇x");
+}
+
+/// Spacing between the draft and the suggestion: models usually reply
+/// without a leading space, which glued "Show me the" + "before/after" into
+/// "Show me thebefore/after".
+#[test]
+fn clean_reply_spacing_rules() {
+    let cases: &[(&str, &str, &str, &str)] = &[
+        // a. Draft ends with whitespace: drop the reply's leading whitespace.
+        (
+            "draft space, reply space",
+            "Fix the ",
+            " failing test",
+            "failing test",
+        ),
+        (
+            "draft space, reply spaces",
+            "Fix the ",
+            "   failing test",
+            "failing test",
+        ),
+        (
+            "draft space, reply tab",
+            "Fix the\t",
+            "\tfailing test",
+            "failing test",
+        ),
+        (
+            "draft space, bare reply",
+            "Fix the ",
+            "failing test",
+            "failing test",
+        ),
+        // b. Reply starts with whitespace: exactly one space.
+        (
+            "one space kept",
+            "Show me the",
+            " before/after view",
+            " before/after view",
+        ),
+        (
+            "spaces collapsed",
+            "Show me the",
+            "   before/after view",
+            " before/after view",
+        ),
+        (
+            "tab becomes a space",
+            "Show me the",
+            "\tbefore/after view",
+            " before/after view",
+        ),
+        // c. Otherwise the model continues the current word.
+        (
+            "mid-word continuation",
+            "Show me the scr",
+            "eenshots",
+            "eenshots",
+        ),
+        (
+            "bare reply kept as is",
+            "Show me the",
+            "before/after",
+            "before/after",
+        ),
+    ];
+    for (name, text, reply, expected) in cases {
+        assert_eq!(clean_reply(text, "", reply), *expected, "{name}");
+    }
+}
+
+/// Junk guard: angle brackets the context never had, or control characters.
+#[test]
+fn clean_reply_drops_junk() {
+    assert_eq!(
+        clean_reply("Show me pe", "assistant: done", "re>n>n>e>r>s>o>n>s>hots>"),
+        ""
+    );
+    assert_eq!(clean_reply("Show me ", "", "<b>the diff</b>"), "");
+    assert_eq!(clean_reply("Fix ", "", "the\u{7}build"), "");
+    assert_eq!(clean_reply("Fix ", "", "the\u{1b}[31mbuild"), "");
+    // Angle brackets the conversation already uses are legitimate.
+    assert_eq!(
+        clean_reply(
+            "Return a ",
+            "fn parse() -> Result<Value>",
+            "Result<Value> instead"
+        ),
+        "Result<Value> instead"
+    );
+    // So are ones the draft itself uses.
+    assert_eq!(clean_reply("Make it Vec<", "", "String>"), "String>");
+}
+
+/// The prompt asks the model for the spacing rules the clean-up enforces.
+#[test]
+fn system_prompt_asks_for_word_boundaries() {
+    assert!(SYSTEM_PROMPT.contains(
+        "If the typed text ends in the middle of a word, start with the rest of that word. \
+         If it ends with a complete word, start your reply with a single space."
+    ));
 }
 
 // --- upstream call --------------------------------------------------------------
