@@ -1,10 +1,10 @@
 //! Confirmation gate for Unsloth model switches (PROTOCOL §5.5).
 //!
-//! The managed Unsloth server holds one model. A turn for an agent on another
-//! model restarts the server, and every other agent on it loses its model. A
-//! user send that would do this while other agents use the server is refused
-//! with `unsloth-model-switch-confirmation-required`, which names those
-//! agents. The client asks the user, then resends with
+//! The daemon runs one Unsloth server per model while memory allows. When a
+//! turn needs a model that does not fit, the pool stops other servers to make
+//! room, and every agent on them loses its model. A user send that would stop
+//! a server other agents use is refused with
+//! `unsloth-model-switch-confirmation-required`, which names those agents. The client asks the user, then resends with
 //! `messageMetadata.confirmUnslothModelSwitch: true`; the daemon consumes that
 //! flag and never persists it.
 
@@ -43,9 +43,6 @@ impl Services {
         let Some(manager) = self.agent_manager() else {
             return Ok(metadata);
         };
-        let Some(current) = manager.unsloth_manager().owned_serving_repo() else {
-            return Ok(metadata);
-        };
         let session = self.store.get_agent_session_summary(agent_id).await?;
         // A remote agent runs on its machine's own server.
         if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
@@ -61,14 +58,25 @@ impl Services {
         let Some(requested) = session.model.clone() else {
             return Ok(metadata);
         };
-        if provider.as_deref() != Some("unsloth") || requested == current {
+        if provider.as_deref() != Some("unsloth") {
             return Ok(metadata);
         }
-        // Only agents running on the served model lose it.
+        // The servers that starting this model would stop to make room. A
+        // running model, or one that fits, stops nothing.
+        let attached = manager.unsloth_agents_by_model(Some(agent_id));
+        let unloaded = manager
+            .unsloth_manager()
+            .plan_for(&requested, &attached)
+            .await;
+        let Some(current) = unloaded.first().cloned() else {
+            return Ok(metadata);
+        };
         let others: Vec<AgentId> = manager
             .agents_with_provider("unsloth")
             .into_iter()
-            .filter(|(id, model)| id != agent_id && model.as_deref() == Some(current.as_str()))
+            .filter(|(id, model)| {
+                id != agent_id && model.as_ref().is_some_and(|model| unloaded.contains(model))
+            })
             .map(|(id, _)| id)
             .collect();
         if others.is_empty() {
@@ -96,13 +104,15 @@ impl Services {
         let count = agents.len();
         Err(Error::confirmation_required(
             format!(
-                "switching the Unsloth server from {current} to {requested} unloads the model for {count} other agent{}; resend with messageMetadata.{CONFIRM_METADATA_KEY} to continue",
+                "starting Unsloth model {requested} stops the server for {} to free memory, unloading the model for {count} other agent{}; resend with messageMetadata.{CONFIRM_METADATA_KEY} to continue",
+                unloaded.join(", "),
                 if count == 1 { "" } else { "s" }
             ),
             json!({
                 "code": "unsloth-model-switch-confirmation-required",
                 "currentModel": current,
                 "requestedModel": requested,
+                "unloadedModels": unloaded,
                 "agents": agents,
             }),
         ))

@@ -10,6 +10,7 @@ use intent_core::{MessageOrigin, WorkspaceApi};
 
 const MODEL_A: &str = "unsloth/Qwen3-4B-GGUF";
 const MODEL_B: &str = "unsloth/gemma-3-27b-it-GGUF";
+const MODEL_C: &str = "unsloth/Llama-3.2-3B-GGUF";
 
 struct Fixture {
     mgr: Arc<AgentManager>,
@@ -27,12 +28,25 @@ impl Fixture {
         let mut row = workspace(&ws);
         row.title = "Dark mode".to_string();
         mgr.services.store.insert_workspace(&row).await.unwrap();
+        // Footprints too large for two models at once: the single-server
+        // case. Tests about fitting reseed them.
+        for model in [MODEL_A, MODEL_B, MODEL_C] {
+            mgr.unsloth_manager()
+                .seed_footprint_for_test(model, u64::MAX / 8);
+        }
         Self {
             mgr,
             ws,
             _db: db,
             pipes: Vec::new(),
         }
+    }
+
+    /// Register a running ready server for `model` with the pool.
+    fn serve(&self, model: &str, owned: bool) {
+        self.mgr
+            .unsloth_manager()
+            .insert_running_for_test(model, owned, true);
     }
 
     async fn agent(&self, id: &str, name: &str, model: &str) -> AgentId {
@@ -111,10 +125,11 @@ async fn a_switch_that_would_unload_other_agents_lists_them() {
     let a = fx.agent("agent-a", "Planner", MODEL_A).await;
     let b = fx.agent("agent-b", "Reviewer", MODEL_B).await;
     fx.live(&a, MODEL_A);
-    fx.mgr.unsloth_manager().set_owned_server_for_test(MODEL_A);
+    fx.serve(MODEL_A, true);
 
     let data = refused(fx.admit(&b, MessageOrigin::User, None).await);
     assert_eq!(data["currentModel"], MODEL_A);
+    assert_eq!(data["unloadedModels"], json!([MODEL_A]));
     assert_eq!(data["requestedModel"], MODEL_B);
     assert_eq!(
         data["agents"],
@@ -133,7 +148,7 @@ async fn the_wire_send_is_refused_before_anything_persists() {
     let a = fx.agent("agent-a", "Planner", MODEL_A).await;
     let b = fx.agent("agent-b", "Reviewer", MODEL_B).await;
     fx.live(&a, MODEL_A);
-    fx.mgr.unsloth_manager().set_owned_server_for_test(MODEL_A);
+    fx.serve(MODEL_A, true);
 
     let err = intent_core::with_caller(
         intent_core::Caller::Daemon,
@@ -171,7 +186,7 @@ async fn a_confirmed_switch_passes_and_the_flag_is_not_persisted() {
     let a = fx.agent("agent-a", "Planner", MODEL_A).await;
     let b = fx.agent("agent-b", "Reviewer", MODEL_B).await;
     fx.live(&a, MODEL_A);
-    fx.mgr.unsloth_manager().set_owned_server_for_test(MODEL_A);
+    fx.serve(MODEL_A, true);
 
     let metadata = json!({ "source": "chat", CONFIRM_METADATA_KEY: true });
     let admitted = fx
@@ -199,7 +214,7 @@ async fn sends_that_unload_no_one_pass() {
     // No server running.
     assert!(fx.admit(&b, MessageOrigin::User, None).await.is_ok());
 
-    fx.mgr.unsloth_manager().set_owned_server_for_test(MODEL_A);
+    fx.serve(MODEL_A, true);
     // Server running, but no other agent uses it.
     assert!(fx.admit(&b, MessageOrigin::User, None).await.is_ok());
 
@@ -212,9 +227,7 @@ async fn sends_that_unload_no_one_pass() {
     assert!(fx.admit(&b, MessageOrigin::Automatic, None).await.is_ok());
 
     // A server Intent adopted is never stopped by a switch.
-    fx.mgr
-        .unsloth_manager()
-        .set_adopted_server_for_test(MODEL_A);
+    fx.serve(MODEL_A, false);
     assert!(fx.admit(&b, MessageOrigin::User, None).await.is_ok());
 }
 
@@ -227,7 +240,7 @@ async fn a_live_agent_on_another_model_still_needs_confirmation() {
     // A live process does not prove the next turn reuses it (a model,
     // policy or recreation change respawns it), so the gate never exempts it.
     fx.live(&b, MODEL_B);
-    fx.mgr.unsloth_manager().set_owned_server_for_test(MODEL_A);
+    fx.serve(MODEL_A, true);
     let data = refused(fx.admit(&b, MessageOrigin::User, None).await);
     assert_eq!(data["requestedModel"], MODEL_B);
 
@@ -235,17 +248,11 @@ async fn a_live_agent_on_another_model_still_needs_confirmation() {
     fx.mgr
         .services
         .store
-        .set_agent_session_model(
-            &fx.ws,
-            &b,
-            "unsloth/Llama-3.2-3B-GGUF",
-            Some("unsloth"),
-            &now_iso(),
-        )
+        .set_agent_session_model(&fx.ws, &b, MODEL_C, Some("unsloth"), &now_iso())
         .await
         .unwrap();
     let data = refused(fx.admit(&b, MessageOrigin::User, None).await);
-    assert_eq!(data["requestedModel"], "unsloth/Llama-3.2-3B-GGUF");
+    assert_eq!(data["requestedModel"], MODEL_C);
 }
 
 #[tokio::test]
@@ -258,7 +265,7 @@ async fn agents_already_off_the_served_model_are_not_listed() {
     // `stale` still runs a process spawned on MODEL_B from before the server
     // switched to MODEL_A: switching back loses it nothing.
     fx.live(&stale, MODEL_B);
-    fx.mgr.unsloth_manager().set_owned_server_for_test(MODEL_A);
+    fx.serve(MODEL_A, true);
 
     let data = refused(fx.admit(&b, MessageOrigin::User, None).await);
     let listed: Vec<&str> = data["agents"]
@@ -276,7 +283,7 @@ async fn a_remote_agent_never_uses_the_local_server() {
     let a = fx.agent("agent-a", "Planner", MODEL_A).await;
     let remote = fx.agent("agent-remote", "Reviewer", MODEL_B).await;
     fx.live(&a, MODEL_A);
-    fx.mgr.unsloth_manager().set_owned_server_for_test(MODEL_A);
+    fx.serve(MODEL_A, true);
 
     let placement = json!({
         "nodeId": "node-1",
@@ -321,7 +328,7 @@ async fn a_dead_process_on_its_model_still_needs_confirmation() {
     let a = fx.agent("agent-a", "Planner", MODEL_A).await;
     let b = fx.agent("agent-b", "Reviewer", MODEL_B).await;
     fx.live(&a, MODEL_A);
-    fx.mgr.unsloth_manager().set_owned_server_for_test(MODEL_A);
+    fx.serve(MODEL_A, true);
 
     // `b` has a handle on MODEL_B whose child already exited: its next turn
     // respawns and asks the server for MODEL_B.
@@ -337,4 +344,17 @@ async fn a_dead_process_on_its_model_still_needs_confirmation() {
 
     let data = refused(fx.admit(&b, MessageOrigin::User, None).await);
     assert_eq!(data["requestedModel"], MODEL_B);
+}
+
+#[tokio::test]
+async fn a_model_that_fits_beside_the_running_one_needs_no_confirmation() {
+    let mut fx = Fixture::new().await;
+    let a = fx.agent("agent-a", "Planner", MODEL_A).await;
+    let b = fx.agent("agent-b", "Reviewer", MODEL_B).await;
+    fx.live(&a, MODEL_A);
+    for model in [MODEL_A, MODEL_B] {
+        fx.mgr.unsloth_manager().seed_footprint_for_test(model, 1);
+    }
+    fx.serve(MODEL_A, true);
+    assert!(fx.admit(&b, MessageOrigin::User, None).await.is_ok());
 }
