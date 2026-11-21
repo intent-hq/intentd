@@ -265,6 +265,7 @@ router identity.connect
 router identity.getUser
 router identity.revoke
 router identity.select
+router input.autocomplete
 router linear.authStatus
 router linear.createIssue
 router linear.getIssue

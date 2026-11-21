@@ -39,8 +39,10 @@ use crate::Services;
 /// The create block (measured `7_680` bytes since its large awaits are built
 /// off-frame by `boxed_await`, down from `17_744`; `WorkspaceCreate` is
 /// `1_200`). Headroom stays below one `WorkspaceCreate` so a stray rebinding
-/// or clone of the request inside the block trips it.
-const CREATE_BLOCK_BUDGET: usize = 8 * 1024;
+/// or clone of the request inside the block trips it. Raised to `8_448`
+/// when the `Services` clone the block holds gained the 8-byte
+/// `autocomplete_upstream` field (measured `8_208`).
+const CREATE_BLOCK_BUDGET: usize = 8_448;
 /// The `execution_call` wrapper around it (measured `2_544` bytes): holds the
 /// create block behind one `Box::pin`. Holding it inline again grows this by
 /// about `2 * 7_680`.
