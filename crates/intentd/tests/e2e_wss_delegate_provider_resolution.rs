@@ -726,7 +726,8 @@ async fn create_and_delegate_reject_hard_false_auth_verdict_over_wss() {
     );
     let message = error["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("not authenticated") && message.contains(&intent_providers::login_command("opencode")),
+        message.contains("not authenticated")
+            && message.contains(&intent_providers::login_command("opencode")),
         "create error carries the same actionable remedy: {message}"
     );
 

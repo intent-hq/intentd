@@ -69,8 +69,8 @@ pub(crate) use models::{
 };
 pub use models::{parse_grok_models_command_output, GrokModel};
 pub use version_gate::{
-    auggie_cli_gate, auggie_gate_reason, npx_gate, pi_cli_gate, pi_gate_reason, stale_npx_reason,
-    PiCliGate, PiCliProbe,
+    auggie_cli_gate, auggie_gate_reason, cli_version_gate, npx_gate, pi_cli_gate, pi_gate_reason,
+    stale_npx_reason, CliVersionGate, PiCliGate, PiCliProbe,
 };
 
 #[cfg(test)]

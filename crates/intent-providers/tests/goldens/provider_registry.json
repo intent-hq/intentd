@@ -11,7 +11,12 @@
       "npxLoginCommandHint": "npx -y @augmentcode/auggie@1.2.2 login",
       "requiresSecondaryBinary": null,
       "installedCli": null,
-      "cliRequirement": null
+      "cliRequirement": null,
+      "cliVersionGate": {
+        "command": "auggie",
+        "minimum": "0.7.0",
+        "requirement": "auggie 0.7.0+"
+      }
     },
     {
       "id": "claude-code",
@@ -28,7 +33,8 @@
         "range": "{auto-pinned}",
         "minimum": "{auto-pinned}",
         "bundled": "@anthropic-ai/claude-code@{auto-pinned}"
-      }
+      },
+      "cliVersionGate": null
     },
     {
       "id": "codex",
@@ -45,7 +51,8 @@
         "range": "{auto-pinned}",
         "minimum": "{auto-pinned}",
         "bundled": "@openai/codex@{auto-pinned}"
-      }
+      },
+      "cliVersionGate": null
     },
     {
       "id": "cortex",
@@ -57,7 +64,8 @@
       "npxLoginCommandHint": null,
       "requiresSecondaryBinary": null,
       "installedCli": null,
-      "cliRequirement": null
+      "cliRequirement": null,
+      "cliVersionGate": null
     },
     {
       "id": "opencode",
@@ -69,7 +77,8 @@
       "npxLoginCommandHint": "npx -y opencode-ai@1.19.6 auth login",
       "requiresSecondaryBinary": null,
       "installedCli": null,
-      "cliRequirement": null
+      "cliRequirement": null,
+      "cliVersionGate": null
     },
     {
       "id": "unsloth",
@@ -81,7 +90,8 @@
       "npxLoginCommandHint": null,
       "requiresSecondaryBinary": "unsloth",
       "installedCli": null,
-      "cliRequirement": null
+      "cliRequirement": null,
+      "cliVersionGate": null
     },
     {
       "id": "pi",
@@ -93,7 +103,12 @@
       "npxLoginCommandHint": null,
       "requiresSecondaryBinary": null,
       "installedCli": null,
-      "cliRequirement": null
+      "cliRequirement": null,
+      "cliVersionGate": {
+        "command": "pi",
+        "minimum": "0.81.0",
+        "requirement": "Pi CLI 0.81.0+"
+      }
     },
     {
       "id": "droid",
@@ -105,7 +120,8 @@
       "npxLoginCommandHint": null,
       "requiresSecondaryBinary": null,
       "installedCli": null,
-      "cliRequirement": null
+      "cliRequirement": null,
+      "cliVersionGate": null
     },
     {
       "id": "grok",
@@ -117,7 +133,8 @@
       "npxLoginCommandHint": "npx -y @xai-official/grok@1.0.89 login",
       "requiresSecondaryBinary": null,
       "installedCli": null,
-      "cliRequirement": null
+      "cliRequirement": null,
+      "cliVersionGate": null
     },
     {
       "id": "antigravity",
@@ -129,7 +146,8 @@
       "npxLoginCommandHint": null,
       "requiresSecondaryBinary": null,
       "installedCli": null,
-      "cliRequirement": null
+      "cliRequirement": null,
+      "cliVersionGate": null
     },
     {
       "id": "cursor",
@@ -141,7 +159,8 @@
       "npxLoginCommandHint": null,
       "requiresSecondaryBinary": null,
       "installedCli": null,
-      "cliRequirement": null
+      "cliRequirement": null,
+      "cliVersionGate": null
     },
     {
       "id": "mock",
@@ -153,7 +172,8 @@
       "npxLoginCommandHint": null,
       "requiresSecondaryBinary": null,
       "installedCli": null,
-      "cliRequirement": null
+      "cliRequirement": null,
+      "cliVersionGate": null
     }
   ]
 }

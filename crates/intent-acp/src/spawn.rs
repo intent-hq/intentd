@@ -1692,12 +1692,18 @@ mod build_command_tests {
         opts.npx_fallback_binary = Some(&npx_path);
         assert!(!opts.via_npx());
         assert_eq!(opts.launch_target().0, LaunchMode::BareCommand);
-        assert_eq!(build_command(&opts).as_std().get_program(), provider.command);
+        assert_eq!(
+            build_command(&opts).as_std().get_program(),
+            provider.command
+        );
 
         opts.npx_fallback_package = Some("example-acp@1.2.3");
         assert!(opts.via_npx());
         assert_eq!(opts.launch_target().0, LaunchMode::NpxFallback);
-        assert_eq!(build_command(&opts).as_std().get_program(), npx_path.as_os_str());
+        assert_eq!(
+            build_command(&opts).as_std().get_program(),
+            npx_path.as_os_str()
+        );
         let args = build_args(&opts);
         assert!(
             args.windows(2).any(|w| w == ["-y", "example-acp@1.2.3"]),

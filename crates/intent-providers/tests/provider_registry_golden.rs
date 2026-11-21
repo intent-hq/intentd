@@ -1,5 +1,5 @@
-//! The one reviewed copy of each provider's npm packages, login hints and CLI
-//! requirement (`tests/goldens/provider_registry.json`). Other crates read
+//! The one reviewed copy of each provider's npm packages, login hints, CLI
+//! requirement and CLI version gate (`tests/goldens/provider_registry.json`). Other crates read
 //! these facts from the registry instead of restating them, so changing one
 //! (intentd#3577 gave Auggie an npm package) is a single golden diff here.
 
@@ -7,7 +7,7 @@ use std::path::Path;
 
 use intent_providers::adapter_cli::requirement;
 use intent_providers::installed_cli::InstalledCli;
-use intent_providers::{ProviderConfig, ACP_PROVIDERS};
+use intent_providers::{cli_version_gate, ProviderConfig, ACP_PROVIDERS};
 use serde_json::{json, Value};
 
 const GOLDEN_REL: &str = "tests/goldens/provider_registry.json";
@@ -30,6 +30,7 @@ fn exact_version(version: &str) -> bool {
 }
 
 /// `name@version` with an auto-pinned version replaced by [`AUTO_PINNED`].
+#[track_caller]
 fn package(spec: &str, auto_pinned: bool) -> String {
     if !auto_pinned {
         return spec.to_owned();
@@ -43,7 +44,9 @@ fn cli_requirement(id: &str, auto_pinned: bool) -> Value {
     let Some(required) = requirement(id) else {
         return Value::Null;
     };
-    let bundled = required.bundled.map(|cli| package(&cli.spec(), auto_pinned));
+    let bundled = required
+        .bundled
+        .map(|cli| package(&cli.spec(), auto_pinned));
     let (range, minimum) = if auto_pinned {
         (AUTO_PINNED.to_owned(), AUTO_PINNED.to_owned())
     } else {
@@ -63,7 +66,11 @@ fn npx_login_command_hint(p: &ProviderConfig, auto_pinned: bool) -> Option<Strin
         return Some(hint);
     };
     let (spec, args) = rest.split_once(' ').unwrap_or((rest, ""));
-    Some(format!("npx -y {} {args}", package(spec, auto_pinned)).trim_end().to_owned())
+    Some(
+        format!("npx -y {} {args}", package(spec, auto_pinned))
+            .trim_end()
+            .to_owned(),
+    )
 }
 
 fn provider_row(p: &ProviderConfig) -> Value {
@@ -79,6 +86,11 @@ fn provider_row(p: &ProviderConfig) -> Value {
         "requiresSecondaryBinary": p.requires_secondary_binary,
         "installedCli": InstalledCli::for_provider(p.id).map(InstalledCli::command),
         "cliRequirement": cli_requirement(p.id, auto_pinned),
+        "cliVersionGate": cli_version_gate(p.id).map(|gate| json!({
+            "command": gate.command,
+            "minimum": gate.min_version,
+            "requirement": gate.requirement,
+        })),
     })
 }
 
@@ -102,7 +114,12 @@ fn provider_registry_matches_golden() {
         return;
     }
     let actual = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}. Generate it with:\n  {REGENERATE}", path.display()))
+        .unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e}. Generate it with:\n  {REGENERATE}",
+                path.display()
+            )
+        })
         .replace("\r\n", "\n");
     if actual == expected {
         return;
