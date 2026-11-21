@@ -23,9 +23,9 @@ use intent_providers::UnslothEndpoint;
 use tokio::sync::Mutex as TokioMutex;
 
 use super::{
-    best_fitting_quant, fetch_repo_file_listing, lock_ignore_poison, parse_repo_quant_sizes,
-    server_stopped_error, shutting_down_error, StatusCallback, StatusLevel, UnslothConfig,
-    UnslothServerManager, UnslothStatus,
+    best_fitting_quant, fetch_repo_file_listing, is_shutting_down_abort, lock_ignore_poison,
+    parse_repo_quant_sizes, server_stopped_error, shutting_down_error, StatusCallback, StatusLevel,
+    UnslothConfig, UnslothServerManager, UnslothStatus,
 };
 
 /// Expected resident size as a multiple of the selected GGUF file size.
@@ -51,6 +51,17 @@ pub(crate) struct Load {
 /// stop order, each with whether it is busy. Idle servers go first, least
 /// recently used first, then busy ones. An unknown budget or need stops all
 /// evictable servers. Servers the daemon may not stop still use memory.
+/// Whether a failed start was aborted because the pool stopped its server
+/// (a stop or an eviction) while the daemon keeps running. Any other error,
+/// including a real failure that a later stop raced, keeps its message.
+fn stopped_by_pool(
+    err: &intent_core::Error,
+    manager_shut_down: bool,
+    pool_shutting_down: bool,
+) -> bool {
+    manager_shut_down && !pool_shutting_down && is_shutting_down_abort(err)
+}
+
 pub(crate) fn plan_evictions(
     budget: Option<u64>,
     need: Option<u64>,
@@ -323,11 +334,14 @@ impl UnslothServerPool {
         if result.is_err() && !manager.has_live_server() {
             self.forget_if_idle(repo_id, &manager);
         }
-        // The pool stopped this server, but the daemon keeps running.
-        if result.is_err() && manager.is_shut_down() && !self.is_shutting_down() {
-            return Err(server_stopped_error());
+        match result {
+            Err(err)
+                if stopped_by_pool(&err, manager.is_shutting_down(), self.is_shutting_down()) =>
+            {
+                Err(server_stopped_error())
+            }
+            result => result,
         }
-        result
     }
 
     /// Make room for `repo_id` and register its (not yet started) manager,
@@ -452,7 +466,7 @@ impl UnslothServerPool {
     /// Stop every server for good (daemon shutdown).
     pub(crate) async fn shutdown(&self) {
         self.shutting_down
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Self::shut_down_all(self.drain()).await;
     }
 
@@ -475,8 +489,7 @@ impl UnslothServerPool {
     }
 
     fn is_shutting_down(&self) -> bool {
-        self.shutting_down
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[cfg(all(test, unix))]
