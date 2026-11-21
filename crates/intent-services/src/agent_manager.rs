@@ -3199,11 +3199,11 @@ pub struct AgentManager {
     /// User-retired sessions remain fenced until explicit restore. This lock
     /// orders retirement with slot claims, worker spawns and handle installs.
     retired: Arc<Mutex<HashSet<AgentId>>>,
-    /// Daemon-owned singleton Unsloth server (spec "Proposed design" §4,
-    /// monorepo#878): started on demand when an `unsloth`-provider agent
-    /// spawns, reused while the served model matches, restarted on model
-    /// switch, and killed on daemon [`AgentManager::shutdown`].
-    unsloth: Arc<crate::unsloth_server::UnslothServerManager>,
+    /// Daemon-owned Unsloth servers, one per model (spec "Proposed design"
+    /// §4, monorepo#878): started on demand when an `unsloth`-provider agent
+    /// spawns, reused while it runs, stopped to make room when memory is
+    /// short, and killed on daemon [`AgentManager::shutdown`].
+    unsloth: Arc<crate::unsloth_server::UnslothServerPool>,
     /// Descendant-tree memory probe for read-only visibility (monorepo#2063
     /// A2): installed unconditionally by the composition root (unlike the
     /// budget probe on the registry, which only exists when
@@ -3369,7 +3369,7 @@ impl AgentManager {
             spawn_attempt_provider: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(Mutex::new(HashSet::new())),
             retired: Arc::new(Mutex::new(HashSet::new())),
-            unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
+            unsloth: Arc::new(crate::unsloth_server::UnslothServerPool::default()),
             tree_probe: std::sync::OnceLock::new(),
             auto_unarchived: Arc::new(Mutex::new(HashMap::new())),
             settled_turns: Mutex::new(HashSet::new()),
@@ -3748,6 +3748,24 @@ impl AgentManager {
         self.agents_with_provider(provider_id).len()
     }
 
+    /// Live `unsloth` agents per model they were spawned on, leaving out
+    /// `except`.
+    pub(crate) fn unsloth_agents_by_model(
+        &self,
+        except: Option<&AgentId>,
+    ) -> std::collections::HashMap<String, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for (id, model) in self.agents_with_provider("unsloth") {
+            if Some(&id) == except {
+                continue;
+            }
+            if let Some(model) = model {
+                *counts.entry(model).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
     /// Currently-tracked agents spawned under the given base provider id,
     /// with the model each was spawned on. Keyed on the selection, not the
     /// command: an `unsloth` agent runs `opencode`.
@@ -3763,9 +3781,9 @@ impl AgentManager {
             .collect()
     }
 
-    /// The daemon-owned singleton Unsloth server manager, for the
-    /// `unsloth.status` / `unsloth.stop` RPCs.
-    pub(crate) fn unsloth_manager(&self) -> &Arc<crate::unsloth_server::UnslothServerManager> {
+    /// The daemon-owned Unsloth servers (one per model), for the
+    /// `unsloth.status` / `unsloth.stop` RPCs and the switch confirmation.
+    pub(crate) fn unsloth_manager(&self) -> &Arc<crate::unsloth_server::UnslothServerPool> {
         &self.unsloth
     }
 
@@ -12442,11 +12460,9 @@ impl AgentManager {
             let status_cb = move |level: crate::unsloth_server::StatusLevel, message: String| {
                 let _ = status_tx.send((level, message));
             };
-            // Live-session snapshot for the restart-on-switch warning:
-            // agents spawned with the unsloth provider are attached to the
-            // managed server and lose the loaded model if a different-model
-            // spawn restarts it.
-            let attached_agents = self.count_agents_with_provider("unsloth");
+            // Live agents per model, for the warning before a server they
+            // use stops to make room for this one.
+            let attached = self.unsloth_agents_by_model(None);
             // `providers.paths["unsloth"]` targets the unsloth CLI the
             // managed-server lifecycle shells out to (NOT the opencode ACP
             // primary, which `resolve_spawn` keys on "opencode").
@@ -12455,7 +12471,7 @@ impl AgentManager {
                 self.unsloth.ensure_endpoint(
                     &repo_id,
                     unsloth_cli_override.as_deref(),
-                    attached_agents,
+                    &attached,
                     &status_cb,
                 )
             })

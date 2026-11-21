@@ -737,6 +737,18 @@ pub(crate) fn gguf_bytes_fit_within_ram(model_bytes: u64, total_ram_bytes: u64) 
     (model_bytes as f64) + FIT_HEADROOM_BYTES <= (total_ram_bytes as f64) * RAM_FIT_FRACTION
 }
 
+/// Bytes the managed Unsloth servers may use together: the same share of
+/// RAM, less the same headroom, as [`gguf_bytes_fit_within_ram`].
+// RAM sizes above 2^53 bytes (8 PiB) do not occur; loss-free in f64.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn ram_budget_bytes(total_ram_bytes: u64) -> u64 {
+    ((total_ram_bytes as f64) * RAM_FIT_FRACTION - FIT_HEADROOM_BYTES).max(0.0) as u64
+}
+
 /// Parse the total parameter count (in billions) out of an HF repo id's model
 /// name, tolerating both dense names (`27B`) and `MoE` names that also carry an
 /// active-parameter suffix (`35B-A3B` — the total is `35B`; `A3B` is the

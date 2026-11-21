@@ -61,6 +61,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as TokioMutex;
 
+mod pool;
+pub(crate) use pool::UnslothServerPool;
+
 /// Default port the managed server listens on (`unsloth run -p <port>`;
 /// matches the Unsloth CLI's own default).
 const DEFAULT_PORT: u16 = 8888;
@@ -726,6 +729,9 @@ pub(crate) struct UnslothConfig {
     /// Pick a free loopback port for a re-port around a conflict; `None` =
     /// no port available (tests override to force the unrecoverable path).
     pub pick_free_port: Box<dyn Fn() -> Option<u16> + Send + Sync>,
+    /// Serializes `unsloth start opencode` across every managed server: it
+    /// writes one shared `opencode.json` that the mint reads right after.
+    pub mint_lock: Arc<TokioMutex<()>>,
 }
 
 impl Default for UnslothConfig {
@@ -749,14 +755,44 @@ impl Default for UnslothConfig {
             total_memory_bytes: Box::new(crate::agent_manager::total_memory_bytes),
             port_is_free: Box::new(loopback_port_is_free),
             pick_free_port: Box::new(pick_free_loopback_port),
+            mint_lock: Arc::new(TokioMutex::new(())),
         }
     }
 }
 
-/// Singleton manager for the daemon-owned Unsloth server. One instance lives
-/// on the [`crate::agent_manager::AgentManager`]; the async mutex serializes
-/// concurrent unsloth-agent spawns so exactly one start/restart runs at a
-/// time (the second spawner reuses the endpoint the first one produced).
+/// GET the Hugging Face per-repo file listing
+/// (`/api/models/<repo>?blobs=true`) with a hard timeout, returning the
+/// raw JSON body. Mirrors the catalog fetch in
+/// [`crate::provider_models`]; errors are strings because the caller
+/// only logs them and falls back.
+async fn fetch_repo_file_listing(
+    config: &UnslothConfig,
+    repo_id: &str,
+) -> std::result::Result<String, String> {
+    let url = format!("{}/api/models/{repo_id}?blobs=true", config.hf_api_base);
+    let client = reqwest::Client::builder()
+        .timeout(config.hf_files_timeout)
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("huggingface request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("huggingface returned {status}"));
+    }
+    resp.text()
+        .await
+        .map_err(|e| format!("failed to read huggingface response: {e}"))
+}
+
+/// Manager for one daemon-owned Unsloth server. The daemon keeps one per
+/// model in an [`UnslothServerPool`]; the async mutex serializes concurrent
+/// spawns for that model so exactly one start/restart runs at a time (the
+/// second spawner reuses the endpoint the first one produced).
 pub(crate) struct UnslothServerManager {
     state: TokioMutex<Option<ManagedServer>>,
     config: UnslothConfig,
@@ -838,14 +874,6 @@ impl UnslothServerManager {
     /// Update the identity mirror (`unsloth.status`'s lock-free read path).
     fn set_identity(&self, identity: Option<ServerIdentity>) {
         *lock_ignore_poison(&self.identity) = identity;
-    }
-
-    /// The model a live server the daemon started serves (or is starting
-    /// for). `None` when no server runs, its child is gone, or the server was
-    /// adopted: a model switch never stops an adopted server.
-    pub(crate) fn owned_serving_repo(&self) -> Option<String> {
-        let identity = lock_ignore_poison(&self.identity).clone()?;
-        pid_is_alive(identity.pid?).then_some(identity.repo_id)
     }
 
     #[cfg(all(test, unix))]
@@ -1214,7 +1242,7 @@ impl UnslothServerManager {
         if let Some(quant) = lock_ignore_poison(&self.quant_cache).get(repo_id) {
             return quant.clone();
         }
-        let selected = match self.fetch_repo_file_listing(repo_id).await {
+        let selected = match fetch_repo_file_listing(&self.config, repo_id).await {
             Ok(body) => {
                 let sizes = parse_repo_quant_sizes(&body);
                 best_fitting_quant(&sizes, (self.config.total_memory_bytes)())
@@ -1236,35 +1264,6 @@ impl UnslothServerManager {
             }
             None => default_quant_variant(repo_id).to_string(),
         }
-    }
-
-    /// GET the Hugging Face per-repo file listing
-    /// (`/api/models/<repo>?blobs=true`) with a hard timeout, returning the
-    /// raw JSON body. Mirrors the catalog fetch in
-    /// [`crate::provider_models`]; errors are strings because the caller
-    /// only logs them and falls back.
-    async fn fetch_repo_file_listing(&self, repo_id: &str) -> std::result::Result<String, String> {
-        let url = format!(
-            "{}/api/models/{repo_id}?blobs=true",
-            self.config.hf_api_base
-        );
-        let client = reqwest::Client::builder()
-            .timeout(self.config.hf_files_timeout)
-            .build()
-            .map_err(|e| format!("failed to build http client: {e}"))?;
-        let resp = client
-            .get(&url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .map_err(|e| format!("huggingface request failed: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("huggingface returned {status}"));
-        }
-        resp.text()
-            .await
-            .map_err(|e| format!("failed to read huggingface response: {e}"))
     }
 
     /// Spawn `unsloth run --model <repo>:<quant> --disable-tools -p <port>`
@@ -1528,8 +1527,10 @@ impl UnslothServerManager {
 
     /// Run `unsloth start opencode --no-launch --model <repo>` and read the
     /// generated `~/.unsloth/studio/auth/agents/opencode/opencode.json`.
-    /// `UNSLOTH_STUDIO_URL` is set when the managed port differs from the
-    /// CLI default so the mint talks to OUR server.
+    /// `UNSLOTH_STUDIO_URL` always names this server's port, so the mint
+    /// talks to OUR server even when several run. Mints run one at a time
+    /// ([`UnslothConfig::mint_lock`]); a mint waiting on a first-use download
+    /// delays another model's mint until it finishes.
     ///
     /// Dogfooding (monorepo#878) showed this command can itself perform (or
     /// wait behind) the first-use multi-GB model download rather than the
@@ -1558,13 +1559,13 @@ impl UnslothServerManager {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if server.port != DEFAULT_PORT {
-            cmd.env(
+            .kill_on_drop(true)
+            .env(
                 "UNSLOTH_STUDIO_URL",
                 format!("http://127.0.0.1:{}", server.port),
             );
-        }
+        // One mint at a time: each rewrites the shared generated config.
+        let _mint = self.config.mint_lock.clone().lock_owned().await;
         let mut mint_child = cmd.spawn().map_err(|e| {
             StartupFailure::terminal(Error::Internal(format!(
                 "failed to run unsloth start opencode: {e}"
@@ -2631,6 +2632,7 @@ mod tests {
                 total_memory_bytes: Box::new(|| Some(32 * GIB)),
                 port_is_free: Box::new(|_| true),
                 pick_free_port: Box::new(pick_free_loopback_port),
+                mint_lock: Arc::new(TokioMutex::new(())),
             }
         }
 

@@ -19019,9 +19019,27 @@ impl WorkspaceApi for Services {
             let Some(manager) = self.agent_manager() else {
                 return Ok(serde_json::json!({ "running": false }));
             };
-            let unsloth = manager.unsloth_manager();
             let attached_agent_count = manager.count_agents_with_provider("unsloth");
-            match unsloth.status_snapshot().await {
+            let by_model = manager.unsloth_agents_by_model(None);
+            // Most recently used first; the top-level fields describe it, so
+            // clients that know one server keep working.
+            let statuses = manager.unsloth_manager().statuses().await;
+            let servers: Vec<serde_json::Value> = statuses
+                .iter()
+                .map(|status| {
+                    serde_json::json!({
+                        "repoId": status.repo_id,
+                        "port": status.port,
+                        "pid": status.pid,
+                        "uptimeSecs": status.uptime_secs,
+                        "phase": status.phase,
+                        "cpuPercent": status.cpu_percent,
+                        "memoryBytes": status.memory_bytes,
+                        "attachedAgentCount": by_model.get(&status.repo_id).copied().unwrap_or(0),
+                    })
+                })
+                .collect();
+            match statuses.first() {
                 Some(status) => Ok(serde_json::json!({
                     "running": true,
                     "repoId": status.repo_id,
@@ -19032,10 +19050,12 @@ impl WorkspaceApi for Services {
                     "cpuPercent": status.cpu_percent,
                     "memoryBytes": status.memory_bytes,
                     "attachedAgentCount": attached_agent_count,
+                    "servers": servers,
                 })),
                 None => Ok(serde_json::json!({
                     "running": false,
                     "attachedAgentCount": attached_agent_count,
+                    "servers": [],
                 })),
             }
         })
@@ -19046,7 +19066,7 @@ impl WorkspaceApi for Services {
             let Some(manager) = self.agent_manager() else {
                 return Ok(serde_json::json!({ "stopped": false }));
             };
-            let stopped = manager.unsloth_manager().stop().await;
+            let stopped = manager.unsloth_manager().stop_all().await;
             Ok(serde_json::json!({ "stopped": stopped }))
         })
     }
