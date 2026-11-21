@@ -492,8 +492,9 @@ async fn keep_alive_extends_the_session_only_when_it_ends_too_soon() {
     assert!((1_200_000..=1_260_000).contains(&duration), "{body}");
     assert_eq!(duration % 60_000, 0, "whole minutes");
 
-    // 30 minutes left, 30 wanted: nothing to do.
-    client.keep_alive(&created.id, 1800).await.unwrap();
+    // About 30 minutes left, 29 wanted: nothing to do. (Asking for the full
+    // 30 would race the clock: a second later, less than 30 is left.)
+    client.keep_alive(&created.id, 1740).await.unwrap();
     assert_eq!(extends(&server), 1);
 }
 
