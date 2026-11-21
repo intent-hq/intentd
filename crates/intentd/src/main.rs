@@ -2142,8 +2142,9 @@ async fn cmd_serve(
     // UDS or a live pid holds the pidfile; clean a stale socket/pidfile whose
     // owner is gone. The returned guard removes our pidfile on shutdown.
     let _pidfile = acquire_single_instance(&config, Some(&datadir_lock)).await?;
-    // The store open. `main` chose Postgres only in orchestrator mode, which
-    // `cmd_serve_owned` resolves again from the same flag and `config.toml`.
+    // The store open. `main` chose Postgres only in orchestrator mode. When
+    // the open is wired, `cmd_serve_owned` must run in that mode
+    // (`PostgresBackend::mode`) rather than resolve `config.toml` again.
     let prepared = match store_backend {
         store_backend::StoreBackend::Sqlite => Store::prepare_for_daemon(&config.db_path)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
