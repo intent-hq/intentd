@@ -91,12 +91,13 @@ const STARTED: &str = "started";
 const RELAY_SCRIPT: &str = r#"set -u
 export INTENTD_DATA_DIR="${INTENTD_DATA_DIR:-$HOME/.intent}"
 errf=$(mktemp)
+trap 'rm -f "$errf"' EXIT
 update() {
   i=0
   until intentd call settings.update --params "$1" >/dev/null 2>"$errf"; do
     # A daemon that answers its status may still be starting its services.
     i=$((i + 1))
-    if [ "$i" -ge 60 ] || ! grep -qi 'not ready' "$errf"; then
+    if [ "$i" -ge 30 ] || ! grep -qi 'not ready' "$errf"; then
       { grep -o '"data": *"[^"]*"' "$errf" || grep -o '"message": *"[^"]*"' "$errf"; } | head -n 1 | sed 's/^"[a-z]*": *"//; s/"$//' >&2
       return 1
     fi
@@ -113,10 +114,14 @@ if ! printf '%s' "$status" | grep -q '"tcAddress"'; then
   # An unchanged setting runs no hook: turn the tunnel off, then on.
   update '{"changes":[{"path":"server.tunnel.enabled","value":false}]}' || exit 3
   if ! update '{"changes":[{"path":"server.tunnel.enabled","value":true}]}'; then
-    grep -q "$INTENT_RELAY_MARKER" "$errf" && exit 4
+    grep -qF "$INTENT_RELAY_MARKER" "$errf" && exit 4
     exit 3
   fi
   status=$(intentd call system.status 2>/dev/null) || status=""
+  if ! printf '%s' "$status" | grep -q '"tcAddress"'; then
+    echo "the tunnel started but reports no address." >&2
+    exit 3
+  fi
 fi
 printf '%s\n' "$status"
 "#;
@@ -248,6 +253,9 @@ pub(crate) async fn run(
     backend: &Value,
     relay: Option<&str>,
 ) -> Result<Minted> {
+    if let Some(url) = relay {
+        check_relay_url(url, Moment::Start)?;
+    }
     start_daemon(client, sandbox, relay).await?;
     if relay.is_some() {
         ensure_relay(client, sandbox, relay, false, Moment::Start).await?;
@@ -376,6 +384,28 @@ fn relay_unreachable(url: &str, moment: Moment, detail: &str) -> Error {
     }
 }
 
+/// Refuse a relay URL the sandbox scripts cannot carry, before anything is
+/// written to the sandbox.
+///
+/// # Errors
+///
+/// `cloud-machine-unavailable` `relay-unreachable`.
+pub(crate) fn check_relay_url(url: &str, moment: Moment) -> Result<()> {
+    let usable = (url.starts_with("https://") || url.starts_with("http://"))
+        && !url
+            .chars()
+            .any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control());
+    if usable {
+        Ok(())
+    } else {
+        Err(relay_unreachable(
+            url,
+            moment,
+            "it is not an http or https URL",
+        ))
+    }
+}
+
 /// Make the sandbox's tunnel use `relay` ([`RELAY_SCRIPT`]); `apply` first
 /// moves a running tunnel to it. Returns the tunnel address.
 ///
@@ -392,18 +422,14 @@ pub(crate) async fn ensure_relay(
     moment: Moment,
 ) -> Result<Option<String>> {
     if let Some(url) = relay {
-        if url
-            .chars()
-            .any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control())
-        {
-            return Err(relay_unreachable(url, moment, "it is not a valid URL"));
-        }
+        check_relay_url(url, moment)?;
     }
     let mut spec = ProcessSpec::new("/bin/sh");
     spec.args = vec!["-c".into(), RELAY_SCRIPT.into()];
-    // A tunnel start: the map and relay checks, a key and tailcat's
-    // address, plus a provider's output drain.
-    spec.timeout = Some(Duration::from_secs(120));
+    // Up to 30 s waiting for a starting daemon, three settings updates, a
+    // tunnel start (map and relay checks, a key and tailcat's address, up
+    // to about 80 s), plus a provider's output drain.
+    spec.timeout = Some(Duration::from_secs(240));
     let params = json!({ "changes": [{ "path": "server.tunnel.derpUrl", "value": relay.unwrap_or_default() }] });
     spec.envs.insert(
         "INTENT_RELAY_PARAMS".to_owned(),

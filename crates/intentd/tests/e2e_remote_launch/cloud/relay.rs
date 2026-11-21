@@ -333,15 +333,37 @@ async fn a_relay_change_reaches_a_sandbox_at_its_next_resume() {
     assert!(lines.iter().all(|l| !l.starts_with("serve")), "{lines:?}");
     let seen = seen + lines.len();
 
-    set_relay(rpc_ws, 100, "").await;
+    // Back to the relay the machine row still names: the failed switch left
+    // the sandbox's tunnel off on the dead relay, so it is applied again.
+    set_relay(rpc_ws, 93, &second.url).await;
     ok(
         rpc_ws,
-        101,
+        94,
         "agent.retry",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
     .await;
-    reply_containing(rpc_ws, agent, "over a dead relay", 102).await;
+    reply_containing(rpc_ws, agent, "over a dead relay", 95).await;
+    let back = machine_of(rpc_ws, 96, &agent_id).await.unwrap();
+    assert_eq!(back["cloud"]["relayUrl"], second.url.as_str(), "{back}");
+    let lines = tailcat_lines(&log, seen);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("serve") && l.contains(&relay_flag)),
+        "{lines:?}"
+    );
+    let seen = seen + lines.len();
+
+    ok(
+        rpc_ws,
+        97,
+        "cloudMachines.pause",
+        json!({ "machineId": machine["id"] }),
+    )
+    .await;
+    set_relay(rpc_ws, 100, "").await;
+    send_and_reply(rpc_ws, agent, "back on the default relay", 101).await;
     let cleared = machine_of(rpc_ws, 110, &agent_id).await.unwrap();
     assert!(cleared["cloud"].get("relayUrl").is_none(), "{cleared}");
     let lines = tailcat_lines(&log, seen);

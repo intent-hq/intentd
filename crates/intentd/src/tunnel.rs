@@ -311,15 +311,44 @@ fn genkey_command(bin: &Path, key_path: &Path, derp_url: Option<&str>) -> Comman
     cmd
 }
 
-/// How long the relay check waits for the map, and for each relay.
+/// How long the relay check waits for the map, and for any relay to answer.
 const RELAY_MAP_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_NODE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What every failed relay check says first; the cloud bootstrap looks for it.
 pub const RELAY_UNREACHABLE: &str = "the self-hosted relay is unreachable";
 
+/// The DERP relays of `map` to probe: each node's `IPv4` (unless empty or
+/// `"none"`) or `HostName`, at `DERPPort` (default 443). STUN-only nodes
+/// relay nothing and are left out.
+fn relay_targets(map: &serde_json::Value) -> Vec<(String, u16)> {
+    let mut targets = Vec::new();
+    let regions = map["Regions"]
+        .as_object()
+        .into_iter()
+        .flat_map(|r| r.values());
+    for node in regions.flat_map(|region| region["Nodes"].as_array().into_iter().flatten()) {
+        if node["STUNOnly"].as_bool() == Some(true) {
+            continue;
+        }
+        let host = [&node["IPv4"], &node["HostName"]]
+            .into_iter()
+            .filter_map(serde_json::Value::as_str)
+            .find(|h| !h.is_empty() && *h != "none");
+        let port = node["DERPPort"]
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|p| *p != 0)
+            .unwrap_or(443);
+        if let Some(host) = host {
+            targets.push((host.to_owned(), port));
+        }
+    }
+    targets
+}
+
 /// Fetch the DERP map at `url` and open a TCP connection to one of its
-/// relays (`HostName` or `IPv4`, at `DERPPort`, default 443).
+/// relays, trying them all at once within [`RELAY_NODE_TIMEOUT`].
 async fn check_relay(url: &str) -> Result<()> {
     let unreachable = |why: String| Error::Internal(format!("{RELAY_UNREACHABLE} ({url}): {why}"));
     let client = reqwest::Client::builder()
@@ -335,46 +364,41 @@ async fn check_relay(url: &str) -> Result<()> {
         .json()
         .await
         .map_err(|e| unreachable(format!("its map is not a DERP map: {e}")))?;
-    let mut targets = Vec::new();
-    for region in map["Regions"]
-        .as_object()
-        .into_iter()
-        .flat_map(|r| r.values())
-    {
-        for node in region["Nodes"].as_array().into_iter().flatten() {
-            let host = [&node["IPv4"], &node["HostName"]]
-                .into_iter()
-                .filter_map(serde_json::Value::as_str)
-                .find(|h| !h.is_empty());
-            let port = node["DERPPort"]
-                .as_u64()
-                .and_then(|p| u16::try_from(p).ok())
-                .filter(|p| *p != 0)
-                .unwrap_or(443);
-            if let Some(host) = host {
-                targets.push((host.to_owned(), port));
-            }
-        }
-    }
+    let targets = relay_targets(&map);
     if targets.is_empty() {
         return Err(unreachable("its map lists no relay".into()));
     }
-    let mut last = String::new();
-    for (host, port) in &targets {
-        match tokio::time::timeout(
-            RELAY_NODE_TIMEOUT,
-            tokio::net::TcpStream::connect((host.as_str(), *port)),
-        )
-        .await
-        {
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(e)) => last = format!("{host}:{port}: {e}"),
-            Err(_) => last = format!("{host}:{port}: timed out"),
-        }
+    let mut probes = tokio::task::JoinSet::new();
+    for (host, port) in targets {
+        probes.spawn(async move {
+            tokio::net::TcpStream::connect((host.as_str(), port))
+                .await
+                .map(drop)
+                .map_err(|e| format!("{host}:{port}: {e}"))
+        });
     }
-    Err(unreachable(format!(
-        "no relay in its map answered ({last})"
-    )))
+    let answered = tokio::time::timeout(RELAY_NODE_TIMEOUT, async {
+        let mut last = String::new();
+        while let Some(probe) = probes.join_next().await {
+            match probe {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(why)) => last = why,
+                Err(e) => last = e.to_string(),
+            }
+        }
+        Err(last)
+    })
+    .await;
+    match answered {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(last)) => Err(unreachable(format!(
+            "no relay in its map answered ({last})"
+        ))),
+        Err(_) => Err(unreachable(format!(
+            "no relay in its map answered within {}s",
+            RELAY_NODE_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 /// Build the `tailcat serve` command: JSON address output, the persisted key,
@@ -949,6 +973,28 @@ esac
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert!(args.contains(&"--derpmap-url=https://derp.example.com/map.json".to_string()));
+    }
+
+    #[test]
+    fn relay_targets_skip_stun_only_nodes_and_default_to_port_443() {
+        let map = serde_json::json!({ "Regions": {
+            "900": { "Nodes": [
+                { "HostName": "derp.example.com" },
+                { "HostName": "b.example.com", "IPv4": "none", "DERPPort": 8443 },
+                { "HostName": "stun.example.com", "STUNOnly": true },
+                { "HostName": "c.example.com", "IPv4": "192.0.2.7", "DERPPort": 0 },
+                { "IPv4": "" },
+            ] },
+        } });
+        assert_eq!(
+            relay_targets(&map),
+            [
+                ("derp.example.com".to_owned(), 443),
+                ("b.example.com".to_owned(), 8443),
+                ("192.0.2.7".to_owned(), 443),
+            ]
+        );
+        assert!(relay_targets(&serde_json::json!({})).is_empty());
     }
 
     #[test]
