@@ -467,6 +467,10 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             "identity.select",
             json!({"provider":"github", "externalUserId":"1"}),
         ),
+        (
+            "input.autocomplete",
+            json!({ "text": "Fix the ", "context": "" }),
+        ),
         ("sourceControl.authStatus", json!({ "provider": "github" })),
         ("sourceControl.cancelAuth", json!({ "provider": "github" })),
         ("sourceControl.connect", json!({ "provider": "github" })),

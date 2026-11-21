@@ -10,6 +10,7 @@ pub(crate) mod fake_runtime;
 pub mod fixtures;
 pub mod goldens;
 pub mod large_state;
+pub mod mock_chat_upstream;
 pub mod profile_launch;
 #[cfg(test)]
 pub(crate) mod provider_installed;

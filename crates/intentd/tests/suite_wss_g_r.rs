@@ -24,6 +24,7 @@ mod e2e_wss_harness_wake;
 mod e2e_wss_hook_mcp_tools;
 mod e2e_wss_host;
 mod e2e_wss_host_credential_env;
+mod e2e_wss_input_autocomplete;
 mod e2e_wss_installed_cli;
 mod e2e_wss_interrupted_agents;
 mod e2e_wss_invite_join;

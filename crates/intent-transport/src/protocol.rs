@@ -769,9 +769,11 @@ use std::time::{Duration, Instant};
 // 18.0 removes guided Antigravity setup: providers.setup.status/start/login/cancel
 // (-32601), the providers.setup.openLogin reverse RPC and the antigravitySetup
 // capability. Antigravity now runs the user's `agy acp`.
+// 18.1 adds the input.autocomplete router method (composer ghost text) and the
+// autocomplete.* settings-catalog entries.
 // The 13.9/13.10 note paging, annotation and cancellable deletion surface was
 // later removed without a version bump: no client ever adopted it.
-pub const PROTOCOL_VERSION: &str = "18.0";
+pub const PROTOCOL_VERSION: &str = "18.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
