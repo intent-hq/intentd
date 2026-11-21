@@ -184,6 +184,19 @@
     "category": "settings"
   },
   {
+    "id": "autocomplete",
+    "tab": "input",
+    "hashAliases": [
+      "autocomplete"
+    ],
+    "scrollSelector": "#autocomplete",
+    "highlightSelector": "[data-highlight-id=\"autocomplete\"]",
+    "label": "Settings: Autocomplete",
+    "route": "/settings?tab=input#autocomplete",
+    "description": "Suggest as you type: service, model and API keys.",
+    "category": "settings"
+  },
+  {
     "id": "mcp-servers",
     "tab": "connections",
     "hashAliases": [

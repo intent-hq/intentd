@@ -362,8 +362,9 @@ Plugins follow the [Agent Plugins](https://agent-plugins.org/specification) form
 
 ## Suggest as you type
 
-Open **Settings → Inputs → Autocomplete** and turn on **Suggest as you type** to
-see a suggested ending for your message in muted text after the cursor. Press
+Open **Settings → Inputs → Autocomplete** (`/settings?tab=input#autocomplete`) and
+turn on **Suggest as you type** to see a suggested ending for your message in muted
+text after the cursor. Press
 **Tab** to accept it or **Esc** to dismiss it; typing the same characters keeps it,
 and any other edit clears it. Suggestions appear only after you type at least five
 characters with the cursor at the end of the message. It is off by default.
@@ -378,7 +379,7 @@ Add, replace or remove keys in the same section; they are stored as secrets.
 When a suggestion fails (no key, rate limit, model unavailable, slow network),
 nothing is shown and no error appears.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/autocomplete_ops.rs; packages/intentd/crates/intent-services/src/settings.rs (autocomplete.* catalog rows). Settings section and composer ghost text: the companion cloudlands-fe composer autocomplete change. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/autocomplete_ops.rs; packages/intentd/crates/intent-services/src/settings.rs (autocomplete.* catalog rows); packages/intentd/crates/intent-acp/resources/app-ui-targets.json (autocomplete); packages/cloudlands-fe/src/lib/components/settings/AutocompleteSettings.svelte. -->
 
 ## Desktop release notes
 
