@@ -238,6 +238,7 @@ forbidden-to-agent identity.connect
 read identity.getUser
 forbidden-to-agent identity.revoke
 forbidden-to-agent identity.select
+mutating input.autocomplete
 unsupported-on-agent-path invite.accept
 unsupported-on-agent-path invite.challenge
 unsupported-on-agent-path invite.inspect
