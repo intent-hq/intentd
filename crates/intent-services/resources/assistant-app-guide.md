@@ -512,6 +512,16 @@ links from the terminal drawer) opens in a browser panel of the workspace shown 
 current window instead. With no workspace open, it opens in a small sign-in window.
 Other link types, such as `mailto:`, are unchanged.
 
+<!-- Sources: packages/cloudlands-fe/src/shared/intent-os.ts; packages/cloudlands-fe/src/lib/utils/platform-capabilities.ts (externalEditors, systemFileManager); packages/cloudlands-fe/src/features/notifications/main/notification.service.ts; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/features/browser/main/browser-view.ipc.ts. -->
+Pending frontend release: on Intent OS, Intent starts with the menu bar hidden
+(**Alt** shows it), the dock off, and updates from the alpha channel. The Labs setting
+**Browser pages in the main process** starts on, so tabs can open in their own
+window; turning it off in **Settings → Labs** stays off. Actions that need a file
+manager or an external editor (**Reveal in file manager**, **Open in VS Code**, the
+open-in editor list) are not shown, and notifications appear inside Intent as
+messages with an **Open** button instead of system banners. A setting the user
+changed keeps the user's value.
+
 <!-- Free OpenCode and npm runtimes: packages/cloudlands-fe/src/features/onboarding/utils/order-onboarding-providers.ts; packages/cloudlands-fe/src/features/onboarding/messages/{AgentGrid,ProviderCard}.svelte; packages/cloudlands-fe/src/store/renderer/seeders/provider-status-bridge-seeder.ts; packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/intentd/crates/intent-services/src/{provider_cli_launch,installed_cli,provider_auth}.rs; packages/intentd/crates/intent-services/src/provider_models/parse.rs; packages/intentd/crates/intent-providers/src/config.rs. -->
 Pending release: OpenCode, Claude Code, Codex and Grok need no install when Node.js
 is present (Auggie too, once enabled; see Auggie visibility below). Without their CLI, Intent runs them from npm: through npx, or for
