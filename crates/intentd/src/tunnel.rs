@@ -140,9 +140,11 @@ impl TunnelSupervisor {
             None => self.state_dir.join("tailcat.private.json"),
             Some(url) => {
                 let digest = sha2::Sha256::digest(url.as_bytes());
-                let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+                let mut prefix = [0u8; 8];
+                prefix.copy_from_slice(&digest[..8]);
+                let name = u64::from_be_bytes(prefix);
                 self.state_dir
-                    .join(format!("tailcat-relay-{name}.private.json"))
+                    .join(format!("tailcat-relay-{name:016x}.private.json"))
             }
         }
     }

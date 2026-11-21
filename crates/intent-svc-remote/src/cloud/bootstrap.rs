@@ -422,20 +422,16 @@ pub(crate) async fn ensure_relay(
     })?;
     if !ran.success() {
         let why = tail(&ran.stderr);
-        return Err(match (relay, ran.exit.exit_code) {
-            (Some(url), 4) => relay_unreachable(url, moment, &why),
-            _ => {
-                let message = format!(
-                    "the sandbox's tunnel did not start (exit {}): {why}",
-                    ran.exit.exit_code
-                );
-                match moment {
-                    Moment::Start => failed(message),
-                    Moment::Resume => {
-                        cloud_machine_unavailable("bootstrap-failed", true, None, message)
-                    }
-                }
-            }
+        if let (Some(url), 4) = (relay, ran.exit.exit_code) {
+            return Err(relay_unreachable(url, moment, &why));
+        }
+        let message = format!(
+            "the sandbox's tunnel did not start (exit {}): {why}",
+            ran.exit.exit_code
+        );
+        return Err(match moment {
+            Moment::Start => failed(message),
+            Moment::Resume => cloud_machine_unavailable("bootstrap-failed", true, None, message),
         });
     }
     let status: Value = serde_json::from_slice(&ran.stdout).unwrap_or(Value::Null);
