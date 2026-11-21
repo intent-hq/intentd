@@ -1437,69 +1437,45 @@ mod find_provider_binary_tests {
         assert_eq!(candidates.first(), Some(&explicit));
     }
 
+    /// Discovery carries each provider's registry packages, and an npx-only
+    /// provider is installed exactly when npx resolves (a missing Codex or
+    /// Claude CLI is replaced by Intent's bundled copy). Which providers are
+    /// npx-only is the registry golden's fact, not this test's.
     #[test]
-    fn discover_providers_reports_claude_code_as_npx_only() {
-        let providers = discover_providers();
-        let cc = providers.iter().find(|p| p.id == "claude-code").unwrap();
-        assert_eq!(
-            cc.npx_only_package,
-            Some(crate::config::CLAUDE_AGENT_ACP_NPX_PACKAGE),
-            "claude-code availability must carry the pinned npx package"
-        );
-        // Assert against the single discovery snapshot rather than re-resolving
-        // npx (no test mutates process-global PATH anymore — monorepo#628 —
-        // but the snapshot assertion stays robust regardless).
-        // A missing `claude` CLI is replaced by Intent's bundled copy, so npx
-        // alone decides `installed`.
-        assert_eq!(cc.installed, cc.resolved_path.is_some());
-        if let Some(path) = &cc.resolved_path {
-            assert!(path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("npx"));
-        }
-    }
-
-    #[test]
-    fn discover_providers_reports_pi_as_npx_only() {
-        let providers = discover_providers();
-        let pi = providers.iter().find(|p| p.id == "pi").unwrap();
-        assert_eq!(
-            pi.npx_only_package,
-            Some(crate::config::PI_ACP_NPX_PACKAGE),
-            "pi availability must carry the pinned npx package"
-        );
-        // Assert against the same discovery snapshot rather than re-resolving
-        // npx (see the claude-code test above; monorepo#628).
-        assert_eq!(pi.installed, pi.resolved_path.is_some());
-        if let Some(path) = &pi.resolved_path {
-            assert!(path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("npx"));
-        }
-    }
-
-    #[test]
-    fn discover_providers_reports_codex_as_npx_only() {
-        let providers = discover_providers();
-        let codex = providers.iter().find(|p| p.id == "codex").unwrap();
-        assert_eq!(
-            codex.npx_only_package,
-            Some(crate::config::CODEX_ACP_NPX_PACKAGE)
-        );
-        assert!(!codex.has_npx_fallback);
-        // A missing `codex` CLI is replaced by Intent's bundled copy, so npx
-        // alone decides `installed`.
-        assert_eq!(codex.installed, codex.resolved_path.is_some());
-        if let Some(path) = &codex.resolved_path {
-            assert!(path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("npx"));
+    fn discover_providers_reports_registry_npx_packages() {
+        for availability in discover_providers() {
+            let config = crate::find_provider(availability.id).unwrap();
+            assert_eq!(
+                availability.npx_only_package, config.npx_only_package,
+                "{}",
+                availability.id
+            );
+            assert_eq!(
+                availability.has_npx_fallback,
+                config.fallback_npx_package.is_some(),
+                "{}",
+                availability.id
+            );
+            if availability.npx_only_package.is_none() || availability.gated_off.is_some() {
+                continue;
+            }
+            assert_eq!(
+                availability.installed,
+                availability.resolved_path.is_some(),
+                "{}",
+                availability.id
+            );
+            if let Some(path) = &availability.resolved_path {
+                assert!(
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("npx"),
+                    "{}: {}",
+                    availability.id,
+                    path.display()
+                );
+            }
         }
     }
 
@@ -1524,17 +1500,6 @@ mod find_provider_binary_tests {
                     "node={has_node}, npx={has_npx}: native adapter cannot replace prerequisites"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn discover_providers_non_npx_only_providers_unchanged() {
-        let providers = discover_providers();
-        for p in providers
-            .iter()
-            .filter(|p| !matches!(p.id, "claude-code" | "pi" | "codex"))
-        {
-            assert_eq!(p.npx_only_package, None, "{} must not be npx-only", p.id);
         }
     }
 

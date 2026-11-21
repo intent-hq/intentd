@@ -950,7 +950,7 @@ fn auth_gate_rejects_hard_false_and_names_remedy() {
         "names the provider: {m}"
     );
     assert!(
-        m.contains("claude auth login"),
+        m.contains(&intent_providers::login_command("claude-code")),
         "names the catalog loginCommandHint: {m}"
     );
     assert!(
@@ -968,23 +968,14 @@ fn auth_gate_rejects_hard_false_and_names_remedy() {
 /// the claude-only desktop-app caveat.
 #[test]
 fn auth_gate_names_each_providers_catalog_login_hint() {
-    for (id, hint) in [
-        ("auggie", "auggie login"),
-        ("grok", "grok login"),
-        // codex's hint names the real `codex` CLI (the probe target), not
-        // the non-runnable adapter fallback "codex-acp login".
-        ("codex", "codex login --device-auth"),
-        // opencode's real login lives under `auth`.
-        ("opencode", "opencode auth login"),
-        // No catalog hint: falls back to `{command} login`.
-        ("droid", "droid login"),
-    ] {
+    for id in ["auggie", "grok", "codex", "opencode", "droid"] {
+        let hint = intent_providers::login_command(id);
         let err = super::ensure_provider_authenticated("agent.delegate", id, Some(false))
             .expect_err("hard-false verdict must be rejected");
         let intent_core::Error::InvalidParams(m) = &err else {
             panic!("user-facing InvalidParams: {err:?}");
         };
-        assert!(m.contains(hint), "catalog login hint for {id}: {m}");
+        assert!(m.contains(&hint), "catalog login hint for {id}: {m}");
         assert!(
             !m.contains("desktop app"),
             "desktop-app caveat is claude-code-only: {m}"

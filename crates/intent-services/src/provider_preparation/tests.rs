@@ -11,7 +11,6 @@ fn eligibility_uses_registry_pins_and_ignores_legacy_overrides() {
             .paths
             .insert(id.into(), "/obsolete/adapter".into());
         assert!(eligible(provider, &settings));
-        assert!(provider.npx_only_package.unwrap().contains('@'));
     }
     assert!(!eligible(find_provider("auggie").unwrap(), &settings));
     settings.providers.enabled = Some(BTreeMap::from([("pi".into(), false)]));
