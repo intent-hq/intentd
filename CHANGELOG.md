@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.267] - 2026-11-21
+
+### 🚀 Features
+
+- *(intentd)* Refuse Postgres outside orchestrator mode ([#3613](https://github.com/intent-hq/intentd/pull/3613))
+- *(remote)* Cloud sandboxes use the backend's self-hosted relay ([#3614](https://github.com/intent-hq/intentd/pull/3614))
+
+### 🐛 Bug Fixes
+
+- *(unsloth)* Tell a start its server was stopped, not that the daemon is shutting down ([#3612](https://github.com/intent-hq/intentd/pull/3612))
+- *(providers)* Run provider CLI probes from a readable folder ([#3609](https://github.com/intent-hq/intentd/pull/3609))
+
+### 📚 Documentation
+
+- Let the Assistant card workspaces on other backends ([#3616](https://github.com/intent-hq/intentd/pull/3616))
+
+### 🧪 Testing
+
+- *(providers)* Keep provider registry facts in one golden snapshot ([#3611](https://github.com/intent-hq/intentd/pull/3611))
+
+
 ## [0.11.266] - 2026-11-21
 
 ### 🚀 Features
