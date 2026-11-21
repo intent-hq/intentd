@@ -66,6 +66,28 @@ fn unknown_budget_or_size_falls_back_to_one_server() {
     assert!(plan_evictions(None, None, &[]).is_empty());
 }
 
+#[test]
+fn only_a_shutdown_abort_from_a_pool_stop_reads_as_stopped() {
+    let abort = shutting_down_error();
+    // The teardown path appends the server output tail to the error.
+    let abort_with_tail = intent_core::Error::Internal(format!("{abort}\n--- tail ---\nbye"));
+    let crash = intent_core::Error::Internal("unsloth server exited before ready".into());
+    let missing = intent_core::Error::InvalidInput("unsloth CLI not found".into());
+
+    assert!(stopped_by_pool(&abort, true, false));
+    assert!(stopped_by_pool(&abort_with_tail, true, false));
+    assert!(
+        !stopped_by_pool(&abort, true, true),
+        "a daemon shutdown keeps its message"
+    );
+    assert!(!stopped_by_pool(&abort, false, false));
+    assert!(
+        !stopped_by_pool(&crash, true, false),
+        "a real failure keeps its error"
+    );
+    assert!(!stopped_by_pool(&missing, true, false));
+}
+
 #[cfg(unix)]
 mod lifecycle {
     use super::*;
@@ -468,5 +490,94 @@ esac
             .expect("A starts again on demand");
         assert_eq!(running(&fx.pool).await.len(), 2);
         fx.pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_start_evicted_to_make_room_says_its_server_stopped() {
+        let fx = fixture(2).await;
+        // 12 GiB + 12 GiB footprints against a ~21 GiB budget.
+        fx.pool.seed_footprint_for_test(A, 12 * GIB);
+        fx.pool.seed_footprint_for_test(B, 12 * GIB);
+        let held = fx.pool.base.mint_lock.clone().lock_owned().await;
+        let pool = Arc::new(fx.pool);
+        let starting = pool.clone();
+        let start_a =
+            tokio::spawn(
+                async move { starting.ensure_endpoint(A, None, &none(), &|_, _| {}).await },
+            );
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                while pool.statuses().await.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await
+        .expect("A's server spawned and waits to mint");
+
+        let starting = pool.clone();
+        let start_b =
+            tokio::spawn(
+                async move { starting.ensure_endpoint(B, None, &none(), &|_, _| {}).await },
+            );
+        let err = start_a
+            .await
+            .unwrap()
+            .expect_err("B's start stops A to make room");
+        assert!(err.to_string().contains("stopped"), "got: {err}");
+        assert!(!err.to_string().contains("shutting down"), "got: {err}");
+
+        drop(held);
+        start_b.await.unwrap().expect("B starts");
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stopping_a_model_that_is_still_starting_says_its_server_stopped() {
+        let fx = fixture(2).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool.seed_footprint_for_test(B, 4 * GIB);
+        fx.pool
+            .ensure_endpoint(B, None, &none(), &|_, _| {})
+            .await
+            .expect("B starts");
+        // A waits to mint behind the lock, like a long first download.
+        let held = fx.pool.base.mint_lock.clone().lock_owned().await;
+        let pool = Arc::new(fx.pool);
+        let starting = pool.clone();
+        let start =
+            tokio::spawn(
+                async move { starting.ensure_endpoint(A, None, &none(), &|_, _| {}).await },
+            );
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                while pool.statuses().await.len() < 2 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await
+        .expect("A's server spawned and waits to mint");
+
+        assert!(
+            pool.stop_model(A).await,
+            "a start in flight counts as stopped"
+        );
+        let err = start
+            .await
+            .unwrap()
+            .expect_err("the interrupted start fails");
+        let message = err.to_string();
+        assert!(!message.contains("shutting down"), "got: {message}");
+        assert!(message.contains("stopped"), "got: {message}");
+        assert_eq!(running(&pool).await, [(B.to_string(), fx.ports[0])]);
+
+        drop(held);
+        pool.ensure_endpoint(A, None, &none(), &|_, _| {})
+            .await
+            .expect("A starts again");
+        pool.shutdown().await;
     }
 }
