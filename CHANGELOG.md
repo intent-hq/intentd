@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.263] - 2026-11-21
+
+### 🚀 Features
+
+- *(assistant)* Follow the reorganized Settings tabs ([#3599](https://github.com/intent-hq/intentd/pull/3599))
+- Route native browser navigation ([#3053](https://github.com/intent-hq/intentd/pull/3053))
+
+
 ## [0.11.262] - 2026-11-21
 
 ### 🚀 Features
