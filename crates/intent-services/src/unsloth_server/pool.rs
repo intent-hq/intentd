@@ -47,10 +47,6 @@ pub(crate) struct Load {
     pub last_used: Instant,
 }
 
-/// The servers to stop so a model needing `need` bytes fits in `budget`, in
-/// stop order, each with whether it is busy. Idle servers go first, least
-/// recently used first, then busy ones. An unknown budget or need stops all
-/// evictable servers. Servers the daemon may not stop still use memory.
 /// Whether a failed start was aborted because the pool stopped its server
 /// (a stop or an eviction) while the daemon keeps running. Any other error,
 /// including a real failure that a later stop raced, keeps its message.
@@ -62,6 +58,10 @@ fn stopped_by_pool(
     manager_shut_down && !pool_shutting_down && is_shutting_down_abort(err)
 }
 
+/// The servers to stop so a model needing `need` bytes fits in `budget`, in
+/// stop order, each with whether it is busy. Idle servers go first, least
+/// recently used first, then busy ones. An unknown budget or need stops all
+/// evictable servers. Servers the daemon may not stop still use memory.
 pub(crate) fn plan_evictions(
     budget: Option<u64>,
     need: Option<u64>,
