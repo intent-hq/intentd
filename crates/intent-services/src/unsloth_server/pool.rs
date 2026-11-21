@@ -24,7 +24,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use super::{
     best_fitting_quant, fetch_repo_file_listing, lock_ignore_poison, parse_repo_quant_sizes,
-    shutting_down_error, StatusCallback, StatusLevel, UnslothConfig, UnslothServerManager,
+    server_stopped_error, shutting_down_error, StatusCallback, StatusLevel, UnslothConfig, UnslothServerManager,
     UnslothStatus,
 };
 
@@ -322,6 +322,10 @@ impl UnslothServerPool {
         drop(in_flight);
         if result.is_err() && !manager.has_live_server() {
             self.forget_if_idle(repo_id, &manager);
+        }
+        // The pool stopped this server, but the daemon keeps running.
+        if result.is_err() && manager.is_shut_down() && !self.is_shutting_down() {
+            return Err(server_stopped_error());
         }
         result
     }

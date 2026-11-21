@@ -168,6 +168,13 @@ fn stop_requested_error() -> Error {
     Error::Internal("unsloth server startup aborted: unsloth.stop was called".to_string())
 }
 
+/// The error a start gets when the pool stopped its server (a per-model
+/// stop, a stop of every server, or an eviction) while the daemon keeps
+/// running; a later start may bring the model back.
+pub(crate) fn server_stopped_error() -> Error {
+    Error::Internal("unsloth server startup aborted: its server was stopped".to_string())
+}
+
 /// The error for an unresolvable port conflict: the configured port is busy,
 /// the occupant is not an adoptable Unsloth server serving the requested
 /// model, and no free port could be picked. `InvalidInput` (not `Internal`)
@@ -1758,6 +1765,12 @@ impl UnslothServerManager {
     pub(crate) fn request_shutdown(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this manager was shut down (by the pool or the daemon).
+    pub(crate) fn is_shut_down(&self) -> bool {
+        self.shutting_down
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Kill the managed server (daemon shutdown / explicit teardown). No-op

@@ -469,4 +469,46 @@ esac
         assert_eq!(running(&fx.pool).await.len(), 2);
         fx.pool.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn stopping_a_model_that_is_still_starting_says_its_server_stopped() {
+        let fx = fixture(2).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool.seed_footprint_for_test(B, 4 * GIB);
+        fx.pool
+            .ensure_endpoint(B, None, &none(), &|_, _| {})
+            .await
+            .expect("B starts");
+        // A waits to mint behind the lock, like a long first download.
+        let held = fx.pool.base.mint_lock.clone().lock_owned().await;
+        let pool = Arc::new(fx.pool);
+        let starting = pool.clone();
+        let start =
+            tokio::spawn(
+                async move { starting.ensure_endpoint(A, None, &none(), &|_, _| {}).await },
+            );
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                while pool.statuses().await.len() < 2 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await
+        .expect("A's server spawned and waits to mint");
+
+        assert!(pool.stop_model(A).await, "a start in flight counts as stopped");
+        let err = start.await.unwrap().expect_err("the interrupted start fails");
+        let message = err.to_string();
+        assert!(!message.contains("shutting down"), "got: {message}");
+        assert!(message.contains("stopped"), "got: {message}");
+        assert_eq!(running(&pool).await, [(B.to_string(), fx.ports[1])]);
+
+        drop(held);
+        pool.ensure_endpoint(A, None, &none(), &|_, _| {})
+            .await
+            .expect("A starts again");
+        pool.shutdown().await;
+    }
 }
