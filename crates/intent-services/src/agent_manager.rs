@@ -2941,6 +2941,12 @@ impl Drop for TeardownFence {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnOrigin {
+    Delivery,
+    HarnessWake,
+}
+
 /// Why a [`AgentManager::try_begin_outcome`] claim did or did not start:
 /// `Started` claimed the slot; `Busy` lost to a turn already in flight (a
 /// prompt worker owns the slot and its receiver); `ReapClaimed` lost to the
@@ -7945,6 +7951,7 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         auto_unarchive: bool,
+        origin: TurnOrigin,
     ) -> TryBeginOutcome {
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
@@ -7961,7 +7968,13 @@ impl AgentManager {
         }) {
             Ok(((), admission)) => {
                 if boxed_await(|| {
-                    self.begin_turn_side_effects(agent_id, workspace_id, auto_unarchive, fence)
+                    self.begin_turn_side_effects(
+                        agent_id,
+                        workspace_id,
+                        auto_unarchive,
+                        fence,
+                        origin,
+                    )
                 })
                 .await
                 {
@@ -8010,8 +8023,16 @@ impl AgentManager {
         });
         match claimed {
             Ok(popped) => {
-                if boxed_await(|| self.begin_turn_side_effects(agent_id, workspace_id, true, fence))
-                    .await
+                if boxed_await(|| {
+                    self.begin_turn_side_effects(
+                        agent_id,
+                        workspace_id,
+                        true,
+                        fence,
+                        TurnOrigin::Delivery,
+                    )
+                })
+                .await
                 {
                     Some(popped)
                 } else {
@@ -8164,6 +8185,7 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
         auto_unarchive: bool,
         archive_fence: Option<crate::ArchiveFenceGuard>,
+        origin: TurnOrigin,
     ) -> bool {
         #[cfg(test)]
         {
@@ -8258,28 +8280,25 @@ impl AgentManager {
             self.services
                 .materialize_legacy_pending_questions_marker(agent_id)
                 .await;
-            // A real turn is starting: this agent's monitoring-idle waiting
-            // period (if any) is over, so clear its once-per-period advisory
-            // markers — the NEXT hook-/PR-monitor-waiting idle opens a NEW
-            // period and may advise its still-armed watchers again. Without
-            // this, the markers only cleared at genuine settlement, so a
-            // child woken mid-wait (user message, hook dispatch) that
-            // stalled monitoring-idle again parked its watchers in silence
-            // indefinitely. Best-effort: a failed clear only suppresses one
-            // future advisory, never a real wake — settlement still clears.
-            self.services
-                .clear_advisory_wake_periods_in_memory_for_child(agent_id);
-            if let Err(e) = self
-                .services
-                .store
-                .clear_advisory_wake_deliveries_for_child(agent_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    agent = %agent_id.0,
-                    "failed to clear advisory-wake markers at turn start"
-                );
+            // Delivery starts a new waiting period; the harness's own
+            // continuation keeps both markers until delivery or settlement.
+            // Best-effort: a failed clear can suppress a later advisory,
+            // but never a genuine completion wake.
+            if origin == TurnOrigin::Delivery {
+                self.services
+                    .clear_advisory_wake_periods_in_memory_for_child(agent_id);
+                if let Err(e) = self
+                    .services
+                    .store
+                    .clear_advisory_wake_deliveries_for_child(agent_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        agent = %agent_id.0,
+                        "failed to clear advisory-wake markers at turn start"
+                    );
+                }
             }
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
@@ -10789,7 +10808,10 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Option<TurnAdmission> {
-        match self.try_begin_outcome(agent_id, workspace_id, true).await {
+        match self
+            .try_begin_outcome(agent_id, workspace_id, true, TurnOrigin::Delivery)
+            .await
+        {
             TryBeginOutcome::Started(admission) => Some(admission),
             TryBeginOutcome::Busy
             | TryBeginOutcome::ReapClaimed
@@ -10960,7 +10982,10 @@ impl AgentManager {
         // to the prompt turn that won the slot: marking idle here would flag
         // the process eviction-eligible (and pop a spawn waiter)
         // mid-prompt-turn.
-        let admission = match self.try_begin_outcome(agent_id, workspace_id, true).await {
+        let admission = match self
+            .try_begin_outcome(agent_id, workspace_id, true, TurnOrigin::HarnessWake)
+            .await
+        {
             TryBeginOutcome::Started(admission) => admission,
             TryBeginOutcome::Busy => {
                 // Outcome deliberately ignored: the prompt turn that won the
@@ -16784,8 +16809,10 @@ async fn run_message_worker(
             .await;
             break 'outer;
         }
-        if let TryBeginOutcome::Started(next_admission) =
-            boxed_await(|| mgr.try_begin_outcome(&agent_id, &workspace_id, false)).await
+        if let TryBeginOutcome::Started(next_admission) = boxed_await(|| {
+            mgr.try_begin_outcome(&agent_id, &workspace_id, false, TurnOrigin::Delivery)
+        })
+        .await
         {
             admission = next_admission;
             // Archived re-check on the raced pop (intent-hq/monorepo#2513):

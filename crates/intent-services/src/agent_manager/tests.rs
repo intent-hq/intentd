@@ -4038,7 +4038,8 @@ async fn suppressed_reclaim_persists_no_notice() {
         .expect("archive row");
 
     assert!(matches!(
-        mgr.try_begin_outcome(&id, &ws, false).await,
+        mgr.try_begin_outcome(&id, &ws, false, super::TurnOrigin::Delivery)
+            .await,
         super::TryBeginOutcome::Started(_)
     ));
     let after = mgr.services.store.get_workspace(&ws).await.unwrap();
