@@ -19051,11 +19051,13 @@ impl WorkspaceApi for Services {
                     "memoryBytes": status.memory_bytes,
                     "attachedAgentCount": attached_agent_count,
                     "servers": servers,
+                    "stopByModel": true,
                 })),
                 None => Ok(serde_json::json!({
                     "running": false,
                     "attachedAgentCount": attached_agent_count,
                     "servers": [],
+                    "stopByModel": true,
                 })),
             }
         })
