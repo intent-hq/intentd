@@ -2627,6 +2627,8 @@ async fn run(
         let connected = match gated {
             Ok(seen) => {
                 pauses = seen.map(|seen| seen.pauses);
+                // The gate may have moved the sandbox to a new address.
+                let target = shared.target();
                 let next_hello = || {
                     let lease = lease.clone();
                     async move { lease.next_hello(ingested).await }

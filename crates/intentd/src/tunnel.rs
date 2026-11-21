@@ -6,7 +6,12 @@
 //! tunnel traffic to the local WSS port. The private key is persisted under
 //! the daemon data dir (`tunnel/tailcat.private.json`), so the `tc...`
 //! address — derived from the key — is stable across daemon and sidecar
-//! restarts. The supervisor restarts the child with capped exponential
+//! restarts. A self-hosted relay (`server.tunnel.derpUrl`) gets its own key,
+//! with the relay's region embedded in the address: tailcat (v0.4.0) puts
+//! only a region number in the address otherwise, which a dialer would look
+//! up in tailcat's default map. Each start with a relay first checks that
+//! its map loads and one of its relays answers; there is no fallback to the
+//! default relay. The supervisor restarts the child with capped exponential
 //! backoff when it exits unexpectedly, and kills it on stop (settings toggle
 //! or daemon shutdown; `kill_on_drop` covers abort paths).
 
@@ -106,9 +111,10 @@ fn tailcat_spawn_error_impl(
 /// from concurrent settings updates (single async Mutex over the state).
 pub struct TunnelSupervisor {
     bin: PathBuf,
-    /// `<data_dir>/tunnel/tailcat.private.json` — persisted named key; same
-    /// key ⇒ same `tc...` address across restarts.
-    key_path: PathBuf,
+    /// `<data_dir>/tunnel`: holds `tailcat.private.json` (the default
+    /// relay's key) and one key per self-hosted relay; same key ⇒ same
+    /// `tc...` address across restarts.
+    state_dir: PathBuf,
     address_timeout: Duration,
     state: tokio::sync::Mutex<Option<Running>>,
 }
@@ -126,12 +132,26 @@ struct Running {
 }
 
 impl TunnelSupervisor {
+    /// The key for `derp_url`: `tailcat.private.json` for the default relay,
+    /// else one named after a hash of the URL.
+    fn key_path(&self, derp_url: Option<&str>) -> PathBuf {
+        use sha2::Digest as _;
+        match derp_url.filter(|u| !u.is_empty()) {
+            None => self.state_dir.join("tailcat.private.json"),
+            Some(url) => {
+                let digest = sha2::Sha256::digest(url.as_bytes());
+                let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+                self.state_dir.join(format!("tailcat-relay-{name}.private.json"))
+            }
+        }
+    }
+
     /// `state_dir` is the directory holding the persisted key (created on
     /// first start), conventionally `<data_dir>/tunnel`.
     pub fn new(bin: PathBuf, state_dir: &Path) -> Self {
         Self {
             bin,
-            key_path: state_dir.join("tailcat.private.json"),
+            state_dir: state_dir.to_path_buf(),
             address_timeout: DEFAULT_ADDRESS_TIMEOUT,
             state: tokio::sync::Mutex::new(None),
         }
@@ -153,10 +173,14 @@ impl TunnelSupervisor {
         if let Some(running) = state.as_ref() {
             return Ok(running.address.clone());
         }
-        self.ensure_key(derp_url.as_deref()).await?;
+        if let Some(url) = derp_url.as_deref() {
+            check_relay(url).await?;
+        }
+        let key_path = self.key_path(derp_url.as_deref());
+        self.ensure_key(&key_path, derp_url.as_deref()).await?;
         let (child, address) = spawn_and_read_address(
             &self.bin,
-            &self.key_path,
+            &key_path,
             ws_port,
             derp_url.as_deref(),
             self.address_timeout,
@@ -167,7 +191,7 @@ impl TunnelSupervisor {
         let recycle = std::sync::Arc::new(tokio::sync::Notify::new());
         let task = intent_core::spawn_daemon(supervise(
             self.bin.clone(),
-            self.key_path.clone(),
+            key_path,
             ws_port,
             derp_url,
             self.address_timeout,
@@ -240,11 +264,11 @@ impl TunnelSupervisor {
     /// rendezvous region in so restarts land in the same place without
     /// re-probing. `derp_url` (when set) must be passed here too so region
     /// discovery uses the configured DERP map, not tailcat's default one.
-    async fn ensure_key(&self, derp_url: Option<&str>) -> Result<()> {
-        if self.key_path.exists() {
+    async fn ensure_key(&self, key_path: &Path, derp_url: Option<&str>) -> Result<()> {
+        if key_path.exists() {
             return Ok(());
         }
-        if let Some(dir) = self.key_path.parent() {
+        if let Some(dir) = key_path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| {
                 Error::Internal(format!(
                     "cannot create tunnel state dir {}: {e}",
@@ -252,7 +276,7 @@ impl TunnelSupervisor {
                 ))
             })?;
         }
-        let output = genkey_command(&self.bin, &self.key_path, derp_url)
+        let output = genkey_command(&self.bin, key_path, derp_url)
             .output()
             .await
             .map_err(|e| tailcat_spawn_error("genkey", &self.bin, &e))?;
@@ -270,16 +294,78 @@ impl TunnelSupervisor {
 
 /// Build the `tailcat genkey` command: persisted key path, optional custom
 /// DERP map URL (so `--fixed-region` discovery probes the configured map,
-/// not the default one), fixed region baked into the key.
+/// not the default one, and `--embed-derp-map` puts that region in the
+/// address), fixed region baked into the key.
 fn genkey_command(bin: &Path, key_path: &Path, derp_url: Option<&str>) -> Command {
     let mut cmd = Command::new(bin);
     cmd.arg("genkey")
         .arg(format!("--key={}", key_path.display()));
     if let Some(url) = derp_url.filter(|u| !u.is_empty()) {
-        cmd.arg(format!("--derpmap-url={url}"));
+        cmd.arg(format!("--derpmap-url={url}"))
+            .arg("--embed-derp-map");
     }
     cmd.arg("--fixed-region").stdin(Stdio::null());
     cmd
+}
+
+/// How long the relay check waits for the map, and for each relay.
+const RELAY_MAP_TIMEOUT: Duration = Duration::from_secs(10);
+const RELAY_NODE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What every failed relay check says first; the cloud bootstrap looks for it.
+pub const RELAY_UNREACHABLE: &str = "the self-hosted relay is unreachable";
+
+/// Fetch the DERP map at `url` and open a TCP connection to one of its
+/// relays (`HostName` or `IPv4`, at `DERPPort`, default 443).
+async fn check_relay(url: &str) -> Result<()> {
+    let unreachable = |why: String| Error::Internal(format!("{RELAY_UNREACHABLE} ({url}): {why}"));
+    let client = reqwest::Client::builder()
+        .timeout(RELAY_MAP_TIMEOUT)
+        .build()
+        .map_err(|e| unreachable(e.to_string()))?;
+    let map: serde_json::Value = client
+        .get(url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| unreachable(format!("its map did not load: {e}")))?
+        .json()
+        .await
+        .map_err(|e| unreachable(format!("its map is not a DERP map: {e}")))?;
+    let mut targets = Vec::new();
+    for region in map["Regions"].as_object().into_iter().flat_map(|r| r.values()) {
+        for node in region["Nodes"].as_array().into_iter().flatten() {
+            let host = [&node["IPv4"], &node["HostName"]]
+                .into_iter()
+                .filter_map(serde_json::Value::as_str)
+                .find(|h| !h.is_empty());
+            let port = node["DERPPort"]
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+                .filter(|p| *p != 0)
+                .unwrap_or(443);
+            if let Some(host) = host {
+                targets.push((host.to_owned(), port));
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Err(unreachable("its map lists no relay".into()));
+    }
+    let mut last = String::new();
+    for (host, port) in &targets {
+        match tokio::time::timeout(
+            RELAY_NODE_TIMEOUT,
+            tokio::net::TcpStream::connect((host.as_str(), *port)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(e)) => last = format!("{host}:{port}: {e}"),
+            Err(_) => last = format!("{host}:{port}: timed out"),
+        }
+    }
+    Err(unreachable(format!("no relay in its map answered ({last})")))
 }
 
 /// Build the `tailcat serve` command: JSON address output, the persisted key,

@@ -57,6 +57,7 @@ fn sandbox(id: &str, started_by: &str) -> ExposedMachine {
             running_seconds: 0,
             running_since: None,
             paused_at: None,
+            relay_url: None,
         }),
     }
 }
