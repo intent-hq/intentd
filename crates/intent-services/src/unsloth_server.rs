@@ -874,7 +874,7 @@ impl UnslothServerManager {
         }
     }
 
-    /// Whether [`Self::shutdown`] has been requested. SeqCst, paired with the
+    /// Whether [`Self::shutdown`] has been requested. `SeqCst`, paired with the
     /// pool's flag, so a start aborted by daemon shutdown never reads the pool
     /// as still running.
     pub(crate) fn is_shutting_down(&self) -> bool {
