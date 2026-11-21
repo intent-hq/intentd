@@ -943,6 +943,9 @@ impl UnslothServerManager {
     /// [`Self::stop_requested`] BEFORE taking the state lock so an in-flight
     /// startup's polling loop aborts within one probe tick instead of
     /// blocking this call for the full startup window.
+    // The pool stops servers with `shutdown` (it also aborts a start that
+    // has not spawned yet); this stays for the per-server lifecycle tests.
+    #[cfg(all(test, unix))]
     pub async fn stop(&self) -> bool {
         let was_running = lock_ignore_poison(&self.identity).is_some();
         if !was_running {
@@ -1564,8 +1567,26 @@ impl UnslothServerManager {
                 "UNSLOTH_STUDIO_URL",
                 format!("http://127.0.0.1:{}", server.port),
             );
-        // One mint at a time: each rewrites the shared generated config.
-        let _mint = self.config.mint_lock.clone().lock_owned().await;
+        // One mint at a time: each rewrites the shared generated config. The
+        // wait honors stop, shutdown and a dead server like the mint itself:
+        // another server's mint can hold the lock through a long download.
+        let _mint = loop {
+            if let Ok(guard) = self.config.mint_lock.clone().try_lock_owned() {
+                break guard;
+            }
+            if self.is_shutting_down() {
+                return Err(StartupFailure::terminal(shutting_down_error()));
+            }
+            if self.is_stop_requested() {
+                return Err(StartupFailure::terminal(stop_requested_error()));
+            }
+            if !server.is_alive() {
+                return Err(StartupFailure::terminal(Error::Internal(format!(
+                    "unsloth server exited while waiting to mint opencode auth for model {repo_id}"
+                ))));
+            }
+            tokio::time::sleep(self.config.probe_interval).await;
+        };
         let mut mint_child = cmd.spawn().map_err(|e| {
             StartupFailure::terminal(Error::Internal(format!(
                 "failed to run unsloth start opencode: {e}"
@@ -1720,6 +1741,23 @@ impl UnslothServerManager {
             }
             tokio::time::sleep(self.config.probe_interval).await;
         }
+    }
+
+    /// Whether this manager's server is alive or a start or stop is under
+    /// way. Unlike [`Self::status_snapshot`] this reaps a dead child, so a
+    /// crashed server is never mistaken for a running one.
+    pub(crate) fn has_live_server(&self) -> bool {
+        match self.state.try_lock() {
+            Err(_) => true,
+            Ok(mut state) => state.as_mut().is_some_and(ManagedServer::is_alive),
+        }
+    }
+
+    /// Set the terminal shutdown latch without waiting, so an in-flight
+    /// startup aborts at its next probe tick. [`Self::shutdown`] does the rest.
+    pub(crate) fn request_shutdown(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Kill the managed server (daemon shutdown / explicit teardown). No-op

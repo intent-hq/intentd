@@ -14,8 +14,9 @@
 //! or model size the pool keeps one server, as the single-server manager did.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use intent_core::Result;
 use intent_providers::UnslothEndpoint;
@@ -30,6 +31,10 @@ use super::{
 /// Expected resident size as a multiple of the selected GGUF file size.
 const FOOTPRINT_FACTOR: u64 = 3;
 
+/// How long an unknown model size is remembered, so the send-time check and
+/// the start that follows plan from the same answer.
+const UNKNOWN_FOOTPRINT_TTL: Duration = Duration::from_secs(300);
+
 /// One running server's share of the memory budget.
 #[derive(Debug, Clone)]
 pub(crate) struct Load {
@@ -37,18 +42,21 @@ pub(crate) struct Load {
     pub bytes: u64,
     /// Agents use it, or it is still starting for a waiting spawn.
     pub busy: bool,
+    /// The daemon may stop it (not an adopted server).
+    pub evictable: bool,
     pub last_used: Instant,
 }
 
 /// The servers to stop so a model needing `need` bytes fits in `budget`, in
 /// stop order, each with whether it is busy. Idle servers go first, least
-/// recently used first, then busy ones. An unknown budget or need stops all.
+/// recently used first, then busy ones. An unknown budget or need stops all
+/// evictable servers. Servers the daemon may not stop still use memory.
 pub(crate) fn plan_evictions(
     budget: Option<u64>,
     need: Option<u64>,
     loads: &[Load],
 ) -> Vec<(String, bool)> {
-    let mut order: Vec<&Load> = loads.iter().collect();
+    let mut order: Vec<&Load> = loads.iter().filter(|load| load.evictable).collect();
     order.sort_by_key(|load| (load.busy, load.last_used));
     let (Some(budget), Some(need)) = (budget, need) else {
         return order
@@ -71,9 +79,22 @@ pub(crate) fn plan_evictions(
 struct Entry {
     manager: Arc<UnslothServerManager>,
     /// The port this server was configured with (its actual port may differ
-    /// after a re-port around a foreign occupant).
+    /// after a re-port around a foreign occupant). Reserved while the entry
+    /// exists, including before its server has spawned.
     port: u16,
     last_used: Instant,
+    /// `ensure_endpoint` calls running through this entry. While one runs,
+    /// the entry is a starting server even before it reports a status.
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// One `ensure_endpoint` call running through an entry.
+struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The daemon's managed Unsloth servers, one per model.
@@ -83,8 +104,9 @@ pub(crate) struct UnslothServerPool {
     /// Serializes planning, stopping and starting, so two new models never
     /// race for memory or ports. Never held across a model's startup wait.
     admission: TokioMutex<()>,
-    /// Expected footprint per model (successful lookups only).
-    footprints: Mutex<HashMap<String, u64>>,
+    /// Expected footprint per model; an unknown size is kept for
+    /// [`UNKNOWN_FOOTPRINT_TTL`].
+    footprints: Mutex<HashMap<String, (Option<u64>, Instant)>>,
     shutting_down: std::sync::atomic::AtomicBool,
 }
 
@@ -130,11 +152,33 @@ impl UnslothServerPool {
         }
     }
 
-    fn lookup(&self, repo_id: &str) -> Option<Arc<UnslothServerManager>> {
+    /// Enter `repo_id`'s entry: count a call in flight and mark it used.
+    /// Returns the calls in flight before this one.
+    fn enter(&self, repo_id: &str) -> Option<(Arc<UnslothServerManager>, InFlight, usize)> {
         let mut servers = lock_ignore_poison(&self.servers);
         let entry = servers.get_mut(repo_id)?;
         entry.last_used = Instant::now();
-        Some(entry.manager.clone())
+        let prior = entry.in_flight.fetch_add(1, Ordering::SeqCst);
+        Some((
+            entry.manager.clone(),
+            InFlight(entry.in_flight.clone()),
+            prior,
+        ))
+    }
+
+    /// Whether `repo_id` has a running or starting server. Read-only.
+    async fn is_up(&self, repo_id: &str) -> bool {
+        let entry = lock_ignore_poison(&self.servers).get(repo_id).map(|entry| {
+            (
+                entry.manager.clone(),
+                entry.in_flight.load(Ordering::SeqCst),
+            )
+        });
+        match entry {
+            Some((_, in_flight)) if in_flight > 0 => true,
+            Some((manager, _)) => manager.status_snapshot().await.is_some(),
+            None => false,
+        }
     }
 
     fn budget(&self) -> Option<u64> {
@@ -142,57 +186,91 @@ impl UnslothServerPool {
     }
 
     /// Expected footprint of `repo_id`, or `None` when its size is unknown.
+    /// Known sizes are kept; an unknown one for [`UNKNOWN_FOOTPRINT_TTL`].
     async fn footprint(&self, repo_id: &str) -> Option<u64> {
-        if let Some(bytes) = lock_ignore_poison(&self.footprints).get(repo_id) {
-            return Some(*bytes);
+        if let Some((bytes, at)) = lock_ignore_poison(&self.footprints).get(repo_id) {
+            if bytes.is_some() || at.elapsed() < UNKNOWN_FOOTPRINT_TTL {
+                return *bytes;
+            }
         }
+        let bytes = self.lookup_footprint(repo_id).await;
+        lock_ignore_poison(&self.footprints).insert(repo_id.to_string(), (bytes, Instant::now()));
+        bytes
+    }
+
+    async fn lookup_footprint(&self, repo_id: &str) -> Option<u64> {
         let body = fetch_repo_file_listing(&self.base, repo_id).await.ok()?;
         let sizes = parse_repo_quant_sizes(&body);
         let quant = best_fitting_quant(&sizes, (self.base.total_memory_bytes)())?;
-        let bytes = sizes.get(&quant)?.saturating_mul(FOOTPRINT_FACTOR);
-        lock_ignore_poison(&self.footprints).insert(repo_id.to_string(), bytes);
-        Some(bytes)
+        Some(sizes.get(&quant)?.saturating_mul(FOOTPRINT_FACTOR))
     }
 
-    /// Loads of the daemon-started servers other than `repo_id`, dropping
-    /// entries whose server is gone. Adopted servers are not ours to stop.
+    fn known_footprint(&self, repo_id: &str) -> Option<u64> {
+        lock_ignore_poison(&self.footprints)
+            .get(repo_id)
+            .and_then(|(bytes, _)| *bytes)
+    }
+
+    /// Loads of the servers other than `repo_id`. A starting server counts
+    /// as busy at its expected size; an adopted one uses memory but is not
+    /// ours to stop. Entries whose server is gone and idle are dropped.
     async fn loads(&self, repo_id: &str, attached: &HashMap<String, usize>) -> Vec<Load> {
-        let entries: Vec<(String, Arc<UnslothServerManager>, Instant)> =
-            lock_ignore_poison(&self.servers)
-                .iter()
-                .filter(|(repo, _)| repo.as_str() != repo_id)
-                .map(|(repo, entry)| (repo.clone(), entry.manager.clone(), entry.last_used))
-                .collect();
+        type Snapshot = (String, Arc<UnslothServerManager>, Instant, Arc<AtomicUsize>);
+        let entries: Vec<Snapshot> = lock_ignore_poison(&self.servers)
+            .iter()
+            .filter(|(repo, _)| repo.as_str() != repo_id)
+            .map(|(repo, entry)| {
+                (
+                    repo.clone(),
+                    entry.manager.clone(),
+                    entry.last_used,
+                    entry.in_flight.clone(),
+                )
+            })
+            .collect();
         let mut loads = Vec::new();
-        for (repo, manager, last_used) in entries {
-            let Some(status) = manager.status_snapshot().await else {
-                self.forget(&repo, &manager);
-                continue;
+        for (repo, manager, last_used, in_flight) in entries {
+            let expected = self.known_footprint(&repo).unwrap_or(0);
+            let has_agents = attached.get(&repo).is_some_and(|n| *n > 0);
+            let load = match manager.status_snapshot().await {
+                None if in_flight.load(Ordering::SeqCst) > 0 => Load {
+                    repo_id: repo,
+                    bytes: expected,
+                    busy: true,
+                    evictable: true,
+                    last_used,
+                },
+                None => {
+                    self.forget_if_idle(&repo, &manager);
+                    continue;
+                }
+                Some(status) if status.pid.is_none() => Load {
+                    repo_id: repo,
+                    bytes: expected,
+                    busy: true,
+                    evictable: false,
+                    last_used,
+                },
+                Some(status) => Load {
+                    repo_id: repo,
+                    bytes: status.memory_bytes.max(expected),
+                    busy: status.phase != "ready" || has_agents,
+                    evictable: true,
+                    last_used,
+                },
             };
-            if status.pid.is_none() {
-                continue;
-            }
-            let expected = lock_ignore_poison(&self.footprints)
-                .get(&repo)
-                .copied()
-                .unwrap_or(0);
-            loads.push(Load {
-                bytes: status.memory_bytes.max(expected),
-                busy: status.phase != "ready" || attached.get(&repo).is_some_and(|n| *n > 0),
-                repo_id: repo,
-                last_used,
-            });
+            loads.push(load);
         }
         loads
     }
 
-    /// Drop `repo_id`'s entry if it still holds `manager`.
-    fn forget(&self, repo_id: &str, manager: &Arc<UnslothServerManager>) {
+    /// Drop `repo_id`'s entry if it still holds `manager` and no call runs
+    /// through it.
+    fn forget_if_idle(&self, repo_id: &str, manager: &Arc<UnslothServerManager>) {
         let mut servers = lock_ignore_poison(&self.servers);
-        if servers
-            .get(repo_id)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.manager, manager))
-        {
+        if servers.get(repo_id).is_some_and(|entry| {
+            Arc::ptr_eq(&entry.manager, manager) && entry.in_flight.load(Ordering::SeqCst) == 0
+        }) {
             servers.remove(repo_id);
         }
     }
@@ -204,10 +282,8 @@ impl UnslothServerPool {
         repo_id: &str,
         attached: &HashMap<String, usize>,
     ) -> Vec<String> {
-        if let Some(manager) = self.lookup(repo_id) {
-            if manager.status_snapshot().await.is_some() {
-                return Vec::new();
-            }
+        if self.is_up(repo_id).await {
+            return Vec::new();
         }
         let loads = self.loads(repo_id, attached).await;
         if loads.is_empty() {
@@ -234,33 +310,47 @@ impl UnslothServerPool {
         if self.is_shutting_down() {
             return Err(shutting_down_error());
         }
-        let manager = match self.lookup(repo_id) {
-            Some(manager) => manager,
+        let (manager, in_flight) = match self.enter(repo_id) {
+            Some((manager, in_flight, prior)) if prior > 0 || manager.has_live_server() => {
+                (manager, in_flight)
+            }
+            // The server died: start it again through the memory check.
+            Some((manager, in_flight, _)) => {
+                drop(in_flight);
+                self.forget_if_idle(repo_id, &manager);
+                self.admit(repo_id, attached, status).await?
+            }
             None => self.admit(repo_id, attached, status).await?,
         };
         let result = manager
             .ensure_endpoint(repo_id, unsloth_cli_override, 0, status)
             .await;
-        if result.is_err() && manager.status_snapshot().await.is_none() {
-            self.forget(repo_id, &manager);
+        drop(in_flight);
+        if result.is_err() && !manager.has_live_server() {
+            self.forget_if_idle(repo_id, &manager);
         }
         result
     }
 
-    /// Make room for `repo_id` and register its (not yet started) manager.
+    /// Make room for `repo_id` and register its (not yet started) manager,
+    /// with this call counted in flight.
     async fn admit(
         &self,
         repo_id: &str,
         attached: &HashMap<String, usize>,
         status: &StatusCallback,
-    ) -> Result<Arc<UnslothServerManager>> {
+    ) -> Result<(Arc<UnslothServerManager>, InFlight)> {
         let need = self.footprint(repo_id).await;
         let _admission = self.admission.lock().await;
         if self.is_shutting_down() {
             return Err(shutting_down_error());
         }
-        if let Some(manager) = self.lookup(repo_id) {
-            return Ok(manager);
+        if let Some((manager, in_flight, prior)) = self.enter(repo_id) {
+            if prior > 0 || manager.has_live_server() {
+                return Ok((manager, in_flight));
+            }
+            drop(in_flight);
+            self.forget_if_idle(repo_id, &manager);
         }
         let loads = self.loads(repo_id, attached).await;
         for (repo, busy) in plan_evictions(self.budget(), need, &loads) {
@@ -277,20 +367,29 @@ impl UnslothServerPool {
             let removed = lock_ignore_poison(&self.servers).remove(&repo);
             if let Some(entry) = removed {
                 tracing::info!(stopped = %repo, starting = %repo_id, "stopping unsloth server to make room");
-                entry.manager.stop().await;
+                // Terminal for this manager: also aborts a start in flight.
+                entry.manager.shutdown().await;
             }
         }
         let port = self.next_port();
         let manager = Arc::new(UnslothServerManager::with_config(self.config_for(port)));
-        lock_ignore_poison(&self.servers).insert(
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        let mut servers = lock_ignore_poison(&self.servers);
+        // Checked under the map lock: `shutdown` sets the flag before it
+        // drains the map, so an entry inserted here is always drained.
+        if self.is_shutting_down() {
+            return Err(shutting_down_error());
+        }
+        servers.insert(
             repo_id.to_string(),
             Entry {
                 manager: manager.clone(),
                 port,
                 last_used: Instant::now(),
+                in_flight: in_flight.clone(),
             },
         );
-        Ok(manager)
+        Ok((manager, InFlight(in_flight)))
     }
 
     /// The configured port when no server uses it, otherwise a free one.
@@ -323,17 +422,17 @@ impl UnslothServerPool {
         statuses
     }
 
-    /// Stop every server; `false` when none was running.
+    /// Stop every server, including starts in flight; `false` when none
+    /// was running or starting.
     pub(crate) async fn stop_all(&self) -> bool {
         let _admission = self.admission.lock().await;
-        let entries: Vec<Entry> = lock_ignore_poison(&self.servers)
-            .drain()
-            .map(|(_, entry)| entry)
-            .collect();
+        let entries = self.drain();
         let mut stopped = false;
-        for entry in entries {
-            stopped |= entry.manager.stop().await;
+        for entry in &entries {
+            stopped |= entry.in_flight.load(Ordering::SeqCst) > 0
+                || entry.manager.status_snapshot().await.is_some();
         }
+        Self::shut_down_all(entries).await;
         stopped
     }
 
@@ -341,10 +440,22 @@ impl UnslothServerPool {
     pub(crate) async fn shutdown(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let entries: Vec<Entry> = lock_ignore_poison(&self.servers)
+        Self::shut_down_all(self.drain()).await;
+    }
+
+    fn drain(&self) -> Vec<Entry> {
+        lock_ignore_poison(&self.servers)
             .drain()
             .map(|(_, entry)| entry)
-            .collect();
+            .collect()
+    }
+
+    /// Signal every manager before waiting on any, so a start waiting behind
+    /// another server's mint aborts instead of holding up the rest.
+    async fn shut_down_all(entries: Vec<Entry>) {
+        for entry in &entries {
+            entry.manager.request_shutdown();
+        }
         for entry in entries {
             entry.manager.shutdown().await;
         }
@@ -355,9 +466,10 @@ impl UnslothServerPool {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn seed_footprint_for_test(&self, repo_id: &str, bytes: u64) {
-        lock_ignore_poison(&self.footprints).insert(repo_id.to_string(), bytes);
+        lock_ignore_poison(&self.footprints)
+            .insert(repo_id.to_string(), (Some(bytes), Instant::now()));
     }
 
     /// Register a fake running server for `repo_id` (owned or adopted).
@@ -379,8 +491,31 @@ impl UnslothServerPool {
                 manager,
                 port,
                 last_used: Instant::now(),
+                in_flight: Arc::new(AtomicUsize::new(0)),
             },
         );
+    }
+
+    /// Register a server that has not spawned yet, with a start in flight.
+    #[cfg(all(test, unix))]
+    pub(crate) fn insert_starting_for_test(&self, repo_id: &str) -> u16 {
+        let port = self.next_port();
+        let manager = Arc::new(UnslothServerManager::with_config(self.config_for(port)));
+        lock_ignore_poison(&self.servers).insert(
+            repo_id.to_string(),
+            Entry {
+                manager,
+                port,
+                last_used: Instant::now(),
+                in_flight: Arc::new(AtomicUsize::new(1)),
+            },
+        );
+        port
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn tracks_for_test(&self, repo_id: &str) -> bool {
+        lock_ignore_poison(&self.servers).contains_key(repo_id)
     }
 }
 

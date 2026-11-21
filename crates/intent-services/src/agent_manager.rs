@@ -12462,7 +12462,8 @@ impl AgentManager {
             };
             // Live agents per model, for the warning before a server they
             // use stops to make room for this one.
-            let attached = self.unsloth_agents_by_model(None);
+            // The sender is left out, as in the send-time confirmation check.
+            let attached = self.unsloth_agents_by_model(Some(agent_id));
             // `providers.paths["unsloth"]` targets the unsloth CLI the
             // managed-server lifecycle shells out to (NOT the opencode ACP
             // primary, which `resolve_spawn` keys on "opencode").

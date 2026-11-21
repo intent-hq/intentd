@@ -1,9 +1,5 @@
 use super::*;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-const A: &str = "unsloth/Qwen3.5-9B-GGUF";
-const B: &str = "unsloth/Qwen3.8-27B-GGUF";
 const GIB: u64 = 1024 * 1024 * 1024;
 
 fn load(repo: &str, gib: u64, busy: bool, age_secs: u64) -> Load {
@@ -11,6 +7,7 @@ fn load(repo: &str, gib: u64, busy: bool, age_secs: u64) -> Load {
         repo_id: repo.to_string(),
         bytes: gib * GIB,
         busy,
+        evictable: true,
         last_used: Instant::now()
             .checked_sub(Duration::from_secs(age_secs))
             .unwrap(),
@@ -42,6 +39,20 @@ fn idle_servers_go_first_then_least_recently_used_busy_ones() {
 }
 
 #[test]
+fn a_server_the_daemon_may_not_stop_still_uses_memory() {
+    let mut adopted = load("adopted", 20, true, 50);
+    adopted.evictable = false;
+    let loads = [adopted, load("idle", 5, false, 1)];
+    // 25 used + 10 needed against 30: only the idle server can go, and that
+    // is not enough, so it goes and the adopted one stays.
+    assert_eq!(
+        evicted(&plan_evictions(Some(30 * GIB), Some(10 * GIB), &loads)),
+        ["idle"]
+    );
+    assert_eq!(evicted(&plan_evictions(None, None, &loads)), ["idle"]);
+}
+
+#[test]
 fn unknown_budget_or_size_falls_back_to_one_server() {
     let loads = [load("x", 1, false, 5), load("y", 1, true, 1)];
     assert_eq!(
@@ -58,6 +69,10 @@ fn unknown_budget_or_size_falls_back_to_one_server() {
 #[cfg(unix)]
 mod lifecycle {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    const A: &str = "unsloth/Qwen3.5-9B-GGUF";
+    const B: &str = "unsloth/Qwen3.8-27B-GGUF";
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -288,6 +303,113 @@ esac
         assert!(fx.pool.plan_for(A, &attached).await.is_empty());
         assert!(fx.pool.plan_for(B, &attached).await.is_empty());
         fx.pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_server_still_starting_keeps_its_entry_and_port() {
+        let fx = fixture(2).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool.seed_footprint_for_test(B, 4 * GIB);
+        let starting_port = fx.pool.insert_starting_for_test(A);
+
+        // A send-time check must not drop the entry before its server spawns.
+        assert!(fx.pool.plan_for(B, &none()).await.is_empty());
+        assert!(fx.pool.tracks_for_test(A));
+
+        let b = fx
+            .pool
+            .ensure_endpoint(B, None, &none(), &|_, _| {})
+            .await
+            .expect("B starts");
+        assert_ne!(b.base_url, format!("http://127.0.0.1:{starting_port}/v1"));
+        assert!(fx.pool.tracks_for_test(A), "A is still starting");
+        fx.pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_crashed_server_restarts_through_the_memory_check() {
+        let fx = fixture(2).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool.seed_footprint_for_test(B, 4 * GIB);
+        for repo in [A, B] {
+            fx.pool
+                .ensure_endpoint(repo, None, &none(), &|_, _| {})
+                .await
+                .expect("starts");
+        }
+        let pid = fx
+            .pool
+            .statuses()
+            .await
+            .into_iter()
+            .find(|status| status.repo_id == A)
+            .and_then(|status| status.pid)
+            .expect("A runs");
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid.cast_signed()),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("kill A");
+
+        // Now A no longer fits beside B: its restart must make room.
+        fx.pool.seed_footprint_for_test(A, 12 * GIB);
+        fx.pool.seed_footprint_for_test(B, 12 * GIB);
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                loop {
+                    let restarted = fx
+                        .pool
+                        .ensure_endpoint(A, None, &none(), &|_, _| {})
+                        .await
+                        .expect("A restarts");
+                    let servers = running(&fx.pool).await;
+                    if servers.iter().all(|(repo, _)| repo != B) {
+                        assert!(restarted.base_url.contains("127.0.0.1:"));
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            },
+        )
+        .await
+        .expect("B stopped to make room for A");
+        assert_eq!(running(&fx.pool).await.len(), 1);
+        fx.pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stopping_does_not_wait_behind_another_servers_mint() {
+        let fx = fixture(1).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        // Another server's mint holds the lock (e.g. a long first download).
+        let held = fx.pool.base.mint_lock.clone().lock_owned().await;
+        let pool = Arc::new(fx.pool);
+        let starting = pool.clone();
+        let start =
+            tokio::spawn(
+                async move { starting.ensure_endpoint(A, None, &none(), &|_, _| {}).await },
+            );
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                while pool.statuses().await.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await
+        .expect("A's server spawned and waits to mint");
+
+        let stopped = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            pool.stop_all(),
+        )
+        .await
+        .expect("stop_all returns while the mint lock is still held");
+        assert!(stopped);
+        assert!(start.await.unwrap().is_err(), "the interrupted start fails");
+        drop(held);
     }
 
     #[tokio::test]
