@@ -4590,17 +4590,7 @@ impl Services {
         session
             .harness_features
             .as_ref()
-            .and_then(|v| {
-                let mut snapshot = v.clone();
-                // Older snapshots without peerAgents captured that capability
-                // as off; do not inherit the new configuration default.
-                if let Some(fields) = snapshot.as_object_mut() {
-                    fields
-                        .entry("peerAgents")
-                        .or_insert(serde_json::Value::Bool(false));
-                }
-                serde_json::from_value(snapshot).ok()
-            })
+            .and_then(decode_agent_features_snapshot)
             .unwrap_or_else(|| self.effective_settings().agent_features)
     }
 
@@ -22413,10 +22403,10 @@ pub(crate) fn stamp_direct_correlation(metadata: &mut Option<Value>, id: &str) {
 }
 
 /// The per-session `agentFeatures` snapshot JSON (intent-hq/monorepo#2459).
-/// The off-by-default `secretRequests` toggle (PROTOCOL §5.56) is written
-/// only when on: an absent key decodes as `false`, so default sessions keep
-/// the exact snapshot shape older daemons and the shared transfer-selection
-/// fixtures expect.
+/// The `secretRequests` toggle (PROTOCOL §5.56) is written only when on: an
+/// absent key decodes as `false` (see [`decode_agent_features_snapshot`]), so
+/// sessions without it keep the snapshot shape older daemons and the shared
+/// transfer-selection fixtures expect.
 pub(crate) fn agent_features_snapshot(
     features: &intent_core::settings_file::AgentFeaturesSettings,
 ) -> serde_json::Result<serde_json::Value> {
@@ -22427,6 +22417,22 @@ pub(crate) fn agent_features_snapshot(
         }
     }
     Ok(snapshot)
+}
+
+/// Decodes a persisted [`agent_features_snapshot`]. A toggle that was added
+/// or turned on by default after a snapshot was written keeps the value the
+/// session was created with: an absent `peerAgents` or `secretRequests` key
+/// reads as off, not as the current configuration default.
+pub(crate) fn decode_agent_features_snapshot(
+    snapshot: &serde_json::Value,
+) -> Option<intent_core::settings_file::AgentFeaturesSettings> {
+    let mut snapshot = snapshot.clone();
+    if let Some(fields) = snapshot.as_object_mut() {
+        for key in ["peerAgents", "secretRequests"] {
+            fields.entry(key).or_insert(serde_json::Value::Bool(false));
+        }
+    }
+    serde_json::from_value(snapshot).ok()
 }
 
 /// Remote agents' accepted `agent.setModel` switches (provider, model as

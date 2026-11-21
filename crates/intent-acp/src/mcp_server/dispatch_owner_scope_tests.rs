@@ -49,7 +49,7 @@ impl WorkspaceApi for ProbeApi {
     }
 }
 
-/// Every feature on (including the default-off `secretRequests`) so every
+/// Every feature on, including `secretRequests`, so every
 /// binding's installer is in the prelude.
 fn all_features() -> AgentFeaturesSettings {
     AgentFeaturesSettings {

@@ -170,7 +170,10 @@ async fn valid_calls_and_feature_detection_are_unchanged() {
 
 #[tokio::test]
 async fn gated_off_secret_namespace_still_reads_undefined() {
-    let server = server(AgentFeaturesSettings::default());
+    let server = server(AgentFeaturesSettings {
+        secret_requests: false,
+        ..AgentFeaturesSettings::default()
+    });
     assert_eq!(
         ok_text(&server, "return typeof ws.secret").await,
         "\"undefined\""

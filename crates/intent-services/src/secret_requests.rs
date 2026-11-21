@@ -1479,20 +1479,30 @@ mod tests {
 
     #[test]
     fn feature_snapshots_carry_secret_requests_only_when_on() {
+        use crate::agent_ops::{agent_features_snapshot, decode_agent_features_snapshot};
         use intent_core::settings_file::AgentFeaturesSettings;
-        let off =
-            crate::agent_ops::agent_features_snapshot(&AgentFeaturesSettings::default()).unwrap();
-        assert!(off.get("secretRequests").is_none(), "{off}");
-        let decoded: AgentFeaturesSettings = serde_json::from_value(off).unwrap();
-        assert!(!decoded.secret_requests);
-        let on = crate::agent_ops::agent_features_snapshot(&AgentFeaturesSettings {
-            secret_requests: true,
+        assert!(AgentFeaturesSettings::default().secret_requests);
+        let off = agent_features_snapshot(&AgentFeaturesSettings {
+            secret_requests: false,
             ..AgentFeaturesSettings::default()
         })
         .unwrap();
+        assert!(off.get("secretRequests").is_none(), "{off}");
+        assert!(
+            !decode_agent_features_snapshot(&off)
+                .unwrap()
+                .secret_requests
+        );
+        let on = agent_features_snapshot(&AgentFeaturesSettings::default()).unwrap();
         assert_eq!(on["secretRequests"], json!(true));
-        let decoded: AgentFeaturesSettings = serde_json::from_value(on).unwrap();
-        assert!(decoded.secret_requests);
+        assert!(decode_agent_features_snapshot(&on).unwrap().secret_requests);
+        // A snapshot written before the default flipped still reads as off.
+        let legacy = json!({ "hostExec": true });
+        assert!(
+            !decode_agent_features_snapshot(&legacy)
+                .unwrap()
+                .secret_requests
+        );
     }
 
     #[test]

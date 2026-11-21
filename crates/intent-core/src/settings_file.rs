@@ -1144,7 +1144,7 @@ pub struct AgentFeaturesSettings {
     pub structured_questions: bool,
     /// `agentFeatures.secretRequests` — expose agent secret requests
     /// (`ws.secret.*` and the `ws.host.exec` `secretEnv` option) to new
-    /// top-level sessions (PROTOCOL §5.56). Defaults **off**; effective only
+    /// top-level sessions (PROTOCOL §5.56). Defaults **on**; effective only
     /// while `hostExec` is also on.
     pub secret_requests: bool,
     /// `agentFeatures.attentionRequests` — expose attention requests
@@ -1192,7 +1192,7 @@ impl Default for AgentFeaturesSettings {
             desktop_control: true,
             rich_chat_blocks: true,
             structured_questions: true,
-            secret_requests: false,
+            secret_requests: true,
             attention_requests: true,
             state_snapshot: true,
             pr_monitor: true,
@@ -2290,9 +2290,6 @@ richChatBlocks = true
 # Structured questions -- expose structured questions (ws.app.question.ask)
 # to agents.
 structuredQuestions = true
-# Secret requests -- let new top-level agents ask the user for secrets
-# (ws.secret.*) that intentd holds in memory for ws.host.exec.
-secretRequests = false
 # Attention requests -- expose attention requests (ws.agent.reportBlocker /
 # ws.agent.requestDiscussion) to agents.
 attentionRequests = true
@@ -2488,7 +2485,10 @@ mod tests {
         assert!(d.agent_features.desktop_control);
         assert!(d.agent_features.rich_chat_blocks);
         assert!(d.agent_features.structured_questions);
-        assert!(!d.agent_features.secret_requests);
+        assert!(d.agent_features.secret_requests);
+        // Configs seeded by older templates carry `secretRequests = false`; new
+        // ones leave it unset so they track the default.
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("secretRequests"));
         assert!(d.agent_features.attention_requests);
         assert!(d.agent_features.state_snapshot);
         assert!(d.agent_features.peer_agents);
