@@ -498,8 +498,14 @@ esac
         .await
         .expect("A's server spawned and waits to mint");
 
-        assert!(pool.stop_model(A).await, "a start in flight counts as stopped");
-        let err = start.await.unwrap().expect_err("the interrupted start fails");
+        assert!(
+            pool.stop_model(A).await,
+            "a start in flight counts as stopped"
+        );
+        let err = start
+            .await
+            .unwrap()
+            .expect_err("the interrupted start fails");
         let message = err.to_string();
         assert!(!message.contains("shutting down"), "got: {message}");
         assert!(message.contains("stopped"), "got: {message}");

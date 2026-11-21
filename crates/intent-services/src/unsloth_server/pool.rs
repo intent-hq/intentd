@@ -24,8 +24,8 @@ use tokio::sync::Mutex as TokioMutex;
 
 use super::{
     best_fitting_quant, fetch_repo_file_listing, lock_ignore_poison, parse_repo_quant_sizes,
-    server_stopped_error, shutting_down_error, StatusCallback, StatusLevel, UnslothConfig, UnslothServerManager,
-    UnslothStatus,
+    server_stopped_error, shutting_down_error, StatusCallback, StatusLevel, UnslothConfig,
+    UnslothServerManager, UnslothStatus,
 };
 
 /// Expected resident size as a multiple of the selected GGUF file size.
