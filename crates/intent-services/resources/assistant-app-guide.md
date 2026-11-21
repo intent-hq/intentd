@@ -270,7 +270,7 @@ Open Settings and use these sidebar labels (English labels shown):
 | General | Notifications, updates, external apps, GitHub link behavior | `/settings?tab=app-behavior#notifications` |
 | Appearance | Theme, colors, language, fonts, and chat display | `/settings?tab=display#theme` |
 | Performance | Animations and effects, agent backend | `/settings?tab=performance#agent-backend` |
-| Inputs | Notch, voice dictation, autocomplete, keyboard shortcuts, hardware | `/settings?tab=input#keyboard-shortcuts` |
+| Inputs | Notch, voice dictation, keyboard shortcuts, hardware | `/settings?tab=input#keyboard-shortcuts` |
 | Workspaces | Git, shell, workspace and archiving defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Labs, connection, data, reset | `/settings?tab=advanced#connection` |
 
@@ -359,27 +359,6 @@ A failed local server start or restart reports `error` with `lastError`. Fix its
 <!-- Sources: packages/intentd/crates/intent-services/src/plugins.rs; packages/intentd/crates/intent-services/src/plugins/ops.rs; packages/cloudlands-fe/src/lib/components/settings/{PluginsSettings.svelte,plugins/PluginList.svelte}. -->
 
 Plugins follow the [Agent Plugins](https://agent-plugins.org/specification) format: a folder with `plugin.json`, optional `skills/` and an optional `mcp.json`. Install one once in **Connections → Plugins** (`/settings?tab=connections#plugins`) from a folder path or a git URL, and every agent gets it on any provider. Its skills appear as `<plugin>:<skill>`. Its MCP servers appear in **Connections → MCP servers** as `<plugin>-<server>`, labelled with the plugin; they work like the user's own servers (status, sign-in, switches, `ws.app.mcp` reads) but can only be changed by updating or removing the plugin. Changes reach new agents only. The row shows warnings for parts that were skipped, and **Update** fetches the source again. The Assistant cannot install plugins for the user yet: send the user to that page.
-
-## Suggest as you type
-
-Open **Settings → Inputs → Autocomplete** (`/settings?tab=input#autocomplete`) and
-turn on **Suggest as you type** to see a suggested ending for your message in muted
-text after the cursor. Press
-**Tab** to accept it or **Esc** to dismiss it; typing the same characters keeps it,
-and any other edit clears it. Suggestions appear only after you type at least five
-characters with the cursor at the end of the message. It is off by default.
-**Service** chooses **Kilo Gateway** or **OpenRouter**, and **Model** chooses
-**Nemotron 3.5 Lightning** (fastest) or **Particle-1** (best suggestions).
-Each suggestion sends your draft and the last part of the visible conversation,
-including suggested prompts, to the chosen service. Kilo works without a key but
-free use is limited to 200 requests an hour per network address; Intent asks you
-to confirm Kilo's data terms before turning it on without a key. An optional Kilo
-key removes the hourly limit and uses your Kilo credits. OpenRouter needs a key.
-Add, replace or remove keys in the same section; they are stored as secrets.
-When a suggestion fails (no key, rate limit, model unavailable, slow network),
-nothing is shown and no error appears.
-
-<!-- Sources: packages/intentd/crates/intent-services/src/autocomplete_ops.rs; packages/intentd/crates/intent-services/src/settings.rs (autocomplete.* catalog rows); packages/intentd/crates/intent-acp/resources/app-ui-targets.json (autocomplete); packages/cloudlands-fe/src/lib/components/settings/AutocompleteSettings.svelte. -->
 
 ## Desktop release notes
 
