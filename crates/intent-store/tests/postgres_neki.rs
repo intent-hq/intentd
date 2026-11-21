@@ -8,7 +8,9 @@
 //! `INTENT_STORE_NEKI_URL=... cargo test -p intent-store --features postgres
 //! --test postgres_neki`. It applies every migration in a fresh schema,
 //! opens two tenants with identical keys, checks they stay apart, and always
-//! drops the schema. Without the URL it skips.
+//! drops the schema. Without the URL it skips. Each run also drops
+//! `intent_ci_*` schemas older than two hours that killed runs left;
+//! `INTENT_STORE_NEKI_KEEP_STALE=1` keeps a run to its own schema.
 //!
 //! The sharded tests (audit finding 1) need a Neki branch, ideally sharded
 //! by `tenant_id` across more than one shard, in
@@ -84,8 +86,12 @@ async fn round_trip(pool: PgPool) -> Result<(), String> {
 }
 
 /// Drop schemas left by runs that panicked or were killed
-/// more than two hours ago.
+/// more than two hours ago, unless `INTENT_STORE_NEKI_KEEP_STALE=1` (a run
+/// that may only touch its own schema).
 async fn drop_stale_schemas(admin: &PgPool, now: u64) {
+    if std::env::var("INTENT_STORE_NEKI_KEEP_STALE").as_deref() == Ok("1") {
+        return;
+    }
     let names: Vec<(String,)> = sqlx::query_as(
         "SELECT nspname::text FROM pg_namespace WHERE nspname LIKE 'intent\\_ci\\_%'",
     )
