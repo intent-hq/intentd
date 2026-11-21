@@ -11008,6 +11008,27 @@ async fn wss_unsloth_status_and_stop_round_trip() {
         "no AgentManager attached: unsloth.stop is a no-op: {resp}"
     );
 
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"unsloth.stop","params":{"repoId":"unsloth/Qwen3-4B-GGUF"}}"#,
+    )
+    .await;
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "stopped": false }),
+        "stopping one model with nothing running is a no-op: {resp}"
+    );
+
+    // A malformed repoId must not fall back to stopping every server.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"unsloth.stop","params":{"repoId":7}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602, "non-string repoId: {resp}");
+
     srv.ws.stop().await;
 }
 

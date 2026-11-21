@@ -5690,7 +5690,7 @@ async fn providers_methods(
 async fn unsloth_methods(
     api: &dyn WorkspaceApi,
     method: &str,
-    _params: &Map<String, Value>,
+    params: &Map<String, Value>,
 ) -> Result<Value, RpcErr> {
     match method {
         "unsloth.status" => {
@@ -5700,9 +5700,15 @@ async fn unsloth_methods(
             Ok(r)
         }
         "unsloth.stop" => {
-            // Gracefully terminate the managed Unsloth server; a no-op
-            // (`{ stopped: false }`) when none is running, not an error.
-            let r = api.unsloth_stop().await.map_err(domain_to_rpc)?;
+            // Gracefully terminate one model's server (`repoId`) or all of
+            // them; a no-op (`{ stopped: false }`) when none matches. A
+            // malformed repoId is rejected so it never widens to stop-all.
+            let repo_id = match params.get("repoId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(repo_id)) => Some(repo_id.clone()),
+                Some(_) => return Err(invalid_params("repoId must be a string")),
+            };
+            let r = api.unsloth_stop(repo_id).await.map_err(domain_to_rpc)?;
             Ok(r)
         }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),

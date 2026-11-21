@@ -7500,13 +7500,15 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `unsloth.stop`: gracefully terminate the managed Unsloth server (and
-    /// its process tree) if one is running — `{ stopped: boolean }`.
-    /// `stopped: false` is a no-op result, not an error, when no server was
-    /// running. Safe to call while agents are attached; the daemon does not
-    /// block or warn — callers should check `unsloth.status`'s
-    /// `attachedAgentCount` first if a live-agent warning is desired.
-    fn unsloth_stop(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+    /// `unsloth.stop`: gracefully terminate managed Unsloth servers (and
+    /// their process trees) — `{ stopped: boolean }`. With `repo_id`, only
+    /// the server for that model stops; without it, every server stops.
+    /// `stopped: false` is a no-op result, not an error, when no matching
+    /// server was running. Safe to call while agents are attached; the daemon
+    /// does not block or warn — callers should check `unsloth.status` first
+    /// if a live-agent warning is desired.
+    fn unsloth_stop(&self, repo_id: Option<String>) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = repo_id;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::unsloth_stop not implemented".to_string(),

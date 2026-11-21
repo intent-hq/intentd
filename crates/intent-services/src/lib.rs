@@ -19061,12 +19061,16 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn unsloth_stop(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn unsloth_stop(&self, repo_id: Option<String>) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let Some(manager) = self.agent_manager() else {
                 return Ok(serde_json::json!({ "stopped": false }));
             };
-            let stopped = manager.unsloth_manager().stop_all().await;
+            let pool = manager.unsloth_manager();
+            let stopped = match repo_id {
+                Some(repo_id) => pool.stop_model(&repo_id).await,
+                None => pool.stop_all().await,
+            };
             Ok(serde_json::json!({ "stopped": stopped }))
         })
     }

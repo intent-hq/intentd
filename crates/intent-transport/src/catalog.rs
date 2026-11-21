@@ -1957,7 +1957,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     mutation("terminal.resize", "Resizes a terminal."),
     mutation("terminal.write", "Writes terminal input."),
     bounded("unsloth.status", "Local model server status."),
-    mutation("unsloth.stop", "Stops the local model server."),
+    mutation("unsloth.stop", "Stops local model servers, or one model's server."),
     bounded("voice.getWorkspaceVocabulary", "Workspace vocabulary hints."),
     mutation("voice.transcribe", "Transcribes audio with a model; spends tokens."),
     mutation("workspace.archive", "Archives a workspace."),

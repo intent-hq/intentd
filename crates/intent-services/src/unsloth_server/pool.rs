@@ -432,6 +432,19 @@ impl UnslothServerPool {
         stopped
     }
 
+    /// Stop the server for one model, including a start in flight; `false`
+    /// when that model had no server. The others keep running.
+    pub(crate) async fn stop_model(&self, repo_id: &str) -> bool {
+        let _admission = self.admission.lock().await;
+        let Some(entry) = lock_ignore_poison(&self.servers).remove(repo_id) else {
+            return false;
+        };
+        let stopped = entry.in_flight.load(Ordering::SeqCst) > 0
+            || entry.manager.status_snapshot().await.is_some();
+        Self::shut_down_all(vec![entry]).await;
+        stopped
+    }
+
     /// Stop every server for good (daemon shutdown).
     pub(crate) async fn shutdown(&self) {
         self.shutting_down

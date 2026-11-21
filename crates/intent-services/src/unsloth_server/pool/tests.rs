@@ -441,4 +441,32 @@ esac
         assert!(fx.pool.statuses().await.is_empty());
         assert!(!fx.pool.stop_all().await, "nothing left to stop");
     }
+
+    #[tokio::test]
+    async fn stopping_one_model_leaves_the_others_running() {
+        let fx = fixture(2).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool.seed_footprint_for_test(B, 4 * GIB);
+        for repo in [A, B] {
+            fx.pool
+                .ensure_endpoint(repo, None, &none(), &|_, _| {})
+                .await
+                .expect("starts");
+        }
+
+        assert!(fx.pool.stop_model(A).await);
+        assert_eq!(running(&fx.pool).await, [(B.to_string(), fx.ports[1])]);
+        assert!(!fx.pool.stop_model(A).await, "A is already stopped");
+        assert!(
+            !fx.pool.stop_model("unsloth/Unknown-GGUF").await,
+            "a model with no server is a no-op"
+        );
+
+        fx.pool
+            .ensure_endpoint(A, None, &none(), &|_, _| {})
+            .await
+            .expect("A starts again on demand");
+        assert_eq!(running(&fx.pool).await.len(), 2);
+        fx.pool.shutdown().await;
+    }
 }
