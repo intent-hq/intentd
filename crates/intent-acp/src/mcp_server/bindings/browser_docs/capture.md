@@ -1,5 +1,8 @@
 # Browser Capture API
 
+Capture requires a desktop automation tab. Tabs marked `navigationOnly: true`
+support native navigation only; capture and screenshots are unavailable there.
+
 Capture is **intentional** - no background listeners run by default. You explicitly instrument when debugging.
 
 ## Simple Snapshot

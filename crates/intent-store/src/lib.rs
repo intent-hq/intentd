@@ -75,6 +75,7 @@ mod agent_session_summary;
 pub mod postgres;
 pub use agent_session_summary::{AgentSessionSummary, FullAgentSessionRow};
 mod attachment_repo;
+mod browser_sender_repo;
 mod browser_tab_repo;
 mod client_repo;
 mod comment_repo;

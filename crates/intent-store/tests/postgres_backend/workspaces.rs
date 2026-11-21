@@ -1161,6 +1161,7 @@ async fn seed_cascade(store: &Store, db: Option<&TestDb>, tenant: &str) {
         workspace_id: wid("ws-del"),
         url: format!("https://{tenant}.example/"),
         requested_url: None,
+        navigation_only: false,
         title: None,
         owner_agent_id: None,
         owner_agent_name: None,

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use intent_core::execution::HostExecutionContext;
 use intent_core::{
     AgentId, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
-    ReverseDispatchError, ScriptCreateParams, WorkspaceApi, WorkspaceId,
+    ReverseDispatchError, ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
 use crate::browser_tabs::BrowserTabOpsExt;
@@ -1120,8 +1120,9 @@ impl RuntimePort for RuntimeFeature {
     /// When an agent triggers this via the MCP `ws.browser.exec` binding
     /// there is no per-connection reverse channel to use (the caller is the
     /// daemon-hosted MCP server, not a client connection), so we route the
-    /// batch through the injected [`AgentReverseDispatch`]. The target is
-    /// the workspace's **driving client** ([`Services::driving_client_target`],
+    /// batch through the injected [`AgentReverseDispatch`]. Named tabs route
+    /// to their registry host, including desktop automation. Explicit claims
+    /// and unnamed requests instead select the workspace's **driving client** ([`Services::driving_client_target`],
     /// REV-2 rules 2–5: pin → client of an active desktop session → host of
     /// the workspace's claimed tabs → first-connected eligible client); a
     /// driving client that is offline is
@@ -1169,10 +1170,8 @@ impl RuntimePort for RuntimeFeature {
                     "browser.exec: actions must be a non-empty array".to_string(),
                 ));
             }
-            // Every tab the batch names must be an open registry tab of this
-            // workspace — before anything is answered or dispatched; the
-            // driving client is the one host, so no per-tab host lookup is
-            // involved (Model 5).
+            // Validate every named tab before answering or dispatching. Native
+            // tabs retain their physical host independently of desktop assignment.
             let mut named_tabs: Vec<&str> = actions
                 .iter()
                 .filter_map(|a| a["tabId"].as_str())
@@ -1181,17 +1180,18 @@ impl RuntimePort for RuntimeFeature {
                 .collect();
             named_tabs.sort_unstable();
             named_tabs.dedup();
+            let mut registry_tabs = Vec::new();
             for id in &named_tabs {
-                let known = svc
-                    .store()
-                    .get_browser_tab(id)
-                    .await?
-                    .is_some_and(|tab| tab.workspace_id == workspace_id);
-                if !known {
+                let known = svc.store().get_browser_tab(id).await?;
+                if known
+                    .as_ref()
+                    .is_none_or(|tab| tab.workspace_id != workspace_id)
+                {
                     return Err(Error::InvalidParams(format!(
                         "browser.exec: tab not found: {id}"
                     )));
                 }
+                registry_tabs.push(known.expect("validated tab"));
             }
             let list_tabs_count = actions
                 .iter()
@@ -1233,7 +1233,135 @@ impl RuntimePort for RuntimeFeature {
                     "browser.exec: no client connected".to_string(),
                 ));
             };
-            let target = svc.browser_client_target(&workspace_id).await?;
+            let navigation = intent_core::browser_navigation_actions(&actions);
+            let claiming = actions.iter().any(|action| action["action"] == "claimTab");
+            let native_tabs: Vec<_> = registry_tabs
+                .iter()
+                .filter(|tab| tab.navigation_only)
+                .collect();
+            let target = if let Some(native) = native_tabs.first() {
+                if !navigation {
+                    return Ok(browser_tabs::navigation_failure(&actions, "browser-automation-unavailable", "This tab supports native navigation only; page automation requires a desktop tab."));
+                }
+                if registry_tabs
+                    .iter()
+                    .any(|tab| tab.host_client_id != native.host_client_id || !tab.navigation_only)
+                {
+                    return Ok(browser_tabs::navigation_failure(
+                        &actions,
+                        "browser-mixed-hosts",
+                        "Native browser batches must address tabs on one physical host.",
+                    ));
+                }
+                ReverseTarget::Client(native.host_client_id.clone())
+            } else if !claiming && !registry_tabs.is_empty() {
+                let host = &registry_tabs[0].host_client_id;
+                if registry_tabs.iter().any(|tab| &tab.host_client_id != host) {
+                    return Ok(browser_tabs::navigation_failure(
+                        &actions,
+                        "browser-mixed-hosts",
+                        "Browser batches must address tabs on one physical host.",
+                    ));
+                }
+                ReverseTarget::Client(host.clone())
+            } else {
+                let mut target = svc.browser_client_target(&workspace_id).await?;
+                let new_tabs =
+                    registry_tabs.is_empty() && actions.iter().all(|a| a["action"] == "openTab");
+                // A human's latest sending device is a preference for new opens,
+                // never an ownership change or permission to run native automation.
+                let starts_new_tab = registry_tabs.is_empty()
+                    && actions.first().is_some_and(|a| a["action"] == "openTab");
+                if starts_new_tab && !matches!(target, ReverseTarget::Pinned(_)) {
+                    if let Some(agent) = agent_id.as_ref() {
+                        if let Some(client) = svc
+                            .store()
+                            .preferred_browser_sender(agent, &workspace_id)
+                            .await?
+                        {
+                            let preferred = ReverseTarget::Client(client);
+                            let eligible = if navigation {
+                                dispatch
+                                    .resolve_navigation(&preferred, &workspace_id)
+                                    .is_ok()
+                            } else {
+                                dispatch
+                                    .connection_snapshot(
+                                        &workspace_id,
+                                        std::slice::from_ref(&preferred),
+                                    )
+                                    .routes
+                                    .first()
+                                    .is_some_and(|route| route.error.is_none())
+                            };
+                            if eligible {
+                                target = preferred;
+                            }
+                        }
+                    }
+                }
+                if new_tabs
+                    && !matches!(target, ReverseTarget::Pinned(_))
+                    && dispatch.resolve_navigation(&target, &workspace_id).is_err()
+                {
+                    target = ReverseTarget::Default;
+                }
+                if let ReverseTarget::Client(client) | ReverseTarget::Pinned(client) = &target {
+                    if svc.browser_client_navigation_only(client).await?
+                        && (!navigation || !registry_tabs.is_empty())
+                    {
+                        return Ok(browser_tabs::navigation_failure(&actions, "browser-automation-unavailable", "The selected client supports native navigation only; existing desktop tabs cannot move there."));
+                    }
+                }
+                target
+            };
+            if !navigation
+                && dispatch.resolve(&target).is_err()
+                && dispatch.resolve_navigation(&target, &workspace_id).is_ok()
+            {
+                return Ok(browser_tabs::navigation_failure(&actions, "browser-automation-unavailable", "Only native navigation is available on this client; page automation requires a desktop."));
+            }
+            // Explicit claims run on the driving client and may bring tabs
+            // from other hosts there. Other actions in the same batch must
+            // already belong there or follow a claim of that particular tab.
+            // Validate the whole batch before dispatch, including actions that
+            // precede a claim: no partial execution on an incompatible host.
+            // Use the same workspace authority filter as final automation
+            // dispatch: Chief excludes member connections even for Default.
+            let executed_on = if claiming {
+                dispatch
+                    .connection_snapshot(&workspace_id, std::slice::from_ref(&target))
+                    .routes
+                    .into_iter()
+                    .next()
+                    .filter(|route| route.error.is_none())
+                    .and_then(|route| route.client_id)
+            } else {
+                None
+            };
+            if claiming {
+                if let Some(destination) = executed_on.as_ref() {
+                    let mut claimed = std::collections::HashSet::new();
+                    for action in &actions {
+                        let Some(id) = action["tabId"].as_str().or(tab_id.as_deref()) else {
+                            continue;
+                        };
+                        if action["action"] == "claimTab" {
+                            claimed.insert(id);
+                        } else if !claimed.contains(id)
+                            && registry_tabs
+                                .iter()
+                                .any(|tab| tab.tab_id == id && &tab.host_client_id != destination)
+                        {
+                            return Ok(browser_tabs::navigation_failure(
+                                &actions,
+                                "browser-mixed-hosts",
+                                "Actions in a claim batch must address its destination host or follow a claim of that tab.",
+                            ));
+                        }
+                    }
+                }
+            }
             // Claims re-home their tab after the dispatch; record which
             // client executed them (the commit re-validates the host).
             let claims: Vec<String> = actions
@@ -1242,11 +1370,6 @@ impl RuntimePort for RuntimeFeature {
                 .filter_map(|a| a["tabId"].as_str().or(tab_id.as_deref()))
                 .map(str::to_string)
                 .collect();
-            let executed_on = if claims.is_empty() {
-                None
-            } else {
-                dispatch.resolve(&target).ok().map(|r| r.client_id)
-            };
             // Shape by *request* arity: the FE aborts a batch on the first
             // failing action, so the reply's results count can be shorter
             // than the batch (see `shape_agent_result`).
@@ -1282,9 +1405,9 @@ impl RuntimePort for RuntimeFeature {
     }
 
     /// `browser.navigateTab { tabId, url }` (REV-2 Model 4): route a
-    /// navigation request to the client that renders the live tab — the
-    /// workspace's driving client for a claimed tab, the physical host for
-    /// an unclaimed one — as a reverse `browser.exec { action: "navigate"
+    /// navigation request to the physical host that renders the live tab,
+    /// including native navigation-only tabs, as a reverse
+    /// `browser.exec { action: "navigate"
     /// }` and echo that action's result envelope. The host then reports the
     /// resulting navigation through `browser.upsertTab` and every client
     /// follows the canonical row.
@@ -1338,7 +1461,7 @@ impl RuntimePort for RuntimeFeature {
                 let target = svc.browser_tab_route_target(&tab).await?;
                 let reachable = svc
                     .feature_reverse_dispatch()
-                    .is_some_and(|d| d.resolve(&target).is_ok());
+                    .is_some_and(|d| d.resolve_navigation(&target, &tab.workspace_id).is_ok());
                 if reachable {
                     // The host is told directly; failures fall through to
                     // the tombstone, which its next sync reconciles.

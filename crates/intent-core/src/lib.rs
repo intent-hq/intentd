@@ -22,6 +22,7 @@ pub mod agent_rpc;
 pub mod agent_runtime;
 pub mod agent_tmp;
 pub mod ansi;
+pub mod browser_message;
 pub mod caller;
 pub mod chief_cwd;
 pub mod cli_env;
@@ -252,9 +253,9 @@ pub use settings_file::{
 };
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{
-    AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, GitDiffPage,
-    PublishEvent, ResolvedClient, RetrieveRequest, RetrieveResult, RetrievedItem,
-    ReverseClientConnections, ReverseConnectionInfo, ReverseConnectionSnapshot,
+    browser_navigation_actions, AgentReverseDispatch, BoxFuture, ContextEngine, ContextError,
+    EngineAvailability, GitDiffPage, PublishEvent, ResolvedClient, RetrieveRequest, RetrieveResult,
+    RetrievedItem, ReverseClientConnections, ReverseConnectionInfo, ReverseConnectionSnapshot,
     ReverseDispatchError, ReverseLiveClient, ReverseRoute, ReverseTarget, WorkspaceApi,
 };
 pub use turn_attachments::{

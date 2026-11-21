@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod browser_sender;
 mod pending_completion;
 mod user_message_pages;
 

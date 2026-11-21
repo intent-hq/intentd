@@ -20,6 +20,8 @@ mod agents;
 mod attachments;
 #[path = "postgres_backend/bounded_deletes.rs"]
 mod bounded_deletes;
+#[path = "postgres_backend/browser_sender.rs"]
+mod browser_sender;
 #[path = "postgres_backend/clients.rs"]
 mod clients;
 #[path = "postgres_backend/completion_watches.rs"]

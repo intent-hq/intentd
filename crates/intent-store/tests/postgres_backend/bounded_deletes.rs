@@ -60,7 +60,7 @@ fn agent(id: &str, ws: &str) -> AgentSession {
 }
 
 /// `ws-big` with agents `a1` and `a2`, [`ROWS`] messages (each with a
-/// payload) and queue entries per agent, and [`ROWS`] notes (each with a
+/// payload), queue entries and sender receipts per agent, and [`ROWS`] notes (each with a
 /// version and a comment, every other one parented); `ws-keep` with agent
 /// `k1` and its own messages and notes, which no delete here may touch.
 async fn seed(db: &TestDb, store: &Store, tenant: &str) {
@@ -81,6 +81,9 @@ async fn seed(db: &TestDb, store: &Store, tenant: &str) {
                  FROM generate_series(1, {ROWS}) g; \
                  INSERT INTO agent_queue (tenant_id, id, agent_id, position, payload, created_at) \
                  SELECT '{tenant}', '{id}-q' || g, '{id}', g, '{{}}', '{T0}' \
+                 FROM generate_series(1, {ROWS}) g; \
+                 INSERT INTO agent_browser_sender (tenant_id, agent_id, submission_id, received_order) \
+                 SELECT '{tenant}', '{id}', '{id}-s' || g, g::text \
                  FROM generate_series(1, {ROWS}) g;"
             ),
         )
@@ -164,10 +167,11 @@ async fn seed(db: &TestDb, store: &Store, tenant: &str) {
 
 /// The heavy tables of an agent (`agent_id` scoped), for the gone, kept
 /// and batch checks.
-const AGENT_TABLES: [&str; 8] = [
+const AGENT_TABLES: [&str; 9] = [
     "agent_message",
     "agent_message_payload",
     "agent_queue",
+    "agent_browser_sender",
     "script_monitor",
     "script_notification_job",
     "agent_queue_admission",

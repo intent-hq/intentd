@@ -68,6 +68,9 @@ impl State {
             });
             let (row, seq) = &mut rows[index];
             let browser_exec = eligible || row.capabilities["browserExec"] == true;
+            let browser_navigation = (entry.channel.may_host_browser()
+                && device.identity.browser_navigation())
+                || row.capabilities["browserNavigation"] == true;
             row.connections += 1;
             row.transports.push(entry.transport.as_str().to_string());
             if device.hello_seq > *seq {
@@ -80,6 +83,9 @@ impl State {
                 };
             }
             row.capabilities["browserExec"] = browser_exec.into();
+            if browser_navigation || row.capabilities.get("browserNavigation").is_some() {
+                row.capabilities["browserNavigation"] = browser_navigation.into();
+            }
         }
         let rows: Vec<_> = rows.into_iter().map(|(row, _)| row).collect();
         let key = |row: &ReverseLiveClient| (row.principal_id.clone(), row.client_id.clone());

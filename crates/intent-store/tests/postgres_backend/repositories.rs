@@ -667,11 +667,18 @@ fn count(stats: &[intent_core::transfer::TransferTableStat], table: &str) -> i64
 parity_test!(transfer_rows_export_and_import, |store, tenant| {
     workspace(&store, "ws-tr", tenant).await;
     session(&store, "ws-tr", "ag-tr", tenant).await;
+    let sender = intent_core::ClientId("transfer-sender".into());
+    store.ensure_client(&sender).await.unwrap();
+    store
+        .record_browser_sender(&AgentId("ag-tr".into()), "receipt", "001", Some(&sender))
+        .await
+        .unwrap();
 
     let stats = store.transfer_table_stats(&wid("ws-tr")).await.unwrap();
     let names: Vec<&str> = stats.iter().map(|s| s.name.as_str()).collect();
     let expected: Vec<&str> = TRANSFER_TABLES.iter().map(|(t, _)| *t).collect();
     assert_eq!(names, expected);
+    assert!(!names.contains(&"agent_browser_sender"));
     assert_eq!(count(&stats, "workspace"), 1);
     assert_eq!(count(&stats, "agent_session"), 1);
     assert!(
@@ -685,6 +692,9 @@ parity_test!(transfer_rows_export_and_import, |store, tenant| {
     assert_eq!(count(&stats, "note"), 0);
 
     let rows = store.transfer_export_rows(&wid("ws-tr")).await.unwrap();
+    assert!(!rows
+        .iter()
+        .any(|(table, _)| table == "agent_browser_sender"));
     assert_eq!(
         rows.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
         expected
@@ -709,6 +719,27 @@ parity_test!(transfer_rows_export_and_import, |store, tenant| {
         .await
         .unwrap();
     assert_eq!(copied.name, format!("ag-tr of {tenant}"));
+    assert_eq!(
+        store
+            .latest_browser_sender(&AgentId("ag-tr2".into()))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .latest_browser_sender(&AgentId("ag-tr".into()))
+            .await
+            .unwrap(),
+        Some(sender.clone())
+    );
+    // Connection-bound receipts cannot be injected through an archive either.
+    assert!(matches!(
+        store
+            .transfer_import_rows(&[("agent_browser_sender".into(), vec![])])
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
     let stats2 = store.transfer_table_stats(&wid("ws-tr2")).await.unwrap();
     assert_eq!(count(&stats2, "workspace"), 1);
     assert_eq!(count(&stats2, "agent_session"), 1);
@@ -746,6 +777,10 @@ parity_test!(transfer_rows_export_and_import, |store, tenant| {
     ));
     if tenant == "decoy" {
         workspace(&store, "ws-tr-bad", tenant).await;
+        store
+            .record_browser_sender(&AgentId("ag-tr2".into()), "receipt", "001", Some(&sender))
+            .await
+            .unwrap();
     }
 });
 

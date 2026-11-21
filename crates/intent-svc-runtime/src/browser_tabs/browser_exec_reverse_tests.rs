@@ -148,10 +148,12 @@ async fn browser_exec_forwards_actions_and_returns_single_result_envelope() {
     // into the forwarded reverse-RPC params so the FE sees the same
     // envelope shape the client-triggered `browser.exec` path emits.
     assert_eq!(calls[0].1["workspaceId"], "ws-1");
-    // REV-2 Model 10: an unpinned workspace whose only tab is unclaimed
-    // has no driving client yet — the first-connected eligible client
-    // is asked (the pin / claimed-host cases live in `browser_routing`).
-    assert_eq!(calls[0].2, ReverseTarget::Default);
+    // Naming a registered tab binds automation to its physical host even
+    // when the workspace has no driving client and the tab is unclaimed.
+    assert_eq!(
+        calls[0].2,
+        ReverseTarget::Client(ClientId::from_string("desktop-a"))
+    );
 }
 
 /// REV-2 Model 5: every `tabId` an agent batch names must be an open
