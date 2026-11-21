@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.266] - 2026-11-21
+
+### 🚀 Features
+
+- *(workspace)* Report the start of a placed first agent as a create progress step ([#3610](https://github.com/intent-hq/intentd/pull/3610))
+
+
 ## [0.11.265] - 2026-11-21
 
 ### 🚀 Features
