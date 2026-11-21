@@ -614,8 +614,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // probe runs `codex login status` on it — not the adapter `command`
         // the default `{command} login` fallback would produce
         // ("codex-acp login" is not a runnable command; same rationale as
-        // the claude-code hint above).
-        login_command_hint: Some("codex login"),
+        // the claude-code hint above). Device auth works on any host: the
+        // browser flow's localhost callback cannot reach a remote daemon.
+        login_command_hint: Some("codex login --device-auth"),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
         requires_secondary_binary: Some("codex"),
         npx_only_package: Some(CODEX_ACP_NPX_PACKAGE),
