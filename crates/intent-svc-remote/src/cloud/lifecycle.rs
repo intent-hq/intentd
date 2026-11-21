@@ -378,7 +378,7 @@ pub(crate) async fn resume(
             // (which leaves the tunnel off on a relay the row does not name).
             // The sandbox's tunnel is moved to it and its relay checked.
             let unsettled = relay_unsettled(&row.id, None);
-            if (relay.is_some() || cloud.relay_url.is_some())
+            if (relay.is_some() || cloud.relay_url.is_some() || unsettled)
                 && (relay != cloud.relay_url
                     || paused
                     || connected.resumed

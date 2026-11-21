@@ -373,5 +373,43 @@ async fn a_relay_change_reaches_a_sandbox_at_its_next_resume() {
             .any(|l| l.starts_with("serve") && !l.contains("--derpmap-url")),
         "{lines:?}"
     );
+    let seen = seen + lines.len();
+
+    // On the default relay, a failed switch then a cleared setting: the row
+    // names no relay either way, and the sandbox is still repaired.
+    ok(
+        rpc_ws,
+        120,
+        "cloudMachines.pause",
+        json!({ "machineId": machine["id"] }),
+    )
+    .await;
+    set_relay(rpc_ws, 121, &dead).await;
+    let mut events = agent_events(backend.port, backend.cfg.clone(), &ws_id).await;
+    ok(
+        rpc_ws,
+        122,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "off the default relay" }),
+    )
+    .await;
+    failure_containing(&mut events, &agent_id, &dead).await;
+    drop(events);
+    set_relay(rpc_ws, 123, "").await;
+    ok(
+        rpc_ws,
+        124,
+        "agent.retry",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    reply_containing(rpc_ws, agent, "off the default relay", 125).await;
+    let lines = tailcat_lines(&log, seen);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("serve") && !l.contains("--derpmap-url")),
+        "{lines:?}"
+    );
     assert_no_secret_logged(&backend.head_dir, &backend.fake);
 }
