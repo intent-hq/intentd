@@ -31745,7 +31745,12 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let svc = Services::new_isolated(store);
 
-        let result = svc.unsloth_stop().await.expect("stop");
+        let result = svc.unsloth_stop(None).await.expect("stop");
+        assert_eq!(result, serde_json::json!({ "stopped": false }));
+        let result = svc
+            .unsloth_stop(Some("unsloth/Qwen3-4B-GGUF".to_string()))
+            .await
+            .expect("stop one model");
         assert_eq!(result, serde_json::json!({ "stopped": false }));
     }
 

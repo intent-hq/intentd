@@ -119,6 +119,15 @@ async fn unsloth_agents_are_counted_by_selection_not_command() {
     assert_eq!(fx.mgr.count_agents_with_provider("opencode"), 1);
 }
 
+/// Older daemons ignore `unsloth.stop`'s `repoId` and stop every server, so
+/// clients send it only when the status says the daemon honours it.
+#[tokio::test]
+async fn status_says_stop_takes_a_model() {
+    let fx = Fixture::new().await;
+    let status = fx.mgr.services.unsloth_status().await.expect("status");
+    assert_eq!(status["stopByModel"], serde_json::json!(true), "{status}");
+}
+
 #[tokio::test]
 async fn a_switch_that_would_unload_other_agents_lists_them() {
     let mut fx = Fixture::new().await;
