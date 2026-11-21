@@ -1673,19 +1673,15 @@ async fn host_provider_discovery_over_wss() {
         "provider.hasNpxFallback must be boolean: {p0}"
     );
 
-    // hasNpxFallback and npxOnly mirror the registry, and npxPackage is the
-    // registry's npx-only package, omitted when there is none. Which
-    // providers have packages is the intent-providers registry golden's fact.
+    // npxOnly mirrors the registry, and npxPackage is the registry's npx-only
+    // package, omitted when there is none. Which providers have packages is
+    // the intent-providers registry golden's fact. hasNpxFallback is not
+    // compared: a missing Codex/Claude CLI also sets it (bundled CLI via npx).
     for p in providers {
         let id = p["id"].as_str().unwrap();
-        let config = intent_providers::find_provider(id)
-            .unwrap_or_else(|| panic!("discovery row for an unregistered provider: {p}"));
-        let npx_only_package = config.npx_only_package;
-        assert_eq!(
-            p["hasNpxFallback"],
-            config.fallback_npx_package.is_some(),
-            "provider.hasNpxFallback must mirror the registry: {p}"
-        );
+        let npx_only_package = intent_providers::find_provider(id)
+            .unwrap_or_else(|| panic!("discovery row for an unregistered provider: {p}"))
+            .npx_only_package;
         assert_eq!(
             p["npxOnly"],
             npx_only_package.is_some(),
