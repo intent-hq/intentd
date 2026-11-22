@@ -52,6 +52,9 @@ pub(crate) struct TenantState {
     /// This process's claim on the tenant (`lease`), shared so a claim
     /// through one store fences every store of the tenant in the process.
     pub(crate) claim: super::lease::ClaimSlot,
+    /// The queue version this process last loaded or wrote, per agent; see
+    /// `agents::QueueVersions`.
+    pub(crate) queue_versions: super::agents::QueueVersions,
 }
 
 static TENANTS: OnceLock<Mutex<HashMap<String, Weak<TenantState>>>> = OnceLock::new();
@@ -106,7 +109,7 @@ impl crate::Store {
     /// Test-only: for each process-local gate, whether this store and
     /// `other` share it. `None` unless both are Postgres stores.
     #[must_use]
-    pub fn postgres_shared_gates(&self, other: &crate::Store) -> Option<[(&'static str, bool); 7]> {
+    pub fn postgres_shared_gates(&self, other: &crate::Store) -> Option<[(&'static str, bool); 8]> {
         let (crate::Backend::Postgres(a), crate::Backend::Postgres(b)) =
             (&self.backend, &other.backend)
         else {
@@ -126,6 +129,7 @@ impl crate::Store {
             desktop_writes,
             writer_slot,
             claim,
+            queue_versions,
             tenant_state,
         } = a;
         // A gate is shared when both stores hold the same one and it is the
@@ -164,6 +168,11 @@ impl crate::Store {
             (
                 "claim",
                 claim.same_as(&b.claim) && claim.same_as(&tenant_state.claim),
+            ),
+            (
+                "queue_versions",
+                queue_versions.same_as(&b.queue_versions)
+                    && queue_versions.same_as(&tenant_state.queue_versions),
             ),
         ])
     }

@@ -308,6 +308,25 @@ pub async fn open_with(db: &TestDb, tenant: &str, rls_guard: bool) -> Store {
     .expect("open tenant store")
 }
 
+/// A trapped store of `tenant` as if opened by another process named
+/// `process`: its own process-local gates (writer slot, note lanes, queue
+/// versions), so only the database orders it against other opens, as
+/// between two daemons.
+pub async fn open_as_process(db: &TestDb, tenant: &str, process: &str) -> Store {
+    Store::open_postgres_as_process(
+        db.app.clone(),
+        TenantId::new(tenant).unwrap(),
+        PostgresOptions {
+            rls_guard: true,
+            ..PostgresOptions::default()
+        },
+        process,
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .expect("open tenant store as another process")
+}
+
 /// A fresh `SQLite` store in a temporary directory (kept alive by the guard).
 pub async fn sqlite_store() -> (Store, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
