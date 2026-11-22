@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -366,6 +366,38 @@ fn observe_exit(session: &PtySession) -> Option<PtyExit> {
     Some(exit)
 }
 
+/// Whether `spec.command` names an executable file: as a path (relative to
+/// `spec.cwd`), or found on the `PATH` the child will get.
+fn program_resolves(spec: &SpawnSpec) -> bool {
+    let program = Path::new(&spec.command);
+    let executable = |path: &Path| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        path.is_file()
+    };
+    if program.components().count() > 1 || program.is_absolute() {
+        let full = match &spec.cwd {
+            Some(cwd) if program.is_relative() => cwd.join(program),
+            _ => program.to_path_buf(),
+        };
+        return executable(&full);
+    }
+    let path = spec
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    std::env::split_paths(&path).any(|dir| executable(&dir.join(program)))
+}
+
 fn internal(e: impl std::fmt::Display) -> Error {
     Error::Internal(e.to_string())
 }
@@ -463,11 +495,13 @@ impl PtyHost {
         let pair = openpty_with_retry(spec.size.to_portable())?;
 
         let (program, args, leaf) = match &spec.workload {
-            Some(workload) => {
+            // A program that cannot be found spawns directly, so the spawn
+            // fails with the same error as before the shim (#9809).
+            Some(workload) if program_resolves(&spec) => {
                 let launch = workload.pty_launch(&spec.command, &spec.args);
                 (launch.program, launch.args, launch.leaf)
             }
-            None => (spec.command.clone(), spec.args.clone(), None),
+            _ => (spec.command.clone(), spec.args.clone(), None),
         };
         let mut cmd = CommandBuilder::new(&program);
         cmd.args(&args);
