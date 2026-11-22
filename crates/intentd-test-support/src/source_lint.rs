@@ -2850,8 +2850,10 @@ use some::module;
             stdout
                 .lines()
                 .find_map(|line| line.split_once("ROOT=").map(|(_, root)| root))
-                .map(PathBuf::from)
-                .unwrap_or_else(|| panic!("child printed no ROOT= line: {stdout}"))
+                .map_or_else(
+                    || panic!("child printed no ROOT= line: {stdout}"),
+                    PathBuf::from,
+                )
         };
         assert_eq!(run(Some(&member)), ws, "from CARGO_MANIFEST_DIR");
         assert_eq!(run(None), ws, "from the working directory");
