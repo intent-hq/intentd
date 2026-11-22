@@ -1837,6 +1837,25 @@ In test builds, page-load failures also show the same message and **Retry** dire
 in the preview. Test-build behavior pending its frontend release.
 If the page closed itself, its empty page shows the message and **Retry** directly.
 
+## Darken websites in the desktop workspace browser
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/browser/main/website-dark-mode.ts; src/main/browser-website-dark-mode.ts; src/main/native-menu-model.ts; messages/en.json. -->
+
+In the desktop app, choose **View → Darken Websites** to show external websites
+in workspace browser tabs dark. Sites with their own dark theme switch to it, and
+light-only sites are darkened automatically. Open tabs change at once, with no
+reload, and new tabs open dark. Clear the same checkbox to restore the normal
+look. The setting is off by default, applies even when Intent uses the Light
+theme, and is saved on this device only; it does not sync.
+
+Local dev servers keep their normal colors: `localhost`, loopback addresses,
+`*.localhost` names such as `daemon.localhost`, and the host of a connected
+remote machine. Local files and other non-web pages are not changed either.
+While the setting is on, agent screenshots of external sites show the darkened
+page. Some sites look poor when darkened automatically; turn the setting off for
+them. The iOS workspace browser and Intent's own interface are not affected.
+Older versions may not have this menu item.
+
 ## iOS workspace browser
 
 <!-- Sources: packages/ios/Intent/Views/Workspaces/{WorkspaceBrowserView,WorkspaceBrowserPage}.swift; packages/ios/Intent/Services/BrowserTunnelURL.swift; packages/ios/Intent/Info.plist; packages/intentd/crates/intent-svc-runtime/src/{runtime,browser_tabs}.rs. -->
