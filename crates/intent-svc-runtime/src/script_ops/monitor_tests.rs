@@ -365,6 +365,7 @@ async fn monitor_terminal_wait_tolerates_settlement_publication_gap() {
         started_at: None,
         stopped_at: now_iso(),
         error: Some("spawn failed before start".into()),
+        started_by: None,
     });
     assert!(h
         .services
@@ -972,6 +973,7 @@ async fn monitor_recovery_prior_result_deadline_interruption_and_cancel_intent()
                 started_at: None,
                 stopped_at: now_iso(),
                 error: None,
+                started_by: None,
             };
             h.services
                 .store()

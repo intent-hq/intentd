@@ -586,6 +586,7 @@ impl ScriptManager {
                         }
                         .into(),
                     ),
+                    started_by: None,
                 });
                 self.complete_monitor(&mut row, result).await?;
             } else if row.state != "active" {
@@ -714,6 +715,7 @@ impl ScriptManager {
                     started_at: None,
                     stopped_at: now_iso(),
                     error: Some("bound run is no longer available".into()),
+                    started_by: None,
                 },
             )
             .await?;

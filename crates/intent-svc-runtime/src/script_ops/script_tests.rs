@@ -317,17 +317,27 @@ async fn service_auto_restarts_after_long_enough_run() {
     let h = harness().await;
     let mut sub = subscribe(&h);
     let id = create(&h, "svc", "sleep 2.1", ScriptMode::Service).await;
-    h.services
-        .script_start(h.ws.clone(), id.clone())
-        .await
-        .expect("start");
-    drain_until(&mut sub, LIVENESS, |v| {
+    let agent = intent_core::AgentId::from("agent-service-starter");
+    intent_core::with_caller(
+        intent_core::Caller::Agent {
+            agent_id: agent.clone(),
+        },
+        h.services.script_start(h.ws.clone(), id.clone()),
+    )
+    .await
+    .expect("start");
+    let (respawned, _) = drain_until(&mut sub, LIVENESS, |v| {
         (v["type"] == "script:state"
             && v["data"]["status"] == "running"
             && v["data"]["restartCount"] == 1)
-            .then_some(())
+            .then(|| v["data"].clone())
     })
     .await;
+    assert_eq!(
+        respawned["startedBy"],
+        serde_json::json!({ "kind": "agent", "agentId": agent.as_str() }),
+        "the auto-restart keeps the run's starter: {respawned}"
+    );
     // The `restartCount: 1` event above proves the single auto-restart;
     // a stalled scheduler can let the short-lived second run exit (and
     // restart again) before this status call, so only assert the floor.

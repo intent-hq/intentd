@@ -164,7 +164,7 @@ async fn a_command_run_starts_on_the_machine_and_settles_from_its_frames() {
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
     let state = runs
-        .start(&place(&agent), &script(ScriptMode::Command, "make"))
+        .start(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
     assert_eq!(state.status, ScriptStatus::Starting);
@@ -208,7 +208,7 @@ async fn frames_of_another_spawn_or_machine_are_ignored() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -228,8 +228,15 @@ async fn a_service_that_exits_is_restarted_with_a_new_spawn_and_the_same_run() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
+    let by = intent_core::ScriptStartedBy::Agent {
+        agent_id: agent.clone(),
+    };
     let first = runs
-        .start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .start(
+            &place(&agent),
+            &script(ScriptMode::Service, "serve"),
+            Some(by.clone()),
+        )
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -248,6 +255,7 @@ async fn a_service_that_exits_is_restarted_with_a_new_spawn_and_the_same_run() {
     let state = runs.state(&place(&agent)).unwrap();
     assert_eq!(state.run_id, first.run_id, "the runId spans restarts");
     assert_eq!(state.restart_count, 1);
+    assert_eq!(state.started_by, Some(by), "the respawn keeps the starter");
 }
 
 #[tokio::test]
@@ -255,7 +263,7 @@ async fn stop_waits_for_the_ack_and_a_second_stop_dismisses_the_run() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -303,11 +311,11 @@ async fn stop_live_stops_live_runs_and_keeps_ended_ones() {
     let runs = MachineRuns::new(hooks(&rec));
     let (live, ended) = (AgentId::new(), AgentId::new());
     let def = script(ScriptMode::Command, "make");
-    runs.start(&place(&ended), &def).await.unwrap();
+    runs.start(&place(&ended), &def, None).await.unwrap();
     let start = last_start(&rec);
     frame(&runs, started(&start)).await;
     frame(&runs, exited(&start, Some(0), None)).await;
-    runs.start(&place(&live), &def).await.unwrap();
+    runs.start(&place(&live), &def, None).await.unwrap();
     frame(&runs, started(&last_start(&rec))).await;
 
     assert_eq!(runs.live_in(&ws()), vec![place(&live)]);
@@ -339,7 +347,7 @@ async fn a_lost_link_settles_live_runs_and_monitors_wake_their_agent() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -376,7 +384,7 @@ async fn an_output_pattern_monitor_wakes_once_on_a_matching_line() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -398,7 +406,7 @@ async fn ending_an_agent_stops_its_runs_and_reports_unacknowledged_stops() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
     runs.monitor(&place(&agent), &serde_json::json!({ "ttlMs": 60000 }))
@@ -447,10 +455,10 @@ async fn changing_the_definition_cancels_and_drops_every_machine_run() {
     let runs = MachineRuns::new(hooks(&rec));
     let a = AgentId::new();
     let b = AgentId::new();
-    runs.start(&place(&a), &script(ScriptMode::Command, "make"))
+    runs.start(&place(&a), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
-    runs.start(&place(&b), &script(ScriptMode::Command, "make"))
+    runs.start(&place(&b), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
     assert_eq!(runs.entries(&ws(), "s1").len(), 2);
@@ -474,7 +482,7 @@ async fn start_fails_when_the_machine_is_unreachable_or_too_old_for_a_restart() 
     rec.unreachable
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let error = runs
-        .start(&place(&agent), &script(ScriptMode::Command, "make"))
+        .start(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("machine-unreachable"), "{error}");
@@ -482,14 +490,14 @@ async fn start_fails_when_the_machine_is_unreachable_or_too_old_for_a_restart() 
 
     rec.unreachable
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
     frame(&runs, exited(&start, Some(0), None)).await;
     rec.protocol.store(7, std::sync::atomic::Ordering::SeqCst);
     let error = runs
-        .restart(&place(&agent), &script(ScriptMode::Command, "make"))
+        .restart(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap_err();
     assert!(
@@ -498,7 +506,7 @@ async fn start_fails_when_the_machine_is_unreachable_or_too_old_for_a_restart() 
     );
     // A protocol 9 link still runs scripts.
     rec.protocol.store(9, std::sync::atomic::Ordering::SeqCst);
-    runs.restart(&place(&agent), &script(ScriptMode::Command, "make"))
+    runs.restart(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
 }
@@ -512,7 +520,7 @@ async fn concurrent_starts_of_one_place_send_one_script_start() {
     let agent = AgentId::new();
     let def = script(ScriptMode::Service, "serve");
     let here = place(&agent);
-    let (a, b) = tokio::join!(runs.start(&here, &def), runs.start(&here, &def));
+    let (a, b) = tokio::join!(runs.start(&here, &def, None), runs.start(&here, &def, None));
     let (a, b) = (a.unwrap(), b.unwrap());
     assert_eq!(a.run_id, b.run_id, "both callers see the same run");
     let starts = rec
@@ -534,10 +542,10 @@ async fn ending_several_agents_waits_once_for_all_their_stops() {
     let runs = MachineRuns::new(hooks(&rec));
     let silent = AgentId::new();
     let prompt = AgentId::new();
-    runs.start(&place(&silent), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&silent), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
-    runs.start(&place(&prompt), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&prompt), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
     // The machine acknowledges `prompt`'s stop as soon as it is sent.
@@ -611,6 +619,7 @@ async fn machine_run_output_replies_are_bounded() {
                     &def,
                     intentd_test_support::test_timeout(Duration::from_secs(10)),
                     10_000,
+                    None,
                 )
                 .await
             })
@@ -666,7 +675,7 @@ async fn output_without_newlines_stays_bounded() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -690,7 +699,7 @@ async fn a_monitor_wake_never_carries_a_huge_line() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -725,7 +734,7 @@ async fn a_final_line_without_a_newline_matches_before_the_exit() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -751,7 +760,7 @@ async fn a_line_cut_off_by_a_lost_link_does_not_match() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -787,7 +796,7 @@ async fn a_service_ended_by_a_final_stop_is_not_restarted() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -811,7 +820,7 @@ async fn a_final_stop_ack_settles_the_runs_never_seen_ending() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -844,7 +853,7 @@ async fn a_final_stop_fences_a_pending_service_respawn() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -877,7 +886,7 @@ async fn a_monitor_on_a_finished_run_is_refused() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -901,7 +910,7 @@ async fn a_stopped_runs_monitor_never_wakes_on_the_next_run() {
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
     let def = script(ScriptMode::Service, "serve");
-    runs.start(&place(&agent), &def).await.unwrap();
+    runs.start(&place(&agent), &def, None).await.unwrap();
     let a = last_start(&rec);
     frame(&runs, started(&a)).await;
     let reply = runs
@@ -937,7 +946,7 @@ async fn a_stopped_runs_monitor_never_wakes_on_the_next_run() {
         "run A's monitor is retired"
     );
     // Run B prints what run A's monitor waited for.
-    runs.start(&place(&agent), &def).await.unwrap();
+    runs.start(&place(&agent), &def, None).await.unwrap();
     let b = last_start(&rec);
     assert_ne!(a.spawn_id, b.spawn_id);
     frame(&runs, started(&b)).await;
@@ -1001,7 +1010,7 @@ async fn stopping_or_restarting_a_monitored_run_wakes_once_cancelled() {
         let agent = AgentId::new();
         let def = script(ScriptMode::Service, "serve");
         let here = place(&agent);
-        runs.start(&here, &def).await.unwrap();
+        runs.start(&here, &def, None).await.unwrap();
         frame(&runs, started(&last_start(&rec))).await;
         runs.monitor(&here, &serde_json::json!({ "ttlMs": 60000 }))
             .await
@@ -1040,7 +1049,7 @@ async fn stopping_or_restarting_a_monitored_run_wakes_once_cancelled() {
                     }
                 })
             };
-            runs.restart(&here, &def).await.unwrap();
+            runs.restart(&here, &def, None).await.unwrap();
             acker.await.unwrap();
         } else {
             stop_acked(&runs, &rec, &here).await;
@@ -1062,7 +1071,7 @@ async fn a_stale_run_id_is_invalid_even_on_a_finished_run() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
     frame(&runs, exited(&last_start(&rec), Some(0), None)).await;
@@ -1087,12 +1096,12 @@ async fn no_start_or_restart_while_a_final_stop_is_under_way() {
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
     let def = script(ScriptMode::Service, "serve");
-    runs.start(&place(&agent), &def).await.unwrap();
+    runs.start(&place(&agent), &def, None).await.unwrap();
     frame(&runs, started(&last_start(&rec))).await;
     runs.final_stop_begun(&agent);
     for result in [
-        runs.restart(&place(&agent), &def).await,
-        runs.start(&place(&agent), &def).await,
+        runs.restart(&place(&agent), &def, None).await,
+        runs.start(&place(&agent), &def, None).await,
     ] {
         let error = result.unwrap_err();
         assert!(
@@ -1104,7 +1113,7 @@ async fn no_start_or_restart_while_a_final_stop_is_under_way() {
     runs.final_stop_acked(&agent, "remote-script-lost: the agent was stopped for good")
         .await;
     // The final stop is over: a later start (a reused id) is not refused.
-    runs.start(&place(&agent), &def).await.unwrap();
+    runs.start(&place(&agent), &def, None).await.unwrap();
     assert_eq!(script_starts(&rec), 2);
 }
 
@@ -1128,9 +1137,9 @@ async fn a_failed_removal_keeps_refusing_until_the_final_stop_ends() {
     .await;
     let timeout = Duration::from_secs(1);
     for error in [
-        runs.start(&place(&agent), &def).await.unwrap_err(),
-        runs.restart(&place(&agent), &def).await.unwrap_err(),
-        runs.run(&place(&agent), &def, timeout, 10)
+        runs.start(&place(&agent), &def, None).await.unwrap_err(),
+        runs.restart(&place(&agent), &def, None).await.unwrap_err(),
+        runs.run(&place(&agent), &def, timeout, 10, None)
             .await
             .unwrap_err(),
     ] {
@@ -1142,7 +1151,7 @@ async fn a_failed_removal_keeps_refusing_until_the_final_stop_ends() {
     assert_eq!(script_starts(&rec), 0);
     runs.final_stop_acked(&agent, "remote-script-lost: the agent was stopped for good")
         .await;
-    runs.start(&place(&agent), &def).await.unwrap();
+    runs.start(&place(&agent), &def, None).await.unwrap();
     assert_eq!(script_starts(&rec), 1);
 }
 
@@ -1159,7 +1168,7 @@ async fn watched(
     mode: ScriptMode,
     options: serde_json::Value,
 ) -> (ScriptStartCommand, String) {
-    runs.start(here, &script(mode, "make")).await.unwrap();
+    runs.start(here, &script(mode, "make"), None).await.unwrap();
     let start = last_start(rec);
     frame(runs, started(&start)).await;
     let reply = runs.monitor(here, &options).await.unwrap();
@@ -1686,9 +1695,13 @@ async fn a_monitor_end_rechecks_its_owner_after_the_wake() {
     );
 
     let unwatched = AgentId::new();
-    runs.start(&place(&unwatched), &script(ScriptMode::Command, "make"))
-        .await
-        .unwrap();
+    runs.start(
+        &place(&unwatched),
+        &script(ScriptMode::Command, "make"),
+        None,
+    )
+    .await
+    .unwrap();
     let other = last_start(&rec);
     frame(&runs, started(&other)).await;
     frame(&runs, exited(&other, Some(0), None)).await;

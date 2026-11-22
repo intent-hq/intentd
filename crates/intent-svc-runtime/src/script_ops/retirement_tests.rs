@@ -334,6 +334,7 @@ async fn retirement_durable_token_fences_rerun_replacement_removal_and_scope() {
         started_at: None,
         stopped_at: now_iso(),
         error: None,
+        started_by: None,
     };
     store.admit_script_run(&h.ws, &id, "old").await.unwrap();
     store.admit_script_run(&h.ws, &id, "new").await.unwrap();
@@ -525,7 +526,7 @@ async fn retirement_unobservable_exit_and_stale_finalizer_are_fenced() {
     let mgr = h.services.script_manager();
     let lock = mgr.locks.definition_lock(&id);
     let guard = lock.lock().await;
-    mgr.prepare_launch(&h.ws, &id).await.unwrap();
+    mgr.prepare_launch(&h.ws, &id, None).await.unwrap();
     let generation = mgr
         .scripts
         .lock()
@@ -954,7 +955,7 @@ async fn retirement_cannot_admit_successor_before_predecessor_publication() {
     let token = h.services.store().pending_script_runs().await.unwrap()[0]
         .2
         .clone();
-    assert!(mgr.prepare_restart(&h.ws, &id).await.is_err());
+    assert!(mgr.prepare_restart(&h.ws, &id, None).await.is_err());
     assert_eq!(
         h.services.store().pending_script_runs().await.unwrap()[0].2,
         token
@@ -1219,5 +1220,55 @@ async fn retirement_out_of_band_kill_exits_before_settlement_archives() {
             .iter()
             .all(|s| s["id"] != id),
         "a settled one-off is absent from the active list: {listed}"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn retirement_pre_spawn_cancel_keeps_the_cancelled_runs_starter() {
+    let h = harness().await;
+    let id = one_off(&h, "true").await;
+    let mgr = h.services.script_manager();
+    let key = (h.ws.clone(), id.clone());
+    let agent = intent_core::ScriptStartedBy::Agent {
+        agent_id: intent_core::AgentId::from("agent-cancelled-run"),
+    };
+    let prev = {
+        let mut scripts = mgr.scripts.lock().unwrap();
+        let m = scripts.get_mut(&key).unwrap();
+        m.state.started_by = Some(intent_core::ScriptStartedBy::User);
+        m.state.clone()
+    };
+    let lock = mgr.locks.definition_lock(&id);
+    let guard = lock.lock().await;
+    mgr.prepare_launch(&h.ws, &id, Some(agent.clone()))
+        .await
+        .unwrap();
+    let generation = {
+        let mut scripts = mgr.scripts.lock().unwrap();
+        let m = scripts.get_mut(&key).unwrap();
+        m.state.status = ScriptStatus::Running;
+        m.run_reserved = Some(Arc::new(tokio::sync::Notify::new()));
+        m.generation
+    };
+    drop(RunReservation {
+        mgr: mgr.clone(),
+        key: key.clone(),
+        prev,
+        generation,
+        armed: true,
+    });
+    {
+        let scripts = mgr.scripts.lock().unwrap();
+        let m = scripts.get(&key).unwrap();
+        assert_eq!(m.state.started_by.as_ref(), Some(&agent));
+        assert_eq!(
+            m.pending_result.as_ref().unwrap().started_by.as_ref(),
+            Some(&agent)
+        );
+    }
+    drop(guard);
+    assert_eq!(
+        retired(&h, &id).await.last_run.unwrap().started_by,
+        Some(agent)
     );
 }
