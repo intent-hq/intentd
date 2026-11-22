@@ -20,6 +20,15 @@ use crate::Services;
 /// winning the race; each retry re-reads the stored goal.
 const MAX_GOAL_WRITE_ATTEMPTS: usize = 8;
 
+/// `NotFound` from a session lookup or write is the contract's
+/// `agent not found` (the agent is unknown or was deleted mid-call).
+fn agent_not_found(e: Error) -> Error {
+    match e {
+        Error::NotFound(_) => Error::ConversationGoal(GoalError::AgentNotFound),
+        other => other,
+    }
+}
+
 /// Bound on notice-row appends that lost the transcript `seq` race.
 const MAX_NOTICE_APPEND_ATTEMPTS: usize = 8;
 
@@ -54,30 +63,34 @@ impl Services {
                 "agents cannot set a conversation goal".to_string(),
             ));
         }
-        let not_found = |e: Error| match e {
-            Error::NotFound(_) => Error::ConversationGoal(GoalError::AgentNotFound),
-            other => other,
-        };
         match workspace_id {
             Some(workspace_id) => self
                 .require_agent_member_in(agent_id, workspace_id)
                 .await
-                .map_err(not_found)?,
+                .map_err(agent_not_found)?,
             None => self
                 .require_agent_member(agent_id)
                 .await
-                .map_err(not_found)?,
+                .map_err(agent_not_found)?,
         }
         let session = self
             .store
             .get_agent_session_summary(agent_id)
             .await
-            .map_err(not_found)?;
+            .map_err(agent_not_found)?;
         if workspace_id.is_some_and(|ws| *ws != session.workspace_id) {
             return Err(Error::ConversationGoal(GoalError::AgentNotFound));
         }
         if session.retired_at.is_some() {
             return Err(Error::ConversationGoal(GoalError::AgentRetired));
+        }
+        // A retired workspace is read-only (§5.1). `agent.sendMessage` is
+        // exempt from the RPC retired gate because a user message revives
+        // the workspace, but a `/goal` command revives nothing, so it is
+        // refused here like `agent.setGoal` and `agent.queueMessage` are.
+        let workspace = self.store.get_workspace(&session.workspace_id).await?;
+        if workspace.retired_at.is_some() {
+            return Err(crate::retire::retired_error(&session.workspace_id));
         }
         Ok((session.workspace_id.clone(), session.goal.clone()))
     }
@@ -101,7 +114,8 @@ impl Services {
             if self
                 .store
                 .set_agent_goal(workspace_id, agent_id, current.as_deref(), next.as_deref())
-                .await?
+                .await
+                .map_err(agent_not_found)?
             {
                 self.invalidate_agent_list_cache(workspace_id);
                 self.publish_agent_mutation_event(
@@ -113,7 +127,11 @@ impl Services {
                 .await;
                 return Ok((action, next));
             }
-            let stored = self.store.get_agent_session_summary(agent_id).await?;
+            let stored = self
+                .store
+                .get_agent_session_summary(agent_id)
+                .await
+                .map_err(agent_not_found)?;
             current.clone_from(&stored.goal);
         }
         Err(Error::Internal(
@@ -142,7 +160,12 @@ impl Services {
         // The append allocates the next transcript `seq` before inserting, so
         // a concurrent append for the same agent (another goal write, a user
         // send) can take the same `seq` and fail the `UNIQUE(agent_id, seq)`
-        // check. Nothing was written then; recompute and retry.
+        // check. Nothing was written then; recompute and retry. The other
+        // writer gets no such retry: like every out-of-turn notice
+        // (`model_changed`, dismissed questions) this append can, in the
+        // millisecond SELECT→INSERT window, make a racing turn or user append
+        // fail. Allocating `seq` inside the store's insert would close it for
+        // every writer.
         let mut attempt = 0;
         let message = loop {
             attempt += 1;
@@ -167,6 +190,34 @@ impl Services {
         Ok(message.id)
     }
 
+    /// The notice row for a goal write that already landed. A failure here
+    /// cannot undo the write, so it is logged and the call still succeeds
+    /// with the stored state (no `noticeMessageId`): the client then clears
+    /// its composer and the `agent:updated` it received stays true.
+    async fn notice_after_write(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        action: GoalAction,
+        goal: Option<&str>,
+    ) -> Option<String> {
+        match self
+            .persist_goal_notice(workspace_id, agent_id, action, goal)
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    action = action.as_str(),
+                    error = %e,
+                    "conversation goal stored but its notice row could not be written"
+                );
+                None
+            }
+        }
+    }
+
     /// `agent.setGoal`: set, replace or remove (`None` / empty after trim)
     /// the conversation goal. `unchanged` writes nothing (no row, no event,
     /// no `noticeMessageId`).
@@ -183,10 +234,12 @@ impl Services {
             .await?;
         let mut result = json!({ "action": action.as_str(), "goal": goal });
         if action.writes() {
-            let id = self
-                .persist_goal_notice(&workspace_id, &agent_id, action, goal.as_deref())
-                .await?;
-            result["noticeMessageId"] = json!(id);
+            if let Some(id) = self
+                .notice_after_write(&workspace_id, &agent_id, action, goal.as_deref())
+                .await
+            {
+                result["noticeMessageId"] = json!(id);
+            }
         }
         Ok(result)
     }
@@ -208,19 +261,22 @@ impl Services {
                     .await?
             }
         };
-        let notice_id = self
-            .persist_goal_notice(&workspace_id, &agent_id, action, goal.as_deref())
-            .await?;
-        Ok(json!({
-            "success": true,
-            "queued": false,
-            "command": {
-                "name": "goal",
-                "action": action.as_str(),
-                "goal": goal,
-                "noticeMessageId": notice_id,
-            },
-        }))
+        let notice_id = if action.writes() {
+            self.notice_after_write(&workspace_id, &agent_id, action, goal.as_deref())
+                .await
+        } else {
+            // Nothing changed: a failed notice fails the command, and a
+            // retry is harmless.
+            Some(
+                self.persist_goal_notice(&workspace_id, &agent_id, action, goal.as_deref())
+                    .await?,
+            )
+        };
+        let mut command = json!({ "name": "goal", "action": action.as_str(), "goal": goal });
+        if let Some(id) = notice_id {
+            command["noticeMessageId"] = json!(id);
+        }
+        Ok(json!({ "success": true, "queued": false, "command": command }))
     }
 
     /// The agent's stored conversation goal for the per-turn prompt block,

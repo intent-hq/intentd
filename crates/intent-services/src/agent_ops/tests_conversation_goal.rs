@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use intent_core::conversation_goal::{GoalError, MAX_CHARS, NO_GOAL_NOTICE};
 use intent_core::events::{AGENT_MESSAGE, AGENT_UPDATED};
-use intent_core::{AgentId, Error, Event, WorkspaceId};
+use intent_core::{AgentId, Error, Event, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use super::tests::{create_agent, setup_with_bus, workspace};
@@ -481,4 +481,110 @@ async fn goal_survives_a_store_reopen() {
     let store = intent_store::Store::open(&tmp.path).await.unwrap();
     let session = store.get_agent_session_summary(&id).await.unwrap();
     assert_eq!(session.goal.as_deref(), Some("Persist me"));
+}
+
+/// A retired workspace is read-only (§5.1): `agent.setGoal` and a `/goal`
+/// command (which `agent.sendMessage` would otherwise let through, since a
+/// plain user message revives the workspace) are refused, and nothing
+/// changes or revives.
+#[intent_test_macros::daemon_test]
+async fn retired_workspace_refuses_goal_writes() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Goal").await;
+    svc.agent_set_goal_op(None, id.clone(), Some("Keep".into()))
+        .await
+        .unwrap();
+    svc.archive_workspace(ws.clone(), None)
+        .await
+        .expect("archive");
+    assert!(svc
+        .store
+        .retire_workspace_if_archived(&ws, &intent_core::now_iso())
+        .await
+        .unwrap());
+    let rows_before = rows(&svc, &id).await.len();
+    for err in [
+        svc.agent_set_goal_op(Some(ws.clone()), id.clone(), Some("New".into()))
+            .await
+            .unwrap_err(),
+        svc.agent_goal_command_op(Some(ws.clone()), id.clone(), "New".into())
+            .await
+            .unwrap_err(),
+        svc.agent_goal_command_op(None, id.clone(), String::new())
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(matches!(err, Error::WorkspaceRetired { .. }), "{err:?}");
+    }
+    assert_eq!(stored_goal(&svc, &id).await.as_deref(), Some("Keep"));
+    assert_eq!(rows(&svc, &id).await.len(), rows_before);
+    let row = svc.store.get_workspace(&ws).await.unwrap();
+    assert!(row.retired_at.is_some(), "nothing revived the workspace");
+}
+
+/// Goal writes and notices touch no attention, question or last-message
+/// state (§5.5 "No side effects").
+#[intent_test_macros::daemon_test]
+async fn goal_writes_leave_attention_and_last_message_alone() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Goal").await;
+    svc.store
+        .set_attention_request(
+            &ws,
+            &id,
+            "discussion",
+            "Need a decision",
+            &intent_core::now_iso(),
+        )
+        .await
+        .unwrap();
+    let before = svc.agent_get_session_op(id.clone()).await.unwrap();
+    let lite_before = serde_json::to_value(
+        svc.agent_get_op(id.clone(), Some(ws.clone()))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    svc.agent_set_goal_op(None, id.clone(), Some("A".into()))
+        .await
+        .unwrap();
+    svc.agent_goal_command_op(None, id.clone(), "B".into())
+        .await
+        .unwrap();
+    svc.agent_goal_command_op(None, id.clone(), String::new())
+        .await
+        .unwrap();
+    svc.agent_set_goal_op(None, id.clone(), None).await.unwrap();
+    let after = svc.agent_get_session_op(id.clone()).await.unwrap();
+    assert_eq!(after.attention_request_kind, before.attention_request_kind);
+    assert_eq!(
+        after.attention_request_reason,
+        before.attention_request_reason
+    );
+    assert_eq!(
+        after.attention_request_timestamp,
+        before.attention_request_timestamp
+    );
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(
+        after.metadata, before.metadata,
+        "no pending-question / seen marker change"
+    );
+    let lite_after = serde_json::to_value(
+        svc.agent_get_op(id.clone(), Some(ws.clone()))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    for key in [
+        "lastMessageRole",
+        "lastMessageId",
+        "lastUserMessage",
+        "lastAgentResponse",
+        "unread",
+        "attentionRequest",
+    ] {
+        assert_eq!(lite_after.get(key), lite_before.get(key), "{key}");
+    }
 }

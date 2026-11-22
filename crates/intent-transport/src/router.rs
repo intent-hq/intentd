@@ -3523,15 +3523,15 @@ async fn agent_methods(
         "agent.sendMessage" => {
             let agent_id = require_agent_id(params)?;
             let content = require_str_param(params, "content")?;
+            let ws = require_ws_note(params)?;
             // Conversation goal (§5.5): a recognized `/goal` command runs here,
             // before every send-path side effect; nothing below sees it.
             if let Some(statement) = goal_command_statement(params, &content)? {
                 return api
-                    .agent_goal_command(opt_workspace_id(params), agent_id, statement)
+                    .agent_goal_command(Some(ws), agent_id, statement)
                     .await
                     .map_err(domain_to_rpc);
             }
-            let ws = require_ws_note(params)?;
             let message_id = opt_str(params, "messageId");
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
@@ -3689,20 +3689,21 @@ async fn agent_methods(
         }
         "agent.queueMessage" => {
             let agent_id = require_agent_id(params)?;
-            let message_id = match params.get("messageId") {
-                None => None,
-                Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
-                Some(_) => return Err(invalid_params("messageId must be a nonempty string")),
-            };
             let content = require_str_param(params, "content")?;
             // Conversation goal (§5.5): a recognized `/goal` command runs
             // before queueing and enqueues nothing; a running turn continues.
+            // `messageId` has no effect on a command, so it is checked after.
             if let Some(statement) = goal_command_statement(params, &content)? {
                 return api
                     .agent_goal_command(opt_workspace_id(params), agent_id, statement)
                     .await
                     .map_err(domain_to_rpc);
             }
+            let message_id = match params.get("messageId") {
+                None => None,
+                Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+                Some(_) => return Err(invalid_params("messageId must be a nonempty string")),
+            };
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
             // Opaque per-message payload (PROTOCOL §5.5), captured on the
@@ -6948,6 +6949,15 @@ fn goal_command_statement(
     content: &str,
 ) -> Result<Option<String>, RpcErr> {
     if params.get("interpretCommands") != Some(&Value::Bool(true)) {
+        return Ok(None);
+    }
+    // Agent-origin sends are never commands (§5.5): one agent cannot set
+    // another agent's goal. The `ws.rpc` seam already drops the flag; this
+    // keeps any other agent-bound route delivering the text.
+    if matches!(
+        intent_core::caller::current_caller(),
+        Some(intent_core::Caller::Agent { .. })
+    ) {
         return Ok(None);
     }
     if !intent_core::conversation_goal::metadata_is_plain(params.get("messageMetadata")) {

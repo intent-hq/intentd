@@ -10624,8 +10624,9 @@ async fn worst_case_agent_list_row(
         .await
         .expect("populate session");
     // The goal is a preference column the full-row write leaves alone;
-    // fill it to its cap through its own writer.
-    let goal = "g".repeat(intent_core::conversation_goal::MAX_CHARS);
+    // fill it to its cap through its own writer, with 4-byte characters (the
+    // widest printable UTF-8): 1,000 characters serialize to ≈ 4,000 B.
+    let goal = "\u{1F3AF}".repeat(intent_core::conversation_goal::MAX_CHARS);
     svc.store()
         .set_agent_goal(ws, &s.id, None, Some(&goal))
         .await

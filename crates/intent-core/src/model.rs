@@ -3867,14 +3867,16 @@ pub const AGENT_LIST_NAME_CAP_BYTES: usize = 128;
 /// frame fit ([`fit_agent_list_frame`]) is the non-protocol half of that:
 /// it lowers the preview cap per response when the row count demands it.
 /// The user-set conversation `goal` (PROTOCOL §5.5 "Conversation goal",
-/// 1–1,000 characters) then joined the row so the chat header and goal
-/// strip render from the list without opening each agent: ≈ 1,010 B more at
-/// the cap, a measured ≈ 7,990 B worst case, and the budget rose to 8.5 KiB
-/// (≈ 6% margin). Only agents with a goal carry it, typical goals are a
-/// sentence or two, and a goal of 1,000 multi-byte characters is still
-/// bounded (it is never truncated, and `agent.list` pages stop at their
-/// 480,000-byte budget either way).
-pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 8 * 1024 + 512;
+/// 1–1,000 characters, never truncated) then joined the row so the chat
+/// header and goal strip render from the list without opening each agent.
+/// The worst-case row carries a goal of 1,000 four-byte characters (the
+/// widest printable UTF-8, ≈ 4,010 B serialized): a measured ≈ 11,000 B
+/// worst case, and the budget rose to 11.5 KiB (≈ 7% margin). Only agents
+/// with a goal carry it and typical goals are a sentence or two (an ASCII
+/// goal at the cap adds ≈ 1,010 B). A goal built from control characters
+/// (escaped as 6-byte `\u00XX`) could exceed this; that is not realistic
+/// input, and `agent.list` pages still stop at their 480,000-byte budget.
+pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 11 * 1024 + 512;
 
 /// Response-level byte budget for the serialized `agent.list` rows array
 /// (intent-hq/intent#5531, fourth recurrence of the oversize frame): the

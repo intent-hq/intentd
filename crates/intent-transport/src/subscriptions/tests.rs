@@ -3405,7 +3405,10 @@ mod agent_delta_list_projection {
     struct DetailAgentApi;
 
     fn detail_row() -> AgentLite {
-        let big = "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 3);
+        // Sized from the row budget so the unprojected row stays over it
+        // whatever the budget is; the projection caps these to the preview
+        // budget.
+        let big = "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES.max(AGENT_LIST_ROW_BUDGET_BYTES / 2));
         let metadata = json!({
             "isBackground": true,
             "specialist": "implementor",

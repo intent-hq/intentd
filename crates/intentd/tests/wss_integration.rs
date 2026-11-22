@@ -3253,6 +3253,10 @@ fn assert_agent_list_projected_row(label: &str, row: &Value) {
 #[tokio::test]
 async fn wss_agent_subscribe_delta_rows_use_the_list_projection() {
     const BUDGET: usize = intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES;
+    // The completion report (uncapped on `agent.get`) is sized from the row
+    // budget so the detail row stays over it whatever the budget is; the
+    // list projection caps it to `BUDGET`.
+    const BIG: usize = intent_core::AGENT_LIST_ROW_BUDGET_BYTES;
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
@@ -3278,7 +3282,7 @@ async fn wss_agent_subscribe_delta_rows_use_the_list_projection() {
     let long_user = format!("user ask starts {}", "u".repeat(BUDGET * 4));
     let long_line = format!("final answer {}", "a".repeat(BUDGET * 4));
     let long_digest = format!("digest {}", "d".repeat(BUDGET * 4));
-    let long_report = format!("report {}", "r".repeat(BUDGET * 4));
+    let long_report = format!("report {}", "r".repeat(BIG));
     let user_frame = serde_json::json!({
         "jsonrpc": "2.0", "id": 3, "method": "agent.appendMessage",
         "params": {

@@ -96,9 +96,18 @@ impl WorkspaceApi for Recording {
 }
 
 async fn rpc(api: &Recording, method: &str, params: Value) -> Value {
+    rpc_as(intent_core::Caller::Daemon, api, method, params).await
+}
+
+async fn rpc_as(
+    caller: intent_core::Caller,
+    api: &Recording,
+    method: &str,
+    params: Value,
+) -> Value {
     let request = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let response = intent_core::with_caller(
-        intent_core::Caller::Daemon,
+        caller,
         Box::pin(super::handle_message(api, &request.to_string())),
     )
     .await
@@ -268,4 +277,34 @@ async fn set_goal_params_and_coded_errors() {
         retired["error"],
         json!({ "code": -32602, "message": "agent is retired", "data": { "code": "agent-retired" } })
     );
+}
+
+/// Send params that have no effect on a command — `messageId` included,
+/// even in a shape `agent.queueMessage` would otherwise reject — do not stop
+/// it.
+#[tokio::test]
+async fn ignored_send_params_do_not_block_a_command() {
+    let api = Recording::default();
+    for message_id in [json!(""), json!(7), json!("m-1")] {
+        let extra = json!({ "interpretCommands": true, "messageId": message_id, "noteIds": ["n"], "model": "x" });
+        let response = rpc(&api, "agent.queueMessage", send_params("/goal x", &extra)).await;
+        assert_eq!(response["result"]["command"]["name"], "goal", "{response}");
+        assert_eq!(api.take()[0]["call"], "goal");
+    }
+}
+
+/// An agent-bound send is never a command: the text is delivered.
+#[tokio::test]
+async fn agent_callers_never_run_a_command() {
+    let api = Recording::default();
+    let agent = intent_core::Caller::Agent {
+        agent_id: AgentId::from("agent-2"),
+    };
+    for method in ["agent.sendMessage", "agent.queueMessage"] {
+        let extra = json!({ "interpretCommands": true });
+        rpc_as(agent.clone(), &api, method, send_params("/goal x", &extra)).await;
+        let calls = api.take();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_ne!(calls[0]["call"], "goal", "{method}");
+    }
 }
