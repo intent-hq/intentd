@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use intent_core::{Error, Result};
+use intent_git::ref_storage::{GitStorage, LocalGitStorage};
 use intent_services::feature_api::Services;
 
 mod agents;
@@ -87,6 +88,24 @@ pub struct RemoteFeature {
     pub(crate) cloud: cloud::CloudState,
     /// The GitHub token every linked machine holds (nodeProtocol 15).
     forge: std::sync::OnceLock<Arc<forge_token::ForgeTokens>>,
+    /// Where remote agents' and homes' refs live.
+    git: GitStore,
+}
+
+/// [`RemoteFeature::git`]: the workspaces' own repositories unless set.
+struct GitStore(Arc<dyn GitStorage>);
+
+impl Default for GitStore {
+    fn default() -> Self {
+        Self(Arc::new(LocalGitStorage))
+    }
+}
+
+/// The git storage of the remote feature registered on `svc`, or the
+/// workspaces' own repositories without one.
+pub(crate) fn git_storage(svc: Option<&Services>) -> Arc<dyn GitStorage> {
+    svc.and_then(|svc| svc.remote_feature())
+        .map_or_else(|| GitStore::default().0, |feature| feature.git.0.clone())
 }
 
 impl RemoteFeature {

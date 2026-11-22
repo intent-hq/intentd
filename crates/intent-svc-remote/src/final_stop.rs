@@ -23,8 +23,6 @@ use intent_core::{Result, Workspace};
 use intent_git::node_git;
 use intent_store::Store;
 
-/// Whether `session` has ended for good or for now (deleted, completed or
-/// retired): its agent must not run on a machine.
 pub(crate) use intent_node_connections::lease::session_ended;
 
 /// The wall clock final-stop bounds are measured against; tests move it.

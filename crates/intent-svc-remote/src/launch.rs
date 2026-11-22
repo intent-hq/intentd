@@ -37,6 +37,7 @@ use intent_core::remote_launch::{
 use intent_core::{AgentId, BoxFuture, Error, Result, Workspace, WorkspaceId};
 use intent_git::hub::AgentRef;
 use intent_git::node_git::{self, AgentRemote};
+use intent_git::ref_storage::GitStorage;
 use intent_services::feature_api::feature_ports::{RemoteLaunchPort, RemoteRuntime};
 use intent_services::feature_api::{harness, Services};
 
@@ -64,6 +65,7 @@ pub(crate) fn checkout_path(workspace: &Workspace) -> Option<PathBuf> {
 /// Point the agent's `base` ref in submodule `pin`'s repository at its
 /// pinned commit, after checking it is still that submodule of `checkout`.
 pub(crate) fn write_module_base_ref(
+    git: &dyn GitStorage,
     checkout: &Path,
     remote: &AgentRemote,
     pin: &SubmodulePin,
@@ -81,7 +83,7 @@ pub(crate) fn write_module_base_ref(
             pin.path
         ))
     })?;
-    node_git::write_base_ref(&module.worktree, remote, commit)
+    node_git::write_base_ref(git, &module.worktree, remote, commit)
 }
 
 fn unavailable(placement: &AgentPlacement, availability: PlatformAvailability) -> Error {
@@ -364,18 +366,19 @@ async fn push_parent_now(svc: &Services, owner: &AgentId) -> bool {
 /// module heads, or `None` when `from` has no `head`. `to`'s `base` refs are
 /// left to the caller.
 pub(crate) fn copy_work(
+    git: &dyn GitStorage,
     checkout: &Path,
     from: &AgentRemote,
     to: &AgentRemote,
     pins: Vec<SubmodulePin>,
 ) -> Result<Option<(String, Vec<SubmodulePin>)>> {
-    let Some(head) = node_git::read_agent_ref(checkout, from, AgentRef::Head)? else {
+    let Some(head) = node_git::read_agent_ref(git, checkout, from, AgentRef::Head)? else {
         return Ok(None);
     };
     if let Some(wip) =
-        node_git::read_agent_ref(checkout, from, AgentRef::Wip)?.filter(|wip| *wip != head)
+        node_git::read_agent_ref(git, checkout, from, AgentRef::Wip)?.filter(|wip| *wip != head)
     {
-        node_git::write_agent_ref(checkout, to, AgentRef::Wip, wip)?;
+        node_git::write_agent_ref(git, checkout, to, AgentRef::Wip, wip)?;
     }
     let mut copied_pins = Vec::with_capacity(pins.len());
     for mut pin in pins {
@@ -389,15 +392,15 @@ pub(crate) fn copy_work(
         )?;
         let from_module = from.with_module(&pin.module_key)?;
         if let Some(module_head) =
-            node_git::read_agent_ref(&module.worktree, &from_module, AgentRef::Head)?
+            node_git::read_agent_ref(git, &module.worktree, &from_module, AgentRef::Head)?
         {
             pin.commit = module_head.to_string();
             if let Some(wip) =
-                node_git::read_agent_ref(&module.worktree, &from_module, AgentRef::Wip)?
+                node_git::read_agent_ref(git, &module.worktree, &from_module, AgentRef::Wip)?
                     .filter(|wip| *wip != module_head)
             {
                 let to_module = to.with_module(&pin.module_key)?;
-                node_git::write_agent_ref(&module.worktree, &to_module, AgentRef::Wip, wip)?;
+                node_git::write_agent_ref(git, &module.worktree, &to_module, AgentRef::Wip, wip)?;
             }
         }
         copied_pins.push(pin);
@@ -407,6 +410,7 @@ pub(crate) fn copy_work(
 
 /// Point `remote`'s `base` refs at `commit` and at each of `pins`.
 pub(crate) fn write_base_refs(
+    git: &dyn GitStorage,
     checkout: &Path,
     remote: &AgentRemote,
     commit: &str,
@@ -414,9 +418,9 @@ pub(crate) fn write_base_refs(
 ) -> Result<()> {
     let commit = git2::Oid::from_str(commit)
         .map_err(|_| Error::Internal("remote launch: invalid base commit".into()))?;
-    node_git::write_base_ref(checkout, remote, commit)?;
+    node_git::write_base_ref(git, checkout, remote, commit)?;
     for pin in pins {
-        write_module_base_ref(checkout, remote, pin)?;
+        write_module_base_ref(git, checkout, remote, pin)?;
     }
     Ok(())
 }
@@ -438,7 +442,9 @@ async fn copy_parent_work(
     let child = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
     let pins = view.pins().to_vec();
     let checkout = checkout.to_path_buf();
-    let copied = blocking(move || copy_work(&checkout, &parent, &child, pins)).await?;
+    let git = crate::git_storage(Some(svc));
+    let copied =
+        blocking(move || copy_work(git.as_ref(), &checkout, &parent, &child, pins)).await?;
     let Some((head, pins)) = copied else {
         return Ok(());
     };
@@ -763,7 +769,9 @@ pub(crate) async fn launch_linked(svc: &Services, request: RemoteLaunchRequest) 
     let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
     let commit = view.base_commit.clone();
     let submodules = view.pins().to_vec();
-    blocking(move || write_base_refs(&checkout, &remote, &commit, &submodules)).await?;
+    let git = crate::git_storage(Some(svc));
+    blocking(move || write_base_refs(git.as_ref(), &checkout, &remote, &commit, &submodules))
+        .await?;
     svc.store()
         .record_remote_agent(&RemoteAgentRecord {
             agent_id,
@@ -1133,9 +1141,11 @@ impl RemoteLaunchPort for RemoteLaunch {
             let checkout = workspace_checkout(svc, workspace_id).await?;
             let remote = AgentRemote::new(workspace_id.as_str(), owner.as_str())?;
             let pins = parent_view.pins().to_vec();
+            let git = crate::git_storage(Some(svc));
             let (head, wip, submodules) = blocking(move || {
-                let head = node_git::read_agent_ref(&checkout, &remote, AgentRef::Head)?;
-                let wip = node_git::read_agent_ref(&checkout, &remote, AgentRef::Wip)?
+                let git = git.as_ref();
+                let head = node_git::read_agent_ref(git, &checkout, &remote, AgentRef::Head)?;
+                let wip = node_git::read_agent_ref(git, &checkout, &remote, AgentRef::Wip)?
                     .filter(|wip| Some(*wip) != head);
                 let mut submodules = Vec::new();
                 for pin in pins {
@@ -1145,14 +1155,22 @@ impl RemoteLaunchPort for RemoteLaunch {
                         continue;
                     };
                     let module_remote = remote.with_module(&pin.module_key)?;
-                    let Some(module_head) =
-                        node_git::read_agent_ref(&module.worktree, &module_remote, AgentRef::Head)?
+                    let Some(module_head) = node_git::read_agent_ref(
+                        git,
+                        &module.worktree,
+                        &module_remote,
+                        AgentRef::Head,
+                    )?
                     else {
                         continue;
                     };
-                    let module_wip =
-                        node_git::read_agent_ref(&module.worktree, &module_remote, AgentRef::Wip)?
-                            .filter(|wip| *wip != module_head);
+                    let module_wip = node_git::read_agent_ref(
+                        git,
+                        &module.worktree,
+                        &module_remote,
+                        AgentRef::Wip,
+                    )?
+                    .filter(|wip| *wip != module_head);
                     submodules.push(BackendParentModule {
                         path: pin.path,
                         head: module_head.to_string(),

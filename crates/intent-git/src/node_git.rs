@@ -23,6 +23,7 @@ use intent_core::{Error, Result};
 use tokio::process::Command;
 
 use crate::hub::{self, AgentRef};
+use crate::ref_storage::{GitStorage, RefExpect};
 
 /// The executable name git looks up for `intent://` remotes.
 pub const HELPER_NAME: &str = "git-remote-intent";
@@ -673,8 +674,13 @@ fn key_of(repo: &git2::Repository) -> Result<String> {
 /// # Errors
 ///
 /// When the repository can't be opened or the commit doesn't exist.
-pub fn write_base_ref(repository: &Path, remote: &AgentRemote, commit: git2::Oid) -> Result<()> {
-    write_agent_ref(repository, remote, AgentRef::Base, commit)
+pub fn write_base_ref(
+    storage: &dyn GitStorage,
+    repository: &Path,
+    remote: &AgentRemote,
+    commit: git2::Oid,
+) -> Result<()> {
+    write_agent_ref(storage, repository, remote, AgentRef::Base, commit)
 }
 
 /// Point head's `kind` ref for `remote` at `commit` in `repository`: a
@@ -685,17 +691,18 @@ pub fn write_base_ref(repository: &Path, remote: &AgentRemote, commit: git2::Oid
 ///
 /// When the repository can't be opened or the commit doesn't exist.
 pub fn write_agent_ref(
+    storage: &dyn GitStorage,
     repository: &Path,
     remote: &AgentRemote,
     kind: AgentRef,
     commit: git2::Oid,
 ) -> Result<()> {
-    let repo = git2::Repository::open(repository).map_err(crate::map_git_err)?;
+    let repo = storage.open(repository).map_err(crate::map_git_err)?;
     repo.find_commit(commit).map_err(crate::map_git_err)?;
-    repo.reference(
+    repo.update_ref(
         &remote.ref_name(kind),
-        commit,
-        true,
+        RefExpect::Any,
+        Some(commit),
         "intent: remote agent ref",
     )
     .map_err(crate::map_git_err)?;
@@ -709,18 +716,14 @@ pub fn write_agent_ref(
 ///
 /// When the repository can't be opened or the ref does not name a commit.
 pub fn read_agent_ref(
+    storage: &dyn GitStorage,
     repository: &Path,
     remote: &AgentRemote,
     kind: AgentRef,
 ) -> Result<Option<git2::Oid>> {
-    let repo = git2::Repository::open(repository).map_err(crate::map_git_err)?;
-    let reference = match repo.find_reference(&remote.ref_name(kind)) {
-        Ok(reference) => reference,
-        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
-        Err(error) => return Err(crate::map_git_err(error)),
-    };
-    let commit = reference.peel_to_commit().map_err(crate::map_git_err)?;
-    Ok(Some(commit.id()))
+    let repo = storage.open(repository).map_err(crate::map_git_err)?;
+    repo.find_commit_ref(&remote.ref_name(kind))
+        .map_err(crate::map_git_err)
 }
 
 const GITLINK_MODE: u32 = 0o160_000;

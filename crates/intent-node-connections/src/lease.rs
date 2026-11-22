@@ -74,7 +74,8 @@ pub async fn new_owner(store: &Store, machine_id: &str) -> Result<LeaseOwner> {
     })
 }
 
-/// Whether `session` has ended for good: retired, deleted or completed.
+/// Whether `session` has ended for good or for now (deleted, completed or
+/// retired): its agent must not run on a machine.
 #[must_use]
 pub fn session_ended(session: &AgentSession) -> bool {
     session.retired_at.is_some()
