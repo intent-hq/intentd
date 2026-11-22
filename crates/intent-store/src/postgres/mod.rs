@@ -51,7 +51,8 @@ pub use sqlx::postgres::PgPool;
 
 pub(crate) use agents::PreparedPgMonitorMessage;
 pub use lease::{
-    LeaseHeartbeat, LeaseState, TenantClaim, TenantLease, LEASE_RENEW_INTERVAL, LEASE_TTL,
+    LeaseHeartbeat, LeaseState, TenantClaim, TenantLease, LEASE_FENCE_MARGIN, LEASE_RENEW_INTERVAL,
+    LEASE_TTL,
 };
 
 mod agent_messages;
@@ -804,6 +805,19 @@ impl WriteTx {
         self.tx.commit().await
     }
 
+    /// Commit, keeping the writer slot: the caller finishes what must happen
+    /// before the next writer of this process runs (a claim records itself),
+    /// then drops the permit.
+    pub(crate) async fn commit_holding_slot(
+        self,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, sqlx::Error> {
+        let Self {
+            tx, _slot: slot, ..
+        } = self;
+        tx.commit().await?;
+        Ok(slot)
+    }
+
     pub(crate) async fn rollback(self) -> std::result::Result<(), sqlx::Error> {
         self.tx.rollback().await
     }
@@ -1115,6 +1129,12 @@ impl PgStore {
     /// [`Self::begin_write`], with or without the fence check: only a claim
     /// skips it, because a claim is how the fence changes.
     pub(crate) async fn begin_write_as(&self, fence: Fence) -> Result<WriteTx> {
+        // A fenced claim writes nothing: refuse before taking the slot. A
+        // writer that passes here and the fence fires while it waits is
+        // refused by the check under the lock below.
+        if fence == Fence::Check {
+            self.claim.refuse_if_fenced(self.tenant())?;
+        }
         let limits = self.options.writer;
         let started = Instant::now();
         let _waiting = Waiting::new(&self.writer_slot.waiting);

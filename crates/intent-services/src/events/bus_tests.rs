@@ -1705,3 +1705,51 @@ async fn home_record_events_are_never_published() {
         .expect("query");
     assert!(stored.is_empty(), "{stored:?}");
 }
+
+/// Self-fence: once the tenant fence fired (or another process took the
+/// tenant over), the store's `insert_events` fails `NotOwner` from
+/// `begin_write`. The bus writer must treat that as permanent: one attempt,
+/// the batch is neither retried, persisted nor broadcast, and the publisher
+/// sees the error. (The store side is proven against Postgres in
+/// `intent-store`'s `self_fence` tests.)
+#[tokio::test(start_paused = true)]
+async fn a_fenced_store_drops_the_batch_without_retry_or_broadcast() {
+    let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
+    let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
+    let not_owner = || {
+        intent_core::Error::NotOwner(
+            "tenant t: this process fenced itself (instance a at epoch 1) and no longer serves \
+             it: lost; nothing was written"
+                .to_owned(),
+        )
+    };
+    assert!(!super::bus::is_transient_insert_error(&not_owner()));
+    let attempts = std::cell::Cell::new(0u32);
+    super::bus::flush_prepared(
+        || {
+            attempts.set(attempts.get() + 1);
+            let e = not_owner();
+            async move { Err(e) }
+        },
+        &mut pending,
+        &btx,
+    )
+    .await;
+    assert_eq!(attempts.get(), 1, "NotOwner is never retried");
+    assert!(pending.is_empty());
+    let resolved = orx.await.expect("oneshot resolved");
+    assert!(resolved
+        .expect_err("the publisher sees the failure")
+        .to_string()
+        .contains("fenced"),);
+    assert!(
+        matches!(
+            brx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "nothing is broadcast"
+    );
+}
