@@ -8,10 +8,13 @@ license.workspace = true
 description = "Composition root for intentd: registers the feature crates on the core services"
 
 [dependencies]
+intent-core = { workspace = true }
 intent-services = { workspace = true }
 intent-svc-remote = { workspace = true }
 intent-svc-runtime = { workspace = true }
 intent-svc-transfer = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = "0.1"
