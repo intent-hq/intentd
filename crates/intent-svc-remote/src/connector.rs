@@ -1974,20 +1974,21 @@ impl RemoteNode {
         if self.shared.demand.send(Some(tx)).is_err() {
             return Err(ConnectFailure::Local("the connector has stopped".into()));
         }
-        // A cloud machine's dial resumes its sandbox first, which can take
-        // minutes: its caller waits for the connector's answer. A shorter
-        // wait reported a refused resume (relay-unreachable) as unreachable
-        // routes (intent#9825).
-        let limit = if self.shared.target().gate.is_some() {
-            crate::cloud::lifecycle::RESUME_BOUND
+        // A cloud machine's dial resumes its sandbox first, which takes as
+        // long as the provider and the sandbox scripts allow: its caller
+        // waits for the connector, which answers every waiter when the dial
+        // ends or drops it when it stops. A shorter wait reported a refused
+        // resume (relay-unreachable) as unreachable routes (intent#9825).
+        let answer = if self.shared.target().gate.is_some() {
+            rx.await
         } else {
-            self.shared.tuning.connect.total + Duration::from_secs(5)
+            let limit = self.shared.tuning.connect.total + Duration::from_secs(5);
+            match tokio::time::timeout(limit, rx).await {
+                Ok(answer) => answer,
+                Err(_) => return Err(ConnectFailure::Unreachable(Vec::new())),
+            }
         };
-        match tokio::time::timeout(limit, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ConnectFailure::Local("the connector has stopped".into())),
-            Err(_) => Err(ConnectFailure::Unreachable(Vec::new())),
-        }
+        answer.unwrap_or_else(|_| Err(ConnectFailure::Local("the connector has stopped".into())))
     }
 
     /// The label of the route the current (or last) link bound on.
