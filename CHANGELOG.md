@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.275] - 2026-11-22
+
+### 🐛 Bug Fixes
+
+- *(store)* Reserve idempotency keys before the keyed operation runs ([#3656](https://github.com/intent-hq/intentd/pull/3656))
+- *(store)* Persist delete grace deadlines so a pending delete commits once ([#3657](https://github.com/intent-hq/intentd/pull/3657))
+
+### 🔧 Refactor
+
+- *(node-connections)* Put the machine connectors behind a NodeConnections trait ([#3670](https://github.com/intent-hq/intentd/pull/3670))
+- *(node-connections)* Give the cloud lifecycle calls on the connector, not its state ([#3686](https://github.com/intent-hq/intentd/pull/3686))
+
+
 ## [0.11.274] - 2026-11-22
 
 ### 🐛 Bug Fixes

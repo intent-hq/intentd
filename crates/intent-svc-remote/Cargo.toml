@@ -1,6 +1,6 @@
 [package]
 name = "intent-svc-remote"
-version = "0.11.274"
+version = "0.11.275"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
