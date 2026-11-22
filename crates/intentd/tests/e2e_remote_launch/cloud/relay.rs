@@ -6,7 +6,8 @@
 //! `relay-unreachable` and deletes the sandbox; a start with the setting
 //! checks that relay and runs every tailcat command with it and a key that
 //! embeds its region, so tailcat never consults its default map; a start
-//! keeps the tunnel its new daemon is still starting; a changed
+//! keeps the tunnel its new daemon is still starting; a relay that takes
+//! connections and never answers fails a start and one resume; a changed
 //! setting moves the sandbox to the new relay at its next resume (new
 //! tunnel address, `cloud.relayUrl`); an unreachable relay fails that
 //! resume; and an empty setting brings back the default relay.
@@ -14,7 +15,7 @@
 use std::sync::atomic::Ordering;
 
 use super::*;
-use crate::common::fake_relay::{dead_relay_url, fake_relay, FakeRelay};
+use crate::common::fake_relay::{closing_relay, dead_relay_url, fake_relay, FakeRelay};
 
 /// A tailcat that appends each command line to `$TAILCAT_LOG`, writes a
 /// key named after its path at genkey, and serves an address made from the
@@ -222,6 +223,77 @@ async fn a_fresh_start_keeps_the_tunnel_its_daemon_is_starting() {
         serves.len(),
         1,
         "the starting tunnel was restarted: {serves:?}"
+    );
+    assert_no_secret_logged(&backend.head_dir, &backend.fake);
+}
+
+/// A relay that takes connections and never answers, as every port looks
+/// from inside an E2B sandbox, fails a start and a resume with
+/// `relay-unreachable` naming it, and a message makes one resume attempt,
+/// not one per retry (intent#9825).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_never_answers_fails_a_start_and_one_resume() {
+    let Some((mut backend, log)) = relay_backend("itd-e2b-relay-c-").await else {
+        return;
+    };
+    let closing = closing_relay().await;
+    set_relay(&mut backend.rpc_ws, 10, &closing.url).await;
+    let refused = ok(
+        &mut backend.rpc_ws,
+        11,
+        "agent.create",
+        placed(&backend.ws_id, &backend.keyed_ref, "Closing"),
+    )
+    .await;
+    let refused_id = refused["agent"]["id"].as_str().unwrap().to_owned();
+    let failed = agent_until(
+        &mut backend.rpc_ws,
+        (&backend.ws_id, &refused_id),
+        20,
+        |a| a.get("placementError").is_some(),
+    )
+    .await;
+    let error = &failed["placementError"];
+    assert_eq!(error["data"]["reason"], "relay-unreachable", "{failed}");
+    assert_eq!(error["data"]["relayUrl"], closing.url.as_str(), "{failed}");
+    assert!(closing.node_hits.load(Ordering::SeqCst) >= 1);
+
+    let relay = fake_relay().await;
+    let (agent_id, machine, _) = start_over(&mut backend, &log, &relay, 30).await;
+    let sandbox = machine["cloud"]["sandboxId"].as_str().unwrap().to_owned();
+    let ws_id = backend.ws_id.clone();
+    let rpc_ws = &mut backend.rpc_ws;
+    ok(
+        rpc_ws,
+        60,
+        "cloudMachines.pause",
+        json!({ "machineId": machine["id"] }),
+    )
+    .await;
+    set_relay(rpc_ws, 61, &closing.url).await;
+    let connects = |fake: &FakeE2b| {
+        fake.calls_for(&sandbox)
+            .iter()
+            .filter(|c| is_call(c, "POST", "/connect"))
+            .count()
+    };
+    let before = connects(&backend.fake);
+    let mut events = agent_events(backend.port, backend.cfg.clone(), &ws_id).await;
+    ok(
+        rpc_ws,
+        62,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "over a closing relay" }),
+    )
+    .await;
+    let failure = failure_containing(&mut events, &agent_id, &closing.url).await;
+    assert!(failure.contains("never falls back"), "{failure}");
+    drop(events);
+    idle(rpc_ws, Duration::from_secs(15)).await;
+    assert_eq!(
+        connects(&backend.fake) - before,
+        1,
+        "one message resumed the sandbox more than once"
     );
     assert_no_secret_logged(&backend.head_dir, &backend.fake);
 }

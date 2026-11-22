@@ -11,7 +11,7 @@
 //! then transition). The connector's dial gate takes only the transition
 //! lock, since a kill waits for stops that need a dial.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -221,6 +221,10 @@ impl CloudGate {
                 "the sandbox was paused; it resumes when something asks for it".into(),
             ));
         }
+        let relay = super::bootstrap::wanted_relay(&self.svc);
+        if let Some(refused) = held_relay_refusal(&self.machine_id, relay.as_deref(), None) {
+            return Err(refused);
+        }
         let row = match self.svc.store().get_exposed_machine(&self.machine_id).await {
             Ok(Some(row)) => row,
             Ok(None) => return Ok(as_is),
@@ -240,6 +244,7 @@ impl CloudGate {
         };
         match resume(&self.svc, feature, &*client, &row).await {
             Ok(resumed) => {
+                forget_relay_refusal(&self.machine_id);
                 // A relay change gives the sandbox a new tunnel address.
                 if let Ok(Some(fresh)) =
                     self.svc.store().get_exposed_machine(&self.machine_id).await
@@ -256,14 +261,21 @@ impl CloudGate {
                 sandbox_lost(&self.svc, feature, Some(shared), &row);
                 Err(lost_failure())
             }
-            Err(Resumed::Refused(error)) => Err(match error {
-                Error::RemoteMachine(failure) => ConnectFailure::Cloud {
-                    message: failure.message,
-                    data: failure.data,
-                    lost: false,
-                },
-                other => ConnectFailure::Local(other.to_string()),
-            }),
+            Err(Resumed::Refused(error)) => {
+                let failure = match error {
+                    Error::RemoteMachine(failure) => ConnectFailure::Cloud {
+                        message: failure.message,
+                        data: failure.data,
+                        lost: false,
+                    },
+                    other => ConnectFailure::Local(other.to_string()),
+                };
+                if matches!(&failure, ConnectFailure::Cloud { data, .. } if data["reason"] == "relay-unreachable")
+                {
+                    held_relay_refusal(&self.machine_id, relay.as_deref(), Some(&failure));
+                }
+                Err(failure)
+            }
         }
     }
 
@@ -470,6 +482,44 @@ async fn pause_after_relay_failure(
             set_state(svc, feature, machine_id, CloudSandboxState::Running).await;
         }
     }
+}
+
+/// How long a relay refusal answers new dials of its machine without
+/// another resume, while the relay setting is unchanged: one message asks
+/// for the link again after a refusal (a redriven turn relaunches its
+/// agent), and each ask resumed and paused the sandbox again (intent#9825).
+const RELAY_REFUSAL_HOLD: Duration = Duration::from_secs(60);
+
+type RelayRefusals = HashMap<String, (Option<String>, Instant, ConnectFailure)>;
+
+fn relay_refusals() -> std::sync::MutexGuard<'static, RelayRefusals> {
+    static REFUSALS: std::sync::LazyLock<std::sync::Mutex<RelayRefusals>> =
+        std::sync::LazyLock::new(Default::default);
+    REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The relay refusal `machine_id` had for `relay` within
+/// [`RELAY_REFUSAL_HOLD`]; `hold` records a new one first.
+fn held_relay_refusal(
+    machine_id: &str,
+    relay: Option<&str>,
+    hold: Option<&ConnectFailure>,
+) -> Option<ConnectFailure> {
+    let mut refusals = relay_refusals();
+    if let Some(failure) = hold {
+        refusals.insert(
+            machine_id.to_owned(),
+            (relay.map(str::to_owned), Instant::now(), failure.clone()),
+        );
+    }
+    let (refused_for, at, failure) = refusals.get(machine_id)?;
+    (refused_for.as_deref() == relay && at.elapsed() < RELAY_REFUSAL_HOLD).then(|| failure.clone())
+}
+
+fn forget_relay_refusal(machine_id: &str) {
+    relay_refusals().remove(machine_id);
 }
 
 /// Whether a relay step failed for `machine_id` since its last success;
