@@ -168,9 +168,12 @@ mod tests {
         assert!(!waiter.is_finished(), "the waiter queues behind the holder");
         waiter.abort();
         drop(held);
-        tokio::time::timeout(Duration::from_secs(1), connections.lifecycle("m1"))
-            .await
-            .expect("the lock is free once its holder and the dropped waiter are gone");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            connections.lifecycle("m1"),
+        )
+        .await
+        .expect("the lock is free once its holder and the dropped waiter are gone");
     }
 
     /// A store holding a live lease on machine `m1`, and `m1`'s target.
