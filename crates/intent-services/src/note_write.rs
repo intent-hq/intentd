@@ -258,9 +258,10 @@ pub(crate) async fn persist_note_content_with_children(
         .map(|(rev, _)| rev)
 }
 
-/// [`persist_note_content`] without a version gate that returns the new
-/// version number instead of the `rev` (`note.restoreVersion` reports which
-/// snapshot the restore created).
+/// [`persist_note_content`] without a caller `expectedVersion` that returns
+/// the new version number instead of the `rev` (`note.restoreVersion`
+/// reports which snapshot the restore created). On Postgres the write still
+/// compares against `note.rev`, the revision read under the lane.
 pub(crate) async fn persist_note_content_new_version(
     store: &Store,
     lock: &NoteWriteLock,

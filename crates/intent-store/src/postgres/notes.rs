@@ -343,7 +343,7 @@ impl PgStore {
             self,
             &mut tx,
             note,
-            Some(expected_version),
+            expected_version,
             NoteUpdateScope::Metadata,
             Some(agent_id),
         )
@@ -360,7 +360,8 @@ impl PgStore {
     ) -> Result<i64> {
         self.prepare_task_events(&note.workspace_id).await;
         let mut tx = self.begin_write().await?;
-        let rev = exec_update_note(self, &mut tx, note, expected_version, scope, None).await?;
+        let expected_rev = cas_rev(note, expected_version);
+        let rev = exec_update_note(self, &mut tx, note, expected_rev, scope, None).await?;
         tx.commit().await.map_err(db)?;
         match rev {
             Some(rev) => Ok(rev),
@@ -666,7 +667,7 @@ impl PgStore {
             self,
             &mut tx,
             note,
-            expected_version,
+            cas_rev(note, expected_version),
             NoteUpdateScope::FullRow,
             None,
         )
@@ -972,14 +973,25 @@ pub(super) async fn exec_insert_note(
     Ok(())
 }
 
+/// The `rev` a note write compares against: the caller's `expectedVersion`
+/// when given, else the `rev` of the note the caller read (batch G 2a).
+/// Every Postgres note write is a compare-and-swap, so a stale process (a
+/// second handle, or a daemon that lost the tenant) cannot silently overwrite
+/// a newer edit: it gets `Conflict` and must re-read. One process sees no
+/// change, since its note lane orders the read before the write.
+pub(super) fn cas_rev(note: &Note, expected_version: Option<i64>) -> i64 {
+    expected_version.unwrap_or(note.rev)
+}
+
 /// The note UPDATE every content/metadata write runs, inside the caller's
-/// transaction: `Some(rev)` after the write, `None` when no row matched.
+/// transaction: `Some(rev)` after the write, `None` when no row matched
+/// (gone, or its `rev` is no longer `expected_rev`; see [`cas_rev`]).
 /// Every parameter is always bound so the numbering stays fixed.
 pub(super) async fn exec_update_note(
     store: &PgStore,
     conn: &mut WriteTx,
     note: &Note,
-    expected_version: Option<i64>,
+    expected_rev: i64,
     scope: NoteUpdateScope,
     required_link: Option<&AgentId>,
 ) -> Result<Option<i64>> {
@@ -994,11 +1006,6 @@ pub(super) async fn exec_update_note(
     } else {
         ""
     };
-    let gate = if expected_version.is_some() {
-        " AND rev = $16"
-    } else {
-        ""
-    };
     let link = if required_link.is_some() {
         " AND EXISTS (SELECT 1 FROM agent_session a WHERE a.tenant_id = $1 AND a.id = $17 \
          AND a.workspace_id = note.workspace_id AND a.task_note_id = note.id)"
@@ -1009,7 +1016,7 @@ pub(super) async fn exec_update_note(
         "UPDATE note SET title = $4, {content}tags = $7, is_pinned = $8, is_archived = $9, \
          is_default = $10, parent_id = $11, visibility = $12, task_json = $13, \
          created_at = $14, updated_at = $15, rev = rev + 1 \
-         WHERE tenant_id = $1 AND id = $2 AND workspace_id = $3{gate}{link} RETURNING rev"
+         WHERE tenant_id = $1 AND id = $2 AND workspace_id = $3 AND rev = $16{link} RETURNING rev"
     )))
     .bind(store.tenant())
     .bind(note.id.as_str())
@@ -1026,7 +1033,7 @@ pub(super) async fn exec_update_note(
     .bind(task_json)
     .bind(&note.created_at)
     .bind(&note.updated_at)
-    .bind(expected_version)
+    .bind(expected_rev)
     .bind(required_link.map(|a| a.0.as_str()))
     .fetch_optional(&mut **conn)
     .await
