@@ -708,8 +708,12 @@ agents to runners**) instead of a subtitle. **Where <backend> runs agents** beco
 **Runners for <host>**, with no **Preferred** mark; a regular host lists itself there as
 **This host**, an orchestrator never does. A saved host stays under Hosts even when it
 also runs agents for the current host. **Set up a new machine** becomes **Set up a host or
-runner**, with **Install a host** and **Install a runner**.
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{HostOnlyMarker,MachineOrderPlainRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/machine-order.ts. -->
+runner**, with **Install a host** and **Install a runner**. **Start on** (now labelled
+**Runner**) drops **First available machine**: it preselects the first runner in the host's
+order that can take the agent (the host itself when it runs agents and comes first), and an
+orchestrator has no row of its own. API callers that omit the placement still get the first
+available runner.
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{HostOnlyMarker,MachineOrderPlainRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{machine-order,start-on}.ts. -->
 <!-- Labs (SSH machine setup, desktop app only): describe only when the user asks about
 installing over SSH, and say it is Labs (turn on **SSH machine setup** in
 Settings → Advanced → Labs). With it on, the install cards also offer
