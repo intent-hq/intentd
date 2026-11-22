@@ -16,11 +16,10 @@ use intent_core::{now_iso, AgentId, Error, ExecutorCredentialId, Result};
 use intent_services::feature_api::Services;
 
 use crate::connect::{connect, ConnectFailure, Connected};
-use crate::connector::Shared;
 use crate::lease::{new_owner, probe_hello, record_new_lease, HeadLease};
 use crate::machine::MachineTarget;
 use crate::{RemoteFeature, RemoteNode};
-use intent_node_connections::process_head_session;
+use intent_node_connections::{process_head_session, LinkView};
 
 /// Longest id, name, credential id or route, in UTF-8 bytes.
 const MAX_TEXT_BYTES: usize = 256;
@@ -29,8 +28,8 @@ const MAX_HOSTS: usize = 32;
 
 /// `RemoteMachine` on the wire. `live` is the machine's connector, when one
 /// runs: it overlays `connected` and counts this backend's live agents.
-pub(crate) fn machine_json(row: &ExposedMachine, live: Option<&Shared>) -> Value {
-    let connected = live.is_some_and(Shared::is_connected);
+pub(crate) fn machine_json(row: &ExposedMachine, live: Option<&dyn LinkView>) -> Value {
+    let connected = live.is_some_and(LinkView::is_connected);
     let state = if connected {
         RemoteMachineState::Connected
     } else {
@@ -51,7 +50,7 @@ pub(crate) fn machine_json(row: &ExposedMachine, live: Option<&Shared>) -> Value
     machine.insert("state".into(), json!(state));
     machine.insert(
         "runningAgents".into(),
-        json!(live.map_or(0, |shared| shared.agents.live_count())),
+        json!(live.map_or(0, LinkView::live_agents)),
     );
     if let Some(capabilities) = &row.capabilities {
         machine.insert("capabilities".into(), json!(capabilities));
@@ -79,7 +78,11 @@ pub(crate) fn machine_json(row: &ExposedMachine, live: Option<&Shared>) -> Value
 
 /// Publish a machine row change: `cloudMachine:changed` for a cloud machine
 /// (never `remoteMachine:changed`), else `remoteMachine:changed`.
-pub(crate) async fn publish_machine(svc: &Services, row: &ExposedMachine, live: Option<&Shared>) {
+pub(crate) async fn publish_machine(
+    svc: &Services,
+    row: &ExposedMachine,
+    live: Option<&dyn LinkView>,
+) {
     let machine = machine_json(row, live);
     if row.is_cloud() {
         svc.publish_cloud_machine_changed(
@@ -198,7 +201,7 @@ async fn list(feature: &RemoteFeature, svc: &Services) -> Result<Value> {
         .iter()
         .map(|row| {
             let live = feature.running_node(&row.id);
-            machine_json(row, live.as_ref().map(RemoteNode::shared_ref))
+            machine_json(row, live.as_ref().map(RemoteNode::view))
         })
         .collect();
     Ok(json!({ "machines": machines }))
@@ -253,12 +256,9 @@ async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
                     continue;
                 };
                 let live = feature.running_node(&row.id);
-                if let Some(mut machine) = machine_models_json(
-                    row,
-                    live.as_ref().map(RemoteNode::shared_ref),
-                    provider,
-                    model,
-                ) {
+                if let Some(mut machine) =
+                    machine_models_json(row, live.as_ref().map(RemoteNode::view), provider, model)
+                {
                     machine["kind"] = json!("machine");
                     machine["rank"] = json!(rank);
                     machines.push(machine);
@@ -314,11 +314,11 @@ async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
 /// the link protocol.
 fn machine_models_json(
     row: &ExposedMachine,
-    live: Option<&Shared>,
+    live: Option<&dyn LinkView>,
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Option<Value> {
-    let state = if live.is_some_and(Shared::is_connected) {
+    let state = if live.is_some_and(LinkView::is_connected) {
         RemoteMachineState::Connected
     } else {
         row.state
@@ -356,7 +356,7 @@ fn machine_models_json(
     }
     machine.insert(
         "runningAgents".into(),
-        json!(live.map_or(0, |shared| shared.agents.live_count())),
+        json!(live.map_or(0, LinkView::live_agents)),
     );
     machine.insert("providers".into(), Value::Array(providers));
     if let Some(disabled) = row
@@ -563,7 +563,7 @@ pub(crate) async fn add_machine(
         // A saved machine that is now an orchestrator is removed.
         ConnectFailure::Orchestrator => {
             if let Some(token) = &stored_token {
-                forget_orchestrator(Some(svc.clone()), params.machine_id.clone(), token.clone());
+                forget_orchestrator(svc.clone(), params.machine_id.clone(), token.clone());
             }
             ConnectFailure::Orchestrator
         }
@@ -645,8 +645,8 @@ pub(crate) async fn add_machine(
     accepted.hosts.clone_from(&row.hosts);
     accepted.tc_address.clone_from(&row.tc_address);
     node.shared_ref().set_target(accepted);
-    let machine = machine_json(&row, Some(node.shared_ref()));
-    publish_machine(svc, &row, Some(node.shared_ref())).await;
+    let machine = machine_json(&row, Some(node.view()));
+    publish_machine(svc, &row, Some(node.view())).await;
     if !row.is_cloud() {
         crate::order::publish(svc).await;
     }
@@ -764,10 +764,7 @@ async fn forget(svc: &Services, machine_id: &str) -> Result<Option<ExecutorCrede
 /// is kept. Its agents end; an orchestrator runs none. A store failure is
 /// retried with backoff until the removal succeeds or no longer applies;
 /// the connector stops only then.
-pub(crate) fn forget_orchestrator(svc: Option<Services>, machine_id: String, refused: String) {
-    let Some(svc) = svc else {
-        return;
-    };
+pub(crate) fn forget_orchestrator(svc: Services, machine_id: String, refused: String) {
     tokio::spawn(async move {
         use crate::RemoteServicesExt as _;
         let Some(feature) = svc.remote_feature() else {
@@ -995,5 +992,5 @@ async fn refresh(feature: &RemoteFeature, svc: &Services, params: &Value) -> Res
         .get_exposed_machine(&machine_id)
         .await?
         .ok_or_else(|| not_found(&machine_id))?;
-    Ok(json!({ "machine": machine_json(&row, Some(node.shared_ref())) }))
+    Ok(json!({ "machine": machine_json(&row, Some(node.view())) }))
 }

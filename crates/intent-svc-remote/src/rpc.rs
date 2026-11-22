@@ -32,7 +32,7 @@ use intent_core::{with_caller, AgentSession, Caller, Error, WorkspaceApi};
 use intent_services::feature_api::Services;
 use intent_transport::node_link::IncomingRequest;
 
-use crate::connector::Shared;
+use intent_node_connections::LinkView;
 
 /// JSON-RPC "method not found".
 const METHOD_NOT_FOUND: i32 = -32601;
@@ -67,13 +67,13 @@ impl HeadCalls {
     }
 
     /// Answer `request` on its own task, giving up if the node cancels it.
-    pub(crate) fn answer(&self, shared: Arc<Shared>, request: IncomingRequest) {
+    pub(crate) fn answer(&self, link: Arc<dyn LinkView>, request: IncomingRequest) {
         let calls = self.clone();
         // caller-binding: allow — the request is checked against the lease, then dispatched with the agent's caller bound in `outcome`
         tokio::spawn(async move {
-            let current = shared.current_link().map(|link| link.binding().clone());
+            let current = link.current_binding();
             let outcome = tokio::select! {
-                outcome = calls.outcome(&shared, current.as_ref(), request.binding(), request.request()) => outcome,
+                outcome = calls.outcome(link.as_ref(), current.as_ref(), request.binding(), request.request()) => outcome,
                 () = request.cancelled() => return,
             };
             let _ = request.respond(outcome).await;
@@ -84,7 +84,7 @@ impl HeadCalls {
     /// node's `current` binding.
     pub(crate) async fn outcome(
         &self,
-        shared: &Shared,
+        link: &dyn LinkView,
         current: Option<&LeaseBinding>,
         binding: &LeaseBinding,
         request: &LinkRequest,
@@ -111,11 +111,16 @@ impl HeadCalls {
         // A frame whose link support is newer than this link (agent
         // secrets, nodeProtocol 14) is refused as the machine would.
         if method.starts_with("secret.")
-            && shared.protocol() < intent_core::node_link::SECRETS_PROTOCOL
+            && link.protocol() < intent_core::node_link::SECRETS_PROTOCOL
         {
             return refusal(FORBIDDEN, workspace_api::forward_refusal(method));
         }
-        let record = match shared.store.get_remote_agent(&request.agent_id).await {
+        let record = match self
+            .services
+            .store()
+            .get_remote_agent(&request.agent_id)
+            .await
+        {
             Ok(Some(record)) if record.lease_id == binding.lease_id => record,
             Ok(_) => {
                 return refusal(

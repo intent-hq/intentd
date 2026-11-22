@@ -12,6 +12,8 @@
 //! link ([`LocalOwnership`]), but the claim and fence calls still run, so
 //! one code path serves both deployments.
 
+mod inbound;
 mod ownership;
 
+pub use inbound::{LinkView, NodeInbound};
 pub use ownership::{process_head_session, Fenced, LinkClaim, LinkOwnership, LocalOwnership};

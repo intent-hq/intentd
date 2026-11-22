@@ -573,12 +573,8 @@ async fn record_relay(
     }
     if let Ok(Some(row)) = svc.store().get_exposed_machine(machine_id).await {
         let live = feature.running_node(machine_id);
-        crate::methods::publish_machine(
-            svc,
-            &row,
-            live.as_ref().map(crate::RemoteNode::shared_ref),
-        )
-        .await;
+        crate::methods::publish_machine(svc, &row, live.as_ref().map(crate::RemoteNode::view))
+            .await;
     }
 }
 
@@ -606,8 +602,7 @@ pub(crate) async fn set_state(
         return None;
     }
     let live = feature.running_node(machine_id);
-    crate::methods::publish_machine(svc, &row, live.as_ref().map(crate::RemoteNode::shared_ref))
-        .await;
+    crate::methods::publish_machine(svc, &row, live.as_ref().map(crate::RemoteNode::view)).await;
     Some(row)
 }
 

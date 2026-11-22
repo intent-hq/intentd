@@ -9,12 +9,13 @@ description = "The node-connection service for intentd: machine links, link owne
 
 [dependencies]
 intent-core = { workspace = true }
+intent-node-link = { workspace = true }
 intent-store = { workspace = true }
+tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { workspace = true }
 
 [lints]
 workspace = true
