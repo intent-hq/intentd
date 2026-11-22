@@ -79,7 +79,7 @@ pub async fn resolve(source: &TokenSource) -> Option<Credentials> {
 /// Resolve each half of the credential pair independently for the given
 /// strategy, so a caller holding one half inline can complete it. Under
 /// `auto`, each half comes from the secrets store, else env.
-pub async fn resolve_parts(source: &TokenSource) -> CredentialParts {
+pub(crate) async fn resolve_parts(source: &TokenSource) -> CredentialParts {
     match source {
         TokenSource::Explicit => file_store_parts().await,
         TokenSource::Env => env_parts(),
@@ -89,10 +89,19 @@ pub async fn resolve_parts(source: &TokenSource) -> CredentialParts {
 
 /// Possibly-partial credential pair from [`resolve_parts`]. Halves are
 /// non-empty when present. The `token` field is secret.
-#[derive(Clone, Default)]
-pub struct CredentialParts {
-    pub token: Option<String>,
-    pub organization: Option<String>,
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct CredentialParts {
+    pub(crate) token: Option<String>,
+    pub(crate) organization: Option<String>,
+}
+
+impl std::fmt::Debug for CredentialParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialParts")
+            .field("organization", &self.organization)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl CredentialParts {
@@ -131,7 +140,10 @@ fn env_parts() -> CredentialParts {
             .ok()
             .as_deref()
             .and_then(non_empty),
-        organization: std::env::var("SENTRY_ORG").ok().as_deref().and_then(non_empty),
+        organization: std::env::var("SENTRY_ORG")
+            .ok()
+            .as_deref()
+            .and_then(non_empty),
     }
 }
 
@@ -232,6 +244,41 @@ mod tests {
         let s: TokenSource = serde_json::from_str("\"explicit\"").unwrap();
         assert_eq!(s, TokenSource::Explicit);
         assert_eq!(TokenSource::default(), TokenSource::Auto);
+    }
+
+    fn parts(token: Option<&str>, organization: Option<&str>) -> CredentialParts {
+        CredentialParts {
+            token: token.map(str::to_string),
+            organization: organization.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn parts_or_fills_only_missing_halves() {
+        let merged = parts(None, Some("saved-org")).or(parts(Some("env-tok"), Some("env-org")));
+        assert_eq!(merged, parts(Some("env-tok"), Some("saved-org")));
+
+        let merged = parts(Some("saved-tok"), None).or(parts(Some("env-tok"), Some("env-org")));
+        assert_eq!(merged, parts(Some("saved-tok"), Some("env-org")));
+
+        let merged = parts(Some("saved-tok"), Some("saved-org")).or(parts(Some("x"), Some("y")));
+        assert_eq!(merged, parts(Some("saved-tok"), Some("saved-org")));
+    }
+
+    #[test]
+    fn parts_complete_needs_both_halves() {
+        let c = parts(Some("tok"), Some("acme")).complete().unwrap();
+        assert_eq!((c.token.as_str(), c.organization.as_str()), ("tok", "acme"));
+        assert!(parts(Some("tok"), None).complete().is_none());
+        assert!(parts(None, Some("acme")).complete().is_none());
+    }
+
+    #[test]
+    fn parts_debug_redacts_token() {
+        let dbg = format!("{:?}", parts(Some("supersecret"), Some("acme")));
+        assert!(!dbg.contains("supersecret"));
+        assert!(dbg.contains("redacted"));
+        assert!(dbg.contains("acme"));
     }
 
     #[test]

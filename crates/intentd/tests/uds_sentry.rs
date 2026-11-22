@@ -584,17 +584,18 @@ async fn fake_sentry() -> (String, SeenHttp) {
 #[intent_test_macros::daemon_test]
 async fn uds_sentry_uses_saved_account_settings() {
     let (base_url, seen) = fake_sentry().await;
-    let (socket, _tx, _base, _ws_root) = start_with("acct", |s| {
-        s.with_sentry_api_base_url(base_url)
-    })
-    .await;
+    let (socket, _tx, _base, _ws_root) =
+        start_with("acct", |s| s.with_sentry_api_base_url(base_url)).await;
 
     let resp = send(
         &socket,
         r#"{"jsonrpc":"2.0","id":1,"method":"settings.update","params":{"changes":[{"path":"accounts.sentry.organization","value":"acme"},{"path":"accounts.sentry.token","value":"sntryu_saved"}]}}"#,
     )
     .await;
-    assert!(resp.get("error").is_none(), "settings.update failed: {resp}");
+    assert!(
+        resp.get("error").is_none(),
+        "settings.update failed: {resp}"
+    );
 
     let resp = send(
         &socket,
@@ -618,8 +619,14 @@ async fn uds_sentry_uses_saved_account_settings() {
 
     let seen = seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 2, "one REST call per method: {seen:?}");
-    assert!(seen[0].0.starts_with("GET /organizations/acme/ "), "{seen:?}");
-    assert!(seen[1].0.starts_with("GET /organizations/acme/projects/"), "{seen:?}");
+    assert!(
+        seen[0].0.starts_with("GET /organizations/acme/ "),
+        "{seen:?}"
+    );
+    assert!(
+        seen[1].0.starts_with("GET /organizations/acme/projects/"),
+        "{seen:?}"
+    );
     for (_, authorization) in &seen {
         assert_eq!(authorization.as_deref(), Some("Bearer sntryu_saved"));
     }

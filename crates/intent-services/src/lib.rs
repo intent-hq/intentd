@@ -2992,22 +2992,22 @@ impl Services {
         Arc::clone(&self.settings_revision_gate)
     }
 
-    /// A string-valued setting's effective value (`None` when unreadable).
     /// The active Sentry engine: the injected one, else one built from the
-    /// saved Sentry account (intent-hq/intent#9645).
+    /// saved Sentry account (intent-hq/intent#9645). An unreadable saved token
+    /// is an error, so it never silently falls back to another identity.
     async fn resolve_sentry_engine(&self) -> Result<Arc<dyn intent_sentry::SentryEngine>> {
         if let Some(engine) = &self.sentry_engine {
             return Ok(engine.clone());
         }
-        let token = match self.secrets.load(sentry_ops::TOKEN_SETTING_PATH).await {
-            Ok(token) => token,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not read the saved Sentry token");
-                None
-            }
-        };
+        let token = self
+            .secrets
+            .load(sentry_ops::TOKEN_SETTING_PATH)
+            .await
+            .map_err(|e| Error::Internal(format!("sentry: could not read the saved token: {e}")))?;
         let settings = intent_sentry::SentrySettings {
-            organization: self.setting_str(sentry_ops::ORGANIZATION_SETTING_PATH).await,
+            organization: self
+                .setting_str(sentry_ops::ORGANIZATION_SETTING_PATH)
+                .await,
             token,
             api_base_url: self.sentry_api_base_url.clone(),
             ..intent_sentry::SentrySettings::default()
@@ -3015,6 +3015,7 @@ impl Services {
         sentry_ops::build_engine(&settings).await
     }
 
+    /// A string-valued setting's effective value (`None` when unreadable).
     async fn setting_str(&self, path: &str) -> Option<String> {
         self.settings_service()
             .get(path)
