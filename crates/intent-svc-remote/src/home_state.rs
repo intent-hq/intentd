@@ -185,7 +185,7 @@ pub(crate) async fn backup_succeeded(
                 .remote_feature()
                 .and_then(|feature| feature.running_node(node_id))
             {
-                node.shared_ref().home_link.backed_up(&home.home_id);
+                node.view().home_backed_up(&home.home_id);
             }
             svc.publish_workspace_home_changed(workspace_id).await;
         }
@@ -281,7 +281,7 @@ pub(crate) fn redial(svc: &Services, home: &WorkspaceHome) {
         let Ok(node) = feature.node(&svc, &node_id).await else {
             return;
         };
-        node.shared_ref().set_holds_homes(true);
+        node.view().set_holds_homes(true);
         if let Err(error) = node.connect().await {
             tracing::debug!(%error, "remote machine: a detached home's machine is still not reachable");
         }

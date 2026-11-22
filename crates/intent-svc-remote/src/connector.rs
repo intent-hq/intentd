@@ -3438,7 +3438,7 @@ async fn serve_git(
 /// homes.
 async fn ingest_record(shared: &Shared, record: intent_core::node_link::JournalRecord) {
     let Some(agent_id) = record.agent_id().cloned() else {
-        if let Some(inbound) = &shared.inbound {
+        if let Some(inbound) = shared.inbound() {
             inbound.home_record(shared, record).await;
         }
         return;

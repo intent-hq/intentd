@@ -1442,6 +1442,8 @@ async fn a_fenced_welcome_claims_and_stops_nothing() {
 struct Recording {
     changed: Mutex<Vec<String>>,
     requests: Mutex<Vec<(String, Option<intent_core::node_link::LeaseBinding>, String)>>,
+    after_binds: Mutex<Vec<String>>,
+    stop_acks: Mutex<Vec<String>>,
 }
 
 impl intent_node_connections::NodeInbound for Recording {
@@ -1505,7 +1507,9 @@ impl intent_node_connections::NodeInbound for Recording {
         Box::pin(async {})
     }
 
-    fn homes_after_bind(&self, _: Arc<dyn intent_node_connections::LinkView>) {}
+    fn homes_after_bind(&self, link: Arc<dyn intent_node_connections::LinkView>) {
+        self.after_binds.lock().unwrap().push(link.machine_id());
+    }
 
     fn home_record<'a>(
         &'a self,
@@ -1518,9 +1522,11 @@ impl intent_node_connections::NodeInbound for Recording {
     fn home_stop_acked(
         &self,
         _: Arc<dyn intent_node_connections::LinkView>,
-        _: intent_core::node_link::HomeStopAck,
+        ack: intent_core::node_link::HomeStopAck,
     ) -> intent_core::BoxFuture<'_, ()> {
-        Box::pin(async {})
+        Box::pin(async move {
+            self.stop_acks.lock().unwrap().push(ack.stop_id);
+        })
     }
 
     fn homes_link_lost<'a>(
@@ -1613,6 +1619,58 @@ async fn link_callbacks_reach_the_inbound_with_the_live_link() {
     // The bind announced the machine: the announcement precedes serving, so
     // the answered call above proves it is done.
     assert!(inbound.changed.lock().unwrap().contains(&machine.id()));
+    node.shutdown();
+}
+
+/// The connector's home hooks reach the head's domain: a bind on the
+/// homes protocol asks it to open the machine's homes, and a `homeStopAck`
+/// reaches it off the ingest loop.
+#[tokio::test]
+async fn home_hooks_reach_the_inbound() {
+    let (mut machine, backend, bare) = exposed().await;
+    bare.shutdown();
+    let inbound = Arc::new(Recording::default());
+    let node = RemoteNode::start(
+        backend.store().clone(),
+        backend.target(&machine).await,
+        tuning(),
+        Some(inbound.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    node.connect().await.unwrap();
+    let end = machine.accept().await;
+    assert!(end.link.protocol() >= intent_core::node_link::HOMES_PROTOCOL);
+    tokio::time::timeout(wait(), async {
+        while inbound.after_binds.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the bind asks the domain to open the machine's homes");
+    assert_eq!(*inbound.after_binds.lock().unwrap(), [machine.id()]);
+
+    end.link
+        .send(&LinkFrame::HomeStopAck(
+            intent_core::node_link::HomeStopAck {
+                stop_id: "stop-1".into(),
+                workspace_id: workspace(),
+                home_id: intent_core::HomeId::from("home-1"),
+                outcome: intent_core::node_link::HomeStopOutcome::Removed,
+                orphaned: None,
+            },
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(wait(), async {
+        while inbound.stop_acks.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the stop ack reaches the domain");
+    assert_eq!(*inbound.stop_acks.lock().unwrap(), ["stop-1".to_owned()]);
     node.shutdown();
 }
 
