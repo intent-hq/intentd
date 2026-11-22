@@ -1101,15 +1101,20 @@ pub fn workspace_root() -> PathBuf {
 }
 
 /// The nearest directory at or above `start` whose `Cargo.toml` declares a
-/// `[workspace]` table (a line reading exactly `[workspace]`), as cargo
-/// finds the workspace of a member.
+/// `workspace` table (a line starting `[workspace]` or `[workspace.`, as
+/// `[workspace.dependencies]` alone defines it too), as cargo finds the
+/// workspace of a member.
 #[must_use]
 pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .find(|dir| {
-            fs::read_to_string(dir.join("Cargo.toml"))
-                .is_ok_and(|manifest| manifest.lines().any(|line| line.trim() == "[workspace]"))
+            fs::read_to_string(dir.join("Cargo.toml")).is_ok_and(|manifest| {
+                manifest.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("[workspace]") || line.starts_with("[workspace.")
+                })
+            })
         })
         .map(Path::to_path_buf)
 }
@@ -2775,6 +2780,9 @@ use some::module;
         write("ws/crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
         write("ws/crates/a/src/lib.rs", "");
         write("other/Cargo.toml", "[package]\n# [workspace]\n");
+        write("commented/Cargo.toml", "[workspace] # the root\n");
+        write("dotted/Cargo.toml", "[workspace.dependencies]\n");
+        write("lookalike/Cargo.toml", "[workspaces]\n");
         let ws = root.path().join("ws");
         assert_eq!(find_workspace_root(&ws.join("crates/a")), Some(ws.clone()));
         assert_eq!(
@@ -2787,6 +2795,11 @@ use some::module;
             None,
             "a commented-out table is not a workspace"
         );
+        let commented = root.path().join("commented");
+        assert_eq!(find_workspace_root(&commented), Some(commented.clone()));
+        let dotted = root.path().join("dotted");
+        assert_eq!(find_workspace_root(&dotted), Some(dotted.clone()));
+        assert_eq!(find_workspace_root(&root.path().join("lookalike")), None);
     }
 
     #[test]

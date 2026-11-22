@@ -19,6 +19,8 @@
 //! "test-hooks"))` item is library code here: it builds into the rlib other
 //! crates' tests link. Test-build code is out of scope: the path a test
 //! binary bakes comes from the same build as the code that reads it.
+//! An `env!` inside `include_str!` / `include_bytes!` arguments is exempt:
+//! those embed the file's bytes, never its path.
 //!
 //! Read the path at run time instead — `source_lint::workspace_root()`, or
 //! `std::env::var_os("CARGO_MANIFEST_DIR")`, which `cargo test` and nextest
@@ -26,15 +28,43 @@
 //! There is no opt-out.
 
 use intentd_test_support::source_lint::{
-    test_code_files_with, tokenize, workspace_root, TestCfgs, TestCodeText,
+    test_code_files_with, tokenize, workspace_root, TestCfgs, TestCodeText, Token,
 };
 
 const VAR: &str = "CARGO_MANIFEST_DIR";
 const MACROS: &[&str] = &["env", "option_env"];
 const OPENERS: &[&str] = &["(", "[", "{"];
+const CLOSERS: &[&str] = &[")", "]", "}"];
+/// Macros that read the file at compile time and embed its bytes, so a path
+/// built from `env!` inside them never reaches the compiled crate.
+const INCLUDE_MACROS: &[&str] = &["include_str", "include_bytes"];
+
+/// Whether the token at `at` sits inside the arguments of an
+/// `include_str!` / `include_bytes!` call, at any nesting depth.
+fn inside_include(tokens: &[Token], at: usize) -> bool {
+    let mut depth = 0usize;
+    for j in (0..at).rev() {
+        if CLOSERS.iter().any(|close| tokens[j].is(close)) {
+            depth += 1;
+        } else if OPENERS.iter().any(|open| tokens[j].is(open)) {
+            if depth > 0 {
+                depth -= 1;
+                continue;
+            }
+            if j >= 2
+                && tokens[j - 1].is("!")
+                && INCLUDE_MACROS.iter().any(|name| tokens[j - 2].is(name))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// 1-based lines of `src` reading `CARGO_MANIFEST_DIR` at compile time
-/// outside test-build-only code (`whole` marks a file that is test code
+/// outside test-build-only code and outside `include_str!` /
+/// `include_bytes!` arguments (`whole` marks a file that is test code
 /// throughout).
 fn hits(src: &str, whole: bool) -> Vec<usize> {
     let text = TestCodeText::with_cfgs(src, whole, TestCfgs::TestBuildOnly);
@@ -49,6 +79,7 @@ fn hits(src: &str, whole: bool) -> Vec<usize> {
                 && OPENERS.iter().any(|open| tokens[before - 1].is(open))
                 && tokens[before - 2].is("!")
                 && MACROS.iter().any(|name| tokens[before - 3].is(name))
+                && !inside_include(&tokens, before - 3)
         })
         .map(|literal| literal.line)
         .collect()
@@ -76,7 +107,8 @@ fn library_code_never_bakes_the_manifest_dir() {
         "compile-time `env!(\"{VAR}\")` in library code bakes this checkout's path into the \
          rlib, which a build reused by another checkout then reads (intent-hq/intentd#3648); \
          resolve it at run time with `source_lint::workspace_root()` or \
-         `std::env::var_os(\"{VAR}\")`, or move the code under `#[cfg(test)]`:\n  {}",
+         `std::env::var_os(\"{VAR}\")`, or move the code under `#[cfg(test)]` (inside \
+         `include_str!` / `include_bytes!` it is fine: only the file's bytes are embedded):\n  {}",
         failures.join("\n  ")
     );
 }
@@ -97,8 +129,9 @@ fn maybe() -> Option<&'static str> {
 pub fn hook_fixture() -> &'static str {
     env!("CARGO_MANIFEST_DIR")
 }
+static AFTER_INCLUDE: (&str, &str) = (include_str!("x.txt"), env!("CARGO_MANIFEST_DIR"));
 "#;
-    assert_eq!(hits(src, false), vec![3, 6, 9, 13]);
+    assert_eq!(hits(src, false), vec![3, 6, 9, 13, 15]);
 }
 
 #[test]
@@ -114,6 +147,8 @@ fn message() -> &'static str {
 fn other() -> &'static str {
     env!("CARGO_PKG_NAME")
 }
+static EMBEDDED: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data.txt"));
+static BYTES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/data.bin"));
 #[cfg(test)]
 fn fixture() -> &'static str {
     env!("CARGO_MANIFEST_DIR")
