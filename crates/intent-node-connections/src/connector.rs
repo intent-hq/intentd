@@ -237,8 +237,8 @@ impl Default for Tuning {
             forge_refresh: Duration::from_secs(5 * 60),
             forge_check: Duration::from_secs(2),
             home_stop_resend: Duration::from_secs(2 * 60),
-            #[cfg(any(test, feature = "test-support"))]
             head_session: None,
+            #[cfg(any(test, feature = "test-support"))]
             fail_ack_writes: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             fail_claim_reads: Arc::default(),

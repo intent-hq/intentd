@@ -108,6 +108,8 @@ pub struct RemoteFeature {
     /// ([`order`]): one per backend, so two tenants never wait on each
     /// other.
     pub(crate) order_lock: tokio::sync::Mutex<()>,
+    /// Set by [`RemoteFeature::close_links`]: no connector starts again.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 /// [`RemoteFeature::head_session`]: picked once per feature, so each start
@@ -170,6 +172,10 @@ impl RemoteFeature {
         self.connections.0.take(machine_id)
     }
 
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Wait for machine `machine_id`'s lifecycle lock.
     pub(crate) async fn lifecycle(
         &self,
@@ -195,14 +201,18 @@ impl RemoteFeature {
     }
 
     /// Shut down every running connector and close its link, as a fenced
-    /// tenant must: a later need starts a new one. Returns how many were
-    /// shut down.
+    /// tenant must, and start no connector again: a start in flight is shut
+    /// down instead of kept. Returns how many were shut down.
     pub fn close_links(&self) -> usize {
-        let nodes: Vec<RemoteNode> = lock(&self.nodes).drain().map(|(_, node)| node).collect();
-        for node in &nodes {
-            node.shutdown();
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut closed = 0;
+        for node in self.connections.0.all() {
+            if let Some(node) = self.connections.0.take(&node.shared_ref().machine_id()) {
+                node.shutdown();
+                closed += 1;
+            }
         }
-        nodes.len()
+        closed
     }
 
     /// The GitHub token the machines hold, its watcher started.
@@ -267,6 +277,9 @@ impl RemoteFeature {
         if let Some(node) = self.running_node(machine_id) {
             return Ok(node);
         }
+        if self.is_closed() {
+            return Err(links_closed());
+        }
         let row = svc
             .store()
             .get_exposed_machine(machine_id)
@@ -296,7 +309,8 @@ impl RemoteFeature {
         let target = machine::MachineTarget::new(&row, &token, self.tailcat_bin())?
             .tapped(svc.link_traffic().clone())
             .gated(gate);
-        self.connections
+        let node = self
+            .connections
             .0
             .start(
                 svc.store().clone(),
@@ -305,11 +319,26 @@ impl RemoteFeature {
                 Some(inbound::ServicesInbound::shared(svc.clone())),
                 Some(self.forge(svc)),
             )
-            .await
+            .await?;
+        // A close that raced this start: it set the flag before this check
+        // (so the node is shut down here) or found the node (so it shut it
+        // down itself). Either way none outlives the close.
+        if self.is_closed() {
+            if let Some(started) = self.connections.0.take(machine_id) {
+                started.shutdown();
+            }
+            node.shutdown();
+            return Err(links_closed());
+        }
+        Ok(node)
     }
 }
 
 pub(crate) use intent_node_connections::lock;
+
+fn links_closed() -> Error {
+    Error::Internal("this backend's machine links are closed".into())
+}
 
 /// Register the remote feature and its remote-launch port on `services`.
 /// Nothing dials a machine until one is needed.

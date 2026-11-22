@@ -80,6 +80,20 @@ async fn closing_one_backends_links_leaves_the_others_up() {
         "the other tenant's link stays up"
     );
     assert_eq!(feature_b.connected_machines(), 1);
+
+    let again = a
+        .services
+        .remote_feature()
+        .unwrap()
+        .node(&a.services, &machine_a.id())
+        .await;
+    assert!(again.is_err(), "a closed backend starts no connector again");
+    assert!(a
+        .services
+        .remote_feature()
+        .unwrap()
+        .running_nodes()
+        .is_empty());
 }
 
 #[tokio::test]
