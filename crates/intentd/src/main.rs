@@ -2756,6 +2756,15 @@ async fn cmd_serve_owned(
         {
             tracing::warn!(%error, "pending delete sweep failed");
         }
+        // Re-arm the delete grace deadlines a previous process stored
+        // (Postgres only; SQLite drops pending deletes on restart by
+        // design), so a delete still in its undo window commits once at its
+        // deadline instead of being lost with that process's timer.
+        match services.rearm_delete_graces().await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "re-armed stored delete deadlines"),
+            Err(error) => tracing::warn!(%error, "re-arming stored delete deadlines failed"),
+        }
     }
     // Rehydrate persisted agent send queues (write-through `agent_queue`
     // table) into the in-memory map before any listener serves RPCs, so

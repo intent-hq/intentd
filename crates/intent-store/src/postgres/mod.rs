@@ -64,6 +64,7 @@ mod browser_tabs;
 mod clients;
 mod comments;
 mod completion_watches;
+mod delete_grace;
 mod desktop;
 mod discussions;
 mod events;

@@ -98,6 +98,8 @@ use store_pool::StorePool;
 /// database through `Store` methods alone.
 #[cfg(any(test, feature = "test-support"))]
 pub use store_pool::{StorePool, StorePoolOptions};
+mod delete_grace_repo;
+pub use delete_grace_repo::DeleteGrace;
 mod diffs_repo;
 mod discussion_activity_repo;
 mod discussion_agent_repo;

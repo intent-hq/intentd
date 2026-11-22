@@ -42,6 +42,8 @@ mod concurrency_pool;
 mod concurrency_queue_order;
 #[path = "postgres_backend/concurrency_support.rs"]
 mod concurrency_support;
+#[path = "postgres_backend/delete_grace.rs"]
+mod delete_grace;
 #[path = "postgres_backend/desktop.rs"]
 mod desktop;
 #[path = "postgres_backend/discussions.rs"]

@@ -17942,6 +17942,36 @@ impl Services {
 }
 
 impl Services {
+    /// Re-arms a workspace delete whose grace deadline a previous process
+    /// stored (Postgres): the same commit as `workspace.delete` with
+    /// `undoDelayMs`, at the stored deadline. No `delete-scheduled` event:
+    /// clients learned of the pending delete when it was first scheduled.
+    pub(crate) async fn rearm_workspace_delete(
+        &self,
+        id: WorkspaceId,
+        delete_at: String,
+    ) -> Result<()> {
+        let timer_services = self.clone();
+        let timer_id = id.clone();
+        self.pending_workspace_deletes
+            .rearm_owned(
+                delete_grace::PendingDeleteSubject::Workspace(id),
+                delete_at,
+                move |claim| {
+                    intent_core::with_caller(intent_core::Caller::Daemon, async move {
+                        if let Err(e) = timer_services
+                            .delete_workspace_with_claim(timer_id.clone(), Some(claim))
+                            .await
+                        {
+                            tracing::warn!(workspace = %timer_id.as_str(), error = %e, "re-armed workspace delete failed at commit");
+                        }
+                    })
+                },
+            )
+            .await
+            .map(|_| ())
+    }
+
     fn delete_workspace_with_claim(
         &self,
         id: WorkspaceId,

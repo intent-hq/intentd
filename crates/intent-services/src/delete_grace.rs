@@ -2,9 +2,13 @@
 //!
 //! A `*.delete` with `undoDelayMs > 0` registers a pending deletion here
 //! instead of committing immediately: the entry pairs the ISO `deleteAt`
-//! deadline with the timer task that commits the delete on expiry. Entries
-//! are **never persisted** — a daemon restart drops every pending deletion
-//! and the entity survives (the spec's restart semantics).
+//! deadline with the timer task that commits the delete on expiry. On
+//! `SQLite` (desktop) entries are **never persisted**: a daemon restart drops
+//! every pending deletion and the entity survives (the spec's restart
+//! semantics). On Postgres (orchestrator mode) the owned registry also
+//! stores the deadline ([`Store::record_delete_grace`]): the next process to
+//! serve the tenant re-arms it ([`OwnedPendingDeletes::rearm_owned`]), and
+//! a commit first takes the stored row, so the delete commits once.
 //!
 //! Race safety is generation-based: each schedule mints a generation token
 //! the timer must present to claim its entry at fire time. A cancel (or an
@@ -153,6 +157,17 @@ enum OwnedKey {
 }
 
 impl PendingDeleteSubject {
+    /// The stored grace row's kind and subject id, and its workspace.
+    fn grace_parts(&self) -> (&'static str, &str, &WorkspaceId) {
+        match self {
+            Self::Workspace(id) => ("workspace", id.as_str(), id),
+            Self::Agent {
+                workspace_id,
+                agent_id,
+            } => ("agent", agent_id.0.as_str(), workspace_id),
+        }
+    }
+
     fn key(&self) -> OwnedKey {
         match self {
             Self::Workspace(id) => OwnedKey::Workspace(id.clone()),
@@ -393,6 +408,40 @@ impl OwnedPendingDeletes {
         F: FnOnce(PendingDeleteClaim) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        let delay_ms = clamp_undo_delay_ms(delay_ms);
+        let delete_at = intent_core::iso_ms_from_now(delay_ms);
+        self.arm_owned(subject, delete_at, Some(delay_ms), delete)
+            .await
+    }
+
+    /// Re-arms a deadline a previous process stored (Postgres): the timer
+    /// fires at the stored `delete_at`, at once when it already passed.
+    pub(crate) async fn rearm_owned<F, Fut>(
+        &self,
+        subject: PendingDeleteSubject,
+        delete_at: String,
+        delete: F,
+    ) -> Result<PendingDeleteSchedule>
+    where
+        F: FnOnce(PendingDeleteClaim) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.arm_owned(subject, delete_at, None, delete).await
+    }
+
+    /// Arms `subject` at `delete_at`; `requested_delay_ms` is the delay that
+    /// deadline was made from, used as is when the store keeps it.
+    async fn arm_owned<F, Fut>(
+        &self,
+        subject: PendingDeleteSubject,
+        delete_at: String,
+        requested_delay_ms: Option<u64>,
+        delete: F,
+    ) -> Result<PendingDeleteSchedule>
+    where
+        F: FnOnce(PendingDeleteClaim) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let (attempt, fresh) = {
             let mut map = self
                 .inner
@@ -451,17 +500,50 @@ impl OwnedPendingDeletes {
                         () = stopping.closed() => return,
                         () = tokio::time::sleep_until(deadline) => {}
                     }
-                    let claimed = inner
-                        .upgrade()
-                        .and_then(|inner| inner.take_armed(&timer_attempt));
-                    if let Some((claim, handle)) = claimed {
-                        drop(handle); // This timer already owns the original claim.
-                        delete(claim).await;
+                    let Some(inner) = inner.upgrade() else {
+                        return;
+                    };
+                    let Some((claim, handle)) = inner.take_armed(&timer_attempt) else {
+                        return;
+                    };
+                    drop(handle); // This timer already owns the original claim.
+                    // Commit once: only the process that takes the stored
+                    // deadline commits (always granted on SQLite). Gone means
+                    // another process committed it or a cancel removed it.
+                    let (kind, id, _) = timer_attempt.subject.grace_parts();
+                    match inner.store.take_delete_grace(kind, id).await {
+                        Ok(true) => delete(claim).await,
+                        Ok(false) => {
+                            tracing::info!(kind, id, "pending delete already committed or cancelled elsewhere; skipping");
+                        }
+                        Err(e) => {
+                            // The row stays for the next process to re-arm.
+                            tracing::warn!(kind, id, error = %e, "could not take the stored delete deadline; not committing now");
+                        }
                     }
                 })
                 .ok_or_else(|| Error::Internal("pending deletion admission closed".into()))?,
         );
-        let delay_ms = clamp_undo_delay_ms(delay_ms);
+        // Store the deadline before the timer can fire (Postgres; a no-op on
+        // SQLite). A deadline another process already stored wins, so a
+        // re-schedule never extends it. On an error the preparation owner
+        // drops the attempt and nothing is armed.
+        let (kind, id, workspace_id) = attempt.subject.grace_parts();
+        let requested_at = delete_at.clone();
+        let delete_at = self
+            .inner
+            .store
+            .record_delete_grace(&intent_store::DeleteGrace {
+                subject_kind: kind.to_string(),
+                subject_id: id.to_string(),
+                workspace_id: workspace_id.as_str().to_string(),
+                delete_at,
+            })
+            .await?;
+        let delay_ms = match requested_delay_ms {
+            Some(ms) if delete_at == requested_at => ms,
+            _ => ms_until(&delete_at),
+        };
         let (delete_at, timer_deadline) = {
             let mut map = self
                 .inner
@@ -472,7 +554,6 @@ impl OwnedPendingDeletes {
             assert!(map
                 .get(&key)
                 .is_some_and(|entry| Arc::ptr_eq(entry.attempt(), &attempt)));
-            let delete_at = intent_core::iso_ms_from_now(delay_ms);
             let timer_deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms);
             map.insert(
@@ -512,6 +593,13 @@ impl OwnedPendingDeletes {
             return Ok(None);
         };
         timer.abort();
+        // The pending deletion is cancelled or superseded by an immediate
+        // delete: drop its stored deadline so no process re-arms it. A
+        // failure leaves a row that a later commit finds and runs, so log.
+        let (kind, id, _) = attempt.subject.grace_parts();
+        if let Err(e) = self.inner.store.take_delete_grace(kind, id).await {
+            tracing::warn!(kind, id, error = %e, "could not drop the stored delete deadline");
+        }
         Ok(Some(claim))
     }
 
@@ -537,6 +625,15 @@ impl OwnedPendingDeletes {
             .await?;
         Ok(PendingDeleteClaim { subject, guard })
     }
+}
+
+/// Milliseconds from now until the ISO `delete_at` (0 when it passed or
+/// does not parse).
+fn ms_until(delete_at: &str) -> u64 {
+    intent_core::parse_iso(delete_at)
+        .map(|at| (at - time::OffsetDateTime::now_utc()).whole_milliseconds())
+        .and_then(|ms| u64::try_from(ms).ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
