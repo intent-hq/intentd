@@ -1578,7 +1578,7 @@ const MEMORY_BUDGET_MAX_MB_FALLBACK: f64 = 1_024_000.0;
 pub fn host_total_memory_bytes() -> Option<u64> {
     static DETECTED: OnceLock<Option<u64>> = OnceLock::new();
     *DETECTED.get_or_init(|| {
-        let mut sys = sysinfo::System::new();
+        let mut sys = sysinfo::System::new().ok()?;
         sys.refresh_memory();
         Some(sys.total_memory()).filter(|&bytes| bytes > 0)
     })
