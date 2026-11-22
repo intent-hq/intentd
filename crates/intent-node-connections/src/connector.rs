@@ -2563,6 +2563,71 @@ impl RemoteNode {
     }
 }
 
+/// What launching, removing and retargeting a machine ask of its
+/// connector.
+impl RemoteNode {
+    /// The current link, if one is up.
+    #[must_use]
+    pub fn current_link(&self) -> Option<NodeLink> {
+        self.shared.current_link()
+    }
+
+    /// The node protocol of the current or last link.
+    #[must_use]
+    pub fn protocol(&self) -> u32 {
+        self.shared.protocol()
+    }
+
+    /// Whether the machine prepares checkouts itself.
+    #[must_use]
+    pub fn offers_prepared_checkout(&self) -> bool {
+        self.shared.offers_prepared_checkout()
+    }
+
+    /// Live attached agents.
+    #[must_use]
+    pub fn live_agents(&self) -> usize {
+        self.shared.agents.live_count()
+    }
+
+    /// `agent_id` is being launched: a stop queued for it no longer holds.
+    pub fn launching(&self, agent_id: &AgentId) {
+        self.shared.launching(agent_id);
+    }
+
+    /// Whether `agent_id`'s parked runtime is still running, so a launch
+    /// reattaches to it.
+    #[must_use]
+    pub fn reattaches(&self, agent_id: &AgentId) -> bool {
+        self.shared.reattaches(agent_id)
+    }
+
+    /// The tail of `agent_id`'s setup output, and whether it was cut.
+    #[must_use]
+    pub fn setup_output_tail(&self, agent_id: &AgentId) -> Option<(String, bool)> {
+        self.shared.setup_output_tail(agent_id)
+    }
+
+    /// How long a removal waits for the machine's stops.
+    #[must_use]
+    pub fn remove_budget(&self) -> Duration {
+        self.shared.remove_budget()
+    }
+
+    /// Stop `agents`' script runs on the machine by `deadline`; the agents
+    /// whose stop was not acknowledged.
+    pub async fn end_agents_machine_runs(
+        &self,
+        agents: &[AgentId],
+        deadline: Instant,
+        reason: &str,
+    ) -> Vec<AgentId> {
+        self.shared
+            .end_agents_machine_runs(agents, deadline, reason)
+            .await
+    }
+}
+
 /// What a cloud machine's lifecycle (pause, resume, idle reaping) asks of
 /// its connector.
 impl RemoteNode {

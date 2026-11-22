@@ -138,13 +138,13 @@ pub(crate) async fn machine_one_shot(
         let Ok(node) = feature.node(svc, &row.id).await else {
             continue;
         };
-        if node.shared_ref().current_link().is_none() {
+        if node.current_link().is_none() {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             if !matches!(tokio::time::timeout(left, node.connect()).await, Ok(Ok(()))) {
                 continue;
             }
         }
-        if node.shared_ref().protocol() < ONE_SHOT_PROTOCOL {
+        if node.protocol() < ONE_SHOT_PROTOCOL {
             outdated.get_or_insert_with(|| row.name.clone());
             continue;
         }
