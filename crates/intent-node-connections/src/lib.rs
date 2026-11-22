@@ -32,7 +32,7 @@ mod ownership;
 pub mod runtime;
 pub mod view;
 
-pub use connections::{InProcessNodeConnections, NodeConnections};
+pub use connections::{InProcessNodeConnections, LifecycleGuard, NodeConnections};
 pub use inbound::{LinkView, NodeInbound};
 pub use ownership::{process_head_session, Fenced, LinkClaim, LinkOwnership, LocalOwnership};
 

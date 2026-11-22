@@ -153,7 +153,10 @@ impl RemoteFeature {
     }
 
     /// Wait for machine `machine_id`'s lifecycle lock.
-    pub(crate) async fn lifecycle(&self, machine_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(crate) async fn lifecycle(
+        &self,
+        machine_id: &str,
+    ) -> intent_node_connections::LifecycleGuard {
         self.connections.0.lifecycle(machine_id).await
     }
 
