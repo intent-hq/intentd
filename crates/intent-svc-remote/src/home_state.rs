@@ -138,6 +138,45 @@ pub(crate) async fn detach_homes_of_removed(
     Ok(())
 }
 
+/// After a move's rollback: the workspace's restored home, when attached to
+/// a machine this backend no longer has (it removed it as an orchestrator
+/// while the home was moving, so [`detach_homes_of_removed`] skipped it), is
+/// detached at once.
+pub(crate) async fn detach_if_machine_removed(svc: &Services, workspace_id: &WorkspaceId) {
+    let Ok(Some(home)) = svc.store().get_workspace_home(workspace_id).await else {
+        return;
+    };
+    if home.state != HomeState::Attached || home.cloud_machine_id.is_some() {
+        return;
+    }
+    let Some(node_id) = home.node_id.as_deref() else {
+        return;
+    };
+    if !matches!(svc.store().get_exposed_machine(node_id).await, Ok(None)) {
+        return;
+    }
+    match svc
+        .store()
+        .move_workspace_home_state(
+            workspace_id,
+            &home.home_id,
+            HomeState::Attached,
+            HomeState::Detached,
+            &intent_core::now_iso(),
+        )
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(workspace = %workspace_id, machine = %node_id, "remote machine: removed during a failed move; the workspace's home is detached");
+            svc.publish_workspace_home_changed(workspace_id).await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not detach the workspace's home");
+        }
+    }
+}
+
 /// After a bind: each detached home of the machine is attached again. The
 /// failing backup streak its loss began goes on until a backup arrives
 /// ("Continuous backup": the warning holds until the next success); the

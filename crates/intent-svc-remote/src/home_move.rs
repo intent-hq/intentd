@@ -359,6 +359,11 @@ async fn rollback(svc: &Services, home_move: &HomeMove) {
             // The target may have opened although its reply was lost: its
             // stop ends its setup and backups and removes the checkout.
             crate::homes::send_workspace_stops(svc, workspace_id).await;
+            // An old home whose machine was removed meanwhile (it became an
+            // orchestrator) is detached now: no connector is left to time
+            // the link-loss grace, and an attached home would make the next
+            // move ask the forgotten machine for a push.
+            crate::home_state::detach_if_machine_removed(svc, workspace_id).await;
             // An old home whose link went down meanwhile is detached after
             // the link-loss grace, as if it had never moved.
             if let Some(old) = svc

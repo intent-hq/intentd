@@ -890,6 +890,9 @@ async fn forget_orchestrator_once(
     // runs no home stop, so the checkout stays on its disk.
     crate::home_state::detach_homes_of_removed(svc, machine_id).await?;
     forget(svc, machine_id, Some(ORCHESTRATOR_REASON)).await?;
+    // A move that rolled back between the pass above and the row's removal
+    // restored an attached home; a rollback after it detaches its own.
+    crate::home_state::detach_homes_of_removed(svc, machine_id).await?;
     if let Some(node) = feature.take_node(machine_id) {
         node.shutdown();
     }

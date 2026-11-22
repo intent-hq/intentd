@@ -4312,4 +4312,62 @@ mod home_stops {
             .expect("the move ends with the link")
             .unwrap();
     }
+
+    /// A home that is moving when its runner becomes an orchestrator is not
+    /// detached then (it is `moving`); when the move fails, its rollback
+    /// detaches it instead of restoring `attached` to a machine the backend
+    /// no longer knows (a later move would ask that machine for a push).
+    #[tokio::test]
+    async fn a_failed_move_from_a_machine_that_became_an_orchestrator_detaches_its_home() {
+        let backend = Backend::orchestrator().await;
+        let mut machine = backend.machine().await;
+        let node = backend.expose(&mut machine).await;
+        let repo = tempfile::tempdir().unwrap();
+        workspace_at(&backend, repo.path()).await;
+        let store = backend.store().clone();
+        let old = machine_home("h1", &machine.id(), intent_core::HomeState::Attached);
+        store.set_workspace_home(&workspace(), &old).await.unwrap();
+        assert!(store
+            .begin_home_move(&intent_store::HomeMove {
+                workspace_id: workspace(),
+                target: machine_home("h-new", "node-gone", intent_core::HomeState::Attached),
+                from_home_id: old.home_id.clone(),
+                from_state: old.state,
+                from_since: old.since.clone(),
+                pushed: true,
+                started_at: intent_core::now_iso(),
+            })
+            .await
+            .unwrap());
+
+        crate::methods::forget_orchestrator(
+            backend.services.clone(),
+            machine.id(),
+            machine.token.clone(),
+        );
+        let id = machine.id();
+        tokio::time::timeout(wait(), async {
+            while store.get_exposed_machine(&id).await.unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the machine is removed");
+        node.shutdown();
+
+        tokio::time::timeout(
+            wait(),
+            crate::home_move::run(&backend.services, &workspace()),
+        )
+        .await
+        .expect("the move to an unknown machine fails");
+        assert!(store.get_home_move(&workspace()).await.unwrap().is_none());
+        let home = store
+            .get_workspace_home(&workspace())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(home.home_id, HomeId::from("h1"));
+        assert_eq!(home.state, intent_core::HomeState::Detached);
+    }
 }
