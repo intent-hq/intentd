@@ -1974,13 +1974,15 @@ impl RemoteNode {
         if self.shared.demand.send(Some(tx)).is_err() {
             return Err(ConnectFailure::Local("the connector has stopped".into()));
         }
-        let mut limit = self.shared.tuning.connect.total + Duration::from_secs(5);
-        if self.shared.target().gate.is_some() {
-            // A cloud machine's dial resumes its sandbox first: waiting less
-            // reported a refused resume (relay-unreachable) as unreachable
-            // routes (intent#9825).
-            limit += crate::cloud::lifecycle::RESUME_BOUND;
-        }
+        // A cloud machine's dial resumes its sandbox first, which can take
+        // minutes: its caller waits for the connector's answer. A shorter
+        // wait reported a refused resume (relay-unreachable) as unreachable
+        // routes (intent#9825).
+        let limit = if self.shared.target().gate.is_some() {
+            crate::cloud::lifecycle::RESUME_BOUND
+        } else {
+            self.shared.tuning.connect.total + Duration::from_secs(5)
+        };
         match tokio::time::timeout(limit, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ConnectFailure::Local("the connector has stopped".into())),

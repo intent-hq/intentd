@@ -35,9 +35,12 @@ use crate::RemoteFeature;
 /// kills it: `autoPause`) when this runs out.
 pub(crate) const SANDBOX_TIMEOUT_SECS: u32 = 30 * 60;
 
-/// Longest a dial's resume may take before the dial: the provider's resume,
-/// a daemon start (its script is bounded at 120 s) and a relay step (240 s).
-pub(crate) const RESUME_BOUND: Duration = Duration::from_secs(7 * 60);
+/// A guard on a caller's wait for a cloud machine's dial. The connector
+/// answers the caller itself once the dial's resume and connect end, each
+/// step bounded (the provider's ready wait, up to 600 s; the start script,
+/// 120 s; the relay script, 240 s); this only ends a wait the connector
+/// never answers.
+pub(crate) const RESUME_BOUND: Duration = Duration::from_secs(30 * 60);
 
 /// Renew the timeout this often while the sandbox runs.
 const RENEW_MINUTES: u32 = 10;
