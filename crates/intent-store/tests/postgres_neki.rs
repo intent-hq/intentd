@@ -32,7 +32,10 @@
 //! bind one fixed schema in the data topology (every table with `tenant_id`
 //! to a shard group with an xxhash index on `tenant_id` spread over two or
 //! more shards, the migration ledger to the authoritative group) and name
-//! it in `INTENT_STORE_NEKI_SHARDED_SCHEMA`. Each sharded test then drops,
+//! it in `INTENT_STORE_NEKI_SHARDED_SCHEMA`. When a migration adds a tenant
+//! table, `migrate` stops until the topology binds it; the tests then bind
+//! it to the schema's tenant group (`migrate_bound`, needs `neki_operator`)
+//! and migrate again, so the topology keeps up with new migrations. Each sharded test then drops,
 //! creates and migrates that schema, keeping the topology, and drops it at
 //! the end; a file lock in cargo's target temp directory
 //! (`CARGO_TARGET_TMPDIR`) runs them one at a time on this host (do not
@@ -58,7 +61,7 @@ async fn exec(pool: &PgPool, sql: String) -> Result<(), String> {
 }
 
 async fn round_trip(pool: PgPool) -> Result<(), String> {
-    postgres::migrate(&pool).await.map_err(|e| e.to_string())?;
+    migrate_bound(&pool).await?;
     let open = |tenant: &'static str| {
         let pool = pool.clone();
         async move {
@@ -96,6 +99,180 @@ async fn round_trip(pool: PgPool) -> Result<(), String> {
     {
         return Err("tenants share a daemon id on Neki".into());
     }
+    Ok(())
+}
+
+/// [`postgres::migrate`], plus the rollout step it leaves to an operator on
+/// a sharded schema: when it stops because the Neki data topology does not
+/// bind a new tenant table (the run on #3642 found `tenant_lease` unbound),
+/// bind the tables it names ([`bind_to_topology`]) and migrate again.
+/// `applied` covers both runs. In an unbound fresh schema, and on a branch
+/// whose topology already binds every table, this is `migrate`.
+async fn migrate_bound(pool: &PgPool) -> Result<postgres::MigrateReport, String> {
+    let before = completed_migrations(pool).await?;
+    let stopped = match postgres::migrate(pool).await {
+        Ok(report) => return Ok(report),
+        Err(e) => e.to_string(),
+    };
+    let gap = postgres::neki_topology_gap(pool)
+        .await
+        .map_err(|e| format!("{stopped}; then reading the topology: {e}"))?;
+    let Some(gap) = gap else {
+        return Err(stopped);
+    };
+    eprintln!("migrate stopped on a topology gap; binding: {gap}");
+    bind_to_topology(pool, &gap).await?;
+    let mut report = postgres::migrate(pool)
+        .await
+        .map_err(|e| format!("migrate after binding: {e}"))?;
+    report.applied = completed_migrations(pool)
+        .await?
+        .into_iter()
+        .filter(|version| !before.contains(version))
+        .collect();
+    Ok(report)
+}
+
+/// The migrations the schema's ledger records complete; none without one.
+async fn completed_migrations(pool: &PgPool) -> Result<Vec<i64>, String> {
+    let (has_ledger,): (bool,) =
+        sqlx::query_as("SELECT to_regclass('intent_schema_migrations') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("look for the ledger: {e}"))?;
+    if !has_ledger {
+        return Ok(Vec::new());
+    }
+    sqlx::query_scalar("SELECT version FROM intent_schema_migrations WHERE complete ORDER BY 1")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("read the ledger: {e}"))
+}
+
+/// Binds `gap`'s unbound tables to its shard group in the Neki data
+/// topology, as the operator does in the rollout (`neki_operator`): reads
+/// the topology and its revision, adds the tables, sets it at that revision
+/// (`expected_revision`, so a concurrent change fails instead of being
+/// overwritten) and waits until every router has it. Tables bound to another
+/// group are an error: moving rows between groups is not a test's call.
+async fn bind_to_topology(pool: &PgPool, gap: &postgres::NekiTopologyGap) -> Result<(), String> {
+    if !gap.misplaced.is_empty() {
+        return Err(format!("{gap}; not moving tables bound to another group"));
+    }
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("connect to bind: {e}"))?
+        .detach();
+    let bound = bind_on(&mut conn, gap).await;
+    let _ = sqlx::Connection::close(conn).await;
+    bound
+}
+
+/// A string as a SQL literal of unknown type, so Postgres reads it as
+/// whatever type the `__neki` function parameter has.
+fn sql_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// The single row `call` (a set-returning call) yields, as a JSON object.
+async fn neki_row(conn: &mut sqlx::PgConnection, call: &str) -> Result<serde_json::Value, String> {
+    let sql = format!("SELECT to_jsonb(r)::text FROM (SELECT * FROM {call}) AS r");
+    let row: String = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .fetch_one(&mut *conn)
+        .await
+        .and_then(|row| sqlx::Row::try_get(&row, 0))
+        .map_err(|e| format!("{}: {e}", call.split('(').next().unwrap_or(call)))?;
+    serde_json::from_str(&row).map_err(|e| format!("parse {row}: {e}"))
+}
+
+/// The revision in a `__neki` result row: its `revision` field, else its
+/// only `*revision` number that is not the one it was based on, else its
+/// only number.
+fn revision_in(row: &serde_json::Value) -> Result<i64, String> {
+    if let Some(revision) = row["revision"].as_i64() {
+        return Ok(revision);
+    }
+    let fields: Vec<(&String, i64)> = row
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, value)| Some((name, value.as_i64()?)))
+        .collect();
+    let named: Vec<i64> = fields
+        .iter()
+        .filter(|(name, _)| name.ends_with("revision") && !name.contains("based"))
+        .map(|(_, revision)| *revision)
+        .collect();
+    if let [revision] = named.as_slice() {
+        return Ok(*revision);
+    }
+    let numbers: Vec<i64> = fields.iter().map(|(_, n)| *n).collect();
+    match numbers.as_slice() {
+        [revision] => Ok(*revision),
+        _ => Err(format!("no revision in {row}")),
+    }
+}
+
+async fn bind_on(
+    conn: &mut sqlx::PgConnection,
+    gap: &postgres::NekiTopologyGap,
+) -> Result<(), String> {
+    let run = |sql: String| sqlx::raw_sql(sqlx::AssertSqlSafe(sql));
+    run("SET __neki.tx_mode = 'multi'".to_owned())
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("multi-shard mode: {e}"))?;
+    let revision = revision_in(&neki_row(conn, "__neki.get_data_topology_revision()").await?)?;
+    let doc: String = sqlx::query_scalar("SELECT __neki.get_data_topology()::text")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| format!("read the data topology: {e}"))?;
+    let mut topology: serde_json::Value =
+        serde_json::from_str(&doc).map_err(|e| format!("parse the topology: {e}"))?;
+    for table in &gap.unbound {
+        topology["databases"][&gap.database]["schemas"][&gap.schema]["tables"][table] =
+            serde_json::json!({ "shard_group": gap.shard_group });
+    }
+    let topology = sql_literal(&topology.to_string());
+    let findings: Vec<String> = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "SELECT to_jsonb(f)::text FROM __neki.validate_data_topology({topology}, \
+         '{{\"overwrite\":true}}') AS f"
+    )))
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| format!("validate the topology: {e}"))?
+    .iter()
+    .map(|row| sqlx::Row::try_get(row, 0))
+    .collect::<Result<_, _>>()
+    .map_err(|e| format!("read the findings: {e}"))?;
+    eprintln!("topology revision {revision}: validation findings {findings:?}");
+    let options = serde_json::json!({
+        "comment": format!(
+            "intent-store postgres_neki: bind {} to {}",
+            gap.unbound.join(", "),
+            gap.shard_group
+        ),
+        "expected_revision": revision,
+    });
+    let set = neki_row(
+        conn,
+        &format!(
+            "__neki.set_data_topology({topology}, true, {})",
+            sql_literal(&options.to_string())
+        ),
+    )
+    .await?;
+    let applied = revision_in(&set)?;
+    run(format!("SELECT __neki.wait_for_data_topology({applied})"))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("wait for topology revision {applied}: {e}"))?;
+    eprintln!(
+        "bound {} to {} at topology revision {applied}",
+        gap.unbound.join(", "),
+        gap.shard_group
+    );
     Ok(())
 }
 
@@ -397,7 +574,7 @@ async fn writers_of_one_tenant_exclude_each_other_on_sharded_neki() {
     };
     let connections = u32::try_from(writer_race::PROCESSES).expect("small") + 1;
     in_sharded_schema(&url, connections, true, |pool| async move {
-        postgres::migrate(&pool)
+        migrate_bound(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
         // A patient budget: the race measures lost updates, not latency
@@ -428,7 +605,7 @@ async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki
     };
     let fixed = matches!(sharded_run_schema(), RunSchema::Fixed(_));
     in_sharded_schema(&url, 2, true, |pool| async move {
-        postgres::migrate(&pool).await.map_err(|e| e.to_string())?;
+        migrate_bound(&pool).await?;
         // A fresh schema is not in the data topology, so all its tenants
         // share the authoritative shard; only the fixed schema is sharded.
         let placement = |tenant: String| {
@@ -529,7 +706,7 @@ async fn a_held_writer_lock_times_out_as_55p03_and_store_busy_on_neki() {
     };
     in_sharded_schema(&url, 3, true, |pool| async move {
         use std::time::Duration;
-        postgres::migrate(&pool)
+        migrate_bound(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
         let tenant = format!("neki-timeout-{}", uuid::Uuid::new_v4().simple());
@@ -659,7 +836,7 @@ async fn migrate_waits_for_ddl_and_open_checks_the_schema_on_neki() {
             return Err("the refused open created the migration ledger".into());
         }
 
-        let first = postgres::migrate(&pool)
+        let first = migrate_bound(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
         eprintln!("first migrate: {first:?}");
@@ -723,16 +900,17 @@ fn fixed_sharded_target() -> Option<String> {
 /// The fixed schema's data topology: after every migration, each table
 /// with a `tenant_id` column is bound to a shard group whose index hashes
 /// `tenant_id` (xxhash) over two or more shards, and each table without
-/// one to the authoritative group. A migration that adds a table fails
-/// this until the topology binds it, instead of the table silently landing
-/// on the authoritative shard.
+/// one to the authoritative group. A migration that adds a tenant table
+/// stops `migrate` until the topology binds it ([`migrate_bound`] binds it
+/// here, as the operator does in a rollout); a table without `tenant_id`
+/// fails this until it is bound to the authoritative group by hand.
 #[tokio::test]
 async fn the_data_topology_binds_every_table_of_the_fixed_schema() {
     let Some(url) = fixed_sharded_target() else {
         return;
     };
     in_sharded_schema(&url, 2, false, |pool| async move {
-        postgres::migrate(&pool)
+        migrate_bound(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
         let (database, schema): (String, String) =
@@ -825,7 +1003,7 @@ async fn tenants_route_to_different_shards_in_the_fixed_schema() {
         return;
     };
     in_sharded_schema(&url, 2, true, |pool| async move {
-        postgres::migrate(&pool)
+        migrate_bound(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
         // The authoritative group has one open key range: its uid is its shard's.
@@ -891,7 +1069,7 @@ async fn identity_inserts_run_in_single_shard_transactions_on_tenant_shards() {
         return;
     };
     in_sharded_schema(&url, 2, true, |pool| async move {
-        postgres::migrate(&pool)
+        migrate_bound(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
         let run = uuid::Uuid::new_v4().simple().to_string();
@@ -961,7 +1139,7 @@ async fn writer_locks_of_tenants_on_other_shards_do_not_block() {
     };
     in_sharded_schema(&url, 4, true, |pool| async move {
         use std::time::{Duration, Instant};
-        postgres::migrate(&pool)
+        migrate_bound(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
         let run = uuid::Uuid::new_v4().simple().to_string();

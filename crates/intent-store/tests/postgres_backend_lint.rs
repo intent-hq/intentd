@@ -232,9 +232,15 @@ const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "mod.rs",
-        "migrate_with",
+        "migrate_once",
         "schema migration, not a tenant read: runs DDL on one detached connection under the \
          migration advisory lock, and each step records its own progress so a crash resumes",
+    ),
+    (
+        "neki_topology.rs",
+        "neki_topology_gap",
+        "not a tenant read: reads the Neki data topology and the schema's catalog for the \
+         migrate job and operators, on one detached connection in multi-shard mode",
     ),
 ];
 
