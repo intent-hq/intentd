@@ -415,10 +415,13 @@ overrides the `agy` executable.
 The daemon never sends `authenticate`, because it opens a browser. A signed-out
 `session/new` returns "Authentication required".
 
-Catalog and auth probes start `agy acp --app-data-dir antigravity-intent-probe`
-(`intent_providers::antigravity::PROBE_APP_DATA_DIR`), so probe sessions do not
-appear in the user's agy history. The directory is relative to `~/.gemini`;
-agy rejects an absolute path.
+Catalog and auth probes start `agy acp --gemini-dir <tempdir>` with a fresh
+ephemeral directory (keeping the default `--app-data-dir antigravity-cli`),
+seeding only file-backed auth files (`antigravity-oauth-token` and
+`cache/acp-auth-state.json`) from `~/.gemini/antigravity-cli` with private
+permissions (`0700`/`0600`). This keeps probe sessions out of the user's agy
+history while recognizing standard `agy acp --login` sign-in on headless Linux
+hosts without an OS keyring.
 
 The catalog lists the base models of `configOptions[id="model"]` with the
 `thought_level` select as reasoning efforts. `session/set_config_option` accepts
