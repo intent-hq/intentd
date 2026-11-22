@@ -5,4 +5,5 @@
 
 pub(crate) mod home_scripts;
 pub(crate) mod home_state;
+pub(crate) mod homes;
 pub(crate) mod terminals;

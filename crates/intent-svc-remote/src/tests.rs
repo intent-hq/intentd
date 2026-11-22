@@ -1505,6 +1505,24 @@ impl intent_node_connections::NodeInbound for Recording {
         Box::pin(async {})
     }
 
+    fn homes_after_bind(&self, _: Arc<dyn intent_node_connections::LinkView>) {}
+
+    fn home_record<'a>(
+        &'a self,
+        _: &'a dyn intent_node_connections::LinkView,
+        _: JournalRecord,
+    ) -> intent_core::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn home_stop_acked(
+        &self,
+        _: Arc<dyn intent_node_connections::LinkView>,
+        _: intent_core::node_link::HomeStopAck,
+    ) -> intent_core::BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
     fn homes_link_lost<'a>(
         &'a self,
         _: &'a dyn intent_node_connections::LinkView,

@@ -422,7 +422,7 @@ pub(crate) struct Shared {
     /// backup warnings (nodes.md "Detached workspaces").
     pub(crate) home_link: crate::home_state::HomeLink,
     /// A worker resends this machine's pending home stops on a timer
-    /// ([`crate::homes::ensure_stop_resends`]).
+    /// ([`crate::link::homes::ensure_stop_resends`]).
     pub(crate) home_stop_resends: std::sync::atomic::AtomicBool,
     /// Terminals on this machine's homes (nodeProtocol 19).
     pub(crate) terminals: crate::terminals::HomeTerminals,
@@ -1699,6 +1699,31 @@ impl LinkView for Shared {
         self.current_link().map(|link| link.binding().clone())
     }
 
+    fn lease_id(&self) -> String {
+        Shared::lease_id(self)
+    }
+
+    fn set_holds_homes(&self, holds: bool) {
+        Shared::set_holds_homes(self, holds);
+    }
+
+    fn home_backed_up(&self, home_id: &intent_core::HomeId) {
+        self.home_link.backed_up(home_id);
+    }
+
+    fn send_home_stop<'a>(
+        &'a self,
+        stop: &'a intent_core::node_link::HomeStopRecord,
+    ) -> intent_core::BoxFuture<'a, ()> {
+        Box::pin(crate::link::homes::send_stop(self, stop))
+    }
+
+    fn resend_home_stops(&self) {
+        if let Some(shared) = self.weak().upgrade() {
+            crate::link::homes::ensure_stop_resends(&shared);
+        }
+    }
+
     fn watch_backup_warning(
         &self,
         home_id: &intent_core::HomeId,
@@ -2932,7 +2957,11 @@ async fn run(
             let _ = waiter.send(Ok(()));
         }
         shared.home_link.bound();
-        crate::homes::after_bind(&shared, &link);
+        if link.protocol() >= intent_core::node_link::HOMES_PROTOCOL {
+            if let Some(inbound) = shared.inbound() {
+                inbound.homes_after_bind(shared.clone());
+            }
+        }
         shared.terminals.after_bind(&link);
         tracing::info!(
             machine = %target.id,
@@ -3133,7 +3162,9 @@ async fn serve(
                         // Off the ingest loop: it writes the store and may
                         // post a notice.
                         intent_core::spawn_daemon(async move {
-                            crate::homes::stop_acked(&shared, ack).await;
+                            if let Some(inbound) = shared.inbound() {
+                                inbound.home_stop_acked(shared.clone(), ack).await;
+                            }
                         });
                     }
                     LinkEvent::Frame(LinkFrame::HomePushReply(reply)) => {
@@ -3407,7 +3438,9 @@ async fn serve_git(
 /// homes.
 async fn ingest_record(shared: &Shared, record: intent_core::node_link::JournalRecord) {
     let Some(agent_id) = record.agent_id().cloned() else {
-        crate::homes::ingest(shared, record).await;
+        if let Some(inbound) = &shared.inbound {
+            inbound.home_record(shared, record).await;
+        }
         return;
     };
     shared.note_activity();
