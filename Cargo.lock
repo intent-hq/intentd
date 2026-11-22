@@ -2400,6 +2400,7 @@ dependencies = [
  "intent-store",
  "tempfile",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

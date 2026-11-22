@@ -48,11 +48,11 @@ use intent_transport::node_link::{
 
 use crate::agents::Agents;
 use crate::connect::{connect, connect_after_resume, ConnectFailure, ConnectTuning, Connected};
-use crate::ingest::{Ingest, Step};
 use crate::lease::HeadLease;
 use crate::lock;
 use crate::machine::MachineTarget;
 use crate::runtime::RemoteAgentRuntime;
+use intent_node_connections::ingest::{Acks, Ingest, Step};
 
 /// Longest a bind waits to resolve the GitHub token afresh.
 const FORGE_BIND_RESOLVE: Duration = Duration::from_secs(10);
@@ -3022,7 +3022,7 @@ async fn serve(
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ingest.start_link();
     let ended = loop {
-        let due = acks.due;
+        let due = acks.due();
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else { break Ended::Lost };
@@ -3052,7 +3052,7 @@ async fn serve(
                             }
                         }
                         *lock(&shared.ingested) = ingest.ingested();
-                        if acks.record(&shared.tuning) {
+                        if acks.record(shared.tuning.ack_interval, shared.tuning.ack_batch) {
                             acks.flush(lease, link, ingest.ingested()).await;
                         }
                     }
@@ -3216,51 +3216,6 @@ async fn serve(
     // the next hello asks for exactly the rest.
     acks.flush(lease, link, ingest.ingested()).await;
     ended
-}
-
-/// Ack batching for one link.
-#[derive(Default)]
-struct Acks {
-    pending: usize,
-    due: Option<Instant>,
-    persisted: Option<NodeCounter>,
-}
-
-impl Acks {
-    /// Count a received record; `true` when the batch is full.
-    fn record(&mut self, tuning: &Tuning) -> bool {
-        self.pending += 1;
-        if self.due.is_none() {
-            self.due = Some(Instant::now() + tuning.ack_interval);
-        }
-        self.pending >= tuning.ack_batch
-    }
-
-    /// Persist `seq`, then ack it. A failed persist sends no ack, so the
-    /// node keeps the records; a fenced one also closes the link, which
-    /// another process owns now.
-    async fn flush(&mut self, lease: &HeadLease, link: &NodeLink, seq: NodeCounter) {
-        self.pending = 0;
-        self.due = None;
-        if self.persisted != Some(seq) {
-            match lease
-                .persist_ack(seq, Some(link.binding().generation))
-                .await
-            {
-                Ok(_) => self.persisted = Some(seq),
-                Err(error) => {
-                    tracing::warn!(%error, seq = seq.0, "remote node: could not persist the journal ack; not acking");
-                    if matches!(error, crate::lease::LinkWrite::Fenced(_)) {
-                        link.close();
-                    }
-                    return;
-                }
-            }
-        }
-        if !link.is_closed() {
-            let _ = link.send(&LinkFrame::Ack { seq }).await;
-        }
-    }
 }
 
 /// Whether agents that may still run are recorded on `lease_id`: a record

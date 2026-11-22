@@ -7,11 +7,16 @@ repository.workspace = true
 license.workspace = true
 description = "The node-connection service for intentd: machine links, link ownership and fencing; below intent-services"
 
+[features]
+# Test-only seams (failing ack writes) for intent-svc-remote's tests.
+test-support = []
+
 [dependencies]
 intent-core = { workspace = true }
 intent-node-link = { workspace = true }
 intent-store = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
