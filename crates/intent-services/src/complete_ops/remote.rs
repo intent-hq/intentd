@@ -195,9 +195,13 @@ impl Services {
     }
 
     /// `agent.enhancePrompt` on an orchestrator: one `oneShot` (auggie) on
-    /// the first machine that can run it.
+    /// the first machine that can run it. `reference` is the effective
+    /// provider (`auggie` or `auggie@…`): its launch plan decides the profile
+    /// environment sent with the frame, so an `auggie@…` profile runs on its
+    /// own session and the machine's sign-in applies only without one.
     pub(crate) async fn enhance_prompt_on_machine(
         &self,
+        reference: &str,
         prompt: String,
         mode: String,
         model: Option<String>,
@@ -207,6 +211,9 @@ impl Services {
         let timeout = timeout_ms
             .unwrap_or(crate::enhance_ops::DEFAULT_TIMEOUT_MS)
             .min(crate::enhance_ops::MAX_TIMEOUT_MS);
+        let plan = self
+            .remote_launch_plan(reference, RemoteTarget::Machine)
+            .await?;
         let frame = OneShot {
             request_id: uuid::Uuid::new_v4(),
             operation: OneShotOperation::Enhance,
@@ -219,7 +226,10 @@ impl Services {
                 },
                 model,
             }),
-            profile_env: None,
+            profile_env: plan
+                .env
+                .as_ref()
+                .map(|env| LaunchProfileEnv(env.to_node_wire())),
             timeout_ms: timeout,
         };
         let answer = self
@@ -230,7 +240,7 @@ impl Services {
                 MachineOneShotRequest {
                     workspace_id,
                     provider: "auggie".to_owned(),
-                    with_profile: false,
+                    with_profile: plan.env.is_some(),
                     node_id: None,
                     frame,
                 },
@@ -316,7 +326,7 @@ impl Services {
                     input.model.as_deref(),
                     None,
                     timeout,
-                    None,
+                    profile.as_ref(),
                 )
                 .await
                 {

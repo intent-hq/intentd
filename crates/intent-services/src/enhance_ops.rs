@@ -309,8 +309,9 @@ impl Services {
             None => None,
         };
         if !self.may_spawn_provider_locally() {
+            let reference = effective_provider.as_deref().unwrap_or("auggie");
             return self
-                .enhance_prompt_on_machine(prompt, mode, model, workspace_id, timeout_ms)
+                .enhance_prompt_on_machine(reference, prompt, mode, model, workspace_id, timeout_ms)
                 .await;
         }
         let auggie = match &self.auggie_bin {
