@@ -15,12 +15,24 @@
 //! open with [`PostgresBackend::unavailable`].
 //!
 //! Startup order on Postgres: this mode guard, then the schema gate, then
-//! any tenant lease, then serving. The schema gate is part of
+//! the tenant lease, then serving. The schema gate is part of
 //! `Store::open_postgres` (it calls `intent_store::postgres::check_schema`
 //! before it writes), so the open cannot skip it: a daemon whose schema does
 //! not match its build fails with `Error::SchemaMismatch` and writes
 //! nothing. `serve` never migrates; one migrate job
 //! (`intent_store::postgres::migrate`) runs before a rollout.
+//!
+//! The orchestrator opens each tenant with `Store::open_postgres_owned`,
+//! which claims the tenant's fenced lease right after the schema gate and
+//! before any write (provisioning included). So the lease is held before
+//! `cmd_serve_owned` runs any startup sweep (the active-flag reset, the
+//! pending-delete sweep and the rest), all of which need the opened store.
+//! A live lease of another instance refuses the start with
+//! `Error::NotOwner` naming that instance and its expiry, having written
+//! nothing; the daemon must exit rather than serve the tenant. Once open,
+//! `intent_store::postgres::LeaseHeartbeat` renews the lease
+//! (`LEASE_TTL`, `LEASE_RENEW_INTERVAL`) and reports its loss; stopping the
+//! tenant's work on a loss (self-fence) is a later step.
 //!
 //! A set but empty, blank or non-UTF-8 URL is an error, never "unset": a
 //! daemon meant for Postgres must not quietly open the `SQLite` store.
@@ -81,8 +93,9 @@ impl PostgresBackend {
 
     /// The open this build cannot do yet: the Postgres backend is not in any
     /// shipped build. Per-tenant composition will take `url` and the token
-    /// here instead, and open through `Store::open_postgres`, which checks
-    /// the schema before anything else (see the module docs).
+    /// here instead, and open through `Store::open_postgres_owned`, which
+    /// checks the schema and then claims the tenant lease before anything
+    /// else (see the module docs).
     pub fn unavailable(self) -> anyhow::Error {
         let mode = mode_name(self.mode());
         let Self { url, token, .. } = self;

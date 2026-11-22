@@ -50,6 +50,9 @@ use sqlx::Transaction;
 pub use sqlx::postgres::PgPool;
 
 pub(crate) use agents::PreparedPgMonitorMessage;
+pub use lease::{
+    LeaseHeartbeat, LeaseState, TenantClaim, TenantLease, LEASE_RENEW_INTERVAL, LEASE_TTL,
+};
 
 mod agent_messages;
 mod agents;
@@ -65,6 +68,7 @@ mod events;
 mod homes;
 mod hooks;
 mod idempotency;
+mod lease;
 mod mcp_oauth;
 mod nodes;
 mod note_search;
@@ -786,9 +790,16 @@ fn dollar_tag(s: &str) -> Option<&str> {
 pub(crate) struct WriteTx {
     tx: Transaction<'static, Postgres>,
     _slot: tokio::sync::OwnedSemaphorePermit,
+    /// The tenant's `tenant_writer` row as the lock returned it.
+    writer: WriterRow,
 }
 
 impl WriteTx {
+    /// The tenant's fence as this transaction locked it.
+    pub(crate) fn writer(&self) -> &WriterRow {
+        &self.writer
+    }
+
     pub(crate) async fn commit(self) -> std::result::Result<(), sqlx::Error> {
         self.tx.commit().await
     }
@@ -865,8 +876,26 @@ const WRITER_LIMITS_SQL: &str = "SELECT set_config('lock_timeout', $1, true), \
 /// `tenant_writer` row. It names `tenant_id`, so Neki routes it to the
 /// tenant's shard (an advisory lock reads no table and carries no shard key).
 /// No row: the tenant has not written since the table was added.
+///
+/// It returns the row's fence (owner instance and epoch, see [`WriterRow`]).
+/// The fence is compared in Rust, never in the `WHERE`: a stale epoch there
+/// would read as "no row" and send the writer down the seed path. At READ
+/// COMMITTED a `FOR UPDATE` that waited returns the newest committed
+/// version of the row, so a writer that queued behind a takeover sees the
+/// new owner.
 #[doc(hidden)]
-pub const WRITER_LOCK_SQL: &str = "SELECT 1 FROM tenant_writer WHERE tenant_id = $1 FOR UPDATE";
+pub const WRITER_LOCK_SQL: &str =
+    "SELECT owner_instance, epoch FROM tenant_writer WHERE tenant_id = $1 FOR UPDATE";
+
+/// A tenant's fence as its locked `tenant_writer` row holds it: the
+/// instance that owns the tenant (`None`: never claimed) and the tenant's
+/// epoch, which every claim bumps.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct WriterRow {
+    pub owner_instance: Option<String>,
+    pub epoch: i64,
+}
 
 /// Seeds the tenant's `tenant_writer` row ($1). On a conflict with a
 /// concurrent seed it waits for that transaction, under `lock_timeout`.
@@ -885,7 +914,8 @@ const MULTI_SHARD_SQL: &str = "SET __neki.tx_mode = 'multi'";
 /// writer limits (`lock_timeout` = `attempt` for this attempt), seeds the
 /// tenant's lock row if it has none, locks it, then resets `lock_timeout`
 /// to `limits.lock_attempt` for the rest of the transaction. A wait past
-/// `attempt` fails with SQLSTATE 55P03.
+/// `attempt` fails with SQLSTATE 55P03. Returns the locked row's fence; the
+/// caller checks it ([`PgStore::begin_write`] does).
 ///
 /// # Errors
 /// The failed statement's error.
@@ -895,32 +925,34 @@ pub async fn lock_tenant_writer(
     tenant: &str,
     attempt: Duration,
     limits: &WriterLimits,
-) -> std::result::Result<(), sqlx::Error> {
+) -> std::result::Result<WriterRow, sqlx::Error> {
     sqlx::query(WRITER_LIMITS_SQL)
         .bind(millis(attempt))
         .bind(millis(limits.statement_timeout))
         .bind(millis(limits.idle_in_transaction_timeout))
         .execute(&mut *conn)
         .await?;
-    let locked = sqlx::query(WRITER_LOCK_SQL)
+    let locked = sqlx::query_as::<_, WriterRow>(WRITER_LOCK_SQL)
         .bind(tenant)
         .fetch_optional(&mut *conn)
         .await?;
-    if locked.is_none() {
+    let row = if let Some(row) = locked {
+        row
+    } else {
         sqlx::query(WRITER_SEED_SQL)
             .bind(tenant)
             .execute(&mut *conn)
             .await?;
-        sqlx::query(WRITER_LOCK_SQL)
+        sqlx::query_as::<_, WriterRow>(WRITER_LOCK_SQL)
             .bind(tenant)
             .fetch_one(&mut *conn)
-            .await?;
-    }
+            .await?
+    };
     sqlx::query(WRITER_RESET_SQL)
         .bind(millis(limits.lock_attempt))
         .execute(&mut *conn)
         .await?;
-    Ok(())
+    Ok(row)
 }
 
 fn is_lock_timeout(e: &sqlx::Error) -> bool {
@@ -936,6 +968,15 @@ fn writer_busy(tenant: &str, waited: Duration) -> Error {
         "tenant {tenant}'s writer lock stayed held for {} ms; nothing was written",
         waited.as_millis()
     ))
+}
+
+/// Whether [`PgStore::begin_write_as`] checks the tenant's fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fence {
+    /// Every write: the locked row must name this process's claim.
+    Check,
+    /// A claim, which changes the fence under the same lock.
+    Skip,
 }
 
 #[derive(Clone)]
@@ -954,6 +995,9 @@ pub(crate) struct PgStore {
     desktop_writes: crate::desktop_repo::DesktopWrites,
     /// See the [pool contract](self#pool-contract).
     writer_slot: WriterSlot,
+    /// This process's claim on the tenant, checked by every write; see
+    /// [`Self::begin_write`] and `lease`.
+    claim: lease::ClaimSlot,
     /// Keeps the gates above registered for the next open of this tenant;
     /// see `tenant_registry`. Held, not read, outside tests.
     #[cfg_attr(
@@ -1055,7 +1099,22 @@ impl PgStore {
     /// `lock_timeout` is reset to the fixed `lock_attempt` (not the attempt's
     /// budget-cut value) for any other lock the transaction waits on; those
     /// failures stay `Internal`.
+    ///
+    /// **Fence.** With the lock held, the writer compares the locked row's
+    /// owner and epoch with this process's claim on the tenant (`lease`).
+    /// A store whose process claimed the tenant writes only while the row
+    /// still names that claim; a store that never claimed writes only while
+    /// no process ever claimed the tenant. Otherwise the transaction rolls
+    /// back and the call fails with [`Error::NotOwner`], having written
+    /// nothing. The row is read after the lock is granted, at READ
+    /// COMMITTED, so a writer that waited behind a takeover sees it.
     pub(crate) async fn begin_write(&self) -> Result<WriteTx> {
+        self.begin_write_as(Fence::Check).await
+    }
+
+    /// [`Self::begin_write`], with or without the fence check: only a claim
+    /// skips it, because a claim is how the fence changes.
+    pub(crate) async fn begin_write_as(&self, fence: Fence) -> Result<WriteTx> {
         let limits = self.options.writer;
         let started = Instant::now();
         let _waiting = Waiting::new(&self.writer_slot.waiting);
@@ -1089,11 +1148,23 @@ impl PgStore {
             match locked {
                 // The deadline is checked last too: a writer never starts
                 // writing after its budget, however the wait was split.
-                Ok(()) if started.elapsed() > limits.wait_budget => {
+                Ok(_) if started.elapsed() > limits.wait_budget => {
                     let _ = tx.rollback().await;
                     return Err(writer_busy(self.tenant(), started.elapsed()));
                 }
-                Ok(()) => return Ok(WriteTx { tx, _slot: slot }),
+                Ok(writer) => {
+                    if fence == Fence::Check {
+                        if let Err(e) = self.claim.check(self.tenant(), &writer) {
+                            let _ = tx.rollback().await;
+                            return Err(e);
+                        }
+                    }
+                    return Ok(WriteTx {
+                        tx,
+                        _slot: slot,
+                        writer,
+                    });
+                }
                 Err(e) if is_lock_timeout(&e) => {
                     let _ = tx.rollback().await;
                     attempts += 1;
@@ -1173,8 +1244,23 @@ impl crate::Store {
         options: PostgresOptions,
         key: String,
     ) -> Result<Self> {
+        let store = PgStore::for_key(pool, tenant, options, key);
+        // The schema gate comes first: a daemon whose schema does not match
+        // its build refuses before it writes anything (no seed rows, and no
+        // later startup step such as a lease).
+        check_schema(&store.pool).await?;
+        store.provision().await?;
+        Ok(Self {
+            backend: crate::Backend::Postgres(store),
+        })
+    }
+}
+
+impl PgStore {
+    /// A store sharing the process-local gates registered under `key`.
+    fn for_key(pool: PgPool, tenant: TenantId, options: PostgresOptions, key: String) -> Self {
         let shared = tenant_registry::tenant_state(key);
-        let store = PgStore {
+        PgStore {
             pool,
             tenant,
             options,
@@ -1184,24 +1270,23 @@ impl crate::Store {
             browser_tab_displayed: shared.browser_tab_displayed.clone(),
             desktop_writes: shared.desktop_writes.clone(),
             writer_slot: shared.writer_slot.clone(),
+            claim: shared.claim.clone(),
             tenant_state: shared,
-        };
-        // The schema gate comes first: a daemon whose schema does not match
-        // its build refuses before it writes anything (no seed rows, and no
-        // later startup step such as a lease).
-        check_schema(&store.pool).await?;
-        // Provisioning writes the tenant's seed rows, so it runs under the
-        // writer lock like every other write (the lint sees the call as one).
-        let mut tx = store.begin_write().await?;
+        }
+    }
+
+    /// Creates the tenant's seed rows on first use. They are writes, so this
+    /// runs under the writer lock and its fence like every other write (the
+    /// lint sees the call as one): an unclaimed open of a tenant another
+    /// process owns fails `NotOwner` here.
+    async fn provision(&self) -> Result<()> {
+        let mut tx = self.begin_write().await?;
         sqlx::query("SELECT intent_provision_tenant($1)")
-            .bind(store.tenant())
+            .bind(self.tenant())
             .execute(&mut *tx)
             .await
             .map_err(db)?;
-        tx.commit().await.map_err(db)?;
-        Ok(Self {
-            backend: crate::Backend::Postgres(store),
-        })
+        tx.commit().await.map_err(db)
     }
 }
 

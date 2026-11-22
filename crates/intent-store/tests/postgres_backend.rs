@@ -80,6 +80,8 @@ mod script_monitors;
 mod scripts;
 #[path = "postgres_backend/settings.rs"]
 mod settings;
+#[path = "postgres_backend/tenant_lease.rs"]
+mod tenant_lease;
 #[path = "postgres_backend/usage_metrics.rs"]
 mod usage_metrics;
 #[path = "postgres_backend/workspaces.rs"]

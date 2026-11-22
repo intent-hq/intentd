@@ -32,6 +32,16 @@ fn store_busy_code_and_display() {
 }
 
 #[test]
+fn not_owner_code_and_display() {
+    let e = Error::NotOwner("tenant t is owned by instance b (epoch 2)".into());
+    assert_eq!(e.code(), -32603);
+    assert_eq!(
+        e.to_string(),
+        "not the tenant owner: tenant t is owned by instance b (epoch 2)"
+    );
+}
+
+#[test]
 fn schema_mismatch_code_and_display() {
     use intent_core::error::SchemaMismatch;
     let mismatch = |applied: Vec<i64>, changed: Vec<i64>, part_way: Vec<i64>| {

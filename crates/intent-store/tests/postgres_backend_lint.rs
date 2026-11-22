@@ -202,10 +202,23 @@ const DEFERRED_WRITES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The function that takes the tenant writer lock, as `(file, function,
-/// table)`: it may write `table` (seeding the tenant's lock row) without
-/// the lock, because writing that row is how the lock is taken.
-const WRITER_LOCK_TAKER: (&str, &str, &str) = ("mod.rs", "lock_tenant_writer", "tenant_writer");
+/// Functions that may write one table without the writer lock, as `(file,
+/// function, table, why)`.
+const UNLOCKED_TABLE_WRITES: &[(&str, &str, &str, &str)] = &[
+    (
+        "mod.rs",
+        "lock_tenant_writer",
+        "tenant_writer",
+        "seeds the tenant's lock row: writing that row is how the lock is taken",
+    ),
+    (
+        "lease.rs",
+        "renew_lease",
+        "tenant_lease",
+        "the lease heartbeat renews outside the writer lock so a busy tenant cannot starve \
+         it; it matches owner and epoch, and a claim locks the lease row",
+    ),
+];
 
 /// Reads allowed to run more than one statement without one snapshot (on
 /// a plain `begin()`, an acquired connection or the pool), as `(file,
@@ -213,7 +226,7 @@ const WRITER_LOCK_TAKER: (&str, &str, &str) = ("mod.rs", "lock_tenant_writer", "
 const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[
     (
         "mod.rs",
-        "begin_write",
+        "begin_write_as",
         "not a read: sets the writer limits and takes the tenant writer lock \
          (lock_tenant_writer) on the transaction it then returns as WriteTx",
     ),
@@ -230,7 +243,7 @@ const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[
 const BEGIN_ESCAPE_ALLOWED: &[(&str, &str, &str)] = &[
     (
         "mod.rs",
-        "begin_write",
+        "begin_write_as",
         "wraps the transaction in WriteTx once it holds the writer lock; every WriteTx \
          is a write transaction, which rule 2 checks",
     ),
@@ -447,12 +460,16 @@ fn check(
                         for v in postgres_ast::violations(&stmts, &exempt) {
                             tenant.insert(format!("{at}: {v} is not filtered by tenant_id = $n"));
                         }
-                        let (taker_file, taker, seeded) = WRITER_LOCK_TAKER;
-                        let is_taker =
-                            file_name.as_deref() == Some(taker_file) && u.function == taker;
+                        let unlocked_ok = |t: &str| {
+                            UNLOCKED_TABLE_WRITES.iter().any(|(f, func, table, _)| {
+                                file_name.as_deref() == Some(*f)
+                                    && u.function == *func
+                                    && t == *table
+                            })
+                        };
                         let writes = postgres_ast::written_tables(&stmts)
                             .into_iter()
-                            .any(|t| !exempt.contains(&t.as_str()) && (!is_taker || t != seeded))
+                            .any(|t| !exempt.contains(&t.as_str()) && !unlocked_ok(&t))
                             || postgres_ast::called_functions(&stmts)
                                 .iter()
                                 .any(|f| writing.contains(f));
@@ -2408,4 +2425,176 @@ fn rule5_messages_and_keys_fit_the_finding() {
     );
     assert!(found.is_empty());
     assert!(used.contains(&("sub/mod.rs".to_owned(), "b".to_owned())));
+}
+
+/// Who may move the tenant fence or write the lease, as `(const, function)`
+/// in `src/postgres/lease.rs`: each SQL const that writes `tenant_lease` or
+/// sets `tenant_writer`'s owner and epoch, and the one function that runs
+/// it. `Fence::Skip` (a writer lock without the fence check) is for the
+/// claim alone.
+const FENCE_MOVERS: &[(&str, &str)] = &[
+    ("LEASE_TAKE_SQL", "claim_lease"),
+    ("FENCE_MOVE_SQL", "claim_lease"),
+    ("LEASE_RENEW_SQL", "renew_lease"),
+];
+const FENCE_SKIPPER: &str = "claim_lease";
+
+/// What one source file says about the fence: per function, the
+/// `FENCE_MOVERS` consts and `Fence::Skip` it names; per string literal
+/// that writes the lease or the fence columns, the const it belongs to.
+#[derive(Default)]
+struct FenceUses {
+    /// `(function, used name)`; `Fence::Skip` is recorded as `Fence::Skip`.
+    names: Vec<(String, String)>,
+    /// `(enclosing const or function, literal)` for literals that move
+    /// the fence.
+    writers: Vec<(String, String)>,
+    /// The const or function being visited.
+    scope: Vec<String>,
+}
+
+fn moves_the_fence(sql: &str) -> bool {
+    let sql = sql
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    sql.contains("into tenant_lease")
+        || sql.contains("update tenant_lease")
+        || sql.contains("delete from tenant_lease")
+        || (sql.contains("update tenant_writer") && sql.contains(" set "))
+        || sql.contains("into tenant_writer (tenant_id, owner_instance")
+}
+
+impl<'ast> syn::visit::Visit<'ast> for FenceUses {
+    fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+        self.scope.push(c.ident.to_string());
+        syn::visit::visit_item_const(self, c);
+        self.scope.pop();
+    }
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        self.scope.push(f.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, f);
+        self.scope.pop();
+    }
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        self.scope.push(f.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, f);
+        self.scope.pop();
+    }
+    fn visit_path(&mut self, p: &'ast syn::Path) {
+        let segments: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
+        let name = if segments.ends_with(&["Fence".to_owned(), "Skip".to_owned()]) {
+            Some("Fence::Skip".to_owned())
+        } else {
+            segments
+                .last()
+                .filter(|last| FENCE_MOVERS.iter().any(|(c, _)| c == last))
+                .cloned()
+        };
+        if let (Some(name), Some(scope)) = (name, self.scope.last()) {
+            self.names.push((scope.clone(), name));
+        }
+        syn::visit::visit_path(self, p);
+    }
+    fn visit_lit_str(&mut self, l: &'ast syn::LitStr) {
+        let value = l.value();
+        if moves_the_fence(&value) {
+            let scope = self.scope.last().cloned().unwrap_or_default();
+            self.writers.push((scope, value));
+        }
+    }
+}
+
+/// Every `(file, scope, what)` that moves the fence outside the allowlist.
+fn fence_problems(sources: &[(PathBuf, String)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (path, text) in sources {
+        let file = path.file_name().map(|f| f.to_string_lossy().into_owned());
+        let in_lease = file.as_deref() == Some("lease.rs");
+        let parsed = syn::parse_file(text).expect("parse source");
+        let mut uses = FenceUses::default();
+        syn::visit::Visit::visit_file(&mut uses, &parsed);
+        for (scope, name) in &uses.names {
+            let allowed = in_lease
+                && if name == "Fence::Skip" {
+                    scope == FENCE_SKIPPER
+                } else {
+                    FENCE_MOVERS.iter().any(|(c, f)| c == name && f == scope)
+                };
+            if !allowed {
+                problems.push(format!("{}: `{scope}` uses {name}", path.display()));
+            }
+        }
+        for (scope, sql) in &uses.writers {
+            if !(in_lease && FENCE_MOVERS.iter().any(|(c, _)| c == scope)) {
+                problems.push(format!(
+                    "{}: `{scope}` writes the tenant lease or fence: {sql}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// Rule 1 of the lease: only the claim moves the fence (and skips its
+/// check), and only the claim and the renewal write the lease. The renewal
+/// matches the claim's owner and epoch, so it cannot extend a lease it lost.
+#[test]
+fn only_the_claim_moves_the_fence_and_only_claim_and_renewal_write_the_lease() {
+    let mut files = Vec::new();
+    rust_files(&src().join("postgres"), &mut files);
+    files.sort();
+    let sources: Vec<(PathBuf, String)> = files
+        .into_iter()
+        .map(|f| {
+            let text = std::fs::read_to_string(&f).expect("read");
+            (f, text)
+        })
+        .collect();
+    let problems = fence_problems(&sources);
+    assert!(
+        problems.is_empty(),
+        "only lease.rs's claim_lease may move the fence or skip its check, and only \
+         claim_lease and renew_lease may write tenant_lease (FENCE_MOVERS):\n{}",
+        problems.join("\n")
+    );
+    let lease = std::fs::read_to_string(src().join("postgres/lease.rs")).expect("read lease.rs");
+    let renew = lease
+        .split("const LEASE_RENEW_SQL")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("LEASE_RENEW_SQL");
+    assert!(
+        renew.contains("owner_instance = $2 AND epoch = $3"),
+        "the renewal must match the claim's owner and epoch: {renew}"
+    );
+}
+
+#[test]
+fn the_fence_lint_flags_a_new_fence_mover() {
+    let lease = PathBuf::from("src/postgres/lease.rs");
+    let other = PathBuf::from("src/postgres/notes.rs");
+    let ok = "const FENCE_MOVE_SQL: &str = \"UPDATE tenant_writer SET epoch = $2 WHERE tenant_id = $1\";\n\
+              fn claim_lease() { let _ = (Fence::Skip, FENCE_MOVE_SQL); }\n";
+    assert!(fence_problems(&[(lease.clone(), ok.to_owned())]).is_empty());
+    for (path, bad) in [
+        (&lease, "fn other() { let _ = Fence::Skip; }\n"),
+        (&lease, "fn other() { let _ = FENCE_MOVE_SQL; }\n"),
+        (&lease, "fn renew_lease() { let _ = LEASE_TAKE_SQL; }\n"),
+        (
+            &other,
+            "fn bump() { q(\"UPDATE tenant_writer SET epoch = epoch + 1 WHERE tenant_id = $1\"); }\n",
+        ),
+        (
+            &other,
+            "fn renew() { q(\"UPDATE tenant_lease SET expires_at = now() WHERE tenant_id = $1\"); }\n",
+        ),
+    ] {
+        assert!(
+            !fence_problems(&[(path.clone(), bad.to_owned())]).is_empty(),
+            "not flagged: {bad}"
+        );
+    }
 }

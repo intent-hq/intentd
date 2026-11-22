@@ -49,6 +49,9 @@ pub(crate) struct TenantState {
     pub(crate) browser_tab_displayed: DisplayedOverlay,
     pub(crate) desktop_writes: DesktopWrites,
     pub(crate) writer_slot: WriterSlot,
+    /// This process's claim on the tenant (`lease`), shared so a claim
+    /// through one store fences every store of the tenant in the process.
+    pub(crate) claim: super::lease::ClaimSlot,
 }
 
 static TENANTS: OnceLock<Mutex<HashMap<String, Weak<TenantState>>>> = OnceLock::new();
@@ -103,7 +106,7 @@ impl crate::Store {
     /// Test-only: for each process-local gate, whether this store and
     /// `other` share it. `None` unless both are Postgres stores.
     #[must_use]
-    pub fn postgres_shared_gates(&self, other: &crate::Store) -> Option<[(&'static str, bool); 6]> {
+    pub fn postgres_shared_gates(&self, other: &crate::Store) -> Option<[(&'static str, bool); 7]> {
         let (crate::Backend::Postgres(a), crate::Backend::Postgres(b)) =
             (&self.backend, &other.backend)
         else {
@@ -122,6 +125,7 @@ impl crate::Store {
             browser_tab_displayed,
             desktop_writes,
             writer_slot,
+            claim,
             tenant_state,
         } = a;
         // A gate is shared when both stores hold the same one and it is the
@@ -156,6 +160,10 @@ impl crate::Store {
                 "writer_slot",
                 writer_slot.same_as(&b.writer_slot)
                     && writer_slot.same_as(&tenant_state.writer_slot),
+            ),
+            (
+                "claim",
+                claim.same_as(&b.claim) && claim.same_as(&tenant_state.claim),
             ),
         ])
     }
