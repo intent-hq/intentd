@@ -7437,17 +7437,19 @@ impl crate::SqliteStore {
         prestaged: bool,
         origin: UsageMessageOrigin,
     ) -> Result<AgentMessage> {
+        // `seq` is NOT read here: the INSERT below allocates it as
+        // `MAX(seq) + 1` on the single write connection, so two concurrent
+        // appends for one agent (a finishing turn and an out-of-turn notice,
+        // or a user send) can never compute the same value and lose a row to
+        // the `UNIQUE(agent_id, seq)` check.
         let row = sqlx::query(
-            "SELECT COALESCE(NULLIF(resolved_model,''), NULLIF(model,''), 'unknown') AS model, \
-             (SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_message WHERE agent_id = ?) AS next \
+            "SELECT COALESCE(NULLIF(resolved_model,''), NULLIF(model,''), 'unknown') AS model \
              FROM agent_session WHERE id = ?",
         )
-        .bind(&agent_id.0)
         .bind(&agent_id.0)
         .fetch_one(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("message provenance read failed: {e}")))?;
-        let seq = row.get::<i64, _>("next");
         let usage_model = row.get::<String, _>("model");
         let metadata_json = match metadata {
             Some(m) => Some(
@@ -7526,26 +7528,27 @@ impl crate::SqliteStore {
         };
         let sql = format!(
             "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}, usage_model, usage_origin) \
-             VALUES (?,?,?,?,?,?,?,?,?)"
+             VALUES (?,?,(SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_message WHERE agent_id = ?),\
+             ?,?,?,?,?,?) RETURNING seq"
         );
-        if preview_update.is_none()
+        let seq = if preview_update.is_none()
             && payload_rows.is_empty()
             && stale_keys.is_empty()
             && origin == UsageMessageOrigin::Excluded
         {
-            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(id)
                 .bind(&agent_id.0)
-                .bind(seq)
+                .bind(&agent_id.0)
                 .bind(role)
                 .bind(&content_json)
                 .bind(metadata_json.as_deref())
                 .bind(created_at)
                 .bind(&usage_model)
                 .bind(origin.as_db())
-                .execute(self.write_pool())
+                .fetch_one(self.write_pool())
                 .await
-                .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?
         } else {
             let pool = self.write_pool();
             // A user/assistant append is by construction the session's
@@ -7563,17 +7566,17 @@ impl crate::SqliteStore {
                 let mut tx = pool.begin().await.map_err(|e| {
                     Error::Internal(format!("append agent message begin failed: {e}"))
                 })?;
-                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                let seq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()))
                     .bind(id)
                     .bind(&agent_id.0)
-                    .bind(seq)
+                    .bind(&agent_id.0)
                     .bind(role)
                     .bind(&content_json)
                     .bind(metadata_json.as_deref())
                     .bind(created_at)
                     .bind(&usage_model)
                     .bind(origin.as_db())
-                    .execute(&mut *tx)
+                    .fetch_one(&mut *tx)
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
                 insert_payload_rows(&mut tx, id, &agent_id.0, &payload_rows).await?;
@@ -7633,10 +7636,10 @@ impl crate::SqliteStore {
                 tx.commit().await.map_err(|e| {
                     Error::Internal(format!("append agent message commit failed: {e}"))
                 })?;
-                Ok(())
+                Ok(seq)
             })
-            .await?;
-        }
+            .await?
+        };
         Ok(AgentMessage {
             id: id.to_string(),
             agent_id: agent_id.clone(),

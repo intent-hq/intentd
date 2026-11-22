@@ -29,19 +29,6 @@ fn agent_not_found(e: Error) -> Error {
     }
 }
 
-/// Bound on notice-row appends that lost the transcript `seq` race.
-const MAX_NOTICE_APPEND_ATTEMPTS: usize = 8;
-
-/// Whether `e` is the `UNIQUE(agent_id, seq)` violation of two concurrent
-/// transcript appends (`SQLite` or Postgres wording).
-fn is_seq_conflict(e: &Error) -> bool {
-    let Error::Internal(message) = e else {
-        return false;
-    };
-    message.contains("agent_message.agent_id, agent_message.seq")
-        || (message.contains("duplicate key") && message.contains("agent_message"))
-}
-
 impl Services {
     /// The agent's workspace and stored goal after the caller gates.
     /// Membership is checked on the same terms as `agent.sendMessage` /
@@ -157,33 +144,18 @@ impl Services {
             goal,
             principal.as_ref().map(|p| p.0.as_str()),
         );
-        // The append allocates the next transcript `seq` before inserting, so
-        // a concurrent append for the same agent (another goal write, a user
-        // send) can take the same `seq` and fail the `UNIQUE(agent_id, seq)`
-        // check. Nothing was written then; recompute and retry. The other
-        // writer gets no such retry: like every out-of-turn notice
-        // (`model_changed`, dismissed questions) this append can, in the
-        // millisecond SELECT→INSERT window, make a racing turn or user append
-        // fail. Allocating `seq` inside the store's insert would close it for
-        // every writer.
-        let mut attempt = 0;
-        let message = loop {
-            attempt += 1;
-            match self
-                .store
-                .append_agent_message_with_metadata(
-                    agent_id,
-                    "system",
-                    &content,
-                    Some(&metadata),
-                    &intent_core::now_iso(),
-                )
-                .await
-            {
-                Err(e) if attempt < MAX_NOTICE_APPEND_ATTEMPTS && is_seq_conflict(&e) => {}
-                other => break other?,
-            }
-        };
+        // The store allocates `seq` inside the insert, so this out-of-turn
+        // append can never collide with a finishing turn or a user send.
+        let message = self
+            .store
+            .append_agent_message_with_metadata(
+                agent_id,
+                "system",
+                &content,
+                Some(&metadata),
+                &intent_core::now_iso(),
+            )
+            .await?;
         self.invalidate_agent_list_cache(workspace_id);
         self.publish_agent_message_events(workspace_id, agent_id, &message, None)
             .await;

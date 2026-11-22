@@ -588,3 +588,58 @@ async fn goal_writes_leave_attention_and_last_message_alone() {
         assert_eq!(lite_after.get(key), lite_before.get(key), "{key}");
     }
 }
+
+/// Regression (intentd#3683 review): an out-of-turn goal notice racing a
+/// turn's assistant append must not take its transcript `seq`. The store
+/// allocates `seq` inside the insert, so every concurrent append lands with
+/// a unique, gap-free `seq`.
+#[intent_test_macros::daemon_test]
+async fn goal_notices_never_steal_a_concurrent_appends_seq() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Goal").await;
+    let before = rows(&svc, &id).await.len();
+    const N: usize = 24;
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..N {
+        let (svc_a, id_a) = (svc.clone(), id.clone());
+        set.spawn(intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            async move {
+                svc_a
+                    .store
+                    .append_agent_message_with_metadata(
+                        &id_a,
+                        "assistant",
+                        &json!([{ "type": "text", "text": format!("answer {i}") }]),
+                        None,
+                        &intent_core::now_iso(),
+                    )
+                    .await
+                    .map(|_| ())
+            },
+        ));
+        let (svc_n, id_n) = (svc.clone(), id.clone());
+        set.spawn(intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            async move {
+                svc_n
+                    // `/goal` alone: a notice row with no goal write, so this
+                    // races only the transcript `seq`, not the goal's own
+                    // compare-and-set (covered by `racing_writers_cannot_both_answer_set`).
+                    .agent_goal_command_op(None, id_n, String::new())
+                    .await
+                    .map(|_| ())
+            },
+        ));
+    }
+    while let Some(joined) = set.join_next().await {
+        joined
+            .expect("task")
+            .expect("every concurrent append lands");
+    }
+    let rows = rows(&svc, &id).await;
+    assert_eq!(rows.len(), before + 2 * N);
+    let seqs: Vec<i64> = rows.iter().map(|m| m.seq).collect();
+    let expected: Vec<i64> = (0..i64::try_from(rows.len()).unwrap()).collect();
+    assert_eq!(seqs, expected, "unique, gap-free seq");
+}
