@@ -30,8 +30,8 @@
 //! - `unsloth` — HTTP fetch of the Hugging Face `unsloth` org's GGUF repos
 //!   ([`UNSLOTH_HF_API_URL`]), one wire row per repo (never per-quant),
 //!   limited to repos that output text and are estimated to fit within ~70%
-//!   of total system RAM (the GGUF parameter count, else the size in the repo
-//!   name, × a Q4-class bytes/param estimate). See
+//!   of total system RAM (the larger of the GGUF parameter count and the
+//!   size in the repo name, × a Q4-class bytes/param estimate). See
 //!   [`parse::build_unsloth_rows`].
 //!
 //! auggie (existing CLI path in `agent_ops`) and cortex (open-gate empty

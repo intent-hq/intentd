@@ -2066,14 +2066,21 @@ fn build_unsloth_rows_drops_models_that_do_not_output_text() {
             "{ram:?}: {ids:?}"
         );
     }
+    let legacy = parse_hf_unsloth_response(
+        r#"[{"id":"unsloth/flan-t5-1B-GGUF","pipeline_tag":"text2text-generation"}]"#,
+    );
+    assert_eq!(build_unsloth_rows(&legacy, None).0.len(), 1);
 }
 
 #[test]
-fn build_unsloth_rows_prefers_gguf_total_over_the_name() {
+fn build_unsloth_rows_uses_the_larger_of_gguf_total_and_the_name() {
+    // Live row (2026-11-22): HF sampled the repo's 1.63B `dflash` draft
+    // file, but the name's 120B is the real model: hidden.
     // The name claims 1B but the weights hold 400B parameters: hidden.
     // A zero or missing total falls back to the name's 20B: shown.
     let repos = parse_hf_unsloth_response(
         r#"[
+          {"id":"unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF","downloads":54847,"pipeline_tag":"image-text-to-text","gguf":{"total":1632922404}},
           {"id":"unsloth/Tiny-1B-GGUF","downloads":3,"gguf":{"total":400000000000}},
           {"id":"unsloth/Zero-20B-GGUF","downloads":2,"gguf":{"total":0}},
           {"id":"unsloth/Bare-20B-GGUF","downloads":1,"gguf":null}
@@ -2084,7 +2091,7 @@ fn build_unsloth_rows_prefers_gguf_total_over_the_name() {
         row_ids(&rows),
         ["unsloth/Zero-20B-GGUF", "unsloth/Bare-20B-GGUF"]
     );
-    assert_eq!(hidden, 1);
+    assert_eq!(hidden, 2);
 }
 
 #[test]

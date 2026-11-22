@@ -664,11 +664,18 @@ pub(super) struct HfRepo {
 }
 
 impl HfRepo {
-    /// Total parameters in billions: the GGUF metadata count, else the
-    /// size token in the repo name.
+    /// Total parameters in billions: the larger of the GGUF metadata count
+    /// and the size token in the repo name. HF samples one GGUF file per
+    /// repo, which can be a small draft or projector file rather than the
+    /// main model, so the metadata alone can understate the size.
     fn params_billion(&self) -> Option<f64> {
-        self.gguf_params_billion
-            .or_else(|| parse_param_count_billions(&self.id))
+        match (
+            self.gguf_params_billion,
+            parse_param_count_billions(&self.id),
+        ) {
+            (Some(gguf), Some(name)) => Some(gguf.max(name)),
+            (gguf, name) => gguf.or(name),
+        }
     }
 
     /// Whether the repo can serve a chat agent: its pipeline outputs text, or
@@ -677,7 +684,10 @@ impl HfRepo {
     fn outputs_text(&self) -> bool {
         self.pipeline_tag.as_deref().is_none_or(|tag| {
             tag.ends_with("-to-text")
-                || matches!(tag, "text-generation" | "any-to-any" | "translation")
+                || matches!(
+                    tag,
+                    "text-generation" | "text2text-generation" | "any-to-any" | "translation"
+                )
         })
     }
 }
@@ -872,8 +882,8 @@ fn unsloth_wire_row(repo: &HfRepo) -> Value {
 /// Build the unsloth catalog's wire rows from parsed HF repos: repos that do
 /// not output text are dropped, the rest are sorted by downloads (ties broken
 /// by `trendingScore`, both descending) and filtered to repos whose estimated
-/// footprint fits [`RAM_FIT_FRACTION`] of `total_ram_bytes`. The size comes
-/// from the GGUF metadata, else the repo name. `total_ram_bytes: None` (RAM
+/// footprint fits [`RAM_FIT_FRACTION`] of `total_ram_bytes`. The size is the
+/// larger of the GGUF metadata count and the repo name's size token. `total_ram_bytes: None` (RAM
 /// detection unsupported on this platform) skips the fit filter entirely.
 /// Returns the wire rows plus how many text repos the fit filter hid (too
 /// large, or of unknown size).
