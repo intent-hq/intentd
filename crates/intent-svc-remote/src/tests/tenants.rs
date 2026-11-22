@@ -109,3 +109,27 @@ async fn one_backends_machine_list_change_does_not_wait_for_anothers() {
     set.expect("setOrder");
     drop(held);
 }
+
+#[tokio::test]
+async fn closing_a_backends_links_ends_its_cloud_supervisor() {
+    let backend = Backend::new().await;
+    backend.services.resume_exposed_machines().await;
+    let feature = backend.services.remote_feature().unwrap();
+    tokio::time::timeout(wait(), async {
+        while !feature.cloud.supervisor_running() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the supervisor starts");
+
+    feature.close_links();
+
+    tokio::time::timeout(wait(), async {
+        while feature.cloud.supervisor_running() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a closed backend's supervisor ends, so it makes no more E2B calls");
+}

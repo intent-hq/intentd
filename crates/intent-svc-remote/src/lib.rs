@@ -108,8 +108,19 @@ pub struct RemoteFeature {
     /// ([`order`]): one per backend, so two tenants never wait on each
     /// other.
     pub(crate) order_lock: tokio::sync::Mutex<()>,
-    /// Set by [`RemoteFeature::close_links`]: no connector starts again.
-    closed: std::sync::atomic::AtomicBool,
+    /// Set by [`RemoteFeature::close_links`]: no connector starts again,
+    /// and the feature's background work (the cloud supervisor, home-move
+    /// runners) ends.
+    closed: Closed,
+}
+
+/// [`RemoteFeature::closed`]: `true` once the links were closed.
+struct Closed(tokio::sync::watch::Sender<bool>);
+
+impl Default for Closed {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
 }
 
 /// [`RemoteFeature::head_session`]: picked once per feature, so each start
@@ -175,7 +186,14 @@ impl RemoteFeature {
     /// Whether [`Self::close_links`] ran: no connector starts again.
     #[must_use]
     pub fn links_closed(&self) -> bool {
-        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        *self.closed.0.borrow()
+    }
+
+    /// Wait until [`Self::close_links`] ran. Cancel-safe.
+    pub(crate) async fn closed(&self) {
+        let mut closed = self.closed.0.subscribe();
+        // The sender lives in `self`, so the wait cannot end with an error.
+        let _ = closed.wait_for(|closed| *closed).await;
     }
 
     /// Wait for machine `machine_id`'s lifecycle lock.
@@ -206,7 +224,7 @@ impl RemoteFeature {
     /// tenant must, and start no connector again: a start in flight is shut
     /// down instead of kept. Returns how many were shut down.
     pub fn close_links(&self) -> usize {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.closed.0.send_replace(true);
         let mut closed = 0;
         for node in self.connections.0.all() {
             if let Some(node) = self.connections.0.take(&node.shared_ref().machine_id()) {

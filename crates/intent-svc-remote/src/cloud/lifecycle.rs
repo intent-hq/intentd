@@ -975,25 +975,56 @@ pub(crate) fn spawn_supervisor(svc: &Services) {
         return;
     }
     let svc = svc.clone();
+    let running = RunningFlag::set(&feature.cloud.supervisor_running);
     intent_core::spawn_daemon(async move {
-        if let Err(error) = config::migrate(&svc).await {
-            tracing::warn!(%error, "cloud machines: could not migrate the saved E2B provider");
-        }
-        if svc.workspace_homes() {
-            super::home::reset_after_restart(&svc).await;
-        }
-        let mut last_reap: Option<Instant> = None;
-        loop {
-            let clock = Clock::current();
-            tokio::time::sleep(clock.tick()).await;
-            let Ok(feature) = super::feature(&svc) else {
-                return;
-            };
-            if let Err(error) = tick(&svc, feature, clock, &mut last_reap).await {
-                tracing::debug!(%error, "cloud machines: lifecycle check failed");
-            }
+        let _running = running;
+        // A fenced tenant's links close: its supervisor ends with them,
+        // mid-check included, so it makes no more E2B calls.
+        let Ok(feature) = super::feature(&svc) else {
+            return;
+        };
+        tokio::select! {
+            () = feature.closed() => {}
+            () = supervise(&svc) => {}
         }
     });
+}
+
+/// `true` while held.
+struct RunningFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl RunningFlag {
+    fn set(flag: &Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag.clone())
+    }
+}
+
+impl Drop for RunningFlag {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The supervisor's work: one-time startup steps, then a check every tick.
+async fn supervise(svc: &Services) {
+    if let Err(error) = config::migrate(svc).await {
+        tracing::warn!(%error, "cloud machines: could not migrate the saved E2B provider");
+    }
+    if svc.workspace_homes() {
+        super::home::reset_after_restart(svc).await;
+    }
+    let mut last_reap: Option<Instant> = None;
+    loop {
+        let clock = Clock::current();
+        tokio::time::sleep(clock.tick()).await;
+        let Ok(feature) = super::feature(svc) else {
+            return;
+        };
+        if let Err(error) = tick(svc, feature, clock, &mut last_reap).await {
+            tracing::debug!(%error, "cloud machines: lifecycle check failed");
+        }
+    }
 }
 
 /// One check of every cloud machine, and the reaper when due, per E2B

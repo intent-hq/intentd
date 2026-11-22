@@ -422,9 +422,10 @@ impl TenantRuntime {
     /// Restore and start the tenant's work over `services`, as the daemon
     /// does for its one backend, and register all of it on `runner`, the
     /// tenant's self-fence, which stops it in the fence's order: the
-    /// client connections, the machine links, then the tasks (every sweep
-    /// and loop started here is cancelled, then the PTYs and the agent
-    /// manager are shut down).
+    /// client connections, the machine links (with the remote feature's
+    /// cloud supervisor and home-move runners), then the tasks (every sweep
+    /// and loop started here is cancelled, then the PTYs, the host
+    /// commands and the agent manager are shut down).
     pub async fn start(
         services: &Services,
         data_dir: &Path,
@@ -459,6 +460,7 @@ impl TenantRuntime {
         let stopping = services.clone();
         runner.on_tasks(move || async move {
             stopping.shutdown_pty_sessions().await;
+            stopping.host_exec_runtime().shutdown().await;
             if let Some(manager) = stopping.agent_manager() {
                 manager.shutdown().await;
             }

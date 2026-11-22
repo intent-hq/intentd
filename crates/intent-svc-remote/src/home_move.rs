@@ -215,11 +215,25 @@ fn spawn(svc: &Services, workspace_id: &WorkspaceId) {
     }
     let svc = svc.clone();
     let workspace_id = workspace_id.clone();
-    // Its own task, as the daemon: the move outlives the request.
+    // Its own task, as the daemon: the move outlives the request, but not
+    // the backend's links (a fenced tenant): then the move stays recorded
+    // for whoever serves the tenant next.
     intent_core::spawn_daemon(async move {
         loop {
-            run(&svc, &workspace_id).await;
+            let closed = if let Some(feature) = svc.remote_feature() {
+                tokio::select! {
+                    () = feature.closed() => true,
+                    () = run(&svc, &workspace_id) => false,
+                }
+            } else {
+                run(&svc, &workspace_id).await;
+                false
+            };
             let mut running = crate::lock(&RUNNING);
+            if closed {
+                running.remove(&workspace_id);
+                return;
+            }
             if running.get(&workspace_id) == Some(&true) {
                 running.insert(workspace_id.clone(), false);
                 continue;
