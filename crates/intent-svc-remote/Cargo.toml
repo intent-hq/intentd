@@ -33,6 +33,7 @@ zeroize = "1.9"
 libc = { workspace = true }
 
 [dev-dependencies]
+intent-node-connections = { workspace = true, features = ["test-support"] }
 base64 = { workspace = true }
 intent-services = { workspace = true, features = ["test-hooks"] }
 # Tests seed and inspect SQLite through the test-only raw pools.

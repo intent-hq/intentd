@@ -8,13 +8,22 @@
 //! and continues from the record it got. A gap in the live stream means the
 //! link dropped records; head stops ingesting and rebinds, so the node
 //! replays from head's ack.
+//!
+//! [`Acks`] batches the acks of one link: each is persisted before it is
+//! sent, so the node never deletes a record head could still lose.
 
-use intent_core::node_link::JournalOrder;
+use std::time::Duration;
+
+use intent_core::node_link::{JournalOrder, LinkFrame};
 use intent_core::nodes::NodeCounter;
+use intent_node_link::NodeLink;
+use tokio::time::Instant;
+
+use crate::lease::{HeadLease, LinkWrite};
 
 /// What to do with one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Step {
+pub enum Step {
     /// The next record: ingest it.
     Ingest,
     /// Ingest it; the records in `lost` (inclusive) will never arrive.
@@ -27,14 +36,15 @@ pub(crate) enum Step {
 }
 
 #[derive(Debug)]
-pub(crate) struct Ingest {
+pub struct Ingest {
     ingested: NodeCounter,
     replaying: bool,
 }
 
 impl Ingest {
     /// Start from `ingested`, the highest contiguous sequence head has.
-    pub(crate) fn new(ingested: NodeCounter) -> Self {
+    #[must_use]
+    pub fn new(ingested: NodeCounter) -> Self {
         Self {
             ingested,
             replaying: false,
@@ -42,22 +52,23 @@ impl Ingest {
     }
 
     /// The highest contiguous sequence ingested.
-    pub(crate) fn ingested(&self) -> NodeCounter {
+    #[must_use]
+    pub fn ingested(&self) -> NodeCounter {
         self.ingested
     }
 
     /// A new link was bound: the node replays first.
-    pub(crate) fn start_link(&mut self) {
+    pub fn start_link(&mut self) {
         self.replaying = true;
     }
 
     /// The node finished replaying.
-    pub(crate) fn replay_complete(&mut self) {
+    pub fn replay_complete(&mut self) {
         self.replaying = false;
     }
 
     /// Classify `seq`, advancing the ingested sequence when it is ingested.
-    pub(crate) fn accept(&mut self, seq: NodeCounter) -> Step {
+    pub fn accept(&mut self, seq: NodeCounter) -> Step {
         match JournalOrder::classify(self.ingested, seq) {
             JournalOrder::Next => {
                 self.ingested = seq;
@@ -70,6 +81,58 @@ impl Ingest {
                 Step::IngestAfterLoss { lost }
             }
             JournalOrder::Gap => Step::Resync,
+        }
+    }
+}
+
+/// Ack batching for one link.
+#[derive(Default)]
+pub struct Acks {
+    pending: usize,
+    due: Option<Instant>,
+    persisted: Option<NodeCounter>,
+}
+
+impl Acks {
+    /// When the pending batch must be flushed, if a record is pending.
+    #[must_use]
+    pub fn due(&self) -> Option<Instant> {
+        self.due
+    }
+
+    /// Count a received record; `true` when the batch of `batch` is full.
+    /// The first record of a batch makes it due after `interval`.
+    pub fn record(&mut self, interval: Duration, batch: usize) -> bool {
+        self.pending += 1;
+        if self.due.is_none() {
+            self.due = Some(Instant::now() + interval);
+        }
+        self.pending >= batch
+    }
+
+    /// Persist `seq`, then ack it. A failed persist sends no ack, so the
+    /// node keeps the records; a fenced one also closes the link, which
+    /// another process owns now.
+    pub async fn flush(&mut self, lease: &HeadLease, link: &NodeLink, seq: NodeCounter) {
+        self.pending = 0;
+        self.due = None;
+        if self.persisted != Some(seq) {
+            match lease
+                .persist_ack(seq, Some(link.binding().generation))
+                .await
+            {
+                Ok(_) => self.persisted = Some(seq),
+                Err(error) => {
+                    tracing::warn!(%error, seq = seq.0, "remote node: could not persist the journal ack; not acking");
+                    if matches!(error, LinkWrite::Fenced(_)) {
+                        link.close();
+                    }
+                    return;
+                }
+            }
+        }
+        if !link.is_closed() {
+            let _ = link.send(&LinkFrame::Ack { seq }).await;
         }
     }
 }

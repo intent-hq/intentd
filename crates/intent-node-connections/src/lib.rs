@@ -13,6 +13,8 @@
 //! one code path serves both deployments.
 
 mod inbound;
+pub mod ingest;
+pub mod lease;
 mod ownership;
 
 pub use inbound::{LinkView, NodeInbound};
