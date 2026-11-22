@@ -4203,4 +4203,77 @@ mod home_stops {
             .await
             .unwrap());
     }
+
+    /// A machine holding a home that restarts as an orchestrator is
+    /// removed (nodes.md "An orchestrator leaves its backends"), and its
+    /// homes are detached at once rather than left attached to a machine
+    /// the backend no longer knows: a detached home can move, from its last
+    /// backup, while an attached one would first ask the gone machine for a
+    /// push and fail.
+    #[tokio::test]
+    async fn a_machine_that_becomes_an_orchestrator_detaches_its_homes() {
+        let backend = Backend::orchestrator().await;
+        let mut machine = backend.machine().await;
+        let node = backend.expose(&mut machine).await;
+        let repo = tempfile::tempdir().unwrap();
+        workspace_at(&backend, repo.path()).await;
+        backend
+            .store()
+            .set_workspace_home(
+                &workspace(),
+                &machine_home("h1", &machine.id(), intent_core::HomeState::Attached),
+            )
+            .await
+            .unwrap();
+        let mut changes = backend
+            .bus
+            .subscribe(intent_services::feature_api::SubscriptionFilter {
+                event_types: vec![
+                    intent_core::events::WORKSPACE_UPDATED.to_owned(),
+                    intent_core::events::REMOTE_MACHINE_CHANGED.to_owned(),
+                ],
+                ..Default::default()
+            });
+
+        crate::methods::forget_orchestrator(
+            backend.services.clone(),
+            machine.id(),
+            machine.token.clone(),
+        );
+        let store = backend.store().clone();
+        let id = machine.id();
+        tokio::time::timeout(wait(), async {
+            while store.get_exposed_machine(&id).await.unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the machine is removed");
+
+        let home = store
+            .get_workspace_home(&workspace())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(home.home_id, HomeId::from("h1"));
+        assert_eq!(home.state, intent_core::HomeState::Detached);
+        assert_eq!(home.node_id.as_deref(), Some(id.as_str()));
+        let (mut detached, mut removed) = (false, None);
+        tokio::time::timeout(wait(), async {
+            while !detached || removed.is_none() {
+                for event in changes.recv().await.expect("subscription open") {
+                    detached |= event.data["changes"]["home"]["state"] == "detached";
+                    if event.data["removed"] == true {
+                        removed = Some(event.data.clone());
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the detached home and the removal are announced");
+        let removed = removed.unwrap();
+        assert_eq!(removed["machineId"], id.as_str(), "{removed}");
+        assert_eq!(removed["reason"], "orchestrator", "{removed}");
+        node.shutdown();
+    }
 }

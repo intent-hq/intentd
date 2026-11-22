@@ -112,6 +112,8 @@ async fn a_machine_that_becomes_an_orchestrator_leaves_its_backends() {
         let changed = event(&mut events, "remoteMachine:changed").await;
         if changed["data"]["removed"] == true {
             assert_eq!(changed["data"]["machineId"], machine_id.as_str());
+            // The app says why the runner left.
+            assert_eq!(changed["data"]["reason"], "orchestrator", "{changed}");
             break;
         }
     }

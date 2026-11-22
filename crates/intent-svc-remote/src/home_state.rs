@@ -104,6 +104,40 @@ pub(crate) async fn detach_homes(svc: &Services, link: &dyn LinkView, lost_at: &
     }
 }
 
+/// Detach each attached home on `machine_id` at once, without the link-loss
+/// grace, because the backend is removing the machine: it is now an
+/// orchestrator (nodes.md "An orchestrator leaves its backends"). No backup
+/// failure is recorded; the last backup stands, and the home can move.
+///
+/// # Errors
+///
+/// The store's error, so the removal is retried.
+pub(crate) async fn detach_homes_of_removed(
+    svc: &Services,
+    machine_id: &str,
+) -> intent_core::Result<()> {
+    if !svc.workspace_homes() {
+        return Ok(());
+    }
+    for (workspace_id, home) in svc.store().homes_on_machine(machine_id).await? {
+        let detached = svc
+            .store()
+            .move_workspace_home_state(
+                &workspace_id,
+                &home.home_id,
+                HomeState::Attached,
+                HomeState::Detached,
+                &intent_core::now_iso(),
+            )
+            .await?;
+        if detached {
+            tracing::info!(workspace = %workspace_id, machine = %machine_id, "remote machine: now an orchestrator; the workspace's home is detached");
+            svc.publish_workspace_home_changed(&workspace_id).await;
+        }
+    }
+    Ok(())
+}
+
 /// After a bind: each detached home of the machine is attached again. The
 /// failing backup streak its loss began goes on until a backup arrives
 /// ("Continuous backup": the warning holds until the next success); the
