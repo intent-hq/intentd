@@ -605,11 +605,12 @@ parity_test!(home_moves_roll_back, |store, tenant| {
     }
 });
 
-/// Removing a machine as an orchestrator detaches its homes in the removal
-/// itself: an attached home at once, and a move away from it gets
-/// `detached` as the state its rollback restores. A restart or a store
-/// error between steps can no longer leave a home attached to a machine
-/// the backend forgot (nodes.md "An orchestrator leaves its backends").
+// An orchestrator's homes are detached before any of its removal's
+// cleanup, and again in the row's deletion: an attached home at once, and
+// a move away from it gets `detached` as the state its rollback restores.
+// A restart or a store error between steps can no longer leave a home
+// attached to a machine the backend forgot (nodes.md "An orchestrator
+// leaves its backends").
 parity_test!(
     an_orchestrator_removal_detaches_its_homes,
     |store, tenant| {
@@ -640,6 +641,25 @@ parity_test!(
             .await
             .unwrap();
 
+        // The first step, before the token, leases and stop records go:
+        // the row stays, its homes are detached.
+        store.detach_orchestrator_homes("mac-1", T2).await.unwrap();
+        assert!(store.get_exposed_machine("mac-1").await.unwrap().is_some());
+        assert_eq!(
+            store.get_workspace_home(&a).await.unwrap().unwrap().state,
+            HomeState::Detached
+        );
+        assert_eq!(
+            store.get_home_move(&m).await.unwrap().unwrap().from_state,
+            HomeState::Detached,
+            "a move away from it rolls back detached"
+        );
+        // A home attached again before the row goes (no bind does this for
+        // an orchestrator) is detached by the row's deletion itself.
+        store
+            .set_workspace_home(&a, &home("h-a1", Some("mac-1"), false))
+            .await
+            .unwrap();
         assert_eq!(
             store
                 .remove_orchestrator_machine("mac-1", T2)

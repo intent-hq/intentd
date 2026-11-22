@@ -787,6 +787,20 @@ async fn forget(
     reason: Option<&str>,
 ) -> Result<Option<ExecutorCredentialId>> {
     let store = svc.store();
+    let orchestrator = reason == Some(ORCHESTRATOR_REASON);
+    if orchestrator {
+        // Its homes are detached first, durably, not after the link-loss
+        // grace: the connector that would time that grace stops, and a home
+        // left attached to a forgotten machine could not move (a move first
+        // asks an attached home for a last push). A move away from it rolls
+        // back to detached. A restart during the cleanup below leaves no
+        // home attached. Nothing is deleted; the orchestrator runs no home
+        // stop, so the checkout stays on its disk.
+        store
+            .detach_orchestrator_homes(machine_id, &intent_core::now_iso())
+            .await?;
+        crate::home_state::publish_homes_of(svc, machine_id).await;
+    }
     // The machine is forgotten: no connector will resend a final stop it
     // did not acknowledge (it was revoked), so their records go too.
     let head_id = store.daemon_id().await?;
@@ -805,18 +819,11 @@ async fn forget(
     store.delete_home_stops_on_machine(machine_id).await?;
     svc.delete_remote_machine_token(machine_id).await?;
     store.end_machine_leases(machine_id, &head_id).await?;
-    let credential = if reason == Some(ORCHESTRATOR_REASON) {
-        // Its homes are detached in the removal itself, not after the
-        // link-loss grace: the connector that would time that grace stops,
-        // and a home left attached to a forgotten machine could not move (a
-        // move first asks an attached home for a last push). A move away
-        // from it rolls back to detached. Nothing is deleted; the
-        // orchestrator runs no home stop, so the checkout stays on its disk.
-        let credential = store
+    let credential = if orchestrator {
+        // Its homes are detached again in the row's deletion.
+        store
             .remove_orchestrator_machine(machine_id, &intent_core::now_iso())
-            .await?;
-        crate::home_state::publish_homes_of(svc, machine_id).await;
-        credential
+            .await?
     } else {
         store.remove_exposed_machine(machine_id).await?
     };

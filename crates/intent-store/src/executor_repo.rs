@@ -305,13 +305,23 @@ impl Store {
         dispatch!(self, backend => backend.remove_exposed_machine(id).await)
     }
 
-    /// Remove exposed machine `id` because it is now an orchestrator
-    /// (nodes.md "An orchestrator leaves its backends"), as
-    /// [`Self::remove_exposed_machine`], and detach its homes in the same
-    /// transaction: each attached home becomes `detached` since `now`, and
-    /// a move away from one of its homes gets `detached` since `now` as the
-    /// state its rollback restores. No later step is left to repair a home
-    /// attached to the forgotten machine.
+    /// The first step of removing exposed machine `id` because it is now an
+    /// orchestrator (nodes.md "An orchestrator leaves its backends"), before
+    /// its token, leases and stop records go: each attached home on it
+    /// becomes `detached` since `now`, and a move away from one of its homes
+    /// gets `detached` since `now` as the state its rollback restores. A
+    /// restart after it leaves no home attached to the machine.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn detach_orchestrator_homes(&self, id: &str, now: &str) -> Result<()> {
+        dispatch!(self, backend => backend.detach_orchestrator_homes(id, now).await)
+    }
+
+    /// Remove exposed machine `id` because it is now an orchestrator, as
+    /// [`Self::remove_exposed_machine`], detaching its homes again in the
+    /// same transaction as [`Self::detach_orchestrator_homes`] does.
     ///
     /// # Errors
     ///
@@ -746,6 +756,13 @@ impl crate::SqliteStore {
         Ok(credential.map(ExecutorCredentialId::from))
     }
 
+    pub async fn detach_orchestrator_homes(&self, id: &str, now: &str) -> Result<()> {
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        detach_machine_homes(&mut tx, id, now).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
+    }
+
     pub async fn remove_orchestrator_machine(
         &self,
         id: &str,
@@ -759,27 +776,7 @@ impl crate::SqliteStore {
                 .await
                 .map_err(db)?;
         if credential.is_some() {
-            sqlx::query(
-                "UPDATE workspace_home SET state = 'detached', since = ? \
-                 WHERE node_id = ? AND cloud_machine_id IS NULL AND state = 'attached'",
-            )
-            .bind(now)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
-            sqlx::query(
-                "UPDATE home_move SET from_state = 'detached', from_since = ? \
-                 WHERE from_state = 'attached' AND EXISTS (SELECT 1 FROM workspace_home h \
-                 WHERE h.workspace_id = home_move.workspace_id \
-                 AND h.home_id = home_move.from_home_id AND h.node_id = ? \
-                 AND h.cloud_machine_id IS NULL)",
-            )
-            .bind(now)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
+            detach_machine_homes(&mut tx, id, now).await?;
         }
         tx.commit().await.map_err(db)?;
         Ok(credential.map(ExecutorCredentialId::from))
@@ -949,3 +946,35 @@ impl crate::SqliteStore {
 
 #[cfg(test)]
 mod tests;
+
+/// Each attached home on machine `id` becomes `detached` since `now`, and a
+/// move away from one of its homes gets `detached` since `now` as the state
+/// its rollback restores (nodes.md "An orchestrator leaves its backends").
+async fn detach_machine_homes(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    now: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE workspace_home SET state = 'detached', since = ? \
+         WHERE node_id = ? AND cloud_machine_id IS NULL AND state = 'attached'",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(&mut *conn)
+    .await
+    .map_err(db)?;
+    sqlx::query(
+        "UPDATE home_move SET from_state = 'detached', from_since = ? \
+         WHERE from_state = 'attached' AND EXISTS (SELECT 1 FROM workspace_home h \
+         WHERE h.workspace_id = home_move.workspace_id \
+         AND h.home_id = home_move.from_home_id AND h.node_id = ? \
+         AND h.cloud_machine_id IS NULL)",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(&mut *conn)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
