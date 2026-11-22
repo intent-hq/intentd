@@ -1020,7 +1020,7 @@ async fn writer_locks_of_tenants_on_other_shards_do_not_block() {
                 took.as_millis()
             ));
             match (expect_free, &got) {
-                (true, Ok(())) if took < Duration::from_secs(3) => {}
+                (true, Ok(_)) if took < Duration::from_secs(3) => {}
                 (false, Err(_)) if code.as_deref() == Some("55P03") => {}
                 _ => problems.push(format!("{tenant} on {shard}: {got:?} after {took:?}")),
             }
