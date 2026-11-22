@@ -172,7 +172,9 @@ impl RemoteFeature {
         self.connections.0.take(machine_id)
     }
 
-    fn is_closed(&self) -> bool {
+    /// Whether [`Self::close_links`] ran: no connector starts again.
+    #[must_use]
+    pub fn links_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -277,8 +279,8 @@ impl RemoteFeature {
         if let Some(node) = self.running_node(machine_id) {
             return Ok(node);
         }
-        if self.is_closed() {
-            return Err(links_closed());
+        if self.links_closed() {
+            return Err(closed_links_error());
         }
         let row = svc
             .store()
@@ -323,12 +325,12 @@ impl RemoteFeature {
         // A close that raced this start: it set the flag before this check
         // (so the node is shut down here) or found the node (so it shut it
         // down itself). Either way none outlives the close.
-        if self.is_closed() {
+        if self.links_closed() {
             if let Some(started) = self.connections.0.take(machine_id) {
                 started.shutdown();
             }
             node.shutdown();
-            return Err(links_closed());
+            return Err(closed_links_error());
         }
         Ok(node)
     }
@@ -336,7 +338,7 @@ impl RemoteFeature {
 
 pub(crate) use intent_node_connections::lock;
 
-fn links_closed() -> Error {
+fn closed_links_error() -> Error {
     Error::Internal("this backend's machine links are closed".into())
 }
 
