@@ -1381,6 +1381,10 @@ pub struct MachineCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homes: Option<bool>,
     pub capacity: MachineCapacity,
+    /// The whole host's CPU and memory use (node-link.md "Resources").
+    /// Optional: an older machine omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<HostResources>,
     pub providers: Vec<ProviderCapability>,
     /// The providers left out of `providers` because the machine's own
     /// `providers.enabled` switches them off, so a backend can tell one
@@ -1389,6 +1393,48 @@ pub struct MachineCapabilities {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_providers: Vec<String>,
     pub observed_at: String,
+}
+
+/// The whole host's CPU and memory use: every process, not only agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostResources {
+    /// CPU use across all cores, 0-100, smoothed over the last few
+    /// seconds; absent until a second sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<u8>,
+    /// Physical memory in use.
+    pub memory_used_bytes: u64,
+    /// Physical memory installed.
+    pub memory_total_bytes: u64,
+}
+
+impl HostResources {
+    /// Memory in use as a whole percentage of the total (0 when unknown).
+    #[must_use]
+    pub fn memory_percent(&self) -> u8 {
+        if self.memory_total_bytes == 0 {
+            return 0;
+        }
+        let percent = u128::from(self.memory_used_bytes.min(self.memory_total_bytes)) * 100
+            / u128::from(self.memory_total_bytes);
+        u8::try_from(percent).unwrap_or(100)
+    }
+
+    /// Whether `self` moved far enough from `reported` to push: CPU or
+    /// memory by `threshold` points or more, or CPU newly known.
+    #[must_use]
+    pub fn moved_from(&self, reported: Option<&Self>, threshold: u8) -> bool {
+        let Some(reported) = reported else {
+            return true;
+        };
+        let cpu = match (self.cpu_percent, reported.cpu_percent) {
+            (Some(now), Some(then)) => now.abs_diff(then) >= threshold,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        cpu || self.memory_percent().abs_diff(reported.memory_percent()) >= threshold
+    }
 }
 
 /// A machine's shared agent limits and their use, counting local and
@@ -1428,6 +1474,7 @@ impl MachineCapabilities {
                 charged_memory_bytes: 0,
                 memory_budget_bytes: None,
             },
+            resources: None,
             providers: Vec::new(),
             disabled_providers: Vec::new(),
             observed_at: observed_at.into(),

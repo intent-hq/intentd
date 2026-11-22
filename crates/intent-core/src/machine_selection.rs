@@ -647,6 +647,12 @@ pub struct HelpCloudEntry {
 /// The line above every agent-facing machine list.
 pub const PREFERENCE_LINE: &str = "Listed in the user's order of preference. When several can run what you need, use the first; pick a later one only when the task needs it (platform, model, capacity).";
 
+/// The harness 3.16 preference line: the user's order still comes first,
+/// and free slots (from the lookup's `load`) can move an agent down the
+/// list. With the confirm line it is no longer than 3.15's text, so the
+/// prompt stays within its context budget.
+pub const LOAD_PREFERENCE_LINE: &str = "Listed in the user's order of preference. Use the first that can run what you need; pick a later one if the task needs it (platform, model) or it has more free slots.";
+
 /// What the remote-placement text is rendered from.
 #[derive(Clone, Copy)]
 pub struct PlacementHelpInputs<'a> {
@@ -822,6 +828,35 @@ pub fn stable_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String> 
     Some(text)
 }
 
+/// The harness 3.16 prompt text: [`stable_machines_help`] with the
+/// [`LOAD_PREFERENCE_LINE`], and the lookup named as the place to read each
+/// machine's load. Still no live facts.
+#[must_use]
+pub fn load_aware_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
+    let mut text = identity_list_with(inputs, LOAD_PREFERENCE_LINE)?;
+    let _ = writeln!(
+        text,
+        "Before you choose a machine, provider or model for a remote agent, confirm it with `{MACHINE_MODELS_SIGNATURE}`: each machine's state, sign-in status, full model list and load. How to place one: `ws.help(\"agent\")`."
+    );
+    text.push_str(REMOTE_LONG_COMMANDS_HINT);
+    Some(text)
+}
+
+/// The harness 3.16 `ws.help("agent")` text: [`stable_machines_reference`]
+/// with the [`LOAD_PREFERENCE_LINE`] and the lookup's `load` and `local`.
+#[must_use]
+pub fn load_aware_machines_reference(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
+    let mut text = identity_list_with(inputs, LOAD_PREFERENCE_LINE)?;
+    let _ = writeln!(
+        text,
+        "  {MACHINE_MODELS_SIGNATURE} → {{ machines, local? }}  // Experimental. Per machine: `nodeId`, `name`, `platform`, `state`, `lastConnectedAt`, `observedAt`, `runningAgents` (this backend's agents there), `load: {{ runningAgents, agentCap, cpuPercent?, memoryUsedBytes?, memoryTotalBytes? }}`, `providers: [{{ id, status, models, modelsStale }}]` and `disabledProviders`, from its last report (up to 1 hour old; no connect). `load` counts every agent on the machine (its own local agents and other backends' included), adds the whole host's CPU use (0-100) and memory when the machine reports them, and is current within seconds; it is absent while the machine is not connected to this backend (which then runs none of your agents there) or too old to report it. `local` is this backend's host in the same shape, counting every agent it runs (`placement: {{ target: \"local\" }}`); absent on an orchestrator. `nodeId` keeps one machine (unknown → `machine-unknown`); `provider` keeps that provider; `model` (exact id) keeps providers listing it. Each kept provider has its full model list. Rows follow the user's order (`rank`); a cloud entry's row has `kind: \"cloud\"` and `cloudMachineId` instead of `nodeId`, lists its providers without models and has no `load` (each agent there gets a new sandbox). Confirm the machine, provider and model here before placing a remote agent; to spread parallel sub-agents, prefer the machine with the most free slots (`agentCap` − `runningAgents`), then the lower CPU and memory use, and pass its `nodeId`."
+    );
+    push_profiles(&mut text, inputs);
+    text.push_str(PLACEMENT_HOW_TO);
+    text.push_str(REMOTE_LONG_COMMANDS_HINT);
+    Some(text)
+}
+
 /// The profiles block: each profile's reference, name, backup flag and
 /// remote compatibility, then each Default that cannot run remotely.
 fn push_profiles(text: &mut String, inputs: &PlacementHelpInputs<'_>) {
@@ -895,6 +930,11 @@ pub fn stable_machines_reference(inputs: &PlacementHelpInputs<'_>) -> Option<Str
 /// within [`HELP_MAX_MACHINES`] and [`HELP_MAX_BYTES`]; the lowest-ranked
 /// rows are cut.
 fn identity_list(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
+    identity_list_with(inputs, PREFERENCE_LINE)
+}
+
+/// [`identity_list`] with `preference` as its preference line.
+fn identity_list_with(inputs: &PlacementHelpInputs<'_>, preference: &str) -> Option<String> {
     let listed = help_rows(inputs);
     if listed.is_empty() {
         return None;
@@ -919,7 +959,7 @@ fn identity_list(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
         shown += 1;
     }
     let mut text = format!(
-        "Remote placement (experimental): machines exposed to this backend:\n{PREFERENCE_LINE}\n{lines}"
+        "Remote placement (experimental): machines exposed to this backend:\n{preference}\n{lines}"
     );
     if shown < listed.len() {
         let _ = writeln!(

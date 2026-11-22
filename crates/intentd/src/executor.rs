@@ -149,7 +149,31 @@ pub(crate) struct ExecutorDeps {
     /// The daemon's link traffic capture: every backend's link is recorded
     /// in it while the owner captures.
     pub link_traffic: Option<Arc<LinkTraffic>>,
+    /// Samples the host's CPU and memory for the report's `resources`.
+    pub resources: HostSample,
 }
+
+/// Samples the whole host's CPU and memory use; `None` where the platform
+/// reports none.
+pub(crate) type HostSample =
+    Arc<dyn Fn() -> Option<intent_core::node_link::HostResources> + Send + Sync>;
+
+/// What the load watch last saw and reported.
+#[derive(Debug, Default)]
+pub(crate) struct LoadState {
+    /// The running-agent count the previous check saw.
+    pub count: Option<u32>,
+    /// The resources the last push carried.
+    pub reported: Option<intent_core::node_link::HostResources>,
+    /// When the last push went out.
+    pub pushed_at: Option<std::time::Instant>,
+}
+
+/// Points CPU or memory use must move by before a resources-only push.
+const RESOURCES_THRESHOLD: u8 = 5;
+
+/// The shortest gap between two pushes made for resources alone.
+const RESOURCES_PUSH_GAP: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Reads the active executor credentials.
 pub(crate) type ActiveCredentials = Arc<
@@ -195,6 +219,12 @@ pub(crate) struct ExecutorService {
     accepted: mpsc::UnboundedSender<(ExecutorCredential, NodeConnection)>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     refresher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Pushes the report when the running-agent count changes.
+    load_watch: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The host's latest CPU and memory sample, for the report.
+    resources: Mutex<Option<intent_core::node_link::HostResources>>,
+    /// What the load watch last saw and pushed.
+    load: Mutex<LoadState>,
     /// Revoked backends being stopped; shutdown waits for them, so a
     /// backend taken out of `backends` is never abandoned half-stopped.
     stopping: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -244,6 +274,9 @@ impl ExecutorService {
             accepted: tx,
             worker: Mutex::new(None),
             refresher: Mutex::new(None),
+            load_watch: Mutex::new(None),
+            resources: Mutex::new(None),
+            load: Mutex::new(LoadState::default()),
             stopping: Mutex::new(Vec::new()),
             #[cfg(test)]
             revoke_pause: Mutex::new(None),
@@ -251,6 +284,9 @@ impl ExecutorService {
         // caller-binding: allow — the executor service's own connection worker
         let worker = tokio::spawn(serve_connections(Arc::downgrade(&service), rx, revocations));
         *lock(&service.worker) = Some(worker);
+        // caller-binding: allow — the executor service's own load watch
+        let load_watch = tokio::spawn(watch_load(Arc::downgrade(&service)));
+        *lock(&service.load_watch) = Some(load_watch);
         // caller-binding: allow — one-time startup cleanup of revoked credentials' storage
         tokio::spawn({
             let service = Arc::downgrade(&service);
@@ -267,10 +303,14 @@ impl ExecutorService {
     /// work pushed before its backend's links close. Run it before the WSS
     /// listener stops, which closes those links.
     pub(crate) async fn shutdown(&self) {
-        let tasks: Vec<_> = [lock(&self.worker).take(), lock(&self.refresher).take()]
-            .into_iter()
-            .flatten()
-            .collect();
+        let tasks: Vec<_> = [
+            lock(&self.worker).take(),
+            lock(&self.refresher).take(),
+            lock(&self.load_watch).take(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         // Abort, then wait until each task has actually stopped: a poll
         // already running on another thread finishes first, so a worker
         // midway through `revoked()` has registered its stop before the
@@ -312,6 +352,13 @@ impl ExecutorService {
             intent_core::now_iso(),
         );
         capabilities.capacity = self.deps.admission.capacity();
+        capabilities.resources = {
+            let mut latest = lock(&self.resources);
+            if latest.is_none() {
+                *latest = (self.deps.resources)();
+            }
+            *latest
+        };
         capabilities.providers = self.deps.report.providers();
         // An id is never in both lists, even while the cached list has not
         // caught up with a settings change yet.
@@ -348,6 +395,61 @@ impl ExecutorService {
         if self.deps.report.providers() != before {
             self.push_capabilities().await;
         }
+    }
+
+    /// Sample the host, then push the report on every live backend link
+    /// when the running-agent count differs from the one the previous check
+    /// saw, or when CPU or memory moved [`RESOURCES_THRESHOLD`] points from
+    /// the last pushed sample and the last push is [`RESOURCES_PUSH_GAP`]
+    /// old, against what the links last got (the first bind's `welcome`
+    /// sets the baseline). Nothing is sampled or pushed while no link is
+    /// live; a change meanwhile is pushed at the next check with one.
+    pub(crate) async fn push_load_change(&self) {
+        let count = self.deps.admission.capacity().running_agents;
+        if !self.has_live_link() {
+            // Nothing to push to, and nothing to sample for: the next bind's
+            // `welcome` samples afresh and sets the baseline.
+            *lock(&self.resources) = None;
+            return;
+        }
+        let sample = (self.deps.resources)();
+        *lock(&self.resources) = sample;
+        let now = std::time::Instant::now();
+        let push = {
+            let mut state = lock(&self.load);
+            let Some(before) = state.count.replace(count) else {
+                state.reported = sample;
+                return;
+            };
+            let resources_moved = sample.is_some_and(|sample| {
+                sample.moved_from(state.reported.as_ref(), RESOURCES_THRESHOLD)
+            }) && state
+                .pushed_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= RESOURCES_PUSH_GAP);
+            let push = before != count || resources_moved;
+            if push {
+                state.reported = sample;
+                state.pushed_at = Some(now);
+            }
+            push
+        };
+        if push {
+            self.push_capabilities().await;
+        }
+    }
+
+    /// The load watch's state, for tests.
+    #[cfg(test)]
+    pub(crate) fn load_state(&self) -> std::sync::MutexGuard<'_, LoadState> {
+        lock(&self.load)
+    }
+
+    /// Whether any backend holds a live link to this machine.
+    fn has_live_link(&self) -> bool {
+        lock(&self.backends)
+            .values()
+            .flat_map(|backend| backend.links.iter())
+            .any(|link| !link.is_closed())
     }
 
     /// Send the current report, unasked, on every live backend link.
@@ -759,11 +861,22 @@ impl ExecutorHost for ExecutorService {
             .map(|backend| backend.runner.running())
             .unwrap_or_default();
         let (hosts, tc_address) = self.deps.report.routes();
+        let capabilities = self.capabilities();
+        // The first welcome sets the baseline. A later one leaves it alone:
+        // the backends already bound may not have seen these values, so the
+        // next check pushes any change to every link.
+        {
+            let mut state = lock(&self.load);
+            if state.count.is_none() {
+                state.count = Some(capabilities.capacity.running_agents);
+                state.reported = capabilities.resources;
+            }
+        }
         LinkWelcome {
             protocol: 0,
             node_id: String::new(),
             running_agents,
-            capabilities: self.capabilities(),
+            capabilities,
             hosts,
             tc_address,
         }
@@ -1351,6 +1464,26 @@ impl MachineLaunch for SettingsLaunch {
     }
 }
 
+/// How often the machine checks its running-agent count and samples its
+/// CPU and memory for a change to push: a burst of starts and stops costs
+/// at most one push per check.
+const LOAD_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Check the running-agent count every [`LOAD_POLL`] and push the report
+/// on every live backend link when it changed (node-link.md "Load pushed on
+/// change"), until the service is gone.
+async fn watch_load(service: std::sync::Weak<ExecutorService>) {
+    let mut tick = tokio::time::interval(LOAD_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Some(service) = service.upgrade() else {
+            return;
+        };
+        service.push_load_change().await;
+    }
+}
+
 /// How often the cached provider report is refreshed while a backend holds
 /// an active executor credential.
 const REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
@@ -1532,6 +1665,7 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
             report: report.clone(),
             executable,
             link_traffic: Some(parts.services.link_traffic().clone()),
+            resources: Arc::new(intent_services::host_resources::sample_host),
             active_credentials: {
                 let store = parts.services.store().clone();
                 Arc::new(move || {

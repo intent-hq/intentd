@@ -611,6 +611,7 @@ async fn expose_node(svc: &Services, providers: Vec<intent_core::node_link::Prov
             credential_id: intent_core::ids::ExecutorCredentialId::from("cred-1".to_string()),
             platform: Some(platform),
             capabilities: Some(MachineCapabilities {
+                resources: None,
                 platform,
                 intentd_version: "0.11.87".into(),
                 capacity: MachineCapacity {

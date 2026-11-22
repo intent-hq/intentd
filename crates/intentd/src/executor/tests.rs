@@ -318,8 +318,21 @@ struct Running {
     service: Arc<ExecutorService>,
     api: Arc<MachineApi>,
     report: Arc<FixedReport>,
+    /// What the host sampler returns; tests move it.
+    host: HostCell,
     endpoint: NodeEndpoint,
     _bus_dir: tempfile::TempDir,
+}
+
+type HostCell = Arc<Mutex<Option<intent_core::node_link::HostResources>>>;
+
+/// A host at `cpu`% CPU with `used` of 32 GiB in use.
+fn host_at(cpu: Option<u8>, used_gib: u64) -> intent_core::node_link::HostResources {
+    intent_core::node_link::HostResources {
+        cpu_percent: cpu,
+        memory_used_bytes: used_gib << 30,
+        memory_total_bytes: 32 << 30,
+    }
 }
 
 impl Running {
@@ -382,6 +395,7 @@ impl Running {
         make_checkouts: MakeCheckouts,
         home_records: Option<Arc<dyn runner::HomeRecords>>,
     ) -> Self {
+        let host: HostCell = Arc::new(Mutex::new(Some(host_at(Some(20), 8))));
         let report = Arc::new(FixedReport {
             refreshes: std::sync::atomic::AtomicUsize::new(0),
             primes: std::sync::atomic::AtomicUsize::new(0),
@@ -402,6 +416,10 @@ impl Running {
                 report: report.clone(),
                 executable: std::env::current_exe().unwrap(),
                 link_traffic: Some(Arc::new(intent_core::link_traffic::LinkTraffic::new())),
+                resources: {
+                    let host = host.clone();
+                    Arc::new(move || *host.lock().unwrap())
+                },
                 active_credentials: {
                     let api = api.clone();
                     Arc::new(move || {
@@ -449,6 +467,7 @@ impl Running {
             service,
             api,
             report,
+            host,
             endpoint,
             _bus_dir: bus_dir,
         }
@@ -545,8 +564,20 @@ async fn next_record(dialed: &mut DialedLink) -> JournalRecord {
     }
 }
 
+/// The next frame other than an unsolicited capabilities report, which the
+/// machine may push at any time (a running-agent count or resources change,
+/// node-link.md "Load pushed on change").
+async fn next_unpushed_frame(dialed: &mut DialedLink) -> Option<LinkFrame> {
+    loop {
+        match next_frame(dialed).await {
+            Some(LinkFrame::CapabilitiesReply { .. }) => {}
+            other => return other,
+        }
+    }
+}
+
 async fn next_raw_record(dialed: &mut DialedLink) -> JournalRecord {
-    match next_frame(dialed).await {
+    match next_unpushed_frame(dialed).await {
         Some(LinkFrame::Journal(record)) => record,
         other => panic!("expected a journal record, got {other:?}"),
     }
@@ -599,7 +630,7 @@ async fn skills_are_journaled_before_started_only_on_protocol_12() {
 }
 
 async fn replay_complete(dialed: &mut DialedLink) -> NodeCounter {
-    match next_frame(dialed).await {
+    match next_unpushed_frame(dialed).await {
         Some(LinkFrame::ReplayComplete { through_seq }) => through_seq,
         other => panic!("expected replay complete, got {other:?}"),
     }
@@ -2179,6 +2210,201 @@ async fn an_enabled_providers_change_pushes_the_report_unasked() {
     let on = (vec!["mock".to_owned()], Vec::<String>::new());
     assert_eq!(pushed(&mut dialed).await, on);
     assert_eq!(pushed(&mut dialed).await, on);
+    node.stop().await;
+}
+
+/// The next pushed report's running-agent count, skipping journal frames.
+async fn pushed_load(dialed: &mut DialedLink) -> u32 {
+    loop {
+        match next_frame(dialed).await {
+            Some(LinkFrame::CapabilitiesReply { capabilities }) => {
+                return capabilities.capacity.running_agents;
+            }
+            Some(LinkFrame::Journal(_)) => {}
+            other => panic!("expected a pushed capabilities report, got {other:?}"),
+        }
+    }
+}
+
+/// When the machine's running-agent count changes (here a local agent
+/// takes a slot and gives it back), every live backend link gets the report
+/// unasked, so an orchestrator sees the runner's load go 0 → 1 → 0 without
+/// asking (Homes GA 16).
+#[tokio::test]
+async fn a_running_agent_count_change_pushes_the_report_unasked() {
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(3);
+    let node = Running::start_with(
+        dir.path(),
+        MachineApi::new(),
+        admission.clone(),
+        BTreeMap::new(),
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+
+    let local = AgentId::from_string("local-agent".to_owned());
+    admission.try_admit(&local).unwrap();
+    assert_eq!(pushed_load(&mut dialed).await, 1, "an agent started");
+    admission.release(&local);
+    assert_eq!(pushed_load(&mut dialed).await, 0, "the agent stopped");
+    node.stop().await;
+}
+
+/// An unchanged count pushes nothing, and a burst of changes inside one
+/// check costs at most one push: start and stop between two checks leave
+/// the count where it was, so nothing is sent.
+#[tokio::test]
+async fn an_unchanged_running_agent_count_pushes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(3);
+    let node = Running::start_with(
+        dir.path(),
+        MachineApi::new(),
+        admission.clone(),
+        BTreeMap::new(),
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+
+    node.service.push_load_change().await;
+    assert_eq!(
+        node.service.load_state().count,
+        Some(0),
+        "a check records the count"
+    );
+    let local = AgentId::from_string("local-agent".to_owned());
+    admission.try_admit(&local).unwrap();
+    admission.release(&local);
+    // A small CPU and memory drift is not worth a push either.
+    *node.host.lock().unwrap() = Some(host_at(Some(23), 9));
+    node.service.push_load_change().await;
+    let window = intentd_test_support::test_timeout(Duration::from_millis(300));
+    let quiet = tokio::time::timeout(window, async {
+        loop {
+            match next_frame(&mut dialed).await {
+                Some(LinkFrame::Journal(_)) => {}
+                other => return other,
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "an unchanged count pushed {quiet:?}");
+    node.stop().await;
+}
+
+/// The report carries the host's CPU and memory; a move of 5 points or
+/// more pushes it, at most once per 10 seconds, while smaller drifts do not.
+#[tokio::test]
+async fn a_resources_move_pushes_the_report_at_most_every_ten_seconds() {
+    async fn pushed(dialed: &mut DialedLink) -> Option<intent_core::node_link::HostResources> {
+        loop {
+            match next_frame(dialed).await {
+                Some(LinkFrame::CapabilitiesReply { capabilities }) => {
+                    return capabilities.resources;
+                }
+                Some(LinkFrame::Journal(_)) => {}
+                other => panic!("expected a pushed capabilities report, got {other:?}"),
+            }
+        }
+    }
+    async fn quiet(dialed: &mut DialedLink) -> bool {
+        let window = intentd_test_support::test_timeout(Duration::from_millis(300));
+        tokio::time::timeout(window, async {
+            loop {
+                match next_frame(dialed).await {
+                    Some(LinkFrame::Journal(_)) => {}
+                    other => return other,
+                }
+            }
+        })
+        .await
+        .is_err()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    let welcome = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    assert_eq!(
+        welcome.welcome.capabilities.resources,
+        Some(host_at(Some(20), 8)),
+        "the welcome carries the host"
+    );
+    let mut dialed = welcome;
+    replay_complete(&mut dialed).await;
+
+    node.service.push_load_change().await;
+    *node.host.lock().unwrap() = Some(host_at(Some(60), 8));
+    node.service.push_load_change().await;
+    assert_eq!(
+        pushed(&mut dialed).await,
+        Some(host_at(Some(60), 8)),
+        "CPU moved"
+    );
+
+    *node.host.lock().unwrap() = Some(host_at(Some(10), 8));
+    node.service.push_load_change().await;
+    assert!(quiet(&mut dialed).await, "within 10 s of the last push");
+
+    {
+        let mut state = node.service.load_state();
+        state.pushed_at = state
+            .pushed_at
+            .and_then(|at| at.checked_sub(std::time::Duration::from_secs(11)));
+    }
+    *node.host.lock().unwrap() = Some(host_at(Some(10), 20));
+    node.service.push_load_change().await;
+    assert_eq!(
+        pushed(&mut dialed).await,
+        Some(host_at(Some(10), 20)),
+        "memory moved"
+    );
+    node.stop().await;
+}
+
+/// A backend that binds between a change and the next check does not reset
+/// the baseline for the backends already bound: they still get the change
+/// (review of Homes GA 16).
+#[tokio::test]
+async fn a_new_bind_does_not_hide_a_change_from_bound_backends() {
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(3);
+    let node = Running::start_with(
+        dir.path(),
+        MachineApi::new(),
+        admission.clone(),
+        BTreeMap::new(),
+    )
+    .await;
+    let mut first = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut first).await;
+
+    let local = AgentId::from_string("local-agent".to_owned());
+    admission.try_admit(&local).unwrap();
+    let mut second = dial_link(
+        &node.endpoint_for(&other_token()),
+        hello_from(OTHER_HEAD, 1, "lease-o", 0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.welcome.capabilities.capacity.running_agents, 1);
+    replay_complete(&mut second).await;
+    node.service.push_load_change().await;
+    assert_eq!(
+        pushed_load(&mut first).await,
+        1,
+        "the bound backend sees it"
+    );
     node.stop().await;
 }
 

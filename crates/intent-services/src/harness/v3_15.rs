@@ -33,8 +33,7 @@ mod tests {
     fn v3_15_is_3_14_with_the_maintainer_rename() {
         let current = super::super::resolve_entry("3.15");
         let prior = super::super::resolve_entry("3.14");
-        assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
+        assert_eq!(current.version, "3.15");
         assert!(std::ptr::eq(current.context, prior.context));
         assert!(std::ptr::addr_eq(current.harness, prior.harness));
         assert!(std::ptr::eq(
