@@ -204,6 +204,8 @@ impl crate::link::gate::DialGate for CloudGate {
         Box::pin(self.before_dial_inner(shared, asked))
     }
 
+    /// The sandbox runs an intentd this backend shares no link protocol
+    /// with, so it can never link again. See [`sandbox_outdated`].
     fn outdated(&self, shared: &Shared) {
         if let Ok(feature) = super::feature(&self.svc) {
             sandbox_outdated(&self.svc, feature, shared, &self.machine_id);
@@ -329,7 +331,7 @@ pub(crate) enum Resumed {
     Refused(Error),
 }
 
-pub(crate) use crate::link::gate::Dialable;
+use crate::link::gate::Dialable;
 
 /// Make E2B run `row`'s sandbox: resume it when paused, else check it and
 /// extend its timeout. The caller holds the machine's transition lock.
