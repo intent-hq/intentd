@@ -32,6 +32,67 @@ fn store_busy_code_and_display() {
 }
 
 #[test]
+fn schema_mismatch_code_and_display() {
+    use intent_core::error::SchemaMismatch;
+    let mismatch = |applied: Vec<i64>, changed: Vec<i64>, part_way: Vec<i64>| {
+        Error::SchemaMismatch(Box::new(SchemaMismatch {
+            applied,
+            expected: vec![1, 2],
+            changed,
+            part_way,
+            legacy_sqlx: false,
+        }))
+    };
+    let missing = mismatch(vec![1], vec![], vec![]);
+    assert_eq!(missing.code(), -32603);
+    assert_eq!(
+        missing.to_string(),
+        "postgres schema does not match this build: applied migrations [1], this build \
+         expects [1, 2]; run the migrate job with this build, then start the daemon"
+    );
+    let known_part_way = mismatch(vec![1], vec![], vec![2]).to_string();
+    assert!(
+        known_part_way.contains("; part-way: [2]"),
+        "{known_part_way}"
+    );
+    assert!(
+        known_part_way.ends_with("run the migrate job with this build, then start the daemon"),
+        "{known_part_way}"
+    );
+    let changed = mismatch(vec![1, 2], vec![2], vec![]).to_string();
+    assert!(
+        changed.contains("changed since they were applied: [2]"),
+        "{changed}"
+    );
+    assert!(
+        changed.contains("restore it, or repair the schema"),
+        "{changed}"
+    );
+    assert!(!changed.contains("run the migrate job"), "{changed}");
+    let newer = mismatch(vec![1, 2, 3], vec![2], vec![]).to_string();
+    assert!(
+        newer.contains("newer than this build (unknown [3])"),
+        "{newer}"
+    );
+    let legacy = Error::SchemaMismatch(Box::new(SchemaMismatch {
+        applied: vec![],
+        expected: vec![1, 2],
+        changed: vec![],
+        part_way: vec![],
+        legacy_sqlx: true,
+    }))
+    .to_string();
+    assert!(legacy.contains("earlier sqlx migrator"), "{legacy}");
+    assert!(legacy.contains("recreate the schema"), "{legacy}");
+    // An unknown version a newer build left part-way is a newer schema too.
+    let newer_part_way = mismatch(vec![1, 2], vec![], vec![3]).to_string();
+    assert!(
+        newer_part_way.contains("newer than this build (unknown [3])"),
+        "{newer_part_way}"
+    );
+}
+
+#[test]
 fn conflict_code_and_display_and_payload() {
     let current = json!({ "rev": 7 });
     let e = Error::Conflict {

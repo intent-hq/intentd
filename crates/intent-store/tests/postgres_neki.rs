@@ -8,7 +8,9 @@
 //! `INTENT_STORE_NEKI_URL=... cargo test -p intent-store --features postgres
 //! --test postgres_neki`. It applies every migration in a fresh schema,
 //! opens two tenants with identical keys, checks they stay apart, and always
-//! drops the schema. Without the URL it skips.
+//! drops the schema. Without the URL it skips. Each run also drops
+//! `intent_ci_*` schemas older than two hours that killed runs left;
+//! `INTENT_STORE_NEKI_KEEP_STALE=1` keeps a run to its own schema.
 //!
 //! The sharded tests (audit finding 1) need a Neki branch, ideally sharded
 //! by `tenant_id` across more than one shard, in
@@ -84,8 +86,12 @@ async fn round_trip(pool: PgPool) -> Result<(), String> {
 }
 
 /// Drop schemas left by runs that panicked or were killed
-/// more than two hours ago.
+/// more than two hours ago, unless `INTENT_STORE_NEKI_KEEP_STALE=1` (a run
+/// that may only touch its own schema).
 async fn drop_stale_schemas(admin: &PgPool, now: u64) {
+    if std::env::var("INTENT_STORE_NEKI_KEEP_STALE").as_deref() == Ok("1") {
+        return;
+    }
     let names: Vec<(String,)> = sqlx::query_as(
         "SELECT nspname::text FROM pg_namespace WHERE nspname LIKE 'intent\\_ci\\_%'",
     )
@@ -385,4 +391,111 @@ async fn a_held_writer_lock_times_out_as_55p03_and_store_busy_on_neki() {
     })
     .await
     .expect("writer-lock timeouts on Neki");
+}
+
+/// Step 0c on Neki: a daemon's open refuses an unmigrated schema and writes
+/// nothing; the migrate job (its own `multi` connection) applies every
+/// migration, then waits for every router to see the DDL
+/// (`__neki.wait_for_ddl`); a second run applies nothing and still waits;
+/// the open then succeeds through a single-shard pool, and refuses again
+/// once the ledger has a migration this build does not know.
+#[tokio::test]
+async fn migrate_waits_for_ddl_and_open_checks_the_schema_on_neki() {
+    let Some(url) = neki_url("INTENT_STORE_NEKI_SHARDED_URL") else {
+        return;
+    };
+    in_fresh_schema(&url, 2, true, |pool| async move {
+        let expected: Vec<i64> = postgres::MIGRATOR.iter().map(|m| m.version).collect();
+        let open = |tenant: &'static str| {
+            let pool = pool.clone();
+            async move {
+                Store::open_postgres(
+                    pool,
+                    TenantId::new(tenant).map_err(|e| e.to_string())?,
+                    PostgresOptions::default(),
+                    intent_store::OrchestratorOnly::for_tests(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }
+        };
+        let schema_mismatch = |tenant: &'static str| {
+            let pool = pool.clone();
+            async move {
+                match Store::open_postgres(
+                    pool,
+                    TenantId::new(tenant).map_err(|e| e.to_string())?,
+                    PostgresOptions::default(),
+                    intent_store::OrchestratorOnly::for_tests(),
+                )
+                .await
+                {
+                    Err(intent_core::Error::SchemaMismatch(m)) => Ok(*m),
+                    Err(e) => Err(format!("open {tenant}: expected SchemaMismatch, got {e}")),
+                    Ok(_) => Err(format!("open {tenant} passed the schema gate")),
+                }
+            }
+        };
+
+        let unmigrated = schema_mismatch("neki-gate-before").await?;
+        if !unmigrated.applied.is_empty() || unmigrated.expected != expected {
+            return Err(format!("unmigrated mismatch: {unmigrated:?}"));
+        }
+        let (ledger,): (bool,) =
+            sqlx::query_as("SELECT to_regclass('intent_schema_migrations') IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if ledger {
+            return Err("the refused open created the migration ledger".into());
+        }
+
+        let first = postgres::migrate(&pool)
+            .await
+            .map_err(|e| format!("migrate: {e}"))?;
+        eprintln!("first migrate: {first:?}");
+        if first.applied != expected {
+            return Err(format!("first migrate applied {:?}", first.applied));
+        }
+        let Some(waited) = first.neki_ddl else {
+            return Err("migrate did not wait for the DDL on Neki".into());
+        };
+        let again = postgres::migrate(&pool)
+            .await
+            .map_err(|e| format!("second migrate: {e}"))?;
+        eprintln!("second migrate: {again:?}");
+        if !again.applied.is_empty() {
+            return Err(format!("second migrate applied {:?}", again.applied));
+        }
+        match again.neki_ddl {
+            Some(v) if v.schema_version >= waited.schema_version => {}
+            other => return Err(format!("second migrate waited for {other:?}")),
+        }
+
+        postgres::check_schema(&pool)
+            .await
+            .map_err(|e| format!("gate after migrate: {e}"))?;
+        let store = open("neki-gate-after").await?;
+        store
+            .set_setting("userRules", "\"x\"")
+            .await
+            .map_err(|e| format!("write after migrate: {e}"))?;
+
+        exec(
+            &pool,
+            "INSERT INTO intent_schema_migrations \
+             (version, description, checksum, applied_statements, applied_prefix, complete) \
+             VALUES (9999, 'future', '\\x00', 0, '\\x00', true)"
+                .to_owned(),
+        )
+        .await
+        .map_err(|e| format!("record a future migration: {e}"))?;
+        let newer = schema_mismatch("neki-gate-newer").await?;
+        if newer.applied.last() != Some(&9999) {
+            return Err(format!("newer-schema mismatch: {newer:?}"));
+        }
+        Ok(())
+    })
+    .await
+    .expect("migrate job and schema gate on Neki");
 }

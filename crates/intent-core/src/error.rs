@@ -333,6 +333,14 @@ pub enum Error {
     #[error("store busy: {0}")]
     StoreBusy(String),
 
+    /// The Postgres schema's applied migrations are not exactly the ones
+    /// this build embeds: not migrated yet, part-way, changed after they were
+    /// applied, or newer than this build. The store refused to open before
+    /// it wrote anything; serving daemons never migrate (a separate migrate
+    /// job does). Boxed to keep [`Error`] small. Surfaces as `-32603`.
+    #[error("{0}")]
+    SchemaMismatch(Box<SchemaMismatch>),
+
     /// A request forwarded to an agent's provider adapter failed (JSON-RPC
     /// error, timeout, or the connection ended before or during the request),
     /// e.g. `agent.workers.stop` (PROTOCOL §5.5b). Surfaces as `-32603` with
@@ -826,6 +834,7 @@ impl Error {
             | Error::SourceControlUnauthorized { .. }
             | Error::RateLimited(_)
             | Error::StoreBusy(_)
+            | Error::SchemaMismatch(_)
             | Error::ProviderRequest(_)
             | Error::IdentityProof(_)
             | Error::IdentityUnverifiable { .. }
@@ -834,6 +843,80 @@ impl Error {
             Error::Conflict { .. } => -32005,
             Error::Forbidden(_) | Error::NodeMode(_) | Error::OrchestratorMode(_) => -32003,
             Error::Invite(kind) => kind.code(),
+        }
+    }
+}
+
+/// What [`Error::SchemaMismatch`] found: the schema's migration ledger
+/// against the migrations this build embeds. The schema matches only when
+/// `applied == expected` and `changed` and `part_way` are empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaMismatch {
+    /// Versions the ledger records as complete, ascending; may include
+    /// versions this build does not know (a newer schema).
+    pub applied: Vec<i64>,
+    /// Versions this build embeds, ascending.
+    pub expected: Vec<i64>,
+    /// Applied versions whose checksum differs from this build's file.
+    pub changed: Vec<i64>,
+    /// Versions a migrate run started but did not finish, ascending.
+    pub part_way: Vec<i64>,
+    /// The schema has no ledger rows but was migrated by the earlier sqlx
+    /// migrator (`_sqlx_migrations`), which the migrate job refuses.
+    pub legacy_sqlx: bool,
+}
+
+impl SchemaMismatch {
+    /// Ledger versions (complete or part-way) this build does not know.
+    #[must_use]
+    pub fn unknown(&self) -> Vec<i64> {
+        let mut unknown: Vec<i64> = self
+            .applied
+            .iter()
+            .chain(&self.part_way)
+            .filter(|v| !self.expected.contains(v))
+            .copied()
+            .collect();
+        unknown.sort_unstable();
+        unknown
+    }
+}
+
+impl std::fmt::Display for SchemaMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "postgres schema does not match this build: applied migrations {:?}, this build \
+             expects {:?}",
+            self.applied, self.expected
+        )?;
+        if !self.part_way.is_empty() {
+            write!(f, "; part-way: {:?}", self.part_way)?;
+        }
+        if !self.changed.is_empty() {
+            write!(f, "; changed since they were applied: {:?}", self.changed)?;
+        }
+        // The first fix that applies; the migrate job refuses the first three.
+        let unknown = self.unknown();
+        if self.legacy_sqlx {
+            f.write_str(
+                "; the schema was migrated by the earlier sqlx migrator (_sqlx_migrations) \
+                 and has no intent_schema_migrations record: recreate the schema, then run \
+                 the migrate job",
+            )
+        } else if !unknown.is_empty() {
+            write!(
+                f,
+                "; the schema is newer than this build (unknown {unknown:?}): run a build that \
+                 knows every applied migration"
+            )
+        } else if !self.changed.is_empty() {
+            f.write_str(
+                "; a migration file changed after it was applied: restore it, or repair the \
+                 schema by hand",
+            )
+        } else {
+            f.write_str("; run the migrate job with this build, then start the daemon")
         }
     }
 }

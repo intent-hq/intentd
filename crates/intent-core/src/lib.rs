@@ -111,7 +111,7 @@ pub use discovery_cache::DiscoveryCache;
 pub use error::{
     BaseRefreshErrorCategory, BaseRefreshFailure, CloneErrorCategory, Error,
     IdentityProofErrorKind, InviteErrorKind, PlainFolderPathReason, PlainFolderPathRejection,
-    ProviderProfileFailure, Result,
+    ProviderProfileFailure, Result, SchemaMismatch,
 };
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
