@@ -102,6 +102,24 @@ pub struct RemoteFeature {
     forge: std::sync::OnceLock<Arc<link::forge_token::ForgeTokens>>,
     /// Where remote agents' and homes' refs live.
     git: GitStore,
+    /// The `hello.headSession` every link of this backend offers.
+    head_session: HeadSession,
+    /// Taken by every change of the ordered machine list
+    /// ([`order`]): one per backend, so two tenants never wait on each
+    /// other.
+    pub(crate) order_lock: tokio::sync::Mutex<()>,
+}
+
+/// [`RemoteFeature::head_session`]: picked once per feature, so each start
+/// of a backend (and each tenant of an orchestrator) has its own, and a
+/// machine drops the agent secrets it held for the previous one
+/// (nodeProtocol 14).
+struct HeadSession(Arc<str>);
+
+impl Default for HeadSession {
+    fn default() -> Self {
+        Self(uuid::Uuid::new_v4().to_string().into())
+    }
 }
 
 /// [`RemoteFeature::connections`]: connectors in this process.
@@ -165,7 +183,26 @@ impl RemoteFeature {
     }
 
     pub(crate) fn tuning(&self) -> connector::Tuning {
-        lock(&self.tuning).clone().unwrap_or_default()
+        let mut tuning = lock(&self.tuning).clone().unwrap_or_default();
+        tuning.head_session = Some(self.head_session.0.clone());
+        tuning
+    }
+
+    /// The `hello.headSession` every link of this backend offers.
+    #[must_use]
+    pub fn head_session(&self) -> &str {
+        &self.head_session.0
+    }
+
+    /// Shut down every running connector and close its link, as a fenced
+    /// tenant must: a later need starts a new one. Returns how many were
+    /// shut down.
+    pub fn close_links(&self) -> usize {
+        let nodes: Vec<RemoteNode> = lock(&self.nodes).drain().map(|(_, node)| node).collect();
+        for node in &nodes {
+            node.shutdown();
+        }
+        nodes.len()
     }
 
     /// The GitHub token the machines hold, its watcher started.

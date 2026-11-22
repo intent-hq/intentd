@@ -19,7 +19,7 @@ use crate::connect::{connect, ConnectFailure, Connected};
 use crate::lease::{new_owner, probe_hello, record_new_lease, HeadLease};
 use crate::machine::MachineTarget;
 use crate::{RemoteFeature, RemoteNode};
-use intent_node_connections::{process_head_session, LinkView};
+use intent_node_connections::LinkView;
 
 /// Longest id, name, credential id or route, in UTF-8 bytes.
 const MAX_TEXT_BYTES: usize = 256;
@@ -604,7 +604,7 @@ pub(crate) async fn add_machine(
     let probed = connect(&target, &feature.tuning().connect, None, || {
         let kept = kept.clone();
         let next = generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let fresh = probe_hello(&owner, NodeCounter(next), process_head_session());
+        let fresh = probe_hello(&owner, NodeCounter(next), feature.head_session());
         async move {
             match kept {
                 Some(lease) => lease.next_hello(acked).await,

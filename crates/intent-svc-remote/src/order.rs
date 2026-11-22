@@ -13,11 +13,20 @@ use intent_core::machine_order::{
 use intent_core::{Error, Result};
 use intent_services::feature_api::Services;
 
-/// Every change of the list takes this lock: `setOrder` reads, checks,
+use crate::RemoteServicesExt as _;
+
+/// Every change of `svc`'s list takes this lock: `setOrder` reads, checks,
 /// saves and announces as one step, and an add or remove announces the list
 /// read after its own change, so the last event a client receives is never
-/// an older list.
-static ORDER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// an older list. Each backend's remote feature holds its own; without one,
+/// a process-wide lock.
+pub(crate) async fn lock(svc: &Services) -> tokio::sync::MutexGuard<'_, ()> {
+    static UNREGISTERED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    match svc.remote_feature() {
+        Some(feature) => feature.order_lock.lock().await,
+        None => UNREGISTERED.lock().await,
+    }
+}
 
 /// The ordered list now.
 ///
@@ -69,7 +78,7 @@ pub(crate) async fn set_order(svc: &Services, params: &Value) -> Result<Value> {
         .ok_or_else(|| Error::InvalidParams("order is required and must be an array".into()))?;
     let order: Vec<MachineOrderKey> = serde_json::from_value(raw.clone())
         .map_err(|error| Error::InvalidParams(format!("order: {error}")))?;
-    let _turn = ORDER_LOCK.lock().await;
+    let _turn = lock(svc).await;
     let rows = rows(svc).await?;
     let now = ordered(
         &parse_saved(
@@ -104,7 +113,7 @@ async fn save(svc: &Services, order: &[MachineOrderKey]) -> Result<()> {
 /// Drop a removed machine or entry from the saved order, so a later add of
 /// the same id is appended at the end, then announce the list.
 pub(crate) async fn forget(svc: &Services, removed: &MachineOrderKey) {
-    let _turn = ORDER_LOCK.lock().await;
+    let _turn = lock(svc).await;
     let pruned = svc
         .store()
         .get_setting(MACHINE_ORDER_STATE_KEY)
@@ -126,7 +135,7 @@ pub(crate) async fn forget(svc: &Services, removed: &MachineOrderKey) {
 
 /// Announce the list after a machine or entry was added or renamed.
 pub(crate) async fn publish(svc: &Services) {
-    let _turn = ORDER_LOCK.lock().await;
+    let _turn = lock(svc).await;
     announce(svc).await;
 }
 

@@ -365,9 +365,13 @@ pub fn ownership(store: &Store, tuning: &crate::connector::Tuning) -> Arc<dyn Li
     if let Some(ownership) = &tuning.ownership.0 {
         return ownership.clone();
     }
-    #[cfg(not(any(test, feature = "test-support")))]
-    let _ = tuning;
-    Arc::new(LocalOwnership::new(store.clone()))
+    match &tuning.head_session {
+        Some(session) => Arc::new(LocalOwnership::with_head_session(
+            store.clone(),
+            session.clone(),
+        )),
+        None => Arc::new(LocalOwnership::new(store.clone())),
+    }
 }
 
 /// Durably start `owner`'s lease on `target` after a probe bound it at

@@ -113,6 +113,10 @@ pub struct Tuning {
     /// How often a linked machine's pending home stops are sent again
     /// (a `failed` ack, or none): every bind sends them too.
     pub home_stop_resend: Duration,
+    /// The `hello.headSession` this backend's links offer: its remote
+    /// feature's, so each tenant of an orchestrator has its own. Without one,
+    /// the process's ([`crate::process_head_session`]).
+    pub head_session: Option<Arc<str>>,
     /// Test seam: fail every ack write while set.
     #[cfg(any(test, feature = "test-support"))]
     pub fail_ack_writes: Arc<std::sync::atomic::AtomicBool>,
@@ -234,6 +238,7 @@ impl Default for Tuning {
             forge_check: Duration::from_secs(2),
             home_stop_resend: Duration::from_secs(2 * 60),
             #[cfg(any(test, feature = "test-support"))]
+            head_session: None,
             fail_ack_writes: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             fail_claim_reads: Arc::default(),
