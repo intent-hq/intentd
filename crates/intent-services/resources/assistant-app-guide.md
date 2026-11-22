@@ -753,7 +753,7 @@ actions can also include **Let <backend> run agents here**, which asks to confir
 listed under **Machines <backend> can run agents on**. An orchestrator (hub icon) never
 offers **Let <backend> run agents here**: it never runs agents for another host, and
 adding it anyway fails with **<machine> is an orchestrator, so it can't run agents for
-<backend>** (older versions may differ).
+<backend>. To use it, switch to it as a host.** (older versions may differ).
 Running agents on those machines is experimental. That list is in the user's order of
 preference, and its first row is marked **Preferred**: **This computer** first by default, then machines and cloud entries as they
 were added (pending frontend release: the list is **Runners for <host>**, with no
