@@ -30,6 +30,7 @@ uuid = { workspace = true }
 zeroize = "1.9"
 
 [dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 
