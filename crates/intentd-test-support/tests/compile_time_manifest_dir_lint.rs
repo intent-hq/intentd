@@ -152,6 +152,7 @@ fn normalize(rel: &str) -> String {
 
 /// Every file scanned whole: the source lints, the modules they load by
 /// `#[path]`, and the files of [`OTHER_SOURCE_SCANNERS`].
+#[track_caller]
 fn source_scanners(files: &[TestCodeFile]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for file in files.iter().filter(|file| is_source_lint(&file.rel)) {
