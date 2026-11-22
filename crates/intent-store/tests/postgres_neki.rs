@@ -109,27 +109,36 @@ async fn round_trip(pool: PgPool) -> Result<(), String> {
 /// `applied` covers both runs. In an unbound fresh schema, and on a branch
 /// whose topology already binds every table, this is `migrate`.
 async fn migrate_bound(pool: &PgPool) -> Result<postgres::MigrateReport, String> {
+    /// Gaps to bind at most: each binds every table unbound at the time,
+    /// so more than one only if a later migration adds another.
+    const BINDS: usize = 4;
     let before = completed_migrations(pool).await?;
-    let stopped = match postgres::migrate(pool).await {
-        Ok(report) => return Ok(report),
-        Err(e) => e.to_string(),
+    let mut binds = 0;
+    let mut report = loop {
+        let stopped = match postgres::migrate(pool).await {
+            Ok(report) => break report,
+            Err(e) => e.to_string(),
+        };
+        let gap = postgres::neki_topology_gap(pool)
+            .await
+            .map_err(|e| format!("{stopped}; then reading the topology: {e}"))?;
+        let Some(gap) = gap else {
+            return Err(stopped);
+        };
+        if binds == BINDS {
+            return Err(format!("still a gap after {BINDS} binds: {stopped}"));
+        }
+        eprintln!("migrate stopped on a topology gap; binding: {gap}");
+        bind_to_topology(pool, &gap).await?;
+        binds += 1;
     };
-    let gap = postgres::neki_topology_gap(pool)
-        .await
-        .map_err(|e| format!("{stopped}; then reading the topology: {e}"))?;
-    let Some(gap) = gap else {
-        return Err(stopped);
-    };
-    eprintln!("migrate stopped on a topology gap; binding: {gap}");
-    bind_to_topology(pool, &gap).await?;
-    let mut report = postgres::migrate(pool)
-        .await
-        .map_err(|e| format!("migrate after binding: {e}"))?;
-    report.applied = completed_migrations(pool)
-        .await?
-        .into_iter()
-        .filter(|version| !before.contains(version))
-        .collect();
+    if binds > 0 {
+        report.applied = completed_migrations(pool)
+            .await?
+            .into_iter()
+            .filter(|version| !before.contains(version))
+            .collect();
+    }
     Ok(report)
 }
 

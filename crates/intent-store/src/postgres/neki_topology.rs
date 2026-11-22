@@ -127,21 +127,44 @@ pub(super) fn gap_in(
 ) -> Option<NekiTopologyGap> {
     let bound = &topology["databases"][database]["schemas"][schema]["tables"];
     let group_of = |table: &str| bound[table]["shard_group"].as_str();
+    let spec_of = |group: &str| {
+        topology["shard_groups"]
+            .as_array()
+            .and_then(|groups| groups.iter().find(|g| g["uid"] == group))
+    };
+    // A bound table's shard index: its own, else its group's default. Two
+    // tables of one group split rows the same way only with the same index.
+    let index_of = |table: &str, group: &str| {
+        bound[table]["shard_index"]
+            .as_str()
+            .or_else(|| spec_of(group).and_then(|spec| spec["default_shard_index"].as_str()))
+    };
     // No bound tenant table: the schema is not sharded, and every tenant
     // table shares the default group.
-    let shard_group = group_of("tenant_writer")
-        .or_else(|| tenant_tables.iter().find_map(|t| group_of(t)))?
-        .to_owned();
+    let home = ["tenant_writer"]
+        .iter()
+        .copied()
+        .chain(tenant_tables.iter().map(String::as_str))
+        .find_map(|t| group_of(t).map(|group| (group, index_of(t, group))))?;
+    let shard_group = home.0.to_owned();
     // An unbound table lives on the default group: together with the others
-    // only when that is their group.
-    let default_is_home = topology["default_shard_group"].as_str() == Some(shard_group.as_str());
+    // only when that is their group and it has one shard (with more, how
+    // the router splits an unbound table is not the bound tables' index).
+    let one_shard = spec_of(home.0)
+        .and_then(|spec| spec["key_ranges"].as_array())
+        .is_some_and(|ranges| ranges.len() <= 1);
+    let default_is_home = topology["default_shard_group"].as_str() == Some(home.0) && one_shard;
     let mut unbound = Vec::new();
     let mut misplaced = Vec::new();
     for table in tenant_tables {
         match group_of(table) {
             None if !default_is_home => unbound.push(table.clone()),
-            Some(group) if group != shard_group => {
+            Some(group) if group != home.0 => {
                 misplaced.push((table.clone(), group.to_owned()));
+            }
+            Some(group) if !one_shard && index_of(table, group) != home.1 => {
+                let index = index_of(table, group).unwrap_or("no index");
+                misplaced.push((table.clone(), format!("{group}, index {index}")));
             }
             _ => {}
         }
@@ -246,7 +269,50 @@ mod tests {
         assert_eq!(gap_in(&json!({}), "postgres", "public", &all), None);
     }
 
-    /// Tenant tables bound to the default group share it with unbound ones.
+    /// A table in the right group but split by another index puts a
+    /// tenant's rows on other shards than its `tenant_writer` row.
+    #[test]
+    fn a_tenant_table_split_by_another_index_is_a_gap() {
+        let mut topology = topology(&json!({
+            "tenant_writer": {"shard_group": "tenant_data"},
+            "tenant_lease": {"shard_group": "tenant_data", "shard_index": "xxhash_owner"}
+        }));
+        topology["shard_indexes"]["xxhash_owner"] =
+            json!({"type": "xxhash", "columns": ["owner_instance"]});
+        let gap = gap_in(
+            &topology,
+            "postgres",
+            "intent_shard_ci",
+            &tables(&["tenant_lease", "tenant_writer"]),
+        )
+        .expect("tenant_lease is split by another index");
+        assert_eq!(
+            gap.misplaced,
+            vec![(
+                "tenant_lease".into(),
+                "tenant_data, index xxhash_owner".into()
+            )]
+        );
+    }
+
+    /// With a multi-shard default group, an unbound table is not known to
+    /// follow the bound tables' index: report it.
+    #[test]
+    fn unbound_tables_in_a_multi_shard_default_group_are_a_gap() {
+        let mut topology = topology(&json!({"tenant_writer": {"shard_group": "tenant_data"}}));
+        topology["default_shard_group"] = json!("tenant_data");
+        let gap = gap_in(
+            &topology,
+            "postgres",
+            "intent_shard_ci",
+            &tables(&["tenant_lease", "tenant_writer"]),
+        )
+        .expect("tenant_lease is unbound");
+        assert_eq!(gap.unbound, tables(&["tenant_lease"]));
+    }
+
+    /// Tenant tables bound to a one-shard default group share it with
+    /// unbound ones.
     #[test]
     fn unbound_tables_are_together_when_the_default_group_is_home() {
         let topology = topology(&json!({"tenant_writer": {"shard_group": "sh1"}}));

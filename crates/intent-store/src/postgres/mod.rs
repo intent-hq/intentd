@@ -375,6 +375,9 @@ fn pool_options(settings: PoolSettings) -> PgPoolOptions {
 /// Binding before the first write matters: rows written while the table was
 /// unbound stay on the default group's shard. A schema with no bound tenant
 /// table is not sharded and passes (a one-shard branch, a fresh test schema).
+/// The migrate job's role must be able to call `__neki.get_data_topology()`
+/// (reading needs no `neki_operator`); if it cannot, every Neki run fails,
+/// including one with nothing to apply.
 ///
 /// # Transient connection failures
 ///
@@ -402,7 +405,9 @@ pub async fn migrate(pool: &PgPool) -> Result<MigrateReport> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrateReport {
     /// Versions this run completed, ascending; empty when the schema was
-    /// already current.
+    /// already current. After a retry it can miss a version whose
+    /// completion committed while the reply was lost: the ledger is the
+    /// record.
     pub applied: Vec<i64>,
     /// The router versions the run waited for on Neki; `None` on vanilla
     /// Postgres.
@@ -521,8 +526,10 @@ fn transient_connection_error(e: &sqlx::Error) -> bool {
 }
 
 fn transient_database_error(code: Option<&str>, message: &str) -> bool {
-    let code_says = code
-        .is_some_and(|code| code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03"));
+    // 08P01 protocol_violation is a bug, not a lost connection.
+    let code_says = code.is_some_and(|code| {
+        (code.starts_with("08") && code != "08P01") || matches!(code, "57P01" | "57P02" | "57P03")
+    });
     let message = message.to_ascii_lowercase();
     code_says
         || ["broken pipe", "connection reset by peer"]
@@ -1652,6 +1659,10 @@ mod tests {
         for code in ["08000", "08003", "08006", "57P01", "57P02", "57P03"] {
             assert!(transient_database_error(Some(code), "x"), "{code}");
         }
+        assert!(!transient_database_error(
+            Some("08P01"),
+            "invalid message format"
+        ));
         let io = sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         assert!(transient_connection_error(&io));
     }
