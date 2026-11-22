@@ -1,13 +1,18 @@
 //! Harness 3.10, 3.12 and 3.13 doctrine goldens: the composed bundled rules are
 //! pinned per agent type and feature/plain-folder variant, the cut sections
 //! stay out, and every feature gate and plain-folder rewrite still bites.
+//!
+//! Refresh every table here after a deliberate change with
+//! `INTENTD_UPDATE_GOLDENS=1 make test-select E='test(v3_10_goldens)'`.
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use intent_core::settings_file::AgentFeaturesSettings;
 use sha2::{Digest, Sha256};
 
 use crate::instructions::{get_instruction_with_common_in, InstructionSet};
+use crate::test_support::golden_rows::{self, Field};
 
 const AGENT_TYPES: &[&str] = &[
     "interactive",
@@ -178,32 +183,68 @@ fn sha256_hex(text: &str) -> String {
         })
 }
 
-#[test]
-fn golden_v3_10_composed_doctrine() {
+const SOURCE: &str = "src/v3_10_goldens.rs";
+const UPDATE_COMMAND: &str = "INTENTD_UPDATE_GOLDENS=1 make test-select E='test(v3_10_goldens)'";
+
+type Row<'a> = (&'a str, usize, &'a str);
+
+fn table_source<'a>(rows: impl IntoIterator<Item = Row<'a>>) -> String {
+    golden_rows::rows_source(
+        rows.into_iter()
+            .map(|row| vec![Field::Str(row.0), Field::Count(row.1), Field::Str(row.2)]),
+    )
+}
+
+/// Compares `set`'s composed doctrine per agent type with `table`, or
+/// rewrites `table` under `INTENTD_UPDATE_GOLDENS=1`. On a difference,
+/// returns the agent types whose row is missing or changed and the stale
+/// rows, or else the row order (the table follows [`AGENT_TYPES`]).
+fn check_table(name: &str, table: &[Row<'static>], set: &'static InstructionSet) -> Option<String> {
     let actual: Vec<(&str, usize, String)> = AGENT_TYPES
         .iter()
         .map(|agent_type| {
-            let text = composed(agent_type);
+            let text = composed_in(set, agent_type);
             (*agent_type, text.len(), sha256_hex(&text))
         })
         .collect();
-    let matches = actual.len() == GOLDEN.len()
-        && actual
-            .iter()
-            .zip(GOLDEN)
-            .all(|(a, g)| a.0 == g.0 && a.1 == g.1 && a.2 == g.2);
-    assert!(
-        matches,
-        "harness 3.10 doctrine changed. 3.10 never shipped on its own (3.12 releases \
-         its surfaces), but eval sessions carry it: gate a change on a new harness \
-         version, or for a deliberate fix paste the rows below into GOLDEN (rerun \
-         `make test-select E='test(golden_v3_10_composed)'`):\n{}",
-        actual
-            .iter()
-            .map(|(t, len, sha)| format!("    (\"{t}\", {len}, \"{sha}\"),"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    let actual: Vec<Row> = actual
+        .iter()
+        .map(|row| (row.0, row.1, row.2.as_str()))
+        .collect();
+    let body = table_source(actual.iter().copied());
+    if golden_rows::updating() {
+        golden_rows::rewrite_table(SOURCE, name, &body);
+        return None;
+    }
+    if body == table_source(table.iter().copied()) {
+        return None;
+    }
+    let changed: Vec<&str> = actual
+        .iter()
+        .filter(|row| table.iter().find(|r| r.0 == row.0) != Some(*row))
+        .map(|row| row.0)
+        .collect();
+    let stale: Vec<&str> = table
+        .iter()
+        .filter(|row| actual.iter().all(|r| r.0 != row.0))
+        .map(|row| row.0)
+        .collect();
+    Some(if changed.is_empty() && stale.is_empty() {
+        "rows out of agent-type order, or duplicated".to_owned()
+    } else {
+        format!("changed rows {changed:?}, stale rows {stale:?}")
+    })
+}
+
+#[test]
+fn golden_v3_10_composed_doctrine() {
+    if let Some(diff) = check_table("GOLDEN", GOLDEN, set()) {
+        panic!(
+            "harness 3.10 doctrine differs ({diff}). 3.10 never shipped on its own (3.12 \
+             releases its surfaces), but eval sessions carry it: gate a change on a new \
+             harness version, or for a deliberate fix refresh the rows with:\n{UPDATE_COMMAND}"
+        );
+    }
 }
 
 #[test]
@@ -304,55 +345,46 @@ fn v3_10_plain_folder_drops_forge_sections_and_rewrites_examples() {
 
 #[test]
 fn golden_v3_12_composed_doctrine() {
-    let set = &crate::instructions::V3_12;
-    let actual: Vec<(&str, usize, String)> = AGENT_TYPES
-        .iter()
-        .map(|agent_type| {
-            let text = composed_in(set, agent_type);
-            (*agent_type, text.len(), sha256_hex(&text))
-        })
-        .collect();
-    let matches = actual.len() == GOLDEN_V3_12.len()
-        && actual
-            .iter()
-            .zip(GOLDEN_V3_12)
-            .all(|(a, g)| a.0 == g.0 && a.1 == g.1 && a.2 == g.2);
-    assert!(
-        matches,
-        "harness 3.12 doctrine changed. 3.12 is released, so live sessions carry it: \
-         gate the change on a new harness version, or for a deliberate all-session fix \
-         paste the rows below into GOLDEN_V3_12:\n{}",
-        actual
-            .iter()
-            .map(|(t, len, sha)| format!("    (\"{t}\", {len}, \"{sha}\"),"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    if let Some(diff) = check_table("GOLDEN_V3_12", GOLDEN_V3_12, &crate::instructions::V3_12) {
+        panic!(
+            "harness 3.12 doctrine differs ({diff}). 3.12 is released, so live sessions \
+             carry it: gate the change on a new harness version, or for a deliberate \
+             all-session fix refresh the rows with:\n{UPDATE_COMMAND}"
+        );
+    }
 }
 
 #[test]
 fn golden_v3_13_composed_doctrine() {
-    let set = &crate::instructions::V3_13;
-    let actual: Vec<(&str, usize, String)> = AGENT_TYPES
-        .iter()
-        .map(|agent_type| {
-            let text = composed_in(set, agent_type);
-            (*agent_type, text.len(), sha256_hex(&text))
-        })
-        .collect();
-    let matches = actual.len() == GOLDEN_V3_13.len()
-        && actual
-            .iter()
-            .zip(GOLDEN_V3_13)
-            .all(|(a, g)| a.0 == g.0 && a.1 == g.1 && a.2 == g.2);
-    assert!(
-        matches,
-        "harness 3.13 doctrine changed. Gate the change on a new harness version, or \
-         for a deliberate all-session fix paste the rows below into GOLDEN_V3_13:\n{}",
-        actual
-            .iter()
-            .map(|(t, len, sha)| format!("    (\"{t}\", {len}, \"{sha}\"),"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    if let Some(diff) = check_table("GOLDEN_V3_13", GOLDEN_V3_13, &crate::instructions::V3_13) {
+        panic!(
+            "harness 3.13 doctrine differs ({diff}). Gate the change on a new harness \
+             version, or for a deliberate all-session fix refresh the rows with:\n\
+             {UPDATE_COMMAND}"
+        );
+    }
+}
+
+/// The update command rewrites the tables in rustfmt's layout: rebuilding
+/// each table from its own rows leaves this file byte-identical. An update
+/// run rewrites the file under the compiled tables, so it skips this check.
+#[test]
+fn tables_regenerate_in_rustfmt_layout() {
+    if golden_rows::updating() {
+        return;
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(SOURCE);
+    let source = std::fs::read_to_string(path).expect("read this file");
+    for (name, table) in [
+        ("GOLDEN", GOLDEN),
+        ("GOLDEN_V3_12", GOLDEN_V3_12),
+        ("GOLDEN_V3_13", GOLDEN_V3_13),
+    ] {
+        let body = table_source(table.iter().copied());
+        assert_eq!(
+            golden_rows::splice_table(&source, name, &body),
+            source,
+            "{name}"
+        );
+    }
 }
