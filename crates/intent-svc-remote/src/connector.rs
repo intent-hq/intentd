@@ -458,7 +458,9 @@ pub(crate) struct Shared {
 
 impl Shared {
     /// The backend's services, when this connector has them: for domain
-    /// code that has not moved behind [`NodeInbound`] yet.
+    /// code that has not moved behind [`NodeInbound`] yet (homes, home state,
+    /// git access). An inbound that is not [`crate::inbound::ServicesInbound`]
+    /// turns those paths off.
     pub(crate) fn services(&self) -> Option<&Services> {
         self.inbound
             .as_ref()?

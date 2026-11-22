@@ -1431,7 +1431,7 @@ async fn a_fenced_welcome_claims_and_stops_nothing() {
 #[derive(Default)]
 struct Recording {
     changed: Mutex<Vec<String>>,
-    requests: Mutex<Vec<(String, Option<NodeCounter>, String)>>,
+    requests: Mutex<Vec<(String, Option<intent_core::node_link::LeaseBinding>, String)>>,
 }
 
 impl intent_node_connections::NodeInbound for Recording {
@@ -1442,7 +1442,7 @@ impl intent_node_connections::NodeInbound for Recording {
     ) {
         self.requests.lock().unwrap().push((
             link.machine_id(),
-            link.current_binding().map(|binding| binding.generation),
+            link.current_binding(),
             request.request().method.clone(),
         ));
         tokio::spawn(async move {
@@ -1499,8 +1499,9 @@ impl intent_node_connections::NodeInbound for Recording {
         &'a self,
         link: &'a dyn intent_node_connections::LinkView,
     ) -> intent_core::BoxFuture<'a, ()> {
-        self.changed.lock().unwrap().push(link.machine_id());
-        Box::pin(async {})
+        Box::pin(async move {
+            self.changed.lock().unwrap().push(link.machine_id());
+        })
     }
 
     fn home_setup_output<'a>(
@@ -1569,11 +1570,12 @@ async fn link_callbacks_reach_the_inbound_with_the_live_link() {
         *inbound.requests.lock().unwrap(),
         [(
             machine.id(),
-            Some(end.hello.binding.generation),
+            Some(end.hello.binding.clone()),
             "workspace.call".to_owned()
         )]
     );
-    // The bind announced the machine.
+    // The bind announced the machine: the announcement precedes serving, so
+    // the answered call above proves it is done.
     assert!(inbound.changed.lock().unwrap().contains(&machine.id()));
     node.shutdown();
 }
