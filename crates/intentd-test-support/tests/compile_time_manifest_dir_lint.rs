@@ -17,14 +17,21 @@
 //! (`#[cfg(test)]` / `#[cfg(all(…, test, …))]` items, conventional test files
 //! and the out-of-line modules they declare). A `cfg(any(test, feature =
 //! "test-hooks"))` item is library code here: it builds into the rlib other
-//! crates' tests link. Test-build code is out of scope: the path a test
-//! binary bakes comes from the same build as the code that reads it.
+//! crates' tests link.
+//!
+//! It also fails on them anywhere in a source lint
+//! (`crates/*/tests/*_lint.rs`): a reused test binary is reused whole, so a
+//! lint that bakes its checkout scans the building checkout even when the
+//! library it links is fixed (`elapsed_assert_lint` read a deleted checkout
+//! in the two-checkout reproduction). Other test code is out of scope: it
+//! reads fixtures of the build it belongs to, not the tree under review.
 //! An `env!` inside `include_str!` / `include_bytes!` arguments is exempt:
 //! those embed the file's bytes, never its path.
 //!
-//! Read the path at run time instead — `source_lint::workspace_root()`, or
-//! `std::env::var_os("CARGO_MANIFEST_DIR")`, which `cargo test` and nextest
-//! set to the running test's package — or move the code under `#[cfg(test)]`.
+//! Read the path at run time instead — `source_lint::workspace_root()` or
+//! `source_lint::package_dir()`, from the `CARGO_MANIFEST_DIR` that
+//! `cargo test` and nextest set for the running test — or, in library code,
+//! move the code under `#[cfg(test)]`.
 //! There is no opt-out.
 
 use intentd_test_support::source_lint::{
@@ -62,17 +69,29 @@ fn inside_include(tokens: &[Token], at: usize) -> bool {
     false
 }
 
-/// 1-based lines of `src` reading `CARGO_MANIFEST_DIR` at compile time
-/// outside test-build-only code and outside `include_str!` /
-/// `include_bytes!` arguments (`whole` marks a file that is test code
-/// throughout).
-fn hits(src: &str, whole: bool) -> Vec<usize> {
+/// Which code of a file the rule covers.
+#[derive(Clone, Copy)]
+enum Scope {
+    /// Library code: everything but test-build-only code (`whole` marks a
+    /// file that is test code throughout).
+    Library { whole: bool },
+    /// A source lint: the whole file.
+    Lint,
+}
+
+/// 1-based lines of `src` reading `CARGO_MANIFEST_DIR` at compile time in
+/// `scope`, outside `include_str!` / `include_bytes!` arguments.
+fn hits(src: &str, scope: Scope) -> Vec<usize> {
+    let whole = matches!(scope, Scope::Library { whole: true });
     let text = TestCodeText::with_cfgs(src, whole, TestCfgs::TestBuildOnly);
     let tokens = tokenize(&text.chars);
     text.lexed
         .literals
         .iter()
-        .filter(|literal| literal.cooked() == VAR && !text.in_test(literal.offset))
+        .filter(|literal| {
+            literal.cooked() == VAR
+                && (matches!(scope, Scope::Lint) || !text.in_test(literal.offset))
+        })
         .filter(|literal| {
             let before = tokens.partition_point(|token| token.start < literal.offset);
             before >= 3
@@ -85,8 +104,14 @@ fn hits(src: &str, whole: bool) -> Vec<usize> {
         .collect()
 }
 
+/// Whether `rel` is a source lint: `crates/<crate>/tests/<name>_lint.rs`.
+fn is_source_lint(rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    matches!(parts.as_slice(), ["crates", _, "tests", name] if name.ends_with("_lint.rs"))
+}
+
 #[test]
-fn library_code_never_bakes_the_manifest_dir() {
+fn library_code_and_source_lints_never_bake_the_manifest_dir() {
     let root = workspace_root();
     let mut failures = Vec::new();
     let files = test_code_files_with(&root, TestCfgs::TestBuildOnly);
@@ -97,17 +122,33 @@ fn library_code_never_bakes_the_manifest_dir() {
         "the scan found no crates/*/src files under {}",
         root.display()
     );
-    for file in files.iter().filter(|file| !file.whole) {
-        for line in hits(&file.src, false) {
+    let lints = files
+        .iter()
+        .filter(|file| is_source_lint(&file.rel))
+        .count();
+    assert!(
+        lints > 1,
+        "the scan found {lints} source lints under {}",
+        root.display()
+    );
+    for file in &files {
+        let scope = if is_source_lint(&file.rel) {
+            Scope::Lint
+        } else if file.whole {
+            continue;
+        } else {
+            Scope::Library { whole: false }
+        };
+        for line in hits(&file.src, scope) {
             failures.push(format!("{}:{line}", file.rel));
         }
     }
     assert!(
         failures.is_empty(),
-        "compile-time `env!(\"{VAR}\")` in library code bakes this checkout's path into the \
-         rlib, which a build reused by another checkout then reads (intent-hq/intentd#3648); \
-         resolve it at run time with `source_lint::workspace_root()` or \
-         `std::env::var_os(\"{VAR}\")`, or move the code under `#[cfg(test)]` (inside \
+        "compile-time `env!(\"{VAR}\")` in library code or a source lint bakes this checkout's \
+         path into the build, which another checkout reusing it then reads \
+         (intent-hq/intentd#3648); resolve it at run time with `source_lint::workspace_root()` / \
+         `source_lint::package_dir()`, or (library code only) move it under `#[cfg(test)]` (inside \
          `include_str!` / `include_bytes!` it is fine: only the file's bytes are embedded):\n  {}",
         failures.join("\n  ")
     );
@@ -131,7 +172,28 @@ pub fn hook_fixture() -> &'static str {
 }
 static AFTER_INCLUDE: (&str, &str) = (include_str!("x.txt"), env!("CARGO_MANIFEST_DIR"));
 "#;
-    assert_eq!(hits(src, false), vec![3, 6, 9, 13, 15]);
+    assert_eq!(
+        hits(src, Scope::Library { whole: false }),
+        vec![3, 6, 9, 13, 15]
+    );
+}
+
+#[test]
+fn source_lints_are_scanned_whole() {
+    let src = "#[cfg(test)]\nconst ROOT: &str = env!(\"CARGO_MANIFEST_DIR\");\n";
+    assert_eq!(hits(src, Scope::Lint), vec![2]);
+    assert_eq!(
+        hits(src, Scope::Library { whole: false }),
+        Vec::<usize>::new()
+    );
+    assert!(is_source_lint(
+        "crates/intent-core/tests/fixed_sleep_lint.rs"
+    ));
+    assert!(!is_source_lint(
+        "crates/intent-core/tests/common/fixed_sleep_lint.rs"
+    ));
+    assert!(!is_source_lint("crates/intent-core/tests/e2e.rs"));
+    assert!(!is_source_lint("crates/intent-core/src/x_lint.rs"));
 }
 
 #[test]
@@ -158,9 +220,15 @@ mod unix_tests {
     const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 }
 "#;
-    assert_eq!(hits(src, false), Vec::<usize>::new());
     assert_eq!(
-        hits("const ROOT: &str = env!(\"CARGO_MANIFEST_DIR\");\n", true),
+        hits(src, Scope::Library { whole: false }),
+        Vec::<usize>::new()
+    );
+    assert_eq!(
+        hits(
+            "const ROOT: &str = env!(\"CARGO_MANIFEST_DIR\");\n",
+            Scope::Library { whole: true }
+        ),
         Vec::<usize>::new(),
         "a whole test file is exempt"
     );

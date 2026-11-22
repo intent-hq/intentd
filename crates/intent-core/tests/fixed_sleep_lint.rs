@@ -356,7 +356,7 @@ fn display_rel(rel: &Path) -> String {
 
 #[test]
 fn fixed_sleeps_are_annotated_or_baselined() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let root = intentd_test_support::source_lint::workspace_root();
     let baseline = read_count_baselines(&root, BASELINE_DIR, "unannotated sleeps")
         .unwrap_or_else(|e| panic!("{e}"));
 

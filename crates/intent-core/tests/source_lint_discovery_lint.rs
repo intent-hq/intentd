@@ -96,8 +96,7 @@ const TOKEN_READER_FNS: [&str; 1] = ["tokens"];
 const TOKEN_READER_TYPES: [&str; 3] = ["Tok", "Token", "TokenKind"];
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
+    intentd_test_support::source_lint::workspace_root()
         .canonicalize()
         .expect("canonicalize workspace root")
 }

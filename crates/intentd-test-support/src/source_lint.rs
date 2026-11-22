@@ -1078,7 +1078,8 @@ impl LineIndex {
 /// another checkout (a Cargo target dir shared between checkouts, or a
 /// compiler cache) then scans a checkout that may be deleted
 /// (`agent_hidden_field_egress_lint` on intent-hq/intentd#3648).
-/// `compile_time_manifest_dir_lint` keeps such paths out of library code.
+/// `compile_time_manifest_dir_lint` keeps such paths out of library code and
+/// source lints.
 ///
 /// # Panics
 ///
@@ -1087,17 +1088,34 @@ impl LineIndex {
 #[must_use]
 #[track_caller]
 pub fn workspace_root() -> PathBuf {
-    let start = std::env::var_os("CARGO_MANIFEST_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| panic!("workspace_root: no CARGO_MANIFEST_DIR and no current dir"));
+    let start = package_dir();
     find_workspace_root(&start).unwrap_or_else(|| {
         panic!(
             "workspace_root: no Cargo.toml with a [workspace] table at or above {}",
             start.display()
         )
     })
+}
+
+/// The running test's package directory, at run time: the
+/// `CARGO_MANIFEST_DIR` that `cargo test` and nextest set in the test
+/// process's environment, or the working directory (which both set to the
+/// package) when it is unset. A source lint reads its own crate's files from
+/// here, never from `env!("CARGO_MANIFEST_DIR")`: a test binary reused by
+/// another checkout (a shared target dir) would read the building checkout
+/// (`compile_time_manifest_dir_lint`).
+///
+/// # Panics
+///
+/// When the variable is unset and the working directory is unavailable.
+#[must_use]
+#[track_caller]
+pub fn package_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| panic!("package_dir: no CARGO_MANIFEST_DIR and no current dir"))
 }
 
 /// The nearest directory at or above `start` whose `Cargo.toml` declares a
