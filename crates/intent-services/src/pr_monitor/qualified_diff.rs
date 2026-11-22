@@ -228,12 +228,6 @@ fn diff_checks(old: &Value, new: &Value) -> Vec<String> {
                 {
                     changes.push(format!("check {name}: {was} → {status}"));
                 }
-                if was == "failed"
-                    && status == "failed"
-                    && crate::pr_ops::is_new_check_run(prior["url"].as_str(), item["url"].as_str())
-                {
-                    changes.push(format!("check {name} is still failing on a new run"));
-                }
             }
             if before["requiredKnown"] == true && after["requiredKnown"] == true {
                 if let (Some(a), Some(b)) =
@@ -305,9 +299,11 @@ mod tests {
         );
     }
 
-    /// intent-hq/intent#9852: a failed check whose run changed failed again.
+    /// intent-hq/intent#9852: the qualified snapshot's check items carry no
+    /// provenance, so a changed link (a re-run, or a legacy status taking
+    /// over from a passing check run) is never reported as a new run here.
     #[test]
-    fn qualified_diff_reports_a_failed_rerun_once() {
+    fn qualified_diff_never_reads_a_changed_link_as_a_rerun() {
         let run = |url: Option<&str>| {
             let mut s = snapshot("failed");
             if let Some(url) = url {
@@ -315,32 +311,27 @@ mod tests {
             }
             s
         };
-        let first = run(Some("https://github.com/o/r/runs/1"));
-        let second = run(Some("https://github.com/o/r/runs/2"));
-        assert_eq!(
-            diff(&first, &second),
-            vec!["check build is still failing on a new run"]
-        );
-        assert!(diff(&second, &second).is_empty());
-        assert!(diff(
-            &second,
-            &run(Some("https://github.com/o/r/actions/runs/9/job/2"))
-        )
-        .is_empty());
-        assert!(diff(&second, &run(None)).is_empty());
-        assert!(diff(&run(None), &second).is_empty());
-        assert!(diff(&second, &run(Some("https://ci.example/o/r/runs/7"))).is_empty());
-        // Only GitHub check-run links are evidence: vendor, Jenkins-style and
-        // empty links never wake, even when they change.
-        let vendor = run(Some("https://ci.example/job/build/123/display/redirect"));
-        assert!(diff(&second, &vendor).is_empty());
-        assert!(diff(&vendor, &second).is_empty());
-        assert!(diff(
-            &vendor,
-            &run(Some("https://ci.example/job/build/124/display/redirect"))
-        )
-        .is_empty());
-        assert!(diff(&run(Some("")), &vendor).is_empty());
+        for (before, after) in [
+            (
+                Some("https://github.com/o/r/runs/1"),
+                Some("https://github.com/o/r/runs/2"),
+            ),
+            (
+                Some("https://github.com/o/r/runs/100"),
+                Some("https://github.com/o/r/runs/200"),
+            ),
+            (
+                Some("https://ci.example/build/1"),
+                Some("https://ci.example/build/2"),
+            ),
+            (None, Some("https://github.com/o/r/runs/2")),
+            (Some(""), Some("https://ci.example/build/2")),
+        ] {
+            assert!(
+                diff(&run(before), &run(after)).is_empty(),
+                "{before:?} → {after:?}"
+            );
+        }
     }
 
     #[test]

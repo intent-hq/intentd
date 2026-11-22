@@ -108,3 +108,168 @@ async fn a_failing_status_taking_over_from_a_passing_run_is_quiet() {
     let text = owner_messages(&svc, &owner).await;
     assert_eq!(text.matches(WAKE).count(), 1, "{text}");
 }
+
+#[derive(Clone, Copy, Debug)]
+enum Link {
+    ActionsJob,
+    CheckRun,
+    Vendor,
+    Empty,
+    Null,
+}
+
+const LINKS: [Link; 5] = [
+    Link::ActionsJob,
+    Link::CheckRun,
+    Link::Vendor,
+    Link::Empty,
+    Link::Null,
+];
+
+fn rollup_link(link: Link, id: u32) -> Option<String> {
+    match link {
+        Link::ActionsJob => Some(format!("https://github.com/o/r/actions/runs/9/job/{id}")),
+        Link::CheckRun => Some(format!("https://github.com/o/r/runs/{id}")),
+        Link::Vendor => Some(format!("https://ci.example/build/{id}")),
+        Link::Empty => Some(String::new()),
+        Link::Null => None,
+    }
+}
+
+/// One read of a `build` check run (id 100) beside a same-name legacy status
+/// (its link built from id 200): the rollup reports both, the REST fallback
+/// only the run's `/runs/<id>` link and keeps the last known status.
+fn read(
+    rollup: bool,
+    run: (CheckState, Link),
+    status: (CheckState, Link),
+    previous: Option<&PrMonitorSnapshot>,
+) -> PrMonitorSnapshot {
+    let check = |kind, state, url: Option<String>| RollupCheck {
+        kind,
+        url,
+        ..build(state, None)
+    };
+    let mut shared = shared_from(&snapshot(|_| {}), true);
+    if rollup {
+        let checks = vec![
+            check(RollupCheckKind::CheckRun, run.0, rollup_link(run.1, 100)),
+            check(
+                RollupCheckKind::StatusContext,
+                status.0,
+                rollup_link(status.1, 200),
+            ),
+        ];
+        let signals = MergeRequirementSignals {
+            checks,
+            checks_known: true,
+            ..Default::default()
+        };
+        shared.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(
+            pr_ops::rollup_items(&signals.checks),
+            true,
+        );
+        shared.status_checks = pr_ops::status_checks(Some(&signals));
+    } else {
+        let runs = [check(
+            RollupCheckKind::CheckRun,
+            run.0,
+            Some("https://github.com/o/r/runs/100".into()),
+        )];
+        shared.requirements.checks =
+            pr_ops::MergeRequirementsChecks::from_items(pr_ops::rollup_items(&runs), false);
+        shared.status_checks = None;
+    }
+    shared.materialize(previous)
+}
+
+/// A check run and a same-name legacy status, each with every link kind,
+/// read by either path before and after each pass/fail transition: the same
+/// run and status never read as a new run, though the reported row moves
+/// between them (a status link that looks like a check-run link included).
+/// A real re-run of the check run still does.
+#[test]
+fn a_check_run_and_a_status_never_read_as_a_rerun() {
+    use CheckState::{Failure as F, Success as P};
+    let transitions = [
+        ((F, F), (P, F)),
+        ((F, F), (F, P)),
+        ((F, F), (F, F)),
+        ((P, F), (F, F)),
+        ((F, P), (F, F)),
+    ];
+    for run_link in LINKS {
+        for status_link in LINKS {
+            for ((run_before, status_before), (run_after, status_after)) in transitions {
+                for (rollup_before, rollup_after) in
+                    [(true, true), (true, false), (false, true), (false, false)]
+                {
+                    let seed = read(
+                        true,
+                        (run_before, run_link),
+                        (status_before, status_link),
+                        None,
+                    );
+                    let before = read(
+                        rollup_before,
+                        (run_before, run_link),
+                        (status_before, status_link),
+                        Some(&seed),
+                    );
+                    let after = read(
+                        rollup_after,
+                        (run_after, run_link),
+                        (status_after, status_link),
+                        Some(&before),
+                    );
+                    let changes = diff_snapshots(&before, &after);
+                    assert!(
+                        !changes.iter().any(|c| c.contains("on a new run")),
+                        "run {run_link:?} {run_before:?}→{run_after:?}, status {status_link:?} \
+                         {status_before:?}→{status_after:?}, rollup {rollup_before}→{rollup_after}: \
+                         {changes:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    let failed_run = |id: u32| {
+        let check = |kind, state, url: Option<String>| RollupCheck {
+            kind,
+            url,
+            ..build(state, None)
+        };
+        let checks = vec![
+            check(
+                RollupCheckKind::CheckRun,
+                F,
+                rollup_link(Link::ActionsJob, id),
+            ),
+            check(
+                RollupCheckKind::StatusContext,
+                P,
+                rollup_link(Link::Vendor, 200),
+            ),
+        ];
+        let signals = MergeRequirementSignals {
+            checks,
+            checks_known: true,
+            ..Default::default()
+        };
+        let mut shared = shared_from(&snapshot(|_| {}), true);
+        shared.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(
+            pr_ops::rollup_items(&signals.checks),
+            true,
+        );
+        shared.status_checks = pr_ops::status_checks(Some(&signals));
+        shared
+    };
+    let first = failed_run(100).materialize(None);
+    let rerun = failed_run(300).materialize(Some(&first));
+    assert!(
+        diff_snapshots(&first, &rerun).contains(&AGAIN.to_string()),
+        "{:?}",
+        diff_snapshots(&first, &rerun)
+    );
+}

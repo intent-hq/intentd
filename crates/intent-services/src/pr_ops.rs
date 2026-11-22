@@ -1692,7 +1692,7 @@ fn dedupe_checks(runs: impl IntoIterator<Item = CheckRunSignal>) -> Vec<MergeReq
         .collect()
 }
 
-fn rollup_items<'a>(
+pub(crate) fn rollup_items<'a>(
     checks: impl IntoIterator<Item = &'a RollupCheck>,
 ) -> Vec<MergeRequirementCheck> {
     dedupe_checks(checks.into_iter().map(|c| CheckRunSignal {
@@ -1705,7 +1705,9 @@ fn rollup_items<'a>(
     }))
 }
 
-fn status_checks(signals: Option<&MergeRequirementSignals>) -> Option<Vec<MergeRequirementCheck>> {
+pub(crate) fn status_checks(
+    signals: Option<&MergeRequirementSignals>,
+) -> Option<Vec<MergeRequirementCheck>> {
     signals.filter(|s| s.checks_known).map(|s| {
         rollup_items(
             s.checks
