@@ -6,8 +6,10 @@
 
 use std::sync::Arc;
 
-use intent_core::node_link::{HomeEvents, HomeRef, LeaseBinding, LinkFrame};
-use intent_core::{AgentId, BoxFuture, WorkspaceId};
+use intent_core::node_link::{
+    HomeEvents, HomeRef, HomeStopAck, HomeStopRecord, JournalRecord, LeaseBinding, LinkFrame,
+};
+use intent_core::{AgentId, BoxFuture, HomeId, WorkspaceId};
 use intent_node_link::IncomingRequest;
 use tokio::time::Instant;
 
@@ -27,6 +29,29 @@ pub trait LinkView: Send + Sync {
 
     /// The binding of the link that is up now, if any.
     fn current_binding(&self) -> Option<LeaseBinding>;
+
+    /// The lease the link binds.
+    fn lease_id(&self) -> String;
+
+    /// Whether the machine holds a home of this backend: its link is kept
+    /// up.
+    fn set_holds_homes(&self, holds: bool);
+
+    /// A backup of `home_id` arrived: its backup-warning wait ends.
+    fn home_backed_up(&self, home_id: &HomeId);
+
+    /// Send `stop` on the current link if it speaks nodeProtocol 19;
+    /// otherwise it goes after the next bind.
+    fn send_home_stop<'a>(&'a self, stop: &'a HomeStopRecord) -> BoxFuture<'a, ()>;
+
+    /// Make sure the machine's pending home stops are resent on a timer
+    /// while it is linked.
+    fn resend_home_stops(&self);
+
+    /// Hold `wait`, the wait for `home_id`'s backup warning, until it ends,
+    /// the home backs up, or the machine's connector goes away. One wait
+    /// per home: while one is pending, `wait` is dropped unstarted.
+    fn watch_backup_warning(&self, home_id: &HomeId, wait: BoxFuture<'static, ()>);
 }
 
 /// The head's domain, as the node-connection service calls it.
@@ -68,6 +93,25 @@ pub trait NodeInbound: Send + Sync + 'static {
         agent_id: &'a AgentId,
         reason: &'a str,
     ) -> BoxFuture<'a, ()>;
+
+    /// A link to the machine behind `link` bound on nodeProtocol 19: open
+    /// its homes again and send its pending home stops, on a task.
+    fn homes_after_bind(&self, link: Arc<dyn LinkView>);
+
+    /// A journal record of one of the machine's homes, in order.
+    fn home_record<'a>(
+        &'a self,
+        link: &'a dyn LinkView,
+        record: JournalRecord,
+    ) -> BoxFuture<'a, ()>;
+
+    /// The machine acknowledged a home stop.
+    fn home_stop_acked(&self, link: Arc<dyn LinkView>, ack: HomeStopAck) -> BoxFuture<'_, ()>;
+
+    /// The machine behind `link` stayed unlinked for the link-loss grace,
+    /// lost at `lost_at`: its homes are detached.
+    fn homes_link_lost<'a>(&'a self, link: &'a dyn LinkView, lost_at: &'a str)
+        -> BoxFuture<'a, ()>;
 
     /// The machine behind `link` changed: announce it as it is now.
     fn machine_changed<'a>(&'a self, link: &'a dyn LinkView) -> BoxFuture<'a, ()>;

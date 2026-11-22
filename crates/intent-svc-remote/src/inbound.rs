@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use intent_core::node_link::{HomeEvents, HomeRef, LinkFrame};
+use intent_core::node_link::{HomeEvents, HomeRef, HomeStopAck, JournalRecord, LinkFrame};
 use intent_core::{AgentId, BoxFuture, WorkspaceId};
 use intent_node_connections::{LinkView, NodeInbound};
 use intent_services::feature_api::Services;
@@ -86,6 +86,34 @@ impl NodeInbound for ServicesInbound {
         let svc = &self.services;
         svc.feature_runtime()
             .machine_runs_final_stop_acked(svc, agent_id, reason)
+    }
+
+    fn homes_after_bind(&self, link: Arc<dyn LinkView>) {
+        crate::homes::after_bind(self.services.clone(), link);
+    }
+
+    fn home_record<'a>(
+        &'a self,
+        link: &'a dyn LinkView,
+        record: JournalRecord,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(crate::homes::ingest(&self.services, link, record))
+    }
+
+    fn home_stop_acked(&self, link: Arc<dyn LinkView>, ack: HomeStopAck) -> BoxFuture<'_, ()> {
+        Box::pin(crate::homes::stop_acked(&self.services, link, ack))
+    }
+
+    fn homes_link_lost<'a>(
+        &'a self,
+        link: &'a dyn LinkView,
+        lost_at: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(crate::home_state::detach_homes(
+            &self.services,
+            link,
+            lost_at,
+        ))
     }
 
     fn machine_changed<'a>(&'a self, link: &'a dyn LinkView) -> BoxFuture<'a, ()> {
