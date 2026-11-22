@@ -3799,7 +3799,7 @@ impl AgentManager {
     /// is dropped.
     pub fn start_unsloth_idle_reaper(self: &Arc<Self>) {
         let manager = Arc::downgrade(self);
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let every = crate::unsloth_server::UNSLOTH_IDLE_CHECK_EVERY;
             let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
