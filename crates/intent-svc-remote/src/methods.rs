@@ -771,7 +771,7 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         node.shutdown();
     }
     let mut result = json!({ "ok": true });
-    if let Some(credential) = forget(svc, &machine_id).await? {
+    if let Some(credential) = forget(svc, &machine_id, None).await? {
         result["credentialId"] = json!(credential);
     }
     Ok(result)
@@ -779,10 +779,29 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
 
 /// Forget exposed machine `machine_id`: its final stop and home stop
 /// records, token and leases, then its row (last, so a failure leaves a row
-/// to remove again), then announce the removal and drop its order entry. The
-/// removed credential's id, if any.
-async fn forget(svc: &Services, machine_id: &str) -> Result<Option<ExecutorCredentialId>> {
+/// to remove again), then announce the removal (with `reason`, when the
+/// backend removed it on its own) and drop its order entry. The removed
+/// credential's id, if any.
+async fn forget(
+    svc: &Services,
+    machine_id: &str,
+    reason: Option<&str>,
+) -> Result<Option<ExecutorCredentialId>> {
     let store = svc.store();
+    let orchestrator = reason == Some(ORCHESTRATOR_REASON);
+    if orchestrator {
+        // Its homes are detached first, durably, not after the link-loss
+        // grace: the connector that would time that grace stops, and a home
+        // left attached to a forgotten machine could not move (a move first
+        // asks an attached home for a last push). A move away from it rolls
+        // back to detached. A restart during the cleanup below leaves no
+        // home attached. Nothing is deleted; the orchestrator runs no home
+        // stop, so the checkout stays on its disk.
+        store
+            .detach_orchestrator_homes(machine_id, &intent_core::now_iso())
+            .await?;
+        crate::home_state::publish_homes_of(svc, machine_id).await;
+    }
     // The machine is forgotten: no connector will resend a final stop it
     // did not acknowledge (it was revoked), so their records go too.
     let head_id = store.daemon_id().await?;
@@ -801,9 +820,19 @@ async fn forget(svc: &Services, machine_id: &str) -> Result<Option<ExecutorCrede
     store.delete_home_stops_on_machine(machine_id).await?;
     svc.delete_remote_machine_token(machine_id).await?;
     store.end_machine_leases(machine_id, &head_id).await?;
-    let credential = store.remove_exposed_machine(machine_id).await?;
-    svc.publish_remote_machine_changed(json!({ "machineId": machine_id, "removed": true }))
-        .await;
+    let credential = if orchestrator {
+        // Its homes are detached again in the row's deletion.
+        store
+            .remove_orchestrator_machine(machine_id, &intent_core::now_iso())
+            .await?
+    } else {
+        store.remove_exposed_machine(machine_id).await?
+    };
+    let mut removed = json!({ "machineId": machine_id, "removed": true });
+    if let Some(reason) = reason {
+        removed["reason"] = json!(reason);
+    }
+    svc.publish_remote_machine_changed(removed).await;
     crate::order::forget(
         svc,
         &MachineOrderKey::Machine {
@@ -813,6 +842,10 @@ async fn forget(svc: &Services, machine_id: &str) -> Result<Option<ExecutorCrede
     .await;
     Ok(credential)
 }
+
+/// The `remoteMachine:changed` removal `reason` for a machine that is now an
+/// orchestrator.
+const ORCHESTRATOR_REASON: &str = "orchestrator";
 
 /// Remove exposed machine `machine_id` in the background after it refused a
 /// bind because it now runs as an orchestrator (nodes.md "Orchestrator
@@ -872,7 +905,7 @@ async fn forget_orchestrator_once(
             row.name
         ));
     }
-    forget(svc, machine_id).await?;
+    forget(svc, machine_id, Some(ORCHESTRATOR_REASON)).await?;
     if let Some(node) = feature.take_node(machine_id) {
         node.shutdown();
     }

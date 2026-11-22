@@ -604,3 +604,120 @@ parity_test!(home_moves_roll_back, |store, tenant| {
             .unwrap();
     }
 });
+
+// An orchestrator's homes are detached before any of its removal's
+// cleanup, and again in the row's deletion: an attached home at once, and
+// a move away from it gets `detached` as the state its rollback restores.
+// A restart or a store error between steps can no longer leave a home
+// attached to a machine the backend forgot (nodes.md "An orchestrator
+// leaves its backends").
+parity_test!(
+    an_orchestrator_removal_detaches_its_homes,
+    |store, tenant| {
+        for id in ["ws-a", "ws-m", "ws-o"] {
+            workspace(&store, id).await;
+        }
+        for id in ["mac-1", "mac-3"] {
+            store
+                .save_exposed_machine(&machine(tenant, id, None))
+                .await
+                .unwrap();
+        }
+        let (a, m, o) = (wid("ws-a"), wid("ws-m"), wid("ws-o"));
+        store
+            .set_workspace_home(&a, &home("h-a1", Some("mac-1"), false))
+            .await
+            .unwrap();
+        store
+            .set_workspace_home(&m, &home("h-m1", Some("mac-1"), false))
+            .await
+            .unwrap();
+        assert!(store
+            .begin_home_move(&moving("ws-m", "h-m1", home("h-m2", Some("mac-2"), false)))
+            .await
+            .unwrap());
+        store
+            .set_workspace_home(&o, &home("h-o1", Some("mac-3"), false))
+            .await
+            .unwrap();
+
+        // The first step, before the token, leases and stop records go:
+        // the row stays, its homes are detached.
+        store.detach_orchestrator_homes("mac-1", T2).await.unwrap();
+        assert!(store.get_exposed_machine("mac-1").await.unwrap().is_some());
+        assert_eq!(
+            store.get_workspace_home(&a).await.unwrap().unwrap().state,
+            HomeState::Detached
+        );
+        assert_eq!(
+            store.get_home_move(&m).await.unwrap().unwrap().from_state,
+            HomeState::Detached,
+            "a move away from it rolls back detached"
+        );
+        // A home attached again before the row goes (no bind does this for
+        // an orchestrator) is detached by the row's deletion itself.
+        store
+            .set_workspace_home(&a, &home("h-a1", Some("mac-1"), false))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .remove_orchestrator_machine("mac-1", T2)
+                .await
+                .unwrap(),
+            Some(ExecutorCredentialId::from("cred-mac-1"))
+        );
+        assert_eq!(store.get_exposed_machine("mac-1").await.unwrap(), None);
+        let attached = store.get_workspace_home(&a).await.unwrap().unwrap();
+        assert_eq!(
+            (attached.state, attached.since.as_str()),
+            (HomeState::Detached, T2),
+            "an attached home on the removed machine is detached at once"
+        );
+        assert_eq!(
+            store.get_workspace_home(&m).await.unwrap().unwrap().state,
+            HomeState::Moving,
+            "a moving home stays moving"
+        );
+        assert_eq!(
+            store.get_workspace_home(&o).await.unwrap().unwrap().state,
+            HomeState::Attached,
+            "another machine's home is untouched"
+        );
+
+        // The move fails after the removal: its rollback restores detached.
+        assert!(store.abort_home_move(&m, &hid("h-m2"), T2).await.unwrap());
+        let back = store.get_workspace_home(&m).await.unwrap().unwrap();
+        assert_eq!(
+            (back.home_id, back.state, back.since.as_str()),
+            (hid("h-m1"), HomeState::Detached, T2)
+        );
+        assert_eq!(
+            store
+                .remove_orchestrator_machine("mac-1", T2)
+                .await
+                .unwrap(),
+            None,
+            "an unknown machine is a no-op"
+        );
+
+        if tenant == "decoy" {
+            store
+                .save_exposed_machine(&machine(tenant, "mac-1", None))
+                .await
+                .unwrap();
+            store
+                .set_workspace_home(&a, &home("h-a1", Some("mac-1"), false))
+                .await
+                .unwrap();
+            store
+                .set_workspace_home(&m, &home("h-m1", Some("mac-1"), false))
+                .await
+                .unwrap();
+            assert!(store
+                .begin_home_move(&moving("ws-m", "h-m1", home("h-m2", Some("mac-2"), false)))
+                .await
+                .unwrap());
+        }
+    }
+);

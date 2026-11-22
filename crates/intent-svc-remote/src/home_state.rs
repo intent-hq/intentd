@@ -104,6 +104,27 @@ pub(crate) async fn detach_homes(svc: &Services, link: &dyn LinkView, lost_at: &
     }
 }
 
+/// After the backend removed `machine_id` as an orchestrator, which
+/// detached its homes in the removal (nodes.md "An orchestrator leaves its
+/// backends"): each workspace with a home there announces its home. No
+/// backup failure is recorded; the last backup stands, and the home can move.
+pub(crate) async fn publish_homes_of(svc: &Services, machine_id: &str) {
+    if !svc.workspace_homes() {
+        return;
+    }
+    match svc.store().homes_on_machine(machine_id).await {
+        Ok(homes) => {
+            for (workspace_id, _) in homes {
+                tracing::info!(workspace = %workspace_id, machine = %machine_id, "remote machine: now an orchestrator; the workspace's home is detached");
+                svc.publish_workspace_home_changed(&workspace_id).await;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(machine = %machine_id, %error, "remote machine: could not list the removed machine's homes");
+        }
+    }
+}
+
 /// After a bind: each detached home of the machine is attached again. The
 /// failing backup streak its loss began goes on until a backup arrives
 /// ("Continuous backup": the warning holds until the next success); the
