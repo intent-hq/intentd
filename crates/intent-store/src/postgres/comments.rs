@@ -8,7 +8,7 @@ use intent_core::{
 use serde_json::{Map, Value};
 use sqlx::postgres::PgRow;
 
-use super::notes::{col, exec_update_note, insert_note_version};
+use super::notes::{cas_rev, col, exec_update_note, insert_note_version};
 use super::{db, PgStore, WriteTx};
 use crate::comment_repo::{
     encode_comment_json, encode_comment_update, ExtraFields, COMMENT_COLUMNS,
@@ -63,7 +63,7 @@ impl PgStore {
             self,
             &mut tx,
             note,
-            expected_version,
+            cas_rev(note, expected_version),
             NoteUpdateScope::FullRow,
             None,
         )

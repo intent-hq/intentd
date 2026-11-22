@@ -192,7 +192,10 @@ async fn note_updates(store: &Store, tenant: &str) {
         2
     );
 
+    // An unversioned write compares against the `rev` of the note it is
+    // given (Postgres; batch G 2a), so stamp the one a caller would re-read.
     let mut meta = next.clone();
+    meta.rev = 2;
     meta.content = "ignored".into();
     meta.is_pinned = true;
     meta.tags = vec!["a".into(), "b".into()];
@@ -216,6 +219,19 @@ async fn note_updates(store: &Store, tenant: &str) {
     assert!(stored.is_pinned);
     assert_eq!(stored.tags, ["a", "b"]);
     assert_eq!(stored.rev, 4);
+
+    // A write from a note read before the last edit is refused on Postgres
+    // instead of overwriting it; `SQLite` (one writer) keeps last-writer-wins.
+    let mut stale = stored.clone();
+    stale.rev = 3;
+    stale.title = "stale".into();
+    let stale_write = store.update_note_metadata(&lock, &stale).await;
+    if tenant == "sqlite" {
+        assert_eq!(stale_write.unwrap(), 5);
+    } else {
+        assert!(matches!(stale_write, Err(Error::Conflict { .. })));
+    }
+    let stored = store.get_note(&ws(), &nid("u1")).await.unwrap();
 
     // A lock for another note is refused before anything is written.
     let mut wrong = stored.clone();

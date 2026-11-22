@@ -8,8 +8,11 @@
 //! - Across handles (separate lanes, as across daemons) a versioned write is
 //!   a compare-and-swap on the revision it read: an editor that lost the
 //!   race gets `Conflict`, re-reads and retries, so again every marker lands
-//!   exactly once. Unversioned writes across handles are not safe today
-//!   (audit finding 3); they are not tested here.
+//!   exactly once.
+//! - On Postgres an unversioned write is a compare-and-swap on the `rev` of
+//!   the note it was given (batch G 2a): a stale handle's write gets
+//!   `Conflict` instead of overwriting another handle's edit. `SQLite` keeps
+//!   last-writer-wins, since one file has one writer and one set of lanes.
 
 use std::fmt::Write as _;
 
@@ -129,5 +132,45 @@ parity_test!(
                 "one handle's lane leaves no versioned write to conflict"
             );
         }
+    }
+);
+
+parity_test!(
+    unversioned_note_write_from_a_stale_handle_conflicts,
+    |store, tenant, db| {
+        if db.is_none() {
+            return;
+        }
+        store.insert_note(&note("stale", tenant)).await.unwrap();
+        let all = handles(&store, db, tenant).await;
+        let (a, b) = (&all[0], &all[1]);
+        let id = NoteId("stale".into());
+        let mut from_a = a.get_note(&ws(), &id).await.unwrap();
+        let mut from_b = b.get_note(&ws(), &id).await.unwrap();
+
+        from_a.content.push_str("[a]");
+        let lock = a.lock_note_content(&ws(), &id).await;
+        a.update_note(&lock, &from_a).await.unwrap();
+        drop(lock);
+
+        from_b.content.push_str("[b]");
+        let lock = b.lock_note_content(&ws(), &id).await;
+        let full = b.update_note(&lock, &from_b).await;
+        assert!(
+            matches!(full, Err(Error::Conflict { .. })),
+            "a full-row write from the revision before A's edit conflicts: {full:?}"
+        );
+        from_b.title = "renamed by b".into();
+        let metadata = b.update_note_metadata(&lock, &from_b).await;
+        assert!(
+            matches!(metadata, Err(Error::Conflict { .. })),
+            "a metadata write from the revision before A's edit conflicts: {metadata:?}"
+        );
+        drop(lock);
+
+        let after = store.get_note(&ws(), &id).await.unwrap();
+        assert_eq!(after.content, format!("{tenant}:[a]"), "A's edit survives");
+        assert_eq!(after.title, format!("stale of {tenant}"));
+        assert_eq!(after.rev, 1);
     }
 );
