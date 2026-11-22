@@ -78,6 +78,10 @@ fn key_error(message: impl fmt::Display) -> Error {
 
 /// Why `id` is not a valid key id, if it is not. Callers wrap the reason
 /// once with [`key_error`].
+///
+/// Keyring construction errors never quote a key id: a misformatted key
+/// file line (`<base64 key>` alone, split at its `=` padding) would put the
+/// key itself where the id belongs.
 fn check_key_id(id: &str) -> std::result::Result<(), String> {
     let valid = !id.is_empty()
         && id.len() <= KEY_ID_MAX
@@ -88,7 +92,7 @@ fn check_key_id(id: &str) -> std::result::Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "invalid key id {id:?}: use 1-{KEY_ID_MAX} characters from A-Z a-z 0-9 . _ -"
+            "invalid key id: use 1-{KEY_ID_MAX} characters from A-Z a-z 0-9 . _ -"
         ))
     }
 }
@@ -96,10 +100,10 @@ fn check_key_id(id: &str) -> std::result::Result<(), String> {
 type KeyBytes = Arc<Zeroizing<[u8; SECRET_KEY_LEN]>>;
 
 /// `key` as a keyring key, or why it is not one (never quoting it).
-fn key_bytes(id: &str, key: &[u8]) -> std::result::Result<KeyBytes, String> {
+fn key_bytes(key: &[u8]) -> std::result::Result<KeyBytes, String> {
     let bytes: [u8; SECRET_KEY_LEN] = key.try_into().map_err(|_| {
         format!(
-            "key {id:?} is {} bytes; it must be exactly {SECRET_KEY_LEN}",
+            "the key is {} bytes; it must be exactly {SECRET_KEY_LEN}",
             key.len()
         )
     })?;
@@ -115,10 +119,7 @@ impl SecretKeyring {
     pub fn new(key_id: &str, key: &[u8]) -> Result<Self> {
         check_key_id(key_id).map_err(key_error)?;
         let mut keys = BTreeMap::new();
-        keys.insert(
-            key_id.to_owned(),
-            key_bytes(key_id, key).map_err(key_error)?,
-        );
+        keys.insert(key_id.to_owned(), key_bytes(key).map_err(key_error)?);
         Ok(Self {
             active: key_id.to_owned(),
             keys,
@@ -133,12 +134,10 @@ impl SecretKeyring {
     pub fn with_previous_key(mut self, key_id: &str, key: &[u8]) -> Result<Self> {
         check_key_id(key_id).map_err(key_error)?;
         if self.keys.contains_key(key_id) {
-            return Err(key_error(format!("duplicate key id {key_id:?}")));
+            return Err(key_error("duplicate key id"));
         }
-        self.keys.insert(
-            key_id.to_owned(),
-            key_bytes(key_id, key).map_err(key_error)?,
-        );
+        self.keys
+            .insert(key_id.to_owned(), key_bytes(key).map_err(key_error)?);
         Ok(self)
     }
 
@@ -149,7 +148,7 @@ impl SecretKeyring {
     /// # Errors
     /// `Error::Internal` naming the line for a malformed line, a bad key id
     /// or key, or a duplicate id, and when `active` is not in the file.
-    /// Errors never quote a key.
+    /// Errors name lines, never an id or a key (see [`check_key_id`]).
     pub fn parse(text: &str, active: &str) -> Result<Self> {
         let mut keys = BTreeMap::new();
         for (i, line) in text.lines().enumerate() {
@@ -166,17 +165,15 @@ impl SecretKeyring {
             let decoded = Zeroizing::new(
                 base64::engine::general_purpose::STANDARD
                     .decode(encoded)
-                    .map_err(|_| key_error(format!("line {n}: key {id:?} is not valid base64")))?,
+                    .map_err(|_| key_error(format!("line {n}: the key is not valid base64")))?,
             );
-            let key = key_bytes(id, &decoded).map_err(|e| key_error(format!("line {n}: {e}")))?;
+            let key = key_bytes(&decoded).map_err(|e| key_error(format!("line {n}: {e}")))?;
             if keys.insert(id.to_owned(), key).is_some() {
-                return Err(key_error(format!("line {n}: duplicate key id {id:?}")));
+                return Err(key_error(format!("line {n}: duplicate key id")));
             }
         }
         if !keys.contains_key(active) {
-            return Err(key_error(format!(
-                "the active key {active:?} is not in the key file"
-            )));
+            return Err(key_error("the active key id is not in the key file"));
         }
         Ok(Self {
             active: active.to_owned(),
@@ -343,11 +340,12 @@ impl fmt::Debug for TenantSecretStore {
 
 impl TenantSecretStore {
     /// The secret store of `store`'s tenant, sealed with `keyring`. Call it
-    /// inside the Tokio runtime the blocking methods will use.
+    /// inside the multi-thread Tokio runtime the blocking methods will use;
+    /// that runtime must outlive the store.
     ///
     /// # Errors
-    /// `Error::Internal` when `store` is not a Postgres store, or no Tokio
-    /// runtime is running.
+    /// `Error::Internal` when `store` is not a Postgres store, or no
+    /// multi-thread Tokio runtime is running.
     pub fn new(store: &crate::Store, keyring: Arc<SecretKeyring>) -> Result<Self> {
         let crate::Backend::Postgres(pg) = &store.backend else {
             return Err(Error::Internal(
@@ -357,6 +355,14 @@ impl TenantSecretStore {
         };
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|e| Error::Internal(format!("tenant secrets need a Tokio runtime: {e}")))?;
+        // A blocking call from a plain thread runs on this runtime; a
+        // current-thread runtime drives no IO from another thread, so that
+        // call would hang.
+        if runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(Error::Internal(
+                "tenant secrets need the multi-thread Tokio runtime".into(),
+            ));
+        }
         Ok(Self {
             store: pg.clone(),
             keyring,
@@ -541,6 +547,9 @@ mod tests {
         );
 
         let short = b64(&[1; 16]);
+        // Keys whose base64 has `+`, `/` and `=` padding: a line with the
+        // key alone splits at the padding, putting the key where the id goes.
+        let plus_slash: [u8; 32] = std::array::from_fn(|i| if i % 2 == 0 { 0xfb } else { 0xff });
         let cases = [
             (format!("k1={}", b64(&KEY_A)), "k9", "not in the key file"),
             ("k1".to_owned(), "k1", "line 1: expected key_id="),
@@ -549,25 +558,33 @@ mod tests {
                 "bad id",
                 "invalid key id",
             ),
-            (
-                format!("k1={short}"),
-                "k1",
-                "line 1: key \"k1\" is 16 bytes",
-            ),
+            (format!("k1={short}"), "k1", "line 1: the key is 16 bytes"),
             ("k1=!!!".to_owned(), "k1", "not valid base64"),
             (
                 format!("k1={}\nk1={}", b64(&KEY_A), b64(&KEY_B)),
                 "k1",
                 "line 2: duplicate key id",
             ),
+            (b64(&KEY_A), "k1", "line 1: the key is 0 bytes"),
+            (b64(&plus_slash), "k1", "line 1: invalid key id"),
+            (
+                format!("{}=k1", b64(&KEY_B)),
+                "k1",
+                "line 1: the key is not valid base64",
+            ),
         ];
+        let secrets = [b64(&KEY_A), b64(&KEY_B), b64(&plus_slash), short.clone()];
         for (text, active, expected) in cases {
             let err = SecretKeyring::parse(&text, active).unwrap_err().to_string();
             assert!(err.contains(expected), "{text:?}: {err}");
-            assert!(
-                !err.contains(&b64(&KEY_A)) && !err.contains(&short),
-                "{err}"
-            );
+            for secret in &secrets {
+                // Any 12-character run of the encoded key would leak it.
+                let unpadded = secret.trim_end_matches('=');
+                for window in unpadded.as_bytes().windows(12) {
+                    let window = std::str::from_utf8(window).unwrap();
+                    assert!(!err.contains(window), "{err} quotes part of a key");
+                }
+            }
         }
         assert!(SecretKeyring::new("k1", &[0; 31]).is_err());
         assert!(SecretKeyring::new("", &KEY_A).is_err());

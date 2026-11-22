@@ -4,6 +4,7 @@
 //! the tenant, or whose self-fence fired, cannot write.
 //!
 //! Each "process" is a store opened through the `*_as_process` test seams.
+//! The tests run on the multi-thread runtime, which the store requires.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use intent_store::postgres::{
 use intent_store::{Error, Store};
 use intentd_test_support::test_timeout;
 
-use super::harness::{sqlite_store, test_db};
+use super::harness::{open_trapped, sqlite_store, test_db, trapped_db};
 
 const LONG_TTL: Duration = Duration::from_secs(60);
 const SHORT_TTL: Duration = Duration::from_millis(500);
@@ -105,7 +106,7 @@ fn assert_not_owner<T: std::fmt::Debug>(result: intent_store::Result<T>, what: &
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_secret_follows_the_tenant_to_the_process_that_takes_it_over() {
     let Some(db) = test_db(false).await else {
         return;
@@ -158,7 +159,7 @@ async fn a_secret_follows_the_tenant_to_the_process_that_takes_it_over() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fired_self_fence_refuses_secret_writes() {
     let Some(db) = test_db(false).await else {
         return;
@@ -176,7 +177,7 @@ async fn a_fired_self_fence_refuses_secret_writes() {
     assert_eq!(secrets.load("acct").await.unwrap().as_deref(), Some("v1"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_database_holds_ciphertext_only() {
     let Some(db) = test_db(false).await else {
         return;
@@ -209,7 +210,7 @@ async fn the_database_holds_ciphertext_only() {
         .any(|w| w == value.as_bytes()));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wrong_or_missing_key_fails_closed() {
     let Some(db) = test_db(false).await else {
         return;
@@ -235,7 +236,7 @@ async fn a_wrong_or_missing_key_fails_closed() {
     assert_eq!(wrong.load("other").await.unwrap(), None);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_row_copied_to_another_tenant_or_account_does_not_open() {
     let Some(db) = test_db(false).await else {
         return;
@@ -279,7 +280,7 @@ async fn a_row_copied_to_another_tenant_or_account_does_not_open() {
     assert!(a_secrets.load("other").await.is_err());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotation_reads_old_rows_and_reseals_them_on_write() {
     let Some(db) = test_db(false).await else {
         return;
@@ -313,7 +314,7 @@ async fn rotation_reads_old_rows_and_reseals_them_on_write() {
     assert!(before.load("one").await.is_err());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_empty_value_loads_as_unset() {
     let Some(db) = test_db(false).await else {
         return;
@@ -347,15 +348,68 @@ async fn the_blocking_methods_work_on_a_multi_thread_runtime() {
     .unwrap();
 }
 
+/// A current-thread runtime cannot drive the database from a blocked
+/// thread: the store refuses one when built, and a blocking call made from
+/// inside one fails instead of hanging.
 #[tokio::test]
-async fn the_blocking_methods_refuse_a_current_thread_runtime() {
+async fn the_store_refuses_a_current_thread_runtime() {
     let Some(db) = test_db(false).await else {
         return;
     };
     let store = open_unclaimed(&db.app, "secrets-current-thread", "proc-a").await;
+    let err = TenantSecretStore::new(&store, ring("k1", &KEY_1))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("multi-thread"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocking_call_inside_a_current_thread_runtime_fails() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let store = open_unclaimed(&db.app, "secrets-nested-runtime", "proc-a").await;
     let secrets = TenantSecretStore::new(&store, ring("k1", &KEY_1)).unwrap();
-    let err = secrets.load_blocking("acct").unwrap_err().to_string();
+    let err = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { secrets.load_blocking("acct") })
+    })
+    .join()
+    .unwrap()
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("current-thread"), "{err}");
+}
+
+/// Every statement is scoped to its tenant: on the leak-trap database, any
+/// read, overwrite or delete that reaches another tenant's row fails, and
+/// two tenants with the same account keep their own values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_statements_never_touch_another_tenants_rows() {
+    let Some(db) = trapped_db().await else {
+        return;
+    };
+    let keys = ring("k1", &KEY_1);
+    let a = open_trapped(&db, "trap-a").await;
+    let b = open_trapped(&db, "trap-b").await;
+    let a_secrets = TenantSecretStore::new(&a, keys.clone()).unwrap();
+    let b_secrets = TenantSecretStore::new(&b, keys).unwrap();
+    a_secrets.store("acct", "a1").await.unwrap();
+    b_secrets.store("acct", "b1").await.unwrap();
+    a_secrets.store("acct", "a2").await.unwrap();
+    assert_eq!(a_secrets.load("acct").await.unwrap().as_deref(), Some("a2"));
+    assert_eq!(b_secrets.load("acct").await.unwrap().as_deref(), Some("b1"));
+    a_secrets.delete("acct").await.unwrap();
+    assert_eq!(a_secrets.load("acct").await.unwrap(), None);
+    assert_eq!(b_secrets.load("acct").await.unwrap().as_deref(), Some("b1"));
+    b_secrets.store_blocking("acct", "b2").unwrap();
+    assert_eq!(
+        b_secrets.load_blocking("acct").unwrap().as_deref(),
+        Some("b2")
+    );
+    assert_eq!(raw_rows(&db.admin, "trap-a").await, []);
 }
 
 /// The `SQLite` daemon keeps its file store: a `SQLite` store has no tenant
