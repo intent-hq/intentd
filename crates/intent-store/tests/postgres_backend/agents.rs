@@ -1163,13 +1163,23 @@ parity_test!(
             "A's queue survives"
         );
 
-        // After a reload B sees A's write and may replace it; A is now stale.
+        // A later load (the shutdown reconcile) does not adopt A's version,
+        // so B's stale in-memory queue still cannot replace A's.
         b.load_all_agent_queues().await.unwrap();
+        assert!(matches!(
+            b.replace_agent_queue(&agent, &[]).await,
+            Err(Error::Conflict { .. })
+        ));
+
+        // A process that starts now loads A's version and may replace it;
+        // A is then the stale one.
+        let fresh = crate::harness::open_as_process(test_db, tenant, "process-c").await;
+        fresh.load_all_agent_queues().await.unwrap();
         let both = [
             queue_row("q1", "agent-a", 0, tenant),
             queue_row("q2", "agent-a", 1, tenant),
         ];
-        b.replace_agent_queue(&agent, &both).await.unwrap();
+        fresh.replace_agent_queue(&agent, &both).await.unwrap();
         assert!(matches!(
             a.replace_agent_queue(&agent, &newer).await,
             Err(Error::Conflict { .. })
@@ -1179,14 +1189,15 @@ parity_test!(
             ["q1", "q2"]
         );
 
-        // One handle never conflicts with itself, including an empty replace
+        // One process never conflicts with itself, including an empty replace
         // for an agent with no session row (nothing to version).
-        b.replace_agent_queue(&agent, &[]).await.unwrap();
-        b.replace_agent_queue(&agent, &newer).await.unwrap();
-        b.replace_agent_queue(&aid("agent-gone"), &[])
+        fresh.replace_agent_queue(&agent, &[]).await.unwrap();
+        fresh.replace_agent_queue(&agent, &newer).await.unwrap();
+        fresh
+            .replace_agent_queue(&aid("agent-gone"), &[])
             .await
             .unwrap();
-        b.replace_agent_queue(&agent, &[]).await.unwrap();
+        fresh.replace_agent_queue(&agent, &[]).await.unwrap();
     }
 );
 

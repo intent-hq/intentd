@@ -3069,8 +3069,11 @@ impl PgStore {
     /// Commits a queue write whose version bumps are `bumped`, recording them
     /// as this process's versions. They are recorded before the commit,
     /// while `tx` still holds the process's writer slot, so no other writer
-    /// of this process reads them in between; a failed commit restores the
-    /// previous ones.
+    /// of this process reads them in between. A failed commit may still have
+    /// landed on the server, so each version is re-read: the new one stays
+    /// when it is stored, else the previous one comes back (or, when even
+    /// the re-read fails, the previous one: the next write then conflicts
+    /// and logs, rather than overwrite).
     async fn commit_queue_write(
         &self,
         tx: WriteTx,
@@ -3087,11 +3090,33 @@ impl PgStore {
         }
         if let Err(e) = tx.commit().await {
             for (agent, version) in previous {
-                self.queue_versions.record(agent, version);
+                let stored = self.stored_queue_version(agent).await.ok().flatten();
+                let next = bumped
+                    .iter()
+                    .find(|(a, _)| *a == agent)
+                    .and_then(|(_, next)| *next);
+                if stored.is_none() || stored != next {
+                    self.queue_versions.record(agent, version);
+                }
             }
             return Err(db(e));
         }
         Ok(())
+    }
+
+    /// The stored queue version of `agent_id`, read outside any write.
+    async fn stored_queue_version(&self, agent_id: &AgentId) -> Result<Option<i64>> {
+        let mut tx = self.begin().await?;
+        let version = sqlx::query_scalar(
+            "SELECT version FROM agent_queue_version WHERE tenant_id = $1 AND agent_id = $2",
+        )
+        .bind(self.tenant())
+        .bind(&agent_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(version)
     }
 
     async fn insert_queue_rows(
@@ -3205,8 +3230,8 @@ impl PgStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
-        // The versions this load saw, in the same snapshot: a later replace
-        // by this process compares against them (see `QueueVersions`).
+        // The versions this load saw, in the same snapshot: adopted on the
+        // process's first load only (see `QueueVersions`).
         let versions: Vec<(String, i64)> = sqlx::query_as(
             "SELECT agent_id, version FROM agent_queue_version WHERE tenant_id = $1",
         )
@@ -3215,7 +3240,7 @@ impl PgStore {
         .await
         .map_err(db)?;
         tx.commit().await.map_err(db)?;
-        self.queue_versions.reload(versions);
+        self.queue_versions.adopt_once(versions);
         rows.iter()
             .map(|row| {
                 let payload_raw: String = col(row, "payload")?;
@@ -3889,12 +3914,23 @@ impl PgStore {
 /// 2e): equal means no other process wrote the queue since, so this
 /// process's in-memory queue, which is the source of truth, may replace it.
 /// An agent this process never saw counts as version 0 (never persisted).
-/// `load_all_agent_queues` refreshes every entry at startup.
+///
+/// Only the process's first `load_all_agent_queues` (startup rehydrate,
+/// before its queues exist in memory) adopts the stored versions. A later
+/// load (the shutdown reconcile) leaves them alone: adopting another
+/// process's newer version there would let this process's older in-memory
+/// queue replace it.
 #[derive(Clone, Default)]
-pub(crate) struct QueueVersions(std::sync::Arc<std::sync::Mutex<HashMap<String, i64>>>);
+pub(crate) struct QueueVersions(std::sync::Arc<std::sync::Mutex<VersionMap>>);
+
+#[derive(Default)]
+struct VersionMap {
+    loaded: bool,
+    versions: HashMap<String, i64>,
+}
 
 impl QueueVersions {
-    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
+    fn map(&self) -> std::sync::MutexGuard<'_, VersionMap> {
         // Every update is a single insert or a whole replace, so a poisoned
         // map is still consistent.
         self.0
@@ -3903,15 +3939,23 @@ impl QueueVersions {
     }
 
     fn seen(&self, agent_id: &AgentId) -> i64 {
-        self.map().get(&agent_id.0).copied().unwrap_or(0)
+        self.map().versions.get(&agent_id.0).copied().unwrap_or(0)
     }
 
     fn record(&self, agent_id: &AgentId, version: i64) {
-        self.map().insert(agent_id.0.clone(), version);
+        self.map().versions.insert(agent_id.0.clone(), version);
     }
 
-    fn reload(&self, versions: Vec<(String, i64)>) {
-        *self.map() = versions.into_iter().collect();
+    /// Adopts the stored versions on the process's first load only.
+    fn adopt_once(&self, versions: Vec<(String, i64)>) {
+        let mut map = self.map();
+        if map.loaded {
+            return;
+        }
+        map.loaded = true;
+        for (agent, version) in versions {
+            map.versions.entry(agent).or_insert(version);
+        }
     }
 
     #[cfg(feature = "test-support")]
