@@ -1,6 +1,6 @@
 //! Home runs of saved scripts, link side (nodeProtocol 19, node-link.md
 //! § Home runs and setup): the runs the machine's connector holds. The
-//! domain side (`crate::home_scripts`) finds the home and its linked
+//! domain side (`intent_svc_remote::home_scripts`) finds the home and its linked
 //! machine and calls [`start_on`]. The script supervisor keeps each run as a
 //! remote PTY in the backend's [`PtyHost`], so its state, restarts, output
 //! log and monitors are the home run's as before; only the process runs in
@@ -28,7 +28,7 @@ use crate::connector::Shared;
 use crate::link::terminals::home_unavailable;
 
 /// The `error` a run lost with its link ends with, as a machine run's.
-pub(crate) const LOST_DISCONNECTED: &str = "remote-script-lost: the machine disconnected";
+pub const LOST_DISCONNECTED: &str = "remote-script-lost: the machine disconnected";
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -38,7 +38,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// One machine's home runs, by `spawnId`.
 #[derive(Default)]
-pub(crate) struct HomeScripts {
+pub struct HomeScripts {
     runs: Mutex<HashMap<String, Run>>,
 }
 
@@ -104,13 +104,13 @@ impl Drop for HomeScripts {
 }
 
 impl HomeScripts {
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         lock(&self.runs).is_empty()
     }
 
     /// Take a home run's script frame from the machine. Frames of a spawn
     /// not held here (an ended run) are dropped.
-    pub(crate) fn frame(&self, frame: LinkFrame) {
+    pub fn frame(&self, frame: LinkFrame) {
         match frame {
             LinkFrame::ScriptStarted(_) => {}
             LinkFrame::ScriptOutput(output) => self.output(&output),
@@ -168,7 +168,7 @@ impl HomeScripts {
     /// stays held until its `scriptExited` (or a lost link) ends it, so a
     /// late end still settles it, and no new run of the same script starts
     /// on the home meanwhile ([`Self::stopping`]).
-    pub(crate) async fn stop(&self, pty: &Arc<PtyHost>, id: PtyId, wait: Duration) -> Stopped {
+    pub async fn stop(&self, pty: &Arc<PtyHost>, id: PtyId, wait: Duration) -> Stopped {
         let mut done = {
             let mut runs = lock(&self.runs);
             let Some(run) = runs
@@ -192,7 +192,7 @@ impl HomeScripts {
 
     /// Whether a run of `script_id` on `home` was stopped and has not ended
     /// yet: its process may still hold what a new run needs.
-    pub(crate) fn stopping(&self, home: &HomeRef, script_id: &str) -> bool {
+    pub fn stopping(&self, home: &HomeRef, script_id: &str) -> bool {
         lock(&self.runs)
             .values()
             .any(|run| &run.home == home && run.script_id == script_id && run.stopping)
@@ -200,7 +200,7 @@ impl HomeScripts {
 
     /// The link closed: every home run on it is lost (the machine ends the
     /// binding's processes as its link closes).
-    pub(crate) fn link_lost(&self, reason: &str) {
+    pub fn link_lost(&self, reason: &str) {
         let lost: Vec<Run> = lock(&self.runs).drain().map(|(_, run)| run).collect();
         for run in lost {
             run.end(None, Some(reason));
@@ -250,7 +250,7 @@ impl RemotePty for LinkRun {
 ///
 /// `home-unavailable` when the machine is not linked now or the script's
 /// last run there has not ended yet; when the PTY cannot be spawned.
-pub(crate) fn start_on(
+pub fn start_on(
     shared: &Shared,
     home: &intent_core::WorkspaceHome,
     workspace_id: &WorkspaceId,
@@ -347,7 +347,7 @@ pub(crate) fn start_on(
 
 /// How [`HomeScripts::stop`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Stopped {
+pub enum Stopped {
     /// The machine reported the run's end.
     Ended,
     /// Not a run held here (it already ended).

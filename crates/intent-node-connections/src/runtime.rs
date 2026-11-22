@@ -62,7 +62,7 @@ impl Drop for TurnGuard<'_> {
 }
 
 impl RemoteAgentRuntime {
-    pub(crate) fn new(agent_id: AgentId, sink: Arc<AgentSink>, shared: Arc<Shared>) -> Self {
+    pub fn new(agent_id: AgentId, sink: Arc<AgentSink>, shared: Arc<Shared>) -> Self {
         Self {
             agent_id,
             sink,

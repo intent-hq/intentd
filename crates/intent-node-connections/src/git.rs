@@ -4,7 +4,7 @@
 //! session (nodeProtocol 10) reaches only a submodule repository named by
 //! the agent's recorded pins, still a gitlink of the workspace's checkout.
 //! A sub-agent's forge session (nodeProtocol 17) reads the workspace's
-//! GitHub repository, refreshed here first ([`forge_refresh`]).
+//! GitHub repository, refreshed here first (`forge_refresh`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,19 +18,17 @@ use intent_core::node_link::{
 use intent_core::remote_launch::RemotePlacementView;
 use intent_core::{AgentId, BoxFuture, Error, HomeId, Result, WorkspaceId};
 use intent_git::node_git::{self, forge, AgentRemote, GitService, ModuleRefusal};
-use intent_transport::node_link::{
-    git_codes, ForgeServe, NodeGitAccess, ReceiveHold, FORGE_REFRESH_FAILED,
-};
+use intent_node_link::{git_codes, ForgeServe, NodeGitAccess, ReceiveHold, FORGE_REFRESH_FAILED};
 use tokio::time::Instant;
 
 use crate::connector::Shared;
 
-pub(crate) struct HeadGitAccess {
+pub struct HeadGitAccess {
     shared: Arc<Shared>,
 }
 
 impl HeadGitAccess {
-    pub(crate) fn new(shared: Arc<Shared>) -> Self {
+    pub fn new(shared: Arc<Shared>) -> Self {
         Self { shared }
     }
 
@@ -59,7 +57,11 @@ static HOME_PUSHES: LazyLock<Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<(
 /// so a push decided for the old home never lands after the switch. Taken
 /// on its own task, so a caller that is dropped meanwhile leaves no
 /// half-taken lock.
-pub(crate) async fn home_push_slot(
+///
+/// # Errors
+///
+/// When the task taking the lock fails.
+pub async fn home_push_slot(
     workspace_id: &WorkspaceId,
 ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
     let slot = HOME_PUSHES

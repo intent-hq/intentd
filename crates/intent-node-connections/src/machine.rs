@@ -8,11 +8,11 @@ use std::sync::Arc;
 use intent_core::link_traffic::{LinkTap, LinkTraffic, PeerKind, TrafficPeer};
 use intent_core::machines::ExposedMachine;
 use intent_core::{Error, Result};
-use intent_transport::node_link::{CertificatePin, ExecutorToken, NodeEndpoint, TailcatRoute};
+use intent_node_link::{CertificatePin, ExecutorToken, NodeEndpoint, TailcatRoute};
 
 /// One way to reach the machine, with the label errors name it by.
 #[derive(Debug, Clone)]
-pub(crate) struct Route {
+pub struct Route {
     /// `host:port` for a direct route, `tailcat:<address>` for tailcat.
     pub label: String,
     pub endpoint: NodeEndpoint,
@@ -20,7 +20,7 @@ pub(crate) struct Route {
 
 /// An exposed machine's dial target.
 #[derive(Clone)]
-pub(crate) struct MachineTarget {
+pub struct MachineTarget {
     pub id: String,
     pub name: String,
     pub hosts: Vec<String>,
@@ -62,7 +62,7 @@ impl MachineTarget {
     ///
     /// When the stored fingerprint is not a SHA-256 or the token is
     /// malformed; the message never quotes the token.
-    pub(crate) fn new(
+    pub fn new(
         machine: &ExposedMachine,
         token: &str,
         tailcat_bin: Option<PathBuf>,
@@ -85,7 +85,7 @@ impl MachineTarget {
     ///
     /// As [`MachineTarget::new`].
     #[expect(clippy::too_many_arguments, reason = "the add params, one value each")]
-    pub(crate) fn from_parts(
+    pub fn from_parts(
         id: &str,
         name: &str,
         hosts: Vec<String>,
@@ -121,7 +121,7 @@ impl MachineTarget {
     /// This target with its links recorded in `traffic`, against this
     /// machine.
     #[must_use]
-    pub(crate) fn tapped(mut self, traffic: Arc<LinkTraffic>) -> Self {
+    pub fn tapped(mut self, traffic: Arc<LinkTraffic>) -> Self {
         self.tap = Some(LinkTap::new(
             traffic,
             TrafficPeer {
@@ -135,13 +135,14 @@ impl MachineTarget {
 
     /// This target with the sandbox lifecycle `gate` of its cloud machine.
     #[must_use]
-    pub(crate) fn gated(mut self, gate: Option<Arc<dyn crate::link::gate::DialGate>>) -> Self {
+    pub fn gated(mut self, gate: Option<Arc<dyn crate::link::gate::DialGate>>) -> Self {
         self.gate = gate;
         self
     }
 
     /// The direct routes, one per host, in the stored order.
-    pub(crate) fn direct_routes(&self) -> Vec<Route> {
+    #[must_use]
+    pub fn direct_routes(&self) -> Vec<Route> {
         self.hosts
             .iter()
             .filter(|host| !host.is_empty())
@@ -166,7 +167,8 @@ impl MachineTarget {
 
     /// The tailcat route, when the machine has a tailcat address and this
     /// daemon has the tailcat binary.
-    pub(crate) fn tailcat_route(&self) -> Option<Route> {
+    #[must_use]
+    pub fn tailcat_route(&self) -> Option<Route> {
         let address = self.tc_address.clone()?;
         let bin = self.tailcat_bin.clone()?;
         Some(Route {

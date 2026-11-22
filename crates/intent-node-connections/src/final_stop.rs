@@ -23,24 +23,21 @@ use intent_core::{Result, Workspace};
 use intent_git::node_git;
 use intent_store::Store;
 
-pub(crate) use intent_node_connections::lease::session_ended;
+pub use crate::lease::session_ended;
 
 /// The wall clock final-stop bounds are measured against; tests move it.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Clock {
+pub struct Clock {
     /// Test seam: seconds added to the real time.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub offset_secs: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl Clock {
-    #[cfg_attr(
-        not(test),
-        expect(clippy::unused_self, reason = "only tests move the clock")
-    )]
-    pub(crate) fn now(&self) -> time::OffsetDateTime {
+    #[must_use]
+    pub fn now(&self) -> time::OffsetDateTime {
         let now = time::OffsetDateTime::now_utc();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let now = now
             + time::Duration::seconds(self.offset_secs.load(std::sync::atomic::Ordering::SeqCst));
         now
@@ -49,11 +46,8 @@ impl Clock {
 
 /// Whether `record` is older than `bound` at `now`. An unreadable timestamp
 /// counts as expired, so a bad record is never kept forever.
-pub(crate) fn expired(
-    record: &RemoteFinalStopRecord,
-    bound: Duration,
-    now: time::OffsetDateTime,
-) -> bool {
+#[must_use]
+pub fn expired(record: &RemoteFinalStopRecord, bound: Duration, now: time::OffsetDateTime) -> bool {
     use time::format_description::well_known::Rfc3339;
     let Ok(requested) = time::OffsetDateTime::parse(&record.requested_at, &Rfc3339) else {
         return true;
@@ -65,7 +59,8 @@ pub(crate) fn expired(
 /// Where a final push for `workspace`'s agents lands: the workspace's
 /// repository, whose refs its worktrees share, so the push still lands once
 /// the worktree is removed. Empty when the workspace has neither.
-pub(crate) fn repo_path(workspace: &Workspace) -> String {
+#[must_use]
+pub fn repo_path(workspace: &Workspace) -> String {
     workspace
         .repository_path
         .as_ref()
@@ -128,7 +123,7 @@ async fn module_repos(
 /// # Errors
 ///
 /// When the record cannot be written.
-pub(crate) async fn record(
+pub async fn record(
     store: &Store,
     placed: &RemoteAgentRecord,
     reason: FinalStopReason,

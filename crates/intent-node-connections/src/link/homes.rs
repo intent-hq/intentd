@@ -1,6 +1,6 @@
 //! Workspace homes, link side: the machine's answers to home frames and
 //! the resend of its pending home stops while it is linked. The domain side
-//! (`crate::homes`) opens, records and settles homes.
+//! (`intent_svc_remote::homes`) opens, records and settles homes.
 
 use std::sync::Arc;
 
@@ -12,14 +12,14 @@ use crate::connector::Shared;
 
 /// The machine's answer to a home frame.
 #[derive(Debug)]
-pub(crate) enum HomeReply {
+pub enum HomeReply {
     Open(HomeOpenReply),
     Push(HomePushReply),
 }
 
 /// Send `stop` on the machine's current link, when it speaks
 /// nodeProtocol 19; otherwise it goes after the next bind.
-pub(crate) async fn send_stop(shared: &Shared, stop: &HomeStopRecord) {
+pub async fn send_stop(shared: &Shared, stop: &HomeStopRecord) {
     if shared.current_link().is_none() || shared.protocol() < HOMES_PROTOCOL {
         return;
     }
@@ -33,7 +33,7 @@ pub(crate) async fn send_stop(shared: &Shared, stop: &HomeStopRecord) {
 /// `failed` ack (a push that did not land) or one that never came is
 /// retried without a reconnect. Called whenever a stop is sent or fails;
 /// a worker that ended (no stop left, or no link) is started again.
-pub(crate) fn ensure_stop_resends(shared: &Arc<Shared>) {
+pub fn ensure_stop_resends(shared: &Arc<Shared>) {
     use std::sync::atomic::Ordering;
     if shared.home_stop_resends.swap(true, Ordering::SeqCst) {
         return;
@@ -79,7 +79,7 @@ async fn pending_while_linked(shared: &Shared) -> Vec<HomeStopRecord> {
 
 impl Shared {
     /// Whether the machine holds a home of this backend (keeps the link up).
-    pub(crate) fn set_holds_homes(&self, holds: bool) {
+    pub fn set_holds_homes(&self, holds: bool) {
         self.holds_homes
             .store(holds, std::sync::atomic::Ordering::SeqCst);
     }

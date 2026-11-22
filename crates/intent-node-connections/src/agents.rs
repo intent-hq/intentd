@@ -14,18 +14,18 @@ use intent_core::{AgentId, WorkspaceId};
 use crate::lock;
 
 /// The shared notification stream an agent runtime hands the manager.
-pub(crate) type Notifications = Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>;
+pub type Notifications = Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>;
 
 /// How a turn ended on the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TurnEnd {
+pub struct TurnEnd {
     pub stop_reason: String,
     pub error: Option<String>,
 }
 
 /// How the agent's provider exited on the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Exit {
+pub struct Exit {
     pub exit_code: Option<i32>,
     pub error: Option<String>,
 }
@@ -40,7 +40,7 @@ struct SinkState {
 }
 
 /// One remote agent's inbox.
-pub(crate) struct AgentSink {
+pub struct AgentSink {
     pub workspace_id: WorkspaceId,
     notes_tx: mpsc::UnboundedSender<IncomingNotification>,
     pub notes: Notifications,
@@ -70,7 +70,7 @@ impl AgentSink {
 
     /// Wait for `turn_id`'s end. The receiver fails when the agent exits.
     /// `None` when it already exited.
-    pub(crate) fn expect_turn(&self, turn_id: &str) -> Option<oneshot::Receiver<TurnEnd>> {
+    pub fn expect_turn(&self, turn_id: &str) -> Option<oneshot::Receiver<TurnEnd>> {
         let mut state = lock(&self.state);
         if state.exit.is_some() || state.closed {
             return None;
@@ -81,13 +81,13 @@ impl AgentSink {
     }
 
     /// Stop waiting for `turn_id` (its prompt was dropped or gave up).
-    pub(crate) fn forget_turn(&self, turn_id: &str) {
+    pub fn forget_turn(&self, turn_id: &str) {
         lock(&self.state).turns.remove(turn_id);
         self.turns_changed.notify_waiters();
     }
 
     /// Returns once no prompt waits for a turn of this live agent.
-    pub(crate) async fn turns_over(&self) {
+    pub async fn turns_over(&self) {
         loop {
             let changed = self.turns_changed.notified();
             tokio::pin!(changed);
@@ -104,7 +104,7 @@ impl AgentSink {
 
     /// Head stopped the agent: fail every waiting prompt and refuse new
     /// turns.
-    pub(crate) fn close(&self) {
+    pub fn close(&self) {
         let mut state = lock(&self.state);
         state.closed = true;
         state.turns.clear();
@@ -129,11 +129,11 @@ impl AgentSink {
     }
 
     /// Whether head closed the sink (the agent was stopped from here).
-    pub(crate) fn is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         lock(&self.state).closed
     }
 
-    pub(crate) fn exit(&self) -> Option<Exit> {
+    pub fn exit(&self) -> Option<Exit> {
         lock(&self.state).exit.clone()
     }
 
@@ -187,33 +187,33 @@ impl AgentSink {
 
 /// Every attached remote agent.
 #[derive(Default)]
-pub(crate) struct Agents {
+pub struct Agents {
     sinks: Mutex<HashMap<AgentId, Arc<AgentSink>>>,
 }
 
 impl Agents {
     /// Attach `agent_id`, replacing any earlier sink.
-    pub(crate) fn attach(&self, agent_id: &AgentId, workspace_id: WorkspaceId) -> Arc<AgentSink> {
+    pub fn attach(&self, agent_id: &AgentId, workspace_id: WorkspaceId) -> Arc<AgentSink> {
         let sink = Arc::new(AgentSink::new(workspace_id));
         lock(&self.sinks).insert(agent_id.clone(), sink.clone());
         sink
     }
 
     /// The workspace of attached agent `agent_id`.
-    pub(crate) fn workspace_of(&self, agent_id: &AgentId) -> Option<WorkspaceId> {
+    pub fn workspace_of(&self, agent_id: &AgentId) -> Option<WorkspaceId> {
         lock(&self.sinks)
             .get(agent_id)
             .map(|sink| sink.workspace_id.clone())
     }
 
     /// Whether `agent_id` has a sink.
-    pub(crate) fn is_attached(&self, agent_id: &AgentId) -> bool {
+    pub fn is_attached(&self, agent_id: &AgentId) -> bool {
         lock(&self.sinks).contains_key(agent_id)
     }
 
     /// Attached agents that neither exited nor were stopped: the node slots
     /// head counts as taken.
-    pub(crate) fn live_count(&self) -> usize {
+    pub fn live_count(&self) -> usize {
         lock(&self.sinks)
             .values()
             .filter(|sink| sink.is_live())
@@ -222,7 +222,7 @@ impl Agents {
 
     /// Live attached agents with a turn in flight (a prompt waiting for its
     /// turn's end).
-    pub(crate) fn turns_in_flight(&self) -> usize {
+    pub fn turns_in_flight(&self) -> usize {
         lock(&self.sinks)
             .values()
             .filter(|sink| sink.is_live() && !lock(&sink.state).turns.is_empty())
@@ -230,7 +230,7 @@ impl Agents {
     }
 
     /// The attached agents that are still live.
-    pub(crate) fn live_ids(&self) -> Vec<AgentId> {
+    pub fn live_ids(&self) -> Vec<AgentId> {
         lock(&self.sinks)
             .iter()
             .filter(|(_, sink)| sink.is_live())
@@ -239,7 +239,7 @@ impl Agents {
     }
 
     /// End every live agent with `error`; returns how many there were.
-    pub(crate) fn end_all(&self, error: &str) -> usize {
+    pub fn end_all(&self, error: &str) -> usize {
         let sinks = lock(&self.sinks);
         let live: Vec<_> = sinks.values().filter(|sink| sink.is_live()).collect();
         for sink in &live {
@@ -249,7 +249,7 @@ impl Agents {
     }
 
     /// End `agent_id`'s sink: waiting prompts fail and it is no longer live.
-    pub(crate) fn close(&self, agent_id: &AgentId) {
+    pub fn close(&self, agent_id: &AgentId) {
         if let Some(sink) = lock(&self.sinks).remove(agent_id) {
             sink.close();
         }
@@ -257,7 +257,7 @@ impl Agents {
 
     /// Returns once no prompt waits for a turn of `agent_id` (at once when
     /// it is not attached).
-    pub(crate) async fn turns_over(&self, agent_id: &AgentId) {
+    pub async fn turns_over(&self, agent_id: &AgentId) {
         let sink = lock(&self.sinks).get(agent_id).cloned();
         if let Some(sink) = sink {
             sink.turns_over().await;
@@ -265,7 +265,7 @@ impl Agents {
     }
 
     /// Detach `agent_id` if `sink` is still its sink.
-    pub(crate) fn detach(&self, agent_id: &AgentId, sink: &Arc<AgentSink>) {
+    pub fn detach(&self, agent_id: &AgentId, sink: &Arc<AgentSink>) {
         let mut sinks = lock(&self.sinks);
         if sinks
             .get(agent_id)
@@ -278,7 +278,7 @@ impl Agents {
     /// Hand an ingested record to its agent. Records of agents not
     /// attached on head (stopped, or from before a head restart) and records
     /// naming a different workspace than the agent's are dropped.
-    pub(crate) fn deliver(&self, agent_id: &AgentId, record: JournalRecord) {
+    pub fn deliver(&self, agent_id: &AgentId, record: JournalRecord) {
         let sink = lock(&self.sinks).get(agent_id).cloned();
         let Some(sink) = sink else {
             tracing::debug!(agent = %agent_id, seq = record.seq.0, "remote node: record for an agent not attached here; dropped");

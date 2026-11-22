@@ -1,8 +1,8 @@
 //! A machine's home timers, link side (monorepo
 //! `docs/protocol/methods/nodes.md`, "Detached workspaces" and "Continuous
 //! backup"): the link-loss grace after which the machine's homes are
-//! detached ([`intent_node_connections::NodeInbound::homes_link_lost`]), and
-//! one backup-warning wait per home. The domain side (`crate::home_state`)
+//! detached ([`crate::NodeInbound::homes_link_lost`]), and
+//! one backup-warning wait per home. The domain side (`intent_svc_remote::home_state`)
 //! detaches, attaches and announces.
 
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// One machine's detach grace and the backup warnings of its homes.
 #[derive(Default)]
-pub(crate) struct HomeLink {
+pub struct HomeLink {
     grace: Mutex<Option<JoinHandle<()>>>,
     warnings: Mutex<HashMap<HomeId, JoinHandle<()>>>,
 }
@@ -41,7 +41,7 @@ impl Drop for HomeLink {
 impl HomeLink {
     /// The machine's link is down (or not up yet at start): its homes are
     /// detached once `grace` passes without a bind.
-    pub(crate) fn link_lost(&self, shared: Weak<Shared>, grace: Duration) {
+    pub fn link_lost(&self, shared: Weak<Shared>, grace: Duration) {
         let holds = shared
             .upgrade()
             .is_some_and(|shared| shared.holds_homes.load(std::sync::atomic::Ordering::SeqCst));
@@ -69,21 +69,21 @@ impl HomeLink {
     }
 
     /// A link bound: no home of the machine is detached for the loss.
-    pub(crate) fn bound(&self) {
+    pub fn bound(&self) {
         if let Some(grace) = lock(&self.grace).take() {
             grace.abort();
         }
     }
 
     /// A backup of `home_id` arrived: its streak is over.
-    pub(crate) fn backed_up(&self, home_id: &HomeId) {
+    pub fn backed_up(&self, home_id: &HomeId) {
         if let Some(warning) = lock(&self.warnings).remove(home_id) {
             warning.abort();
         }
     }
 
     /// Hold `wait`, `home_id`'s backup-warning wait, unless one is pending.
-    pub(crate) fn watch_warning(&self, home_id: &HomeId, wait: BoxFuture<'static, ()>) {
+    pub fn watch_warning(&self, home_id: &HomeId, wait: BoxFuture<'static, ()>) {
         let mut warnings = lock(&self.warnings);
         warnings.retain(|_, waiting| !waiting.is_finished());
         if warnings
