@@ -27,7 +27,7 @@ use intent_services::feature_api::Services;
 use intent_services::home_setup::HomeSetupFinished;
 
 use crate::link::checkout::git_error;
-pub(crate) use crate::link::homes::{ensure_stop_resends, send_stop, HomeReply};
+pub(crate) use crate::link::homes::HomeReply;
 use crate::RemoteServicesExt as _;
 
 /// How long a `homeOpen` may take: the machine's own 5 minute bound, plus
@@ -90,7 +90,7 @@ pub(crate) async fn machine_candidate(svc: &Services, node_id: &str) -> Candidat
     let Ok(node) = feature.node(svc, node_id).await else {
         return Candidate::No;
     };
-    if node.shared_ref().current_link().is_none()
+    if node.current_link().is_none()
         && !matches!(
             tokio::time::timeout(CONNECT_WAIT, node.connect()).await,
             Ok(Ok(()))
@@ -98,7 +98,7 @@ pub(crate) async fn machine_candidate(svc: &Services, node_id: &str) -> Candidat
     {
         return Candidate::No;
     }
-    if node.shared_ref().protocol() < HOMES_PROTOCOL {
+    if node.protocol() < HOMES_PROTOCOL {
         return Candidate::TooOld(too_old(&row));
     }
     // The welcome refreshed the report: read it again.
@@ -463,7 +463,7 @@ pub(crate) async fn send_open(
         None => None,
     };
     let node = feature.node(svc, node_id).await?;
-    node.shared_ref().set_holds_homes(true);
+    node.view().set_holds_homes(true);
     let mut frame = home_open_frame(svc, workspace_id, home_id).await?;
     frame.restore = restore;
     let request_id = frame.request_id;
@@ -810,10 +810,10 @@ pub(crate) async fn send_workspace_stops(svc: &Services, workspace_id: &Workspac
                 continue;
             }
         };
-        node.shared_ref().set_holds_homes(true);
-        if node.shared_ref().current_link().is_some() {
-            send_stop(node.shared_ref(), &stop).await;
-            ensure_stop_resends(&node.shared());
+        node.view().set_holds_homes(true);
+        if node.current_link().is_some() {
+            node.view().send_home_stop(&stop).await;
+            node.view().resend_home_stops();
             continue;
         }
         // The bind sends it.

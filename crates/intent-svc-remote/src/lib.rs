@@ -387,17 +387,14 @@ async fn resume_exposed_machines(svc: &Services) -> Vec<String> {
                     .await
                     .is_ok_and(|stops| !stops.is_empty());
                 if !homes.is_empty() || owes_stops {
-                    let shared = node.shared_ref();
-                    shared.set_holds_homes(true);
+                    node.view().set_holds_homes(true);
                     if !homes.is_empty() {
                         // A failing backup streak from before the restart
                         // still raises its warning on time.
-                        home_state::resume_warnings(svc, shared, &homes).await;
+                        home_state::resume_warnings(svc, node.view(), &homes).await;
                         // Its homes are detached if no link comes up within
                         // the link-loss grace.
-                        shared
-                            .home_link
-                            .link_lost(shared.weak(), shared.tuning.link_loss_grace);
+                        node.home_link_lost();
                     }
                     // caller-binding: allow — dials a home's machine at start; the connector retries with backoff
                     tokio::spawn(async move {

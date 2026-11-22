@@ -87,14 +87,14 @@ async fn home_node(
         Err(error) => return Err(unreached(svc, workspace_id, home, method, &error).await),
     };
     let gate = if gated {
-        Some(node.shared_ref().begin_use().await)
+        Some(node.begin_use().await)
     } else {
         None
     };
     if let Err(error) = node.connect().await {
         return Err(unreached(svc, workspace_id, home, method, &error).await);
     }
-    if node.shared_ref().protocol() < HOMES_PROTOCOL {
+    if node.protocol() < HOMES_PROTOCOL {
         return Err(call_unavailable(
             home,
             method,

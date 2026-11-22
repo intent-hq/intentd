@@ -100,11 +100,11 @@ async fn linked_home(
             return Err(crate::cloud::home::unreachable(svc, workspace_id, &home, &error).await)
         }
     };
-    let gate = node.shared_ref().begin_use().await;
+    let gate = node.begin_use().await;
     if let Err(error) = node.connect().await {
         return Err(crate::cloud::home::unreachable(svc, workspace_id, &home, &error).await);
     }
-    if node.shared_ref().protocol() < HOMES_PROTOCOL {
+    if node.protocol() < HOMES_PROTOCOL {
         return Err(home_unavailable(
             &home,
             "its machine needs an intentd update for workspace homes",
@@ -130,7 +130,8 @@ pub(crate) async fn open(
     let Some((home, node, _use)) = linked_home(svc, workspace_id).await? else {
         return Ok(None);
     };
-    crate::link::terminals::open_on(node.shared_ref(), &home, workspace_id, pty, open).map(Some)
+    node.open_home_terminal(&home, workspace_id, pty, open)
+        .map(Some)
 }
 
 /// Start a `host.execStream` process on `workspace_id`'s home: an
@@ -149,10 +150,5 @@ pub(crate) async fn open_exec(
     let Some((home, node, _use)) = linked_home(svc, workspace_id).await? else {
         return Ok(None);
     };
-    Ok(Some(crate::link::terminals::open_exec_on(
-        node.shared_ref(),
-        &home,
-        workspace_id,
-        open,
-    )))
+    Ok(Some(node.open_home_exec(&home, workspace_id, open)))
 }
