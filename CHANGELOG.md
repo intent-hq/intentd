@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.272] - 2026-11-22
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Wake when a re-run of a failed check fails again ([#3648](https://github.com/intent-hq/intentd/pull/3648))
+- *(deps)* Bump sysinfo to 0.40 and handle fallible constructors ([#3663](https://github.com/intent-hq/intentd/pull/3663))
+
+### 🔧 Refactor
+
+- *(node-connections)* Move the connector and link halves into intent-node-connections ([#3668](https://github.com/intent-hq/intentd/pull/3668))
+- *(remote)* Take the last domain calls out of the link side ([#3666](https://github.com/intent-hq/intentd/pull/3666))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump toon-format from 0.6.1 to 0.7.0 ([#3317](https://github.com/intent-hq/intentd/pull/3317))
+
+
 ## [0.11.271] - 2026-11-22
 
 ### 🐛 Bug Fixes
