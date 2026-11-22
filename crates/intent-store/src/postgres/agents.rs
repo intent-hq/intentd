@@ -3256,6 +3256,11 @@ impl PgStore {
     }
 
     pub async fn load_all_agent_queues(&self) -> Result<Vec<AgentQueueRow>> {
+        // Wait for this process's queue writes still committing on their own
+        // task (each holds the queue write lock until its commit and recovery
+        // finish), so the rows read here include them: the shutdown reconcile
+        // compares against this load and must not miss a commit landing later.
+        let _queue_write = self.queue_versions.write_lock().await;
         // One snapshot: the versions adopted must be those of the rows read.
         let mut tx = self.begin_read_snapshot().await?;
         let rows = sqlx::query(
