@@ -241,9 +241,10 @@ async fn every_profile_kind_launches_the_same_locally_and_on_a_machine() {
 
         match kind.own_home(provider, default) {
             Some((variable, folder)) => {
-                let path = value(&node, variable)
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| panic!("{case}: no {variable} on the machine"));
+                let path = value(&node, variable).map_or_else(
+                    || panic!("{case}: no {variable} on the machine"),
+                    std::path::PathBuf::from,
+                );
                 assert!(
                     path.starts_with(home.join(folder)),
                     "{case}: {variable} {} is not under {folder}",
