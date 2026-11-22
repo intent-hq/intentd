@@ -51,7 +51,10 @@ fn nextest_runs_this_binary_one_test_at_a_time() {
         .expect("profile.default.overrides");
     let group = overrides
         .iter()
-        .find(|o| o.get("filter").and_then(|f| f.as_str()) == Some("binary_id(=intent-store::compile_fail)"))
+        .find(|o| {
+            o.get("filter").and_then(|f| f.as_str())
+                == Some("binary_id(=intent-store::compile_fail)")
+        })
         .and_then(|o| o.get("test-group"))
         .and_then(|g| g.as_str())
         .expect("an override with filter binary_id(=intent-store::compile_fail) and a test-group");
