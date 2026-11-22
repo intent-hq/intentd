@@ -1073,9 +1073,9 @@ do not list it among the normal workspace settings below. -->
 
 Open **New workspace** (`/workspace/new`), describe the work in the prompt, and
 choose **Create workspace**. During creation, the button shows the current step
-and a loader on the right, with a progress bar along its bottom edge. Once the
-daemon reports progress, a caption under the button shows the percentage, plus the
-downloaded size and speed while a repository clones. Steps include cloning,
+and a loader on the right, with a progress bar along its bottom edge. While a
+repository clones, a caption under the button shows the downloaded size and speed
+(older versions may show a percentage above the button). Steps include cloning,
 submodules ("Submodules (3/12)…"), copying or checking out the workspace,
 finalizing, and, when the first agent runs on another machine (always on an
 orchestrator), "Starting agent on <machine>…". Before any progress arrives the
