@@ -1,7 +1,7 @@
 //! Answers of the calls the head makes to one connected machine.
 
-/// One secret frame for a machine secret call. `Debug`
-/// never shows a value.
+/// One secret frame for a machine secret call (`RemoteLaunchPort::machine_secret`
+/// in `intent-services`). `Debug` never shows a value.
 pub enum MachineSecretOp {
     /// Hold `value` as secret `name`.
     Put {
@@ -27,7 +27,8 @@ impl std::fmt::Debug for MachineSecretOp {
     }
 }
 
-/// A machine's answer for a machine secret call.
+/// A machine's answer for a machine secret call
+/// (`RemoteLaunchPort::machine_secret` in `intent-services`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineSecretAnswer {
     /// `Put` held the value.
@@ -46,7 +47,8 @@ pub enum MachineSecretAnswer {
     Failed(String),
 }
 
-/// A machine's answer for a machine skills query.
+/// A machine's answer for a machine skills query
+/// (`RemoteLaunchPort::machine_skills` in `intent-services`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineSkills {
     /// The user skills it listed.

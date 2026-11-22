@@ -1300,8 +1300,8 @@ impl RemoteLaunchPort for RemoteLaunch {
         svc: &'a Services,
         agent_id: &'a AgentId,
         query: bool,
-    ) -> BoxFuture<'a, intent_services::feature_api::feature_ports::MachineSkills> {
-        use intent_services::feature_api::feature_ports::MachineSkills;
+    ) -> BoxFuture<'a, intent_core::machine_calls::MachineSkills> {
+        use intent_core::machine_calls::MachineSkills;
         Box::pin(async move {
             let Ok(Some(record)) = svc.store().get_remote_agent(agent_id).await else {
                 return MachineSkills::Offline;
@@ -1320,9 +1320,9 @@ impl RemoteLaunchPort for RemoteLaunch {
         &'a self,
         svc: &'a Services,
         agent_id: &'a AgentId,
-        op: intent_services::feature_api::feature_ports::MachineSecretOp,
-    ) -> BoxFuture<'a, intent_services::feature_api::feature_ports::MachineSecretAnswer> {
-        use intent_services::feature_api::feature_ports::{MachineSecretAnswer, MachineSecretOp};
+        op: intent_core::machine_calls::MachineSecretOp,
+    ) -> BoxFuture<'a, intent_core::machine_calls::MachineSecretAnswer> {
+        use intent_core::machine_calls::{MachineSecretAnswer, MachineSecretOp};
         Box::pin(async move {
             let forget = match &op {
                 MachineSecretOp::Forget { name } => Some(name.clone()),

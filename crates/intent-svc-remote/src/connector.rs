@@ -310,7 +310,9 @@ pub(crate) struct Shared {
     pub tuning: Tuning,
     pub store: Store,
     /// The head's domain: answers forwarded calls and hears the link's
-    /// changes. `None` refuses every machine request.
+    /// changes. `None` refuses every machine request, turns homes off,
+    /// hands machines no forge token and keeps refs in the workspaces' own
+    /// repositories.
     inbound: Option<Arc<dyn NodeInbound>>,
     /// Where the machine is dialed; refreshed from every welcome.
     target: Mutex<MachineTarget>,

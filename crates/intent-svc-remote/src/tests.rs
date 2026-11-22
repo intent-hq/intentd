@@ -3455,7 +3455,7 @@ async fn an_unsolicited_capabilities_report_replaces_the_recorded_one() {
 #[tokio::test]
 async fn a_queued_secret_forget_never_lands_after_a_newer_put() {
     use intent_core::node_link::{SecretOutcome, SecretReply, SecretValue};
-    use intent_services::feature_api::feature_ports::{MachineSecretAnswer, MachineSecretOp};
+    use intent_core::machine_calls::{MachineSecretAnswer, MachineSecretOp};
     let backend = Backend::new().await;
     let mut machine = Machine::start(&backend.id().await).await;
     backend.expose(&mut machine).await.shutdown();
