@@ -389,3 +389,78 @@ async fn a_silently_cancelled_remote_script_monitor_settles_the_parents_watch() 
         "one completion wake"
     );
 }
+
+/// A remote agent's forwarded start is attributed to that remote agent; the
+/// app's restart of the same machine run (`remoteAgentId`) to the user.
+#[intent_test_macros::daemon_test]
+async fn machine_runs_record_the_remote_agent_and_a_user_restart() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let svc = crate::test_runtime::with_runtime(Services::new_repository_fixture(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
+        None,
+    ))
+    .with_settings_registry(test_registry_with_default_provider(&tmp))
+    .with_remote_launch_port(Arc::new(FakeMachine(UnavailableRemoteLaunch)));
+    let remote = agent(&svc, &ws, "Mac runner").await;
+    let script = svc
+        .script_create(
+            ws.clone(),
+            ScriptCreateParams {
+                name: "Mac tests".into(),
+                command: "make test".into(),
+                mode: ScriptMode::Command,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("script.create");
+    let script_id = script["id"].as_str().expect("script id").to_owned();
+    let caller = intent_services::feature_api::feature_ports::RemoteScriptCaller {
+        workspace_id: ws.clone(),
+        agent_id: remote.clone(),
+        node_id: "mac".into(),
+    };
+    let started = crate::remote_scripts::remote_call(
+        &svc,
+        caller,
+        "script.start",
+        json!({ "scriptId": script_id }),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("remote start");
+    assert_eq!(
+        started["startedBy"],
+        json!({ "kind": "agent", "agentId": remote.as_str() }),
+        "{started}"
+    );
+
+    // Lose the run so the restart does not wait on an unacknowledged stop.
+    let runs_mgr = svc.script_manager();
+    let runs = runs_mgr.machine_runs().expect("machine runs");
+    runs.link_lost("mac", "test").await;
+    let owner = Caller::Wire {
+        principal_id: svc.store().get_primary_principal().await.unwrap().id,
+        host_role: intent_core::HostRole::Owner,
+    };
+    let restarted = with_caller(
+        owner,
+        crate::remote_scripts::machine_run_call(
+            &svc,
+            ws.clone(),
+            "restart",
+            json!({ "remoteAgentId": remote.as_str(), "scriptId": script_id }),
+        ),
+    )
+    .await
+    .expect("app restart");
+    assert_eq!(
+        restarted["startedBy"],
+        json!({ "kind": "user" }),
+        "{restarted}"
+    );
+}

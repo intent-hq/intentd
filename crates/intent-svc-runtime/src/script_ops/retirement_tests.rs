@@ -1222,3 +1222,53 @@ async fn retirement_out_of_band_kill_exits_before_settlement_archives() {
         "a settled one-off is absent from the active list: {listed}"
     );
 }
+
+#[intent_test_macros::daemon_test]
+async fn retirement_pre_spawn_cancel_keeps_the_cancelled_runs_starter() {
+    let h = harness().await;
+    let id = one_off(&h, "true").await;
+    let mgr = h.services.script_manager();
+    let key = (h.ws.clone(), id.clone());
+    let agent = intent_core::ScriptStartedBy::Agent {
+        agent_id: intent_core::AgentId::from("agent-cancelled-run"),
+    };
+    let prev = {
+        let mut scripts = mgr.scripts.lock().unwrap();
+        let m = scripts.get_mut(&key).unwrap();
+        m.state.started_by = Some(intent_core::ScriptStartedBy::User);
+        m.state.clone()
+    };
+    let lock = mgr.locks.definition_lock(&id);
+    let guard = lock.lock().await;
+    mgr.prepare_launch(&h.ws, &id, Some(agent.clone()))
+        .await
+        .unwrap();
+    let generation = {
+        let mut scripts = mgr.scripts.lock().unwrap();
+        let m = scripts.get_mut(&key).unwrap();
+        m.state.status = ScriptStatus::Running;
+        m.run_reserved = Some(Arc::new(tokio::sync::Notify::new()));
+        m.generation
+    };
+    drop(RunReservation {
+        mgr: mgr.clone(),
+        key: key.clone(),
+        prev,
+        generation,
+        armed: true,
+    });
+    {
+        let scripts = mgr.scripts.lock().unwrap();
+        let m = scripts.get(&key).unwrap();
+        assert_eq!(m.state.started_by.as_ref(), Some(&agent));
+        assert_eq!(
+            m.pending_result.as_ref().unwrap().started_by.as_ref(),
+            Some(&agent)
+        );
+    }
+    drop(guard);
+    assert_eq!(
+        retired(&h, &id).await.last_run.unwrap().started_by,
+        Some(agent)
+    );
+}

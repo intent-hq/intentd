@@ -432,12 +432,14 @@ impl Drop for RunReservation {
             {
                 if m.state.status == ScriptStatus::Running {
                     let run_id = m.state.run_id.clone();
+                    let started_by = m.state.started_by.take();
                     m.state = if m.stopped_by_user {
                         ScriptRuntimeState::default()
                     } else {
                         self.prev.clone()
                     };
                     m.state.run_id = run_id;
+                    m.state.started_by = started_by;
                 }
                 if !m.running_at_shutdown
                     && !m.stopped_by_user

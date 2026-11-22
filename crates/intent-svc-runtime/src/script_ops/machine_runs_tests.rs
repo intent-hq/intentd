@@ -228,8 +228,15 @@ async fn a_service_that_exits_is_restarted_with_a_new_spawn_and_the_same_run() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
+    let by = intent_core::ScriptStartedBy::Agent {
+        agent_id: agent.clone(),
+    };
     let first = runs
-        .start(&place(&agent), &script(ScriptMode::Service, "serve"), None)
+        .start(
+            &place(&agent),
+            &script(ScriptMode::Service, "serve"),
+            Some(by.clone()),
+        )
         .await
         .unwrap();
     let start = last_start(&rec);
@@ -248,6 +255,7 @@ async fn a_service_that_exits_is_restarted_with_a_new_spawn_and_the_same_run() {
     let state = runs.state(&place(&agent)).unwrap();
     assert_eq!(state.run_id, first.run_id, "the runId spans restarts");
     assert_eq!(state.restart_count, 1);
+    assert_eq!(state.started_by, Some(by), "the respawn keeps the starter");
 }
 
 #[tokio::test]
