@@ -83,6 +83,7 @@ pub mod tilde;
 pub(crate) mod traits;
 pub mod transfer;
 pub mod turn_attachments;
+pub mod workload;
 
 pub use agent_configs::{
     agent_configs_root, create_agent_configs_dir, is_npx_launch_dir_name, sweep_agent_configs,

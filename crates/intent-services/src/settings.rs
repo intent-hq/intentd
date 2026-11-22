@@ -1678,11 +1678,10 @@ fn memory_budget_default_mb() -> f64 {
 /// The result is **clamped** to [`memory_budget_max_mb_for`] the same total:
 /// `defaultValue` must satisfy the numeric schema it ships in. Above roughly
 /// 2 TiB the recommendation `(RAM − 8 GiB) / 2` outgrows the 1,024,000 MB
-/// parse bound the max is capped at, and below 4 GiB of RAM the 4 GiB floor
-/// outgrows the RAM-sized max; unclamped, either advertises a default the
-/// catalog itself rejects and no client can write back. In those two corners
-/// the daemon still runs the unclamped recommendation — the clamp keeps the
-/// wire description settable, it does not change the policy.
+/// parse bound the max is capped at; unclamped, it would advertise a default
+/// the catalog itself rejects and no client can write back. There the daemon
+/// still runs the unclamped recommendation — the clamp keeps the wire
+/// description settable, it does not change the policy.
 // MiB counts above 2^53 do not occur; loss-free in f64.
 #[expect(clippy::cast_precision_loss)]
 fn memory_budget_default_mb_for(total_memory_bytes: Option<u64>) -> f64 {
@@ -6808,9 +6807,7 @@ mod tests {
     /// roughly 2 TiB the recommendation `(RAM − 8 GiB) / 2` outgrows the
     /// 1,024,000 MB parse bound the max is capped at, and unclamped the catalog
     /// would advertise a default its own numeric schema rejects — a figure no
-    /// client could write back through `settings.update`. The clamp also
-    /// binds at the other end, where the 4 GiB floor outgrows a sub-4 GiB
-    /// host's RAM-sized max.
+    /// client could write back through `settings.update`.
     #[test]
     // Asserting exact whole-valued MB figures; the MiB count fits in f64 exactly.
     #[expect(clippy::float_cmp)]
@@ -6835,12 +6832,9 @@ mod tests {
         // 1 TiB: the max is capped but the 520,192 MB recommendation is not.
         assert_eq!(memory_budget_default_mb_for(Some(TIB)), 520_192.0);
 
-        // Sub-4 GiB host: the 4 GiB floor is above the RAM-sized max.
-        assert_eq!(memory_budget_default_mb_for(Some(2 * GIB)), 2_048.0);
-        assert_eq!(
-            memory_budget_default_mb_for(Some(2 * GIB)),
-            memory_budget_max_mb_for(Some(2 * GIB))
-        );
+        // Sub-12 GiB hosts follow the small-host budget (intent-hq/intent#9809),
+        // which stays under the RAM-sized max: 2 GiB → max(1 GiB / 2, 512 MiB).
+        assert_eq!(memory_budget_default_mb_for(Some(2 * GIB)), 512.0);
 
         for total in [
             None,

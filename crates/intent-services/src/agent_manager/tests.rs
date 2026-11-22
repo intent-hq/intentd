@@ -23,6 +23,7 @@ use tokio::time::{timeout, Duration};
 
 use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
+    host_memory_reserve_bytes, small_host_reserve_bytes,
     is_cancel_transport_closed, pop_and_wake_waiter, recommended_memory_budget_bytes,
     resolve_npx_only, resolve_spawn, settle_stale_waiter, text_prompt, usage_message_origin,
     AgentHandle, AgentManager, BusEventSink, KillFn, LocalResources, ProcessRegistry,
@@ -190,9 +191,10 @@ fn compute_process_cap_reserves_8gb_and_budgets_1gb_per_agent() {
 
 #[test]
 fn compute_process_cap_lower_clamp_floors_at_4() {
-    // Below the 8 GB reserve the subtraction saturates to 0 → clamp to 4.
+    // An unknown (0) total keeps today's floor; a known small host follows
+    // the small-host rule (intent-hq/intent#9809).
     assert_eq!(compute_process_cap(0), 4);
-    assert_eq!(compute_process_cap(4 * super::GB), 4);
+    assert_eq!(compute_process_cap(4 * super::GB), 2);
     // Just past the reserve, the raw budget (1..=4 GB) is still at or below the floor.
     assert_eq!(compute_process_cap(12 * super::GB), 4);
     // First value above the floor.
@@ -208,12 +210,86 @@ fn compute_process_cap_upper_clamp_caps_at_100() {
     assert_eq!(compute_process_cap(u64::MAX), 100);
 }
 
+/// Today's (pre-#9809) formulas, kept here so the small-host rule can be
+/// proven to only ever lower them.
+fn legacy_cap(total: u64) -> usize {
+    (total.saturating_sub(8 * super::GB) / super::GB).clamp(4, 100) as usize
+}
+fn legacy_budget(total: u64) -> u64 {
+    (total.saturating_sub(8 * super::GB) / 2).max(4 * super::GB)
+}
+
+/// intent-hq/intent#9809: below 12 GiB the auto slot cap, budget and host
+/// reserve follow the small-host formulas; at or above it they are exactly
+/// today's, including a 15.5 GiB "nominal 16 GB" box.
+#[test]
+fn small_host_defaults_match_the_worked_values() {
+    let gib = super::GB;
+    let mib = 1024 * 1024;
+    let at = |tenths: u64| tenths * gib / 10;
+    // 3.8 GiB: reserve 1.9 GiB, budget ~0.95 GiB, 2 slots.
+    assert_eq!(small_host_reserve_bytes(at(38)), Some(at(38) / 2));
+    assert_eq!(compute_process_cap(at(38)), 2);
+    assert_eq!(recommended_memory_budget_bytes(at(38)), (at(38) - at(38) / 2) / 2);
+    assert_eq!(
+        host_memory_reserve_bytes(Some(at(38))),
+        at(38) / 2 + PROVISIONAL_AGENT_BYTES
+    );
+    // 8 GiB: reserve 4 GiB, budget 2 GiB, 4 slots.
+    assert_eq!(compute_process_cap(8 * gib), 4);
+    assert_eq!(recommended_memory_budget_bytes(8 * gib), 2 * gib);
+    assert_eq!(
+        host_memory_reserve_bytes(Some(8 * gib)),
+        4 * gib + PROVISIONAL_AGENT_BYTES
+    );
+    // 11.9 GiB: budget ~2.97 GiB, 4 slots.
+    assert_eq!(compute_process_cap(at(119)), 4);
+    let budget = recommended_memory_budget_bytes(at(119));
+    assert!(budget > 2970 * mib && budget < 2980 * mib, "{budget}");
+    // A tiny host keeps the 512 MiB budget floor and the 2-slot floor.
+    assert_eq!(recommended_memory_budget_bytes(gib), 512 * mib);
+    assert_eq!(compute_process_cap(gib), 2);
+    // At and above 12 GiB, and for an unknown (0) total: exactly today's.
+    for total in [0, 12 * gib, at(155), 16 * gib, 48 * gib, 128 * gib] {
+        assert_eq!(compute_process_cap(total), legacy_cap(total), "cap at {total}");
+        assert_eq!(
+            recommended_memory_budget_bytes(total),
+            legacy_budget(total),
+            "budget at {total}"
+        );
+        assert_eq!(
+            host_memory_reserve_bytes(Some(total)),
+            HOST_MEMORY_RESERVE_BYTES,
+            "reserve at {total}"
+        );
+    }
+    assert_eq!(host_memory_reserve_bytes(None), HOST_MEMORY_RESERVE_BYTES);
+}
+
+#[test]
+fn small_host_defaults_never_exceed_todays_values() {
+    let step = 64 * 1024 * 1024;
+    let mut total = 0;
+    while total <= 20 * super::GB {
+        assert!(compute_process_cap(total) <= legacy_cap(total), "cap at {total}");
+        assert!(
+            recommended_memory_budget_bytes(total) <= legacy_budget(total),
+            "budget at {total}"
+        );
+        assert!(
+            host_memory_reserve_bytes(Some(total)) <= HOST_MEMORY_RESERVE_BYTES,
+            "reserve at {total}"
+        );
+        total += step;
+    }
+}
+
 #[test]
 fn compute_process_cap_is_monotonic_with_no_cliffs() {
     // The old step table jumped 30 → 100 between 64 and 65 GB; the smooth
     // formula must grow by at most 1 per GB.
-    let mut prev = compute_process_cap(0);
-    for gb in 1..=160 {
+    let mut prev = compute_process_cap(super::GB);
+    for gb in 2..=160 {
         let cap = compute_process_cap(gb * super::GB);
         assert!(cap >= prev, "cap must be monotonic at {gb} GB");
         assert!(cap - prev <= 1, "cap must not cliff at {gb} GB");
@@ -477,9 +553,10 @@ fn recommended_budget_halves_ram_left_after_the_8gb_reserve() {
     // The reporter's 48 GB seat: 20 GB, which the measured 21.5 GB tree crosses.
     assert_eq!(recommended_memory_budget_bytes(48 * gb), 20 * gb);
     assert_eq!(recommended_memory_budget_bytes(32 * gb), 12 * gb);
-    // Floor: never below 4 GB, however small (or undetectable) the host.
+    // Floor: 4 GB from 12 GB up.
     assert_eq!(recommended_memory_budget_bytes(16 * gb), 4 * gb);
-    assert_eq!(recommended_memory_budget_bytes(8 * gb), 4 * gb);
+    // Small hosts follow the small-host rule; an unknown (0) total keeps the floor.
+    assert_eq!(recommended_memory_budget_bytes(8 * gb), 2 * gb);
     assert_eq!(recommended_memory_budget_bytes(0), 4 * gb);
     // Always strictly under the slot cap's implied budget, which spends all of
     // the same post-reserve RAM at 1 GB per agent.
@@ -506,9 +583,9 @@ fn budget_admits_an_empty_registry_however_fat_the_tree() {
     // Over budget with nothing registered: the tree is one-shot adapters or
     // simply another process the daemon does not own, and refusing forever
     // would wedge the daemon.
-    assert!(budget_admits(u64::MAX, 1_000, 0, None));
-    assert!(!budget_admits(1_000, 1_000, 1, None), "at budget denies");
-    assert!(budget_admits(999, 1_000, 1, None));
+    assert!(budget_admits(u64::MAX, 1_000, 0, None, HOST_MEMORY_RESERVE_BYTES));
+    assert!(!budget_admits(1_000, 1_000, 1, None, HOST_MEMORY_RESERVE_BYTES), "at budget denies");
+    assert!(budget_admits(999, 1_000, 1, None, HOST_MEMORY_RESERVE_BYTES));
 }
 
 /// The host-headroom criterion (spec root cause A): the tree sums RSS of
@@ -520,19 +597,19 @@ fn budget_denies_an_over_budget_tree_only_when_the_host_is_short() {
     let gb = super::GB;
     let reserve = HOST_MEMORY_RESERVE_BYTES;
     // Over budget, ample headroom → admits.
-    assert!(budget_admits(67 * gb, 63 * gb, 13, Some(63 * gb)));
+    assert!(budget_admits(67 * gb, 63 * gb, 13, Some(63 * gb), HOST_MEMORY_RESERVE_BYTES));
     assert!(
-        budget_admits(67 * gb, 63 * gb, 13, Some(reserve)),
+        budget_admits(67 * gb, 63 * gb, 13, Some(reserve), HOST_MEMORY_RESERVE_BYTES),
         "exactly the reserve is enough"
     );
     // Over budget, host short → denies.
-    assert!(!budget_admits(67 * gb, 63 * gb, 13, Some(reserve - 1)));
-    assert!(!budget_admits(67 * gb, 63 * gb, 13, Some(0)));
+    assert!(!budget_admits(67 * gb, 63 * gb, 13, Some(reserve - 1), HOST_MEMORY_RESERVE_BYTES));
+    assert!(!budget_admits(67 * gb, 63 * gb, 13, Some(0), HOST_MEMORY_RESERVE_BYTES));
     // No headroom reading keeps the tree-only criterion.
-    assert!(!budget_admits(67 * gb, 63 * gb, 13, None));
+    assert!(!budget_admits(67 * gb, 63 * gb, 13, None, HOST_MEMORY_RESERVE_BYTES));
     // Under budget admits regardless of headroom; `live == 0` always admits.
-    assert!(budget_admits(gb, 63 * gb, 13, Some(0)));
-    assert!(budget_admits(u64::MAX, 1_000, 0, Some(0)));
+    assert!(budget_admits(gb, 63 * gb, 13, Some(0), HOST_MEMORY_RESERVE_BYTES));
+    assert!(budget_admits(u64::MAX, 1_000, 0, Some(0), HOST_MEMORY_RESERVE_BYTES));
     assert_eq!(reserve, 8 * gb + PROVISIONAL_AGENT_BYTES);
 }
 
