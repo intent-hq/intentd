@@ -11,6 +11,11 @@
 //! every durable link write. On the desktop one process always owns every
 //! link ([`LocalOwnership`]), but the claim and fence calls still run, so
 //! one code path serves both deployments.
+//!
+//! [`connector::RemoteNode`] is one machine's connector: it dials the
+//! machine, ingests its journal and relays its agents through
+//! [`runtime::RemoteAgentRuntime`]. The `link` modules hold the link halves
+//! of homes, home terminals and scripts, the forge token and the dial gate.
 
 pub mod agents;
 pub mod connect;
@@ -30,6 +35,7 @@ pub use inbound::{LinkView, NodeInbound};
 pub use ownership::{process_head_session, Fenced, LinkClaim, LinkOwnership, LocalOwnership};
 
 /// Lock `mutex`, taking over a poisoned one.
+#[doc(hidden)]
 pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
