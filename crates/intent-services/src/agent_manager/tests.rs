@@ -248,7 +248,10 @@ fn small_host_defaults_match_the_worked_values() {
     // 11.9 GiB: budget ~2.97 GiB, 4 slots.
     assert_eq!(compute_process_cap(at(119)), 4);
     let budget = recommended_memory_budget_bytes(at(119));
-    assert!(budget > 2970 * mib && budget < 2980 * mib, "{budget}");
+    assert!(
+        budget > gib / 1000 * 2970 && budget < gib / 1000 * 2980,
+        "{budget}"
+    );
     // A tiny host keeps the 512 MiB budget floor and the 2-slot floor.
     assert_eq!(recommended_memory_budget_bytes(gib), 512 * mib);
     assert_eq!(compute_process_cap(gib), 2);

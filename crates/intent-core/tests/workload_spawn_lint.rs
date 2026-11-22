@@ -53,24 +53,20 @@ const SITES: &[(&str, Class)] = &[
         Internal("login-shell environment capture"),
     ),
     (
-        "crates/intent-core/src/secrets.rs",
-        Internal("OS keychain helper"),
-    ),
-    (
         "crates/intent-core/src/workload/cgroup.rs",
         Internal("systemctl delegation query"),
+    ),
+    (
+        "crates/intent-core/src/workload/leaf.rs",
+        Internal("the cgroup-exec shim execs a workload that already joined its leaf"),
     ),
     ("crates/intent-git/src/auth.rs", GIT),
     ("crates/intent-git/src/cow_checkout.rs", GIT),
     ("crates/intent-git/src/fetch.rs", GIT),
-    ("crates/intent-git/src/history.rs", GIT),
-    ("crates/intent-git/src/identity.rs", GIT),
     ("crates/intent-git/src/ls_remote.rs", GIT),
     ("crates/intent-git/src/node_git.rs", GIT),
-    ("crates/intent-git/src/pull.rs", GIT),
     ("crates/intent-git/src/repo_cache.rs", GIT),
     ("crates/intent-git/src/stage.rs", GIT),
-    ("crates/intent-git/src/standalone_work.rs", GIT),
     ("crates/intent-git/src/submodule.rs", GIT),
     (
         "crates/intent-node-link/src/dial.rs",
@@ -81,7 +77,6 @@ const SITES: &[(&str, Class)] = &[
     ("crates/intent-services/src/agy_cli.rs", INSTALL),
     ("crates/intent-services/src/auggie_cli.rs", PROBE),
     ("crates/intent-services/src/bundled_cli.rs", INSTALL),
-    ("crates/intent-services/src/capability.rs", PROBE),
     ("crates/intent-services/src/clone_ops.rs", GIT),
     (
         "crates/intent-services/src/codex_diagnostics/catalog.rs",
@@ -94,14 +89,6 @@ const SITES: &[(&str, Class)] = &[
     ),
     (
         "crates/intent-services/src/codex_diagnostics/process/linux_fallback.rs",
-        PROBE,
-    ),
-    (
-        "crates/intent-services/src/codex_diagnostics/process/macos.rs",
-        PROBE,
-    ),
-    (
-        "crates/intent-services/src/codex_diagnostics/process/windows.rs",
         PROBE,
     ),
     ("crates/intent-services/src/cursor_cli.rs", PROBE),
@@ -146,7 +133,6 @@ const SITES: &[(&str, Class)] = &[
         GIT,
     ),
     ("crates/intent-svc-transfer/src/transfer_submodules.rs", GIT),
-    ("crates/intent-transport/build.rs", Internal("build script")),
     (
         "crates/intent-transport/src/host.rs",
         Internal("opens a URL or file for the desktop"),
@@ -169,10 +155,6 @@ const SITES: &[(&str, Class)] = &[
         Internal("the sitter starting the daemon"),
     ),
     (
-        "crates/intentd-sitter/src/windows.rs",
-        Internal("the sitter starting the daemon"),
-    ),
-    (
         "crates/intentd/src/command_evidence.rs",
         Internal("an evidence run, already inside its caller's box"),
     ),
@@ -182,10 +164,6 @@ const SITES: &[(&str, Class)] = &[
     ("crates/intentd/src/executor/setup.rs", Workload),
     ("crates/intentd/src/executor/terminals.rs", Workload),
     ("crates/intentd/src/executor/workspace_api.rs", GIT),
-    (
-        "crates/intentd/src/main.rs",
-        Internal("daemon CLI subcommands"),
-    ),
     (
         "crates/intentd/src/plugin_exec.rs",
         Internal("a plugin helper, already inside its caller's box"),

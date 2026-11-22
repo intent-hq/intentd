@@ -70,6 +70,7 @@ fn fresh_unit_moves_the_sitter_and_daemon_and_sets_the_ceiling() {
         }
     );
     assert_eq!(read(unit.join("workloads/memory.max")), max.to_string());
+    assert_eq!(read(unit.join("workloads/memory.swap.max")), "0");
     let high: u64 = read(unit.join("workloads/memory.high")).parse().unwrap();
     assert!(high < max && high >= max - max / 20 - 1, "{high} vs {max}");
 }

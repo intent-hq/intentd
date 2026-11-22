@@ -187,6 +187,10 @@ pub(super) fn setup(host: &Host, config: &ContainmentConfig) -> Result<Layout, S
     };
     write(&workloads.join("memory.max"), &max.to_string())?;
     write(&workloads.join("memory.high"), &high_for(max).to_string())?;
+    // No swap for the box: swapping workloads would thrash the host's disk
+    // and stall the daemon just like running out of RAM. Best effort: the
+    // file is absent when the kernel has no swap accounting.
+    let _ = fs::write(workloads.join("memory.swap.max"), "0");
     // Best effort: protection only reaches as far as the parent grants.
     let _ = fs::write(daemon.join("memory.low"), reserve.to_string());
     Ok(Layout {

@@ -157,6 +157,7 @@ async fn await_uds(socket: &Path) -> bool {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
             }
+            // timing-guard: poll interval of a bounded wait on an observable state
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
@@ -366,6 +367,7 @@ async fn read_when_written(path: &Path) -> String {
             "{} was never written",
             path.display()
         );
+        // timing-guard: poll interval of a bounded wait on an observable state
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -485,6 +487,7 @@ async fn cgroup_box_kills_a_runaway_script_and_the_daemon_survives() {
         &ws_id,
         "forker",
         &format!(
+            // timing-guard: a long-lived service process, stopped by script.stop, not a wait
             "sleep 300 & echo $! > {}; echo $$ > {}; exec sleep 300",
             child_pid.display(),
             shell_pid.display()
@@ -505,14 +508,14 @@ async fn cgroup_box_kills_a_runaway_script_and_the_daemon_survives() {
     assert!(shell.contains("/workloads/script-"), "{shell}");
     assert_eq!(forked, shell, "the forked child shares the shell's leaf");
 
-    // A runaway allocation (1 GiB with no newline, buffered by `tail`) is
+    // A runaway allocation (1 GiB with no newline, which `tail -n 1` buffers) is
     // OOM-killed inside the 512 MB box.
     let hog = script(
         &mut ws,
         5,
         &ws_id,
         "hog",
-        "head -c 1073741824 /dev/zero | tail -c 1",
+        "head -c 1073741824 /dev/zero | tail -n 1 > /dev/null",
         "command",
     )
     .await;
@@ -574,6 +577,7 @@ async fn cgroup_box_kills_a_runaway_script_and_the_daemon_survives() {
             tokio::time::Instant::now() < deadline,
             "the daemon was not respawned"
         );
+        // timing-guard: poll interval of a bounded wait on an observable state
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     let (cfg, port) = wss_endpoint(&socket).await;

@@ -654,6 +654,11 @@ impl HomeTerminals {
         cmd.envs(env);
         #[cfg(unix)]
         cmd.process_group(0);
+        intent_core::workload::Workload::new(
+            intent_core::workload::WorkloadKind::HostExec,
+            "host.exec",
+        )
+        .apply_pinned(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
         let pgid = child.id();
         let stdin = child.stdin.take();

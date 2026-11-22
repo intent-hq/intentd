@@ -113,6 +113,7 @@ async fn spawn_and_wait(
             command
         }
         setup_runner::SetupScriptRunner::CmdWrapper => {
+            // workload-spawn: allow — the Windows branch of the one archive spawn; the helper below covers both
             let mut command = tokio::process::Command::new("cmd.exe");
             command.args(["/d", "/c"]).arg(script_path);
             command

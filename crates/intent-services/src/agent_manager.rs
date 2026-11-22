@@ -865,7 +865,7 @@ pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
     let today = budget_gb.clamp(4, 100) as usize;
     match small_host_reserve_bytes(total_memory_bytes) {
         Some(reserve) => {
-            let small = ((total_memory_bytes - reserve) / GB).clamp(2, 100) as usize;
+            let small = (total_memory_bytes.saturating_sub(reserve) / GB).clamp(2, 100) as usize;
             today.min(small)
         }
         None => today,
@@ -928,7 +928,7 @@ pub fn host_memory_reserve_bytes(total_memory_bytes: Option<u64>) -> u64 {
 pub fn recommended_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
     let today = (total_memory_bytes.saturating_sub(8 * GB) / 2).max(4 * GB);
     match small_host_reserve_bytes(total_memory_bytes) {
-        Some(reserve) => today.min(((total_memory_bytes - reserve) / 2).max(GB / 2)),
+        Some(reserve) => today.min((total_memory_bytes.saturating_sub(reserve) / 2).max(GB / 2)),
         None => today,
     }
 }
