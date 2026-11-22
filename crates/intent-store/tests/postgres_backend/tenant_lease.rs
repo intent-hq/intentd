@@ -570,7 +570,7 @@ async fn dropping_the_heartbeat_after_a_cancelled_wait_stops_renewals() {
         .expect("heartbeat runs");
     // A cancelled wait: the heartbeat keeps running and can still report.
     assert!(
-        tokio::time::timeout(interval * 2, heartbeat.lost())
+        tokio::time::timeout(test_timeout(interval * 2), heartbeat.lost())
             .await
             .is_err(),
         "the lease is held, so lost() is still pending"
