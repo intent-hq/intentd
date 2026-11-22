@@ -3109,7 +3109,10 @@ async fn node_runner_records_setup_for_a_kept_checkout_without_one() {
 fn signed_out_applies_only_to_providers_with_a_default_configuration() {
     assert!(signs_in_on_the_machine("claude-code"));
     assert!(signs_in_on_the_machine("codex"));
+    assert!(signs_in_on_the_machine("grok"));
+    assert!(signs_in_on_the_machine("cursor"));
     assert!(!signs_in_on_the_machine(PROVIDER));
+    assert!(signed_out_error("cursor").contains("Cursor isn't signed in on this machine"));
     assert!(!signs_in_on_the_machine("unsloth"));
     let error = signed_out_error("claude-code");
     assert!(error.starts_with(codes::SIGNED_OUT), "{error}");

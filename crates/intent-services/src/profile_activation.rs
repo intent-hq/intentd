@@ -439,7 +439,7 @@ mod tests {
         }
         // A provider that cannot carry settings is always current.
         let reg = ProfileActivation::default();
-        assert!(reg.is_current(&SettingsRead::resolved("auggie", None)));
+        assert!(reg.is_current(&SettingsRead::resolved("opencode", None)));
     }
 
     /// A chat turn's read is its live process's registration: stale once an
@@ -551,7 +551,7 @@ mod tests {
     fn other_providers_and_deleted_profiles_never_report_earlier_settings() {
         let reg = ProfileActivation::default();
         let a = AgentId::from("a-1");
-        assert!(reg.register(&ws(), &a, "auggie", "f1").is_none());
+        assert!(reg.register(&ws(), &a, "opencode", "f1").is_none());
         reg.register(&ws(), &a, "codex@pwork", "f1").unwrap();
         reg.saved_changed("pwork", Some("f2"));
         assert!(reg.uses_earlier_settings(&a));
@@ -580,7 +580,7 @@ mod tests {
             assert_eq!(reg.running_processes("pwork"), 0);
             assert!(!reg.uses_earlier_settings(&p));
             assert_eq!(reg.live_fingerprint(&d, base).as_deref(), Some(""));
-            assert_eq!(reg.live_fingerprint(&d, "auggie"), None);
+            assert_eq!(reg.live_fingerprint(&d, "opencode"), None);
         }
     }
 }

@@ -172,7 +172,7 @@ fn profile_refs_parse_only_canonical_qualified_forms() {
     );
     for bad in [
         "codex",
-        "auggie@p1",
+        "opencode@p1",
         "Codex@p1",
         "codex@P1",
         " codex@p1",
@@ -271,7 +271,7 @@ fn keys_intent_writes_at_launch_are_reserved_with_a_clear_reason() {
         "GIT_COMMITTER_NAME",
         "GIT_COMMITTER_EMAIL",
     ] {
-        for base in PROFILE_BASE_PROVIDERS {
+        for base in PROFILE_BASE_PROVIDERS.iter() {
             let reason = reserved_key_reason(key, base)
                 .unwrap_or_else(|| panic!("{key} must be reserved for {base}"));
             assert!(
@@ -318,7 +318,7 @@ fn every_key_written_at_launch_is_reserved() {
         )
         .collect();
     assert!(git_keys.iter().any(|k| k == "GIT_CONFIG_PARAMETERS"));
-    for base in PROFILE_BASE_PROVIDERS {
+    for base in PROFILE_BASE_PROVIDERS.iter() {
         let provider = intent_providers::find_provider(base).unwrap();
         let mut keys = git_keys.clone();
         for via_npx in [false, true] {
@@ -370,6 +370,40 @@ fn home_reservation_points_to_the_account_variable() {
         "npm_config_cache",
     ] {
         assert!(reserved_key_reason(key, "codex").is_none(), "{key}");
+    }
+}
+
+/// The profile spec drives the HOME hint and the provider's own reserved
+/// keys: Grok names its account folder, a base without one says so, and
+/// Cursor's credential-store switch is reserved for Cursor only.
+#[test]
+fn reserved_keys_follow_each_base_profile_spec() {
+    let grok = reserved_key_reason("HOME", "grok").unwrap();
+    assert!(grok.contains("GROK_HOME"), "{grok}");
+    for base in ["droid", "auggie", "cursor"] {
+        let reason = reserved_key_reason("HOME", base).unwrap();
+        assert!(
+            reason.contains("does not select an account"),
+            "{base}: {reason}"
+        );
+    }
+    let cursor = reserved_key_reason("agent_cli_credential_store", "cursor").unwrap();
+    assert!(cursor.contains("stored Cursor login"), "{cursor}");
+    for base in ["codex", "claude-code", "grok", "droid", "auggie"] {
+        assert!(
+            reserved_key_reason("AGENT_CLI_CREDENTIAL_STORE", base).is_none(),
+            "{base}"
+        );
+    }
+    for (base, key) in [
+        ("grok", "XAI_API_KEY"),
+        ("grok", "GROK_HOME"),
+        ("droid", "FACTORY_API_KEY"),
+        ("auggie", "AUGMENT_SESSION_AUTH"),
+        ("cursor", "CURSOR_API_KEY"),
+        ("cursor", "CURSOR_CONFIG_DIR"),
+    ] {
+        assert!(reserved_key_reason(key, base).is_none(), "{base} {key}");
     }
 }
 
@@ -514,7 +548,7 @@ async fn create_reports_every_field_error_and_writes_nothing() {
     let err = fx
         .svc
         .provider_profiles_create_impl(json!({
-            "baseProviderId": "auggie",
+            "baseProviderId": "opencode",
             "name": "default",
             "env": [
                 { "key": "PATH", "kind": "set", "value": "/x" },
@@ -861,7 +895,7 @@ async fn settings_update_rejects_missing_profile_references_only_when_new_or_cha
         .unwrap_err();
     assert_eq!(err.code(), -32602);
     assert_eq!(data_code(&err), "provider-profile-not-found");
-    for bad in ["auggie@p1", "Codex@p1"] {
+    for bad in ["opencode@p1", "Codex@p1"] {
         let err = fx
             .svc
             .settings_update_checking_profiles(
@@ -1218,7 +1252,7 @@ fn entries_of(profile: &intent_acp::ProfileEnv) -> Vec<(String, Option<String>)>
 #[intent_test_macros::daemon_test]
 async fn bare_references_resolve_to_the_default_configuration() {
     let fx = Fixture::new().await;
-    for bare in ["codex", "claude-code", "auggie"] {
+    for bare in ["codex", "claude-code", "opencode"] {
         assert!(fx.svc.resolve_profile_env(bare).await.unwrap().is_none());
     }
 }
@@ -1300,7 +1334,7 @@ async fn saved_edits_change_the_resolved_fingerprint_and_values() {
 #[intent_test_macros::daemon_test]
 async fn missing_or_malformed_references_require_replacement_never_default() {
     let fx = Fixture::new().await;
-    for reference in ["codex@p0000000000000", "codex@", "codex@Bad", "auggie@p1"] {
+    for reference in ["codex@p0000000000000", "codex@", "codex@Bad", "opencode@p1"] {
         let err = fx.svc.resolve_profile_env(reference).await.unwrap_err();
         assert_eq!(
             data_code(&err),
@@ -1658,7 +1692,7 @@ fn reorder_validation_requires_exactly_the_base_profiles() {
         order_codes(reorder_profiles(&saved, base, &owned(ids)).unwrap_err())
     };
     assert_eq!(
-        err("auggie", &[]),
+        err("opencode", &[]),
         [("baseProviderId".to_string(), "base-provider-unsupported")]
     );
     assert_eq!(

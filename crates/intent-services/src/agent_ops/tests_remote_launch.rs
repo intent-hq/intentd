@@ -190,7 +190,7 @@ async fn create(
         None,
         false,
         AgentCreateExtra {
-            provider: Some("auggie".into()),
+            provider: Some("opencode".into()),
             ..extra
         },
     )
@@ -234,11 +234,11 @@ async fn a_placed_create_persists_its_node_and_reports_what_it_starts_from() {
     assert_eq!(
         remote.needs.lock().unwrap().clone(),
         [RemoteLaunchNeeds {
-            provider: "auggie".into(),
+            provider: "opencode".into(),
             model: Some("sonnet4.5".into()),
             with_profile: false,
             sets_profile_env: false,
-            provider_ref: "auggie".into(),
+            provider_ref: "opencode".into(),
             inherited: false,
             machine_sign_in: false,
             profile_fallback: false,
@@ -771,7 +771,7 @@ async fn a_remote_agent_switches_to_a_model_its_machine_offers() {
     expose_node(
         &svc,
         vec![offered(
-            "auggie",
+            "opencode",
             ProviderStatus::SignedIn,
             &["sonnet4.5", "opus4.5"],
         )],
@@ -787,7 +787,7 @@ async fn a_remote_agent_switches_to_a_model_its_machine_offers() {
         .await
         .unwrap();
     assert_eq!(session.model.as_deref(), Some("opus4.5"));
-    assert_eq!(session.provider.as_deref(), Some("auggie"));
+    assert_eq!(session.provider.as_deref(), Some("opencode"));
 }
 
 /// A model the agent's machine does not list, or a provider it cannot run,
@@ -801,7 +801,7 @@ async fn a_remote_agent_cannot_switch_to_what_its_machine_does_not_offer() {
     expose_node(
         &svc,
         vec![
-            offered("auggie", ProviderStatus::SignedIn, &["sonnet4.5"]),
+            offered("opencode", ProviderStatus::SignedIn, &["sonnet4.5"]),
             offered("claude-code", ProviderStatus::SignedOut, &["opus"]),
         ],
     )
@@ -835,7 +835,7 @@ async fn a_remote_agent_cannot_switch_to_what_its_machine_does_not_offer() {
         .await
         .unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
-    assert_eq!(session.provider.as_deref(), Some("auggie"));
+    assert_eq!(session.provider.as_deref(), Some("opencode"));
 }
 
 /// Switching to a profile: an account-folder profile is refused as not
@@ -849,7 +849,7 @@ async fn a_remote_agent_switches_only_to_a_remote_compatible_profile() {
     expose_node(
         &svc,
         vec![
-            offered("auggie", ProviderStatus::SignedIn, &["sonnet4.5"]),
+            offered("opencode", ProviderStatus::SignedIn, &["sonnet4.5"]),
             offered("codex", ProviderStatus::SignedOut, &["gpt-5"]),
         ],
     )
@@ -871,7 +871,7 @@ async fn a_remote_agent_switches_only_to_a_remote_compatible_profile() {
         .get_agent_session_with_transcript(&id)
         .await
         .unwrap();
-    assert_eq!(session.provider.as_deref(), Some("auggie"));
+    assert_eq!(session.provider.as_deref(), Some("opencode"));
 
     let api_key = daemon_profile(
         &svc,
@@ -952,7 +952,7 @@ async fn the_default_model_sentinel_requests_no_model() {
     let svc = svc.with_remote_launch_port(remote.clone());
     svc.admit_remote_agent(
         &ws,
-        "auggie",
+        "opencode",
         Some("default"),
         &placement(json!({"target": "remote"})),
         false,
@@ -1001,7 +1001,7 @@ async fn a_failed_parent_read_fails_the_sub_agent_instead_of_running_it_locally(
             None,
             false,
             AgentCreateExtra {
-                provider: Some("auggie".into()),
+                provider: Some("opencode".into()),
                 ..Default::default()
             },
         )
@@ -1472,7 +1472,7 @@ async fn spawn_under(
             None,
             false,
             AgentCreateExtra {
-                provider: Some("auggie".into()),
+                provider: Some("opencode".into()),
                 placement: placement_json.map(placement),
                 ..Default::default()
             },
@@ -1937,7 +1937,7 @@ async fn a_local_parents_unplaced_sub_agent_stays_local() {
             None,
             false,
             AgentCreateExtra {
-                provider: Some("auggie".into()),
+                provider: Some("opencode".into()),
                 ..Default::default()
             },
         )

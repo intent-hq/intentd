@@ -238,13 +238,15 @@ async fn a_placed_initial_agent_starts_on_the_chosen_machine() {
     assert_eq!(
         remote.needs.lock().unwrap().clone(),
         [RemoteLaunchNeeds {
+            // The initial agent runs the default provider, auggie: a profile
+            // base, so its unmarked Default runs on the machine's own sign-in.
             provider: "auggie".into(),
             model: Some("sonnet4.5".into()),
             with_profile: false,
             sets_profile_env: false,
             provider_ref: "auggie".into(),
             inherited: false,
-            machine_sign_in: false,
+            machine_sign_in: true,
             profile_fallback: false,
         }]
     );

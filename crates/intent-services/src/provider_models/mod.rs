@@ -168,6 +168,35 @@ fn finish(provider_id: &str, outcome: Result<Vec<Value>, ProbeError>) -> Provide
     }
 }
 
+/// The model catalog of a named profile of a provider without an installed
+/// context (PROTOCOL §5.54): the base provider's own probe, run with the
+/// profile's overlay and launch-only API key home, so the list is the one
+/// the profile's account sees. Installed CLIs (Codex, Claude Code) use
+/// [`installed_model_command`] instead.
+pub(crate) async fn fetch_profile_models(
+    base: &str,
+    profile: std::sync::Arc<intent_acp::ProfileEnv>,
+    cursor_path: Option<String>,
+) -> ProviderModelsFetch {
+    match base {
+        "grok" => {
+            fetch_grok_models_for(Some(crate::agent_manager::local_launch_overlay(&profile))).await
+        }
+        "droid" => fetch_droid_models_for(Some(profile)).await,
+        "cursor" => {
+            fetch_cursor_models_for(cursor_binary(cursor_path.as_deref()), Some(profile)).await
+        }
+        "auggie" => match crate::agent_ops::fetch_auggie_models_for(None, Some(&profile)).await {
+            Some(models) => ProviderModelsFetch::ok(models),
+            None => ProviderModelsFetch::unavailable(
+                "auggie",
+                "auggie CLI unavailable or returned no models",
+            ),
+        },
+        other => ProviderModelsFetch::unavailable(other, "no model source for this profile"),
+    }
+}
+
 /// Dispatch a model-catalog fetch by provider id. Providers without a
 /// daemon-side source here (auggie's CLI path and cortex's open-gate empty
 /// list are wired elsewhere) return `None` with a warning.
@@ -585,6 +614,13 @@ pub(crate) async fn fetch_pi_models() -> ProviderModelsFetch {
 /// (`droid exec --output-format acp`). An explicit ACP auth-required error is
 /// surfaced as a distinct warning (parity with the FE `droid-acp-probe.ts`).
 pub(crate) async fn fetch_droid_models() -> ProviderModelsFetch {
+    fetch_droid_models_for(None).await
+}
+
+/// [`fetch_droid_models`] under a named profile's overlay (`None` = Default).
+async fn fetch_droid_models_for(
+    profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
+) -> ProviderModelsFetch {
     let Some(bin) = find_provider_binary("droid", "droid", None) else {
         return ProviderModelsFetch::unavailable("droid", "droid binary not found");
     };
@@ -593,10 +629,8 @@ pub(crate) async fn fetch_droid_models() -> ProviderModelsFetch {
         "--output-format".to_string(),
         "acp".to_string(),
     ];
-    let outcome = run_acp_probe(AcpProbeCommand::binary(bin, args), |v| {
-        parse::parse_acp_models(v, "droid")
-    })
-    .await;
+    let cmd = AcpProbeCommand::binary(bin, args).with_profile(profile);
+    let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "droid")).await;
     match outcome {
         Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
             ProviderModelsFetch::unavailable("droid", "authentication required")
@@ -611,16 +645,17 @@ pub(crate) async fn fetch_droid_models() -> ProviderModelsFetch {
 /// auth-required error ⇒ not authenticated, anything else (timeout, spawn
 /// failure, empty catalog) ⇒ unknown. `bin` is the caller-resolved `droid`
 /// binary (the caller's install gate).
-pub(crate) async fn probe_droid_auth(bin: PathBuf) -> Option<bool> {
+pub(crate) async fn probe_droid_auth(
+    bin: PathBuf,
+    profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
+) -> Option<bool> {
     let args = vec![
         "exec".to_string(),
         "--output-format".to_string(),
         "acp".to_string(),
     ];
-    let outcome = run_acp_probe(AcpProbeCommand::binary(bin, args), |v| {
-        parse::parse_acp_models(v, "droid")
-    })
-    .await;
+    let cmd = AcpProbeCommand::binary(bin, args).with_profile(profile);
+    let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "droid")).await;
     match outcome {
         Ok(models) if !models.is_empty() => Some(true),
         Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
@@ -766,11 +801,21 @@ fn stderr_tail(stderr: &str) -> String {
 /// [`intent_providers::parse_grok_models_command_output`] (auth markers, then
 /// a JSON payload, then text rows — parity with the FE grok probe).
 pub(crate) async fn fetch_grok_models() -> ProviderModelsFetch {
+    fetch_grok_models_for(None).await
+}
+
+/// [`fetch_grok_models`] under a named profile's launch overlay (its own
+/// Grok home for an API key profile); `None` = Default.
+async fn fetch_grok_models_for(overlay: Option<intent_acp::ProfileEnv>) -> ProviderModelsFetch {
     let Some(cli) = crate::provider_cli_launch::ProviderCli::resolve("grok", None) else {
         return ProviderModelsFetch::unavailable("grok", "grok binary not found");
     };
     let timeout = cli.timeout(GROK_CLI_TIMEOUT);
-    match run_grok_models_cli(cli.command(&["models"]), timeout).await {
+    let mut command = cli.command(&["models"]);
+    if let Some(overlay) = &overlay {
+        overlay.apply_to_command(&mut command);
+    }
+    match run_grok_models_cli(command, timeout).await {
         Ok(output) => grok_fetch_outcome(
             &String::from_utf8_lossy(&output.stdout),
             output.status,
@@ -795,10 +840,19 @@ pub(crate) fn cursor_binary(explicit_path: Option<&str>) -> Option<PathBuf> {
 /// auth-required error. Auth itself stays on `cursor-agent models`
 /// (`provider_auth`).
 pub(crate) async fn fetch_cursor_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
+    fetch_cursor_models_for(binary, None).await
+}
+
+/// [`fetch_cursor_models_at`] under a named profile's overlay (`None` =
+/// Default).
+async fn fetch_cursor_models_for(
+    binary: Option<PathBuf>,
+    profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
+) -> ProviderModelsFetch {
     let Some(bin) = binary else {
         return ProviderModelsFetch::unavailable("cursor", "cursor-agent binary not found");
     };
-    let mut cmd = AcpProbeCommand::binary(bin, vec!["acp".to_string()]);
+    let mut cmd = AcpProbeCommand::binary(bin, vec!["acp".to_string()]).with_profile(profile);
     for (key, value) in intent_providers::cursor::CURSOR_PLAIN_OUTPUT_ENV {
         cmd = cmd.env(*key, *value);
     }

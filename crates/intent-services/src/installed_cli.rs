@@ -134,11 +134,7 @@ impl InstalledContext {
         // A Codex API key profile signs in in its own home (resolved against
         // this host's home, as a node does for a remote launch).
         let profile = if cli == InstalledCli::Codex {
-            Arc::new(
-                (*profile)
-                    .clone()
-                    .with_codex_api_key_home(self.home().as_deref()),
-            )
+            Arc::new((*profile).clone().with_api_key_home(self.home().as_deref()))
         } else {
             profile
         };

@@ -300,7 +300,7 @@ async fn provider_profiles_crud_contract_over_wss() {
     assert_eq!(list["result"]["revision"], 0);
     assert_eq!(
         list["result"]["defaults"].as_array().map(Vec::len),
-        Some(2),
+        Some(intent_providers::PROFILE_BASE_PROVIDERS.len()),
         "one Default row per profile base: {list}"
     );
 
@@ -309,7 +309,7 @@ async fn provider_profiles_crud_contract_over_wss() {
         &mut ws,
         2,
         "providers.profiles.create",
-        json!({ "baseProviderId": "auggie", "name": " ", "env": [
+        json!({ "baseProviderId": "opencode", "name": " ", "env": [
             { "key": "HOME", "kind": "set", "value": "/x" },
             { "key": "X", "kind": "set", "value": "********" },
         ] }),
@@ -332,10 +332,11 @@ async fn provider_profiles_crud_contract_over_wss() {
             ("env[1].value", "env-value-placeholder"),
         ]
     );
+    // A base without profiles names no account folder in the HOME hint.
     assert!(bad["error"]["data"]["fieldErrors"][2]["message"]
         .as_str()
         .unwrap()
-        .contains("CODEX_HOME"));
+        .contains("HOME is reserved"));
     assert!(!data_dir.join("provider-profiles.json").exists());
 
     // Create.
@@ -805,7 +806,7 @@ async fn provider_profile_selection_surfaces_over_wss() {
         |id: &str| rows.iter().find(|r| r["id"] == id).unwrap()["supportsProfiles"].clone();
     assert_eq!(supports("codex"), json!(true));
     assert_eq!(supports("claude-code"), json!(true));
-    assert_eq!(supports("auggie"), json!(false));
+    assert_eq!(supports("opencode"), json!(false));
     assert_eq!(
         rows.iter().filter(|r| r["id"] == "codex").count(),
         1,
@@ -963,7 +964,10 @@ async fn provider_default_overrides_contract_over_wss() {
     let list = ok(&mut ws, 1, "providers.profiles.list", json!({})).await;
     assert_eq!(
         list["defaults"],
-        json!([unrenamed("codex"), unrenamed("claude-code")])
+        json!(intent_providers::PROFILE_BASE_PROVIDERS
+            .iter()
+            .map(|base| unrenamed(base))
+            .collect::<Vec<_>>())
     );
 
     // Validation: field errors in the profile envelope, nothing written.
@@ -996,7 +1000,7 @@ async fn provider_default_overrides_contract_over_wss() {
         &mut ws,
         3,
         "providers.profiles.updateDefault",
-        json!({ "baseProviderId": "auggie", "name": "x" }),
+        json!({ "baseProviderId": "opencode", "name": "x" }),
     )
     .await;
     assert_eq!(

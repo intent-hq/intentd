@@ -2950,7 +2950,7 @@ pub(crate) async fn fetch_auggie_models(
     let Some(auggie) = resolve_auggie_bin(auggie_bin) else {
         return Ok(None);
     };
-    let Some(output) = auggie_output(&auggie, &["model", "list"]).await else {
+    let Some(output) = auggie_output(&auggie, &["model", "list"], None).await else {
         return Ok(None);
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3061,9 +3061,13 @@ const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 async fn auggie_output(
     auggie: &crate::provider_cli_launch::ProviderCli,
     args: &[&str],
+    overlay: Option<&intent_acp::ProfileEnv>,
 ) -> Option<std::process::Output> {
     tokio::time::timeout(auggie.timeout(AUGGIE_MODELS_TIMEOUT), {
         let mut command = auggie.command(args);
+        if let Some(overlay) = overlay {
+            overlay.apply_to_command(&mut command);
+        }
         if let crate::provider_cli_launch::ProviderCli::Installed(bin) = auggie {
             command.env("PATH", intent_context::discovery::exec_path(bin));
         }
@@ -3092,14 +3096,25 @@ async fn auggie_output(
 pub(crate) async fn fetch_auggie_models_rich(
     auggie_bin: Option<std::path::PathBuf>,
 ) -> Option<Vec<Value>> {
+    fetch_auggie_models_for(auggie_bin, None).await
+}
+
+/// [`fetch_auggie_models_rich`] under a named profile's launch overlay
+/// (its `AUGMENT_SESSION_AUTH`); `None` = Default.
+pub(crate) async fn fetch_auggie_models_for(
+    auggie_bin: Option<std::path::PathBuf>,
+    profile: Option<&intent_acp::ProfileEnv>,
+) -> Option<Vec<Value>> {
     let auggie = resolve_auggie_bin(auggie_bin)?;
+    let overlay = profile.map(crate::agent_manager::local_launch_overlay);
+    let overlay = overlay.as_ref();
     let mut rows: Option<Vec<Value>> = None;
-    if let Some(output) = auggie_output(&auggie, &["model", "list", "--json"]).await {
+    if let Some(output) = auggie_output(&auggie, &["model", "list", "--json"], overlay).await {
         rows = parse_model_list_json(&String::from_utf8_lossy(&output.stdout))
             .filter(|r| !r.is_empty());
     }
     if rows.is_none() {
-        let output = auggie_output(&auggie, &["model", "list"]).await?;
+        let output = auggie_output(&auggie, &["model", "list"], overlay).await?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut parsed = parse_model_list_output(&stdout);
         if parsed.is_empty() {
@@ -3162,6 +3177,7 @@ pub(crate) async fn fetch_session_stats(
     let output = auggie_output(
         &auggie,
         &["session", "stats", session_id.0.as_str(), "--json"],
+        None,
     )
     .await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -9587,8 +9603,29 @@ impl Services {
             return Ok(empty);
         }
         let Some(provider_id) = provider_id else {
+            // The legacy no-`providerId` call is the auggie catalog: an
+            // overridden auggie Default lists with its overrides and
+            // fingerprint, as `providerId: "auggie"` does, in the legacy
+            // shape (no `providerId`; `auggie` or `static`, empty on failure).
+            if self.default_has_overrides("auggie") {
+                let out = self
+                    .models_list_profile_op("auggie".to_owned(), force_refresh)
+                    .await?;
+                return Ok(legacy_auggie_shape(out));
+            }
             return self.models_list_auggie_op(force_refresh, false).await;
         };
+        // The Default of a base without an installed context (Grok, Droid,
+        // Auggie, Cursor) with saved overrides: its catalog runs with them,
+        // cached under its fingerprint, like a profile's (PROTOCOL §5.54).
+        if crate::provider_profiles::is_default_config_ref(&provider_id)
+            && intent_providers::installed_cli::InstalledCli::for_provider(&provider_id).is_none()
+            && self.default_has_overrides(&provider_id)
+        {
+            return self
+                .models_list_profile_op(provider_id, force_refresh)
+                .await;
+        }
         if provider_id == "auggie" {
             let mut response = self.models_list_auggie_op(force_refresh, true).await?;
             response["providerId"] = Value::String(provider_id);
@@ -9710,10 +9747,65 @@ impl Services {
         force_refresh: bool,
     ) -> Result<Value> {
         let profile = self.resolve_selected_profile(&reference).await?.overlay;
-        let resolved = self
-            .models_catalog
-            .resolve_installed_for(&reference, profile, force_refresh)
-            .await;
+        let base = intent_providers::base_provider_id(&reference).to_owned();
+        let resolved = if intent_providers::installed_cli::InstalledCli::for_provider(&base)
+            .is_some()
+        {
+            self.models_catalog
+                .resolve_installed_for(&reference, profile, force_refresh)
+                .await
+        } else {
+            // Grok, Droid, Auggie, Cursor: the base's own probe under the
+            // profile's overlay, cached under the reference plus the base
+            // source's version and the profile's settings fingerprint, so a
+            // catalog never crosses profiles, the Default or saved edits.
+            let base_version = crate::model_catalog::source_for(&base)
+                .map(|source| (source.version_key)())
+                .unwrap_or_default();
+            let cursor_path = self
+                .effective_settings()
+                .providers
+                .paths
+                .get("cursor")
+                .cloned();
+            // Cursor's version key follows its configured binary path.
+            let base_version = if base == "cursor" {
+                crate::model_catalog::CursorModelSource::resolve(cursor_path.as_deref()).version_key
+            } else {
+                base_version
+            };
+            let version_key = format!(
+                "{base_version}#{}",
+                profile.as_ref().map(|p| p.cache_key()).unwrap_or_default()
+            );
+            crate::model_catalog::resolve_with_cache(
+                &self.models_catalog,
+                &reference,
+                &version_key,
+                force_refresh,
+                crate::model_catalog::ModelCatalogCache::now_ms(),
+                move || {
+                    Box::pin(async move {
+                        let Some(profile) = profile else {
+                            return crate::model_catalog::ModelFetchResult {
+                                models: None,
+                                warning: Some("the profile's settings could not be read".into()),
+                                warning_kind: None,
+                            };
+                        };
+                        crate::model_catalog::from_provider_fetch(
+                            crate::provider_models::fetch_profile_models(
+                                &base,
+                                profile,
+                                cursor_path,
+                            )
+                            .await,
+                        )
+                    })
+                },
+            )
+            .await
+        };
         let kind = resolved.warning_kind;
         let Some(models) = resolved.models else {
             let mut out = static_provider_response(
@@ -22462,3 +22554,49 @@ pub(crate) fn decode_agent_features_snapshot(
 /// machine. In-memory: after a restart there is no live run to replace.
 pub(crate) type RemoteModelSwitches =
     Arc<Mutex<HashMap<AgentId, (Option<String>, Option<String>)>>>;
+
+/// A provider-scoped auggie `models.list` response in the legacy
+/// no-`providerId` shape: no `providerId`, `source` `auggie` with models or
+/// `static` with an empty list.
+fn legacy_auggie_shape(mut out: Value) -> Value {
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove("providerId");
+        obj.remove("warningKind");
+        let has_models = obj
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(|m| !m.is_empty());
+        if has_models {
+            obj.insert("source".into(), json!("auggie"));
+        } else {
+            obj.insert("models".into(), json!([]));
+            obj.insert("source".into(), json!("static"));
+            obj.remove("warning");
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod legacy_auggie_shape_tests {
+    use super::legacy_auggie_shape;
+    use serde_json::json;
+
+    /// An overridden auggie Default's catalog answers the legacy call in the
+    /// legacy shape, never with a provider-scoped field.
+    #[test]
+    fn keeps_the_legacy_shape() {
+        let ok = legacy_auggie_shape(json!({
+            "providerId": "auggie", "models": [{ "id": "m" }], "source": "auggie", "stale": true,
+        }));
+        assert_eq!(
+            ok,
+            json!({ "models": [{ "id": "m" }], "source": "auggie", "stale": true })
+        );
+        let failed = legacy_auggie_shape(json!({
+            "providerId": "auggie", "models": [], "source": "static",
+            "warning": "auggie CLI unavailable", "warningKind": "cli-missing",
+        }));
+        assert_eq!(failed, json!({ "models": [], "source": "static" }));
+    }
+}

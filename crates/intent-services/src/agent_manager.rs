@@ -3270,20 +3270,31 @@ fn spawn_unsloth_status_publisher(
     status_tx
 }
 
-/// The overlay a local agent launch of `provider_id` runs a resolved profile
-/// with: a Codex API key profile signs in in its own home under `home`. The
-/// machine-side counterpart is the node runner's `node_profile`; the parity
-/// test in `intentd`'s executor runner tests keeps the two in step.
+/// The overlay a local agent launch runs a resolved profile with (keyed by
+/// the profile's own base, so a mock standing in for a provider is fine): an API key profile of a base with an API key home (Codex, Grok,
+/// Cursor) runs in its own home under `home`. The machine-side counterpart
+/// is the node runner's `node_profile`; the parity test in `intentd`'s
+/// executor runner tests keeps the two in step.
 pub(crate) fn local_launch_profile(
-    provider_id: &str,
-    profile: Arc<intent_acp::ProfileEnv>,
+    profile: &intent_acp::ProfileEnv,
     home: Option<&Path>,
 ) -> Arc<intent_acp::ProfileEnv> {
-    if provider_id == "codex" {
-        Arc::new((*profile).clone().with_codex_api_key_home(home))
-    } else {
-        profile
-    }
+    Arc::new(profile.clone().with_api_key_home(home))
+}
+
+/// [`local_launch_profile`] against the daemon user's home: the overlay a
+/// probe or one-shot of a provider without an installed context runs with.
+pub(crate) fn local_launch_overlay(profile: &intent_acp::ProfileEnv) -> intent_acp::ProfileEnv {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    local_launch_overlay_in(profile, home.as_deref())
+}
+
+/// [`local_launch_overlay`] against `home` (the parity test's seam).
+pub(crate) fn local_launch_overlay_in(
+    profile: &intent_acp::ProfileEnv,
+    home: Option<&Path>,
+) -> intent_acp::ProfileEnv {
+    profile.clone().with_api_key_home(home)
 }
 
 impl AgentManager {
@@ -12550,12 +12561,12 @@ impl AgentManager {
         } else {
             None
         };
-        // A Codex API key profile signs in in its own home. Derived before
-        // the command is built, so a login-shell `CODEX_HOME` never fills in
+        // An API key profile runs in its own home. Derived before the
+        // command is built, so a login-shell home variable never fills in
         // over it.
         let profile_env = profile_env.map(|profile| {
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-            local_launch_profile(resolved.provider.id, profile, home.as_deref())
+            local_launch_profile(&profile, home.as_deref())
         });
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.profile_env = profile_env.as_deref();

@@ -377,7 +377,62 @@ pub struct ProviderConfig {
     /// `subagents` client capability and `cursor-agent acp` has no
     /// disable-tool flag.
     pub system_prompt_note: Option<&'static str>,
+    /// How this provider accepts named profiles (PROTOCOL §5.54); `None`
+    /// when it accepts none. The one table behind every profile list:
+    /// [`PROFILE_BASE_PROVIDERS`], reference parsing, reserved keys, account
+    /// folders, the remote credential auto-mark and `supportsProfiles`.
+    pub profile: Option<ProfileSpec>,
 }
+
+/// One provider's profile support (PROTOCOL §5.54 "Profile-capable bases").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileSpec {
+    /// API key and token variables. Adding one to a Default marks it for
+    /// remote machines (credential auto-mark); they are also the inherited
+    /// credentials a single-credential profile unsets, so a value from the
+    /// daemon or the login shell never overrides the profile's own.
+    pub credential_keys: &'static [&'static str],
+    /// Variables that select a signed-in account folder on this host: a
+    /// leading `~` is expanded, reads are unmasked, and a configuration that
+    /// sets one never runs on a remote machine.
+    pub account_dir_keys: &'static [&'static str],
+    /// The launch-only home an API key profile runs in, for a CLI that
+    /// prefers a saved login over a key in its environment.
+    pub api_key_home: Option<ApiKeyHome>,
+    /// Launch-only variables a profile gets whenever it sets one of its
+    /// [`Self::credential_keys`] to a non-empty value, whatever else it sets
+    /// (Cursor: no stored login, even with the profile's own config dir).
+    pub credential_launch_env: &'static [(&'static str, &'static str)],
+    /// Provider-specific reserved keys and why (a profile can't set or
+    /// unset them), on top of the keys every base reserves.
+    pub reserved_keys: &'static [(&'static str, &'static str)],
+}
+
+/// The launch-only home of an API key profile (PROTOCOL §5.54 "Codex API
+/// key"): a profile that sets a non-empty [`Self::key`] and does not control
+/// [`Self::home_key`] runs with `home_key=<home>/.intent/<dir_name>/<profile
+/// id>-<key digest>` plus [`Self::launch_env`]. Never saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApiKeyHome {
+    /// The API key variable that triggers the home.
+    pub key: &'static str,
+    /// The variable that selects the CLI's home folder.
+    pub home_key: &'static str,
+    /// The folder under `~/.intent` that holds the per-profile homes.
+    pub dir_name: &'static str,
+    /// Further launch-only variables.
+    pub launch_env: &'static [(&'static str, &'static str)],
+}
+
+/// What the Codex ACP adapter runs when its Codex home has no login: its
+/// `api-key` method, which reads `CODEX_API_KEY` from the launch environment.
+/// Codex itself ignores a key that is only in the environment.
+pub const CODEX_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
+
+/// Cursor's credential-store switch: `memory` keeps no login, so the CLI
+/// uses `CURSOR_API_KEY` even when a login is stored (in a file, or the
+/// macOS Keychain). Verified on cursor-agent 2026.11.05-86047df.
+pub const CURSOR_CREDENTIAL_STORE_ENV: &str = "AGENT_CLI_CREDENTIAL_STORE";
 
 /// Cursor's prompt-only native-subagent restriction
 /// ([`ProviderConfig::system_prompt_note`]).
@@ -466,6 +521,7 @@ impl ProviderConfig {
             auto_allow_once: false,
             allow_always_scopes: &[],
             system_prompt_note: None,
+            profile: None,
         }
     }
 
@@ -530,6 +586,15 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // the next send respawns + resumes off the persisted `acpSessionId`.
         kills_child_on_interrupt: true,
         fallback_npx_package: Some(AUGGIE_NPX_PACKAGE),
+        // `AUGMENT_SESSION_AUTH` (the `auggie token print` JSON) is read
+        // before the saved session file (auggie 0.35.0), so it needs no home.
+        profile: Some(ProfileSpec {
+            credential_keys: &["AUGMENT_SESSION_AUTH"],
+            account_dir_keys: &[],
+            api_key_home: None,
+            credential_launch_env: &[],
+            reserved_keys: &[],
+        }),
         ..ProviderConfig::empty("auggie", "Augment Auggie", "auggie")
     },
     ProviderConfig {
@@ -577,6 +642,17 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             ("allow-skill-", AllowAlwaysScope::Workspace),
             ("exit-plan-", AllowAlwaysScope::Chat),
         ],
+        profile: Some(ProfileSpec {
+            credential_keys: &[
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ],
+            account_dir_keys: &["CLAUDE_CONFIG_DIR"],
+            api_key_home: None,
+            credential_launch_env: &[],
+            reserved_keys: &[],
+        }),
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
@@ -633,6 +709,21 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
                 AllowAlwaysScope::AllWorkspaces,
             ),
         ],
+        // Codex ignores a key that is only in its environment: an API key
+        // profile signs its own home in through the adapter's `api-key`
+        // method.
+        profile: Some(ProfileSpec {
+            credential_keys: &["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY"],
+            account_dir_keys: &["CODEX_HOME"],
+            api_key_home: Some(ApiKeyHome {
+                key: "CODEX_API_KEY",
+                home_key: "CODEX_HOME",
+                dir_name: "codex-api-key",
+                launch_env: &[("DEFAULT_AUTH_REQUEST", CODEX_API_KEY_AUTH_REQUEST)],
+            }),
+            credential_launch_env: &[],
+            reserved_keys: &[],
+        }),
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
     },
     ProviderConfig {
@@ -746,6 +837,15 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         remove_tool_flag: Some("--disabled-tools"),
         remove_tool_style: ToolRemovalStyle::CommaJoined,
         fallback_npx_package: Some(DROID_NPX_PACKAGE),
+        // `FACTORY_API_KEY` is read before any stored login (droid 1.16.0),
+        // so it needs no home.
+        profile: Some(ProfileSpec {
+            credential_keys: &["FACTORY_API_KEY"],
+            account_dir_keys: &[],
+            api_key_home: None,
+            credential_launch_env: &[],
+            reserved_keys: &[],
+        }),
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
     },
     ProviderConfig {
@@ -789,6 +889,21 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // `AgentArgs`). Orchestrator restrictions on grok are prompt-only;
         // MCP-side filtering (§6.8) still covers workspace tools.
         fallback_npx_package: Some(GROK_NPX_PACKAGE),
+        // Grok uses `XAI_API_KEY` only when no session is saved in
+        // `$GROK_HOME/auth.json`, and its `GROK_CONFIG` overlay drops auth
+        // settings (grok 1.0.89), so a key profile runs in its own home.
+        profile: Some(ProfileSpec {
+            credential_keys: &["XAI_API_KEY"],
+            account_dir_keys: &["GROK_HOME"],
+            api_key_home: Some(ApiKeyHome {
+                key: "XAI_API_KEY",
+                home_key: "GROK_HOME",
+                dir_name: "grok-api-key",
+                launch_env: &[],
+            }),
+            credential_launch_env: &[],
+            reserved_keys: &[],
+        }),
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
     },
     ProviderConfig {
@@ -868,6 +983,26 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         system_prompt_note: Some(CURSOR_SUBAGENT_PROMPT_NOTE),
         // Cursor's `allow-always` writes `~/.cursor/cli-config.json`.
         allow_always_scopes: &[("allow-always", AllowAlwaysScope::AllWorkspaces)],
+        // A stored login beats `CURSOR_API_KEY`, and the login is not in
+        // `CURSOR_CONFIG_DIR` (Keychain on macOS), so every key or token
+        // profile runs with a memory credential store; an API key profile
+        // without its own config dir gets one, which keeps model picks out
+        // of the user's CLI default. Never `--api-key` (argv is visible).
+        profile: Some(ProfileSpec {
+            credential_keys: &["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"],
+            account_dir_keys: &[],
+            api_key_home: Some(ApiKeyHome {
+                key: "CURSOR_API_KEY",
+                home_key: "CURSOR_CONFIG_DIR",
+                dir_name: "cursor-api-key",
+                launch_env: &[],
+            }),
+            credential_launch_env: &[(CURSOR_CREDENTIAL_STORE_ENV, "memory")],
+            reserved_keys: &[(
+                CURSOR_CREDENTIAL_STORE_ENV,
+                "Intent sets it so an API key profile never uses a stored Cursor login",
+            )],
+        }),
         ..ProviderConfig::empty("cursor", "Cursor", "cursor-agent")
     },
     ProviderConfig {
@@ -907,8 +1042,39 @@ pub fn first_provider_id() -> &'static str {
 /// suppression list in `getProviderConfig`.
 const DEFAULT_PROVIDER_ALIASES: &[&str] = &["default", "acp", "augment"];
 
-/// Canonical base providers that accept named profiles (PROTOCOL §5.54).
-pub const PROFILE_BASE_PROVIDERS: &[&str] = &["codex", "claude-code"];
+/// Canonical base providers that accept named profiles (PROTOCOL §5.54),
+/// in registry order: every provider with a [`ProviderConfig::profile`].
+pub static PROFILE_BASE_PROVIDERS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        ACP_PROVIDERS
+            .iter()
+            .filter(|p| p.profile.is_some())
+            .map(|p| p.id)
+            .collect()
+    });
+
+/// The profile support of a canonical base provider id, `None` for any
+/// other id (aliases, profile references, providers without profiles).
+#[must_use]
+pub fn profile_spec(base_provider_id: &str) -> Option<&'static ProfileSpec> {
+    find_provider(base_provider_id).and_then(|p| p.profile.as_ref())
+}
+
+/// Every profile base's account-folder variables, in registry order.
+pub fn profile_account_dir_keys() -> impl Iterator<Item = &'static str> {
+    ACP_PROVIDERS
+        .iter()
+        .filter_map(|p| p.profile.as_ref())
+        .flat_map(|spec| spec.account_dir_keys.iter().copied())
+}
+
+/// Every profile base's credential variables, in registry order.
+pub fn profile_credential_keys() -> impl Iterator<Item = &'static str> {
+    ACP_PROVIDERS
+        .iter()
+        .filter_map(|p| p.profile.as_ref())
+        .flat_map(|spec| spec.credential_keys.iter().copied())
+}
 
 /// Separator between a base provider id and a profile id in a provider
 /// reference (`<baseProviderId>@<profileId>`).

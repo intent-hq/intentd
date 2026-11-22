@@ -2159,7 +2159,7 @@ mod captured_env_tests {
         let provider = intent_providers::find_provider("codex").unwrap();
         let home = tempfile::tempdir().unwrap();
         let profile = work_profile(vec![("CODEX_API_KEY".into(), Some("sk-work".into()))])
-            .with_codex_api_key_home(Some(home.path()));
+            .with_api_key_home(Some(home.path()));
         let mut opts = SpawnOptions::new(provider);
         opts.profile_env = Some(&profile);
         let captured = BTreeMap::from([("CODEX_HOME".to_string(), "/personal/.codex".to_string())]);

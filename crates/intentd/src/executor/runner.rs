@@ -2670,7 +2670,7 @@ impl Runner {
         })?;
         profile
             .for_node(self.inner.home.as_deref())
-            .map(|profile| profile.with_codex_api_key_home(self.inner.home.as_deref()))
+            .map(|profile| profile.with_api_key_home(self.inner.home.as_deref()))
             .map_err(|missing| missing.to_string())
     }
 
@@ -3407,17 +3407,13 @@ const EXIT_DETAIL_MAX: usize = 512;
 /// this machine's own sign-in, which the user can fix by signing in here or
 /// marking a configuration for remote machines.
 pub(super) fn signs_in_on_the_machine(provider: &str) -> bool {
-    matches!(provider, "claude-code" | "codex")
+    intent_providers::PROFILE_BASE_PROVIDERS.contains(&provider)
 }
 
 /// The `node-provider-signed-out` start failure: names the provider and the
 /// fix, never the provider's own error text (it can echo a credential).
 fn signed_out_error(provider: &str) -> String {
-    let name = match provider {
-        "claude-code" => "Claude Code",
-        "codex" => "Codex",
-        other => other,
-    };
+    let name = intent_providers::find_provider(provider).map_or(provider, |p| p.short_name);
     format!(
         "{}: {name} isn't signed in on this machine, and Default sends no sign-in of its own. Sign in to {name} on this machine, or pick a profile with an API key or token that is marked for remote machines.",
         codes::SIGNED_OUT

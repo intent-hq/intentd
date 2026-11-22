@@ -228,7 +228,7 @@ async fn default_and_profile_names_cannot_collide_within_one_base() {
 async fn update_default_validates_like_profiles_and_keeps_masked_entries() {
     let fx = Fixture::new().await;
     let err = fx
-        .update_default(json!({ "baseProviderId": "auggie", "name": "x" }))
+        .update_default(json!({ "baseProviderId": "opencode", "name": "x" }))
         .await
         .unwrap_err();
     assert_eq!(
@@ -460,7 +460,7 @@ async fn default_process_fingerprint_is_empty_until_overrides_are_saved() {
         Some("")
     );
     assert_eq!(
-        fx.svc.profile_process_fingerprint(&agent, "auggie").await,
+        fx.svc.profile_process_fingerprint(&agent, "opencode").await,
         None
     );
     let saved = fx
@@ -566,7 +566,7 @@ async fn only_a_default_with_saved_overrides_skips_the_bare_verdict() {
     .unwrap();
     assert!(fx.svc.default_has_overrides("codex"));
     assert!(!fx.svc.default_has_overrides("claude-code"));
-    assert!(!fx.svc.default_has_overrides("auggie"));
+    assert!(!fx.svc.default_has_overrides("opencode"));
     assert!(!fx.svc.default_has_overrides("codex@pwork"));
 }
 
@@ -585,7 +585,7 @@ async fn an_unknown_base_in_defaults_is_ignored_not_fatal() {
 
 #[test]
 fn default_activation_keys_round_trip_and_never_match_profile_ids() {
-    for base in PROFILE_BASE_PROVIDERS {
+    for base in PROFILE_BASE_PROVIDERS.iter() {
         let key = default_activation_key(base);
         assert_eq!(parse_default_activation_key(&key), Some(*base));
         assert!(!is_valid_profile_id(&key));

@@ -212,17 +212,6 @@ fn doc_folder_keys(entries: &[StoredEnv]) -> Vec<String> {
     }))
 }
 
-/// The API key and token variables whose addition marks a Default for
-/// remote machines (§5.54 "Credential auto-mark").
-const CREDENTIAL_KEYS: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CODEX_ACCESS_TOKEN",
-    "CODEX_API_KEY",
-    "OPENAI_API_KEY",
-];
-
 /// Whether `next` sets a credential that `saved` did not set: a Default
 /// write that adds one is marked for remote machines unless it says
 /// otherwise or sets an account folder.
@@ -232,9 +221,10 @@ pub(super) fn adds_credential(saved: &[StoredEnv], next: &[StoredEnv]) -> bool {
             |entry| matches!(entry, StoredEnv::Set { key: k, .. } if k.eq_ignore_ascii_case(key)),
         )
     };
-    CREDENTIAL_KEYS
-        .iter()
-        .any(|key| sets(next, key) && !sets(saved, key))
+    // The API key and token variables whose addition marks a Default for
+    // remote machines (§5.54 "Credential auto-mark"): every profile base's
+    // `ProfileSpec::credential_keys`.
+    intent_providers::profile_credential_keys().any(|key| sets(next, key) && !sets(saved, key))
 }
 
 /// The migration rule, which is today's behaviour: a profile is marked
@@ -524,7 +514,7 @@ impl Services {
     pub(super) async fn default_remote_catalog(&self) -> Option<Value> {
         let saved = self.provider_profiles.defaults().ok()?;
         let mut launch = serde_json::Map::new();
-        for base in PROFILE_BASE_PROVIDERS {
+        for base in PROFILE_BASE_PROVIDERS.iter() {
             let meta = saved.get(*base).cloned().unwrap_or_default();
             let value = match self.load_default_env(&meta).await {
                 Ok(env) => default_remote_launch(&classify(
@@ -562,7 +552,7 @@ impl Services {
             }
         }
         let defaults = store.defaults().unwrap_or_default();
-        for base in PROFILE_BASE_PROVIDERS {
+        for base in PROFILE_BASE_PROVIDERS.iter() {
             if bases.iter().any(|b| b == base) {
                 continue;
             }
@@ -606,7 +596,7 @@ impl Services {
             next.profiles
                 .insert(meta.id.clone(), migration_rule(&entries, false));
         }
-        for base in PROFILE_BASE_PROVIDERS {
+        for base in PROFILE_BASE_PROVIDERS.iter() {
             if next.defaults.contains_key(*base) {
                 continue;
             }
@@ -622,5 +612,47 @@ impl Services {
                 tracing::warn!(error = %e, "remote-compatible choice migration failed; reads keep today's rule");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+
+    fn set(key: &str) -> StoredEnv {
+        StoredEnv::Set {
+            key: key.to_owned(),
+            value: "v".to_owned(),
+        }
+    }
+
+    /// Every profile base's credentials auto-mark a Default; other keys,
+    /// and an account folder, do not.
+    #[test]
+    fn credential_auto_mark_and_account_folders_follow_the_profile_spec() {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "CODEX_API_KEY",
+            "xai_api_key",
+            "FACTORY_API_KEY",
+            "AUGMENT_SESSION_AUTH",
+            "CURSOR_API_KEY",
+            "CURSOR_AUTH_TOKEN",
+        ] {
+            assert!(adds_credential(&[], &[set(key)]), "{key}");
+            assert!(!adds_credential(&[set(key)], &[set(key)]), "{key}");
+        }
+        for key in ["GROK_HOME", "CURSOR_CONFIG_DIR", "HTTPS_PROXY"] {
+            assert!(!adds_credential(&[], &[set(key)]), "{key}");
+        }
+        assert_eq!(doc_folder_keys(&[set("grok_home")]), vec!["grok_home"]);
+        assert!(doc_folder_keys(&[set("CURSOR_CONFIG_DIR"), set("XAI_API_KEY")]).is_empty());
+        assert!(matches!(
+            classify(None, &[set("GROK_HOME")], false),
+            RemoteCompatibility::NotRemoteCompatible {
+                reason: REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+                ..
+            }
+        ));
     }
 }

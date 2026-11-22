@@ -16,6 +16,15 @@
         "command": "auggie",
         "minimum": "0.7.0",
         "requirement": "auggie 0.7.0+"
+      },
+      "profile": {
+        "credentialKeys": [
+          "AUGMENT_SESSION_AUTH"
+        ],
+        "accountDirKeys": [],
+        "apiKeyHome": null,
+        "credentialLaunchEnv": [],
+        "reservedKeys": []
       }
     },
     {
@@ -34,7 +43,20 @@
         "minimum": "{auto-pinned}",
         "bundled": "@anthropic-ai/claude-code@{auto-pinned}"
       },
-      "cliVersionGate": null
+      "cliVersionGate": null,
+      "profile": {
+        "credentialKeys": [
+          "ANTHROPIC_API_KEY",
+          "ANTHROPIC_AUTH_TOKEN",
+          "CLAUDE_CODE_OAUTH_TOKEN"
+        ],
+        "accountDirKeys": [
+          "CLAUDE_CONFIG_DIR"
+        ],
+        "apiKeyHome": null,
+        "credentialLaunchEnv": [],
+        "reservedKeys": []
+      }
     },
     {
       "id": "codex",
@@ -52,7 +74,30 @@
         "minimum": "{auto-pinned}",
         "bundled": "@openai/codex@{auto-pinned}"
       },
-      "cliVersionGate": null
+      "cliVersionGate": null,
+      "profile": {
+        "credentialKeys": [
+          "CODEX_ACCESS_TOKEN",
+          "CODEX_API_KEY",
+          "OPENAI_API_KEY"
+        ],
+        "accountDirKeys": [
+          "CODEX_HOME"
+        ],
+        "apiKeyHome": {
+          "key": "CODEX_API_KEY",
+          "homeKey": "CODEX_HOME",
+          "dirName": "codex-api-key",
+          "launchEnv": [
+            [
+              "DEFAULT_AUTH_REQUEST",
+              "{\"methodId\":\"api-key\"}"
+            ]
+          ]
+        },
+        "credentialLaunchEnv": [],
+        "reservedKeys": []
+      }
     },
     {
       "id": "cortex",
@@ -65,7 +110,8 @@
       "requiresSecondaryBinary": null,
       "installedCli": null,
       "cliRequirement": null,
-      "cliVersionGate": null
+      "cliVersionGate": null,
+      "profile": null
     },
     {
       "id": "opencode",
@@ -78,7 +124,8 @@
       "requiresSecondaryBinary": null,
       "installedCli": null,
       "cliRequirement": null,
-      "cliVersionGate": null
+      "cliVersionGate": null,
+      "profile": null
     },
     {
       "id": "unsloth",
@@ -91,7 +138,8 @@
       "requiresSecondaryBinary": "unsloth",
       "installedCli": null,
       "cliRequirement": null,
-      "cliVersionGate": null
+      "cliVersionGate": null,
+      "profile": null
     },
     {
       "id": "pi",
@@ -108,7 +156,8 @@
         "command": "pi",
         "minimum": "0.81.0",
         "requirement": "Pi CLI 0.81.0+"
-      }
+      },
+      "profile": null
     },
     {
       "id": "droid",
@@ -121,7 +170,16 @@
       "requiresSecondaryBinary": null,
       "installedCli": null,
       "cliRequirement": null,
-      "cliVersionGate": null
+      "cliVersionGate": null,
+      "profile": {
+        "credentialKeys": [
+          "FACTORY_API_KEY"
+        ],
+        "accountDirKeys": [],
+        "apiKeyHome": null,
+        "credentialLaunchEnv": [],
+        "reservedKeys": []
+      }
     },
     {
       "id": "grok",
@@ -134,7 +192,23 @@
       "requiresSecondaryBinary": null,
       "installedCli": null,
       "cliRequirement": null,
-      "cliVersionGate": null
+      "cliVersionGate": null,
+      "profile": {
+        "credentialKeys": [
+          "XAI_API_KEY"
+        ],
+        "accountDirKeys": [
+          "GROK_HOME"
+        ],
+        "apiKeyHome": {
+          "key": "XAI_API_KEY",
+          "homeKey": "GROK_HOME",
+          "dirName": "grok-api-key",
+          "launchEnv": []
+        },
+        "credentialLaunchEnv": [],
+        "reservedKeys": []
+      }
     },
     {
       "id": "antigravity",
@@ -147,7 +221,8 @@
       "requiresSecondaryBinary": null,
       "installedCli": null,
       "cliRequirement": null,
-      "cliVersionGate": null
+      "cliVersionGate": null,
+      "profile": null
     },
     {
       "id": "cursor",
@@ -160,7 +235,29 @@
       "requiresSecondaryBinary": null,
       "installedCli": null,
       "cliRequirement": null,
-      "cliVersionGate": null
+      "cliVersionGate": null,
+      "profile": {
+        "credentialKeys": [
+          "CURSOR_API_KEY",
+          "CURSOR_AUTH_TOKEN"
+        ],
+        "accountDirKeys": [],
+        "apiKeyHome": {
+          "key": "CURSOR_API_KEY",
+          "homeKey": "CURSOR_CONFIG_DIR",
+          "dirName": "cursor-api-key",
+          "launchEnv": []
+        },
+        "credentialLaunchEnv": [
+          [
+            "AGENT_CLI_CREDENTIAL_STORE",
+            "memory"
+          ]
+        ],
+        "reservedKeys": [
+          "AGENT_CLI_CREDENTIAL_STORE"
+        ]
+      }
     },
     {
       "id": "mock",
@@ -173,7 +270,8 @@
       "requiresSecondaryBinary": null,
       "installedCli": null,
       "cliRequirement": null,
-      "cliVersionGate": null
+      "cliVersionGate": null,
+      "profile": null
     }
   ]
 }

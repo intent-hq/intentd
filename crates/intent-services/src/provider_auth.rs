@@ -213,7 +213,7 @@ pub async fn check_provider_auth_cli(
     program: &OsStr,
     auth_check_args: &[&str],
 ) -> CliAuthProbe {
-    check_provider_auth_cli_in(provider_id, program, auth_check_args, None).await
+    check_provider_auth_cli_in(provider_id, program, auth_check_args, None, None).await
 }
 
 /// The login-shell credential capture a profile-less launch gap-fills
@@ -245,11 +245,16 @@ fn gap_fill_credentials(
 /// context's environment, as its launches do. Without one it runs with the
 /// environment a profile-less launch gets: the daemon's own, gap-filled
 /// with the captured login-shell credentials.
+///
+/// `overlay` is a named profile's launch overlay for a provider without an
+/// installed context (Grok, Auggie, Cursor): applied over the gap-filled
+/// environment, as its launches apply it.
 async fn check_provider_auth_cli_in(
     provider_id: &str,
     program: &OsStr,
     auth_check_args: &[&str],
     context: Option<&crate::installed_cli::InstalledContext>,
+    overlay: Option<&intent_acp::ProfileEnv>,
 ) -> CliAuthProbe {
     let captured = if context.is_none() && provider_id != "claude-code" {
         captured_credential_env().await
@@ -258,7 +263,15 @@ async fn check_provider_auth_cli_in(
             std::collections::BTreeMap::new();
         &EMPTY
     };
-    check_provider_auth_cli_with(provider_id, program, auth_check_args, context, captured).await
+    check_provider_auth_cli_with(
+        provider_id,
+        program,
+        auth_check_args,
+        context,
+        overlay,
+        captured,
+    )
+    .await
 }
 
 /// [`check_provider_auth_cli_in`] with the captured credentials given
@@ -268,13 +281,18 @@ async fn check_provider_auth_cli_with(
     program: &OsStr,
     auth_check_args: &[&str],
     context: Option<&crate::installed_cli::InstalledContext>,
+    overlay: Option<&intent_acp::ProfileEnv>,
     captured: &std::collections::BTreeMap<String, String>,
 ) -> CliAuthProbe {
     let probe_command = |program: &OsStr| {
         let mut cmd = probe_command(program);
-        match context {
-            Some(context) => context.apply(&mut cmd),
-            None => gap_fill_credentials(&mut cmd, captured),
+        if let Some(context) = context {
+            context.apply(&mut cmd);
+        } else {
+            gap_fill_credentials(&mut cmd, captured);
+            if let Some(overlay) = overlay {
+                overlay.apply_to_command(&mut cmd);
+            }
         }
         cmd
     };
@@ -559,17 +577,33 @@ pub(crate) const CURSOR_STORED_LOGIN_IN_USE_NOTE: &str =
 /// reaches the CLI (daemon env or captured login-shell env) and `cursor-agent
 /// status --format json` reports a stored access token, say the stored login
 /// is in use. Any probe failure omits the note.
-async fn cursor_stored_login_note(program: &OsStr) -> Option<String> {
+async fn cursor_stored_login_note(
+    program: &OsStr,
+    overlay: Option<&intent_acp::ProfileEnv>,
+) -> Option<String> {
     let captured = captured_credential_env().await;
-    let key_present = std::env::var_os("CURSOR_API_KEY").is_some_and(|v| !v.is_empty())
-        || captured
-            .get("CURSOR_API_KEY")
-            .is_some_and(|v| !v.is_empty());
+    // The key the probe actually sees: the overlay's set or unset wins over
+    // the daemon's and the login shell's.
+    let overlay_key = overlay.and_then(|o| {
+        o.entries()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("CURSOR_API_KEY"))
+            .last()
+            .map(|(_, v)| v.is_some_and(|v| !v.is_empty()))
+    });
+    let key_present = overlay_key.unwrap_or_else(|| {
+        std::env::var_os("CURSOR_API_KEY").is_some_and(|v| !v.is_empty())
+            || captured
+                .get("CURSOR_API_KEY")
+                .is_some_and(|v| !v.is_empty())
+    });
     if !key_present {
         return None;
     }
     let mut cmd = probe_command(program);
     gap_fill_credentials(&mut cmd, captured);
+    if let Some(overlay) = overlay {
+        overlay.apply_to_command(&mut cmd);
+    }
     cmd.args(["status", "--format", "json"]);
     let output = crate::cursor_cli::run_cursor_cli(cmd, CLI_AUTH_TIMEOUT).await?;
     cursor_status_note(true, &String::from_utf8_lossy(&output.stdout))
@@ -634,8 +668,13 @@ async fn probe_provider(
                 Err(_) => return AuthVerdict::default(),
             }
         }
-        (Some(_), None) => return AuthVerdict::default(),
-        (None, _) => None,
+        (Some(_), None) | (None, _) => None,
+    };
+    // A named profile of a provider without an installed context probes
+    // with the overlay its launches run with (its API key home included).
+    let overlay = match (&profile, &context) {
+        (Some(profile), None) => Some(crate::agent_manager::local_launch_overlay(profile)),
+        _ => None,
     };
     let program = context
         .as_ref()
@@ -645,11 +684,21 @@ async fn probe_provider(
             let args = intent_providers::find_provider(provider_id)
                 .and_then(|cfg| cfg.auth_check_args)
                 .unwrap_or_default();
-            let authenticated = check_provider_auth_cli_in(provider_id, &program, args, None)
-                .await
-                .auth_status();
-            let status_note = if authenticated == Some(true) {
-                cursor_stored_login_note(&program).await
+            let authenticated =
+                check_provider_auth_cli_in(provider_id, &program, args, None, overlay.as_ref())
+                    .await
+                    .auth_status();
+            // A key profile never uses the stored login, so the note that
+            // the stored login wins applies to the Default only.
+            // A profile on the memory credential store never uses the stored
+            // login; anything else (an overridden Default too) still can.
+            let memory_store = overlay.as_ref().is_some_and(|o| {
+                o.entries().any(|(k, v)| {
+                    k == intent_providers::CURSOR_CREDENTIAL_STORE_ENV && v == Some("memory")
+                })
+            });
+            let status_note = if authenticated == Some(true) && !memory_store {
+                cursor_stored_login_note(&program, overlay.as_ref()).await
             } else {
                 None
             };
@@ -676,9 +725,15 @@ async fn probe_provider(
                 return AuthVerdict::default();
             }
             AuthVerdict::plain(
-                check_provider_auth_cli_in(provider_id, &program, args, context.as_ref())
-                    .await
-                    .auth_status(),
+                check_provider_auth_cli_in(
+                    provider_id,
+                    &program,
+                    args,
+                    context.as_ref(),
+                    overlay.as_ref(),
+                )
+                .await
+                .auth_status(),
             )
         }
         "claude-code" => {
@@ -703,9 +758,9 @@ async fn probe_provider(
                 status_note: None,
             }
         }
-        "droid" => {
-            AuthVerdict::plain(crate::provider_models::probe_droid_auth(program.into()).await)
-        }
+        "droid" => AuthVerdict::plain(
+            crate::provider_models::probe_droid_auth(program.into(), profile.clone()).await,
+        ),
         "pi" => AuthVerdict::plain(crate::provider_models::probe_pi_auth().await),
         "antigravity" => {
             AuthVerdict::plain(crate::provider_models::probe_antigravity_auth(program.into()).await)
@@ -1236,7 +1291,7 @@ fn npx_probe(
                 }
             }
             _ => AuthVerdict::plain(
-                check_provider_auth_cli_in(provider_id, program.as_os_str(), &args, None)
+                check_provider_auth_cli_in(provider_id, program.as_os_str(), &args, None, None)
                     .await
                     .auth_status(),
             ),
@@ -1566,10 +1621,92 @@ mod tests {
             let captured: std::collections::BTreeMap<String, String> = captured
                 .map(|key| [("CURSOR_API_KEY".to_string(), key.to_string())].into())
                 .unwrap_or_default();
-            let probe =
-                check_provider_auth_cli_with("cursor", stub.as_os_str(), args, None, &captured)
-                    .await;
+            let probe = check_provider_auth_cli_with(
+                "cursor",
+                stub.as_os_str(),
+                args,
+                None,
+                None,
+                &captured,
+            )
+            .await;
             assert_eq!(probe, expected, "stub {name}");
+        }
+    }
+
+    /// A Grok or Cursor API key profile's auth probe runs with the overlay
+    /// its launches use: its own key over a login-shell one, and its own home
+    /// (Cursor: the memory credential store too), so the user's saved login
+    /// never answers for the profile.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn key_profile_auth_probe_uses_the_profile_launch_overlay() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("key-profile-probe");
+        let home = tempfile::tempdir().unwrap();
+        let captured: std::collections::BTreeMap<String, String> = [
+            ("XAI_API_KEY".to_string(), "xai-shell".to_string()),
+            ("CURSOR_API_KEY".to_string(), "shell-key".to_string()),
+        ]
+        .into();
+        let grok_stub = dir.path().join("grok");
+        std::fs::write(
+            &grok_stub,
+            "#!/bin/sh\ncase \"$GROK_HOME\" in */.intent/grok-api-key/*) ;; *) echo 'You are not authenticated.'; exit 0;; esac\nif [ \"$XAI_API_KEY\" = xai-profile ]; then printf 'You are using XAI_API_KEY.\\n\\nAvailable models:\\n  * grok-4.6 (default)\\n'; else echo 'You are not authenticated.'; fi\n",
+        )
+        .unwrap();
+        let cursor_stub = dir.path().join("cursor");
+        std::fs::write(
+            &cursor_stub,
+            "#!/bin/sh\nif [ \"$AGENT_CLI_CREDENTIAL_STORE\" = memory ] && [ \"$CURSOR_API_KEY\" = profile-key ] && [ -d \"$CURSOR_CONFIG_DIR\" ]; then printf 'Available models\\n\\nauto - Auto\\n'; exit 0; fi\necho 'Error: Authentication required.' >&2; exit 1\n",
+        )
+        .unwrap();
+        for stub in [&grok_stub, &cursor_stub] {
+            std::fs::set_permissions(stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let grok = intent_acp::ProfileEnv::new(
+            "grok@work",
+            "f1",
+            vec![("XAI_API_KEY".into(), Some("xai-profile".into()))],
+        )
+        .with_api_key_home(Some(home.path()));
+        let cursor = intent_acp::ProfileEnv::new(
+            "cursor@work",
+            "f1",
+            vec![
+                ("CURSOR_API_KEY".into(), Some("profile-key".into())),
+                ("CURSOR_AUTH_TOKEN".into(), None),
+            ],
+        )
+        .with_api_key_home(Some(home.path()));
+        for (provider, stub, overlay) in [
+            ("grok", &grok_stub, &grok),
+            ("cursor", &cursor_stub, &cursor),
+        ] {
+            let args = intent_providers::find_provider(provider)
+                .unwrap()
+                .auth_check_args
+                .unwrap();
+            let with = check_provider_auth_cli_with(
+                provider,
+                stub.as_os_str(),
+                args,
+                None,
+                Some(overlay),
+                &captured,
+            )
+            .await;
+            assert_eq!(with, CliAuthProbe::Authenticated, "{provider}");
+            let without = check_provider_auth_cli_with(
+                provider,
+                stub.as_os_str(),
+                args,
+                None,
+                None,
+                &captured,
+            )
+            .await;
+            assert_eq!(without, CliAuthProbe::NotAuthenticated, "{provider}");
         }
     }
 
@@ -2176,12 +2313,14 @@ while IFS= read -r unexpected; do exit 95; done
             home.to_str().unwrap().to_owned(),
         )]);
         let probe =
-            check_provider_auth_cli_with("codex", stub.as_os_str(), args, None, &shell_only).await;
+            check_provider_auth_cli_with("codex", stub.as_os_str(), args, None, None, &shell_only)
+                .await;
         assert_eq!(probe, CliAuthProbe::Authenticated);
         let without = check_provider_auth_cli_with(
             "codex",
             stub.as_os_str(),
             args,
+            None,
             None,
             &std::collections::BTreeMap::new(),
         )
@@ -2692,6 +2831,7 @@ while IFS= read -r unexpected; do exit 95; done
                 context.runtime.path().as_os_str(),
                 args,
                 Some(&context),
+                None,
             )
             .await;
             assert_eq!(probe, expected, "{}", home.display());

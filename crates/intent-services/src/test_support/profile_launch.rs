@@ -47,16 +47,17 @@ pub fn resolve_saved_profile(
 pub struct LocalProfileLaunch {
     /// The overlay a local agent launch hands to `SpawnOptions.profile_env`.
     pub agent: ProfileEnv,
-    /// The overlay `InstalledContext::with_profile` applied (probes,
-    /// quick actions, model catalogs).
+    /// The overlay probes, quick actions and model catalogs run with:
+    /// `InstalledContext::with_profile` for Codex and Claude Code, the
+    /// adapter launch overlay for every other provider.
     pub installed: ProfileEnv,
     /// The Codex folder the installed context runs Codex in (Codex only).
     pub installed_codex_home: Option<PathBuf>,
 }
 
-/// Run `profile` through both local derivations for `provider_id`
-/// (`claude-code` or `codex`) on a host whose home is `home`. A stub CLI is
-/// written to `bin`; nothing is executed.
+/// Run `profile` through both local derivations for `provider_id` (any
+/// profile base) on a host whose home is `home`. For Codex and Claude Code a
+/// stub CLI is written to `bin`; nothing is executed.
 ///
 /// # Panics
 /// On an unknown provider or when the stub CLI cannot be written.
@@ -76,16 +77,18 @@ pub fn local_profile_launch(
 
     use crate::installed_cli::InstalledContext;
 
-    let cli = match provider_id {
-        "codex" => InstalledCli::Codex,
-        "claude-code" => InstalledCli::Claude,
-        other => panic!("no installed CLI for provider {other:?}"),
-    };
-    let agent = crate::agent_manager::local_launch_profile(
-        provider_id,
-        Arc::new(profile.clone()),
-        Some(home),
+    assert!(
+        intent_providers::profile_spec(provider_id).is_some(),
+        "not a profile base: {provider_id:?}"
     );
+    let agent = crate::agent_manager::local_launch_profile(profile, Some(home));
+    let Some(cli) = InstalledCli::for_provider(provider_id) else {
+        return LocalProfileLaunch {
+            agent: (*agent).clone(),
+            installed: crate::agent_manager::local_launch_overlay_in(profile, Some(home)),
+            installed_codex_home: None,
+        };
+    };
     std::fs::create_dir_all(bin).unwrap();
     let exe = bin.join(cli.command());
     std::fs::write(&exe, "#!/bin/sh\n").unwrap();
