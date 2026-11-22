@@ -305,6 +305,25 @@ impl Store {
         dispatch!(self, backend => backend.remove_exposed_machine(id).await)
     }
 
+    /// Remove exposed machine `id` because it is now an orchestrator
+    /// (nodes.md "An orchestrator leaves its backends"), as
+    /// [`Self::remove_exposed_machine`], and detach its homes in the same
+    /// transaction: each attached home becomes `detached` since `now`, and
+    /// a move away from one of its homes gets `detached` since `now` as the
+    /// state its rollback restores. No later step is left to repair a home
+    /// attached to the forgotten machine.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn remove_orchestrator_machine(
+        &self,
+        id: &str,
+        now: &str,
+    ) -> Result<Option<ExecutorCredentialId>> {
+        dispatch!(self, backend => backend.remove_orchestrator_machine(id, now).await)
+    }
+
     /// Replace a cloud machine row's sandbox state. Returns whether the row
     /// exists and is a cloud machine.
     ///
@@ -724,6 +743,45 @@ impl crate::SqliteStore {
                 .fetch_optional(self.write_pool())
                 .await
                 .map_err(db)?;
+        Ok(credential.map(ExecutorCredentialId::from))
+    }
+
+    pub async fn remove_orchestrator_machine(
+        &self,
+        id: &str,
+        now: &str,
+    ) -> Result<Option<ExecutorCredentialId>> {
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let credential: Option<String> =
+            sqlx::query_scalar("DELETE FROM exposed_machine WHERE id = ? RETURNING credential_id")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?;
+        if credential.is_some() {
+            sqlx::query(
+                "UPDATE workspace_home SET state = 'detached', since = ? \
+                 WHERE node_id = ? AND cloud_machine_id IS NULL AND state = 'attached'",
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+            sqlx::query(
+                "UPDATE home_move SET from_state = 'detached', from_since = ? \
+                 WHERE from_state = 'attached' AND EXISTS (SELECT 1 FROM workspace_home h \
+                 WHERE h.workspace_id = home_move.workspace_id \
+                 AND h.home_id = home_move.from_home_id AND h.node_id = ? \
+                 AND h.cloud_machine_id IS NULL)",
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
         Ok(credential.map(ExecutorCredentialId::from))
     }
 

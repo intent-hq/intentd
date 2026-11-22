@@ -1060,6 +1060,51 @@ impl PgStore {
         Ok(credential.map(ExecutorCredentialId::from))
     }
 
+    pub async fn remove_orchestrator_machine(
+        &self,
+        id: &str,
+        now: &str,
+    ) -> Result<Option<ExecutorCredentialId>> {
+        let tenant = self.tenant();
+        let mut tx = self.begin_write().await?;
+        let credential: Option<String> = sqlx::query_scalar(
+            "DELETE FROM exposed_machine WHERE tenant_id = $1 AND id = $2 RETURNING credential_id",
+        )
+        .bind(tenant)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if credential.is_some() {
+            sqlx::query(
+                "UPDATE workspace_home SET state = 'detached', since = $3 \
+                 WHERE tenant_id = $1 AND node_id = $2 AND cloud_machine_id IS NULL \
+                 AND state = 'attached'",
+            )
+            .bind(tenant)
+            .bind(id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+            sqlx::query(
+                "UPDATE home_move m SET from_state = 'detached', from_since = $3 \
+                 WHERE m.tenant_id = $1 AND m.from_state = 'attached' \
+                 AND EXISTS (SELECT 1 FROM workspace_home h WHERE h.tenant_id = $1 \
+                 AND h.workspace_id = m.workspace_id AND h.home_id = m.from_home_id \
+                 AND h.node_id = $2 AND h.cloud_machine_id IS NULL)",
+            )
+            .bind(tenant)
+            .bind(id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(credential.map(ExecutorCredentialId::from))
+    }
+
     pub async fn update_cloud_machine(&self, id: &str, cloud: &CloudMachine) -> Result<bool> {
         let mut tx = self.begin_write().await?;
         let done = sqlx::query(

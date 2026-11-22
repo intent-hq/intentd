@@ -104,75 +104,23 @@ pub(crate) async fn detach_homes(svc: &Services, link: &dyn LinkView, lost_at: &
     }
 }
 
-/// Detach each attached home on `machine_id` at once, without the link-loss
-/// grace, because the backend is removing the machine: it is now an
-/// orchestrator (nodes.md "An orchestrator leaves its backends"). No backup
-/// failure is recorded; the last backup stands, and the home can move.
-///
-/// # Errors
-///
-/// The store's error, so the removal is retried.
-pub(crate) async fn detach_homes_of_removed(
-    svc: &Services,
-    machine_id: &str,
-) -> intent_core::Result<()> {
+/// After the backend removed `machine_id` as an orchestrator, which
+/// detached its homes in the removal (nodes.md "An orchestrator leaves its
+/// backends"): each workspace with a home there announces its home. No
+/// backup failure is recorded; the last backup stands, and the home can move.
+pub(crate) async fn publish_homes_of(svc: &Services, machine_id: &str) {
     if !svc.workspace_homes() {
-        return Ok(());
+        return;
     }
-    for (workspace_id, home) in svc.store().homes_on_machine(machine_id).await? {
-        let detached = svc
-            .store()
-            .move_workspace_home_state(
-                &workspace_id,
-                &home.home_id,
-                HomeState::Attached,
-                HomeState::Detached,
-                &intent_core::now_iso(),
-            )
-            .await?;
-        if detached {
-            tracing::info!(workspace = %workspace_id, machine = %machine_id, "remote machine: now an orchestrator; the workspace's home is detached");
-            svc.publish_workspace_home_changed(&workspace_id).await;
+    match svc.store().homes_on_machine(machine_id).await {
+        Ok(homes) => {
+            for (workspace_id, _) in homes {
+                tracing::info!(workspace = %workspace_id, machine = %machine_id, "remote machine: now an orchestrator; the workspace's home is detached");
+                svc.publish_workspace_home_changed(&workspace_id).await;
+            }
         }
-    }
-    Ok(())
-}
-
-/// After a move's rollback: the workspace's restored home, when attached to
-/// a machine this backend no longer has (it removed it as an orchestrator
-/// while the home was moving, so [`detach_homes_of_removed`] skipped it), is
-/// detached at once.
-pub(crate) async fn detach_if_machine_removed(svc: &Services, workspace_id: &WorkspaceId) {
-    let Ok(Some(home)) = svc.store().get_workspace_home(workspace_id).await else {
-        return;
-    };
-    if home.state != HomeState::Attached || home.cloud_machine_id.is_some() {
-        return;
-    }
-    let Some(node_id) = home.node_id.as_deref() else {
-        return;
-    };
-    if !matches!(svc.store().get_exposed_machine(node_id).await, Ok(None)) {
-        return;
-    }
-    match svc
-        .store()
-        .move_workspace_home_state(
-            workspace_id,
-            &home.home_id,
-            HomeState::Attached,
-            HomeState::Detached,
-            &intent_core::now_iso(),
-        )
-        .await
-    {
-        Ok(true) => {
-            tracing::info!(workspace = %workspace_id, machine = %node_id, "remote machine: removed during a failed move; the workspace's home is detached");
-            svc.publish_workspace_home_changed(workspace_id).await;
-        }
-        Ok(false) => {}
         Err(error) => {
-            tracing::warn!(workspace = %workspace_id, %error, "remote machine: could not detach the workspace's home");
+            tracing::warn!(machine = %machine_id, %error, "remote machine: could not list the removed machine's homes");
         }
     }
 }

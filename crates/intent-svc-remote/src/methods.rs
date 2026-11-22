@@ -805,7 +805,21 @@ async fn forget(
     store.delete_home_stops_on_machine(machine_id).await?;
     svc.delete_remote_machine_token(machine_id).await?;
     store.end_machine_leases(machine_id, &head_id).await?;
-    let credential = store.remove_exposed_machine(machine_id).await?;
+    let credential = if reason == Some(ORCHESTRATOR_REASON) {
+        // Its homes are detached in the removal itself, not after the
+        // link-loss grace: the connector that would time that grace stops,
+        // and a home left attached to a forgotten machine could not move (a
+        // move first asks an attached home for a last push). A move away
+        // from it rolls back to detached. Nothing is deleted; the
+        // orchestrator runs no home stop, so the checkout stays on its disk.
+        let credential = store
+            .remove_orchestrator_machine(machine_id, &intent_core::now_iso())
+            .await?;
+        crate::home_state::publish_homes_of(svc, machine_id).await;
+        credential
+    } else {
+        store.remove_exposed_machine(machine_id).await?
+    };
     let mut removed = json!({ "machineId": machine_id, "removed": true });
     if let Some(reason) = reason {
         removed["reason"] = json!(reason);
@@ -883,16 +897,7 @@ async fn forget_orchestrator_once(
             row.name
         ));
     }
-    // Its homes are detached now, not after the link-loss grace: the
-    // connector that would time that grace stops here, and a home left
-    // attached to a forgotten machine could not move (a move first asks an
-    // attached home for a last push). Nothing is deleted; the orchestrator
-    // runs no home stop, so the checkout stays on its disk.
-    crate::home_state::detach_homes_of_removed(svc, machine_id).await?;
     forget(svc, machine_id, Some(ORCHESTRATOR_REASON)).await?;
-    // A move that rolled back between the pass above and the row's removal
-    // restored an attached home; a rollback after it detaches its own.
-    crate::home_state::detach_homes_of_removed(svc, machine_id).await?;
     if let Some(node) = feature.take_node(machine_id) {
         node.shutdown();
     }
