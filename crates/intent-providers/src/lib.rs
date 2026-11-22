@@ -43,14 +43,16 @@ pub use args::{
 pub use config::{
     all_provider_ids, auth_error_message, base_provider_id, find_provider,
     find_provider_or_legacy_alias, first_provider_id, is_provider_authentication_error,
-    legacy_aliases_for_provider, login_command, provider_config, split_profile_ref,
-    AllowAlwaysScope, InjectionMechanism, ProviderConfig, ToolRemovalStyle, ACP_PROVIDERS,
+    legacy_aliases_for_provider, login_command, profile_account_dir_keys, profile_credential_keys,
+    profile_spec, provider_config, split_profile_ref, AllowAlwaysScope, ApiKeyHome,
+    InjectionMechanism, ProfileSpec, ProviderConfig, ToolRemovalStyle, ACP_PROVIDERS,
     AUGGIE_CLI_MIN_VERSION, AUGGIE_CLI_REQUIREMENT, AUGGIE_NPX_PACKAGE,
     CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION,
-    CODEX_ACP_NPX_PACKAGE, CODEX_ACP_PREREQUISITE_ERROR, CODEX_INITIAL_AGENT_MODE_ENV,
-    CODEX_SUBAGENT_POLICY_CONFIG, CURSOR_SUBAGENT_PROMPT_NOTE, DROID_NPX_PACKAGE, GROK_NPX_PACKAGE,
-    NPX_MIN_NPM_VERSION, NPX_NPM_REQUIREMENT, OPENCODE_NPX_PACKAGE, PI_ACP_NPX_PACKAGE,
-    PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT, PROFILE_BASE_PROVIDERS, PROFILE_REF_SEPARATOR,
+    CODEX_ACP_NPX_PACKAGE, CODEX_ACP_PREREQUISITE_ERROR, CODEX_API_KEY_AUTH_REQUEST,
+    CODEX_INITIAL_AGENT_MODE_ENV, CODEX_SUBAGENT_POLICY_CONFIG, CURSOR_CREDENTIAL_STORE_ENV,
+    CURSOR_SUBAGENT_PROMPT_NOTE, DROID_NPX_PACKAGE, GROK_NPX_PACKAGE, NPX_MIN_NPM_VERSION,
+    NPX_NPM_REQUIREMENT, OPENCODE_NPX_PACKAGE, PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION,
+    PI_CLI_REQUIREMENT, PROFILE_BASE_PROVIDERS, PROFILE_REF_SEPARATOR,
 };
 #[cfg(test)]
 pub(crate) use config::{

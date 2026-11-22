@@ -170,6 +170,9 @@ pub(crate) fn clean_agent_message(content: &str) -> String {
 /// background completions — e.g. auto-commit message generation, which runs
 /// on its own budget — no longer masquerade as prompt-enhancement timeouts
 /// (monorepo#4032).
+///
+/// `overlay` is an `auggie@…` profile's launch overlay (its
+/// `AUGMENT_SESSION_AUTH`), applied above the inherited environment.
 pub(crate) async fn run_auggie_print(
     bin: &Path,
     model: Option<&str>,
@@ -177,8 +180,12 @@ pub(crate) async fn run_auggie_print(
     prompt: &str,
     timeout_ms: u64,
     timeout_op: &str,
+    overlay: Option<&intent_acp::ProfileEnv>,
 ) -> Result<String> {
     let mut cmd = tokio::process::Command::new(bin);
+    if let Some(overlay) = overlay {
+        overlay.apply_to_command(&mut cmd);
+    }
     cmd.arg("--print")
         .arg("--mcp-config")
         .arg(r#"{"mcpServers":{}}"#);
@@ -271,7 +278,11 @@ impl Services {
         // the FE can hide the affordance gracefully without an error crash.
         let settings = self.effective_settings();
         let effective_provider = crate::agent_session::derived_default_provider(&settings);
-        if effective_provider.as_deref() != Some("auggie") {
+        // An `auggie@…` profile enhances with its own session (PROTOCOL §5.54).
+        if effective_provider
+            .as_deref()
+            .is_none_or(|p| intent_providers::base_provider_id(p) != "auggie")
+        {
             return Ok(json!({
                 "available": false,
                 "reason": "enhance-prompt requires auggie as the effective default provider"
@@ -308,6 +319,15 @@ impl Services {
                 .ok_or_else(|| Error::Internal("auggie CLI not found".to_string()))?,
         };
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
+        let overlay = match effective_provider.as_deref() {
+            Some(reference) if crate::provider_profiles::is_qualified_ref(reference) => {
+                Box::pin(self.resolve_selected_profile(reference))
+                    .await?
+                    .overlay
+                    .map(|p| crate::agent_manager::local_launch_overlay(&p))
+            }
+            _ => None,
+        };
         let enhanced = enhance_with_auggie(
             &auggie,
             &prompt,
@@ -315,6 +335,7 @@ impl Services {
             model.as_deref(),
             cwd.as_deref(),
             timeout,
+            overlay.as_ref(),
         )
         .await?;
         Ok(json!({ "enhanced": enhanced, "original": prompt, "mode": mode }))
@@ -335,6 +356,7 @@ pub(crate) async fn enhance_with_auggie(
     model: Option<&str>,
     cwd: Option<&std::path::Path>,
     timeout: u64,
+    overlay: Option<&intent_acp::ProfileEnv>,
 ) -> Result<String> {
     {
         let system = if mode == "layout" {
@@ -356,6 +378,7 @@ pub(crate) async fn enhance_with_auggie(
             &full_prompt,
             timeout,
             "Prompt enhancement",
+            overlay,
         )
         .await?;
         let cleaned = clean_agent_message(&stdout);
@@ -567,6 +590,30 @@ mod tests {
         );
     }
 
+    /// An `auggie@…` profile's session reaches `auggie --print`, over an
+    /// inherited one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_auggie_print_applies_the_profile_overlay() {
+        let (_bin_dir, bin) = fake_auggie("session", "echo \"$AUGMENT_SESSION_AUTH\"");
+        let overlay = intent_acp::ProfileEnv::new(
+            "auggie@work",
+            "f1",
+            vec![(
+                "AUGMENT_SESSION_AUTH".into(),
+                Some("profile-session".into()),
+            )],
+        );
+        let out = run_auggie_print(&bin, None, None, "hi", 5_000, "t", Some(&overlay))
+            .await
+            .unwrap();
+        assert!(out.contains("profile-session"), "{out}");
+        let plain = run_auggie_print(&bin, None, None, "hi", 5_000, "t", None)
+            .await
+            .unwrap();
+        assert!(!plain.contains("profile-session"), "{plain}");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn enhance_op_times_out() {
@@ -605,7 +652,7 @@ mod tests {
         // never starts and the hang guard below fails instead.
         let result = tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(10)),
-            run_auggie_print(&bin, None, None, &prompt, 200, "One-shot completion"),
+            run_auggie_print(&bin, None, None, &prompt, 200, "One-shot completion", None),
         )
         .await
         .expect("stdin write blocked past the outer deadline: budget never started");

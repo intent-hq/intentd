@@ -65,7 +65,14 @@ fn profile_references_resolve_to_their_base_configuration() {
         split_profile_ref("claude-code@work-1"),
         Some(("claude-code", "work-1"))
     );
-    for reference in ["codex@p1", "claude-code@p1"] {
+    for reference in [
+        "codex@p1",
+        "claude-code@p1",
+        "grok@p1",
+        "droid@p1",
+        "auggie@p1",
+        "cursor@p1",
+    ] {
         let base = base_provider_id(reference);
         assert_eq!(provider_config(reference).id, base);
         assert_eq!(find_provider_or_legacy_alias(reference).unwrap().id, base);
@@ -80,15 +87,15 @@ fn profile_references_resolve_to_their_base_configuration() {
         "codex@ p1",
         " codex@p1",
         "Codex@p1",
-        "auggie@p1",
+        "opencode@p1",
         "acp@p1",
-        "grok@p1",
+        "pi@p1",
         "codex@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ] {
         assert!(split_profile_ref(malformed).is_none(), "{malformed}");
         assert_eq!(base_provider_id(malformed), malformed);
     }
-    assert!(find_provider_or_legacy_alias("auggie@p1").is_none());
+    assert!(find_provider_or_legacy_alias("opencode@p1").is_none());
     assert_eq!(base_provider_id("codex"), "codex");
 }
 
@@ -1911,5 +1918,40 @@ fn codex_and_claude_code_need_only_npx_to_be_runnable() {
         let availability =
             crate::discover::provider_availability_with(provider, &npx_only, &|_| false, &|_| None);
         assert!(availability.installed, "{id}");
+    }
+}
+
+/// The profile spec is the one list of profile bases, and each entry is
+/// self-consistent: an API key home is triggered by one of the base's own
+/// credentials, never by an account folder, and its launch variables are
+/// reserved where a profile could otherwise change them.
+#[test]
+fn profile_spec_drives_the_profile_bases_consistently() {
+    let mut bases: Vec<&str> = crate::PROFILE_BASE_PROVIDERS.to_vec();
+    bases.sort_unstable();
+    assert_eq!(
+        bases,
+        ["auggie", "claude-code", "codex", "cursor", "droid", "grok"]
+    );
+    for base in crate::PROFILE_BASE_PROVIDERS.iter() {
+        let spec = crate::profile_spec(base).unwrap();
+        assert!(!spec.credential_keys.is_empty(), "{base}");
+        for dir in spec.account_dir_keys {
+            assert!(!spec.credential_keys.contains(dir), "{base} {dir}");
+        }
+        if let Some(home) = spec.api_key_home {
+            assert!(spec.credential_keys.contains(&home.key), "{base}");
+            assert!(!spec.account_dir_keys.contains(&home.home_key) || *base != "cursor");
+            assert!(home.dir_name.ends_with("-api-key"), "{base}");
+        }
+    }
+    assert!(crate::profile_spec("opencode").is_none());
+    assert!(crate::profile_spec("codex@p1").is_none());
+    let mut dirs: Vec<&str> = crate::profile_account_dir_keys().collect();
+    dirs.sort_unstable();
+    assert_eq!(dirs, ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"]);
+    let cursor = crate::profile_spec("cursor").unwrap();
+    for (key, _) in cursor.credential_launch_env {
+        assert!(cursor.reserved_keys.iter().any(|(k, _)| k == key), "{key}");
     }
 }

@@ -223,6 +223,16 @@ impl AcpAdapterCommand {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // A named profile of a provider without an installed context (Grok,
+        // Droid, Auggie, Cursor) applies its overlay here, with its launch-only
+        // API key home: above the inherited environment, below Intent's own
+        // wiring (`envs`), as on a session launch. Installed CLIs carry the
+        // profile in their prepared context instead.
+        if self.installed_cli.is_none() {
+            if let Some(profile) = &self.profile {
+                crate::agent_manager::local_launch_overlay(profile).apply_to_command(&mut command);
+            }
+        }
         for (key, value) in &self.envs {
             command.env(key, value);
         }
@@ -1246,6 +1256,41 @@ mod setup_budget_tests {
 #[cfg(test)]
 mod slot_tests {
     use super::*;
+
+    /// Probes, test prompts and one-shots of a provider without an installed
+    /// context run a named profile's overlay: its keys set, its unsets
+    /// removed, and Intent's own wiring (`env`) still on top.
+    #[test]
+    fn profile_overlay_applies_to_adapters_without_an_installed_context() {
+        let profile = intent_acp::ProfileEnv::new(
+            "droid@work",
+            "f1",
+            vec![
+                ("FACTORY_API_KEY".into(), Some("fk-profile".into())),
+                ("FORCE_COLOR".into(), Some("1".into())),
+                ("HTTPS_PROXY".into(), None),
+            ],
+        );
+        let cmd = AcpAdapterCommand::binary(PathBuf::from("droid"), Vec::new())
+            .env("FORCE_COLOR", "0")
+            .with_profile(Some(Arc::new(profile)));
+        let command = cmd.command_in(&std::env::temp_dir());
+        let envs: std::collections::BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(std::ffi::OsStr::to_owned)))
+            .collect();
+        let get = |key: &str| envs.get(std::ffi::OsStr::new(key)).cloned();
+        assert_eq!(get("FACTORY_API_KEY"), Some(Some("fk-profile".into())));
+        assert_eq!(get("FORCE_COLOR"), Some(Some("0".into())));
+        assert_eq!(get("HTTPS_PROXY"), Some(None));
+        let plain = AcpAdapterCommand::binary(PathBuf::from("droid"), Vec::new())
+            .command_in(&std::env::temp_dir());
+        assert!(!plain
+            .as_std()
+            .get_envs()
+            .any(|(k, _)| k == "FACTORY_API_KEY"));
+    }
 
     /// The bound admits exactly `limit` holders at once; the next caller waits
     /// and is admitted the moment a permit drops (which, in the real runner,

@@ -510,7 +510,8 @@ impl Services {
             .filter(|s| !s.is_empty());
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
-        if run_provider != "auggie" {
+        // `auggie` and its profiles take the `auggie --print` route.
+        if intent_providers::base_provider_id(&run_provider) != "auggie" {
             return self
                 .complete_once_failing_over(
                     &run_provider,
@@ -534,6 +535,15 @@ impl Services {
         let full_prompt = compose_prompt(&prompt, system_prompt);
 
         let auggie = self.one_shot_auggie_bin()?;
+        // An `auggie@…` profile runs with its own session (PROTOCOL §5.54).
+        let overlay = if crate::provider_profiles::is_qualified_ref(&run_provider) {
+            Box::pin(self.resolve_selected_profile(&run_provider))
+                .await?
+                .overlay
+                .map(|p| crate::agent_manager::local_launch_overlay(&p))
+        } else {
+            None
+        };
         let stdout = run_auggie_print(
             &auggie,
             model.as_deref(),
@@ -541,6 +551,7 @@ impl Services {
             &full_prompt,
             timeout,
             "One-shot completion",
+            overlay.as_ref(),
         )
         .await?;
         let text = clean_agent_message(&stdout);

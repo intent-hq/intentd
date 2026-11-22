@@ -240,7 +240,14 @@ async fn the_catalog_says_every_default_runs_on_a_machine() {
     let catalog = fx.svc.providers_catalog().await.unwrap();
     assert_eq!(
         catalog["defaultRemoteLaunch"],
-        json!({ "claude-code": "machine-sign-in", "codex": "machine-sign-in" })
+        json!({
+            "auggie": "machine-sign-in",
+            "claude-code": "machine-sign-in",
+            "codex": "machine-sign-in",
+            "droid": "machine-sign-in",
+            "grok": "machine-sign-in",
+            "cursor": "machine-sign-in",
+        })
     );
     assert!(
         catalog.get("defaultRemoteIncompatibility").is_none(),
@@ -435,7 +442,7 @@ async fn launch_rules_for_the_default() {
 #[intent_test_macros::daemon_test]
 async fn launch_rules_for_providers_without_profiles() {
     let fx = Fixture::new().await;
-    for provider in ["unsloth", "auggie"] {
+    for provider in ["unsloth", "opencode"] {
         let plan = fx.plan(provider).await.unwrap();
         assert!(plan.env.is_none(), "{provider}");
         assert!(!plan.machine_sign_in, "{provider}: no Default to mark");

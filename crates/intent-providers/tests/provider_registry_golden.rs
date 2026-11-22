@@ -91,6 +91,18 @@ fn provider_row(p: &ProviderConfig) -> Value {
             "minimum": gate.min_version,
             "requirement": gate.requirement,
         })),
+        "profile": p.profile.map(|spec| json!({
+            "credentialKeys": spec.credential_keys,
+            "accountDirKeys": spec.account_dir_keys,
+            "apiKeyHome": spec.api_key_home.map(|home| json!({
+                "key": home.key,
+                "homeKey": home.home_key,
+                "dirName": home.dir_name,
+                "launchEnv": home.launch_env.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
+            })),
+            "credentialLaunchEnv": spec.credential_launch_env.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
+            "reservedKeys": spec.reserved_keys.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        })),
     })
 }
 

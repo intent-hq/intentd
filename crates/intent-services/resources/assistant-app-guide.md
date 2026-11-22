@@ -432,7 +432,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog,BackgroundAgentSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/background-agent-settings/background-agent-settings-slice.ts (editQuickAction); packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,provider_version,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace/workspace-selectors.ts (selectHidesProviderProfileNames). -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog,BackgroundAgentSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/background-agent-settings/background-agent-settings-slice.ts (editQuickAction); packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,provider_version,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace/workspace-selectors.ts (selectHidesProviderProfileNames); packages/cloudlands-fe/src/lib/provider-profile-kinds.ts; packages/intentd/crates/intent-providers/src/config.rs (ProfileSpec); packages/intentd/crates/intent-acp/src/profile_env.rs (with_api_key_home). -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -546,7 +546,7 @@ installed or it is already enabled. An enabled but missing installation stays
 visible so you can disable it; it disappears afterward. Sign-in is not required
 for an installed Auggie to appear.
 
-**Provider profiles (Codex and Claude Code only).** A profile runs the installed
+**Provider profiles.** A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
 or a different endpoint. In **Settings → Providers**, open the ⋯ menu on Codex or
 Claude Code and choose **Add profile**, then a kind: **Different login**, **API key**
@@ -568,9 +568,18 @@ credentials that would otherwise win. Pending frontend release (not in current b
 keys); Intent signs Codex in with it in a folder of its own on the machine that runs the
 agent (`~/.intent/codex-api-key/`), so the user's own Codex login is never changed. On an
 orchestrator, **API key** and **Token** check only the key's format before **Create**,
-because an orchestrator runs no test prompt. **Advanced** is the raw editor: a name and
+because an orchestrator runs no test prompt. Pending frontend release (not in current
+builds): **Add profile** is also offered for Grok (**API key**, `xai-…`), Cursor
+(**API key**), Auggie (**Access token**: paste the JSON that `auggie token print` prints)
+and Factory Droid (**API key**, `fk-…`; only while Droid is enabled), each with
+**Advanced**. Grok and Cursor prefer a saved login over a key, so their API key profiles
+run in a folder of their own on the machine that runs the agent
+(`~/.intent/grok-api-key/`, `~/.intent/cursor-api-key/`): the user's own login is never
+used or changed, and a Grok key profile does not see the user's own Grok settings or
+skills. Cursor has no npm package, so each machine needs `cursor-agent` installed.
+**Advanced** is the raw editor: a name and
 environment variables (literal values, **Empty value**, or **Unset**; no shell
-expansion). Use `CODEX_HOME` or `CLAUDE_CONFIG_DIR` to choose an account folder; there
+expansion). Use `CODEX_HOME`, `CLAUDE_CONFIG_DIR` or `GROK_HOME` to choose an account folder; there
 only, a leading `~` or `~/` means the provider host user's home folder (`~user` stays
 literal), and the saved folder path is shown as typed while other saved values stay
 hidden. Credentials inherited from the environment can still apply to an Advanced
@@ -732,10 +741,11 @@ machines** with no install or sign-in step, and keeps **Let's go** disabled with
 **Settings → Machines** while its machine list is empty (an orchestrator shows **Settings → Machines**
 and reads that list without the Labs **Remote agents** switch; if the list can't be read,
 onboarding does not block). Also pending: on an orchestrator, onboarding and **Settings →
-Providers** offer only Claude Code and Codex (in Settings, another provider stays listed
-while it is turned on), and onboarding has five steps: after the provider, **Connect <provider>** asks
-for **Subscription token** (`claude setup-token`) or **API key** for Claude Code, or
-**ChatGPT access token** or **API key** for Codex. **Continue** is enabled once the pasted
+Providers** offer Claude Code, Codex, Grok, Cursor, Auggie and (while enabled) Factory
+Droid (in Settings, another provider stays listed while it is turned on), and onboarding
+has five steps: after the provider, **Connect <provider>** asks for **Subscription token**
+(`claude setup-token`) or **API key** for Claude Code, **ChatGPT access token** or **API
+key** for Codex, an **API key** for Grok, Cursor or Droid, or an **Access token** for Auggie. **Continue** is enabled once the pasted
 value has the right format; it saves a profile and makes it the provider's default. The
 orchestrator keeps it and sends it to a machine only when an agent starts there.
 <!-- Sources: packages/cloudlands-fe/src/features/onboarding/{steps/OnboardingAgentMachinesNotice.svelte,steps/OnboardingConnectStep.svelte,utils/onboarding-agent-machines.ts,utils/onboarding-steps.ts,utils/resolve-onboarding-model.ts,messages/ProviderCard.svelte}; packages/cloudlands-fe/src/lib/components/settings/ProviderSelector.svelte; packages/cloudlands-fe/src/store/renderer/slices/host-requirements/host-requirements-selectors.ts. -->

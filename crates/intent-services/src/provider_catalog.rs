@@ -57,10 +57,9 @@ fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> 
     row.insert("command".into(), json!(p.command));
     row.insert("canBeDisabled".into(), json!(p.can_be_disabled));
     row.insert("supportsTestPrompt".into(), json!(p.supports_test_prompt));
-    row.insert(
-        "supportsProfiles".into(),
-        json!(intent_providers::PROFILE_BASE_PROVIDERS.contains(&p.id)),
-    );
+    // A capability, like the rest of the row: a gated-off base (Droid
+    // without `INTENTD_ENABLE_DROID`) keeps it and is hidden by `visible`.
+    row.insert("supportsProfiles".into(), json!(p.profile.is_some()));
     if let Some(hint) = p.login_command_hint {
         row.insert("loginCommandHint".into(), json!(hint));
     }
@@ -111,18 +110,21 @@ mod tests {
 
     /// Only the profile bases advertise `supportsProfiles: true`; every row
     /// carries the boolean, and rows stay one per provider type, so
-    /// onboarding (which reads `providers`) never sees a profile row.
+    /// onboarding (which reads `providers`) never sees a profile row. A
+    /// gated-off base (Droid without its env var) is hidden by `visible`.
     #[test]
-    fn supports_profiles_only_on_codex_and_claude_code() {
+    fn supports_profiles_follows_the_profile_spec() {
+        let bases = ["auggie", "claude-code", "codex", "cursor", "droid", "grok"];
         let v = catalog(&|_| false);
         for provider in intent_providers::ACP_PROVIDERS {
             assert_eq!(
                 row(&v, provider.id)["supportsProfiles"],
-                matches!(provider.id, "codex" | "claude-code"),
+                bases.contains(&provider.id),
                 "{}",
                 provider.id
             );
         }
+        assert_eq!(row(&v, "droid")["visible"], false);
         assert!(
             v.get("profiles").is_none(),
             "the static builder adds no profiles"
@@ -141,7 +143,7 @@ mod tests {
         assert_eq!(cursor["command"], "cursor-agent");
         assert_eq!(cursor["canBeDisabled"], true);
         assert_eq!(cursor["supportsTestPrompt"], true);
-        assert_eq!(cursor["supportsProfiles"], false);
+        assert_eq!(cursor["supportsProfiles"], true);
         assert_eq!(cursor["visible"], true);
         assert_eq!(
             cursor["loginDocsUrl"],

@@ -58,7 +58,7 @@ pub(crate) const PROFILES_FILE: &str = "provider-profiles.json";
 /// The only metadata file version this daemon reads or writes.
 const FILE_VERSION: u32 = 1;
 /// Canonical base provider ids that advertise `supportsProfiles: true`.
-pub(crate) const PROFILE_BASE_PROVIDERS: &[&str] = intent_providers::PROFILE_BASE_PROVIDERS;
+pub(crate) use intent_providers::PROFILE_BASE_PROVIDERS;
 /// Separator between a base provider id and a profile id in a reference.
 pub(crate) const REF_SEPARATOR: char = intent_providers::PROFILE_REF_SEPARATOR;
 /// `agent_session.metadata` key holding the profile `settingsFingerprint`
@@ -475,11 +475,20 @@ fn launch_wired_keys(base_provider: &str) -> impl Iterator<Item = &'static str> 
 pub(crate) fn reserved_key_reason(key: &str, base_provider: &str) -> Option<String> {
     let upper = key.to_ascii_uppercase();
     let lower = key.to_ascii_lowercase();
-    let account_var = if base_provider == "claude-code" {
-        "CLAUDE_CONFIG_DIR"
-    } else {
-        "CODEX_HOME"
-    };
+    let spec = intent_providers::profile_spec(base_provider);
+    let account_hint = spec
+        .and_then(|spec| spec.account_dir_keys.first())
+        .map_or_else(
+            || "a profile does not select an account through it".to_owned(),
+            |var| format!("use {var} to select an account"),
+        );
+    if let Some((_, why)) = spec
+        .into_iter()
+        .flat_map(|spec| spec.reserved_keys.iter())
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+    {
+        return Some(format!("{key} is reserved: {why}"));
+    }
     let reason = match upper.as_str() {
         "PATH" => "Intent rewrites PATH at launch with the enhanced executable path".to_string(),
         "CODEX_PATH" | "CLAUDE_CODE_EXECUTABLE" => {
@@ -487,9 +496,9 @@ pub(crate) fn reserved_key_reason(key: &str, base_provider: &str) -> Option<Stri
         }
         "CODEX_CONFIG" => "Intent sets the enforced Codex policy after every env merge".to_string(),
         "NODE_OPTIONS" => "Intent composes the adapter memory cap in NODE_OPTIONS".to_string(),
-        "HOME" | "USERPROFILE" => format!(
-            "Intent reads {upper} to find the shared installation; use {account_var} to select an account"
-        ),
+        "HOME" | "USERPROFILE" => {
+            format!("Intent reads {upper} to find the shared installation; {account_hint}")
+        }
         _ if launch_wired_keys(base_provider).any(|k| k.eq_ignore_ascii_case(key)) => {
             "Intent sets this at launch (session wiring and commit identity)".to_string()
         }
@@ -517,8 +526,8 @@ fn is_valid_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
-/// Whether `key` names an account folder (`CLAUDE_CONFIG_DIR` or
-/// `CODEX_HOME`, ignoring ASCII case). Reads return these values unmasked:
+/// Whether `key` names an account folder of any profile base
+/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, ignoring ASCII case). Reads return these values unmasked:
 /// a folder path is not a credential. Launch-log redaction still covers
 /// them through `ProfileEnv::secret_values`.
 fn is_folder_path_key(key: &str) -> bool {
@@ -1972,7 +1981,7 @@ impl Services {
             }
         }
         let saved_defaults = store.defaults().unwrap_or_default();
-        for base in PROFILE_BASE_PROVIDERS {
+        for base in PROFILE_BASE_PROVIDERS.iter() {
             let saved = saved_defaults.get(*base).cloned().unwrap_or_default();
             let env = match &saved.env_id {
                 None => Some(EnvDoc::default()),

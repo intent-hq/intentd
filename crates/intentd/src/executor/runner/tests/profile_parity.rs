@@ -26,6 +26,10 @@ use super::harness_with;
 enum Provider {
     Claude,
     Codex,
+    Grok,
+    Droid,
+    Auggie,
+    Cursor,
 }
 
 /// Every kind the profile dialog saves (cloudlands-fe
@@ -36,9 +40,10 @@ enum Provider {
 /// the frontend is not caught here: add it to this enum alongside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
-    /// Signs in with a token (`CLAUDE_CODE_OAUTH_TOKEN` / `CODEX_ACCESS_TOKEN`).
+    /// Signs in with a token (`CLAUDE_CODE_OAUTH_TOKEN` / `CODEX_ACCESS_TOKEN`
+    /// / Auggie's `AUGMENT_SESSION_AUTH`).
     Token,
-    /// Signs in with an API key (`ANTHROPIC_API_KEY` / `CODEX_API_KEY`).
+    /// Signs in with an API key.
     ApiKey,
     /// A separate login in its own account folder.
     DifferentLogin,
@@ -47,12 +52,23 @@ enum Kind {
 }
 
 impl Provider {
-    const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+    const ALL: [Self; 6] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Grok,
+        Self::Droid,
+        Self::Auggie,
+        Self::Cursor,
+    ];
 
     fn base(self) -> &'static str {
         match self {
             Self::Claude => "claude-code",
             Self::Codex => "codex",
+            Self::Grok => "grok",
+            Self::Droid => "droid",
+            Self::Auggie => "auggie",
+            Self::Cursor => "cursor",
         }
     }
 }
@@ -65,9 +81,10 @@ impl Kind {
         Self::CustomEnv,
     ];
 
-    /// The entries the dialog saves for this kind (values are fake).
-    fn saved(self, provider: Provider) -> Vec<(&'static str, Option<&'static str>)> {
-        match (provider, self) {
+    /// The entries the dialog saves for this kind (values are fake), or
+    /// `None` when the dialog has no such kind for the provider.
+    fn saved(self, provider: Provider) -> Option<Vec<(&'static str, Option<&'static str>)>> {
+        Some(match (provider, self) {
             (Provider::Claude, Self::Token) => vec![
                 ("CLAUDE_CODE_OAUTH_TOKEN", Some("sk-ant-oat-parity")),
                 ("ANTHROPIC_API_KEY", None),
@@ -101,26 +118,52 @@ impl Kind {
                 ("CODEX_API_KEY", None),
                 ("OPENAI_API_KEY", None),
             ],
+            (Provider::Grok, Self::ApiKey) => vec![("XAI_API_KEY", Some("xai-parity"))],
+            (Provider::Droid, Self::ApiKey) => vec![("FACTORY_API_KEY", Some("fk-parity"))],
+            (Provider::Auggie, Self::Token) => vec![(
+                "AUGMENT_SESSION_AUTH",
+                Some(
+                    r#"{"accessToken":"parity","tenantURL":"https://t.invalid/","scopes":["email"]}"#,
+                ),
+            )],
+            (Provider::Cursor, Self::ApiKey) => vec![
+                ("CURSOR_API_KEY", Some("key_parity")),
+                ("CURSOR_AUTH_TOKEN", None),
+            ],
+            (
+                Provider::Grok | Provider::Droid | Provider::Cursor,
+                Self::Token | Self::DifferentLogin,
+            )
+            | (Provider::Auggie, Self::ApiKey | Self::DifferentLogin) => return None,
             (_, Self::CustomEnv) => vec![
                 ("PARITY_SETTING", Some("custom-value")),
                 ("PARITY_EMPTY", Some("")),
                 ("HTTPS_PROXY", None),
             ],
-        }
+        })
     }
 
-    /// The Codex folder both paths must agree on, relative to the home:
-    /// `Some` when the profile selects one, `None` when Codex keeps the
-    /// host's own. Guards against both paths dropping the derivation. Only a
-    /// named Codex API key profile gets its own home; a Default
-    /// configuration with a key keeps the host's (`with_codex_api_key_home`
-    /// applies to `codex@<id>` references only).
-    fn codex_folder(self, provider: Provider, default: bool) -> Option<&'static str> {
+    /// The home folder both paths must agree on, relative to the home:
+    /// `Some((variable, folder))` when the profile selects one, `None` when
+    /// the provider keeps the host's own. Guards against both paths dropping
+    /// the derivation. Only a named API key profile of a base with an API key
+    /// home gets its own; a Default configuration with a key keeps the
+    /// host's (`with_api_key_home` applies to `<base>@<id>` references only).
+    fn own_home(self, provider: Provider, default: bool) -> Option<(&'static str, &'static str)> {
         match (provider, self) {
-            (Provider::Codex, Self::ApiKey) if !default => Some(".intent/codex-api-key/"),
-            (Provider::Codex, Self::DifferentLogin) => Some("intent/profiles/codex/work"),
-            (Provider::Claude, _)
-            | (Provider::Codex, Self::ApiKey | Self::Token | Self::CustomEnv) => None,
+            (Provider::Codex, Self::ApiKey) if !default => {
+                Some(("CODEX_HOME", ".intent/codex-api-key/"))
+            }
+            (Provider::Grok, Self::ApiKey) if !default => {
+                Some(("GROK_HOME", ".intent/grok-api-key/"))
+            }
+            (Provider::Cursor, Self::ApiKey) if !default => {
+                Some(("CURSOR_CONFIG_DIR", ".intent/cursor-api-key/"))
+            }
+            (Provider::Codex, Self::DifferentLogin) => {
+                Some(("CODEX_HOME", "intent/profiles/codex/work"))
+            }
+            _ => None,
         }
     }
 }
@@ -130,6 +173,13 @@ fn entries(profile: &ProfileEnv) -> BTreeMap<String, Option<String>> {
         .entries()
         .map(|(k, v)| (k.to_owned(), v.map(str::to_owned)))
         .collect()
+}
+
+fn value<'a>(profile: &'a ProfileEnv, key: &str) -> Option<&'a str> {
+    profile
+        .entries()
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, v)| v)
 }
 
 #[tokio::test]
@@ -154,6 +204,9 @@ async fn every_profile_kind_launches_the_same_locally_and_on_a_machine() {
             .into_iter()
             .flat_map(move |kind| [false, true].map(|default| (provider, kind, default)))
     }) {
+        let Some(saved) = kind.saved(provider) else {
+            continue;
+        };
         let case = format!(
             "{provider:?} {kind:?}{}",
             if default {
@@ -165,9 +218,8 @@ async fn every_profile_kind_launches_the_same_locally_and_on_a_machine() {
         let reference = if default {
             provider.base().to_owned()
         } else {
-            format!("{}@parity-{kind:?}", provider.base())
+            format!("{}@parity-{kind:?}", provider.base()).to_lowercase()
         };
-        let saved = kind.saved(provider);
         let local_resolved = resolve_saved_profile(&reference, provider.base(), &saved, Some(home));
         let local = local_profile_launch(provider.base(), &local_resolved, home, bin.path());
         let remote_resolved = resolve_saved_profile(&reference, provider.base(), &saved, None);
@@ -184,38 +236,39 @@ async fn every_profile_kind_launches_the_same_locally_and_on_a_machine() {
         assert_eq!(
             entries(&local.installed),
             entries(&node),
-            "{case}: local installed CLI context and machine launch differ"
+            "{case}: local probe / installed CLI context and machine launch differ"
         );
 
-        let node_codex_home = node
-            .entries()
-            .find(|(k, _)| *k == "CODEX_HOME")
-            .and_then(|(_, v)| v)
-            .map(std::path::PathBuf::from);
-        match kind.codex_folder(provider, default) {
-            Some(folder) => {
-                let path = node_codex_home
-                    .clone()
-                    .unwrap_or_else(|| panic!("{case}: no CODEX_HOME on the machine"));
+        match kind.own_home(provider, default) {
+            Some((variable, folder)) => {
+                let path = value(&node, variable)
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| panic!("{case}: no {variable} on the machine"));
                 assert!(
                     path.starts_with(home.join(folder)),
-                    "{case}: CODEX_HOME {} is not under {folder}",
+                    "{case}: {variable} {} is not under {folder}",
                     path.display()
                 );
                 assert!(path.is_dir(), "{case}: {}", path.display());
-                assert_eq!(
-                    local.installed_codex_home, node_codex_home,
-                    "{case}: local and machine Codex folders differ"
-                );
             }
-            None => assert_eq!(node_codex_home, None, "{case}"),
+            None => {
+                for variable in ["CODEX_HOME", "GROK_HOME", "CURSOR_CONFIG_DIR"] {
+                    assert_eq!(value(&node, variable), None, "{case}: {variable}");
+                }
+            }
         }
-        if provider == Provider::Codex && node_codex_home.is_none() {
-            // Codex keeps the host's own folder on both paths.
+        // A Cursor key profile never reads a stored login, on either path.
+        assert_eq!(
+            value(&node, intent_providers::CURSOR_CREDENTIAL_STORE_ENV),
+            (provider == Provider::Cursor && kind == Kind::ApiKey && !default).then_some("memory"),
+            "{case}"
+        );
+        if provider == Provider::Codex {
+            let node_codex_home = value(&node, "CODEX_HOME").map(std::path::PathBuf::from);
             assert_eq!(
                 local.installed_codex_home,
-                Some(home.join(".codex")),
-                "{case}"
+                node_codex_home.or_else(|| Some(home.join(".codex"))),
+                "{case}: local and machine Codex folders differ"
             );
         }
     }

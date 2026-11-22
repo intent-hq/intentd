@@ -316,6 +316,7 @@ impl Services {
                     input.model.as_deref(),
                     None,
                     timeout,
+                    None,
                 )
                 .await
                 {
@@ -335,9 +336,14 @@ impl Services {
             OneShotInput::Complete(input) if frame.operation == OneShotOperation::Complete => {
                 let effort = input.effort.clone().unwrap_or_default();
                 let result = if input.provider_id == "auggie" {
-                    self.machine_auggie_completion(&input, effort.requested.as_deref(), timeout)
-                        .await
-                        .map_err(AttemptFailure::from)
+                    self.machine_auggie_completion(
+                        &input,
+                        effort.requested.as_deref(),
+                        timeout,
+                        profile.as_ref(),
+                    )
+                    .await
+                    .map_err(AttemptFailure::from)
                 } else {
                     crate::acp_adapter::NEVER_QUEUE
                         .scope(
@@ -415,6 +421,7 @@ impl Services {
         input: &OneShotCompleteInput,
         requested_effort: Option<&str>,
         timeout: u64,
+        profile: Option<&intent_acp::ProfileEnv>,
     ) -> Result<Value> {
         if let Some(requested) = requested_effort {
             return Err(Error::InvalidParams(format!(
@@ -430,6 +437,7 @@ impl Services {
             &full_prompt,
             timeout,
             "One-shot completion",
+            profile,
         )
         .await?;
         Ok(json!({ "text": super::clean_agent_message(&stdout) }))

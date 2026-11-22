@@ -9,7 +9,7 @@
 //! 1. inherited daemon environment and captured login-shell credentials;
 //! 2. **the profile**: `set` replaces, `unset` removes (values are literal,
 //!    never shell-expanded — except that the daemon expands a leading `~` /
-//!    `~/` of `CLAUDE_CONFIG_DIR` and `CODEX_HOME` to its home directory
+//!    `~/` of an account folder ([`ACCOUNT_DIR_KEYS`]) to its home directory
 //!    before building this overlay);
 //! 3. Intent's own launch wiring (provider env, session/bootstrap variables,
 //!    the selected executable, enforced configuration and `PATH`), which a
@@ -20,19 +20,34 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use serde_json::{json, Map, Value};
 
 /// Account-directory variables whose leading `~` is expanded where the
 /// provider runs: by the daemon for local launches, by the node for remote
-/// ones (keys compared ignoring ASCII case).
-pub const ACCOUNT_DIR_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+/// ones (keys compared ignoring ASCII case). Every profile base's
+/// [`intent_providers::ProfileSpec::account_dir_keys`].
+pub static ACCOUNT_DIR_KEYS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| intent_providers::profile_account_dir_keys().collect());
 
-/// What the Codex ACP adapter runs when its Codex home has no login: its
-/// `api-key` method, which reads `CODEX_API_KEY` from the launch environment.
-/// Codex itself ignores a key that is only in the environment.
-pub const CODEX_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
+pub use intent_providers::CODEX_API_KEY_AUTH_REQUEST;
 const DEFAULT_AUTH_REQUEST: &str = "DEFAULT_AUTH_REQUEST";
+
+/// Launch-only wiring an API key home adds next to the home folder
+/// (`DEFAULT_AUTH_REQUEST`, Cursor's credential store): not a secret.
+fn is_api_key_home_wiring(key: &str) -> bool {
+    intent_providers::ACP_PROVIDERS
+        .iter()
+        .filter_map(|p| p.profile.as_ref())
+        .flat_map(|spec| {
+            spec.api_key_home
+                .iter()
+                .flat_map(|home| home.launch_env.iter())
+                .chain(spec.credential_launch_env.iter())
+        })
+        .any(|(k, _)| *k == key)
+}
 
 fn is_account_dir_key(key: &str) -> bool {
     ACCOUNT_DIR_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key))
@@ -146,28 +161,73 @@ impl ProfileEnv {
     pub fn secret_values(&self) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|(k, _)| k != DEFAULT_AUTH_REQUEST)
+            .filter(|(k, _)| !is_api_key_home_wiring(k))
             .filter_map(|(_, v)| v.clone())
             .filter(|v| !v.is_empty())
             .collect()
     }
 
-    /// A Codex profile that sets a non-empty `CODEX_API_KEY` and no
-    /// `CODEX_HOME`, resolved where the provider runs (`home` is that host's
-    /// home): the overlay gains `CODEX_HOME=<home>/.intent/codex-api-key/
-    /// <profile id>-<key digest>` (created) and `DEFAULT_AUTH_REQUEST`, so
-    /// the adapter signs that home in with the key and never touches the
-    /// user's `~/.codex` login. A changed key gets a new home, so a stale
-    /// login never wins. Launch-only: never saved. Any other profile, or no
-    /// home, is returned unchanged.
+    /// A profile whose base has an API key home
+    /// ([`intent_providers::ApiKeyHome`]: Codex, Grok, Cursor) and that sets
+    /// a non-empty key and not the home variable, resolved where the provider
+    /// runs (`home` is that host's home): the overlay gains `<home_key>=<home>
+    /// /.intent/<dir>/<profile id>-<key digest>` (created) plus the base's
+    /// launch variables, so the CLI never uses the user's own saved login.
+    /// A changed key gets a new home, so a stale login never wins.
+    /// Launch-only: never saved. A Default configuration, any other profile,
+    /// or no home is returned unchanged.
+    ///
+    /// Before that, a profile that sets one of its base's credentials gets
+    /// the base's `credential_launch_env` (Cursor's memory credential store),
+    /// whatever else it sets.
     #[must_use]
-    pub fn with_codex_api_key_home(mut self, home: Option<&Path>) -> Self {
-        use sha2::{Digest, Sha256};
-        use std::fmt::Write as _;
-        let (Some(home), Some(key)) = (home, self.codex_api_key()) else {
+    pub fn with_api_key_home(mut self, home: Option<&Path>) -> Self {
+        let Some((base, _)) = self.provider_ref.split_once('@') else {
             return self;
         };
-        if self.controls_ignoring_case("CODEX_HOME") || self.signs_in_with_codex_api_key() {
+        let Some(spec) = intent_providers::profile_spec(base) else {
+            return self;
+        };
+        let sets_credential = spec
+            .credential_keys
+            .iter()
+            .any(|key| self.set_value_ignoring_case(key).is_some());
+        if sets_credential {
+            for (key, value) in spec.credential_launch_env {
+                if !self
+                    .entries
+                    .iter()
+                    .any(|(k, v)| k == key && v.as_deref() == Some(value))
+                {
+                    self.entries
+                        .push(((*key).to_owned(), Some((*value).to_owned())));
+                }
+            }
+        }
+        self.with_own_home(home, spec.api_key_home)
+    }
+
+    fn with_own_home(
+        mut self,
+        home: Option<&Path>,
+        spec: Option<intent_providers::ApiKeyHome>,
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        let Some(id) = self
+            .provider_ref
+            .split_once('@')
+            .map(|(_, id)| id.to_owned())
+        else {
+            return self;
+        };
+        let Some(spec) = spec else {
+            return self;
+        };
+        let (Some(home), Some(key)) = (home, self.set_value_ignoring_case(spec.key)) else {
+            return self;
+        };
+        if self.controls_ignoring_case(spec.home_key) {
             return self;
         }
         let digest = Sha256::digest(key.as_bytes()).iter().take(8).fold(
@@ -177,10 +237,7 @@ impl ProfileEnv {
                 hex
             },
         );
-        let id = self
-            .provider_ref
-            .split_once('@')
-            .map_or(self.provider_ref.as_str(), |(_, id)| id)
+        let id = id
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -190,25 +247,28 @@ impl ProfileEnv {
                 }
             })
             .collect::<String>();
-        let codex_home = home
+        let api_key_home = home
             .join(".intent")
-            .join("codex-api-key")
+            .join(spec.dir_name)
             .join(format!("{id}-{digest}"));
-        if let Err(e) = create_private_dir(&codex_home) {
-            tracing::warn!("could not create the Codex home of an API key profile: {e}");
+        if let Err(e) = create_private_dir(&api_key_home) {
+            tracing::warn!(
+                home_key = spec.home_key,
+                "could not create the home of an API key profile: {e}"
+            );
         }
         self.entries.push((
-            "CODEX_HOME".to_owned(),
-            Some(codex_home.to_string_lossy().into_owned()),
+            spec.home_key.to_owned(),
+            Some(api_key_home.to_string_lossy().into_owned()),
         ));
-        self.entries.push((
-            DEFAULT_AUTH_REQUEST.to_owned(),
-            Some(CODEX_API_KEY_AUTH_REQUEST.to_owned()),
-        ));
+        for (key, value) in spec.launch_env {
+            self.entries
+                .push(((*key).to_owned(), Some((*value).to_owned())));
+        }
         self
     }
 
-    /// Whether [`Self::with_codex_api_key_home`] applied: the adapter signs
+    /// Whether [`Self::with_api_key_home`] applied to a Codex profile: the adapter signs
     /// this profile in with its key at launch.
     #[must_use]
     pub fn signs_in_with_codex_api_key(&self) -> bool {
@@ -217,13 +277,10 @@ impl ProfileEnv {
         })
     }
 
-    fn codex_api_key(&self) -> Option<&str> {
-        if !self.provider_ref.starts_with("codex@") {
-            return None;
-        }
+    fn set_value_ignoring_case(&self, key: &str) -> Option<&str> {
         self.entries
             .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case("CODEX_API_KEY"))
+            .filter(|(k, _)| k.eq_ignore_ascii_case(key))
             .find_map(|(_, v)| v.as_deref())
             .filter(|v| !v.is_empty())
     }
@@ -389,7 +446,7 @@ mod tests {
     fn codex_api_key_profile_gets_a_home_per_key_and_the_api_key_sign_in() {
         let home = tempfile::tempdir().unwrap();
         let one = codex(&[("CODEX_API_KEY", Some("sk-one")), ("OPENAI_API_KEY", None)])
-            .with_codex_api_key_home(Some(home.path()));
+            .with_api_key_home(Some(home.path()));
         let path = std::path::PathBuf::from(value(&one, "CODEX_HOME").unwrap());
         assert!(path.starts_with(home.path().join(".intent/codex-api-key")));
         assert!(path
@@ -408,14 +465,128 @@ mod tests {
             .secret_values()
             .contains(&CODEX_API_KEY_AUTH_REQUEST.to_owned()));
         let again =
-            codex(&[("CODEX_API_KEY", Some("sk-one"))]).with_codex_api_key_home(Some(home.path()));
+            codex(&[("CODEX_API_KEY", Some("sk-one"))]).with_api_key_home(Some(home.path()));
         assert_eq!(value(&again, "CODEX_HOME"), value(&one, "CODEX_HOME"));
-        let two =
-            codex(&[("CODEX_API_KEY", Some("sk-two"))]).with_codex_api_key_home(Some(home.path()));
+        let two = codex(&[("CODEX_API_KEY", Some("sk-two"))]).with_api_key_home(Some(home.path()));
         assert_ne!(value(&two, "CODEX_HOME"), value(&one, "CODEX_HOME"));
         // Applying it twice changes nothing.
-        let twice = one.clone().with_codex_api_key_home(Some(home.path()));
+        let twice = one.clone().with_api_key_home(Some(home.path()));
         assert_eq!(twice.entries().count(), one.entries().count());
+    }
+
+    fn profile(reference: &str, entries: &[(&str, Option<&str>)]) -> ProfileEnv {
+        ProfileEnv::new(
+            reference,
+            "f1",
+            entries
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.map(str::to_owned)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn grok_api_key_profile_gets_its_own_grok_home_per_key() {
+        let home = tempfile::tempdir().unwrap();
+        let one = profile("grok@p1", &[("XAI_API_KEY", Some("xai-one"))])
+            .with_api_key_home(Some(home.path()));
+        let path = std::path::PathBuf::from(value(&one, "GROK_HOME").unwrap());
+        assert!(path.starts_with(home.path().join(".intent/grok-api-key")));
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("p1-"));
+        assert!(path.is_dir());
+        assert!(!one.signs_in_with_codex_api_key());
+        let two = profile("grok@p1", &[("XAI_API_KEY", Some("xai-two"))])
+            .with_api_key_home(Some(home.path()));
+        assert_ne!(value(&two, "GROK_HOME"), value(&one, "GROK_HOME"));
+        let twice = one.clone().with_api_key_home(Some(home.path()));
+        assert_eq!(twice.entries().count(), one.entries().count());
+    }
+
+    #[test]
+    fn cursor_api_key_profile_ignores_a_stored_login_and_keeps_its_own_config() {
+        let home = tempfile::tempdir().unwrap();
+        let one = profile(
+            "cursor@p2",
+            &[
+                ("CURSOR_API_KEY", Some("key_one")),
+                ("CURSOR_AUTH_TOKEN", None),
+            ],
+        )
+        .with_api_key_home(Some(home.path()));
+        assert_eq!(value(&one, "AGENT_CLI_CREDENTIAL_STORE"), Some("memory"));
+        let path = std::path::PathBuf::from(value(&one, "CURSOR_CONFIG_DIR").unwrap());
+        assert!(path.starts_with(home.path().join(".intent/cursor-api-key")));
+        assert!(path.is_dir());
+        // The store switch is wiring, not a secret to redact from output.
+        assert!(!one.secret_values().contains(&"memory".to_owned()));
+        let twice = one.clone().with_api_key_home(Some(home.path()));
+        assert_eq!(twice.entries().count(), one.entries().count());
+        // Its own config dir, or a token instead of a key: still no stored
+        // login (the login is not in the config dir), but no Intent dir.
+        for own in [
+            profile(
+                "cursor@p",
+                &[
+                    ("CURSOR_API_KEY", Some("k")),
+                    ("CURSOR_CONFIG_DIR", Some("/c")),
+                ],
+            ),
+            profile("cursor@p", &[("CURSOR_AUTH_TOKEN", Some("t"))]),
+        ] {
+            let after = own.clone().with_api_key_home(Some(home.path()));
+            assert_eq!(value(&after, "AGENT_CLI_CREDENTIAL_STORE"), Some("memory"));
+            assert_eq!(after.entries().count(), own.entries().count() + 1);
+            assert!(!value(&after, "CURSOR_CONFIG_DIR").is_some_and(|v| v.contains(".intent")));
+        }
+    }
+
+    #[test]
+    fn providers_whose_key_wins_and_default_configs_are_left_as_saved() {
+        let home = tempfile::tempdir().unwrap();
+        for profile in [
+            profile("droid@p", &[("FACTORY_API_KEY", Some("fk-1"))]),
+            profile("auggie@p", &[("AUGMENT_SESSION_AUTH", Some("{}"))]),
+            profile("grok", &[("XAI_API_KEY", Some("xai-1"))]),
+            profile("cursor", &[("CURSOR_API_KEY", Some("k"))]),
+            profile(
+                "grok@p",
+                &[("XAI_API_KEY", Some("x")), ("GROK_HOME", Some("/g"))],
+            ),
+            profile(
+                "cursor@p",
+                &[("CURSOR_API_KEY", Some("")), ("HTTPS_PROXY", None)],
+            ),
+        ] {
+            let before = profile.entries().count();
+            let after = profile.clone().with_api_key_home(Some(home.path()));
+            assert_eq!(
+                after.entries().count(),
+                before,
+                "{}",
+                profile.provider_ref()
+            );
+        }
+        assert!(!home.path().join(".intent").exists());
+    }
+
+    #[test]
+    fn account_dir_keys_come_from_every_profile_base() {
+        for key in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"] {
+            assert!(ACCOUNT_DIR_KEYS.contains(&key), "{key}");
+        }
+        assert_eq!(
+            expand_account_dir("grok_home", "~/.grok-work", Some(Path::new("/h"))),
+            "/h/.grok-work"
+        );
+        assert_eq!(
+            expand_account_dir("CURSOR_CONFIG_DIR", "~/.c", Some(Path::new("/h"))),
+            "~/.c"
+        );
     }
 
     #[test]
@@ -433,7 +604,7 @@ mod tests {
             codex(&[("CODEX_API_KEY", Some("sk")), ("CODEX_HOME", Some("/x"))]),
         ] {
             let before = profile.entries().count();
-            let after = profile.clone().with_codex_api_key_home(Some(home.path()));
+            let after = profile.clone().with_api_key_home(Some(home.path()));
             assert_eq!(after.entries().count(), before);
             assert!(!after.signs_in_with_codex_api_key());
         }
