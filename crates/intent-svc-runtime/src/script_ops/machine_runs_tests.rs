@@ -211,7 +211,7 @@ async fn a_machine_run_killed_by_the_memory_limit_reports_why() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
-    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"), None)
         .await
         .unwrap();
     let start = last_start(&rec);
