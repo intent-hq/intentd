@@ -981,6 +981,25 @@ pub struct MergeRequirementCheck {
     pub url: Option<String>,
 }
 
+/// Whether two links of the same check name point at different runs: a
+/// re-run that kept the status (intent-hq/intent#9852). A run is identified
+/// by the last path segment, so GitHub's `/runs/<id>` and Actions
+/// `/actions/runs/<run>/job/<id>` links of one check run match. An absent
+/// link is never evidence of a new run.
+pub(crate) fn is_new_check_run(before: Option<&str>, after: Option<&str>) -> bool {
+    fn run_id(url: &str) -> &str {
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        path.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+    }
+    match (before, after) {
+        (Some(a), Some(b)) => run_id(a) != run_id(b),
+        _ => false,
+    }
+}
+
 /// The `checks` block of the checklist.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

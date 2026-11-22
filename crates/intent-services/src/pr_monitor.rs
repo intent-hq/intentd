@@ -5801,6 +5801,7 @@ mod tests {
     mod quota_regression;
     mod qwen_regression;
     mod registration_visibility;
+    mod rerun_failed_again;
     mod unknown_blip;
     use std::path::PathBuf;
 

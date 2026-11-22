@@ -228,6 +228,12 @@ fn diff_checks(old: &Value, new: &Value) -> Vec<String> {
                 {
                     changes.push(format!("check {name}: {was} → {status}"));
                 }
+                if was == "failed"
+                    && status == "failed"
+                    && crate::pr_ops::is_new_check_run(prior["url"].as_str(), item["url"].as_str())
+                {
+                    changes.push(format!("check {name} failed again on a new run"));
+                }
             }
             if before["requiredKnown"] == true && after["requiredKnown"] == true {
                 if let (Some(a), Some(b)) =
@@ -297,6 +303,32 @@ mod tests {
             diff(&snapshot("failed"), &snapshot("passed")),
             vec!["check build: failed → passed"]
         );
+    }
+
+    /// intent-hq/intent#9852: a failed check whose run changed failed again.
+    #[test]
+    fn qualified_diff_reports_a_failed_rerun_once() {
+        let run = |url: Option<&str>| {
+            let mut s = snapshot("failed");
+            if let Some(url) = url {
+                s["requirements"]["checks"]["items"][0]["url"] = json!(url);
+            }
+            s
+        };
+        let first = run(Some("https://github.com/o/r/runs/1"));
+        let second = run(Some("https://github.com/o/r/runs/2"));
+        assert_eq!(
+            diff(&first, &second),
+            vec!["check build failed again on a new run"]
+        );
+        assert!(diff(&second, &second).is_empty());
+        assert!(diff(
+            &second,
+            &run(Some("https://github.com/o/r/actions/runs/9/job/2"))
+        )
+        .is_empty());
+        assert!(diff(&second, &run(None)).is_empty());
+        assert!(diff(&run(None), &second).is_empty());
     }
 
     #[test]
