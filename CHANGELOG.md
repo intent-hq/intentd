@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.273] - 2026-11-22
+
+### 🚀 Features
+
+- *(scripts)* Record startedBy on script runs ([#3660](https://github.com/intent-hq/intentd/pull/3660))
+
+### 🐛 Bug Fixes
+
+- *(store)* Make Postgres agent queue replaces a compare-and-swap ([#3647](https://github.com/intent-hq/intentd/pull/3647))
+
+
 ## [0.11.272] - 2026-11-22
 
 ### 🐛 Bug Fixes
