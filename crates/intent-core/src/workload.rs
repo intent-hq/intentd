@@ -26,6 +26,7 @@
 
 #[cfg(not(target_os = "linux"))]
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -99,6 +100,7 @@ pub const AGENT_OOM_SCORE_ADJ: i32 = 500;
 pub const TASK_OOM_SCORE_ADJ: i32 = 800;
 
 impl WorkloadKind {
+    #[cfg(target_os = "linux")]
     fn prefix(self) -> &'static str {
         match self {
             Self::Agent => "agent",
@@ -226,6 +228,7 @@ struct State {
     mode: ContainmentMode,
     reason: Option<String>,
     /// `workloads/` in cgroup mode.
+    #[cfg(target_os = "linux")]
     workloads: Option<PathBuf>,
     memory_max_bytes: Option<u64>,
 }
@@ -270,7 +273,6 @@ fn init_state(_config: &ContainmentConfig) -> State {
     State {
         mode: ContainmentMode::None,
         reason: Some("memory containment needs Linux cgroup v2".into()),
-        workloads: None,
         memory_max_bytes: None,
     }
 }
@@ -282,19 +284,22 @@ pub fn status() -> ContainmentStatus {
     let Some(state) = STATE.get() else {
         return ContainmentStatus::without(ContainmentMode::None, "not initialised");
     };
-    let mut status = ContainmentStatus {
+    #[cfg(target_os = "linux")]
+    let (memory_current_bytes, oom_kills) = state.workloads.as_deref().map_or((None, None), |w| {
+        (
+            cgroup::read_u64(&w.join("memory.current")),
+            cgroup::oom_kills(w),
+        )
+    });
+    #[cfg(not(target_os = "linux"))]
+    let (memory_current_bytes, oom_kills) = (None, None);
+    ContainmentStatus {
         mode: state.mode,
         reason: state.reason.clone(),
         memory_max_bytes: state.memory_max_bytes,
-        memory_current_bytes: None,
-        oom_kills: None,
-    };
-    #[cfg(target_os = "linux")]
-    if let Some(workloads) = &state.workloads {
-        status.memory_current_bytes = cgroup::read_u64(&workloads.join("memory.current"));
-        status.oom_kills = cgroup::oom_kills(workloads);
+        memory_current_bytes,
+        oom_kills,
     }
-    status
 }
 
 /// The active mode ([`ContainmentMode::None`] before [`init`]).
@@ -307,6 +312,10 @@ pub fn mode() -> ContainmentMode {
 #[derive(Clone, Debug)]
 pub struct Workload {
     kind: WorkloadKind,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "leaves are Linux-only")
+    )]
     label: String,
 }
 
@@ -341,7 +350,6 @@ impl Workload {
     /// `oom_score_adj` before it runs any code. Keep the returned leaf for as
     /// long as the workload's result matters (memory-limit reporting, stop);
     /// dropping it early is harmless. Never makes the spawn fail.
-    #[cfg_attr(not(target_os = "linux"), expect(clippy::unused_self))]
     pub fn apply(&self, cmd: &mut std::process::Command) -> Option<Leaf> {
         #[cfg(target_os = "linux")]
         {

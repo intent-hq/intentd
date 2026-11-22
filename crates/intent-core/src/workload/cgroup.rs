@@ -206,12 +206,15 @@ pub(super) fn setup(host: &Host, config: &ContainmentConfig) -> Result<Layout, S
 fn box_total(host: &Host, domain: &Path) -> Option<u64> {
     let mut total = host.mem_total;
     let mut dir = Some(domain);
-    while let Some(d) = dir {
-        if !d.starts_with(&host.mount) || d == host.mount {
-            break;
-        }
+    // Up to and including the mount: in a cgroup namespace the mount root
+    // is the container's cgroup and holds its limit (the real root has no
+    // `memory.max`).
+    while let Some(d) = dir.filter(|d| d.starts_with(&host.mount)) {
         if let Some(limit) = read_u64(&d.join("memory.max")) {
             total = Some(total.map_or(limit, |t| t.min(limit)));
+        }
+        if d == host.mount {
+            break;
         }
         dir = d.parent();
     }

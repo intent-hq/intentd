@@ -12,6 +12,14 @@ const GIB: u64 = 1024 * MIB;
 const PID: u32 = 4242;
 const SITTER: u32 = 4241;
 
+/// The leaf registry is process-global: tests that poll or sweep it run
+/// one at a time so one cannot consume another's OOM report.
+fn registry_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn cgroup_dir(path: &Path, procs: &[u32]) {
     fs::create_dir_all(path).unwrap();
     fs::write(path.join("cgroup.controllers"), "cpu memory pids").unwrap();
@@ -223,6 +231,7 @@ fn reserve_bounds() {
 
 #[test]
 fn sweep_removes_only_empty_unowned_leaves() {
+    let _registry = registry_lock();
     let workloads = tempfile::tempdir().unwrap();
     let owned = super::Leaf::create(workloads.path(), WorkloadKind::Script, "script a").unwrap();
     let orphan = workloads.path().join("script-1-99");
@@ -244,6 +253,7 @@ fn sweep_removes_only_empty_unowned_leaves() {
 
 #[test]
 fn oom_kills_are_reported_once_per_increase_for_agent_leaves_only() {
+    let _registry = registry_lock();
     let workloads = tempfile::tempdir().unwrap();
     let agent = super::Leaf::create(workloads.path(), WorkloadKind::Agent, "agent A").unwrap();
     let script = super::Leaf::create(workloads.path(), WorkloadKind::Script, "script S").unwrap();
@@ -273,6 +283,7 @@ fn oom_kills_are_reported_once_per_increase_for_agent_leaves_only() {
 
 #[test]
 fn a_pinned_leaf_outlives_its_handle_until_empty() {
+    let _registry = registry_lock();
     let workloads = tempfile::tempdir().unwrap();
     let leaf = super::Leaf::create(workloads.path(), WorkloadKind::Agent, "agent P").unwrap();
     let path = leaf.path().to_path_buf();
@@ -295,6 +306,7 @@ fn a_pinned_leaf_outlives_its_handle_until_empty() {
 
 #[test]
 fn an_oom_kill_in_an_emptied_pinned_leaf_is_reported_before_release() {
+    let _registry = registry_lock();
     let workloads = tempfile::tempdir().unwrap();
     let leaf = super::Leaf::create(workloads.path(), WorkloadKind::Mcp, "mcp Q").unwrap();
     leaf.pin();
@@ -310,4 +322,22 @@ fn an_oom_kill_in_an_emptied_pinned_leaf_is_reported_before_release() {
             .any(|r| r.label == "mcp Q" && r.new_kills == 1),
         "{reports:?}"
     );
+}
+
+#[test]
+fn the_auto_ceiling_respects_a_limit_on_the_namespace_root() {
+    // A container with its own cgroup namespace: the mount root is the
+    // container's cgroup and carries its memory limit.
+    let mount = tempfile::tempdir().unwrap();
+    cgroup_dir(mount.path(), &[1, PID]);
+    fs::write(mount.path().join("memory.max"), (2 * GIB).to_string()).unwrap();
+    let layout = cgroup::setup(
+        &Host {
+            mem_total: Some(64 * GIB),
+            ..host(mount.path(), "/")
+        },
+        &config(Ceiling::Auto),
+    )
+    .unwrap();
+    assert_eq!(layout.memory_max_bytes, 2 * GIB - 768 * MIB);
 }
