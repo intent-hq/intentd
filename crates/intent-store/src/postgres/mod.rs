@@ -54,6 +54,7 @@ pub use lease::{
     LeaseHeartbeat, LeaseState, TenantClaim, TenantLease, LEASE_FENCE_MARGIN, LEASE_RENEW_INTERVAL,
     LEASE_TTL,
 };
+pub use neki_topology::{neki_topology_gap, NekiTopologyGap};
 
 mod agent_messages;
 mod agents;
@@ -71,6 +72,7 @@ mod hooks;
 mod idempotency;
 mod lease;
 mod mcp_oauth;
+mod neki_topology;
 mod nodes;
 mod note_search;
 mod notes;
@@ -352,24 +354,76 @@ fn pool_options(settings: PoolSettings) -> PgPoolOptions {
 /// [`NEKI_DDL_WAIT`]). Vanilla Postgres has neither function, so there is
 /// nothing to wait for.
 ///
+/// # New tables and the Neki data topology
+///
+/// On Neki, a migration is marked complete only once the data topology keeps
+/// every tenant table of the schema in one shard group ([`neki_topology_gap`]
+/// is `None`). A migration that adds a tenant table to a sharded schema
+/// therefore stops after its last statement, with the new table created and
+/// empty, and fails naming the tables to bind; the ledger shows it part-way,
+/// so the schema gate refuses every open and nothing writes the table yet.
+/// The rollout order is:
+///
+/// 1. run the migrate job; it stops on the gap (or bind the tables first,
+///    if the topology accepts names of tables that do not exist yet);
+/// 2. bind the named tables to [`NekiTopologyGap::shard_group`] with
+///    `__neki.set_data_topology` (role `neki_operator`) and wait for
+///    `__neki.wait_for_data_topology`;
+/// 3. re-run the migrate job: it runs no statement again, finds no gap and
+///    marks the migration complete;
+/// 4. roll out the daemons.
+///
+/// Binding before the first write matters: rows written while the table was
+/// unbound stay on the default group's shard. A schema with no bound tenant
+/// table is not sharded and passes (a one-shard branch, a fresh test schema).
+/// The migrate job's role must be able to call `__neki.get_data_topology()`
+/// (reading needs no `neki_operator`); if it cannot, every Neki run fails,
+/// including one with nothing to apply.
+///
+/// # Transient connection failures
+///
+/// A run whose connection breaks, or whose Neki router loses its connection
+/// to a shard's Postgres (the router reports `write unix
+/// @->/var/run/postgresql/.s.PGSQL.5432: write: broken pipe`), is retried on
+/// a fresh connection, up to [`MIGRATE_ATTEMPTS`] runs in all. A retry is a
+/// re-run: it resumes from the ledger, replaying at most the statement that
+/// failed, which every statement is safe to do (see above). Other failures
+/// are not retried. [`MigrateReport::transient_errors`] lists what was
+/// retried.
+///
 /// # Errors
 /// `Error::Internal` when a statement fails, an applied migration changed,
 /// the schema has a migration this build does not know, the schema was
-/// migrated by the earlier sqlx migrator, or the Neki routers did not see
-/// the DDL within [`NEKI_DDL_WAIT`] (the migrations are applied; re-run).
+/// migrated by the earlier sqlx migrator, the Neki data topology does not
+/// bind a tenant table (bind it and re-run), the connection kept failing for
+/// [`MIGRATE_ATTEMPTS`] runs, or the Neki routers did not see the DDL within
+/// [`NEKI_DDL_WAIT`] (the migrations are applied; re-run).
 pub async fn migrate(pool: &PgPool) -> Result<MigrateReport> {
-    migrate_with(pool, false).await
+    migrate_with(pool, MigrateFaults::default()).await
 }
 
 /// What a [`migrate`] run did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrateReport {
     /// Versions this run completed, ascending; empty when the schema was
-    /// already current.
+    /// already current. After a retry it can miss a version whose
+    /// completion committed while the reply was lost: the ledger is the
+    /// record.
     pub applied: Vec<i64>,
     /// The router versions the run waited for on Neki; `None` on vanilla
     /// Postgres.
     pub neki_ddl: Option<NekiDdlVersions>,
+    /// The transient connection failures the run retried, oldest first.
+    pub transient_errors: Vec<String>,
+}
+
+/// How many times [`migrate`] runs at most when its connection fails
+/// transiently: the first run and two retries.
+pub const MIGRATE_ATTEMPTS: u32 = 3;
+
+/// The pause before retry `retry` (1-based) of a transient failure.
+fn migrate_retry_pause(retry: u32) -> Duration {
+    Duration::from_secs(1 << retry.saturating_sub(1).min(4))
 }
 
 /// A Neki router's applied schema and cluster catalog versions
@@ -390,34 +444,183 @@ pub const NEKI_DDL_WAIT: Duration = Duration::from_secs(120);
 /// As [`migrate`].
 #[doc(hidden)]
 pub async fn migrate_replaying_each_statement(pool: &PgPool) -> Result<MigrateReport> {
-    migrate_with(pool, true).await
+    let faults = MigrateFaults {
+        replay: true,
+        ..MigrateFaults::default()
+    };
+    migrate_with(pool, faults).await
 }
 
-async fn migrate_with(pool: &PgPool, replay: bool) -> Result<MigrateReport> {
-    let mut conn = pool.acquire().await.map_err(db)?.detach();
-    // Schema changes span every shard: undo a single-shard pool's startup
-    // mode on this detached connection, which is closed at the end.
-    sqlx::query(MULTI_SHARD_SQL)
-        .execute(&mut conn)
-        .await
-        .map_err(db)?;
-    sqlx::query("SELECT pg_advisory_lock(hashtextextended('intent-schema-migrations', 0))")
-        .execute(&mut conn)
-        .await
-        .map_err(db)?;
-    let outcome = match migrate_locked(&mut conn, replay).await {
-        Ok(applied) => wait_for_neki_ddl(&mut conn)
-            .await
-            .map(|neki_ddl| MigrateReport { applied, neki_ddl }),
-        Err(e) => Err(e),
+/// [`migrate`], whose first run loses its connection (the server ends the
+/// session) just before statement `statement` (1-based) of migration
+/// `version`: a transient failure it must retry. For the store tests.
+///
+/// # Errors
+/// As [`migrate`].
+#[doc(hidden)]
+pub async fn migrate_losing_the_connection_at(
+    pool: &PgPool,
+    version: i64,
+    statement: usize,
+) -> Result<MigrateReport> {
+    let faults = MigrateFaults {
+        drop_connection_at: Some((version, statement)),
+        ..MigrateFaults::default()
     };
-    let closed = sqlx::Connection::close(conn).await.map_err(db);
-    outcome.and_then(|report| closed.map(|()| report))
+    migrate_with(pool, faults).await
+}
+
+/// Faults the store tests inject into [`migrate`].
+#[derive(Debug, Clone, Copy, Default)]
+struct MigrateFaults {
+    /// Run each statement twice.
+    replay: bool,
+    /// First run only: end the session before this `(version, statement)`.
+    drop_connection_at: Option<(i64, usize)>,
+}
+
+/// Why a migrate run failed, and whether a fresh run may get past it.
+struct MigrateFailure {
+    error: Error,
+    transient: bool,
+}
+
+impl From<Error> for MigrateFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            transient: false,
+        }
+    }
+}
+
+impl MigrateFailure {
+    /// `e` as `describe` words it; transient when its connection failed.
+    fn sql(e: sqlx::Error, describe: impl FnOnce(sqlx::Error) -> Error) -> Self {
+        let transient = transient_connection_error(&e);
+        Self {
+            error: describe(e),
+            transient,
+        }
+    }
+}
+
+fn sql_failure(e: sqlx::Error) -> MigrateFailure {
+    MigrateFailure::sql(e, db)
+}
+
+type Step<T> = std::result::Result<T, MigrateFailure>;
+
+/// Whether `e` means the connection broke rather than the statement failed:
+/// the session ended or the socket failed (`Io`), Postgres reported a
+/// connection exception (class 08) or a shutdown (57P01-57P03), or the Neki
+/// router lost its own connection to a shard's Postgres. The router reports
+/// that as an error response with the socket error as its message (`write
+/// unix @->/var/run/postgresql/.s.PGSQL.5432: write: broken pipe`), and the
+/// client session survives it.
+fn transient_connection_error(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Io(_) => true,
+        sqlx::Error::Database(e) => transient_database_error(e.code().as_deref(), e.message()),
+        _ => false,
+    }
+}
+
+fn transient_database_error(code: Option<&str>, message: &str) -> bool {
+    // 08P01 protocol_violation is a bug, not a lost connection.
+    let code_says = code.is_some_and(|code| {
+        (code.starts_with("08") && code != "08P01") || matches!(code, "57P01" | "57P02" | "57P03")
+    });
+    let message = message.to_ascii_lowercase();
+    code_says
+        || ["broken pipe", "connection reset by peer"]
+            .iter()
+            .any(|socket_error| message.contains(socket_error))
+}
+
+async fn migrate_with(pool: &PgPool, faults: MigrateFaults) -> Result<MigrateReport> {
+    let mut applied = Vec::new();
+    let mut transient_errors = Vec::new();
+    let mut attempt = 1;
+    loop {
+        let faults = if attempt == 1 {
+            faults
+        } else {
+            MigrateFaults {
+                drop_connection_at: None,
+                ..faults
+            }
+        };
+        match migrate_once(pool, faults, &mut applied).await {
+            Ok(neki_ddl) => {
+                return Ok(MigrateReport {
+                    applied,
+                    neki_ddl,
+                    transient_errors,
+                })
+            }
+            Err(failure) if failure.transient && attempt < MIGRATE_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    error = %failure.error,
+                    "postgres migrate lost its connection; resuming on a fresh one"
+                );
+                transient_errors.push(failure.error.to_string());
+                tokio::time::sleep(migrate_retry_pause(attempt)).await;
+                attempt += 1;
+            }
+            Err(MigrateFailure {
+                error: Error::Internal(message),
+                transient: true,
+            }) => {
+                return Err(Error::Internal(format!(
+                    "{message} (the connection failed in each of {MIGRATE_ATTEMPTS} runs; \
+                     re-run the migrate job)"
+                )))
+            }
+            Err(failure) => return Err(failure.error),
+        }
+    }
+}
+
+/// One migrate run on its own connection, detached from the pool and closed
+/// at the end, so the session's advisory lock goes with it. Appends the
+/// versions it completes to `applied`.
+async fn migrate_once(
+    pool: &PgPool,
+    faults: MigrateFaults,
+    applied: &mut Vec<i64>,
+) -> Step<Option<NekiDdlVersions>> {
+    let mut conn = pool.acquire().await.map_err(sql_failure)?.detach();
+    let outcome = migrate_on(&mut conn, faults, applied).await;
+    let closed = sqlx::Connection::close(conn).await;
+    let neki_ddl = outcome?;
+    closed.map_err(sql_failure)?;
+    Ok(neki_ddl)
+}
+
+async fn migrate_on(
+    conn: &mut sqlx::PgConnection,
+    faults: MigrateFaults,
+    applied: &mut Vec<i64>,
+) -> Step<Option<NekiDdlVersions>> {
+    // Schema changes span every shard: undo a single-shard pool's startup
+    // mode on this connection.
+    sqlx::query(MULTI_SHARD_SQL)
+        .execute(&mut *conn)
+        .await
+        .map_err(sql_failure)?;
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended('intent-schema-migrations', 0))")
+        .execute(&mut *conn)
+        .await
+        .map_err(sql_failure)?;
+    migrate_locked(conn, faults, applied).await?;
+    wait_for_neki_ddl(conn).await
 }
 
 /// On Neki, waits until every router has the DDL this connection's router
 /// applied; `None` on vanilla Postgres, which has no `__neki` functions.
-async fn wait_for_neki_ddl(conn: &mut sqlx::PgConnection) -> Result<Option<NekiDdlVersions>> {
+async fn wait_for_neki_ddl(conn: &mut sqlx::PgConnection) -> Step<Option<NekiDdlVersions>> {
     let versions: std::result::Result<(i64, i64), sqlx::Error> =
         sqlx::query_as("SELECT schema_version, cluster_version FROM __neki.ddl_versions()")
             .fetch_one(&mut *conn)
@@ -431,7 +634,11 @@ async fn wait_for_neki_ddl(conn: &mut sqlx::PgConnection) -> Result<Option<NekiD
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("3F000") => {
             return Ok(None);
         }
-        Err(e) => return Err(Error::Internal(format!("neki ddl_versions failed: {e}"))),
+        Err(e) => {
+            return Err(MigrateFailure::sql(e, |e| {
+                Error::Internal(format!("neki ddl_versions failed: {e}"))
+            }))
+        }
     };
     sqlx::query("SELECT __neki.wait_for_ddl($1, $2, make_interval(secs => $3))")
         .bind(schema_version)
@@ -440,17 +647,52 @@ async fn wait_for_neki_ddl(conn: &mut sqlx::PgConnection) -> Result<Option<NekiD
         .execute(&mut *conn)
         .await
         .map_err(|e| {
-            Error::Internal(format!(
-                "postgres migrations are applied, but not every Neki router saw the DDL \
-                 (schema version {schema_version}, cluster version {cluster_version}) within \
-                 {} s; re-run the migrate job: {e}",
-                NEKI_DDL_WAIT.as_secs()
-            ))
+            MigrateFailure::sql(e, |e| {
+                Error::Internal(format!(
+                    "postgres migrations are applied, but not every Neki router saw the DDL \
+                     (schema version {schema_version}, cluster version {cluster_version}) within \
+                     {} s; re-run the migrate job: {e}",
+                    NEKI_DDL_WAIT.as_secs()
+                ))
+            })
         })?;
     Ok(Some(NekiDdlVersions {
         schema_version,
         cluster_version,
     }))
+}
+
+/// On Neki, fails while the data topology does not keep the schema's tenant
+/// tables together (see [`migrate`]); `migration` is the one about to be
+/// marked complete, `None` for a run that completed none.
+async fn refuse_topology_gap(
+    conn: &mut sqlx::PgConnection,
+    migration: Option<&sqlx::migrate::Migration>,
+) -> Step<()> {
+    let gap = neki_topology::topology_gap(conn).await.map_err(|e| {
+        MigrateFailure::sql(e, |e| {
+            Error::Internal(format!("reading the Neki data topology failed: {e}"))
+        })
+    })?;
+    let Some(gap) = gap else {
+        return Ok(());
+    };
+    let group = &gap.shard_group;
+    let message = match migration {
+        Some(m) => format!(
+            "postgres migration {} ({}) ran every statement but is not marked complete: {gap}. \
+             Bind those tables to shard group {group} (__neki.set_data_topology, role \
+             neki_operator) before anything writes them, then re-run migrate; until then the \
+             schema gate refuses every open",
+            m.version, m.description
+        ),
+        None => format!(
+            "postgres migrations are applied, but {gap}. Bind those tables to shard group \
+             {group} (__neki.set_data_topology, role neki_operator) and re-run migrate; rows \
+             written to them so far are on the default shard group"
+        ),
+    };
+    Err(Error::Internal(message).into())
 }
 
 /// The schema gate every serving daemon passes before it writes: the
@@ -568,8 +810,13 @@ fn schema_mismatch(
 /// `(version, checksum, applied_statements, applied_prefix, complete)`.
 type LedgerRow = (i64, Vec<u8>, i32, Vec<u8>, bool);
 
-/// Returns the versions this run completed.
-async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<Vec<i64>> {
+/// Applies what the ledger lacks; appends the versions it completes to
+/// `completed`.
+async fn migrate_locked(
+    conn: &mut sqlx::PgConnection,
+    faults: MigrateFaults,
+    completed: &mut Vec<i64>,
+) -> Step<()> {
     // The applied-migration ledger belongs to the schema, not to a tenant.
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS intent_schema_migrations \
@@ -579,27 +826,28 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<V
     )
     .execute(&mut *conn)
     .await
-    .map_err(db)?;
+    .map_err(sql_failure)?;
     let applied: Vec<LedgerRow> = sqlx::query_as(
         "SELECT version, checksum, applied_statements, applied_prefix, complete \
          FROM intent_schema_migrations ORDER BY version",
     )
     .fetch_all(&mut *conn)
     .await
-    .map_err(db)?;
+    .map_err(sql_failure)?;
     if applied.is_empty() {
         let (legacy,): (bool,) =
             sqlx::query_as("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
                 .fetch_one(&mut *conn)
                 .await
-                .map_err(db)?;
+                .map_err(sql_failure)?;
         if legacy {
             return Err(Error::Internal(
                 "postgres schema was migrated by the earlier sqlx migrator \
                  (_sqlx_migrations) and has no intent_schema_migrations record; \
                  recreate the schema"
                     .into(),
-            ));
+            )
+            .into());
         }
     }
     if let Some((version, ..)) = applied
@@ -608,9 +856,15 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<V
     {
         return Err(Error::Internal(format!(
             "postgres migration {version} is applied but unknown to this build"
-        )));
+        ))
+        .into());
     }
-    let mut completed = Vec::new();
+    // Only Neki has a data topology to check (`__neki.get_data_topology()`).
+    let (neki,): (bool,) = sqlx::query_as("SELECT to_regnamespace('__neki') IS NOT NULL")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(sql_failure)?;
+    let mut completed_any = false;
     for migration in MIGRATOR.iter() {
         let version = migration.version;
         let stmts = statements(migration.sql.as_str());
@@ -619,7 +873,8 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<V
                 if checksum.as_slice() != migration.checksum.as_ref() {
                     return Err(Error::Internal(format!(
                         "postgres migration {version} changed after it was applied"
-                    )));
+                    ))
+                    .into());
                 }
                 continue;
             }
@@ -629,7 +884,8 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<V
                     return Err(Error::Internal(format!(
                         "postgres migration {version} stopped after {done} statements, and \
                          those statements changed since; restore them or repair the schema"
-                    )));
+                    ))
+                    .into());
                 }
                 done
             }
@@ -645,22 +901,30 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<V
                 .bind(prefix_hash(&[]))
                 .execute(&mut *conn)
                 .await
-                .map_err(db)?;
+                .map_err(sql_failure)?;
                 0
             }
         };
         for (i, statement) in stmts.iter().enumerate().skip(start) {
             let done = i32::try_from(i + 1).map_err(db)?;
-            for _ in 0..=usize::from(replay) {
+            if faults.drop_connection_at == Some((version, i + 1)) {
+                // The server ends this session, as a lost router would.
+                let _ = sqlx::query("SELECT pg_terminate_backend(pg_backend_pid())")
+                    .execute(&mut *conn)
+                    .await;
+            }
+            for _ in 0..=usize::from(faults.replay) {
                 sqlx::raw_sql(sqlx::AssertSqlSafe((*statement).to_owned()))
                     .execute(&mut *conn)
                     .await
                     .map_err(|e| {
-                        Error::Internal(format!(
-                            "postgres migration {version} ({}) statement {} failed: {e}",
-                            migration.description,
-                            i + 1
-                        ))
+                        MigrateFailure::sql(e, |e| {
+                            Error::Internal(format!(
+                                "postgres migration {version} ({}) statement {} failed: {e}",
+                                migration.description,
+                                i + 1
+                            ))
+                        })
                     })?;
             }
             sqlx::query(
@@ -672,7 +936,10 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<V
             .bind(prefix_hash(&stmts[..=i]))
             .execute(&mut *conn)
             .await
-            .map_err(db)?;
+            .map_err(sql_failure)?;
+        }
+        if neki {
+            refuse_topology_gap(conn, Some(migration)).await?;
         }
         sqlx::query(
             "UPDATE intent_schema_migrations \
@@ -684,10 +951,16 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection, replay: bool) -> Result<V
         .bind(migration.description.as_ref())
         .execute(&mut *conn)
         .await
-        .map_err(db)?;
+        .map_err(sql_failure)?;
         completed.push(version);
+        completed_any = true;
     }
-    Ok(completed)
+    if neki && !completed_any {
+        // A schema migrated before this check (or a topology changed since)
+        // still fails the job, though the gate already lets daemons in.
+        refuse_topology_gap(conn, None).await?;
+    }
+    Ok(())
 }
 
 /// Identifies the statements a part-way migration already applied.
@@ -1381,10 +1654,66 @@ impl PgStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_lock_attempt, retry_backoff, schema_mismatch, statements, with_bundled_root_cert,
-        WriterLimits, MIGRATOR,
+        migrate_retry_pause, next_lock_attempt, retry_backoff, schema_mismatch, statements,
+        transient_connection_error, transient_database_error, with_bundled_root_cert, WriterLimits,
+        MIGRATE_ATTEMPTS, MIGRATOR,
     };
     use std::time::Duration;
+
+    /// The Neki router's own socket error, from the failing sharded runs
+    /// (migrations 3 and 12, and before the first statement): an error
+    /// response, not a broken client connection.
+    #[test]
+    fn a_neki_router_broken_pipe_is_transient() {
+        let router = "write unix @->/var/run/postgresql/.s.PGSQL.5432: write: broken pipe";
+        assert!(transient_database_error(None, router));
+        assert!(transient_database_error(Some("XX000"), router));
+        assert!(transient_database_error(
+            Some("XX000"),
+            "read tcp 10.0.0.1:5432: read: Connection reset by peer"
+        ));
+    }
+
+    #[test]
+    fn connection_exceptions_and_shutdowns_are_transient() {
+        for code in ["08000", "08003", "08006", "57P01", "57P02", "57P03"] {
+            assert!(transient_database_error(Some(code), "x"), "{code}");
+        }
+        assert!(!transient_database_error(
+            Some("08P01"),
+            "invalid message format"
+        ));
+        let io = sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert!(transient_connection_error(&io));
+    }
+
+    /// A statement's own failure must surface at once: a retry would only
+    /// repeat it, and NK313 or a lock timeout is not a lost connection.
+    #[test]
+    fn statement_failures_are_not_transient() {
+        for (code, message) in [
+            ("42601", "syntax error at or near \"TABLE\""),
+            ("42P07", "relation \"note\" already exists"),
+            ("55P03", "canceling statement due to lock timeout"),
+            ("57014", "canceling statement due to statement timeout"),
+            (
+                "NK313",
+                "__neki.tx_mode = 'single' forbids a transaction from touching more than one shard",
+            ),
+        ] {
+            assert!(!transient_database_error(Some(code), message), "{code}");
+        }
+        assert!(!transient_connection_error(&sqlx::Error::PoolTimedOut));
+        assert!(!transient_connection_error(&sqlx::Error::RowNotFound));
+    }
+
+    #[test]
+    fn migrate_retries_are_bounded_and_back_off() {
+        assert_eq!(MIGRATE_ATTEMPTS, 3);
+        assert_eq!(migrate_retry_pause(1), Duration::from_secs(1));
+        assert_eq!(migrate_retry_pause(2), Duration::from_secs(2));
+        assert_eq!(migrate_retry_pause(40), Duration::from_secs(16));
+    }
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
 

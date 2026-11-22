@@ -183,7 +183,15 @@ async fn migrate_fails_when_neki_ddl_versions_is_missing() {
     let Some((_, admin)) = empty_db().await else {
         return;
     };
-    exec(&admin, "CREATE SCHEMA __neki".to_owned()).await;
+    // An empty data topology, so only ddl_versions() is missing.
+    exec(
+        &admin,
+        "CREATE SCHEMA __neki; \
+         CREATE FUNCTION __neki.get_data_topology() RETURNS text \
+         LANGUAGE sql AS $$ SELECT '{}'::text $$"
+            .to_owned(),
+    )
+    .await;
     let err = postgres::migrate(&admin)
         .await
         .expect_err("a __neki schema without ddl_versions() must not pass as vanilla")
@@ -201,4 +209,174 @@ async fn sqlite_open_still_migrates_itself() {
     let status = store.migration_status().await.unwrap();
     assert!(status.is_current(), "{status:?}");
     assert!(!status.applied.is_empty());
+}
+
+/// A fake `__neki` schema on vanilla Postgres: a data topology that binds
+/// every table with a `tenant_id` column of the current schema to shard
+/// group `tenant_data`, except those named in `__neki.unbound`, with `sh1` as
+/// the default group; `ddl_versions()` and a `wait_for_ddl` that returns at
+/// once.
+const FAKE_NEKI: &str = "CREATE SCHEMA __neki; \
+    CREATE TABLE __neki.unbound (name text PRIMARY KEY); \
+    CREATE FUNCTION __neki.get_data_topology() RETURNS text LANGUAGE sql AS $$ \
+      SELECT json_build_object( \
+        'default_shard_group', 'sh1', 'authoritative_shard_group', 'sh1', \
+        'databases', json_build_object(current_database(), json_build_object('schemas', \
+          json_build_object(current_schema(), json_build_object('tables', \
+            COALESCE((SELECT json_object_agg(c.relname, \
+                        json_build_object('shard_group', 'tenant_data')) \
+                      FROM pg_class c \
+                      WHERE c.relnamespace = current_schema()::regnamespace \
+                        AND c.relkind = 'r' \
+                        AND EXISTS (SELECT 1 FROM pg_attribute a \
+                                    WHERE a.attrelid = c.oid AND a.attname = 'tenant_id') \
+                        AND c.relname NOT IN (SELECT name FROM __neki.unbound)), \
+                     '{}'::json))))))::text $$; \
+    CREATE FUNCTION __neki.ddl_versions(OUT schema_version bigint, OUT cluster_version bigint) \
+      LANGUAGE sql AS $$ SELECT 1::bigint, 1::bigint $$; \
+    CREATE FUNCTION __neki.wait_for_ddl(bigint, bigint, interval) RETURNS void \
+      LANGUAGE plpgsql AS $$ BEGIN END $$;";
+
+/// The migration that adds `tenant_lease`, the table the sharded run found
+/// unbound.
+const TENANT_LEASE_MIGRATION: i64 = 11;
+
+/// The sharded Neki run on #3642: the topology bound every tenant table but
+/// `tenant_lease`, so claims (which lock `tenant_writer` and `tenant_lease`
+/// in one single-shard transaction) would fail for every tenant off the
+/// default shard. On Neki, migrate must stop before it marks the migration
+/// that adds such a table complete, so the gate keeps daemons out until the
+/// table is bound, and finish it on the re-run once it is.
+#[tokio::test]
+async fn migrate_stops_while_the_neki_topology_leaves_a_tenant_table_unbound() {
+    let Some((_, admin)) = empty_db().await else {
+        return;
+    };
+    exec(&admin, FAKE_NEKI.to_owned()).await;
+    exec(
+        &admin,
+        "INSERT INTO __neki.unbound VALUES ('tenant_lease')".to_owned(),
+    )
+    .await;
+
+    let err = postgres::migrate(&admin)
+        .await
+        .expect_err("an unbound tenant table must stop migrate on Neki")
+        .to_string();
+    assert!(
+        err.contains(&format!("migration {TENANT_LEASE_MIGRATION} "))
+            && err.contains("not bound: tenant_lease")
+            && err.contains("tenant_data")
+            && err.contains("set_data_topology"),
+        "{err}"
+    );
+    // The table exists (empty), but the migration is part-way: the gate
+    // refuses every open, so nothing writes it before it is bound.
+    let mismatch = refused(&admin, "unbound-lease").await;
+    assert_eq!(mismatch.part_way, vec![TENANT_LEASE_MIGRATION]);
+    let gap = postgres::neki_topology_gap(&admin)
+        .await
+        .expect("read the topology")
+        .expect("tenant_lease is unbound");
+    assert_eq!(gap.shard_group, "tenant_data");
+    assert_eq!(gap.unbound, vec!["tenant_lease".to_owned()]);
+    assert_eq!(gap.schema, "public");
+
+    // The operator binds it; the re-run runs no statement again and
+    // completes the migration.
+    exec(&admin, "DELETE FROM __neki.unbound".to_owned()).await;
+    assert_eq!(postgres::neki_topology_gap(&admin).await.unwrap(), None);
+    let resumed = postgres::migrate(&admin).await.expect("migrate once bound");
+    let rest: Vec<i64> = expected_versions()
+        .into_iter()
+        .filter(|v| *v >= TENANT_LEASE_MIGRATION)
+        .collect();
+    assert_eq!(resumed.applied, rest);
+    assert!(resumed.neki_ddl.is_some());
+    postgres::check_schema(&admin)
+        .await
+        .expect("the gate passes once the table is bound");
+
+    // A topology that loses a binding later still fails the migrate job,
+    // though the ledger is complete.
+    exec(
+        &admin,
+        "INSERT INTO __neki.unbound VALUES ('tenant_lease')".to_owned(),
+    )
+    .await;
+    let drift = postgres::migrate(&admin)
+        .await
+        .expect_err("a later gap fails the job")
+        .to_string();
+    assert!(
+        drift.contains("migrations are applied, but") && drift.contains("tenant_lease"),
+        "{drift}"
+    );
+}
+
+/// A schema the Neki topology does not shard (no bound tenant table, as a
+/// fresh test schema or a one-shard branch) migrates as before.
+#[tokio::test]
+async fn migrate_passes_on_neki_when_the_schema_is_not_sharded() {
+    let Some((_, admin)) = empty_db().await else {
+        return;
+    };
+    exec(&admin, FAKE_NEKI.to_owned()).await;
+    // Every tenant table unbound: all of them on the default group.
+    exec(
+        &admin,
+        "CREATE OR REPLACE FUNCTION __neki.get_data_topology() RETURNS text \
+         LANGUAGE sql AS $$ SELECT '{\"default_shard_group\": \"sh1\"}'::text $$"
+            .to_owned(),
+    )
+    .await;
+    let report = postgres::migrate(&admin).await.expect("migrate");
+    assert_eq!(report.applied, expected_versions());
+    assert_eq!(postgres::neki_topology_gap(&admin).await.unwrap(), None);
+}
+
+/// Like `ddl_versions()`: a `__neki` schema without `get_data_topology()`
+/// is a changed Neki, not vanilla Postgres, so migrate fails rather than
+/// skip the check; no migration is marked complete.
+#[tokio::test]
+async fn migrate_fails_when_neki_get_data_topology_is_missing() {
+    let Some((_, admin)) = empty_db().await else {
+        return;
+    };
+    exec(&admin, "CREATE SCHEMA __neki".to_owned()).await;
+    let err = postgres::migrate(&admin)
+        .await
+        .expect_err("a __neki schema without get_data_topology() must not pass")
+        .to_string();
+    assert!(err.contains("get_data_topology"), "{err}");
+    assert_eq!(
+        refused(&admin, "no-topology").await.applied,
+        Vec::<i64>::new()
+    );
+}
+
+/// The sharded Neki runs lost migrate's connection part-way ("write: broken
+/// pipe" from the router, in migrations 3 and 12). Migrate resumes on a
+/// fresh connection from the ledger and finishes, and reports the retry.
+#[tokio::test]
+async fn migrate_resumes_on_a_fresh_connection_after_losing_its_own() {
+    let Some((_, admin)) = empty_db().await else {
+        return;
+    };
+    let report = postgres::migrate_losing_the_connection_at(&admin, 3, 5)
+        .await
+        .expect("migrate retries a lost connection");
+    assert_eq!(report.applied, expected_versions());
+    assert_eq!(report.transient_errors.len(), 1, "{report:?}");
+    assert!(
+        report.transient_errors[0].contains("migration 3 ")
+            && report.transient_errors[0].contains("statement 5 "),
+        "{report:?}"
+    );
+    postgres::check_schema(&admin)
+        .await
+        .expect("the gate passes after the resumed run");
+    let again = postgres::migrate(&admin).await.expect("second migrate");
+    assert_eq!(again.applied, Vec::<i64>::new());
+    assert!(again.transient_errors.is_empty());
 }
