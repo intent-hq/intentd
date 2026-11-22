@@ -700,6 +700,18 @@ only on a fresh install: re-installing never switches a computer to or from Orch
 (it keeps its current role and says so). A
 remote machine's actions include **Edit** and **Connect**, with **Test connection** inside
 its editing panel.
+Pending frontend release (not in current builds): the page becomes **Settings → Hosts**.
+Hosts are the Intent servers the user connects to. Runners are the computers a host runs
+agents on: other hosts allowed to, runner-only installs (formerly nodes) and cloud entries.
+The machine rail becomes the host rail. A host row has a **Switch to** button instead of the
+**Connect** action (the host on screen shows **Current**; runner-only rows have neither): it
+adds the host to the window's host rail when the rail is on, shows it, and opens its
+**Settings → Hosts**. This computer's row reads **This computer**, and the host on screen
+shows its plain name (no **(connected backend)**). An orchestrator's row shows a hub icon after its name (tooltip **Host
+only: sends agents to runners**) instead of a subtitle. A saved host stays under Hosts even
+when it also runs agents for the current host. **Set up a new machine** becomes **Set up a
+host or runner**, with **Install a host** and **Install a runner**.
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{HostOnlyMarker,MachineOrderPlainRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{machine-order,start-on}.ts. -->
 <!-- Labs (SSH machine setup, desktop app only): describe only when the user asks about
 installing over SSH, and say it is Labs (turn on **SSH machine setup** in
 Settings → Advanced → Labs). With it on, the install cards also offer
@@ -720,7 +732,8 @@ actions can also include **Let <backend> run agents here**, which asks to confir
 listed under **Machines <backend> can run agents on**.
 Running agents on those machines is experimental. That list is in the user's order of
 preference, and its first row is marked **Preferred**: **This computer** first by default, then machines and cloud entries as they
-were added. Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
+were added (pending frontend release: the list is **Runners for <host>**, with no
+**Preferred** mark, and the host's own row shows its name with **This host**). Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
 menu. In **Where <backend> runs agents**, a row shows a status badge only when it cannot run
 agents (such as **Unreachable**, **Update required** or **Key rejected**). An agent started without a **Start on** choice runs on the first row that can run
 it; a sub-agent started by an agent on this computer stays here. A backend started as an
@@ -728,10 +741,15 @@ orchestrator (`intentd serve --orchestrator`, experimental) runs every agent on 
 machines: its list has no **This computer** row, and **Settings → Providers** shows only
 the enable switches and profiles, with no **Test** button and no sign-in status. On an
 orchestrator, **Start on** offers **First available machine** instead of the backend, plus
-each machine. Pending frontend release (not in current builds): first-run onboarding on an
-orchestrator checks only git (no Node.js), shows each provider card as **Runs on your
-machines** with no install or sign-in step, and keeps **Let's go** disabled with a link to
-**Settings → Machines** while its machine list is empty (an orchestrator shows **Settings → Machines**
+each machine. Pending frontend release (not in current builds): the picker, labelled
+**Runner**, drops **First available machine** and preselects the first row in the host's
+order that can take the agent (the host itself when it runs agents and comes first); an
+orchestrator has no row of its own. Choosing the host always starts the agent there. API callers that
+omit the placement still get the first available runner. A backend choice saved before this
+change follows the order too. Also pending: first-run onboarding on an
+orchestrator checks only git (no Node.js), shows each provider card as **Runs on a
+runner** with no install or sign-in step, and keeps **Let's go** disabled with a link to
+**Settings → Hosts** while its runner list is empty (an orchestrator shows **Settings → Hosts**
 and reads that list without the Labs **Remote agents** switch; if the list can't be read,
 onboarding does not block). Also pending: on an orchestrator, onboarding and **Settings →
 Providers** offer only Claude Code and Codex (in Settings, another provider stays listed
