@@ -175,6 +175,72 @@ async fn open_on_a_legacy_sqlx_schema_says_to_recreate_it() {
     assert!(migrate.contains("recreate the schema"), "{migrate}");
 }
 
+/// The numbered Postgres migrations (versions 1 to 15) are one schema file
+/// now. A schema left at that history must not be reused or "upgraded": the
+/// gate and the migrate job both say to recreate it, and migrate changes
+/// nothing.
+#[tokio::test]
+async fn a_schema_left_at_the_numbered_migrations_says_to_recreate_it() {
+    let Some((_, admin)) = empty_db().await else {
+        return;
+    };
+    // What a run of the numbered migrations left: `0001_compat.sql`'s
+    // checksum (SHA-384) on version 1, then versions 2 to 15.
+    let compat_checksum = "d7858ba9e8b41588417655e346f4c2565b812c941edf2368114bb67655ef700f\
+                           b85f8a20b801421a578de19c6996ba1f";
+    let rows: Vec<String> = (1..=15)
+        .map(|v| {
+            let (description, checksum) = if v == 1 {
+                ("compat", compat_checksum)
+            } else {
+                ("numbered", "00")
+            };
+            format!("({v}, '{description}', '\\x{checksum}', 1, '\\x00', true)")
+        })
+        .collect();
+    exec(
+        &admin,
+        format!(
+            "CREATE TABLE intent_schema_migrations \
+             (version bigint PRIMARY KEY, description text NOT NULL, checksum bytea NOT NULL, \
+              applied_statements integer NOT NULL, applied_prefix bytea NOT NULL, \
+              complete boolean NOT NULL, applied_at timestamptz NOT NULL DEFAULT now()); \
+             INSERT INTO intent_schema_migrations \
+             (version, description, checksum, applied_statements, applied_prefix, complete) \
+             VALUES {}",
+            rows.join(", ")
+        ),
+    )
+    .await;
+    let objects = public_objects(&admin).await;
+
+    let mismatch = refused(&admin, "numbered").await;
+    assert!(mismatch.folded_history, "{mismatch:?}");
+    assert_eq!(mismatch.applied, (1..=15).collect::<Vec<i64>>());
+    let message = Error::SchemaMismatch(Box::new(mismatch)).to_string();
+    assert!(message.contains("recreate the schema"), "{message}");
+
+    let migrate = postgres::migrate(&admin).await.unwrap_err().to_string();
+    assert!(
+        migrate.contains("numbered Postgres migrations") && migrate.contains("recreate the schema"),
+        "{migrate}"
+    );
+    assert_eq!(
+        public_objects(&admin).await,
+        objects,
+        "migrate changed nothing"
+    );
+
+    // Recreated, the schema migrates and opens.
+    exec(&admin, "DROP TABLE intent_schema_migrations".to_owned()).await;
+    postgres::migrate(&admin)
+        .await
+        .expect("migrate the recreated schema");
+    postgres::check_schema(&admin)
+        .await
+        .expect("the gate passes on the recreated schema");
+}
+
 /// Only a missing `__neki` schema means "not Neki". A `__neki` schema
 /// without `ddl_versions()` (renamed or changed on a Neki upgrade) must fail
 /// the migrate job, not skip the wait for the routers.
@@ -238,8 +304,8 @@ const FAKE_NEKI: &str = "CREATE SCHEMA __neki; \
       LANGUAGE plpgsql AS $$ BEGIN END $$;";
 
 /// The migration that adds `tenant_lease`, the table the sharded run found
-/// unbound.
-const TENANT_LEASE_MIGRATION: i64 = 11;
+/// unbound: the one schema file.
+const TENANT_LEASE_MIGRATION: i64 = 1;
 
 /// The sharded Neki run on #3642: the topology bound every tenant table but
 /// `tenant_lease`, so claims (which lock `tenant_writer` and `tenant_lease`
@@ -356,21 +422,23 @@ async fn migrate_fails_when_neki_get_data_topology_is_missing() {
 }
 
 /// The sharded Neki runs lost migrate's connection part-way ("write: broken
-/// pipe" from the router, in migrations 3 and 12). Migrate resumes on a
+/// pipe" from the router, in the tables and triggers). Migrate resumes on a
 /// fresh connection from the ledger and finishes, and reports the retry.
 #[tokio::test]
 async fn migrate_resumes_on_a_fresh_connection_after_losing_its_own() {
     let Some((_, admin)) = empty_db().await else {
         return;
     };
-    let report = postgres::migrate_losing_the_connection_at(&admin, 3, 5)
+    // Well into the file: past the compatibility functions and the tables.
+    let (version, statement) = (expected_versions()[0], 250);
+    let report = postgres::migrate_losing_the_connection_at(&admin, version, statement)
         .await
         .expect("migrate retries a lost connection");
     assert_eq!(report.applied, expected_versions());
     assert_eq!(report.transient_errors.len(), 1, "{report:?}");
     assert!(
-        report.transient_errors[0].contains("migration 3 ")
-            && report.transient_errors[0].contains("statement 5 "),
+        report.transient_errors[0].contains(&format!("migration {version} "))
+            && report.transient_errors[0].contains(&format!("statement {statement} ")),
         "{report:?}"
     );
     postgres::check_schema(&admin)

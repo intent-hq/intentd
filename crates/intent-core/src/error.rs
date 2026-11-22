@@ -881,6 +881,10 @@ pub struct SchemaMismatch {
     /// The schema has no ledger rows but was migrated by the earlier sqlx
     /// migrator (`_sqlx_migrations`), which the migrate job refuses.
     pub legacy_sqlx: bool,
+    /// The ledger records the numbered Postgres migrations (`0001_compat`
+    /// to `0015_delete_grace`) that were folded into one schema file. The
+    /// migrate job refuses such a schema: recreate it.
+    pub folded_history: bool,
 }
 
 impl SchemaMismatch {
@@ -913,13 +917,18 @@ impl std::fmt::Display for SchemaMismatch {
         if !self.changed.is_empty() {
             write!(f, "; changed since they were applied: {:?}", self.changed)?;
         }
-        // The first fix that applies; the migrate job refuses the first three.
+        // The first fix that applies; the migrate job refuses the first four.
         let unknown = self.unknown();
         if self.legacy_sqlx {
             f.write_str(
                 "; the schema was migrated by the earlier sqlx migrator (_sqlx_migrations) \
                  and has no intent_schema_migrations record: recreate the schema, then run \
                  the migrate job",
+            )
+        } else if self.folded_history {
+            f.write_str(
+                "; the schema was built from the numbered Postgres migrations that are now \
+                 one schema file: recreate the schema, then run the migrate job",
             )
         } else if !unknown.is_empty() {
             write!(
@@ -928,9 +937,11 @@ impl std::fmt::Display for SchemaMismatch {
                  knows every applied migration"
             )
         } else if !self.changed.is_empty() {
+            // While nobody runs Postgres the schema file is edited in place,
+            // so a changed file is the usual case.
             f.write_str(
-                "; a migration file changed after it was applied: restore it, or repair the \
-                 schema by hand",
+                "; a migration file changed after it was applied: restore it, or recreate \
+                 the schema and run the migrate job",
             )
         } else {
             f.write_str("; run the migrate job with this build, then start the daemon")

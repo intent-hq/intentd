@@ -51,6 +51,7 @@ fn schema_mismatch_code_and_display() {
             changed,
             part_way,
             legacy_sqlx: false,
+            folded_history: false,
         }))
     };
     let missing = mismatch(vec![1], vec![], vec![]);
@@ -75,10 +76,15 @@ fn schema_mismatch_code_and_display() {
         "{changed}"
     );
     assert!(
-        changed.contains("restore it, or repair the schema"),
+        changed.contains("restore it, or recreate the schema"),
         "{changed}"
     );
-    assert!(!changed.contains("run the migrate job"), "{changed}");
+    // Not "run the migrate job" alone: migrate refuses a changed file.
+    assert!(
+        !changed.contains("run the migrate job with this build"),
+        "{changed}"
+    );
+    assert!(changed.contains("recreate the schema and run"), "{changed}");
     let newer = mismatch(vec![1, 2, 3], vec![2], vec![]).to_string();
     assert!(
         newer.contains("newer than this build (unknown [3])"),
@@ -90,10 +96,26 @@ fn schema_mismatch_code_and_display() {
         changed: vec![],
         part_way: vec![],
         legacy_sqlx: true,
+        folded_history: false,
     }))
     .to_string();
     assert!(legacy.contains("earlier sqlx migrator"), "{legacy}");
     assert!(legacy.contains("recreate the schema"), "{legacy}");
+    // A schema left at the numbered migrations before they were folded into
+    // one file: its versions 2-15 are unknown, but the repair is recreating
+    // it, not a newer build.
+    let folded = Error::SchemaMismatch(Box::new(SchemaMismatch {
+        applied: (1..=15).collect(),
+        expected: vec![1],
+        changed: vec![1],
+        part_way: vec![],
+        legacy_sqlx: false,
+        folded_history: true,
+    }))
+    .to_string();
+    assert!(folded.contains("numbered Postgres migrations"), "{folded}");
+    assert!(folded.contains("recreate the schema"), "{folded}");
+    assert!(!folded.contains("newer than this build"), "{folded}");
     // An unknown version a newer build left part-way is a newer schema too.
     let newer_part_way = mismatch(vec![1, 2], vec![], vec![3]).to_string();
     assert!(

@@ -263,14 +263,14 @@ async fn migrate_resumes_a_part_way_file_and_refuses_unknown_history() {
         return;
     };
     let ledger = |sql: &str| exec(&db.admin, sql.to_owned());
-    // Every statement of 0002 committed, but the run stopped before the file
+    // Every statement of the schema file committed, but the run stopped before it
     // was marked complete: a re-run must not repeat its CREATE TABLEs.
-    ledger("UPDATE intent_schema_migrations SET complete = false WHERE version = 2").await;
+    ledger("UPDATE intent_schema_migrations SET complete = false WHERE version = 1").await;
     postgres::migrate(&db.admin)
         .await
         .expect("resume after the last applied statement");
     let (complete,): (bool,) =
-        sqlx::query_as("SELECT complete FROM intent_schema_migrations WHERE version = 2")
+        sqlx::query_as("SELECT complete FROM intent_schema_migrations WHERE version = 1")
             .fetch_one(&db.admin)
             .await
             .unwrap();
@@ -278,12 +278,12 @@ async fn migrate_resumes_a_part_way_file_and_refuses_unknown_history() {
 
     ledger(
         "UPDATE intent_schema_migrations SET complete = false, applied_prefix = '\\x00' \
-         WHERE version = 2",
+         WHERE version = 1",
     )
     .await;
     let changed = postgres::migrate(&db.admin).await.unwrap_err().to_string();
     assert!(changed.contains("changed since"), "{changed}");
-    ledger("UPDATE intent_schema_migrations SET complete = true WHERE version = 2").await;
+    ledger("UPDATE intent_schema_migrations SET complete = true WHERE version = 1").await;
 
     ledger(
         "INSERT INTO intent_schema_migrations \
