@@ -96,9 +96,16 @@ impl Store {
     /// must belong to `agent_id` — a mismatch fails fast instead of silently
     /// persisting rows under the wrong agent.
     ///
+    /// On Postgres the replace is a compare-and-swap on the agent's queue
+    /// version (batch G 2e): it fails `Error::Conflict` and writes nothing
+    /// when another process persisted the queue since this process last
+    /// loaded ([`Store::load_all_agent_queues`]) or wrote it, so an older
+    /// snapshot never replaces a newer queue. `SQLite` has one writer.
+    ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the database operation fails.
+    /// Returns `Error::Conflict` (Postgres) for an out-of-date snapshot, and
+    /// `Error::Internal` if the database operation fails.
     pub async fn replace_agent_queue(
         &self,
         agent_id: &AgentId,
@@ -115,11 +122,14 @@ impl Store {
     /// non-atomic clear-then-replace pair risks either a PK-conflict
     /// rollback or a crash window where the messages are durable on
     /// NEITHER queue — this op commits the hand-off as a single unit.
-    /// Every row must belong to `to`; a mismatch fails fast.
+    /// Every row must belong to `to`; a mismatch fails fast. On Postgres
+    /// both queues are compared and swapped as in
+    /// [`Store::replace_agent_queue`].
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the database operation fails.
+    /// Returns `Error::Conflict` (Postgres) for an out-of-date queue, and
+    /// `Error::Internal` if the database operation fails.
     pub async fn move_agent_queue(
         &self,
         from: &AgentId,

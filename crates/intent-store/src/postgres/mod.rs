@@ -998,6 +998,9 @@ pub(crate) struct PgStore {
     /// This process's claim on the tenant, checked by every write; see
     /// [`Self::begin_write`] and `lease`.
     claim: lease::ClaimSlot,
+    /// Process-local: the queue version this process last saw per agent;
+    /// see `agents::QueueVersions`.
+    queue_versions: agents::QueueVersions,
     /// Keeps the gates above registered for the next open of this tenant;
     /// see `tenant_registry`. Held, not read, outside tests.
     #[cfg_attr(
@@ -1271,6 +1274,7 @@ impl PgStore {
             desktop_writes: shared.desktop_writes.clone(),
             writer_slot: shared.writer_slot.clone(),
             claim: shared.claim.clone(),
+            queue_versions: shared.queue_versions.clone(),
             tenant_state: shared,
         }
     }

@@ -3018,6 +3018,82 @@ impl PgStore {
 
     // ---- persisted queues -------------------------------------------------------
 
+    /// Checks that `agent_id`'s queue version is still the one this process
+    /// last saw, then bumps it, inside `tx` (under the writer lock, so no
+    /// other process writes between the check and the bump). Returns the
+    /// new version to record once `tx` commits, or `None` when the agent has
+    /// no session row (nothing to version; its queue rows cannot exist).
+    async fn bump_queue_version(
+        &self,
+        tx: &mut WriteTx,
+        agent_id: &AgentId,
+    ) -> Result<Option<i64>> {
+        let seen = self.queue_versions.seen(agent_id);
+        let row: Option<(bool, Option<i64>)> = sqlx::query_as(
+            "SELECT TRUE, (SELECT v.version FROM agent_queue_version v \
+                 WHERE v.tenant_id = $1 AND v.agent_id = $2) \
+             FROM agent_session s WHERE s.tenant_id = $1 AND s.id = $2",
+        )
+        .bind(self.tenant())
+        .bind(&agent_id.0)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?;
+        let Some((_, stored)) = row else {
+            return Ok(None);
+        };
+        let current = stored.unwrap_or(0);
+        if current != seen {
+            return Err(Error::Conflict {
+                current: serde_json::json!({
+                    "agentId": agent_id.0,
+                    "queueVersion": current,
+                    "seenQueueVersion": seen,
+                }),
+            });
+        }
+        let next = current + 1;
+        sqlx::query(
+            "INSERT INTO agent_queue_version (tenant_id, agent_id, version) VALUES ($1, $2, $3) \
+             ON CONFLICT (tenant_id, agent_id) DO UPDATE SET version = excluded.version",
+        )
+        .bind(self.tenant())
+        .bind(&agent_id.0)
+        .bind(next)
+        .execute(&mut **tx)
+        .await
+        .map_err(db)?;
+        Ok(Some(next))
+    }
+
+    /// Commits a queue write whose version bumps are `bumped`, recording them
+    /// as this process's versions. They are recorded before the commit,
+    /// while `tx` still holds the process's writer slot, so no other writer
+    /// of this process reads them in between; a failed commit restores the
+    /// previous ones.
+    async fn commit_queue_write(
+        &self,
+        tx: WriteTx,
+        bumped: &[(&AgentId, Option<i64>)],
+    ) -> Result<()> {
+        let previous: Vec<(&AgentId, i64)> = bumped
+            .iter()
+            .filter_map(|(agent, next)| next.map(|_| (*agent, self.queue_versions.seen(agent))))
+            .collect();
+        for (agent, next) in bumped {
+            if let Some(next) = next {
+                self.queue_versions.record(agent, *next);
+            }
+        }
+        if let Err(e) = tx.commit().await {
+            for (agent, version) in previous {
+                self.queue_versions.record(agent, version);
+            }
+            return Err(db(e));
+        }
+        Ok(())
+    }
+
     async fn insert_queue_rows(
         &self,
         tx: &mut WriteTx,
@@ -3065,6 +3141,7 @@ impl PgStore {
             )));
         }
         let mut tx = self.begin_write().await?;
+        let next = self.bump_queue_version(&mut tx, agent_id).await?;
         sqlx::query("DELETE FROM agent_queue WHERE tenant_id = $1 AND agent_id = $2")
             .bind(self.tenant())
             .bind(&agent_id.0)
@@ -3072,7 +3149,7 @@ impl PgStore {
             .await
             .map_err(db)?;
         self.insert_queue_rows(&mut tx, agent_id, rows).await?;
-        tx.commit().await.map_err(db)
+        self.commit_queue_write(tx, &[(agent_id, next)]).await
     }
 
     pub async fn move_agent_queue(
@@ -3088,6 +3165,12 @@ impl PgStore {
             )));
         }
         let mut tx = self.begin_write().await?;
+        let from_next = self.bump_queue_version(&mut tx, from).await?;
+        let to_next = if from == to {
+            from_next
+        } else {
+            self.bump_queue_version(&mut tx, to).await?
+        };
         sqlx::query("DELETE FROM agent_queue WHERE tenant_id = $1 AND agent_id IN ($2, $3)")
             .bind(self.tenant())
             .bind(&from.0)
@@ -3096,7 +3179,11 @@ impl PgStore {
             .await
             .map_err(db)?;
         self.insert_queue_rows(&mut tx, to, rows).await?;
-        tx.commit().await.map_err(db)
+        if from == to {
+            return self.commit_queue_write(tx, &[(to, to_next)]).await;
+        }
+        self.commit_queue_write(tx, &[(from, from_next), (to, to_next)])
+            .await
     }
 
     pub async fn load_all_agent_queues(&self) -> Result<Vec<AgentQueueRow>> {
@@ -3118,7 +3205,17 @@ impl PgStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
+        // The versions this load saw, in the same snapshot: a later replace
+        // by this process compares against them (see `QueueVersions`).
+        let versions: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT agent_id, version FROM agent_queue_version WHERE tenant_id = $1",
+        )
+        .bind(self.tenant())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
         tx.commit().await.map_err(db)?;
+        self.queue_versions.reload(versions);
         rows.iter()
             .map(|row| {
                 let payload_raw: String = col(row, "payload")?;
@@ -3783,5 +3880,42 @@ impl PgStore {
             workspace_id: monitor.workspace_id.clone(),
             envelope_sha256,
         }))
+    }
+}
+
+/// The queue version this process last loaded or wrote, per agent, shared by
+/// every store of the tenant in the process (`tenant_registry`), like the
+/// note lanes. A queue replace compares the stored version with it (batch G
+/// 2e): equal means no other process wrote the queue since, so this
+/// process's in-memory queue, which is the source of truth, may replace it.
+/// An agent this process never saw counts as version 0 (never persisted).
+/// `load_all_agent_queues` refreshes every entry at startup.
+#[derive(Clone, Default)]
+pub(crate) struct QueueVersions(std::sync::Arc<std::sync::Mutex<HashMap<String, i64>>>);
+
+impl QueueVersions {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
+        // Every update is a single insert or a whole replace, so a poisoned
+        // map is still consistent.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn seen(&self, agent_id: &AgentId) -> i64 {
+        self.map().get(&agent_id.0).copied().unwrap_or(0)
+    }
+
+    fn record(&self, agent_id: &AgentId, version: i64) {
+        self.map().insert(agent_id.0.clone(), version);
+    }
+
+    fn reload(&self, versions: Vec<(String, i64)>) {
+        *self.map() = versions.into_iter().collect();
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
 }

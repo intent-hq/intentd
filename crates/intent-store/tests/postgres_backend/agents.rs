@@ -1124,6 +1124,72 @@ fn queue_row(id: &str, agent: &str, position: i64, tenant: &str) -> AgentQueueRo
     }
 }
 
+// Batch G 2e: replacing a queue is a compare-and-swap on the agent's queue
+// version. Each process remembers the version it last loaded or wrote; a
+// snapshot from a process that missed a newer write gets `Conflict` and
+// leaves the newer queue in place. `SQLite` (one writer per file) keeps the
+// plain replace.
+parity_test!(
+    stale_queue_snapshot_from_another_handle_conflicts,
+    |store, tenant, db| {
+        seed_sessions(&store, tenant).await;
+        let Some(test_db) = db else {
+            return;
+        };
+        let other = crate::harness::open_as_process(test_db, tenant, "process-b").await;
+        let (a, b) = (&store, &other);
+        let agent = aid("agent-a");
+        a.load_all_agent_queues().await.unwrap();
+        b.load_all_agent_queues().await.unwrap();
+
+        // A persists the newer queue; B then persists its older (empty) one.
+        let newer = [queue_row("q1", "agent-a", 0, tenant)];
+        a.replace_agent_queue(&agent, &newer).await.unwrap();
+        let stale = b.replace_agent_queue(&agent, &[]).await;
+        assert!(
+            matches!(stale, Err(Error::Conflict { .. })),
+            "an out-of-date snapshot conflicts: {stale:?}"
+        );
+        let moved = b.move_agent_queue(&agent, &aid("agent-b"), &[]).await;
+        assert!(
+            matches!(moved, Err(Error::Conflict { .. })),
+            "an out-of-date move conflicts: {moved:?}"
+        );
+        let ids =
+            |rows: Vec<AgentQueueRow>| -> Vec<String> { rows.into_iter().map(|r| r.id).collect() };
+        assert_eq!(
+            ids(store.load_all_agent_queues().await.unwrap()),
+            ["q1"],
+            "A's queue survives"
+        );
+
+        // After a reload B sees A's write and may replace it; A is now stale.
+        b.load_all_agent_queues().await.unwrap();
+        let both = [
+            queue_row("q1", "agent-a", 0, tenant),
+            queue_row("q2", "agent-a", 1, tenant),
+        ];
+        b.replace_agent_queue(&agent, &both).await.unwrap();
+        assert!(matches!(
+            a.replace_agent_queue(&agent, &newer).await,
+            Err(Error::Conflict { .. })
+        ));
+        assert_eq!(
+            ids(store.load_all_agent_queues().await.unwrap()),
+            ["q1", "q2"]
+        );
+
+        // One handle never conflicts with itself, including an empty replace
+        // for an agent with no session row (nothing to version).
+        b.replace_agent_queue(&agent, &[]).await.unwrap();
+        b.replace_agent_queue(&agent, &newer).await.unwrap();
+        b.replace_agent_queue(&aid("agent-gone"), &[])
+            .await
+            .unwrap();
+        b.replace_agent_queue(&agent, &[]).await.unwrap();
+    }
+);
+
 parity_test!(agent_queues_round_trip, |store, tenant| {
     assert!(store.load_all_agent_queues().await.unwrap().is_empty());
     seed_sessions(&store, tenant).await;
