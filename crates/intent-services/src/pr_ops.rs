@@ -1004,10 +1004,14 @@ fn github_check_run_id(url: &str) -> Option<(&str, &str)> {
         .then_some((host, *id))
 }
 
-/// The run a check link names, the same under either read path for GitHub
-/// check-run links: the tie-break key among same-name twins.
-fn check_run_identity(url: &str) -> (&str, &str) {
-    github_check_run_id(url).unwrap_or(("", bare_link(url)))
+/// The tie-break key among same-name twins. GitHub check-run links key on
+/// the check-run id, the same under either read path. Any other link (a CI
+/// vendor's details link, which only the rollup reports) outranks them: the
+/// rollup then picks a vendor link, which [`is_new_check_run`] never compares
+/// with a check-run link, rather than a check-run id that the REST fallback,
+/// seeing every twin's id, could rank differently.
+fn check_run_identity(url: &str) -> (bool, &str, &str) {
+    github_check_run_id(url).map_or((true, "", bare_link(url)), |(host, id)| (false, host, id))
 }
 
 /// Whether two links of the same check name point at different runs: a
@@ -1644,7 +1648,7 @@ fn live_key(run: &CheckRunSignal) -> (bool, Option<OffsetDateTime>, u8) {
 /// in any listing order and under either read path: a flipped link would
 /// read as a re-run (intent-hq/intent#9852).
 fn supersedes(candidate: &CheckRunSignal, held: &CheckRunSignal) -> bool {
-    fn run(signal: &CheckRunSignal) -> Option<(&str, &str)> {
+    fn run(signal: &CheckRunSignal) -> Option<(bool, &str, &str)> {
         signal.url.as_deref().map(check_run_identity)
     }
     (live_key(candidate), run(candidate)) > (live_key(held), run(held))
@@ -3544,6 +3548,26 @@ mod tests {
             rollup_link.as_deref(),
             rest_link.as_deref()
         ));
+
+        // An Actions twin beside a CI vendor app's twin: the rollup gives the
+        // app's details link, REST its check-run link. Whichever id is
+        // larger, the two reads never report a new run.
+        for (actions_id, app_id) in [(100, 200), (200, 100)] {
+            let rollup_link = link(vec![
+                at(&format!(
+                    "https://github.com/o/r/actions/runs/9/job/{actions_id}"
+                )),
+                at("https://app.circleci.com/pipelines/gh/o/r/5/workflows/w/jobs/9"),
+            ]);
+            let rest_link = link(vec![
+                at(&format!("https://github.com/o/r/runs/{actions_id}")),
+                at(&format!("https://github.com/o/r/runs/{app_id}")),
+            ]);
+            assert!(
+                !is_new_check_run(rollup_link.as_deref(), rest_link.as_deref()),
+                "{rollup_link:?} vs {rest_link:?}"
+            );
+        }
     }
 
     /// Regression (intent-hq/intent#5372): a head carrying two runs of the
