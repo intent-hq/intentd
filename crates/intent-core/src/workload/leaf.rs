@@ -11,7 +11,11 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 /// How long a pinned leaf is kept before an empty one may be released.
-const PIN_GRACE: Duration = Duration::from_secs(30);
+const PIN_GRACE: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(30)
+};
 
 use super::cgroup;
 use super::{OomKillReport, WorkloadKind};
@@ -203,6 +207,14 @@ pub(super) fn sweep(workloads: &Path) {
     for dir in dirs.iter().filter(|d| !owned.contains(d)) {
         cgroup::remove_tree_if_empty(dir);
     }
+}
+
+/// [`poll_oom_kills`], then [`sweep`]: polling first reads the final OOM
+/// count of a pinned leaf before an empty one is released.
+pub(super) fn poll_then_sweep(workloads: &Path) -> Vec<OomKillReport> {
+    let reports = poll_oom_kills();
+    sweep(workloads);
+    reports
 }
 
 /// New OOM kills in live agent-type leaves since the previous poll.

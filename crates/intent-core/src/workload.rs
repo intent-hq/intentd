@@ -436,8 +436,7 @@ pub fn poll_oom_kills() -> Vec<OomKillReport> {
         let Some(workloads) = STATE.get().and_then(|s| s.workloads.as_deref()) else {
             return Vec::new();
         };
-        leaf::sweep(workloads);
-        leaf::poll_oom_kills()
+        leaf::poll_then_sweep(workloads)
     }
     #[cfg(not(target_os = "linux"))]
     Vec::new()

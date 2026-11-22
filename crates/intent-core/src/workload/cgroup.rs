@@ -326,10 +326,18 @@ fn sweep_stale_domains(mount: &Path, ours: &Path) {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("intentd-"));
-        if is_domain && path != ours && path.is_dir() {
+        // A populated domain belongs to a live daemon: removing even its
+        // empty `workloads/` would leave its workloads unboxed.
+        if is_domain && path != ours && path.is_dir() && !populated(&path) {
             remove_tree_if_empty(&path);
         }
     }
+}
+
+/// Whether `cgroup.events` reports a process in the cgroup or below it.
+fn populated(dir: &Path) -> bool {
+    fs::read_to_string(dir.join("cgroup.events"))
+        .is_ok_and(|events| events.lines().any(|l| l.trim() == "populated 1"))
 }
 
 /// `rmdir` the cgroup's children, then the cgroup; stops at the first

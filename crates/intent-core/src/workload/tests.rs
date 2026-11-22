@@ -162,9 +162,13 @@ fn the_root_cgroup_gets_a_dedicated_domain_and_sweeps_stale_ones() {
     cgroup_dir(mount.path(), &[1, 77, PID]);
     let stale = mount.path().join("intentd-0000000000000001");
     fs::create_dir_all(stale.join("workloads/script-1-0")).unwrap();
+    // A live daemon's domain: its `workloads/` is empty and may be listed
+    // before `daemon/`, but `cgroup.events` reports the domain populated.
     let busy = mount.path().join("intentd-0000000000000002");
+    fs::create_dir_all(busy.join("workloads")).unwrap();
     fs::create_dir_all(busy.join("daemon")).unwrap();
     fs::write(busy.join("daemon/cgroup.procs"), "99").unwrap();
+    fs::write(busy.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
 
     let layout = cgroup::setup(&host(mount.path(), "/"), &config(Ceiling::Auto)).unwrap();
 
@@ -174,7 +178,10 @@ fn the_root_cgroup_gets_a_dedicated_domain_and_sweeps_stale_ones() {
     assert_eq!(read(mount.path().join("cgroup.subtree_control")), "+memory");
     assert_eq!(read(domain.join("daemon/cgroup.procs")), PID.to_string());
     assert!(!stale.exists(), "an empty stale domain is removed");
-    assert!(busy.exists(), "a busy domain is kept");
+    assert!(
+        busy.join("workloads").is_dir(),
+        "a live domain keeps its empty workloads cgroup"
+    );
     // Same data dir, same domain.
     let again = cgroup::plan(&host(mount.path(), "/"), "/data").unwrap();
     assert_eq!(
@@ -284,4 +291,23 @@ fn a_pinned_leaf_outlives_its_handle_until_empty() {
     assert!(super::leaf::poll_oom_kills()
         .iter()
         .any(|r| r.label == "agent P" && r.new_kills == 1));
+}
+
+#[test]
+fn an_oom_kill_in_an_emptied_pinned_leaf_is_reported_before_release() {
+    let workloads = tempfile::tempdir().unwrap();
+    let leaf = super::Leaf::create(workloads.path(), WorkloadKind::Mcp, "mcp Q").unwrap();
+    leaf.pin();
+    let path = leaf.path().to_path_buf();
+    drop(leaf);
+    // The process died to the OOM killer: the leaf is empty now.
+    fs::write(path.join("cgroup.procs"), "").unwrap();
+    fs::write(path.join("memory.events"), "oom_kill 1\n").unwrap();
+    let reports = super::leaf::poll_then_sweep(workloads.path());
+    assert!(
+        reports
+            .iter()
+            .any(|r| r.label == "mcp Q" && r.new_kills == 1),
+        "{reports:?}"
+    );
 }
