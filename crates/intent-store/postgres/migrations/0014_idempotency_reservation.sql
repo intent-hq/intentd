@@ -9,7 +9,8 @@
 -- A reservation names the tenant's epoch (`tenant_writer.epoch`, read
 -- under the writer lock) and the reserving process (a token per process).
 -- It is stale only when a newer epoch exists (a takeover), never by
--- elapsed time, so a slow but live holder keeps it. A process's first
+-- elapsed time, so a slow but live holder keeps it (the ~hourly reaper still
+-- drops any row older than its retention, pending or not). A process's first
 -- unleased open of the tenant drops other processes' pending rows (an
 -- unleased tenant has one process by design). Rows from before this
 -- migration all carry a result.
@@ -20,6 +21,7 @@ ALTER TABLE idempotency_key ALTER COLUMN result_json DROP NOT NULL;
 ALTER TABLE idempotency_key ADD COLUMN IF NOT EXISTS claim_epoch bigint;
 ALTER TABLE idempotency_key ADD COLUMN IF NOT EXISTS claim_token text;
 -- A pending row names its reservation; a completed one names none.
-ALTER TABLE idempotency_key DROP CONSTRAINT IF EXISTS idempotency_key_pending_check;
-ALTER TABLE idempotency_key ADD CONSTRAINT idempotency_key_pending_check
+-- One statement, so replaying it after a crash is harmless.
+ALTER TABLE idempotency_key DROP CONSTRAINT IF EXISTS idempotency_key_pending_check,
+    ADD CONSTRAINT idempotency_key_pending_check
     CHECK ((result_json IS NULL) = (claim_token IS NOT NULL));
