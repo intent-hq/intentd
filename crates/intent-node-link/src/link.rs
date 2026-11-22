@@ -31,6 +31,7 @@ const NODE_LINK_PROTOCOLS_MAX: u32 = intent_core::node_link::NODE_LINK_PROTOCOLS
 /// Heartbeat cadence, the silence after which a link is declared dead, and
 /// queue sizes.
 #[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
 pub struct Tuning {
     pub heartbeat: Duration,
     pub dead_after: Duration,

@@ -9,8 +9,9 @@ holds if nothing below a feature reaches up into it:
   or on intent-app, through any kind of edge. A dev-dependency from core on a
   feature would also compile two copies of core into core's own tests.
 - intent-node-connections (the node-connection service) and intent-node-link
-  (the link transport it uses) sit below intent-services too: the head's domain reaches it through its traits, so it
-  never depends on intent-services, a feature crate or intent-app.
+  (the link transport it uses) sit below intent-services too: the head's
+  domain reaches the service through its traits, so neither depends on
+  intent-services, a feature crate or intent-app.
 - Every other edge into an `intent-svc-*` crate or intent-app must be listed in
   ALLOWED below: intent-app composes every feature, intentd depends on
   intent-app, and feature-to-feature edges are the ones in the split plan

@@ -38,6 +38,15 @@ pub mod test_support {
     pub use crate::dial::{decode_rejection, dial_link_with, read_welcome};
     pub use crate::link::Tuning;
 
+    /// [`crate::ExecutorLinks`] with `tuning`.
+    #[must_use]
+    pub fn executor_links_with_tuning(
+        host: std::sync::Arc<dyn crate::ExecutorHost>,
+        tuning: Tuning,
+    ) -> std::sync::Arc<crate::ExecutorLinks> {
+        crate::ExecutorLinks::with_tuning(host, tuning)
+    }
+
     pub mod pin {
         pub use crate::pin::client_config;
     }

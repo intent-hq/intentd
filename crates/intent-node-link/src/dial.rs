@@ -124,6 +124,7 @@ pub async fn dial_link(endpoint: &NodeEndpoint, hello: LinkHello) -> Result<Dial
 /// # Errors
 ///
 /// As [`dial_link`].
+#[doc(hidden)]
 pub async fn dial_link_with(
     endpoint: &NodeEndpoint,
     hello: LinkHello,
@@ -193,6 +194,7 @@ pub async fn dial_git(endpoint: &NodeEndpoint, binding: &LeaseBinding) -> Result
 ///
 /// A link error when the node closes, rejects the binding or breaks the
 /// protocol.
+#[doc(hidden)]
 pub async fn read_welcome<S>(
     socket: &mut WebSocketStream<S>,
     binding: &LeaseBinding,
@@ -225,6 +227,7 @@ where
 /// Turn a node's close reason into a link error. Only known codes are
 /// recognized, and only a generation number is taken from the text, so a
 /// peer cannot inject arbitrary text into head's errors.
+#[doc(hidden)]
 #[must_use]
 pub fn decode_rejection(reason: &str) -> Error {
     let (code, detail) = reason.split_once(':').unwrap_or((reason, ""));

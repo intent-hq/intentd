@@ -147,9 +147,7 @@ impl ExecutorLinks {
         Self::with_tuning(host, Tuning::default())
     }
 
-    #[doc(hidden)]
-    #[must_use]
-    pub fn with_tuning(host: Arc<dyn ExecutorHost>, tuning: Tuning) -> Arc<Self> {
+    pub(super) fn with_tuning(host: Arc<dyn ExecutorHost>, tuning: Tuning) -> Arc<Self> {
         Arc::new(Self {
             host,
             tuning,
