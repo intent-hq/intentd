@@ -361,7 +361,7 @@ async fn a_held_writer_lock_times_out_as_55p03_and_store_busy_on_neki() {
         .await;
         let _ = waiter.rollback().await;
         let code = match second_attempt {
-            Ok(()) => {
+            Ok(_) => {
                 let _ = holder.rollback().await;
                 return Err("a second transaction took the held writer lock".into());
             }
