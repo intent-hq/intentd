@@ -218,7 +218,11 @@ async fn a_fresh_start_keeps_the_tunnel_its_daemon_is_starting() {
         .into_iter()
         .filter(|line| line.starts_with("serve"))
         .collect();
-    assert_eq!(serves.len(), 1, "the starting tunnel was restarted: {serves:?}");
+    assert_eq!(
+        serves.len(),
+        1,
+        "the starting tunnel was restarted: {serves:?}"
+    );
     assert_no_secret_logged(&backend.head_dir, &backend.fake);
 }
 

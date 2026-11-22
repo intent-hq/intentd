@@ -689,7 +689,8 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_whose_relay_does_not_answer_says_so() {
     let Some((fake, _head, ws_id, keyed_ref, mut rpc_ws, (port, cfg))) =
-        backend("itd-vc-relay-").await else {
+        backend("itd-vc-relay-").await
+    else {
         return;
     };
     let tailcat = super::relay::write_logging_tailcat(fake.scratch.path());
@@ -727,12 +728,22 @@ async fn a_resume_whose_relay_does_not_answer_says_so() {
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
-    echoed(&mut rpc_ws, (ws_id.as_str(), agent_id.as_str()), "first turn", 21).await;
+    echoed(
+        &mut rpc_ws,
+        (ws_id.as_str(), agent_id.as_str()),
+        "first turn",
+        21,
+    )
+    .await;
     let name = fake.only_sandbox().unwrap();
     let machine = machine_until(&mut rpc_ws, 30, &name, |m| m.is_some())
         .await
         .unwrap();
-    assert_eq!(machine["cloud"]["relayUrl"], relay.url.as_str(), "{machine}");
+    assert_eq!(
+        machine["cloud"]["relayUrl"],
+        relay.url.as_str(),
+        "{machine}"
+    );
     ok(
         &mut rpc_ws,
         40,
