@@ -161,7 +161,7 @@ impl Node {
         )
         .unwrap();
         let (tx, accepted) = tokio::sync::mpsc::unbounded_channel();
-        server.install_executor_links(ExecutorLinks::with_tuning(
+        server.install_executor_links(intent_node_link::test_support::executor_links_with_tuning(
             Arc::new(TestHost { accepted: tx }),
             tuning,
         ));

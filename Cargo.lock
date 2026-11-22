@@ -2403,6 +2403,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "intent-node-link"
+version = "0.11.267"
+dependencies = [
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "intent-core",
+ "intent-git",
+ "intentd-test-support",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "intent-nodes"
 version = "0.11.267"
 dependencies = [
@@ -2704,6 +2729,7 @@ dependencies = [
  "if-addrs",
  "intent-core",
  "intent-git",
+ "intent-node-link",
  "intent-services",
  "intent-store",
  "intentd-test-support",
@@ -2728,7 +2754,6 @@ dependencies = [
  "uuid",
  "whoami",
  "x509-parser",
- "zeroize",
 ]
 
 [[package]]

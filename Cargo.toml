@@ -50,6 +50,7 @@ intent-git = { path = "crates/intent-git", version = "0.11.267" }
 intent-js = { path = "crates/intent-js", version = "0.11.267" }
 intent-linear = { path = "crates/intent-linear", version = "0.11.267" }
 intent-node-connections = { path = "crates/intent-node-connections", version = "0.11.267" }
+intent-node-link = { path = "crates/intent-node-link", version = "0.11.267" }
 intent-nodes = { path = "crates/intent-nodes", version = "0.11.267" }
 intent-providers = { path = "crates/intent-providers", version = "0.11.267" }
 intent-pty = { path = "crates/intent-pty", version = "0.11.267" }
@@ -157,6 +158,8 @@ debug = "line-tables-only"
 [profile.dev.package.intent-linear]
 debug = "line-tables-only"
 [profile.dev.package.intent-node-connections]
+debug = "line-tables-only"
+[profile.dev.package.intent-node-link]
 debug = "line-tables-only"
 [profile.dev.package.intent-nodes]
 debug = "line-tables-only"

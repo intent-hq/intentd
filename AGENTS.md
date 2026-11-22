@@ -36,6 +36,7 @@ crates/
 ├── intent-svc-transfer/   # feature crate: workspace transfer, above intent-services
 ├── intent-svc-remote/     # feature crate: remote agents on an execution node (head connector, journal ingest)
 ├── intent-node-connections/ # node-connection service below intent-services: link ownership and fencing
+├── intent-node-link/      # backend-to-machine node link (WSS link, git connection, executor side); re-exported as intent_transport::node_link
 ├── intent-svc-runtime/    # feature crate: scripts, hooks, terminals, browser tabs, sandboxes
 ├── intent-app/            # registers the feature crates (`compose`)
 ├── intent-transport/      # UDS + WSS listeners, JSON-RPC router

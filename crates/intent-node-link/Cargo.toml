@@ -1,0 +1,40 @@
+[package]
+name = "intent-node-link"
+version = "0.11.267"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "The backend-to-machine node link for intentd: WSS link, git connection and executor side; below intent-services"
+
+[features]
+# Test-only: exposes the link internals to intent-transport's node-link tests,
+# which run the executor side on transport's WSS server.
+test-support = []
+
+[dependencies]
+intent-core = { workspace = true }
+intent-git = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+sha2 = "0.11.0"
+x509-parser = "0.18.1"
+getrandom = "0.4"
+hex = "0.4"
+zeroize = "1.9"
+uuid = { workspace = true }
+
+[dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+
+[lints]
+workspace = true

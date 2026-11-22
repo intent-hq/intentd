@@ -20,7 +20,7 @@ trap 'rm -rf "$tmp"' EXIT
 failures=0
 fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
 
-crates=(intent-core intent-services intent-transport intent-node-connections intent-svc-agents
+crates=(intent-core intent-services intent-transport intent-node-link intent-node-connections intent-svc-agents
   intent-svc-providers intent-svc-scm intent-svc-runtime intent-svc-transfer intent-svc-collab
   intent-svc-remote intent-app intentd)
 
@@ -44,11 +44,13 @@ new_workspace() {
   for crate in "${crates[@]}"; do
     case $crate in
       intent-core) deps='' ;;
-      intent-services | intent-node-connections) deps='intent-core' ;;
+      intent-services | intent-node-link) deps='intent-core' ;;
+      intent-node-connections) deps='intent-core intent-node-link' ;;
       intent-svc-remote) deps='intent-services intent-node-connections' ;;
       intent-svc-agents) deps='intent-services intent-svc-providers intent-svc-scm intent-svc-runtime' ;;
       intent-svc-transfer) deps='intent-services intent-svc-agents' ;;
-      intent-svc-* | intent-transport) deps='intent-services' ;;
+      intent-transport) deps='intent-services intent-node-link' ;;
+      intent-svc-*) deps='intent-services' ;;
       intent-app) deps='intent-services intent-svc-agents intent-svc-providers intent-svc-scm intent-svc-runtime intent-svc-transfer intent-svc-collab intent-svc-remote' ;;
       intentd) deps='intent-app intent-transport' ;;
     esac
@@ -127,6 +129,9 @@ expect_fail nc_services intent-node-connections intent-services
 new_workspace nc_services_dev intent-node-connections '[dev-dependencies]
 intent-services = { path = "../intent-services" }'
 expect_fail nc_services_dev intent-node-connections intent-services
+
+new_workspace link_services intent-node-link 'intent-services = { path = "../intent-services" }'
+expect_fail link_services intent-node-link intent-services
 
 new_workspace nc_feature intent-node-connections 'intent-svc-runtime = { path = "../intent-svc-runtime" }'
 expect_fail nc_feature intent-node-connections intent-svc-runtime

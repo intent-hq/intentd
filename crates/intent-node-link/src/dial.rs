@@ -119,7 +119,13 @@ pub async fn dial_link(endpoint: &NodeEndpoint, hello: LinkHello) -> Result<Dial
     dial_link_with(endpoint, hello, Tuning::default()).await
 }
 
-pub(super) async fn dial_link_with(
+/// [`dial_link`] with `tuning`.
+///
+/// # Errors
+///
+/// As [`dial_link`].
+#[doc(hidden)]
+pub async fn dial_link_with(
     endpoint: &NodeEndpoint,
     hello: LinkHello,
     tuning: Tuning,
@@ -182,7 +188,14 @@ pub async fn dial_git(endpoint: &NodeEndpoint, binding: &LeaseBinding) -> Result
     Ok(GitConnection::start(socket, binding.clone(), None))
 }
 
-pub(super) async fn read_welcome<S>(
+/// Read the node's welcome for `binding` from `socket`.
+///
+/// # Errors
+///
+/// A link error when the node closes, rejects the binding or breaks the
+/// protocol.
+#[doc(hidden)]
+pub async fn read_welcome<S>(
     socket: &mut WebSocketStream<S>,
     binding: &LeaseBinding,
 ) -> Result<LinkWelcome>
@@ -214,7 +227,9 @@ where
 /// Turn a node's close reason into a link error. Only known codes are
 /// recognized, and only a generation number is taken from the text, so a
 /// peer cannot inject arbitrary text into head's errors.
-pub(super) fn decode_rejection(reason: &str) -> Error {
+#[doc(hidden)]
+#[must_use]
+pub fn decode_rejection(reason: &str) -> Error {
     let (code, detail) = reason.split_once(':').unwrap_or((reason, ""));
     let number = || {
         let digits: String = detail.chars().filter(char::is_ascii_digit).collect();
@@ -403,7 +418,9 @@ async fn connect_with(
     Ok(socket)
 }
 
-pub(crate) fn socket_config() -> tungstenite::protocol::WebSocketConfig {
+#[doc(hidden)]
+#[must_use]
+pub fn socket_config() -> tungstenite::protocol::WebSocketConfig {
     tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(intent_core::node_link::MAX_FRAME_BYTES))
         .max_frame_size(Some(intent_core::node_link::MAX_FRAME_BYTES))

@@ -132,7 +132,8 @@ impl std::fmt::Debug for ExecutorLinks {
 
 /// The connection an admitted `/node/*` upgrade asked for.
 #[derive(Debug)]
-pub(crate) enum ExecutorRoute {
+#[doc(hidden)]
+pub enum ExecutorRoute {
     Link,
     Git {
         binding: LeaseBinding,
@@ -163,7 +164,8 @@ impl ExecutorLinks {
 
     /// Admit a git upgrade only for the credential's current binding, named
     /// by the binding headers. `None` refuses it (`409`).
-    pub(crate) async fn git_route(
+    #[doc(hidden)]
+    pub async fn git_route(
         &self,
         credential: &ExecutorCredential,
         header: impl Fn(&str) -> Option<String>,
@@ -202,7 +204,9 @@ impl ExecutorLinks {
     }
 
     /// The current listener epoch; an upgrade records it before its `101`.
-    pub(crate) fn epoch(&self) -> u64 {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
         *self.epoch.borrow()
     }
 
@@ -220,7 +224,8 @@ impl ExecutorLinks {
     /// Serve an upgraded `/node/*` connection admitted in listener `epoch`.
     /// `revocations` must have been subscribed before the credential was
     /// resolved, so a revocation racing the upgrade is not missed.
-    pub(crate) async fn serve<S>(
+    #[doc(hidden)]
+    pub async fn serve<S>(
         self: Arc<Self>,
         api: Arc<dyn WorkspaceApi>,
         credential: ExecutorCredential,
