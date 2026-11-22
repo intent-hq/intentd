@@ -36,6 +36,14 @@ pub trait DialGate: Send + Sync {
     /// The machine answered the dial with `machine-update-required`: it can
     /// never link again.
     fn outdated(&self, link: &dyn GateLink);
+
+    /// The dials right after a resume got no answer: restart the machine's
+    /// tunnel by a way other than the link. Returns whether it did, so the
+    /// connector dials again.
+    fn revive<'a>(&'a self, link: &'a dyn GateLink) -> intent_core::BoxFuture<'a, bool> {
+        let _ = link;
+        Box::pin(async { false })
+    }
 }
 
 /// What a dial gate may do to its machine's connector.
