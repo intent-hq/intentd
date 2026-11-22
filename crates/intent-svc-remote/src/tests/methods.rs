@@ -1998,10 +1998,20 @@ async fn models_reports_a_connected_machines_load_as_it_pushes_it() {
         models["machines"][0]["runningAgents"], 0,
         "this backend runs none of them"
     );
-    let changed = changes(&mut sub, 2).await;
-    assert_eq!(
-        changed[1]["machine"]["capabilities"]["capacity"]["runningAgents"],
-        1
+    // Other changes (the state going connected) may come first: some event
+    // carries the pushed count.
+    let announced = tokio::time::timeout(wait(), async {
+        loop {
+            let event = changes(&mut sub, 1).await.remove(0);
+            if event["machine"]["capabilities"]["capacity"]["runningAgents"] == 1 {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        announced.is_ok(),
+        "no remoteMachine:changed carried the count"
     );
 
     link.link
