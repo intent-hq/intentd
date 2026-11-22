@@ -165,6 +165,31 @@ async fn opening_a_tenant_provisions_its_seed_rows_once() {
     assert_eq!(chiefs, 2);
 }
 
+/// A table-less advisory lock carries no shard key: on Neki sharded by
+/// `tenant_id` the router runs it on another shard than the tenant's, and a
+/// single-shard pool fails with NK313 (0005's `intent_provision_tenant` lock
+/// made every tenant open fail on a non-authoritative shard). No function
+/// the migrations leave behind may take one; the session lock `migrate`
+/// takes on its own cross-shard connection is not in a function.
+#[tokio::test]
+async fn no_migrated_function_takes_an_advisory_lock() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let offenders: Vec<String> = sqlx::query_scalar(
+        "SELECT p.proname::text FROM pg_proc p \
+         WHERE p.pronamespace = current_schema()::regnamespace \
+           AND p.prosrc ILIKE '%pg\\_advisory%' ORDER BY 1",
+    )
+    .fetch_all(&db.admin)
+    .await
+    .unwrap();
+    assert!(
+        offenders.is_empty(),
+        "functions taking an advisory lock: {offenders:?}"
+    );
+}
+
 #[tokio::test]
 async fn row_level_security_policies_work_with_the_guard_mode() {
     let Some(db) = test_db(true).await else {
