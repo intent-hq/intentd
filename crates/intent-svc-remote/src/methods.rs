@@ -348,7 +348,8 @@ fn local_load(svc: &Services) -> Option<Value> {
 
 /// One `MachineModels` row, or `None` when a `provider` or `model` filter
 /// leaves it no provider. Never carries routes, the pin, the memory figures
-/// or the link protocol; `load` only while the machine is connected.
+/// or the link protocol; `load` only while the machine is connected and
+/// pushes its load.
 fn machine_models_json(
     row: &ExposedMachine,
     live: Option<&dyn LinkView>,
@@ -396,7 +397,14 @@ fn machine_models_json(
         "runningAgents".into(),
         json!(live.map_or(0, LinkView::live_agents)),
     );
-    if let Some(caps) = row.capabilities.as_ref().filter(|_| connected) {
+    // Only a machine that pushes its load keeps `capacity` current; it is
+    // the one that sends `resources`. An older one's count can be an hour
+    // old, so it gets no `load`.
+    if let Some(caps) = row
+        .capabilities
+        .as_ref()
+        .filter(|caps| connected && caps.resources.is_some())
+    {
         machine.insert(
             "load".into(),
             load_json(

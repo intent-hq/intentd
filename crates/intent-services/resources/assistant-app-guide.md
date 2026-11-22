@@ -727,7 +727,7 @@ release (not in current builds): while a machine is connected, its row shows how
 run on it in total (**3 agents running**), counting other backends' agents and the machine's
 own; hover it for the agent limit and the whole computer's CPU and memory use. The count
 updates within seconds of an agent starting or stopping; CPU and memory refresh when they
-move noticeably. Older machines show no CPU or memory. Agents see the same figures when they choose a machine, so a coordinator can spread
+move noticeably. Older machines show no CPU or memory. Newer agent sessions see the same figures when they choose a machine, so a coordinator can spread
 sub-agents onto the least busy one; nothing balances the load automatically. An agent started without a **Start on** choice runs on the first row that can run
 it; a sub-agent started by an agent on this computer stays here. A backend started as an
 orchestrator (`intentd serve --orchestrator`, experimental) runs every agent on those

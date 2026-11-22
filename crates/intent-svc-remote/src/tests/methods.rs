@@ -1953,6 +1953,25 @@ async fn load_becomes(backend: &Backend, node_id: &str, want: Value) {
 /// announces the machine's change to the app.
 #[tokio::test]
 async fn models_reports_a_connected_machines_load_as_it_pushes_it() {
+    // A machine that pushes its load sends `resources` with its report.
+    fn pushing(running: u32) -> MachineCapabilities {
+        let mut report = capabilities(running);
+        report.resources = Some(intent_core::node_link::HostResources {
+            cpu_percent: Some(35),
+            memory_used_bytes: 12 << 30,
+            memory_total_bytes: 32 << 30,
+        });
+        report
+    }
+    let load = |running: u32| {
+        json!({
+            "runningAgents": running,
+            "agentCap": 2,
+            "cpuPercent": 35,
+            "memoryUsedBytes": 12_u64 << 30,
+            "memoryTotalBytes": 32_u64 << 30,
+        })
+    };
     let backend = Backend::new().await;
     let mut machine = backend.machine().await;
     let node = backend.expose(&mut machine).await;
@@ -1960,16 +1979,17 @@ async fn models_reports_a_connected_machines_load_as_it_pushes_it() {
     let link = machine.accept().await;
     link.replay_complete(0).await;
     let id = machine.id();
-    load_becomes(&backend, &id, json!({ "runningAgents": 0, "agentCap": 2 })).await;
 
     let mut sub = subscribe(&backend);
-    link.link
-        .send(&LinkFrame::CapabilitiesReply {
-            capabilities: capabilities(1),
-        })
-        .await
-        .unwrap();
-    load_becomes(&backend, &id, json!({ "runningAgents": 1, "agentCap": 2 })).await;
+    for running in [0, 1] {
+        link.link
+            .send(&LinkFrame::CapabilitiesReply {
+                capabilities: pushing(running),
+            })
+            .await
+            .unwrap();
+        load_becomes(&backend, &id, load(running)).await;
+    }
     let models = backend
         .call("models", json!({ "nodeId": id }))
         .await
@@ -1978,37 +1998,29 @@ async fn models_reports_a_connected_machines_load_as_it_pushes_it() {
         models["machines"][0]["runningAgents"], 0,
         "this backend runs none of them"
     );
-    let changed = changes(&mut sub, 1).await;
+    let changed = changes(&mut sub, 2).await;
     assert_eq!(
-        changed[0]["machine"]["capabilities"]["capacity"]["runningAgents"],
+        changed[1]["machine"]["capabilities"]["capacity"]["runningAgents"],
         1
     );
 
-    // A machine that samples its host adds its CPU and memory.
-    let mut sampled = capabilities(0);
-    sampled.resources = Some(intent_core::node_link::HostResources {
-        cpu_percent: Some(35),
-        memory_used_bytes: 12 << 30,
-        memory_total_bytes: 32 << 30,
-    });
     link.link
         .send(&LinkFrame::CapabilitiesReply {
-            capabilities: sampled,
+            capabilities: pushing(0),
         })
         .await
         .unwrap();
-    load_becomes(
-        &backend,
-        &id,
-        json!({
-            "runningAgents": 0,
-            "agentCap": 2,
-            "cpuPercent": 35,
-            "memoryUsedBytes": 12_u64 << 30,
-            "memoryTotalBytes": 32_u64 << 30,
-        }),
-    )
-    .await;
+    load_becomes(&backend, &id, load(0)).await;
+
+    // An older machine (no `resources`) never pushes its load: its count
+    // can be an hour old, so it gets no `load` at all.
+    link.link
+        .send(&LinkFrame::CapabilitiesReply {
+            capabilities: capabilities(1),
+        })
+        .await
+        .unwrap();
+    load_becomes(&backend, &id, Value::Null).await;
     node.shutdown();
 }
 

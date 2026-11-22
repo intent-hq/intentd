@@ -13,6 +13,10 @@ use intent_core::node_link::HostResources;
 /// Weight of the newest CPU reading in the moving average.
 const CPU_SMOOTHING: f32 = 0.5;
 
+/// A CPU refresh older than this starts the average over: a delta over a
+/// long idle gap says nothing about the last few seconds.
+const CPU_STALE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Samples the host. Not shared: [`sample_host`] holds the daemon's one.
 pub struct HostSampler {
     system: sysinfo::System,
@@ -38,9 +42,18 @@ impl HostSampler {
 
     /// The host now: memory always (when the platform reports it), CPU
     /// once two refreshes are far enough apart. A call sooner than the
-    /// platform's minimum interval keeps the last CPU reading.
+    /// platform's minimum interval keeps the last CPU reading; one more
+    /// than [`CPU_STALE`] after the last refresh starts over, with no CPU.
     pub fn sample(&mut self) -> Option<HostResources> {
         let now = Instant::now();
+        // A refresh long ago would average over the whole idle gap: start over.
+        if self
+            .cpu_refreshed
+            .is_some_and(|at| now.duration_since(at) > CPU_STALE)
+        {
+            self.cpu_refreshed = None;
+            self.cpu_average = None;
+        }
         let due = self
             .cpu_refreshed
             .is_none_or(|at| now.duration_since(at) >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
@@ -107,6 +120,22 @@ mod tests {
         assert_eq!(percent(99.6), 100);
         assert_eq!(percent(-3.0), 0);
         assert_eq!(percent(34.4), 34);
+    }
+
+    /// A refresh long ago would average CPU over the whole idle gap, so the
+    /// sampler starts over and reports no CPU until a fresh pair exists.
+    #[test]
+    fn a_stale_cpu_reading_is_dropped() {
+        let mut sampler = HostSampler::new();
+        if sampler.sample().is_none() {
+            eprintln!("skipping: this platform reports no memory");
+            return;
+        }
+        sampler.cpu_average = Some(50.0);
+        sampler.cpu_refreshed = Instant::now().checked_sub(CPU_STALE * 2);
+        let after_gap = sampler.sample().unwrap();
+        assert_eq!(after_gap.cpu_percent, None, "{after_gap:?}");
+        assert_eq!(sampler.cpu_average, None);
     }
 
     /// Memory comes with the first sample; CPU only from the second one

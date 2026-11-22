@@ -2358,6 +2358,44 @@ async fn a_resources_move_pushes_the_report_at_most_every_ten_seconds() {
     node.stop().await;
 }
 
+/// A backend that binds between a change and the next check does not reset
+/// the baseline for the backends already bound: they still get the change
+/// (review of Homes GA 16).
+#[tokio::test]
+async fn a_new_bind_does_not_hide_a_change_from_bound_backends() {
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(3);
+    let node = Running::start_with(
+        dir.path(),
+        MachineApi::new(),
+        admission.clone(),
+        BTreeMap::new(),
+    )
+    .await;
+    let mut first = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut first).await;
+
+    let local = AgentId::from_string("local-agent".to_owned());
+    admission.try_admit(&local).unwrap();
+    let mut second = dial_link(
+        &node.endpoint_for(&other_token()),
+        hello_from(OTHER_HEAD, 1, "lease-o", 0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.welcome.capabilities.capacity.running_agents, 1);
+    replay_complete(&mut second).await;
+    node.service.push_load_change().await;
+    assert_eq!(
+        pushed_load(&mut first).await,
+        1,
+        "the bound backend sees it"
+    );
+    node.stop().await;
+}
+
 /// A backend binding right after its first mint gets the primed report (no
 /// models yet). When the background refresh lands the full one, every live
 /// link gets it unasked, so an orchestrator's model picker does not wait an

@@ -401,9 +401,9 @@ impl ExecutorService {
     /// when the running-agent count differs from the one the previous check
     /// saw, or when CPU or memory moved [`RESOURCES_THRESHOLD`] points from
     /// the last pushed sample and the last push is [`RESOURCES_PUSH_GAP`]
-    /// old, against the baseline the last bind's `welcome` set (it carries
-    /// the current values). Nothing is sampled or pushed while no link is
-    /// live.
+    /// old, against what the links last got (the first bind's `welcome`
+    /// sets the baseline). Nothing is sampled or pushed while no link is
+    /// live; a change meanwhile is pushed at the next check with one.
     pub(crate) async fn push_load_change(&self) {
         let count = self.deps.admission.capacity().running_agents;
         if !self.has_live_link() {
@@ -862,11 +862,15 @@ impl ExecutorHost for ExecutorService {
             .unwrap_or_default();
         let (hosts, tc_address) = self.deps.report.routes();
         let capabilities = self.capabilities();
-        // The welcome reports the load: later checks push changes from it.
+        // The first welcome sets the baseline. A later one leaves it alone:
+        // the backends already bound may not have seen these values, so the
+        // next check pushes any change to every link.
         {
             let mut state = lock(&self.load);
-            state.count = Some(capabilities.capacity.running_agents);
-            state.reported = capabilities.resources;
+            if state.count.is_none() {
+                state.count = Some(capabilities.capacity.running_agents);
+                state.reported = capabilities.resources;
+            }
         }
         LinkWelcome {
             protocol: 0,
