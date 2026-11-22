@@ -536,14 +536,12 @@ impl Services {
 
         let auggie = self.one_shot_auggie_bin()?;
         // An `auggie@…` profile runs with its own session (PROTOCOL §5.54).
-        let overlay = if crate::provider_profiles::is_qualified_ref(&run_provider) {
-            Box::pin(self.resolve_selected_profile(&run_provider))
-                .await?
-                .overlay
-                .map(|p| crate::agent_manager::local_launch_overlay(&p))
-        } else {
-            None
-        };
+        // An auggie Default with saved overrides runs with them too; `None`
+        // when nothing is saved, and an unreadable Default fails closed.
+        let overlay = Box::pin(self.resolve_selected_profile(&run_provider))
+            .await?
+            .overlay
+            .map(|p| crate::agent_manager::local_launch_overlay(&p));
         let stdout = run_auggie_print(
             &auggie,
             model.as_deref(),

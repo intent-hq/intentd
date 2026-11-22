@@ -9605,6 +9605,17 @@ impl Services {
         let Some(provider_id) = provider_id else {
             return self.models_list_auggie_op(force_refresh, false).await;
         };
+        // The Default of a base without an installed context (Grok, Droid,
+        // Auggie, Cursor) with saved overrides: its catalog runs with them,
+        // cached under its fingerprint, like a profile's (PROTOCOL §5.54).
+        if crate::provider_profiles::is_default_config_ref(&provider_id)
+            && intent_providers::installed_cli::InstalledCli::for_provider(&provider_id).is_none()
+            && self.default_has_overrides(&provider_id)
+        {
+            return self
+                .models_list_profile_op(provider_id, force_refresh)
+                .await;
+        }
         if provider_id == "auggie" {
             let mut response = self.models_list_auggie_op(force_refresh, true).await?;
             response["providerId"] = Value::String(provider_id);
@@ -9741,16 +9752,22 @@ impl Services {
             let base_version = crate::model_catalog::source_for(&base)
                 .map(|source| (source.version_key)())
                 .unwrap_or_default();
-            let version_key = format!(
-                "{base_version}#{}",
-                profile.as_ref().map(|p| p.cache_key()).unwrap_or_default()
-            );
             let cursor_path = self
                 .effective_settings()
                 .providers
                 .paths
                 .get("cursor")
                 .cloned();
+            // Cursor's version key follows its configured binary path.
+            let base_version = if base == "cursor" {
+                crate::model_catalog::CursorModelSource::resolve(cursor_path.as_deref()).version_key
+            } else {
+                base_version
+            };
+            let version_key = format!(
+                "{base_version}#{}",
+                profile.as_ref().map(|p| p.cache_key()).unwrap_or_default()
+            );
             crate::model_catalog::resolve_with_cache(
                 &self.models_catalog,
                 &reference,

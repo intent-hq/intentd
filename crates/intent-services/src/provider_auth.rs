@@ -674,7 +674,14 @@ async fn probe_provider(
                     .auth_status();
             // A key profile never uses the stored login, so the note that
             // the stored login wins applies to the Default only.
-            let status_note = if authenticated == Some(true) && overlay.is_none() {
+            // A profile on the memory credential store never uses the stored
+            // login; anything else (an overridden Default too) still can.
+            let memory_store = overlay.as_ref().is_some_and(|o| {
+                o.entries().any(|(k, v)| {
+                    k == intent_providers::CURSOR_CREDENTIAL_STORE_ENV && v == Some("memory")
+                })
+            });
+            let status_note = if authenticated == Some(true) && !memory_store {
                 cursor_stored_login_note(&program).await
             } else {
                 None

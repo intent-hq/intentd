@@ -320,13 +320,12 @@ impl Services {
         };
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
         let overlay = match effective_provider.as_deref() {
-            Some(reference) if crate::provider_profiles::is_qualified_ref(reference) => {
-                Box::pin(self.resolve_selected_profile(reference))
-                    .await?
-                    .overlay
-                    .map(|p| crate::agent_manager::local_launch_overlay(&p))
-            }
-            _ => None,
+            // An overridden auggie Default enhances with its overrides too.
+            Some(reference) => Box::pin(self.resolve_selected_profile(reference))
+                .await?
+                .overlay
+                .map(|p| crate::agent_manager::local_launch_overlay(&p)),
+            None => None,
         };
         let enhanced = enhance_with_auggie(
             &auggie,
@@ -612,6 +611,38 @@ mod tests {
             .await
             .unwrap();
         assert!(!plain.contains("profile-session"), "{plain}");
+    }
+
+    /// An auggie Default with a saved session enhances with it (PROTOCOL
+    /// §5.54 Default configuration overrides).
+    #[cfg(unix)]
+    #[intent_test_macros::daemon_test]
+    async fn enhance_op_runs_an_overridden_auggie_default_with_its_session() {
+        let (_bin_dir, bin) = fake_auggie("default-session", "echo \"$AUGMENT_SESSION_AUTH\"");
+        let (tmp, services) = services_with_bin(bin).await;
+        let services = services
+            .with_secret_store(std::sync::Arc::new(
+                crate::settings::InMemorySecretStore::default(),
+            ))
+            .with_provider_profiles_dir(tmp.dir.path());
+        services
+            .provider_profiles_update_default_impl(serde_json::json!({
+                "baseProviderId": "auggie",
+                "env": [{ "key": "AUGMENT_SESSION_AUTH", "kind": "set", "value": "default-session" }],
+            }))
+            .await
+            .expect("save the Default's session");
+        let out = services
+            .agent_enhance_prompt_op(
+                "lay me out".into(),
+                "layout".into(),
+                None,
+                None,
+                Some(10_000),
+            )
+            .await
+            .expect("enhance runs");
+        assert_eq!(out["enhanced"], "default-session", "{out}");
     }
 
     #[cfg(unix)]
