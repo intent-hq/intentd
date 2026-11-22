@@ -48,7 +48,7 @@ use intent_core::{
     WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_core::{AgentReverseDispatch, ReverseLiveClient};
-use intent_store::{EventQuery, NewEvent, Store};
+use intent_store::{EventQuery, IdempotencyReservation, NewEvent, Store};
 use stack_frame::boxed_await;
 
 pub use intent_core::{Error, Result, WorkspaceApi};
@@ -15842,11 +15842,15 @@ pub(crate) type IdempotencyInflight = KeyedInflight<IdempotencyIdent>;
 /// and returns it (errors are not cached). When `key` is absent this is a
 /// SOFT-LAUNCH (R5): log a warn and execute normally — never reject.
 ///
-/// The lookup → `op` → store sequence runs under the key's [`IdempotencyInflight`]
+/// The reserve → `op` → store sequence runs under the key's [`IdempotencyInflight`]
 /// lock, so concurrent first-use callers on one key are serialized: the second
 /// caller's lookup sees the first's stored result and replays it rather than
 /// running `op` again. A failed `op` releases the key without storing, so the
-/// next same-key caller runs `op` itself.
+/// next same-key caller runs `op` itself (a panic or cancellation releases it
+/// too, see [`ReservationGuard`]). Across daemons (Postgres) the key is
+/// reserved in the store before `op` runs ([`Store::reserve_idempotent`]): a
+/// caller that finds it reserved elsewhere waits up to
+/// [`IDEMPOTENCY_IN_PROGRESS_WAIT`] for the result, then fails `StoreBusy`.
 ///
 /// `workspace_id` is the `""` sentinel for global methods that carry no
 /// workspaceId (e.g. `workspace.create`).
@@ -15872,19 +15876,91 @@ where
     };
     let slot = inflight.enter((workspace_id.to_string(), key.clone()));
     let _held = slot.acquire().await;
-    if let Some(stored) = store.get_idempotent(workspace_id, &key).await? {
-        let value: T = serde_json::from_str(&stored)
-            .map_err(|e| Error::Internal(format!("decode idempotent result failed: {e}")))?;
-        return Ok(value);
+    // Batch G 2b: reserve the key in the store before `op` runs, so a retry
+    // that reaches another process meanwhile waits for this result instead
+    // of running `op` a second time.
+    let waited_since = tokio::time::Instant::now();
+    loop {
+        match store.reserve_idempotent(workspace_id, &key, method).await? {
+            IdempotencyReservation::Reserved => break,
+            IdempotencyReservation::Done(stored) => {
+                return serde_json::from_str(&stored)
+                    .map_err(|e| Error::Internal(format!("decode idempotent result failed: {e}")));
+            }
+            IdempotencyReservation::InProgress => {
+                if waited_since.elapsed() >= IDEMPOTENCY_IN_PROGRESS_WAIT {
+                    return Err(Error::StoreBusy(format!(
+                        "{method} with this idempotency key is still running in another \
+                         daemon; retry with the same key"
+                    )));
+                }
+                tokio::time::sleep(IDEMPOTENCY_IN_PROGRESS_POLL).await;
+            }
+        }
     }
+    // Nothing is stored for an `op` that fails, panics or is cancelled, or
+    // whose result cannot be stored: the guard releases the reservation on
+    // every such exit so another daemon's retry may run it, instead of
+    // waiting for a restart or takeover of this live process.
+    let mut reservation = ReservationGuard {
+        store: store.clone(),
+        workspace_id: workspace_id.to_string(),
+        key: key.clone(),
+        method: method.to_string(),
+        armed: true,
+    };
     let result = op().await?;
     let result_json = serde_json::to_string(&result)
         .map_err(|e| Error::Internal(format!("encode idempotent result failed: {e}")))?;
     store
-        .put_idempotent(workspace_id, &key, method, &result_json)
+        .complete_idempotent(workspace_id, &key, method, &result_json)
         .await?;
+    reservation.armed = false;
     Ok(result)
 }
+
+/// Releases a [`with_idempotency`] reservation when it is dropped armed: the
+/// keyed call ended without storing a result (an `op` error, a panic, a
+/// cancelled future, or a failed encode or store). Release is best-effort and
+/// runs on a spawned task, since `Drop` cannot await; a failed release is
+/// freed by the next process that opens the tenant or a takeover.
+struct ReservationGuard {
+    store: Store,
+    workspace_id: String,
+    key: String,
+    method: String,
+    armed: bool,
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let store = self.store.clone();
+        let (workspace_id, key, method) = (
+            std::mem::take(&mut self.workspace_id),
+            std::mem::take(&mut self.key),
+            std::mem::take(&mut self.method),
+        );
+        runtime.spawn(async move {
+            if let Err(e) = store.release_idempotent(&workspace_id, &key).await {
+                tracing::warn!(method, error = %e, "idempotency key release failed");
+            }
+        });
+    }
+}
+
+/// How long a keyed call waits for another daemon that reserved the same key
+/// to finish before it fails with a retryable `StoreBusy` (Postgres only;
+/// `SQLite` never reports a key in progress).
+const IDEMPOTENCY_IN_PROGRESS_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a keyed call looks again at a key another daemon reserved.
+const IDEMPOTENCY_IN_PROGRESS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Extract the completed child agent id from a completion event: the canonical
 /// data.agentId, falling back to the event actor id when present.
