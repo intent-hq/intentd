@@ -268,7 +268,9 @@ pub(crate) fn settle_home_push(
             }
         }
     }
-    // The worktree is the orchestrator's mirror, not the home's refs.
+    // The worktree is the orchestrator's mirror, not the home's refs. With
+    // refs kept elsewhere than this repository, `head` must be fetched into
+    // it before the reset.
     let repo =
         git2::Repository::open(checkout).map_err(git_error("open the workspace repository"))?;
     let at = repo.head().ok().and_then(|head| head.target());

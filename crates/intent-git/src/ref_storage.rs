@@ -1,9 +1,14 @@
 //! Where head keeps the git refs of its remote agents and homes: the
 //! `refs/intent/ws/...` refs in each workspace's own repository on this
 //! host ([`LocalGitStorage`]). An object-store backend can implement the
-//! same traits later; every ref write goes through
-//! [`RefRepository::update_ref`], a compare-and-swap, so both backends share
-//! its semantics.
+//! same traits later; every ref read and write head makes itself goes
+//! through them, writes through [`RefRepository::update_ref`], a
+//! compare-and-swap, so both backends share its semantics.
+//!
+//! Not yet behind these traits: refs a node pushes over its git session
+//! (`git receive-pack` with head's update hook, [`crate::node_git`]) and the
+//! hub repositories ([`crate::hub`]). An object-store backend must cover the
+//! receive-pack path too; it writes most of these refs.
 //!
 //! Errors are [`git2::Error`]s so callers keep their own error mapping; a
 //! backend that is not git2 builds them with [`git2::Error::new`].
@@ -42,13 +47,12 @@ pub trait RefRepository {
     /// [`ErrorCode::NotFound`] when there is no such ref.
     fn find_ref(&self, name: &str) -> Result<Option<Oid>, git2::Error>;
 
-    /// The commit ref `name` peels to.
+    /// The commit ref `name` peels to; `None` when there is no such ref.
     ///
     /// # Errors
     ///
-    /// [`ErrorCode::NotFound`] when there is no such ref; when it does not
-    /// name a commit.
-    fn find_commit_ref(&self, name: &str) -> Result<Oid, git2::Error>;
+    /// When the ref cannot be read or does not name a commit.
+    fn find_commit_ref(&self, name: &str) -> Result<Option<Oid>, git2::Error>;
 
     /// Check that commit `oid` exists.
     ///
@@ -63,8 +67,9 @@ pub trait RefRepository {
     ///
     /// [`ErrorCode::Exists`] when `expect` is [`RefExpect::Absent`] and the
     /// ref exists; [`ErrorCode::Modified`] when it is [`RefExpect::Is`] and
-    /// the ref holds something else; [`ErrorCode::NotFound`] when a delete
-    /// finds no ref; any write failure.
+    /// the ref holds something else; [`ErrorCode::NotFound`] when it is
+    /// [`RefExpect::Is`] and there is no ref, or when a delete finds no ref;
+    /// any write failure. A refused update changes nothing.
     fn update_ref(
         &self,
         name: &str,
@@ -106,8 +111,13 @@ impl RefRepository for LocalRefs {
         Ok(self.0.find_reference(name)?.target())
     }
 
-    fn find_commit_ref(&self, name: &str) -> Result<Oid, git2::Error> {
-        Ok(self.0.find_reference(name)?.peel_to_commit()?.id())
+    fn find_commit_ref(&self, name: &str) -> Result<Option<Oid>, git2::Error> {
+        let reference = match self.0.find_reference(name) {
+            Ok(reference) => reference,
+            Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(reference.peel_to_commit()?.id()))
     }
 
     fn find_commit(&self, oid: Oid) -> Result<(), git2::Error> {
@@ -184,9 +194,68 @@ mod tests {
         let (dir, _, _) = repo();
         let refs = refs(&dir);
         assert_eq!(refs.find_ref(REF).unwrap_err().code(), ErrorCode::NotFound);
+        assert_eq!(refs.find_commit_ref(REF).unwrap(), None);
+    }
+
+    #[test]
+    fn a_forced_update_creates_an_absent_ref() {
+        let (dir, first, _) = repo();
+        let refs = refs(&dir);
+        refs.update_ref(REF, RefExpect::Any, Some(first), "t")
+            .unwrap();
+        assert_eq!(refs.find_ref(REF).unwrap(), Some(first));
+        assert_eq!(refs.find_commit_ref(REF).unwrap(), Some(first));
+    }
+
+    #[test]
+    fn an_expected_object_on_an_absent_ref_is_not_found() {
+        let (dir, first, second) = repo();
+        let refs = refs(&dir);
         assert_eq!(
-            refs.find_commit_ref(REF).unwrap_err().code(),
+            refs.update_ref(REF, RefExpect::Is(first), Some(second), "t")
+                .unwrap_err()
+                .code(),
             ErrorCode::NotFound
+        );
+        assert_eq!(
+            refs.update_ref(REF, RefExpect::Is(first), None, "t")
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(refs.find_ref(REF).unwrap_err().code(), ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn deleting_an_expected_absent_ref_checks_it_is_absent() {
+        let (dir, first, _) = repo();
+        let refs = refs(&dir);
+        refs.update_ref(REF, RefExpect::Absent, None, "t").unwrap();
+        refs.update_ref(REF, RefExpect::Any, Some(first), "t")
+            .unwrap();
+        assert_eq!(
+            refs.update_ref(REF, RefExpect::Absent, None, "t")
+                .unwrap_err()
+                .code(),
+            ErrorCode::Exists
+        );
+        assert_eq!(refs.find_ref(REF).unwrap(), Some(first));
+    }
+
+    #[test]
+    fn a_symbolic_ref_has_no_direct_target() {
+        let (dir, first, _) = repo();
+        let refs = refs(&dir);
+        refs.update_ref(REF, RefExpect::Any, Some(first), "t")
+            .unwrap();
+        git2::Repository::open(dir.path())
+            .unwrap()
+            .reference_symbolic("refs/intent/link", REF, true, "t")
+            .unwrap();
+        assert_eq!(refs.find_ref("refs/intent/link").unwrap(), None);
+        assert_eq!(
+            refs.find_commit_ref("refs/intent/link").unwrap(),
+            Some(first)
         );
     }
 
@@ -203,7 +272,7 @@ mod tests {
                 .code(),
             ErrorCode::Exists
         );
-        assert_eq!(refs.find_commit_ref(REF).unwrap(), first);
+        assert_eq!(refs.find_commit_ref(REF).unwrap(), Some(first));
     }
 
     #[test]
@@ -212,9 +281,12 @@ mod tests {
         let refs = refs(&dir);
         refs.update_ref(REF, RefExpect::Any, Some(first), "t")
             .unwrap();
-        assert!(refs
-            .update_ref(REF, RefExpect::Is(second), Some(second), "t")
-            .is_err());
+        assert_eq!(
+            refs.update_ref(REF, RefExpect::Is(second), Some(second), "t")
+                .unwrap_err()
+                .code(),
+            ErrorCode::Modified
+        );
         assert_eq!(refs.find_ref(REF).unwrap(), Some(first));
         refs.update_ref(REF, RefExpect::Is(first), Some(second), "t")
             .unwrap();

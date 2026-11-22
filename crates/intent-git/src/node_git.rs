@@ -722,14 +722,8 @@ pub fn read_agent_ref(
     kind: AgentRef,
 ) -> Result<Option<git2::Oid>> {
     let repo = storage.open(repository).map_err(crate::map_git_err)?;
-    let name = remote.ref_name(kind);
-    match repo.find_ref(&name) {
-        Ok(_) => {}
-        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
-        Err(error) => return Err(crate::map_git_err(error)),
-    }
-    let commit = repo.find_commit_ref(&name).map_err(crate::map_git_err)?;
-    Ok(Some(commit))
+    repo.find_commit_ref(&remote.ref_name(kind))
+        .map_err(crate::map_git_err)
 }
 
 const GITLINK_MODE: u32 = 0o160_000;
