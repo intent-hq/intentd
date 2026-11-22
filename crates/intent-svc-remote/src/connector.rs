@@ -139,6 +139,22 @@ pub(crate) struct Tuning {
     /// its record and leaving `Shared::in_grace`.
     #[cfg(test)]
     pub grace_gate: GraceGate,
+    /// Test seam: the link ownership the connector claims and fences with,
+    /// instead of this process owning every link.
+    #[cfg(test)]
+    pub ownership: OwnershipSeam,
+}
+
+/// See [`Tuning::ownership`].
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct OwnershipSeam(pub Option<Arc<dyn intent_node_connections::LinkOwnership>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for OwnershipSeam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnershipSeam")
+    }
 }
 
 /// See [`Tuning::forge_resolver`].
@@ -232,6 +248,8 @@ impl Default for Tuning {
             forge_resolver: ForgeResolver::default(),
             #[cfg(test)]
             grace_gate: GraceGate::default(),
+            #[cfg(test)]
+            ownership: OwnershipSeam::default(),
         }
     }
 }
@@ -1805,7 +1823,8 @@ impl RemoteNode {
         services: Option<Services>,
         forge: Option<Arc<crate::forge_token::ForgeTokens>>,
     ) -> Result<Self> {
-        let lease = HeadLease::open(store, &target.id).await?;
+        let ownership = crate::lease::ownership(&store, &tuning);
+        let lease = HeadLease::open(store, &target.id, ownership).await?;
         #[cfg(test)]
         let lease = lease.failing_ack_writes_when(tuning.fail_ack_writes.clone());
         let acked = lease.acked().await?;
@@ -2768,30 +2787,44 @@ async fn run(
         retry = false;
         shared.cloud_refusal.send_replace(None);
         *lock(&shared.route) = Some(route);
-        if let Err(error) = lease.record_welcome(&welcome).await {
-            tracing::warn!(%error, "remote machine: could not record the welcome");
-        }
-        shared.welcome(&welcome);
-        shared.record_link(&welcome).await;
-        // Before the link is published: queue the stops of agents head no
-        // longer claims, then send every queued stop, so they precede any
-        // launch or prompt on this link.
-        #[cfg(test)]
-        if let Some(hook) = &shared.tuning.before_claim.0 {
-            hook(&shared);
-        }
-        if !claim(&shared, &welcome.running_agents).await {
+        let fenced = match lease
+            .record_welcome(&welcome, link.binding().generation)
+            .await
+        {
+            Ok(()) => false,
+            Err(error) => {
+                tracing::warn!(%error, "remote machine: could not record the welcome");
+                matches!(error, crate::lease::LinkWrite::Fenced(_))
+            }
+        };
+        let refusal = if fenced {
+            // Another process owns this link: write nothing, claim no agent
+            // and stop none.
+            Some("another backend process owns this machine's link now; nothing was received")
+        } else {
+            shared.welcome(&welcome);
+            shared.record_link(&welcome).await;
+            // Before the link is published: queue the stops of agents head no
+            // longer claims, then send every queued stop, so they precede any
+            // launch or prompt on this link.
+            #[cfg(test)]
+            if let Some(hook) = &shared.tuning.before_claim.0 {
+                hook(&shared);
+            }
             // The survivors cannot be told apart, so this link is not served:
             // their journal records would have no runtime to go to, yet be
-            // acknowledged. Close it and bind again (with backoff) until the
-            // claim succeeds; nothing was acknowledged, so the machine
-            // replays everything on the next bind.
+            // acknowledged.
+            (!claim(&shared, &welcome.running_agents).await).then_some(
+                "could not tell which of this backend's agents still run there (its agent records could not be read); nothing was received",
+            )
+        };
+        if let Some(refusal) = refusal {
+            // Close it and bind again (with backoff); nothing was
+            // acknowledged, so the machine replays everything on the next
+            // bind.
             link.close();
             shared.disconnected();
-            let failure = ConnectFailure::Local(
-                "could not tell which of this backend's agents still run there (its agent records could not be read); nothing was received"
-                    .into(),
-            );
+            let failure = ConnectFailure::Local(refusal.into());
             for waiter in waiters.drain(..) {
                 let _ = waiter.send(Err(failure.clone()));
             }
@@ -3212,15 +3245,22 @@ impl Acks {
     }
 
     /// Persist `seq`, then ack it. A failed persist sends no ack, so the
-    /// node keeps the records.
+    /// node keeps the records; a fenced one also closes the link, which
+    /// another process owns now.
     async fn flush(&mut self, lease: &HeadLease, link: &NodeLink, seq: NodeCounter) {
         self.pending = 0;
         self.due = None;
         if self.persisted != Some(seq) {
-            match lease.persist_ack(seq).await {
+            match lease
+                .persist_ack(seq, Some(link.binding().generation))
+                .await
+            {
                 Ok(_) => self.persisted = Some(seq),
                 Err(error) => {
                     tracing::warn!(%error, seq = seq.0, "remote node: could not persist the journal ack; not acking");
+                    if matches!(error, crate::lease::LinkWrite::Fenced(_)) {
+                        link.close();
+                    }
                     return;
                 }
             }

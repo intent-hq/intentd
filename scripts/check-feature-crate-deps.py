@@ -8,6 +8,9 @@ holds if nothing below a feature reaches up into it:
 - intent-services (core) and intent-transport never depend on a feature crate
   or on intent-app, through any kind of edge. A dev-dependency from core on a
   feature would also compile two copies of core into core's own tests.
+- intent-node-connections (the node-connection service) sits below
+  intent-services too: the head's domain reaches it through its traits, so it
+  never depends on intent-services, a feature crate or intent-app.
 - Every other edge into an `intent-svc-*` crate or intent-app must be listed in
   ALLOWED below: intent-app composes every feature, intentd depends on
   intent-app, and feature-to-feature edges are the ones in the split plan
@@ -40,7 +43,10 @@ from pathlib import Path
 FEATURE_PREFIX = "intent-svc-"
 APP = "intent-app"
 # Crates below every feature: they may not depend on a feature or on intent-app.
-BELOW_FEATURES = ("intent-services", "intent-transport")
+BELOW_FEATURES = ("intent-services", "intent-transport", "intent-node-connections")
+SERVICES = "intent-services"
+# Crates below intent-services itself: they may not depend on it either.
+BELOW_SERVICES = ("intent-node-connections",)
 
 # Allowed edges into a feature crate or intent-app, as (from, to). A `to` of
 # FEATURE_PREFIX + "*" matches every feature crate.
@@ -109,7 +115,10 @@ def main(argv: list[str]) -> int:
         src = package["name"]
         for dep in package["dependencies"]:
             dst = dep["name"]
-            if dst not in members or not is_upper(dst) or allowed(src, dst):
+            if dst not in members:
+                continue
+            below_services = src in BELOW_SERVICES and dst == SERVICES
+            if not below_services and (not is_upper(dst) or allowed(src, dst)):
                 continue
             violations.append((src, dst, edge_kind(dep)))
 
@@ -117,7 +126,9 @@ def main(argv: list[str]) -> int:
         print(f"ok: every dependency on a services feature crate or {APP} is allowed")
         return 0
     for src, dst, kind in sorted(set(violations)):
-        if src in BELOW_FEATURES:
+        if src in BELOW_SERVICES and dst == SERVICES:
+            why = f"{src} sits below {SERVICES} and may not depend on it"
+        elif src in BELOW_FEATURES:
             why = f"{src} sits below every feature crate and may not depend on {dst}"
         else:
             why = f"{src} -> {dst} is not an allowed edge"

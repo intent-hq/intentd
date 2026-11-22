@@ -20,6 +20,7 @@ use crate::connector::Shared;
 use crate::lease::{new_owner, probe_hello, record_new_lease, HeadLease};
 use crate::machine::MachineTarget;
 use crate::{RemoteFeature, RemoteNode};
+use intent_node_connections::process_head_session;
 
 /// Longest id, name, credential id or route, in UTF-8 bytes.
 const MAX_TEXT_BYTES: usize = 256;
@@ -523,9 +524,13 @@ pub(crate) async fn add_machine(
     // routes: keep its live lease and offer that lease's next generation, as
     // the connector would, since the machine refuses one it already saw.
     let kept = if previous.is_some() && !replacing_credential {
-        HeadLease::open(store.clone(), &params.machine_id)
-            .await
-            .ok()
+        HeadLease::open(
+            store.clone(),
+            &params.machine_id,
+            crate::lease::ownership(store, &feature.tuning()),
+        )
+        .await
+        .ok()
     } else {
         None
     };
@@ -543,7 +548,7 @@ pub(crate) async fn add_machine(
     let probed = connect(&target, &feature.tuning().connect, None, || {
         let kept = kept.clone();
         let next = generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let fresh = probe_hello(&owner, NodeCounter(next));
+        let fresh = probe_hello(&owner, NodeCounter(next), process_head_session());
         async move {
             match kept {
                 Some(lease) => lease.next_hello(acked).await,

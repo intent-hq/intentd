@@ -12,22 +12,60 @@ use intent_core::nodes::{
     LeaseOwner, LeaseState, NodeArch, NodeCapacity, NodeCounter, NodeKind, NodeLease, NodeOs,
     NodeRecord, NodeState,
 };
+use std::sync::{Arc, Mutex};
+
 use intent_core::{now_iso, AgentId, Error, Result};
+use intent_node_connections::{Fenced, LinkClaim, LinkOwnership, LocalOwnership};
 use intent_store::Store;
 
 use crate::machine::MachineTarget;
 
-/// This backend process's `hello.headSession` (nodeProtocol 14): picked
-/// once per start, so a machine drops the agent secrets it held for the
-/// previous process.
-pub(crate) fn head_session() -> &'static str {
-    static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SESSION.get_or_init(|| uuid::Uuid::new_v4().to_string())
+/// This backend's ownership of its machine links: the desktop's, where this
+/// process owns every link, unless a test replaced it.
+pub(crate) fn ownership(
+    store: &Store,
+    tuning: &crate::connector::Tuning,
+) -> Arc<dyn LinkOwnership> {
+    #[cfg(test)]
+    if let Some(ownership) = &tuning.ownership.0 {
+        return ownership.clone();
+    }
+    #[cfg(not(test))]
+    let _ = tuning;
+    Arc::new(LocalOwnership::new(store.clone()))
+}
+
+/// Why a durable link write did not happen.
+#[derive(Debug)]
+pub(crate) enum LinkWrite {
+    /// Another process owns the link, or a newer dial of this one
+    /// superseded it: the link must close.
+    Fenced(Fenced),
+    Failed(Error),
+}
+
+impl std::fmt::Display for LinkWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fenced(fenced) => fenced.fmt(f),
+            Self::Failed(error) => error.fmt(f),
+        }
+    }
+}
+
+impl From<Error> for LinkWrite {
+    fn from(error: Error) -> Self {
+        Self::Failed(error)
+    }
 }
 
 /// The hello of a probe: binds `owner`'s binding at `generation` with no
 /// journal acked yet (a new credential's journal is empty).
-pub(crate) fn probe_hello(owner: &LeaseOwner, generation: NodeCounter) -> LinkHello {
+pub(crate) fn probe_hello(
+    owner: &LeaseOwner,
+    generation: NodeCounter,
+    head_session: &str,
+) -> LinkHello {
     LinkHello {
         protocol: NODE_LINK_PROTOCOLS,
         intentd_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -39,7 +77,7 @@ pub(crate) fn probe_hello(owner: &LeaseOwner, generation: NodeCounter) -> LinkHe
         },
         acked_seq: NodeCounter(0),
         lease_agents: Vec::new(),
-        head_session: Some(head_session().to_owned()),
+        head_session: Some(head_session.to_owned()),
         lease_homes: None,
     }
 }
@@ -110,6 +148,11 @@ pub(crate) async fn record_new_lease(
 pub(crate) struct HeadLease {
     store: Store,
     owner: LeaseOwner,
+    ownership: Arc<dyn LinkOwnership>,
+    /// The claim of the latest dial, shared by every clone; `None` before
+    /// the first. A link's writes pass only while its generation is this
+    /// claim's: a superseded link writes nothing.
+    claim: Arc<Mutex<Option<LinkClaim>>>,
     /// Test seam: fail every ack write while set.
     #[cfg(test)]
     fail_ack_writes: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -126,7 +169,11 @@ impl HeadLease {
     ///
     /// `remote-node-lease-ended` when the machine has no live lease (it was
     /// removed, or its credential replaced).
-    pub(crate) async fn open(store: Store, machine_id: &str) -> Result<Self> {
+    pub(crate) async fn open(
+        store: Store,
+        machine_id: &str,
+        ownership: Arc<dyn LinkOwnership>,
+    ) -> Result<Self> {
         let head_id = store.daemon_id().await?;
         let lease = store
             .list_owned_node_leases(&head_id)
@@ -141,6 +188,8 @@ impl HeadLease {
         Ok(Self {
             store,
             owner: lease.owner,
+            ownership,
+            claim: Arc::default(),
             #[cfg(test)]
             fail_ack_writes: std::sync::Arc::default(),
         })
@@ -158,6 +207,23 @@ impl HeadLease {
 
     pub(crate) fn owner(&self) -> &LeaseOwner {
         &self.owner
+    }
+
+    /// Check the claim before a durable write for the link bound at
+    /// `generation` (`None`: a write between links). Before the first claim
+    /// there is nothing to check.
+    async fn fence(&self, generation: Option<NodeCounter>) -> std::result::Result<(), Fenced> {
+        let claim = crate::lock(&self.claim).clone();
+        let Some(claim) = claim else {
+            return Ok(());
+        };
+        if generation.is_some_and(|generation| generation != claim.generation) {
+            return Err(Fenced {
+                machine_id: claim.owner.node_id,
+                epoch: claim.epoch,
+            });
+        }
+        self.ownership.fence(&claim).await
     }
 
     /// The persisted journal ack.
@@ -200,21 +266,24 @@ impl HeadLease {
         Ok(lease_agents)
     }
 
-    /// Durably advance the generation, then build the hello offering it.
+    /// Claim the link (durably advancing the generation), then build the
+    /// hello offering it.
     /// The hello acks only what is persisted: the node deletes the records
     /// it acks, so offering `ingested` before it is saved could lose records
     /// a restarted head still needs. Head first tries to persist `ingested`;
     /// if that fails it offers the older durable ack and its in-memory
     /// sequence skips the replayed duplicates.
     pub(crate) async fn next_hello(&self, ingested: NodeCounter) -> Result<LinkHello> {
-        let acked = match self.persist_ack(ingested).await {
+        let acked = match self.persist_ack(ingested, None).await {
             Ok(acked) => acked,
             Err(error) => {
                 tracing::warn!(%error, seq = ingested.0, "remote node: could not persist the journal ack; offering the saved one");
                 self.acked().await?
             }
         };
-        let generation = self.store.next_node_link_generation(&self.owner).await?;
+        let claim = self.ownership.claim(&self.owner).await?;
+        let generation = claim.generation;
+        *crate::lock(&self.claim) = Some(claim);
         let lease_agents = self.lease_agents().await?;
         let lease_homes = self.lease_homes().await?;
         Ok(LinkHello {
@@ -228,7 +297,7 @@ impl HeadLease {
             },
             acked_seq: acked,
             lease_agents,
-            head_session: Some(head_session().to_owned()),
+            head_session: Some(self.ownership.head_session().to_owned()),
             lease_homes: Some(lease_homes),
         })
     }
@@ -271,8 +340,15 @@ impl HeadLease {
         Ok(homes)
     }
 
-    /// Record what the node reported for a new link.
-    pub(crate) async fn record_welcome(&self, welcome: &LinkWelcome) -> Result<()> {
+    /// Record what the node reported for the link bound at `generation`.
+    pub(crate) async fn record_welcome(
+        &self,
+        welcome: &LinkWelcome,
+        generation: NodeCounter,
+    ) -> std::result::Result<(), LinkWrite> {
+        self.fence(Some(generation))
+            .await
+            .map_err(LinkWrite::Fenced)?;
         self.store
             .record_node_welcome(
                 &self.owner,
@@ -283,17 +359,24 @@ impl HeadLease {
             )
             .await
             .map(drop)
+            .map_err(LinkWrite::Failed)
     }
 
-    /// Persist that every record up to `seq` is ingested.
-    pub(crate) async fn persist_ack(&self, seq: NodeCounter) -> Result<NodeCounter> {
+    /// Persist that every record up to `seq` is ingested, for the link bound
+    /// at `generation` (`None`: between links).
+    pub(crate) async fn persist_ack(
+        &self,
+        seq: NodeCounter,
+        generation: Option<NodeCounter>,
+    ) -> std::result::Result<NodeCounter, LinkWrite> {
         #[cfg(test)]
         if self
             .fail_ack_writes
             .load(std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(Error::Internal("injected ack write failure".into()));
+            return Err(Error::Internal("injected ack write failure".into()).into());
         }
-        self.store.advance_node_lease_ack(&self.owner, seq).await
+        self.fence(generation).await.map_err(LinkWrite::Fenced)?;
+        Ok(self.store.advance_node_lease_ack(&self.owner, seq).await?)
     }
 }
