@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.271] - 2026-11-22
+
+### 🐛 Bug Fixes
+
+- *(test)* Run intent-store trybuild cases one at a time under nextest ([#3664](https://github.com/intent-hq/intentd/pull/3664))
+
+### 🔧 Refactor
+
+- *(remote)* Put the cloud dial gate and forge token behind link-side halves ([#3665](https://github.com/intent-hq/intentd/pull/3665))
+
+
 ## [0.11.270] - 2026-11-22
 
 ### 🚀 Features
