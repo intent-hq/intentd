@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.274] - 2026-11-22
+
+### 🐛 Bug Fixes
+
+- *(store)* Claim completion watches and delegation groups before delivery ([#3649](https://github.com/intent-hq/intentd/pull/3649))
+
+
 ## [0.11.273] - 2026-11-22
 
 ### 🚀 Features
