@@ -186,6 +186,27 @@ async fn every_row_seq_table_uses_the_tenant_counter() {
         untriggered.is_empty(),
         "row_seq tables without the tenant-counter trigger: {untriggered:?}"
     );
+    // The counter's starting floor reads every row_seq table by name.
+    let floor: String =
+        sqlx::query_scalar("SELECT pg_get_functiondef('intent_row_seq_floor(text)'::regprocedure)")
+            .fetch_one(&db.admin)
+            .await
+            .unwrap();
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND column_name = 'row_seq' ORDER BY 1",
+    )
+    .fetch_all(&db.admin)
+    .await
+    .unwrap();
+    let unfloored: Vec<&String> = tables
+        .iter()
+        .filter(|t| !floor.contains(&format!("FROM {t} WHERE {t}.tenant_id = p_tenant")))
+        .collect();
+    assert!(
+        unfloored.is_empty(),
+        "row_seq tables missing from intent_row_seq_floor: {unfloored:?}"
+    );
 }
 
 fn known_repo_insert(tenant: &str, path: &str) -> String {

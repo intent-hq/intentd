@@ -25,9 +25,22 @@
 -- true insertion order. (Release builds never enable the postgres feature,
 -- so only test and dogfood databases hold such rows.)
 --
--- A new table with a row_seq column needs the same trigger;
+-- The first allocation of a tenant after this migration scans the tenant's
+-- rows in every row_seq table (no index covers row_seq), inside the writer
+-- lock and its statement_timeout. That is cheap at today's sizes; if it ever
+-- timed out, the write would fail and last_row_seq stay NULL, so each later
+-- write would retry the scan.
+--
+-- Deploy order: stop every daemon of the old build before the migrate job
+-- applies this. An old daemon's lock statement does not set
+-- intent.writer_tenant, so its inserts fail here, and between a table's DROP
+-- IDENTITY and its trigger an insert fails NOT NULL. (Release builds never
+-- enable the postgres feature, so only dogfood deployments are affected.)
+--
+-- A new table with a row_seq column needs the same triggers and a line in
+-- intent_row_seq_floor;
 -- postgres_backend::row_seq::every_row_seq_table_uses_the_tenant_counter
--- checks this.
+-- checks both.
 
 ALTER TABLE tenant_writer ADD COLUMN IF NOT EXISTS last_row_seq bigint;
 

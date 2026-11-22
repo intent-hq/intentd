@@ -340,11 +340,17 @@ pub async fn sqlite_store() -> (Store, tempfile::TempDir) {
 pub async fn tenant_rows(admin: &PgPool, tenant: &str) -> Vec<(String, String)> {
     let tables = tenant_tables(admin).await;
     let mut rows = Vec::new();
-    // tenant_writer is the writer lock and row_seq counter, not tenant data:
-    // any write (even an INSERT ... ON CONFLICT DO NOTHING) moves it.
-    for table in tables.into_iter().filter(|t| t != "tenant_writer") {
+    for table in tables {
+        // tenant_writer.last_row_seq is the row_seq counter: any write (even
+        // an INSERT ... ON CONFLICT DO NOTHING) moves it. The rest of the row
+        // is still compared.
+        let row = if table == "tenant_writer" {
+            "(to_jsonb(t) - 'last_row_seq')::text"
+        } else {
+            "t::text"
+        };
         let texts: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT t::text FROM {table} t WHERE tenant_id = $1 ORDER BY 1"
+            "SELECT {row} FROM {table} t WHERE tenant_id = $1 ORDER BY 1"
         )))
         .bind(tenant)
         .fetch_all(admin)
