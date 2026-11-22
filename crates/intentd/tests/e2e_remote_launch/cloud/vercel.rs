@@ -57,6 +57,8 @@ struct Machines {
     commands: Vec<(String, CommandStart)>,
     /// Every stdout, to look for the executor token.
     outputs: Vec<String>,
+    /// Sessions started again from a stopped sandbox.
+    resumes: usize,
 }
 
 /// Runs each sandbox's commands in its folder, and its lifecycle on its
@@ -189,7 +191,10 @@ impl Host for LocalHost {
                         machine.group.kill();
                     }
                 }
-                Event::Resumed(name) => self.new_group(&name),
+                Event::Resumed(name) => {
+                    self.machines().resumes += 1;
+                    self.new_group(&name);
+                }
                 Event::Deleted(name) => {
                     if let Some(machine) = self.machines().by_name.remove(&name) {
                         machine.group.terminate(stop_grace());
@@ -682,8 +687,8 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
 }
 
 /// A stopped sandbox whose self-hosted relay stops answering: the message
-/// that resumes it fails with the relay's reason and URL, and the sandbox is
-/// stopped again. Its resume (a daemon start and a relay check that wait
+/// that resumes it fails with the relay's reason and URL after one resume,
+/// and the sandbox is stopped again. Its resume (a daemon start and a relay check that wait
 /// out the relay) outlasts a dial; the message used to fail with only
 /// "Could not reach … on any of its routes" (intent#9825).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -758,6 +763,7 @@ async fn a_resume_whose_relay_does_not_answer_says_so() {
 
     let silent = silent_relay_url().await;
     super::relay::set_relay(&mut rpc_ws, 50, &silent).await;
+    let resumes = fake.host.machines().resumes;
     let mut events = agent_events(port, cfg, &ws_id).await;
     ok(
         &mut rpc_ws,
@@ -770,6 +776,12 @@ async fn a_resume_whose_relay_does_not_answer_says_so() {
     assert!(failure.contains("never falls back"), "{failure}");
     assert!(!failure.contains("any of its routes"), "{failure}");
     drop(events);
+    idle(&mut rpc_ws, Duration::from_secs(15)).await;
+    assert_eq!(
+        fake.host.machines().resumes - resumes,
+        1,
+        "one message resumed the sandbox more than once"
+    );
     machine_until(&mut rpc_ws, 60, &name, |m| {
         m.is_some_and(|m| m["cloud"]["state"] == "paused")
     })

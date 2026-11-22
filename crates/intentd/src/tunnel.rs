@@ -318,10 +318,32 @@ const RELAY_NODE_TIMEOUT: Duration = Duration::from_secs(5);
 /// What every failed relay check says first; the cloud bootstrap looks for it.
 pub const RELAY_UNREACHABLE: &str = "the self-hosted relay is unreachable";
 
+/// One DERP relay of a map to probe.
+#[derive(Debug, PartialEq, Eq)]
+struct RelayTarget {
+    host: String,
+    port: u16,
+    /// The map's `InsecureForTests`: the relay speaks plain HTTP.
+    insecure: bool,
+}
+
+impl RelayTarget {
+    /// derper's liveness endpoint on this relay.
+    fn probe_url(&self) -> String {
+        let scheme = if self.insecure { "http" } else { "https" };
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("{scheme}://{host}:{}/derp/probe", self.port)
+    }
+}
+
 /// The DERP relays of `map` to probe: each node's `IPv4` (unless empty or
 /// `"none"`) or `HostName`, at `DERPPort` (default 443). STUN-only nodes
 /// relay nothing and are left out.
-fn relay_targets(map: &serde_json::Value) -> Vec<(String, u16)> {
+fn relay_targets(map: &serde_json::Value) -> Vec<RelayTarget> {
     let mut targets = Vec::new();
     let regions = map["Regions"]
         .as_object()
@@ -341,14 +363,20 @@ fn relay_targets(map: &serde_json::Value) -> Vec<(String, u16)> {
             .filter(|p| *p != 0)
             .unwrap_or(443);
         if let Some(host) = host {
-            targets.push((host.to_owned(), port));
+            targets.push(RelayTarget {
+                host: host.to_owned(),
+                port,
+                insecure: node["InsecureForTests"].as_bool() == Some(true),
+            });
         }
     }
     targets
 }
 
-/// Fetch the DERP map at `url` and open a TCP connection to one of its
-/// relays, trying them all at once within [`RELAY_NODE_TIMEOUT`].
+/// Fetch the DERP map at `url` and ask its relays' liveness endpoint, all
+/// at once within [`RELAY_NODE_TIMEOUT`]; any HTTP answer counts. A TCP
+/// connect alone proves nothing: an E2B sandbox's network accepts a connect
+/// to any port (intent#9825).
 async fn check_relay(url: &str) -> Result<()> {
     let unreachable = |why: String| Error::Internal(format!("{RELAY_UNREACHABLE} ({url}): {why}"));
     let client = reqwest::Client::builder()
@@ -368,13 +396,24 @@ async fn check_relay(url: &str) -> Result<()> {
     if targets.is_empty() {
         return Err(unreachable("its map lists no relay".into()));
     }
+    // A relay may serve a self-signed certificate (pinned by `CertName`,
+    // which tailcat checks); this probe only asks whether it answers.
+    let probe = reqwest::Client::builder()
+        .timeout(RELAY_NODE_TIMEOUT)
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| unreachable(e.to_string()))?;
     let mut probes = tokio::task::JoinSet::new();
-    for (host, port) in targets {
+    for target in targets {
+        let probe = probe.clone();
         probes.spawn(async move {
-            tokio::net::TcpStream::connect((host.as_str(), port))
+            probe
+                .get(target.probe_url())
+                .send()
                 .await
                 .map(drop)
-                .map_err(|e| format!("{host}:{port}: {e}"))
+                .map_err(|e| format!("{}:{}: {e}", target.host, target.port))
         });
     }
     let answered = tokio::time::timeout(RELAY_NODE_TIMEOUT, async {
@@ -986,13 +1025,22 @@ esac
                 { "IPv4": "" },
             ] },
         } });
+        let target = |host: &str, port: u16| RelayTarget {
+            host: host.to_owned(),
+            port,
+            insecure: false,
+        };
         assert_eq!(
             relay_targets(&map),
             [
-                ("derp.example.com".to_owned(), 443),
-                ("b.example.com".to_owned(), 8443),
-                ("192.0.2.7".to_owned(), 443),
+                target("derp.example.com", 443),
+                target("b.example.com", 8443),
+                target("192.0.2.7", 443),
             ]
+        );
+        assert_eq!(
+            target("b.example.com", 8443).probe_url(),
+            "https://b.example.com:8443/derp/probe"
         );
         assert!(relay_targets(&serde_json::json!({})).is_empty());
     }
@@ -1009,5 +1057,66 @@ esac
             Some(v) => std::env::set_var("INTENTD_TAILCAT_BIN", v),
             None => std::env::remove_var("INTENTD_TAILCAT_BIN"),
         }
+    }
+
+    /// A local server: each connection gets an HTTP 200 with `body`, or
+    /// with `None` is closed without a byte, as E2B's network answers a
+    /// connect to any port. Returns its port.
+    async fn local_server(body: Option<String>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let Some(body) = body.clone() else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// The URL of a DERP map whose one plain-HTTP node is `node_port`.
+    async fn map_url(node_port: u16) -> String {
+        let map = serde_json::json!({ "Regions": { "900": { "RegionID": 900, "Nodes": [{
+            "Name": "900a", "RegionID": 900, "HostName": "127.0.0.1",
+            "DERPPort": node_port, "InsecureForTests": true,
+        }] } } });
+        let port = local_server(Some(map.to_string())).await;
+        format!("http://127.0.0.1:{port}/derpmap.json")
+    }
+
+    /// E2B's network accepts a connect to any port: a relay that takes the
+    /// connection and never answers is not reachable (intent#9825).
+    #[tokio::test]
+    async fn a_relay_that_accepts_connections_but_never_answers_is_unreachable() {
+        let node = local_server(None).await;
+        let error = check_relay(&map_url(node).await)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(RELAY_UNREACHABLE), "{error}");
+        assert!(error.contains(&format!("127.0.0.1:{node}")), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_answers_its_probe_is_reachable() {
+        let node = local_server(Some(String::new())).await;
+        check_relay(&map_url(node).await).await.unwrap();
     }
 }
