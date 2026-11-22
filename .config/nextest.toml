@@ -106,6 +106,17 @@ slow-timeout = { period = "90s", terminate-after = 2 }
 
 [test-groups]
 timing-serial = { max-threads = 1 }
+trybuild-serial = { max-threads = 1 }
+
+# trybuild-serial: intent-store's compile_fail cases share one trybuild project
+# directory. trybuild serializes them with an in-process mutex, which never
+# applies under nextest's process-per-test model, plus a lockfile that a waiter
+# takes over after 1.5s without a heartbeat. A holder stalled under llvm-cov
+# load loses it, two processes rewrite the project's Cargo.toml together, and
+# cargo reads it half-written (merge-queue run 44979683017).
+[[profile.default.overrides]]
+filter = 'binary_id(=intent-store::compile_fail)'
+test-group = 'trybuild-serial'
 
 [[profile.default.overrides]]
 filter = '(binary_id(=intentd::suite_wss_agents) & test(/^e2e_wss_delegation_group_persist::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_interrupted_agents::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_resolve_interrupted::/)) | (binary_id(=intentd::suite_wss_s_z) & test(/^e2e_wss_serve_resume_all::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_pool_contention_stress::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_mcp_servers::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_mcp_oauth_refresh::/)) | binary_id(=intentd::e2e_pty_job_control)'
