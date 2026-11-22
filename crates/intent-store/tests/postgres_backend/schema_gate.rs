@@ -429,8 +429,10 @@ async fn migrate_resumes_on_a_fresh_connection_after_losing_its_own() {
     let Some((_, admin)) = empty_db().await else {
         return;
     };
-    // Well into the file: past the compatibility functions and the tables.
-    let (version, statement) = (expected_versions()[0], 250);
+    // Statement 5 of the triggers, past the compatibility functions (38
+    // statements) and the tables, indexes and foreign keys (271): where the
+    // sharded run lost its connection in the numbered `0003_triggers.sql`.
+    let (version, statement) = (expected_versions()[0], 314);
     let report = postgres::migrate_losing_the_connection_at(&admin, version, statement)
         .await
         .expect("migrate retries a lost connection");
