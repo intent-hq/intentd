@@ -9,7 +9,67 @@ use sqlx::Row;
 
 use crate::Store;
 
+/// What [`Store::reserve_idempotent`] found for a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyReservation {
+    /// This process reserved the key: run the operation, then
+    /// [`Store::complete_idempotent`] (or [`Store::release_idempotent`] when
+    /// it fails).
+    Reserved,
+    /// The operation already ran: replay its stored `result_json`.
+    Done(String),
+    /// Another process reserved the key in the tenant's current epoch and
+    /// is still running the operation (Postgres only): wait and look again.
+    InProgress,
+}
+
 impl Store {
+    /// Reserve `(workspace_id, key)` before running a keyed operation, so a
+    /// retry in another process cannot run it a second time (batch G 2b).
+    /// On Postgres a reservation is a `pending` row naming the tenant's
+    /// epoch and this process; it is stale only when a newer epoch exists
+    /// (a takeover), never by elapsed time. `SQLite` (one process) reports
+    /// the stored result or `Reserved`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotOwner` when this process lost the tenant, and
+    /// `Error::Internal` if the database operation fails.
+    pub async fn reserve_idempotent(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        method: &str,
+    ) -> Result<IdempotencyReservation> {
+        dispatch!(self, backend => backend.reserve_idempotent(workspace_id, key, method).await)
+    }
+
+    /// Store the result of an operation this process reserved; it is then
+    /// replayed to every later caller with the key.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn complete_idempotent(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        method: &str,
+        result_json: &str,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.complete_idempotent(workspace_id, key, method, result_json).await)
+    }
+
+    /// Drop this process's reservation after the operation failed, so a
+    /// retry may run it (nothing is stored for a failed operation).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn release_idempotent(&self, workspace_id: &str, key: &str) -> Result<()> {
+        dispatch!(self, backend => backend.release_idempotent(workspace_id, key).await)
+    }
+
     /// Look up the stored `result_json` for `(workspace_id, key)`, or `None` when
     /// the key has not been recorded yet.
     ///
@@ -51,6 +111,37 @@ impl Store {
 }
 
 impl crate::SqliteStore {
+    // One process per database file: the in-process key lock orders callers,
+    // so a reservation is just the lookup.
+    pub async fn reserve_idempotent(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        _method: &str,
+    ) -> Result<IdempotencyReservation> {
+        Ok(match self.get_idempotent(workspace_id, key).await? {
+            Some(stored) => IdempotencyReservation::Done(stored),
+            None => IdempotencyReservation::Reserved,
+        })
+    }
+
+    pub async fn complete_idempotent(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        method: &str,
+        result_json: &str,
+    ) -> Result<()> {
+        self.put_idempotent(workspace_id, key, method, result_json)
+            .await
+            .map(|_| ())
+    }
+
+    #[expect(clippy::unused_async, reason = "mirrors the Postgres reservation")]
+    pub async fn release_idempotent(&self, _workspace_id: &str, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
     pub async fn get_idempotent(&self, workspace_id: &str, key: &str) -> Result<Option<String>> {
         let row = sqlx::query(
             "SELECT result_json FROM idempotency_key WHERE workspace_id = ? AND idempotency_key = ?",

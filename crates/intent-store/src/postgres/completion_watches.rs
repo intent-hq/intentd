@@ -580,6 +580,10 @@ const CLEAR_FOREIGN_WATCH_CLAIMS_SQL: &str = "UPDATE completion_watch \
 const CLEAR_FOREIGN_GROUP_CLAIMS_SQL: &str = "UPDATE delegation_group \
      SET claim_epoch = NULL, claim_token = NULL \
      WHERE tenant_id = $1 AND claim_token IS NOT NULL AND claim_token <> $2";
+/// Drops the idempotency reservations of every other process ($1 tenant,
+/// $2 process token), so a retry runs the operation again (batch G 2b).
+const CLEAR_FOREIGN_RESERVATIONS_SQL: &str = "DELETE FROM idempotency_key \
+     WHERE tenant_id = $1 AND result_json IS NULL AND claim_token <> $2";
 /// Drops this process's claim ($1 tenant, $2 key, $3 process token).
 const RELEASE_WATCH_SQL: &str = "UPDATE completion_watch \
      SET claim_epoch = NULL, claim_token = NULL \
@@ -620,8 +624,9 @@ impl ClaimTable {
 
 impl PgStore {
     /// On this process's first open of the tenant, drops the delivery claims
-    /// other processes left (a crashed or stopped daemon): a process that
-    /// opens the tenant anew takes over their deliveries, as a takeover's
+    /// and idempotency reservations other processes left (a crashed or
+    /// stopped daemon): a process that opens the tenant anew takes over their
+    /// deliveries and keyed operations, as a takeover's
     /// newer epoch does. Without it a claim left at an unchanged epoch (a
     /// tenant never leased) would block its watch or group for good. Later
     /// opens in the same process share its token and clear nothing.
@@ -644,6 +649,7 @@ impl PgStore {
             for sql in [
                 CLEAR_FOREIGN_WATCH_CLAIMS_SQL,
                 CLEAR_FOREIGN_GROUP_CLAIMS_SQL,
+                CLEAR_FOREIGN_RESERVATIONS_SQL,
             ] {
                 sqlx::query(sql)
                     .bind(self.tenant())

@@ -112,6 +112,7 @@ mod executor_repo;
 mod hook_repo;
 mod host_membership_repo;
 mod idempotency_repo;
+pub use idempotency_repo::IdempotencyReservation;
 mod known_repo_repo;
 mod mcp_oauth_repo;
 mod message_payload;
