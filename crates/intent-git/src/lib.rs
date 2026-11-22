@@ -38,6 +38,7 @@ pub mod pull;
 pub mod push;
 pub mod rebase;
 pub mod redact;
+pub mod ref_storage;
 pub mod refs;
 pub mod remote;
 pub mod repo_cache;

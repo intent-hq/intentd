@@ -492,8 +492,9 @@ impl NodeGitAccess for HeadGitAccess {
             }
             let pin_repository = repository.to_path_buf();
             let pin_remote = remote.clone();
+            let git = crate::git_storage(self.shared.services());
             let pinned = tokio::task::spawn_blocking(move || {
-                crate::homes::pin_home_head(&pin_repository, &pin_remote)
+                crate::homes::pin_home_head(git.as_ref(), &pin_repository, &pin_remote)
             })
             .await
             .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
@@ -522,9 +523,10 @@ impl NodeGitAccess for HeadGitAccess {
             // Its own task, owning the lock until the settlement is done,
             // also when this session ends meanwhile.
             // caller-binding: allow — settles one home push under its workspace lock
+            let git = crate::git_storage(self.shared.services());
             let settled = tokio::spawn(async move {
                 let settled = tokio::task::spawn_blocking(move || {
-                    crate::homes::settle_home_push(&checkout, &remote, &pins)
+                    crate::homes::settle_home_push(git.as_ref(), &checkout, &remote, &pins)
                 })
                 .await;
                 drop(guard);

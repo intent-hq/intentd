@@ -62,8 +62,20 @@ impl Fixture {
         commit_file(head.path(), "README.md", "base\n");
         let base = git(head.path(), &["rev-parse", "HEAD"]);
         let oid = git2::Oid::from_str(&base).unwrap();
-        write_base_ref(head.path(), &remote(AGENT), oid).unwrap();
-        write_base_ref(head.path(), &remote(OTHER), oid).unwrap();
+        write_base_ref(
+            &crate::ref_storage::LocalGitStorage,
+            head.path(),
+            &remote(AGENT),
+            oid,
+        )
+        .unwrap();
+        write_base_ref(
+            &crate::ref_storage::LocalGitStorage,
+            head.path(),
+            &remote(OTHER),
+            oid,
+        )
+        .unwrap();
         let node = tempfile::tempdir().unwrap();
         configure_receive_hooks(&node.path().join("data")).unwrap();
         let mut node_git = NodeGit::new(node.path().join("bin"), node.path().join("git.sock"));
