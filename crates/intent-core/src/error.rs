@@ -849,7 +849,7 @@ impl Error {
 
 /// What [`Error::SchemaMismatch`] found: the schema's migration ledger
 /// against the migrations this build embeds. The schema matches only when
-/// `applied == expected` and `changed` is empty.
+/// `applied == expected` and `changed` and `part_way` are empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaMismatch {
     /// Versions the ledger records as complete, ascending; may include
@@ -859,6 +859,24 @@ pub struct SchemaMismatch {
     pub expected: Vec<i64>,
     /// Applied versions whose checksum differs from this build's file.
     pub changed: Vec<i64>,
+    /// Versions a migrate run started but did not finish, ascending.
+    pub part_way: Vec<i64>,
+}
+
+impl SchemaMismatch {
+    /// Ledger versions (complete or part-way) this build does not know.
+    #[must_use]
+    pub fn unknown(&self) -> Vec<i64> {
+        let mut unknown: Vec<i64> = self
+            .applied
+            .iter()
+            .chain(&self.part_way)
+            .filter(|v| !self.expected.contains(v))
+            .copied()
+            .collect();
+        unknown.sort_unstable();
+        unknown
+    }
 }
 
 impl std::fmt::Display for SchemaMismatch {
@@ -869,14 +887,24 @@ impl std::fmt::Display for SchemaMismatch {
              expects {:?}",
             self.applied, self.expected
         )?;
+        if !self.part_way.is_empty() {
+            write!(f, "; part-way: {:?}", self.part_way)?;
+        }
         if !self.changed.is_empty() {
             write!(f, "; changed since they were applied: {:?}", self.changed)?;
         }
-        let newer = self.applied.iter().any(|v| !self.expected.contains(v));
-        if newer {
+        // The first fix that applies; the migrate job refuses the first two.
+        let unknown = self.unknown();
+        if !unknown.is_empty() {
+            write!(
+                f,
+                "; the schema is newer than this build (unknown {unknown:?}): run a build that \
+                 knows every applied migration"
+            )
+        } else if !self.changed.is_empty() {
             f.write_str(
-                "; the schema is newer than this build: run a build that knows every applied \
-                 migration",
+                "; a migration file changed after it was applied: restore it, or repair the \
+                 schema by hand",
             )
         } else {
             f.write_str("; run the migrate job with this build, then start the daemon")

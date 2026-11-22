@@ -110,6 +110,7 @@ async fn open_on_a_changed_or_part_way_migration_fails() {
     .await;
     let part_way = refused(&db.app, "part-way").await;
     assert_eq!(part_way.changed, Vec::<i64>::new());
+    assert_eq!(part_way.part_way, vec![last]);
     assert_eq!(
         part_way.applied,
         expected_versions()[..expected_versions().len() - 1]
@@ -152,6 +153,26 @@ async fn open_after_migrate_succeeds_and_migrate_is_idempotent() {
         .expect("open after migrate");
     store.set_setting("k", "1").await.unwrap();
     assert_eq!(store.get_setting("k").await.unwrap().as_deref(), Some("1"));
+}
+
+/// Only a missing `__neki` schema means "not Neki". A `__neki` schema
+/// without `ddl_versions()` (renamed or changed on a Neki upgrade) must fail
+/// the migrate job, not skip the wait for the routers.
+#[tokio::test]
+async fn migrate_fails_when_neki_ddl_versions_is_missing() {
+    let Some((_, admin)) = empty_db().await else {
+        return;
+    };
+    exec(&admin, "CREATE SCHEMA __neki".to_owned()).await;
+    let err = postgres::migrate(&admin)
+        .await
+        .expect_err("a __neki schema without ddl_versions() must not pass as vanilla")
+        .to_string();
+    assert!(err.contains("ddl_versions"), "{err}");
+    // The migrations themselves applied: a re-run after the fix only waits.
+    postgres::check_schema(&admin)
+        .await
+        .expect("the schema is migrated");
 }
 
 #[tokio::test]

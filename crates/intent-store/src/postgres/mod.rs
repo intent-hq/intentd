@@ -419,8 +419,11 @@ async fn wait_for_neki_ddl(conn: &mut sqlx::PgConnection) -> Result<Option<NekiD
             .await;
     let (schema_version, cluster_version) = match versions {
         Ok(versions) => versions,
-        // invalid_schema_name / undefined_function: not Neki.
-        Err(sqlx::Error::Database(e)) if matches!(e.code().as_deref(), Some("3F000" | "42883")) => {
+        // invalid_schema_name: no `__neki` schema, so not Neki. Anything
+        // else, including undefined_function (42883: `__neki` exists but the
+        // function is missing or changed), is an error: skipping the wait on
+        // Neki would let lagging routers serve the old schema.
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("3F000") => {
             return Ok(None);
         }
         Err(e) => return Err(Error::Internal(format!("neki ddl_versions failed: {e}"))),
@@ -454,6 +457,17 @@ async fn wait_for_neki_ddl(conn: &mut sqlx::PgConnection) -> Result<Option<NekiD
 /// know) is refused too: migrations are not checked to be
 /// backward-compatible, so a newer schema may have dropped or changed what
 /// the older binary uses. Roll out the new binary after the migrate job.
+///
+/// [`Store::open_postgres`](crate::Store::open_postgres) runs this on every
+/// open, so the gate cannot be skipped; it costs one short read-only
+/// transaction per open. A consequence for rollouts: once the migrate job
+/// has run, a still-running older daemon keeps serving the tenants it has
+/// open but refuses to open any other tenant until it is replaced, and a
+/// newer daemon refuses every tenant until the migrate job has run. Keep
+/// that window short: migrate, then replace the daemons at once.
+///
+/// The serving role needs `SELECT` on `intent_schema_migrations` (and
+/// `to_regclass` needs `USAGE` on its schema).
 ///
 /// # Errors
 /// `Error::SchemaMismatch` on any difference; `Error::StoreBusy` when no
@@ -522,14 +536,20 @@ fn schema_mismatch(
         })
         .map(|(v, ..)| *v)
         .collect();
-    let part_way = ledger.iter().any(|(_, _, complete)| !complete);
-    if applied == expected && changed.is_empty() && !part_way {
+    let mut part_way: Vec<i64> = ledger
+        .iter()
+        .filter(|(_, _, complete)| !*complete)
+        .map(|(v, ..)| *v)
+        .collect();
+    part_way.sort_unstable();
+    if applied == expected && changed.is_empty() && part_way.is_empty() {
         return None;
     }
     Some(SchemaMismatch {
         applied,
         expected,
         changed,
+        part_way,
     })
 }
 
@@ -1270,7 +1290,7 @@ mod tests {
         assert!(empty.applied.is_empty());
         let part_way =
             schema_mismatch(&[row(1, b"a", true), row(2, b"b", false)], &embedded).unwrap();
-        assert_eq!(part_way.applied, vec![1]);
+        assert_eq!((part_way.applied, part_way.part_way), (vec![1], vec![2]));
         let changed =
             schema_mismatch(&[row(1, b"x", true), row(2, b"b", true)], &embedded).unwrap();
         assert_eq!((changed.applied, changed.changed), (vec![1, 2], vec![1]));
@@ -1281,11 +1301,12 @@ mod tests {
         .unwrap();
         assert_eq!(newer.applied, vec![1, 2, 3]);
         // An unknown part-way version is still a newer schema.
-        assert!(schema_mismatch(
+        let newer_part_way = schema_mismatch(
             &[row(1, b"a", true), row(2, b"b", true), row(3, b"c", false)],
-            &embedded
+            &embedded,
         )
-        .is_some());
+        .unwrap();
+        assert_eq!(newer_part_way.unknown(), vec![3]);
     }
 
     #[test]
