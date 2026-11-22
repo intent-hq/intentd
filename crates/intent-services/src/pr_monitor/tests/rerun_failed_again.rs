@@ -63,7 +63,8 @@ async fn a_rerun_that_fails_again_wakes_once() {
 
     // The same run read again, under its Actions job link, without a link,
     // or under a CI vendor's details link (the rollup read) next to GitHub's
-    // own (the REST fallback), is not news; neither is an empty link.
+    // own (the REST fallback), is not news; neither is an empty link or a
+    // vendor link on another host shaped like a check-run link.
     for url in [
         Some("https://github.com/o/r/runs/2"),
         Some("https://github.com/o/r/actions/runs/77/job/2"),
@@ -73,6 +74,12 @@ async fn a_rerun_that_fails_again_wakes_once() {
         Some("https://github.com/o/r/runs/2"),
         Some(""),
         Some("https://app.circleci.com/pipelines/gh/o/r/5/workflows/w/jobs/9"),
+        Some("https://github.com/o/r/runs/2"),
+        // A vendor link shaped like a check-run link is another host's id.
+        Some("https://ci.example/o/r/runs/7"),
+        Some("https://github.com/o/r/runs/2"),
+        Some("https://ci.example/o/r/job/7"),
+        Some("https://github.com/o/r/runs/2"),
     ] {
         forge.edit(|s| s.checks = vec![build(CheckState::Failure, url)]);
         svc.poll_pr_monitors().await;
@@ -272,4 +279,15 @@ fn a_check_run_and_a_status_never_read_as_a_rerun() {
         "{:?}",
         diff_snapshots(&first, &rerun)
     );
+}
+
+/// A snapshot persisted before `status_checks` existed cannot tell a check
+/// run's link from a legacy status's, so its links are never evidence.
+#[test]
+fn unknown_link_provenance_is_never_rerun_evidence() {
+    let s = snapshot(|s| {
+        s.status_checks = None;
+        s.requirements.checks.items[0].url = Some("https://github.com/o/r/runs/1".into());
+    });
+    assert_eq!(s.check_run_link(&s.requirements.checks.items[0]), None);
 }
