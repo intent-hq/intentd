@@ -1067,16 +1067,51 @@ impl LineIndex {
     }
 }
 
-/// The cargo workspace root (the directory holding `Cargo.toml` and
-/// `crates/`), resolved from this crate's own manifest directory so every
-/// lint gets the same answer whichever crate it lives in.
+/// The cargo workspace root (the directory whose `Cargo.toml` has a
+/// `[workspace]` table), found at run time from the running test's package:
+/// the `CARGO_MANIFEST_DIR` that `cargo test` and nextest set in the test
+/// process's environment, or the working directory (which both set to that
+/// package) when it is unset.
+///
+/// Never resolve it from `env!("CARGO_MANIFEST_DIR")`: that bakes the
+/// building checkout's path into this crate's rlib, and a build reused by
+/// another checkout (a Cargo target dir shared between checkouts, or a
+/// compiler cache) then scans a checkout that may be deleted
+/// (`agent_hidden_field_egress_lint` on intent-hq/intentd#3648).
+/// `compile_time_manifest_dir_lint` keeps such paths out of library code.
+///
+/// # Panics
+///
+/// When neither start point is available or no ancestor of it holds a
+/// workspace manifest.
 #[must_use]
+#[track_caller]
 pub fn workspace_root() -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    match manifest.ancestors().nth(2) {
-        Some(root) => root.to_path_buf(),
-        None => manifest.to_path_buf(),
-    }
+    let start = std::env::var_os("CARGO_MANIFEST_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| panic!("workspace_root: no CARGO_MANIFEST_DIR and no current dir"));
+    find_workspace_root(&start).unwrap_or_else(|| {
+        panic!(
+            "workspace_root: no Cargo.toml with a [workspace] table at or above {}",
+            start.display()
+        )
+    })
+}
+
+/// The nearest directory at or above `start` whose `Cargo.toml` declares a
+/// `[workspace]` table (a line reading exactly `[workspace]`), as cargo
+/// finds the workspace of a member.
+#[must_use]
+pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| {
+            fs::read_to_string(dir.join("Cargo.toml"))
+                .is_ok_and(|manifest| manifest.lines().any(|line| line.trim() == "[workspace]"))
+        })
+        .map(Path::to_path_buf)
 }
 
 /// The one traversal behind [`rust_files`] and [`crate_src_files`]: appends
@@ -1538,6 +1573,20 @@ fn path_attr(chars: &[char], literals: &[Literal], start: usize, end: usize) -> 
         .map(Literal::cooked)
 }
 
+/// Which `cfg` forms make an item test code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestCfgs {
+    /// `cfg(test)`, `cfg(all(…, test, …))`, and
+    /// `cfg(any(test, feature = "test-hooks"))`: code no production build
+    /// contains. What [`TestCodeText::new`] and [`test_code_files`] use.
+    WithTestHooks,
+    /// `cfg(test)` and `cfg(all(…, test, …))` only: code that only a crate's
+    /// own test build (`rustc --test`) compiles. A `test-hooks` item is
+    /// library code here, since it builds into the rlib that other crates'
+    /// tests link.
+    TestBuildOnly,
+}
+
 /// A source file as a test-code lint scans it: comments and literals
 /// blanked, test-only `cfg` forms normalized, and the `#[cfg(test)]` items
 /// that make up its test code when the whole file is not.
@@ -1545,7 +1594,8 @@ fn path_attr(chars: &[char], literals: &[Literal], start: usize, end: usize) -> 
 pub struct TestCodeText {
     /// What [`lex`] found; `lexed.blanked` is before cfg normalization.
     pub lexed: Lexed,
-    /// The blanked text with [`normalize_test_cfgs`] applied.
+    /// The blanked text with [`normalize_test_cfgs`] applied (only the
+    /// `cfg(all(…))` half under [`TestCfgs::TestBuildOnly`]).
     pub chars: Vec<char>,
     /// Every `#[cfg(test)]` item of `chars`, in source order.
     pub items: Vec<CfgTestItem>,
@@ -1557,9 +1607,19 @@ impl TestCodeText {
     /// Prepares `src`; `whole` marks a file that is test code throughout.
     #[must_use]
     pub fn new(src: &str, whole: bool) -> Self {
+        Self::with_cfgs(src, whole, TestCfgs::WithTestHooks)
+    }
+
+    /// [`TestCodeText::new`] with `cfgs` choosing which `cfg` forms are test
+    /// code.
+    #[must_use]
+    pub fn with_cfgs(src: &str, whole: bool, cfgs: TestCfgs) -> Self {
         let lexed = lex(src);
         let mut chars: Vec<char> = lexed.blanked.chars().collect();
-        normalize_test_cfgs(&mut chars, &lexed.literals);
+        match cfgs {
+            TestCfgs::WithTestHooks => normalize_test_cfgs(&mut chars, &lexed.literals),
+            TestCfgs::TestBuildOnly => normalize_cfg_all_test(&mut chars),
+        }
         let items = cfg_test_items(&chars);
         Self {
             lexed,
@@ -1637,7 +1697,7 @@ pub fn test_mod_targets(file: &Path, name: &str, path: Option<&str>) -> Vec<Path
 }
 
 /// One Rust file under `crates/*/src/` or `crates/*/tests/`, as
-/// [`test_code_files`] classifies it.
+/// [`test_code_files`] (or [`test_code_files_with`]) classifies it.
 #[derive(Debug, Clone)]
 pub struct TestCodeFile {
     /// Workspace-relative path with `/` separators.
@@ -1669,6 +1729,18 @@ impl TestCodeFile {
 /// When `crates/` or any scanned directory or file cannot be read.
 #[must_use]
 pub fn test_code_files(root: &Path) -> Vec<TestCodeFile> {
+    test_code_files_with(root, TestCfgs::WithTestHooks)
+}
+
+/// [`test_code_files`] with `cfgs` choosing which `cfg` forms are test code,
+/// so under [`TestCfgs::TestBuildOnly`] a `cfg(any(test, feature =
+/// "test-hooks"))` module stays library code.
+///
+/// # Panics
+///
+/// When `crates/` or any scanned directory or file cannot be read.
+#[must_use]
+pub fn test_code_files_with(root: &Path, cfgs: TestCfgs) -> Vec<TestCodeFile> {
     let crates_dir = root.join("crates");
     let mut krates: Vec<PathBuf> = fs::read_dir(&crates_dir)
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()))
@@ -1715,7 +1787,7 @@ pub fn test_code_files(root: &Path) -> Vec<TestCodeFile> {
             if !expanded.insert(file.clone()) {
                 continue;
             }
-            for (name, path) in TestCodeText::new(src, *whole).test_mods() {
+            for (name, path) in TestCodeText::with_cfgs(src, *whole, cfgs).test_mods() {
                 for target in test_mod_targets(file, &name, path.as_deref()) {
                     if !targets.contains(&target) {
                         targets.push(target);
@@ -2689,6 +2761,100 @@ use some::module;
         ] {
             assert_eq!(is_conventional_test_file(Path::new(rel)), expected, "{rel}");
         }
+    }
+
+    #[test]
+    fn find_workspace_root_takes_the_nearest_workspace_manifest() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let write = |rel: &str, body: &str| {
+            let path = root.path().join(rel);
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(path, body).expect("write");
+        };
+        write("ws/Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        write("ws/crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
+        write("ws/crates/a/src/lib.rs", "");
+        write("other/Cargo.toml", "[package]\n# [workspace]\n");
+        let ws = root.path().join("ws");
+        assert_eq!(find_workspace_root(&ws.join("crates/a")), Some(ws.clone()));
+        assert_eq!(
+            find_workspace_root(&ws.join("crates/a/src")),
+            Some(ws.clone())
+        );
+        assert_eq!(find_workspace_root(&ws), Some(ws.clone()));
+        assert_eq!(
+            find_workspace_root(&root.path().join("other")),
+            None,
+            "a commented-out table is not a workspace"
+        );
+    }
+
+    #[test]
+    fn workspace_root_is_this_checkout() {
+        let root = workspace_root();
+        let manifest = PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        );
+        assert_eq!(manifest.ancestors().nth(2), Some(root.as_path()));
+        assert!(root
+            .join("crates/intentd-test-support/src/source_lint.rs")
+            .is_file());
+    }
+
+    /// Env var under which [`print_workspace_root_for_parent`] reports.
+    const REPORT_ROOT_ENV: &str = "INTENTD_SOURCE_LINT_REPORT_ROOT";
+
+    /// Child half of [`workspace_root_follows_the_running_checkout`]: prints
+    /// what `workspace_root` resolves in this process; a no-op otherwise.
+    #[test]
+    fn print_workspace_root_for_parent() {
+        if std::env::var_os(REPORT_ROOT_ENV).is_some() {
+            println!("ROOT={}", workspace_root().display());
+        }
+    }
+
+    /// The root comes from the running process, not from the path this rlib
+    /// was compiled in: a build reused by another checkout (a shared Cargo
+    /// target dir or compiler cache) must scan that checkout
+    /// (`agent_hidden_field_egress_lint` read a deleted checkout on
+    /// intent-hq/intentd#3648). Re-runs this test binary with
+    /// `CARGO_MANIFEST_DIR` and the working directory pointing at another
+    /// workspace.
+    #[test]
+    fn workspace_root_follows_the_running_checkout() {
+        let other = tempfile::tempdir().expect("tempdir");
+        let ws = other.path().join("checkout-b");
+        fs::create_dir_all(ws.join("crates/intentd-test-support")).expect("mkdir");
+        fs::write(ws.join("Cargo.toml"), "[workspace]\n").expect("write");
+        let ws = ws.canonicalize().expect("canonicalize");
+        let member = ws.join("crates/intentd-test-support");
+        let module = module_path!().split_once("::").map_or("", |(_, rest)| rest);
+        let child = format!("{module}::print_workspace_root_for_parent");
+        let run = |manifest_dir: Option<&Path>| {
+            let mut command = std::process::Command::new(std::env::current_exe().expect("exe"));
+            command
+                .args(["--exact", &child, "--nocapture", "--test-threads=1"])
+                .env(REPORT_ROOT_ENV, "1")
+                .current_dir(&member);
+            match manifest_dir {
+                Some(dir) => command.env("CARGO_MANIFEST_DIR", dir),
+                None => command.env_remove("CARGO_MANIFEST_DIR"),
+            };
+            let output = command.output().expect("run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(
+                output.status.success(),
+                "child failed: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            stdout
+                .lines()
+                .find_map(|line| line.split_once("ROOT=").map(|(_, root)| root))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| panic!("child printed no ROOT= line: {stdout}"))
+        };
+        assert_eq!(run(Some(&member)), ws, "from CARGO_MANIFEST_DIR");
+        assert_eq!(run(None), ws, "from the working directory");
     }
 
     #[test]
