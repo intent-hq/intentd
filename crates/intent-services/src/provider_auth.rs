@@ -577,17 +577,33 @@ pub(crate) const CURSOR_STORED_LOGIN_IN_USE_NOTE: &str =
 /// reaches the CLI (daemon env or captured login-shell env) and `cursor-agent
 /// status --format json` reports a stored access token, say the stored login
 /// is in use. Any probe failure omits the note.
-async fn cursor_stored_login_note(program: &OsStr) -> Option<String> {
+async fn cursor_stored_login_note(
+    program: &OsStr,
+    overlay: Option<&intent_acp::ProfileEnv>,
+) -> Option<String> {
     let captured = captured_credential_env().await;
-    let key_present = std::env::var_os("CURSOR_API_KEY").is_some_and(|v| !v.is_empty())
-        || captured
-            .get("CURSOR_API_KEY")
-            .is_some_and(|v| !v.is_empty());
+    // The key the probe actually sees: the overlay's set or unset wins over
+    // the daemon's and the login shell's.
+    let overlay_key = overlay.and_then(|o| {
+        o.entries()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("CURSOR_API_KEY"))
+            .last()
+            .map(|(_, v)| v.is_some_and(|v| !v.is_empty()))
+    });
+    let key_present = overlay_key.unwrap_or_else(|| {
+        std::env::var_os("CURSOR_API_KEY").is_some_and(|v| !v.is_empty())
+            || captured
+                .get("CURSOR_API_KEY")
+                .is_some_and(|v| !v.is_empty())
+    });
     if !key_present {
         return None;
     }
     let mut cmd = probe_command(program);
     gap_fill_credentials(&mut cmd, captured);
+    if let Some(overlay) = overlay {
+        overlay.apply_to_command(&mut cmd);
+    }
     cmd.args(["status", "--format", "json"]);
     let output = crate::cursor_cli::run_cursor_cli(cmd, CLI_AUTH_TIMEOUT).await?;
     cursor_status_note(true, &String::from_utf8_lossy(&output.stdout))
@@ -682,7 +698,7 @@ async fn probe_provider(
                 })
             });
             let status_note = if authenticated == Some(true) && !memory_store {
-                cursor_stored_login_note(&program).await
+                cursor_stored_login_note(&program, overlay.as_ref()).await
             } else {
                 None
             };

@@ -9603,6 +9603,16 @@ impl Services {
             return Ok(empty);
         }
         let Some(provider_id) = provider_id else {
+            // The legacy no-`providerId` call is the auggie catalog: an
+            // overridden auggie Default lists with its overrides and
+            // fingerprint, as `providerId: "auggie"` does, in the legacy
+            // shape (no `providerId`; `auggie` or `static`, empty on failure).
+            if self.default_has_overrides("auggie") {
+                let out = self
+                    .models_list_profile_op("auggie".to_owned(), force_refresh)
+                    .await?;
+                return Ok(legacy_auggie_shape(out));
+            }
             return self.models_list_auggie_op(force_refresh, false).await;
         };
         // The Default of a base without an installed context (Grok, Droid,
@@ -22544,3 +22554,49 @@ pub(crate) fn decode_agent_features_snapshot(
 /// machine. In-memory: after a restart there is no live run to replace.
 pub(crate) type RemoteModelSwitches =
     Arc<Mutex<HashMap<AgentId, (Option<String>, Option<String>)>>>;
+
+/// A provider-scoped auggie `models.list` response in the legacy
+/// no-`providerId` shape: no `providerId`, `source` `auggie` with models or
+/// `static` with an empty list.
+fn legacy_auggie_shape(mut out: Value) -> Value {
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove("providerId");
+        obj.remove("warningKind");
+        let has_models = obj
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(|m| !m.is_empty());
+        if has_models {
+            obj.insert("source".into(), json!("auggie"));
+        } else {
+            obj.insert("models".into(), json!([]));
+            obj.insert("source".into(), json!("static"));
+            obj.remove("warning");
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod legacy_auggie_shape_tests {
+    use super::legacy_auggie_shape;
+    use serde_json::json;
+
+    /// An overridden auggie Default's catalog answers the legacy call in the
+    /// legacy shape, never with a provider-scoped field.
+    #[test]
+    fn keeps_the_legacy_shape() {
+        let ok = legacy_auggie_shape(json!({
+            "providerId": "auggie", "models": [{ "id": "m" }], "source": "auggie", "stale": true,
+        }));
+        assert_eq!(
+            ok,
+            json!({ "models": [{ "id": "m" }], "source": "auggie", "stale": true })
+        );
+        let failed = legacy_auggie_shape(json!({
+            "providerId": "auggie", "models": [], "source": "static",
+            "warning": "auggie CLI unavailable", "warningKind": "cli-missing",
+        }));
+        assert_eq!(failed, json!({ "models": [], "source": "static" }));
+    }
+}
