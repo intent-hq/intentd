@@ -213,7 +213,7 @@ async fn the_gate_off_hands_out_no_token() {
     let tmp = TempDb::new();
     let services =
         Services::new(Store::open(&tmp.path).await.unwrap()).with_settings_registry(registry);
-    let forge = Arc::new(ForgeTokens::for_services(&services));
+    let forge = Arc::new(crate::forge_token::for_services(&services));
     let held = forge.subscribe();
     forge.refresh().await;
     assert!(held.borrow().frame_token().is_none());

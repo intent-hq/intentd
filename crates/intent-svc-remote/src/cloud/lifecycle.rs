@@ -174,15 +174,17 @@ impl CloudGate {
             machine_id: machine_id.to_owned(),
         })
     }
+}
 
+impl crate::link::gate::DialGate for CloudGate {
     /// How many pauses of this machine began, so a dial that binds after
     /// one knows it reached a frozen sandbox.
-    pub(crate) fn pauses(&self) -> u64 {
+    fn pauses(&self) -> u64 {
         super::feature(&self.svc).map_or(0, |feature| feature.cloud.pauses(&self.machine_id))
     }
 
     /// Whether the sandbox is paused: no dial until something asks.
-    pub(crate) fn parked(&self) -> bool {
+    fn parked(&self) -> bool {
         super::feature(&self.svc).is_ok_and(|feature| feature.cloud.is_parked(&self.machine_id))
     }
 
@@ -194,7 +196,25 @@ impl CloudGate {
     /// pause count as seen under its transition lock, for the connector to
     /// tell whether a pause began after this check, and whether the sandbox
     /// was resumed now.
-    pub(crate) async fn before_dial(
+    fn before_dial<'a>(
+        &'a self,
+        shared: &'a Shared,
+        asked: bool,
+    ) -> intent_core::BoxFuture<'a, std::result::Result<Dialable, ConnectFailure>> {
+        Box::pin(self.before_dial_inner(shared, asked))
+    }
+
+    /// The sandbox runs an intentd this backend shares no link protocol
+    /// with, so it can never link again. See [`sandbox_outdated`].
+    fn outdated(&self, shared: &Shared) {
+        if let Ok(feature) = super::feature(&self.svc) {
+            sandbox_outdated(&self.svc, feature, shared, &self.machine_id);
+        }
+    }
+}
+
+impl CloudGate {
+    async fn before_dial_inner(
         &self,
         shared: &Shared,
         asked: bool,
@@ -278,15 +298,6 @@ impl CloudGate {
             }
         }
     }
-
-    /// The sandbox answered the dial with `machine-update-required`: it
-    /// runs an intentd this backend shares no link protocol with, so it
-    /// can never link again. See [`sandbox_outdated`].
-    pub(crate) fn outdated(&self, shared: &Shared) {
-        if let Ok(feature) = super::feature(&self.svc) {
-            sandbox_outdated(&self.svc, feature, shared, &self.machine_id);
-        }
-    }
 }
 
 pub(crate) fn outdated_turn_error() -> String {
@@ -320,14 +331,7 @@ pub(crate) enum Resumed {
     Refused(Error),
 }
 
-/// What [`CloudGate::before_dial`] saw.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Dialable {
-    /// The machine's pause count under its transition lock.
-    pub pauses: u64,
-    /// The sandbox was resumed (or its intentd started again) just now.
-    pub resumed: bool,
-}
+use crate::link::gate::Dialable;
 
 /// Make E2B run `row`'s sandbox: resume it when paused, else check it and
 /// extend its timeout. The caller holds the machine's transition lock.

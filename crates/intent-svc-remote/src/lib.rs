@@ -168,10 +168,10 @@ impl RemoteFeature {
                     Arc::new(forge_token::ForgeTokens::new(resolver))
                 }
                 #[cfg(not(test))]
-                Arc::new(forge_token::ForgeTokens::for_services(svc))
+                Arc::new(forge_token::for_services(svc))
             })
             .clone();
-        forge.watch(svc, tuning.forge_refresh, tuning.forge_check);
+        forge_token::watch(&forge, svc, tuning.forge_refresh, tuning.forge_check);
         forge
     }
 
@@ -238,7 +238,7 @@ impl RemoteFeature {
             ) {
                 self.cloud.park(machine_id);
             }
-            cloud::CloudGate::new(svc.clone(), machine_id)
+            cloud::CloudGate::new(svc.clone(), machine_id) as Arc<dyn link::gate::DialGate>
         });
         let target = machine::MachineTarget::new(&row, &token, self.tailcat_bin())?
             .tapped(svc.link_traffic().clone())

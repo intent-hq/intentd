@@ -37,7 +37,7 @@ pub(crate) struct MachineTarget {
     pub tap: Option<LinkTap>,
     /// A cloud machine's sandbox lifecycle: resumes a paused sandbox before
     /// a dial, and keeps a paused one from being dialed without a demand.
-    pub gate: Option<Arc<crate::cloud::CloudGate>>,
+    pub gate: Option<Arc<dyn crate::link::gate::DialGate>>,
 }
 
 impl std::fmt::Debug for MachineTarget {
@@ -135,7 +135,7 @@ impl MachineTarget {
 
     /// This target with the sandbox lifecycle `gate` of its cloud machine.
     #[must_use]
-    pub(crate) fn gated(mut self, gate: Option<Arc<crate::cloud::CloudGate>>) -> Self {
+    pub(crate) fn gated(mut self, gate: Option<Arc<dyn crate::link::gate::DialGate>>) -> Self {
         self.gate = gate;
         self
     }
