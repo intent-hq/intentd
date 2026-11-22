@@ -54,6 +54,7 @@ crates/
 ├── intent-voice/          # voice.* speech-to-text engine + providers
 ├── intent-test-macros/    # test-only attribute macros (bound Caller); never a prod dependency
 ├── intentd/               # binary: composition root + tests/
+├── intentd-orchestrator/  # multi-tenant Postgres orchestrator (`--features postgres`); never shipped
 ├── intentd-sitter/        # self-updating supervisor shim, shipped as `intentd`
 └── intentd-test-support/  # shared e2e test support (GuardedChild, source_lint); never published
 ```

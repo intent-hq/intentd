@@ -2811,7 +2811,8 @@ jobs:
   # intent-store's multi-tenant Postgres backend (cargo feature `postgres`,
   # never shipped; the check job's feature guard keeps it out of release
   # graphs): clippy with the feature on, the schema/query lints, and the
-  # backend tests against Postgres 18 (PlanetScale Neki's major version).
+  # backend tests against Postgres 18 (PlanetScale Neki's major version);
+  # then the orchestrator binary that serves several tenants over it.
   # GitHub-hosted for the service container. Release-metadata PRs skip it
   # like the other slow jobs; the queue always runs it.
   # The tests run under nextest, so .config/nextest.toml's postgres_backend
@@ -2866,6 +2867,15 @@ jobs:
       # helpers) build only with the feature, so no other job runs them.
       - name: Postgres unit tests
         run: cargo nextest run -p intent-store --features postgres --lib -E 'test(/^postgres::/)'
+      # The orchestrator binary (crates/intentd-orchestrator, never shipped)
+      # builds only with its `postgres` feature: Clippy over it, then its
+      # tests, two real tenants in one process among them. Clippy lints only
+      # this crate (`--no-deps`): the other members are linted by the check
+      # job, in the feature set they ship with.
+      - name: Clippy (orchestrator, postgres feature)
+        run: cargo clippy -p intentd-orchestrator --features postgres --all-targets --no-deps -- -D warnings
+      - name: Orchestrator tests
+        run: cargo nextest run -p intentd-orchestrator --features postgres
 
   # intent-passkey (the WebAuthn sidecar, its own Cargo workspace under
   # intent-passkey/) links libdbus, libudev and libpam, so it stays out of the daemon

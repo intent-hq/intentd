@@ -7,9 +7,11 @@
 //! (`target/`, `vendor/` and `.git/` aside):
 //!
 //! - `mint_for_intentd_serve` is named only by its definition and once by
-//!   the intentd binary's store choice (`crates/intentd/src/store_backend.rs`),
-//!   outside its `#[cfg(test)]` items and inside a private `fn`, so no other
-//!   module can reach the mint through a public wrapper.
+//!   each binary that runs in orchestrator mode ([`MINT_CALLERS`]: intentd's
+//!   store choice, `crates/intentd/src/store_backend.rs`, and the
+//!   orchestrator binary, `crates/intentd-orchestrator/src/main.rs`),
+//!   outside their `#[cfg(test)]` items and inside a private `fn`, so no
+//!   other module can reach the mint through a public wrapper.
 //! - In any file that names `OrchestratorOnly`, the identifier `for_tests`
 //!   appears only in test code: a crate's `tests/` directory, a `tests.rs`
 //!   file, a `#[cfg(test)]` item, or the `intentd-test-support` crate. Matching
@@ -25,7 +27,11 @@ use intentd_test_support::source_lint::{blank_cfg_test_items, lex, rust_files, w
 
 const MINT: &str = "mint_for_intentd_serve";
 const MINT_DEFINITION: &str = "crates/intent-store/src/orchestrator_only.rs";
-const MINT_CALLER: &str = "crates/intentd/src/store_backend.rs";
+/// The binaries that may mint the token, each exactly once.
+const MINT_CALLERS: &[&str] = &[
+    "crates/intentd/src/store_backend.rs",
+    "crates/intentd-orchestrator/src/main.rs",
+];
 const TOKEN: &str = "OrchestratorOnly";
 const FOR_TESTS: &str = "for_tests";
 const THIS_FILE: &str = "crates/intent-store/tests/orchestrator_only_lint.rs";
@@ -109,7 +115,7 @@ fn check_file(rel: &Path, src: &str) -> (Vec<String>, usize) {
         if rel_str == MINT_DEFINITION && code[..at].trim_end().ends_with("fn") {
             continue;
         }
-        if rel_str == MINT_CALLER && non_test_mints.contains(&at) {
+        if MINT_CALLERS.contains(&rel_str.as_str()) && non_test_mints.contains(&at) {
             if enclosing_fn_is_private(&code, at) {
                 mint_calls += 1;
             } else {
@@ -121,7 +127,8 @@ fn check_file(rel: &Path, src: &str) -> (Vec<String>, usize) {
             continue;
         }
         violations.push(format!(
-            "{rel_str}:{line}: `{MINT}` may be called only from {MINT_CALLER} (non-test code)"
+            "{rel_str}:{line}: `{MINT}` may be called only from {} (non-test code)",
+            MINT_CALLERS.join(" or ")
         ));
     }
 
@@ -144,7 +151,7 @@ fn check_file(rel: &Path, src: &str) -> (Vec<String>, usize) {
 fn orchestrator_only_constructors_stay_where_they_belong() {
     let root = workspace_root();
     let mut violations = Vec::new();
-    let mut mint_calls = 0;
+    let mut mint_calls = std::collections::BTreeMap::new();
     for path in repository_rust_files(&root) {
         let rel = path.strip_prefix(&root).expect("under the workspace root");
         if rel == Path::new(THIS_FILE) {
@@ -153,13 +160,18 @@ fn orchestrator_only_constructors_stay_where_they_belong() {
         let src = std::fs::read_to_string(&path).expect("read source");
         let (found, calls) = check_file(rel, &src);
         violations.extend(found);
-        mint_calls += calls;
+        if calls > 0 {
+            mint_calls.insert(rel.to_string_lossy().replace('\\', "/"), calls);
+        }
     }
     assert!(violations.is_empty(), "{}", violations.join("\n"));
-    assert_eq!(
-        mint_calls, 1,
-        "{MINT_CALLER} must mint the token exactly once, from the resolved daemon mode"
-    );
+    for caller in MINT_CALLERS {
+        assert_eq!(
+            mint_calls.get(*caller).copied().unwrap_or(0),
+            1,
+            "{caller} must mint the token exactly once, in orchestrator mode only"
+        );
+    }
 }
 
 #[test]
@@ -173,7 +185,7 @@ fn word_hits_match_whole_identifiers_only() {
 /// The lint's own negative cases: each source must be flagged.
 #[test]
 fn the_lint_flags_escapes() {
-    let caller = Path::new(MINT_CALLER);
+    let caller = Path::new(MINT_CALLERS[0]);
     let public_wrapper = "pub fn choose() -> T { OrchestratorOnly::mint_for_intentd_serve() }\n";
     assert_eq!(check_file(caller, public_wrapper).0.len(), 1);
     let crate_wrapper =

@@ -2843,6 +2843,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "intentd-orchestrator"
+version = "0.0.0"
+dependencies = [
+ "intent-app",
+ "intent-core",
+ "intent-services",
+ "intent-store",
+ "intentd-test-support",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "intentd-sitter"
 version = "0.1.48"
 dependencies = [
