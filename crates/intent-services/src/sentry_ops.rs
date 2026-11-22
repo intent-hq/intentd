@@ -2,15 +2,12 @@
 //!
 //! The engine + REST transport live in `intent-sentry`; this module owns only
 //! the parity-critical wire glue so it stays unit-testable without a network:
-//! resolving the active [`SentryEngine`] (injected handle else the
-//! registry-built engine from default settings, i.e. `SENTRY_ORG` /
-//! `SENTRY_API_TOKEN` / keychain), validating the `status` enum, and mapping
-//! engine errors onto the domain `Internal` error (→ `-32603`). It mirrors
-//! `linear_ops::resolve_engine`.
+//! building the [`SentryEngine`] from the saved account settings, validating
+//! the `status` enum, and mapping engine errors onto the domain `Internal`
+//! error (→ `-32603`).
 //!
-//! GUARDRAIL: the Sentry auth token is a secret. It never appears here — the
-//! engine reads it internally and only derived identity (the org slug)
-//! crosses the wire.
+//! GUARDRAIL: the Sentry auth token is a secret. It is only handed to the
+//! engine; only derived identity (the org slug) crosses the wire.
 
 use std::sync::Arc;
 
@@ -25,21 +22,18 @@ pub(crate) fn map_sentry_err(e: &intent_sentry::Error) -> Error {
     Error::Internal(e.to_string())
 }
 
-/// Resolve the active [`SentryEngine`]: the injected handle (tests / explicit
-/// wiring) else the registry-built engine from default settings (org/token
-/// from `SENTRY_ORG` / `SENTRY_API_TOKEN` / keychain, §5.29). A missing pair
-/// yields `Internal` (graceful "not configured"), never a panic. Async
-/// because the keychain lookup runs on the blocking pool with a bounded
-/// timeout so a wedged OS keychain never blocks the async runtime.
-pub(crate) async fn resolve_engine(
-    injected: Option<Arc<dyn SentryEngine>>,
-) -> Result<Arc<dyn SentryEngine>> {
-    match injected {
-        Some(engine) => Ok(engine),
-        None => SentryRegistry::from_settings(&SentrySettings::default())
-            .await
-            .map_err(|e: intent_sentry::Error| map_sentry_err(&e)),
-    }
+/// Settings path of the Sentry organization slug (non-secret, `config.toml`).
+pub(crate) const ORGANIZATION_SETTING_PATH: &str = "accounts.sentry.organization";
+/// Settings path, and secrets-store account, of the Sentry API token.
+pub(crate) const TOKEN_SETTING_PATH: &str = "accounts.sentry.token";
+
+/// Build the [`SentryEngine`] from `settings` (the saved account, falling
+/// back to `SENTRY_ORG` / `SENTRY_API_TOKEN` per half). A missing pair yields
+/// `Internal` (graceful "not configured"), never a panic.
+pub(crate) async fn build_engine(settings: &SentrySettings) -> Result<Arc<dyn SentryEngine>> {
+    SentryRegistry::from_settings(settings)
+        .await
+        .map_err(|e: intent_sentry::Error| map_sentry_err(&e))
 }
 
 /// Validate/default the `sentry.listIssues` `status` (default `unresolved`);

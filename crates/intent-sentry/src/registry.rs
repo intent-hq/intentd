@@ -1,7 +1,8 @@
 //! Engine selection from settings.
 //!
 //! [`SentryRegistry::from_settings`] resolves the Sentry credential pair
-//! (inline org/token, secrets store, or env) and builds a [`SentryEngine`]. A
+//! (inline org/token, each missing half from the secrets store or env) and
+//! builds a [`SentryEngine`]. A
 //! missing pair yields a typed [`Error::NotConfigured`] so the daemon stays
 //! up (graceful, mirroring `intent-linear`).
 
@@ -12,14 +13,14 @@ use serde::{Deserialize, Serialize};
 use crate::client::SentryClient;
 use crate::engine::{SentryEngine, SentryEngineImpl};
 use crate::error::{Error, Result};
-use crate::token::{self, Credentials, TokenSource};
+use crate::token::{self, CredentialParts, Credentials, TokenSource};
 
 /// Sentry settings (`sentry.*`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SentrySettings {
-    /// Inline organization slug (already resolved). When present together
-    /// with [`Self::token`] it takes precedence over [`Self::token_source`].
+    /// Inline organization slug (already resolved). Takes precedence over
+    /// [`Self::token_source`], which only fills a missing half.
     #[serde(default)]
     pub organization: Option<String>,
     /// Inline API token (already resolved, e.g. read from the secrets store
@@ -56,28 +57,22 @@ impl SentryRegistry {
     }
 }
 
-/// Resolve credentials from inline settings or the configured source.
+/// Resolve credentials from inline settings, filling a missing half from the
+/// configured source.
 async fn resolve_credentials(settings: &SentrySettings) -> Result<Credentials> {
-    let inline_token = settings
-        .token
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let inline_org = settings
-        .organization
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if let (Some(token), Some(organization)) = (inline_token, inline_org) {
-        return Ok(Credentials {
-            token: token.to_string(),
-            organization: organization.to_string(),
-        });
-    }
-    token::resolve(&settings.token_source).await.ok_or_else(|| {
+    let inline = CredentialParts {
+        token: settings.token.as_deref().and_then(token::non_empty),
+        organization: settings.organization.as_deref().and_then(token::non_empty),
+    };
+    let parts = if inline.token.is_some() && inline.organization.is_some() {
+        inline
+    } else {
+        inline.or(token::resolve_parts(&settings.token_source).await)
+    };
+    parts.complete().ok_or_else(|| {
         Error::NotConfigured(
-            "sentry: no credentials found (set sentry.organization + sentry.token, or \
-             SENTRY_ORG + SENTRY_API_TOKEN)"
+            "sentry: no credentials found (set accounts.sentry.organization + \
+             accounts.sentry.token, or SENTRY_ORG + SENTRY_API_TOKEN)"
                 .to_string(),
         )
     })

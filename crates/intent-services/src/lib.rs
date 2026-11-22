@@ -945,10 +945,15 @@ pub struct Services {
     linear_engine: Option<Arc<dyn intent_linear::LinearEngine>>,
     /// Active Sentry engine for the `sentry.*` methods (§5.29). `None` until
     /// wired by the composition root or a test; when unset, the `sentry.*`
-    /// handlers build the engine from default settings (org/token from
-    /// `SENTRY_ORG` / `SENTRY_API_TOKEN` / keychain), surfacing a graceful
+    /// handlers build the engine per call from the saved Sentry account
+    /// (`accounts.sentry.organization` + the `accounts.sentry.token` secret),
+    /// else `SENTRY_ORG` / `SENTRY_API_TOKEN`, surfacing a graceful
     /// "not configured" `Internal` error when no pair is available.
     sentry_engine: Option<Arc<dyn intent_sentry::SentryEngine>>,
+    /// Sentry REST endpoint override for the settings-built engine. `None`
+    /// uses the public API; tests point it at a local mock via
+    /// [`Services::with_sentry_api_base_url`].
+    sentry_api_base_url: Option<String>,
     /// Active voice engine for `voice.transcribe`. `None` until wired by a
     /// test; when unset, the handler builds the provider engine per call from
     /// the `voice.provider` setting (key from the secrets store /
@@ -1866,6 +1871,7 @@ impl Services {
             source_control: None,
             linear_engine: None,
             sentry_engine: None,
+            sentry_api_base_url: None,
             voice_engine: None,
             autocomplete_upstream: Arc::default(),
             workspace_vocabulary: Arc::new(workspace_vocabulary::WorkspaceVocabularyCache::new()),
@@ -2987,6 +2993,28 @@ impl Services {
     }
 
     /// A string-valued setting's effective value (`None` when unreadable).
+    /// The active Sentry engine: the injected one, else one built from the
+    /// saved Sentry account (intent-hq/intent#9645).
+    async fn resolve_sentry_engine(&self) -> Result<Arc<dyn intent_sentry::SentryEngine>> {
+        if let Some(engine) = &self.sentry_engine {
+            return Ok(engine.clone());
+        }
+        let token = match self.secrets.load(sentry_ops::TOKEN_SETTING_PATH).await {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the saved Sentry token");
+                None
+            }
+        };
+        let settings = intent_sentry::SentrySettings {
+            organization: self.setting_str(sentry_ops::ORGANIZATION_SETTING_PATH).await,
+            token,
+            api_base_url: self.sentry_api_base_url.clone(),
+            ..intent_sentry::SentrySettings::default()
+        };
+        sentry_ops::build_engine(&settings).await
+    }
+
     async fn setting_str(&self, path: &str) -> Option<String> {
         self.settings_service()
             .get(path)
@@ -5084,6 +5112,14 @@ impl Services {
         sentry_engine: Arc<dyn intent_sentry::SentryEngine>,
     ) -> Self {
         self.sentry_engine = Some(sentry_engine);
+        self
+    }
+
+    /// Point the settings-built Sentry engine at another REST endpoint (tests
+    /// use a local mock server).
+    #[must_use]
+    pub fn with_sentry_api_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.sentry_api_base_url = Some(base_url.into());
         self
     }
 
@@ -34870,18 +34906,17 @@ impl WorkspaceApi for Services {
 
     // ========================================================================
     // sentry.* read surface (PROTOCOL §5.29). Maps onto the `SentryEngine`
-    // trait; the engine resolves the credential pair (org + token from
-    // `SENTRY_ORG` / `SENTRY_API_TOKEN` / keychain) and talks to Sentry's REST
-    // API. A missing/invalid pair → `Internal` ("not configured", graceful).
+    // trait; the engine resolves the credential pair (the saved Sentry
+    // account, else `SENTRY_ORG` / `SENTRY_API_TOKEN`) and talks to Sentry's
+    // REST API. A missing/invalid pair → `Internal` ("not configured", graceful).
     // Validation/resolution glue lives in `sentry_ops`. The token is never
     // logged or returned over the wire.
     // ========================================================================
 
     fn sentry_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.sentry_engine.clone();
         Box::pin(async move {
             Self::require_administrator("sentry.authStatus")?;
-            let engine = sentry_ops::resolve_engine(injected).await?;
+            let engine = self.resolve_sentry_engine().await?;
             let status = engine
                 .auth_status()
                 .await
@@ -34899,12 +34934,11 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.sentry_engine.clone();
         Box::pin(async move {
             self.require_host_execution("sentry.listIssues").await?;
             let status = sentry_ops::parse_status(status.as_deref())?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let engine = sentry_ops::resolve_engine(injected).await?;
+            let engine = self.resolve_sentry_engine().await?;
             let request = intent_sentry::FetchIssuesRequest {
                 project,
                 status,
@@ -34932,11 +34966,10 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.sentry_engine.clone();
         Box::pin(async move {
             self.require_host_execution("sentry.searchIssues").await?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let engine = sentry_ops::resolve_engine(injected).await?;
+            let engine = self.resolve_sentry_engine().await?;
             let page = engine
                 .search_issues(
                     &query,
@@ -34956,10 +34989,9 @@ impl WorkspaceApi for Services {
     }
 
     fn sentry_list_projects(&self, limit: Option<i64>) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.sentry_engine.clone();
         Box::pin(async move {
             self.require_host_execution("sentry.listProjects").await?;
-            let engine = sentry_ops::resolve_engine(injected).await?;
+            let engine = self.resolve_sentry_engine().await?;
             let projects = engine
                 .list_projects(sentry_ops::wire_limit(limit))
                 .await
@@ -34970,10 +35002,9 @@ impl WorkspaceApi for Services {
     }
 
     fn sentry_get_issue(&self, id_or_short_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.sentry_engine.clone();
         Box::pin(async move {
             self.require_host_execution("sentry.getIssue").await?;
-            let engine = sentry_ops::resolve_engine(injected).await?;
+            let engine = self.resolve_sentry_engine().await?;
             let issue = engine
                 .get_issue(&id_or_short_id)
                 .await
@@ -34984,10 +35015,9 @@ impl WorkspaceApi for Services {
     }
 
     fn sentry_resolve_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.sentry_engine.clone();
         Box::pin(async move {
             self.require_host_execution("sentry.resolveIssue").await?;
-            let engine = sentry_ops::resolve_engine(injected).await?;
+            let engine = self.resolve_sentry_engine().await?;
             let issue = engine
                 .resolve_issue(&id)
                 .await
@@ -34998,10 +35028,9 @@ impl WorkspaceApi for Services {
     }
 
     fn sentry_ignore_issue(&self, id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.sentry_engine.clone();
         Box::pin(async move {
             self.require_host_execution("sentry.ignoreIssue").await?;
-            let engine = sentry_ops::resolve_engine(injected).await?;
+            let engine = self.resolve_sentry_engine().await?;
             let issue = engine
                 .ignore_issue(&id)
                 .await
@@ -35016,10 +35045,9 @@ impl WorkspaceApi for Services {
         id: String,
         assigned_to: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.sentry_engine.clone();
         Box::pin(async move {
             self.require_host_execution("sentry.assignIssue").await?;
-            let engine = sentry_ops::resolve_engine(injected).await?;
+            let engine = self.resolve_sentry_engine().await?;
             let issue = engine
                 .assign_issue(&id, assigned_to.as_deref())
                 .await
