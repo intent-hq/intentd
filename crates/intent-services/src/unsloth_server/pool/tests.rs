@@ -714,4 +714,31 @@ esac
             "the crashed entry is forgotten"
         );
     }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_stop_already_under_way() {
+        let fx = fixture(1).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool
+            .ensure_endpoint(A, None, &none(), &|_, _| {})
+            .await
+            .expect("A starts");
+        let pool = Arc::new(fx.pool);
+        // An idle stop or eviction holds admission while it kills.
+        let stopping = pool.admission.lock().await;
+        let closing = pool.clone();
+        let shutdown = tokio::spawn(async move { closing.shutdown().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!shutdown.is_finished(), "shutdown waits for the stop");
+
+        drop(stopping);
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            shutdown,
+        )
+        .await
+        .expect("shutdown finishes once the stop is done")
+        .unwrap();
+        assert!(pool.statuses().await.is_empty());
+    }
 }

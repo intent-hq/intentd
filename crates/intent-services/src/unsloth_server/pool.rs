@@ -545,6 +545,12 @@ impl UnslothServerPool {
     pub(crate) async fn shutdown(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Abort starts now, then wait for an idle stop or eviction that holds
+        // admission, so no server it took out of the map is left mid-kill.
+        for entry in lock_ignore_poison(&self.servers).values() {
+            entry.manager.request_shutdown();
+        }
+        let _admission = self.admission.lock().await;
         Self::shut_down_all(self.drain()).await;
     }
 
