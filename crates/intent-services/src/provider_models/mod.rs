@@ -987,8 +987,8 @@ async fn fetch_unsloth_hf_catalog(timeout: Duration) -> Result<String, String> {
     decode_hf_body(encoding.as_deref(), &body, UNSLOTH_HF_MAX_BODY_BYTES)
 }
 
-/// Decode a Hugging Face response body by its `Content-Encoding`: gzip is
-/// inflated, an absent or `identity` encoding passes through, and any other
+/// Decode a Hugging Face response body by its `Content-Encoding`: gzip (or
+/// its `x-gzip` alias, every member) is inflated, an absent or `identity` encoding passes through, and any other
 /// encoding (never requested) is an error. The decoded body may not exceed
 /// `max_bytes`, so a small compressed body cannot expand without bound.
 fn decode_hf_body(
@@ -1000,9 +1000,9 @@ fn decode_hf_body(
     let decoded = match content_encoding.map(str::trim) {
         None | Some("") => body.to_vec(),
         Some(enc) if enc.eq_ignore_ascii_case("identity") => body.to_vec(),
-        Some(enc) if enc.eq_ignore_ascii_case("gzip") => {
+        Some(enc) if enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip") => {
             let mut out = Vec::new();
-            flate2::read::GzDecoder::new(body)
+            flate2::read::MultiGzDecoder::new(body)
                 .take(
                     u64::try_from(max_bytes)
                         .unwrap_or(u64::MAX)

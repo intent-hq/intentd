@@ -2334,13 +2334,24 @@ fn gzip(bytes: &[u8]) -> Vec<u8> {
 #[test]
 fn decode_hf_body_inflates_gzip_in_any_case() {
     let compressed = gzip(UNSLOTH_HF_EXPANDED_FIXTURE.as_bytes());
-    for encoding in ["gzip", "GZIP", " gzip "] {
+    for encoding in ["gzip", "GZIP", " gzip ", "x-gzip"] {
         assert_eq!(
             super::decode_hf_body(Some(encoding), &compressed, 1 << 20).as_deref(),
             Ok(UNSLOTH_HF_EXPANDED_FIXTURE),
             "{encoding:?}"
         );
     }
+}
+
+#[test]
+fn decode_hf_body_inflates_every_gzip_member() {
+    let (head, tail) = UNSLOTH_HF_EXPANDED_FIXTURE.split_at(UNSLOTH_HF_EXPANDED_FIXTURE.len() / 2);
+    let mut compressed = gzip(head.as_bytes());
+    compressed.extend(gzip(tail.as_bytes()));
+    assert_eq!(
+        super::decode_hf_body(Some("gzip"), &compressed, 1 << 20).as_deref(),
+        Ok(UNSLOTH_HF_EXPANDED_FIXTURE)
+    );
 }
 
 #[test]
@@ -2384,12 +2395,13 @@ fn decode_hf_body_rejects_unrequested_encodings() {
     assert!(err.contains("br"), "{err}");
 }
 
-/// Live end-to-end check of the real request: gzip negotiation, bounded
-/// decoding and catalog parsing against huggingface.co. Run with
+/// Live end-to-end check of the real request against huggingface.co: the
+/// download (gzip or plain), bounded decoding and catalog parsing. The
+/// Inkling assertion tracks a repo HF hosts today. Run with
 /// `cargo test -p intent-services --lib unsloth_live_catalog -- --ignored`.
 #[tokio::test]
 #[ignore = "requires network access to huggingface.co"]
-async fn unsloth_live_catalog_downloads_gzip_and_lists_inkling() {
+async fn unsloth_live_catalog_downloads_and_lists_inkling() {
     let body = super::fetch_unsloth_hf_catalog(super::UNSLOTH_HF_TIMEOUT)
         .await
         .expect("catalog fetched");
