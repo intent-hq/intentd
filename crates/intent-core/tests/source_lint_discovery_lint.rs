@@ -58,8 +58,8 @@
 //! / `enum` / `struct` keyword; a marker without a reason is itself a
 //! failure. The shared module lives under `src/`, so the rules never see it.
 //!
-//! The workspace root is located from `CARGO_MANIFEST_DIR`, as the other lints
-//! do; the checks themselves take any root, which is how the fixture tests
+//! The workspace root is found at run time (`source_lint::workspace_root()`),
+//! as the other lints do; the checks themselves take any root, which is how the fixture tests
 //! below exercise them against throwaway workspaces.
 
 use std::collections::BTreeSet;
@@ -96,8 +96,7 @@ const TOKEN_READER_FNS: [&str; 1] = ["tokens"];
 const TOKEN_READER_TYPES: [&str; 3] = ["Tok", "Token", "TokenKind"];
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
+    intentd_test_support::source_lint::workspace_root()
         .canonicalize()
         .expect("canonicalize workspace root")
 }

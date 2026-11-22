@@ -376,7 +376,7 @@ fn report(found: &BTreeMap<String, Vec<Hit>>, baseline: &BTreeMap<String, usize>
 
 #[test]
 fn tests_do_not_assert_measured_durations_stay_under_a_limit() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let root = intentd_test_support::source_lint::workspace_root();
     let baseline = read_count_baselines(&root, BASELINE_DIR, "elapsed-time assertions")
         .unwrap_or_else(|e| panic!("{e}"));
     let found = scan_tree(&root);

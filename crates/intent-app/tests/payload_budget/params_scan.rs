@@ -21,6 +21,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use intentd_test_support::source_lint::workspace_root;
+
 /// Params one router arm reads.
 #[derive(Debug, Default, Clone)]
 pub struct ArmParams {
@@ -197,11 +199,9 @@ fn dispatch_body(src: &str) -> &str {
 /// Params each of `methods` reads in `router.rs`; methods without a router
 /// arm are absent from the map.
 pub fn router_params(methods: &[&str]) -> BTreeMap<String, ArmParams> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../intent-transport/src/router.rs"
-    );
-    let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let path = crates_path("intent-transport/src/router.rs");
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let helpers = helper_bodies(&src);
     let helper_keys = helper_keys(&helpers);
     let dispatch = dispatch_body(&src);
@@ -243,8 +243,15 @@ pub enum OpaqueSource {
     Unknown,
 }
 
-fn crate_dir(krate: &str) -> String {
-    format!("{}/../{krate}/src", env!("CARGO_MANIFEST_DIR"))
+/// `rel` under this checkout's `crates/`, resolved at run time: a test binary
+/// reused from another checkout (a shared target dir) must scan this tree,
+/// not the one it was built in (`compile_time_manifest_dir_lint`).
+fn crates_path(rel: &str) -> std::path::PathBuf {
+    workspace_root().join("crates").join(rel)
+}
+
+fn crate_dir(krate: &str) -> std::path::PathBuf {
+    crates_path(&format!("{krate}/src"))
 }
 
 fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -292,7 +299,7 @@ fn serde_attr<'a>(attr: &'a str, key: &str) -> Option<&'a str> {
 /// when no such struct exists.
 pub fn struct_keys(name: &str) -> Option<BTreeSet<String>> {
     let mut files = Vec::new();
-    rust_files(std::path::Path::new(&crate_dir("intent-core")), &mut files);
+    rust_files(&crate_dir("intent-core"), &mut files);
     for file in files {
         let src = std::fs::read_to_string(&file).expect("read source");
         let lines: Vec<&str> = src.lines().collect();
@@ -350,7 +357,7 @@ pub fn struct_keys(name: &str) -> Option<BTreeSet<String>> {
 
 /// The parameter type (last path segment) of `WorkspaceApi::fn_name`.
 fn api_param_type(fn_name: &str) -> Option<String> {
-    let src = std::fs::read_to_string(format!("{}/traits.rs", crate_dir("intent-core")))
+    let src = std::fs::read_to_string(crate_dir("intent-core").join("traits.rs"))
         .expect("read traits.rs");
     let at = src.find(&format!("fn {fn_name}("))?;
     let sig = src[at..].split(") ->").next()?;
@@ -361,8 +368,9 @@ fn api_param_type(fn_name: &str) -> Option<String> {
 /// Literal keys `parse_fn` in `file` reads from `var`, and whether it also
 /// reads a key through a variable (`var.get(name)`).
 pub fn parse_fn_keys(file: &str, parse_fn: &str, var: &str) -> (BTreeSet<String>, bool) {
-    let path = format!("{}/../{file}", env!("CARGO_MANIFEST_DIR"));
-    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let path = crates_path(file);
+    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let path = path.display();
     let at = src
         .find(&format!("fn {parse_fn}("))
         .unwrap_or_else(|| panic!("{path}: no fn {parse_fn}"));
@@ -392,11 +400,8 @@ pub fn parse_fn_keys(file: &str, parse_fn: &str, var: &str) -> (BTreeSet<String>
 /// deserializes into the parameter of the `WorkspaceApi` method it calls,
 /// otherwise the row-declared parse function (`parse`), otherwise unknown.
 pub fn opaque_source(method: &str, parse: Option<(&str, &str, &str)>) -> OpaqueSource {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../intent-transport/src/router.rs"
-    );
-    let src = std::fs::read_to_string(path).expect("read router.rs");
+    let src = std::fs::read_to_string(crates_path("intent-transport/src/router.rs"))
+        .expect("read router.rs");
     let body: String = arm_body(dispatch_body(&src), method)
         .unwrap_or_default()
         .chars()

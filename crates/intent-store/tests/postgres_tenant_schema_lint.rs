@@ -21,7 +21,7 @@
 //! A table reference spelled through a CTE or a view is not seen.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[path = "support/postgres_sql.rs"]
 mod postgres_sql;
@@ -39,7 +39,7 @@ const GIN_EXCEPTIONS: &[&str] = &["agent_message_search_tsv", "note_search_tsv"]
 const ONE_ROW_PER_TENANT: &[&str] = &["tenant_lease", "tenant_writer"];
 
 fn store_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    intentd_test_support::source_lint::package_dir()
 }
 
 fn migrations() -> Vec<(String, String)> {

@@ -869,7 +869,7 @@ async fn run_sweep(scale: &LargeStateScale, baseline_file: &str) {
         .filter(|m| m.variant != "golden")
         .map(|m| ((m.method.clone(), m.variant.clone()), m.bytes))
         .collect();
-    let baseline_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let baseline_path = intentd_test_support::source_lint::package_dir()
         .join("tests/payload_budget")
         .join(baseline_file);
     if std::env::var("PAYLOAD_BUDGET_UPDATE").is_ok_and(|v| v == "1") {

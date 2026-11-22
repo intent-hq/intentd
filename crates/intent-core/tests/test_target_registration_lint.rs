@@ -45,8 +45,7 @@ const GLOBAL_STATE_CALLS: [&str; 4] = [
 const GLOBAL_STATE_MARKER: &str = "// process-global: allow — ";
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
+    intentd_test_support::source_lint::workspace_root()
         .canonicalize()
         .expect("canonicalize workspace root")
 }

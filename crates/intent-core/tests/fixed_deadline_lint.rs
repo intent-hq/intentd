@@ -686,7 +686,7 @@ fn report(
 
 #[test]
 fn fixed_test_deadlines_use_the_timeout_multiplier() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let root = intentd_test_support::source_lint::workspace_root();
     let baseline = read_count_baselines(&root, BASELINE_DIR, "fixed deadlines")
         .unwrap_or_else(|e| panic!("{e}"));
     let Tree { deadlines, whole } = scan_tree(&root);

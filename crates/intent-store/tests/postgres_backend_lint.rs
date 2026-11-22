@@ -80,7 +80,7 @@ use sql_uses::{list_key, rust_files, Index, LockProblem, Pos, Sql, TxKind, MAX_E
 use syn::{Expr, Lit};
 
 fn src() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    intentd_test_support::source_lint::package_dir().join("src")
 }
 
 /// Tables that belong to the schema rather than a tenant, with why.
@@ -117,7 +117,7 @@ fn postgres_index() -> Index {
 }
 
 fn unparsed_list() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/tenant-lint-unparsed.txt")
+    intentd_test_support::source_lint::package_dir().join("postgres/tenant-lint-unparsed.txt")
 }
 
 /// `postgres/tenant-lint-unparsed.txt`: `<file> | <prefix> — <reason>` per
@@ -273,7 +273,7 @@ const LIST_IT: &str = "in postgres/tenant-lint-unparsed.txt";
 
 /// Every table the Postgres migrations create.
 fn schema_tables() -> BTreeSet<String> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/migrations");
+    let dir = intentd_test_support::source_lint::package_dir().join("postgres/migrations");
     let mut out = BTreeSet::new();
     for entry in std::fs::read_dir(&dir).expect("read postgres/migrations") {
         let sql = std::fs::read_to_string(entry.expect("entry").path())
@@ -297,7 +297,7 @@ fn schema_tables() -> BTreeSet<String> {
 /// that calls one writes (`SELECT intent_provision_tenant($1)`), so rule 2
 /// needs the writer lock for it as for a plain INSERT.
 fn writing_functions() -> BTreeSet<String> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/migrations");
+    let dir = intentd_test_support::source_lint::package_dir().join("postgres/migrations");
     // In migration order, so a later `CREATE OR REPLACE` wins.
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("read postgres/migrations")
@@ -1632,7 +1632,7 @@ fn every_transfer_predicate_is_scoped() {
 }
 
 fn pending_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/pending")
+    intentd_test_support::source_lint::package_dir().join("postgres/pending")
 }
 
 /// The top-level module under `src/` a file belongs to: `lib.rs` is `lib`,
@@ -1744,7 +1744,7 @@ fn sqlite_only_in_source() -> BTreeSet<String> {
 
 /// `name — reason` lines of `postgres/sqlite_only.txt`, and lines without a reason.
 fn sqlite_only_listed() -> (BTreeSet<String>, Vec<String>) {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("postgres/sqlite_only.txt");
+    let path = intentd_test_support::source_lint::package_dir().join("postgres/sqlite_only.txt");
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut listed = BTreeSet::new();
     let mut unexplained = Vec::new();
@@ -1876,7 +1876,7 @@ fn sqlite_only_methods_match_the_list_and_stay_off_postgres() {
         .filter(|m| !TEST_ONLY_SQLITE_ONLY.contains(&m.as_str()))
         .collect();
 
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let crates = intentd_test_support::source_lint::package_dir().join("..");
     let mut files = Vec::new();
     for entry in std::fs::read_dir(&crates).expect("read crates") {
         let dir = entry.expect("entry").path();
