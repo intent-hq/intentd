@@ -24,6 +24,7 @@ use intent_services::feature_api::Services;
 
 use super::config::{self, ProviderState};
 use super::{bootstrap, StartFailure, StartOutcome};
+use crate::link::gate::GateLink;
 use crate::methods::AddParams;
 use crate::RemoteFeature;
 

@@ -2492,6 +2492,8 @@ impl RemoteNode {
         self.shared.as_ref()
     }
 
+    /// The connector's internal state. Domain code calls the methods on
+    /// `RemoteNode` (and [`GateLink`](crate::link::gate::GateLink)) instead.
     #[must_use]
     pub fn shared_ref(&self) -> &Shared {
         &self.shared
@@ -2568,16 +2570,6 @@ impl RemoteNode {
     #[must_use]
     pub fn turns_in_flight(&self) -> usize {
         self.shared.agents.turns_in_flight()
-    }
-
-    /// End every live agent with `error`.
-    pub fn end_all_agents(&self, error: &str) {
-        self.shared.agents.end_all(error);
-    }
-
-    /// Drop the queued stops: the machine's agents are gone.
-    pub fn drop_stops(&self) {
-        self.shared.drop_stops();
     }
 
     /// Close the current link without a redial.

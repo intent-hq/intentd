@@ -198,17 +198,17 @@ impl crate::link::gate::DialGate for CloudGate {
     /// was resumed now.
     fn before_dial<'a>(
         &'a self,
-        shared: &'a dyn GateLink,
+        link: &'a dyn GateLink,
         asked: bool,
     ) -> intent_core::BoxFuture<'a, std::result::Result<Dialable, ConnectFailure>> {
-        Box::pin(self.before_dial_inner(shared, asked))
+        Box::pin(self.before_dial_inner(link, asked))
     }
 
     /// The sandbox runs an intentd this backend shares no link protocol
     /// with, so it can never link again. See [`sandbox_outdated`].
-    fn outdated(&self, shared: &dyn GateLink) {
+    fn outdated(&self, link: &dyn GateLink) {
         if let Ok(feature) = super::feature(&self.svc) {
-            sandbox_outdated(&self.svc, feature, shared, &self.machine_id);
+            sandbox_outdated(&self.svc, feature, link, &self.machine_id);
         }
     }
 }
@@ -216,7 +216,7 @@ impl crate::link::gate::DialGate for CloudGate {
 impl CloudGate {
     async fn before_dial_inner(
         &self,
-        shared: &dyn GateLink,
+        link: &dyn GateLink,
         asked: bool,
     ) -> std::result::Result<Dialable, ConnectFailure> {
         let Ok(feature) = super::feature(&self.svc) else {
@@ -269,16 +269,16 @@ impl CloudGate {
                 if let Ok(Some(fresh)) =
                     self.svc.store().get_exposed_machine(&self.machine_id).await
                 {
-                    let mut target = shared.target();
+                    let mut target = link.target();
                     if target.tc_address != fresh.tc_address {
                         target.tc_address = fresh.tc_address;
-                        shared.set_target(target);
+                        link.set_target(target);
                     }
                 }
                 Ok(Dialable { pauses, resumed })
             }
             Err(Resumed::Lost) => {
-                sandbox_lost(&self.svc, feature, Some(shared), &row);
+                sandbox_lost(&self.svc, feature, Some(link), &row);
                 Err(lost_failure())
             }
             Err(Resumed::Refused(error)) => {
@@ -640,7 +640,7 @@ fn apply_state(cloud: &mut CloudMachine, state: CloudSandboxState) {
 pub(crate) fn sandbox_lost(
     svc: &Services,
     feature: &RemoteFeature,
-    shared: Option<&dyn GateLink>,
+    link: Option<&dyn GateLink>,
     row: &ExposedMachine,
 ) {
     if !feature.cloud.mark_lost(&row.id, Loss::Removed) {
@@ -649,11 +649,11 @@ pub(crate) fn sandbox_lost(
     tracing::warn!(machine = %row.id, sandbox = %row.cloud.as_ref().map(|c| c.sandbox_id.as_str()).unwrap_or_default(), "cloud machine: E2B removed the sandbox");
     let turn_error = format!("cloud-machine-unavailable (sandbox-lost): {SANDBOX_LOST_MESSAGE}");
     let node = feature.running_node(&row.id);
-    let shared = shared.or_else(|| node.as_ref().map(|node| node as &dyn GateLink));
-    if let Some(shared) = shared {
+    let link = link.or_else(|| node.as_ref().map(|node| node as &dyn GateLink));
+    if let Some(link) = link {
         // The sandbox took its agents with it: their stops are moot.
-        shared.drop_stops();
-        shared.end_all_agents(&turn_error);
+        link.drop_stops();
+        link.end_all_agents(&turn_error);
     }
     let svc = svc.clone();
     let row = row.clone();
@@ -676,7 +676,7 @@ pub(crate) fn sandbox_lost(
 fn sandbox_outdated(
     svc: &Services,
     feature: &RemoteFeature,
-    shared: &dyn GateLink,
+    link: &dyn GateLink,
     machine_id: &str,
 ) {
     if !feature.cloud.mark_lost(machine_id, Loss::Outdated) {
@@ -686,8 +686,8 @@ fn sandbox_outdated(
     // A prompt waiting for the link fails with this refusal. Ending the
     // agents here would close their transport first, and a prompt closed
     // before any output is silently redriven instead of told.
-    shared.refuse_turns(&outdated_turn_error());
-    shared.drop_stops();
+    link.refuse_turns(&outdated_turn_error());
+    link.drop_stops();
     let svc = svc.clone();
     let machine_id = machine_id.to_owned();
     tokio::spawn(async move {
