@@ -81,11 +81,7 @@ pub fn local_profile_launch(
         intent_providers::profile_spec(provider_id).is_some(),
         "not a profile base: {provider_id:?}"
     );
-    let agent = crate::agent_manager::local_launch_profile(
-        provider_id,
-        Arc::new(profile.clone()),
-        Some(home),
-    );
+    let agent = crate::agent_manager::local_launch_profile(provider_id, profile, Some(home));
     let Some(cli) = InstalledCli::for_provider(provider_id) else {
         return LocalProfileLaunch {
             agent: (*agent).clone(),

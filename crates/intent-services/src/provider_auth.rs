@@ -286,13 +286,12 @@ async fn check_provider_auth_cli_with(
 ) -> CliAuthProbe {
     let probe_command = |program: &OsStr| {
         let mut cmd = probe_command(program);
-        match context {
-            Some(context) => context.apply(&mut cmd),
-            None => {
-                gap_fill_credentials(&mut cmd, captured);
-                if let Some(overlay) = overlay {
-                    overlay.apply_to_command(&mut cmd);
-                }
+        if let Some(context) = context {
+            context.apply(&mut cmd);
+        } else {
+            gap_fill_credentials(&mut cmd, captured);
+            if let Some(overlay) = overlay {
+                overlay.apply_to_command(&mut cmd);
             }
         }
         cmd

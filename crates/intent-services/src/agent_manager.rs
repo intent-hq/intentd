@@ -3277,14 +3277,14 @@ fn spawn_unsloth_status_publisher(
 /// executor runner tests keeps the two in step.
 pub(crate) fn local_launch_profile(
     provider_id: &str,
-    profile: Arc<intent_acp::ProfileEnv>,
+    profile: &intent_acp::ProfileEnv,
     home: Option<&Path>,
 ) -> Arc<intent_acp::ProfileEnv> {
     debug_assert_eq!(
         intent_providers::base_provider_id(profile.provider_ref()),
         intent_providers::base_provider_id(provider_id),
     );
-    Arc::new((*profile).clone().with_api_key_home(home))
+    Arc::new(profile.clone().with_api_key_home(home))
 }
 
 /// [`local_launch_profile`] against the daemon user's home: the overlay a
@@ -12537,7 +12537,7 @@ impl AgentManager {
         // over it.
         let profile_env = profile_env.map(|profile| {
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-            local_launch_profile(resolved.provider.id, profile, home.as_deref())
+            local_launch_profile(resolved.provider.id, &profile, home.as_deref())
         });
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.profile_env = profile_env.as_deref();
