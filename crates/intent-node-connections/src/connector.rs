@@ -2492,6 +2492,8 @@ impl RemoteNode {
         self.shared.as_ref()
     }
 
+    /// The connector's internal state. Domain code calls the methods on
+    /// `RemoteNode` (and [`GateLink`](crate::link::gate::GateLink)) instead.
     #[must_use]
     pub fn shared_ref(&self) -> &Shared {
         &self.shared
@@ -2558,6 +2560,55 @@ impl RemoteNode {
         if let Some(link) = self.shared.link.borrow().as_ref() {
             link.close();
         }
+    }
+}
+
+/// What a cloud machine's lifecycle (pause, resume, idle reaping) asks of
+/// its connector.
+impl RemoteNode {
+    /// Live attached agents with a turn in flight.
+    #[must_use]
+    pub fn turns_in_flight(&self) -> usize {
+        self.shared.agents.turns_in_flight()
+    }
+
+    /// Close the current link without a redial.
+    pub fn close_link(&self) {
+        self.shared.close_link();
+    }
+
+    /// Whether something would keep a link up now.
+    #[must_use]
+    pub fn link_wanted(&self) -> bool {
+        self.shared.link_wanted()
+    }
+
+    /// Ask for a link without waiting.
+    pub fn wake(&self) {
+        self.shared.wake();
+    }
+
+    /// `agents`' processes are gone: their runtimes end with `error`.
+    pub fn processes_lost(&self, agents: &[AgentId], error: &str) {
+        self.shared.processes_lost(agents, error);
+    }
+
+    /// Whether the machine has work now; one without any may be paused.
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.shared.busy()
+    }
+
+    /// When the machine last had agent activity.
+    #[must_use]
+    pub fn last_activity(&self) -> Instant {
+        self.shared.last_activity()
+    }
+
+    /// Wait up to `wait` for the uses in flight to end and hold off new
+    /// ones while the guard lives; `None` when uses kept it busy.
+    pub async fn quiesce(&self, wait: Duration) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        self.shared.quiesce(wait).await
     }
 }
 
@@ -2666,7 +2717,7 @@ async fn run(
         let ingested = ingest.ingested();
         let gated = match &target.gate {
             Some(gate) => tokio::select! {
-                gated = gate.before_dial(&shared, asked) => gated.map(Some),
+                gated = gate.before_dial(shared.as_ref(), asked) => gated.map(Some),
                 () = wait_true(&mut shutdown) => return,
             },
             None => Ok(None),
@@ -2731,7 +2782,7 @@ async fn run(
                     // update: it is deleted. A newer one (this backend was
                     // rolled back) links again once the backend is updated.
                     if update.update == intent_core::machines::UpdateSide::Machine {
-                        gate.outdated(&shared);
+                        gate.outdated(shared.as_ref());
                     }
                 }
                 if matches!(failure, ConnectFailure::Revoked(_)) {

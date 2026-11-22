@@ -24,6 +24,7 @@ use intent_services::feature_api::Services;
 
 use super::config::{self, ProviderState};
 use super::{bootstrap, StartFailure, StartOutcome};
+use crate::link::gate::GateLink;
 use crate::methods::AddParams;
 use crate::RemoteFeature;
 
@@ -1285,12 +1286,12 @@ pub(crate) async fn remove_machine(
         feature.node_locked(svc, &row.id).await.ok()
     } else {
         if let Some(node) = feature.running_node(&row.id) {
-            node.shared_ref().drop_stops();
+            node.drop_stops();
             let turn_error = match removal {
                 Removal::Unlinkable => super::lifecycle::outdated_turn_error(),
                 Removal::Stop | Removal::FailedStart | Removal::Unneeded(_) | Removal::Lost(_) => "cloud-machine-unavailable: the agent's E2B sandbox was deleted without a final stop; work it pushed is kept".to_owned(),
             };
-            node.shared_ref().agents.end_all(&turn_error);
+            node.end_all_agents(&turn_error);
         }
         None
     };

@@ -28,7 +28,7 @@ use intent_services::feature_api::Services;
 use super::config::{self, Provider};
 use super::start::Removal;
 use crate::connect::ConnectFailure;
-use crate::connector::Shared;
+use crate::link::gate::GateLink;
 use crate::RemoteFeature;
 
 /// The E2B timeout a live sandbox is kept ahead by. E2B pauses it (never
@@ -198,17 +198,17 @@ impl crate::link::gate::DialGate for CloudGate {
     /// was resumed now.
     fn before_dial<'a>(
         &'a self,
-        shared: &'a Shared,
+        link: &'a dyn GateLink,
         asked: bool,
     ) -> intent_core::BoxFuture<'a, std::result::Result<Dialable, ConnectFailure>> {
-        Box::pin(self.before_dial_inner(shared, asked))
+        Box::pin(self.before_dial_inner(link, asked))
     }
 
     /// The sandbox runs an intentd this backend shares no link protocol
     /// with, so it can never link again. See [`sandbox_outdated`].
-    fn outdated(&self, shared: &Shared) {
+    fn outdated(&self, link: &dyn GateLink) {
         if let Ok(feature) = super::feature(&self.svc) {
-            sandbox_outdated(&self.svc, feature, shared, &self.machine_id);
+            sandbox_outdated(&self.svc, feature, link, &self.machine_id);
         }
     }
 }
@@ -216,7 +216,7 @@ impl crate::link::gate::DialGate for CloudGate {
 impl CloudGate {
     async fn before_dial_inner(
         &self,
-        shared: &Shared,
+        link: &dyn GateLink,
         asked: bool,
     ) -> std::result::Result<Dialable, ConnectFailure> {
         let Ok(feature) = super::feature(&self.svc) else {
@@ -269,16 +269,16 @@ impl CloudGate {
                 if let Ok(Some(fresh)) =
                     self.svc.store().get_exposed_machine(&self.machine_id).await
                 {
-                    let mut target = shared.target();
+                    let mut target = link.target();
                     if target.tc_address != fresh.tc_address {
                         target.tc_address = fresh.tc_address;
-                        shared.set_target(target);
+                        link.set_target(target);
                     }
                 }
                 Ok(Dialable { pauses, resumed })
             }
             Err(Resumed::Lost) => {
-                sandbox_lost(&self.svc, feature, Some(shared), &row);
+                sandbox_lost(&self.svc, feature, Some(link), &row);
                 Err(lost_failure())
             }
             Err(Resumed::Refused(error)) => {
@@ -640,7 +640,7 @@ fn apply_state(cloud: &mut CloudMachine, state: CloudSandboxState) {
 pub(crate) fn sandbox_lost(
     svc: &Services,
     feature: &RemoteFeature,
-    shared: Option<&Shared>,
+    link: Option<&dyn GateLink>,
     row: &ExposedMachine,
 ) {
     if !feature.cloud.mark_lost(&row.id, Loss::Removed) {
@@ -649,11 +649,11 @@ pub(crate) fn sandbox_lost(
     tracing::warn!(machine = %row.id, sandbox = %row.cloud.as_ref().map(|c| c.sandbox_id.as_str()).unwrap_or_default(), "cloud machine: E2B removed the sandbox");
     let turn_error = format!("cloud-machine-unavailable (sandbox-lost): {SANDBOX_LOST_MESSAGE}");
     let node = feature.running_node(&row.id);
-    let shared = shared.or_else(|| node.as_ref().map(crate::RemoteNode::shared_ref));
-    if let Some(shared) = shared {
+    let link = link.or_else(|| node.as_ref().map(|node| node as &dyn GateLink));
+    if let Some(link) = link {
         // The sandbox took its agents with it: their stops are moot.
-        shared.drop_stops();
-        shared.agents.end_all(&turn_error);
+        link.drop_stops();
+        link.end_all_agents(&turn_error);
     }
     let svc = svc.clone();
     let row = row.clone();
@@ -673,7 +673,12 @@ pub(crate) fn sandbox_lost(
 /// then delete the sandbox without a final stop (none can reach it) and
 /// remove the machine in the background. Its agents become agents without
 /// a sandbox; the next message starts a new one from their pushed work.
-fn sandbox_outdated(svc: &Services, feature: &RemoteFeature, shared: &Shared, machine_id: &str) {
+fn sandbox_outdated(
+    svc: &Services,
+    feature: &RemoteFeature,
+    link: &dyn GateLink,
+    machine_id: &str,
+) {
     if !feature.cloud.mark_lost(machine_id, Loss::Outdated) {
         return;
     }
@@ -681,8 +686,8 @@ fn sandbox_outdated(svc: &Services, feature: &RemoteFeature, shared: &Shared, ma
     // A prompt waiting for the link fails with this refusal. Ending the
     // agents here would close their transport first, and a prompt closed
     // before any output is silently redriven instead of told.
-    shared.refuse_turns(&outdated_turn_error());
-    shared.drop_stops();
+    link.refuse_turns(&outdated_turn_error());
+    link.drop_stops();
     let svc = svc.clone();
     let machine_id = machine_id.to_owned();
     tokio::spawn(async move {
@@ -743,7 +748,7 @@ pub(crate) async fn pause(
     }
     let node = feature.running_node(machine_id);
     if let Some(node) = &node {
-        let turns = node.shared_ref().agents.turns_in_flight();
+        let turns = node.turns_in_flight();
         if turns > 0 {
             return Err(crate::methods::in_use(&row.name, turns));
         }
@@ -752,7 +757,7 @@ pub(crate) async fn pause(
     // and a dial in flight is dropped when it binds.
     feature.cloud.park(machine_id);
     if let Some(node) = &node {
-        node.shared_ref().close_link();
+        node.close_link();
     }
     feature.cloud.count_pause(machine_id);
     set_state(svc, feature, machine_id, CloudSandboxState::Pausing).await;
@@ -787,8 +792,8 @@ pub(crate) async fn pause(
             feature.cloud.touch(machine_id);
             set_state(svc, feature, machine_id, CloudSandboxState::Running).await;
             if let Some(node) = &node {
-                if node.shared_ref().link_wanted() {
-                    node.shared_ref().wake();
+                if node.link_wanted() {
+                    node.wake();
                 }
             }
             Err(config::to_error(
@@ -814,7 +819,7 @@ async fn disk_resumed(svc: &Services, feature: &RemoteFeature, machine_id: &str)
             // an agent the machine does not know.
             if let Some(node) = feature.running_node(machine_id) {
                 let ids: Vec<_> = agents.into_iter().map(|agent| agent.agent_id).collect();
-                node.shared_ref().processes_lost(
+                node.processes_lost(
                     &ids,
                     &format!(
                         "transport closed: {}",
@@ -989,8 +994,8 @@ async fn check(
     let settled = !feature.cloud.in_transition(&row.id);
     match cloud.state {
         CloudSandboxState::Running => {
-            let busy = node.as_ref().is_some_and(|node| node.shared_ref().busy());
-            let last_active = node.as_ref().map(|node| node.shared_ref().last_activity());
+            let busy = node.as_ref().is_some_and(crate::RemoteNode::busy);
+            let last_active = node.as_ref().map(crate::RemoteNode::last_activity);
             let activity = feature.cloud.activity(&row.id, busy, last_active);
             // A provider without a lease has nothing to renew: only the
             // idle pause below stops it. E2B caps a continuous run; Vercel
@@ -1099,7 +1104,7 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, why: PauseFo
     let idle_since = super::feature(svc)
         .ok()
         .and_then(|feature| feature.running_node(machine_id))
-        .map(|node| node.shared_ref().last_activity());
+        .map(|node| node.last_activity());
     let svc = svc.clone();
     let client = client.clone();
     let machine_id = machine_id.to_owned();
@@ -1125,7 +1130,7 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, why: PauseFo
         }
         if why == PauseFor::Cap {
             if let Some(node) = feature.running_node(&machine_id) {
-                if node.shared_ref().link_wanted() {
+                if node.link_wanted() {
                     tracing::info!(machine = %machine_id, "cloud machine: planned pause before the run cap; resuming");
                     if let Err(error) = node.connect().await {
                         tracing::warn!(machine = %machine_id, %error, "cloud machine: could not resume after the planned pause");
@@ -1141,7 +1146,7 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, why: PauseFo
 const USE_WAIT: Duration = Duration::from_secs(5);
 
 /// An idle pause. It holds its machine's use gate exclusively
-/// ([`crate::connector::Shared::quiesce`]): the uses in flight (home calls,
+/// ([`crate::connector::RemoteNode::quiesce`]): the uses in flight (home calls,
 /// terminal and script opens, turns) end first, and new ones wait until the
 /// link is closed, then dial, which resumes the sandbox. Under the gate it
 /// checks the sandbox is still idle (nothing busy, no activity since the
@@ -1158,15 +1163,15 @@ async fn idle_pause(
     // Held until the pause ends: new uses wait for it.
     let mut quiet = None;
     if let Some(node) = &node {
-        quiet = node.shared_ref().quiesce(USE_WAIT).await;
+        quiet = node.quiesce(USE_WAIT).await;
         if quiet.is_none() {
             feature.cloud.touch(machine_id);
             return Err(Error::Internal("the sandbox kept being used".into()));
         }
     }
-    let used = node.as_ref().is_some_and(|node| {
-        node.shared_ref().busy() || Some(node.shared_ref().last_activity()) != idle_since
-    });
+    let used = node
+        .as_ref()
+        .is_some_and(|node| node.busy() || Some(node.last_activity()) != idle_since);
     if used {
         feature.cloud.touch(machine_id);
         return Err(Error::Internal("the sandbox is in use".into()));
