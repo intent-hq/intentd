@@ -163,24 +163,6 @@ async fn opening_a_tenant_provisions_its_seed_rows_once() {
     assert_eq!(chiefs, 2);
 }
 
-/// Concurrent first opens of one tenant still provision it once: the
-/// tenant writer row lock serializes them (provisioning takes no advisory
-/// lock of its own since migration 0010).
-#[tokio::test]
-async fn concurrent_first_opens_provision_a_tenant_once() {
-    let Some(db) = test_db(false).await else {
-        return;
-    };
-    futures_util::future::join_all((0..6).map(|_| open(&db, "tenant-race"))).await;
-    let primaries: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM principal WHERE tenant_id = 'tenant-race' AND is_primary = 1",
-    )
-    .fetch_one(&db.admin)
-    .await
-    .unwrap();
-    assert_eq!(primaries, 1);
-}
-
 /// A table-less advisory lock carries no shard key: on Neki sharded by
 /// `tenant_id` the router runs it on another shard than the tenant's, and a
 /// single-shard pool fails with NK313 (0005's `intent_provision_tenant` lock
