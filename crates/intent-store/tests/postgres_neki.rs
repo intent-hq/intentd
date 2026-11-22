@@ -25,6 +25,18 @@
 //! - in single-shard mode (`PoolSettings::single_shard`), a transaction
 //!   that reaches a second tenant's shard fails instead of running across
 //!   shards.
+//!
+//! A fresh `intent_ci_*` schema is not in the branch's data topology, so
+//! every table in it lands on the authoritative shard: the sharded tests
+//! then run, but nothing in them is cross-shard. To exercise real sharding,
+//! bind one fixed schema in the data topology (every table with `tenant_id`
+//! to a shard group with an xxhash index on `tenant_id` spread over two or
+//! more shards, the migration ledger to the authoritative group) and name
+//! it in `INTENT_STORE_NEKI_SHARDED_SCHEMA`. Each sharded test then drops,
+//! creates and migrates that schema, keeping the topology, and drops it at
+//! the end; a file lock in the temp directory runs them one at a time. Only
+//! in that mode do the topology-dependent tests run (routing, identity
+//! inserts, cross-shard writer locks); they skip otherwise.
 #![cfg(feature = "postgres")]
 
 #[path = "support/writer_race.rs"]
@@ -120,6 +132,121 @@ fn neki_url(var: &str) -> Option<String> {
     url
 }
 
+/// The SQLSTATE Neki returns when a transaction in single-shard mode
+/// (`__neki.tx_mode = 'single'`) reaches a second shard.
+const NEKI_SINGLE_SHARD_VIOLATION: &str = "NK313";
+
+/// The shard the router sends `tenant`'s `tenant_writer` row to, read from
+/// the `Shard <uid>` node of `EXPLAIN (ANALYZE, NEKI_PLAN)` (plain
+/// `NEKI_PLAN` names only the shard group).
+async fn shard_of(pool: &PgPool, tenant: &str) -> Result<String, String> {
+    let plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, NEKI_PLAN) SELECT 1 FROM tenant_writer WHERE tenant_id = $1",
+    )
+    .bind(tenant)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("plan {tenant}: {e}"))?;
+    let shards: Vec<&str> = plan
+        .iter()
+        .filter_map(|line| line.trim_start().strip_prefix("->  Shard "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
+    match shards.as_slice() {
+        [shard] => Ok((*shard).to_owned()),
+        _ => Err(format!(
+            "plan for {tenant} does not name one shard:\n{}",
+            plan.join("\n")
+        )),
+    }
+}
+
+/// Opens `tenant` on `pool`, which seeds its `tenant_writer` row.
+async fn open_tenant(pool: &PgPool, tenant: &str) -> Result<Store, String> {
+    Store::open_postgres(
+        pool.clone(),
+        TenantId::new(tenant).map_err(|e| e.to_string())?,
+        PostgresOptions::default(),
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .map_err(|e| format!("open {tenant}: {e}"))
+}
+
+/// Up to `count` tenants named after `prefix`, each with its shard, until
+/// two shards are seen; `Err` when all landed on one.
+async fn tenants_on_two_shards(
+    pool: &PgPool,
+    prefix: &str,
+    count: usize,
+) -> Result<Vec<(String, String)>, String> {
+    let mut placed = Vec::new();
+    for i in 0..count {
+        let tenant = format!("{prefix}-{i}");
+        let shard = shard_of(pool, &tenant).await?;
+        placed.push((tenant, shard));
+        let first = &placed[0].1;
+        if placed.iter().any(|(_, shard)| shard != first) {
+            return Ok(placed);
+        }
+    }
+    Err(format!(
+        "all {count} tenants routed to one shard: {placed:?}"
+    ))
+}
+
+/// The topology-bound schema named in `INTENT_STORE_NEKI_SHARDED_SCHEMA`,
+/// or `None` when it is unset or empty. Panics on a name that is not a
+/// plain lower-case identifier (it is spliced into DDL).
+fn fixed_sharded_schema() -> Option<String> {
+    let name = std::env::var("INTENT_STORE_NEKI_SHARDED_SCHEMA")
+        .ok()
+        .filter(|name| !name.is_empty())?;
+    let plain = name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    assert!(
+        plain && !name.starts_with("intent_ci_"),
+        "INTENT_STORE_NEKI_SHARDED_SCHEMA must be a plain lower-case identifier \
+         outside the intent_ci_ run prefix, not {name:?}"
+    );
+    Some(name)
+}
+
+/// Where a test runs: a fresh, unbound `intent_ci_*` schema, or the fixed
+/// schema the data topology binds.
+enum RunSchema {
+    Fresh,
+    Fixed(String),
+}
+
+/// The schema for a sharded test: the fixed one when configured.
+fn sharded_run_schema() -> RunSchema {
+    fixed_sharded_schema().map_or(RunSchema::Fresh, RunSchema::Fixed)
+}
+
+/// An exclusive lock on a temp file named after `schema`, held until
+/// dropped, so test processes sharing the fixed schema run one at a time.
+/// (`flock`; `std::fs::File::lock` is newer than the crate's MSRV.)
+#[cfg(unix)]
+fn lock_fixed_schema(schema: &str) -> nix::fcntl::Flock<std::fs::File> {
+    let path = std::env::temp_dir().join(format!("intent-store-neki-{schema}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        .unwrap_or_else(|(_, e)| panic!("lock {}: {e}", path.display()))
+}
+
+/// Without `flock`, run the fixed-schema tests one at a time by hand
+/// (`--test-threads 1`, one process).
+#[cfg(not(unix))]
+fn lock_fixed_schema(_schema: &str) {}
+
 /// Runs `body` on a pool of `connections` whose `search_path` is a fresh
 /// schema on the Neki database at `url` (in single-shard mode when
 /// `single_shard`), then drops the schema.
@@ -133,15 +260,62 @@ where
     F: FnOnce(PgPool) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
+    in_schema(url, RunSchema::Fresh, connections, single_shard, body).await
+}
+
+/// [`in_fresh_schema`] for a sharded test: in the fixed, topology-bound
+/// schema when `INTENT_STORE_NEKI_SHARDED_SCHEMA` names one.
+async fn in_sharded_schema<F, Fut>(
+    url: &str,
+    connections: u32,
+    single_shard: bool,
+    body: F,
+) -> Result<(), String>
+where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    in_schema(url, sharded_run_schema(), connections, single_shard, body).await
+}
+
+/// Runs `body` on a pool of `connections` whose `search_path` is `run`'s
+/// schema, created empty for the run and dropped after it. A fixed schema
+/// is dropped first if a killed run left it, under [`lock_fixed_schema`];
+/// stale `intent_ci_*` schemas are only cleaned up by fresh-schema runs.
+async fn in_schema<F, Fut>(
+    url: &str,
+    run: RunSchema,
+    connections: u32,
+    single_shard: bool,
+    body: F,
+) -> Result<(), String>
+where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after 1970")
         .as_secs();
-    let schema = format!("intent_ci_{now}_{}", uuid::Uuid::new_v4().simple());
     let admin = postgres::connect(url, 1)
         .await
         .map_err(|e| format!("connect to Neki: {e}"))?;
-    drop_stale_schemas(&admin, now).await;
+    let (schema, _lock) = match run {
+        RunSchema::Fresh => {
+            drop_stale_schemas(&admin, now).await;
+            (
+                format!("intent_ci_{now}_{}", uuid::Uuid::new_v4().simple()),
+                None,
+            )
+        }
+        RunSchema::Fixed(schema) => {
+            let lock = lock_fixed_schema(&schema);
+            exec(&admin, format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                .await
+                .map_err(|e| format!("drop a leftover {schema}: {e}"))?;
+            (schema, Some(lock))
+        }
+    };
     exec(&admin, format!("CREATE SCHEMA {schema}"))
         .await
         .map_err(|e| format!("create the run's schema: {e}"))?;
@@ -202,7 +376,7 @@ async fn writers_of_one_tenant_exclude_each_other_on_sharded_neki() {
         return;
     };
     let connections = u32::try_from(writer_race::PROCESSES).expect("small") + 1;
-    in_fresh_schema(&url, connections, true, |pool| async move {
+    in_sharded_schema(&url, connections, true, |pool| async move {
         postgres::migrate(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
@@ -218,18 +392,20 @@ async fn writers_of_one_tenant_exclude_each_other_on_sharded_neki() {
     .expect("the tenant writer lock excludes on sharded Neki");
 }
 
-/// A client cannot tell which shard a tenant lives on, so one transaction
-/// in single-shard mode locks a first tenant's writer row and then tries
-/// each of 16 others in turn. Any on another shard must be rejected; with
-/// more than one shard, all 16 sharing the first's shard is vanishingly
-/// unlikely, so at least one rejection is required. On a one-shard branch
-/// nothing is cross-shard: every lock must succeed.
+/// One transaction in single-shard mode locks a first tenant's writer row
+/// and then tries each of 16 others in turn. Each tenant's shard comes from
+/// the router's plan ([`shard_of`]): a second tenant on another shard must
+/// be refused with Neki's single-shard error, one on the same shard must
+/// lock. In an unbound fresh schema every tenant is on the authoritative
+/// shard, so every lock must succeed; in the fixed, topology-bound schema
+/// all 16 sharing the first's shard is vanishingly unlikely, so at least
+/// one cross-shard pair is required.
 #[tokio::test]
 async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki() {
     let Some(url) = neki_url("INTENT_STORE_NEKI_SHARDED_URL") else {
         return;
     };
-    in_fresh_schema(&url, 2, true, |pool| async move {
+    in_sharded_schema(&url, 2, true, |pool| async move {
         postgres::migrate(&pool).await.map_err(|e| e.to_string())?;
         let run = uuid::Uuid::new_v4().simple().to_string();
         let first = format!("neki-shard-0-{run}");
@@ -248,8 +424,11 @@ async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki
                 .await
                 .map_err(|e| format!("write {tenant}: {e}"))?;
         }
-        let mut rejected = Vec::new();
+        let first_shard = shard_of(&pool, &first).await?;
+        let mut cross_shard = 0;
+        let mut wrong = Vec::new();
         for other in &others {
+            let other_shard = shard_of(&pool, other).await?;
             let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
             sqlx::query(postgres::WRITER_LOCK_SQL)
                 .bind(&first)
@@ -261,45 +440,41 @@ async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki
                 .fetch_one(&mut *tx)
                 .await;
             let _ = tx.rollback().await;
-            match second {
-                Ok(_) => {}
-                // A lock wait or a lost connection is not a shard rejection.
-                Err(sqlx::Error::Database(e)) if e.code().as_deref() != Some("55P03") => {
-                    rejected.push(format!("{other}: {:?} {e}", e.code()));
+            let outcome = match &second {
+                Ok(_) => "locked".to_owned(),
+                Err(sqlx::Error::Database(e)) => {
+                    format!("{} {e}", e.code().as_deref().unwrap_or("-"))
                 }
                 Err(e) => return Err(format!("lock {other}: {e}")),
+            };
+            eprintln!("  {first_shard} + {other_shard}: {outcome}");
+            let rejected_by_neki = matches!(
+                &second,
+                Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some(NEKI_SINGLE_SHARD_VIOLATION)
+            );
+            if other_shard == first_shard {
+                if second.is_err() {
+                    wrong.push(format!("same-shard {other} was refused: {outcome}"));
+                }
+            } else {
+                cross_shard += 1;
+                if !rejected_by_neki {
+                    wrong.push(format!("cross-shard {other} was not refused: {outcome}"));
+                }
             }
         }
-        let shards: i64 = sqlx::query_scalar("SELECT count(*) FROM __neki.list_shards()")
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| format!("count the shards: {e}"))?;
         eprintln!(
-            "single-shard mode rejected {} of {} second tenants on {shards} shard(s)",
-            rejected.len(),
+            "single-shard mode: {cross_shard} of {} second tenants on another shard than {first_shard}",
             others.len()
         );
-        for line in &rejected {
-            eprintln!("  {line}");
+        if !wrong.is_empty() {
+            return Err(wrong.join("; "));
         }
-        if shards < 2 {
-            // Every tenant is on the one shard: nothing can be cross-shard,
-            // so single-shard mode must reject nothing.
-            eprintln!(
-                "only {shards} shard(s): cross-shard rejection cannot be observed; \
-                 checked that single-shard transactions run"
-            );
-            return if rejected.is_empty() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "single-shard mode rejected a same-shard tenant: {rejected:?}"
-                ))
-            };
-        }
-        if rejected.is_empty() {
+        if matches!(sharded_run_schema(), RunSchema::Fixed(_)) && cross_shard == 0 {
+            // With two or more tenant shards, all 16 sharing the first's
+            // shard is vanishingly unlikely: the topology is not applied.
             return Err(format!(
-                "single-shard mode let one transaction lock all {} tenants",
+                "all {} tenants routed to {first_shard} in the fixed schema",
                 others.len() + 1
             ));
         }
@@ -318,7 +493,7 @@ async fn a_held_writer_lock_times_out_as_55p03_and_store_busy_on_neki() {
     let Some(url) = neki_url("INTENT_STORE_NEKI_SHARDED_URL") else {
         return;
     };
-    in_fresh_schema(&url, 3, true, |pool| async move {
+    in_sharded_schema(&url, 3, true, |pool| async move {
         use std::time::Duration;
         postgres::migrate(&pool)
             .await
@@ -404,7 +579,7 @@ async fn migrate_waits_for_ddl_and_open_checks_the_schema_on_neki() {
     let Some(url) = neki_url("INTENT_STORE_NEKI_SHARDED_URL") else {
         return;
     };
-    in_fresh_schema(&url, 2, true, |pool| async move {
+    in_sharded_schema(&url, 2, true, |pool| async move {
         let expected: Vec<i64> = postgres::MIGRATOR.iter().map(|m| m.version).collect();
         let open = |tenant: &'static str| {
             let pool = pool.clone();
@@ -498,4 +673,330 @@ async fn migrate_waits_for_ddl_and_open_checks_the_schema_on_neki() {
     })
     .await
     .expect("migrate job and schema gate on Neki");
+}
+
+/// The URL of a sharded branch and its fixed, topology-bound schema, or
+/// `None` (the test skips) unless both are set.
+fn fixed_sharded_target() -> Option<String> {
+    let url = neki_url("INTENT_STORE_NEKI_SHARDED_URL")?;
+    if fixed_sharded_schema().is_none() {
+        eprintln!("skipping: INTENT_STORE_NEKI_SHARDED_SCHEMA is unset");
+        return None;
+    }
+    Some(url)
+}
+
+/// The fixed schema's data topology: after every migration, each table
+/// with a `tenant_id` column is bound to a shard group whose index hashes
+/// `tenant_id` (xxhash) over two or more shards, and each table without
+/// one to the authoritative group. A migration that adds a table fails
+/// this until the topology binds it, instead of the table silently landing
+/// on the authoritative shard.
+#[tokio::test]
+async fn the_data_topology_binds_every_table_of_the_fixed_schema() {
+    let Some(url) = fixed_sharded_target() else {
+        return;
+    };
+    in_sharded_schema(&url, 2, false, |pool| async move {
+        postgres::migrate(&pool)
+            .await
+            .map_err(|e| format!("migrate: {e}"))?;
+        let (database, schema): (String, String) =
+            sqlx::query_as("SELECT current_database()::text, current_schema()::text")
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        let (json,): (String,) = sqlx::query_as("SELECT __neki.get_data_topology()")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| format!("read the data topology: {e}"))?;
+        let topology: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| format!("parse the topology: {e}"))?;
+        let authoritative = topology["authoritative_shard_group"]
+            .as_str()
+            .ok_or("no authoritative_shard_group")?;
+        let tables: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT c.relname::text, EXISTS (SELECT 1 FROM pg_attribute a \
+               WHERE a.attrelid = c.oid AND a.attname = 'tenant_id' AND NOT a.attisdropped) \
+             FROM pg_class c WHERE c.relnamespace = current_schema()::regnamespace \
+               AND c.relkind IN ('r', 'p') ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let bound = &topology["databases"][&database]["schemas"][&schema]["tables"];
+        let mut problems = Vec::new();
+        let mut tenant_tables = 0;
+        for (table, has_tenant) in &tables {
+            let Some(group) = bound[table]["shard_group"].as_str() else {
+                problems.push(format!("{table} is not bound"));
+                continue;
+            };
+            if !has_tenant {
+                if group != authoritative {
+                    problems.push(format!("{table} has no tenant_id but is bound to {group}"));
+                }
+                continue;
+            }
+            tenant_tables += 1;
+            let Some(spec) = topology["shard_groups"]
+                .as_array()
+                .and_then(|groups| groups.iter().find(|g| g["uid"] == group))
+            else {
+                problems.push(format!("{table}: no shard group {group}"));
+                continue;
+            };
+            let index = bound[table]["shard_index"]
+                .as_str()
+                .or_else(|| spec["default_shard_index"].as_str())
+                .unwrap_or_default();
+            let shard_index = &topology["shard_indexes"][index];
+            let shards: std::collections::BTreeSet<&str> = spec["key_ranges"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|range| range["shard_uid"].as_str())
+                .collect();
+            if shard_index["type"] != "xxhash"
+                || shard_index["columns"] != serde_json::json!(["tenant_id"])
+                || shards.len() < 2
+            {
+                problems.push(format!(
+                    "{table} is bound to {group} (index {index:?}: {shard_index}, shards {shards:?}), \
+                     not an xxhash(tenant_id) group over two or more shards"
+                ));
+            }
+        }
+        eprintln!(
+            "{schema}: {} tables, {tenant_tables} sharded by tenant_id, {} on {authoritative}",
+            tables.len(),
+            tables.len() - tenant_tables
+        );
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("\n"))
+        }
+    })
+    .await
+    .expect("the data topology binds the fixed schema");
+}
+
+/// (a) The router plans each tenant's single-tenant read for one shard, and
+/// two tenants land on different shards of the tenant group: sharding by
+/// `tenant_id` is in effect, not every row on the authoritative shard.
+#[tokio::test]
+async fn tenants_route_to_different_shards_in_the_fixed_schema() {
+    let Some(url) = fixed_sharded_target() else {
+        return;
+    };
+    in_sharded_schema(&url, 2, true, |pool| async move {
+        postgres::migrate(&pool)
+            .await
+            .map_err(|e| format!("migrate: {e}"))?;
+        // The authoritative group has one open key range: its uid is its shard's.
+        let authoritative: String = sqlx::query_scalar(
+            "SELECT (__neki.get_data_topology()::jsonb) ->> 'authoritative_shard_group'",
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| format!("read the authoritative group: {e}"))?;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let placed = tenants_on_two_shards(&pool, &format!("neki-route-{run}"), 32).await?;
+        let (a, a_shard) = &placed[0];
+        let (b, b_shard) = placed
+            .iter()
+            .find(|(_, shard)| shard != a_shard)
+            .ok_or("no second shard")?;
+        for (tenant, shard) in [(a, a_shard), (b, b_shard)] {
+            if *shard == authoritative {
+                return Err(format!(
+                    "{tenant} routed to the authoritative shard {shard}"
+                ));
+            }
+            open_tenant(&pool, tenant)
+                .await?
+                .set_setting("userRules", "\"routed\"")
+                .await
+                .map_err(|e| format!("write {tenant}: {e}"))?;
+            let plan: Vec<String> = sqlx::query_scalar(
+                "EXPLAIN (ANALYZE, NEKI_PLAN) SELECT value FROM settings \
+                 WHERE tenant_id = $1 AND \"key\" = 'userRules'",
+            )
+            .bind(tenant)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            eprintln!("{tenant}:\n{}", plan.join("\n"));
+            let on_shard = format!("->  Shard {shard} ");
+            let routed = plan.iter().any(|l| l.contains("Route [EqualUnique]"))
+                && plan.iter().any(|l| l.trim_start().starts_with(&on_shard))
+                && plan.iter().any(|l| l.trim() == "RowsTotal: 1");
+            if !routed {
+                return Err(format!(
+                    "{tenant}'s settings read is not a one-row route to {shard}"
+                ));
+            }
+        }
+        eprintln!("{a} -> {a_shard}, {b} -> {b_shard} (authoritative {authoritative})");
+        Ok(())
+    })
+    .await
+    .expect("tenants route to different shards");
+}
+
+/// (d) `row_seq` is `GENERATED BY DEFAULT AS IDENTITY`, and a sequence lives
+/// on one shard. Inserts that draw from it must still run in single-shard
+/// transactions on a tenant shard: through the store, and many in one
+/// transaction (past the router's batch of reserved values).
+#[tokio::test]
+async fn identity_inserts_run_in_single_shard_transactions_on_tenant_shards() {
+    /// Rows in one transaction: past the router's batch of reserved values.
+    const BULK: i64 = 2500;
+    let Some(url) = fixed_sharded_target() else {
+        return;
+    };
+    in_sharded_schema(&url, 2, true, |pool| async move {
+        postgres::migrate(&pool)
+            .await
+            .map_err(|e| format!("migrate: {e}"))?;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let placed = tenants_on_two_shards(&pool, &format!("neki-seq-{run}"), 32).await?;
+        let first_shard = &placed[0].1;
+        let pair = [
+            placed[0].clone(),
+            placed
+                .iter()
+                .find(|(_, shard)| shard != first_shard)
+                .cloned()
+                .ok_or("no second shard")?,
+        ];
+        for (tenant, shard) in &pair {
+            open_tenant(&pool, tenant)
+                .await?
+                .set_setting("userRules", "\"seq\"")
+                .await
+                .map_err(|e| format!("store write for {tenant} on {shard}: {e}"))?;
+            let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+            let inserted = sqlx::query(
+                "INSERT INTO settings (tenant_id, \"key\", value) \
+                 SELECT $1, 'bulk-' || n, 'v' FROM generate_series(1, $2::bigint) AS n",
+            )
+            .bind(tenant)
+            .bind(BULK)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                let code = e
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .map(std::borrow::Cow::into_owned);
+                format!("bulk identity insert for {tenant} on {shard}: {code:?} {e}")
+            })?;
+            tx.commit().await.map_err(|e| format!("commit: {e}"))?;
+            let (rows, distinct, low, high): (i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT count(*), count(DISTINCT row_seq), min(row_seq), max(row_seq) \
+                 FROM settings WHERE tenant_id = $1",
+            )
+            .bind(tenant)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            eprintln!(
+                "{tenant} on {shard}: inserted {}, {rows} rows, {distinct} distinct row_seq in {low}..={high}",
+                inserted.rows_affected()
+            );
+            if rows != BULK + 1 || distinct != rows {
+                return Err(format!("{tenant}: {rows} rows with {distinct} distinct row_seq"));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .expect("identity inserts in single-shard mode");
+}
+
+/// (f) The tenant writer lock is a row lock on the tenant's own shard, so a
+/// held lock for one tenant does not delay a writer of a tenant on another
+/// shard (nor, as a control, one on the same shard); a second writer of the
+/// held tenant still times out.
+#[tokio::test]
+async fn writer_locks_of_tenants_on_other_shards_do_not_block() {
+    let Some(url) = fixed_sharded_target() else {
+        return;
+    };
+    in_sharded_schema(&url, 4, true, |pool| async move {
+        use std::time::{Duration, Instant};
+        postgres::migrate(&pool)
+            .await
+            .map_err(|e| format!("migrate: {e}"))?;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mut placed = tenants_on_two_shards(&pool, &format!("neki-lock-{run}"), 32).await?;
+        let (held, held_shard) = placed[0].clone();
+        let other_shard = placed
+            .iter()
+            .find(|(_, shard)| *shard != held_shard)
+            .cloned()
+            .ok_or("no second shard")?;
+        let mut i = placed.len();
+        let same_shard = loop {
+            if let Some(found) = placed[1..].iter().find(|(_, shard)| *shard == held_shard) {
+                break found.clone();
+            }
+            if i > 64 {
+                return Err(format!("no second tenant on {held_shard}"));
+            }
+            let tenant = format!("neki-lock-{run}-{i}");
+            let shard = shard_of(&pool, &tenant).await?;
+            placed.push((tenant, shard));
+            i += 1;
+        };
+        for tenant in [&held, &other_shard.0, &same_shard.0] {
+            open_tenant(&pool, tenant).await?;
+        }
+        let limits = postgres::WriterLimits::default();
+        let mut holder = pool.begin().await.map_err(|e| e.to_string())?;
+        postgres::lock_tenant_writer(&mut holder, &held, Duration::from_secs(10), &limits)
+            .await
+            .map_err(|e| format!("hold {held}'s writer lock: {e}"))?;
+        let mut report = Vec::new();
+        let mut problems = Vec::new();
+        for (tenant, shard, expect_free) in [
+            (&other_shard.0, &other_shard.1, true),
+            (&same_shard.0, &same_shard.1, true),
+            (&held, &held_shard, false),
+        ] {
+            let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+            let started = Instant::now();
+            let got =
+                postgres::lock_tenant_writer(&mut tx, tenant, Duration::from_millis(1500), &limits)
+                    .await;
+            let took = started.elapsed();
+            let _ = tx.rollback().await;
+            let code = got
+                .as_ref()
+                .err()
+                .and_then(|e| e.as_database_error())
+                .and_then(sqlx::error::DatabaseError::code)
+                .map(std::borrow::Cow::into_owned);
+            report.push(format!(
+                "{tenant} on {shard}: {code:?} after {} ms",
+                took.as_millis()
+            ));
+            match (expect_free, &got) {
+                (true, Ok(())) if took < Duration::from_secs(1) => {}
+                (false, Err(_)) if code.as_deref() == Some("55P03") => {}
+                _ => problems.push(format!("{tenant} on {shard}: {got:?} after {took:?}")),
+            }
+        }
+        let _ = holder.rollback().await;
+        eprintln!("holding {held} on {held_shard}:\n  {}", report.join("\n  "));
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
+    })
+    .await
+    .expect("writer locks on other shards do not block");
 }
