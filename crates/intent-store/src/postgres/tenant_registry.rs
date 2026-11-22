@@ -57,6 +57,9 @@ pub(crate) struct TenantState {
     pub(crate) queue_versions: super::agents::QueueVersions,
     /// Names this process in delivery claims; see `completion_watches`.
     pub(crate) process_token: super::completion_watches::ProcessToken,
+    /// Set once this process cleared the claims other processes left on the
+    /// tenant (`completion_watches::clear_foreign_claims`).
+    pub(crate) foreign_claims_cleared: AtomicBool,
 }
 
 static TENANTS: OnceLock<Mutex<HashMap<String, Weak<TenantState>>>> = OnceLock::new();

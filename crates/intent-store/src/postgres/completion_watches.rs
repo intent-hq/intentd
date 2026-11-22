@@ -113,7 +113,7 @@ impl PgStore {
             .bind(self.tenant())
             .bind(id)
             .bind(epoch)
-            .bind(self.process_token.as_str())
+            .bind(self.process_token())
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("claim {name} failed: {e}")))?
@@ -143,7 +143,7 @@ impl PgStore {
         sqlx::query(table.release_sql())
             .bind(self.tenant())
             .bind(id)
-            .bind(self.process_token.as_str())
+            .bind(self.process_token())
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("release {name} claim failed: {e}")))?;
@@ -573,6 +573,13 @@ const CLAIM_GROUP_SQL: &str = "UPDATE delegation_group SET claim_epoch = $3, cla
 const PROBE_WATCH_SQL: &str = "SELECT 1 FROM completion_watch WHERE tenant_id = $1 AND id = $2";
 const PROBE_GROUP_SQL: &str =
     "SELECT 1 FROM delegation_group WHERE tenant_id = $1 AND group_id = $2";
+/// Drops the claims of every other process ($1 tenant, $2 process token).
+const CLEAR_FOREIGN_WATCH_CLAIMS_SQL: &str = "UPDATE completion_watch \
+     SET claim_epoch = NULL, claim_token = NULL \
+     WHERE tenant_id = $1 AND claim_token IS NOT NULL AND claim_token <> $2";
+const CLEAR_FOREIGN_GROUP_CLAIMS_SQL: &str = "UPDATE delegation_group \
+     SET claim_epoch = NULL, claim_token = NULL \
+     WHERE tenant_id = $1 AND claim_token IS NOT NULL AND claim_token <> $2";
 /// Drops this process's claim ($1 tenant, $2 key, $3 process token).
 const RELEASE_WATCH_SQL: &str = "UPDATE completion_watch \
      SET claim_epoch = NULL, claim_token = NULL \
@@ -608,6 +615,58 @@ impl ClaimTable {
             Self::Watch => RELEASE_WATCH_SQL,
             Self::Group => RELEASE_GROUP_SQL,
         }
+    }
+}
+
+impl PgStore {
+    /// On this process's first open of the tenant, drops the delivery claims
+    /// other processes left (a crashed or stopped daemon): a process that
+    /// opens the tenant anew takes over their deliveries, as a takeover's
+    /// newer epoch does. Without it a claim left at an unchanged epoch (a
+    /// tenant never leased) would block its watch or group for good. Later
+    /// opens in the same process share its token and clear nothing.
+    ///
+    /// Assumption: only the unleased open (`open_postgres`) runs this, and
+    /// an unleased tenant is served by one process by design, so every
+    /// other token's claim belongs to a process that is gone. A leased open
+    /// (`open_postgres_owned`) never clears: there a live holder keeps its
+    /// claim until a takeover's newer epoch makes it stale.
+    pub(super) async fn clear_foreign_claims_once(&self) -> Result<()> {
+        if self
+            .tenant_state
+            .foreign_claims_cleared
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let cleared = async {
+            let mut tx = self.begin_write().await?;
+            for sql in [
+                CLEAR_FOREIGN_WATCH_CLAIMS_SQL,
+                CLEAR_FOREIGN_GROUP_CLAIMS_SQL,
+            ] {
+                sqlx::query(sql)
+                    .bind(self.tenant())
+                    .bind(self.process_token())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Error::Internal(format!("clear foreign claims failed: {e}")))?;
+            }
+            tx.commit().await.map_err(db)
+        }
+        .await;
+        if cleared.is_err() {
+            // Let the next open try again.
+            self.tenant_state
+                .foreign_claims_cleared
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        cleared
+    }
+
+    /// This process's token for the rows it claims; see [`ProcessToken`].
+    pub(super) fn process_token(&self) -> &str {
+        self.process_token.as_str()
     }
 }
 

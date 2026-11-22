@@ -1292,11 +1292,7 @@ pub(crate) struct PgStore {
     /// `completion_watches`.
     process_token: completion_watches::ProcessToken,
     /// Keeps the gates above registered for the next open of this tenant;
-    /// see `tenant_registry`. Held, not read, outside tests.
-    #[cfg_attr(
-        not(feature = "test-support"),
-        expect(dead_code, reason = "held so the registry entry stays live")
-    )]
+    /// see `tenant_registry`.
     tenant_state: Arc<tenant_registry::TenantState>,
 }
 
@@ -1549,6 +1545,9 @@ impl crate::Store {
         // later startup step such as a lease).
         check_schema(&store.pool).await?;
         store.provision().await?;
+        // Unleased opens only (one process per tenant by design); see
+        // `clear_foreign_claims_once`. The leased open does not call it.
+        store.clear_foreign_claims_once().await?;
         Ok(Self {
             backend: crate::Backend::Postgres(store),
         })

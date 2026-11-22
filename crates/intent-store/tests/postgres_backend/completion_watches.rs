@@ -546,8 +546,9 @@ async fn open_as_process(db: &TestDb, tenant: &str, process: &str) -> Store {
 /// not both wake the parent. Each claims the watch (or the delegation
 /// group) in the database before it delivers: the claim names the tenant's
 /// epoch and the claiming process, so the other process skips until the
-/// claim is released or a newer epoch (a takeover) makes it stale. A slow
-/// owner never loses its claim to a timer. `SQLite` has one process and
+/// claim is released, a newer epoch (a takeover) makes it stale, or a new
+/// process opens the tenant (a restart without a lease). A slow owner never
+/// loses its claim to a timer. `SQLite` has one process and
 /// always grants the claim.
 #[tokio::test]
 async fn a_completion_is_delivered_by_one_process_at_a_time() {
@@ -597,6 +598,14 @@ async fn a_completion_is_delivered_by_one_process_at_a_time() {
         assert!(!claim(&a).await, "{id}: now held by the other process");
     }
 
+    // A restarted daemon (a new process; the tenant never leased, so the
+    // epoch is unchanged) takes over the claims the old process left: its
+    // first open of the tenant clears them.
+    let restarted = open_as_process(&db, tenant, "process-restarted").await;
+    assert!(restarted.claim_completion_watch("w1").await.unwrap());
+    assert!(restarted.claim_delegation_group("g1").await.unwrap());
+    assert!(!b.claim_completion_watch("w1").await.unwrap());
+
     // No persisted row (the write-through has not landed): nothing to
     // order against, so the in-process claim alone decides.
     assert!(a.claim_completion_watch("never-persisted").await.unwrap());
@@ -615,8 +624,57 @@ async fn a_completion_is_delivered_by_one_process_at_a_time() {
     )
     .await
     .expect("claim the tenant");
+    // The leased open cleared nothing: the restarted process's claims are
+    // still on the rows, only stale by epoch.
+    for (table, key, id) in [
+        ("completion_watch", "id", "w1"),
+        ("delegation_group", "group_id", "g1"),
+    ] {
+        let (epoch, token): (Option<i64>, Option<String>) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT claim_epoch, claim_token FROM {table} WHERE tenant_id = $1 AND {key} = $2"
+            )))
+            .bind(tenant)
+            .bind(id)
+            .fetch_one(&db.admin)
+            .await
+            .unwrap();
+        assert_eq!(epoch, Some(0), "{table} {id}: claimed before any lease");
+        assert!(
+            token.is_some(),
+            "{table} {id}: a leased open clears no claim"
+        );
+    }
     assert!(owner.claim_completion_watch("w1").await.unwrap());
     assert!(owner.claim_delegation_group("g1").await.unwrap());
+
+    // Within the owner's epoch its claim holds against a later leased open
+    // that fails (the lease is live) and against an unleased process,
+    // whose writes are fenced.
+    assert!(Store::open_postgres_owned_as_process(
+        db.app.clone(),
+        intent_store::postgres::TenantId::new(tenant).unwrap(),
+        intent_store::postgres::PostgresOptions::default(),
+        "process-d",
+        "process-d",
+        std::time::Duration::from_secs(60),
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .is_err());
+    assert!(owner.claim_completion_watch("w1").await.unwrap());
+    let (epoch, token): (Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT claim_epoch, claim_token FROM completion_watch WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(tenant)
+    .bind("w1")
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert!(
+        epoch.is_some_and(|e| e > 0) && token.is_some(),
+        "the owner's claim stands"
+    );
     assert!(
         matches!(
             b.claim_completion_watch("w2").await,
