@@ -19,20 +19,20 @@ use serde_json::json;
 use intent_core::machines::{MachineUpdateRequired, UpdateSide};
 use intent_core::node_link::{LinkHello, ProtocolRange, NODE_LINK_PROTOCOLS};
 use intent_core::{Error, Result};
-use intent_transport::node_link::{self as link, codes, Backoff, DialedLink, NodeEndpoint};
+use intent_node_link::{self as link, codes, Backoff, DialedLink, NodeEndpoint};
 
 use crate::machine::{MachineTarget, Route};
 
 /// `error.data.code` of a machine none of whose routes bound.
-pub(crate) const MACHINE_UNREACHABLE: &str = "machine-unreachable";
+pub const MACHINE_UNREACHABLE: &str = "machine-unreachable";
 /// `error.data.code` of a machine that refused this backend's credential.
-pub(crate) const MACHINE_REVOKED: &str = "machine-revoked";
+pub const MACHINE_REVOKED: &str = "machine-revoked";
 /// `error.data.code` of a machine that now runs as an orchestrator.
-pub(crate) const MACHINE_ORCHESTRATOR: &str = "machine-orchestrator";
+pub const MACHINE_ORCHESTRATOR: &str = "machine-orchestrator";
 
 /// Connect timing; tests shorten it.
 #[derive(Debug, Clone)]
-pub(crate) struct ConnectTuning {
+pub struct ConnectTuning {
     /// Longest one route may take to accept a TCP connection.
     pub attempt: Duration,
     /// Longest the whole connect may take.
@@ -58,7 +58,7 @@ impl Default for ConnectTuning {
 
 /// One route that did not bind, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Attempt {
+pub struct Attempt {
     pub route: String,
     /// The executor link code, for example `node-link-unauthorized`.
     pub error: String,
@@ -66,7 +66,7 @@ pub(crate) struct Attempt {
 
 /// Why a connect failed.
 #[derive(Debug, Clone)]
-pub(crate) enum ConnectFailure {
+pub enum ConnectFailure {
     /// No route bound; each tried route's error.
     Unreachable(Vec<Attempt>),
     /// The machine refused the credential (revoked or unknown).
@@ -92,7 +92,8 @@ pub(crate) enum ConnectFailure {
 impl ConnectFailure {
     /// The JSON-RPC error for `remoteMachines.add` / `refresh`, naming the
     /// machine. Never carries the token.
-    pub(crate) fn into_error(self, name: &str) -> Error {
+    #[must_use]
+    pub fn into_error(self, name: &str) -> Error {
         match self {
             Self::Unreachable(attempts) => Error::remote_machine(
                 true,
@@ -122,7 +123,8 @@ impl ConnectFailure {
 
 /// `machine-unreachable` for a link that bound on `route` but then failed
 /// with the executor link `code` before the machine answered.
-pub(crate) fn live_link_failure(name: &str, route: &str, code: &str) -> Error {
+#[must_use]
+pub fn live_link_failure(name: &str, route: &str, code: &str) -> Error {
     let message = if code == codes::TIMEOUT {
         format!(
             "{name} is connected but did not report its capabilities in time; \
@@ -168,7 +170,7 @@ fn peer_protocol(error: &Error) -> Option<u32> {
 
 /// A successful connect: the dialed link and the endpoint it came over (the
 /// git connection must use the same route).
-pub(crate) struct Connected {
+pub struct Connected {
     pub dialed: DialedLink,
     pub endpoint: NodeEndpoint,
     /// The route's label, as in [`Attempt::route`].
@@ -178,7 +180,11 @@ pub(crate) struct Connected {
 /// Connect to `target`, binding with a hello from `hello` (called once per
 /// dial, so each dial offers a newly advanced generation). `machine_version`
 /// names the machine's last known intentd version for an update error.
-pub(crate) async fn connect<F, Fut>(
+///
+/// # Errors
+///
+/// When no route links before the deadline: the failure says why.
+pub async fn connect<F, Fut>(
     target: &MachineTarget,
     tuning: &ConnectTuning,
     machine_version: Option<&str>,
@@ -213,7 +219,11 @@ where
 /// refused. Each tailcat attempt is bounded and an unreachable one is
 /// retried quickly, all within [`ConnectTuning::total`], so the first
 /// stalled pipe no longer takes the whole budget.
-pub(crate) async fn connect_after_resume<F, Fut>(
+///
+/// # Errors
+///
+/// When no route links before the deadline: the failure says why.
+pub async fn connect_after_resume<F, Fut>(
     target: &MachineTarget,
     tuning: &ConnectTuning,
     machine_version: Option<&str>,
@@ -401,7 +411,8 @@ where
 /// Race `routes` at the TCP level: each task yields its route and whether
 /// it accepted a connection within [`ConnectTuning::attempt`], in the order
 /// they finish.
-pub(crate) fn race_direct(
+#[must_use]
+pub fn race_direct(
     routes: Vec<Route>,
     tuning: &ConnectTuning,
 ) -> tokio::task::JoinSet<(Route, bool)> {

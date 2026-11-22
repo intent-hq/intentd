@@ -40,14 +40,21 @@ use intent_core::{Error, Result};
 use intent_git::ref_storage::{GitStorage, LocalGitStorage};
 use intent_services::feature_api::Services;
 
-mod agents;
 mod claim;
 mod cloud;
-mod connect;
-mod connector;
-mod final_stop;
+mod connect {
+    pub(crate) use intent_node_connections::connect::*;
+}
+mod connector {
+    pub(crate) use intent_node_connections::connector::*;
+}
+mod final_stop {
+    pub(crate) use intent_node_connections::final_stop::*;
+}
 mod forge_token;
-mod git;
+mod git {
+    pub(crate) use intent_node_connections::git::*;
+}
 mod home_calls;
 mod home_move;
 mod home_scripts;
@@ -55,20 +62,27 @@ mod home_state;
 mod homes;
 mod inbound;
 mod launch;
-mod lease;
-mod link;
-mod machine;
+mod lease {
+    pub(crate) use intent_node_connections::lease::*;
+}
+mod link {
+    pub(crate) use intent_node_connections::link::*;
+}
+mod machine {
+    pub(crate) use intent_node_connections::machine::*;
+}
 mod methods;
 pub mod order;
 mod quick_action;
 mod rpc;
-mod runtime;
 mod terminals;
-mod view;
+mod view {
+    pub(crate) use intent_node_connections::view::*;
+}
 
-pub use connector::{NodeStatus, RemoteNode};
+pub use intent_node_connections::connector::{NodeStatus, RemoteNode};
+pub use intent_node_connections::runtime::RemoteAgentRuntime;
 pub use launch::RemoteLaunch;
-pub use runtime::RemoteAgentRuntime;
 
 #[cfg(test)]
 mod tests;
@@ -261,11 +275,7 @@ impl RemoteFeature {
     }
 }
 
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+pub(crate) use intent_node_connections::lock;
 
 /// Register the remote feature and its remote-launch port on `services`.
 /// Nothing dials a machine until one is needed.

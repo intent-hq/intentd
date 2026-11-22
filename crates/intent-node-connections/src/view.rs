@@ -8,7 +8,11 @@ use intent_store::Store;
 /// Apply `change` to the agent's view and store it; `true` when the stored
 /// view changed. An agent without a view (not remote, or deleted) is left
 /// alone.
-pub(crate) async fn update(
+///
+/// # Errors
+///
+/// When the store cannot read or write the session.
+pub async fn update(
     store: &Store,
     workspace_id: &WorkspaceId,
     agent_id: &AgentId,

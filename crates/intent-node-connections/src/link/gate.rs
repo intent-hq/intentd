@@ -1,14 +1,14 @@
 //! A machine's dial gate, link side: what the connector asks before each
 //! dial of a machine whose availability the domain manages (a cloud
 //! sandbox that may be paused). The domain implements it
-//! (`crate::cloud::CloudGate`).
+//! (`intent_svc_remote::cloud::CloudGate`).
 
 use crate::connect::ConnectFailure;
 use crate::connector::Shared;
 
 /// What [`DialGate::before_dial`] saw.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Dialable {
+pub struct Dialable {
     /// The machine's pause count under its transition lock.
     pub pauses: u64,
     /// The sandbox was resumed (or its intentd started again) just now.
@@ -16,7 +16,7 @@ pub(crate) struct Dialable {
 }
 
 /// Asked by the connector around each dial of its machine.
-pub(crate) trait DialGate: Send + Sync {
+pub trait DialGate: Send + Sync {
     /// How many pauses of the machine began, so a dial that binds after
     /// one knows it reached a frozen machine.
     fn pauses(&self) -> u64;

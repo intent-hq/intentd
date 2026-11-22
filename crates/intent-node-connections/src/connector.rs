@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+use crate::{LinkView, NodeInbound};
 use intent_core::machine_calls::{MachineSecretAnswer, MachineSecretOp, MachineSkills};
 use intent_core::machines::RemoteMachineState;
 use intent_core::node_link::{
@@ -37,19 +38,18 @@ use intent_core::remote_launch::{
     EffectiveIsolation, PlacementError, RemoteSetupState, RemoteSetupStatus,
 };
 use intent_core::{AgentId, Error, Result, WorkspaceId};
-use intent_node_connections::{LinkView, NodeInbound};
-use intent_store::Store;
-use intent_transport::node_link::{
+use intent_node_link::{
     self as link, Backoff, IncomingRequest, LinkEvent, LinkEvents, NodeEndpoint, NodeLink,
 };
+use intent_store::Store;
 
 use crate::agents::Agents;
 use crate::connect::{connect, connect_after_resume, ConnectFailure, ConnectTuning, Connected};
+use crate::ingest::{Acks, Ingest, Step};
 use crate::lease::HeadLease;
 use crate::lock;
 use crate::machine::MachineTarget;
 use crate::runtime::RemoteAgentRuntime;
-use intent_node_connections::ingest::{Acks, Ingest, Step};
 
 /// Longest a bind waits to resolve the GitHub token afresh.
 const FORGE_BIND_RESOLVE: Duration = Duration::from_secs(10);
@@ -63,7 +63,7 @@ const UNSUPPORTED_CODE: i32 = -32601;
 
 /// Timing knobs; tests shorten them.
 #[derive(Debug, Clone)]
-pub(crate) struct Tuning {
+pub struct Tuning {
     /// Longest an ingested record waits for its ack.
     pub ack_interval: Duration,
     /// Records ingested (or skipped) before an ack is sent at once.
@@ -114,40 +114,40 @@ pub(crate) struct Tuning {
     /// (a `failed` ack, or none): every bind sends them too.
     pub home_stop_resend: Duration,
     /// Test seam: fail every ack write while set.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fail_ack_writes: Arc<std::sync::atomic::AtomicBool>,
     /// Test seam: fail every claim's read of this lease's agent records
     /// while set.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fail_claim_reads: Arc<std::sync::atomic::AtomicBool>,
     /// Test seam: runs at bind, after the queued stops are sent and before
     /// the link is published.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub before_publish: BeforePublish,
     /// Test seam: runs at bind, after the route is recorded and before the
     /// welcome's agents are claimed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub before_claim: BeforePublish,
     /// Test seam: resolves the GitHub token the machines get; without one,
     /// a test backend hands out none (it never reads the host's).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub forge_resolver: ForgeResolver,
     /// Test seam: holds a below-nodeProtocol-9 grace task between dropping
     /// its record and leaving `Shared::in_grace`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub grace_gate: GraceGate,
     /// Test seam: the link ownership the connector claims and fences with,
     /// instead of this process owning every link.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub ownership: OwnershipSeam,
 }
 
 /// See [`Tuning::ownership`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
-pub(crate) struct OwnershipSeam(pub Option<Arc<dyn intent_node_connections::LinkOwnership>>);
+pub struct OwnershipSeam(pub Option<Arc<dyn crate::LinkOwnership>>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Debug for OwnershipSeam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("OwnershipSeam")
@@ -155,11 +155,11 @@ impl std::fmt::Debug for OwnershipSeam {
 }
 
 /// See [`Tuning::forge_resolver`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
-pub(crate) struct ForgeResolver(pub Option<crate::link::forge_token::Resolver>);
+pub struct ForgeResolver(pub Option<crate::link::forge_token::Resolver>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Debug for ForgeResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ForgeResolver")
@@ -170,21 +170,21 @@ impl std::fmt::Debug for ForgeResolver {
 /// reaching the gate, then waits for the second.
 ///
 /// [`Notify`]: tokio::sync::Notify
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default, Debug)]
-pub(crate) struct GraceGate(pub Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>);
+pub struct GraceGate(pub Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>);
 
 /// A test hook run with the connector's state just before a bound link is
 /// published.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
-pub(crate) struct BeforePublish(pub Option<PublishHook>);
+pub struct BeforePublish(pub Option<PublishHook>);
 
 /// See [`BeforePublish`].
-#[cfg(test)]
-pub(crate) type PublishHook = Arc<dyn Fn(&Arc<Shared>) + Send + Sync>;
+#[cfg(any(test, feature = "test-support"))]
+pub type PublishHook = Arc<dyn Fn(&Arc<Shared>) + Send + Sync>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Debug for BeforePublish {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(if self.0.is_some() {
@@ -233,19 +233,19 @@ impl Default for Tuning {
             forge_refresh: Duration::from_secs(5 * 60),
             forge_check: Duration::from_secs(2),
             home_stop_resend: Duration::from_secs(2 * 60),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fail_ack_writes: Arc::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fail_claim_reads: Arc::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             before_publish: BeforePublish::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             before_claim: BeforePublish::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             forge_resolver: ForgeResolver::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             grace_gate: GraceGate::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             ownership: OwnershipSeam::default(),
         }
     }
@@ -282,7 +282,7 @@ enum StopExit {
 
 /// One unacknowledged stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct QueuedStop {
+pub struct QueuedStop {
     pub stop_id: StopId,
     /// The agent ends for good: the machine pushes its work one last time
     /// and removes its checkout (sent as final from nodeProtocol 9).
@@ -305,7 +305,7 @@ impl QueuedStop {
 type Waiter = oneshot::Sender<std::result::Result<(), ConnectFailure>>;
 
 /// State shared by the connector task, the runtimes and [`RemoteNode`].
-pub(crate) struct Shared {
+pub struct Shared {
     pub agents: Agents,
     pub tuning: Tuning,
     pub store: Store,
@@ -371,10 +371,10 @@ pub(crate) struct Shared {
     /// from its home pushes until the link is closed.
     use_gate: Arc<tokio::sync::RwLock<()>>,
     /// Agents whose machine runs an acknowledged final stop settled.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     final_settles: Mutex<Vec<AgentId>>,
     /// Agents whose final stop was queued (and so began for their runs).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     final_begins: Mutex<Vec<AgentId>>,
     /// The label of the route the current (or last) link bound on.
     route: Mutex<Option<String>>,
@@ -410,23 +410,23 @@ pub(crate) struct Shared {
     one_shot_waiters: Mutex<HashMap<LinkId, oneshot::Sender<intent_core::node_link::OneShotReply>>>,
     /// `homeOpen`s and `homePush`es waiting for their reply (nodeProtocol
     /// 19).
-    pub(crate) home_waiters: Mutex<HashMap<LinkId, oneshot::Sender<crate::link::homes::HomeReply>>>,
+    pub home_waiters: Mutex<HashMap<LinkId, oneshot::Sender<crate::link::homes::HomeReply>>>,
     /// `homeCall`s waiting for their reply (nodeProtocol 19).
     home_call_waiters:
         Mutex<HashMap<LinkId, oneshot::Sender<intent_core::node_link::HomeCallReply>>>,
     /// The machine holds a home of this backend's workspaces: its link stays
     /// up, so the home is backed up and reachable.
-    pub(crate) holds_homes: std::sync::atomic::AtomicBool,
+    pub holds_homes: std::sync::atomic::AtomicBool,
     /// Detaching this machine's homes after a link loss, and their
     /// backup warnings (nodes.md "Detached workspaces").
-    pub(crate) home_link: crate::link::home_state::HomeLink,
+    pub home_link: crate::link::home_state::HomeLink,
     /// A worker resends this machine's pending home stops on a timer
     /// ([`crate::link::homes::ensure_stop_resends`]).
-    pub(crate) home_stop_resends: std::sync::atomic::AtomicBool,
+    pub home_stop_resends: std::sync::atomic::AtomicBool,
     /// Terminals on this machine's homes (nodeProtocol 19).
-    pub(crate) terminals: crate::link::terminals::HomeTerminals,
+    pub terminals: crate::link::terminals::HomeTerminals,
     /// The home runs of saved scripts on this machine (nodeProtocol 19).
-    pub(crate) home_scripts: crate::link::home_scripts::HomeScripts,
+    pub home_scripts: crate::link::home_scripts::HomeScripts,
     /// Secret forgets for a machine that was not connected (nodeProtocol
     /// 14): sent after the next bind. Memory only; a backend restart drops
     /// them, and its new `headSession` drops the values on the machine.
@@ -457,24 +457,24 @@ pub(crate) struct Shared {
 
 impl Shared {
     /// The head's domain, when this connector has it.
-    pub(crate) fn inbound(&self) -> Option<&Arc<dyn NodeInbound>> {
+    pub fn inbound(&self) -> Option<&Arc<dyn NodeInbound>> {
         self.inbound.as_ref()
     }
 
     /// The current link, if one is up.
-    pub(crate) fn current_link(&self) -> Option<NodeLink> {
+    pub fn current_link(&self) -> Option<NodeLink> {
         self.link.borrow().clone().filter(|link| !link.is_closed())
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_parked(&self, agent_id: &AgentId) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_parked(&self, agent_id: &AgentId) -> bool {
         lock(&self.parked).contains_key(agent_id)
     }
 
     /// Whether a launch for `agent_id` now reattaches to the run the
     /// machine kept across a restart rather than starting one (see
     /// [`RemoteNode::launch`]).
-    pub(crate) fn reattaches(&self, agent_id: &AgentId) -> bool {
+    pub fn reattaches(&self, agent_id: &AgentId) -> bool {
         lock(&self.parked)
             .get(agent_id)
             .is_some_and(|runtime| runtime.is_running())
@@ -483,8 +483,8 @@ impl Shared {
 
     /// Whether the current link's machine confirmed holding the GitHub
     /// token (nodeProtocol 15).
-    #[cfg(test)]
-    pub(crate) fn forge_token_confirmed(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn forge_token_confirmed(&self) -> bool {
         lock(&self.forge_confirmed).token()
     }
 
@@ -510,46 +510,46 @@ impl Shared {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn tuning_ref(&self) -> &Tuning {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tuning_ref(&self) -> &Tuning {
         &self.tuning
     }
 
     /// The protocol the current (or last) link negotiated; 0 before the
     /// first bind.
-    pub(crate) fn protocol(&self) -> u32 {
+    pub fn protocol(&self) -> u32 {
         self.protocol.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// See the `prepared_checkout` field.
-    pub(crate) fn offers_prepared_checkout(&self) -> bool {
+    pub fn offers_prepared_checkout(&self) -> bool {
         self.prepared_checkout
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    #[cfg(all(test, unix))]
-    pub(crate) fn offer_prepared_checkout_for_test(&self) {
+    #[cfg(all(any(test, feature = "test-support"), unix))]
+    pub fn offer_prepared_checkout_for_test(&self) {
         self.prepared_checkout
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_protocol_for_test(&self, protocol: u32) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_protocol_for_test(&self, protocol: u32) {
         self.protocol
             .store(protocol, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub(crate) fn weak(&self) -> std::sync::Weak<Shared> {
+    pub fn weak(&self) -> std::sync::Weak<Shared> {
         lock(&self.self_ref).clone()
     }
 
     /// Ask the connector for a link without waiting.
-    pub(crate) fn wake(&self) {
+    pub fn wake(&self) {
         let _ = self.demand.send(None);
     }
 
     /// The current link, asking for one and waiting up to `grace` for it.
-    pub(crate) async fn link_within(&self, grace: Duration) -> Option<NodeLink> {
+    pub async fn link_within(&self, grace: Duration) -> Option<NodeLink> {
         let mut rx = self.link.subscribe();
         if self.current_link().is_none() {
             self.wake();
@@ -571,7 +571,11 @@ impl Shared {
     }
 
     /// Send a control frame on the current link.
-    pub(crate) async fn send(&self, frame: &LinkFrame) -> Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// When no link is up, or the send fails.
+    pub async fn send(&self, frame: &LinkFrame) -> Result<()> {
         let link = self
             .current_link()
             .ok_or_else(|| Error::Internal(link::codes::UNAVAILABLE.into()))?;
@@ -604,7 +608,7 @@ impl Shared {
     /// Whether the machine has work now: a turn in flight, a live script
     /// run, a stop to deliver or a request waiting for its reply. A cloud
     /// machine without any is idle and may be paused.
-    pub(crate) fn busy(&self) -> bool {
+    pub fn busy(&self) -> bool {
         self.agents.turns_in_flight() > 0
             || self.machine_runs_live()
             || !lock(&self.stops).is_empty()
@@ -621,47 +625,44 @@ impl Shared {
     }
 
     /// When the machine last had agent activity (see `last_activity`).
-    pub(crate) fn last_activity(&self) -> Instant {
+    pub fn last_activity(&self) -> Instant {
         *lock(&self.last_activity)
     }
 
     /// Begin a use of the machine over its link; it waits while an idle
     /// pause runs, and the guard ends the use.
-    pub(crate) async fn begin_use(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+    pub async fn begin_use(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.use_gate.clone().read_owned().await
     }
 
     /// For an idle pause: wait up to `wait` for the uses in flight to end,
     /// and hold off new ones while the guard lives. `None` when uses kept
     /// it busy.
-    pub(crate) async fn quiesce(
-        &self,
-        wait: Duration,
-    ) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+    pub async fn quiesce(&self, wait: Duration) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
         tokio::time::timeout(wait, self.use_gate.clone().write_owned())
             .await
             .ok()
     }
 
     /// Ask for a link: a parked cloud machine resumes for it.
-    pub(crate) fn ask_link(&self) {
+    pub fn ask_link(&self) {
         let (tx, _rx) = oneshot::channel();
         let _ = self.demand.send(Some(tx));
     }
 
     /// The machine has agent activity now.
-    pub(crate) fn note_activity(&self) {
+    pub fn note_activity(&self) {
         *lock(&self.last_activity) = Instant::now();
     }
 
     /// Whether something would keep a link up now (see the module docs).
-    pub(crate) fn link_wanted(&self) -> bool {
+    pub fn link_wanted(&self) -> bool {
         self.wants_link()
     }
 
     /// Close the current link, if any, without a redial: the cloud machine's
     /// sandbox is being paused, and its gate holds dials until a demand.
-    pub(crate) fn close_link(&self) {
+    pub fn close_link(&self) {
         if let Some(link) = self.current_link() {
             link.close();
         }
@@ -669,12 +670,12 @@ impl Shared {
 
     /// Fail waiting prompts with `turn_error` (see the `cloud_refusal`
     /// field).
-    pub(crate) fn refuse_turns(&self, turn_error: &str) {
+    pub fn refuse_turns(&self, turn_error: &str) {
         self.cloud_refusal.send_replace(Some(turn_error.to_owned()));
     }
 
     /// Subscribe to cloud resume refusals (see the `cloud_refusal` field).
-    pub(crate) fn cloud_refusals(&self) -> watch::Receiver<Option<String>> {
+    pub fn cloud_refusals(&self) -> watch::Receiver<Option<String>> {
         self.cloud_refusal.subscribe()
     }
 
@@ -688,7 +689,7 @@ impl Shared {
 
     /// Lease end for `agents`' machine runs: send every stop, wait once
     /// until `deadline`; the agents whose script stop was unacknowledged.
-    pub(crate) async fn end_agents_machine_runs(
+    pub async fn end_agents_machine_runs(
         &self,
         agents: &[AgentId],
         deadline: Instant,
@@ -705,7 +706,7 @@ impl Shared {
     }
 
     /// Every live script run on this machine is lost with `reason`.
-    pub(crate) async fn machine_runs_lost(&self, reason: &str) {
+    pub async fn machine_runs_lost(&self, reason: &str) {
         if let Some(inbound) = &self.inbound {
             inbound.machine_runs_lost(&self.machine_id(), reason).await;
         }
@@ -715,7 +716,7 @@ impl Shared {
     /// queued) and start resending it now if a link is up; otherwise it goes
     /// out right after the next bind. It stays queued, and is resent, until
     /// the machine acknowledges it; nothing waits for that here.
-    pub(crate) fn request_stop(self: &Arc<Self>, agent_id: &AgentId) {
+    pub fn request_stop(self: &Arc<Self>, agent_id: &AgentId) {
         let stop_id = self.queue_stop(agent_id);
         let Some(link) = self.current_link() else {
             self.wake();
@@ -781,7 +782,7 @@ impl Shared {
         // sends it again to an agent the machine still runs): its runs are
         // settled, and its ack settles nothing, so nothing begins.
         if !settled {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             lock(&self.final_begins).push(agent_id.clone());
             if let Some(inbound) = &self.inbound {
                 inbound.final_stop_begun(agent_id);
@@ -797,7 +798,7 @@ impl Shared {
     /// End `agent_id` for good with `reason`: record its final stop when
     /// it is placed on this backend (falling back to one held in memory),
     /// detach its runtime and queue the stop. Returns the stop's id.
-    pub(crate) async fn final_stop(
+    pub async fn final_stop(
         self: &Arc<Self>,
         agent_id: &AgentId,
         reason: intent_core::remote_launch::FinalStopReason,
@@ -831,7 +832,7 @@ impl Shared {
     /// Queue final stop `stop_id` for `agent_id` and start resending it now
     /// if a link is up; otherwise it goes out right after the next bind.
     /// `durable` when its record is written.
-    pub(crate) fn request_final_stop(
+    pub fn request_final_stop(
         self: &Arc<Self>,
         agent_id: &AgentId,
         stop_id: StopId,
@@ -866,7 +867,7 @@ impl Shared {
 
     /// How long `remoteMachines.remove` waits for its stops' acks on the
     /// current link: longer from nodeProtocol 9, to fit the final push.
-    pub(crate) fn remove_budget(&self) -> Duration {
+    pub fn remove_budget(&self) -> Duration {
         if self.speaks_final_stops() {
             self.tuning.final_remove_timeout
         } else {
@@ -882,7 +883,7 @@ impl Shared {
     /// Queue every final stop recorded on this lease, dropping (as done)
     /// those past their bound, whose checkout the machine's next bind sweep
     /// removes. A read failure is logged; the next bind tries again.
-    pub(crate) async fn load_final_stops(&self) {
+    pub async fn load_final_stops(&self) {
         let lease_id = lock(&self.status).lease_id.clone();
         let records = match self.store.list_final_stops(&lease_id).await {
             Ok(records) => records,
@@ -969,7 +970,7 @@ impl Shared {
     /// bound): any machine run the machine never reported ending is settled
     /// now, and its scripts are no longer refused as ending.
     async fn final_stop_over(&self, agent_id: &AgentId) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         lock(&self.final_settles).push(agent_id.clone());
         // The agent is gone for good: so is its kept setup output.
         lock(&self.setup_outputs).remove(agent_id);
@@ -984,12 +985,12 @@ impl Shared {
     }
 
     /// Whether `agent_id` has an unacknowledged stop.
-    pub(crate) fn stop_queued(&self, agent_id: &AgentId) -> bool {
+    pub fn stop_queued(&self, agent_id: &AgentId) -> bool {
         lock(&self.stops).contains_key(agent_id)
     }
 
     /// Whether `agent_id` has an unacknowledged final stop.
-    pub(crate) fn final_stop_queued(&self, agent_id: &AgentId) -> bool {
+    pub fn final_stop_queued(&self, agent_id: &AgentId) -> bool {
         lock(&self.stops)
             .get(agent_id)
             .is_some_and(|queued| queued.final_stop)
@@ -1058,7 +1059,7 @@ impl Shared {
     /// there: the queued stops are moot. Recorded final stops stay (a
     /// revocation alone drops no record) until acknowledged or past their
     /// bound.
-    pub(crate) fn drop_stops(&self) {
+    pub fn drop_stops(&self) {
         let dropped = {
             let mut stops = lock(&self.stops);
             let before = stops.len();
@@ -1262,7 +1263,7 @@ impl Shared {
             let grace = self.tuning.legacy_push_grace;
             let agent_id = agent_id.clone();
             let shared = self.weak();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let gate = self.tuning.grace_gate.0.clone();
             // caller-binding: allow — drops one acknowledged final stop's record after the push grace
             tokio::spawn(async move {
@@ -1276,7 +1277,7 @@ impl Shared {
                 {
                     tracing::warn!(agent = %agent_id, %error, "remote machine: could not drop an acknowledged final stop");
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(gate) = gate {
                     gate.0.notify_one();
                     gate.1.notified().await;
@@ -1302,7 +1303,7 @@ impl Shared {
 
     /// Wait until none of `agents` has an unacknowledged stop, or until
     /// `deadline`; returns those still unacknowledged.
-    pub(crate) async fn wait_stops(&self, agents: &[AgentId], deadline: Instant) -> Vec<AgentId> {
+    pub async fn wait_stops(&self, agents: &[AgentId], deadline: Instant) -> Vec<AgentId> {
         let mut changed = self.stops_changed.subscribe();
         loop {
             let unconfirmed: Vec<AgentId> = {
@@ -1330,7 +1331,7 @@ impl Shared {
     /// # Errors
     ///
     /// `node-link-unavailable` when the stop is still unacknowledged.
-    pub(crate) async fn no_stop_pending(&self, agent_id: &AgentId) -> Result<()> {
+    pub async fn no_stop_pending(&self, agent_id: &AgentId) -> Result<()> {
         let deadline = Instant::now() + self.tuning.stop_wait;
         if self.stop_queued(agent_id) {
             // The stop needs a link: ask for one, since its own request may
@@ -1421,7 +1422,7 @@ impl Shared {
     /// The machine started again from its disk: `agents`' processes are
     /// gone, so no exit record of theirs is coming, and their runtimes here
     /// end with `error` (a waiting prompt is redriven on a relaunch).
-    pub(crate) fn processes_lost(&self, agents: &[AgentId], error: &str) {
+    pub fn processes_lost(&self, agents: &[AgentId], error: &str) {
         lock(&self.lost_processes).extend(agents.iter().cloned());
         {
             let mut exits = lock(&self.stop_exits);
@@ -1439,7 +1440,7 @@ impl Shared {
     /// in a disk resume no longer applies. While the lost process's stop
     /// is still out, its answer settles the mark instead: a resend answered
     /// `not-running` owes no exit record (intent-hq/intent#9238).
-    pub(crate) fn launching(&self, agent_id: &AgentId) {
+    pub fn launching(&self, agent_id: &AgentId) {
         if self.stop_queued(agent_id) || lock(&self.stop_exits).contains_key(agent_id) {
             return;
         }
@@ -1469,8 +1470,12 @@ impl Shared {
     }
 
     /// The recorded final stops of this lease, listed now.
-    #[cfg(test)]
-    pub(crate) async fn list_final_stops_for_test(
+    ///
+    /// # Panics
+    ///
+    /// When the store cannot list the stops.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn list_final_stops_for_test(
         &self,
     ) -> Vec<intent_core::remote_launch::RemoteFinalStopRecord> {
         let lease_id = lock(&self.status).lease_id.clone();
@@ -1479,8 +1484,8 @@ impl Shared {
 
     /// Settle `records` from two loads at once, as the expiry timer and the
     /// dial loop do when both list the same record.
-    #[cfg(test)]
-    pub(crate) async fn settle_twice_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn settle_twice_for_test(
         &self,
         records: Vec<intent_core::remote_launch::RemoteFinalStopRecord>,
     ) {
@@ -1490,60 +1495,60 @@ impl Shared {
         );
     }
 
-    #[cfg(test)]
-    pub(crate) fn final_begins_for_test(&self) -> Vec<AgentId> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn final_begins_for_test(&self) -> Vec<AgentId> {
         let mut agents = lock(&self.final_begins).clone();
         agents.dedup();
         agents
     }
 
-    #[cfg(test)]
-    pub(crate) fn final_settles_for_test(&self) -> Vec<AgentId> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn final_settles_for_test(&self) -> Vec<AgentId> {
         lock(&self.final_settles).clone()
     }
 
     /// How many times a final stop began (queued) for any agent.
-    #[cfg(test)]
-    pub(crate) fn final_begin_count_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn final_begin_count_for_test(&self) -> usize {
         lock(&self.final_begins).len()
     }
 
     /// Queue final stop `stop_id` of `agent_id` as recorded, as a bind's
     /// claim does.
-    #[cfg(test)]
-    pub(crate) fn queue_final_stop_for_test(&self, agent_id: &AgentId, stop_id: StopId) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn queue_final_stop_for_test(&self, agent_id: &AgentId, stop_id: StopId) {
         self.queue_final_stop(agent_id, stop_id, true);
     }
 
     /// Whether final stop `stop_id` waits out its grace.
-    #[cfg(test)]
-    pub(crate) fn in_grace_for_test(&self, stop_id: StopId) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn in_grace_for_test(&self, stop_id: StopId) -> bool {
         lock(&self.in_grace).contains(&stop_id)
     }
 
     /// Whether a task is still resending stop `stop_id`.
-    #[cfg(test)]
-    pub(crate) fn resending_for_test(&self, stop_id: StopId) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resending_for_test(&self, stop_id: StopId) -> bool {
         lock(&self.resending).contains_key(&stop_id)
     }
 
     /// Settle the final stops `records` listed earlier, as a load does.
-    #[cfg(test)]
-    pub(crate) async fn settle_listed_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn settle_listed_for_test(
         &self,
         records: Vec<intent_core::remote_launch::RemoteFinalStopRecord>,
     ) {
         self.settle_listed_final_stops(records).await;
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_pending_stops(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_pending_stops(&self) -> bool {
         !lock(&self.stops).is_empty()
     }
 
     /// Dial `target` (the routes, port and pin a refreshed registration
     /// was accepted on) from now on.
-    pub(crate) fn set_target(&self, mut target: MachineTarget) {
+    pub fn set_target(&self, mut target: MachineTarget) {
         let mut current = lock(&self.target);
         if target.gate.is_none() {
             target.gate.clone_from(&current.gate);
@@ -1551,17 +1556,17 @@ impl Shared {
         *current = target;
     }
 
-    pub(crate) fn target(&self) -> MachineTarget {
+    pub fn target(&self) -> MachineTarget {
         lock(&self.target).clone()
     }
 
-    pub(crate) fn machine_id(&self) -> String {
+    pub fn machine_id(&self) -> String {
         lock(&self.status).node_id.clone()
     }
 
     /// The lease this connector binds: its journal's sequences are this
     /// lease's.
-    pub(crate) fn lease_id(&self) -> String {
+    pub fn lease_id(&self) -> String {
         lock(&self.status).lease_id.clone()
     }
 
@@ -1597,7 +1602,7 @@ impl Shared {
 
     /// The machine's platforms: supported once it has said what it runs, and
     /// available while it is connected with a free agent slot.
-    pub(crate) fn availability(&self) -> PlatformAvailability {
+    pub fn availability(&self) -> PlatformAvailability {
         let status = lock(&self.status).clone();
         let supported: Vec<AgentPlatform> = status.platform.into_iter().collect();
         let free = status.connected
@@ -1653,14 +1658,14 @@ impl Shared {
     }
 
     /// Publish `remoteMachine:changed` with the machine as it is now.
-    pub(crate) async fn announce(&self) {
+    pub async fn announce(&self) {
         if let Some(inbound) = &self.inbound {
             inbound.machine_changed(self).await;
         }
     }
 
     /// Whether a link is up now.
-    pub(crate) fn is_connected(&self) -> bool {
+    pub fn is_connected(&self) -> bool {
         lock(&self.status).connected
     }
 }
@@ -1812,7 +1817,7 @@ impl Shared {
     }
 
     /// `agent_id`'s kept setup output and whether earlier output was cut.
-    pub(crate) fn setup_output_tail(&self, agent_id: &AgentId) -> Option<(String, bool)> {
+    pub fn setup_output_tail(&self, agent_id: &AgentId) -> Option<(String, bool)> {
         lock(&self.setup_outputs)
             .get(agent_id)
             .map(|tail| (tail.text.clone(), tail.truncated))
@@ -1824,7 +1829,11 @@ impl RemoteNode {
     /// Nothing is dialed until a link is wanted. Forwarded `workspace_api`
     /// calls are answered and changes announced with `inbound`; without
     /// them, every machine request is refused.
-    pub(crate) async fn start(
+    ///
+    /// # Errors
+    ///
+    /// When the machine's lease cannot be opened or read.
+    pub async fn start(
         store: Store,
         target: MachineTarget,
         tuning: Tuning,
@@ -1833,7 +1842,7 @@ impl RemoteNode {
     ) -> Result<Self> {
         let ownership = crate::lease::ownership(&store, &tuning);
         let lease = HeadLease::open(store, &target.id, ownership).await?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let lease = lease.failing_ack_writes_when(tuning.fail_ack_writes.clone());
         let acked = lease.acked().await?;
         let store = lease.store().clone();
@@ -1873,9 +1882,9 @@ impl RemoteNode {
             lost_processes: Mutex::default(),
             last_activity: Mutex::new(Instant::now()),
             use_gate: Arc::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             final_settles: Mutex::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             final_begins: Mutex::default(),
             route: Mutex::new(None),
             claimed: std::sync::atomic::AtomicBool::new(false),
@@ -1925,7 +1934,8 @@ impl RemoteNode {
         Ok(Self { shared })
     }
 
-    pub(crate) fn shared(&self) -> Arc<Shared> {
+    #[must_use]
+    pub fn shared(&self) -> Arc<Shared> {
         self.shared.clone()
     }
 
@@ -2000,13 +2010,15 @@ impl RemoteNode {
     }
 
     /// The label of the route the current (or last) link bound on.
-    pub(crate) fn route(&self) -> Option<String> {
+    #[must_use]
+    pub fn route(&self) -> Option<String> {
         lock(&self.shared.route).clone()
     }
 
     /// Whether a bind in this process has claimed the machine's surviving
     /// agents, so [`Self::running`] counts them.
-    pub(crate) fn has_claimed(&self) -> bool {
+    #[must_use]
+    pub fn has_claimed(&self) -> bool {
         self.shared
             .claimed
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -2016,7 +2028,7 @@ impl RemoteNode {
     /// succeeded yet (the bind's could not read this lease's records).
     /// Stops it queues go out on the live link. Returns whether the
     /// survivors are now claimed.
-    pub(crate) async fn reclaim(&self) -> bool {
+    pub async fn reclaim(&self) -> bool {
         if self.has_claimed() {
             return true;
         }
@@ -2099,7 +2111,7 @@ impl RemoteNode {
     /// § Secrets on the machine), connecting on demand, and wait for the
     /// machine's answer; one deadline of `wait` for both. A forget that
     /// gets no answer is queued for the next bind.
-    pub(crate) async fn machine_secret(
+    pub async fn machine_secret(
         &self,
         agent_id: &AgentId,
         op: MachineSecretOp,
@@ -2184,11 +2196,7 @@ impl RemoteNode {
     ///
     /// As [`RemoteNode::connect`]; `node-link-timeout` when the machine
     /// does not answer in time.
-    pub(crate) async fn push_wip(
-        &self,
-        agent_id: &AgentId,
-        wait: Duration,
-    ) -> Result<PushWipResult> {
+    pub async fn push_wip(&self, agent_id: &AgentId, wait: Duration) -> Result<PushWipResult> {
         let request_id = intent_core::node_link::LinkId::new_v4();
         let (tx, rx) = oneshot::channel();
         lock(&self.shared.push_waiters).insert(request_id, tx);
@@ -2223,7 +2231,7 @@ impl RemoteNode {
     ///
     /// As [`RemoteNode::connect`]; `node-link-timeout` when the machine
     /// does not answer in time.
-    pub(crate) async fn checkout_read(
+    pub async fn checkout_read(
         &self,
         read: intent_core::node_link::CheckoutRead,
         wait: Duration,
@@ -2251,7 +2259,7 @@ impl RemoteNode {
 
     /// Wait until none of `agents` has an unacknowledged stop, or until
     /// `deadline`; returns those still unacknowledged.
-    pub(crate) async fn wait_stops(&self, agents: &[AgentId], deadline: Instant) -> Vec<AgentId> {
+    pub async fn wait_stops(&self, agents: &[AgentId], deadline: Instant) -> Vec<AgentId> {
         self.shared.wait_stops(agents, deadline).await
     }
 
@@ -2264,7 +2272,7 @@ impl RemoteNode {
     ///
     /// The send error; `node-link-timeout` when the machine does not answer
     /// in time; `node-link-closed` when the link drops first.
-    pub(crate) async fn one_shot(
+    pub async fn one_shot(
         &self,
         frame: intent_core::node_link::OneShot,
         wait: Duration,
@@ -2322,7 +2330,7 @@ impl RemoteNode {
     ///
     /// The send error; `node-link-timeout` when the machine does not answer
     /// in time; `node-link-closed` when the link drops first.
-    pub(crate) async fn home_call(
+    pub async fn home_call(
         &self,
         frame: intent_core::node_link::HomeCall,
         wait: Duration,
@@ -2382,7 +2390,7 @@ impl RemoteNode {
     ///
     /// As [`RemoteNode::connect`]; `node-link-timeout` when the machine does
     /// not answer in time; `node-link-closed` when the link drops first.
-    pub(crate) async fn home_request(
+    pub async fn home_request(
         &self,
         request_id: LinkId,
         frame: LinkFrame,
@@ -2479,11 +2487,13 @@ impl RemoteNode {
     }
 
     /// The link as the domain reads it.
-    pub(crate) fn view(&self) -> &dyn LinkView {
+    #[must_use]
+    pub fn view(&self) -> &dyn LinkView {
         self.shared.as_ref()
     }
 
-    pub(crate) fn shared_ref(&self) -> &Shared {
+    #[must_use]
+    pub fn shared_ref(&self) -> &Shared {
         &self.shared
     }
 
@@ -2829,7 +2839,7 @@ async fn run(
             // Before the link is published: queue the stops of agents head no
             // longer claims, then send every queued stop, so they precede any
             // launch or prompt on this link.
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(hook) = &shared.tuning.before_claim.0 {
                 hook(&shared);
             }
@@ -2903,7 +2913,7 @@ async fn run(
             _ => None,
         };
         shared.send_queued(&link).await;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(hook) = &shared.tuning.before_publish.0 {
             hook(&shared);
         }
@@ -3252,7 +3262,11 @@ async fn serve(
 /// Whether agents that may still run are recorded on `lease_id`: a record
 /// whose session has not ended (deleted or completed). A session that cannot
 /// be read counts, so a read failure never hides a survivor.
-pub(crate) async fn has_live_records(store: &Store, lease_id: &str) -> Result<bool> {
+///
+/// # Errors
+///
+/// When the store cannot be read.
+pub async fn has_live_records(store: &Store, lease_id: &str) -> Result<bool> {
     if !store.list_final_stops(lease_id).await?.is_empty() {
         return Ok(true);
     }
@@ -3283,7 +3297,7 @@ async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
         return true;
     }
     let lease_id = lock(&shared.status).lease_id.clone();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let read = if shared
         .tuning
         .fail_claim_reads
@@ -3295,7 +3309,7 @@ async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
     } else {
         shared.store.list_remote_agents(&lease_id).await
     };
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let read = shared.store.list_remote_agents(&lease_id).await;
     let read = match read {
         Ok(claimed) => shared

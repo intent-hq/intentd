@@ -1,6 +1,6 @@
 //! Terminals on a workspace home, link side (nodeProtocol 19,
 //! node-link.md § Terminals on the home): the relay state the machine's
-//! connector holds. The domain side (`crate::terminals`) finds the home and
+//! connector holds. The domain side (`intent_svc_remote::terminals`) finds the home and
 //! its linked machine and calls [`open_on`] / [`open_exec_on`]. Each is a remote PTY in the
 //! backend's [`PtyHost`]: its buffer, replay offsets, list row and every
 //! client attach are served here, while the process runs in the home
@@ -17,15 +17,15 @@ use intent_core::node_link::{
     PtyResize, PtyStream,
 };
 use intent_core::{Error, HomeId, Result, WorkspaceId};
+use intent_node_link::NodeLink;
 use intent_pty::home::{HomeExec, HomeExecControl, HomeExecEvent, HomeExecOpen, HomeTerminalOpen};
 use intent_pty::{PtyHost, PtyId, PtySize, RemotePty, RemoteSpec};
-use intent_transport::node_link::NodeLink;
 use tokio::sync::mpsc;
 
 use crate::connector::Shared;
 
 /// `error.data.code` of a home terminal the home's machine cannot run now.
-pub(crate) const HOME_UNAVAILABLE: &str = "home-unavailable";
+pub const HOME_UNAVAILABLE: &str = "home-unavailable";
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -35,7 +35,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// One machine's home terminals.
 #[derive(Default)]
-pub(crate) struct HomeTerminals {
+pub struct HomeTerminals {
     state: Mutex<State>,
 }
 
@@ -137,7 +137,7 @@ impl Drop for HomeTerminals {
 }
 
 impl HomeTerminals {
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         lock(&self.state).terms.is_empty()
     }
 
@@ -145,7 +145,7 @@ impl HomeTerminals {
     /// highest contiguous `seq`. A resent frame is acknowledged again; one
     /// past a gap is not taken. A frame of a terminal no longer held is
     /// acknowledged too, so the machine can let it go.
-    pub(crate) async fn output(&self, link: &NodeLink, frame: PtyOutput) {
+    pub async fn output(&self, link: &NodeLink, frame: PtyOutput) {
         let ack = {
             let mut state = lock(&self.state);
             match state.terms.get_mut(&frame.terminal_id) {
@@ -187,7 +187,7 @@ impl HomeTerminals {
     }
 
     /// A terminal ended on the machine. One that never started shows why.
-    pub(crate) fn exited(&self, frame: &PtyExited) {
+    pub fn exited(&self, frame: &PtyExited) {
         let term = lock(&self.state).terms.remove(&frame.terminal_id);
         if let Some(term) = term {
             term.end(frame.exit_code, frame.error.as_deref());
@@ -203,7 +203,7 @@ impl HomeTerminals {
 
     /// The home `home_id` is moving away: each of its terminals and exec
     /// processes ends here now, and its process is killed on the machine.
-    pub(crate) async fn end_home(&self, shared: &Shared, home_id: &HomeId) {
+    pub async fn end_home(&self, shared: &Shared, home_id: &HomeId) {
         let ended: Vec<(String, Term)> = {
             let mut state = lock(&self.state);
             let ids: Vec<String> = state
@@ -233,7 +233,7 @@ impl HomeTerminals {
 
     /// A link bound: stop the grace, and ask after every terminal still
     /// held, so one the machine no longer runs is answered with its end.
-    pub(crate) fn after_bind(&self, link: &NodeLink) {
+    pub fn after_bind(&self, link: &NodeLink) {
         let probes: Vec<LinkFrame> = {
             let mut state = lock(&self.state);
             if let Some(grace) = state.grace.take() {
@@ -282,7 +282,7 @@ impl HomeTerminals {
 
     /// The link closed: the terminals end once `grace` passes without a
     /// bind (the machine ends their processes then too).
-    pub(crate) fn link_lost(&self, shared: Weak<Shared>, grace: Duration) {
+    pub fn link_lost(&self, shared: Weak<Shared>, grace: Duration) {
         let mut state = lock(&self.state);
         if state.terms.is_empty() {
             return;
@@ -388,7 +388,7 @@ impl RemotePty for LinkPty {
 
 /// `home-unavailable` for `home` (nodes.md "Detached workspaces"): the
 /// documented message and data; `detail` is logged.
-pub(crate) fn home_unavailable(home: &intent_core::WorkspaceHome, detail: &str) -> Error {
+pub fn home_unavailable(home: &intent_core::WorkspaceHome, detail: &str) -> Error {
     tracing::info!(home = %home.home_id, %detail, "the workspace's home is unavailable");
     let mut data = serde_json::json!({
         "code": HOME_UNAVAILABLE,
@@ -416,7 +416,8 @@ pub(crate) fn home_unavailable(home: &intent_core::WorkspaceHome, detail: &str) 
 
 /// `home-unavailable` with `moving: true` while `home` is moving (nodes.md
 /// "Moving the home").
-pub(crate) fn home_moving(home: &intent_core::WorkspaceHome) -> Error {
+#[must_use]
+pub fn home_moving(home: &intent_core::WorkspaceHome) -> Error {
     match home_unavailable(home, "it is moving") {
         Error::RemoteMachine(mut failure) => {
             if let Some(data) = failure.data.as_object_mut() {
@@ -430,7 +431,8 @@ pub(crate) fn home_moving(home: &intent_core::WorkspaceHome) -> Error {
 
 /// `home-unavailable` with `starting: true` while cloud home `home` still
 /// starts after a call's wait (nodes.md "Cloud homes" 6).
-pub(crate) fn home_starting(home: &intent_core::WorkspaceHome) -> Error {
+#[must_use]
+pub fn home_starting(home: &intent_core::WorkspaceHome) -> Error {
     match home_unavailable(home, "it is still starting") {
         Error::RemoteMachine(mut failure) => {
             if let Some(data) = failure.data.as_object_mut() {
@@ -481,7 +483,7 @@ fn env_vars(env: Vec<(String, String)>) -> Vec<PtyEnvVar> {
 /// # Errors
 ///
 /// When the PTY cannot be spawned.
-pub(crate) fn open_on(
+pub fn open_on(
     shared: &Shared,
     home: &intent_core::WorkspaceHome,
     workspace_id: &WorkspaceId,
@@ -537,7 +539,7 @@ pub(crate) fn open_on(
 /// Start a `host.execStream` process on `home`, whose machine `shared` is
 /// linked: an exec-mode `ptyOpen` whose output arrives by stream, then its
 /// end.
-pub(crate) fn open_exec_on(
+pub fn open_exec_on(
     shared: &Shared,
     home: &intent_core::WorkspaceHome,
     workspace_id: &WorkspaceId,

@@ -13,7 +13,7 @@ use intent_git::ref_storage::{GitStorage, RefExpect};
 
 /// The checkout a workspace's agents work in: its worktree, or the
 /// repository it was opened on.
-pub(crate) fn checkout_path(workspace: &Workspace) -> Option<PathBuf> {
+pub fn checkout_path(workspace: &Workspace) -> Option<PathBuf> {
     workspace
         .worktree_path
         .as_ref()
@@ -25,7 +25,11 @@ pub(crate) fn checkout_path(workspace: &Workspace) -> Option<PathBuf> {
 /// The pins of the checkout `agent_id` works in on its machine: its own,
 /// or its checkout owner's when it shares one. Empty for an agent without
 /// pins or in a home checkout.
-pub(crate) async fn checkout_pins(
+///
+/// # Errors
+///
+/// When the store cannot be read.
+pub async fn checkout_pins(
     store: &intent_store::Store,
     agent_id: &AgentId,
 ) -> Result<Vec<SubmodulePin>> {
@@ -53,7 +57,7 @@ fn rewritten_ref(remote: &AgentRemote, sha: &str) -> String {
     format!("{}rewritten/{sha}", remote.ref_prefix())
 }
 
-pub(crate) fn git_error(what: &str) -> impl Fn(git2::Error) -> Error + '_ {
+pub fn git_error(what: &str) -> impl Fn(git2::Error) -> Error + '_ {
     move |e| Error::Internal(format!("{what}: {e}"))
 }
 
@@ -64,7 +68,7 @@ pub(crate) fn git_error(what: &str) -> impl Fn(git2::Error) -> Error + '_ {
 /// # Errors
 ///
 /// When the repository cannot be opened or the pin cannot be written.
-pub(crate) fn pin_home_head(
+pub fn pin_home_head(
     git: &dyn GitStorage,
     repository: &std::path::Path,
     remote: &AgentRemote,
@@ -101,7 +105,7 @@ pub(crate) fn pin_home_head(
 ///
 /// When the repository cannot be opened, a pin cannot be dropped or the
 /// worktree cannot be moved.
-pub(crate) fn settle_home_push(
+pub fn settle_home_push(
     git: &dyn GitStorage,
     checkout: &std::path::Path,
     remote: &AgentRemote,

@@ -12,10 +12,26 @@
 //! link ([`LocalOwnership`]), but the claim and fence calls still run, so
 //! one code path serves both deployments.
 
+pub mod agents;
+pub mod connect;
+pub mod connector;
+pub mod final_stop;
+pub mod git;
 mod inbound;
 pub mod ingest;
 pub mod lease;
+pub mod link;
+pub mod machine;
 mod ownership;
+pub mod runtime;
+pub mod view;
 
 pub use inbound::{LinkView, NodeInbound};
 pub use ownership::{process_head_session, Fenced, LinkClaim, LinkOwnership, LocalOwnership};
+
+/// Lock `mutex`, taking over a poisoned one.
+pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
