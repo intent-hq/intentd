@@ -52,6 +52,7 @@ mod home_move;
 mod home_scripts;
 mod home_state;
 mod homes;
+mod inbound;
 mod ingest;
 mod launch;
 mod lease;
@@ -227,7 +228,7 @@ impl RemoteFeature {
             svc.store().clone(),
             target,
             self.tuning(),
-            Some(svc.clone()),
+            Some(inbound::ServicesInbound::shared(svc.clone())),
             Some(self.forge(svc)),
         )
         .await?;

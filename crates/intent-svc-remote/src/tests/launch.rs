@@ -941,11 +941,15 @@ async fn a_forwarded_call_on_a_replaced_binding_is_refused() {
         timeout_ms: 5_000,
     };
     for current in [Some(&current), None] {
-        let error = refused(calls.outcome(&shared, current, &stale, &request).await);
+        let error = refused(
+            calls
+                .outcome(shared.as_ref(), current, &stale, &request)
+                .await,
+        );
         assert!(error.message.starts_with("node-link-stale"), "{error:?}");
     }
     let fresh = calls
-        .outcome(&shared, Some(&current), &current, &request)
+        .outcome(shared.as_ref(), Some(&current), &current, &request)
         .await;
     assert!(matches!(fresh, LinkOutcome::Ok(_)), "{fresh:?}");
     f.node.shutdown();

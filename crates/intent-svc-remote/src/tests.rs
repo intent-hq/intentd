@@ -1427,6 +1427,157 @@ async fn a_fenced_welcome_claims_and_stops_nothing() {
     node.shutdown();
 }
 
+/// The head's domain as a recording of what the connector calls back with.
+#[derive(Default)]
+struct Recording {
+    changed: Mutex<Vec<String>>,
+    requests: Mutex<Vec<(String, Option<NodeCounter>, String)>>,
+}
+
+impl intent_node_connections::NodeInbound for Recording {
+    fn link_request(
+        &self,
+        link: Arc<dyn intent_node_connections::LinkView>,
+        request: intent_transport::node_link::IncomingRequest,
+    ) {
+        self.requests.lock().unwrap().push((
+            link.machine_id(),
+            link.current_binding().map(|binding| binding.generation),
+            request.request().method.clone(),
+        ));
+        tokio::spawn(async move {
+            let _ = request
+                .respond(LinkOutcome::Ok(json!({ "ok": true })))
+                .await;
+        });
+    }
+
+    fn home_events<'a>(
+        &'a self,
+        _: &'a str,
+        _: intent_core::node_link::HomeEvents,
+    ) -> intent_core::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn machine_script_frame<'a>(
+        &'a self,
+        _: &'a str,
+        _: LinkFrame,
+    ) -> intent_core::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn machine_runs_live(&self, _: &str) -> bool {
+        false
+    }
+
+    fn end_agents_machine_runs<'a>(
+        &'a self,
+        _: &'a [AgentId],
+        _: tokio::time::Instant,
+        _: &'a str,
+    ) -> intent_core::BoxFuture<'a, Vec<AgentId>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    fn machine_runs_lost<'a>(&'a self, _: &'a str, _: &'a str) -> intent_core::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn final_stop_begun(&self, _: &AgentId) {}
+
+    fn final_stop_settled<'a>(
+        &'a self,
+        _: &'a AgentId,
+        _: &'a str,
+    ) -> intent_core::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn machine_changed<'a>(
+        &'a self,
+        link: &'a dyn intent_node_connections::LinkView,
+    ) -> intent_core::BoxFuture<'a, ()> {
+        self.changed.lock().unwrap().push(link.machine_id());
+        Box::pin(async {})
+    }
+
+    fn home_setup_output<'a>(
+        &'a self,
+        _: &'a intent_core::node_link::HomeRef,
+        _: u64,
+        _: &'a str,
+    ) -> intent_core::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn agent_placement_changed<'a>(
+        &'a self,
+        _: &'a WorkspaceId,
+        _: &'a AgentId,
+    ) -> intent_core::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn agent_skills_changed<'a>(
+        &'a self,
+        _: &'a WorkspaceId,
+        _: &'a AgentId,
+    ) -> intent_core::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn machine_became_orchestrator(&self, _: String, _: String) {}
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[tokio::test]
+async fn link_callbacks_reach_the_inbound_with_the_live_link() {
+    let (mut machine, backend, bare) = exposed().await;
+    bare.shutdown();
+    let inbound = Arc::new(Recording::default());
+    let node = RemoteNode::start(
+        backend.store().clone(),
+        backend.target(&machine).await,
+        tuning(),
+        Some(inbound.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    node.connect().await.unwrap();
+    let end = machine.accept().await;
+
+    // A machine request is answered by the domain, which sees the link it
+    // arrived on.
+    let outcome = end
+        .link
+        .call(
+            AgentId::new(),
+            "workspace.call",
+            json!({ "method": "note.list" }),
+            wait(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, LinkOutcome::Ok(_)), "{outcome:?}");
+    assert_eq!(
+        *inbound.requests.lock().unwrap(),
+        [(
+            machine.id(),
+            Some(end.hello.binding.generation),
+            "workspace.call".to_owned()
+        )]
+    );
+    // The bind announced the machine.
+    assert!(inbound.changed.lock().unwrap().contains(&machine.id()));
+    node.shutdown();
+}
+
 /// On-demand connect, idle disconnect and reconnect while agents are live.
 mod on_demand {
     use super::*;

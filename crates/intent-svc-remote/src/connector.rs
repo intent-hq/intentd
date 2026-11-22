@@ -36,6 +36,7 @@ use intent_core::remote_launch::{
     EffectiveIsolation, PlacementError, RemoteSetupState, RemoteSetupStatus,
 };
 use intent_core::{AgentId, Error, Result, WorkspaceId};
+use intent_node_connections::{LinkView, NodeInbound};
 use intent_services::feature_api::feature_ports::{
     MachineSecretAnswer, MachineSecretOp, MachineSkills,
 };
@@ -51,7 +52,6 @@ use crate::ingest::{Ingest, Step};
 use crate::lease::HeadLease;
 use crate::lock;
 use crate::machine::MachineTarget;
-use crate::rpc::HeadCalls;
 use crate::runtime::RemoteAgentRuntime;
 
 /// Longest a bind waits to resolve the GitHub token afresh.
@@ -312,9 +312,9 @@ pub(crate) struct Shared {
     pub agents: Agents,
     pub tuning: Tuning,
     pub store: Store,
-    /// The backend's services: answer forwarded calls and publish
-    /// `remoteMachine:changed`. `None` refuses every machine request.
-    services: Option<Services>,
+    /// The head's domain: answers forwarded calls and hears the link's
+    /// changes. `None` refuses every machine request.
+    inbound: Option<Arc<dyn NodeInbound>>,
     /// Where the machine is dialed; refreshed from every welcome.
     target: Mutex<MachineTarget>,
     /// Runtimes of agents the machine was already running when head bound
@@ -457,9 +457,14 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// The backend's services, when this connector has them.
+    /// The backend's services, when this connector has them: for domain
+    /// code that has not moved behind [`NodeInbound`] yet.
     pub(crate) fn services(&self) -> Option<&Services> {
-        self.services.as_ref()
+        self.inbound
+            .as_ref()?
+            .as_any()
+            .downcast_ref::<crate::inbound::ServicesInbound>()
+            .map(crate::inbound::ServicesInbound::services)
     }
 
     /// The current link, if one is up.
@@ -682,10 +687,9 @@ impl Shared {
     /// Whether one of this machine's script runs is live: the machine stops
     /// a binding's scripts when its link closes, so the link stays up.
     fn machine_runs_live(&self) -> bool {
-        self.services.as_ref().is_some_and(|svc| {
-            svc.feature_runtime()
-                .machine_runs_live(svc, &self.machine_id())
-        })
+        self.inbound
+            .as_ref()
+            .is_some_and(|inbound| inbound.machine_runs_live(&self.machine_id()))
     }
 
     /// Lease end for `agents`' machine runs: send every stop, wait once
@@ -696,10 +700,10 @@ impl Shared {
         deadline: Instant,
         reason: &str,
     ) -> Vec<AgentId> {
-        match &self.services {
-            Some(svc) => {
-                svc.feature_runtime()
-                    .end_agents_machine_runs(svc, agents, deadline, reason)
+        match &self.inbound {
+            Some(inbound) => {
+                inbound
+                    .end_agents_machine_runs(agents, deadline, reason)
                     .await
             }
             None => Vec::new(),
@@ -708,10 +712,8 @@ impl Shared {
 
     /// Every live script run on this machine is lost with `reason`.
     pub(crate) async fn machine_runs_lost(&self, reason: &str) {
-        if let Some(svc) = &self.services {
-            svc.feature_runtime()
-                .machine_link_lost(svc, &self.machine_id(), reason)
-                .await;
+        if let Some(inbound) = &self.inbound {
+            inbound.machine_runs_lost(&self.machine_id(), reason).await;
         }
     }
 
@@ -787,9 +789,8 @@ impl Shared {
         if !settled {
             #[cfg(test)]
             lock(&self.final_begins).push(agent_id.clone());
-            if let Some(svc) = &self.services {
-                svc.feature_runtime()
-                    .machine_runs_final_stop_begun(svc, agent_id);
+            if let Some(inbound) = &self.inbound {
+                inbound.final_stop_begun(agent_id);
             }
         }
         self.watch_stop_exit(agent_id);
@@ -978,10 +979,9 @@ impl Shared {
         lock(&self.final_settles).push(agent_id.clone());
         // The agent is gone for good: so is its kept setup output.
         lock(&self.setup_outputs).remove(agent_id);
-        if let Some(svc) = &self.services {
-            svc.feature_runtime()
-                .machine_runs_final_stop_acked(
-                    svc,
+        if let Some(inbound) = &self.inbound {
+            inbound
+                .final_stop_settled(
                     agent_id,
                     "remote-script-lost: the agent was stopped for good",
                 )
@@ -1660,23 +1660,36 @@ impl Shared {
 
     /// Publish `remoteMachine:changed` with the machine as it is now.
     pub(crate) async fn announce(&self) {
-        let Some(services) = &self.services else {
-            return;
-        };
-        match self.store.get_exposed_machine(&self.machine_id()).await {
-            Ok(Some(row)) => {
-                crate::methods::publish_machine(services, &row, Some(self)).await;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(%error, "remote machine: could not read it to announce a change");
-            }
+        if let Some(inbound) = &self.inbound {
+            inbound.machine_changed(self).await;
         }
     }
 
     /// Whether a link is up now.
     pub(crate) fn is_connected(&self) -> bool {
         lock(&self.status).connected
+    }
+}
+
+impl LinkView for Shared {
+    fn machine_id(&self) -> String {
+        Shared::machine_id(self)
+    }
+
+    fn is_connected(&self) -> bool {
+        Shared::is_connected(self)
+    }
+
+    fn live_agents(&self) -> usize {
+        self.agents.live_count()
+    }
+
+    fn protocol(&self) -> u32 {
+        Shared::protocol(self)
+    }
+
+    fn current_binding(&self) -> Option<intent_core::node_link::LeaseBinding> {
+        self.current_link().map(|link| link.binding().clone())
     }
 }
 
@@ -1718,40 +1731,8 @@ impl Shared {
         seq: u64,
         data: &str,
     ) {
-        let Some(services) = &self.services else {
-            return;
-        };
-        match services.home_setups().output(
-            &home.workspace_id,
-            &home.home_id,
-            seq,
-            data,
-            std::time::Instant::now(),
-        ) {
-            intent_services::home_setup::OutputAnnounce::Now => {
-                services
-                    .publish_workspace_home_changed(&home.workspace_id)
-                    .await;
-            }
-            intent_services::home_setup::OutputAnnounce::After(delay) => {
-                // One trailing announcement, so the last output is not left
-                // unannounced until the next state change.
-                let services = services.clone();
-                let home = home.clone();
-                intent_core::spawn_daemon(async move {
-                    tokio::time::sleep(delay).await;
-                    if services.home_setups().flush_output(
-                        &home.workspace_id,
-                        &home.home_id,
-                        std::time::Instant::now(),
-                    ) {
-                        services
-                            .publish_workspace_home_changed(&home.workspace_id)
-                            .await;
-                    }
-                });
-            }
-            intent_services::home_setup::OutputAnnounce::No => {}
+        if let Some(inbound) = &self.inbound {
+            inbound.home_setup_output(home, seq, data).await;
         }
     }
 
@@ -1795,9 +1776,9 @@ impl Shared {
             due
         };
         if publish {
-            if let Some(services) = &self.services {
-                services
-                    .publish_agent_placement_changed(&workspace_id, &agent_id)
+            if let Some(inbound) = &self.inbound {
+                inbound
+                    .agent_placement_changed(&workspace_id, &agent_id)
                     .await;
             }
         }
@@ -1814,13 +1795,13 @@ impl Shared {
 impl RemoteNode {
     /// Start the connector to `target` on this backend's live lease there.
     /// Nothing is dialed until a link is wanted. Forwarded `workspace_api`
-    /// calls are answered and changes announced with `services`; without
+    /// calls are answered and changes announced with `inbound`; without
     /// them, every machine request is refused.
     pub(crate) async fn start(
         store: Store,
         target: MachineTarget,
         tuning: Tuning,
-        services: Option<Services>,
+        inbound: Option<Arc<dyn NodeInbound>>,
         forge: Option<Arc<crate::forge_token::ForgeTokens>>,
     ) -> Result<Self> {
         let ownership = crate::lease::ownership(&store, &tuning);
@@ -1844,7 +1825,7 @@ impl RemoteNode {
             agents: Agents::default(),
             tuning,
             store,
-            services,
+            inbound,
             target: Mutex::new(target),
             parked: Mutex::new(HashMap::new()),
             link: watch::channel(None).0,
@@ -2461,6 +2442,11 @@ impl RemoteNode {
         self.shared.availability()
     }
 
+    /// The link as the domain reads it.
+    pub(crate) fn view(&self) -> &dyn LinkView {
+        self.shared.as_ref()
+    }
+
     pub(crate) fn shared_ref(&self) -> &Shared {
         &self.shared
     }
@@ -2572,7 +2558,6 @@ async fn run(
     mut ingest: Ingest,
     mut demands: mpsc::UnboundedReceiver<Option<Waiter>>,
 ) {
-    let calls = shared.services.clone().map(HeadCalls::new);
     let mut backoff = shared.tuning.backoff.clone();
     let mut shutdown = shared.shutdown.subscribe();
     let mut waiters: Vec<Waiter> = Vec::new();
@@ -2724,11 +2709,12 @@ async fn run(
                         crate::connect::MACHINE_ORCHESTRATOR,
                         target.name
                     ));
-                    crate::methods::forget_orchestrator(
-                        shared.services().cloned(),
-                        target.id.clone(),
-                        target.token.expose().to_owned(),
-                    );
+                    if let Some(inbound) = &shared.inbound {
+                        inbound.machine_became_orchestrator(
+                            target.id.clone(),
+                            target.token.expose().to_owned(),
+                        );
+                    }
                 } else {
                     shared.announce().await;
                 }
@@ -2934,7 +2920,6 @@ async fn run(
         let served = Served {
             lease: &lease,
             link: &link,
-            calls: calls.as_ref(),
             forge,
         };
         let ended = serve(
@@ -3001,7 +2986,6 @@ async fn run(
 struct Served<'a> {
     lease: &'a HeadLease,
     link: &'a NodeLink,
-    calls: Option<&'a HeadCalls>,
     /// Changes of the GitHub token to send (nodeProtocol 15).
     forge: Option<watch::Receiver<crate::forge_token::Held>>,
 }
@@ -3014,7 +2998,6 @@ async fn serve(
     Served {
         lease,
         link,
-        calls,
         mut forge,
     }: Served<'_>,
     ingest: &mut Ingest,
@@ -3117,10 +3100,8 @@ async fn serve(
                     }
                     LinkEvent::Frame(LinkFrame::HomeEvents(events)) => {
                         // In order: one frame's events before the next's.
-                        if let Some(services) = &shared.services {
-                            services
-                                .publish_home_events(&shared.machine_id(), events)
-                                .await;
+                        if let Some(inbound) = &shared.inbound {
+                            inbound.home_events(&shared.machine_id(), events).await;
                         }
                     }
                     LinkEvent::Frame(LinkFrame::HomeStopAck(ack)) => {
@@ -3179,17 +3160,17 @@ async fn serve(
                     LinkEvent::Frame(frame)
                         if frame.channel() == intent_core::node_link::LinkChannel::Script =>
                     {
-                        if let Some(svc) = &shared.services {
-                            svc.feature_runtime()
-                                .machine_script_frame(svc, &shared.machine_id(), frame)
+                        if let Some(inbound) = &shared.inbound {
+                            inbound
+                                .machine_script_frame(&shared.machine_id(), frame)
                                 .await;
                         }
                     }
                     LinkEvent::Frame(frame) => {
                         tracing::debug!(channel = ?frame.channel(), "remote machine: ignoring an unexpected frame");
                     }
-                    LinkEvent::Request(request) => match calls {
-                        Some(calls) => calls.answer(shared.clone(), request),
+                    LinkEvent::Request(request) => match &shared.inbound {
+                        Some(inbound) => inbound.link_request(shared.clone(), request),
                         None => answer_unsupported(request),
                     },
                 }
@@ -3535,9 +3516,9 @@ async fn record_placement(
         // Announce the change so the agent list follows it (the list row
         // carries `effectiveIsolation` / `placementError`).
         Ok(true) => {
-            if let Some(services) = &shared.services {
-                services
-                    .publish_agent_placement_changed(&record.workspace_id, agent_id)
+            if let Some(inbound) = &shared.inbound {
+                inbound
+                    .agent_placement_changed(&record.workspace_id, agent_id)
                     .await;
             }
         }
@@ -3563,9 +3544,9 @@ async fn record_skills(
     .await
     {
         Ok(true) => {
-            if let Some(services) = &shared.services {
-                services
-                    .publish_agent_skills_changed(&record.workspace_id, agent_id)
+            if let Some(inbound) = &shared.inbound {
+                inbound
+                    .agent_skills_changed(&record.workspace_id, agent_id)
                     .await;
             }
         }
@@ -3576,7 +3557,7 @@ async fn record_skills(
     }
 }
 
-/// Without services to answer with, refuse a node request.
+/// Without the head's domain to answer with, refuse a node request.
 fn answer_unsupported(request: IncomingRequest) {
     // caller-binding: allow — only answers the link request; no service call
     tokio::spawn(async move {
