@@ -19,6 +19,7 @@
 
 pub mod agents;
 pub mod connect;
+mod connections;
 pub mod connector;
 pub mod final_stop;
 pub mod git;
@@ -31,6 +32,7 @@ mod ownership;
 pub mod runtime;
 pub mod view;
 
+pub use connections::{InProcessNodeConnections, NodeConnections};
 pub use inbound::{LinkView, NodeInbound};
 pub use ownership::{process_head_session, Fenced, LinkClaim, LinkOwnership, LocalOwnership};
 

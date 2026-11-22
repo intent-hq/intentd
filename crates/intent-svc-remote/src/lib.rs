@@ -32,12 +32,12 @@
 //! the model is told about remote placement only while a machine is
 //! exposed to this backend. In node mode no connector ever starts.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use intent_core::{Error, Result};
 use intent_git::ref_storage::{GitStorage, LocalGitStorage};
+use intent_node_connections::{InProcessNodeConnections, NodeConnections};
 use intent_services::feature_api::Services;
 
 mod claim;
@@ -91,11 +91,8 @@ mod tests;
 /// when the machine is first needed.
 #[derive(Default)]
 pub struct RemoteFeature {
-    nodes: Mutex<HashMap<String, RemoteNode>>,
-    /// Per-machine lifecycle locks: adding, replacing or removing a machine
-    /// and starting an agent on it take turns, so no agent starts under a
-    /// credential that is being replaced or removed.
-    lifecycles: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The machines' connectors and lifecycle locks.
+    connections: Connections,
     tailcat_bin: Mutex<Option<PathBuf>>,
     /// Connector timing; the defaults unless a test shortens them.
     tuning: Mutex<Option<connector::Tuning>>,
@@ -105,6 +102,15 @@ pub struct RemoteFeature {
     forge: std::sync::OnceLock<Arc<link::forge_token::ForgeTokens>>,
     /// Where remote agents' and homes' refs live.
     git: GitStore,
+}
+
+/// [`RemoteFeature::connections`]: connectors in this process.
+struct Connections(Arc<dyn NodeConnections>);
+
+impl Default for Connections {
+    fn default() -> Self {
+        Self(Arc::new(InProcessNodeConnections::default()))
+    }
 }
 
 /// [`RemoteFeature::git`]: the workspaces' own repositories unless set.
@@ -127,35 +133,28 @@ impl RemoteFeature {
     /// The running connector to machine `machine_id`, if one was started.
     #[must_use]
     pub fn running_node(&self, machine_id: &str) -> Option<RemoteNode> {
-        lock(&self.nodes).get(machine_id).cloned()
+        self.connections.0.running(machine_id)
     }
 
     /// Every running connector.
     #[must_use]
     pub fn running_nodes(&self) -> Vec<RemoteNode> {
-        lock(&self.nodes).values().cloned().collect()
+        self.connections.0.all()
     }
 
     /// How many exposed machines this backend holds a live link to now.
     #[must_use]
     pub fn connected_machines(&self) -> usize {
-        lock(&self.nodes)
-            .values()
-            .filter(|node| node.status().connected)
-            .count()
+        self.connections.0.connected_machines()
     }
 
     pub(crate) fn take_node(&self, machine_id: &str) -> Option<RemoteNode> {
-        lock(&self.nodes).remove(machine_id)
+        self.connections.0.take(machine_id)
     }
 
     /// Wait for machine `machine_id`'s lifecycle lock.
     pub(crate) async fn lifecycle(&self, machine_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let machine = lock(&self.lifecycles)
-            .entry(machine_id.to_owned())
-            .or_default()
-            .clone();
-        machine.lock_owned().await
+        self.connections.0.lifecycle(machine_id).await
     }
 
     pub(crate) fn tailcat_bin(&self) -> Option<PathBuf> {
@@ -257,21 +256,16 @@ impl RemoteFeature {
         let target = machine::MachineTarget::new(&row, &token, self.tailcat_bin())?
             .tapped(svc.link_traffic().clone())
             .gated(gate);
-        let node = RemoteNode::start(
-            svc.store().clone(),
-            target,
-            self.tuning(),
-            Some(inbound::ServicesInbound::shared(svc.clone())),
-            Some(self.forge(svc)),
-        )
-        .await?;
-        let mut nodes = lock(&self.nodes);
-        if let Some(existing) = nodes.get(machine_id) {
-            node.shutdown();
-            return Ok(existing.clone());
-        }
-        nodes.insert(machine_id.to_owned(), node.clone());
-        Ok(node)
+        self.connections
+            .0
+            .start(
+                svc.store().clone(),
+                target,
+                self.tuning(),
+                Some(inbound::ServicesInbound::shared(svc.clone())),
+                Some(self.forge(svc)),
+            )
+            .await
     }
 }
 
