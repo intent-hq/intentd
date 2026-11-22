@@ -143,6 +143,7 @@ fn protocol_ranges_negotiate_the_highest_common_version() {
 
 fn capabilities() -> MachineCapabilities {
     MachineCapabilities {
+        resources: None,
         platform: AgentPlatform {
             os: NodeOs::Macos,
             arch: NodeArch::Aarch64,

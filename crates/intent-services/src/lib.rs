@@ -79,6 +79,7 @@ mod auto_retire;
 mod boot_settings_migrations;
 mod executor_capabilities;
 mod executor_ops;
+pub mod host_resources;
 mod link_traffic_ops;
 pub mod lock_order;
 pub use lock_order::{OrderedGate, OrderedGuard};

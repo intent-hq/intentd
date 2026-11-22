@@ -1923,3 +1923,160 @@ async fn models_lists_every_machines_providers_and_filters_exactly() {
     .unwrap();
     assert_eq!(in_process["machines"][0]["nodeId"], "m-zed");
 }
+
+/// The `load` of `node_id`'s `remoteMachines.models` row, once it is `want`.
+async fn load_becomes(backend: &Backend, node_id: &str, want: Value) {
+    let mut last = Value::Null;
+    let reached = tokio::time::timeout(wait(), async {
+        loop {
+            let models = backend
+                .call("models", json!({ "nodeId": node_id }))
+                .await
+                .unwrap();
+            last = models["machines"][0]
+                .get("load")
+                .cloned()
+                .unwrap_or(Value::Null);
+            if last == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(reached.is_ok(), "load stayed {last}, wanted {want}");
+}
+
+/// Homes GA 16: a connected machine's row carries its machine-wide load from
+/// the report it pushes when its running-agent count changes (0 → 1 → 0),
+/// apart from this backend's own `runningAgents` there; each push also
+/// announces the machine's change to the app.
+#[tokio::test]
+async fn models_reports_a_connected_machines_load_as_it_pushes_it() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    node.connect().await.unwrap();
+    let link = machine.accept().await;
+    link.replay_complete(0).await;
+    let id = machine.id();
+    load_becomes(&backend, &id, json!({ "runningAgents": 0, "agentCap": 2 })).await;
+
+    let mut sub = subscribe(&backend);
+    link.link
+        .send(&LinkFrame::CapabilitiesReply {
+            capabilities: capabilities(1),
+        })
+        .await
+        .unwrap();
+    load_becomes(&backend, &id, json!({ "runningAgents": 1, "agentCap": 2 })).await;
+    let models = backend
+        .call("models", json!({ "nodeId": id }))
+        .await
+        .unwrap();
+    assert_eq!(
+        models["machines"][0]["runningAgents"], 0,
+        "this backend runs none of them"
+    );
+    let changed = changes(&mut sub, 1).await;
+    assert_eq!(
+        changed[0]["machine"]["capabilities"]["capacity"]["runningAgents"],
+        1
+    );
+
+    // A machine that samples its host adds its CPU and memory.
+    let mut sampled = capabilities(0);
+    sampled.resources = Some(intent_core::node_link::HostResources {
+        cpu_percent: Some(35),
+        memory_used_bytes: 12 << 30,
+        memory_total_bytes: 32 << 30,
+    });
+    link.link
+        .send(&LinkFrame::CapabilitiesReply {
+            capabilities: sampled,
+        })
+        .await
+        .unwrap();
+    load_becomes(
+        &backend,
+        &id,
+        json!({
+            "runningAgents": 0,
+            "agentCap": 2,
+            "cpuPercent": 35,
+            "memoryUsedBytes": 12_u64 << 30,
+            "memoryTotalBytes": 32_u64 << 30,
+        }),
+    )
+    .await;
+    node.shutdown();
+}
+
+/// A machine that is not connected has no `load`: its last count says
+/// nothing about now. Its other fields still come from the saved report.
+#[tokio::test]
+async fn models_leaves_out_the_load_of_a_machine_that_is_not_connected() {
+    use intent_core::node_link::ProviderStatus;
+    let backend = Backend::new().await;
+    save_reported(
+        &backend,
+        "m-away",
+        "Away box",
+        Some(vec![entry(
+            "claude-code",
+            ProviderStatus::SignedIn,
+            &["sonnet"],
+        )]),
+    )
+    .await;
+    let models = backend.call("models", json!({})).await.unwrap();
+    assert_eq!(models["machines"][0]["nodeId"], "m-away");
+    assert!(models["machines"][0].get("load").is_none(), "{models}");
+    assert!(models.get("local").is_none(), "no agent manager here");
+}
+
+/// The result's `local` is this backend's own load from its process
+/// registry, while it runs agents itself; an orchestrator runs none and
+/// has no `local`.
+#[tokio::test]
+async fn models_reports_this_backends_own_load_unless_it_is_an_orchestrator() {
+    use intent_services::feature_api::agent_manager::{AgentManager, BusEventSink};
+    let backend = Backend::new().await;
+    let manager = Arc::new(AgentManager::new(
+        backend.services.clone(),
+        Arc::new(BusEventSink::new(backend.bus.clone())),
+        3,
+    ));
+    backend.services.attach_agent_manager(&manager);
+    let models = backend.call("models", json!({})).await.unwrap();
+    assert_eq!(models["local"]["runningAgents"], 0, "{models}");
+    assert_eq!(models["local"]["agentCap"], 3, "{models}");
+
+    manager
+        .registry()
+        .try_admit(&AgentId::from_string("local-agent"))
+        .unwrap();
+    let models = backend.call("models", json!({})).await.unwrap();
+    assert_eq!(models["local"]["runningAgents"], 1, "{models}");
+    assert_eq!(models["local"]["agentCap"], 3, "{models}");
+    // This host's own memory, where the platform reports it.
+    if let Some(total) = models["local"]["memoryTotalBytes"].as_u64() {
+        assert!(total > 0);
+        assert!(models["local"]["memoryUsedBytes"].as_u64().unwrap() <= total);
+    }
+    let one = backend
+        .call("models", json!({ "provider": "codex" }))
+        .await
+        .unwrap();
+    assert_eq!(one["local"]["runningAgents"], 1, "filters keep `local`");
+
+    let orchestrator = Backend::orchestrator().await;
+    let manager = Arc::new(AgentManager::new(
+        orchestrator.services.clone(),
+        Arc::new(BusEventSink::new(orchestrator.bus.clone())),
+        3,
+    ));
+    orchestrator.services.attach_agent_manager(&manager);
+    let models = orchestrator.call("models", json!({})).await.unwrap();
+    assert!(models.get("local").is_none(), "{models}");
+}

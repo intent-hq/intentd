@@ -306,19 +306,57 @@ async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
             }
         }
     }
-    Ok(json!({ "machines": machines }))
+    let mut result = json!({ "machines": machines });
+    if let Some(local) = local_load(svc) {
+        result["local"] = local;
+    }
+    Ok(result)
+}
+
+/// `MachineLoad`: running agents against the agent cap, and the host's CPU
+/// and memory when known.
+fn load_json(
+    running_agents: u32,
+    agent_cap: u32,
+    resources: Option<intent_core::node_link::HostResources>,
+) -> Value {
+    let mut load = json!({ "runningAgents": running_agents, "agentCap": agent_cap });
+    if let Some(resources) = resources {
+        if let Some(cpu) = resources.cpu_percent {
+            load["cpuPercent"] = json!(cpu);
+        }
+        load["memoryUsedBytes"] = json!(resources.memory_used_bytes);
+        load["memoryTotalBytes"] = json!(resources.memory_total_bytes);
+    }
+    load
+}
+
+/// This backend's own load from its process registry, while it runs agents
+/// itself: `None` in orchestrator mode or without an agent manager.
+fn local_load(svc: &Services) -> Option<Value> {
+    if svc.orchestrator_mode() {
+        return None;
+    }
+    let manager = svc.agent_manager()?;
+    let registry = manager.registry();
+    Some(load_json(
+        u32::try_from(registry.size()).unwrap_or(u32::MAX),
+        u32::try_from(registry.cap()).unwrap_or(u32::MAX),
+        intent_services::host_resources::sample_host(),
+    ))
 }
 
 /// One `MachineModels` row, or `None` when a `provider` or `model` filter
-/// leaves it no provider. Never carries routes, the pin, the capacity or
-/// the link protocol.
+/// leaves it no provider. Never carries routes, the pin, the memory figures
+/// or the link protocol; `load` only while the machine is connected.
 fn machine_models_json(
     row: &ExposedMachine,
     live: Option<&dyn LinkView>,
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Option<Value> {
-    let state = if live.is_some_and(LinkView::is_connected) {
+    let connected = live.is_some_and(LinkView::is_connected);
+    let state = if connected {
         RemoteMachineState::Connected
     } else {
         row.state
@@ -358,6 +396,16 @@ fn machine_models_json(
         "runningAgents".into(),
         json!(live.map_or(0, LinkView::live_agents)),
     );
+    if let Some(caps) = row.capabilities.as_ref().filter(|_| connected) {
+        machine.insert(
+            "load".into(),
+            load_json(
+                caps.capacity.running_agents,
+                caps.capacity.agent_cap,
+                caps.resources,
+            ),
+        );
+    }
     machine.insert("providers".into(), Value::Array(providers));
     if let Some(disabled) = row
         .capabilities

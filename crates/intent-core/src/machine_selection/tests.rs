@@ -43,6 +43,7 @@ fn report(
     providers: Vec<ProviderCapability>,
 ) -> MachineCapabilities {
     MachineCapabilities {
+        resources: None,
         platform,
         intentd_version: "0.11.87".into(),
         capacity: MachineCapacity {
@@ -430,6 +431,7 @@ async fn model_unavailable_without_a_model_names_the_provider_status() {
 /// the machine.
 fn report_disabling(providers: Vec<ProviderCapability>, disabled: &[&str]) -> MachineCapabilities {
     MachineCapabilities {
+        resources: None,
         disabled_providers: disabled.iter().map(|id| (*id).to_owned()).collect(),
         ..report(MAC, FRESH, providers)
     }
@@ -1676,4 +1678,67 @@ fn help_lists_machines_and_cloud_entries_in_the_saved_order() {
         only_cloud.contains("1. \"E2B\" (cloudMachineId `e2b`"),
         "{only_cloud}"
     );
+}
+
+/// Harness 3.16: the prompt text and `ws.help("agent")` point agents at
+/// each machine's load for placing parallel sub-agents, and the lookup's
+/// line documents `load` and `local`. The identity list is unchanged and
+/// the text still carries no live facts.
+#[test]
+fn load_aware_help_points_at_each_machines_load() {
+    let mut mac = machine(
+        "d-mac",
+        Some(report(
+            MAC,
+            FRESH,
+            vec![provider("claude-code", ProviderStatus::SignedIn, &["opus"])],
+        )),
+    );
+    mac.name = "Mac mini".into();
+    let rows = [mac];
+    let inputs = PlacementHelpInputs::new(&rows, &|_| false);
+    let text = load_aware_machines_help(&inputs).unwrap();
+    assert_eq!(
+        text,
+        "Remote placement (experimental): machines exposed to this backend:\n\
+         Listed in the user's order of preference. Use the first that can run what you need; pick a later one if the task needs it (platform, model) or it has more free slots.\n\
+         1. \"Mac mini\" (nodeId `d-mac`, macos/aarch64)\n\
+         Before you choose a machine, provider or model for a remote agent, confirm it with `ws.agent.machineModels(nodeId?, { provider?, model? }?)`: each machine's state, sign-in status, full model list and load. How to place one: `ws.help(\"agent\")`.\n\
+         On a remote machine, run anything over 30 s with `ws.script.start`; shell background jobs never wake you."
+    );
+    let stable = stable_machines_help(&inputs).unwrap();
+    assert!(
+        text.len() <= stable.len(),
+        "3.16's prompt text stays within 3.15's length (context budget)"
+    );
+    assert_eq!(
+        text.lines().nth(2),
+        stable.lines().nth(2),
+        "the identity list is 3.15's"
+    );
+
+    let reference = load_aware_machines_reference(&inputs).unwrap();
+    assert!(reference.starts_with(&format!(
+        "Remote placement (experimental): machines exposed to this backend:\n{LOAD_PREFERENCE_LINE}\n1. \"Mac mini\""
+    )));
+    for doc in [
+        "→ { machines, local? }  // Experimental.",
+        "`load: { runningAgents, agentCap, cpuPercent?, memoryUsedBytes?, memoryTotalBytes? }`",
+        "`runningAgents` (this backend's agents there)",
+        "`local` is this backend's own load in the same shape",
+        "the whole host's CPU use",
+        "has no `load`",
+        "prefer the machine with the most free slots",
+    ] {
+        assert!(reference.contains(doc), "{doc} missing: {reference}");
+    }
+    assert!(reference.contains("To run an agent on one, pass `placement"));
+    assert_eq!(reference.lines().last(), Some(REMOTE_LONG_COMMANDS_HINT));
+    for live in [FRESH, "2026-10-30", "signed-in", "opus", "last seen"] {
+        assert!(!text.contains(live), "{live} in {text}");
+        assert!(!reference.contains(live), "{live} in {reference}");
+    }
+    let empty = PlacementHelpInputs::new(&[], &|_| false);
+    assert_eq!(load_aware_machines_help(&empty), None);
+    assert_eq!(load_aware_machines_reference(&empty), None);
 }

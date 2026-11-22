@@ -536,6 +536,15 @@ impl Backend {
     }
 
     async fn with_tuning(tuning: Tuning) -> Self {
+        Self::build(tuning, false).await
+    }
+
+    /// A backend in orchestrator mode: it runs no agent itself.
+    async fn orchestrator() -> Self {
+        Self::build(tuning(), true).await
+    }
+
+    async fn build(tuning: Tuning, orchestrator: bool) -> Self {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
         let config = tempfile::TempDir::new().unwrap();
@@ -545,7 +554,8 @@ impl Backend {
             Services::new(store)
                 .with_settings_registry(registry)
                 .with_secret_store(Arc::new(InMemorySecretStore::default()))
-                .with_event_bus(bus.clone()),
+                .with_event_bus(bus.clone())
+                .with_orchestrator_mode(orchestrator),
         );
         *crate::lock(&services.remote_feature().unwrap().tuning) = Some(tuning);
         Self {
