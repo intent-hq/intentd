@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.268] - 2026-11-22
+
+### 🚀 Features
+
+- *(store)* Check the Postgres schema before serving ([#3621](https://github.com/intent-hq/intentd/pull/3621))
+
+### 🐛 Bug Fixes
+
+- *(store)* Drop the advisory lock from Postgres tenant provisioning ([#3626](https://github.com/intent-hq/intentd/pull/3626))
+
+### 🔧 Refactor
+
+- *(transport)* Move the node link into its own crate ([#3624](https://github.com/intent-hq/intentd/pull/3624))
+- *(remote)* Add node-connection crate with a link ownership seam ([#3619](https://github.com/intent-hq/intentd/pull/3619))
+
+### 🧪 Testing
+
+- *(goldens)* Refresh session-surface rows with INTENTD_UPDATE_GOLDENS=1 ([#3622](https://github.com/intent-hq/intentd/pull/3622))
+- *(assistant)* A guest connection cannot report backends for ws.rpc ([#3625](https://github.com/intent-hq/intentd/pull/3625))
+
+
 ## [0.11.267] - 2026-11-21
 
 ### 🚀 Features
