@@ -137,13 +137,14 @@ fn table_source<'a>(rows: impl IntoIterator<Item = Row<'a>>) -> String {
 }
 
 /// Compares `actual` with `table`, or rewrites `table` under
-/// `INTENTD_UPDATE_GOLDENS=1`. On a difference, returns the ids whose row
-/// is missing or changed, and the ids of stale rows.
+/// `INTENTD_UPDATE_GOLDENS=1`. On a difference, returns what differs: the
+/// ids whose row is missing or changed and the ids of stale rows, or else
+/// the row order (the table follows the provider registry) or a duplicate.
 fn check_table(
     name: &str,
     table: &[Row<'static>],
     actual: &[(&str, usize, String, usize, String)],
-) -> Option<(Vec<String>, Vec<String>)> {
+) -> Option<String> {
     let actual: Vec<Row> = actual
         .iter()
         .map(|row| (row.0, row.1, row.2.as_str(), row.3, row.4.as_str()))
@@ -156,17 +157,21 @@ fn check_table(
     if body == table_source(table.iter().copied()) {
         return None;
     }
-    let changed = actual
+    let changed: Vec<&str> = actual
         .iter()
         .filter(|row| table.iter().find(|r| r.0 == row.0) != Some(*row))
-        .map(|row| row.0.to_owned())
+        .map(|row| row.0)
         .collect();
-    let stale = table
+    let stale: Vec<&str> = table
         .iter()
         .filter(|row| actual.iter().all(|r| r.0 != row.0))
-        .map(|row| row.0.to_owned())
+        .map(|row| row.0)
         .collect();
-    Some((changed, stale))
+    Some(if changed.is_empty() && stale.is_empty() {
+        "rows out of provider order, or duplicated".to_owned()
+    } else {
+        format!("changed rows {changed:?}, stale rows {stale:?}")
+    })
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -382,10 +387,9 @@ async fn v3_10_workspace_api_surfaces() {
             sha256_hex(&reference),
         ));
     }
-    if let Some((changed, stale)) = check_table("V3_10_WORKSPACE_API", V3_10_WORKSPACE_API, &actual)
-    {
+    if let Some(diff) = check_table("V3_10_WORKSPACE_API", V3_10_WORKSPACE_API, &actual) {
         panic!(
-            "harness 3.10 workspace_api surfaces changed for {changed:?} (stale rows {stale:?}). \
+            "harness 3.10 workspace_api surfaces differ ({diff}). \
              3.12 reuses these surfaces, so live sessions carry this text: move the change to a \
              new harness version, or for a deliberate all-session fix refresh the rows with:\n\
              {UPDATE_COMMAND}"
@@ -483,9 +487,9 @@ async fn frozen_sessions_keep_tool_description_and_system_prompt() {
         let (tool_len, tool_sha, prompt_len, prompt_sha) = rows.remove(0);
         actual.push((provider.id, tool_len, tool_sha, prompt_len, prompt_sha));
     }
-    if let Some((changed, stale)) = check_table("FROZEN_SURFACES", FROZEN_SURFACES, &actual) {
+    if let Some(diff) = check_table("FROZEN_SURFACES", FROZEN_SURFACES, &actual) {
         panic!(
-            "frozen surfaces changed for {changed:?} (stale rows {stale:?}). A new provider \
+            "frozen surfaces differ ({diff}). A new provider \
              adds its row. A changed row means sessions on a frozen harness see new text: \
              gate the change on a new harness version, or for a deliberate fix to every \
              version refresh the rows with:\n{UPDATE_COMMAND}"
