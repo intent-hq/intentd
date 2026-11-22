@@ -564,8 +564,20 @@ async fn next_record(dialed: &mut DialedLink) -> JournalRecord {
     }
 }
 
+/// The next frame other than an unsolicited capabilities report, which the
+/// machine may push at any time (a running-agent count or resources change,
+/// node-link.md "Load pushed on change").
+async fn next_unpushed_frame(dialed: &mut DialedLink) -> Option<LinkFrame> {
+    loop {
+        match next_frame(dialed).await {
+            Some(LinkFrame::CapabilitiesReply { .. }) => {}
+            other => return other,
+        }
+    }
+}
+
 async fn next_raw_record(dialed: &mut DialedLink) -> JournalRecord {
-    match next_frame(dialed).await {
+    match next_unpushed_frame(dialed).await {
         Some(LinkFrame::Journal(record)) => record,
         other => panic!("expected a journal record, got {other:?}"),
     }
@@ -618,7 +630,7 @@ async fn skills_are_journaled_before_started_only_on_protocol_12() {
 }
 
 async fn replay_complete(dialed: &mut DialedLink) -> NodeCounter {
-    match next_frame(dialed).await {
+    match next_unpushed_frame(dialed).await {
         Some(LinkFrame::ReplayComplete { through_seq }) => through_seq,
         other => panic!("expected replay complete, got {other:?}"),
     }
