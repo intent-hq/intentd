@@ -299,6 +299,41 @@ mod tests {
         );
     }
 
+    /// intent-hq/intent#9852: the qualified snapshot's check items carry no
+    /// provenance, so a changed link (a re-run, or a legacy status taking
+    /// over from a passing check run) is never reported as a new run here.
+    #[test]
+    fn qualified_diff_never_reads_a_changed_link_as_a_rerun() {
+        let run = |url: Option<&str>| {
+            let mut s = snapshot("failed");
+            if let Some(url) = url {
+                s["requirements"]["checks"]["items"][0]["url"] = json!(url);
+            }
+            s
+        };
+        for (before, after) in [
+            (
+                Some("https://github.com/o/r/runs/1"),
+                Some("https://github.com/o/r/runs/2"),
+            ),
+            (
+                Some("https://github.com/o/r/runs/100"),
+                Some("https://github.com/o/r/runs/200"),
+            ),
+            (
+                Some("https://ci.example/build/1"),
+                Some("https://ci.example/build/2"),
+            ),
+            (None, Some("https://github.com/o/r/runs/2")),
+            (Some(""), Some("https://ci.example/build/2")),
+        ] {
+            assert!(
+                diff(&run(before), &run(after)).is_empty(),
+                "{before:?} → {after:?}"
+            );
+        }
+    }
+
     #[test]
     fn qualified_diff_completion_names_skipped_checks() {
         let item = |name: &str, status: &str| json!({"name":name,"status":status,"required":true});

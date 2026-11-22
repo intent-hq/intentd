@@ -773,6 +773,23 @@ impl PrMonitorSnapshot {
             .or(self.unresolved_threads_last_known)
     }
 
+    /// The link of `check` when this snapshot knows it came from a check run,
+    /// the only re-run evidence (intent-hq/intent#9852). A legacy status's
+    /// link (by `status_checks`) never is, even when it looks like a
+    /// check-run link, and neither is a link of unknown provenance (a
+    /// snapshot persisted before `status_checks` existed).
+    pub(crate) fn check_run_link<'a>(
+        &'a self,
+        check: &'a pr_ops::MergeRequirementCheck,
+    ) -> Option<&'a str> {
+        let url = check.url.as_deref()?;
+        let statuses = self.status_checks.as_ref()?;
+        (!statuses
+            .iter()
+            .any(|s| s.name == check.name && s.url.as_deref() == Some(url)))
+        .then_some(url)
+    }
+
     pub(crate) fn known_required_checks(&self) -> BTreeSet<String> {
         self.required_check_names.clone().unwrap_or_else(|| {
             self.requirements
@@ -5801,6 +5818,7 @@ mod tests {
     mod quota_regression;
     mod qwen_regression;
     mod registration_visibility;
+    mod rerun_failed_again;
     mod unknown_blip;
     use std::path::PathBuf;
 

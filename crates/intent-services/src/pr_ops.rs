@@ -981,6 +981,59 @@ pub struct MergeRequirementCheck {
     pub url: Option<String>,
 }
 
+/// A check link without its query or fragment.
+fn bare_link(url: &str) -> &str {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/')
+}
+
+/// The host and check-run id of a GitHub check-run link: `/runs/<id>` (REST
+/// `html_url`) or Actions `/actions/runs/<run>/job/<id>` (GraphQL
+/// `detailsUrl`) name the same run.
+fn github_check_run_id(url: &str) -> Option<(&str, &str)> {
+    let bare = bare_link(url);
+    let host = bare.split('/').nth(2)?;
+    let segments: Vec<&str> = bare.split('/').collect();
+    let [.., parent, kind, id] = segments.as_slice() else {
+        return None;
+    };
+    let numeric = !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
+    (numeric && (*kind == "job" || (*kind == "runs" && *parent != "actions")))
+        .then_some((host, *id))
+}
+
+/// The tie-break key among same-name twins. A twin whose link is a GitHub
+/// check-run link keys on the check-run id, which both read paths report
+/// alike. Any twin without one (a CI vendor's details link, an empty link, or
+/// none) outranks those: a read that sees such a twin then reports a link
+/// that [`is_new_check_run`] never compares, rather than a check-run id the
+/// other read path, which may see every twin's id, could rank differently.
+fn check_run_identity(url: Option<&str>) -> (bool, &str, &str) {
+    match url.and_then(github_check_run_id) {
+        Some((host, id)) => (false, host, id),
+        None => (true, "", url.map_or("", bare_link)),
+    }
+}
+
+/// Whether two links of the same check name point at different runs: a
+/// re-run that kept the status (intent-hq/intent#9852). Only GitHub
+/// check-run links on one host are evidence, compared by check-run id. Other
+/// links can change without a re-run: the rollup and the REST fallback give a
+/// CI vendor's check different links, and a name with both a check run and a
+/// legacy status moves its link between them. Empty and absent links are
+/// never evidence either.
+pub(crate) fn is_new_check_run(before: Option<&str>, after: Option<&str>) -> bool {
+    match (
+        before.and_then(github_check_run_id),
+        after.and_then(github_check_run_id),
+    ) {
+        (Some(a), Some(b)) => a.0 == b.0 && a.1 != b.1,
+        _ => false,
+    }
+}
+
 /// The `checks` block of the checklist.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1593,10 +1646,15 @@ fn live_key(run: &CheckRunSignal) -> (bool, Option<OffsetDateTime>, u8) {
     )
 }
 
-/// Whether `candidate` is the live run of its name over `held`; equal keys
-/// keep `held`, so the first-listed of identical twins supplies the link.
+/// Whether `candidate` is the live run of its name over `held`. Equal keys
+/// fall back to the run the link names, so the same twin supplies the link
+/// in any listing order and under either read path: a flipped link would
+/// read as a re-run (intent-hq/intent#9852).
 fn supersedes(candidate: &CheckRunSignal, held: &CheckRunSignal) -> bool {
-    live_key(candidate) > live_key(held)
+    fn run(signal: &CheckRunSignal) -> (bool, &str, &str) {
+        check_run_identity(signal.url.as_deref())
+    }
+    (live_key(candidate), run(candidate)) > (live_key(held), run(held))
 }
 
 /// One checklist entry per check name. A head that carries several runs of
@@ -1634,7 +1692,7 @@ fn dedupe_checks(runs: impl IntoIterator<Item = CheckRunSignal>) -> Vec<MergeReq
         .collect()
 }
 
-fn rollup_items<'a>(
+pub(crate) fn rollup_items<'a>(
     checks: impl IntoIterator<Item = &'a RollupCheck>,
 ) -> Vec<MergeRequirementCheck> {
     dedupe_checks(checks.into_iter().map(|c| CheckRunSignal {
@@ -1647,7 +1705,9 @@ fn rollup_items<'a>(
     }))
 }
 
-fn status_checks(signals: Option<&MergeRequirementSignals>) -> Option<Vec<MergeRequirementCheck>> {
+pub(crate) fn status_checks(
+    signals: Option<&MergeRequirementSignals>,
+) -> Option<Vec<MergeRequirementCheck>> {
     signals.filter(|s| s.checks_known).map(|s| {
         rollup_items(
             s.checks
@@ -3451,6 +3511,166 @@ mod tests {
         assert_eq!(req.checks.total, 2);
         assert!(!req.checks.required_known);
         assert_eq!(req.merge_state_status.as_deref(), Some("UNSTABLE"));
+    }
+
+    /// Two same-name twins with equal liveness keys, each of every link kind,
+    /// read by the rollup (`detailsUrl`) and by the REST fallback
+    /// (`html_url`), in both listing orders and both id orders: the same pair
+    /// of runs never reads as a new run, across paths or within one. A real
+    /// re-run (new check-run ids on both reads) still does
+    /// (intent-hq/intent#9852).
+    #[test]
+    fn twin_link_kinds_never_read_as_a_rerun_across_read_paths() {
+        #[derive(Clone, Copy, Debug)]
+        enum Kind {
+            ActionsJob,
+            CheckRun,
+            Vendor,
+            Empty,
+            Null,
+        }
+        const KINDS: [Kind; 5] = [
+            Kind::ActionsJob,
+            Kind::CheckRun,
+            Kind::Vendor,
+            Kind::Empty,
+            Kind::Null,
+        ];
+        let rollup_url = |kind: Kind, id: u32| match kind {
+            Kind::ActionsJob => Some(format!("https://github.com/o/r/actions/runs/9/job/{id}")),
+            Kind::CheckRun => Some(format!("https://github.com/o/r/runs/{id}")),
+            Kind::Vendor => Some(format!("https://ci.example/build/{id}")),
+            Kind::Empty => Some(String::new()),
+            Kind::Null => None,
+        };
+        let rest_url = |_: Kind, id: u32| Some(format!("https://github.com/o/r/runs/{id}"));
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let link = |urls: Vec<Option<String>>| {
+            let signals = MergeRequirementSignals {
+                merge_state_status: Some("BLOCKED".into()),
+                checks: urls
+                    .into_iter()
+                    .map(|url| RollupCheck {
+                        url,
+                        ..rollup("build", CheckState::Failure, true)
+                    })
+                    .collect(),
+                checks_known: true,
+                ..Default::default()
+            };
+            merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0))
+                .checks
+                .items[0]
+                .url
+                .clone()
+        };
+        let read = |path: &dyn Fn(Kind, u32) -> Option<String>,
+                    twins: [(Kind, u32); 2],
+                    reversed: bool| {
+            let mut urls: Vec<_> = twins.iter().map(|&(k, id)| path(k, id)).collect();
+            if reversed {
+                urls.reverse();
+            }
+            link(urls)
+        };
+        for a in KINDS {
+            for b in KINDS {
+                for (id_a, id_b) in [(100, 200), (200, 100)] {
+                    let twins = [(a, id_a), (b, id_b)];
+                    let reads: Vec<Option<String>> = [false, true]
+                        .into_iter()
+                        .flat_map(|reversed| {
+                            [
+                                read(&rollup_url, twins, reversed),
+                                read(&rest_url, twins, reversed),
+                            ]
+                        })
+                        .collect();
+                    for before in &reads {
+                        for after in &reads {
+                            assert!(
+                                !is_new_check_run(before.as_deref(), after.as_deref()),
+                                "{twins:?}: {before:?} → {after:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let rerun = read(
+            &rest_url,
+            [(Kind::CheckRun, 300), (Kind::CheckRun, 400)],
+            false,
+        );
+        for kind in [Kind::ActionsJob, Kind::CheckRun] {
+            let first = read(&rollup_url, [(kind, 100), (kind, 200)], false);
+            assert!(
+                is_new_check_run(first.as_deref(), rerun.as_deref()),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// Twins with equal liveness keys supply the same link in any listing
+    /// order, so a reordered rollup never reads as a re-run
+    /// (intent-hq/intent#9852).
+    #[test]
+    fn merge_requirements_twin_link_ignores_listing_order() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let twin = |n: u8| RollupCheck {
+            url: Some(format!("https://github.com/o/r/runs/{n}")),
+            ..rollup("build", CheckState::Failure, true)
+        };
+        let link = |checks: Vec<RollupCheck>| {
+            let signals = MergeRequirementSignals {
+                merge_state_status: Some("BLOCKED".into()),
+                checks,
+                checks_known: true,
+                ..Default::default()
+            };
+            let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
+            req.checks.items[0].url.clone()
+        };
+        assert_eq!(link(vec![twin(1), twin(2)]), link(vec![twin(2), twin(1)]));
+
+        // The rollup lists Actions job links, the REST fallback check-run
+        // links: both reads pick the same run.
+        let at = |url: &str| RollupCheck {
+            url: Some(url.into()),
+            ..rollup("build", CheckState::Failure, true)
+        };
+        let rollup_link = link(vec![
+            at("https://github.com/o/r/actions/runs/100/job/200"),
+            at("https://github.com/o/r/actions/runs/101/job/100"),
+        ]);
+        let rest_link = link(vec![
+            at("https://github.com/o/r/runs/200"),
+            at("https://github.com/o/r/runs/100"),
+        ]);
+        assert!(!is_new_check_run(
+            rollup_link.as_deref(),
+            rest_link.as_deref()
+        ));
+
+        // An Actions twin beside a CI vendor app's twin: the rollup gives the
+        // app's details link, REST its check-run link. Whichever id is
+        // larger, the two reads never report a new run.
+        for (actions_id, app_id) in [(100, 200), (200, 100)] {
+            let rollup_link = link(vec![
+                at(&format!(
+                    "https://github.com/o/r/actions/runs/9/job/{actions_id}"
+                )),
+                at("https://app.circleci.com/pipelines/gh/o/r/5/workflows/w/jobs/9"),
+            ]);
+            let rest_link = link(vec![
+                at(&format!("https://github.com/o/r/runs/{actions_id}")),
+                at(&format!("https://github.com/o/r/runs/{app_id}")),
+            ]);
+            assert!(
+                !is_new_check_run(rollup_link.as_deref(), rest_link.as_deref()),
+                "{rollup_link:?} vs {rest_link:?}"
+            );
+        }
     }
 
     /// Regression (intent-hq/intent#5372): a head carrying two runs of the
