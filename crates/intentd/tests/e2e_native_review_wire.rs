@@ -156,7 +156,9 @@ impl FixtureMetadata {
             host: intent_transport::host_env::detect_host_environment(),
             has_display: intent_transport::host_env::detect_has_display(),
             started: std::time::Instant::now(),
-            process: std::sync::Mutex::new(sysinfo::System::new()),
+            process: std::sync::Mutex::new(
+                sysinfo::System::new().expect("sysinfo supports this host"),
+            ),
             pid: sysinfo::get_current_pid().unwrap(),
             dir,
             token,

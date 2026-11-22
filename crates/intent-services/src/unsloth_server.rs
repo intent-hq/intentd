@@ -1917,7 +1917,9 @@ async fn sample_process_tree(root: u32) -> (f32, u64) {
     );
     let sys_pids: Vec<Pid> = pids.iter().map(|&p| Pid::from(p as usize)).collect();
     let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
-    let mut sys = System::new();
+    let Ok(mut sys) = System::new() else {
+        return (0.0, 0);
+    };
     sys.refresh_processes_specifics(ProcessesToUpdate::Some(&sys_pids), true, refresh_kind);
     tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
     sys.refresh_processes_specifics(ProcessesToUpdate::Some(&sys_pids), true, refresh_kind);

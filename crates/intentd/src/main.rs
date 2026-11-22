@@ -4167,10 +4167,9 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
 
     // Descriptor sampling does not need the pid, so a pid lookup failure only
     // disables the cpu/memory half of the tick.
-    let mut cpu_mem = match sysinfo::get_current_pid() {
-        Ok(pid) => {
+    let mut cpu_mem = match sysinfo::get_current_pid().and_then(|pid| Ok((pid, System::new()?))) {
+        Ok((pid, mut sys)) => {
             let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
-            let mut sys = System::new();
             let sample = move |sys: &mut System, usage: &ProcUsage| {
                 sys.refresh_processes_specifics(
                     ProcessesToUpdate::Some(&[pid]),
@@ -4185,7 +4184,7 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
             Some((sys, sample))
         }
         Err(e) => {
-            tracing::warn!(error = %e, "cannot resolve own pid; cpu/memory sampling disabled");
+            tracing::warn!(error = %e, "cannot sample own process; cpu/memory sampling disabled");
             None
         }
     };
@@ -4369,9 +4368,8 @@ impl WorkspacesDiskUsage {
 /// falls back to prefix-matching the raw path). `None` when no mount matches.
 fn workspaces_disk_sample(root: &Path) -> Option<(u64, u64)> {
     let target = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
     disks
-        .list()
         .iter()
         .filter(|d| target.starts_with(d.mount_point()))
         .max_by_key(|d| d.mount_point().as_os_str().len())
@@ -4928,8 +4926,14 @@ fn spawn_child_tree_sampler(
         tracing::warn!("cannot resolve own pid; child-process memory sampling disabled");
         return;
     };
+    let mut sys = match System::new() {
+        Ok(sys) => sys,
+        Err(e) => {
+            tracing::warn!(error = %e, "child-process memory sampling disabled");
+            return;
+        }
+    };
     let warn_threshold = {
-        let mut sys = System::new();
         sys.refresh_memory();
         match sys.total_memory() {
             0 => CHILD_TREE_WARN_FALLBACK_BYTES,
@@ -4956,7 +4960,6 @@ fn spawn_child_tree_sampler(
         // `/proc/<pid>/cmdline` read when it first appears), and never on a
         // burst sweep, which consumes only the aggregate.
         let publish_refresh_kind = refresh_kind.with_cmd(UpdateKind::OnlyIfNotSet);
-        let mut sys = System::new();
         let mut warned = false;
         let mut tick = tokio::time::interval(CHILD_TREE_BURST_PERIOD);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -6063,7 +6066,9 @@ fn pid_is_sitter(pid: u32, expected_parent: u32) -> bool {
         return false;
     }
     let pid = sysinfo::Pid::from_u32(pid);
-    let mut sys = System::new();
+    let Ok(mut sys) = System::new() else {
+        return false;
+    };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
@@ -12468,7 +12473,7 @@ for line in sys.stdin:
         // Refresh WITH tasks — the table shape the sampler saw before the
         // fix — so the walk itself must be what excludes the thread rows.
         let child_pid = sysinfo::Pid::from_u32(child.id());
-        let mut sys = sysinfo::System::new();
+        let mut sys = sysinfo::System::new().expect("sysinfo supports this host");
         sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
             true,
