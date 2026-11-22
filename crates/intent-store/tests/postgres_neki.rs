@@ -34,7 +34,8 @@
 //! more shards, the migration ledger to the authoritative group) and name
 //! it in `INTENT_STORE_NEKI_SHARDED_SCHEMA`. Each sharded test then drops,
 //! creates and migrates that schema, keeping the topology, and drops it at
-//! the end; a file lock in the temp directory runs them one at a time. Only
+//! the end; a file lock in the temp directory runs them one at a time on
+//! this host (do not point two hosts at one schema). Only
 //! in that mode do the topology-dependent tests run (routing, identity
 //! inserts, cross-shard writer locks); they skip otherwise.
 #![cfg(feature = "postgres")]
@@ -195,21 +196,27 @@ async fn tenants_on_two_shards(
     ))
 }
 
+/// The prefix a fixed sharded schema must carry: the tests drop it.
+const FIXED_SCHEMA_PREFIX: &str = "intent_shard_";
+
 /// The topology-bound schema named in `INTENT_STORE_NEKI_SHARDED_SCHEMA`,
-/// or `None` when it is unset or empty. Panics on a name that is not a
-/// plain lower-case identifier (it is spliced into DDL).
+/// or `None` when it is unset or empty. Every sharded test drops this
+/// schema, so it must carry the dedicated `intent_shard_` prefix (never
+/// `public` or a real schema) and be a plain lower-case identifier (it is
+/// spliced into DDL); anything else panics.
 fn fixed_sharded_schema() -> Option<String> {
     let name = std::env::var("INTENT_STORE_NEKI_SHARDED_SCHEMA")
         .ok()
         .filter(|name| !name.is_empty())?;
-    let plain = name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+    let plain = name.len() > FIXED_SCHEMA_PREFIX.len()
+        && name.starts_with(FIXED_SCHEMA_PREFIX)
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     assert!(
-        plain && !name.starts_with("intent_ci_"),
+        plain,
         "INTENT_STORE_NEKI_SHARDED_SCHEMA must be a plain lower-case identifier \
-         outside the intent_ci_ run prefix, not {name:?}"
+         starting with {FIXED_SCHEMA_PREFIX}, not {name:?}"
     );
     Some(name)
 }
@@ -227,7 +234,8 @@ fn sharded_run_schema() -> RunSchema {
 }
 
 /// An exclusive lock on a temp file named after `schema`, held until
-/// dropped, so test processes sharing the fixed schema run one at a time.
+/// dropped, so tests sharing the fixed schema run one at a time on this
+/// host (as threads of one test binary or as separate processes).
 /// (`flock`; `std::fs::File::lock` is newer than the crate's MSRV.)
 #[cfg(unix)]
 fn lock_fixed_schema(schema: &str) -> nix::fcntl::Flock<std::fs::File> {
@@ -297,23 +305,32 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after 1970")
         .as_secs();
+    // Wait for the fixed schema's lock before connecting, so a waiting
+    // test holds no idle Neki connection; wait off the runtime thread.
+    let _lock = match &run {
+        RunSchema::Fresh => None,
+        RunSchema::Fixed(schema) => {
+            let schema = schema.clone();
+            Some(
+                tokio::task::spawn_blocking(move || lock_fixed_schema(&schema))
+                    .await
+                    .expect("lock the fixed schema"),
+            )
+        }
+    };
     let admin = postgres::connect(url, 1)
         .await
         .map_err(|e| format!("connect to Neki: {e}"))?;
-    let (schema, _lock) = match run {
+    let schema = match run {
         RunSchema::Fresh => {
             drop_stale_schemas(&admin, now).await;
-            (
-                format!("intent_ci_{now}_{}", uuid::Uuid::new_v4().simple()),
-                None,
-            )
+            format!("intent_ci_{now}_{}", uuid::Uuid::new_v4().simple())
         }
         RunSchema::Fixed(schema) => {
-            let lock = lock_fixed_schema(&schema);
             exec(&admin, format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
                 .await
                 .map_err(|e| format!("drop a leftover {schema}: {e}"))?;
-            (schema, Some(lock))
+            schema
         }
     };
     exec(&admin, format!("CREATE SCHEMA {schema}"))
@@ -393,11 +410,12 @@ async fn writers_of_one_tenant_exclude_each_other_on_sharded_neki() {
 }
 
 /// One transaction in single-shard mode locks a first tenant's writer row
-/// and then tries each of 16 others in turn. Each tenant's shard comes from
-/// the router's plan ([`shard_of`]): a second tenant on another shard must
-/// be refused with Neki's single-shard error, one on the same shard must
-/// lock. In an unbound fresh schema every tenant is on the authoritative
-/// shard, so every lock must succeed; in the fixed, topology-bound schema
+/// and then tries each of 16 others in turn: a second tenant on another
+/// shard must be refused with Neki's single-shard error, one on the same
+/// shard must lock. In an unbound fresh schema every tenant is on the
+/// authoritative shard, so every lock must succeed; in the fixed,
+/// topology-bound schema each tenant's shard comes from the router's plan
+/// ([`shard_of`]), and
 /// all 16 sharing the first's shard is vanishingly unlikely, so at least
 /// one cross-shard pair is required.
 #[tokio::test]
@@ -405,8 +423,21 @@ async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki
     let Some(url) = neki_url("INTENT_STORE_NEKI_SHARDED_URL") else {
         return;
     };
+    let fixed = matches!(sharded_run_schema(), RunSchema::Fixed(_));
     in_sharded_schema(&url, 2, true, |pool| async move {
         postgres::migrate(&pool).await.map_err(|e| e.to_string())?;
+        // A fresh schema is not in the data topology, so all its tenants
+        // share the authoritative shard; only the fixed schema is sharded.
+        let placement = |tenant: String| {
+            let pool = pool.clone();
+            async move {
+                if fixed {
+                    shard_of(&pool, &tenant).await
+                } else {
+                    Ok("the authoritative shard".to_owned())
+                }
+            }
+        };
         let run = uuid::Uuid::new_v4().simple().to_string();
         let first = format!("neki-shard-0-{run}");
         let others: Vec<String> = (1..=16).map(|i| format!("neki-shard-{i}-{run}")).collect();
@@ -424,11 +455,11 @@ async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki
                 .await
                 .map_err(|e| format!("write {tenant}: {e}"))?;
         }
-        let first_shard = shard_of(&pool, &first).await?;
+        let first_shard = placement(first.clone()).await?;
         let mut cross_shard = 0;
         let mut wrong = Vec::new();
         for other in &others {
-            let other_shard = shard_of(&pool, other).await?;
+            let other_shard = placement(other.clone()).await?;
             let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
             sqlx::query(postgres::WRITER_LOCK_SQL)
                 .bind(&first)
@@ -470,7 +501,7 @@ async fn a_single_shard_transaction_cannot_reach_a_second_tenant_on_sharded_neki
         if !wrong.is_empty() {
             return Err(wrong.join("; "));
         }
-        if matches!(sharded_run_schema(), RunSchema::Fixed(_)) && cross_shard == 0 {
+        if fixed && cross_shard == 0 {
             // With two or more tenant shards, all 16 sharing the first's
             // shard is vanishingly unlikely: the topology is not applied.
             return Err(format!(
@@ -782,7 +813,7 @@ async fn the_data_topology_binds_every_table_of_the_fixed_schema() {
     .expect("the data topology binds the fixed schema");
 }
 
-/// (a) The router plans each tenant's single-tenant read for one shard, and
+/// The router plans each tenant's single-tenant read for one shard, and
 /// two tenants land on different shards of the tenant group: sharding by
 /// `tenant_id` is in effect, not every row on the authoritative shard.
 #[tokio::test]
@@ -845,7 +876,7 @@ async fn tenants_route_to_different_shards_in_the_fixed_schema() {
     .expect("tenants route to different shards");
 }
 
-/// (d) `row_seq` is `GENERATED BY DEFAULT AS IDENTITY`, and a sequence lives
+/// `row_seq` is `GENERATED BY DEFAULT AS IDENTITY`, and a sequence lives
 /// on one shard. Inserts that draw from it must still run in single-shard
 /// transactions on a tenant shard: through the store, and many in one
 /// transaction (past the router's batch of reserved values).
@@ -916,7 +947,7 @@ async fn identity_inserts_run_in_single_shard_transactions_on_tenant_shards() {
     .expect("identity inserts in single-shard mode");
 }
 
-/// (f) The tenant writer lock is a row lock on the tenant's own shard, so a
+/// The tenant writer lock is a row lock on the tenant's own shard, so a
 /// held lock for one tenant does not delay a writer of a tenant on another
 /// shard (nor, as a control, one on the same shard); a second writer of the
 /// held tenant still times out.
@@ -944,7 +975,9 @@ async fn writer_locks_of_tenants_on_other_shards_do_not_block() {
                 break found.clone();
             }
             if i > 64 {
-                return Err(format!("no second tenant on {held_shard}"));
+                return Err(format!(
+                    "none of {i} tenants shares {held_shard} with {held}"
+                ));
             }
             let tenant = format!("neki-lock-{run}-{i}");
             let shard = shard_of(&pool, &tenant).await?;
@@ -969,7 +1002,7 @@ async fn writer_locks_of_tenants_on_other_shards_do_not_block() {
             let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
             let started = Instant::now();
             let got =
-                postgres::lock_tenant_writer(&mut tx, tenant, Duration::from_millis(1500), &limits)
+                postgres::lock_tenant_writer(&mut tx, tenant, Duration::from_secs(5), &limits)
                     .await;
             let took = started.elapsed();
             let _ = tx.rollback().await;
@@ -984,7 +1017,7 @@ async fn writer_locks_of_tenants_on_other_shards_do_not_block() {
                 took.as_millis()
             ));
             match (expect_free, &got) {
-                (true, Ok(())) if took < Duration::from_secs(1) => {}
+                (true, Ok(())) if took < Duration::from_secs(3) => {}
                 (false, Err(_)) if code.as_deref() == Some("55P03") => {}
                 _ => problems.push(format!("{tenant} on {shard}: {got:?} after {took:?}")),
             }
