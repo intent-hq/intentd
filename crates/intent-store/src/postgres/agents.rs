@@ -3084,12 +3084,32 @@ impl PgStore {
     async fn commit_queue_write(
         &self,
         tx: WriteTx,
+        queue_write: tokio::sync::OwnedMutexGuard<()>,
+        write_id: String,
+        bumped: Vec<(AgentId, Option<i64>)>,
+    ) -> Result<()> {
+        // Commit and recovery run on their own task, so a caller that is
+        // cancelled meanwhile (a worker aborted at shutdown) cannot leave the
+        // recorded version ahead of the database; the task also holds the
+        // process's queue write lock until it is done.
+        let store = self.clone();
+        tokio::spawn(async move {
+            let _queue_write = queue_write;
+            store.commit_and_reconcile(tx, &write_id, &bumped).await
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("queue write commit task failed: {e}")))?
+    }
+
+    async fn commit_and_reconcile(
+        &self,
+        tx: WriteTx,
         write_id: &str,
-        bumped: &[(&AgentId, Option<i64>)],
+        bumped: &[(AgentId, Option<i64>)],
     ) -> Result<()> {
         let previous: Vec<(&AgentId, i64)> = bumped
             .iter()
-            .filter_map(|(agent, next)| next.map(|_| (*agent, self.queue_versions.seen(agent))))
+            .filter_map(|(agent, next)| next.map(|_| (agent, self.queue_versions.seen(agent))))
             .collect();
         for (agent, next) in bumped {
             if let Some(next) = next {
@@ -3175,7 +3195,7 @@ impl PgStore {
             )));
         }
         // Held through the commit and its recovery: see `QueueVersions`.
-        let _queue_write = self.queue_versions.write_lock().await;
+        let queue_write = self.queue_versions.write_lock().await;
         let write_id = uuid::Uuid::new_v4().to_string();
         let mut tx = self.begin_write().await?;
         let next = self
@@ -3188,7 +3208,7 @@ impl PgStore {
             .await
             .map_err(db)?;
         self.insert_queue_rows(&mut tx, agent_id, rows).await?;
-        self.commit_queue_write(tx, &write_id, &[(agent_id, next)])
+        self.commit_queue_write(tx, queue_write, write_id, vec![(agent_id.clone(), next)])
             .await
     }
 
@@ -3204,7 +3224,7 @@ impl PgStore {
                 row.id, row.agent_id.0, to.0
             )));
         }
-        let _queue_write = self.queue_versions.write_lock().await;
+        let queue_write = self.queue_versions.write_lock().await;
         let write_id = uuid::Uuid::new_v4().to_string();
         let mut tx = self.begin_write().await?;
         let from_next = self.bump_queue_version(&mut tx, from, &write_id).await?;
@@ -3223,11 +3243,16 @@ impl PgStore {
         self.insert_queue_rows(&mut tx, to, rows).await?;
         if from == to {
             return self
-                .commit_queue_write(tx, &write_id, &[(to, to_next)])
+                .commit_queue_write(tx, queue_write, write_id, vec![(to.clone(), to_next)])
                 .await;
         }
-        self.commit_queue_write(tx, &write_id, &[(from, from_next), (to, to_next)])
-            .await
+        self.commit_queue_write(
+            tx,
+            queue_write,
+            write_id,
+            vec![(from.clone(), from_next), (to.clone(), to_next)],
+        )
+        .await
     }
 
     pub async fn load_all_agent_queues(&self) -> Result<Vec<AgentQueueRow>> {
@@ -3965,8 +3990,8 @@ impl QueueVersions {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    async fn write_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.write_lock.lock().await
+    async fn write_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        std::sync::Arc::clone(&self.write_lock).lock_owned().await
     }
 
     fn seen(&self, agent_id: &AgentId) -> i64 {
