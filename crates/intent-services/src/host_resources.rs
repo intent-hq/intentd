@@ -19,7 +19,8 @@ const CPU_STALE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Samples the host. Not shared: [`sample_host`] holds the daemon's one.
 pub struct HostSampler {
-    system: sysinfo::System,
+    /// `None` where sysinfo does not support the platform.
+    system: Option<sysinfo::System>,
     cpu_refreshed: Option<Instant>,
     cpu_average: Option<f32>,
 }
@@ -34,7 +35,7 @@ impl HostSampler {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            system: sysinfo::System::new(),
+            system: sysinfo::System::new().ok(),
             cpu_refreshed: None,
             cpu_average: None,
         }
@@ -45,6 +46,7 @@ impl HostSampler {
     /// platform's minimum interval keeps the last CPU reading; one more
     /// than [`CPU_STALE`] after the last refresh starts over, with no CPU.
     pub fn sample(&mut self) -> Option<HostResources> {
+        let system = self.system.as_mut()?;
         let now = Instant::now();
         // A refresh long ago would average over the whole idle gap: start over.
         if self
@@ -58,17 +60,17 @@ impl HostSampler {
             .cpu_refreshed
             .is_none_or(|at| now.duration_since(at) >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         if due {
-            self.system.refresh_cpu_usage();
+            system.refresh_cpu_usage();
             if self.cpu_refreshed.is_some() {
-                self.cpu_average = Some(smooth(self.cpu_average, self.system.global_cpu_usage()));
+                self.cpu_average = Some(smooth(self.cpu_average, system.global_cpu_usage()));
             }
             self.cpu_refreshed = Some(now);
         }
-        self.system.refresh_memory();
-        let total = self.system.total_memory();
+        system.refresh_memory();
+        let total = system.total_memory();
         (total > 0).then(|| HostResources {
             cpu_percent: self.cpu_average.map(percent),
-            memory_used_bytes: self.system.used_memory().min(total),
+            memory_used_bytes: system.used_memory().min(total),
             memory_total_bytes: total,
         })
     }
