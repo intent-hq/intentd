@@ -138,7 +138,7 @@ impl PendingDeletes {
 }
 
 use intent_core::{AgentId, Error, Result, WorkspaceId};
-use intent_store::{RepositoryLifecycleKey, RepositoryPendingDeleteGuard, Store};
+use intent_store::{PendingDelete, RepositoryLifecycleKey, RepositoryPendingDeleteGuard, Store};
 use tokio::sync::{oneshot, watch};
 
 /// Original operation selectors, never permission or reconstructed row identity.
@@ -531,9 +531,22 @@ impl OwnedPendingDeletes {
                                 // record releases the claim and keeps the
                                 // row, so the next start re-arms and retries
                                 // it instead of losing it.
-                                let finished = match delete(claim).await.into() {
-                                    GraceCommit::Done => inner.store.finish_delete_grace(kind, id).await,
-                                    GraceCommit::Retry => inner.store.release_delete_grace(kind, id).await,
+                                let reported: GraceCommit = delete(claim).await.into();
+                                // A delete path can acknowledge without
+                                // deleting (it read nothing it could act on),
+                                // so check the store too: the row goes only
+                                // when the subject is gone or a durable
+                                // delete record hands it to the startup
+                                // sweep. SQLite stores no row to settle.
+                                let settled = matches!(reported, GraceCommit::Done)
+                                    && (!inner.store.persists_delete_graces()
+                                        || delete_settled(&inner.store, &timer_attempt.subject)
+                                            .await
+                                            .unwrap_or(false));
+                                let finished = if settled {
+                                    inner.store.finish_delete_grace(kind, id).await
+                                } else {
+                                    inner.store.release_delete_grace(kind, id).await
                                 };
                                 if let Err(e) = finished {
                                     // A stale claim re-arms on the next
@@ -700,6 +713,39 @@ impl From<()> for GraceCommit {
     fn from((): ()) -> Self {
         Self::Done
     }
+}
+
+/// Whether a committed delete is settled durably: its subject is gone from
+/// the store, or a `delete_purge` record (its own, or its workspace's) hands
+/// it to the startup sweep. A read error counts as unsettled.
+async fn delete_settled(store: &Store, subject: &PendingDeleteSubject) -> Result<bool> {
+    let gone = match subject {
+        PendingDeleteSubject::Workspace(id) => {
+            matches!(store.get_workspace(id).await, Err(Error::NotFound(_)))
+        }
+        PendingDeleteSubject::Agent { agent_id, .. } => matches!(
+            store.get_agent_session_summary(agent_id).await,
+            Err(Error::NotFound(_))
+        ),
+    };
+    if gone {
+        return Ok(true);
+    }
+    Ok(store
+        .pending_deletes()
+        .await?
+        .iter()
+        .any(|record| match (record, subject) {
+            (PendingDelete::Workspace(w), PendingDeleteSubject::Workspace(id)) => w == id,
+            (PendingDelete::Workspace(w), PendingDeleteSubject::Agent { workspace_id, .. }) => {
+                w == workspace_id
+            }
+            (
+                PendingDelete::Agent { agent_id: a, .. },
+                PendingDeleteSubject::Agent { agent_id, .. },
+            ) => a == agent_id,
+            (PendingDelete::Agent { .. }, PendingDeleteSubject::Workspace(_)) => false,
+        }))
 }
 
 /// A service delete's result as a [`GraceCommit`]: done when it succeeded
