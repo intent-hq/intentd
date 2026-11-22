@@ -34,7 +34,7 @@ use intent_core::remote_launch::{
     RemoteAgentRecord, RemoteCheckoutBase, RemoteLaunchNeeds, RemoteLaunchRequest,
     RemotePlacementView, RemoteSetupStatus,
 };
-use intent_core::{AgentId, BoxFuture, Error, Result, Workspace, WorkspaceId};
+use intent_core::{AgentId, BoxFuture, Error, Result, WorkspaceId};
 use intent_git::hub::AgentRef;
 use intent_git::node_git::{self, AgentRemote};
 use intent_git::ref_storage::GitStorage;
@@ -44,23 +44,13 @@ use intent_services::feature_api::{harness, Services};
 use intent_core::machines::{MachineUpdateRequired, RemoteMachineState};
 
 use crate::connector::RemoteNode;
+use crate::link::checkout::{checkout_path, checkout_pins};
 use crate::RemoteServicesExt as _;
 
 /// The remote-launch port of the feature. With no exposed machine it
 /// behaves like the unavailable port.
 #[derive(Default)]
 pub struct RemoteLaunch;
-
-/// The checkout a workspace's agents work in: its worktree, or the
-/// repository it was opened on.
-pub(crate) fn checkout_path(workspace: &Workspace) -> Option<PathBuf> {
-    workspace
-        .worktree_path
-        .as_ref()
-        .or(workspace.repository_path.as_ref())
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-}
 
 /// Point the agent's `base` ref in submodule `pin`'s repository at its
 /// pinned commit, after checking it is still that submodule of `checkout`.
@@ -119,32 +109,6 @@ async fn forge_launch(svc: &Services, workspace_id: &WorkspaceId) -> Option<Box<
         .await
         .ok()??;
     ForgeLaunch::for_github(&origin, &workspace.branch).map(Box::new)
-}
-
-/// The pins of the checkout `agent_id` works in on its machine: its own,
-/// or its checkout owner's when it shares one. Empty for an agent without
-/// pins or in a home checkout.
-pub(crate) async fn checkout_pins(
-    store: &intent_store::Store,
-    agent_id: &AgentId,
-) -> Result<Vec<SubmodulePin>> {
-    let view_of = |summary: &intent_store::AgentSessionSummary| {
-        RemotePlacementView::from_metadata(summary.metadata.as_ref())
-    };
-    let Some(view) = view_of(&store.get_agent_session_summary(agent_id).await?) else {
-        return Ok(Vec::new());
-    };
-    if view.home_checkout.is_some() {
-        return Ok(Vec::new());
-    }
-    let view = match &view.shared_checkout_of {
-        Some(owner) => match view_of(&store.get_agent_session_summary(owner).await?) {
-            Some(owner) => owner,
-            None => return Ok(Vec::new()),
-        },
-        None => view,
-    };
-    Ok(view.pins().to_vec())
 }
 
 /// The `forgeFetch` member a sub-agent of `workspace_id` would carry
@@ -442,7 +406,7 @@ async fn copy_parent_work(
     let child = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
     let pins = view.pins().to_vec();
     let checkout = checkout.to_path_buf();
-    let git = crate::git_storage(Some(svc));
+    let git = crate::git_storage(svc);
     let copied =
         blocking(move || copy_work(git.as_ref(), &checkout, &parent, &child, pins)).await?;
     let Some((head, pins)) = copied else {
@@ -769,7 +733,7 @@ pub(crate) async fn launch_linked(svc: &Services, request: RemoteLaunchRequest) 
     let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
     let commit = view.base_commit.clone();
     let submodules = view.pins().to_vec();
-    let git = crate::git_storage(Some(svc));
+    let git = crate::git_storage(svc);
     blocking(move || write_base_refs(git.as_ref(), &checkout, &remote, &commit, &submodules))
         .await?;
     svc.store()
@@ -1141,7 +1105,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             let checkout = workspace_checkout(svc, workspace_id).await?;
             let remote = AgentRemote::new(workspace_id.as_str(), owner.as_str())?;
             let pins = parent_view.pins().to_vec();
-            let git = crate::git_storage(Some(svc));
+            let git = crate::git_storage(svc);
             let (head, wip, submodules) = blocking(move || {
                 let git = git.as_ref();
                 let head = node_git::read_agent_ref(git, &checkout, &remote, AgentRef::Head)?;
@@ -1336,8 +1300,8 @@ impl RemoteLaunchPort for RemoteLaunch {
         svc: &'a Services,
         agent_id: &'a AgentId,
         query: bool,
-    ) -> BoxFuture<'a, intent_services::feature_api::feature_ports::MachineSkills> {
-        use intent_services::feature_api::feature_ports::MachineSkills;
+    ) -> BoxFuture<'a, intent_core::machine_calls::MachineSkills> {
+        use intent_core::machine_calls::MachineSkills;
         Box::pin(async move {
             let Ok(Some(record)) = svc.store().get_remote_agent(agent_id).await else {
                 return MachineSkills::Offline;
@@ -1356,9 +1320,9 @@ impl RemoteLaunchPort for RemoteLaunch {
         &'a self,
         svc: &'a Services,
         agent_id: &'a AgentId,
-        op: intent_services::feature_api::feature_ports::MachineSecretOp,
-    ) -> BoxFuture<'a, intent_services::feature_api::feature_ports::MachineSecretAnswer> {
-        use intent_services::feature_api::feature_ports::{MachineSecretAnswer, MachineSecretOp};
+        op: intent_core::machine_calls::MachineSecretOp,
+    ) -> BoxFuture<'a, intent_core::machine_calls::MachineSecretAnswer> {
+        use intent_core::machine_calls::{MachineSecretAnswer, MachineSecretOp};
         Box::pin(async move {
             let forget = match &op {
                 MachineSecretOp::Forget { name } => Some(name.clone()),

@@ -1573,8 +1573,16 @@ impl intent_node_connections::NodeInbound for Recording {
 
     fn machine_became_orchestrator(&self, _: String, _: String) {}
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn homes_enabled(&self) -> bool {
+        false
+    }
+
+    fn forge_token(&self) -> intent_core::BoxFuture<'_, Option<String>> {
+        Box::pin(async { None })
+    }
+
+    fn git_storage(&self) -> Arc<dyn intent_git::ref_storage::GitStorage> {
+        Arc::new(intent_git::ref_storage::LocalGitStorage)
     }
 }
 
@@ -3446,8 +3454,8 @@ async fn an_unsolicited_capabilities_report_replaces_the_recorded_one() {
 /// forget never wipes the newer, confirmed value.
 #[tokio::test]
 async fn a_queued_secret_forget_never_lands_after_a_newer_put() {
+    use intent_core::machine_calls::{MachineSecretAnswer, MachineSecretOp};
     use intent_core::node_link::{SecretOutcome, SecretReply, SecretValue};
-    use intent_services::feature_api::feature_ports::{MachineSecretAnswer, MachineSecretOp};
     let backend = Backend::new().await;
     let mut machine = Machine::start(&backend.id().await).await;
     backend.expose(&mut machine).await.shutdown();

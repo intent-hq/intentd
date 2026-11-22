@@ -11,7 +11,7 @@ use intent_pty::home::HomeScriptOpen;
 use intent_pty::{PtyHost, PtyId};
 use intent_services::Services;
 
-pub(crate) use crate::link::home_scripts::{HomeScripts, Stopped, LOST_DISCONNECTED};
+pub(crate) use crate::link::home_scripts::Stopped;
 use crate::terminals::home_unavailable;
 use crate::RemoteServicesExt as _;
 

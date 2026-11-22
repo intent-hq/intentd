@@ -10,9 +10,7 @@ use intent_pty::home::{HomeExec, HomeExecOpen, HomeTerminalOpen};
 use intent_pty::{PtyHost, PtyId};
 use intent_services::Services;
 
-pub(crate) use crate::link::terminals::{
-    home_moving, home_starting, home_unavailable, HomeTerminals,
-};
+pub(crate) use crate::link::terminals::{home_moving, home_starting, home_unavailable};
 use crate::RemoteServicesExt as _;
 
 /// `home-unavailable` while `home` is detached: nothing waits on a dial to

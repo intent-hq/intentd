@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use intent_core::node_link::{HomeEvents, HomeRef, HomeStopAck, JournalRecord, LinkFrame};
 use intent_core::{AgentId, BoxFuture, WorkspaceId};
+use intent_git::ref_storage::GitStorage;
 use intent_node_connections::{LinkView, NodeInbound};
 use intent_services::feature_api::Services;
 use intent_transport::node_link::IncomingRequest;
@@ -24,10 +25,6 @@ impl ServicesInbound {
             calls: HeadCalls::new(services.clone()),
             services,
         })
-    }
-
-    pub(crate) fn services(&self) -> &Services {
-        &self.services
     }
 }
 
@@ -204,7 +201,18 @@ impl NodeInbound for ServicesInbound {
         crate::methods::forget_orchestrator(self.services.clone(), machine_id, refused_token);
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn homes_enabled(&self) -> bool {
+        self.services.workspace_homes()
+    }
+
+    fn forge_token(&self) -> BoxFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let registry = self.services.settings_registry();
+            intent_services::github_backend_token(registry.as_deref()).await
+        })
+    }
+
+    fn git_storage(&self) -> Arc<dyn GitStorage> {
+        crate::git_storage(&self.services)
     }
 }

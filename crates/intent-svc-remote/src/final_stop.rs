@@ -89,7 +89,7 @@ async fn module_repos(
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    let Some(checkout) = crate::launch::checkout_path(workspace) else {
+    let Some(checkout) = crate::link::checkout::checkout_path(workspace) else {
         return Vec::new();
     };
     if pins.is_empty() {

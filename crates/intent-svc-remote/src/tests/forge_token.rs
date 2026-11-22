@@ -11,7 +11,7 @@ use intent_core::node_link::{
 use zeroize::Zeroizing;
 
 use super::*;
-use crate::forge_token::ForgeTokens;
+use crate::link::forge_token::ForgeTokens;
 
 /// Tokens resolved from `value`, as the daemon's credential would be.
 fn tokens(value: &Arc<Mutex<Option<String>>>) -> Arc<ForgeTokens> {
@@ -167,7 +167,7 @@ async fn the_watcher_follows_credential_changes_while_a_machine_is_linked() {
     let mut linked = forge.subscribe();
     // Bump the state until the watcher resolves again (its first look may
     // already have seen a bump).
-    let bump_until_changed = |rx: &tokio::sync::watch::Receiver<crate::forge_token::Held>| {
+    let bump_until_changed = |rx: &tokio::sync::watch::Receiver<crate::link::forge_token::Held>| {
         let mut rx = rx.clone();
         let generation = generation.clone();
         async move {

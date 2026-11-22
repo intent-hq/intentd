@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+use intent_core::machine_calls::{MachineSecretAnswer, MachineSecretOp, MachineSkills};
 use intent_core::machines::RemoteMachineState;
 use intent_core::node_link::{
     JournalBody, LaunchCommand, LinkFrame, LinkId, LinkOutcome, LinkRpcError, LinkWelcome,
@@ -37,10 +38,6 @@ use intent_core::remote_launch::{
 };
 use intent_core::{AgentId, Error, Result, WorkspaceId};
 use intent_node_connections::{LinkView, NodeInbound};
-use intent_services::feature_api::feature_ports::{
-    MachineSecretAnswer, MachineSecretOp, MachineSkills,
-};
-use intent_services::feature_api::Services;
 use intent_store::Store;
 use intent_transport::node_link::{
     self as link, Backoff, IncomingRequest, LinkEvent, LinkEvents, NodeEndpoint, NodeLink,
@@ -313,7 +310,9 @@ pub(crate) struct Shared {
     pub tuning: Tuning,
     pub store: Store,
     /// The head's domain: answers forwarded calls and hears the link's
-    /// changes. `None` refuses every machine request.
+    /// changes. `None` refuses every machine request, turns homes off,
+    /// hands machines no forge token and keeps refs in the workspaces' own
+    /// repositories.
     inbound: Option<Arc<dyn NodeInbound>>,
     /// Where the machine is dialed; refreshed from every welcome.
     target: Mutex<MachineTarget>,
@@ -411,7 +410,7 @@ pub(crate) struct Shared {
     one_shot_waiters: Mutex<HashMap<LinkId, oneshot::Sender<intent_core::node_link::OneShotReply>>>,
     /// `homeOpen`s and `homePush`es waiting for their reply (nodeProtocol
     /// 19).
-    pub(crate) home_waiters: Mutex<HashMap<LinkId, oneshot::Sender<crate::homes::HomeReply>>>,
+    pub(crate) home_waiters: Mutex<HashMap<LinkId, oneshot::Sender<crate::link::homes::HomeReply>>>,
     /// `homeCall`s waiting for their reply (nodeProtocol 19).
     home_call_waiters:
         Mutex<HashMap<LinkId, oneshot::Sender<intent_core::node_link::HomeCallReply>>>,
@@ -420,14 +419,14 @@ pub(crate) struct Shared {
     pub(crate) holds_homes: std::sync::atomic::AtomicBool,
     /// Detaching this machine's homes after a link loss, and their
     /// backup warnings (nodes.md "Detached workspaces").
-    pub(crate) home_link: crate::home_state::HomeLink,
+    pub(crate) home_link: crate::link::home_state::HomeLink,
     /// A worker resends this machine's pending home stops on a timer
     /// ([`crate::link::homes::ensure_stop_resends`]).
     pub(crate) home_stop_resends: std::sync::atomic::AtomicBool,
     /// Terminals on this machine's homes (nodeProtocol 19).
-    pub(crate) terminals: crate::terminals::HomeTerminals,
+    pub(crate) terminals: crate::link::terminals::HomeTerminals,
     /// The home runs of saved scripts on this machine (nodeProtocol 19).
-    pub(crate) home_scripts: crate::home_scripts::HomeScripts,
+    pub(crate) home_scripts: crate::link::home_scripts::HomeScripts,
     /// Secret forgets for a machine that was not connected (nodeProtocol
     /// 14): sent after the next bind. Memory only; a backend restart drops
     /// them, and its new `headSession` drops the values on the machine.
@@ -438,9 +437,9 @@ pub(crate) struct Shared {
     secret_locks: Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>,
     /// The backend's GitHub token, sent after every bind and on each change
     /// (nodeProtocol 15); `None` hands out none.
-    forge: Option<Arc<crate::forge_token::ForgeTokens>>,
+    forge: Option<Arc<crate::link::forge_token::ForgeTokens>>,
     /// What the current link's machine confirmed of it.
-    forge_confirmed: Mutex<crate::forge_token::Confirmed>,
+    forge_confirmed: Mutex<crate::link::forge_token::Confirmed>,
     /// Bumped on each bind and each answer to a `forgeToken`, so a launch
     /// waiting on [`Self::forge_confirmed`] looks again.
     forge_answers: watch::Sender<u64>,
@@ -457,18 +456,6 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// The backend's services, when this connector has them: for domain
-    /// code that has not moved behind [`NodeInbound`] yet (homes, home state,
-    /// git access). An inbound that is not [`crate::inbound::ServicesInbound`]
-    /// turns those paths off.
-    pub(crate) fn services(&self) -> Option<&Services> {
-        self.inbound
-            .as_ref()?
-            .as_any()
-            .downcast_ref::<crate::inbound::ServicesInbound>()
-            .map(crate::inbound::ServicesInbound::services)
-    }
-
     /// The head's domain, when this connector has it.
     pub(crate) fn inbound(&self) -> Option<&Arc<dyn NodeInbound>> {
         self.inbound.as_ref()
@@ -1842,7 +1829,7 @@ impl RemoteNode {
         target: MachineTarget,
         tuning: Tuning,
         inbound: Option<Arc<dyn NodeInbound>>,
-        forge: Option<Arc<crate::forge_token::ForgeTokens>>,
+        forge: Option<Arc<crate::link::forge_token::ForgeTokens>>,
     ) -> Result<Self> {
         let ownership = crate::lease::ownership(&store, &tuning);
         let lease = HeadLease::open(store, &target.id, ownership).await?;
@@ -1902,10 +1889,10 @@ impl RemoteNode {
             home_waiters: Mutex::new(HashMap::new()),
             home_call_waiters: Mutex::new(HashMap::new()),
             holds_homes: std::sync::atomic::AtomicBool::new(false),
-            home_link: crate::home_state::HomeLink::default(),
+            home_link: crate::link::home_state::HomeLink::default(),
             home_stop_resends: std::sync::atomic::AtomicBool::new(false),
-            terminals: crate::terminals::HomeTerminals::default(),
-            home_scripts: crate::home_scripts::HomeScripts::default(),
+            terminals: crate::link::terminals::HomeTerminals::default(),
+            home_scripts: crate::link::home_scripts::HomeScripts::default(),
             secret_waiters: Mutex::new(HashMap::new()),
             secret_forgets: Mutex::new(Vec::new()),
             secret_locks: Mutex::new(HashMap::new()),
@@ -2400,7 +2387,7 @@ impl RemoteNode {
         request_id: LinkId,
         frame: LinkFrame,
         wait: Duration,
-    ) -> Result<crate::homes::HomeReply> {
+    ) -> Result<crate::link::homes::HomeReply> {
         let (tx, rx) = oneshot::channel();
         lock(&self.shared.home_waiters).insert(request_id, tx);
         let reply = async {
@@ -2908,8 +2895,8 @@ async fn run(
                     tokio::time::timeout(FORGE_BIND_RESOLVE, forge.refresh_in_background()).await;
                 let held = changes.borrow_and_update().clone();
                 // A bind starts with nothing confirmed.
-                *lock(&shared.forge_confirmed) = crate::forge_token::Confirmed::default();
-                crate::forge_token::send(&link, &held, &shared.forge_confirmed).await;
+                *lock(&shared.forge_confirmed) = crate::link::forge_token::Confirmed::default();
+                crate::link::forge_token::send(&link, &held, &shared.forge_confirmed).await;
                 shared.forge_answers.send_modify(|n| *n = n.wrapping_add(1));
                 Some(changes)
             }
@@ -3017,9 +3004,9 @@ async fn run(
         // The machine stops this binding's scripts when its link closes.
         shared
             .home_scripts
-            .link_lost(crate::home_scripts::LOST_DISCONNECTED);
+            .link_lost(crate::link::home_scripts::LOST_DISCONNECTED);
         shared
-            .machine_runs_lost(crate::home_scripts::LOST_DISCONNECTED)
+            .machine_runs_lost(crate::link::home_scripts::LOST_DISCONNECTED)
             .await;
         match ended {
             Ended::Shutdown => return,
@@ -3040,7 +3027,7 @@ struct Served<'a> {
     lease: &'a HeadLease,
     link: &'a NodeLink,
     /// Changes of the GitHub token to send (nodeProtocol 15).
-    forge: Option<watch::Receiver<crate::forge_token::Held>>,
+    forge: Option<watch::Receiver<crate::link::forge_token::Held>>,
 }
 
 /// Ingest one link's journal, answer its requests and connect requests,
@@ -3135,7 +3122,7 @@ async fn serve(
                     }
                     LinkEvent::Frame(LinkFrame::HomeOpenReply(reply)) => {
                         if let Some(waiter) = lock(&shared.home_waiters).remove(&reply.request_id) {
-                            let _ = waiter.send(crate::homes::HomeReply::Open(reply));
+                            let _ = waiter.send(crate::link::homes::HomeReply::Open(reply));
                         }
                     }
                     LinkEvent::Frame(LinkFrame::PtyOutput(output)) => {
@@ -3169,7 +3156,7 @@ async fn serve(
                     }
                     LinkEvent::Frame(LinkFrame::HomePushReply(reply)) => {
                         if let Some(waiter) = lock(&shared.home_waiters).remove(&reply.request_id) {
-                            let _ = waiter.send(crate::homes::HomeReply::Push(reply));
+                            let _ = waiter.send(crate::link::homes::HomeReply::Push(reply));
                         }
                     }
                     LinkEvent::Frame(LinkFrame::CheckoutReadReply(reply)) => {
@@ -3230,8 +3217,8 @@ async fn serve(
                     },
                 }
             }
-            held = crate::forge_token::changed(&mut forge) => {
-                crate::forge_token::send(link, &held, &shared.forge_confirmed).await;
+            held = crate::link::forge_token::changed(&mut forge) => {
+                crate::link::forge_token::send(link, &held, &shared.forge_confirmed).await;
             }
             demand = demands.recv() => {
                 // Someone needs the link: it is up, so answer at once and

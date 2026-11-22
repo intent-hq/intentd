@@ -38,6 +38,7 @@ pub mod host_membership;
 pub mod human_author;
 pub mod ids;
 pub mod link_traffic;
+pub mod machine_calls;
 pub mod machine_order;
 pub mod machine_selection;
 pub mod machines;
