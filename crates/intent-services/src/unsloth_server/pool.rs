@@ -464,54 +464,62 @@ impl UnslothServerPool {
 
     /// Stop every daemon-started, ready server that no live agent and no
     /// start has used for `after`, as of `now`; returns their models. An
-    /// adopted, loading or starting server is never idle.
+    /// adopted, loading or starting server is never idle, and a crashed
+    /// server's entry is forgotten. Admission is taken only to stop.
     pub(crate) async fn reap_idle(
         &self,
         attached: &HashMap<String, usize>,
         now: Instant,
         after: Duration,
     ) -> Vec<String> {
+        if self.is_shutting_down() {
+            return Vec::new();
+        }
+        let expired = |entry: &Entry| {
+            entry.in_flight.load(Ordering::SeqCst) == 0
+                && entry
+                    .idle_since
+                    .is_some_and(|since| now.saturating_duration_since(since) >= after)
+        };
+        let any_expired = {
+            let mut servers = lock_ignore_poison(&self.servers);
+            servers.retain(|repo, entry| {
+                let busy = entry.in_flight.load(Ordering::SeqCst) > 0;
+                let state = entry.manager.owned_and_ready();
+                if state.is_none() && !busy {
+                    return false;
+                }
+                let unused = attached.get(repo).is_none_or(|count| *count == 0);
+                if busy || !unused || state != Some(true) {
+                    entry.idle_since = None;
+                } else {
+                    entry.idle_since.get_or_insert(now);
+                }
+                true
+            });
+            servers.values().any(expired)
+        };
+        if !any_expired {
+            return Vec::new();
+        }
+
         let _admission = self.admission.lock().await;
         if self.is_shutting_down() {
             return Vec::new();
         }
-        let entries: Vec<(String, Arc<UnslothServerManager>)> = lock_ignore_poison(&self.servers)
-            .iter()
-            .map(|(repo, entry)| (repo.clone(), entry.manager.clone()))
-            .collect();
-        let mut idle = Vec::new();
-        for (repo, manager) in entries {
-            let unused = attached.get(&repo).is_none_or(|count| *count == 0);
-            let ours_and_ready = manager
-                .status_snapshot()
-                .await
-                .is_some_and(|status| status.pid.is_some() && status.phase == "ready");
-            idle.push((repo, manager, unused && ours_and_ready));
-        }
-
-        let mut stopped = Vec::new();
-        {
+        // A join since the pass above clears `idle_since` or counts in flight.
+        let stopped: Vec<(String, Entry)> = {
             let mut servers = lock_ignore_poison(&self.servers);
-            for (repo, manager, unused) in idle {
-                let Some(entry) = servers.get_mut(&repo) else {
-                    continue;
-                };
-                // A join since the snapshot counts as use.
-                let idle_now = unused
-                    && Arc::ptr_eq(&entry.manager, &manager)
-                    && entry.in_flight.load(Ordering::SeqCst) == 0;
-                if !idle_now {
-                    entry.idle_since = None;
-                    continue;
-                }
-                let since = *entry.idle_since.get_or_insert(now);
-                if now.saturating_duration_since(since) >= after {
-                    if let Some(entry) = servers.remove(&repo) {
-                        stopped.push((repo, entry));
-                    }
-                }
-            }
-        }
+            let repos: Vec<String> = servers
+                .iter()
+                .filter(|(_, entry)| expired(entry))
+                .map(|(repo, _)| repo.clone())
+                .collect();
+            repos
+                .into_iter()
+                .filter_map(|repo| servers.remove(&repo).map(|entry| (repo, entry)))
+                .collect()
+        };
         let repos = stopped.iter().map(|(repo, _)| repo.clone()).collect();
         for (repo, _) in &stopped {
             tracing::info!(repo = %repo, "stopping idle managed unsloth server");

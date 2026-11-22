@@ -658,4 +658,60 @@ esac
             assert!(fx.pool.tracks_for_test(repo), "{repo} is kept");
         }
     }
+
+    #[tokio::test]
+    async fn an_agent_attaching_during_the_countdown_resets_it() {
+        let fx = fixture(1).await;
+        fx.pool.insert_running_for_test(A, true, true);
+        let a_in_use = HashMap::from([(A.to_string(), 1)]);
+        let t0 = Instant::now();
+
+        assert!(fx.pool.reap_idle(&none(), t0, IDLE).await.is_empty());
+        assert!(fx
+            .pool
+            .reap_idle(&a_in_use, t0 + Duration::from_secs(60), IDLE)
+            .await
+            .is_empty());
+        assert!(
+            fx.pool.reap_idle(&none(), t0 + IDLE, IDLE).await.is_empty(),
+            "the agent restarted the countdown"
+        );
+        assert_eq!(fx.pool.reap_idle(&none(), t0 + 2 * IDLE, IDLE).await, [A]);
+    }
+
+    #[tokio::test]
+    async fn the_idle_check_forgets_a_crashed_server() {
+        let fx = fixture(1).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool
+            .ensure_endpoint(A, None, &none(), &|_, _| {})
+            .await
+            .expect("A starts");
+        let pid = fx.pool.statuses().await[0].pid.expect("A has a pid");
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid.cast_signed()),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("kill A");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                while fx.pool.server_is_live_for_test(A) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await
+        .expect("A's server is gone");
+
+        assert!(fx
+            .pool
+            .reap_idle(&none(), Instant::now(), IDLE)
+            .await
+            .is_empty());
+        assert!(
+            !fx.pool.tracks_for_test(A),
+            "the crashed entry is forgotten"
+        );
+    }
 }
