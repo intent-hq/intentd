@@ -305,12 +305,16 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(db)?;
-        tx.commit().await.map_err(db)?;
+        // Record the claim before the writer slot is released: a writer of
+        // this process queued behind the claim must see it, not compare the
+        // new row with the old claim and fail `NotOwner`.
+        let slot = tx.commit_holding_slot().await.map_err(db)?;
         self.claim.set(Claim {
             instance: instance.into(),
             epoch,
             fence: TenantFence::guarding_writes(self.writer_slot.permit.clone()),
         });
+        drop(slot);
         Ok(TenantClaim::TenantOwned(TenantLease {
             instance: instance.to_owned(),
             epoch,
@@ -321,7 +325,13 @@ impl PgStore {
 
     /// See [`Store::renew_tenant_lease`](crate::Store::renew_tenant_lease).
     /// One statement on the lease row, outside the writer lock.
-    pub(crate) async fn renew_lease(&self, ttl: Duration) -> Result<OffsetDateTime> {
+    /// With `epoch`, it renews only while the current claim is that epoch's
+    /// (a heartbeat must not renew a newer claim).
+    pub(crate) async fn renew_lease(
+        &self,
+        ttl: Duration,
+        epoch: Option<i64>,
+    ) -> Result<OffsetDateTime> {
         let ttl_ms = ttl_millis(ttl)?;
         let Some(claim) = self.claim.get() else {
             return Err(Error::NotOwner(format!(
@@ -329,6 +339,9 @@ impl PgStore {
                 self.tenant()
             )));
         };
+        if let Some(epoch) = epoch.filter(|e| *e != claim.epoch) {
+            return Err(stale_claim(self.tenant(), epoch, claim.epoch));
+        }
         // A fenced claim stays fenced: its consumers are stopping.
         refuse_fenced(self.tenant(), &claim)?;
         let mut tx = self.begin().await?;
@@ -358,6 +371,40 @@ impl PgStore {
     /// See [`Store::tenant_fence`](crate::Store::tenant_fence).
     pub(crate) fn tenant_fence(&self) -> Option<TenantFence> {
         self.claim.fence()
+    }
+
+    /// The fence of the current claim if it is `epoch`'s.
+    fn fence_for_epoch(&self, epoch: i64) -> Option<TenantFence> {
+        self.claim
+            .get()
+            .filter(|c| c.epoch == epoch)
+            .map(|c| c.fence)
+    }
+}
+
+fn stale_claim(tenant: &str, epoch: i64, current: i64) -> Error {
+    Error::NotOwner(format!(
+        "tenant {tenant}: the lease at epoch {epoch} was replaced by this process's claim at \
+         epoch {current}; nothing was renewed"
+    ))
+}
+
+impl crate::Store {
+    /// Renew the claim at `epoch` only (see [`Self::renew_tenant_lease`]).
+    async fn renew_tenant_lease_at(&self, ttl: Duration, epoch: i64) -> Result<OffsetDateTime> {
+        match &self.backend {
+            crate::Backend::Postgres(store) => store.renew_lease(ttl, Some(epoch)).await,
+            crate::Backend::Sqlite(_) => Err(no_lease_on_sqlite()),
+        }
+    }
+
+    /// The fence of this process's claim at `epoch`, if that is the current
+    /// claim.
+    fn tenant_fence_at(&self, epoch: i64) -> Option<TenantFence> {
+        match &self.backend {
+            crate::Backend::Postgres(store) => store.fence_for_epoch(epoch),
+            crate::Backend::Sqlite(_) => None,
+        }
     }
 }
 
@@ -400,7 +447,7 @@ impl crate::Store {
     /// lease may still be held: retry before it expires).
     pub async fn renew_tenant_lease(&self, ttl: Duration) -> Result<OffsetDateTime> {
         match &self.backend {
-            crate::Backend::Postgres(store) => store.renew_lease(ttl).await,
+            crate::Backend::Postgres(store) => store.renew_lease(ttl, None).await,
             crate::Backend::Sqlite(_) => Err(no_lease_on_sqlite()),
         }
     }
@@ -502,10 +549,17 @@ pub enum LeaseState {
 /// [`LeaseState::Lost`] and [`Self::lost`] returns the error. A fence fired
 /// elsewhere (a write met `NotOwner`, the caller fired it) stops the
 /// heartbeat too. Dropping the heartbeat stops renewals and fires the fence:
-/// nothing keeps the lease past its TTL any more.
+/// nothing keeps the lease past its TTL any more. [`Self::stop`] stops
+/// renewals without firing it, for a shutdown that stops writing on its own.
+///
+/// The heartbeat belongs to its lease's epoch: it renews only while the
+/// process's current claim is that epoch's, fires only that claim's fence,
+/// and stops (`NotOwner`) once a newer claim replaces it.
 pub struct LeaseHeartbeat {
     state: watch::Receiver<LeaseState>,
     fence: TenantFence,
+    /// Fire the fence on drop (everything but [`Self::stop`]).
+    fire_on_drop: bool,
     /// Kept for the heartbeat's whole life (never moved out), so dropping
     /// the heartbeat always aborts it, even after a cancelled `lost()`.
     task: tokio::task::JoinHandle<Error>,
@@ -533,9 +587,11 @@ impl LeaseHeartbeat {
     /// no renewal succeeded by the lease's local deadline minus `margin`.
     /// The margin is capped at half the TTL.
     ///
-    /// It fires `store`'s current claim's fence
-    /// ([`Store::tenant_fence`](crate::Store::tenant_fence)); a store that
-    /// never claimed gets a fence of its own, fired at the first renewal.
+    /// It fires the fence of `store`'s claim at `lease.epoch`
+    /// ([`Store::tenant_fence`](crate::Store::tenant_fence)). When that is
+    /// not the current claim (never claimed, or since replaced), the
+    /// heartbeat gets a fence of its own and stops at once with `NotOwner`,
+    /// leaving any newer claim alone.
     #[must_use]
     pub fn spawn_with_margin(
         store: crate::Store,
@@ -547,16 +603,24 @@ impl LeaseHeartbeat {
         let (tx, rx) = watch::channel(LeaseState::Held {
             expires_at: lease.expires_at,
         });
-        let fence = store.tenant_fence().unwrap_or_default();
+        let fence = store.tenant_fence_at(lease.epoch).unwrap_or_default();
         let timing = Timing {
             ttl,
             interval,
             margin: margin.min(ttl / 2),
         };
-        let task = tokio::spawn(heartbeat(store, timing, lease.renew_by, fence.clone(), tx));
+        let task = tokio::spawn(heartbeat(
+            store,
+            timing,
+            lease.epoch,
+            lease.renew_by,
+            fence.clone(),
+            tx,
+        ));
         Self {
             state: rx,
             fence,
+            fire_on_drop: true,
             task,
             reported: false,
         }
@@ -587,11 +651,22 @@ impl LeaseHeartbeat {
     }
 }
 
+impl LeaseHeartbeat {
+    /// Stop renewing without firing the fence: for a shutdown that stops
+    /// the tenant's work and writes on its own. The lease then lapses after
+    /// its TTL (a clean release is a separate step).
+    pub fn stop(mut self) {
+        self.fire_on_drop = false;
+    }
+}
+
 impl Drop for LeaseHeartbeat {
     fn drop(&mut self) {
         self.task.abort();
-        self.fence
-            .fire("the lease heartbeat stopped, so nothing renews the tenant lease");
+        if self.fire_on_drop {
+            self.fence
+                .fire("the lease heartbeat stopped, so nothing renews the tenant lease");
+        }
     }
 }
 
@@ -612,6 +687,7 @@ impl Timing {
 async fn heartbeat(
     store: crate::Store,
     timing: Timing,
+    epoch: i64,
     renew_by: Instant,
     fence: TenantFence,
     state: watch::Sender<LeaseState>,
@@ -629,7 +705,14 @@ async fn heartbeat(
     };
     let mut deadline = timing.renew_deadline(renew_by);
     loop {
-        let wake = (Instant::now() + timing.interval).min(deadline);
+        // Renew every interval, but never sleep through the deadline: with
+        // less than an interval left, try at half the time left, so a
+        // renewal is always attempted (and retried) before the fence fires.
+        let now = Instant::now();
+        let wake = now
+            + timing
+                .interval
+                .min(deadline.saturating_duration_since(now) / 2);
         tokio::select! {
             () = tokio::time::sleep_until(wake.into()) => {}
             () = fence.fenced() => return lose(fenced_elsewhere(&fence)),
@@ -640,7 +723,7 @@ async fn heartbeat(
         }
         let left = deadline.saturating_duration_since(started);
         let renewed = tokio::select! {
-            renewed = tokio::time::timeout(left, store.renew_tenant_lease(timing.ttl)) => {
+            renewed = tokio::time::timeout(left, store.renew_tenant_lease_at(timing.ttl, epoch)) => {
                 renewed.unwrap_or_else(|_| Err(Error::Internal(format!(
                     "lease renewal took longer than the {} ms left before the renew deadline",
                     left.as_millis()

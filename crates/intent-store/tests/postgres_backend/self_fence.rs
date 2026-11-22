@@ -19,7 +19,7 @@ use intent_store::{Error, NewEvent, Store, TenantFence};
 use intentd_test_support::test_timeout;
 use serde_json::json;
 
-use super::harness::{sqlite_store, test_db};
+use super::harness::{hold_writer_lock, sqlite_store, test_db, writer_lock_waiters};
 
 const LONG_TTL: Duration = Duration::from_secs(60);
 
@@ -93,10 +93,12 @@ async fn wait_fenced(fence: &TenantFence) {
         .expect("the fence fires");
 }
 
-/// Whether the tenant's lease is still live by the database clock.
-async fn lease_live(admin: &PgPool, tenant: &str) -> bool {
+/// How long the tenant's lease has left by the database clock, in ms
+/// (negative once expired).
+async fn lease_left_ms(admin: &PgPool, tenant: &str) -> i64 {
     sqlx::query_scalar(
-        "SELECT expires_at > clock_timestamp() FROM tenant_lease WHERE tenant_id = $1",
+        "SELECT (extract(epoch FROM expires_at - clock_timestamp()) * 1000)::bigint \
+         FROM tenant_lease WHERE tenant_id = $1",
     )
     .bind(tenant)
     .fetch_one(admin)
@@ -143,8 +145,8 @@ async fn blocked_renewals_fence_the_tenant_before_its_lease_expires() {
         let admin = db.admin.clone();
         let closed = closed_tx.clone();
         let close = move || async move {
-            let live = lease_live(&admin, tenant).await;
-            closed.send((what, live)).unwrap();
+            let left = lease_left_ms(&admin, tenant).await;
+            closed.send((what, left)).unwrap();
         };
         if what == "client connections" {
             runner.on_client_connections(close);
@@ -196,13 +198,20 @@ async fn blocked_renewals_fence_the_tenant_before_its_lease_expires() {
     while let Some(c) = closed_rx.recv().await {
         closed.push(c);
     }
-    assert_eq!(
-        closed,
-        [("client connections", true), ("machine links", true)],
-        "fenced after {fenced_after:?}; each close must run while the lease is live"
-    );
+    // The fence fires `margin` before the local deadline, so each close runs
+    // with well over half the margin left on the lease; a fence that fired
+    // only at the deadline (no margin) would leave next to nothing.
+    let names: Vec<&str> = closed.iter().map(|(what, _)| *what).collect();
+    assert_eq!(names, ["client connections", "machine links"]);
+    let half_margin = i64::try_from(margin.as_millis() / 2).unwrap();
+    for (what, left) in &closed {
+        assert!(
+            *left > half_margin,
+            "fenced after {fenced_after:?}; {what} closed with only {left} ms left on the lease"
+        );
+    }
     assert!(
-        lease_live(&db.admin, tenant).await,
+        lease_left_ms(&db.admin, tenant).await > 0,
         "the lease is still live once stopped"
     );
     assert!(cancelled.is_finished(), "the tenant's tasks are cancelled");
@@ -377,4 +386,146 @@ async fn only_a_claimed_store_has_a_fence() {
     .await
     .unwrap();
     assert!(unclaimed.tenant_fence().is_none());
+}
+
+/// Wait until `n` sessions wait for a `tenant_writer` row lock.
+async fn wait_for_lock_waiters(admin: &PgPool, n: usize) {
+    tokio::time::timeout(test_timeout(Duration::from_secs(30)), async {
+        while writer_lock_waiters(admin).await.len() < n {
+            // timing-guard: poll interval while waiting for the writer to queue on the row lock
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{n} writers wait for the writer lock"));
+}
+
+/// A write that passed the entry check and queued for the row lock before
+/// the fence fired is refused under the lock, and `settled()` waits for it
+/// to end: it holds the writer slot.
+#[tokio::test]
+async fn a_write_queued_before_the_fire_is_refused_and_settled_waits_for_it() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "fence-queued";
+    let (store, _lease) = open_owned(&db.app, tenant, "proc-a", LONG_TTL).await;
+    let fence = store.tenant_fence().expect("claimed");
+    let holder = hold_writer_lock(&db.admin, tenant).await;
+    let write = tokio::spawn({
+        let store = store.clone();
+        async move { store.insert_event(&event(0)).await }
+    });
+    wait_for_lock_waiters(&db.admin, 1).await;
+    assert!(fence.fire("test: lost"));
+    let settled = tokio::spawn({
+        let fence = fence.clone();
+        async move { fence.settled().await }
+    });
+    // timing-guard: give settled() a chance to (wrongly) return while the queued write holds the slot
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !settled.is_finished(),
+        "the queued write holds the writer slot"
+    );
+    holder.rollback().await.unwrap();
+    let message = assert_not_owner(
+        tokio::time::timeout(test_timeout(Duration::from_secs(30)), write)
+            .await
+            .expect("the write ends")
+            .unwrap(),
+        "a write queued before the fire",
+    );
+    assert!(message.contains("fenced itself"), "{message}");
+    tokio::time::timeout(test_timeout(Duration::from_secs(30)), settled)
+        .await
+        .expect("settles once the write ends")
+        .unwrap();
+    assert_eq!(event_rows(&db.admin, tenant).await, 0);
+}
+
+/// A renew interval longer than the time left before the renew deadline
+/// still renews before the deadline: the heartbeat never fences a healthy
+/// lease without trying to renew it.
+#[tokio::test]
+async fn the_heartbeat_renews_before_a_deadline_closer_than_its_interval() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let ttl = Duration::from_secs(3);
+    let (store, lease) = open_owned(&db.app, "fence-short-deadline", "proc-a", ttl).await;
+    let heartbeat = LeaseHeartbeat::spawn_with_margin(
+        store,
+        &lease,
+        ttl,
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+    );
+    let fence = heartbeat.fence();
+    // timing-guard: outlive two TTLs; with no renewal the fence would fire within one
+    tokio::time::sleep(ttl * 2).await;
+    assert!(!fence.is_fenced(), "{:?}", fence.reason());
+    let state = heartbeat.state().borrow().clone();
+    match state {
+        intent_store::postgres::LeaseState::Held { expires_at } => {
+            assert!(expires_at > lease.expires_at, "it renewed");
+        }
+        lost @ intent_store::postgres::LeaseState::Lost(_) => {
+            panic!("expected a held lease, got {lost:?}")
+        }
+    }
+}
+
+/// A heartbeat started for a lease the process has since replaced with a
+/// newer claim stops at once and never fences the newer claim.
+#[tokio::test]
+async fn a_heartbeat_for_a_stale_lease_leaves_the_new_claim_alone() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let ttl = Duration::from_millis(500);
+    let (store, stale) = open_owned(&db.app, "fence-stale", "proc-a", ttl).await;
+    // timing-guard: let the short lease lapse by the database clock
+    tokio::time::sleep(ttl * 2).await;
+    let claim = store.claim_tenant("proc-a", LONG_TTL).await.unwrap();
+    assert!(matches!(
+        claim,
+        intent_store::postgres::TenantClaim::TenantOwned(_)
+    ));
+    let current = store.tenant_fence().expect("claimed again");
+    let mut heartbeat =
+        LeaseHeartbeat::spawn(store.clone(), &stale, LONG_TTL, Duration::from_millis(50));
+    assert!(!heartbeat.fence().same_as(&current));
+    let lost = tokio::time::timeout(test_timeout(Duration::from_secs(30)), heartbeat.lost())
+        .await
+        .expect("the stale heartbeat stops");
+    assert!(matches!(lost, Error::NotOwner(_)), "{lost:?}");
+    drop(heartbeat);
+    assert!(!current.is_fenced(), "{:?}", current.reason());
+    store.insert_event(&event(0)).await.unwrap();
+}
+
+/// `stop()` ends renewals without firing the fence (a clean shutdown that
+/// stops writing on its own); dropping the heartbeat fires it.
+#[tokio::test]
+async fn stopping_the_heartbeat_does_not_fire_the_fence() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let (store, lease) = open_owned(&db.app, "fence-stop", "proc-a", LONG_TTL).await;
+    let heartbeat = LeaseHeartbeat::spawn(store.clone(), &lease, LONG_TTL, Duration::from_secs(10));
+    let fence = heartbeat.fence();
+    heartbeat.stop();
+    assert!(!fence.is_fenced(), "{:?}", fence.reason());
+    store.insert_event(&event(0)).await.unwrap();
+}
+
+/// The self-fence's budgeted steps fit inside the lease's fence margin, so
+/// a stop that keeps to its budget ends before the lease can expire.
+#[test]
+fn the_self_fence_budget_fits_inside_the_fence_margin() {
+    use intent_core::tenant_fence::{SELF_FENCE_BUDGETED_STEPS, SELF_FENCE_STEP_BUDGET};
+    use intent_store::postgres::{LEASE_FENCE_MARGIN, LEASE_TTL};
+    assert!(SELF_FENCE_STEP_BUDGET * SELF_FENCE_BUDGETED_STEPS < LEASE_FENCE_MARGIN);
+    assert_eq!(LEASE_FENCE_MARGIN, LEASE_TTL / 6, "spawn's default margin");
 }

@@ -805,6 +805,19 @@ impl WriteTx {
         self.tx.commit().await
     }
 
+    /// Commit, keeping the writer slot: the caller finishes what must happen
+    /// before the next writer of this process runs (a claim records itself),
+    /// then drops the permit.
+    pub(crate) async fn commit_holding_slot(
+        self,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, sqlx::Error> {
+        let Self {
+            tx, _slot: slot, ..
+        } = self;
+        tx.commit().await?;
+        Ok(slot)
+    }
+
     pub(crate) async fn rollback(self) -> std::result::Result<(), sqlx::Error> {
         self.tx.rollback().await
     }

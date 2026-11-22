@@ -1,6 +1,8 @@
 //! The services side of a tenant's self-fence (see
-//! [`intent_core::tenant_fence`]): stop the tenant's MCP servers and drop
-//! its [`Services`] when its fence fires.
+//! [`intent_core::tenant_fence`]): stop the tenant's MCP servers and release
+//! the runner's [`Services`] handle when its fence fires. Other clones of
+//! the `Services` live on with their owners (listeners, loops), which the
+//! composition stops through the runner's other steps.
 //!
 //! [`tenant_self_fence`] is the library constructor the per-tenant
 //! composition calls. It returns the runner with those two consumers
@@ -16,7 +18,8 @@ use crate::Services;
 
 /// The self-fence of the tenant `services` serves: on the store's current
 /// claim's fence, it stops the services' MCP servers (background starts and
-/// health ticks first, then every running server) and drops `services`.
+/// health ticks first, then every running server) and drops this handle
+/// to `services`; the runner keeps it alive until then.
 /// `None` when the store has no fence (`SQLite`, or a Postgres store whose
 /// process never claimed the tenant).
 #[must_use]

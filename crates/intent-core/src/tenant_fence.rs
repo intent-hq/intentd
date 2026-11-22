@@ -162,7 +162,8 @@ pub enum FenceStep {
     Tasks,
     /// The tenant's MCP servers are stopped.
     McpServers,
-    /// The tenant's `Services` (and anything else owned) are dropped.
+    /// The runner's handles on the tenant's `Services` (and anything else
+    /// owned) are dropped.
     Services,
     /// No write that passed the fence is still open
     /// ([`TenantFence::settled`]).
@@ -179,7 +180,10 @@ pub struct SelfFenceReport {
     /// Each step and when it finished, in order.
     pub steps: Vec<(FenceStep, Instant)>,
     /// Steps that ran past [`SelfFence::with_step_budget`]: the runner moved
-    /// on, leaving them to finish (or not) in the background.
+    /// on, leaving them to finish (or not) in the background. Their work
+    /// may still run after the lease expires, so the composition must treat
+    /// a non-empty list as fatal for the tenant (stop the process when it
+    /// cannot stop the work).
     pub overran: Vec<FenceStep>,
 }
 
@@ -188,8 +192,14 @@ pub type StopFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type Stop = Box<dyn FnOnce() -> StopFuture + Send>;
 
 /// The default time each [`SelfFence`] step may take before the runner
-/// moves on: the whole stop must fit well inside the lease's fence margin.
+/// moves on. The budgeted steps together must fit inside the lease's fence
+/// margin (`intent_store::postgres::LEASE_FENCE_MARGIN`, 5 s); a store test
+/// checks it.
 pub const SELF_FENCE_STEP_BUDGET: Duration = Duration::from_secs(1);
+
+/// How many [`SelfFence`] steps are budgeted (all but dropping and
+/// settling).
+pub const SELF_FENCE_BUDGETED_STEPS: u32 = 4;
 
 /// Owns what serves one tenant in this process and stops it when the
 /// tenant's fence fires (see the module docs for the order). Build it with
@@ -199,6 +209,7 @@ pub struct SelfFence {
     connections: Vec<Stop>,
     links: Vec<Stop>,
     tasks: Vec<JoinHandle<()>>,
+    task_stops: Vec<Stop>,
     mcp: Vec<Stop>,
     owned: Vec<Box<dyn Any + Send>>,
     step_budget: Duration,
@@ -213,6 +224,7 @@ impl SelfFence {
             connections: Vec::new(),
             links: Vec::new(),
             tasks: Vec::new(),
+            task_stops: Vec::new(),
             mcp: Vec::new(),
             owned: Vec::new(),
             step_budget: SELF_FENCE_STEP_BUDGET,
@@ -257,13 +269,26 @@ impl SelfFence {
     }
 
     /// Cancel (abort and join) `task`, one of the tenant's `startup_work` or
-    /// orchestration tasks, on the fence.
+    /// orchestration tasks, on the fence. Aborting a handle does not reach
+    /// tasks it spawned (agent turns, subprocesses): register their owner's
+    /// stop with [`Self::on_tasks`].
     pub fn adopt_task(&mut self, task: JoinHandle<()>) {
         self.tasks.push(task);
     }
 
+    /// Stop work the adopted handles do not own (the agent manager's turns
+    /// and child processes, PTYs) with `stop` on the fence, in the tasks
+    /// step, after the adopted handles are cancelled.
+    pub fn on_tasks<F>(&mut self, stop: impl FnOnce() -> F + Send + 'static)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.task_stops.push(boxed(stop));
+    }
+
     /// Own `value` (the tenant's `Services`, its store handles) until the
-    /// fence, then drop it.
+    /// fence, then drop it. This releases the runner's handle only: work
+    /// holding other clones must be stopped by the steps above.
     pub fn own<T: Send + 'static>(&mut self, value: T) {
         self.owned.push(Box::new(value));
     }
@@ -290,6 +315,7 @@ impl SelfFence {
             connections,
             links,
             tasks,
+            task_stops,
             mcp,
             owned,
             step_budget,
@@ -309,7 +335,10 @@ impl SelfFence {
             .step(FenceStep::MachineLinks, budget, run_all(links))
             .await;
         report
-            .step(FenceStep::Tasks, budget, cancel_all(tasks))
+            .step(FenceStep::Tasks, budget, async move {
+                cancel_all(tasks).await;
+                run_all(task_stops).await;
+            })
             .await;
         report
             .step(FenceStep::McpServers, budget, run_all(mcp))
@@ -465,6 +494,8 @@ mod tests {
         runner.on_machine_links(move || async move { l.push("links") });
         let l = log.clone();
         runner.on_mcp_servers(move || async move { l.push("mcp") });
+        let l = log.clone();
+        runner.on_tasks(move || async move { l.push("agents") });
         let task = tokio::spawn(std::future::pending::<()>());
         let aborted = task.abort_handle();
         runner.adopt_task(task);
@@ -483,7 +514,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(report.reason, "lease lost");
-        assert_eq!(log.get(), ["connections", "links", "mcp"]);
+        assert_eq!(log.get(), ["connections", "links", "agents", "mcp"]);
         assert!(aborted.is_finished(), "the tenant's task was cancelled");
         assert!(
             dropped.load(Ordering::SeqCst),

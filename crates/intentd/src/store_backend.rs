@@ -34,10 +34,12 @@
 //! (`LEASE_TTL`, `LEASE_RENEW_INTERVAL`) and fires the claim's
 //! `intent_core::tenant_fence::TenantFence` once it cannot renew by the
 //! expiry minus `LEASE_FENCE_MARGIN`; any `NotOwner` write fires it too, and
-//! a fired fence refuses every later write. Per-tenant composition builds
-//! the tenant's `SelfFence` (`intent_services::self_fence::tenant_self_fence`,
-//! then its client connections, machine links and tasks) so the tenant's
-//! work stops on the fence.
+//! a fired fence refuses every later write. Nothing in this binary
+//! starts the heartbeat or a `SelfFence` yet: per-tenant composition (a
+//! later step) will spawn `LeaseHeartbeat`, build the tenant's `SelfFence`
+//! (`intent_services::self_fence::tenant_self_fence`, then its client
+//! connections, machine links and tasks) and spawn it, so the tenant's work
+//! stops on the fence.
 //!
 //! A set but empty, blank or non-UTF-8 URL is an error, never "unset": a
 //! daemon meant for Postgres must not quietly open the `SQLite` store.
