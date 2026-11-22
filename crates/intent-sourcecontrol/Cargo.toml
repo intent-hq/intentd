@@ -1,6 +1,6 @@
 [package]
 name = "intent-sourcecontrol"
-version = "0.11.268"
+version = "0.11.269"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true

@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.269] - 2026-11-22
+
+### 🚀 Features
+
+- *(unsloth)* Stop managed servers no agent has used for 15 minutes ([#3629](https://github.com/intent-hq/intentd/pull/3629))
+- *(input)* Add composer autocomplete via input.autocomplete ([#3617](https://github.com/intent-hq/intentd/pull/3617))
+- *(store)* Fenced tenant lease for Postgres orchestrators ([#3636](https://github.com/intent-hq/intentd/pull/3636))
+
+### 🐛 Bug Fixes
+
+- *(push-relay)* End running on any notice, not only done ([#3584](https://github.com/intent-hq/intentd/pull/3584))
+- *(unsloth)* Size catalog models by their real parameter count ([#3637](https://github.com/intent-hq/intentd/pull/3637))
+- *(store)* Make every Postgres note write a compare-and-swap on rev ([#3646](https://github.com/intent-hq/intentd/pull/3646))
+- *(remote)* Keep a new sandbox's starting tunnel; show the relay reason on resume ([#3632](https://github.com/intent-hq/intentd/pull/3632))
+- *(remote)* Probe a self-hosted relay over HTTP; one resume per refused relay ([#3635](https://github.com/intent-hq/intentd/pull/3635))
+- *(antigravity)* Seed file-backed auth into isolated probe gemini-dir ([#3643](https://github.com/intent-hq/intentd/pull/3643))
+
+### 🔧 Refactor
+
+- *(remote)* Route connector callbacks through NodeInbound ([#3627](https://github.com/intent-hq/intentd/pull/3627))
+- *(remote)* Move journal ingest and the ack cursor into intent-node-connections ([#3639](https://github.com/intent-hq/intentd/pull/3639))
+- *(remote)* Put head-side agent and home refs behind GitStorage ([#3644](https://github.com/intent-hq/intentd/pull/3644))
+
+### 📚 Documentation
+
+- *(guide)* Onboarding enables OpenCode as a free backup ([#3630](https://github.com/intent-hq/intentd/pull/3630))
+- *(guide)* Describe Settings → Hosts, runners and Switch to ([#3631](https://github.com/intent-hq/intentd/pull/3631))
+- *(guide)* Describe Suggest as you type autocomplete ([#3618](https://github.com/intent-hq/intentd/pull/3618))
+
+### 🧪 Testing
+
+- *(store)* Run the Neki sharded suite in a topology-bound schema ([#3641](https://github.com/intent-hq/intentd/pull/3641))
+- *(goldens)* Refresh doctrine rows with INTENTD_UPDATE_GOLDENS=1 ([#3628](https://github.com/intent-hq/intentd/pull/3628))
+
+
 ## [0.11.268] - 2026-11-22
 
 ### 🚀 Features
