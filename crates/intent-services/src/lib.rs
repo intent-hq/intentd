@@ -145,6 +145,7 @@ pub mod host_exec;
 pub mod host_exec_stream;
 mod installed_cli;
 mod pending_delete_sweep;
+pub mod self_fence;
 mod workspace_mutations;
 
 mod github_ops;

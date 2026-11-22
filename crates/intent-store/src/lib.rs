@@ -130,6 +130,7 @@ pub use note_write_lock::NoteWriteLock;
 mod orchestrator_only;
 pub use orchestrator_only::OrchestratorOnly;
 mod pr_monitor_repo;
+pub use intent_core::tenant_fence::TenantFence;
 mod presence_focus_repo;
 mod principal_repo;
 mod repository_authority_repo;
@@ -489,6 +490,20 @@ impl Store {
     fn from_sqlite(store: SqliteStore) -> Self {
         Self {
             backend: Backend::Sqlite(store),
+        }
+    }
+}
+
+impl Store {
+    /// The fence of this process's current claim on the store's tenant:
+    /// `None` on `SQLite` (no lease) and on a Postgres store whose process
+    /// never claimed the tenant. See [`TenantFence`].
+    #[must_use]
+    pub fn tenant_fence(&self) -> Option<TenantFence> {
+        match &self.backend {
+            Backend::Sqlite(_) => None,
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(store) => store.tenant_fence(),
         }
     }
 }

@@ -75,6 +75,7 @@ pub mod server_control;
 pub mod settings_file;
 pub mod slug;
 pub mod startup;
+pub mod tenant_fence;
 pub mod test_isolation;
 pub mod text_field_page;
 pub mod tilde;

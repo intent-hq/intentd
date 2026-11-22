@@ -78,6 +78,8 @@ mod schema_gate;
 mod script_monitors;
 #[path = "postgres_backend/scripts.rs"]
 mod scripts;
+#[path = "postgres_backend/self_fence.rs"]
+mod self_fence;
 #[path = "postgres_backend/settings.rs"]
 mod settings;
 #[path = "postgres_backend/tenant_lease.rs"]
