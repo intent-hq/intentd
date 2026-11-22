@@ -238,11 +238,11 @@ async fn a_placed_initial_agent_starts_on_the_chosen_machine() {
     assert_eq!(
         remote.needs.lock().unwrap().clone(),
         [RemoteLaunchNeeds {
-            provider: "auggie".into(),
+            provider: "opencode".into(),
             model: Some("sonnet4.5".into()),
             with_profile: false,
             sets_profile_env: false,
-            provider_ref: "auggie".into(),
+            provider_ref: "opencode".into(),
             inherited: false,
             machine_sign_in: false,
             profile_fallback: false,

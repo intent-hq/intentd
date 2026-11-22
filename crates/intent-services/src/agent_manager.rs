@@ -3270,20 +3270,15 @@ fn spawn_unsloth_status_publisher(
     status_tx
 }
 
-/// The overlay a local agent launch of `provider_id` runs a resolved profile
-/// with: an API key profile of a base with an API key home (Codex, Grok,
+/// The overlay a local agent launch runs a resolved profile with (keyed by
+/// the profile's own base, so a mock standing in for a provider is fine): an API key profile of a base with an API key home (Codex, Grok,
 /// Cursor) runs in its own home under `home`. The machine-side counterpart
 /// is the node runner's `node_profile`; the parity test in `intentd`'s
 /// executor runner tests keeps the two in step.
 pub(crate) fn local_launch_profile(
-    provider_id: &str,
     profile: &intent_acp::ProfileEnv,
     home: Option<&Path>,
 ) -> Arc<intent_acp::ProfileEnv> {
-    debug_assert_eq!(
-        intent_providers::base_provider_id(profile.provider_ref()),
-        intent_providers::base_provider_id(provider_id),
-    );
     Arc::new(profile.clone().with_api_key_home(home))
 }
 
@@ -12537,7 +12532,7 @@ impl AgentManager {
         // over it.
         let profile_env = profile_env.map(|profile| {
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-            local_launch_profile(resolved.provider.id, &profile, home.as_deref())
+            local_launch_profile(&profile, home.as_deref())
         });
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.profile_env = profile_env.as_deref();
