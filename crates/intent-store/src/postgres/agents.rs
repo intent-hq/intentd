@@ -3212,7 +3212,8 @@ impl PgStore {
     }
 
     pub async fn load_all_agent_queues(&self) -> Result<Vec<AgentQueueRow>> {
-        let mut tx = self.begin().await?;
+        // One snapshot: the versions adopted must be those of the rows read.
+        let mut tx = self.begin_read_snapshot().await?;
         let rows = sqlx::query(
             "SELECT q.id, q.agent_id COLLATE \"C\" AS agent_id, q.position, q.payload, q.created_at, \
                     COALESCE(q.turn_id, q.id) AS turn_id \
