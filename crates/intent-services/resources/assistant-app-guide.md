@@ -704,7 +704,8 @@ agents on: other hosts allowed to, runner-only installs (formerly nodes) and clo
 The machine rail becomes the host rail. A host row has a **Switch to** button instead of the
 **Connect** action (the host on screen shows **Current**; runner-only rows have neither): it
 adds the host to the window's host rail when the rail is on, shows it, and opens its
-**Settings → Hosts**. An orchestrator's row shows a hub icon after its name (tooltip **Host
+**Settings → Hosts**. This computer's row reads **This computer**, and the host on screen
+shows its plain name (no **(connected backend)**). An orchestrator's row shows a hub icon after its name (tooltip **Host
 only: sends agents to runners**) instead of a subtitle. A saved host stays under Hosts even
 when it also runs agents for the current host. **Set up a new machine** becomes **Set up a
 host or runner**, with **Install a host** and **Install a runner**.
