@@ -28,10 +28,11 @@
 //!   [`intent_providers::parse_grok_models_command_output`] (auth markers +
 //!   JSON payload + text rows; the exit code is never trusted).
 //! - `unsloth` — HTTP fetch of the Hugging Face `unsloth` org's GGUF repos
-//!   (`https://huggingface.co/api/models?author=unsloth&filter=gguf`), one
-//!   wire row per repo (never per-quant), filtered to repos estimated to fit
-//!   within ~70% of total system RAM (a parsed parameter count × a
-//!   Q4-class bytes/param estimate). See [`parse::build_unsloth_rows`].
+//!   ([`UNSLOTH_HF_API_URL`]), one wire row per repo (never per-quant),
+//!   limited to repos that output text and are estimated to fit within ~70%
+//!   of total system RAM (the larger of the GGUF parameter count and the
+//!   size in the repo name, × a Q4-class bytes/param estimate). See
+//!   [`parse::build_unsloth_rows`].
 //!
 //! auggie (existing CLI path in `agent_ops`) and cortex (open-gate empty
 //! list — the provider CLI owns model selection) are deliberately NOT
@@ -63,11 +64,16 @@ const GROK_CLI_TIMEOUT: Duration = Duration::from_secs(10);
 const UNSLOTH_HF_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Hugging Face `models` list API, scoped to the `unsloth` org's GGUF repos.
-/// `limit=1000` covers the org's full catalog (~350 repos as of 2026-07) in
+/// `limit=1000` covers the org's full catalog (~400 repos as of 2026-11) in
 /// one request — HF's default page size (~50) would otherwise require
-/// pagination we don't need.
-const UNSLOTH_HF_API_URL: &str =
-    "https://huggingface.co/api/models?author=unsloth&filter=gguf&limit=1000";
+/// pagination we don't need. With any `expand[]` HF returns only the
+/// expanded fields, so every field the parser reads is listed; `gguf`
+/// carries the real parameter count (`gguf.total`).
+const UNSLOTH_HF_API_URL: &str = concat!(
+    "https://huggingface.co/api/models?author=unsloth&filter=gguf&limit=1000",
+    "&expand%5B%5D=downloads&expand%5B%5D=trendingScore&expand%5B%5D=private",
+    "&expand%5B%5D=pipeline_tag&expand%5B%5D=gguf",
+);
 
 /// Result of a provider model-catalog fetch.
 ///

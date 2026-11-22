@@ -656,11 +656,44 @@ pub(super) struct HfRepo {
     pub id: String,
     pub downloads: u64,
     pub trending_score: f64,
+    /// Total parameter count (in billions) from the repo's GGUF metadata
+    /// (`gguf.total`), when Hugging Face reports a positive one.
+    pub gguf_params_billion: Option<f64>,
+    /// `pipeline_tag`, when the repo declares one.
+    pub pipeline_tag: Option<String>,
 }
 
-/// Parse the raw JSON array returned by
-/// `https://huggingface.co/api/models?author=unsloth&filter=gguf&limit=1000`
-/// into [`HfRepo`] rows. Private repos are dropped (the API should never
+impl HfRepo {
+    /// Total parameters in billions: the larger of the GGUF metadata count
+    /// and the size token in the repo name. HF samples one GGUF file per
+    /// repo, which can be a small draft or projector file rather than the
+    /// main model, so the metadata alone can understate the size.
+    fn params_billion(&self) -> Option<f64> {
+        match (
+            self.gguf_params_billion,
+            parse_param_count_billions(&self.id),
+        ) {
+            (Some(gguf), Some(name)) => Some(gguf.max(name)),
+            (gguf, name) => gguf.or(name),
+        }
+    }
+
+    /// Whether the repo can serve a chat agent: its pipeline outputs text, or
+    /// it declares no pipeline. Image, video, audio and embedding repos are
+    /// not chat models.
+    fn outputs_text(&self) -> bool {
+        self.pipeline_tag.as_deref().is_none_or(|tag| {
+            tag.ends_with("-to-text")
+                || matches!(
+                    tag,
+                    "text-generation" | "text2text-generation" | "any-to-any" | "translation"
+                )
+        })
+    }
+}
+
+/// Parse the raw JSON array returned by the unsloth catalog request
+/// (`UNSLOTH_HF_API_URL`) into [`HfRepo`] rows. Private repos are dropped (the API should never
 /// return them for an unauthenticated request, but the check is cheap
 /// insurance); entries missing a non-empty `id` are skipped. Malformed JSON
 /// (not an array) yields an empty list rather than an error — the caller
@@ -687,10 +720,21 @@ pub(super) fn parse_hf_unsloth_response(body: &str) -> Vec<HfRepo> {
                 .get("trendingScore")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
+            let gguf_params_billion = entry
+                .pointer("/gguf/total")
+                .and_then(Value::as_f64)
+                .filter(|total| *total > 0.0)
+                .map(|total| total / 1_000_000_000_f64);
+            let pipeline_tag = entry
+                .get("pipeline_tag")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             Some(HfRepo {
                 id,
                 downloads,
                 trending_score,
+                gguf_params_billion,
+                pipeline_tag,
             })
         })
         .collect()
@@ -753,9 +797,9 @@ pub(crate) fn ram_budget_bytes(total_ram_bytes: u64) -> u64 {
 /// name, tolerating both dense names (`27B`) and `MoE` names that also carry an
 /// active-parameter suffix (`35B-A3B` — the total is `35B`; `A3B` is the
 /// active count and is skipped). Returns `None` when no size token is found
-/// (e.g. `grok-2-GGUF`, `Qwen3-Coder-Next-GGUF`) — the catalog treats an
-/// unparseable size as unknown and excludes it from the fit-filtered list
-/// rather than guessing.
+/// (e.g. `grok-2-GGUF`, `Qwen3-Coder-Next-GGUF`). The catalog uses this only
+/// when the repo has no GGUF parameter count, and hides a repo whose size is
+/// still unknown rather than guessing.
 pub(super) fn parse_param_count_billions(repo_id: &str) -> Option<f64> {
     let name = repo_id.rsplit('/').next().unwrap_or(repo_id);
     name.split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
@@ -835,18 +879,19 @@ fn unsloth_wire_row(repo: &HfRepo) -> Value {
     wire_row(&repo.id, &name, "unsloth", Some(&description))
 }
 
-/// Build the unsloth catalog's wire rows from parsed HF repos: sorted by
-/// downloads (ties broken by `trendingScore`, both descending) and filtered
-/// to repos whose estimated footprint fits [`RAM_FIT_FRACTION`] of
-/// `total_ram_bytes`. `total_ram_bytes: None` (RAM detection unsupported on
-/// this platform) skips the fit filter entirely — every repo is included.
-/// Returns the wire rows plus how many repos were hidden by the fit filter
-/// (too large, or of unknown/unparseable size).
+/// Build the unsloth catalog's wire rows from parsed HF repos: repos that do
+/// not output text are dropped, the rest are sorted by downloads (ties broken
+/// by `trendingScore`, both descending) and filtered to repos whose estimated
+/// footprint fits [`RAM_FIT_FRACTION`] of `total_ram_bytes`. The size is the
+/// larger of the GGUF metadata count and the repo name's size token. `total_ram_bytes: None` (RAM
+/// detection unsupported on this platform) skips the fit filter entirely.
+/// Returns the wire rows plus how many text repos the fit filter hid (too
+/// large, or of unknown size).
 pub(super) fn build_unsloth_rows(
     repos: &[HfRepo],
     total_ram_bytes: Option<u64>,
 ) -> (Vec<Value>, usize) {
-    let mut sorted: Vec<&HfRepo> = repos.iter().collect();
+    let mut sorted: Vec<&HfRepo> = repos.iter().filter(|r| r.outputs_text()).collect();
     sorted.sort_by(|a, b| {
         b.downloads.cmp(&a.downloads).then_with(|| {
             b.trending_score
@@ -862,7 +907,7 @@ pub(super) fn build_unsloth_rows(
     let mut rows = Vec::with_capacity(sorted.len());
     let mut hidden = 0usize;
     for repo in sorted {
-        match parse_param_count_billions(&repo.id) {
+        match repo.params_billion() {
             Some(params_billion) if fits_within_ram(params_billion, total_ram_bytes) => {
                 rows.push(unsloth_wire_row(repo));
             }
