@@ -11,7 +11,8 @@
 //! `auto` (the default) tries the secrets store then env and uses the first
 //! hit that yields **both** values. A missing pair is *not* an error here —
 //! [`resolve`] returns `None`, and the registry turns that into a graceful
-//! `NotConfigured`.
+//! `NotConfigured`. The saved account (`accounts.sentry.*`) is read by the
+//! daemon and passed inline; [`resolve_parts`] fills only the missing half.
 //!
 //! GUARDRAIL: the token is a secret. It is only ever read and handed to the
 //! HTTP client — never logged, echoed, or returned across the wire.
@@ -75,11 +76,94 @@ pub async fn resolve(source: &TokenSource) -> Option<Credentials> {
     }
 }
 
+/// Resolve each half of the credential pair independently for the given
+/// strategy, so a caller holding one half inline can complete it. Under
+/// `auto`, each half comes from the secrets store, else env.
+pub(crate) async fn resolve_parts(source: &TokenSource) -> CredentialParts {
+    match source {
+        TokenSource::Explicit => file_store_parts().await,
+        TokenSource::Env => env_parts(),
+        TokenSource::Auto => file_store_parts().await.or(env_parts()),
+    }
+}
+
+/// Possibly-partial credential pair from [`resolve_parts`]. Halves are
+/// non-empty when present. The `token` field is secret.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct CredentialParts {
+    pub(crate) token: Option<String>,
+    pub(crate) organization: Option<String>,
+}
+
+impl std::fmt::Debug for CredentialParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialParts")
+            .field("organization", &self.organization)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl CredentialParts {
+    /// Fill each missing half from `fallback`.
+    #[must_use]
+    pub fn or(self, fallback: Self) -> Self {
+        Self {
+            token: self.token.or(fallback.token),
+            organization: self.organization.or(fallback.organization),
+        }
+    }
+
+    /// `Some` only when both halves are present.
+    #[must_use]
+    pub fn complete(self) -> Option<Credentials> {
+        Some(Credentials {
+            token: self.token?,
+            organization: self.organization?,
+        })
+    }
+}
+
+async fn file_store_parts() -> CredentialParts {
+    match file_store_pair().await {
+        Some((token, organization)) => CredentialParts {
+            token: token.as_deref().and_then(non_empty),
+            organization: organization.as_deref().and_then(non_empty),
+        },
+        None => CredentialParts::default(),
+    }
+}
+
+fn env_parts() -> CredentialParts {
+    CredentialParts {
+        token: std::env::var("SENTRY_API_TOKEN")
+            .ok()
+            .as_deref()
+            .and_then(non_empty),
+        organization: std::env::var("SENTRY_ORG")
+            .ok()
+            .as_deref()
+            .and_then(non_empty),
+    }
+}
+
 /// Read both halves of the credential pair from the file-backed secrets store
 /// ([`intent_core::FileSecretStore`]). Both entries are loaded off the async
 /// runtime on the blocking pool with a bounded timeout so a stalled backing
 /// store cannot wedge a tokio worker.
 async fn file_store_credentials() -> Option<Credentials> {
+    let (token, organization) = file_store_pair().await?;
+    let token = non_empty(&token.unwrap_or_default())?;
+    let organization = non_empty(&organization.unwrap_or_default())?;
+    Some(Credentials {
+        token,
+        organization,
+    })
+}
+
+/// Raw `(token, organization)` entries from the file-backed secrets store,
+/// or `None` when the store cannot be read in time.
+async fn file_store_pair() -> Option<(Option<String>, Option<String>)> {
     type LoadResult = Result<Option<(Option<String>, Option<String>)>, intent_core::error::Error>;
     let handle = tokio::task::spawn_blocking(|| -> LoadResult {
         let store = intent_core::FileSecretStore::new();
@@ -87,27 +171,21 @@ async fn file_store_credentials() -> Option<Credentials> {
         let organization = store.load(SECRET_ORG_ACCOUNT)?;
         Ok(Some((token, organization)))
     });
-    let pair = match timeout(SECRET_LOAD_TIMEOUT, handle).await {
-        Ok(Ok(Ok(Some(pair)))) => pair,
-        Ok(Ok(Ok(None)) | Err(_)) => return None,
+    match timeout(SECRET_LOAD_TIMEOUT, handle).await {
+        Ok(Ok(Ok(Some(pair)))) => Some(pair),
+        Ok(Ok(Ok(None)) | Err(_)) => None,
         Ok(Ok(Err(e))) => {
             tracing::warn!(
                 error = %e,
                 "secrets-store load failed for sentry credentials (corrupt/unreadable file)"
             );
-            return None;
+            None
         }
         Err(_) => {
             tracing::warn!("secrets-store load timed out for sentry credentials");
-            return None;
+            None
         }
-    };
-    let token = non_empty(&pair.0.unwrap_or_default())?;
-    let organization = non_empty(&pair.1.unwrap_or_default())?;
-    Some(Credentials {
-        token,
-        organization,
-    })
+    }
 }
 
 /// Read both halves of the credential pair from the environment.
@@ -133,7 +211,7 @@ pub(crate) fn pick_env_credentials(
 }
 
 /// `Some(s)` only when `s` is non-empty after trimming.
-fn non_empty(s: &str) -> Option<String> {
+pub(crate) fn non_empty(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         None
@@ -166,6 +244,41 @@ mod tests {
         let s: TokenSource = serde_json::from_str("\"explicit\"").unwrap();
         assert_eq!(s, TokenSource::Explicit);
         assert_eq!(TokenSource::default(), TokenSource::Auto);
+    }
+
+    fn parts(token: Option<&str>, organization: Option<&str>) -> CredentialParts {
+        CredentialParts {
+            token: token.map(str::to_string),
+            organization: organization.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn parts_or_fills_only_missing_halves() {
+        let merged = parts(None, Some("saved-org")).or(parts(Some("env-tok"), Some("env-org")));
+        assert_eq!(merged, parts(Some("env-tok"), Some("saved-org")));
+
+        let merged = parts(Some("saved-tok"), None).or(parts(Some("env-tok"), Some("env-org")));
+        assert_eq!(merged, parts(Some("saved-tok"), Some("env-org")));
+
+        let merged = parts(Some("saved-tok"), Some("saved-org")).or(parts(Some("x"), Some("y")));
+        assert_eq!(merged, parts(Some("saved-tok"), Some("saved-org")));
+    }
+
+    #[test]
+    fn parts_complete_needs_both_halves() {
+        let c = parts(Some("tok"), Some("acme")).complete().unwrap();
+        assert_eq!((c.token.as_str(), c.organization.as_str()), ("tok", "acme"));
+        assert!(parts(Some("tok"), None).complete().is_none());
+        assert!(parts(None, Some("acme")).complete().is_none());
+    }
+
+    #[test]
+    fn parts_debug_redacts_token() {
+        let dbg = format!("{:?}", parts(Some("supersecret"), Some("acme")));
+        assert!(!dbg.contains("supersecret"));
+        assert!(dbg.contains("redacted"));
+        assert!(dbg.contains("acme"));
     }
 
     #[test]

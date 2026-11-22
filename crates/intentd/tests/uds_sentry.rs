@@ -212,6 +212,19 @@ async fn start(
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
+    start_with(tag, |s| s.with_sentry_engine(engine)).await
+}
+
+/// Boot a daemon over a temp UDS, letting `wire` customize the services.
+async fn start_with(
+    tag: &str,
+    wire: impl FnOnce(Services) -> Services,
+) -> (
+    PathBuf,
+    tokio::sync::oneshot::Sender<()>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
     // Short prefix under /tmp: the daemon's UDS socket lives inside this base
     // and macOS caps UDS paths at ~104 bytes (SUN_LEN).
     let base = common::test_tempdir_in("/tmp", &format!("itd-sen-{tag}-"));
@@ -225,11 +238,9 @@ async fn start(
     let store = Store::open(&config.db_path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new_isolated(store)
-            .with_workspaces_root(ws_root.path().to_path_buf())
-            .with_sentry_engine(engine),
-    );
+    let services: Arc<dyn WorkspaceApi> = Arc::new(wire(
+        Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()),
+    ));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let serve_socket = socket.clone();
@@ -508,4 +519,115 @@ async fn uds_sentry_p1_p2_round_trip() {
         *seen_assign.lock().unwrap(),
         Some(("i-4".to_string(), None))
     );
+}
+
+/// One request seen by [`fake_sentry`]: the request line and the
+/// `Authorization` header value.
+type SeenHttp = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+/// Minimal local Sentry REST stand-in: answers every request with `200 {}`
+/// and records what it saw. Returns the base URL.
+async fn fake_sentry() -> (String, SeenHttp) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake sentry");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen: SeenHttp = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let record = record.clone();
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).await.is_err() {
+                    return;
+                }
+                let mut authorization = None;
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("authorization") {
+                            authorization = Some(value.trim().to_string());
+                        }
+                    }
+                }
+                record
+                    .lock()
+                    .unwrap()
+                    .push((request_line.trim_end().to_string(), authorization));
+                let _ = write_half
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            });
+        }
+    });
+    (base, seen)
+}
+
+/// intent-hq/intent#9645: the Sentry account saved through `settings.update`
+/// (organization slug + `accounts.sentry.token` secret, the paths Settings →
+/// Connections → Accounts writes) must reach the real engine. Before the fix
+/// the engine ignored both and reported "no credentials found".
+#[intent_test_macros::daemon_test]
+async fn uds_sentry_uses_saved_account_settings() {
+    let (base_url, seen) = fake_sentry().await;
+    let (socket, _tx, _base, _ws_root) =
+        start_with("acct", |s| s.with_sentry_api_base_url(base_url)).await;
+
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":1,"method":"settings.update","params":{"changes":[{"path":"accounts.sentry.organization","value":"acme"},{"path":"accounts.sentry.token","value":"sntryu_saved"}]}}"#,
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "settings.update failed: {resp}"
+    );
+
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":2,"method":"sentry.authStatus","params":{}}"#,
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "authStatus failed: {resp}");
+    assert_eq!(resp["result"]["authenticated"], json!(true));
+    assert_eq!(resp["result"]["organization"], json!("acme"));
+    assert!(
+        !resp.to_string().contains("sntryu_saved"),
+        "the token never crosses the wire"
+    );
+
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":3,"method":"sentry.listProjects","params":{}}"#,
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "listProjects failed: {resp}");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "one REST call per method: {seen:?}");
+    assert!(
+        seen[0].0.starts_with("GET /organizations/acme/ "),
+        "{seen:?}"
+    );
+    assert!(
+        seen[1].0.starts_with("GET /organizations/acme/projects/"),
+        "{seen:?}"
+    );
+    for (_, authorization) in &seen {
+        assert_eq!(authorization.as_deref(), Some("Bearer sntryu_saved"));
+    }
 }
