@@ -19,7 +19,7 @@ use intent_store::{
 };
 use serde_json::json;
 
-use crate::harness::{exec, open, parity_test, test_db, TestDb};
+use crate::harness::{admin_write, exec, open, parity_test, test_db, TestDb};
 
 const T1: &str = "2026-02-01T00:00:01.000Z";
 const T2: &str = "2026-02-01T00:00:02.000Z";
@@ -75,7 +75,12 @@ async fn workspace(store: &Store, id: &str, tenant: &str) {
 /// subject's writes expect. A no-op on `SQLite` and for the subject.
 async fn decoy_sql(db: Option<&TestDb>, tenant: &str, sql: &str) {
     if let (Some(db), "decoy") = (db, tenant) {
-        exec(&db.admin, sql.replace("{w}", "tenant_id = 'decoy'")).await;
+        admin_write(
+            &db.admin,
+            "decoy",
+            sql.replace("{w}", "tenant_id = 'decoy'"),
+        )
+        .await;
     }
 }
 

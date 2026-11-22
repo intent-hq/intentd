@@ -55,12 +55,12 @@ fn invalid<T: std::fmt::Debug>(r: &intent_core::Result<T>) -> bool {
 async fn sql(store: &Store, db: Option<&TestDb>, tenant: &str, stmt: &str) {
     match db {
         Some(db) => {
-            sqlx::raw_sql(sqlx::AssertSqlSafe(
+            crate::harness::admin_write(
+                &db.admin,
+                tenant,
                 stmt.replace("{w}", &format!("tenant_id = '{tenant}'")),
-            ))
-            .execute(&db.admin)
-            .await
-            .expect("setup statement");
+            )
+            .await;
         }
         None => {
             sqlx::raw_sql(sqlx::AssertSqlSafe(stmt.replace("{w}", "1 = 1")))

@@ -340,7 +340,9 @@ pub async fn sqlite_store() -> (Store, tempfile::TempDir) {
 pub async fn tenant_rows(admin: &PgPool, tenant: &str) -> Vec<(String, String)> {
     let tables = tenant_tables(admin).await;
     let mut rows = Vec::new();
-    for table in tables {
+    // tenant_writer is the writer lock and row_seq counter, not tenant data:
+    // any write (even an INSERT ... ON CONFLICT DO NOTHING) moves it.
+    for table in tables.into_iter().filter(|t| t != "tenant_writer") {
         let texts: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT t::text FROM {table} t WHERE tenant_id = $1 ORDER BY 1"
         )))
@@ -370,15 +372,27 @@ pub async fn seed_sql(store: &Store, db: Option<&TestDb>, tenant: &str, stmt: &s
         .replace("{t}", &column)
         .replace("{v}", &value)
         .replace("{w}", &filter);
-    let query = sqlx::raw_sql(sqlx::AssertSqlSafe(stmt));
     if let Some(db) = db {
-        query.execute(&db.admin).await.expect("setup statement");
+        admin_write(&db.admin, tenant, stmt).await;
     } else {
+        let query = sqlx::raw_sql(sqlx::AssertSqlSafe(stmt));
         query
             .execute(store.write_pool())
             .await
             .expect("setup statement");
     }
+}
+
+/// Runs `sql` on `admin` in one transaction holding `tenant`'s writer lock,
+/// as a store writer would. Inserts into `row_seq` tables need the lock
+/// (migration 0012's trigger refuses them otherwise).
+pub async fn admin_write(admin: &PgPool, tenant: &str, sql: String) {
+    let mut tx = hold_writer_lock(admin, tenant).await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(&mut *tx)
+        .await
+        .expect("setup statement");
+    tx.commit().await.expect("commit setup statement");
 }
 
 /// Rows of `table` matching `filter`, among this run's rows.

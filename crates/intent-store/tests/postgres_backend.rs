@@ -74,6 +74,8 @@ mod principals;
 mod read_snapshots;
 #[path = "postgres_backend/repositories.rs"]
 mod repositories;
+#[path = "postgres_backend/row_seq.rs"]
+mod row_seq;
 #[path = "postgres_backend/schema_gate.rs"]
 mod schema_gate;
 #[path = "postgres_backend/script_monitors.rs"]
@@ -216,6 +218,12 @@ async fn row_level_security_policies_work_with_the_guard_mode() {
         .await
         .unwrap();
     assert_eq!(seen, ["1"]);
+    // Claim tenant B's writer lock marker directly (the guard hides B's lock
+    // row), so the row_seq trigger lets the insert through to the guard.
+    sqlx::query("SELECT set_config('intent.writer_tenant', 'tenant-b', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     let foreign =
         sqlx::query("INSERT INTO settings (tenant_id, key, value) VALUES ('tenant-b', 'x', '1')")
             .execute(&mut *tx)
@@ -320,6 +328,17 @@ async fn every_migration_statement_survives_a_replay() {
 /// Runs one statement as the app role with `tenant` set, index scans off so
 /// every row is visited, and rolls back.
 async fn run_as(db: &harness::TestDb, tenant: &str, sql: &str) -> Result<(), String> {
+    run_as_writer_of(db, tenant, tenant, sql).await
+}
+
+/// [`run_as`], holding `writer`'s writer lock marker instead of `tenant`'s
+/// (set directly: `tenant` cannot see `writer`'s lock row under the trap).
+async fn run_as_writer_of(
+    db: &harness::TestDb,
+    tenant: &str,
+    writer: &str,
+    sql: &str,
+) -> Result<(), String> {
     let mut tx = db.app.begin().await.unwrap();
     for setup in [
         "SET LOCAL enable_indexscan = off",
@@ -333,6 +352,21 @@ async fn run_as(db: &harness::TestDb, tenant: &str, sql: &str) -> Result<(), Str
         .execute(&mut *tx)
         .await
         .unwrap();
+    // Writes need the tenant's writer lock (migration 0012's row_seq
+    // trigger); the lock statement is itself tenant-scoped.
+    if writer == tenant {
+        sqlx::query(postgres::WRITER_LOCK_SQL)
+            .bind(tenant)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    } else {
+        sqlx::query("SELECT set_config('intent.writer_tenant', $1, true)")
+            .bind(writer)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
     let outcome = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()))
         .bind(tenant)
         .execute(&mut *tx)
@@ -389,10 +423,13 @@ async fn the_leak_trap_fails_unscoped_statements_and_only_those() {
     ] {
         leak(run_as(&db, "subject", unscoped).await, unscoped);
     }
+    // With the decoy's lock marker, so the row_seq trigger (which refuses
+    // another tenant's insert on its own) lets the row reach the trap.
     leak(
-        run_as(
+        run_as_writer_of(
             &db,
             "subject",
+            "decoy",
             "INSERT INTO settings (tenant_id, key, value) VALUES ('decoy', 'x', $1)",
         )
         .await,

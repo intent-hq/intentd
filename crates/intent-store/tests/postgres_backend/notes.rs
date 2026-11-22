@@ -920,13 +920,15 @@ async fn drafts_round_trip() {
         return;
     };
     for tenant in ["decoy", "subject"] {
+        let mut locked = crate::harness::hold_writer_lock(&db.admin, tenant).await;
         sqlx::query(
             "INSERT INTO client (tenant_id, id, first_seen, last_seen) VALUES ($1, 'client-1', 'x', 'x')",
         )
         .bind(tenant)
-        .execute(&db.admin)
+        .execute(&mut *locked)
         .await
         .unwrap();
+        locked.commit().await.unwrap();
         // The decoy's leftover "kept" draft has the ids the subject deletes.
         let before = tenant_rows(&db.admin, "decoy").await;
         drafts(&open(&db, tenant).await, tenant).await;
@@ -945,14 +947,16 @@ async fn agent_linked_metadata_update_checks_the_link_in_the_same_tenant() {
     };
     let a = open(&db, "tenant-a").await;
     let b = open(&db, "tenant-b").await;
+    let mut locked = crate::harness::hold_writer_lock(&db.admin, "tenant-a").await;
     sqlx::query(
         "INSERT INTO agent_session (tenant_id, id, workspace_id, name, status, created_at, \
          updated_at, task_note_id) VALUES ('tenant-a', 'agent-1', $1, 'A', 'idle', 'x', 'x', 'tn')",
     )
     .bind(WS)
-    .execute(&db.admin)
+    .execute(&mut *locked)
     .await
     .unwrap();
+    locked.commit().await.unwrap();
     let n = note("tn", "Task", "", "2026-10-01T00:00:00Z");
     for store in [&a, &b] {
         store.insert_note(&n).await.unwrap();
@@ -986,24 +990,28 @@ async fn retired_note_paging_cleanup_deletes_only_the_tenants_rows() {
     let n = note("pn", "Paged", "", "2026-10-01T00:00:00Z");
     for (tenant, store) in [("tenant-a", &a), ("tenant-b", &b)] {
         store.insert_note(&n).await.unwrap();
+        let mut locked = crate::harness::hold_writer_lock(&db.admin, tenant).await;
         sqlx::query(
             "INSERT INTO note_page_head (tenant_id, workspace_id, note_id, instance_id, \
              current_rev, generation) VALUES ($1, $2, 'pn', 'i', 0, 'g')",
         )
         .bind(tenant)
         .bind(WS)
-        .execute(&db.admin)
+        .execute(&mut *locked)
         .await
         .unwrap();
+        locked.commit().await.unwrap();
+        let mut locked = crate::harness::hold_writer_lock(&db.admin, tenant).await;
         sqlx::query(
             "INSERT INTO note_page_entry (tenant_id, workspace_id, note_id, collection, \
              position, value) SELECT $1, $2, 'pn', 'c', p, 'v' FROM generate_series(1, 5) p",
         )
         .bind(tenant)
         .bind(WS)
-        .execute(&db.admin)
+        .execute(&mut *locked)
         .await
         .unwrap();
+        locked.commit().await.unwrap();
     }
     assert_eq!(
         a.retired_note_paging_step(3).await.unwrap(),

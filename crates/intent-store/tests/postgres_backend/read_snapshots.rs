@@ -27,7 +27,7 @@ use intent_store::postgres::{PostgresOptions, TenantId};
 use intent_store::Store;
 use intentd_test_support::test_timeout;
 
-use crate::harness::{exec, hold_writer_lock, open_trapped, trapped_db, TestDb};
+use crate::harness::{admin_write, hold_writer_lock, open_trapped, trapped_db, TestDb};
 
 const T0: &str = "2026-01-01T00:00:00.000Z";
 const WS: &str = "ws-snap";
@@ -110,7 +110,7 @@ async fn read_across_write<T: Send + 'static>(
     read_across(
         tenant,
         reader,
-        exec(&db.admin, write.replace("{t}", tenant)),
+        admin_write(&db.admin, tenant, write.replace("{t}", tenant)),
         read,
     )
     .await
@@ -178,8 +178,9 @@ async fn reaction_state_reads_its_access_check_and_state_from_one_snapshot() {
 async fn conversation_and_agent(db: &TestDb, store: &Store, tenant: &str, grant: bool) {
     workspace(store).await;
     agent(store, "agent-a").await;
-    exec(
+    admin_write(
         &db.admin,
+        tenant,
         format!(
             "INSERT INTO workspace_discussion_conversation (tenant_id, workspace_id, id, name, created_at) \
              VALUES ('{tenant}', '{WS}', 'c1', 'one', '{T0}')"
@@ -187,8 +188,9 @@ async fn conversation_and_agent(db: &TestDb, store: &Store, tenant: &str, grant:
     )
     .await;
     if grant {
-        exec(
+        admin_write(
             &db.admin,
+            tenant,
             format!(
                 "INSERT INTO discussion_agent_grant (tenant_id, workspace_id, conversation_id, agent_id) \
                  VALUES ('{tenant}', '{WS}', 'c1', 'agent-a')"
@@ -403,8 +405,9 @@ async fn discussion_conversation_reads_its_fallback_chain_from_one_snapshot() {
     let tenant = "snap-conversation";
     let store = open_trapped(&db, tenant).await;
     workspace(&store).await;
-    exec(
+    admin_write(
         &db.admin,
+        tenant,
         format!(
             "INSERT INTO discussion_conversation (tenant_id, id, workspace_id, kind, \
              participants_json, created_at) VALUES ('{tenant}', 'p1', '{WS}', 'direct', '[]', '{T0}')"
@@ -763,8 +766,9 @@ async fn browser_sender_inheritance_reads_ancestors_from_one_snapshot() {
         })
         .await
         .unwrap();
-    exec(
+    admin_write(
         &db.admin,
+        tenant,
         format!(
             "INSERT INTO client (tenant_id, id, first_seen, last_seen) \
              VALUES ('{tenant}', 'sender-client', '{T0}', '{T0}')"

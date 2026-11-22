@@ -1483,6 +1483,7 @@ async fn review_context_enrollment_reads_the_tenants_rows() {
         seed_sessions(store, tenant).await;
         store.set_acp_session_id(&w, &a, "acp-1").await.unwrap();
     }
+    let mut locked = crate::harness::hold_writer_lock(&db.admin, "tenant-a").await;
     sqlx::query(
         "INSERT INTO review_context_enrollment \
          (tenant_id, agent_id, workspace_id, acp_session_id, owner_key, version) \
@@ -1490,9 +1491,10 @@ async fn review_context_enrollment_reads_the_tenants_rows() {
     )
     .bind(WS)
     .bind(key)
-    .execute(&db.admin)
+    .execute(&mut *locked)
     .await
     .unwrap();
+    locked.commit().await.unwrap();
     let found = a_store
         .get_review_context_enrollment(&w, &a, "acp-1")
         .await
@@ -1504,13 +1506,15 @@ async fn review_context_enrollment_reads_the_tenants_rows() {
         .await
         .unwrap()
         .is_none());
+    let mut locked = crate::harness::hold_writer_lock(&db.admin, "tenant-a").await;
     sqlx::query(
         "INSERT INTO review_context_private_family (tenant_id, acp_session_id, version) \
          VALUES ('tenant-a', 'acp-2', 1)",
     )
-    .execute(&db.admin)
+    .execute(&mut *locked)
     .await
     .unwrap();
+    locked.commit().await.unwrap();
     assert!(a_store
         .get_review_context_enrollment(&w, &a, "acp-2")
         .await
@@ -1554,6 +1558,7 @@ async fn append(
         "user" => "human",
         _ => "excluded",
     };
+    let mut locked = crate::harness::hold_writer_lock(admin, tenant).await;
     let (id, seq): (String, i64) = sqlx::query_as(
         "INSERT INTO agent_message (tenant_id, id, agent_id, seq, role, content, created_at, \
          metadata, usage_model, usage_origin) \
@@ -1571,9 +1576,10 @@ async fn append(
     .bind(created_at)
     .bind(metadata.as_ref().map(Value::to_string))
     .bind(origin)
-    .fetch_one(admin)
+    .fetch_one(&mut *locked)
     .await
     .unwrap();
+    locked.commit().await.unwrap();
     if origin != "excluded" {
         sqlx::query(
             "UPDATE agent_session SET last_message_role = $3, last_message_id = $4 \
@@ -1586,6 +1592,7 @@ async fn append(
         .execute(admin)
         .await
         .unwrap();
+        let mut locked = crate::harness::hold_writer_lock(admin, tenant).await;
         sqlx::query(
             "INSERT INTO agent_usage_cell (tenant_id, agent_id, model, human_messages, agent_messages) \
              SELECT $1, $2, usage_model, CAST(usage_origin = 'human' AS INT), \
@@ -1598,9 +1605,10 @@ async fn append(
         .bind(tenant)
         .bind(agent)
         .bind(&id)
-        .execute(admin)
+        .execute(&mut *locked)
         .await
         .unwrap();
+        locked.commit().await.unwrap();
     }
     AgentMessage {
         id,
@@ -1767,13 +1775,15 @@ message_parity_test!(
         if let (Some(admin), "decoy") = (admin, tenant) {
             // An old-model cell the subject's decrement and prune must not reach.
             // Plus the subject's resolved-model cell key.
+            let mut locked = crate::harness::hold_writer_lock(admin, "decoy").await;
             sqlx::query(
                 "INSERT INTO agent_usage_cell (tenant_id, agent_id, model, human_messages) \
                  VALUES ('decoy', 'agent-b', 'opus', 1), ('decoy', 'agent-b', 'Opus subject', 1)",
             )
-            .execute(admin)
+            .execute(&mut *locked)
             .await
             .unwrap();
+            locked.commit().await.unwrap();
         }
 
         // No reported usage: the tally reads per-message usage instead.
