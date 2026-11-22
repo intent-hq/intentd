@@ -112,6 +112,7 @@ parity_test!(script_definitions_round_trip, |store, tenant| {
         started_at: Some(T1.into()),
         stopped_at: T2.into(),
         error: None,
+        started_by: None,
     });
     store.upsert_scripts(&[b.clone(), c.clone()]).await.unwrap();
     assert_eq!(all(&store).await, [a.clone(), b.clone(), c.clone()]);
@@ -325,6 +326,7 @@ parity_test!(script_runs_admit_start_and_settle, |store, tenant| {
             started_at: Some(T1.into()),
             stopped_at: T2.into(),
             error: Some(format!("{tenant} failed")),
+            started_by: None,
         };
         store.admit_script_run(&wa, "r-settle", tok).await.unwrap();
         assert!(store
@@ -490,6 +492,7 @@ parity_test!(script_summary_pages_bound_and_page_rows, |store, tenant| {
         started_at: None,
         stopped_at: T1.into(),
         error: Some(error.clone()),
+        started_by: None,
     });
     long.remote_author = Some(ScriptRemoteAuthor {
         agent_id: AgentId(format!("{tenant}-agent")),

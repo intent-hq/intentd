@@ -22,7 +22,7 @@ use intent_core::ansi::strip_ansi;
 use intent_core::events::{SCRIPT_CHANGED, SCRIPT_OUTPUT, SCRIPT_STATE};
 use intent_core::{
     now_iso, Error, Result, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState,
-    ScriptStatus, WorkspaceId,
+    ScriptStartedBy, ScriptStatus, WorkspaceId,
 };
 use intent_pty::{OutputSink, PtyExit, PtyHost, PtyId, SpawnSpec};
 use intent_services::feature_api::pagination::{
@@ -451,6 +451,7 @@ impl Drop for RunReservation {
                         started_at: None,
                         stopped_at: now_iso(),
                         error: Some("script.run caller cancelled before launch".into()),
+                        started_by: m.state.started_by.clone(),
                     });
                     settle = true;
                 }
@@ -1206,7 +1207,10 @@ impl ScriptManager {
                         ..Default::default()
                     }
                 };
-                state.run_id = latest.map(|(run, _)| run);
+                if let Some((run, result)) = latest {
+                    state.run_id = Some(run);
+                    state.started_by = result.and_then(|r| r.started_by);
+                }
                 ManagedScript {
                     def,
                     state,
@@ -1299,6 +1303,7 @@ impl ScriptManager {
                     state.stopped_at = Some(result.stopped_at);
                 }
                 state.error = result.error;
+                state.started_by = result.started_by;
             }
         }
         self.scripts.lock().unwrap().insert(
@@ -1358,6 +1363,7 @@ impl ScriptManager {
                 started_at,
                 stopped_at: now_iso(),
                 error: Some(LOST_AT_DAEMON_STOP_ERROR.into()),
+                started_by: None,
             };
             self.store
                 .settle_script_run(workspace_id, script_id, run_id, &result, false)
@@ -2294,7 +2300,12 @@ impl ScriptManager {
             return Ok(json!({ "ok": true, "scriptId": script_id }));
         }
         self.finish_previous_locked(workspace_id, script_id).await;
-        self.prepare_launch(workspace_id, script_id).await?;
+        // Boot restore and `autoStart` are the daemon's own starts.
+        let started_by = (kind == StartKind::Client)
+            .then(ScriptStartedBy::current)
+            .flatten();
+        self.prepare_launch(workspace_id, script_id, started_by)
+            .await?;
         let publication = self.locks.publication_lock(script_id);
         let _publishing = publication.lock().await;
         self.start_inner(workspace_id, script_id, kind == StartKind::Restore)
@@ -2491,6 +2502,7 @@ impl ScriptManager {
                 if m.state.status == ScriptStatus::Running && m.state.pid.is_none() {
                     m.state = ScriptRuntimeState {
                         run_id: m.state.run_id.clone(),
+                        started_by: m.state.started_by.clone(),
                         ..Default::default()
                     };
                 }
@@ -2509,6 +2521,7 @@ impl ScriptManager {
                         if std::mem::take(&mut m.lost_at_daemon_stop) {
                             m.state = ScriptRuntimeState {
                                 run_id: m.state.run_id.clone(),
+                                started_by: m.state.started_by.clone(),
                                 ..Default::default()
                             };
                             dismissed = true;
@@ -2699,7 +2712,8 @@ impl ScriptManager {
         // Admission survives teardown, but its predecessor cannot report an
         // outcome for the successor token while shutdown is draining it.
         self.stop_inner(workspace_id, script_id, true).await?;
-        self.prepare_restart(workspace_id, script_id).await?;
+        self.prepare_restart(workspace_id, script_id, ScriptStartedBy::current())
+            .await?;
         let publication = self.locks.publication_lock(script_id);
         let _publishing = publication.lock().await;
         let state = {
@@ -2848,7 +2862,10 @@ impl ScriptManager {
         let (ready, receive) = tokio::sync::oneshot::channel();
         self.spawn_admission(async move {
             let _admission = admission;
-            let result = match mgr.prepare_launch(&ws, &id).await {
+            let result = match mgr
+                .prepare_launch(&ws, &id, ScriptStartedBy::current())
+                .await
+            {
                 Ok(()) => Ok(reservation),
                 Err(error) => Err(error),
             };
@@ -3513,6 +3530,7 @@ impl ScriptManager {
                 m.state = ScriptRuntimeState {
                     previously_running: m.state.previously_running,
                     run_id: m.state.run_id.clone(),
+                    started_by: m.state.started_by.clone(),
                     ..Default::default()
                 };
             } else {
@@ -8343,6 +8361,7 @@ mod tests {
             started_at: Some(now_iso()),
             stopped_at: now_iso(),
             error: None,
+            started_by: None,
         };
         {
             let mut scripts = mgr.scripts.lock().unwrap();

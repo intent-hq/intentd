@@ -3,6 +3,7 @@ use super::{
     json, now_iso, Error, HashSet, ManagedScript, Result, ScriptManager, ScriptMode, ScriptStatus,
     Value, WorkspaceId,
 };
+use intent_core::ScriptStartedBy;
 
 impl ScriptManager {
     pub(super) fn is_live(&self, ws: &WorkspaceId, id: &str) -> Result<bool> {
@@ -42,15 +43,31 @@ impl ScriptManager {
 
     /// Caller holds the definition lock through launch admission. A failed
     /// durable restore refuses the launch; the invalidation precedes live state.
-    pub(super) async fn prepare_launch(&self, ws: &WorkspaceId, id: &str) -> Result<()> {
-        self.prepare_admission(ws, id, false).await
+    pub(super) async fn prepare_launch(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        started_by: Option<ScriptStartedBy>,
+    ) -> Result<()> {
+        self.prepare_admission(ws, id, false, started_by).await
     }
 
-    pub(super) async fn prepare_restart(&self, ws: &WorkspaceId, id: &str) -> Result<()> {
-        self.prepare_admission(ws, id, true).await
+    pub(super) async fn prepare_restart(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        started_by: Option<ScriptStartedBy>,
+    ) -> Result<()> {
+        self.prepare_admission(ws, id, true, started_by).await
     }
 
-    async fn prepare_admission(&self, ws: &WorkspaceId, id: &str, restart: bool) -> Result<()> {
+    async fn prepare_admission(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        restart: bool,
+        started_by: Option<ScriptStartedBy>,
+    ) -> Result<()> {
         // Caller holds the definition lock, which workspace deletion takes
         // after setting the mark: a launch either finishes admission first
         // (and is then stopped) or is refused here.
@@ -80,6 +97,7 @@ impl ScriptManager {
         m.state.started_at = None;
         m.state.stopped_at = None;
         m.state.run_id = Some(token.clone());
+        m.state.started_by = started_by;
         m.run_id = Some(token);
         m.run_generation = (!restart).then_some(m.generation);
         m.pending_result = None;

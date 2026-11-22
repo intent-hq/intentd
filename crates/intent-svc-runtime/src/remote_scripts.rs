@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use intent_core::{
     AgentId, BoxFuture, Error, Result, Script, ScriptCreateParams, ScriptRemoteAuthor,
-    WorkspaceApi, WorkspaceId,
+    ScriptStartedBy, WorkspaceApi, WorkspaceId,
 };
 use intent_services::feature_api::feature_ports::RemoteScriptCaller;
 use intent_services::feature_api::Services;
@@ -114,13 +114,16 @@ async fn remote_call_inner(
             let place = place(&args)?;
             let def = definition(svc, &caller.workspace_id, &place.script_id).await?;
             let runs = runs(&mgr)?;
+            let by = Some(ScriptStartedBy::Agent {
+                agent_id: caller.agent_id.clone(),
+            });
             match method {
-                "script.start" => Ok(json!(runs.start(&place, &def).await?)),
+                "script.start" => Ok(json!(runs.start(&place, &def, by).await?)),
                 "script.restart" => {
                     if runs.state(&place).is_none() {
-                        Ok(json!(runs.start(&place, &def).await?))
+                        Ok(json!(runs.start(&place, &def, by).await?))
                     } else {
-                        Ok(json!(runs.restart(&place, &def).await?))
+                        Ok(json!(runs.restart(&place, &def, by).await?))
                     }
                 }
                 _ => {
@@ -132,7 +135,7 @@ async fn remote_call_inner(
                         .and_then(Value::as_u64)
                         .map_or(ceiling, Duration::from_secs)
                         .min(ceiling);
-                    runs.run(&place, &def, timeout, max_lines(&args)).await
+                    runs.run(&place, &def, timeout, max_lines(&args), by).await
                 }
             }
         }
@@ -356,7 +359,10 @@ pub(crate) async fn machine_run_call(
         "restart" => {
             runs.state(&place).ok_or_else(unknown)?;
             let def = definition(svc, &workspace_id, &place.script_id).await?;
-            Ok(json!(runs.restart(&place, &def).await?))
+            Ok(json!(
+                runs.restart(&place, &def, ScriptStartedBy::current())
+                    .await?
+            ))
         }
         other => Err(Error::InvalidParams(format!(
             "script.{other} does not take remoteAgentId"

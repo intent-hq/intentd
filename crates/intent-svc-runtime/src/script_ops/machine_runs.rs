@@ -26,7 +26,7 @@ use intent_core::node_link::{
 };
 use intent_core::{
     now_iso, AgentId, BoxFuture, Error, Result, Script, ScriptLastRun, ScriptMode,
-    ScriptRunOutcome, ScriptRuntimeState, ScriptStatus, WorkspaceId,
+    ScriptRunOutcome, ScriptRuntimeState, ScriptStartedBy, ScriptStatus, WorkspaceId,
 };
 use intent_services::feature_api::feature_ports::MachineScriptLink;
 use serde_json::{json, Value};
@@ -347,7 +347,12 @@ impl MachineRuns {
     ///
     /// `machine-unreachable` when no link comes up; `machine-update-required`
     /// when the machine links below protocol 8.
-    pub(crate) async fn start(&self, place: &RunPlace, def: &Script) -> Result<ScriptRuntimeState> {
+    pub(crate) async fn start(
+        &self,
+        place: &RunPlace,
+        def: &Script,
+        started_by: Option<ScriptStartedBy>,
+    ) -> Result<ScriptRuntimeState> {
         self.refuse_if_ending(place)?;
         if let Some(state) = self.state(place).filter(is_live) {
             return Ok(state);
@@ -394,6 +399,7 @@ impl MachineRuns {
                 run_id: Some(new_id()),
                 status: ScriptStatus::Starting,
                 started_at: Some(now_iso()),
+                started_by,
                 ..ScriptRuntimeState::default()
             };
             run.state.clone()
@@ -535,6 +541,7 @@ impl MachineRuns {
         &self,
         place: &RunPlace,
         def: &Script,
+        started_by: Option<ScriptStartedBy>,
     ) -> Result<ScriptRuntimeState> {
         // Check the final stop and the link before stopping, so a refused
         // restart stops nothing.
@@ -547,7 +554,7 @@ impl MachineRuns {
             self.stop_because(place, "the run was restarted", StopWhen::Always)
                 .await?;
         }
-        self.start(place, def).await
+        self.start(place, def, started_by).await
     }
 
     /// Start a command run and wait for it to end (or `timeout`).
@@ -561,9 +568,10 @@ impl MachineRuns {
         def: &Script,
         timeout: Duration,
         max_lines: usize,
+        started_by: Option<ScriptStartedBy>,
     ) -> Result<Value> {
         let mut settled = self.inner.settled.subscribe();
-        let state = self.start(place, def).await?;
+        let state = self.start(place, def, started_by).await?;
         let run_id = state.run_id.clone();
         let done = tokio::time::timeout(timeout, async {
             loop {
@@ -1604,6 +1612,7 @@ fn idle_after(state: &ScriptRuntimeState) -> ScriptRuntimeState {
         started_at: state.started_at.clone(),
         stopped_at: Some(now_iso()),
         restart_count: state.restart_count,
+        started_by: state.started_by.clone(),
         ..ScriptRuntimeState::default()
     }
 }
@@ -1621,6 +1630,7 @@ fn last_run(
         started_at: state.started_at.clone(),
         stopped_at: now_iso(),
         error,
+        started_by: state.started_by.clone(),
     }
 }
 

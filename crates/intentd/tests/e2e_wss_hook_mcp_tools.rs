@@ -489,3 +489,5 @@ async fn hook_calls_mcp_tool_end_to_end_and_gated_toggle_rejects() {
 
 #[path = "e2e_wss_hook_mcp_tools/script_monitors.rs"]
 mod script_monitors;
+#[path = "e2e_wss_hook_mcp_tools/script_started_by.rs"]
+mod script_started_by;

@@ -72,6 +72,7 @@ impl ScriptManager {
             } else {
                 m.state.error.clone()
             },
+            started_by: m.state.started_by.clone(),
         });
     }
 
@@ -233,6 +234,7 @@ impl ScriptManager {
                 started_at,
                 stopped_at: now_iso(),
                 error: Some(LOST_AT_DAEMON_STOP_ERROR.into()),
+                started_by: None,
             };
             let recovered = match self
                 .store

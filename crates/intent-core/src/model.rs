@@ -6227,6 +6227,42 @@ pub enum ScriptRunOutcome {
     Interrupted,
 }
 
+/// Who started a script run (`startedBy` on the run's runtime state and
+/// `lastRun`). Omitted when unknown: legacy rows and daemon-initiated runs
+/// (boot restore, `autoStart`). An automatic service restart keeps the
+/// logical run's value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ScriptStartedBy {
+    Agent {
+        #[serde(rename = "agentId")]
+        agent_id: AgentId,
+    },
+    User,
+}
+
+impl ScriptStartedBy {
+    /// The run starter for `caller`: an agent session or a user client.
+    /// The daemon and executor links start nothing on anyone's behalf.
+    #[must_use]
+    pub fn from_caller(caller: Option<&crate::caller::Caller>) -> Option<Self> {
+        use crate::caller::Caller;
+        match caller? {
+            Caller::Agent { agent_id } => Some(Self::Agent {
+                agent_id: agent_id.clone(),
+            }),
+            Caller::Wire { .. } => Some(Self::User),
+            Caller::Daemon | Caller::Executor { .. } => None,
+        }
+    }
+
+    /// [`Self::from_caller`] for the request bound to the current task.
+    #[must_use]
+    pub fn current() -> Option<Self> {
+        Self::from_caller(crate::caller::current_caller().as_ref())
+    }
+}
+
 /// Compact durable result; full PTY output remains transient.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -6241,6 +6277,8 @@ pub struct ScriptLastRun {
     pub stopped_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<ScriptStartedBy>,
 }
 
 /// Runtime status of a script process (ported from the TS `ScriptStatus`,
@@ -6293,6 +6331,9 @@ pub struct ScriptRuntimeState {
     /// PROTOCOL §5.8); cleared once the script is started or stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previously_running: Option<bool>,
+    /// Who started the current (or latest) run; see [`ScriptStartedBy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<ScriptStartedBy>,
 }
 
 impl Default for ScriptRuntimeState {
@@ -6308,6 +6349,7 @@ impl Default for ScriptRuntimeState {
             error: None,
             detected_url: None,
             previously_running: None,
+            started_by: None,
         }
     }
 }

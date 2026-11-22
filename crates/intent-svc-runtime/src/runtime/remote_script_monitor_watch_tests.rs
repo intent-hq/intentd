@@ -201,7 +201,9 @@ impl Harness {
         };
         let mgr = svc.script_manager();
         let runs = mgr.machine_runs().expect("machine runs");
-        runs.start(&place, &def).await.expect("machine run starts");
+        runs.start(&place, &def, None)
+            .await
+            .expect("machine run starts");
         let reply = runs
             .monitor(&place, &json!({ "ttlMs": 600_000 }))
             .await

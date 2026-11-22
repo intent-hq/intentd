@@ -334,6 +334,7 @@ async fn retirement_durable_token_fences_rerun_replacement_removal_and_scope() {
         started_at: None,
         stopped_at: now_iso(),
         error: None,
+        started_by: None,
     };
     store.admit_script_run(&h.ws, &id, "old").await.unwrap();
     store.admit_script_run(&h.ws, &id, "new").await.unwrap();
@@ -525,7 +526,7 @@ async fn retirement_unobservable_exit_and_stale_finalizer_are_fenced() {
     let mgr = h.services.script_manager();
     let lock = mgr.locks.definition_lock(&id);
     let guard = lock.lock().await;
-    mgr.prepare_launch(&h.ws, &id).await.unwrap();
+    mgr.prepare_launch(&h.ws, &id, None).await.unwrap();
     let generation = mgr
         .scripts
         .lock()
@@ -954,7 +955,7 @@ async fn retirement_cannot_admit_successor_before_predecessor_publication() {
     let token = h.services.store().pending_script_runs().await.unwrap()[0]
         .2
         .clone();
-    assert!(mgr.prepare_restart(&h.ws, &id).await.is_err());
+    assert!(mgr.prepare_restart(&h.ws, &id, None).await.is_err());
     assert_eq!(
         h.services.store().pending_script_runs().await.unwrap()[0].2,
         token
