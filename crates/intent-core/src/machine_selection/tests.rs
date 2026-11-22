@@ -1725,7 +1725,7 @@ fn load_aware_help_points_at_each_machines_load() {
         "→ { machines, local? }  // Experimental.",
         "`load: { runningAgents, agentCap, cpuPercent?, memoryUsedBytes?, memoryTotalBytes? }`",
         "`runningAgents` (this backend's agents there)",
-        "`local` is this backend's own load in the same shape",
+        "`local` is this backend's host in the same shape, counting every agent it runs",
         "the whole host's CPU use",
         "has no `load`",
         "prefer the machine with the most free slots",
