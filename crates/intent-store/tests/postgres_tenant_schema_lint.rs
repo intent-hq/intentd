@@ -36,7 +36,7 @@ const GIN_EXCEPTIONS: &[&str] = &["agent_message_search_tsv", "note_search_tsv"]
 
 /// Tables keyed by the tenant alone (`PRIMARY KEY (tenant_id)`): one row
 /// per tenant. Every other table's key leads with `tenant_id` and has more.
-const ONE_ROW_PER_TENANT: &[&str] = &["tenant_writer"];
+const ONE_ROW_PER_TENANT: &[&str] = &["tenant_lease", "tenant_writer"];
 
 fn store_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()

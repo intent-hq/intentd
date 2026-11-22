@@ -341,6 +341,14 @@ pub enum Error {
     #[error("{0}")]
     SchemaMismatch(Box<SchemaMismatch>),
 
+    /// This process does not own the Postgres tenant: another process holds
+    /// its lease, or took it over since this process claimed it (the
+    /// tenant's epoch moved on). The write was rolled back and changed
+    /// nothing; the process must stop serving the tenant. Surfaces as
+    /// `-32603`.
+    #[error("not the tenant owner: {0}")]
+    NotOwner(String),
+
     /// A request forwarded to an agent's provider adapter failed (JSON-RPC
     /// error, timeout, or the connection ended before or during the request),
     /// e.g. `agent.workers.stop` (PROTOCOL §5.5b). Surfaces as `-32603` with
@@ -835,6 +843,7 @@ impl Error {
             | Error::RateLimited(_)
             | Error::StoreBusy(_)
             | Error::SchemaMismatch(_)
+            | Error::NotOwner(_)
             | Error::ProviderRequest(_)
             | Error::IdentityProof(_)
             | Error::IdentityUnverifiable { .. }

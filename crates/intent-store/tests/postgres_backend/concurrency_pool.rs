@@ -316,7 +316,9 @@ async fn run_writer_lock_sql(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::
         idle_in_transaction_timeout: Duration::from_secs(60),
         ..WriterLimits::default()
     };
-    postgres::lock_tenant_writer(conn, "tenant-a", Duration::from_millis(100), &limits).await
+    postgres::lock_tenant_writer(conn, "tenant-a", Duration::from_millis(100), &limits)
+        .await
+        .map(drop)
 }
 
 /// The lock statement waits under the attempt's `lock_timeout` and leaves

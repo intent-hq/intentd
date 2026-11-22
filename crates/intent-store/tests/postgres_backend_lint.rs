@@ -202,10 +202,23 @@ const DEFERRED_WRITES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The function that takes the tenant writer lock, as `(file, function,
-/// table)`: it may write `table` (seeding the tenant's lock row) without
-/// the lock, because writing that row is how the lock is taken.
-const WRITER_LOCK_TAKER: (&str, &str, &str) = ("mod.rs", "lock_tenant_writer", "tenant_writer");
+/// Functions that may write one table without the writer lock, as `(file,
+/// function, table, why)`.
+const UNLOCKED_TABLE_WRITES: &[(&str, &str, &str, &str)] = &[
+    (
+        "mod.rs",
+        "lock_tenant_writer",
+        "tenant_writer",
+        "seeds the tenant's lock row: writing that row is how the lock is taken",
+    ),
+    (
+        "lease.rs",
+        "renew_lease",
+        "tenant_lease",
+        "the lease heartbeat renews outside the writer lock so a busy tenant cannot starve \
+         it; it matches owner and epoch, and a claim locks the lease row",
+    ),
+];
 
 /// Reads allowed to run more than one statement without one snapshot (on
 /// a plain `begin()`, an acquired connection or the pool), as `(file,
@@ -213,7 +226,7 @@ const WRITER_LOCK_TAKER: (&str, &str, &str) = ("mod.rs", "lock_tenant_writer", "
 const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[
     (
         "mod.rs",
-        "begin_write",
+        "begin_write_as",
         "not a read: sets the writer limits and takes the tenant writer lock \
          (lock_tenant_writer) on the transaction it then returns as WriteTx",
     ),
@@ -230,7 +243,7 @@ const MULTI_READ_ALLOWED: &[(&str, &str, &str)] = &[
 const BEGIN_ESCAPE_ALLOWED: &[(&str, &str, &str)] = &[
     (
         "mod.rs",
-        "begin_write",
+        "begin_write_as",
         "wraps the transaction in WriteTx once it holds the writer lock; every WriteTx \
          is a write transaction, which rule 2 checks",
     ),
@@ -447,12 +460,16 @@ fn check(
                         for v in postgres_ast::violations(&stmts, &exempt) {
                             tenant.insert(format!("{at}: {v} is not filtered by tenant_id = $n"));
                         }
-                        let (taker_file, taker, seeded) = WRITER_LOCK_TAKER;
-                        let is_taker =
-                            file_name.as_deref() == Some(taker_file) && u.function == taker;
+                        let unlocked_ok = |t: &str| {
+                            UNLOCKED_TABLE_WRITES.iter().any(|(f, func, table, _)| {
+                                file_name.as_deref() == Some(*f)
+                                    && u.function == *func
+                                    && t == *table
+                            })
+                        };
                         let writes = postgres_ast::written_tables(&stmts)
                             .into_iter()
-                            .any(|t| !exempt.contains(&t.as_str()) && (!is_taker || t != seeded))
+                            .any(|t| !exempt.contains(&t.as_str()) && !unlocked_ok(&t))
                             || postgres_ast::called_functions(&stmts)
                                 .iter()
                                 .any(|f| writing.contains(f));
