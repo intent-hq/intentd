@@ -264,7 +264,10 @@ create workspaces.
 
 ## Find a setting
 
-Open Settings and use these sidebar labels (English labels shown):
+When you open Settings, Intent returns to the last page you visited in this app
+or browser profile. If there is no saved page, Settings opens to **Providers**
+when available. A link to a specific setting opens that setting directly.
+Use these sidebar labels (English labels shown):
 
 | Section | What it contains | Canonical link |
 | --- | --- | --- |
