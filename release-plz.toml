@@ -58,6 +58,7 @@ changelog_include = [
     "intent-js",
     "intent-linear",
     "intent-node-connections",
+    "intent-node-link",
     "intent-nodes",
     "intent-providers",
     "intent-pty",
@@ -122,6 +123,12 @@ version_group = "intentd"
 
 [[package]]
 name = "intent-node-connections"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-node-link"
 release = true
 git_only = true
 version_group = "intentd"

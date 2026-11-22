@@ -25,13 +25,13 @@ use intent_core::{AgentId, Error, Result};
 
 use super::codes;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const NODE_LINK_PROTOCOLS_MAX: u32 = intent_core::node_link::NODE_LINK_PROTOCOLS.max;
 
 /// Heartbeat cadence, the silence after which a link is declared dead, and
 /// queue sizes.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Tuning {
+pub struct Tuning {
     pub heartbeat: Duration,
     pub dead_after: Duration,
     pub outbound_queue: usize,
@@ -357,8 +357,9 @@ impl Drop for CallGuard {
 
 impl NodeLink {
     /// Run the link over an upgraded socket whose handshake is complete.
-    #[cfg(test)]
-    pub(super) fn start<S>(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn start<S>(
         socket: WebSocketStream<S>,
         binding: LeaseBinding,
         tuning: Tuning,
@@ -377,8 +378,9 @@ impl NodeLink {
     }
 
     /// [`Self::start`] on a link that negotiated `protocol`.
-    #[cfg(test)]
-    pub(super) fn start_at<S>(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn start_at<S>(
         socket: WebSocketStream<S>,
         binding: LeaseBinding,
         tuning: Tuning,

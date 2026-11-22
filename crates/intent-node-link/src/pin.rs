@@ -106,7 +106,11 @@ impl ServerCertVerifier for PinVerifier {
 }
 
 /// A client config that trusts only `pin`.
-pub(super) fn client_config(pin: CertificatePin) -> Result<rustls::ClientConfig> {
+///
+/// # Errors
+///
+/// When the TLS configuration cannot be built.
+pub fn client_config(pin: CertificatePin) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     Ok(
         rustls::ClientConfig::builder_with_provider(provider.clone())

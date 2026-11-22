@@ -96,6 +96,8 @@ crates/intent-node-connections/src/*                 intentd::suite_e2e        e
 crates/intent-node-connections/src/*                 intent-svc-remote::lib
 crates/intent-git/src/node_git.rs                    intentd::suite_e2e        e2e_remote_launch
 crates/intent-transport/src/node_link/*              intentd::suite_e2e        e2e_remote_launch
+crates/intent-node-link/src/*                        intentd::suite_e2e        e2e_remote_launch
+crates/intent-node-link/src/*                        intent-transport::lib     node_link::tests
 crates/intent-core/src/remote_launch.rs              intentd::suite_e2e        e2e_remote_launch
 crates/intent-nodes/src/northflank*                  intentd::suite_e2e        e2e_remote_launch::cloud::northflank
 crates/intent-nodes/src/cloud*                       intentd::suite_e2e        e2e_remote_launch::cloud

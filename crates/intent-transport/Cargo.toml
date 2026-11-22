@@ -16,6 +16,7 @@ repository-test-fixtures = []
 intent-core = { workspace = true }
 intent-services = { workspace = true }
 intent-git = { workspace = true }
+intent-node-link = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -47,6 +48,7 @@ uuid = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+intent-node-link = { workspace = true, features = ["test-support"] }
 intentd-test-support = { path = "../intentd-test-support" }
 tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
