@@ -147,6 +147,14 @@ class FakeGitHub:
 class Scenarios:
     def setUp(self):
         self.api = FakeGitHub(self.REPO)
+        self.clock, self.sleeps = 0, []
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            self.clock += seconds
+        patcher = mock.patch('time.sleep', side_effect=sleep)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def scan(self, apply=True, **kwargs):
         return P.reconcile(self.api, self.REPO, apply=apply, **kwargs)
@@ -398,7 +406,8 @@ class Scenarios:
         # Shape of cloudlands-fe run 43235620671 / intentd run 43364575898: one page, no Link,
         # total_count disagreeing with workflow_runs while runs change status.
         path = self.api.root + '/actions/workflows/123/runs?event=merge_group&status=queued&per_page=100'
-        for skewed_reads, mutations in ((1, self.expected()), (2, self.expected()), (3, [])):
+        for skewed_reads, mutations in ((1, self.expected()), (P.INVENTORY_READS - 1, self.expected()),
+                                        (P.INVENTORY_READS, [])):
             with self.subTest(skewed_reads=skewed_reads):
                 self.api = FakeGitHub(self.REPO)
                 self.api.override = lambda method, p, body, n: self.api.response(
@@ -418,6 +427,48 @@ class Scenarios:
         result = self.scan()
         self.assertEqual(self.api.mutations, self.expected(), result)
         self.assertEqual([d['id'] for d in result['decisions']], [10])
+
+    def test_count_lag_after_a_queue_run_starts_outlasts_immediate_rereads(self):
+        # cloudlands-fe runs 44975717566 / 44823018885, intentd 44804512029 / 44736815196 /
+        # 44177642872: each failed 3-49 s after a merge_group run was created or completed.
+        # total_count lags workflow_runs for tens of seconds, longer than three back-to-back reads.
+        path = self.api.root + '/actions/workflows/123/runs?event=merge_group&status=queued&per_page=100'
+        self.api.override = lambda method, p, body, n: self.api.response(
+            {'total_count': 2, 'workflow_runs': [self.api.runs[10]]}) if p == path and self.clock < 30 else None
+        result = self.scan()
+        self.assertTrue(result['complete'], result)
+        self.assertEqual(self.api.mutations, self.expected(), result)
+        self.assertGreaterEqual(sum(self.sleeps), 30)
+
+    def test_run_moving_between_status_lists_is_reread(self):
+        # Status lists are separate reads: a run that starts between the queued and
+        # in_progress reads is listed twice. That is a moving snapshot, not a bad run ID.
+        path = self.api.root + '/actions/workflows/123/runs?event=merge_group&status=in_progress&per_page=100'
+        moved = dict(self.api.runs[10], status='in_progress')
+        self.api.override = lambda method, p, body, n: self.api.response(
+            {'total_count': 1, 'workflow_runs': [moved]}) if p == path and n == 1 else None
+        result = self.scan()
+        self.assertEqual(self.api.mutations, self.expected(), result)
+        self.assertEqual([d['id'] for d in result['decisions']], [10])
+
+    def test_inventory_that_never_settles_fails_closed_within_a_bounded_wait(self):
+        queued = self.api.root + '/actions/workflows/123/runs?event=merge_group&status=queued&per_page=100'
+        running = self.api.root + '/actions/workflows/123/runs?event=merge_group&status=in_progress&per_page=100'
+        moved = dict(self.api.runs[10], status='in_progress')
+        for override, error in (
+                (lambda m, p, b, n: self.api.response({'total_count': 2, 'workflow_runs': [self.api.runs[10]]})
+                 if p == queued else None, 'incomplete run pages'),
+                (lambda m, p, b, n: self.api.response({'total_count': 1, 'workflow_runs': [moved]})
+                 if p == running else None, 'run changed status during inventory')):
+            with self.subTest(error=error):
+                self.setUp()
+                self.api.override = override
+                result = self.assert_skips()
+                self.assertEqual(result['error'], error)
+                self.assertEqual(result['decisions'], [])
+                self.assertEqual(self.api.counts[('GET', queued)], P.INVENTORY_READS)
+                self.assertEqual(sum(self.sleeps), sum(P.INVENTORY_DELAYS))
+                self.assertLessEqual(sum(self.sleeps), 120)
 
     def test_run_count_change_between_pages_is_reread(self):
         self.api.runs[20] = self.api.make_run(20)

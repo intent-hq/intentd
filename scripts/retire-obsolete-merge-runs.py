@@ -25,19 +25,23 @@ Production integration must prove actual workflow-token visibility of bypass
 metadata in dry-run before enabling apply; local gh visibility is insufficient.
 The injectable transport is the sole network/cancellation boundary. 202 means
 accepted, not stopped. No retries, force-cancel, or replacement-run targeting;
-only a self-inconsistent run-list read is re-read, and only a consistent one is used.
+only a moving run inventory is re-read, after a bounded wait, and only a settled one is used.
 """
 import argparse
 import json
 import re
 import subprocess
 import sys
+import time
 from urllib.parse import parse_qs, urlsplit
 
 WORKFLOWS = {'intent-hq/intentd': '.github/workflows/ci.yml',
              'intent-hq/cloudlands-fe': '.github/workflows/intent-pr.yml'}
 LIVE = ('queued', 'in_progress', 'waiting', 'pending', 'requested')
-INVENTORY_READS = 3  # GitHub counts and lists filtered runs separately; a status change skews one read.
+# GitHub counts and lists filtered runs separately; after a run starts or ends they can
+# disagree for tens of seconds, so re-read the whole inventory after waiting (seconds).
+INVENTORY_DELAYS = (5, 10, 20, 30)
+INVENTORY_READS = len(INVENTORY_DELAYS) + 1
 QUEUE_STATES = {'QUEUED', 'AWAITING_CHECKS', 'MERGEABLE', 'UNMERGEABLE', 'LOCKED'}
 REQUIRED_RULES = {'deletion', 'non_fast_forward', 'required_linear_history'}
 QUEUE_REF = re.compile(r'gh-readonly-queue/main/pr-[1-9][0-9]*-[0-9a-f]{40}')
@@ -57,7 +61,7 @@ class SafetyError(ValueError):
 
 
 class Inconsistent(SafetyError):
-    """A run-list snapshot disagreed with itself (rows vs total_count); re-read it, bounded."""
+    """The run inventory moved while it was read; re-read it after a bounded wait."""
 
 
 class Skip(ValueError):
@@ -201,22 +205,28 @@ def run_snapshot(client, path):
     return runs
 
 
-def discover(client, ctx):
+def inventory(client, ctx):
     discovered = {}
     for status in LIVE:
         path = client.root + f'/actions/workflows/{ctx["workflow_id"]}/runs?event=merge_group&status={status}&per_page=100'
-        for attempt in range(1, INVENTORY_READS + 1):
-            try:
-                runs = run_snapshot(client, path)
-                break
-            except Inconsistent:
-                if attempt == INVENTORY_READS:
-                    raise
-        for run in runs:
-            require(integer(run['id'], 1) and run['id'] not in discovered, 'duplicate or invalid run ID')
+        listed = set()
+        for run in run_snapshot(client, path):
+            require(integer(run['id'], 1) and run['id'] not in listed, 'duplicate or invalid run ID')
+            listed.add(run['id'])
+            if run['id'] in discovered:
+                raise Inconsistent('run changed status during inventory')
             discovered[run['id']] = run
         require(len(discovered) <= 1000, 'run discovery bound exceeded')
     return [discovered[key] for key in sorted(discovered)]
+
+
+def discover(client, ctx):
+    for delay in INVENTORY_DELAYS:
+        try:
+            return inventory(client, ctx)
+        except Inconsistent:
+            time.sleep(delay)
+    return inventory(client, ctx)
 
 
 def run_identity(run, ctx):
