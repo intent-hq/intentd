@@ -1,5 +1,5 @@
 //! Two real Postgres tenants in one orchestrator process: when A's lease
-//! renewals stop, A's fence fires and A's work stops, while B keeps its
+//! renewals are blocked, A's fence fires and A's work stops, while B keeps its
 //! lease, its loops and its writes.
 //!
 //! Needs `--features postgres` and `INTENT_STORE_TEST_PG_URL` (the
@@ -45,18 +45,18 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
     let dir = tempfile::tempdir().unwrap();
     let run = uuid_suffix();
     let instance = format!("orchestrator-test-{run}");
-    // A's lease is never renewed (the first renewal is due after an hour),
-    // so its heartbeat fires the fence a sixth of the TTL before expiry.
-    let stalled = LeaseTiming {
-        ttl: Duration::from_secs(3),
-        interval: Duration::from_secs(3600),
+    let a_tenant = format!("a-{run}");
+    // A short lease for A, so its fence fires soon once renewals stop.
+    let short = LeaseTiming {
+        ttl: Duration::from_secs(4),
+        interval: Duration::from_millis(100),
     };
     let mut a = serve_tenant(
         pool.clone(),
-        &format!("a-{run}"),
+        &a_tenant,
         dir.path(),
         &instance,
-        stalled,
+        short,
         OrchestratorOnly::for_tests(),
     )
     .await
@@ -75,6 +75,19 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
     assert!(a.dir().starts_with(dir.path().join("tenants")));
     settled().await;
     assert_eq!(b.runtime().loops_running(), tenant::LOOPS);
+    assert!(
+        !a.fence().is_fenced(),
+        "A's heartbeat renews while nothing blocks it"
+    );
+
+    // Block A's renewals only: hold A's lease row lock in an open
+    // transaction, so every renewal waits until the heartbeat gives up.
+    let mut blocker = pool.begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM tenant_lease WHERE tenant_id = $1 FOR UPDATE")
+        .bind(&a_tenant)
+        .execute(&mut *blocker)
+        .await
+        .expect("lock A's lease row");
 
     let report = tokio::time::timeout(wait(), a.stopped())
         .await
@@ -113,6 +126,7 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
         .set_setting("orchestrator.test", "still served")
         .await
         .expect("B still writes");
+    blocker.rollback().await.expect("release A's lease row");
 }
 
 #[tokio::test]

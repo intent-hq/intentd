@@ -2851,6 +2851,7 @@ dependencies = [
  "intent-services",
  "intent-store",
  "intentd-test-support",
+ "sqlx",
  "tempfile",
  "tokio",
  "tracing",

@@ -5,7 +5,7 @@
 //! A tenant whose fence fires stops on its own; the others keep running.
 //! The process exits [`FENCE_OVERRAN_EXIT`] when a fence step overran (its
 //! work may outlive the lease), 1 when a tenant cannot be opened at start
-//! or every tenant stopped, and 0 on Ctrl-C after stopping every tenant.
+//! or every tenant stopped, and 0 on Ctrl-C or SIGTERM after stopping every tenant.
 
 use std::process::ExitCode;
 
@@ -18,15 +18,32 @@ use intentd_orchestrator::{
 /// Connections the shared pool keeps; each tenant writes through it.
 const POOL_CONNECTIONS: u32 = 16;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    match run().await {
+    // Read and clear the URL (it may carry a password) while this process
+    // is still single-threaded, so no child process inherits it.
+    let url = std::env::var(POSTGRES_URL_ENV);
+    std::env::remove_var(POSTGRES_URL_ENV);
+    let Ok(url) = url else {
+        tracing::error!("{POSTGRES_URL_ENV} is unset");
+        return ExitCode::FAILURE;
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "could not start the async runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run(url)) {
         Ok(code) => code,
         Err(error) => {
             tracing::error!(%error, "orchestrator stopped");
@@ -35,11 +52,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<ExitCode, String> {
-    let url =
-        std::env::var(POSTGRES_URL_ENV).map_err(|_| format!("{POSTGRES_URL_ENV} is unset"))?;
-    // Keep the URL (and its password) from every child process.
-    std::env::remove_var(POSTGRES_URL_ENV);
+async fn run(url: String) -> Result<ExitCode, String> {
     let tenants =
         parse_tenants(&std::env::var(TENANTS_ENV).map_err(|_| format!("{TENANTS_ENV} is unset"))?)?;
     let data_dir = intent_core::Config::resolve()
@@ -80,7 +93,7 @@ async fn run() -> Result<ExitCode, String> {
             let waits = served.iter_mut().map(|tenant| Box::pin(tenant.stopped()));
             tokio::select! {
                 (report, index) = first_of(waits) => Some((index, report)),
-                _ = tokio::signal::ctrl_c() => None,
+                () = shutdown_signal() => None,
             }
         };
         let Some((index, report)) = stopped else {
@@ -98,6 +111,30 @@ async fn run() -> Result<ExitCode, String> {
             std::process::exit(FENCE_OVERRAN_EXIT);
         }
     }
+}
+
+/// Ctrl-C, or SIGTERM on Unix (systemd, `docker stop`, Kubernetes): either
+/// stops every tenant before the process exits.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(term) => term,
+            Err(error) => {
+                tracing::warn!(%error, "SIGTERM cannot be handled; only Ctrl-C stops the tenants");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Fire every tenant's fence and wait for its work to stop; the exit code.

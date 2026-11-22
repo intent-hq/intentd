@@ -36,6 +36,9 @@ uuid = { workspace = true }
 [dev-dependencies]
 intent-store = { workspace = true, features = ["test-support"] }
 intentd-test-support = { path = "../intentd-test-support" }
+# The Postgres tests lock a lease row to stop renewals. No feature of its
+# own: `postgres` turns sqlx's Postgres driver on through intent-store.
+sqlx = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 
