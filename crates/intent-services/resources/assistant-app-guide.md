@@ -750,7 +750,10 @@ Sources: packages/cloudlands-fe/src/features/machine-setup/,
 packages/intentd/scripts/install.sh (INTENTD_PAIR, INTENTD_LINK_MARKER). --> A machine's
 actions can also include **Let <backend> run agents here**, which asks to confirm with
 **Allow**, and **Stop letting <backend> run agents here**; machines allowed this way are
-listed under **Machines <backend> can run agents on**.
+listed under **Machines <backend> can run agents on**. An orchestrator (hub icon) never
+offers **Let <backend> run agents here**: it never runs agents for another host, and
+adding it anyway fails with **<machine> is an orchestrator, so it can't run agents for
+<backend>** (older versions may differ).
 Running agents on those machines is experimental. That list is in the user's order of
 preference, and its first row is marked **Preferred**: **This computer** first by default, then machines and cloud entries as they
 were added (pending frontend release: the list is **Runners for <host>**, with no
@@ -787,7 +790,11 @@ value has the right format; it saves a profile and makes it the provider's defau
 orchestrator keeps it and sends it to a machine only when an agent starts there.
 <!-- Sources: packages/cloudlands-fe/src/features/onboarding/{steps/OnboardingAgentMachinesNotice.svelte,steps/OnboardingConnectStep.svelte,utils/onboarding-agent-machines.ts,utils/onboarding-steps.ts,utils/resolve-onboarding-model.ts,messages/ProviderCard.svelte}; packages/cloudlands-fe/src/lib/components/settings/ProviderSelector.svelte; packages/cloudlands-fe/src/store/renderer/slices/host-requirements/host-requirements-selectors.ts. -->
 Switching a machine to orchestrator removes it from the backends that used
-it to run agents; pair with it again to use it as a backend. Homes are part of
+it to run agents, the next time each one reaches it, and the app shows **<machine> is now an
+orchestrator and was removed from your runners**; pair with it again to use it as a backend.
+A workspace whose home was on it shows its home as unavailable at once: use **Move home…**
+to restore it on another machine from its last backup. Nothing on that computer is
+deleted. Older versions may differ. Homes are part of
 orchestrator mode: on an orchestrator a git workspace
 gets a **home**, a machine that holds its files, terminals and scripts, shown as
 **Home: <machine>** under the workspace title (hover it for the last backup). Right after
