@@ -95,6 +95,23 @@ async fn round_trip(pool: PgPool) -> Result<(), String> {
     if seen != (Some("\"a\"".into()), Some("\"b\"".into())) {
         return Err(format!("tenants not isolated on Neki: {seen:?}"));
     }
+    // Tenant secrets: the row lands on the tenant's shard next to its
+    // `tenant_writer` row, which every secret write locks.
+    let keys = std::sync::Arc::new(
+        postgres::SecretKeyring::new("neki", &[0x5a; 32]).map_err(|e| e.to_string())?,
+    );
+    for (store, value) in [(&a, "secret-a"), (&b, "secret-b")] {
+        let secrets =
+            postgres::TenantSecretStore::new(store, keys.clone()).map_err(|e| e.to_string())?;
+        secrets
+            .store("acct", value)
+            .await
+            .map_err(|e| e.to_string())?;
+        let seen = secrets.load("acct").await.map_err(|e| e.to_string())?;
+        if seen.as_deref() != Some(value) {
+            return Err(format!("tenant secret not isolated on Neki: {seen:?}"));
+        }
+    }
     if a.daemon_id().await.map_err(|e| e.to_string())?
         == b.daemon_id().await.map_err(|e| e.to_string())?
     {
