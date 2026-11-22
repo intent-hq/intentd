@@ -86,6 +86,70 @@ fn encode<T: serde::Serialize>(value: &T, name: &str) -> Result<String> {
 impl PgStore {
     // ---- completion watches ----------------------------------------------------------
 
+    pub async fn claim_completion_watch(&self, watch_id: &str) -> Result<bool> {
+        self.claim_delivery(ClaimTable::Watch, watch_id).await
+    }
+
+    pub async fn release_completion_watch_claim(&self, watch_id: &str) -> Result<()> {
+        self.release_delivery(ClaimTable::Watch, watch_id).await
+    }
+
+    pub async fn claim_delegation_group(&self, group_id: &str) -> Result<bool> {
+        self.claim_delivery(ClaimTable::Group, group_id).await
+    }
+
+    pub async fn release_delegation_group_claim(&self, group_id: &str) -> Result<()> {
+        self.release_delivery(ClaimTable::Group, group_id).await
+    }
+
+    /// Takes the row's delivery claim at the tenant's current epoch, under
+    /// the writer lock: free, already this process's, or left by an older
+    /// epoch. `false` only when another process holds it at this epoch.
+    async fn claim_delivery(&self, table: ClaimTable, id: &str) -> Result<bool> {
+        let name = table.name();
+        let mut tx = self.begin_write().await?;
+        let epoch = tx.writer().epoch;
+        let claimed = sqlx::query(table.claim_sql())
+            .bind(self.tenant())
+            .bind(id)
+            .bind(epoch)
+            .bind(self.process_token.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("claim {name} failed: {e}")))?
+            .rows_affected()
+            > 0;
+        let won = if claimed {
+            true
+        } else {
+            // No row at all: nothing to order against (the write-through
+            // has not landed), so the in-process claim decides.
+            sqlx::query_scalar::<_, i32>(table.probe_sql())
+                .bind(self.tenant())
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("probe {name} failed: {e}")))?
+                .is_none()
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(won)
+    }
+
+    /// Drops this process's claim on the row; another process's claim stays.
+    async fn release_delivery(&self, table: ClaimTable, id: &str) -> Result<()> {
+        let name = table.name();
+        let mut tx = self.begin_write().await?;
+        sqlx::query(table.release_sql())
+            .bind(self.tenant())
+            .bind(id)
+            .bind(self.process_token.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("release {name} claim failed: {e}")))?;
+        tx.commit().await.map_err(db)
+    }
+
     pub async fn retire_completion_watch_after_delivery(
         &self,
         watch_id: &str,
@@ -487,5 +551,87 @@ impl PgStore {
                 created_at,
             })
             .collect())
+    }
+}
+
+/// The rows a delivery claim can sit on.
+#[derive(Clone, Copy)]
+enum ClaimTable {
+    Watch,
+    Group,
+}
+
+/// Takes the claim ($1 tenant, $2 key, $3 epoch, $4 process token): free,
+/// already this process's, or left by an older epoch.
+const CLAIM_WATCH_SQL: &str = "UPDATE completion_watch SET claim_epoch = $3, claim_token = $4 \
+     WHERE tenant_id = $1 AND id = $2 \
+     AND (claim_token IS NULL OR claim_token = $4 OR claim_epoch < $3)";
+const CLAIM_GROUP_SQL: &str = "UPDATE delegation_group SET claim_epoch = $3, claim_token = $4 \
+     WHERE tenant_id = $1 AND group_id = $2 \
+     AND (claim_token IS NULL OR claim_token = $4 OR claim_epoch < $3)";
+/// Whether the row exists ($1 tenant, $2 key).
+const PROBE_WATCH_SQL: &str = "SELECT 1 FROM completion_watch WHERE tenant_id = $1 AND id = $2";
+const PROBE_GROUP_SQL: &str =
+    "SELECT 1 FROM delegation_group WHERE tenant_id = $1 AND group_id = $2";
+/// Drops this process's claim ($1 tenant, $2 key, $3 process token).
+const RELEASE_WATCH_SQL: &str = "UPDATE completion_watch \
+     SET claim_epoch = NULL, claim_token = NULL \
+     WHERE tenant_id = $1 AND id = $2 AND claim_token = $3";
+const RELEASE_GROUP_SQL: &str = "UPDATE delegation_group \
+     SET claim_epoch = NULL, claim_token = NULL \
+     WHERE tenant_id = $1 AND group_id = $2 AND claim_token = $3";
+
+impl ClaimTable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Watch => "completion_watch",
+            Self::Group => "delegation_group",
+        }
+    }
+
+    fn claim_sql(self) -> &'static str {
+        match self {
+            Self::Watch => CLAIM_WATCH_SQL,
+            Self::Group => CLAIM_GROUP_SQL,
+        }
+    }
+
+    fn probe_sql(self) -> &'static str {
+        match self {
+            Self::Watch => PROBE_WATCH_SQL,
+            Self::Group => PROBE_GROUP_SQL,
+        }
+    }
+
+    fn release_sql(self) -> &'static str {
+        match self {
+            Self::Watch => RELEASE_WATCH_SQL,
+            Self::Group => RELEASE_GROUP_SQL,
+        }
+    }
+}
+
+/// Names one process in the rows it claims (delivery claims, batch G 2c): a
+/// random id made when the process first opens the tenant, shared by every
+/// store of the tenant in the process (`tenant_registry`). With a claim's
+/// epoch it tells this process's claim (re-entrant, releasable) from
+/// another's.
+#[derive(Clone)]
+pub(crate) struct ProcessToken(std::sync::Arc<str>);
+
+impl Default for ProcessToken {
+    fn default() -> Self {
+        Self(uuid::Uuid::new_v4().to_string().into())
+    }
+}
+
+impl ProcessToken {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
 }

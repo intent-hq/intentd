@@ -1288,6 +1288,9 @@ pub(crate) struct PgStore {
     /// Process-local: the queue version this process last saw per agent;
     /// see `agents::QueueVersions`.
     queue_versions: agents::QueueVersions,
+    /// Process-local: names this process in delivery claims; see
+    /// `completion_watches`.
+    process_token: completion_watches::ProcessToken,
     /// Keeps the gates above registered for the next open of this tenant;
     /// see `tenant_registry`. Held, not read, outside tests.
     #[cfg_attr(
@@ -1568,6 +1571,7 @@ impl PgStore {
             writer_slot: shared.writer_slot.clone(),
             claim: shared.claim.clone(),
             queue_versions: shared.queue_versions.clone(),
+            process_token: shared.process_token.clone(),
             tenant_state: shared,
         }
     }

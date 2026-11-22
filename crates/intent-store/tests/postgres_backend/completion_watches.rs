@@ -524,3 +524,104 @@ parity_test!(stop_redelivery_round_trip, |store, tenant, db| {
         }
     }
 });
+
+// ---- delivery claims (batch G 2c) --------------------------------------------------------
+
+/// A store of `tenant` opened as if by another process named `process`: its
+/// own process-local gates, so only the database orders it against others.
+async fn open_as_process(db: &TestDb, tenant: &str, process: &str) -> Store {
+    Store::open_postgres_as_process(
+        db.app.clone(),
+        intent_store::postgres::TenantId::new(tenant).unwrap(),
+        intent_store::postgres::PostgresOptions::default(),
+        process,
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .expect("open tenant store as another process")
+}
+
+/// Two processes that both see one child's completion (two delivery loops,
+/// or a daemon still delivering while another rehydrated the watch) must
+/// not both wake the parent. Each claims the watch (or the delegation
+/// group) in the database before it delivers: the claim names the tenant's
+/// epoch and the claiming process, so the other process skips until the
+/// claim is released or a newer epoch (a takeover) makes it stale. A slow
+/// owner never loses its claim to a timer. `SQLite` has one process and
+/// always grants the claim.
+#[tokio::test]
+async fn a_completion_is_delivered_by_one_process_at_a_time() {
+    let Some(db) = crate::harness::test_db(false).await else {
+        let (store, _dir) = crate::harness::sqlite_store().await;
+        assert!(store.claim_completion_watch("w1").await.unwrap());
+        assert!(store.claim_completion_watch("w1").await.unwrap());
+        assert!(store.claim_delegation_group("g1").await.unwrap());
+        return;
+    };
+    let tenant = "claims";
+    let a = open_as_process(&db, tenant, "process-a").await;
+    let b = open_as_process(&db, tenant, "process-b").await;
+    seed_watches(&a, tenant).await;
+
+    for id in ["w1", "g1"] {
+        let claim = |s: &Store| {
+            let s = s.clone();
+            async move {
+                if id.starts_with('w') {
+                    s.claim_completion_watch(id).await.unwrap()
+                } else {
+                    s.claim_delegation_group(id).await.unwrap()
+                }
+            }
+        };
+        let release = |s: &Store| {
+            let s = s.clone();
+            async move {
+                if id.starts_with('w') {
+                    s.release_completion_watch_claim(id).await.unwrap();
+                } else {
+                    s.release_delegation_group_claim(id).await.unwrap();
+                }
+            }
+        };
+        assert!(claim(&a).await, "{id}: the first process claims");
+        assert!(claim(&a).await, "{id}: its own claim is re-entrant");
+        assert!(!claim(&b).await, "{id}: the other process skips");
+        release(&b).await;
+        assert!(
+            !claim(&b).await,
+            "{id}: a release by a non-holder is a no-op"
+        );
+        release(&a).await;
+        assert!(claim(&b).await, "{id}: a released claim can be taken");
+        assert!(!claim(&a).await, "{id}: now held by the other process");
+    }
+
+    // No persisted row (the write-through has not landed): nothing to
+    // order against, so the in-process claim alone decides.
+    assert!(a.claim_completion_watch("never-persisted").await.unwrap());
+    assert!(a.claim_delegation_group("never-persisted").await.unwrap());
+
+    // A takeover bumps the tenant's epoch: claims from the old epoch are
+    // stale, so the new owner may deliver what the old one left claimed.
+    let (owner, _lease) = Store::open_postgres_owned_as_process(
+        db.app.clone(),
+        intent_store::postgres::TenantId::new(tenant).unwrap(),
+        intent_store::postgres::PostgresOptions::default(),
+        "process-c",
+        "process-c",
+        std::time::Duration::from_secs(60),
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .expect("claim the tenant");
+    assert!(owner.claim_completion_watch("w1").await.unwrap());
+    assert!(owner.claim_delegation_group("g1").await.unwrap());
+    assert!(
+        matches!(
+            b.claim_completion_watch("w2").await,
+            Err(intent_store::Error::NotOwner(_))
+        ),
+        "a process that lost the tenant cannot claim at all"
+    );
+}
