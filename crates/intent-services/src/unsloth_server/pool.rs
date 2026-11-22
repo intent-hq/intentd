@@ -35,6 +35,13 @@ const FOOTPRINT_FACTOR: u64 = 3;
 /// the start that follows plan from the same answer.
 const UNKNOWN_FOOTPRINT_TTL: Duration = Duration::from_secs(300);
 
+/// How long a daemon-started server may sit with no live agents before it
+/// stops to free its memory.
+pub(crate) const UNSLOTH_IDLE_STOP_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// How often the agent manager checks for idle servers.
+pub(crate) const UNSLOTH_IDLE_CHECK_EVERY: Duration = Duration::from_secs(60);
+
 /// One running server's share of the memory budget.
 #[derive(Debug, Clone)]
 pub(crate) struct Load {
@@ -94,6 +101,9 @@ struct Entry {
     /// exists, including before its server has spawned.
     port: u16,
     last_used: Instant,
+    /// When the idle check first saw this server with no agents and no
+    /// start; cleared when one joins.
+    idle_since: Option<Instant>,
     /// `ensure_endpoint` calls running through this entry. While one runs,
     /// the entry is a starting server even before it reports a status.
     in_flight: Arc<AtomicUsize>,
@@ -174,6 +184,7 @@ impl UnslothServerPool {
             return None;
         }
         entry.last_used = Instant::now();
+        entry.idle_since = None;
         entry.in_flight.fetch_add(1, Ordering::SeqCst);
         Some((entry.manager.clone(), InFlight(entry.in_flight.clone())))
     }
@@ -400,6 +411,7 @@ impl UnslothServerPool {
                 manager: manager.clone(),
                 port,
                 last_used: Instant::now(),
+                idle_since: None,
                 in_flight: in_flight.clone(),
             },
         );
@@ -448,6 +460,64 @@ impl UnslothServerPool {
         }
         Self::shut_down_all(entries).await;
         stopped
+    }
+
+    /// Stop every daemon-started, ready server that no live agent and no
+    /// start has used for `after`, as of `now`; returns their models. An
+    /// adopted, loading or starting server is never idle.
+    pub(crate) async fn reap_idle(
+        &self,
+        attached: &HashMap<String, usize>,
+        now: Instant,
+        after: Duration,
+    ) -> Vec<String> {
+        let _admission = self.admission.lock().await;
+        if self.is_shutting_down() {
+            return Vec::new();
+        }
+        let entries: Vec<(String, Arc<UnslothServerManager>)> = lock_ignore_poison(&self.servers)
+            .iter()
+            .map(|(repo, entry)| (repo.clone(), entry.manager.clone()))
+            .collect();
+        let mut idle = Vec::new();
+        for (repo, manager) in entries {
+            let unused = attached.get(&repo).is_none_or(|count| *count == 0);
+            let ours_and_ready = manager
+                .status_snapshot()
+                .await
+                .is_some_and(|status| status.pid.is_some() && status.phase == "ready");
+            idle.push((repo, manager, unused && ours_and_ready));
+        }
+
+        let mut stopped = Vec::new();
+        {
+            let mut servers = lock_ignore_poison(&self.servers);
+            for (repo, manager, unused) in idle {
+                let Some(entry) = servers.get_mut(&repo) else {
+                    continue;
+                };
+                // A join since the snapshot counts as use.
+                let idle_now = unused
+                    && Arc::ptr_eq(&entry.manager, &manager)
+                    && entry.in_flight.load(Ordering::SeqCst) == 0;
+                if !idle_now {
+                    entry.idle_since = None;
+                    continue;
+                }
+                let since = *entry.idle_since.get_or_insert(now);
+                if now.saturating_duration_since(since) >= after {
+                    if let Some(entry) = servers.remove(&repo) {
+                        stopped.push((repo, entry));
+                    }
+                }
+            }
+        }
+        let repos = stopped.iter().map(|(repo, _)| repo.clone()).collect();
+        for (repo, _) in &stopped {
+            tracing::info!(repo = %repo, "stopping idle managed unsloth server");
+        }
+        Self::shut_down_all(stopped.into_iter().map(|(_, entry)| entry).collect()).await;
+        repos
     }
 
     /// Stop the server for one model, including a start in flight; `false`
@@ -517,6 +587,7 @@ impl UnslothServerPool {
                 manager,
                 port,
                 last_used: Instant::now(),
+                idle_since: None,
                 in_flight: Arc::new(AtomicUsize::new(0)),
             },
         );
@@ -533,6 +604,7 @@ impl UnslothServerPool {
                 manager,
                 port,
                 last_used: Instant::now(),
+                idle_since: None,
                 in_flight: Arc::new(AtomicUsize::new(1)),
             },
         );

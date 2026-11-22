@@ -2666,6 +2666,7 @@ async fn cmd_serve_owned(
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
     // visible to every clone, including the api handed to the transport below).
     services.attach_agent_manager(&manager);
+    manager.start_unsloth_idle_reaper();
     // Read-only tree probe for `agent.diagnostics` per-agent subtree memory
     // attribution (monorepo#2063 A2): installed unconditionally, unlike the
     // budget below, which only exists when the budget resolves positive.

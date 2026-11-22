@@ -367,3 +367,23 @@ async fn a_model_that_fits_beside_the_running_one_needs_no_confirmation() {
     fx.serve(MODEL_A, true);
     assert!(fx.admit(&b, MessageOrigin::User, None).await.is_ok());
 }
+
+/// An attached agent keeps its model's server up; a server no agent uses
+/// stops once idle for the timeout.
+#[tokio::test]
+async fn idle_servers_stop_but_one_with_an_attached_agent_stays() {
+    let mut fx = Fixture::new().await;
+    fx.serve(MODEL_A, true);
+    fx.serve(MODEL_B, true);
+    let a = fx.agent("agent-a", "Planner", MODEL_A).await;
+    fx.live(&a, MODEL_A);
+    let t0 = std::time::Instant::now();
+
+    assert!(fx.mgr.reap_idle_unsloth_servers(t0).await.is_empty());
+    let stopped = fx
+        .mgr
+        .reap_idle_unsloth_servers(t0 + crate::unsloth_server::UNSLOTH_IDLE_STOP_AFTER)
+        .await;
+    assert_eq!(stopped, [MODEL_B]);
+    assert!(fx.mgr.unsloth_manager().tracks_for_test(MODEL_A));
+}

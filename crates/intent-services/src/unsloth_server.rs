@@ -62,7 +62,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex as TokioMutex;
 
 mod pool;
-pub(crate) use pool::UnslothServerPool;
+pub(crate) use pool::{UnslothServerPool, UNSLOTH_IDLE_CHECK_EVERY, UNSLOTH_IDLE_STOP_AFTER};
 
 /// Default port the managed server listens on (`unsloth run -p <port>`;
 /// matches the Unsloth CLI's own default).
