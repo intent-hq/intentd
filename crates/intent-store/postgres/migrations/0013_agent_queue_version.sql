@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS agent_queue_version (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
     version bigint NOT NULL,
+    -- A fresh id per write, so a process whose commit failed can tell
+    -- whether its own write landed.
+    write_id text NOT NULL,
     PRIMARY KEY (tenant_id, agent_id),
     FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE
 );
