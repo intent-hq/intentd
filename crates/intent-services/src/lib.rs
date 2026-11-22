@@ -17959,12 +17959,13 @@ impl Services {
                 delete_at,
                 move |claim| {
                     intent_core::with_caller(intent_core::Caller::Daemon, async move {
-                        if let Err(e) = timer_services
+                        let result = timer_services
                             .delete_workspace_with_claim(timer_id.clone(), Some(claim))
-                            .await
-                        {
+                            .await;
+                        if let Err(e) = &result {
                             tracing::warn!(workspace = %timer_id.as_str(), error = %e, "re-armed workspace delete failed at commit");
                         }
+                        delete_grace::commit_outcome(&result)
                     })
                 },
             )
@@ -24381,9 +24382,11 @@ impl WorkspaceApi for Services {
                 delete_grace::PendingDeleteSubject::Workspace(id.clone()),
                 undo_delay_ms,
                 move |claim| intent_core::with_caller(intent_core::Caller::Daemon, async move {
-                    if let Err(e) = timer_services.delete_workspace_with_claim(timer_id.clone(), Some(claim)).await {
+                    let result = timer_services.delete_workspace_with_claim(timer_id.clone(), Some(claim)).await;
+                    if let Err(e) = &result {
                         tracing::warn!(workspace = %timer_id.as_str(), error = %e, "scheduled workspace delete failed at commit");
                     }
+                    delete_grace::commit_outcome(&result)
                 }),
             ).await?;
             let delete_at = scheduled.delete_at;

@@ -74,6 +74,22 @@ impl PgStore {
         tx.commit().await.map_err(db)
     }
 
+    pub async fn release_delete_grace(&self, subject_kind: &str, subject_id: &str) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        sqlx::query(
+            "UPDATE delete_grace SET claim_epoch = NULL, claim_token = NULL \
+             WHERE tenant_id = $1 AND subject_kind = $2 AND subject_id = $3 AND claim_token = $4",
+        )
+        .bind(self.tenant())
+        .bind(subject_kind)
+        .bind(subject_id)
+        .bind(self.process_token())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
     pub async fn cancel_delete_grace(&self, subject_kind: &str, subject_id: &str) -> Result<bool> {
         let mut tx = self.begin_write().await?;
         let cancelled = sqlx::query(

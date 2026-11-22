@@ -399,7 +399,7 @@ impl OwnedPendingDeletes {
         })
     }
 
-    pub(crate) async fn schedule_owned<F, Fut>(
+    pub(crate) async fn schedule_owned<F, Fut, O>(
         &self,
         subject: PendingDeleteSubject,
         delay_ms: u64,
@@ -407,7 +407,8 @@ impl OwnedPendingDeletes {
     ) -> Result<PendingDeleteSchedule>
     where
         F: FnOnce(PendingDeleteClaim) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = O> + Send + 'static,
+        O: Into<GraceCommit> + Send + 'static,
     {
         let delay_ms = clamp_undo_delay_ms(delay_ms);
         let delete_at = intent_core::iso_ms_from_now(delay_ms);
@@ -417,7 +418,7 @@ impl OwnedPendingDeletes {
 
     /// Re-arms a deadline a previous process stored (Postgres): the timer
     /// fires at the stored `delete_at`, at once when it already passed.
-    pub(crate) async fn rearm_owned<F, Fut>(
+    pub(crate) async fn rearm_owned<F, Fut, O>(
         &self,
         subject: PendingDeleteSubject,
         delete_at: String,
@@ -425,14 +426,15 @@ impl OwnedPendingDeletes {
     ) -> Result<PendingDeleteSchedule>
     where
         F: FnOnce(PendingDeleteClaim) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = O> + Send + 'static,
+        O: Into<GraceCommit> + Send + 'static,
     {
         self.arm_owned(subject, delete_at, None, delete).await
     }
 
     /// Arms `subject` at `delete_at`; `requested_delay_ms` is the delay that
     /// deadline was made from, used as is when the store keeps it.
-    async fn arm_owned<F, Fut>(
+    async fn arm_owned<F, Fut, O>(
         &self,
         subject: PendingDeleteSubject,
         delete_at: String,
@@ -441,7 +443,8 @@ impl OwnedPendingDeletes {
     ) -> Result<PendingDeleteSchedule>
     where
         F: FnOnce(PendingDeleteClaim) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = O> + Send + 'static,
+        O: Into<GraceCommit> + Send + 'static,
     {
         let (attempt, fresh) = {
             let mut map = self
@@ -522,12 +525,21 @@ impl OwnedPendingDeletes {
                     loop {
                         match inner.store.claim_delete_grace(kind, id).await {
                             Ok(true) => {
-                                delete(claim).await;
-                                if let Err(e) = inner.store.finish_delete_grace(kind, id).await {
-                                    // The stale claim re-arms on the next
-                                    // start; the delete then finds its
+                                // The stored deadline goes only once the
+                                // delete completed (or its subject is gone).
+                                // A delete that failed before its own durable
+                                // record releases the claim and keeps the
+                                // row, so the next start re-arms and retries
+                                // it instead of losing it.
+                                let finished = match delete(claim).await.into() {
+                                    GraceCommit::Done => inner.store.finish_delete_grace(kind, id).await,
+                                    GraceCommit::Retry => inner.store.release_delete_grace(kind, id).await,
+                                };
+                                if let Err(e) = finished {
+                                    // A stale claim re-arms on the next
+                                    // start; a finished delete then finds its
                                     // subject gone and drops the row.
-                                    tracing::warn!(kind, id, error = %e, "could not remove a committed delete deadline");
+                                    tracing::warn!(kind, id, error = %e, "could not settle a committed delete deadline");
                                 }
                                 return;
                             }
@@ -669,6 +681,33 @@ impl OwnedPendingDeletes {
             .begin_repository_pending_delete(&[subject.lifecycle_key()])
             .await?;
         Ok(PendingDeleteClaim { subject, guard })
+    }
+}
+
+/// What a pending deletion's commit reports to the registry.
+pub(crate) enum GraceCommit {
+    /// The delete completed, or its subject is already gone: the stored
+    /// deadline is removed.
+    Done,
+    /// The delete failed before it was durably under way: the stored
+    /// deadline stays (its claim released) for the next start to retry.
+    Retry,
+}
+
+/// A commit closure that reports nothing counts as done (the in-memory
+/// behaviour: a failed commit was only logged).
+impl From<()> for GraceCommit {
+    fn from((): ()) -> Self {
+        Self::Done
+    }
+}
+
+/// A service delete's result as a [`GraceCommit`]: done when it succeeded
+/// or its subject is already gone, retry on any other error.
+pub(crate) fn commit_outcome<T>(result: &Result<T>) -> GraceCommit {
+    match result {
+        Ok(_) | Err(Error::NotFound(_)) => GraceCommit::Done,
+        Err(_) => GraceCommit::Retry,
     }
 }
 

@@ -69,6 +69,17 @@ impl Store {
         dispatch!(self, backend => backend.finish_delete_grace(subject_kind, subject_id).await)
     }
 
+    /// Releases this process's claim on a deadline whose delete failed
+    /// before it was durably under way: the row stays for the next start to
+    /// re-arm and retry. `SQLite`: a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn release_delete_grace(&self, subject_kind: &str, subject_id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.release_delete_grace(subject_kind, subject_id).await)
+    }
+
     /// Cancels a pending delete's stored deadline: `true` when this call
     /// removed it, `false` when it is gone or claimed by a commit already
     /// under way. `SQLite` always returns `true`.
@@ -124,6 +135,11 @@ impl crate::SqliteStore {
 
     #[expect(clippy::unused_async, reason = "same signature as the Postgres store")]
     pub async fn finish_delete_grace(&self, _subject_kind: &str, _subject_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    #[expect(clippy::unused_async, reason = "same signature as the Postgres store")]
+    pub async fn release_delete_grace(&self, _subject_kind: &str, _subject_id: &str) -> Result<()> {
         Ok(())
     }
 

@@ -8083,12 +8083,13 @@ impl Services {
                 delete_at,
                 move |claim| {
                     intent_core::with_caller(intent_core::Caller::Daemon, async move {
-                        if let Err(e) = timer_services
+                        let result = timer_services
                             .agent_delete_with_claim(timer_id.clone(), Some(timer_ws), Some(claim))
-                            .await
-                        {
+                            .await;
+                        if let Err(e) = &result {
                             tracing::warn!(agent = %timer_id.0, error = %e, "re-armed agent delete failed at commit");
                         }
+                        crate::delete_grace::commit_outcome(&result)
                     })
                 },
             )
@@ -8131,9 +8132,11 @@ impl Services {
             crate::delete_grace::PendingDeleteSubject::Agent { workspace_id: session_ws.clone(), agent_id: agent_id.clone() },
             undo_delay_ms,
             move |claim| intent_core::with_caller(intent_core::Caller::Daemon, async move {
-                if let Err(e) = timer_services.agent_delete_with_claim(timer_id.clone(), Some(timer_ws), Some(claim)).await {
+                let result = timer_services.agent_delete_with_claim(timer_id.clone(), Some(timer_ws), Some(claim)).await;
+                if let Err(e) = &result {
                     tracing::warn!(agent = %timer_id.0, error = %e, "scheduled agent delete failed at commit");
                 }
+                crate::delete_grace::commit_outcome(&result)
             }),
         ).await?;
         let delete_at = scheduled.delete_at;

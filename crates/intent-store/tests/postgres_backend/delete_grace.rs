@@ -96,6 +96,24 @@ async fn a_delete_in_grace_survives_takeover_and_commits_once() {
         .unwrap();
     assert!(restarted.list_delete_graces().await.unwrap().is_empty());
 
+    // A delete that failed before it was durably under way releases its
+    // claim and keeps the row, so another attempt (or the next start)
+    // retries it instead of losing it.
+    restarted.record_delete_grace(&agent).await.unwrap();
+    assert!(restarted
+        .claim_delete_grace("agent", "agent-1")
+        .await
+        .unwrap());
+    restarted
+        .release_delete_grace("agent", "agent-1")
+        .await
+        .unwrap();
+    assert!(
+        b.claim_delete_grace("agent", "agent-1").await.unwrap(),
+        "released, so claimable"
+    );
+    b.finish_delete_grace("agent", "agent-1").await.unwrap();
+
     // A cancel removes an unclaimed deadline, so nothing is left to commit.
     restarted.record_delete_grace(&ws).await.unwrap();
     assert!(restarted
