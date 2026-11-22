@@ -25,6 +25,7 @@
 
 pub use intent_core::Result;
 
+pub mod home;
 pub mod host;
 pub mod scrollback;
 
