@@ -730,7 +730,7 @@ listed under **Machines <backend> can run agents on**.
 Running agents on those machines is experimental. That list is in the user's order of
 preference, and its first row is marked **Preferred**: **This computer** first by default, then machines and cloud entries as they
 were added (pending frontend release: the list is **Runners for <host>**, with no
-**Preferred** mark, and the host's own row reads **This host**). Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
+**Preferred** mark, and the host's own row shows its name with **This host**). Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
 menu. In **Where <backend> runs agents**, a row shows a status badge only when it cannot run
 agents (such as **Unreachable**, **Update required** or **Key rejected**). An agent started without a **Start on** choice runs on the first row that can run
 it; a sub-agent started by an agent on this computer stays here. A backend started as an
@@ -741,8 +741,9 @@ orchestrator, **Start on** offers **First available machine** instead of the bac
 each machine. Pending frontend release (not in current builds): the picker, labelled
 **Runner**, drops **First available machine** and preselects the first row in the host's
 order that can take the agent (the host itself when it runs agents and comes first); an
-orchestrator has no row of its own. Choosing the host sends it explicitly. API callers that
-omit the placement still get the first available runner. Also pending: first-run onboarding on an
+orchestrator has no row of its own. Choosing the host always starts the agent there. API callers that
+omit the placement still get the first available runner. A backend choice saved before this
+change follows the order too. Also pending: first-run onboarding on an
 orchestrator checks only git (no Node.js), shows each provider card as **Runs on a
 runner** with no install or sign-in step, and keeps **Let's go** disabled with a link to
 **Settings → Hosts** while its runner list is empty (an orchestrator shows **Settings → Hosts**
