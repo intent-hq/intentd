@@ -67,9 +67,9 @@ pub(crate) async fn connect_home(svc: &Services, workspace_id: &WorkspaceId) -> 
 /// 19; `None` when the workspace has no home on a machine.
 /// The workspace's home and its connected machine, with the use of the
 /// machine the caller holds while it opens its terminal
-/// ([`Shared::begin_use`]).
+/// ([`RemoteNode::begin_use`]).
 ///
-/// [`Shared::begin_use`]: crate::connector::Shared::begin_use
+/// [`RemoteNode::begin_use`]: crate::RemoteNode::begin_use
 async fn linked_home(
     svc: &Services,
     workspace_id: &WorkspaceId,

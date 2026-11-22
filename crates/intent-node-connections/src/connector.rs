@@ -636,6 +636,7 @@ impl Shared {
 
     /// Begin a use of the machine over its link; it waits while an idle
     /// pause runs, and the guard ends the use.
+    #[must_use = "the use ends when the guard drops"]
     pub async fn begin_use(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.use_gate.clone().read_owned().await
     }
@@ -2498,7 +2499,8 @@ impl RemoteNode {
     }
 
     /// The connector's internal state. Domain code calls the methods on
-    /// `RemoteNode` (and [`GateLink`](crate::link::gate::GateLink)) instead.
+    /// `RemoteNode`, [`GateLink`](crate::link::gate::GateLink) and
+    /// [`view`](Self::view) instead.
     #[must_use]
     pub fn shared_ref(&self) -> &Shared {
         &self.shared
@@ -2572,6 +2574,7 @@ impl RemoteNode {
 /// machine's connector.
 impl RemoteNode {
     /// Take a use of the machine: an idle pause waits for it to end.
+    #[must_use = "the use ends when the guard drops"]
     pub async fn begin_use(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.shared.begin_use().await
     }

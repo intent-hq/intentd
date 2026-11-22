@@ -58,14 +58,14 @@ async fn unreached(
     call_unavailable(home, method, &error.to_string())
 }
 
-/// A use of the home's machine, held while a call runs ([`Shared::begin_use`]).
+/// A use of the home's machine, held while a call runs ([`RemoteNode::begin_use`]).
 type Use = tokio::sync::OwnedRwLockReadGuard<()>;
 
 /// The home's machine, connected and speaking nodeProtocol 19. With
 /// `gated`, the call is a use of the machine: it waits out an idle pause
 /// before it connects (a pause's own pushes are not gated).
 ///
-/// [`Shared::begin_use`]: crate::connector::Shared::begin_use
+/// [`RemoteNode::begin_use`]: crate::RemoteNode::begin_use
 async fn home_node(
     svc: &Services,
     workspace_id: &WorkspaceId,
