@@ -486,11 +486,13 @@ pub async fn check_schema(pool: &PgPool) -> Result<()> {
             )),
             e => db(e),
         })?;
-    let (has_ledger,): (bool,) =
-        sqlx::query_as("SELECT to_regclass('intent_schema_migrations') IS NOT NULL")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db)?;
+    let (has_ledger, legacy_sqlx): (bool, bool) = sqlx::query_as(
+        "SELECT to_regclass('intent_schema_migrations') IS NOT NULL, \
+                to_regclass('_sqlx_migrations') IS NOT NULL",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db)?;
     let ledger: Vec<(i64, Vec<u8>, bool)> = if has_ledger {
         sqlx::query_as(
             "SELECT version, checksum, complete FROM intent_schema_migrations ORDER BY version",
@@ -508,7 +510,11 @@ pub async fn check_schema(pool: &PgPool) -> Result<()> {
         .collect();
     match schema_mismatch(&ledger, &embedded) {
         None => Ok(()),
-        Some(mismatch) => Err(Error::SchemaMismatch(Box::new(mismatch))),
+        Some(mut mismatch) => {
+            // As `migrate` decides: a legacy schema only without ledger rows.
+            mismatch.legacy_sqlx = legacy_sqlx && ledger.is_empty();
+            Err(Error::SchemaMismatch(Box::new(mismatch)))
+        }
     }
 }
 
@@ -550,6 +556,7 @@ fn schema_mismatch(
         expected,
         changed,
         part_way,
+        legacy_sqlx: false,
     })
 }
 

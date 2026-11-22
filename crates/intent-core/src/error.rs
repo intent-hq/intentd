@@ -861,6 +861,9 @@ pub struct SchemaMismatch {
     pub changed: Vec<i64>,
     /// Versions a migrate run started but did not finish, ascending.
     pub part_way: Vec<i64>,
+    /// The schema has no ledger rows but was migrated by the earlier sqlx
+    /// migrator (`_sqlx_migrations`), which the migrate job refuses.
+    pub legacy_sqlx: bool,
 }
 
 impl SchemaMismatch {
@@ -893,9 +896,15 @@ impl std::fmt::Display for SchemaMismatch {
         if !self.changed.is_empty() {
             write!(f, "; changed since they were applied: {:?}", self.changed)?;
         }
-        // The first fix that applies; the migrate job refuses the first two.
+        // The first fix that applies; the migrate job refuses the first three.
         let unknown = self.unknown();
-        if !unknown.is_empty() {
+        if self.legacy_sqlx {
+            f.write_str(
+                "; the schema was migrated by the earlier sqlx migrator (_sqlx_migrations) \
+                 and has no intent_schema_migrations record: recreate the schema, then run \
+                 the migrate job",
+            )
+        } else if !unknown.is_empty() {
             write!(
                 f,
                 "; the schema is newer than this build (unknown {unknown:?}): run a build that \

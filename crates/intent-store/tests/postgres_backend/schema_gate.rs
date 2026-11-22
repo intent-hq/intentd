@@ -155,6 +155,26 @@ async fn open_after_migrate_succeeds_and_migrate_is_idempotent() {
     assert_eq!(store.get_setting("k").await.unwrap().as_deref(), Some("1"));
 }
 
+/// A schema the earlier sqlx migrator built has no ledger; `migrate`
+/// refuses it, so the gate must name the real repair, not "run migrate".
+#[tokio::test]
+async fn open_on_a_legacy_sqlx_schema_says_to_recreate_it() {
+    let Some((_, admin)) = empty_db().await else {
+        return;
+    };
+    exec(
+        &admin,
+        "CREATE TABLE _sqlx_migrations (version bigint PRIMARY KEY)".to_owned(),
+    )
+    .await;
+    let mismatch = refused(&admin, "legacy").await;
+    assert!(mismatch.legacy_sqlx, "{mismatch:?}");
+    let message = Error::SchemaMismatch(Box::new(mismatch)).to_string();
+    assert!(message.contains("recreate the schema"), "{message}");
+    let migrate = postgres::migrate(&admin).await.unwrap_err().to_string();
+    assert!(migrate.contains("recreate the schema"), "{migrate}");
+}
+
 /// Only a missing `__neki` schema means "not Neki". A `__neki` schema
 /// without `ddl_versions()` (renamed or changed on a Neki upgrade) must fail
 /// the migrate job, not skip the wait for the routers.

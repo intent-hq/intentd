@@ -40,6 +40,7 @@ fn schema_mismatch_code_and_display() {
             expected: vec![1, 2],
             changed,
             part_way,
+            legacy_sqlx: false,
         }))
     };
     let missing = mismatch(vec![1], vec![], vec![]);
@@ -73,6 +74,16 @@ fn schema_mismatch_code_and_display() {
         newer.contains("newer than this build (unknown [3])"),
         "{newer}"
     );
+    let legacy = Error::SchemaMismatch(Box::new(SchemaMismatch {
+        applied: vec![],
+        expected: vec![1, 2],
+        changed: vec![],
+        part_way: vec![],
+        legacy_sqlx: true,
+    }))
+    .to_string();
+    assert!(legacy.contains("earlier sqlx migrator"), "{legacy}");
+    assert!(legacy.contains("recreate the schema"), "{legacy}");
     // An unknown version a newer build left part-way is a newer schema too.
     let newer_part_way = mismatch(vec![1, 2], vec![], vec![3]).to_string();
     assert!(
