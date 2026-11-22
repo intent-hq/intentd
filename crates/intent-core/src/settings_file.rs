@@ -80,6 +80,7 @@ pub struct SettingsFile {
     pub identity: IdentitySettings,
     pub accounts: AccountsSettings,
     pub voice: VoiceSettings,
+    pub autocomplete: AutocompleteSettings,
     pub context: ContextSettings,
     pub storage: StorageSettings,
     pub workspaces: WorkspacesSettings,
@@ -791,6 +792,41 @@ impl Default for VoiceWorkspaceVocabularySettings {
             max_terms: DEFAULT_VOICE_WORKSPACE_VOCABULARY_MAX_TERMS,
         }
     }
+}
+
+/// `[autocomplete]` — composer autocomplete (`autocomplete.*`, served by
+/// `input.autocomplete`). The service API keys (`autocomplete.kilo.apiKey`,
+/// `autocomplete.openrouter.apiKey`) are secrets and live in `.secrets.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct AutocompleteSettings {
+    /// `autocomplete.enabled` — suggest a continuation while the user types.
+    pub enabled: bool,
+    /// `autocomplete.service` — the OpenAI-compatible gateway asked for
+    /// suggestions.
+    pub service: AutocompleteService,
+    /// `autocomplete.model` — base model id (without a `:free` suffix; the
+    /// daemon adds it when the service and key call for it).
+    pub model: AutocompleteModel,
+}
+
+/// `autocomplete.service` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutocompleteService {
+    #[default]
+    Kilo,
+    Openrouter,
+}
+
+/// `autocomplete.model` values (base ids shared by both services).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AutocompleteModel {
+    #[default]
+    #[serde(rename = "nvidia/nemotron-3.5-lightning")]
+    Nemotron35Lightning,
+    #[serde(rename = "particle-ai/particle-1")]
+    Particle1,
 }
 
 /// `[context]` — context engine (`context.*`).
@@ -2142,6 +2178,18 @@ model = "gpt-4o-transcribe"
 # entirely; max 100).
 maxTerms = 50
 
+[autocomplete]
+# Suggest as you type -- ask the autocomplete service for a short
+# continuation of the composer draft (input.autocomplete).
+enabled = false
+# Autocomplete service -- "kilo" (Kilo Gateway; free models work without a
+# key) or "openrouter" (needs a key). The API keys are secrets and live in
+# .secrets.json (autocomplete.kilo.apiKey / autocomplete.openrouter.apiKey).
+service = "kilo"
+# Autocomplete model -- base model id: "nvidia/nemotron-3.5-lightning" or
+# "particle-ai/particle-1".
+model = "nvidia/nemotron-3.5-lightning"
+
 [context]
 # Context engine -- enable the auggie context engine.
 enabled = true
@@ -2472,6 +2520,9 @@ mod tests {
             d.voice.workspace_vocabulary.max_terms,
             DEFAULT_VOICE_WORKSPACE_VOCABULARY_MAX_TERMS
         );
+        assert!(!d.autocomplete.enabled);
+        assert_eq!(d.autocomplete.service, AutocompleteService::Kilo);
+        assert_eq!(d.autocomplete.model, AutocompleteModel::Nemotron35Lightning);
         assert!(d.context.enabled);
         assert!(d.context.allow_indexing);
         assert_eq!(d.logging.level, LogLevel::Info);
@@ -3446,6 +3497,34 @@ mod tests {
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.pr_monitor, parsed.pr_monitor);
         assert!(templated.agent_features.pr_monitor);
+    }
+
+    #[test]
+    fn autocomplete_defaults_template_and_override_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(parsed.autocomplete, AutocompleteSettings::default());
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[autocomplete]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.autocomplete, parsed.autocomplete);
+
+        let custom = SettingsFile::parse_str(
+            "[autocomplete]\nenabled = true\nservice = \"openrouter\"\nmodel = \"particle-ai/particle-1\"\n",
+        )
+        .expect("custom autocomplete parses");
+        assert!(custom.autocomplete.enabled);
+        assert_eq!(custom.autocomplete.service, AutocompleteService::Openrouter);
+        assert_eq!(custom.autocomplete.model, AutocompleteModel::Particle1);
+
+        for bad in [
+            "[autocomplete]\nservice = \"groq\"\n",
+            "[autocomplete]\nmodel = \"particle-ai/particle-1:free\"\n",
+            "[autocomplete]\napiKey = \"sk-x\"\n",
+        ] {
+            assert!(
+                SettingsFile::parse_str(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]

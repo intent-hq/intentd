@@ -1364,10 +1364,13 @@ impl SettingDefinition {
 /// they are neither sensitive nor read-only: the listener, auth and tunnel
 /// (`server.`), guest access (`sharing.`), forge endpoints, OAuth clients and
 /// credential routing (`sourceControl.`), account companions of stored
-/// secrets (`accounts.`), and running agents for other daemons
-/// (`remoteAgents.`). Users change these in Settings.
+/// secrets (`accounts.`), running agents for other daemons
+/// (`remoteAgents.`), and composer autocomplete (`autocomplete.`), which sends
+/// conversation text to a third-party gateway only after the Settings consent
+/// step. Users change these in Settings.
 const PROPOSAL_EXCLUDED_PREFIXES: &[&str] = &[
     "server.",
+    "autocomplete.",
     "sharing.",
     "sourceControl.",
     "accounts.",
@@ -2305,6 +2308,46 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Vocabulary terms (string array) biased into every voice.transcribe call",
             "voice",
             Some(json!(crate::voice_ops::DEFAULT_VOCABULARY)),
+        ),
+        // --- Group A: composer autocomplete (input.autocomplete) --------------
+        boolean(
+            "autocomplete.enabled",
+            "Suggest as you type",
+            "Ask the autocomplete service for a short continuation of the composer draft \
+             (input.autocomplete); sends the draft and recent conversation text to the service",
+            "autocomplete",
+            false,
+        ),
+        enumerated(
+            "autocomplete.service",
+            "Autocomplete service",
+            "OpenAI-compatible gateway asked for suggestions: Kilo Gateway (free models work \
+             without a key) or OpenRouter (needs a key)",
+            "autocomplete",
+            &["kilo", "openrouter"],
+            "kilo",
+        ),
+        enumerated(
+            "autocomplete.model",
+            "Autocomplete model",
+            "Base model id used for suggestions; the daemon adds the :free suffix on Kilo \
+             without a key",
+            "autocomplete",
+            &["nvidia/nemotron-3.5-lightning", "particle-ai/particle-1"],
+            "nvidia/nemotron-3.5-lightning",
+        ),
+        secret(
+            "autocomplete.kilo.apiKey",
+            "Kilo API key",
+            "Optional Kilo Gateway API key; with a key, suggestions use the paid model \
+             without the hourly free limit",
+            "autocomplete",
+        ),
+        secret(
+            "autocomplete.openrouter.apiKey",
+            "OpenRouter API key",
+            "OpenRouter API key; required when the autocomplete service is OpenRouter",
+            "autocomplete",
         ),
         // --- Group A: persisted permission rules ------------------------------
         // Port of the FE `ConfigManager` `config.permissions.rules` bag: an array
@@ -8747,6 +8790,105 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+
+    /// The `autocomplete.*` catalog rows (PROTOCOL §5.12, v18.1): three
+    /// TOML-backed, non-proposable entries under `[autocomplete]` plus two
+    /// sensitive service keys that persist to the secret store, never to
+    /// config.toml or `SQLite`, and read back redacted.
+    #[tokio::test]
+    async fn autocomplete_settings_match_the_contract() {
+        let enabled = find_definition("autocomplete.enabled").expect("autocomplete.enabled");
+        assert!(matches!(enabled.ty, SettingType::Boolean));
+        assert_eq!(enabled.default_value, Some(json!(false)));
+        let service = find_definition("autocomplete.service").expect("autocomplete.service");
+        assert!(matches!(
+            service.ty,
+            SettingType::Enum(&["kilo", "openrouter"])
+        ));
+        assert_eq!(service.default_value, Some(json!("kilo")));
+        let model = find_definition("autocomplete.model").expect("autocomplete.model");
+        assert!(matches!(
+            model.ty,
+            SettingType::Enum(&["nvidia/nemotron-3.5-lightning", "particle-ai/particle-1"])
+        ));
+        assert_eq!(
+            model.default_value,
+            Some(json!("nvidia/nemotron-3.5-lightning"))
+        );
+        for def in [&enabled, &service, &model] {
+            assert!(!def.sensitive, "{}", def.path);
+            assert!(!def.read_only, "{}", def.path);
+            assert_eq!(def.category, "autocomplete", "{}", def.path);
+            assert!(
+                KNOWN_PATHS.contains(&def.path),
+                "{} must be TOML-backed",
+                def.path
+            );
+            assert!(!def.proposable(), "{} must not be proposable", def.path);
+        }
+        for path in ["autocomplete.kilo.apiKey", "autocomplete.openrouter.apiKey"] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(def.sensitive, "{path} must be a secret");
+            assert!(
+                !KNOWN_PATHS.contains(&path),
+                "{path} must not reach config.toml"
+            );
+            assert!(def.default_value.is_none());
+        }
+
+        let dir = crate::test_support::test_tempdir("intentd-settings-autocomplete-");
+        let store = Store::open(&dir.path().join("db.sqlite"))
+            .await
+            .expect("open store");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        svc.update(&json!([
+            { "path": "autocomplete.enabled", "value": true },
+            { "path": "autocomplete.service", "value": "openrouter" },
+            { "path": "autocomplete.model", "value": "particle-ai/particle-1" },
+            { "path": "autocomplete.openrouter.apiKey", "value": "sk-or-secret" },
+        ]))
+        .await
+        .expect("update");
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("[autocomplete]"), "{text}");
+        assert!(text.contains("particle-ai/particle-1"), "{text}");
+        assert!(!text.contains("sk-or-secret"), "{text}");
+        assert_eq!(
+            store
+                .get_setting("autocomplete.enabled")
+                .await
+                .expect("read settings table"),
+            None
+        );
+        assert_eq!(
+            secrets
+                .load("autocomplete.openrouter.apiKey")
+                .await
+                .expect("load secret")
+                .as_deref(),
+            Some("sk-or-secret")
+        );
+        let got = svc
+            .get("autocomplete.openrouter.apiKey")
+            .await
+            .expect("get key");
+        assert!(!got.to_string().contains("sk-or-secret"), "{got}");
+
+        svc.update(&json!([{ "path": "autocomplete.service", "value": "groq" }]))
+            .await
+            .expect_err("out-of-enum service must be rejected");
+        svc.update(&json!([
+            { "path": "autocomplete.model", "value": "particle-ai/particle-1:free" }
+        ]))
+        .await
+        .expect_err("a :free id is not a stored model value");
     }
 
     /// `voice.language` is a TOML-backed optional string (no default —

@@ -1391,6 +1391,7 @@ async fn dispatch(
         }
         "unsloth" => crate::stack_frame::boxed_await(|| unsloth_methods(api, method, params)).await,
         "voice" => crate::stack_frame::boxed_await(|| voice_methods(api, method, params)).await,
+        "input" => crate::stack_frame::boxed_await(|| input_methods(api, method, params)).await,
         "accept-changes" => {
             crate::stack_frame::boxed_await(|| accept_changes_methods(api, method, params)).await
         }
@@ -5746,6 +5747,27 @@ async fn voice_methods(
             match api.voice_get_workspace_vocabulary(ws).await {
                 Ok(v) => Ok(v),
                 Err(Error::NotFound(_)) => Err(not_found("Workspace not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
+    }
+}
+
+async fn input_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    match method {
+        "input.autocomplete" => {
+            // Daemon-global: no `workspaceId`. `text` (1..=2000 chars) and
+            // `context` (0..=4000 chars) are validated in the service layer
+            // (bad types/lengths → -32602). Every upstream or configuration
+            // failure answers `{ completion: "" }`, never an error.
+            match api.input_autocomplete(Value::Object(params.clone())).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }

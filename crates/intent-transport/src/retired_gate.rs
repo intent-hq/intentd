@@ -312,6 +312,7 @@ pub(crate) const RETIRED_UNGATED_METHODS: &[&str] = &[
     "identity.getUser",
     "identity.revoke",
     "identity.select",
+    "input.autocomplete",
     "linear.authStatus",
     "linear.createIssue",
     "linear.getIssue",

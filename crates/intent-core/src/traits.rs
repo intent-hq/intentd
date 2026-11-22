@@ -7032,6 +7032,24 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `input.autocomplete`: a short continuation of the user's composer
+    /// draft from the configured `autocomplete.*` service. `params` carries
+    /// `text` (the draft, 1..=2000 chars) and `context` (recent conversation,
+    /// 0..=4000 chars); returns `{ completion }`. Bad types or lengths →
+    /// `InvalidParams` (-32602). Every upstream or configuration failure is
+    /// soft: `{ completion: "" }`, never an error.
+    fn input_autocomplete(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::input_autocomplete not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `voice.transcribe`: speech-to-text over a pluggable provider
     /// (`ElevenLabs` Scribe | `OpenAI`). `params` carries `audio` (required,
     /// base64), optional `mimeType`, `language`, `provider` override, and

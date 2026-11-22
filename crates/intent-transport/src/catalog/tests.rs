@@ -856,6 +856,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "identity.getUser",
     "identity.revoke",
     "identity.select",
+    "input.autocomplete",
     "invite.accept",
     "invite.challenge",
     "invite.inspect",
@@ -1366,7 +1367,8 @@ pub(super) fn client_callable_universe() -> BTreeSet<String> {
 ///
 /// Owner-only families: `host.*` but the two display probes, `browser.*`,
 /// `forward.*`, `terminal.*`, script definition writes, `github.*`, `linear.*`, `sentry.*`,
-/// `voice.*`, `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
+/// `voice.*`, `input.autocomplete` (spends the owner's service key),
+/// `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
 /// `pairing.*`, `system.*` (but `system.capabilities`
 /// and `system.status`),
 /// `rules.list` / `rules.update`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
@@ -1496,6 +1498,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "identity.getUser",
     "identity.revoke",
     "identity.select",
+    "input.autocomplete",
     "invite.accept",
     "invite.challenge",
     "invite.inspect",

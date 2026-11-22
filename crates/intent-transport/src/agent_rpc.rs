@@ -48,6 +48,7 @@ const NAMESPACE_DOCS: &[(&str, &str)] = &[
     ("github", "methods/integrations.md"),
     ("hook", "methods/hooks.md"),
     ("identity", "methods/integrations.md"),
+    ("input", "methods/input.md"),
     ("invite", "methods/multiplayer.md"),
     ("linear", "methods/integrations.md"),
     ("mcp", "methods/mcp-servers.md"),

@@ -235,6 +235,7 @@ identity.connect
 identity.getUser
 identity.revoke
 identity.select
+input.autocomplete
 invite.accept
 invite.challenge
 invite.inspect

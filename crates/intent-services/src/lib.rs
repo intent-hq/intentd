@@ -76,6 +76,9 @@ mod agent_workers;
 mod archive_script;
 mod auto_archive;
 mod auto_retire;
+mod autocomplete_ops;
+#[cfg(test)]
+mod autocomplete_service_tests;
 mod boot_settings_migrations;
 mod executor_capabilities;
 mod executor_ops;
@@ -356,6 +359,7 @@ mod v3_10_goldens;
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use auto_archive::AutoArchiveReport;
 pub use auto_retire::AutoRetireReport;
+pub use autocomplete_ops::AutocompleteUpstream;
 pub use boot_settings_migrations::run_boot_settings_migrations;
 pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
@@ -949,6 +953,10 @@ pub struct Services {
     /// `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`), surfacing a graceful
     /// "not configured" `Internal` error when no key is available.
     voice_engine: Option<Arc<dyn intent_voice::VoiceEngine>>,
+    /// Upstream endpoints and timeout for `input.autocomplete`. Production
+    /// uses the Kilo Gateway / `OpenRouter` defaults; tests point it at a local
+    /// mock via [`Services::with_autocomplete_upstream`].
+    autocomplete_upstream: Arc<autocomplete_ops::AutocompleteUpstream>,
     /// Per-workspace auto-derived vocabulary cache (PROTOCOL §5.41, v4.6)
     /// backing the `voice.transcribe` workspace-vocabulary injection and
     /// `voice.getWorkspaceVocabulary`. Shared across clones so repeated calls
@@ -1857,6 +1865,7 @@ impl Services {
             linear_engine: None,
             sentry_engine: None,
             voice_engine: None,
+            autocomplete_upstream: Arc::default(),
             workspace_vocabulary: Arc::new(workspace_vocabulary::WorkspaceVocabularyCache::new()),
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             workspaces_root: None,
@@ -2973,6 +2982,70 @@ impl Services {
     #[must_use]
     pub fn settings_revision_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
         Arc::clone(&self.settings_revision_gate)
+    }
+
+    /// A string-valued setting's effective value (`None` when unreadable).
+    async fn setting_str(&self, path: &str) -> Option<String> {
+        self.settings_service()
+            .get(path)
+            .await
+            .ok()
+            .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string))
+    }
+
+    /// The `input.autocomplete` completion for validated params: `""` when
+    /// autocomplete is off, `OpenRouter` has no key, or the upstream call fails.
+    async fn autocomplete_completion(&self, parsed: &autocomplete_ops::Params) -> String {
+        let enabled = self
+            .settings_service()
+            .get("autocomplete.enabled")
+            .await
+            .ok()
+            .and_then(|v| v.get("value").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        if !enabled {
+            return String::new();
+        }
+        let service = autocomplete_ops::parse_service(
+            self.setting_str("autocomplete.service").await.as_deref(),
+        );
+        let model =
+            autocomplete_ops::parse_model(self.setting_str("autocomplete.model").await.as_deref());
+        let api_key = match self.secrets.load(autocomplete_ops::key_path(service)).await {
+            Ok(Some(key)) if !key.trim().is_empty() => Some(key.trim().to_string()),
+            Ok(_) => None,
+            Err(_) => {
+                // Never fall back to the keyless free tier for a user who saved a key.
+                tracing::debug!("input.autocomplete could not read the service API key");
+                return String::new();
+            }
+        };
+        let Some(model_id) = autocomplete_ops::resolve_model_id(service, model, api_key.is_some())
+        else {
+            tracing::debug!("input.autocomplete skipped: the service needs an API key");
+            return String::new();
+        };
+        let upstream = self.autocomplete_upstream.clone();
+        let url = match service {
+            intent_core::settings_file::AutocompleteService::Kilo => upstream.kilo_url.as_str(),
+            intent_core::settings_file::AutocompleteService::Openrouter => {
+                upstream.openrouter_url.as_str()
+            }
+        };
+        let reply = autocomplete_ops::request_completion(
+            autocomplete_ops::http_client(),
+            autocomplete_ops::UpstreamRequest {
+                url,
+                service,
+                api_key: api_key.as_deref(),
+                body: autocomplete_ops::build_body(&model_id, parsed),
+                timeout: upstream.timeout,
+            },
+        )
+        .await;
+        reply.map_or_else(String::new, |r| {
+            autocomplete_ops::clean_reply(&parsed.text, &parsed.context, &r)
+        })
     }
 
     /// Effective `voice.workspaceVocabulary.maxTerms` cap (PROTOCOL §5.12,
@@ -5009,6 +5082,17 @@ impl Services {
         sentry_engine: Arc<dyn intent_sentry::SentryEngine>,
     ) -> Self {
         self.sentry_engine = Some(sentry_engine);
+        self
+    }
+
+    /// Point `input.autocomplete` at other upstream endpoints (tests use a
+    /// local mock server and a short timeout).
+    #[must_use]
+    pub fn with_autocomplete_upstream(
+        mut self,
+        upstream: autocomplete_ops::AutocompleteUpstream,
+    ) -> Self {
+        self.autocomplete_upstream = Arc::new(upstream);
         self
     }
 
@@ -34944,6 +35028,24 @@ impl WorkspaceApi for Services {
     }
 
     // ========================================================================
+    // input.autocomplete — composer ghost text (PROTOCOL §5.12 autocomplete.*
+    // settings). Soft by design: every configuration or upstream failure
+    // answers `{ completion: "" }`; only malformed params reject (-32602).
+    // The API key and the draft/conversation text are never logged.
+    fn input_autocomplete(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Owner and host members only: suggestions spend the owner's
+            // service key and quota.
+            self.require_host_execution("input.autocomplete").await?;
+            let parsed = autocomplete_ops::parse_params(&params)?;
+            let completion = self.autocomplete_completion(&parsed).await;
+            Ok(serde_json::json!({ "completion": completion }))
+        })
+    }
+
     // voice.transcribe — daemon-side speech-to-text. Maps onto the
     // `VoiceEngine` trait; the engine resolves the API key (secrets store /
     // `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`) and posts the audio to the
