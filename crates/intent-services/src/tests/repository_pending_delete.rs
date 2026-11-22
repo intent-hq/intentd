@@ -265,6 +265,11 @@ fn subject(h: &Harness, agent: bool) -> crate::delete_grace::PendingDeleteSubjec
     }
 }
 
+/// A commit callback that must never run (a duplicate schedule).
+fn duplicate_callback() -> std::future::Ready<()> {
+    panic!("duplicate callback")
+}
+
 #[intent_test_macros::daemon_test]
 async fn duplicates_rearm_and_unrelated_workspace_keep_original_identity() {
     let h = Harness::new().await;
@@ -301,9 +306,7 @@ async fn duplicates_rearm_and_unrelated_workspace_keep_original_identity() {
         let duplicate = h
             .services
             .pending_agent_deletes
-            .schedule_owned(subject(&h, agent), 1, |_| async {
-                panic!("duplicate callback")
-            })
+            .schedule_owned(subject(&h, agent), 1, |_| duplicate_callback())
             .await
             .unwrap();
         assert_eq!(first.delete_at, duplicate.delete_at);

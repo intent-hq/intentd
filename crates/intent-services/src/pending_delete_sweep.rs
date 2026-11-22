@@ -61,6 +61,72 @@ pub struct PendingDeleteSweep {
 }
 
 impl Services {
+    /// Re-arms the delete grace deadlines a previous process stored
+    /// (Postgres, orchestrator mode; `SQLite` stores none): a workspace or
+    /// agent delete still in its grace period when that process stopped or
+    /// lost the tenant commits at its deadline here, once (the commit takes
+    /// the stored row first). A deadline whose subject is already gone is
+    /// dropped. Returns how many were re-armed. Run at startup after
+    /// [`Services::finish_pending_deletes`].
+    ///
+    /// # Errors
+    ///
+    /// Only if listing the stored deadlines fails; a deadline that cannot
+    /// be re-armed is logged and kept for the next start.
+    pub async fn rearm_delete_graces(&self) -> Result<usize> {
+        let mut armed = 0;
+        for grace in self.store.list_delete_graces().await? {
+            let rearmed = match grace.subject_kind.as_str() {
+                "workspace" => {
+                    let id = WorkspaceId(grace.subject_id.clone());
+                    match self.store.get_workspace(&id).await {
+                        Ok(_) => Some(
+                            self.rearm_workspace_delete(id, grace.delete_at.clone())
+                                .await,
+                        ),
+                        Err(Error::NotFound(_)) => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                }
+                "agent" => {
+                    let agent = intent_core::AgentId(grace.subject_id.clone());
+                    match self.store.get_agent_session_summary(&agent).await {
+                        Ok(summary) => Some(
+                            self.rearm_agent_delete(
+                                agent,
+                                summary.workspace_id.clone(),
+                                grace.delete_at.clone(),
+                            )
+                            .await,
+                        ),
+                        Err(Error::NotFound(_)) => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                }
+                _ => None,
+            };
+            match rearmed {
+                Some(Ok(())) => armed += 1,
+                Some(Err(e)) => tracing::warn!(
+                    kind = %grace.subject_kind,
+                    id = %grace.subject_id,
+                    error = %e,
+                    "could not re-arm a stored delete deadline; kept for the next start"
+                ),
+                None => {
+                    if let Err(e) = self
+                        .store
+                        .take_delete_grace(&grace.subject_kind, &grace.subject_id)
+                        .await
+                    {
+                        tracing::warn!(id = %grace.subject_id, error = %e, "could not drop a stale delete deadline");
+                    }
+                }
+            }
+        }
+        Ok(armed)
+    }
+
     /// Finish every delete the store lists as pending, one at a time,
     /// through the same service paths as `workspace.delete` and
     /// `agent.delete`, with daemon authority. Returns when every record has

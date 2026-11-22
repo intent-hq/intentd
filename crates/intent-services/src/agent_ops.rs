@@ -8062,6 +8062,41 @@ impl Services {
         Ok(json!({ "success": true }))
     }
 
+    /// Re-arms an agent delete whose grace deadline a previous process stored
+    /// (Postgres): the same commit as `agent.delete` with `undoDelayMs`, at
+    /// the stored deadline, with no new `delete-scheduled` event.
+    pub(crate) async fn rearm_agent_delete(
+        &self,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        delete_at: String,
+    ) -> Result<()> {
+        let timer_services = self.clone();
+        let timer_id = agent_id.clone();
+        let timer_ws = workspace_id.clone();
+        self.pending_agent_deletes
+            .rearm_owned(
+                crate::delete_grace::PendingDeleteSubject::Agent {
+                    workspace_id,
+                    agent_id,
+                },
+                delete_at,
+                move |claim| {
+                    intent_core::with_caller(intent_core::Caller::Daemon, async move {
+                        let result = timer_services
+                            .agent_delete_with_claim(timer_id.clone(), Some(timer_ws), Some(claim))
+                            .await;
+                        if let Err(e) = &result {
+                            tracing::warn!(agent = %timer_id.0, error = %e, "re-armed agent delete failed at commit");
+                        }
+                        crate::delete_grace::commit_outcome(&result)
+                    })
+                },
+            )
+            .await
+            .map(|_| ())
+    }
+
     /// `agent.delete` with `undoDelayMs > 0` (PROTOCOL §5.5): register an
     /// in-memory pending deletion with deadline `now + undo_delay_ms`
     /// (clamped to the 60s cap) and return the ISO `deleteAt` deadline.
@@ -8097,9 +8132,11 @@ impl Services {
             crate::delete_grace::PendingDeleteSubject::Agent { workspace_id: session_ws.clone(), agent_id: agent_id.clone() },
             undo_delay_ms,
             move |claim| intent_core::with_caller(intent_core::Caller::Daemon, async move {
-                if let Err(e) = timer_services.agent_delete_with_claim(timer_id.clone(), Some(timer_ws), Some(claim)).await {
+                let result = timer_services.agent_delete_with_claim(timer_id.clone(), Some(timer_ws), Some(claim)).await;
+                if let Err(e) = &result {
                     tracing::warn!(agent = %timer_id.0, error = %e, "scheduled agent delete failed at commit");
                 }
+                crate::delete_grace::commit_outcome(&result)
             }),
         ).await?;
         let delete_at = scheduled.delete_at;
