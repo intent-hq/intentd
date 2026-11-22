@@ -584,6 +584,11 @@ const CLEAR_FOREIGN_GROUP_CLAIMS_SQL: &str = "UPDATE delegation_group \
 /// $2 process token), so a retry runs the operation again (batch G 2b).
 const CLEAR_FOREIGN_RESERVATIONS_SQL: &str = "DELETE FROM idempotency_key \
      WHERE tenant_id = $1 AND result_json IS NULL AND claim_token <> $2";
+/// Drops the delete grace claims of every other process ($1 tenant, $2
+/// process token): their commits never finished, so the rows re-arm here.
+const CLEAR_FOREIGN_GRACE_CLAIMS_SQL: &str = "UPDATE delete_grace \
+     SET claim_epoch = NULL, claim_token = NULL \
+     WHERE tenant_id = $1 AND claim_token IS NOT NULL AND claim_token <> $2";
 /// Drops this process's claim ($1 tenant, $2 key, $3 process token).
 const RELEASE_WATCH_SQL: &str = "UPDATE completion_watch \
      SET claim_epoch = NULL, claim_token = NULL \
@@ -650,6 +655,7 @@ impl PgStore {
                 CLEAR_FOREIGN_WATCH_CLAIMS_SQL,
                 CLEAR_FOREIGN_GROUP_CLAIMS_SQL,
                 CLEAR_FOREIGN_RESERVATIONS_SQL,
+                CLEAR_FOREIGN_GRACE_CLAIMS_SQL,
             ] {
                 sqlx::query(sql)
                     .bind(self.tenant())

@@ -29,8 +29,10 @@ fn grace(kind: &str, id: &str, ws: &str, delete_at: &str) -> DeleteGrace {
 
 /// Process A schedules a workspace and an agent delete, then stops (a crash,
 /// or it lost the tenant). Process B finds both deadlines and commits them;
-/// A, still running late, finds them gone and does not commit again.
-/// `SQLite` keeps the desktop behaviour: nothing is stored.
+/// A, still running late, cannot claim them. A commit that crashes after its
+/// claim but before the delete finished leaves the row for the next process,
+/// which re-runs it. A cancel removes only an unclaimed deadline. `SQLite`
+/// keeps the desktop behaviour: nothing is stored.
 #[tokio::test]
 async fn a_delete_in_grace_survives_takeover_and_commits_once() {
     let Some(db) = test_db(false).await else {
@@ -38,7 +40,11 @@ async fn a_delete_in_grace_survives_takeover_and_commits_once() {
         let ws = grace("workspace", "ws-1", "ws-1", "2026-11-22T08:00:00.000Z");
         assert_eq!(store.record_delete_grace(&ws).await.unwrap(), ws.delete_at);
         assert!(store.list_delete_graces().await.unwrap().is_empty());
-        assert!(store.take_delete_grace("workspace", "ws-1").await.unwrap());
+        assert!(store.claim_delete_grace("workspace", "ws-1").await.unwrap());
+        assert!(store
+            .cancel_delete_grace("workspace", "ws-1")
+            .await
+            .unwrap());
         return;
     };
     let tenant = "graces";
@@ -60,15 +66,55 @@ async fn a_delete_in_grace_survives_takeover_and_commits_once() {
     found.sort_by(|x, y| x.subject_id.cmp(&y.subject_id));
     assert_eq!(found, [agent.clone(), ws.clone()], "the deadlines survive");
 
-    // Each commits once: whoever takes the row first.
-    assert!(b.take_delete_grace("workspace", "ws-1").await.unwrap());
-    assert!(!a.take_delete_grace("workspace", "ws-1").await.unwrap());
-    assert!(a.take_delete_grace("agent", "agent-1").await.unwrap());
-    assert!(!b.take_delete_grace("agent", "agent-1").await.unwrap());
-    assert!(b.list_delete_graces().await.unwrap().is_empty());
+    // Each commits once: B claims and finishes the workspace delete while A,
+    // late, cannot claim it; A commits the agent delete and B cannot.
+    assert!(b.claim_delete_grace("workspace", "ws-1").await.unwrap());
+    assert!(!a.claim_delete_grace("workspace", "ws-1").await.unwrap());
+    assert!(
+        !a.cancel_delete_grace("workspace", "ws-1").await.unwrap(),
+        "too late to cancel"
+    );
+    b.finish_delete_grace("workspace", "ws-1").await.unwrap();
+    assert!(!a.claim_delete_grace("workspace", "ws-1").await.unwrap());
+    assert!(a.claim_delete_grace("agent", "agent-1").await.unwrap());
+    assert!(!b.claim_delete_grace("agent", "agent-1").await.unwrap());
 
-    // A cancelled delete (row taken) leaves nothing to commit.
-    b.record_delete_grace(&ws).await.unwrap();
-    assert!(b.take_delete_grace("workspace", "ws-1").await.unwrap());
-    assert!(!a.take_delete_grace("workspace", "ws-1").await.unwrap());
+    // A crashes after claiming the agent delete, before it finished: the row
+    // stays, and a restarted process re-runs the delete.
+    let restarted = open_as_process(&db, tenant, "process-restarted").await;
+    assert_eq!(
+        restarted.list_delete_graces().await.unwrap(),
+        std::slice::from_ref(&agent)
+    );
+    assert!(restarted
+        .claim_delete_grace("agent", "agent-1")
+        .await
+        .unwrap());
+    restarted
+        .finish_delete_grace("agent", "agent-1")
+        .await
+        .unwrap();
+    assert!(restarted.list_delete_graces().await.unwrap().is_empty());
+
+    // A cancel removes an unclaimed deadline, so nothing is left to commit.
+    restarted.record_delete_grace(&ws).await.unwrap();
+    assert!(restarted
+        .cancel_delete_grace("workspace", "ws-1")
+        .await
+        .unwrap());
+    assert!(!restarted
+        .claim_delete_grace("workspace", "ws-1")
+        .await
+        .unwrap());
+    // An immediate delete removes the deadline whatever its claim.
+    restarted.record_delete_grace(&ws).await.unwrap();
+    assert!(restarted
+        .claim_delete_grace("workspace", "ws-1")
+        .await
+        .unwrap());
+    assert!(restarted
+        .take_delete_grace("workspace", "ws-1")
+        .await
+        .unwrap());
+    assert!(restarted.list_delete_graces().await.unwrap().is_empty());
 }

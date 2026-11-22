@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS delete_grace (
     workspace_id text NOT NULL,
     delete_at text NOT NULL,
     created_at text NOT NULL,
+    claim_epoch bigint,
+    claim_token text,
     PRIMARY KEY (tenant_id, subject_kind, subject_id),
     CHECK (subject_kind IN ('workspace', 'agent'))
 );

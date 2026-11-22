@@ -8,7 +8,8 @@
 //! semantics). On Postgres (orchestrator mode) the owned registry also
 //! stores the deadline ([`Store::record_delete_grace`]): the next process to
 //! serve the tenant re-arms it ([`OwnedPendingDeletes::rearm_owned`]), and
-//! a commit first takes the stored row, so the delete commits once.
+//! a commit claims the stored row before the delete and removes it after,
+//! so the delete commits once and a crash in between is retried.
 //!
 //! Race safety is generation-based: each schedule mints a generation token
 //! the timer must present to claim its entry at fire time. A cancel (or an
@@ -507,21 +508,31 @@ impl OwnedPendingDeletes {
                         return;
                     };
                     drop(handle); // This timer already owns the original claim.
-                    // Commit once: only the process that takes the stored
-                    // deadline commits (always granted on SQLite). Gone means
-                    // another process committed it or a cancel removed it.
+                    // Commit once: only the process that claims the stored
+                    // deadline commits (always granted on SQLite), and the
+                    // row goes only after the delete ran, so a crash or
+                    // takeover in between leaves a stale claim the next owner
+                    // takes over. Gone means a cancel removed it or another
+                    // process finished it; held means another live process
+                    // is committing it.
                     // A transient store error is retried while this process
                     // still serves the tenant; `NotOwner` means another
                     // process does, and re-arms the row itself.
                     let (kind, id, _) = timer_attempt.subject.grace_parts();
                     loop {
-                        match inner.store.take_delete_grace(kind, id).await {
+                        match inner.store.claim_delete_grace(kind, id).await {
                             Ok(true) => {
                                 delete(claim).await;
+                                if let Err(e) = inner.store.finish_delete_grace(kind, id).await {
+                                    // The stale claim re-arms on the next
+                                    // start; the delete then finds its
+                                    // subject gone and drops the row.
+                                    tracing::warn!(kind, id, error = %e, "could not remove a committed delete deadline");
+                                }
                                 return;
                             }
                             Ok(false) => {
-                                tracing::info!(kind, id, "pending delete already committed or cancelled elsewhere; skipping");
+                                tracing::info!(kind, id, "pending delete cancelled, finished or being committed elsewhere; skipping");
                                 return;
                             }
                             Err(Error::NotOwner(e)) => {
@@ -529,7 +540,7 @@ impl OwnedPendingDeletes {
                                 return;
                             }
                             Err(e) => {
-                                tracing::warn!(kind, id, error = %e, "could not take the stored delete deadline; retrying");
+                                tracing::warn!(kind, id, error = %e, "could not claim the stored delete deadline; retrying");
                             }
                         }
                         tokio::select! {
@@ -630,11 +641,12 @@ impl OwnedPendingDeletes {
         }
         // Drop the stored deadline first: if that fails the cancel fails and
         // nothing changed (the timer stays armed), so no later process can
-        // re-arm and commit a delete the user undid. `true` on Postgres
-        // means this call removed it, so the commit (which takes the row
-        // first) will not run even if its timer fired meanwhile.
+        // re-arm and commit a delete the user undid. Only an unclaimed row
+        // is removed: a claimed one is being committed, too late to cancel.
+        // `true` on Postgres means this call removed it, so the commit
+        // (which must claim the row) will not run even if its timer fired.
         let (kind, id, _) = subject.grace_parts();
-        let took_row = self.inner.store.take_delete_grace(kind, id).await?
+        let took_row = self.inner.store.cancel_delete_grace(kind, id).await?
             && self.inner.store.persists_delete_graces();
         let Some((claim, timer)) = self.inner.take_armed(&attempt) else {
             return Ok(took_row);

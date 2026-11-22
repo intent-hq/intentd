@@ -2,9 +2,10 @@
 //! `undoDelayMs > 0` arms an in-memory timer (`intent-services`
 //! `delete_grace`). On Postgres (orchestrator mode) the deadline is also
 //! stored, so a delete in its grace period survives a restart or a takeover
-//! by another process and commits once: the process that commits it first
-//! takes the row ([`Store::take_delete_grace`]); a process that finds the
-//! row gone skips. `SQLite` (desktop) keeps the documented behaviour: a
+//! by another process and commits once: the committing process claims the
+//! row ([`Store::claim_delete_grace`]), runs the delete, then removes it
+//! ([`Store::finish_delete_grace`]); a crash in between leaves a stale claim
+//! that the next owner takes over. `SQLite` (desktop) keeps the documented behaviour: a
 //! restart drops pending deletions, so nothing is stored there.
 
 use intent_core::Result;
@@ -45,10 +46,44 @@ impl Store {
         dispatch!(self, backend => backend.record_delete_grace(grace).await)
     }
 
-    /// Takes the stored deadline of a subject: `true` when this call removed
-    /// it, `false` when it was already gone (cancelled, or committed by
-    /// another process). A commit runs only on `true`, so it runs once.
-    /// `SQLite` always returns `true`.
+    /// Claims a stored deadline for its commit, at the tenant's epoch and in
+    /// this process's name: `true` when this process may run the delete
+    /// (unclaimed, already its claim, or a claim from an older epoch or a
+    /// gone process), `false` when the row is gone (cancelled or finished)
+    /// or another live process holds it. `SQLite` always returns `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotOwner` when this process lost the tenant, and
+    /// `Error::Internal` if the database operation fails.
+    pub async fn claim_delete_grace(&self, subject_kind: &str, subject_id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.claim_delete_grace(subject_kind, subject_id).await)
+    }
+
+    /// Removes a deadline this process claimed, once its delete ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn finish_delete_grace(&self, subject_kind: &str, subject_id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.finish_delete_grace(subject_kind, subject_id).await)
+    }
+
+    /// Cancels a pending delete's stored deadline: `true` when this call
+    /// removed it, `false` when it is gone or claimed by a commit already
+    /// under way. `SQLite` always returns `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotOwner` when this process lost the tenant, and
+    /// `Error::Internal` if the database operation fails.
+    pub async fn cancel_delete_grace(&self, subject_kind: &str, subject_id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.cancel_delete_grace(subject_kind, subject_id).await)
+    }
+
+    /// Removes a stored deadline whatever its claim (an immediate delete
+    /// superseded it, or its subject is gone): `true` when a row was
+    /// removed. `SQLite` always returns `true`.
     ///
     /// # Errors
     ///
@@ -79,6 +114,25 @@ impl crate::SqliteStore {
 
     #[expect(clippy::unused_async, reason = "same signature as the Postgres store")]
     pub async fn take_delete_grace(&self, _subject_kind: &str, _subject_id: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    #[expect(clippy::unused_async, reason = "same signature as the Postgres store")]
+    pub async fn claim_delete_grace(&self, _subject_kind: &str, _subject_id: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    #[expect(clippy::unused_async, reason = "same signature as the Postgres store")]
+    pub async fn finish_delete_grace(&self, _subject_kind: &str, _subject_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    #[expect(clippy::unused_async, reason = "same signature as the Postgres store")]
+    pub async fn cancel_delete_grace(
+        &self,
+        _subject_kind: &str,
+        _subject_id: &str,
+    ) -> Result<bool> {
         Ok(true)
     }
 

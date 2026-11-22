@@ -37,6 +37,61 @@ impl PgStore {
         Ok(stored)
     }
 
+    pub async fn claim_delete_grace(&self, subject_kind: &str, subject_id: &str) -> Result<bool> {
+        let mut tx = self.begin_write().await?;
+        let epoch = tx.writer().epoch;
+        let claimed = sqlx::query(
+            "UPDATE delete_grace SET claim_epoch = $4, claim_token = $5 \
+             WHERE tenant_id = $1 AND subject_kind = $2 AND subject_id = $3 \
+             AND (claim_token IS NULL OR claim_token = $5 OR claim_epoch < $4)",
+        )
+        .bind(self.tenant())
+        .bind(subject_kind)
+        .bind(subject_id)
+        .bind(epoch)
+        .bind(self.process_token())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        tx.commit().await.map_err(db)?;
+        Ok(claimed > 0)
+    }
+
+    pub async fn finish_delete_grace(&self, subject_kind: &str, subject_id: &str) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        sqlx::query(
+            "DELETE FROM delete_grace \
+             WHERE tenant_id = $1 AND subject_kind = $2 AND subject_id = $3 AND claim_token = $4",
+        )
+        .bind(self.tenant())
+        .bind(subject_kind)
+        .bind(subject_id)
+        .bind(self.process_token())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
+    pub async fn cancel_delete_grace(&self, subject_kind: &str, subject_id: &str) -> Result<bool> {
+        let mut tx = self.begin_write().await?;
+        let cancelled = sqlx::query(
+            "DELETE FROM delete_grace \
+             WHERE tenant_id = $1 AND subject_kind = $2 AND subject_id = $3 \
+             AND claim_token IS NULL",
+        )
+        .bind(self.tenant())
+        .bind(subject_kind)
+        .bind(subject_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        tx.commit().await.map_err(db)?;
+        Ok(cancelled > 0)
+    }
+
     pub async fn take_delete_grace(&self, subject_kind: &str, subject_id: &str) -> Result<bool> {
         let mut tx = self.begin_write().await?;
         let taken = sqlx::query(
