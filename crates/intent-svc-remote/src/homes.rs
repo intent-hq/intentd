@@ -26,6 +26,7 @@ use intent_node_connections::LinkView;
 use intent_services::feature_api::Services;
 use intent_services::home_setup::HomeSetupFinished;
 
+use crate::link::checkout::git_error;
 pub(crate) use crate::link::homes::{ensure_stop_resends, send_stop, HomeReply};
 use crate::RemoteServicesExt as _;
 
@@ -177,106 +178,6 @@ fn seed_home_head(
     node_git::write_base_ref(git, repository, remote, oid)
 }
 
-/// `home/rewritten/<sha>` of `remote`'s workspace.
-fn rewritten_ref(remote: &AgentRemote, sha: &str) -> String {
-    format!("{}rewritten/{sha}", remote.ref_prefix())
-}
-
-fn git_error(what: &str) -> impl Fn(git2::Error) -> Error + '_ {
-    move |e| Error::Internal(format!("{what}: {e}"))
-}
-
-/// Before a home push: pin the current `home/head` as
-/// `home/rewritten/<sha>` unless that pin exists. The sha of a pin made
-/// here; `None` when there is nothing to pin or it was pinned already.
-///
-/// # Errors
-///
-/// When the repository cannot be opened or the pin cannot be written.
-pub(crate) fn pin_home_head(
-    git: &dyn GitStorage,
-    repository: &std::path::Path,
-    remote: &AgentRemote,
-) -> Result<Option<String>> {
-    let repo = git
-        .open(repository)
-        .map_err(git_error("open the workspace repository"))?;
-    let Ok(head) = repo.find_ref(&remote.ref_name(AgentRef::Head)) else {
-        return Ok(None);
-    };
-    let Some(oid) = head else {
-        return Ok(None);
-    };
-    let sha = oid.to_string();
-    let pin = rewritten_ref(remote, &sha);
-    if repo.find_ref(&pin).is_ok() {
-        return Ok(None);
-    }
-    repo.update_ref(
-        &pin,
-        RefExpect::Absent,
-        Some(oid),
-        "pin the home's head before a push",
-    )
-    .map_err(git_error("pin the home's head"))?;
-    Ok(Some(sha))
-}
-
-/// After a home push: drop each pin of `pins` the new `home/head` still
-/// contains (the push only added commits), and move the orchestrator's
-/// worktree, its read-only mirror, to the new `home/head`.
-///
-/// # Errors
-///
-/// When the repository cannot be opened, a pin cannot be dropped or the
-/// worktree cannot be moved.
-pub(crate) fn settle_home_push(
-    git: &dyn GitStorage,
-    checkout: &std::path::Path,
-    remote: &AgentRemote,
-    pins: &[String],
-) -> Result<()> {
-    let refs = git
-        .open(checkout)
-        .map_err(git_error("open the workspace repository"))?;
-    let Some(head) = refs
-        .find_ref(&remote.ref_name(AgentRef::Head))
-        .ok()
-        .flatten()
-    else {
-        return Ok(());
-    };
-    for sha in pins {
-        let Ok(old) = git2::Oid::from_str(sha) else {
-            continue;
-        };
-        let kept = old == head || refs.is_descendant_of(head, old).unwrap_or(false);
-        if kept {
-            let pin = rewritten_ref(remote, sha);
-            if let Ok(target) = refs.find_ref(&pin) {
-                if target == Some(old) {
-                    refs.update_ref(&pin, RefExpect::Is(old), None, "drop a rewritten pin")
-                        .map_err(git_error("drop a rewritten pin"))?;
-                }
-            }
-        }
-    }
-    // The worktree is the orchestrator's mirror, not the home's refs. With
-    // refs kept elsewhere than this repository, `head` must be fetched into
-    // it before the reset.
-    let repo =
-        git2::Repository::open(checkout).map_err(git_error("open the workspace repository"))?;
-    let at = repo.head().ok().and_then(|head| head.target());
-    if at != Some(head) {
-        let commit = repo
-            .find_object(head, Some(git2::ObjectType::Commit))
-            .map_err(git_error("read the home's head"))?;
-        repo.reset(&commit, git2::ResetType::Hard, None)
-            .map_err(git_error("move the mirror to the home's head"))?;
-    }
-    Ok(())
-}
-
 /// The home an agent placed on `view`'s machine works in (nodes.md
 /// "Workspace homes" → "Sharing"): the workspace's home when it is on that
 /// machine, the placement names no checkout, and the link speaks
@@ -372,7 +273,7 @@ pub(crate) async fn leave_moved_home(
     } else {
         Vec::new()
     };
-    let git = crate::git_storage(Some(svc));
+    let git = crate::git_storage(svc);
     let (base, pins) = crate::launch::blocking(move || {
         let git = git.as_ref();
         clear_wip(git, &checkout, &agent, &pins)?;
@@ -509,11 +410,11 @@ pub(crate) async fn home_restore(
     workspace_id: &WorkspaceId,
 ) -> Result<Option<HomeRestore>> {
     let workspace = svc.store().get_workspace(workspace_id).await?;
-    let checkout = crate::launch::checkout_path(&workspace).ok_or_else(|| {
+    let checkout = crate::link::checkout::checkout_path(&workspace).ok_or_else(|| {
         Error::InvalidParams("a workspace home needs a workspace with a git repository".into())
     })?;
     let remote = AgentRemote::home(workspace_id.as_str(), &HomeId::new().0)?;
-    let git = crate::git_storage(Some(svc));
+    let git = crate::git_storage(svc);
     tokio::task::spawn_blocking(move || {
         let repo = git
             .open(&checkout)
@@ -577,7 +478,7 @@ async fn home_open_frame(
     home_id: &HomeId,
 ) -> Result<HomeOpen> {
     let workspace = svc.store().get_workspace(workspace_id).await?;
-    let checkout = crate::launch::checkout_path(&workspace).ok_or_else(|| {
+    let checkout = crate::link::checkout::checkout_path(&workspace).ok_or_else(|| {
         Error::InvalidParams("a workspace home needs a workspace with a git repository".into())
     })?;
     let base = crate::launch::checkout_base(svc, workspace_id).await?;
@@ -587,7 +488,7 @@ async fn home_open_frame(
         let checkout = checkout.clone();
         let remote = remote.clone();
         let base = base.clone();
-        let git = crate::git_storage(Some(svc));
+        let git = crate::git_storage(svc);
         tokio::task::spawn_blocking(move || {
             let git = git.as_ref();
             seed_home_head(git, &checkout, &remote, &base.commit)?;
@@ -985,7 +886,7 @@ pub(crate) async fn stop_acked(svc: &Services, link: Arc<dyn LinkView>, ack: Hom
     };
     let repository = std::path::PathBuf::from(crate::final_stop::repo_path(&workspace));
     let workspace_id = stop.workspace_id.clone();
-    let git = crate::git_storage(Some(svc));
+    let git = crate::git_storage(svc);
     let refs = tokio::task::spawn_blocking(move || {
         orphaned_refs(git.as_ref(), &repository, &workspace_id, &at)
     })

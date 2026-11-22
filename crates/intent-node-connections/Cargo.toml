@@ -13,6 +13,7 @@ test-support = []
 
 [dependencies]
 intent-core = { workspace = true }
+intent-git = { workspace = true }
 intent-node-link = { workspace = true }
 intent-store = { workspace = true }
 tokio = { workspace = true }

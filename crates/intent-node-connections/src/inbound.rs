@@ -10,6 +10,7 @@ use intent_core::node_link::{
     HomeEvents, HomeRef, HomeStopAck, HomeStopRecord, JournalRecord, LeaseBinding, LinkFrame,
 };
 use intent_core::{AgentId, BoxFuture, HomeId, WorkspaceId};
+use intent_git::ref_storage::GitStorage;
 use intent_node_link::IncomingRequest;
 use tokio::time::Instant;
 
@@ -141,7 +142,13 @@ pub trait NodeInbound: Send + Sync + 'static {
     /// The machine now runs as an orchestrator and refused `refused_token`.
     fn machine_became_orchestrator(&self, machine_id: String, refused_token: String);
 
-    /// The in-process implementation, for domain code that has not moved
-    /// behind these calls yet.
-    fn as_any(&self) -> &dyn std::any::Any;
+    /// Whether this backend serves workspace homes.
+    fn homes_enabled(&self) -> bool;
+
+    /// The backend's GitHub token for a machine's forge fetch, if it has
+    /// a usable one.
+    fn forge_token(&self) -> BoxFuture<'_, Option<String>>;
+
+    /// Where the head keeps the refs machines push.
+    fn git_storage(&self) -> Arc<dyn GitStorage>;
 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 use intent_services::feature_api::Services;
 use zeroize::Zeroizing;
 
-pub(crate) use crate::link::forge_token::{changed, send, Confirmed, ForgeTokens, Held};
+use crate::link::forge_token::ForgeTokens;
 
 /// The daemon's own GitHub credential, behind its gate.
 pub(crate) fn for_services(svc: &Services) -> ForgeTokens {

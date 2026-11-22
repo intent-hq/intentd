@@ -24,7 +24,6 @@ use intent_transport::node_link::{
 use tokio::time::Instant;
 
 use crate::connector::Shared;
-use intent_services::feature_api::Services;
 
 pub(crate) struct HeadGitAccess {
     shared: Arc<Shared>,
@@ -33,6 +32,18 @@ pub(crate) struct HeadGitAccess {
 impl HeadGitAccess {
     pub(crate) fn new(shared: Arc<Shared>) -> Self {
         Self { shared }
+    }
+
+    /// The head's ref storage; the workspaces' own repositories when the
+    /// connector has no domain.
+    fn git_storage(&self) -> Arc<dyn intent_git::ref_storage::GitStorage> {
+        self.shared.inbound().map_or_else(
+            || {
+                Arc::new(intent_git::ref_storage::LocalGitStorage)
+                    as Arc<dyn intent_git::ref_storage::GitStorage>
+            },
+            |inbound| inbound.git_storage(),
+        )
     }
 }
 
@@ -237,7 +248,7 @@ impl HeadGitAccess {
             .store
             .get_workspace(&WorkspaceId::from(remote.workspace_id()))
             .await?;
-        let checkout = crate::launch::checkout_path(&workspace).ok_or_else(denied)?;
+        let checkout = crate::link::checkout::checkout_path(&workspace).ok_or_else(denied)?;
         let probe = checkout.clone();
         let origin = tokio::task::spawn_blocking(move || intent_git::remote::origin_url(&probe))
             .await
@@ -289,7 +300,7 @@ impl HeadGitAccess {
             return Err(denied());
         }
         let workspace = self.shared.store.get_workspace(&workspace_id).await?;
-        let checkout = crate::launch::checkout_path(&workspace).ok_or_else(denied)?;
+        let checkout = crate::link::checkout::checkout_path(&workspace).ok_or_else(denied)?;
         Ok((checkout, workspace_id, target))
     }
 
@@ -352,7 +363,8 @@ impl HeadGitAccess {
         if let Some(key) = remote.module_key() {
             // An archived workspace's worktree may be gone: its repository
             // holds the same submodules.
-            let worktree = crate::launch::checkout_path(&workspace).filter(|dir| dir.is_dir());
+            let worktree =
+                crate::link::checkout::checkout_path(&workspace).filter(|dir| dir.is_dir());
             let repository = PathBuf::from(crate::final_stop::repo_path(&workspace));
             let mut last = Err(denied());
             for checkout in worktree.into_iter().chain([repository]) {
@@ -422,8 +434,8 @@ impl NodeGitAccess for HeadGitAccess {
         self.shared.protocol() >= HOMES_PROTOCOL
             && self
                 .shared
-                .services()
-                .is_some_and(Services::workspace_homes)
+                .inbound()
+                .is_some_and(|inbound| inbound.homes_enabled())
     }
 
     /// Every home push holds its workspace's push slot until its process
@@ -492,9 +504,9 @@ impl NodeGitAccess for HeadGitAccess {
             }
             let pin_repository = repository.to_path_buf();
             let pin_remote = remote.clone();
-            let git = crate::git_storage(self.shared.services());
+            let git = self.git_storage();
             let pinned = tokio::task::spawn_blocking(move || {
-                crate::homes::pin_home_head(git.as_ref(), &pin_repository, &pin_remote)
+                crate::link::checkout::pin_home_head(git.as_ref(), &pin_repository, &pin_remote)
             })
             .await
             .map_err(|e| Error::Internal(format!("node git: pin the home's head: {e}")))?
@@ -523,10 +535,10 @@ impl NodeGitAccess for HeadGitAccess {
             // Its own task, owning the lock until the settlement is done,
             // also when this session ends meanwhile.
             // caller-binding: allow — settles one home push under its workspace lock
-            let git = crate::git_storage(self.shared.services());
+            let git = self.git_storage();
             let settled = tokio::spawn(async move {
                 let settled = tokio::task::spawn_blocking(move || {
-                    crate::homes::settle_home_push(git.as_ref(), &checkout, &remote, &pins)
+                    crate::link::checkout::settle_home_push(git.as_ref(), &checkout, &remote, &pins)
                 })
                 .await;
                 drop(guard);
@@ -558,7 +570,8 @@ impl NodeGitAccess for HeadGitAccess {
                 Some(key) => {
                     let key = key.to_owned();
                     let agent_id = AgentId::from(remote.agent_id());
-                    let pins = crate::launch::checkout_pins(&self.shared.store, &agent_id).await?;
+                    let pins =
+                        crate::link::checkout::checkout_pins(&self.shared.store, &agent_id).await?;
                     let module =
                         tokio::task::spawn_blocking(move || forge::module(&checkout, &pins, &key))
                             .await
@@ -573,11 +586,10 @@ impl NodeGitAccess for HeadGitAccess {
                 }
                 None => (checkout, launch.remote_url),
             };
-            let registry = self
-                .shared
-                .services()
-                .and_then(intent_services::feature_api::Services::settings_registry);
-            let token = intent_services::github_backend_token(registry.as_deref()).await;
+            let token = match self.shared.inbound() {
+                Some(inbound) => inbound.forge_token().await,
+                None => None,
+            };
             let token = token.map(zeroize::Zeroizing::new);
             let fresh = forge_refresh(
                 &repository,
@@ -664,7 +676,7 @@ impl NodeGitAccess for HeadGitAccess {
                 .store
                 .get_workspace(&WorkspaceId::from(remote.workspace_id()))
                 .await?;
-            let checkout = crate::launch::checkout_path(&workspace).ok_or_else(denied)?;
+            let checkout = crate::link::checkout::checkout_path(&workspace).ok_or_else(denied)?;
             let Some(key) = remote.module_key() else {
                 return Ok(checkout);
             };

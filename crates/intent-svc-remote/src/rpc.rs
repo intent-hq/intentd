@@ -311,7 +311,7 @@ impl HeadCalls {
             .get_workspace(&record.workspace_id)
             .await
         {
-            Ok(workspace) => crate::launch::checkout_path(&workspace),
+            Ok(workspace) => crate::link::checkout::checkout_path(&workspace),
             Err(error) => {
                 tracing::debug!(%error, "no workspace checkout for a remote agent's git roots");
                 None

@@ -88,7 +88,7 @@ pub struct RemoteFeature {
     /// E2B cloud machines: starts in flight and the settings lock.
     pub(crate) cloud: cloud::CloudState,
     /// The GitHub token every linked machine holds (nodeProtocol 15).
-    forge: std::sync::OnceLock<Arc<forge_token::ForgeTokens>>,
+    forge: std::sync::OnceLock<Arc<link::forge_token::ForgeTokens>>,
     /// Where remote agents' and homes' refs live.
     git: GitStore,
 }
@@ -104,8 +104,8 @@ impl Default for GitStore {
 
 /// The git storage of the remote feature registered on `svc`, or the
 /// workspaces' own repositories without one.
-pub(crate) fn git_storage(svc: Option<&Services>) -> Arc<dyn GitStorage> {
-    svc.and_then(|svc| svc.remote_feature())
+pub(crate) fn git_storage(svc: &Services) -> Arc<dyn GitStorage> {
+    svc.remote_feature()
         .map_or_else(|| GitStore::default().0, |feature| feature.git.0.clone())
 }
 
@@ -153,7 +153,7 @@ impl RemoteFeature {
     }
 
     /// The GitHub token the machines hold, its watcher started.
-    fn forge(&self, svc: &Services) -> Arc<forge_token::ForgeTokens> {
+    fn forge(&self, svc: &Services) -> Arc<link::forge_token::ForgeTokens> {
         let tuning = self.tuning();
         let forge = self
             .forge
@@ -165,7 +165,7 @@ impl RemoteFeature {
                             Box::pin(async { None })
                         })
                     });
-                    Arc::new(forge_token::ForgeTokens::new(resolver))
+                    Arc::new(link::forge_token::ForgeTokens::new(resolver))
                 }
                 #[cfg(not(test))]
                 Arc::new(forge_token::for_services(svc))

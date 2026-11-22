@@ -1573,8 +1573,16 @@ impl intent_node_connections::NodeInbound for Recording {
 
     fn machine_became_orchestrator(&self, _: String, _: String) {}
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn homes_enabled(&self) -> bool {
+        false
+    }
+
+    fn forge_token(&self) -> intent_core::BoxFuture<'_, Option<String>> {
+        Box::pin(async { None })
+    }
+
+    fn git_storage(&self) -> Arc<dyn intent_git::ref_storage::GitStorage> {
+        Arc::new(intent_git::ref_storage::LocalGitStorage)
     }
 }
 

@@ -11,7 +11,6 @@ use intent_core::{BoxFuture, HomeId, HomeState, WorkspaceHome, WorkspaceId};
 use intent_node_connections::LinkView;
 use intent_services::feature_api::Services;
 
-pub(crate) use crate::link::home_state::HomeLink;
 use crate::RemoteServicesExt as _;
 
 /// The wait that announces `home_id` once its failing streak, begun at

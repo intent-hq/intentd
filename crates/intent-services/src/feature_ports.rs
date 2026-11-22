@@ -40,6 +40,7 @@ use intent_core::{
 
 use crate::Services;
 
+pub use intent_core::machine_calls::{MachineSecretAnswer, MachineSecretOp, MachineSkills};
 pub use intent_pty::home::{
     HomeExec, HomeExecControl, HomeExecEvent, HomeExecOpen, HomeScriptOpen, HomeTerminalOpen,
 };
@@ -1943,66 +1944,6 @@ pub enum MachineOneShotAnswer {
     /// The call's one deadline passed before the chosen machine replied;
     /// the run there was cancelled.
     TimedOut { machine: String, timeout_ms: u64 },
-}
-
-/// One secret frame for [`RemoteLaunchPort::machine_secret`]. `Debug`
-/// never shows a value.
-pub enum MachineSecretOp {
-    /// Hold `value` as secret `name`.
-    Put {
-        name: String,
-        value: zeroize::Zeroizing<String>,
-    },
-    /// Drop secret `name`, or all of the agent's secrets.
-    Forget { name: Option<String> },
-    /// The held names.
-    List,
-}
-
-impl std::fmt::Debug for MachineSecretOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Put { name, .. } => f
-                .debug_struct("Put")
-                .field("name", name)
-                .finish_non_exhaustive(),
-            Self::Forget { name } => f.debug_struct("Forget").field("name", name).finish(),
-            Self::List => f.write_str("List"),
-        }
-    }
-}
-
-/// A machine's answer for [`RemoteLaunchPort::machine_secret`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MachineSecretAnswer {
-    /// `Put` held the value.
-    Stored,
-    /// `Forget`: whether anything was dropped.
-    Forgotten(bool),
-    /// `List`: the held names, sorted.
-    Names(Vec<String>),
-    /// `Forget` for a machine that is not connected: sent after its next
-    /// bind.
-    Queued,
-    /// No link came up, it is older than nodeProtocol 14, or it did not
-    /// answer in time.
-    Offline,
-    /// The machine refused, with its fixed code.
-    Failed(String),
-}
-
-/// A machine's answer for [`RemoteLaunchPort::machine_skills`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MachineSkills {
-    /// The user skills it listed.
-    Listed(Vec<intent_core::node_link::MachineSkill>),
-    /// It is reachable (no query was made).
-    Reachable,
-    /// No link came up, or it did not answer in time.
-    Offline,
-    /// Its link speaks a protocol older than
-    /// [`intent_core::node_link::SKILLS_PROTOCOL`].
-    UpdateRequired,
 }
 
 /// A remote agent calling `ws.script.*` through its machine.
