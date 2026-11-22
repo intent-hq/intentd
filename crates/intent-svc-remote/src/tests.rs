@@ -4216,6 +4216,7 @@ mod home_stops {
         let mut machine = backend.machine().await;
         let node = backend.expose(&mut machine).await;
         let repo = tempfile::tempdir().unwrap();
+        committed_repo(repo.path());
         workspace_at(&backend, repo.path()).await;
         backend
             .store()
@@ -4275,5 +4276,40 @@ mod home_stops {
         assert_eq!(removed["machineId"], id.as_str(), "{removed}");
         assert_eq!(removed["reason"], "orchestrator", "{removed}");
         node.shutdown();
+
+        // Move home: the detached home asks the gone machine for no last
+        // push, so the move reaches the new machine's `homeOpen`.
+        let mut other = backend.machine().await;
+        let other_node = backend.expose(&mut other).await;
+        assert!(store
+            .begin_home_move(&intent_store::HomeMove {
+                workspace_id: workspace(),
+                target: machine_home("h-new", &other.id(), intent_core::HomeState::Attached),
+                from_home_id: home.home_id.clone(),
+                from_state: home.state,
+                from_since: home.since.clone(),
+                pushed: false,
+                started_at: intent_core::now_iso(),
+            })
+            .await
+            .unwrap());
+        other_node.connect().await.unwrap();
+        let mut link = other.accept().await;
+        link.replay_complete(0).await;
+        bound(&other_node).await;
+        let services = backend.services.clone();
+        let run = tokio::spawn(async move { crate::home_move::run(&services, &workspace()).await });
+        let open = link
+            .expect(|frame| match frame {
+                LinkFrame::HomeOpen(open) => Some(open),
+                _ => None,
+            })
+            .await;
+        assert_eq!(open.home_id, HomeId::from("h-new"));
+        other.stop().await;
+        tokio::time::timeout(wait(), run)
+            .await
+            .expect("the move ends with the link")
+            .unwrap();
     }
 }
