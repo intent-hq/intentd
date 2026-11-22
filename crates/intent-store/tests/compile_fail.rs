@@ -52,16 +52,16 @@ fn nextest_runs_this_binary_one_test_at_a_time() {
     let group = overrides
         .iter()
         .find(|o| {
-            o.get("filter").and_then(|f| f.as_str())
+            o.get("filter").and_then(toml::Value::as_str)
                 == Some("binary_id(=intent-store::compile_fail)")
         })
         .and_then(|o| o.get("test-group"))
-        .and_then(|g| g.as_str())
+        .and_then(toml::Value::as_str)
         .expect("an override with filter binary_id(=intent-store::compile_fail) and a test-group");
     assert_eq!(
         config["test-groups"][group]
             .get("max-threads")
-            .and_then(|t| t.as_integer()),
+            .and_then(toml::Value::as_integer),
         Some(1),
         "test group {group} must run one test at a time"
     );
