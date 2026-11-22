@@ -1667,7 +1667,7 @@ or a blocker.
 
 ## Workspace numbers for Micro keys
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,key-switch-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; src/features/hardware-console/prompt-picker/{radial-layout,prompt-picker-service}.ts; src/features/hardware-console/prompt-picker/RadialPromptPickerOverlay.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceChat}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,key-switch-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; src/features/hardware-console/prompt-picker/{radial-layout,prompt-picker-service,chat-suggestions}.ts; src/features/hardware-console/prompt-picker/RadialPromptPickerOverlay.svelte; messages/en.json. -->
 
 With a supported **Creator Micro 2** or **Codex Micro** connected to Intent,
 **Home → Workspaces** shows colored numbered squares on assigned workspaces in
@@ -1692,10 +1692,12 @@ Pressing keys **1–6** switches to the assigned workspace. When the press lands
 an agent tab, its chat box is focused so you can type right away.
 
 Push the joystick to open the prompt ring. Up to three suggested prompts from the
-focused chat appear at top, top-right, and right, numbered and tinted purple. Your
-most-used prompts fill the other directions, and **Cancel** is at the bottom.
-Release on a suggestion to send it, or on a used prompt to insert it into the
-focused text box. **Settings → Inputs → Hardware → Creator Micro → Prompt picker limit**
+focused chat appear at top, top-right, and right, numbered and tinted purple. On
+Home, the open workspace preview's chat counts as focused unless another chat
+has focus. Your most-used prompts fill the other directions, and **Cancel** is at
+the bottom. Release on a suggestion to send it, or on a used prompt to insert it
+into the focused text box, or into that chat's box when no text box has focus.
+Older versions may differ. **Settings → Inputs → Hardware → Creator Micro → Prompt picker limit**
 sets how many used prompts appear: up to 7, fewer when chat suggestions take the
 top directions.
 
