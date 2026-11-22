@@ -152,10 +152,10 @@ fn needs_prepared_checkout(submodules: &[SubmodulePin], setup: Option<&SetupComm
 
 /// The protocol of `node`'s link, connecting first when none is up.
 async fn link_protocol(node: &RemoteNode) -> Result<u32> {
-    if node.shared_ref().current_link().is_none() {
+    if node.current_link().is_none() {
         node.connect().await?;
     }
-    Ok(node.shared_ref().protocol())
+    Ok(node.protocol())
 }
 
 /// How long the backend waits for the machine's answer to one piece of a
@@ -198,7 +198,7 @@ async fn read_machine_checkout(
             node.status().node_name
         ))
     };
-    let recorded = node.shared_ref().protocol();
+    let recorded = node.protocol();
     if recorded != 0 && recorded < CHECKOUT_FILES_PROTOCOL {
         return Err(older(recorded));
     }
@@ -240,7 +240,7 @@ pub(crate) fn mcp_servers_notice(machine: &str) -> String {
 /// submodules and without the setup script.
 /// Nothing is refused while this build does not offer the prepared checkout.
 fn require_prepared_checkout(node: &RemoteNode, protocol: u32) -> Result<()> {
-    if protocol >= PREPARED_CHECKOUT_PROTOCOL || !node.shared_ref().offers_prepared_checkout() {
+    if protocol >= PREPARED_CHECKOUT_PROTOCOL || !node.offers_prepared_checkout() {
         return Ok(());
     }
     let status = node.status();
@@ -268,7 +268,7 @@ async fn check_machine_prepares(
     }
     let feature = svc.remote_feature().ok_or_else(no_node)?;
     let node = feature.node(svc, &view.node_id).await?;
-    if !node.shared_ref().offers_prepared_checkout() {
+    if !node.offers_prepared_checkout() {
         return Ok(());
     }
     let setup = svc.remote_setup_command(workspace_id, view).await?;
@@ -1170,7 +1170,6 @@ impl RemoteLaunchPort for RemoteLaunch {
     ) -> Option<(String, bool)> {
         svc.remote_feature()?
             .running_node(node_id)?
-            .shared_ref()
             .setup_output_tail(agent_id)
     }
 
@@ -1275,7 +1274,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             let feature = svc.remote_feature().ok_or_else(no_node)?;
             let node = feature.node(svc, &record.node_id).await?;
             node.connect().await?;
-            let link = node.shared().current_link().ok_or_else(|| {
+            let link = node.current_link().ok_or_else(|| {
                 Error::Internal("machine-unreachable: the machine's link closed".into())
             })?;
             let status = node.status();
@@ -1429,7 +1428,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             }
             let checkout = if checkout_of.is_some() || home.is_some() {
                 None
-            } else if view.submodules.is_some() && node.shared_ref().offers_prepared_checkout() {
+            } else if view.submodules.is_some() && node.offers_prepared_checkout() {
                 let protocol = link_protocol(&node).await?;
                 let setup = svc
                     .remote_setup_command(&record.workspace_id, &view)
@@ -1490,7 +1489,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             let resumed_from_disk = new_machine.is_none() && disk_resumed;
             // A launch of a new process: a later not-running stop answer
             // owes its exit record again.
-            node.shared_ref().launching(agent_id);
+            node.launching(agent_id);
             // A sub-agent reaches GitHub through this backend (nodeProtocol
             // 17); the connector drops it on an older link.
             let (forge_fetch, forge_fetch_modules) = if is_sub_agent
@@ -1519,7 +1518,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .map(|workspace| workspace.title);
             // A run the machine kept across a restart keeps the account it
             // launched with: only a fresh launch records this one's.
-            let reattach = node.shared_ref().reattaches(agent_id);
+            let reattach = node.reattaches(agent_id);
             let workspace_id = record.workspace_id.clone();
             let runtime = node
                 .launch(LaunchCommand {

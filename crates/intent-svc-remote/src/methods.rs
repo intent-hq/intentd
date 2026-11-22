@@ -17,6 +17,7 @@ use intent_services::feature_api::Services;
 
 use crate::connect::{connect, ConnectFailure, Connected};
 use crate::lease::{new_owner, probe_hello, record_new_lease, HeadLease};
+use crate::link::gate::GateLink;
 use crate::machine::MachineTarget;
 use crate::{RemoteFeature, RemoteNode};
 use intent_node_connections::LinkView;
@@ -287,7 +288,7 @@ async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
                             .is_some_and(|cloud| &cloud.cloud_machine_id == cloud_machine_id)
                     })
                     .filter_map(|row| feature.running_node(&row.id))
-                    .map(|node| node.shared_ref().agents.live_count())
+                    .map(|node| node.live_agents())
                     .sum();
                 let state = if entry.state == crate::cloud::config::ProviderState::Ready {
                     RemoteMachineState::Connected
@@ -700,7 +701,7 @@ pub(crate) async fn add_machine(
     let mut accepted = target;
     accepted.hosts.clone_from(&row.hosts);
     accepted.tc_address.clone_from(&row.tc_address);
-    node.shared_ref().set_target(accepted);
+    node.set_target(accepted);
     let machine = machine_json(&row, Some(node.view()));
     publish_machine(svc, &row, Some(node.view())).await;
     if !row.is_cloud() {
@@ -864,8 +865,8 @@ async fn forget_orchestrator_once(
         return Ok(());
     }
     if let Some(node) = feature.running_node(machine_id) {
-        node.shared_ref().drop_stops();
-        node.shared_ref().agents.end_all(&format!(
+        node.drop_stops();
+        node.end_all_agents(&format!(
             "{}: {} is now an orchestrator and no longer runs agents for other backends",
             crate::connect::MACHINE_ORCHESTRATOR,
             row.name
@@ -983,15 +984,14 @@ pub(crate) async fn deliver_stops(
     let wait_until = if unreachable {
         tokio::time::Instant::now()
     } else {
-        started + node.shared_ref().remove_budget()
+        started + node.remove_budget()
     };
     // The agents' stops and their script runs' stops are awaited together,
     // within the same budget: every script stop is sent before any wait, and
     // an unacknowledged script stop leaves its agent unconfirmed.
-    let shared = node.shared();
     let (mut unconfirmed, scripts_unacked) = tokio::join!(
         node.wait_stops(agents, wait_until),
-        shared.end_agents_machine_runs(
+        node.end_agents_machine_runs(
             agents,
             wait_until,
             "remote-script-lost: the machine was removed",
