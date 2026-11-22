@@ -71,8 +71,7 @@ fn fresh_unit_moves_the_sitter_and_daemon_and_sets_the_ceiling() {
     );
     assert_eq!(read(unit.join("workloads/memory.max")), max.to_string());
     assert_eq!(read(unit.join("workloads/memory.swap.max")), "0");
-    let high: u64 = read(unit.join("workloads/memory.high")).parse().unwrap();
-    assert!(high < max && high >= max - max / 20 - 1, "{high} vs {max}");
+    assert_eq!(read(unit.join("workloads/memory.high")), "max");
 }
 
 #[test]
@@ -207,14 +206,12 @@ fn the_auto_ceiling_respects_a_lower_ancestor_limit() {
 }
 
 #[test]
-fn reserve_and_high_bounds() {
+fn reserve_bounds() {
     assert_eq!(super::reserve_bytes(4 * GIB), 768 * MIB);
     assert_eq!(super::reserve_bytes(8 * GIB), 8 * GIB / 100 * 15);
     assert_eq!(super::reserve_bytes(64 * GIB), 2 * GIB);
     assert_eq!(super::auto_ceiling_bytes(4 * GIB), 4 * GIB - 768 * MIB);
     assert_eq!(super::auto_ceiling_bytes(512 * MIB), 256 * MIB);
-    assert_eq!(cgroup::high_for(GIB), GIB - GIB / 20);
-    assert_eq!(cgroup::high_for(256 * MIB), 224 * MIB);
 }
 
 #[test]

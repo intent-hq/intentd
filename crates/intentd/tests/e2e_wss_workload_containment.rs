@@ -243,6 +243,8 @@ fn delegated(data_dir: &Path, unit: &str) -> Command {
     ])
     .arg(format!("--unit={unit}"))
     .args(["-p", "Delegate=memory pids"])
+    // A test killed by its timeout never runs `Drop`; the unit ends itself.
+    .args(["-p", "RuntimeMaxSec=600"])
     .arg("-p")
     .arg(format!("User={}", user.trim()))
     .arg("-p")
@@ -346,7 +348,7 @@ async fn script(
         ws,
         id,
         "script.create",
-        json!({ "workspaceId": ws_id, "name": name, "command": command, "mode": mode }),
+        json!({ "workspaceId": ws_id, "name": name, "command": command, "mode": mode, "purpose": "saved" }),
     )
     .await;
     created["id"].as_str().expect("script id").to_owned()

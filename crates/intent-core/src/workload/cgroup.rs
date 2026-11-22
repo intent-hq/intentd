@@ -11,8 +11,6 @@ use super::{Ceiling, ContainmentConfig};
 
 use super::{auto_ceiling_bytes, reserve_bytes};
 
-const MIB: u64 = 1024 * 1024;
-
 const FIX: &str = "run intentd as root, or in its own systemd unit with Delegate=memory pids";
 
 /// What the daemon knows about its own cgroup placement.
@@ -186,7 +184,11 @@ pub(super) fn setup(host: &Host, config: &ContainmentConfig) -> Result<Layout, S
         Ceiling::Auto | Ceiling::Off => auto_ceiling_bytes(box_total),
     };
     write(&workloads.join("memory.max"), &max.to_string())?;
-    write(&workloads.join("memory.high"), &high_for(max).to_string())?;
+    // No `memory.high` throttle: without swap, reclaim cannot free a
+    // runaway's anonymous memory, so a throttled process stalls just under
+    // the limit for minutes instead of being OOM-killed (measured: 104,921
+    // high events, never killed). `max` also resets an older hierarchy.
+    write(&workloads.join("memory.high"), "max")?;
     // No swap for the box: swapping workloads would thrash the host's disk
     // and stall the daemon just like running out of RAM. Best effort: the
     // file is absent when the kernel has no swap accounting.
@@ -197,11 +199,6 @@ pub(super) fn setup(host: &Host, config: &ContainmentConfig) -> Result<Layout, S
         workloads,
         memory_max_bytes: max,
     })
-}
-
-/// `memory.high` a little below `memory.max`, so reclaim starts early.
-pub(super) fn high_for(max: u64) -> u64 {
-    max.saturating_sub((max / 20).max(32 * MIB))
 }
 
 /// The memory the box can really use: `MemTotal`, or less when the domain

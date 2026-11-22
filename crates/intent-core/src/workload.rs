@@ -8,7 +8,7 @@
 //! <domain>/            the daemon's own cgroup (or `intentd-<key>` under root)
 //! ├── supervisor/      the sitter that spawned the daemon, when it shared the cgroup
 //! ├── daemon/          the daemon and its internal helpers (git, probes)
-//! └── workloads/       memory.max = ceiling, memory.high a little below
+//! └── workloads/       memory.max = ceiling, no memory.high, no swap
 //!     └── <kind>-<pid>-<seq>/   one leaf per workload
 //! ```
 //!
