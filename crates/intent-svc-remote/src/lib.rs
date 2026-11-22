@@ -238,7 +238,7 @@ impl RemoteFeature {
             ) {
                 self.cloud.park(machine_id);
             }
-            cloud::CloudGate::new(svc.clone(), machine_id)
+            cloud::CloudGate::new(svc.clone(), machine_id) as Arc<dyn link::gate::DialGate>
         });
         let target = machine::MachineTarget::new(&row, &token, self.tailcat_bin())?
             .tapped(svc.link_traffic().clone())

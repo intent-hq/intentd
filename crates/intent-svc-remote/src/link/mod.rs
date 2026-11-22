@@ -3,6 +3,7 @@
 //! `intent-node-connections` with the connector; the domain halves beside
 //! them in this crate find homes and machines and call in here.
 
+pub(crate) mod gate;
 pub(crate) mod home_scripts;
 pub(crate) mod home_state;
 pub(crate) mod homes;
