@@ -47,6 +47,7 @@ mod launch;
 mod methods;
 #[cfg(unix)]
 mod resume_dial;
+mod tenants;
 
 fn wait() -> Duration {
     intentd_test_support::test_timeout(Duration::from_secs(5))
@@ -79,6 +80,7 @@ fn tuning() -> Tuning {
         forge_refresh: Duration::from_secs(600),
         forge_check: Duration::from_millis(20),
         home_stop_resend: Duration::from_millis(200),
+        head_session: None,
         fail_ack_writes: Arc::default(),
         fail_claim_reads: Arc::default(),
         before_publish: crate::connector::BeforePublish::default(),

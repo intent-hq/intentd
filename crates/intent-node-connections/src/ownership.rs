@@ -88,12 +88,27 @@ pub fn process_head_session() -> &'static str {
 /// claim is the generation advance alone and a claim is never fenced.
 pub struct LocalOwnership {
     store: Store,
+    head_session: Option<std::sync::Arc<str>>,
 }
 
 impl LocalOwnership {
+    /// Ownership offering [`process_head_session`].
     #[must_use]
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            head_session: None,
+        }
+    }
+
+    /// Ownership offering `head_session`: one backend's own session, so two
+    /// tenants of one process never share one.
+    #[must_use]
+    pub fn with_head_session(store: Store, head_session: std::sync::Arc<str>) -> Self {
+        Self {
+            store,
+            head_session: Some(head_session),
+        }
     }
 }
 
@@ -117,7 +132,9 @@ impl LinkOwnership for LocalOwnership {
     }
 
     fn head_session(&self) -> &str {
-        process_head_session()
+        self.head_session
+            .as_deref()
+            .unwrap_or_else(|| process_head_session())
     }
 }
 
@@ -221,5 +238,14 @@ mod tests {
         assert_eq!(a.head_session(), b.head_session());
         assert_eq!(a.head_session(), process_head_session());
         assert!(uuid::Uuid::parse_str(a.head_session()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_owner_given_a_session_offers_that_session() {
+        let (_dir, store, _owner) = store_with_lease().await;
+        let session: std::sync::Arc<str> = uuid::Uuid::new_v4().to_string().into();
+        let owned = LocalOwnership::with_head_session(store, session.clone());
+        assert_eq!(owned.head_session(), &*session);
+        assert_ne!(owned.head_session(), process_head_session());
     }
 }
