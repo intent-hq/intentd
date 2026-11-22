@@ -4,4 +4,5 @@
 //! them in this crate find homes and machines and call in here.
 
 pub(crate) mod home_scripts;
+pub(crate) mod home_state;
 pub(crate) mod terminals;

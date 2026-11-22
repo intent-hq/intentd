@@ -1505,6 +1505,14 @@ impl intent_node_connections::NodeInbound for Recording {
         Box::pin(async {})
     }
 
+    fn homes_link_lost<'a>(
+        &'a self,
+        _: &'a dyn intent_node_connections::LinkView,
+        _: &'a str,
+    ) -> intent_core::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
     fn machine_changed<'a>(
         &'a self,
         link: &'a dyn intent_node_connections::LinkView,

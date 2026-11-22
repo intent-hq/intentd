@@ -469,6 +469,11 @@ impl Shared {
             .map(crate::inbound::ServicesInbound::services)
     }
 
+    /// The head's domain, when this connector has it.
+    pub(crate) fn inbound(&self) -> Option<&Arc<dyn NodeInbound>> {
+        self.inbound.as_ref()
+    }
+
     /// The current link, if one is up.
     pub(crate) fn current_link(&self) -> Option<NodeLink> {
         self.link.borrow().clone().filter(|link| !link.is_closed())
@@ -1692,6 +1697,14 @@ impl LinkView for Shared {
 
     fn current_binding(&self) -> Option<intent_core::node_link::LeaseBinding> {
         self.current_link().map(|link| link.binding().clone())
+    }
+
+    fn watch_backup_warning(
+        &self,
+        home_id: &intent_core::HomeId,
+        wait: intent_core::BoxFuture<'static, ()>,
+    ) {
+        self.home_link.watch_warning(home_id, wait);
     }
 }
 

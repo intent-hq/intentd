@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use intent_core::node_link::{HomeEvents, HomeRef, LeaseBinding, LinkFrame};
-use intent_core::{AgentId, BoxFuture, WorkspaceId};
+use intent_core::{AgentId, BoxFuture, HomeId, WorkspaceId};
 use intent_node_link::IncomingRequest;
 use tokio::time::Instant;
 
@@ -27,6 +27,11 @@ pub trait LinkView: Send + Sync {
 
     /// The binding of the link that is up now, if any.
     fn current_binding(&self) -> Option<LeaseBinding>;
+
+    /// Hold `wait`, the wait for `home_id`'s backup warning, until it ends,
+    /// the home backs up, or the machine's connector goes away. One wait
+    /// per home: while one is pending, `wait` is dropped unstarted.
+    fn watch_backup_warning(&self, home_id: &HomeId, wait: BoxFuture<'static, ()>);
 }
 
 /// The head's domain, as the node-connection service calls it.
@@ -68,6 +73,11 @@ pub trait NodeInbound: Send + Sync + 'static {
         agent_id: &'a AgentId,
         reason: &'a str,
     ) -> BoxFuture<'a, ()>;
+
+    /// The machine behind `link` stayed unlinked for the link-loss grace,
+    /// lost at `lost_at`: its homes are detached.
+    fn homes_link_lost<'a>(&'a self, link: &'a dyn LinkView, lost_at: &'a str)
+        -> BoxFuture<'a, ()>;
 
     /// The machine behind `link` changed: announce it as it is now.
     fn machine_changed<'a>(&'a self, link: &'a dyn LinkView) -> BoxFuture<'a, ()>;
