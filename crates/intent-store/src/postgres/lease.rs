@@ -22,6 +22,11 @@
 //! takeover either commits first (the claim then sees a live lease) or
 //! waits and then matches no row.
 //!
+//! A store that never claimed writes only while no process ever claimed the
+//! tenant. So once an orchestrator has claimed a tenant, an unclaimed tool
+//! (admin, backfill, repair) cannot write to it again, even after the lease
+//! expires: it must claim the tenant itself (after expiry) to write.
+//!
 //! Self-fencing (stopping the tenant's work when renewals fail) is the
 //! caller's: the heartbeat only reports the loss.
 //!
@@ -59,6 +64,11 @@ pub struct TenantLease {
     pub epoch: i64,
     /// When the lease lapses unless renewed, by the database clock.
     pub expires_at: OffsetDateTime,
+    /// When the lease lapses at the latest, on this host's monotonic clock:
+    /// the start of the claim plus its TTL. The database set `expires_at`
+    /// after that start, so this is never later, and it needs no agreement
+    /// between the host's and the database's wall clocks.
+    pub renew_by: Instant,
 }
 
 /// What [`Store::claim_tenant`](crate::Store::claim_tenant) found.
@@ -193,6 +203,7 @@ impl PgStore {
     pub(crate) async fn claim_lease(&self, instance: &str, ttl: Duration) -> Result<TenantClaim> {
         check_instance(instance)?;
         let ttl_ms = ttl_millis(ttl)?;
+        let started = Instant::now();
         // The writer lock without the fence check: a claim is how the fence
         // moves. It orders this claim against every writer and claimant.
         let mut tx: WriteTx = self.begin_write_as(Fence::Skip).await?;
@@ -237,6 +248,7 @@ impl PgStore {
             instance: instance.to_owned(),
             epoch,
             expires_at: timestamp(expires_ms)?,
+            renew_by: started + ttl,
         }))
     }
 
@@ -281,6 +293,13 @@ impl crate::Store {
     /// and any other process's writes fail `Error::NotOwner`. A live lease
     /// (also this process's own) is [`TenantClaim::AlreadyOwned`] and
     /// changes nothing. See the `lease` module docs.
+    ///
+    /// The process's claim is recorded only once the commit is acknowledged.
+    /// If the commit lands but its reply is lost, the database names this
+    /// instance while the process holds no claim: its writes fail
+    /// `NotOwner` (safe), and claiming again sees its own live lease
+    /// (`AlreadyOwned`) until the TTL passes, so the tenant is unserved for
+    /// up to one TTL.
     ///
     /// # Errors
     /// `Error::InvalidParams` on `SQLite` (no lease there), for an empty or
@@ -403,12 +422,17 @@ pub enum LeaseState {
 /// (self-fence). Dropping the heartbeat stops it.
 pub struct LeaseHeartbeat {
     state: watch::Receiver<LeaseState>,
-    task: Option<tokio::task::JoinHandle<Error>>,
+    /// Kept for the heartbeat's whole life (never moved out), so dropping
+    /// the heartbeat always aborts it, even after a cancelled `lost()`.
+    task: tokio::task::JoinHandle<Error>,
+    /// `lost()` already returned the task's result.
+    reported: bool,
 }
 
 impl LeaseHeartbeat {
     /// Start renewing `store`'s lease, claimed as `lease`, for `ttl` every
-    /// `interval` (see [`LEASE_TTL`], [`LEASE_RENEW_INTERVAL`]).
+    /// `interval` (see [`LEASE_TTL`], [`LEASE_RENEW_INTERVAL`]). The first
+    /// local deadline is the claim's [`TenantLease::renew_by`].
     #[must_use]
     pub fn spawn(
         store: crate::Store,
@@ -416,16 +440,14 @@ impl LeaseHeartbeat {
         ttl: Duration,
         interval: Duration,
     ) -> Self {
-        let left = lease.expires_at - OffsetDateTime::now_utc();
-        let left = Duration::try_from(left).unwrap_or(Duration::ZERO).min(ttl);
-        let deadline = Instant::now() + left;
         let (tx, rx) = watch::channel(LeaseState::Held {
             expires_at: lease.expires_at,
         });
-        let task = tokio::spawn(heartbeat(store, ttl, interval, deadline, tx));
+        let task = tokio::spawn(heartbeat(store, ttl, interval, lease.renew_by, tx));
         Self {
             state: rx,
-            task: Some(task),
+            task,
+            reported: false,
         }
     }
 
@@ -436,22 +458,21 @@ impl LeaseHeartbeat {
     }
 
     /// Wait until the lease is lost; the error says why (`NotOwner`). Later
-    /// calls return an `Internal` error.
+    /// calls return an `Internal` error. Cancel-safe: dropping a pending
+    /// call leaves the heartbeat running, and a later call waits again.
     pub async fn lost(&mut self) -> Error {
-        match self.task.take() {
-            Some(task) => task
-                .await
-                .unwrap_or_else(|e| Error::Internal(format!("lease heartbeat ended: {e}"))),
-            None => Error::Internal("lease heartbeat already reported its loss".to_owned()),
+        if self.reported {
+            return Error::Internal("lease heartbeat already reported its loss".to_owned());
         }
+        let ended = (&mut self.task).await;
+        self.reported = true;
+        ended.unwrap_or_else(|e| Error::Internal(format!("lease heartbeat ended: {e}")))
     }
 }
 
 impl Drop for LeaseHeartbeat {
     fn drop(&mut self) {
-        if let Some(task) = &self.task {
-            task.abort();
-        }
+        self.task.abort();
     }
 }
 

@@ -429,3 +429,162 @@ fn the_lease_constants_suit_the_neki_router_timeouts() {
     assert!(postgres::LEASE_RENEW_INTERVAL * 3 <= postgres::LEASE_TTL);
     assert!(postgres::LEASE_RENEW_INTERVAL < Duration::from_secs(5 * 60));
 }
+
+/// Sessions of `admin`'s database waiting for a `tenant_lease` row lock.
+async fn lease_lock_waiters(admin: &PgPool) -> usize {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+         AND datname = current_database() AND query LIKE '%tenant_lease%'",
+    )
+    .fetch_one(admin)
+    .await
+    .expect("count lease lock waiters");
+    usize::try_from(n).expect("a count")
+}
+
+async fn wait_for_lease_waiters(admin: &PgPool, n: usize) {
+    tokio::time::timeout(test_timeout(Duration::from_secs(30)), async {
+        while lease_lock_waiters(admin).await < n {
+            // timing-guard: poll interval while waiting for lease lock waiters in pg_stat_activity
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{n} sessions wait for the lease row lock"));
+}
+
+/// When the lease was last renewed, by the database clock (epoch ms).
+async fn renewed_at(admin: &PgPool, tenant: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT (extract(epoch FROM renewed_at) * 1000)::bigint FROM tenant_lease \
+         WHERE tenant_id = $1",
+    )
+    .bind(tenant)
+    .fetch_one(admin)
+    .await
+    .expect("read renewed_at")
+}
+
+/// Until another process claims, an expired lease is still this process's:
+/// nobody else has written, so renewing it is safe and keeps the tenant.
+#[tokio::test]
+async fn a_renewal_after_expiry_but_before_a_takeover_keeps_the_tenant() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-late-renew";
+    let (store, _) = open_owned(&db.app, tenant, "proc-a", SHORT_TTL)
+        .await
+        .unwrap();
+    wait_for_expiry(&db.admin, tenant).await;
+    store.renew_tenant_lease(LONG_TTL).await.unwrap();
+    assert_not_owner(
+        open_owned(&db.app, tenant, "proc-b", LONG_TTL).await,
+        "a claim of a renewed lease",
+    );
+    store.set_setting("userRules", "\"a\"").await.unwrap();
+}
+
+/// A renewal racing a real takeover: the claim holds the lease row lock, the
+/// renewal waits for it, then matches no row (the epoch moved) and fails.
+#[tokio::test]
+async fn a_renewal_queued_behind_a_takeover_fails_not_owner() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-renew-race";
+    let (old, _) = open_owned(&db.app, tenant, "proc-a", SHORT_TTL)
+        .await
+        .unwrap();
+    wait_for_expiry(&db.admin, tenant).await;
+
+    // Hold the lease row so the takeover queues on it first, then the renewal.
+    let mut holder = db.admin.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM tenant_lease WHERE tenant_id = $1 FOR UPDATE")
+        .bind(tenant)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    let pool = db.app.clone();
+    let takeover = tokio::spawn(async move { open_owned(&pool, tenant, "proc-b", LONG_TTL).await });
+    wait_for_lease_waiters(&db.admin, 1).await;
+    let renewer = old.clone();
+    let renewal = tokio::spawn(async move { renewer.renew_tenant_lease(LONG_TTL).await });
+    wait_for_lease_waiters(&db.admin, 2).await;
+    holder.rollback().await.unwrap();
+
+    let (_new, lease) = takeover.await.unwrap().expect("the takeover claims");
+    assert_eq!(lease.epoch, 2);
+    assert_not_owner(renewal.await.unwrap(), "the queued renewal");
+    assert_eq!(
+        owner_rows(&db.admin, tenant).await,
+        (
+            Some(("proc-b".to_owned(), 2)),
+            (Some("proc-b".to_owned()), 2)
+        )
+    );
+}
+
+/// Renewals that keep failing for another reason (here, a closed pool) are
+/// retried until the lease's local deadline, then reported as a lapse.
+#[tokio::test]
+async fn the_heartbeat_reports_a_lapse_when_renewals_keep_failing() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-lapse";
+    let pool = postgres::connect(&db.url, 2).await.unwrap();
+    let (store, lease) = open_owned(&pool, tenant, "proc-a", SHORT_TTL)
+        .await
+        .unwrap();
+    let mut heartbeat = LeaseHeartbeat::spawn(store, &lease, SHORT_TTL, Duration::from_millis(50));
+    pool.close().await;
+    let lost = tokio::time::timeout(test_timeout(Duration::from_secs(30)), heartbeat.lost())
+        .await
+        .expect("the heartbeat reports the lapse");
+    match lost {
+        Error::NotOwner(message) => assert!(message.contains("lapsed"), "{message}"),
+        other => panic!("expected a NotOwner lapse, got {other:?}"),
+    }
+    assert!(matches!(*heartbeat.state().borrow(), LeaseState::Lost(_)));
+}
+
+/// A `lost()` wait that is cancelled (as in a `select!` on shutdown) leaves
+/// the heartbeat in place, and dropping the heartbeat stops renewals, so
+/// the lease can lapse and another process take over.
+#[tokio::test]
+async fn dropping_the_heartbeat_after_a_cancelled_wait_stops_renewals() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-drop";
+    let (store, lease) = open_owned(&db.app, tenant, "proc-a", LONG_TTL)
+        .await
+        .unwrap();
+    let interval = Duration::from_millis(50);
+    let mut heartbeat = LeaseHeartbeat::spawn(store, &lease, LONG_TTL, interval);
+    let mut state = heartbeat.state();
+    tokio::time::timeout(test_timeout(Duration::from_secs(30)), state.changed())
+        .await
+        .expect("a renewal")
+        .expect("heartbeat runs");
+    // A cancelled wait: the heartbeat keeps running and can still report.
+    assert!(
+        tokio::time::timeout(interval * 2, heartbeat.lost())
+            .await
+            .is_err(),
+        "the lease is held, so lost() is still pending"
+    );
+    tokio::time::timeout(test_timeout(Duration::from_secs(30)), state.changed())
+        .await
+        .expect("renewals go on after the cancelled wait")
+        .expect("heartbeat runs");
+
+    drop(heartbeat);
+    // timing-guard: let a renewal already on the wire when the task was aborted settle
+    tokio::time::sleep(interval * 2).await;
+    let before = renewed_at(&db.admin, tenant).await;
+    // timing-guard: several renew intervals with no heartbeat, to see that none renews
+    tokio::time::sleep(interval * 10).await;
+    assert_eq!(renewed_at(&db.admin, tenant).await, before);
+}
