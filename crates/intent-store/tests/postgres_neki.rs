@@ -34,8 +34,9 @@
 //! more shards, the migration ledger to the authoritative group) and name
 //! it in `INTENT_STORE_NEKI_SHARDED_SCHEMA`. Each sharded test then drops,
 //! creates and migrates that schema, keeping the topology, and drops it at
-//! the end; a file lock in the temp directory runs them one at a time on
-//! this host (do not point two hosts at one schema). Only
+//! the end; a file lock in cargo's target temp directory
+//! (`CARGO_TARGET_TMPDIR`) runs them one at a time on this host (do not
+//! point two hosts at one schema). Only
 //! in that mode do the topology-dependent tests run (routing, identity
 //! inserts, cross-shard writer locks); they skip otherwise.
 #![cfg(feature = "postgres")]
@@ -204,6 +205,7 @@ const FIXED_SCHEMA_PREFIX: &str = "intent_shard_";
 /// schema, so it must carry the dedicated `intent_shard_` prefix (never
 /// `public` or a real schema) and be a plain lower-case identifier (it is
 /// spliced into DDL); anything else panics.
+#[track_caller]
 fn fixed_sharded_schema() -> Option<String> {
     let name = std::env::var("INTENT_STORE_NEKI_SHARDED_SCHEMA")
         .ok()
@@ -239,7 +241,8 @@ fn sharded_run_schema() -> RunSchema {
 /// (`flock`; `std::fs::File::lock` is newer than the crate's MSRV.)
 #[cfg(unix)]
 fn lock_fixed_schema(schema: &str) -> nix::fcntl::Flock<std::fs::File> {
-    let path = std::env::temp_dir().join(format!("intent-store-neki-{schema}.lock"));
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("intent-store-neki-{schema}.lock"));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
