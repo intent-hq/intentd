@@ -237,8 +237,8 @@ describe('container image', () => {
     assert.ok(lines.includes('WORKDIR /home/user'));
   });
   it('pins the base by digest, so its layers and the cache above them stay put', () => {
-    assert.match(BASE_IMAGE, /^node:24-bookworm@sha256:[0-9a-f]{64}$/);
-    assert.throws(() => baseImage('FROM node:24-bookworm\n'), /pinned by digest/);
+    assert.match(BASE_IMAGE, /^node:26-bookworm@sha256:[0-9a-f]{64}$/);
+    assert.throws(() => baseImage('FROM node:26-bookworm\n'), /pinned by digest/);
     assert.throws(() => baseImage(`FROM ${BASE_IMAGE}\nFROM ${BASE_IMAGE}\n`), /one FROM line/);
     const dependabot = readFileSync(join(ROOT, '.github/dependabot.yml'), 'utf8');
     assert.match(dependabot, /package-ecosystem: "docker"\n\s+directory: "\/packaging\/e2b"/);
