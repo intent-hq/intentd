@@ -43,3 +43,4 @@ mod e2e_wss_unblocked_hints;
 mod e2e_wss_voice_transcribe;
 mod e2e_wss_wake_or_create;
 mod e2e_wss_wake_resume;
+mod e2e_wss_workload_containment;

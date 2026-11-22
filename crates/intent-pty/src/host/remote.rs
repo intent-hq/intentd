@@ -277,6 +277,7 @@ impl PtyHost {
                 sink: spec.output_sink,
                 lost: Mutex::default(),
             }),
+            leaf: None,
         });
         let id = PtyId(
             self.next_id
@@ -314,7 +315,12 @@ impl PtyHost {
     /// # Panics
     ///
     /// Panics if a per-session mutex is poisoned.
-    pub fn remote_exited(&self, id: PtyId, exit_code: Option<i32>) -> Result<()> {
+    pub fn remote_exited(
+        &self,
+        id: PtyId,
+        exit_code: Option<i32>,
+        memory_limit: bool,
+    ) -> Result<()> {
         let session = self.get(id)?;
         let Some(slot) = session.remote.as_ref().map(|remote| &remote.exit) else {
             return Err(internal("not a remote terminal"));
@@ -324,6 +330,7 @@ impl PtyHost {
                 exit_code: code,
                 success: code == 0,
                 observed: true,
+                memory_limit: memory_limit && code != 0,
             },
             None => PtyExit::unobservable(),
         };
@@ -362,7 +369,7 @@ impl PtyHost {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_or_insert_with(|| reason.to_owned());
         drop(session);
-        self.remote_exited(id, None)
+        self.remote_exited(id, None, false)
     }
 
     /// Why remote process `id` ended without an exit status, if it was
@@ -451,7 +458,7 @@ mod tests {
         assert_eq!(info.process, crate::PtyProcess::default());
         assert_eq!(host.try_exit(id).unwrap(), None);
 
-        host.remote_exited(id, Some(3)).unwrap();
+        host.remote_exited(id, Some(3), false).unwrap();
         host.wait_output_eof(id).await.unwrap();
         let exit = host.wait(id).await.unwrap();
         assert_eq!(
@@ -519,7 +526,7 @@ mod tests {
         assert!(host.push_remote_output(id, b"late").is_err());
 
         let other = host.spawn_remote(RemoteSpec::new("ws-1"), io).unwrap();
-        host.remote_exited(other, None).unwrap();
+        host.remote_exited(other, None, false).unwrap();
         assert_eq!(host.try_exit(other).unwrap(), Some(PtyExit::unobservable()));
     }
 }

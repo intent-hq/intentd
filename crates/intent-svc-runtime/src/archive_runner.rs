@@ -113,6 +113,7 @@ async fn spawn_and_wait(
             command
         }
         setup_runner::SetupScriptRunner::CmdWrapper => {
+            // workload-spawn: allow — the Windows branch of the one archive spawn; the helper below covers both
             let mut command = tokio::process::Command::new("cmd.exe");
             command.args(["/d", "/c"]).arg(script_path);
             command
@@ -137,6 +138,11 @@ async fn spawn_and_wait(
     }
     #[cfg(unix)]
     command.process_group(0);
+    intent_core::workload::Workload::new(
+        intent_core::workload::WorkloadKind::Archive,
+        format!("archive script in {workspace}"),
+    )
+    .apply_pinned(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {

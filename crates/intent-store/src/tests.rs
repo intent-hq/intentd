@@ -11153,6 +11153,7 @@ async fn script_lifecycle_legacy_defaults_and_durable_scope() {
         stopped_at: "t2".into(),
         error: Some("failed".into()),
         started_by: None,
+        exit_reason: None,
     });
     store.upsert_script(&def).await.unwrap();
     store

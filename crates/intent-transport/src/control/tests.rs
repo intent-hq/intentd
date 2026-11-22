@@ -77,6 +77,7 @@ impl FakeControl {
                     backends: 1,
                     machines: 2,
                 }),
+                workload_containment: None,
             },
             shutdown_called: AtomicBool::new(false),
             credential: None,
@@ -263,6 +264,7 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         busy_agents: 0,
         idle_update_check: IdleUpdateCheckStatus::default(),
         remote_links: None,
+        workload_containment: None,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));

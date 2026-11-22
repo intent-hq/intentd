@@ -176,6 +176,10 @@ pub struct SystemStatus {
     /// Live daemon-to-daemon link counts. `None` on daemons that do not
     /// report them: `remoteLinks` is presence-detected, never null.
     pub remote_links: Option<RemoteLinks>,
+    /// Workload memory containment (intent-hq/intent#9809): mode, the reason
+    /// when the cgroup box is not active, and the box's limit, usage and OOM
+    /// kills. Presence-detected on the wire; administrator-only.
+    pub workload_containment: Option<intent_core::workload::ContainmentStatus>,
 }
 
 /// `system.status.remoteLinks`: the daemons linked to this one right now.
@@ -579,6 +583,9 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     }
     if let Some(limit) = status.fd_limit {
         obj.insert("fdLimit".into(), limit.into());
+    }
+    if let Some(containment) = &status.workload_containment {
+        obj.insert("workloadContainment".into(), json!(containment));
     }
     if let Some(links) = status.remote_links {
         obj.insert(

@@ -2075,3 +2075,30 @@ without changing them. If doctor reports damage outside the search indexes, stop
 copy the whole data folder before any recovery.
 
 <!-- Sources: packages/intentd/README.md (Start, status, stop, and restart; Repairing a damaged search index); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,supervisor.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Agents, Stop, Doctor, RepairIndexes); packages/intentd/crates/intentd/src/agents_cmd.rs; packages/intentd/crates/intentd/src/db_repair.rs; packages/intentd/crates/intent-store/src/derived_index.rs. -->
+
+## Memory limits on Linux
+
+On Linux, Intent runs agents, scripts, terminals, `host.exec` commands, MCP servers
+and model servers in one shared memory box, so a runaway job (a big test run, say)
+is killed inside the box while Intent itself and its clients stay up. A script,
+terminal or `host.exec` command killed this way ends with the error **killed:
+workload memory limit** (`exitReason: "memoryLimit"`). When a process inside an
+agent's own tool call is killed, the agent sees a plain exit 137 and Intent logs
+which agent lost the process. The kernel kills the largest process in the box,
+so a long-running dev server can take room from an agent's tests.
+
+The box needs a writable cgroup v2: Intent runs as root, or in a systemd unit with
+`Delegate=memory pids` (the `.deb` user unit has it; after upgrading the package,
+run `systemctl --user daemon-reload && systemctl --user restart intentd`). Otherwise,
+for example a daemon started from a desktop session or a shell, jobs only get a
+higher out-of-memory score than Intent, so the kernel picks them first.
+`intentd doctor` and `intentd call system.status` (`workloadContainment`) show
+which applies and why. macOS and Windows have no memory box.
+
+The limit defaults to total memory less a reserve for Intent (15 %, between
+768 MB and 2 GB). Change it with `intentd settings agents.workloadMemoryMaxMb <MB>`
+(`0` turns the box off), then restart the daemon. On machines with less than
+12 GB of memory, Intent also lowers the automatic agent slot count and memory
+budget (a 4 GB machine gets 2 agent slots). Older versions may differ.
+
+<!-- Sources: packages/intentd/crates/intent-core/src/workload.rs; packages/intentd/crates/intent-core/src/workload/{cgroup,leaf}.rs; packages/intentd/crates/intent-services/src/agent_manager.rs (small-host defaults); packages/intentd/crates/intent-services/src/settings.rs (agents.workloadMemoryMaxMb); packages/intentd/packaging/deb/intentd.service; packages/intentd/crates/intentd/src/main.rs (report_workload_containment). -->

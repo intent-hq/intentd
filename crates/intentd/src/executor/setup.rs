@@ -468,6 +468,10 @@ async fn spawn_and_wait(
     spec.env_remove
         .push(intent_git::node_git::SOCKET_ENV.to_owned());
     spec.cwd = Some(run.worktree.to_path_buf());
+    spec.workload = Some(intent_core::workload::Workload::new(
+        intent_core::workload::WorkloadKind::Script,
+        "remote setup script",
+    ));
     spec.listed = false;
     spec.scrollback_bytes = SCROLLBACK_BYTES;
     let writer = output.clone();
@@ -604,6 +608,7 @@ async fn untracked(worktree: &Path, pins: &[SubmodulePin]) -> Vec<(Option<usize>
     );
     let mut listed = Vec::new();
     for (repo, dir) in repos {
+        // workload-spawn: allow — git ls-files, the daemon's own helper
         let out = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&dir)
@@ -680,6 +685,7 @@ fn write_excludes(
 /// `core.excludesFile` names, else git's default `git/ignore` under
 /// `$XDG_CONFIG_HOME` (or `~/.config`).
 fn global_excludes(worktree: &Path) -> String {
+    // workload-spawn: allow — git config read, the daemon's own helper
     let configured = std::process::Command::new("git")
         .arg("-C")
         .arg(worktree)

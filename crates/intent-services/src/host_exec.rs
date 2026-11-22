@@ -483,6 +483,7 @@ async fn run_prepared(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<Value, HostExecError> {
     let mut cmd = build_command(&args, cwd_resolved.as_deref());
+    let leaf = host_exec_workload().apply_tokio(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| HostExecError::internal(format!("spawn failed: {}: {e}", args.command)))?;
@@ -545,6 +546,9 @@ async fn run_prepared(
             }
             intent_acp::sweep_escaped_descendants(&descendants).await;
         }
+        if let Some(leaf) = &leaf {
+            leaf.kill();
+        }
         #[cfg(not(unix))]
         {
             let _ = pid;
@@ -597,7 +601,26 @@ async fn run_prepared(
     if timed_out {
         result["timedOut"] = json!(true);
     }
+    if let Some(reason) = memory_limit_reason(status.success(), leaf.as_ref()) {
+        result["exitReason"] = json!(reason);
+    }
     Ok(result)
+}
+
+/// The workload every `host.exec` / `host.execStream` child runs as
+/// (intent-hq/intent#9809). The label carries no argv: it can hold secrets.
+pub(crate) fn host_exec_workload() -> intent_core::workload::Workload {
+    intent_core::workload::Workload::new(intent_core::workload::WorkloadKind::HostExec, "host.exec")
+}
+
+/// `exitReason: memoryLimit` for a failed command whose leaf cgroup saw an
+/// OOM kill.
+pub(crate) fn memory_limit_reason(
+    success: bool,
+    leaf: Option<&intent_core::workload::Leaf>,
+) -> Option<intent_core::ExitReason> {
+    (!success && leaf.is_some_and(|leaf| leaf.oom_kills() > 0))
+        .then_some(intent_core::ExitReason::MemoryLimit)
 }
 
 /// Owns one-shot command completion even if the requesting task is cancelled.

@@ -227,6 +227,7 @@ impl FixtureMetadata {
             update_supported: false,
             idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
             remote_links: None,
+            workload_containment: None,
         }
     }
     fn unsupported(&self) {

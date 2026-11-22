@@ -40,6 +40,8 @@ pub enum HomeExecEvent {
     Exited {
         exit_code: Option<i32>,
         error: Option<String>,
+        /// Why it ended, when the machine said (intent-hq/intent#9809).
+        exit_reason: Option<intent_core::ExitReason>,
     },
 }
 

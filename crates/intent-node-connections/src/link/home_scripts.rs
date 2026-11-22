@@ -72,10 +72,10 @@ impl Run {
 
     /// End the PTY: `exit_code`; or, with `error`, without one, `error`
     /// shown as the run's last output line and kept as why it ended.
-    fn end(&self, exit_code: Option<i32>, error: Option<&str>) {
+    fn end(&self, exit_code: Option<i32>, error: Option<&str>, memory_limit: bool) {
         self.done.send_replace(true);
         let Some(error) = error else {
-            let _ = self.pty.remote_exited(self.id, exit_code);
+            let _ = self.pty.remote_exited(self.id, exit_code, memory_limit);
             return;
         };
         let line = format!(
@@ -98,7 +98,11 @@ impl Drop for HomeScripts {
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, run) in runs.drain() {
-            run.end(None, Some("remote-script-lost: the machine was removed"));
+            run.end(
+                None,
+                Some("remote-script-lost: the machine was removed"),
+                false,
+            );
         }
     }
 }
@@ -160,7 +164,7 @@ impl HomeScripts {
         drop(runs);
         // A refused start or stop carries `error` without an exit code.
         let error = frame.error.as_deref().filter(|_| frame.exit_code.is_none());
-        run.end(frame.exit_code, error);
+        run.end(frame.exit_code, error, frame.exit_reason.is_some());
     }
 
     /// Stop the run of PTY `id` in `pty` and wait, up to `wait`, for the
@@ -203,7 +207,7 @@ impl HomeScripts {
     pub fn link_lost(&self, reason: &str) {
         let lost: Vec<Run> = lock(&self.runs).drain().map(|(_, run)| run).collect();
         for run in lost {
-            run.end(None, Some(reason));
+            run.end(None, Some(reason), false);
         }
     }
 }
@@ -360,7 +364,7 @@ pub enum Stopped {
 fn lose(shared: &Shared, spawn_id: &str) {
     let run = lock(&shared.home_scripts.runs).remove(spawn_id);
     if let Some(run) = run {
-        run.end(None, Some(LOST_DISCONNECTED));
+        run.end(None, Some(LOST_DISCONNECTED), false);
     }
 }
 
@@ -439,6 +443,7 @@ mod tests {
             spawn_id: "p1".into(),
             exit_code,
             error: error.map(str::to_owned),
+            exit_reason: None,
         })
     }
 

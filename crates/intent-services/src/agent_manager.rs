@@ -856,10 +856,47 @@ const DEFAULT_PROCESS_CAP: usize = 8;
 /// cap while high-RAM machines are not artificially throttled (for exact byte
 /// counts: 16 GB → 8, 32 GB → 24, 64 GB → 56, ≥108 GB → 100; Linux `MemTotal`
 /// runs slightly below nominal RAM, so a nominal 16 GB box may compute 7).
+///
+/// Below [`SMALL_HOST_BYTES`] the small-host cap applies when it is lower
+/// (intent-hq/intent#9809): a 4 GB host gets 2 slots, not 4.
 #[must_use]
 pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
     let budget_gb = total_memory_bytes.saturating_sub(8 * GB) / GB;
-    budget_gb.clamp(4, 100) as usize
+    let today = budget_gb.clamp(4, 100) as usize;
+    match small_host_reserve_bytes(total_memory_bytes) {
+        Some(reserve) => {
+            let small = (total_memory_bytes.saturating_sub(reserve) / GB).clamp(2, 100) as usize;
+            today.min(small)
+        }
+        None => today,
+    }
+}
+
+/// Hosts with less RAM than this get the small-host defaults
+/// (intent-hq/intent#9809); at or above it every auto value is unchanged.
+pub const SMALL_HOST_BYTES: u64 = 12 * GB;
+
+/// The OS/other-apps reserve of a small host, `clamp(total / 2, 1 GiB,
+/// 8 GiB)`; `None` at or above [`SMALL_HOST_BYTES`] and for an unknown (`0`)
+/// total, where the fixed 8 GB reserve applies. Every small-host value is
+/// combined with today's by `min`, so it can only lower a default.
+#[must_use]
+pub fn small_host_reserve_bytes(total_memory_bytes: u64) -> Option<u64> {
+    (total_memory_bytes > 0 && total_memory_bytes < SMALL_HOST_BYTES)
+        .then(|| (total_memory_bytes / 2).clamp(GB, 8 * GB))
+}
+
+/// Host headroom [`budget_admits`] defends on a host with
+/// `total_memory_bytes` of RAM: [`HOST_MEMORY_RESERVE_BYTES`], or on a small
+/// host its own reserve plus one provisional agent when that is lower. An
+/// unknown total keeps the fixed reserve.
+#[must_use]
+pub fn host_memory_reserve_bytes(total_memory_bytes: Option<u64>) -> u64 {
+    total_memory_bytes
+        .and_then(small_host_reserve_bytes)
+        .map_or(HOST_MEMORY_RESERVE_BYTES, |reserve| {
+            HOST_MEMORY_RESERVE_BYTES.min(reserve + PROVISIONAL_AGENT_BYTES)
+        })
 }
 
 /// Aggregate memory budget recommended for `total_memory_bytes` (monorepo#2063).
@@ -883,9 +920,17 @@ pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
 /// browsers started through `ws.script` / `host.exec` included, with shared
 /// pages double-counted — so on a large host it crosses this number while
 /// tens of gigabytes are still free.
+///
+/// Below [`SMALL_HOST_BYTES`] the small-host budget, `max((total − reserve) /
+/// 2, 512 MiB)`, applies when it is lower (intent-hq/intent#9809): today's
+/// 4 GB floor is the whole of a 4 GB host.
 #[must_use]
 pub fn recommended_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
-    (total_memory_bytes.saturating_sub(8 * GB) / 2).max(4 * GB)
+    let today = (total_memory_bytes.saturating_sub(8 * GB) / 2).max(4 * GB);
+    match small_host_reserve_bytes(total_memory_bytes) {
+        Some(reserve) => today.min((total_memory_bytes.saturating_sub(reserve) / 2).max(GB / 2)),
+        None => today,
+    }
 }
 
 /// Best-effort process cap from detected system RAM, falling back to
@@ -1495,6 +1540,7 @@ pub const HOST_MEMORY_RESERVE_BYTES: u64 = 8 * GB + PROVISIONAL_AGENT_BYTES;
 /// An installed aggregate memory budget (monorepo#2063).
 struct MemoryBudget {
     budget_bytes: u64,
+    host_reserve_bytes: u64,
     probe: Arc<dyn TreeMemoryProbe>,
 }
 
@@ -1587,7 +1633,7 @@ fn charged_bytes(sampled: u64, pending: i64) -> u64 {
 ///
 /// Otherwise the budget denies only when the tree is over budget **and** the
 /// host is actually short: `available_memory` below
-/// [`HOST_MEMORY_RESERVE_BYTES`]. An over-budget tree with ample host headroom
+/// `host_reserve_bytes` ([`host_memory_reserve_bytes`]). An over-budget tree with ample host headroom
 /// admits — the tree sums RSS of every descendant, dev servers and test runs
 /// included, and crossed a 63 GB budget with 63 GB still available. `None`
 /// (probe does not measure host memory) keeps the tree-only criterion.
@@ -1596,10 +1642,11 @@ fn budget_admits(
     budget_bytes: u64,
     live: usize,
     available_memory: Option<u64>,
+    host_reserve_bytes: u64,
 ) -> bool {
     live == 0
         || charged < budget_bytes
-        || available_memory.is_some_and(|available| available >= HOST_MEMORY_RESERVE_BYTES)
+        || available_memory.is_some_and(|available| available >= host_reserve_bytes)
 }
 
 impl ProcessRegistry {
@@ -1634,6 +1681,9 @@ impl ProcessRegistry {
         self.memory
             .set(MemoryBudget {
                 budget_bytes,
+                host_reserve_bytes: host_memory_reserve_bytes(
+                    crate::settings::host_total_memory_bytes(),
+                ),
                 probe,
             })
             .is_ok()
@@ -1667,6 +1717,7 @@ impl ProcessRegistry {
             budget.budget_bytes,
             inner.entries.len(),
             available_memory,
+            budget.host_reserve_bytes,
         ))
         .then_some(BudgetDenial {
             charged,
@@ -2092,7 +2143,7 @@ impl ProcessRegistry {
                             charged_memory_bytes = denial.charged,
                             budget_bytes = self.memory.get().map(|b| b.budget_bytes),
                             host_available_memory_bytes = denial.available_memory,
-                            host_memory_reserve_bytes = HOST_MEMORY_RESERVE_BYTES,
+                            host_memory_reserve_bytes = self.memory.get().map(|b| b.host_reserve_bytes),
                             "process registry: spawn queued (aggregate memory budget)"
                         );
                     } else {
@@ -2280,7 +2331,7 @@ impl ProcessRegistry {
                             charged_memory_bytes = denial.charged,
                             budget_bytes = self.memory.get().map(|b| b.budget_bytes),
                             host_available_memory_bytes = denial.available_memory,
-                            host_memory_reserve_bytes = HOST_MEMORY_RESERVE_BYTES,
+                            host_memory_reserve_bytes = self.memory.get().map(|b| b.host_reserve_bytes),
                             "process registry: turn start queued (aggregate memory budget)"
                         );
                         if let Some(ref f) = self.event_fn {

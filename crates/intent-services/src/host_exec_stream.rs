@@ -453,6 +453,7 @@ pub async fn start_stream(
     // Spawn with piped stdin so follow-up writes reach the child.
     let mut cmd = build_command(&common, cwd_resolved.as_deref());
     cmd.stdin(Stdio::piped());
+    let leaf = host_exec::host_exec_workload().apply_tokio(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| HostExecError {
         data: None,
         code: -32603,
@@ -534,7 +535,7 @@ pub async fn start_stream(
             ws_wait,
             req_wait,
             child,
-            pid,
+            (pid, leaf),
             cancel_token,
             timeout_ms,
         )
@@ -589,7 +590,7 @@ async fn run_wait_loop(
     workspace_id: WorkspaceId,
     request_id: String,
     mut child: tokio::process::Child,
-    pid: Option<u32>,
+    (pid, leaf): (Option<u32>, Option<intent_core::workload::Leaf>),
     cancel_token: Arc<AtomicBool>,
     timeout_ms: Option<u64>,
 ) {
@@ -602,12 +603,18 @@ async fn run_wait_loop(
         if cancel_token.load(Ordering::SeqCst) {
             cancelled = true;
             reap_child_group(&mut child, pid).await;
+            if let Some(leaf) = &leaf {
+                leaf.kill();
+            }
             break child.wait().await;
         }
         if let Some(dl) = deadline {
             if tokio::time::Instant::now() >= dl {
                 timed_out = true;
                 reap_child_group(&mut child, pid).await;
+                if let Some(leaf) = &leaf {
+                    leaf.kill();
+                }
                 break child.wait().await;
             }
         }
@@ -641,6 +648,9 @@ async fn run_wait_loop(
     }
     if cancelled {
         data["cancelled"] = json!(true);
+    }
+    if let Some(reason) = host_exec::memory_limit_reason(ok, leaf.as_ref()) {
+        data["exitReason"] = json!(reason);
     }
 
     let ev = NewEvent {
@@ -877,7 +887,7 @@ async fn run_home_wait(
     let mut killed_at: Option<tokio::time::Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let (exit_code, error) = loop {
+    let (exit_code, error, exit_reason) = loop {
         tokio::select! {
             event = events.recv() => match event {
                 Some(HomeExecEvent::Output { stderr, bytes }) => {
@@ -885,8 +895,8 @@ async fn run_home_wait(
                     let chunk = base64::engine::general_purpose::STANDARD.encode(&bytes);
                     let _ = bus.publish_transient(&chunk_event(&workspace_id, &request_id, kind, &chunk));
                 }
-                Some(HomeExecEvent::Exited { exit_code, error }) => break (exit_code, error),
-                None => break (None, Some("the home's process was dropped".to_owned())),
+                Some(HomeExecEvent::Exited { exit_code, error, exit_reason }) => break (exit_code, error, exit_reason),
+                None => break (None, Some("the home's process was dropped".to_owned()), None),
             },
             _ = tick.tick() => {
                 let now = tokio::time::Instant::now();
@@ -903,7 +913,7 @@ async fn run_home_wait(
                     }
                     // The machine ends it after its next bind; this
                     // stream ends here now, at once when shutting down.
-                    Some(at) if now.duration_since(at) >= kill_wait() => break (None, None),
+                    Some(at) if now.duration_since(at) >= kill_wait() => break (None, None, None),
                     _ => {}
                 }
             }
@@ -933,6 +943,9 @@ async fn run_home_wait(
     }
     if cancelled {
         data["cancelled"] = json!(true);
+    }
+    if let Some(reason) = exit_reason.filter(|_| exit_code != Some(0)) {
+        data["exitReason"] = json!(reason);
     }
     let ev = NewEvent {
         workspace_id,

@@ -85,6 +85,7 @@ async fn script_frames_travel_both_ways(
             spawn_id: "spawn-1".into(),
             exit_code: Some(0),
             error: None,
+            exit_reason: None,
         }))
         .await
         .unwrap();

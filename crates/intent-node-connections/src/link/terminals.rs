@@ -16,7 +16,7 @@ use intent_core::node_link::{
     LinkFrame, PtyAck, PtyEnvVar, PtyExited, PtyInput, PtyKill, PtyMode, PtyOpen, PtyOutput,
     PtyResize, PtyStream,
 };
-use intent_core::{Error, HomeId, Result, WorkspaceId};
+use intent_core::{Error, ExitReason, HomeId, Result, WorkspaceId};
 use intent_node_link::NodeLink;
 use intent_pty::home::{HomeExec, HomeExecControl, HomeExecEvent, HomeExecOpen, HomeTerminalOpen};
 use intent_pty::{PtyHost, PtyId, PtySize, RemotePty, RemoteSpec};
@@ -85,7 +85,7 @@ impl Term {
 
     /// The process ended; a start failure (an `error` and no exit code)
     /// shows why.
-    fn end(self, exit_code: Option<i32>, error: Option<&str>) {
+    fn end(self, exit_code: Option<i32>, error: Option<&str>, exit_reason: Option<ExitReason>) {
         match self.sink {
             Sink::Pty { pty, id } => {
                 if let (Some(error), None) = (error, exit_code) {
@@ -95,12 +95,13 @@ impl Term {
                     );
                     let _ = pty.push_remote_output(id, line.as_bytes());
                 }
-                let _ = pty.remote_exited(id, exit_code);
+                let _ = pty.remote_exited(id, exit_code, exit_reason.is_some());
             }
             Sink::Exec(events) => {
                 let _ = events.send(HomeExecEvent::Exited {
                     exit_code,
                     error: error.map(str::to_owned),
+                    exit_reason,
                 });
             }
         }
@@ -113,8 +114,8 @@ impl Term {
             self.home_name
         );
         match &self.sink {
-            Sink::Pty { .. } => self.end(None, None),
-            Sink::Exec(_) => self.end(None, Some(&error)),
+            Sink::Pty { .. } => self.end(None, None, None),
+            Sink::Exec(_) => self.end(None, Some(&error), None),
         }
     }
 }
@@ -190,7 +191,7 @@ impl HomeTerminals {
     pub fn exited(&self, frame: &PtyExited) {
         let term = lock(&self.state).terms.remove(&frame.terminal_id);
         if let Some(term) = term {
-            term.end(frame.exit_code, frame.error.as_deref());
+            term.end(frame.exit_code, frame.error.as_deref(), frame.exit_reason);
         }
     }
 
@@ -227,7 +228,7 @@ impl HomeTerminals {
                 "{HOME_UNAVAILABLE}: the workspace's home is moving away from {}",
                 term.home_name
             );
-            term.end(None, Some(&error));
+            term.end(None, Some(&error), None);
         }
     }
 
@@ -606,7 +607,7 @@ mod tests {
         let (term, mut received) = exec_term();
         assert!(term.push(b"out", Some(PtyStream::Stdout)));
         assert!(term.push(b"err", Some(PtyStream::Stderr)));
-        term.end(Some(3), None);
+        term.end(Some(3), None, None);
         assert_eq!(
             received.try_recv().unwrap(),
             HomeExecEvent::Output {
@@ -625,7 +626,8 @@ mod tests {
             received.try_recv().unwrap(),
             HomeExecEvent::Exited {
                 exit_code: Some(3),
-                error: None
+                error: None,
+                exit_reason: None,
             }
         );
     }
@@ -642,6 +644,7 @@ mod tests {
             HomeExecEvent::Exited {
                 exit_code: None,
                 error: Some(error),
+                ..
             } => {
                 assert!(error.starts_with(HOME_UNAVAILABLE), "{error}");
                 assert!(error.contains("Machine A"), "{error}");

@@ -1327,6 +1327,11 @@ impl UnslothServerManager {
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
+        intent_core::workload::Workload::new(
+            intent_core::workload::WorkloadKind::ModelServer,
+            format!("model server {repo_id}"),
+        )
+        .apply_pinned(&mut cmd);
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::Internal(format!("failed to spawn unsloth server: {e}")))?;
@@ -1620,6 +1625,11 @@ impl UnslothServerManager {
             }
             tokio::time::sleep(self.config.probe_interval).await;
         };
+        intent_core::workload::Workload::new(
+            intent_core::workload::WorkloadKind::ModelServer,
+            format!("model setup {repo_id}"),
+        )
+        .apply_pinned(&mut cmd);
         let mut mint_child = cmd.spawn().map_err(|e| {
             StartupFailure::terminal(Error::Internal(format!(
                 "failed to run unsloth start opencode: {e}"

@@ -77,15 +77,16 @@ fn is_false(value: &bool) -> bool {
 /// ([`CHECKOUT_FILES_PROTOCOL`]); 17 lets sub-agents fetch GitHub through the
 /// backend ([`FORGE_FETCH_PROTOCOL`]); 18 adds quick actions
 /// ([`ONE_SHOT_PROTOCOL`]); 19 adds workspace homes ([`HOMES_PROTOCOL`]);
+/// 20 adds the exit reason of a script or terminal ([`EXIT_REASON_PROTOCOL`]);
 /// each keeps everything the one before has. Neither 6 nor the single-node
 /// 5 ever shipped, and a protocol-6 peer cannot confirm a stop, so this
-/// build speaks 7 to 19: a backend never takes a stop as confirmed by a machine
+/// build speaks 7 to 20: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 19 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 20 };
 
 /// The first protocol with reads of an agent's checkout files for
 /// `ws.file.pull`: the [`LinkFrame::CheckoutRead`] /
@@ -116,6 +117,13 @@ pub const ONE_SHOT_PROTOCOL: u32 = 18;
 /// sends none of them on a link that negotiated less, and a machine there
 /// cannot be a home.
 pub const HOMES_PROTOCOL: u32 = 19;
+
+/// The first protocol where a machine reports why a script or terminal
+/// ended: `exitReason` on [`ScriptExited`] and [`PtyExited`]
+/// (`memoryLimit` when the workload memory limit killed it,
+/// intent-hq/intent#9809). A machine sends the field only on a link that
+/// negotiated this protocol ([`LinkFrame::for_protocol`]).
+pub const EXIT_REASON_PROTOCOL: u32 = 20;
 
 /// A home frame for a `homeId` the machine does not hold, or that is not in
 /// the bound hello's `leaseHomes`.
@@ -574,6 +582,9 @@ pub struct PtyExited {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why the process ended, when known ([`EXIT_REASON_PROTOCOL`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_reason: Option<crate::ExitReason>,
 }
 
 /// The largest raw chunk one [`PtyOutput`] carries, before base64.
@@ -2353,6 +2364,9 @@ owned_script_frame! {
         exit_code: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// Why the run ended, when known ([`EXIT_REASON_PROTOCOL`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_reason: Option<crate::ExitReason>,
     }
 }
 
@@ -2815,6 +2829,8 @@ impl LinkFrame {
     #[must_use]
     pub fn min_protocol(&self) -> u32 {
         match self {
+            Self::PtyExited(exited) if exited.exit_reason.is_some() => EXIT_REASON_PROTOCOL,
+            Self::ScriptExited(exited) if exited.exit_reason.is_some() => EXIT_REASON_PROTOCOL,
             Self::HomeOpen(_)
             | Self::HomeOpenReply(_)
             | Self::HomePush(_)
@@ -2946,6 +2962,30 @@ impl LinkFrame {
             | Self::PtyExited(_)
             | Self::HomeCallReply(_)
             | Self::HomeEvents(_) => false,
+        }
+    }
+
+    /// A copy of this frame without the fields a link on `protocol` does not
+    /// know, or `None` when the frame is fine as it is. Only the optional
+    /// exit reason ([`EXIT_REASON_PROTOCOL`]) is dropped this way.
+    #[must_use]
+    pub fn for_protocol(&self, protocol: u32) -> Option<Self> {
+        if protocol >= EXIT_REASON_PROTOCOL {
+            return None;
+        }
+        match self {
+            Self::PtyExited(exited) if exited.exit_reason.is_some() => {
+                Some(Self::PtyExited(PtyExited {
+                    exit_reason: None,
+                    ..exited.clone()
+                }))
+            }
+            Self::ScriptExited(exited) if exited.exit_reason.is_some() => {
+                let mut exited = exited.clone();
+                exited.exit_reason = None;
+                Some(Self::ScriptExited(exited))
+            }
+            _ => None,
         }
     }
 

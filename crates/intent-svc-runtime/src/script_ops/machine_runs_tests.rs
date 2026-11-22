@@ -155,6 +155,7 @@ fn exited(start: &ScriptStartCommand, code: Option<i32>, error: Option<&str>) ->
         spawn_id: start.spawn_id.clone(),
         exit_code: code,
         error: error.map(str::to_owned),
+        exit_reason: None,
     })
 }
 
@@ -201,6 +202,38 @@ async fn a_command_run_starts_on_the_machine_and_settles_from_its_frames() {
         rec.changed.lock().unwrap().len() >= 3,
         "each transition is published"
     );
+}
+
+/// intent-hq/intent#9809: a run the machine's memory limit killed reports
+/// `memoryLimit` on its runtime and `lastRun`.
+#[tokio::test]
+async fn a_machine_run_killed_by_the_memory_limit_reports_why() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"), None)
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    frame(&runs, started(&start)).await;
+    let mut killed = exited(&start, Some(137), None);
+    if let LinkFrame::ScriptExited(exited) = &mut killed {
+        exited.exit_reason = Some(intent_core::ExitReason::MemoryLimit);
+    }
+    frame(&runs, killed).await;
+    let state = runs.state(&place(&agent)).unwrap();
+    assert_eq!(
+        state.exit_reason,
+        Some(intent_core::ExitReason::MemoryLimit)
+    );
+    assert_eq!(
+        state.error.as_deref(),
+        Some("killed: workload memory limit")
+    );
+    let entries = runs.entries(&ws(), "s1");
+    assert_eq!(entries[0]["runtime"]["exitReason"], "memoryLimit");
+    assert_eq!(entries[0]["lastRun"]["exitReason"], "memoryLimit");
+    assert_eq!(entries[0]["lastRun"]["outcome"], "failed");
 }
 
 #[tokio::test]
@@ -568,6 +601,7 @@ async fn ending_several_agents_waits_once_for_all_their_stops() {
                             spawn_id: stop.spawn_id,
                             exit_code: Some(143),
                             error: None,
+                            exit_reason: None,
                         }),
                     )
                     .await;
@@ -986,6 +1020,7 @@ async fn stop_acked(runs: &MachineRuns, rec: &Arc<Recorded>, here: &RunPlace) {
                             spawn_id: stop.spawn_id,
                             exit_code: Some(143),
                             error: None,
+                            exit_reason: None,
                         }),
                     )
                     .await;
@@ -1040,6 +1075,7 @@ async fn stopping_or_restarting_a_monitored_run_wakes_once_cancelled() {
                                     spawn_id: stop.spawn_id,
                                     exit_code: Some(143),
                                     error: None,
+                                    exit_reason: None,
                                 }),
                             )
                             .await;

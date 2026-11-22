@@ -1027,6 +1027,11 @@ async fn spawn_stdio(config: &Value) -> Result<(Child, Option<u32>, Connection, 
     // Own process group so reaping signals the whole tree (no orphans, §5.6).
     #[cfg(unix)]
     cmd.process_group(0);
+    intent_core::workload::Workload::new(
+        intent_core::workload::WorkloadKind::Mcp,
+        format!("mcp server {command}"),
+    )
+    .apply_pinned(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::Internal(format!("{command}: {e}")))?;

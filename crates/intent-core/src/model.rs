@@ -6263,6 +6263,27 @@ impl ScriptStartedBy {
     }
 }
 
+/// Why a script run, `host.exec` call or terminal ended, when the daemon
+/// knows more than the exit code (intent-hq/intent#9809). Additive wire
+/// field `exitReason`; omitted when no reason is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExitReason {
+    /// The workload memory limit killed a process of the run and the run
+    /// did not succeed.
+    MemoryLimit,
+}
+
+impl ExitReason {
+    /// The `error` text shown for this reason.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::MemoryLimit => "killed: workload memory limit",
+        }
+    }
+}
+
 /// Compact durable result; full PTY output remains transient.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -6279,6 +6300,9 @@ pub struct ScriptLastRun {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_by: Option<ScriptStartedBy>,
+    /// Why the run ended, when known (intent-hq/intent#9809).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_reason: Option<ExitReason>,
 }
 
 /// Runtime status of a script process (ported from the TS `ScriptStatus`,
@@ -6334,6 +6358,10 @@ pub struct ScriptRuntimeState {
     /// Who started the current (or latest) run; see [`ScriptStartedBy`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_by: Option<ScriptStartedBy>,
+    /// Why the process exited, when known (intent-hq/intent#9809); cleared
+    /// on the next start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_reason: Option<ExitReason>,
 }
 
 impl Default for ScriptRuntimeState {
@@ -6350,6 +6378,7 @@ impl Default for ScriptRuntimeState {
             detected_url: None,
             previously_running: None,
             started_by: None,
+            exit_reason: None,
         }
     }
 }

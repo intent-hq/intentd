@@ -360,6 +360,11 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // The PTY workload shim (#9809) runs before anything else: it joins a
+    // leaf cgroup and execs the workload.
+    if let Some(code) = intent_core::workload::dispatch_shim() {
+        return code;
+    }
     #[cfg(target_os = "linux")]
     if let Some(code) = intent_services::dispatch_diagnostic_owner() {
         return code;
@@ -2493,6 +2498,25 @@ async fn cmd_serve_owned(
             .await
             .err()
             .map(|e| anyhow::anyhow!(e.to_string()));
+    // Workload memory containment (#9809), before the first workload spawn:
+    // agents, scripts, terminals and host.exec run in a memory-limited
+    // cgroup, or with a raised oom_score_adj when no cgroup is usable.
+    // Applies on restart, like `agents.maxConcurrent`.
+    let containment = intent_core::workload::init(&intent_core::workload::ContainmentConfig {
+        ceiling: intent_services::workload_memory_ceiling(&boot_settings.effective),
+        instance_key: config.data_dir.display().to_string(),
+    });
+    match containment.mode {
+        intent_core::workload::ContainmentMode::Cgroup => tracing::info!(
+            memory_max_bytes = containment.memory_max_bytes,
+            "workload memory containment on"
+        ),
+        mode => tracing::warn!(
+            ?mode,
+            reason = containment.reason.as_deref().unwrap_or(""),
+            "workload memory containment unavailable"
+        ),
+    }
     // Resolve the concurrent agent cap: positive effective value → explicit
     // override; 0 (the schema default) → auto (RAM-based default_process_cap).
     // The setting applies on daemon restart (§9.8 agents.maxConcurrent).
@@ -5037,6 +5061,15 @@ fn spawn_child_tree_sampler(
                 // baseline from when the sweep *finished* would add its own
                 // ~12 ms to every period and let the published cadence drift.
                 last_full = Some(polled_at);
+                // The daemon cannot relabel an agent's own tool results, so
+                // an OOM kill inside an agent's leaf is reported here (#9809).
+                for report in intent_core::workload::poll_oom_kills() {
+                    tracing::warn!(
+                        workload = %report.label,
+                        oom_kills = report.new_kills,
+                        "workload memory limit killed a process in this agent's tree"
+                    );
+                }
             } else {
                 task_usage.observe_burst(bytes);
             }
@@ -5321,6 +5354,9 @@ impl SystemControl for DaemonControl {
             // Two in-memory reads: the executor's open inbound links and the
             // exposed-machine connectors' link state.
             remote_links: Some((self.remote_links)()),
+            // Two small sysfs reads in cgroup mode (memory.current,
+            // memory.events), none otherwise.
+            workload_containment: Some(intent_core::workload::status()),
         }
     }
 
@@ -8379,6 +8415,7 @@ async fn cmd_doctor(codex_models: bool) -> ExitCode {
     report_host_capabilities();
     report_fd_limit();
     report_cow_support(&config);
+    report_workload_containment(&config).await;
 
     if ok {
         ExitCode::SUCCESS
@@ -8390,6 +8427,31 @@ async fn cmd_doctor(codex_models: bool) -> ExitCode {
 /// Process descriptor limit (`RLIMIT_NOFILE`), informational only: `serve`
 /// raises the soft limit at startup (intent-hq/intent#4390), so this reports
 /// the limit `doctor` itself inherited, never a failure.
+/// Workload memory containment (#9809) as the running daemon applied it: the
+/// mode, and the reason with the fix when its cgroup is not used. Never fatal.
+async fn report_workload_containment(config: &Config) {
+    let status =
+        client::rpc_call(&config.socket_path, "system.status", serde_json::json!({})).await;
+    let Some(containment) = status
+        .ok()
+        .and_then(|r| r.get("result")?.get("workloadContainment").cloned())
+    else {
+        println!("[--] workload memory containment: daemon not running (start it to check)");
+        return;
+    };
+    let reason = containment["reason"].as_str().unwrap_or("");
+    match containment["mode"].as_str() {
+        Some("cgroup") => println!(
+            "[ok] workload memory containment: cgroup, ceiling {} MB",
+            containment["memoryMaxBytes"].as_u64().unwrap_or(0) / (1024 * 1024)
+        ),
+        Some("oomScoreAdj") => println!(
+            "[--] workload memory containment: OOM score only ({reason}); for a memory box run intentd as root or in a systemd unit with Delegate=memory pids"
+        ),
+        _ => println!("[--] workload memory containment: none ({reason})"),
+    }
+}
+
 fn report_fd_limit() {
     match fd_limit::read() {
         Ok((soft, hard)) => println!(

@@ -1678,11 +1678,10 @@ fn memory_budget_default_mb() -> f64 {
 /// The result is **clamped** to [`memory_budget_max_mb_for`] the same total:
 /// `defaultValue` must satisfy the numeric schema it ships in. Above roughly
 /// 2 TiB the recommendation `(RAM − 8 GiB) / 2` outgrows the 1,024,000 MB
-/// parse bound the max is capped at, and below 4 GiB of RAM the 4 GiB floor
-/// outgrows the RAM-sized max; unclamped, either advertises a default the
-/// catalog itself rejects and no client can write back. In those two corners
-/// the daemon still runs the unclamped recommendation — the clamp keeps the
-/// wire description settable, it does not change the policy.
+/// parse bound the max is capped at; unclamped, it would advertise a default
+/// the catalog itself rejects and no client can write back. There the daemon
+/// still runs the unclamped recommendation — the clamp keeps the wire
+/// description settable, it does not change the policy.
 // MiB counts above 2^53 do not occur; loss-free in f64.
 #[expect(clippy::cast_precision_loss)]
 fn memory_budget_default_mb_for(total_memory_bytes: Option<u64>) -> f64 {
@@ -2489,6 +2488,22 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             read_only: false,
             token_impact: None,
         },
+        // Absent = auto (#9809); `default_value` advertises the ceiling auto
+        // resolves to from this host's RAM, like `agents.memoryBudgetMb`.
+        SettingDefinition {
+            path: "agents.workloadMemoryMaxMb",
+            label: "Workload memory ceiling (MB)",
+            description: "Linux only: the memory limit of the shared cgroup that agents, scripts, terminals, host.exec commands, MCP servers and model servers run in, so a runaway workload is killed inside it while the daemon keeps running. Needs a writable cgroup v2 (root, or a systemd unit with Delegate=memory pids); otherwise workloads only get a higher OOM score than the daemon (absent = auto, total memory less a daemon reserve; 0 = no limit; changes apply on daemon restart)",
+            category: "agents",
+            ty: SettingType::Number {
+                min: Some(0.0),
+                max: Some(memory_budget_max_mb()),
+            },
+            default_value: Some(json!(workload_memory_default_mb())),
+            sensitive: false,
+            read_only: false,
+            token_impact: None,
+        },
         number(
             "agents.acpNodeMaxOldSpaceMb",
             "ACP Node heap limit (MB)",
@@ -2900,6 +2915,29 @@ pub fn agent_memory_budget_bytes(settings: &SettingsFile, total_memory_bytes: u6
         Some(0) => None,
         Some(mb) => Some(u64::from(mb) * 1024 * 1024),
     }
+}
+
+/// The effective `agents.workloadMemoryMaxMb` setting (intent-hq/intent#9809):
+/// absent = auto, explicit `0` = off, positive = MB in bytes.
+#[must_use]
+pub fn workload_memory_ceiling(settings: &SettingsFile) -> intent_core::workload::Ceiling {
+    use intent_core::workload::Ceiling;
+    match settings.agents.workload_memory_max_mb {
+        None => Ceiling::Auto,
+        Some(0) => Ceiling::Off,
+        Some(mb) => Ceiling::Bytes(u64::from(mb) * 1024 * 1024),
+    }
+}
+
+/// Catalog default for `agents.workloadMemoryMaxMb`: the ceiling auto
+/// resolves to from this host's RAM (a memory-limited container can lower
+/// it further at startup). Clamped to the catalog max like the budget's.
+// MiB counts above 2^53 do not occur; loss-free in f64.
+#[expect(clippy::cast_precision_loss)]
+fn workload_memory_default_mb() -> f64 {
+    let total = host_total_memory_bytes();
+    let bytes = intent_core::workload::auto_ceiling_bytes(total.unwrap_or(0));
+    ((bytes / (1024 * 1024)) as f64).min(memory_budget_max_mb_for(total))
 }
 
 /// The effective `agents.maxConcurrentAdapters` setting: the daemon-wide cap
@@ -4759,6 +4797,7 @@ mod tests {
             "logging.level",
             "agents.maxConcurrent",
             "agents.memoryBudgetMb",
+            "agents.workloadMemoryMaxMb",
             "agents.acpNodeMaxOldSpaceMb",
             "agents.maxConcurrentAdapters",
             "agents.maxTopLevelAgents",
@@ -4862,6 +4901,7 @@ mod tests {
             "prMonitor.pollSeconds",
             "agents.maxConcurrent",
             "agents.memoryBudgetMb",
+            "agents.workloadMemoryMaxMb",
             "workspace.purgeArchivedAfterDays",
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
@@ -6808,9 +6848,7 @@ mod tests {
     /// roughly 2 TiB the recommendation `(RAM − 8 GiB) / 2` outgrows the
     /// 1,024,000 MB parse bound the max is capped at, and unclamped the catalog
     /// would advertise a default its own numeric schema rejects — a figure no
-    /// client could write back through `settings.update`. The clamp also
-    /// binds at the other end, where the 4 GiB floor outgrows a sub-4 GiB
-    /// host's RAM-sized max.
+    /// client could write back through `settings.update`.
     #[test]
     // Asserting exact whole-valued MB figures; the MiB count fits in f64 exactly.
     #[expect(clippy::float_cmp)]
@@ -6835,12 +6873,9 @@ mod tests {
         // 1 TiB: the max is capped but the 520,192 MB recommendation is not.
         assert_eq!(memory_budget_default_mb_for(Some(TIB)), 520_192.0);
 
-        // Sub-4 GiB host: the 4 GiB floor is above the RAM-sized max.
-        assert_eq!(memory_budget_default_mb_for(Some(2 * GIB)), 2_048.0);
-        assert_eq!(
-            memory_budget_default_mb_for(Some(2 * GIB)),
-            memory_budget_max_mb_for(Some(2 * GIB))
-        );
+        // Sub-12 GiB hosts follow the small-host budget (intent-hq/intent#9809),
+        // which stays under the RAM-sized max: 2 GiB → max(1 GiB / 2, 512 MiB).
+        assert_eq!(memory_budget_default_mb_for(Some(2 * GIB)), 512.0);
 
         for total in [
             None,
