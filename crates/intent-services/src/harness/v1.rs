@@ -295,7 +295,10 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
                     && check.status == "failed"
                     && crate::pr_ops::is_new_check_run(prev.url.as_deref(), check.url.as_deref())
                 {
-                    changes.push(format!("check {} failed again on a new run", check.name));
+                    changes.push(format!(
+                        "check {} is still failing on a new run",
+                        check.name
+                    ));
                 }
                 if old_required.contains(&check.name)
                     && new_required.contains(&check.name)

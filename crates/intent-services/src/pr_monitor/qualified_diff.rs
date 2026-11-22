@@ -232,7 +232,7 @@ fn diff_checks(old: &Value, new: &Value) -> Vec<String> {
                     && status == "failed"
                     && crate::pr_ops::is_new_check_run(prior["url"].as_str(), item["url"].as_str())
                 {
-                    changes.push(format!("check {name} failed again on a new run"));
+                    changes.push(format!("check {name} is still failing on a new run"));
                 }
             }
             if before["requiredKnown"] == true && after["requiredKnown"] == true {
@@ -319,7 +319,7 @@ mod tests {
         let second = run(Some("https://github.com/o/r/runs/2"));
         assert_eq!(
             diff(&first, &second),
-            vec!["check build failed again on a new run"]
+            vec!["check build is still failing on a new run"]
         );
         assert!(diff(&second, &second).is_empty());
         assert!(diff(
@@ -329,6 +329,24 @@ mod tests {
         .is_empty());
         assert!(diff(&second, &run(None)).is_empty());
         assert!(diff(&run(None), &second).is_empty());
+        assert!(diff(&second, &run(Some("https://ci.example/o/r/runs/7"))).is_empty());
+        let vendor = run(Some(
+            "https://ci.example/job/build/123/display/redirect?x=1",
+        ));
+        assert!(diff(&second, &vendor).is_empty());
+        assert!(diff(&vendor, &second).is_empty());
+        assert!(diff(
+            &vendor,
+            &run(Some("https://ci.example/job/build/123/display/redirect"))
+        )
+        .is_empty());
+        assert_eq!(
+            diff(
+                &vendor,
+                &run(Some("https://ci.example/job/build/124/display/redirect"))
+            ),
+            vec!["check build is still failing on a new run"]
+        );
     }
 
     #[test]

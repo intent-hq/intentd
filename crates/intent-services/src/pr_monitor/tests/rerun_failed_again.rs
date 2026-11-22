@@ -5,7 +5,7 @@
 use super::*;
 
 const WAKE: &str = "[PR monitor o/r#42]";
-const AGAIN: &str = "check build failed again on a new run";
+const AGAIN: &str = "check build is still failing on a new run";
 
 fn build(state: CheckState, url: Option<&str>) -> RollupCheck {
     RollupCheck {
@@ -61,12 +61,15 @@ async fn a_rerun_that_fails_again_wakes_once() {
     assert!(flush(&svc, &ws, &id).await);
     assert_eq!(owner_messages(&svc, &owner).await.matches(WAKE).count(), 2);
 
-    // The same run read again, under its Actions job link, or without a
-    // link, is not news.
+    // The same run read again, under its Actions job link, without a link,
+    // or under a CI vendor's details link (the rollup read) next to GitHub's
+    // own (the REST fallback), is not news.
     for url in [
         Some("https://github.com/o/r/runs/2"),
         Some("https://github.com/o/r/actions/runs/77/job/2"),
         None,
+        Some("https://github.com/o/r/runs/2"),
+        Some("https://app.circleci.com/pipelines/gh/o/r/5/workflows/w/jobs/9"),
         Some("https://github.com/o/r/runs/2"),
     ] {
         forge.edit(|s| s.checks = vec![build(CheckState::Failure, url)]);

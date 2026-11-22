@@ -982,20 +982,36 @@ pub struct MergeRequirementCheck {
 }
 
 /// Whether two links of the same check name point at different runs: a
-/// re-run that kept the status (intent-hq/intent#9852). A run is identified
-/// by the last path segment, so GitHub's `/runs/<id>` and Actions
-/// `/actions/runs/<run>/job/<id>` links of one check run match. An absent
-/// link is never evidence of a new run.
+/// re-run that kept the status (intent-hq/intent#9852). GitHub check-run
+/// links (`/runs/<id>`, Actions `/actions/runs/<run>/job/<id>`) compare by
+/// check-run id; other links compare whole, without query or fragment. Links
+/// of different forms come from different read paths (a CI vendor's details
+/// link vs GitHub's own), so they are never evidence of a new run, and
+/// neither is an absent link.
 pub(crate) fn is_new_check_run(before: Option<&str>, after: Option<&str>) -> bool {
-    fn run_id(url: &str) -> &str {
-        let path = url.split(['?', '#']).next().unwrap_or(url);
-        path.trim_end_matches('/')
-            .rsplit('/')
+    fn bare(url: &str) -> &str {
+        url.split(['?', '#'])
             .next()
-            .unwrap_or(path)
+            .unwrap_or(url)
+            .trim_end_matches('/')
     }
-    match (before, after) {
-        (Some(a), Some(b)) => run_id(a) != run_id(b),
+    /// The host and check-run id of a GitHub check-run link.
+    fn github_run_id(url: &str) -> Option<(&str, &str)> {
+        let segments: Vec<&str> = bare(url).split('/').collect();
+        let host = *segments.get(2)?;
+        let [.., parent, kind, id] = segments.as_slice() else {
+            return None;
+        };
+        let numeric = !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
+        (numeric && (*kind == "job" || (*kind == "runs" && *parent != "actions")))
+            .then_some((host, *id))
+    }
+    let (Some(before), Some(after)) = (before, after) else {
+        return false;
+    };
+    match (github_run_id(before), github_run_id(after)) {
+        (Some((host_a, a)), Some((host_b, b))) => host_a == host_b && a != b,
+        (None, None) => bare(before) != bare(after),
         _ => false,
     }
 }
@@ -1612,10 +1628,11 @@ fn live_key(run: &CheckRunSignal) -> (bool, Option<OffsetDateTime>, u8) {
     )
 }
 
-/// Whether `candidate` is the live run of its name over `held`; equal keys
-/// keep `held`, so the first-listed of identical twins supplies the link.
+/// Whether `candidate` is the live run of its name over `held`. Equal keys
+/// fall back to the link, so the same twins supply the same link in any
+/// listing order: a flipped link would read as a re-run (intent-hq/intent#9852).
 fn supersedes(candidate: &CheckRunSignal, held: &CheckRunSignal) -> bool {
-    live_key(candidate) > live_key(held)
+    (live_key(candidate), &candidate.url) > (live_key(held), &held.url)
 }
 
 /// One checklist entry per check name. A head that carries several runs of
@@ -3481,6 +3498,29 @@ mod tests {
     /// depends on rollup order. Without start times a genuine failure
     /// still wins over a same-name success, an in-flight re-run over any
     /// completed outcome, and a cancelled run over nothing.
+    /// Twins with equal liveness keys supply the same link in any listing
+    /// order, so a reordered rollup never reads as a re-run
+    /// (intent-hq/intent#9852).
+    #[test]
+    fn merge_requirements_twin_link_ignores_listing_order() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let twin = |n: u8| RollupCheck {
+            url: Some(format!("https://github.com/o/r/runs/{n}")),
+            ..rollup("build", CheckState::Failure, true)
+        };
+        let link = |checks: Vec<RollupCheck>| {
+            let signals = MergeRequirementSignals {
+                merge_state_status: Some("BLOCKED".into()),
+                checks,
+                checks_known: true,
+                ..Default::default()
+            };
+            let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
+            req.checks.items[0].url.clone()
+        };
+        assert_eq!(link(vec![twin(1), twin(2)]), link(vec![twin(2), twin(1)]));
+    }
+
     #[test]
     fn merge_requirements_dedupes_same_name_checks_by_live_outcome() {
         let p = pr(PrState::Open, false, Some(true), Some("clean"));
