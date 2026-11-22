@@ -981,37 +981,48 @@ pub struct MergeRequirementCheck {
     pub url: Option<String>,
 }
 
-/// Whether two links of the same check name point at different runs: a
-/// re-run that kept the status (intent-hq/intent#9852). GitHub check-run
-/// links (`/runs/<id>`, Actions `/actions/runs/<run>/job/<id>`) compare by
-/// check-run id; other links compare whole, without query or fragment. Links
-/// of different forms come from different read paths (a CI vendor's details
-/// link vs GitHub's own), so they are never evidence of a new run, and
-/// neither is an absent link.
-pub(crate) fn is_new_check_run(before: Option<&str>, after: Option<&str>) -> bool {
-    fn bare(url: &str) -> &str {
-        url.split(['?', '#'])
-            .next()
-            .unwrap_or(url)
-            .trim_end_matches('/')
-    }
-    /// The host and check-run id of a GitHub check-run link.
-    fn github_run_id(url: &str) -> Option<(&str, &str)> {
-        let segments: Vec<&str> = bare(url).split('/').collect();
-        let host = *segments.get(2)?;
-        let [.., parent, kind, id] = segments.as_slice() else {
-            return None;
-        };
-        let numeric = !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
-        (numeric && (*kind == "job" || (*kind == "runs" && *parent != "actions")))
-            .then_some((host, *id))
-    }
-    let (Some(before), Some(after)) = (before, after) else {
-        return false;
+/// A check link without its query or fragment.
+fn bare_link(url: &str) -> &str {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/')
+}
+
+/// The host and check-run id of a GitHub check-run link: `/runs/<id>` (REST
+/// `html_url`) or Actions `/actions/runs/<run>/job/<id>` (GraphQL
+/// `detailsUrl`) name the same run.
+fn github_check_run_id(url: &str) -> Option<(&str, &str)> {
+    let bare = bare_link(url);
+    let host = bare.split('/').nth(2)?;
+    let segments: Vec<&str> = bare.split('/').collect();
+    let [.., parent, kind, id] = segments.as_slice() else {
+        return None;
     };
-    match (github_run_id(before), github_run_id(after)) {
-        (Some((host_a, a)), Some((host_b, b))) => host_a == host_b && a != b,
-        (None, None) => bare(before) != bare(after),
+    let numeric = !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
+    (numeric && (*kind == "job" || (*kind == "runs" && *parent != "actions")))
+        .then_some((host, *id))
+}
+
+/// The run a check link names, the same under either read path for GitHub
+/// check-run links: the tie-break key among same-name twins.
+fn check_run_identity(url: &str) -> (&str, &str) {
+    github_check_run_id(url).unwrap_or(("", bare_link(url)))
+}
+
+/// Whether two links of the same check name point at different runs: a
+/// re-run that kept the status (intent-hq/intent#9852). Only GitHub
+/// check-run links on one host are evidence, compared by check-run id. Other
+/// links can change without a re-run: the rollup and the REST fallback give a
+/// CI vendor's check different links, and a name with both a check run and a
+/// legacy status moves its link between them. Empty and absent links are
+/// never evidence either.
+pub(crate) fn is_new_check_run(before: Option<&str>, after: Option<&str>) -> bool {
+    match (
+        before.and_then(github_check_run_id),
+        after.and_then(github_check_run_id),
+    ) {
+        (Some(a), Some(b)) => a.0 == b.0 && a.1 != b.1,
         _ => false,
     }
 }
@@ -1629,10 +1640,14 @@ fn live_key(run: &CheckRunSignal) -> (bool, Option<OffsetDateTime>, u8) {
 }
 
 /// Whether `candidate` is the live run of its name over `held`. Equal keys
-/// fall back to the link, so the same twins supply the same link in any
-/// listing order: a flipped link would read as a re-run (intent-hq/intent#9852).
+/// fall back to the run the link names, so the same twin supplies the link
+/// in any listing order and under either read path: a flipped link would
+/// read as a re-run (intent-hq/intent#9852).
 fn supersedes(candidate: &CheckRunSignal, held: &CheckRunSignal) -> bool {
-    (live_key(candidate), &candidate.url) > (live_key(held), &held.url)
+    fn run(signal: &CheckRunSignal) -> Option<(&str, &str)> {
+        signal.url.as_deref().map(check_run_identity)
+    }
+    (live_key(candidate), run(candidate)) > (live_key(held), run(held))
 }
 
 /// One checklist entry per check name. A head that carries several runs of
@@ -3489,15 +3504,6 @@ mod tests {
         assert_eq!(req.merge_state_status.as_deref(), Some("UNSTABLE"));
     }
 
-    /// Regression (intent-hq/intent#5372): a head carrying two runs of the
-    /// same workflow — the live `completed/success` run and an earlier
-    /// `concurrency`-cancelled duplicate whose gate job reports a genuine
-    /// `failure` — reports ONE `passed` entry per check name, whichever
-    /// order the host lists the nodes in: the latest-started run is the
-    /// live one, so the tally never counts the superseded twin and never
-    /// depends on rollup order. Without start times a genuine failure
-    /// still wins over a same-name success, an in-flight re-run over any
-    /// completed outcome, and a cancelled run over nothing.
     /// Twins with equal liveness keys supply the same link in any listing
     /// order, so a reordered rollup never reads as a re-run
     /// (intent-hq/intent#9852).
@@ -3519,8 +3525,36 @@ mod tests {
             req.checks.items[0].url.clone()
         };
         assert_eq!(link(vec![twin(1), twin(2)]), link(vec![twin(2), twin(1)]));
+
+        // The rollup lists Actions job links, the REST fallback check-run
+        // links: both reads pick the same run.
+        let at = |url: &str| RollupCheck {
+            url: Some(url.into()),
+            ..rollup("build", CheckState::Failure, true)
+        };
+        let rollup_link = link(vec![
+            at("https://github.com/o/r/actions/runs/100/job/200"),
+            at("https://github.com/o/r/actions/runs/101/job/100"),
+        ]);
+        let rest_link = link(vec![
+            at("https://github.com/o/r/runs/200"),
+            at("https://github.com/o/r/runs/100"),
+        ]);
+        assert!(!is_new_check_run(
+            rollup_link.as_deref(),
+            rest_link.as_deref()
+        ));
     }
 
+    /// Regression (intent-hq/intent#5372): a head carrying two runs of the
+    /// same workflow — the live `completed/success` run and an earlier
+    /// `concurrency`-cancelled duplicate whose gate job reports a genuine
+    /// `failure` — reports ONE `passed` entry per check name, whichever
+    /// order the host lists the nodes in: the latest-started run is the
+    /// live one, so the tally never counts the superseded twin and never
+    /// depends on rollup order. Without start times a genuine failure
+    /// still wins over a same-name success, an in-flight re-run over any
+    /// completed outcome, and a cancelled run over nothing.
     #[test]
     fn merge_requirements_dedupes_same_name_checks_by_live_outcome() {
         let p = pr(PrState::Open, false, Some(true), Some("clean"));

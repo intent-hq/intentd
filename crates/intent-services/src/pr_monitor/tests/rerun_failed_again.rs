@@ -63,7 +63,7 @@ async fn a_rerun_that_fails_again_wakes_once() {
 
     // The same run read again, under its Actions job link, without a link,
     // or under a CI vendor's details link (the rollup read) next to GitHub's
-    // own (the REST fallback), is not news.
+    // own (the REST fallback), is not news; neither is an empty link.
     for url in [
         Some("https://github.com/o/r/runs/2"),
         Some("https://github.com/o/r/actions/runs/77/job/2"),
@@ -71,6 +71,8 @@ async fn a_rerun_that_fails_again_wakes_once() {
         Some("https://github.com/o/r/runs/2"),
         Some("https://app.circleci.com/pipelines/gh/o/r/5/workflows/w/jobs/9"),
         Some("https://github.com/o/r/runs/2"),
+        Some(""),
+        Some("https://app.circleci.com/pipelines/gh/o/r/5/workflows/w/jobs/9"),
     ] {
         forge.edit(|s| s.checks = vec![build(CheckState::Failure, url)]);
         svc.poll_pr_monitors().await;
@@ -80,4 +82,29 @@ async fn a_rerun_that_fails_again_wakes_once() {
     let text = owner_messages(&svc, &owner).await;
     assert_eq!(text.matches(WAKE).count(), 2, "{text}");
     assert_eq!(text.matches(AGAIN).count(), 1, "{text}");
+}
+
+/// A name with both a check run and a legacy commit status reports the worse
+/// of the two, so its link moves from the run to the status when the run
+/// passes and the status still fails. That is not a re-run.
+#[tokio::test]
+async fn a_failing_status_taking_over_from_a_passing_run_is_quiet() {
+    let (_db, _root, svc, forge, ws, owner) = setup().await;
+    let id = register(&svc, &ws, &owner).await.monitor_id;
+    let status = |state: CheckState| RollupCheck {
+        kind: RollupCheckKind::StatusContext,
+        ..build(state, Some("https://ci.example/status/build/1"))
+    };
+    let app_run = |state: CheckState| build(state, Some("https://ci.example/app/build/7"));
+
+    forge.edit(|s| s.checks = vec![app_run(CheckState::Failure), status(CheckState::Failure)]);
+    svc.poll_pr_monitors().await;
+    assert!(flush(&svc, &ws, &id).await);
+
+    forge.edit(|s| s.checks = vec![app_run(CheckState::Success), status(CheckState::Failure)]);
+    svc.poll_pr_monitors().await;
+    assert_eq!(pending(&svc, &id).await, Vec::<String>::new());
+    assert!(!flush(&svc, &ws, &id).await);
+    let text = owner_messages(&svc, &owner).await;
+    assert_eq!(text.matches(WAKE).count(), 1, "{text}");
 }
