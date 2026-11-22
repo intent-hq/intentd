@@ -540,10 +540,20 @@ async fn antigravity_runs_agy_acp_and_applies_the_stored_model_over_wss() {
             calls
                 .iter()
                 .filter(|call| call["method"] == "session/new")
-                .all(|call| call["argv"] == json!(["acp"])
-                    || call["argv"]
-                        == json!(["acp", "--app-data-dir", "antigravity-intent-probe"])),
-            "probes run in their own app data: {calls:?}"
+                .all(|call| {
+                    let argv = call["argv"].as_array().map(Vec::as_slice);
+                    matches!(argv, Some([a]) if a == "acp")
+                        || matches!(
+                            argv,
+                            Some([a, flag, dir])
+                                if a == "acp"
+                                    && flag == "--gemini-dir"
+                                    && dir
+                                        .as_str()
+                                        .is_some_and(|p| p.contains("intentd-antigravity-probe-"))
+                        )
+                }),
+            "probes run in an isolated ephemeral --gemini-dir: {calls:?}"
         );
         assert!(
             prompts[0]["params"]["prompt"]

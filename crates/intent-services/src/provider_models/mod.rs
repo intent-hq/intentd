@@ -190,10 +190,17 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
 /// `agy acp` catalog: the base models of `configOptions[id="model"]` with the
 /// `thought_level` efforts. The probe never sends `authenticate` or a prompt.
 pub(crate) async fn fetch_antigravity_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
+    fetch_antigravity_models_in(binary, user_antigravity_app_data_dir().as_deref()).await
+}
+
+async fn fetch_antigravity_models_in(
+    binary: Option<PathBuf>,
+    user_app_data_dir: Option<&Path>,
+) -> ProviderModelsFetch {
     let Some(bin) = binary else {
         return ProviderModelsFetch::unavailable("antigravity", "agy binary not found");
     };
-    match antigravity_probe(bin, false, |value| {
+    match antigravity_probe_in(bin, user_app_data_dir, false, |value| {
         parse::parse_acp_config_option_models(value, "antigravity")
     })
     .await
@@ -207,8 +214,12 @@ pub(crate) async fn fetch_antigravity_models_at(binary: Option<PathBuf>) -> Prov
 
 /// A valid `session/new` proves authentication, even with an empty catalog.
 pub(crate) async fn probe_antigravity_auth(bin: PathBuf) -> Option<bool> {
+    probe_antigravity_auth_in(bin, user_antigravity_app_data_dir().as_deref()).await
+}
+
+async fn probe_antigravity_auth_in(bin: PathBuf, user_app_data_dir: Option<&Path>) -> Option<bool> {
     antigravity_auth_outcome(
-        antigravity_probe(bin, true, |value| {
+        antigravity_probe_in(bin, user_app_data_dir, true, |value| {
             value
                 .get("sessionId")
                 .and_then(Value::as_str)
@@ -230,32 +241,125 @@ fn antigravity_auth_outcome(outcome: Result<Vec<Value>, ProbeError>) -> Option<b
     }
 }
 
-async fn antigravity_probe<F>(
+/// The user's default `agy` app-data directory: `~/.gemini/antigravity-cli`.
+fn user_antigravity_app_data_dir() -> Option<PathBuf> {
+    let non_empty = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty());
+    let home = non_empty("HOME").or_else(|| non_empty("USERPROFILE"))?;
+    Some(
+        PathBuf::from(home)
+            .join(intent_providers::antigravity::DEFAULT_GEMINI_DIR)
+            .join(intent_providers::antigravity::DEFAULT_APP_DATA_DIR),
+    )
+}
+
+/// Auth files copied from the user's default `agy` app-data directory into an
+/// ephemeral probe `--gemini-dir`. Keeps file-backed headless-Linux logins
+/// visible while deliberately excluding conversation history, settings, hooks,
+/// plugins, and MCP servers.
+const ANTIGRAVITY_AUTH_SEED_FILES: &[&str] = &[
+    intent_providers::antigravity::OAUTH_TOKEN_FILE,
+    intent_providers::antigravity::ACP_AUTH_STATE_REL_PATH,
+];
+
+/// Copy a credential file into a private (`0700`) directory with `0600`
+/// permissions from creation (never world-readable, never logged).
+fn copy_private_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(parent)?;
+    }
+    let mut reader = std::fs::File::open(src)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut writer = options.open(dst)?;
+    let _ = std::io::copy(&mut reader, &mut writer)?;
+    Ok(())
+}
+
+/// Create a fresh ephemeral `--gemini-dir` for one Antigravity probe. Seeds
+/// only the file-backed auth files from `user_app_data_dir` into
+/// `<tempdir>/antigravity-cli/` so headless Linux (no OS keyring) recognizes
+/// standard `agy acp --login` credentials while probe sessions stay out of the
+/// user's conversation history and vanish when the returned `TempDir` drops.
+fn isolated_antigravity_gemini_dir(
+    user_app_data_dir: Option<&Path>,
+) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("intentd-antigravity-probe-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let dir = builder.tempdir()?;
+    if let Some(user_dir) = user_app_data_dir {
+        let probe_app_data = dir
+            .path()
+            .join(intent_providers::antigravity::DEFAULT_APP_DATA_DIR);
+        for rel in ANTIGRAVITY_AUTH_SEED_FILES {
+            let src = user_dir.join(rel);
+            if src.is_file() {
+                if let Err(e) = copy_private_file(&src, &probe_app_data.join(rel)) {
+                    tracing::warn!(
+                        file = *rel,
+                        error = %e,
+                        "failed to seed antigravity auth file into isolated probe dir"
+                    );
+                }
+            }
+        }
+    }
+    Ok(dir)
+}
+
+async fn antigravity_probe_in<F>(
     bin: PathBuf,
+    user_app_data_dir: Option<&Path>,
     session_only: bool,
     extract: F,
 ) -> Result<Vec<Value>, ProbeError>
 where
     F: Fn(&Value) -> Vec<Value>,
 {
-    let args = [
-        "acp",
-        "--app-data-dir",
-        intent_providers::antigravity::PROBE_APP_DATA_DIR,
-    ]
-    .map(String::from)
-    .to_vec();
+    let probe_dir = isolated_antigravity_gemini_dir(user_app_data_dir).map_err(|e| {
+        ProbeError::Spawn(format!(
+            "failed to create isolated antigravity probe dir: {e}"
+        ))
+    })?;
+    let Some(gemini_dir) = probe_dir.path().to_str() else {
+        return Err(ProbeError::Spawn(
+            "isolated antigravity probe dir path is not valid UTF-8".to_string(),
+        ));
+    };
+    let args = vec![
+        "acp".to_string(),
+        "--gemini-dir".to_string(),
+        gemini_dir.to_string(),
+    ];
     if !session_only {
         crate::agy_cli::ensure_current(&bin)
             .await
             .map_err(ProbeError::Spawn)?;
     }
     let cmd = AcpProbeCommand::binary(bin, args);
-    if session_only {
+    let outcome = if session_only {
         probe::run_acp_session_probe(cmd, extract).await
     } else {
         run_acp_probe(cmd, extract).await
-    }
+    };
+    drop(probe_dir);
+    outcome
 }
 
 /// claude-code: ACP probe via the pinned npx adapter. Models arrive in the

@@ -110,19 +110,26 @@ if IFS= read -r unexpected; then exit 44; fi
 
 #[cfg(unix)]
 #[tokio::test]
-async fn antigravity_probe_runs_agy_acp_in_a_separate_app_data_dir() {
+async fn antigravity_probe_runs_agy_acp_in_a_separate_gemini_dir() {
     let dir = tempfile::tempdir().unwrap();
     let payload: serde_json::Value =
         serde_json::from_str(include_str!("antigravity-session-new.json")).unwrap();
     let response = json!({"jsonrpc": "2.0", "id": 2, "result": payload}).to_string();
     let bin = antigravity_mock_adapter(dir.path(), &response);
-    let fetched = super::fetch_antigravity_models_at(Some(bin)).await;
+    let fetched = super::fetch_antigravity_models_in(Some(bin), None).await;
     assert_eq!(fetched.models.unwrap().len(), 6, "{:?}", fetched.warning);
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("argv.txt"))
-            .unwrap()
-            .trim(),
-        "acp --app-data-dir antigravity-intent-probe"
+    let argv = std::fs::read_to_string(dir.path().join("argv.txt")).unwrap();
+    let parts: Vec<&str> = argv.split_whitespace().collect();
+    assert_eq!(parts.len(), 3, "unexpected argv: {argv}");
+    assert_eq!(parts[0], "acp");
+    assert_eq!(parts[1], "--gemini-dir");
+    assert!(
+        parts[2].contains("intentd-antigravity-probe-"),
+        "expected isolated temp gemini dir: {argv}"
+    );
+    assert!(
+        !std::path::Path::new(parts[2]).exists(),
+        "ephemeral probe dir must be removed after probe completes"
     );
     let requests: Vec<serde_json::Value> =
         std::fs::read_to_string(dir.path().join("requests.jsonl"))
@@ -141,6 +148,157 @@ async fn antigravity_probe_runs_agy_acp_in_a_separate_app_data_dir() {
 }
 
 #[cfg(unix)]
+#[test]
+fn isolated_antigravity_gemini_dir_seeds_only_private_auth_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("antigravity-oauth-token"), "oauth-secret").unwrap();
+    std::fs::create_dir_all(user.path().join("cache")).unwrap();
+    std::fs::write(
+        user.path().join("cache/acp-auth-state.json"),
+        r#"{"methodId":"oauth-personal"}"#,
+    )
+    .unwrap();
+    // Unrelated user files must not be copied into the probe dir.
+    std::fs::create_dir_all(user.path().join("conversations")).unwrap();
+    std::fs::write(user.path().join("conversations/chat.pb"), "history").unwrap();
+    std::fs::write(user.path().join("settings.json"), "{}").unwrap();
+    std::fs::write(user.path().join("mcp_config.json"), "{}").unwrap();
+    std::fs::write(user.path().join("hooks.json"), "{}").unwrap();
+
+    let probe = super::isolated_antigravity_gemini_dir(Some(user.path())).unwrap();
+    let app_data = probe.path().join("antigravity-cli");
+    let token = app_data.join("antigravity-oauth-token");
+    let state = app_data.join("cache/acp-auth-state.json");
+
+    assert_eq!(std::fs::read_to_string(&token).unwrap(), "oauth-secret");
+    assert_eq!(
+        std::fs::read_to_string(&state).unwrap(),
+        r#"{"methodId":"oauth-personal"}"#
+    );
+    assert_eq!(
+        std::fs::metadata(probe.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&app_data).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(app_data.join("cache"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&token).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!app_data.join("conversations").exists());
+    assert!(!app_data.join("settings.json").exists());
+    assert!(!app_data.join("mcp_config.json").exists());
+    assert!(!app_data.join("hooks.json").exists());
+}
+
+/// Regression for headless Linux file-backed tokens: standard login writes
+/// `~/.gemini/antigravity-cli/antigravity-oauth-token` (and
+/// `cache/acp-auth-state.json`). The probe must recognize that login, keep
+/// probe conversation writes out of the user's app-data dir, and immediately
+/// report signed-out once the token is absent.
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_probe_recognizes_file_backed_login_and_isolates_history() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let user_app_data = dir.path().join("user-home/.gemini/antigravity-cli");
+    std::fs::create_dir_all(user_app_data.join("cache")).unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(include_str!("antigravity-session-new.json")).unwrap();
+    let session_ok = json!({"jsonrpc": "2.0", "id": 2, "result": payload}).to_string();
+    let session_unauth =
+        json!({"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}})
+            .to_string();
+
+    // Fake agy that checks `<--gemini-dir>/antigravity-cli/antigravity-oauth-token`
+    // and writes a probe conversation file under that gemini dir.
+    let bin = dir.path().join("agy");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 1.5.14; exit 0; fi
+gemini_dir=""
+shift
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --gemini-dir ]; then gemini_dir="$2"; shift 2; continue; fi
+  shift
+done
+app_dir="$gemini_dir/antigravity-cli"
+mkdir -p "$app_dir/conversations"
+printf 'probe-session\n' > "$app_dir/conversations/probe.pb"
+IFS= read -r _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'
+IFS= read -r _session
+if [ -f "$app_dir/antigravity-oauth-token" ] && [ -f "$app_dir/cache/acp-auth-state.json" ]; then
+  printf '%s\n' '{}'
+else
+  printf '%s\n' '{}'
+fi
+"#,
+        session_ok.replace('\'', "'\"'\"'"),
+        session_unauth.replace('\'', "'\"'\"'"),
+    );
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Signed out before login.
+    assert_eq!(
+        super::probe_antigravity_auth_in(bin.clone(), Some(&user_app_data)).await,
+        Some(false)
+    );
+
+    // Standard `agy acp --login` writes token + auth state in default app-data dir.
+    std::fs::write(user_app_data.join("antigravity-oauth-token"), "token-bytes").unwrap();
+    std::fs::write(
+        user_app_data.join("cache/acp-auth-state.json"),
+        r#"{"methodId":"oauth-personal"}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        super::probe_antigravity_auth_in(bin.clone(), Some(&user_app_data)).await,
+        Some(true)
+    );
+    let fetched = super::fetch_antigravity_models_in(Some(bin.clone()), Some(&user_app_data)).await;
+    assert_eq!(fetched.models.unwrap().len(), 6, "{:?}", fetched.warning);
+    assert!(
+        !user_app_data.join("conversations").exists(),
+        "probe must not write conversations into the user's app-data dir"
+    );
+
+    // Signing out removes the token; the next probe must immediately report signed-out.
+    std::fs::remove_file(user_app_data.join("antigravity-oauth-token")).unwrap();
+    assert_eq!(
+        super::probe_antigravity_auth_in(bin.clone(), Some(&user_app_data)).await,
+        Some(false)
+    );
+    let fetched = super::fetch_antigravity_models_in(Some(bin), Some(&user_app_data)).await;
+    assert!(fetched.models.is_none());
+    assert_eq!(
+        fetched.warning.as_deref(),
+        Some("antigravity: authentication required")
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn antigravity_auth_accepts_valid_empty_catalog_and_detects_sign_out() {
     let dir = tempfile::tempdir().unwrap();
@@ -148,7 +306,10 @@ async fn antigravity_auth_accepts_valid_empty_catalog_and_detects_sign_out() {
         dir.path(),
         r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"authenticated","models":{"availableModels":[]}}}"#,
     );
-    assert_eq!(super::probe_antigravity_auth(bin).await, Some(true));
+    assert_eq!(
+        super::probe_antigravity_auth_in(bin, None).await,
+        Some(true)
+    );
     let notification_then_error = format!(
         "{}\n{}",
         json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"not-yet-ready","update":{}}}),
@@ -156,10 +317,10 @@ async fn antigravity_auth_accepts_valid_empty_catalog_and_detects_sign_out() {
     );
     let bin = antigravity_mock_adapter(dir.path(), &notification_then_error);
     assert_eq!(
-        super::probe_antigravity_auth(bin.clone()).await,
+        super::probe_antigravity_auth_in(bin.clone(), None).await,
         Some(false)
     );
-    let fetched = super::fetch_antigravity_models_at(Some(bin)).await;
+    let fetched = super::fetch_antigravity_models_in(Some(bin), None).await;
     assert!(fetched.models.is_none());
     assert_eq!(
         fetched.warning.as_deref(),
