@@ -160,7 +160,7 @@ impl std::fmt::Debug for OwnershipSeam {
 /// See [`Tuning::forge_resolver`].
 #[cfg(test)]
 #[derive(Clone, Default)]
-pub(crate) struct ForgeResolver(pub Option<crate::forge_token::Resolver>);
+pub(crate) struct ForgeResolver(pub Option<crate::link::forge_token::Resolver>);
 
 #[cfg(test)]
 impl std::fmt::Debug for ForgeResolver {
