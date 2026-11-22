@@ -19,7 +19,8 @@
 //! kept and the disk notice once; a session Vercel ended while the backend
 //! was away is marked paused and resumed on demand; removing the entry with
 //! `stopAgents` deletes the sandbox with its snapshots; the token never
-//! reaches the backend's log or a command.
+//! reaches the backend's log or a command; a resume whose self-hosted relay
+//! does not answer fails the message with `relay-unreachable`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -31,6 +32,7 @@ use intent_nodes::vercel::fake_server::{FakeServer, Host, Ran};
 use intentd_test_support::ProcessGroup;
 
 use super::*;
+use crate::common::fake_relay::{fake_relay, silent_relay_url};
 
 const VERCEL_TOKEN: &str = "e2e-vercel-token-0000000000000000";
 const TEAM: &str = "team_e2e00000000000000000000";
@@ -64,6 +66,8 @@ struct LocalHost {
     shim_dir: std::path::PathBuf,
     fixture: String,
     machines: Mutex<Machines>,
+    /// More environment for every new sandbox.
+    extra_env: Mutex<Vec<(String, String)>>,
 }
 
 impl LocalHost {
@@ -118,6 +122,7 @@ impl LocalHost {
             .unwrap()
             .port();
         env.push(("INTENTD_TCP_PORT".into(), port.to_string()));
+        env.extend(self.extra_env.lock().unwrap().iter().cloned());
         env
     }
 
@@ -226,6 +231,7 @@ impl FakeVercel {
             shim_dir,
             fixture: fixture.to_owned(),
             machines: Mutex::default(),
+            extra_env: Mutex::default(),
         });
         let server =
             FakeServer::start(VercelApi::new(VERCEL_TOKEN, TEAM, PROJECT), host.clone()).await;
@@ -294,6 +300,7 @@ async fn backend(
     String,
     String,
     common::TlsWs,
+    (u16, Arc<ClientConfig>),
 )> {
     if intent_providers::resolve_on_path("node").is_none()
         || intent_providers::resolve_on_path("git").is_none()
@@ -327,7 +334,7 @@ async fn backend(
         ],
     )
     .await;
-    let mut rpc_ws = connect(port, cfg).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
     ok(
         &mut rpc_ws,
         1,
@@ -345,7 +352,7 @@ async fn backend(
     )
     .await;
     let keyed_ref = format!("codex@{}", keyed["profile"]["id"].as_str().unwrap());
-    Some((fake, head, ws_id, keyed_ref, rpc_ws))
+    Some((fake, head, ws_id, keyed_ref, rpc_ws, (port, cfg)))
 }
 
 /// Configure refusals, before anything is saved.
@@ -437,7 +444,7 @@ async fn configure_refusals(fake: &FakeVercel, rpc_ws: &mut common::TlsWs) {
 /// The life of one agent on a Vercel sandbox.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
-    let Some((fake, _head, ws_id, keyed_ref, mut rpc_ws)) = backend("itd-vc-").await else {
+    let Some((fake, _head, ws_id, keyed_ref, mut rpc_ws, _)) = backend("itd-vc-").await else {
         return;
     };
     let head_dir = fake.scratch.path().join("head");
@@ -674,12 +681,108 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
     }
 }
 
+/// A stopped sandbox whose self-hosted relay stops answering: the message
+/// that resumes it fails with the relay's reason and URL, and the sandbox is
+/// stopped again. Its resume (a daemon start and a relay check that wait
+/// out the relay) outlasts a dial; the message used to fail with only
+/// "Could not reach … on any of its routes" (intent#9825).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_whose_relay_does_not_answer_says_so() {
+    let Some((fake, _head, ws_id, keyed_ref, mut rpc_ws, (port, cfg))) =
+        backend("itd-vc-relay-").await
+    else {
+        return;
+    };
+    let tailcat = super::relay::write_logging_tailcat(fake.scratch.path());
+    fake.host.extra_env.lock().unwrap().extend([
+        (
+            "INTENTD_TAILCAT_BIN".to_owned(),
+            tailcat.to_string_lossy().into_owned(),
+        ),
+        (
+            "TAILCAT_LOG".to_owned(),
+            fake.scratch
+                .path()
+                .join("tailcat.log")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]);
+    let relay = fake_relay().await;
+    super::relay::set_relay(&mut rpc_ws, 10, &relay.url).await;
+    ok(
+        &mut rpc_ws,
+        11,
+        "cloudMachines.configure",
+        vercel_params(&json!({ "size": "2x4", "idlePauseMinutes": 1440 })),
+    )
+    .await;
+    let created = ok(
+        &mut rpc_ws,
+        20,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "name": "Relayed", "model": "default", "provider": keyed_ref,
+            "placement": { "target": "cloud" },
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    echoed(
+        &mut rpc_ws,
+        (ws_id.as_str(), agent_id.as_str()),
+        "first turn",
+        21,
+    )
+    .await;
+    let name = fake.only_sandbox().unwrap();
+    let machine = machine_until(&mut rpc_ws, 30, &name, |m| m.is_some())
+        .await
+        .unwrap();
+    assert_eq!(
+        machine["cloud"]["relayUrl"],
+        relay.url.as_str(),
+        "{machine}"
+    );
+    ok(
+        &mut rpc_ws,
+        40,
+        "cloudMachines.pause",
+        json!({ "machineId": machine["id"] }),
+    )
+    .await;
+    machine_until(&mut rpc_ws, 41, &name, |m| {
+        m.is_some_and(|m| m["cloud"]["state"] == "paused")
+    })
+    .await;
+
+    let silent = silent_relay_url().await;
+    super::relay::set_relay(&mut rpc_ws, 50, &silent).await;
+    let mut events = agent_events(port, cfg, &ws_id).await;
+    ok(
+        &mut rpc_ws,
+        51,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "over a silent relay" }),
+    )
+    .await;
+    let failure = failure_containing(&mut events, &agent_id, &silent).await;
+    assert!(failure.contains("never falls back"), "{failure}");
+    assert!(!failure.contains("any of its routes"), "{failure}");
+    drop(events);
+    machine_until(&mut rpc_ws, 60, &name, |m| {
+        m.is_some_and(|m| m["cloud"]["state"] == "paused")
+    })
+    .await;
+    assert_eq!(fake.api().sandbox(&name).unwrap().session.status, "stopped");
+}
+
 /// The reaper, with one settings minute of 100 ms, deletes a sandbox with
 /// this backend's tag that no machine knows, and leaves another backend's
 /// alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reaper_deletes_this_backends_leftover_vercel_sandboxes() {
-    let Some((fake, _head, _ws_id, _keyed, mut rpc_ws)) = backend("itd-vc-reap-").await else {
+    let Some((fake, _head, _ws_id, _keyed, mut rpc_ws, _)) = backend("itd-vc-reap-").await else {
         return;
     };
     let backend_info = ok(&mut rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;

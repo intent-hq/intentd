@@ -68,6 +68,20 @@ pub async fn fake_relay() -> FakeRelay {
     }
 }
 
+/// A map URL whose server takes connections and never answers them, so a
+/// relay check waits out its map timeout.
+pub async fn silent_relay_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("http://127.0.0.1:{port}/derpmap.json")
+}
+
 /// A map URL nothing answers.
 pub async fn dead_relay_url() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

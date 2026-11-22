@@ -87,7 +87,10 @@ const STARTED: &str = "started";
 /// on: a setting update that changes nothing runs no hook), which checks the
 /// relay; exit 4 means the relay check failed, 3 another failure. The daemon
 /// answers `system.status` while it starts, before it takes a settings
-/// update, so an update is retried while the daemon is not ready.
+/// update, so an update is retried while the daemon is not ready. It starts
+/// its tunnel before it is ready, so the address is read once it is: a
+/// tunnel restarted while it still started left a new E2B sandbox
+/// unanswered over a self-hosted relay (intent#9825).
 const RELAY_SCRIPT: &str = r#"set -u
 export INTENTD_DATA_DIR="${INTENTD_DATA_DIR:-$HOME/.intent}"
 errf=$(mktemp)
@@ -110,6 +113,15 @@ if [ -n "${INTENT_RELAY_APPLY:-}" ]; then
   update "$INTENT_RELAY_PARAMS" || exit 3
 fi
 status=$(intentd call system.status 2>/dev/null) || status=""
+# A daemon that is not ready yet is still starting its tunnel: wait for that
+# start rather than restart a tunnel that is about to come up.
+i=0
+while printf '%s' "$status" | grep -q '"ready": *false'; do
+  i=$((i + 1))
+  [ "$i" -ge 120 ] && break
+  sleep 1
+  status=$(intentd call system.status 2>/dev/null) || status=""
+done
 if ! printf '%s' "$status" | grep -q '"tcAddress"'; then
   # An unchanged setting runs no hook: turn the tunnel off, then on.
   update '{"changes":[{"path":"server.tunnel.enabled","value":false}]}' || exit 3

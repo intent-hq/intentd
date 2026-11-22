@@ -5,7 +5,8 @@
 //! Proves: a relay whose map cannot be fetched fails the start with
 //! `relay-unreachable` and deletes the sandbox; a start with the setting
 //! checks that relay and runs every tailcat command with it and a key that
-//! embeds its region, so tailcat never consults its default map; a changed
+//! embeds its region, so tailcat never consults its default map; a start
+//! keeps the tunnel its new daemon is still starting; a changed
 //! setting moves the sandbox to the new relay at its next resume (new
 //! tunnel address, `cloud.relayUrl`); an unreachable relay fails that
 //! resume; and an empty setting brings back the default relay.
@@ -17,8 +18,8 @@ use crate::common::fake_relay::{dead_relay_url, fake_relay, FakeRelay};
 
 /// A tailcat that appends each command line to `$TAILCAT_LOG`, writes a
 /// key named after its path at genkey, and serves an address made from the
-/// key it was given.
-fn write_logging_tailcat(dir: &Path) -> std::path::PathBuf {
+/// key it was given, `$TAILCAT_SERVE_DELAY` seconds after it starts.
+pub(super) fn write_logging_tailcat(dir: &Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("logging-tailcat.sh");
     let script = r#"#!/bin/sh
@@ -34,6 +35,7 @@ case "$1" in
     printf '%s' "$key" | cksum | cut -d' ' -f1 > "$key"
     ;;
   serve)
+    sleep "${TAILCAT_SERVE_DELAY:-0}" # // timing-guard: a tunnel that takes a while to come up
     printf '{"listenAddr":"tc%s"}\n' "$(cat "$key")"
     exec sleep 600 # // timing-guard: a fake sidecar serves until the daemon kills it
     ;;
@@ -44,7 +46,7 @@ esac
     path
 }
 
-async fn set_relay(rpc_ws: &mut common::TlsWs, id: i64, url: &str) {
+pub(super) async fn set_relay(rpc_ws: &mut common::TlsWs, id: i64, url: &str) {
     ok(
         rpc_ws,
         id,
@@ -194,6 +196,34 @@ async fn a_sandbox_start_uses_only_the_backends_relay() {
     let relay = fake_relay().await;
     start_over(&mut backend, &log, &relay, 30).await;
     assert_no_secret_logged(&backend.head_dir, &fake);
+}
+
+/// A new sandbox's daemon starts its tunnel before it is ready: the start
+/// waits for that tunnel instead of restarting it. On E2B a tunnel
+/// restarted that way left the first dial over the relay unanswered, so
+/// every fresh start failed `machine-unreachable` (intent#9825).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_start_keeps_the_tunnel_its_daemon_is_starting() {
+    let Some((mut backend, log)) = relay_backend("itd-e2b-relay-f-").await else {
+        return;
+    };
+    backend
+        .fake
+        .state()
+        .sandbox_env
+        .push(("TAILCAT_SERVE_DELAY".to_owned(), "3".to_owned()));
+    let relay = fake_relay().await;
+    start_over(&mut backend, &log, &relay, 10).await;
+    let serves: Vec<String> = tailcat_lines(&log, 0)
+        .into_iter()
+        .filter(|line| line.starts_with("serve"))
+        .collect();
+    assert_eq!(
+        serves.len(),
+        1,
+        "the starting tunnel was restarted: {serves:?}"
+    );
+    assert_no_secret_logged(&backend.head_dir, &backend.fake);
 }
 
 /// A changed setting moves a paused sandbox to the new relay at its next
