@@ -1131,3 +1131,80 @@ let SESSION_ID = `config-session-${process.pid}`;
         exercise(true).await;
     }
 }
+
+/// Conversation goal (PROTOCOL §5.5): every outbound turn carries one goal
+/// block in the turn-text block, directly before the turn body; the
+/// repository-guidance block follows as a separate later block. Also
+/// holds for a session pinned to an older harness; the goal is never stored in
+/// the user's text. With no goal set the prompt has no goal block.
+#[intent_test_macros::daemon_test]
+async fn prompt_envelope_conversation_goal_block_order() {
+    const GOAL_OPEN: &str = "<conversation-goal>";
+    for stamp in [None, Some("3.2"), Some("3.16")] {
+        let h = Harness::new(stamp, false).await;
+        h.turn("before any goal").await;
+        h.services
+            .store
+            .set_agent_goal(
+                &h.row.workspace_id,
+                &h.row.id,
+                None,
+                Some("Ship it.\nAll green."),
+            )
+            .await
+            .unwrap();
+        h.turn("with a goal").await;
+        let prompts: Vec<Vec<String>> = h
+            .records("prompts.jsonl")
+            .iter()
+            .filter_map(|row| row["blocks"].as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(prompts.len(), 2, "{stamp:?}: {prompts:?}");
+        assert!(
+            prompts[0].iter().all(|text| !text.contains(GOAL_OPEN)),
+            "{stamp:?}: {:?}",
+            prompts[0]
+        );
+        let texts = &prompts[1];
+        let goal_at: Vec<usize> = texts
+            .iter()
+            .enumerate()
+            .filter(|(_, text)| text.contains(GOAL_OPEN))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(goal_at.len(), 1, "{stamp:?}: one goal block: {texts:?}");
+        let text = &texts[goal_at[0]];
+        assert_eq!(text.matches(GOAL_OPEN).count(), 1, "{text}");
+        let block = "<conversation-goal>\nShip it.\nAll green.\n</conversation-goal>\n\n";
+        let (_, after) = text.split_once(block).expect("verbatim goal block");
+        assert!(
+            after.ends_with("with a goal"),
+            "goal directly before the body: {text}"
+        );
+        // Repository guidance rides as its own later block: the goal stays in
+        // the turn-text block, which comes first.
+        if let Some(guidance_at) = texts.iter().position(|t| t.contains(FACTS)) {
+            assert!(guidance_at > goal_at[0], "{stamp:?}: {texts:?}");
+            assert!(!texts[guidance_at].contains(GOAL_OPEN), "{texts:?}");
+        }
+        assert!(
+            h.services
+                .store
+                .get_agent_session_with_transcript(&h.row.id)
+                .await
+                .unwrap()
+                .messages
+                .iter()
+                .all(|m| !m.content.to_string().contains(GOAL_OPEN)),
+            "the goal block is never persisted"
+        );
+        h.finish().await;
+    }
+}

@@ -121,6 +121,9 @@ pub(crate) fn server_json(
     capabilities["agentPlugins"] = json!(1);
     // agent.importableSessions.list / agent.importSession (§5.5).
     capabilities["sessionImport"] = json!(1);
+    // Conversation goal (§5.5): the `goal` session field, `agent.setGoal`,
+    // `interpretCommands` on sends and `goal_command` notice rows.
+    capabilities["conversationGoal"] = json!(1);
     // Per-agent CoW sandboxes are retired (protocol 16).
     capabilities["agentIsolation"] = json!(2);
     let mut server = json!({

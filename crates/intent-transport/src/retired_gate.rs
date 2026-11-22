@@ -49,6 +49,7 @@ pub(crate) const RETIRED_GATED_METHODS: &[&str] = &[
     "agent.sendQueuedMessageNow",
     "agent.sendQueuedMessagesNow",
     "agent.sendToTask",
+    "agent.setGoal",
     "agent.setModel",
     "agent.stop",
     "agent.update",

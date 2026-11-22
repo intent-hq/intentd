@@ -10623,6 +10623,13 @@ async fn worst_case_agent_list_row(
         .update_agent_session(ws, &s)
         .await
         .expect("populate session");
+    // The goal is a preference column the full-row write leaves alone;
+    // fill it to its cap through its own writer.
+    let goal = "g".repeat(intent_core::conversation_goal::MAX_CHARS);
+    svc.store()
+        .set_agent_goal(ws, &s.id, None, Some(&goal))
+        .await
+        .expect("goal");
     svc.store()
         .set_attention_request(
             ws,

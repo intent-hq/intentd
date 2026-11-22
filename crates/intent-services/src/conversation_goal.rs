@@ -1,0 +1,237 @@
+//! Conversation goal service path (PROTOCOL §5.5 "Conversation goal",
+//! intent-hq/intent#9646): the `/goal` command and `agent.setGoal`.
+//!
+//! Both share one write path: validate, compare-and-set the stored goal
+//! through the narrow store writer (never advancing `updatedAt`), persist one
+//! transcript-only `goal_command` notice row outside any turn, and emit
+//! `agent:updated { agentId, goal }` when the stored goal changed. Nothing
+//! here wakes the agent, touches its queue, attention, unread or turn state,
+//! or revives an archived workspace. The per-turn prompt block is rendered
+//! by the harness in the turn envelope ([`Services::agent_conversation_goal`]).
+
+use intent_core::conversation_goal::{self, GoalAction, GoalError};
+use intent_core::events::AGENT_UPDATED;
+use intent_core::{AgentId, Error, Result, WorkspaceId};
+use serde_json::{json, Value};
+
+use crate::Services;
+
+/// Bound on compare-and-set retries when concurrent goal writers keep
+/// winning the race; each retry re-reads the stored goal.
+const MAX_GOAL_WRITE_ATTEMPTS: usize = 8;
+
+/// Bound on notice-row appends that lost the transcript `seq` race.
+const MAX_NOTICE_APPEND_ATTEMPTS: usize = 8;
+
+/// Whether `e` is the `UNIQUE(agent_id, seq)` violation of two concurrent
+/// transcript appends (`SQLite` or Postgres wording).
+fn is_seq_conflict(e: &Error) -> bool {
+    let Error::Internal(message) = e else {
+        return false;
+    };
+    message.contains("agent_message.agent_id, agent_message.seq")
+        || (message.contains("duplicate key") && message.contains("agent_message"))
+}
+
+impl Services {
+    /// The agent's workspace and stored goal after the caller gates.
+    /// Membership is checked on the same terms as `agent.sendMessage` /
+    /// `agent.queueMessage`; an explicit `workspace_id` must be the agent's
+    /// own. An unknown or deleted agent is `agent not found`, a retired one
+    /// `agent is retired`. An agent caller is refused outright: one agent
+    /// cannot set another agent's goal (the RPC seam already refuses every
+    /// agent-origin route; this is the backstop).
+    async fn goal_target(
+        &self,
+        workspace_id: Option<&WorkspaceId>,
+        agent_id: &AgentId,
+    ) -> Result<(WorkspaceId, Option<String>)> {
+        if matches!(
+            intent_core::caller::current_caller(),
+            Some(intent_core::caller::Caller::Agent { .. })
+        ) {
+            return Err(Error::Forbidden(
+                "agents cannot set a conversation goal".to_string(),
+            ));
+        }
+        let not_found = |e: Error| match e {
+            Error::NotFound(_) => Error::ConversationGoal(GoalError::AgentNotFound),
+            other => other,
+        };
+        match workspace_id {
+            Some(workspace_id) => self
+                .require_agent_member_in(agent_id, workspace_id)
+                .await
+                .map_err(not_found)?,
+            None => self
+                .require_agent_member(agent_id)
+                .await
+                .map_err(not_found)?,
+        }
+        let session = self
+            .store
+            .get_agent_session_summary(agent_id)
+            .await
+            .map_err(not_found)?;
+        if workspace_id.is_some_and(|ws| *ws != session.workspace_id) {
+            return Err(Error::ConversationGoal(GoalError::AgentNotFound));
+        }
+        if session.retired_at.is_some() {
+            return Err(Error::ConversationGoal(GoalError::AgentRetired));
+        }
+        Ok((session.workspace_id.clone(), session.goal.clone()))
+    }
+
+    /// Move the stored goal to `next`, starting from the observed `current`.
+    /// Returns the action and the goal after it. A compare-and-set lost to a
+    /// concurrent writer re-reads and recomputes, so the action always
+    /// describes the write that actually landed.
+    async fn write_goal(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        mut current: Option<String>,
+        next: Option<String>,
+    ) -> Result<(GoalAction, Option<String>)> {
+        for _ in 0..MAX_GOAL_WRITE_ATTEMPTS {
+            let action = conversation_goal::write_action(current.as_deref(), next.as_deref());
+            if !action.writes() {
+                return Ok((action, current));
+            }
+            if self
+                .store
+                .set_agent_goal(workspace_id, agent_id, current.as_deref(), next.as_deref())
+                .await?
+            {
+                self.invalidate_agent_list_cache(workspace_id);
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({ "agentId": agent_id.0, "goal": next }),
+                )
+                .await;
+                return Ok((action, next));
+            }
+            let stored = self.store.get_agent_session_summary(agent_id).await?;
+            current.clone_from(&stored.goal);
+        }
+        Err(Error::Internal(
+            "the conversation goal kept changing concurrently; try again".to_string(),
+        ))
+    }
+
+    /// Persist the transcript-only `goal_command` notice row and publish it
+    /// on `agent:message`. Written outside any turn through the plain
+    /// append: a `system` row moves no preview, `lastMessageRole`,
+    /// `updatedAt`, unread marker or attention state. Returns the row id.
+    async fn persist_goal_notice(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        action: GoalAction,
+        goal: Option<&str>,
+    ) -> Result<String> {
+        let principal = crate::principal_ops::attributed_caller_id();
+        let content = conversation_goal::notice_content(action, goal);
+        let metadata = conversation_goal::notice_metadata(
+            action,
+            goal,
+            principal.as_ref().map(|p| p.0.as_str()),
+        );
+        // The append allocates the next transcript `seq` before inserting, so
+        // a concurrent append for the same agent (another goal write, a user
+        // send) can take the same `seq` and fail the `UNIQUE(agent_id, seq)`
+        // check. Nothing was written then; recompute and retry.
+        let mut attempt = 0;
+        let message = loop {
+            attempt += 1;
+            match self
+                .store
+                .append_agent_message_with_metadata(
+                    agent_id,
+                    "system",
+                    &content,
+                    Some(&metadata),
+                    &intent_core::now_iso(),
+                )
+                .await
+            {
+                Err(e) if attempt < MAX_NOTICE_APPEND_ATTEMPTS && is_seq_conflict(&e) => {}
+                other => break other?,
+            }
+        };
+        self.invalidate_agent_list_cache(workspace_id);
+        self.publish_agent_message_events(workspace_id, agent_id, &message, None)
+            .await;
+        Ok(message.id)
+    }
+
+    /// `agent.setGoal`: set, replace or remove (`None` / empty after trim)
+    /// the conversation goal. `unchanged` writes nothing (no row, no event,
+    /// no `noticeMessageId`).
+    pub(crate) async fn agent_set_goal_op(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: AgentId,
+        goal: Option<String>,
+    ) -> Result<Value> {
+        let next = conversation_goal::normalize(goal.as_deref())?;
+        let (workspace_id, current) = self.goal_target(workspace_id.as_ref(), &agent_id).await?;
+        let (action, goal) = self
+            .write_goal(&workspace_id, &agent_id, current, next)
+            .await?;
+        let mut result = json!({ "action": action.as_str(), "goal": goal });
+        if action.writes() {
+            let id = self
+                .persist_goal_notice(&workspace_id, &agent_id, action, goal.as_deref())
+                .await?;
+            result["noticeMessageId"] = json!(id);
+        }
+        Ok(result)
+    }
+
+    /// A recognized `/goal` command: an empty statement shows the current
+    /// goal, any other sets or replaces it. Always persists one notice row.
+    pub(crate) async fn agent_goal_command_op(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: AgentId,
+        statement: String,
+    ) -> Result<Value> {
+        let next = conversation_goal::normalize(Some(&statement))?;
+        let (workspace_id, current) = self.goal_target(workspace_id.as_ref(), &agent_id).await?;
+        let (action, goal) = match next {
+            None => (GoalAction::Shown, current),
+            Some(next) => {
+                self.write_goal(&workspace_id, &agent_id, current, Some(next))
+                    .await?
+            }
+        };
+        let notice_id = self
+            .persist_goal_notice(&workspace_id, &agent_id, action, goal.as_deref())
+            .await?;
+        Ok(json!({
+            "success": true,
+            "queued": false,
+            "command": {
+                "name": "goal",
+                "action": action.as_str(),
+                "goal": goal,
+                "noticeMessageId": notice_id,
+            },
+        }))
+    }
+
+    /// The agent's stored conversation goal for the per-turn prompt block,
+    /// or `None` when unset or unreadable. Metadata-only read (no transcript
+    /// load), like the role reminder.
+    pub(crate) async fn agent_conversation_goal(&self, agent_id: &AgentId) -> Option<String> {
+        self.store
+            .get_agent_session_summary(agent_id)
+            .await
+            .ok()?
+            .goal
+            .clone()
+    }
+}

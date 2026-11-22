@@ -650,6 +650,9 @@ mod tests_specialist_frontmatter;
 
 #[cfg(test)]
 mod tests_creation_preferences;
+
+#[cfg(test)]
+mod tests_conversation_goal;
 #[cfg(test)]
 mod tests_identity_pin;
 #[cfg(test)]
@@ -7401,6 +7404,7 @@ impl Services {
             notifications_muted: false,
             pinned: false,
             permission_policy: None,
+            goal: None,
             harness_version: harness_version.to_string(),
             harness_features: Some(harness_features),
             created_at: now.clone(),

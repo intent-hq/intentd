@@ -510,6 +510,11 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "host-membership-required" })),
         },
+        ref e @ Error::ConversationGoal(goal_error) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: goal_error.data(),
+        },
         ref e @ Error::SecretRequest { code, .. } => RpcErr {
             code: e.code(),
             message: e.to_string(),
@@ -3518,6 +3523,14 @@ async fn agent_methods(
         "agent.sendMessage" => {
             let agent_id = require_agent_id(params)?;
             let content = require_str_param(params, "content")?;
+            // Conversation goal (§5.5): a recognized `/goal` command runs here,
+            // before every send-path side effect; nothing below sees it.
+            if let Some(statement) = goal_command_statement(params, &content)? {
+                return api
+                    .agent_goal_command(opt_workspace_id(params), agent_id, statement)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             let ws = require_ws_note(params)?;
             let message_id = opt_str(params, "messageId");
             let image_blocks = opt_value(params, "imageBlocks");
@@ -3629,6 +3642,19 @@ async fn agent_methods(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "agent.setGoal" => {
+            let agent_id = require_agent_id(params)?;
+            // `goal: string | null`; empty (after trim) or null removes it.
+            let goal = match params.get("goal") {
+                Some(Value::String(goal)) => Some(goal.clone()),
+                Some(Value::Null) => None,
+                None => return Err(invalid_params("goal is required (a string or null)")),
+                Some(_) => return Err(invalid_params("goal must be a string or null")),
+            };
+            api.agent_set_goal(opt_workspace_id(params), agent_id, goal)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "agent.markSeen" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;
@@ -3669,6 +3695,14 @@ async fn agent_methods(
                 Some(_) => return Err(invalid_params("messageId must be a nonempty string")),
             };
             let content = require_str_param(params, "content")?;
+            // Conversation goal (§5.5): a recognized `/goal` command runs
+            // before queueing and enqueues nothing; a running turn continues.
+            if let Some(statement) = goal_command_statement(params, &content)? {
+                return api
+                    .agent_goal_command(opt_workspace_id(params), agent_id, statement)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
             // Opaque per-message payload (PROTOCOL §5.5), captured on the
@@ -6903,6 +6937,38 @@ fn require_note_id(params: &Map<String, Value>) -> Result<NoteId, RpcErr> {
     require_str_param(params, "noteId").map(NoteId::from)
 }
 
+/// The `/goal` statement of an `agent.sendMessage` / `agent.queueMessage`
+/// request (§5.5 "Conversation goal"), or `None` for an ordinary delivery.
+/// Parsed only with top-level `interpretCommands: true` and
+/// `messageMetadata` absent, `null` or an object without `type`. A command
+/// with non-empty `imageBlocks` / `fileBlocks` is refused (`-32602`,
+/// `goal-attachments-not-allowed`) before any state change.
+fn goal_command_statement(
+    params: &Map<String, Value>,
+    content: &str,
+) -> Result<Option<String>, RpcErr> {
+    if params.get("interpretCommands") != Some(&Value::Bool(true)) {
+        return Ok(None);
+    }
+    if !intent_core::conversation_goal::metadata_is_plain(params.get("messageMetadata")) {
+        return Ok(None);
+    }
+    let Some(statement) = intent_core::conversation_goal::parse_command(content) else {
+        return Ok(None);
+    };
+    let has_blocks = |name: &str| match params.get(name) {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(blocks)) => !blocks.is_empty(),
+        Some(_) => true,
+    };
+    if has_blocks("imageBlocks") || has_blocks("fileBlocks") {
+        return Err(domain_to_rpc(Error::ConversationGoal(
+            intent_core::conversation_goal::GoalError::Attachments,
+        )));
+    }
+    Ok(Some(statement.to_string()))
+}
+
 /// Require an `agentId` string param (`requireParam` parity).
 fn require_agent_id(params: &Map<String, Value>) -> Result<AgentId, RpcErr> {
     require_str_param(params, "agentId").map(|s| AgentId::from(s.as_str()))
@@ -7875,6 +7941,9 @@ mod tests;
 
 #[cfg(test)]
 mod blank_model_tests;
+
+#[cfg(test)]
+mod goal_tests;
 
 #[cfg(test)]
 mod dispatch_stack_tests;

@@ -35,7 +35,7 @@ pub const FORBIDDEN_ERROR_MESSAGE: &str = "Forbidden";
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 317 canonical methods routed through the per-namespace dispatch matches in
+/// These are the 318 canonical methods routed through the per-namespace dispatch matches in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -98,6 +98,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "agent.sendQueuedMessageNow",
     "agent.sendQueuedMessagesNow",
     "agent.sendToTask",
+    "agent.setGoal",
     "agent.setModel",
     "agent.stop",
     "agent.subscribe",
@@ -670,6 +671,7 @@ pub const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.sendQueuedMessageNow", "Steer: promotes a queued message. Queue write, agent-scoped."),
     ("agent.sendQueuedMessagesNow", "Steer: sends a visible ready queue snapshot as one batch. Queue write, agent-scoped."),
     ("agent.sendToTask", "Steer: messages the agent assigned to a task note. Same as sendMessage, sender preamble included."),
+    ("agent.setGoal", "Steer: sets or removes an agent's conversation goal; same callers as agent.sendMessage. Writes a notice row stamped with the caller's principal."),
     ("agent.setModel", "Steer: switches an agent's model among the catalog (decided: allowed). No credential access."),
     ("agent.stop", "Steer: stops an agent turn (decided: allowed)."),
     ("agent.subscribe", "Client boot: subscribes to an agent's events (fast path when no eventTypes). Delivery is narrowed by the collaborator event allowlist."),
@@ -1078,6 +1080,10 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
         "Approves the Assistant's own held calls.",
     ),
     ("agent.respondPermission", "Answers a permission prompt."),
+    (
+        "agent.setGoal",
+        "The conversation goal is the user's; one agent cannot set another agent's goal.",
+    ),
     (
         "backends.report",
         "Only owner apps report their own backends.",
@@ -1574,6 +1580,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     mutation("agent.sendQueuedMessageNow", "Promotes a queued message."),
     mutation("agent.sendQueuedMessagesNow", "Sends the queue as one batch."),
     mutation("agent.sendToTask", "Messages a task's agent."),
+    mutation("agent.setGoal", "Sets or removes the conversation goal."),
     mutation("agent.setModel", "Switches the agent model."),
     mutation("agent.stop", "Stops the running turn."),
     subscription("agent.subscribe", "Registers an agent event or collection subscription; the seq-0 snapshot is listed in SNAPSHOT_CHANNELS."),

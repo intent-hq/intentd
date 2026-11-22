@@ -198,6 +198,7 @@ fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         pinned: false,
         effective_permission_policy: None,
         permission_policy: None,
+        goal: None,
         metadata: AgentMetadata {
             attention_request_reason_truncated: false,
             completion_report_truncated: false,

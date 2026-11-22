@@ -80,6 +80,7 @@ mod autocomplete_ops;
 #[cfg(test)]
 mod autocomplete_service_tests;
 mod boot_settings_migrations;
+mod conversation_goal;
 mod executor_capabilities;
 mod executor_ops;
 pub mod host_resources;
@@ -19094,6 +19095,9 @@ impl WorkspaceApi for Services {
             // Reads answer bounded pages by default (default page sizes,
             // maximums and byte budgets), so a new app pages them.
             caps.insert("boundedReads".into(), serde_json::json!(1));
+            // Conversation goal (§5.5): `/goal`, `agent.setGoal` and the
+            // per-turn goal block.
+            caps.insert("conversationGoal".into(), serde_json::json!(1));
             Ok(serde_json::Value::Object(caps))
         })
     }
@@ -30781,6 +30785,29 @@ impl WorkspaceApi for Services {
             self.require_agent_member(&agent_id).await?;
             self.agent_get_session_bounded_op(agent_id).await
         })
+    }
+
+    fn agent_set_goal(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: AgentId,
+        goal: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.instruction_admission(async move {
+            self.agent_set_goal_op(workspace_id, agent_id, goal).await
+        }))
+    }
+
+    fn agent_goal_command(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: AgentId,
+        statement: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.instruction_admission(async move {
+            self.agent_goal_command_op(workspace_id, agent_id, statement)
+                .await
+        }))
     }
 
     fn agent_update(

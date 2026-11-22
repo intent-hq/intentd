@@ -93,6 +93,13 @@ pub enum Error {
     #[error("{message}")]
     SecretRequest { code: &'static str, message: String },
 
+    /// A conversation goal call (`agent.setGoal`, a `/goal` command) failed
+    /// for a documented reason (PROTOCOL §5.5 "Conversation goal").
+    /// Surfaces as `-32602` with the exact contract message and
+    /// [`crate::conversation_goal::GoalError::data`]. Nothing was changed.
+    #[error("{}", .0.message())]
+    ConversationGoal(crate::conversation_goal::GoalError),
+
     /// libgit2 classified an authentication failure. Legacy wire rendering
     /// matches Internal; shared execution may attach safe recovery.
     #[error("internal error: {0}")]
@@ -811,6 +818,7 @@ impl Error {
             | Error::PlainFolderInvalidParams(_)
             | Error::PlainFolderPathRejected(_)
             | Error::SecretRequest { .. }
+            | Error::ConversationGoal(_)
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
             | Error::PlacementUnavailable(_)

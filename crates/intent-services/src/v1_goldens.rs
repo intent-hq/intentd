@@ -1267,6 +1267,7 @@ fn golden_setup_notice_bytes_and_envelope_slot() {
         stdin_context: Some("ctx"),
         naming_nudge: None,
         role_reminder: None,
+        conversation_goal: None,
         body: "hello",
     });
     assert_eq!(
