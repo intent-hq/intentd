@@ -600,7 +600,7 @@ esac
         assert!(fx.pool.reap_idle(&b_in_use, t0, IDLE).await.is_empty());
         assert!(
             fx.pool
-                .reap_idle(&b_in_use, t0 + IDLE - Duration::from_secs(1), IDLE)
+                .reap_idle(&b_in_use, t0 + Duration::from_secs(15 * 60 - 1), IDLE)
                 .await
                 .is_empty(),
             "not idle long enough yet"
