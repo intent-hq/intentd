@@ -9,17 +9,9 @@ use std::path::{Path, PathBuf};
 
 use super::{Ceiling, ContainmentConfig};
 
-const MIB: u64 = 1024 * 1024;
-const GIB: u64 = 1024 * MIB;
+use super::{auto_ceiling_bytes, reserve_bytes};
 
-/// Smallest daemon reserve. Measured daemon RSS was 438 MB on a busy host
-/// (many workspaces, 16 h uptime); 768 MiB leaves room for the OS and the
-/// daemon's page cache on a 4 GB machine.
-pub(super) const MIN_RESERVE_BYTES: u64 = 768 * MIB;
-/// Largest daemon reserve.
-pub(super) const MAX_RESERVE_BYTES: u64 = 2 * GIB;
-/// Smallest ceiling ever written, so a tiny or misread box still runs work.
-const MIN_CEILING_BYTES: u64 = 256 * MIB;
+const MIB: u64 = 1024 * 1024;
 
 const FIX: &str = "run intentd as root, or in its own systemd unit with Delegate=memory pids";
 
@@ -116,7 +108,9 @@ pub(super) fn plan(host: &Host, instance_key: &str) -> Result<Plan, String> {
     if host.start == "/" {
         require_memory(&host.mount, "/")?;
         return Ok(Plan::Root {
-            domain: host.mount.join(format!("intentd-{:016x}", fnv1a(instance_key))),
+            domain: host
+                .mount
+                .join(format!("intentd-{:016x}", fnv1a(instance_key))),
         });
     }
     let base = host.start_dir();
@@ -130,7 +124,8 @@ pub(super) fn plan(host: &Host, instance_key: &str) -> Result<Plan, String> {
     }
     require_memory(&base, &host.start)?;
     require_delegated(&base, &host.start, host.query_systemd)?;
-    let procs = read_procs(&base).map_err(|e| format!("cannot read {}/cgroup.procs: {e}", host.start))?;
+    let procs =
+        read_procs(&base).map_err(|e| format!("cannot read {}/cgroup.procs: {e}", host.start))?;
     let others = procs
         .iter()
         .filter(|&&p| p != host.pid && p != host.parent_pid)
@@ -158,7 +153,10 @@ pub(super) fn setup(host: &Host, config: &ContainmentConfig) -> Result<Layout, S
             if *move_parent {
                 let supervisor = domain.join("supervisor");
                 make_dir(&supervisor)?;
-                write(&supervisor.join("cgroup.procs"), &host.parent_pid.to_string())?;
+                write(
+                    &supervisor.join("cgroup.procs"),
+                    &host.parent_pid.to_string(),
+                )?;
             }
             make_dir(&daemon)?;
             write(&daemon.join("cgroup.procs"), &host.pid.to_string())?;
@@ -185,9 +183,8 @@ pub(super) fn setup(host: &Host, config: &ContainmentConfig) -> Result<Layout, S
     let reserve = reserve_bytes(box_total);
     let max = match config.ceiling {
         Ceiling::Bytes(bytes) => bytes,
-        Ceiling::Auto | Ceiling::Off => box_total.saturating_sub(reserve),
-    }
-    .max(MIN_CEILING_BYTES);
+        Ceiling::Auto | Ceiling::Off => auto_ceiling_bytes(box_total),
+    };
     write(&workloads.join("memory.max"), &max.to_string())?;
     write(&workloads.join("memory.high"), &high_for(max).to_string())?;
     // Best effort: protection only reaches as far as the parent grants.
@@ -196,11 +193,6 @@ pub(super) fn setup(host: &Host, config: &ContainmentConfig) -> Result<Layout, S
         workloads,
         memory_max_bytes: max,
     })
-}
-
-/// `clamp(15 % of the box, 768 MiB, 2 GiB)`.
-pub(super) fn reserve_bytes(box_total: u64) -> u64 {
-    (box_total / 100 * 15).clamp(MIN_RESERVE_BYTES, MAX_RESERVE_BYTES)
 }
 
 /// `memory.high` a little below `memory.max`, so reclaim starts early.
@@ -241,7 +233,10 @@ fn require_memory(dir: &Path, rel: &str) -> Result<(), String> {
 /// when the unit delegates it; anything else is trusted when writable.
 fn require_delegated(dir: &Path, rel: &str, query_systemd: bool) -> Result<(), String> {
     let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let Some(kind) = [".service", ".scope"].into_iter().find(|s| name.ends_with(s)) else {
+    let Some(kind) = [".service", ".scope"]
+        .into_iter()
+        .find(|s| name.ends_with(s))
+    else {
         return Ok(());
     };
     if has_delegate_xattr(dir) {
@@ -292,9 +287,7 @@ fn systemd_delegates(unit: &str, user: bool) -> bool {
 
 fn enable_memory(dir: &Path) -> Result<(), String> {
     let control = dir.join("cgroup.subtree_control");
-    if fs::read_to_string(&control)
-        .is_ok_and(|s| s.split_whitespace().any(|c| c == "memory"))
-    {
+    if fs::read_to_string(&control).is_ok_and(|s| s.split_whitespace().any(|c| c == "memory")) {
         return Ok(());
     }
     write(&control, "+memory")

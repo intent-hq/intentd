@@ -1631,6 +1631,7 @@ fn last_run(
         stopped_at: now_iso(),
         error,
         started_by: state.started_by.clone(),
+        exit_reason: None,
     }
 }
 

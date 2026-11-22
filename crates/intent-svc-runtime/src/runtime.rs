@@ -1621,6 +1621,10 @@ impl RuntimePort for RuntimeFeature {
                 spec.args = args;
                 spec.size = intent_pty::PtySize { rows: 24, cols: 80 };
                 spec.name = Some(SETUP_TERMINAL_NAME.to_string());
+                spec.workload = Some(intent_core::workload::Workload::new(
+                    intent_core::workload::WorkloadKind::Script,
+                    format!("setup script in {}", workspace_id.as_str()),
+                ));
                 spec.cwd = Some(worktree_for_read.clone());
                 spec.env = vec![
                     ("MAIN_CHECKOUT".to_string(), repo_path),

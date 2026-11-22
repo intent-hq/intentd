@@ -454,6 +454,7 @@ impl Drop for RunReservation {
                         stopped_at: now_iso(),
                         error: Some("script.run caller cancelled before launch".into()),
                         started_by: m.state.started_by.clone(),
+                        exit_reason: None,
                     });
                     settle = true;
                 }
@@ -1366,6 +1367,7 @@ impl ScriptManager {
                 stopped_at: now_iso(),
                 error: Some(LOST_AT_DAEMON_STOP_ERROR.into()),
                 started_by: None,
+                exit_reason: None,
             };
             self.store
                 .settle_script_run(workspace_id, script_id, run_id, &result, false)
@@ -2357,6 +2359,7 @@ impl ScriptManager {
             m.state.pid = None;
             m.state.started_at = None;
             m.state.exit_code = None;
+            m.state.exit_reason = None;
             m.state.stopped_at = None;
             m.state.error = None;
             m.state.detected_url = None;
@@ -2836,6 +2839,7 @@ impl ScriptManager {
             m.state.status = ScriptStatus::Running;
             m.state.pid = None;
             m.state.exit_code = None;
+            m.state.exit_reason = None;
             m.state.error = None;
             m.state.started_at = None;
             m.state.stopped_at = None;
@@ -3375,6 +3379,7 @@ impl ScriptManager {
                     m.state.pid = pid;
                     m.state.started_at = Some(started_at);
                     m.state.exit_code = None;
+                    m.state.exit_reason = None;
                     m.state.stopped_at = None;
                     m.state.error = None;
                     m.state.detected_url = None;
@@ -3433,6 +3438,13 @@ impl ScriptManager {
             m.state.status = ScriptStatus::Exited;
             let code = terminal_exit_code(exit.as_ref());
             m.state.exit_code = Some(code);
+            m.state.exit_reason = exit
+                .as_ref()
+                .filter(|e| e.memory_limit)
+                .map(|_| intent_core::ExitReason::MemoryLimit);
+            if let Some(reason) = m.state.exit_reason {
+                m.state.error = Some(reason.message().to_owned());
+            }
             if code == EXIT_CODE_UNOBSERVABLE {
                 // A home run (nodeProtocol 19) lost with its machine says
                 // why; one the user stopped ends on the machine, which
@@ -3747,6 +3759,10 @@ impl ScriptManager {
         spec.env_remove = scrubbed_env_vars_except(&spec.env);
         spec.listed = false;
         spec.scrollback_bytes = SCRIPT_SCROLLBACK_BYTES;
+        spec.workload = Some(intent_core::workload::Workload::new(
+            intent_core::workload::WorkloadKind::Script,
+            format!("script {} in {ws}", def.id),
+        ));
         spec
     }
 }
@@ -6280,6 +6296,7 @@ mod tests {
             exit_code: 3,
             success: false,
             observed: true,
+            memory_limit: false,
         };
         assert_eq!(terminal_exit_code(Some(&observed)), 3);
         let unobserved = PtyExit::unobservable();
@@ -8364,6 +8381,7 @@ mod tests {
             stopped_at: now_iso(),
             error: None,
             started_by: None,
+            exit_reason: None,
         };
         {
             let mut scripts = mgr.scripts.lock().unwrap();

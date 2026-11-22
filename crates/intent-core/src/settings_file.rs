@@ -909,6 +909,14 @@ pub struct AgentsSettings {
     /// positive = budget in MB (changes apply on daemon restart; max
     /// 1,024,000).
     pub memory_budget_mb: Option<u32>,
+    /// `agents.workloadMemoryMaxMb` — the memory ceiling (MB) of the shared
+    /// cgroup every workload (agents, scripts, terminals, `host.exec`, MCP
+    /// and model servers) runs in on Linux (intent-hq/intent#9809). Absent
+    /// (`None`, the default) = auto (total memory less the daemon reserve);
+    /// explicit `0` = no cgroup containment (workload roots still get a
+    /// raised `oom_score_adj`); positive = ceiling in MB (changes apply on
+    /// daemon restart; max 1,024,000).
+    pub workload_memory_max_mb: Option<u32>,
     /// `agents.acpNodeMaxOldSpaceMb` — V8 `--max-old-space-size` cap in MB
     /// injected via `NODE_OPTIONS` into Node/Electron ACP provider processes.
     /// Absent (`None`, the default) = [`DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB`]
@@ -1000,6 +1008,7 @@ impl Default for AgentsSettings {
         Self {
             max_concurrent: 0,
             memory_budget_mb: None,
+            workload_memory_max_mb: None,
             acp_node_max_old_space_mb: None,
             max_concurrent_adapters: DEFAULT_MAX_CONCURRENT_ADAPTERS,
             max_top_level_agents: DEFAULT_MAX_TOP_LEVEL_AGENTS,
@@ -1753,6 +1762,14 @@ impl SettingsFile {
                 ));
             }
         }
+        if let Some(mb) = self.agents.workload_memory_max_mb {
+            if mb > 1_024_000 {
+                return Err(bad(
+                    "agents.workloadMemoryMaxMb",
+                    &format!("must be absent (auto), 0 (off), or between 1 and 1024000, got {mb}"),
+                ));
+            }
+        }
         if let Some(mb) = self.agents.acp_node_max_old_space_mb {
             if !(ACP_NODE_MAX_OLD_SPACE_MB_MIN..=ACP_NODE_MAX_OLD_SPACE_MB_MAX).contains(&mb) {
                 return Err(bad(
@@ -2225,7 +2242,8 @@ maxConcurrent = 0
 # Agent memory budget (MB) -- aggregate resident memory of the daemon's whole
 # child-process tree. The budget reclaims only when two conditions hold at
 # once: the tree is over budget AND the host's available memory is below
-# 8 GiB plus one provisional agent (~660 MB). Then new agent spawns queue
+# 8 GiB plus one provisional agent (~660 MB; on hosts under 12 GiB, half of
+# RAM, at least 1 GiB, plus one provisional agent). Then new agent spawns queue
 # behind idle-process eviction, and a background sweep drains idle agents
 # largest-first (nothing running is ever killed; changes apply on daemon
 # restart). An over-budget tree on a host with more available memory than
@@ -2235,7 +2253,8 @@ maxConcurrent = 0
 # is crossed while tens of gigabytes are still free. When available memory
 # cannot be sampled the budget is strict: over budget alone reclaims.
 # Absent (the default, as in this file) = auto: the daemon picks the budget
-# ((RAM - 8 GB) / 2, min 4 GB). Explicit 0 = off, always. Upgrade note:
+# ((RAM - 8 GB) / 2, min 4 GB; under 12 GiB of RAM the lower of that and
+# (RAM - reserve) / 2, min 512 MB). Explicit 0 = off, always. Upgrade note:
 # config files written before this key defaulted to auto carry a literal
 # `memoryBudgetMb = 0`, which stays off -- delete the line to opt into
 # auto. A positive value is the budget in MB (max 1024000). A soft
@@ -2250,6 +2269,17 @@ maxConcurrent = 0
 # test suite) is never re-checked and can carry the tree past the budget by
 # itself.
 # memoryBudgetMb = 8192
+# Workload memory ceiling (MB) -- Linux only. Agents, scripts, terminals,
+# host.exec commands, MCP servers and model servers run in one shared
+# cgroup with this memory limit, so a runaway workload is killed inside it
+# while the daemon keeps running. Absent (the default, as in this file) =
+# auto: total memory less a daemon reserve (15%, between 768 MB and 2 GB).
+# 0 = no cgroup limit (workloads still get a higher OOM score than the
+# daemon). A positive value is the ceiling in MB (max 1024000). Needs a
+# writable cgroup v2: run as root, or in a systemd unit with
+# Delegate=memory pids; otherwise only the OOM score applies. Changes apply
+# on daemon restart.
+# workloadMemoryMaxMb = 3072
 # ACP Node heap limit (MB) -- V8 --max-old-space-size cap injected via
 # NODE_OPTIONS into Node/Electron ACP provider processes (1024-65536; applies
 # to newly started agent processes). Absent (the default, as in this file) =
@@ -3701,6 +3731,29 @@ mod tests {
         assert!(
             SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 1024000\n").is_ok(),
             "the upper bound itself is legal"
+        );
+    }
+
+    /// The `agents.workloadMemoryMaxMb` parse matrix (intent-hq/intent#9809):
+    /// absent = auto, `0` = off, positive = MB, same upper bound as the budget.
+    #[test]
+    fn workload_memory_max_mb_absent_auto_zero_off_positive_explicit() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.agents.workload_memory_max_mb, None,
+            "absent key = auto"
+        );
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("\nworkloadMemoryMaxMb ="));
+        let off = SettingsFile::parse_str("[agents]\nworkloadMemoryMaxMb = 0\n").expect("0 parses");
+        assert_eq!(off.agents.workload_memory_max_mb, Some(0));
+        let set = SettingsFile::parse_str("[agents]\nworkloadMemoryMaxMb = 3072\n")
+            .expect("value parses");
+        assert_eq!(set.agents.workload_memory_max_mb, Some(3072));
+        let err = SettingsFile::parse_str("[agents]\nworkloadMemoryMaxMb = 2000000\n")
+            .expect_err("out of range");
+        assert!(
+            err.to_string().contains("agents.workloadMemoryMaxMb"),
+            "{err}"
         );
     }
 

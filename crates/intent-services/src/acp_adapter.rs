@@ -255,6 +255,11 @@ impl AcpAdapterCommand {
         // for CPU and disk like a session agent does, so it starts at the
         // same reduced priority and can never starve the daemon.
         intent_acp::AgentPriority::from_env().apply(&mut command);
+        intent_core::workload::Workload::new(
+            intent_core::workload::WorkloadKind::Adapter,
+            "adapter chain",
+        )
+        .apply_pinned(&mut command);
 
         command
     }

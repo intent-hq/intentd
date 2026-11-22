@@ -137,6 +137,11 @@ async fn spawn_and_wait(
     }
     #[cfg(unix)]
     command.process_group(0);
+    intent_core::workload::Workload::new(
+        intent_core::workload::WorkloadKind::Archive,
+        format!("archive script in {workspace}"),
+    )
+    .apply_pinned(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {

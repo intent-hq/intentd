@@ -9,6 +9,11 @@ After=network.target
 #   intentd settings agents.resumeInterruptedOnStart off
 [Service]
 Type=simple
+# Hand the unit's cgroup to intentd, which runs agents, scripts, terminals and
+# host.exec commands in a memory-limited sub-cgroup so a runaway workload is
+# killed there instead of stalling the whole machine
+# (agents.workloadMemoryMaxMb).
+Delegate=memory pids
 ExecStart=/usr/bin/intentd serve
 ExecStop=/usr/bin/intentd stop
 Restart=on-failure

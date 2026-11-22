@@ -335,6 +335,7 @@ async fn retirement_durable_token_fences_rerun_replacement_removal_and_scope() {
         stopped_at: now_iso(),
         error: None,
         started_by: None,
+        exit_reason: None,
     };
     store.admit_script_run(&h.ws, &id, "old").await.unwrap();
     store.admit_script_run(&h.ws, &id, "new").await.unwrap();

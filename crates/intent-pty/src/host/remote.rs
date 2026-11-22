@@ -277,6 +277,7 @@ impl PtyHost {
                 sink: spec.output_sink,
                 lost: Mutex::default(),
             }),
+            leaf: None,
         });
         let id = PtyId(
             self.next_id
@@ -324,6 +325,7 @@ impl PtyHost {
                 exit_code: code,
                 success: code == 0,
                 observed: true,
+                memory_limit: false,
             },
             None => PtyExit::unobservable(),
         };

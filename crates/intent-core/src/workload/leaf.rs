@@ -8,6 +8,10 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
+
+/// How long a pinned leaf is kept before an empty one may be released.
+const PIN_GRACE: Duration = Duration::from_secs(30);
 
 use super::cgroup;
 use super::{OomKillReport, WorkloadKind};
@@ -34,6 +38,10 @@ impl Drop for Inner {
 
 struct Entry {
     leaf: Weak<Inner>,
+    /// Set by [`Leaf::pin`]: the registry keeps the leaf until it is empty
+    /// (and at least [`PIN_GRACE`] old, so a leaf pinned before its spawn
+    /// is never released before the child joins it).
+    pinned: Option<(Arc<Inner>, Instant)>,
     seen_oom_kills: u64,
 }
 
@@ -61,6 +69,7 @@ impl Leaf {
             path.clone(),
             Entry {
                 leaf: Arc::downgrade(&inner),
+                pinned: None,
                 seen_oom_kills: 0,
             },
         );
@@ -69,6 +78,15 @@ impl Leaf {
             return None;
         }
         Some(Self(inner))
+    }
+
+    /// Keep the leaf (and its OOM-kill reporting) alive until its processes
+    /// have exited, even after every handle is dropped — for a workload whose
+    /// owner does not hold the handle for the process's whole life.
+    pub fn pin(&self) {
+        if let Some(entry) = registry().get_mut(&self.0.path) {
+            entry.pinned = Some((Arc::clone(&self.0), Instant::now()));
+        }
     }
 
     /// The leaf's directory.
@@ -149,7 +167,24 @@ pub(super) fn install_pre_exec(cmd: &mut std::process::Command, leaf: Option<&Le
 
 /// Remove empty leaves under `workloads` that no live [`Leaf`] owns: those a
 /// previous daemon left, and those whose processes outlived their handle.
+/// Pinned leaves are released once empty.
 pub(super) fn sweep(workloads: &Path) {
+    // Arcs released here are dropped after the lock: `Inner::drop` locks it.
+    let released: Vec<Arc<Inner>> = {
+        let mut registry = registry();
+        registry
+            .iter_mut()
+            .filter(|(path, entry)| {
+                entry
+                    .pinned
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed() >= PIN_GRACE)
+                    && cgroup::read_procs(path).map_or(true, |procs| procs.is_empty())
+            })
+            .filter_map(|(_, entry)| entry.pinned.take().map(|(leaf, _)| leaf))
+            .collect()
+    };
+    drop(released);
     let Ok(entries) = fs::read_dir(workloads) else {
         return;
     };
@@ -172,25 +207,31 @@ pub(super) fn sweep(workloads: &Path) {
 
 /// New OOM kills in live agent-type leaves since the previous poll.
 pub(super) fn poll_oom_kills() -> Vec<OomKillReport> {
-    let mut registry = registry();
     let mut reports = Vec::new();
-    registry.retain(|path, entry| {
-        let Some(leaf) = entry.leaf.upgrade() else {
-            return false;
-        };
-        if leaf.kind.is_agent_like() {
-            let kills = cgroup::oom_kills(path).unwrap_or(0);
-            if kills > entry.seen_oom_kills {
-                reports.push(OomKillReport {
-                    kind: leaf.kind,
-                    label: leaf.label.clone(),
-                    new_kills: kills - entry.seen_oom_kills,
-                });
-                entry.seen_oom_kills = kills;
+    // Upgraded handles are dropped after the lock: `Inner::drop` locks it.
+    let mut live: Vec<Arc<Inner>> = Vec::new();
+    {
+        let mut registry = registry();
+        registry.retain(|path, entry| {
+            let Some(leaf) = entry.leaf.upgrade() else {
+                return false;
+            };
+            if leaf.kind.is_agent_like() {
+                let kills = cgroup::oom_kills(path).unwrap_or(0);
+                if kills > entry.seen_oom_kills {
+                    reports.push(OomKillReport {
+                        kind: leaf.kind,
+                        label: leaf.label.clone(),
+                        new_kills: kills - entry.seen_oom_kills,
+                    });
+                    entry.seen_oom_kills = kills;
+                }
             }
-        }
-        true
-    });
+            live.push(leaf);
+            true
+        });
+    }
+    drop(live);
     reports
 }
 
@@ -230,6 +271,9 @@ pub(super) fn run_shim(args: Vec<OsString>) -> std::process::ExitCode {
         let _ = fs::write("/proc/self/oom_score_adj", score.as_encoded_bytes());
     }
     let error = std::process::Command::new(&program).args(rest).exec();
-    eprintln!("intentd cgroup-exec: {}: {error}", program.to_string_lossy());
+    eprintln!(
+        "intentd cgroup-exec: {}: {error}",
+        program.to_string_lossy()
+    );
     std::process::ExitCode::from(127)
 }

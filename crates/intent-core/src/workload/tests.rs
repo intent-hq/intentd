@@ -50,10 +50,16 @@ fn fresh_unit_moves_the_sitter_and_daemon_and_sets_the_ceiling() {
 
     let layout = cgroup::setup(&host(mount.path(), "/svc"), &config(Ceiling::Auto)).unwrap();
 
-    assert_eq!(read(unit.join("supervisor/cgroup.procs")), SITTER.to_string());
+    assert_eq!(
+        read(unit.join("supervisor/cgroup.procs")),
+        SITTER.to_string()
+    );
     assert_eq!(read(unit.join("daemon/cgroup.procs")), PID.to_string());
     assert_eq!(read(unit.join("cgroup.subtree_control")), "+memory");
-    assert_eq!(read(unit.join("workloads/cgroup.subtree_control")), "+memory");
+    assert_eq!(
+        read(unit.join("workloads/cgroup.subtree_control")),
+        "+memory"
+    );
     // 4 GiB: reserve = clamp(15 %, 768 MiB, 2 GiB) = 768 MiB.
     let max = 4 * GIB - 768 * MIB;
     assert_eq!(
@@ -90,8 +96,11 @@ fn a_shared_cgroup_falls_back_and_changes_nothing() {
     let mount = tempfile::tempdir().unwrap();
     let scope = mount.path().join("session.scope");
     cgroup_dir(&scope, &[1, 2, SITTER, PID]);
-    let err = cgroup::setup(&host(mount.path(), "/session.scope"), &config(Ceiling::Auto))
-        .unwrap_err();
+    let err = cgroup::setup(
+        &host(mount.path(), "/session.scope"),
+        &config(Ceiling::Auto),
+    )
+    .unwrap_err();
     // A systemd scope without delegation is refused before the process check.
     assert!(err.contains("does not delegate"), "{err}");
 
@@ -110,7 +119,10 @@ fn missing_memory_controller_falls_back_with_the_fix() {
     cgroup_dir(&unit, &[PID]);
     fs::write(unit.join("cgroup.controllers"), "cpu pids").unwrap();
     let err = cgroup::setup(&host(mount.path(), "/svc"), &config(Ceiling::Auto)).unwrap_err();
-    assert!(err.contains("memory controller") && err.contains("Delegate=memory pids"), "{err}");
+    assert!(
+        err.contains("memory controller") && err.contains("Delegate=memory pids"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -132,7 +144,10 @@ fn a_sitter_respawn_readopts_the_existing_hierarchy() {
     );
     let layout = cgroup::setup(&respawned, &config(Ceiling::Bytes(GIB))).unwrap();
     assert_eq!(layout.workloads, unit.join("workloads"));
-    assert_eq!(read(unit.join("daemon/cgroup.procs")), (PID + 10).to_string());
+    assert_eq!(
+        read(unit.join("daemon/cgroup.procs")),
+        (PID + 10).to_string()
+    );
     assert_eq!(read(unit.join("workloads/memory.max")), GIB.to_string());
     assert_eq!(
         read(unit.join("supervisor/cgroup.procs")),
@@ -192,9 +207,11 @@ fn the_auto_ceiling_respects_a_lower_ancestor_limit() {
 
 #[test]
 fn reserve_and_high_bounds() {
-    assert_eq!(cgroup::reserve_bytes(4 * GIB), 768 * MIB);
-    assert_eq!(cgroup::reserve_bytes(8 * GIB), 8 * GIB / 100 * 15);
-    assert_eq!(cgroup::reserve_bytes(64 * GIB), 2 * GIB);
+    assert_eq!(super::reserve_bytes(4 * GIB), 768 * MIB);
+    assert_eq!(super::reserve_bytes(8 * GIB), 8 * GIB / 100 * 15);
+    assert_eq!(super::reserve_bytes(64 * GIB), 2 * GIB);
+    assert_eq!(super::auto_ceiling_bytes(4 * GIB), 4 * GIB - 768 * MIB);
+    assert_eq!(super::auto_ceiling_bytes(512 * MIB), 256 * MIB);
     assert_eq!(cgroup::high_for(GIB), GIB - GIB / 20);
     assert_eq!(cgroup::high_for(256 * MIB), 224 * MIB);
 }
@@ -234,12 +251,39 @@ fn oom_kills_are_reported_once_per_increase_for_agent_leaves_only() {
         .filter(|r| r.label == "agent A" || r.label == "script S")
         .collect();
     assert_eq!(reports.len(), 1, "{reports:?}");
-    assert_eq!((reports[0].label.as_str(), reports[0].new_kills), ("agent A", 2));
+    assert_eq!(
+        (reports[0].label.as_str(), reports[0].new_kills),
+        ("agent A", 2)
+    );
     assert_eq!(script.oom_kills(), 1);
     assert!(super::leaf::poll_oom_kills()
         .iter()
         .all(|r| r.label != "agent A"));
     fs::write(agent.path().join("memory.events"), events(3)).unwrap();
     let again = super::leaf::poll_oom_kills();
-    assert!(again.iter().any(|r| r.label == "agent A" && r.new_kills == 1));
+    assert!(again
+        .iter()
+        .any(|r| r.label == "agent A" && r.new_kills == 1));
+}
+
+#[test]
+fn a_pinned_leaf_outlives_its_handle_until_empty() {
+    let workloads = tempfile::tempdir().unwrap();
+    let leaf = super::Leaf::create(workloads.path(), WorkloadKind::Agent, "agent P").unwrap();
+    let path = leaf.path().to_path_buf();
+    fs::write(path.join("cgroup.procs"), "123\n").unwrap();
+    leaf.pin();
+    drop(leaf);
+    super::leaf::sweep(workloads.path());
+    assert!(path.is_dir(), "a pinned leaf with a process stays");
+    assert!(
+        super::leaf::poll_oom_kills()
+            .iter()
+            .all(|r| r.label != "agent P"),
+        "no kills yet"
+    );
+    fs::write(path.join("memory.events"), "oom_kill 1\n").unwrap();
+    assert!(super::leaf::poll_oom_kills()
+        .iter()
+        .any(|r| r.label == "agent P" && r.new_kills == 1));
 }

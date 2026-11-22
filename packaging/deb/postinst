@@ -8,6 +8,8 @@ set -e
 if [ "$1" = "configure" ]; then
     echo "intentd installed. To start it now and at every login, run as your user:"
     echo "    systemctl --user enable --now intentd"
+    echo "After an upgrade, load the new unit (it adds workload memory containment) with:"
+    echo "    systemctl --user daemon-reload && systemctl --user restart intentd"
     echo "Startup auto-resume of interrupted agents defaults to auto (headless hosts only);"
     echo "toggle it with: intentd settings agents.resumeInterruptedOnStart on|off"
     echo "To use this computer only as a node that runs agents for another Intent,"

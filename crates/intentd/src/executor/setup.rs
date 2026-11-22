@@ -468,6 +468,10 @@ async fn spawn_and_wait(
     spec.env_remove
         .push(intent_git::node_git::SOCKET_ENV.to_owned());
     spec.cwd = Some(run.worktree.to_path_buf());
+    spec.workload = Some(intent_core::workload::Workload::new(
+        intent_core::workload::WorkloadKind::Script,
+        "remote setup script",
+    ));
     spec.listed = false;
     spec.scrollback_bytes = SCROLLBACK_BYTES;
     let writer = output.clone();

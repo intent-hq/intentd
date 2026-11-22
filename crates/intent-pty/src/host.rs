@@ -118,6 +118,9 @@ pub struct PtyExit {
     /// its real code is unknown; callers surface it as unobservable rather
     /// than trusting `exit_code`.
     pub observed: bool,
+    /// Whether the workload memory limit killed a process in this PTY's leaf
+    /// cgroup and the process did not succeed (intent-hq/intent#9809).
+    pub memory_limit: bool,
 }
 
 impl PtyExit {
@@ -132,6 +135,7 @@ impl PtyExit {
             exit_code: Self::UNOBSERVABLE_CODE,
             success: false,
             observed: false,
+            memory_limit: false,
         }
     }
 }
@@ -179,6 +183,10 @@ pub struct SpawnSpec {
     /// Optional lossless copy of the output: called on the reader thread with
     /// every chunk, in order, before it reaches scrollback or subscribers.
     pub output_sink: Option<OutputSink>,
+    /// The workload this PTY runs (intent-hq/intent#9809): the child joins its
+    /// memory-limited leaf cgroup through the `cgroup-exec` shim. `None`
+    /// spawns the command directly.
+    pub workload: Option<intent_core::workload::Workload>,
 }
 
 /// Receives every output chunk of one PTY on its blocking reader thread, in
@@ -229,6 +237,7 @@ impl SpawnSpec {
             name: None,
             listed: true,
             output_sink: None,
+            workload: None,
         }
     }
 }
@@ -319,6 +328,8 @@ struct PtySession {
     /// it survives later teardown/removal (the `portable-pty` child only yields
     /// its status once).
     exit: Mutex<Option<PtyExit>>,
+    /// The workload's leaf cgroup, when contained (intent-hq/intent#9809).
+    leaf: Option<intent_core::workload::Leaf>,
 }
 
 /// Latch and return a session's exit status: returns the cached value, or polls
@@ -338,6 +349,11 @@ fn observe_exit(session: &PtySession) -> Option<PtyExit> {
             exit_code: status.exit_code(),
             success: status.success(),
             observed: true,
+            memory_limit: !status.success()
+                && session
+                    .leaf
+                    .as_ref()
+                    .is_some_and(|leaf| leaf.oom_kills() > 0),
         },
         Ok(None) => return None,
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return None,
@@ -446,8 +462,15 @@ impl PtyHost {
     pub fn spawn(&self, spec: SpawnSpec) -> Result<PtyId> {
         let pair = openpty_with_retry(spec.size.to_portable())?;
 
-        let mut cmd = CommandBuilder::new(&spec.command);
-        cmd.args(&spec.args);
+        let (program, args, leaf) = match &spec.workload {
+            Some(workload) => {
+                let launch = workload.pty_launch(&spec.command, &spec.args);
+                (launch.program, launch.args, launch.leaf)
+            }
+            None => (spec.command.clone(), spec.args.clone(), None),
+        };
+        let mut cmd = CommandBuilder::new(&program);
+        cmd.args(&args);
         if let Some(cwd) = &spec.cwd {
             cmd.cwd(cwd);
         }
@@ -548,6 +571,7 @@ impl PtyHost {
             watcher: Mutex::new(None),
             exit: Mutex::new(None),
             remote: None,
+            leaf,
         });
 
         let watcher_session = Arc::clone(&session);
@@ -1357,6 +1381,11 @@ async fn escalate_group_kill(pid: u32, session: &PtySession) {
     }
     if !group_empty {
         let _ = kill_group(pid, PtySignal::Kill);
+    }
+    // Processes that left the group (`setsid`, double fork) are still in the
+    // workload's leaf cgroup.
+    if let Some(leaf) = &session.leaf {
+        leaf.kill();
     }
 }
 

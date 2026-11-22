@@ -62,6 +62,10 @@ impl Leaf {
     pub fn kill(&self) {
         match self.0 {}
     }
+    /// See the Linux implementation.
+    pub fn pin(&self) {
+        match self.0 {}
+    }
 }
 
 /// The hidden subcommand the PTY shim runs as.
@@ -123,6 +127,32 @@ impl WorkloadKind {
     pub fn is_agent_like(self) -> bool {
         self.oom_score_adj() == AGENT_OOM_SCORE_ADJ
     }
+}
+
+const MIB: u64 = 1024 * 1024;
+/// Smallest daemon reserve. Measured daemon RSS was 438 MB on a busy host
+/// (many workspaces, 16 h uptime); 768 MiB leaves room for the OS and the
+/// daemon's page cache on a 4 GB machine.
+pub const MIN_RESERVE_BYTES: u64 = 768 * MIB;
+/// Largest daemon reserve.
+pub const MAX_RESERVE_BYTES: u64 = 2048 * MIB;
+/// Smallest ceiling ever written, so a tiny or misread box still runs work.
+const MIN_CEILING_BYTES: u64 = 256 * MIB;
+
+/// The memory kept outside the workloads box for the daemon and the OS:
+/// `clamp(15 % of the box, 768 MiB, 2 GiB)`.
+#[must_use]
+pub fn reserve_bytes(box_total: u64) -> u64 {
+    (box_total / 100 * 15).clamp(MIN_RESERVE_BYTES, MAX_RESERVE_BYTES)
+}
+
+/// The auto workloads ceiling for a box of `box_total` bytes (at least
+/// 256 MiB).
+#[must_use]
+pub fn auto_ceiling_bytes(box_total: u64) -> u64 {
+    box_total
+        .saturating_sub(reserve_bytes(box_total))
+        .max(MIN_CEILING_BYTES)
 }
 
 /// How workloads are contained on this host (`system.status`).
@@ -332,6 +362,15 @@ impl Workload {
     /// [`Self::apply`] for a `tokio` command.
     pub fn apply_tokio(&self, cmd: &mut tokio::process::Command) -> Option<Leaf> {
         self.apply(cmd.as_std_mut())
+    }
+
+    /// [`Self::apply_tokio`] for a site that does not keep the handle: the
+    /// leaf stays registered (OOM-kill reporting, sweeping) until its
+    /// processes have exited.
+    pub fn apply_pinned(&self, cmd: &mut tokio::process::Command) {
+        if let Some(leaf) = self.apply_tokio(cmd) {
+            leaf.pin();
+        }
     }
 
     /// The program and argv for a PTY spawn of `program args…`: the

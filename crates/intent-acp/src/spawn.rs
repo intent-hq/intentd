@@ -854,6 +854,7 @@ pub struct SpawnedAgent {
     connection: Connection,
     npx_launch_dir: Option<NpxLaunchDir>,
     agent_tmp_dir: Option<AgentTempDir>,
+    leaf: Option<intent_core::workload::Leaf>,
 }
 
 impl SpawnedAgent {
@@ -904,6 +905,9 @@ impl SpawnedAgent {
         let wait_result = self.child.wait().await.map(|_| ());
         #[cfg(unix)]
         crate::descendant_sweep::sweep_escaped_descendants(&descendants).await;
+        if let Some(leaf) = &self.leaf {
+            leaf.kill();
+        }
         kill_result.and(wait_result)
     }
 
@@ -1078,6 +1082,14 @@ pub fn spawn_prepared_provider(
     let command_name = target.to_string_lossy().into_owned();
     let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
     let process_cwd = process_cwd(opts, launch_cwd);
+    // The agent's memory box (intent-hq/intent#9809). Pinned: the registry
+    // owns it until the agent's processes exit, so its OOM kills are logged
+    // however the caller stores the child.
+    let leaf = intent_core::workload::Workload::new(
+        intent_core::workload::WorkloadKind::Agent,
+        format!("agent {}", opts.agent_tmp_key.unwrap_or(&command_name)),
+    )
+    .apply_tokio(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             classify_not_found(
@@ -1106,11 +1118,15 @@ pub fn spawn_prepared_provider(
         .take()
         .map(|s| Box::new(s) as Box<dyn AsyncRead + Unpin + Send>);
     let connection = Connection::new(stdin, stdout, stderr, hooks);
+    if let Some(leaf) = &leaf {
+        leaf.pin();
+    }
     Ok(SpawnedAgent {
         child,
         connection,
         npx_launch_dir,
         agent_tmp_dir,
+        leaf,
     })
 }
 

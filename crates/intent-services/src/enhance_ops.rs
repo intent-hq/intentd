@@ -204,6 +204,8 @@ pub(crate) async fn run_auggie_print(
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
+    intent_core::workload::Workload::new(intent_core::workload::WorkloadKind::Adapter, "enhance")
+        .apply_pinned(&mut cmd);
 
     let mut child = cmd
         .spawn()

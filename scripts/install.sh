@@ -945,6 +945,8 @@ After=network.target
 #   intentd settings agents.resumeInterruptedOnStart off
 [Service]
 Type=simple
+# Lets intentd run workloads in a memory-limited sub-cgroup.
+Delegate=memory pids
 ExecStart="$exec_path" serve
 ExecStop="$exec_path" stop
 Restart=on-failure

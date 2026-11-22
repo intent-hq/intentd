@@ -567,6 +567,10 @@ impl HomeTerminals {
         spec.cwd = Some(cwd);
         spec.listed = false;
         spec.scrollback_bytes = SCROLLBACK_BYTES;
+        spec.workload = Some(intent_core::workload::Workload::new(
+            intent_core::workload::WorkloadKind::Terminal,
+            format!("home terminal {}", frame.home_id),
+        ));
         if let (Some(cols), Some(rows)) = (frame.cols, frame.rows) {
             spec.size = PtySize { rows, cols };
         }

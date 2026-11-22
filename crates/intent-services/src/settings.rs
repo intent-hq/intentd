@@ -2488,6 +2488,22 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             read_only: false,
             token_impact: None,
         },
+        // Absent = auto (#9809); `default_value` advertises the ceiling auto
+        // resolves to from this host's RAM, like `agents.memoryBudgetMb`.
+        SettingDefinition {
+            path: "agents.workloadMemoryMaxMb",
+            label: "Workload memory ceiling (MB)",
+            description: "Linux only: the memory limit of the shared cgroup that agents, scripts, terminals, host.exec commands, MCP servers and model servers run in, so a runaway workload is killed inside it while the daemon keeps running. Needs a writable cgroup v2 (root, or a systemd unit with Delegate=memory pids); otherwise workloads only get a higher OOM score than the daemon (absent = auto, total memory less a daemon reserve; 0 = no limit; changes apply on daemon restart)",
+            category: "agents",
+            ty: SettingType::Number {
+                min: Some(0.0),
+                max: Some(memory_budget_max_mb()),
+            },
+            default_value: Some(json!(workload_memory_default_mb())),
+            sensitive: false,
+            read_only: false,
+            token_impact: None,
+        },
         number(
             "agents.acpNodeMaxOldSpaceMb",
             "ACP Node heap limit (MB)",
@@ -2899,6 +2915,29 @@ pub fn agent_memory_budget_bytes(settings: &SettingsFile, total_memory_bytes: u6
         Some(0) => None,
         Some(mb) => Some(u64::from(mb) * 1024 * 1024),
     }
+}
+
+/// The effective `agents.workloadMemoryMaxMb` setting (intent-hq/intent#9809):
+/// absent = auto, explicit `0` = off, positive = MB in bytes.
+#[must_use]
+pub fn workload_memory_ceiling(settings: &SettingsFile) -> intent_core::workload::Ceiling {
+    use intent_core::workload::Ceiling;
+    match settings.agents.workload_memory_max_mb {
+        None => Ceiling::Auto,
+        Some(0) => Ceiling::Off,
+        Some(mb) => Ceiling::Bytes(u64::from(mb) * 1024 * 1024),
+    }
+}
+
+/// Catalog default for `agents.workloadMemoryMaxMb`: the ceiling auto
+/// resolves to from this host's RAM (a memory-limited container can lower
+/// it further at startup). Clamped to the catalog max like the budget's.
+// MiB counts above 2^53 do not occur; loss-free in f64.
+#[expect(clippy::cast_precision_loss)]
+fn workload_memory_default_mb() -> f64 {
+    let total = host_total_memory_bytes();
+    let bytes = intent_core::workload::auto_ceiling_bytes(total.unwrap_or(0));
+    ((bytes / (1024 * 1024)) as f64).min(memory_budget_max_mb_for(total))
 }
 
 /// The effective `agents.maxConcurrentAdapters` setting: the daemon-wide cap
@@ -4758,6 +4797,7 @@ mod tests {
             "logging.level",
             "agents.maxConcurrent",
             "agents.memoryBudgetMb",
+            "agents.workloadMemoryMaxMb",
             "agents.acpNodeMaxOldSpaceMb",
             "agents.maxConcurrentAdapters",
             "agents.maxTopLevelAgents",
@@ -4861,6 +4901,7 @@ mod tests {
             "prMonitor.pollSeconds",
             "agents.maxConcurrent",
             "agents.memoryBudgetMb",
+            "agents.workloadMemoryMaxMb",
             "workspace.purgeArchivedAfterDays",
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));

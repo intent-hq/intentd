@@ -372,7 +372,7 @@ pub use provider_profiles::{
 pub use settings::{
     agent_memory_budget_bytes, history_replay_tool_content_chars, host_total_memory_bytes,
     max_concurrent_adapters, max_concurrent_agents, report_to_parent_debounce_seconds,
-    tool_payload_retention_days, InMemorySecretStore, SecretStore,
+    tool_payload_retention_days, workload_memory_ceiling, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry, SettingsSnapshot, WsApiPortPolicy};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};

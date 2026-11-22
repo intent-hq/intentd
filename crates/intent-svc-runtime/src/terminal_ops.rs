@@ -139,6 +139,10 @@ pub(crate) async fn create_owned(
     );
     spec.size = PtySize { rows, cols };
     spec.cwd = spawn_cwd;
+    spec.workload = Some(intent_core::workload::Workload::new(
+        intent_core::workload::WorkloadKind::Terminal,
+        format!("terminal in {workspace_id}"),
+    ));
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
     spawn_output_stream(tasks, pty, bus, workspace_id, pty_id, terminal_id.clone());
@@ -771,15 +775,12 @@ async fn emit_exit(
     exit: Option<PtyExit>,
 ) {
     let exit_code = exit.as_ref().and_then(observed_exit_code);
-    publish_event(
-        bus,
-        terminal_event(
-            ws,
-            TERMINAL_EXIT,
-            json!({ "terminalId": terminal_id, "exitCode": exit_code, "signal": Value::Null }),
-        ),
-    )
-    .await;
+    let mut data =
+        json!({ "terminalId": terminal_id, "exitCode": exit_code, "signal": Value::Null });
+    if exit.as_ref().is_some_and(|e| e.memory_limit) {
+        data["exitReason"] = json!(intent_core::ExitReason::MemoryLimit);
+    }
+    publish_event(bus, terminal_event(ws, TERMINAL_EXIT, data)).await;
 }
 
 /// Build a terminal change event with the daemon system actor.
@@ -857,6 +858,10 @@ impl TerminalHost for PtyTerminalHost {
                 (params.command, params.args)
             };
             let mut spec = SpawnSpec::new(params.session_id, command);
+            spec.workload = Some(intent_core::workload::Workload::new(
+                intent_core::workload::WorkloadKind::Terminal,
+                format!("agent terminal in session {}", spec.scope),
+            ));
             spec.args = args;
             spec.env = overlay_credential_env(credential, params.env);
             let inherited_term = std::env::var("TERM").ok();
@@ -2849,6 +2854,7 @@ mod tests {
             exit_code: 3,
             success: false,
             observed: true,
+            memory_limit: false,
         });
         assert_eq!(observed.exit_code, Some(3));
     }
@@ -2883,6 +2889,7 @@ mod tests {
                 exit_code: 2,
                 success: false,
                 observed: true,
+                memory_limit: false,
             }),
         )
         .await;

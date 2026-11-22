@@ -453,6 +453,7 @@ pub async fn start_stream(
     // Spawn with piped stdin so follow-up writes reach the child.
     let mut cmd = build_command(&common, cwd_resolved.as_deref());
     cmd.stdin(Stdio::piped());
+    let leaf = host_exec::host_exec_workload().apply_tokio(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| HostExecError {
         data: None,
         code: -32603,
@@ -534,7 +535,7 @@ pub async fn start_stream(
             ws_wait,
             req_wait,
             child,
-            pid,
+            (pid, leaf),
             cancel_token,
             timeout_ms,
         )
@@ -589,7 +590,7 @@ async fn run_wait_loop(
     workspace_id: WorkspaceId,
     request_id: String,
     mut child: tokio::process::Child,
-    pid: Option<u32>,
+    (pid, leaf): (Option<u32>, Option<intent_core::workload::Leaf>),
     cancel_token: Arc<AtomicBool>,
     timeout_ms: Option<u64>,
 ) {
@@ -602,12 +603,18 @@ async fn run_wait_loop(
         if cancel_token.load(Ordering::SeqCst) {
             cancelled = true;
             reap_child_group(&mut child, pid).await;
+            if let Some(leaf) = &leaf {
+                leaf.kill();
+            }
             break child.wait().await;
         }
         if let Some(dl) = deadline {
             if tokio::time::Instant::now() >= dl {
                 timed_out = true;
                 reap_child_group(&mut child, pid).await;
+                if let Some(leaf) = &leaf {
+                    leaf.kill();
+                }
                 break child.wait().await;
             }
         }
@@ -641,6 +648,9 @@ async fn run_wait_loop(
     }
     if cancelled {
         data["cancelled"] = json!(true);
+    }
+    if let Some(reason) = host_exec::memory_limit_reason(ok, leaf.as_ref()) {
+        data["exitReason"] = json!(reason);
     }
 
     let ev = NewEvent {

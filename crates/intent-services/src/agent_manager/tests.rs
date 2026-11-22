@@ -23,12 +23,12 @@ use tokio::time::{timeout, Duration};
 
 use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
-    host_memory_reserve_bytes, small_host_reserve_bytes,
-    is_cancel_transport_closed, pop_and_wake_waiter, recommended_memory_budget_bytes,
-    resolve_npx_only, resolve_spawn, settle_stale_waiter, text_prompt, usage_message_origin,
-    AgentHandle, AgentManager, BusEventSink, KillFn, LocalResources, ProcessRegistry,
-    RegistryInner, ResolvedSpawn, RuntimeHandle, TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE,
-    HOST_MEMORY_RESERVE_BYTES, PROVISIONAL_AGENT_BYTES, REASON_MEMORY_BUDGET, REASON_SLOTS,
+    host_memory_reserve_bytes, is_cancel_transport_closed, pop_and_wake_waiter,
+    recommended_memory_budget_bytes, resolve_npx_only, resolve_spawn, settle_stale_waiter,
+    small_host_reserve_bytes, text_prompt, usage_message_origin, AgentHandle, AgentManager,
+    BusEventSink, KillFn, LocalResources, ProcessRegistry, RegistryInner, ResolvedSpawn,
+    RuntimeHandle, TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES,
+    PROVISIONAL_AGENT_BYTES, REASON_MEMORY_BUDGET, REASON_SLOTS,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -230,7 +230,10 @@ fn small_host_defaults_match_the_worked_values() {
     // 3.8 GiB: reserve 1.9 GiB, budget ~0.95 GiB, 2 slots.
     assert_eq!(small_host_reserve_bytes(at(38)), Some(at(38) / 2));
     assert_eq!(compute_process_cap(at(38)), 2);
-    assert_eq!(recommended_memory_budget_bytes(at(38)), (at(38) - at(38) / 2) / 2);
+    assert_eq!(
+        recommended_memory_budget_bytes(at(38)),
+        (at(38) - at(38) / 2) / 2
+    );
     assert_eq!(
         host_memory_reserve_bytes(Some(at(38))),
         at(38) / 2 + PROVISIONAL_AGENT_BYTES
@@ -251,7 +254,11 @@ fn small_host_defaults_match_the_worked_values() {
     assert_eq!(compute_process_cap(gib), 2);
     // At and above 12 GiB, and for an unknown (0) total: exactly today's.
     for total in [0, 12 * gib, at(155), 16 * gib, 48 * gib, 128 * gib] {
-        assert_eq!(compute_process_cap(total), legacy_cap(total), "cap at {total}");
+        assert_eq!(
+            compute_process_cap(total),
+            legacy_cap(total),
+            "cap at {total}"
+        );
         assert_eq!(
             recommended_memory_budget_bytes(total),
             legacy_budget(total),
@@ -271,7 +278,10 @@ fn small_host_defaults_never_exceed_todays_values() {
     let step = 64 * 1024 * 1024;
     let mut total = 0;
     while total <= 20 * super::GB {
-        assert!(compute_process_cap(total) <= legacy_cap(total), "cap at {total}");
+        assert!(
+            compute_process_cap(total) <= legacy_cap(total),
+            "cap at {total}"
+        );
         assert!(
             recommended_memory_budget_bytes(total) <= legacy_budget(total),
             "budget at {total}"
@@ -583,9 +593,24 @@ fn budget_admits_an_empty_registry_however_fat_the_tree() {
     // Over budget with nothing registered: the tree is one-shot adapters or
     // simply another process the daemon does not own, and refusing forever
     // would wedge the daemon.
-    assert!(budget_admits(u64::MAX, 1_000, 0, None, HOST_MEMORY_RESERVE_BYTES));
-    assert!(!budget_admits(1_000, 1_000, 1, None, HOST_MEMORY_RESERVE_BYTES), "at budget denies");
-    assert!(budget_admits(999, 1_000, 1, None, HOST_MEMORY_RESERVE_BYTES));
+    assert!(budget_admits(
+        u64::MAX,
+        1_000,
+        0,
+        None,
+        HOST_MEMORY_RESERVE_BYTES
+    ));
+    assert!(
+        !budget_admits(1_000, 1_000, 1, None, HOST_MEMORY_RESERVE_BYTES),
+        "at budget denies"
+    );
+    assert!(budget_admits(
+        999,
+        1_000,
+        1,
+        None,
+        HOST_MEMORY_RESERVE_BYTES
+    ));
 }
 
 /// The host-headroom criterion (spec root cause A): the tree sums RSS of
@@ -597,19 +622,61 @@ fn budget_denies_an_over_budget_tree_only_when_the_host_is_short() {
     let gb = super::GB;
     let reserve = HOST_MEMORY_RESERVE_BYTES;
     // Over budget, ample headroom → admits.
-    assert!(budget_admits(67 * gb, 63 * gb, 13, Some(63 * gb), HOST_MEMORY_RESERVE_BYTES));
+    assert!(budget_admits(
+        67 * gb,
+        63 * gb,
+        13,
+        Some(63 * gb),
+        HOST_MEMORY_RESERVE_BYTES
+    ));
     assert!(
-        budget_admits(67 * gb, 63 * gb, 13, Some(reserve), HOST_MEMORY_RESERVE_BYTES),
+        budget_admits(
+            67 * gb,
+            63 * gb,
+            13,
+            Some(reserve),
+            HOST_MEMORY_RESERVE_BYTES
+        ),
         "exactly the reserve is enough"
     );
     // Over budget, host short → denies.
-    assert!(!budget_admits(67 * gb, 63 * gb, 13, Some(reserve - 1), HOST_MEMORY_RESERVE_BYTES));
-    assert!(!budget_admits(67 * gb, 63 * gb, 13, Some(0), HOST_MEMORY_RESERVE_BYTES));
+    assert!(!budget_admits(
+        67 * gb,
+        63 * gb,
+        13,
+        Some(reserve - 1),
+        HOST_MEMORY_RESERVE_BYTES
+    ));
+    assert!(!budget_admits(
+        67 * gb,
+        63 * gb,
+        13,
+        Some(0),
+        HOST_MEMORY_RESERVE_BYTES
+    ));
     // No headroom reading keeps the tree-only criterion.
-    assert!(!budget_admits(67 * gb, 63 * gb, 13, None, HOST_MEMORY_RESERVE_BYTES));
+    assert!(!budget_admits(
+        67 * gb,
+        63 * gb,
+        13,
+        None,
+        HOST_MEMORY_RESERVE_BYTES
+    ));
     // Under budget admits regardless of headroom; `live == 0` always admits.
-    assert!(budget_admits(gb, 63 * gb, 13, Some(0), HOST_MEMORY_RESERVE_BYTES));
-    assert!(budget_admits(u64::MAX, 1_000, 0, Some(0), HOST_MEMORY_RESERVE_BYTES));
+    assert!(budget_admits(
+        gb,
+        63 * gb,
+        13,
+        Some(0),
+        HOST_MEMORY_RESERVE_BYTES
+    ));
+    assert!(budget_admits(
+        u64::MAX,
+        1_000,
+        0,
+        Some(0),
+        HOST_MEMORY_RESERVE_BYTES
+    ));
     assert_eq!(reserve, 8 * gb + PROVISIONAL_AGENT_BYTES);
 }
 

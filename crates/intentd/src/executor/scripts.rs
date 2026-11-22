@@ -273,6 +273,10 @@ impl ScriptProcesses {
         spec.env_remove = scrubbed_env_vars_except(&spec.env);
         spec.cwd = Some(cwd);
         spec.listed = false;
+        spec.workload = Some(intent_core::workload::Workload::new(
+            intent_core::workload::WorkloadKind::Script,
+            format!("remote script {}", spec.scope),
+        ));
         spec.scrollback_bytes = SCROLLBACK_BYTES;
         let (sink, stream) = output_sink(link.clone(), &key);
         spec.output_sink = Some(sink);
