@@ -698,6 +698,18 @@ only on a fresh install: re-installing never switches a computer to or from Orch
 (it keeps its current role and says so). A
 remote machine's actions include **Edit** and **Connect**, with **Test connection** inside
 its editing panel.
+Pending frontend release (not in current builds): the page becomes **Settings → Hosts**.
+Hosts are the Intents the user connects to; runners (formerly nodes) are the computers a
+host runs agents on, and the machine rail is the host rail. Each other host's row has
+**Switch to** instead of **Connect** (the host on screen shows **Current**): it adds the
+host to the window's host rail when the rail is on, shows it, and opens its **Settings →
+Hosts**. An orchestrator's row shows a hub icon after its name (tooltip **Host only: sends
+agents to runners**) instead of a subtitle. **Where <backend> runs agents** becomes
+**Runners for <host>**, with no **Preferred** mark; a regular host lists itself there as
+**This host**, an orchestrator never does. A saved host stays under Hosts even when it
+also runs agents for the current host. **Set up a new machine** becomes **Set up a host or
+runner**, with **Install a host** and **Install a runner**.
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{HostOnlyMarker,MachineOrderPlainRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/machine-order.ts. -->
 <!-- Labs (SSH machine setup, desktop app only): describe only when the user asks about
 installing over SSH, and say it is Labs (turn on **SSH machine setup** in
 Settings → Advanced → Labs). With it on, the install cards also offer
