@@ -94,8 +94,9 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     // agent secrets on the machine, 15 the backend's forge token, 16 reads
     // of an agent's checkout files, 17 sub-agent fetch through the backend,
     // 18 an orchestrator's quick actions on the machine, 19 workspace
-    // homes; a protocol-7 peer still binds and runs agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 19 });
+    // homes, 20 run exit reasons; a protocol-7 peer still binds and runs
+    // agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 20 });
     assert_eq!(ONE_SHOT_PROTOCOL, 18);
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
@@ -108,9 +109,10 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     assert_eq!(FORGE_TOKEN_PROTOCOL, 15);
     assert_eq!(CHECKOUT_FILES_PROTOCOL, 16);
     assert_eq!(FORGE_FETCH_PROTOCOL, 17);
-    assert_eq!(HOMES_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(HOMES_PROTOCOL, 19);
+    assert_eq!(EXIT_REASON_PROTOCOL, 20);
     assert!(offers_prepared_checkout());
-    for version in 7..=19 {
+    for version in 7..=20 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -603,6 +605,7 @@ fn every_frame() -> Vec<LinkFrame> {
             spawn_id: "r1".into(),
             exit_code: Some(0),
             error: None,
+            exit_reason: None,
         }),
         LinkFrame::Skills(SkillsQuery {
             query_id: request_id,
@@ -797,6 +800,7 @@ fn every_frame() -> Vec<LinkFrame> {
             terminal_id: "t1".into(),
             exit_code: Some(0),
             error: None,
+            exit_reason: None,
         }),
         LinkFrame::HomeCall(home_call()),
         LinkFrame::HomeCallCancel(HomeCallCancel {
@@ -1555,6 +1559,7 @@ fn script_frames_match_the_documented_wire_shapes() {
         spawn_id: "r1".into(),
         exit_code: None,
         error: Some("node-script-invalid-cwd: /etc".into()),
+        exit_reason: None,
     });
     assert_eq!(
         serde_json::to_value(refused).unwrap(),
@@ -2590,6 +2595,7 @@ fn script_frames_name_an_agent_or_a_home_and_a_home_needs_protocol_19() {
             spawn_id: "p1".into(),
             exit_code: Some(0),
             error: None,
+            exit_reason: None,
         }),
     ];
     for frame in frames {
@@ -2692,4 +2698,49 @@ fn a_moved_record_names_its_orphaned_refs_by_its_time() {
     );
     assert_eq!(retired.orphaned_at, None);
     assert_ne!(retired.stop_id, record.stop_id);
+}
+
+/// Protocol 20 (intent-hq/intent#9809): a run's exit reason rides the exit
+/// frames; a link that negotiated less never sees the field.
+#[test]
+fn exit_reasons_need_protocol_20_and_are_stripped_for_older_links() {
+    let script = LinkFrame::ScriptExited(ScriptExited {
+        owner: AgentId::from("a1").into(),
+        script_id: "s1".into(),
+        spawn_id: "r1".into(),
+        exit_code: Some(137),
+        error: None,
+        exit_reason: Some(crate::ExitReason::MemoryLimit),
+    });
+    let pty = LinkFrame::PtyExited(PtyExited {
+        terminal_id: "t1".into(),
+        exit_code: Some(137),
+        error: None,
+        exit_reason: Some(crate::ExitReason::MemoryLimit),
+    });
+    assert_eq!(EXIT_REASON_PROTOCOL, 20);
+    assert_eq!(EXIT_REASON_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    for frame in [&script, &pty] {
+        assert_eq!(frame.min_protocol(), EXIT_REASON_PROTOCOL);
+        let encoded = String::from_utf8(frame.encode().unwrap()).unwrap();
+        assert!(
+            encoded.contains("\"exitReason\":\"memoryLimit\""),
+            "{encoded}"
+        );
+        assert_eq!(LinkFrame::decode(encoded.as_bytes()).unwrap(), *frame);
+        assert!(frame.for_protocol(EXIT_REASON_PROTOCOL).is_none());
+        let older = frame.for_protocol(HOMES_PROTOCOL).expect("stripped copy");
+        assert!(older.min_protocol() <= HOMES_PROTOCOL);
+        let encoded = String::from_utf8(older.encode().unwrap()).unwrap();
+        assert!(!encoded.contains("exitReason"), "{encoded}");
+    }
+    // A frame without a reason is unchanged at every protocol.
+    let plain = LinkFrame::PtyExited(PtyExited {
+        terminal_id: "t1".into(),
+        exit_code: Some(0),
+        error: None,
+        exit_reason: None,
+    });
+    assert!(plain.for_protocol(HOMES_PROTOCOL).is_none());
+    assert_eq!(plain.min_protocol(), HOMES_PROTOCOL);
 }

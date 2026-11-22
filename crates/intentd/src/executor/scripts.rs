@@ -171,6 +171,7 @@ fn exited(key: &Key, exit_code: Option<i32>, error: Option<String>) -> LinkFrame
         spawn_id: key.2.clone(),
         exit_code,
         error,
+        exit_reason: None,
     })
 }
 
@@ -357,11 +358,20 @@ impl ScriptProcesses {
         // Output loss is always reported, and before the exit.
         finish_output(&link, &stream).await;
         let frame = match exit {
-            Ok(exit) if exit.observed => exited(
-                &key,
-                Some(i32::try_from(exit.exit_code).unwrap_or(-1)),
-                None,
-            ),
+            Ok(exit) if exit.observed => {
+                let mut frame = exited(
+                    &key,
+                    Some(i32::try_from(exit.exit_code).unwrap_or(-1)),
+                    None,
+                );
+                // Dropped by the link when the backend predates protocol 20.
+                if let LinkFrame::ScriptExited(exited) = &mut frame {
+                    exited.exit_reason = exit
+                        .memory_limit
+                        .then_some(intent_core::ExitReason::MemoryLimit);
+                }
+                frame
+            }
             _ => exited(&key, Some(-1), Some("exit status unobservable".to_owned())),
         };
         let _ = link.send(&frame).await;

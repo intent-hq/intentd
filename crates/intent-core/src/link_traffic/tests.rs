@@ -909,6 +909,7 @@ async fn script_frames_are_summarized() {
                 spawn_id,
                 exit_code: Some(2),
                 error: None,
+                exit_reason: None,
             }),
             "scriptExited script-1 spawn run-1 for agent-1 code 2",
         ),

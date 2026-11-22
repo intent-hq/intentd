@@ -887,7 +887,7 @@ async fn run_home_wait(
     let mut killed_at: Option<tokio::time::Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let (exit_code, error) = loop {
+    let (exit_code, error, exit_reason) = loop {
         tokio::select! {
             event = events.recv() => match event {
                 Some(HomeExecEvent::Output { stderr, bytes }) => {
@@ -895,8 +895,8 @@ async fn run_home_wait(
                     let chunk = base64::engine::general_purpose::STANDARD.encode(&bytes);
                     let _ = bus.publish_transient(&chunk_event(&workspace_id, &request_id, kind, &chunk));
                 }
-                Some(HomeExecEvent::Exited { exit_code, error }) => break (exit_code, error),
-                None => break (None, Some("the home's process was dropped".to_owned())),
+                Some(HomeExecEvent::Exited { exit_code, error, exit_reason }) => break (exit_code, error, exit_reason),
+                None => break (None, Some("the home's process was dropped".to_owned()), None),
             },
             _ = tick.tick() => {
                 let now = tokio::time::Instant::now();
@@ -913,7 +913,7 @@ async fn run_home_wait(
                     }
                     // The machine ends it after its next bind; this
                     // stream ends here now, at once when shutting down.
-                    Some(at) if now.duration_since(at) >= kill_wait() => break (None, None),
+                    Some(at) if now.duration_since(at) >= kill_wait() => break (None, None, None),
                     _ => {}
                 }
             }
@@ -943,6 +943,9 @@ async fn run_home_wait(
     }
     if cancelled {
         data["cancelled"] = json!(true);
+    }
+    if let Some(reason) = exit_reason.filter(|_| exit_code != Some(0)) {
+        data["exitReason"] = json!(reason);
     }
     let ev = NewEvent {
         workspace_id,

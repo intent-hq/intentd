@@ -597,6 +597,9 @@ impl NodeLink {
         ) {
             return Err(super::protocol("frame is not sent directly"));
         }
+        // An older peer gets the frame without the fields it does not know.
+        let older = frame.for_protocol(self.inner.protocol);
+        let frame = older.as_ref().unwrap_or(frame);
         self.check_protocol(frame)?;
         if frame.channel() == LinkChannel::Script {
             if self.is_closed() {

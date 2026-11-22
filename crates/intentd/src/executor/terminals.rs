@@ -272,6 +272,7 @@ impl Term {
             terminal_id: self.id.clone(),
             exit_code: None,
             error: Some(format!("{code}: {detail}")),
+            exit_reason: None,
         });
     }
 
@@ -330,6 +331,7 @@ impl HomeTerminals {
                 error: Some(format!(
                     "{UNKNOWN}: this machine runs no terminal {terminal_id}"
                 )),
+                exit_reason: None,
             });
             // caller-binding: allow — node-local answer for an unknown home terminal
             tokio::spawn(async move {
@@ -612,14 +614,18 @@ impl HomeTerminals {
             // paused reader and stops it, so this wait always ends with it.
             let _ = reader_done.wait_for(|done| *done).await;
             pty.kill(pty_id).await;
-            let exit_code = match exit {
-                Ok(exit) if exit.observed => i32::try_from(exit.exit_code).unwrap_or(-1),
-                _ => -1,
+            let (exit_code, memory_limit) = match exit {
+                Ok(exit) if exit.observed => (
+                    i32::try_from(exit.exit_code).unwrap_or(-1),
+                    exit.memory_limit,
+                ),
+                _ => (-1, false),
             };
             reaped.finish(PtyExited {
                 terminal_id: reaped.id.clone(),
                 exit_code: Some(exit_code),
                 error: None,
+                exit_reason: memory_limit.then_some(intent_core::ExitReason::MemoryLimit),
             });
         });
         Ok(())
@@ -654,11 +660,11 @@ impl HomeTerminals {
         cmd.envs(env);
         #[cfg(unix)]
         cmd.process_group(0);
-        intent_core::workload::Workload::new(
+        let leaf = intent_core::workload::Workload::new(
             intent_core::workload::WorkloadKind::HostExec,
             "host.exec",
         )
-        .apply_pinned(&mut cmd);
+        .apply_tokio(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
         let pgid = child.id();
         let stdin = child.stdin.take();
@@ -729,10 +735,13 @@ impl HomeTerminals {
                     let _ = reader.await;
                 }
             }
+            let failed = !status.is_some_and(|s| s.success());
             reaped.finish(PtyExited {
                 terminal_id: reaped.id.clone(),
                 exit_code: Some(status.and_then(|s| s.code()).unwrap_or(-1)),
                 error: None,
+                exit_reason: (failed && leaf.as_ref().is_some_and(|l| l.oom_kills() > 0))
+                    .then_some(intent_core::ExitReason::MemoryLimit),
             });
         });
         Ok(())

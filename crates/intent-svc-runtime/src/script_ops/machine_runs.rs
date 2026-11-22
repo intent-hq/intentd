@@ -176,6 +176,8 @@ struct Run {
     spawned_at: Option<tokio::time::Instant>,
     fast_restarts: u32,
     monitor: Option<Monitor>,
+    /// The exit reason of the `scriptExited` being settled.
+    exit_reason: Option<intent_core::ExitReason>,
 }
 
 struct Inner {
@@ -384,6 +386,7 @@ impl MachineRuns {
                 spawned_at: None,
                 fast_restarts: 0,
                 monitor: None,
+                exit_reason: None,
             });
             run.node_id.clone_from(&link.node_id);
             run.machine_name.clone_from(&link.machine_name);
@@ -733,8 +736,12 @@ impl MachineRuns {
                 spawn_id,
                 exit_code,
                 error,
+                exit_reason,
                 ..
             }) => {
+                if let Some(run) = lock(&self.inner.runs).get_mut(&place) {
+                    run.exit_reason = exit_reason;
+                }
                 self.settle(
                     &place,
                     &spawn_id,
@@ -819,6 +826,7 @@ impl MachineRuns {
                 return;
             }
             run.spawn_id = None;
+            let exit_reason = run.exit_reason.take();
             if !run.partial.is_empty() {
                 let rest = std::mem::take(&mut run.partial);
                 run.output.push_str(&rest);
@@ -858,6 +866,10 @@ impl MachineRuns {
                 run.state.status = ScriptStatus::Exited;
                 run.state.exit_code = Some(code);
                 run.state.error.clone_from(&error);
+                run.state.exit_reason = exit_reason.filter(|_| code != 0);
+                if let (Some(reason), None) = (run.state.exit_reason, &error) {
+                    run.state.error = Some(reason.message().to_owned());
+                }
                 run.state.stopped_at = Some(now_iso());
                 run.state.pid = None;
                 let outcome = if error
@@ -870,7 +882,7 @@ impl MachineRuns {
                 } else {
                     ScriptRunOutcome::Failed
                 };
-                let result = last_run(&run.state, outcome, Some(code), error.clone());
+                let result = last_run(&run.state, outcome, Some(code), run.state.error.clone());
                 if run.def.mode == ScriptMode::Command {
                     run.last_run = Some(result.clone());
                 }
@@ -1631,7 +1643,7 @@ fn last_run(
         stopped_at: now_iso(),
         error,
         started_by: state.started_by.clone(),
-        exit_reason: None,
+        exit_reason: state.exit_reason,
     }
 }
 
