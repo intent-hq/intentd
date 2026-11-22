@@ -62,7 +62,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex as TokioMutex;
 
 mod pool;
-pub(crate) use pool::UnslothServerPool;
+pub(crate) use pool::{UnslothServerPool, UNSLOTH_IDLE_CHECK_EVERY, UNSLOTH_IDLE_STOP_AFTER};
 
 /// Default port the managed server listens on (`unsloth run -p <port>`;
 /// matches the Unsloth CLI's own default).
@@ -932,6 +932,18 @@ impl UnslothServerManager {
     /// (`unsloth` spawns `llama-server` as a child holding the model
     /// weights) — best-effort: a sampling failure yields zeros rather than
     /// failing the whole snapshot.
+    /// Whether the server is up and idle-eligible, without sampling its
+    /// process tree: `None` when it is gone, `Some(true)` when the daemon
+    /// started it and it is ready, `Some(false)` otherwise.
+    pub(crate) fn owned_and_ready(&self) -> Option<bool> {
+        let identity = lock_ignore_poison(&self.identity).clone()?;
+        match identity.pid {
+            Some(pid) if !pid_is_alive(pid) => None,
+            Some(_) => Some(*lock_ignore_poison(&self.phase) == Some("ready")),
+            None => Some(false),
+        }
+    }
+
     pub(crate) async fn status_snapshot(&self) -> Option<UnslothStatus> {
         let identity = lock_ignore_poison(&self.identity).clone()?;
         if let Some(pid) = identity.pid {

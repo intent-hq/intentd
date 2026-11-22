@@ -35,6 +35,13 @@ const FOOTPRINT_FACTOR: u64 = 3;
 /// the start that follows plan from the same answer.
 const UNKNOWN_FOOTPRINT_TTL: Duration = Duration::from_secs(300);
 
+/// How long a daemon-started server may sit with no live agents before it
+/// stops to free its memory.
+pub(crate) const UNSLOTH_IDLE_STOP_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// How often the agent manager checks for idle servers.
+pub(crate) const UNSLOTH_IDLE_CHECK_EVERY: Duration = Duration::from_secs(60);
+
 /// One running server's share of the memory budget.
 #[derive(Debug, Clone)]
 pub(crate) struct Load {
@@ -94,6 +101,9 @@ struct Entry {
     /// exists, including before its server has spawned.
     port: u16,
     last_used: Instant,
+    /// When the idle check first saw this server with no agents and no
+    /// start; cleared when one joins.
+    idle_since: Option<Instant>,
     /// `ensure_endpoint` calls running through this entry. While one runs,
     /// the entry is a starting server even before it reports a status.
     in_flight: Arc<AtomicUsize>,
@@ -174,6 +184,7 @@ impl UnslothServerPool {
             return None;
         }
         entry.last_used = Instant::now();
+        entry.idle_since = None;
         entry.in_flight.fetch_add(1, Ordering::SeqCst);
         Some((entry.manager.clone(), InFlight(entry.in_flight.clone())))
     }
@@ -400,6 +411,7 @@ impl UnslothServerPool {
                 manager: manager.clone(),
                 port,
                 last_used: Instant::now(),
+                idle_since: None,
                 in_flight: in_flight.clone(),
             },
         );
@@ -450,6 +462,72 @@ impl UnslothServerPool {
         stopped
     }
 
+    /// Stop every daemon-started, ready server that no live agent and no
+    /// start has used for `after`, as of `now`; returns their models. An
+    /// adopted, loading or starting server is never idle, and a crashed
+    /// server's entry is forgotten. Admission is taken only to stop.
+    pub(crate) async fn reap_idle(
+        &self,
+        attached: &HashMap<String, usize>,
+        now: Instant,
+        after: Duration,
+    ) -> Vec<String> {
+        if self.is_shutting_down() {
+            return Vec::new();
+        }
+        let expired = |entry: &Entry| {
+            entry.in_flight.load(Ordering::SeqCst) == 0
+                && entry
+                    .idle_since
+                    .is_some_and(|since| now.saturating_duration_since(since) >= after)
+        };
+        let any_expired = {
+            let mut servers = lock_ignore_poison(&self.servers);
+            servers.retain(|repo, entry| {
+                let busy = entry.in_flight.load(Ordering::SeqCst) > 0;
+                let state = entry.manager.owned_and_ready();
+                if state.is_none() && !busy {
+                    return false;
+                }
+                let unused = attached.get(repo).is_none_or(|count| *count == 0);
+                if busy || !unused || state != Some(true) {
+                    entry.idle_since = None;
+                } else {
+                    entry.idle_since.get_or_insert(now);
+                }
+                true
+            });
+            servers.values().any(expired)
+        };
+        if !any_expired {
+            return Vec::new();
+        }
+
+        let _admission = self.admission.lock().await;
+        if self.is_shutting_down() {
+            return Vec::new();
+        }
+        // A join since the pass above clears `idle_since` or counts in flight.
+        let stopped: Vec<(String, Entry)> = {
+            let mut servers = lock_ignore_poison(&self.servers);
+            let repos: Vec<String> = servers
+                .iter()
+                .filter(|(_, entry)| expired(entry))
+                .map(|(repo, _)| repo.clone())
+                .collect();
+            repos
+                .into_iter()
+                .filter_map(|repo| servers.remove(&repo).map(|entry| (repo, entry)))
+                .collect()
+        };
+        let repos = stopped.iter().map(|(repo, _)| repo.clone()).collect();
+        for (repo, _) in &stopped {
+            tracing::info!(repo = %repo, "stopping idle managed unsloth server");
+        }
+        Self::shut_down_all(stopped.into_iter().map(|(_, entry)| entry).collect()).await;
+        repos
+    }
+
     /// Stop the server for one model, including a start in flight; `false`
     /// when that model had no server. The others keep running.
     pub(crate) async fn stop_model(&self, repo_id: &str) -> bool {
@@ -467,6 +545,12 @@ impl UnslothServerPool {
     pub(crate) async fn shutdown(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Abort starts now, then wait for an idle stop or eviction that holds
+        // admission, so no server it took out of the map is left mid-kill.
+        for entry in lock_ignore_poison(&self.servers).values() {
+            entry.manager.request_shutdown();
+        }
+        let _admission = self.admission.lock().await;
         Self::shut_down_all(self.drain()).await;
     }
 
@@ -517,6 +601,7 @@ impl UnslothServerPool {
                 manager,
                 port,
                 last_used: Instant::now(),
+                idle_since: None,
                 in_flight: Arc::new(AtomicUsize::new(0)),
             },
         );
@@ -533,6 +618,7 @@ impl UnslothServerPool {
                 manager,
                 port,
                 last_used: Instant::now(),
+                idle_since: None,
                 in_flight: Arc::new(AtomicUsize::new(1)),
             },
         );

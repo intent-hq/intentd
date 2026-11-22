@@ -3781,6 +3781,40 @@ impl AgentManager {
             .collect()
     }
 
+    /// Stop Unsloth servers no live agent has used for
+    /// [`crate::unsloth_server::UNSLOTH_IDLE_STOP_AFTER`] as of `now`.
+    pub(crate) async fn reap_idle_unsloth_servers(&self, now: std::time::Instant) -> Vec<String> {
+        let attached = self.unsloth_agents_by_model(None);
+        self.unsloth
+            .reap_idle(
+                &attached,
+                now,
+                crate::unsloth_server::UNSLOTH_IDLE_STOP_AFTER,
+            )
+            .await
+    }
+
+    /// Check for idle Unsloth servers every
+    /// [`crate::unsloth_server::UNSLOTH_IDLE_CHECK_EVERY`] until the manager
+    /// is dropped.
+    pub fn start_unsloth_idle_reaper(self: &Arc<Self>) {
+        let manager = Arc::downgrade(self);
+        intent_core::spawn_daemon(async move {
+            let every = crate::unsloth_server::UNSLOTH_IDLE_CHECK_EVERY;
+            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                manager
+                    .reap_idle_unsloth_servers(std::time::Instant::now())
+                    .await;
+            }
+        });
+    }
+
     /// The daemon-owned Unsloth servers (one per model), for the
     /// `unsloth.status` / `unsloth.stop` RPCs and the switch confirmation.
     pub(crate) fn unsloth_manager(&self) -> &Arc<crate::unsloth_server::UnslothServerPool> {

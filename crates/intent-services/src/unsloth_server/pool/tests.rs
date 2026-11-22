@@ -580,4 +580,165 @@ esac
             .expect("A starts again");
         pool.shutdown().await;
     }
+
+    const IDLE: Duration = Duration::from_secs(15 * 60);
+
+    #[tokio::test]
+    async fn a_server_no_agent_uses_stops_after_the_idle_timeout() {
+        let fx = fixture(2).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool.seed_footprint_for_test(B, 4 * GIB);
+        for repo in [A, B] {
+            fx.pool
+                .ensure_endpoint(repo, None, &none(), &|_, _| {})
+                .await
+                .expect("starts");
+        }
+        let b_in_use = HashMap::from([(B.to_string(), 1)]);
+        let t0 = Instant::now();
+
+        assert!(fx.pool.reap_idle(&b_in_use, t0, IDLE).await.is_empty());
+        assert!(
+            fx.pool
+                .reap_idle(&b_in_use, t0 + Duration::from_secs(15 * 60 - 1), IDLE)
+                .await
+                .is_empty(),
+            "not idle long enough yet"
+        );
+        assert_eq!(fx.pool.reap_idle(&b_in_use, t0 + IDLE, IDLE).await, [A]);
+        assert_eq!(running(&fx.pool).await, [(B.to_string(), fx.ports[1])]);
+
+        fx.pool
+            .ensure_endpoint(A, None, &none(), &|_, _| {})
+            .await
+            .expect("A starts again on demand");
+        fx.pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_spawn_during_the_countdown_resets_it() {
+        let fx = fixture(1).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool
+            .ensure_endpoint(A, None, &none(), &|_, _| {})
+            .await
+            .expect("A starts");
+        let t0 = Instant::now();
+        assert!(fx.pool.reap_idle(&none(), t0, IDLE).await.is_empty());
+
+        // A new agent's spawn joins the running server.
+        fx.pool
+            .ensure_endpoint(A, None, &none(), &|_, _| {})
+            .await
+            .expect("A reused");
+        assert!(
+            fx.pool.reap_idle(&none(), t0 + IDLE, IDLE).await.is_empty(),
+            "the spawn restarted the countdown"
+        );
+        assert_eq!(fx.pool.reap_idle(&none(), t0 + 2 * IDLE, IDLE).await, [A]);
+        assert!(fx.pool.statuses().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adopted_loading_and_starting_servers_never_stop_when_idle() {
+        let fx = fixture(1).await;
+        fx.pool.insert_running_for_test(A, false, true);
+        fx.pool.insert_running_for_test(B, true, false);
+        let starting = "unsloth/Llama-3.2-3B-GGUF";
+        fx.pool.insert_starting_for_test(starting);
+        let t0 = Instant::now();
+
+        assert!(fx.pool.reap_idle(&none(), t0, IDLE).await.is_empty());
+        assert!(fx
+            .pool
+            .reap_idle(&none(), t0 + 4 * IDLE, IDLE)
+            .await
+            .is_empty());
+        for repo in [A, B, starting] {
+            assert!(fx.pool.tracks_for_test(repo), "{repo} is kept");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_attaching_during_the_countdown_resets_it() {
+        let fx = fixture(1).await;
+        fx.pool.insert_running_for_test(A, true, true);
+        let a_in_use = HashMap::from([(A.to_string(), 1)]);
+        let t0 = Instant::now();
+
+        assert!(fx.pool.reap_idle(&none(), t0, IDLE).await.is_empty());
+        assert!(fx
+            .pool
+            .reap_idle(&a_in_use, t0 + Duration::from_secs(60), IDLE)
+            .await
+            .is_empty());
+        assert!(
+            fx.pool.reap_idle(&none(), t0 + IDLE, IDLE).await.is_empty(),
+            "the agent restarted the countdown"
+        );
+        assert_eq!(fx.pool.reap_idle(&none(), t0 + 2 * IDLE, IDLE).await, [A]);
+    }
+
+    #[tokio::test]
+    async fn the_idle_check_forgets_a_crashed_server() {
+        let fx = fixture(1).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool
+            .ensure_endpoint(A, None, &none(), &|_, _| {})
+            .await
+            .expect("A starts");
+        let pid = fx.pool.statuses().await[0].pid.expect("A has a pid");
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid.cast_signed()),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("kill A");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                while fx.pool.server_is_live_for_test(A) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await
+        .expect("A's server is gone");
+
+        assert!(fx
+            .pool
+            .reap_idle(&none(), Instant::now(), IDLE)
+            .await
+            .is_empty());
+        assert!(
+            !fx.pool.tracks_for_test(A),
+            "the crashed entry is forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_stop_already_under_way() {
+        let fx = fixture(1).await;
+        fx.pool.seed_footprint_for_test(A, 4 * GIB);
+        fx.pool
+            .ensure_endpoint(A, None, &none(), &|_, _| {})
+            .await
+            .expect("A starts");
+        let pool = Arc::new(fx.pool);
+        // An idle stop or eviction holds admission while it kills.
+        let stopping = pool.admission.lock().await;
+        let closing = pool.clone();
+        let shutdown = tokio::spawn(async move { closing.shutdown().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!shutdown.is_finished(), "shutdown waits for the stop");
+
+        drop(stopping);
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            shutdown,
+        )
+        .await
+        .expect("shutdown finishes once the stop is done")
+        .unwrap();
+        assert!(pool.statuses().await.is_empty());
+    }
 }
