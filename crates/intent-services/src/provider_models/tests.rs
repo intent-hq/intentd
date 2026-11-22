@@ -194,6 +194,21 @@ const UNSLOTH_HF_FIXTURE: &str = r#"[
   {"id":"","downloads":1,"trendingScore":0,"private":false}
 ]"#;
 
+/// Recorded (trimmed) rows from the expanded catalog request
+/// (`expand[]=gguf,downloads,trendingScore,private,pipeline_tag`, captured
+/// 2026-11-22). Covers names with no size token whose `gguf.total` is known
+/// (`Inkling-2-Mini`, `gemma-4-E4B-it-qat`, `Qwen3-Coder-Next`) and models
+/// that do not output text (`MiniMax-H3` video, `FLUX.2-klein-4B` image).
+const UNSLOTH_HF_EXPANDED_FIXTURE: &str = r#"[
+  {"id":"unsloth/Inkling-2-Mini-GGUF","downloads":238152,"trendingScore":585,"private":false,"pipeline_tag":"image-text-to-text","gguf":{"total":26070390272}},
+  {"id":"unsloth/Qwen3.6-35B-A3B-GGUF","downloads":1774171,"trendingScore":24,"private":false,"pipeline_tag":"image-text-to-text","gguf":{"total":34660610688}},
+  {"id":"unsloth/MiniMax-H3-GGUF","downloads":3482113,"trendingScore":16,"private":false,"pipeline_tag":"image-text-to-video","gguf":{"total":20111438744}},
+  {"id":"unsloth/gpt-oss-20b-GGUF","downloads":601166,"trendingScore":6,"private":false,"pipeline_tag":"text-generation","gguf":{"total":20914757184}},
+  {"id":"unsloth/gemma-4-E4B-it-qat-GGUF","downloads":96385,"trendingScore":2,"private":false,"pipeline_tag":"any-to-any","gguf":{"total":7463013674}},
+  {"id":"unsloth/FLUX.2-klein-4B-GGUF","downloads":517982,"trendingScore":1,"private":false,"pipeline_tag":"image-to-image","gguf":{"total":3875544576}},
+  {"id":"unsloth/Qwen3-Coder-Next-GGUF","downloads":212640,"trendingScore":1,"private":false,"pipeline_tag":"text-generation","gguf":{"total":79674391296}}
+]"#;
+
 #[test]
 fn parse_acp_models_from_session_new_result() {
     // claude-code / droid shape: models.availableModels in the session/new result.
@@ -2005,6 +2020,78 @@ fn build_unsloth_rows_filters_by_ram_fit_and_counts_hidden() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], "unsloth/gpt-oss-20b-GGUF");
     assert_eq!(hidden, 4);
+}
+
+fn row_ids(rows: &[serde_json::Value]) -> Vec<&str> {
+    rows.iter().map(|r| r["id"].as_str().unwrap()).collect()
+}
+
+#[test]
+fn build_unsloth_rows_uses_gguf_total_when_the_name_has_no_size() {
+    let repos = parse_hf_unsloth_response(UNSLOTH_HF_EXPANDED_FIXTURE);
+    // 32 GiB budget ≈ 24.05 GB. Inkling-2-Mini (26.07B ≈ 16.7 GB) and
+    // gemma-4-E4B (7.46B ≈ 5.5 GB) fit by their real size; Qwen3-Coder-Next
+    // (79.7B ≈ 48.9 GB) is too large.
+    let (rows, hidden) = build_unsloth_rows(&repos, Some(32 * GIB));
+    assert_eq!(
+        row_ids(&rows),
+        [
+            "unsloth/Qwen3.6-35B-A3B-GGUF",
+            "unsloth/gpt-oss-20b-GGUF",
+            "unsloth/Inkling-2-Mini-GGUF",
+            "unsloth/gemma-4-E4B-it-qat-GGUF",
+        ]
+    );
+    assert_eq!(rows[2]["name"], "Inkling-2-Mini");
+    assert_eq!(hidden, 1);
+
+    // 16 GiB budget ≈ 12.03 GB: only gemma-4-E4B fits.
+    let (rows, hidden) = build_unsloth_rows(&repos, Some(16 * GIB));
+    assert_eq!(row_ids(&rows), ["unsloth/gemma-4-E4B-it-qat-GGUF"]);
+    assert_eq!(hidden, 4);
+}
+
+#[test]
+fn build_unsloth_rows_drops_models_that_do_not_output_text() {
+    let repos = parse_hf_unsloth_response(UNSLOTH_HF_EXPANDED_FIXTURE);
+    for ram in [None, Some(512 * GIB)] {
+        let (rows, _hidden) = build_unsloth_rows(&repos, ram);
+        let ids = row_ids(&rows);
+        assert!(
+            !ids.contains(&"unsloth/MiniMax-H3-GGUF"),
+            "{ram:?}: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"unsloth/FLUX.2-klein-4B-GGUF"),
+            "{ram:?}: {ids:?}"
+        );
+    }
+}
+
+#[test]
+fn build_unsloth_rows_prefers_gguf_total_over_the_name() {
+    // The name claims 1B but the weights hold 400B parameters: hidden.
+    // A zero or missing total falls back to the name's 20B: shown.
+    let repos = parse_hf_unsloth_response(
+        r#"[
+          {"id":"unsloth/Tiny-1B-GGUF","downloads":3,"gguf":{"total":400000000000}},
+          {"id":"unsloth/Zero-20B-GGUF","downloads":2,"gguf":{"total":0}},
+          {"id":"unsloth/Bare-20B-GGUF","downloads":1,"gguf":null}
+        ]"#,
+    );
+    let (rows, hidden) = build_unsloth_rows(&repos, Some(32 * GIB));
+    assert_eq!(
+        row_ids(&rows),
+        ["unsloth/Zero-20B-GGUF", "unsloth/Bare-20B-GGUF"]
+    );
+    assert_eq!(hidden, 1);
+}
+
+#[test]
+fn unsloth_fetch_outcome_does_not_count_non_text_models_as_hidden() {
+    let fetch = super::unsloth_fetch_outcome(UNSLOTH_HF_EXPANDED_FIXTURE, Some(512 * GIB));
+    assert_eq!(fetch.models.expect("models present").len(), 5);
+    assert!(fetch.warning.is_none(), "{:?}", fetch.warning);
 }
 
 #[test]
