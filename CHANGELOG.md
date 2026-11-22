@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.270] - 2026-11-22
+
+### 🚀 Features
+
+- *(remote)* Report runner load and host CPU/memory, and expose them to agents ([#3633](https://github.com/intent-hq/intentd/pull/3633))
+- *(profiles)* Profiles for Grok, Droid, Auggie and Cursor ([#3640](https://github.com/intent-hq/intentd/pull/3640))
+- *(store)* Self-fence a tenant when its lease is lost ([#3652](https://github.com/intent-hq/intentd/pull/3652))
+
+### 🐛 Bug Fixes
+
+- *(store)* Bind new Neki tenant tables before use and retry migrate on broken pipes ([#3661](https://github.com/intent-hq/intentd/pull/3661))
+- Bump Codex ACP fallback to v2.9.0 ([#3650](https://github.com/intent-hq/intentd/pull/3650))
+
+### 🔧 Refactor
+
+- *(remote)* Split home terminals and home scripts into link and domain halves ([#3655](https://github.com/intent-hq/intentd/pull/3655))
+- *(remote)* Split home state and homes into link and domain halves ([#3659](https://github.com/intent-hq/intentd/pull/3659))
+
+### 📚 Documentation
+
+- *(guide)* Describe the clone size and rate caption under the Create button ([#3651](https://github.com/intent-hq/intentd/pull/3651))
+- *(app-guide)* Describe the Micro prompt ring on Home's preview chat ([#3653](https://github.com/intent-hq/intentd/pull/3653))
+
+
 ## [0.11.269] - 2026-11-22
 
 ### 🚀 Features
