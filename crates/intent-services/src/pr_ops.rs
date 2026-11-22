@@ -1004,14 +1004,17 @@ fn github_check_run_id(url: &str) -> Option<(&str, &str)> {
         .then_some((host, *id))
 }
 
-/// The tie-break key among same-name twins. GitHub check-run links key on
-/// the check-run id, the same under either read path. Any other link (a CI
-/// vendor's details link, which only the rollup reports) outranks them: the
-/// rollup then picks a vendor link, which [`is_new_check_run`] never compares
-/// with a check-run link, rather than a check-run id that the REST fallback,
-/// seeing every twin's id, could rank differently.
-fn check_run_identity(url: &str) -> (bool, &str, &str) {
-    github_check_run_id(url).map_or((true, "", bare_link(url)), |(host, id)| (false, host, id))
+/// The tie-break key among same-name twins. A twin whose link is a GitHub
+/// check-run link keys on the check-run id, which both read paths report
+/// alike. Any twin without one (a CI vendor's details link, an empty link, or
+/// none) outranks those: a read that sees such a twin then reports a link
+/// that [`is_new_check_run`] never compares, rather than a check-run id the
+/// other read path, which may see every twin's id, could rank differently.
+fn check_run_identity(url: Option<&str>) -> (bool, &str, &str) {
+    match url.and_then(github_check_run_id) {
+        Some((host, id)) => (false, host, id),
+        None => (true, "", url.map_or("", bare_link)),
+    }
 }
 
 /// Whether two links of the same check name point at different runs: a
@@ -1648,8 +1651,8 @@ fn live_key(run: &CheckRunSignal) -> (bool, Option<OffsetDateTime>, u8) {
 /// in any listing order and under either read path: a flipped link would
 /// read as a re-run (intent-hq/intent#9852).
 fn supersedes(candidate: &CheckRunSignal, held: &CheckRunSignal) -> bool {
-    fn run(signal: &CheckRunSignal) -> Option<(bool, &str, &str)> {
-        signal.url.as_deref().map(check_run_identity)
+    fn run(signal: &CheckRunSignal) -> (bool, &str, &str) {
+        check_run_identity(signal.url.as_deref())
     }
     (live_key(candidate), run(candidate)) > (live_key(held), run(held))
 }
@@ -3506,6 +3509,104 @@ mod tests {
         assert_eq!(req.checks.total, 2);
         assert!(!req.checks.required_known);
         assert_eq!(req.merge_state_status.as_deref(), Some("UNSTABLE"));
+    }
+
+    /// Two same-name twins with equal liveness keys, each of every link kind,
+    /// read by the rollup (`detailsUrl`) and by the REST fallback
+    /// (`html_url`), in both listing orders and both id orders: the same pair
+    /// of runs never reads as a new run, across paths or within one. A real
+    /// re-run (new check-run ids on both reads) still does
+    /// (intent-hq/intent#9852).
+    #[test]
+    fn twin_link_kinds_never_read_as_a_rerun_across_read_paths() {
+        #[derive(Clone, Copy, Debug)]
+        enum Kind {
+            ActionsJob,
+            CheckRun,
+            Vendor,
+            Empty,
+            Null,
+        }
+        const KINDS: [Kind; 5] = [
+            Kind::ActionsJob,
+            Kind::CheckRun,
+            Kind::Vendor,
+            Kind::Empty,
+            Kind::Null,
+        ];
+        let rollup_url = |kind: Kind, id: u32| match kind {
+            Kind::ActionsJob => Some(format!("https://github.com/o/r/actions/runs/9/job/{id}")),
+            Kind::CheckRun => Some(format!("https://github.com/o/r/runs/{id}")),
+            Kind::Vendor => Some(format!("https://ci.example/build/{id}")),
+            Kind::Empty => Some(String::new()),
+            Kind::Null => None,
+        };
+        let rest_url = |_: Kind, id: u32| Some(format!("https://github.com/o/r/runs/{id}"));
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let link = |urls: Vec<Option<String>>| {
+            let signals = MergeRequirementSignals {
+                merge_state_status: Some("BLOCKED".into()),
+                checks: urls
+                    .into_iter()
+                    .map(|url| RollupCheck {
+                        url,
+                        ..rollup("build", CheckState::Failure, true)
+                    })
+                    .collect(),
+                checks_known: true,
+                ..Default::default()
+            };
+            merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0))
+                .checks
+                .items[0]
+                .url
+                .clone()
+        };
+        let read = |path: &dyn Fn(Kind, u32) -> Option<String>,
+                    twins: [(Kind, u32); 2],
+                    reversed: bool| {
+            let mut urls: Vec<_> = twins.iter().map(|&(k, id)| path(k, id)).collect();
+            if reversed {
+                urls.reverse();
+            }
+            link(urls)
+        };
+        for a in KINDS {
+            for b in KINDS {
+                for (id_a, id_b) in [(100, 200), (200, 100)] {
+                    let twins = [(a, id_a), (b, id_b)];
+                    let reads: Vec<Option<String>> = [false, true]
+                        .into_iter()
+                        .flat_map(|reversed| {
+                            [
+                                read(&rollup_url, twins, reversed),
+                                read(&rest_url, twins, reversed),
+                            ]
+                        })
+                        .collect();
+                    for before in &reads {
+                        for after in &reads {
+                            assert!(
+                                !is_new_check_run(before.as_deref(), after.as_deref()),
+                                "{twins:?}: {before:?} → {after:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let rerun = read(
+            &rest_url,
+            [(Kind::CheckRun, 300), (Kind::CheckRun, 400)],
+            false,
+        );
+        for kind in [Kind::ActionsJob, Kind::CheckRun] {
+            let first = read(&rollup_url, [(kind, 100), (kind, 200)], false);
+            assert!(
+                is_new_check_run(first.as_deref(), rerun.as_deref()),
+                "{kind:?}"
+            );
+        }
     }
 
     /// Twins with equal liveness keys supply the same link in any listing
