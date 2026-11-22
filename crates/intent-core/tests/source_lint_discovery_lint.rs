@@ -58,8 +58,8 @@
 //! / `enum` / `struct` keyword; a marker without a reason is itself a
 //! failure. The shared module lives under `src/`, so the rules never see it.
 //!
-//! The workspace root is located from `CARGO_MANIFEST_DIR`, as the other lints
-//! do; the checks themselves take any root, which is how the fixture tests
+//! The workspace root is found at run time (`source_lint::workspace_root()`),
+//! as the other lints do; the checks themselves take any root, which is how the fixture tests
 //! below exercise them against throwaway workspaces.
 
 use std::collections::BTreeSet;

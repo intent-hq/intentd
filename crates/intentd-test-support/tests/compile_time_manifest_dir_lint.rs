@@ -19,12 +19,18 @@
 //! "test-hooks"))` item is library code here: it builds into the rlib other
 //! crates' tests link.
 //!
-//! It also fails on them anywhere in a source lint
-//! (`crates/*/tests/*_lint.rs`): a reused test binary is reused whole, so a
-//! lint that bakes its checkout scans the building checkout even when the
-//! library it links is fixed (`elapsed_assert_lint` read a deleted checkout
-//! in the two-checkout reproduction). Other test code is out of scope: it
-//! reads fixtures of the build it belongs to, not the tree under review.
+//! It also fails on them anywhere in a source scanner: a source lint
+//! (`crates/*/tests/*_lint.rs`), a module one loads by `#[path = "…"]`, or a
+//! file under `OTHER_SOURCE_SCANNERS` (the payload-budget sweep, which scans
+//! other crates' `src/`). A reused test binary is reused whole, so a scanner
+//! that bakes its checkout scans the building checkout even when the library
+//! it links is fixed (`elapsed_assert_lint` read a deleted checkout in the
+//! two-checkout reproduction). A new scanner not named `*_lint.rs` belongs in
+//! `OTHER_SOURCE_SCANNERS`.
+//!
+//! Other test code is not checked, and is a known gap: a fixture or golden it
+//! reads through a baked path comes from the building checkout when the
+//! binary is reused, so a golden edited in this checkout can go unseen.
 //! An `env!` inside `include_str!` / `include_bytes!` arguments is exempt:
 //! those embed the file's bytes, never its path.
 //!
@@ -34,8 +40,10 @@
 //! move the code under `#[cfg(test)]`.
 //! There is no opt-out.
 
+use std::collections::BTreeSet;
+
 use intentd_test_support::source_lint::{
-    test_code_files_with, tokenize, workspace_root, TestCfgs, TestCodeText, Token,
+    test_code_files_with, tokenize, workspace_root, TestCfgs, TestCodeFile, TestCodeText, Token,
 };
 
 const VAR: &str = "CARGO_MANIFEST_DIR";
@@ -110,6 +118,62 @@ fn is_source_lint(rel: &str) -> bool {
     matches!(parts.as_slice(), ["crates", _, "tests", name] if name.ends_with("_lint.rs"))
 }
 
+/// Test targets that scan workspace source but are not named `*_lint.rs`,
+/// scanned whole like a source lint (every file under the prefix).
+const OTHER_SOURCE_SCANNERS: &[&str] = &["crates/intent-app/tests/payload_budget/"];
+
+/// Workspace-relative paths of the modules a source lint at `lint_rel` loads
+/// with a `#[path = "…"]` attribute, resolved against the lint's directory.
+fn path_modules(lint_rel: &str, src: &str) -> Vec<String> {
+    let dir = lint_rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+    src.lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("#[path = \"")?;
+            let (path, _) = rest.split_once('"')?;
+            Some(normalize(&format!("{dir}/{path}")))
+        })
+        .collect()
+}
+
+/// `rel` with `.` and `dir/..` segments folded.
+fn normalize(rel: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rel.split('/') {
+        match part {
+            "." | "" => {}
+            ".." if parts.last().is_some_and(|last| *last != "..") => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+/// Every file scanned whole: the source lints, the modules they load by
+/// `#[path]`, and the files of [`OTHER_SOURCE_SCANNERS`].
+fn source_scanners(files: &[TestCodeFile]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for file in files.iter().filter(|file| is_source_lint(&file.rel)) {
+        out.insert(file.rel.clone());
+        out.extend(path_modules(&file.rel, &file.src));
+    }
+    for prefix in OTHER_SOURCE_SCANNERS {
+        let before = out.len();
+        out.extend(
+            files
+                .iter()
+                .filter(|file| file.rel.starts_with(prefix))
+                .map(|file| file.rel.clone()),
+        );
+        assert!(
+            out.len() > before,
+            "OTHER_SOURCE_SCANNERS entry {prefix} matched no file; update the list"
+        );
+    }
+    out
+}
+
 #[test]
 fn library_code_and_source_lints_never_bake_the_manifest_dir() {
     let root = workspace_root();
@@ -131,8 +195,15 @@ fn library_code_and_source_lints_never_bake_the_manifest_dir() {
         "the scan found {lints} source lints under {}",
         root.display()
     );
+    let scanners = source_scanners(&files);
+    for module in scanners.iter().filter(|rel| !rel.ends_with("_lint.rs")) {
+        assert!(
+            files.iter().any(|file| &file.rel == module),
+            "{module}: a source lint loads it by #[path], but the scan did not find it"
+        );
+    }
     for file in &files {
-        let scope = if is_source_lint(&file.rel) {
+        let scope = if scanners.contains(&file.rel) {
             Scope::Lint
         } else if file.whole {
             continue;
@@ -145,7 +216,7 @@ fn library_code_and_source_lints_never_bake_the_manifest_dir() {
     }
     assert!(
         failures.is_empty(),
-        "compile-time `env!(\"{VAR}\")` in library code or a source lint bakes this checkout's \
+        "compile-time `env!(\"{VAR}\")` in library code or a source scanner bakes this checkout's \
          path into the build, which another checkout reusing it then reads \
          (intent-hq/intentd#3648); resolve it at run time with `source_lint::workspace_root()` / \
          `source_lint::package_dir()`, or (library code only) move it under `#[cfg(test)]` (inside \
@@ -194,6 +265,23 @@ fn source_lints_are_scanned_whole() {
     ));
     assert!(!is_source_lint("crates/intent-core/tests/e2e.rs"));
     assert!(!is_source_lint("crates/intent-core/src/x_lint.rs"));
+}
+
+#[test]
+fn path_modules_of_a_lint_resolve_against_its_directory() {
+    let src = "#[path = \"support/postgres_sql.rs\"]\nmod postgres_sql;\n\
+               const FIXTURE: &str = \"#[path = \\\"x.rs\\\"]\";\n\
+               #[path = \"../../intent-core/tests/common/a.rs\"]\nmod a;\n";
+    assert_eq!(
+        path_modules(
+            "crates/intent-store/tests/postgres_tenant_schema_lint.rs",
+            src
+        ),
+        vec![
+            "crates/intent-store/tests/support/postgres_sql.rs".to_string(),
+            "crates/intent-core/tests/common/a.rs".to_string(),
+        ]
+    );
 }
 
 #[test]
