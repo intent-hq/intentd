@@ -510,15 +510,33 @@ impl OwnedPendingDeletes {
                     // Commit once: only the process that takes the stored
                     // deadline commits (always granted on SQLite). Gone means
                     // another process committed it or a cancel removed it.
+                    // A transient store error is retried while this process
+                    // still serves the tenant; `NotOwner` means another
+                    // process does, and re-arms the row itself.
                     let (kind, id, _) = timer_attempt.subject.grace_parts();
-                    match inner.store.take_delete_grace(kind, id).await {
-                        Ok(true) => delete(claim).await,
-                        Ok(false) => {
-                            tracing::info!(kind, id, "pending delete already committed or cancelled elsewhere; skipping");
+                    loop {
+                        match inner.store.take_delete_grace(kind, id).await {
+                            Ok(true) => {
+                                delete(claim).await;
+                                return;
+                            }
+                            Ok(false) => {
+                                tracing::info!(kind, id, "pending delete already committed or cancelled elsewhere; skipping");
+                                return;
+                            }
+                            Err(Error::NotOwner(e)) => {
+                                tracing::info!(kind, id, error = %e, "tenant served by another process; it commits this pending delete");
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::warn!(kind, id, error = %e, "could not take the stored delete deadline; retrying");
+                            }
                         }
-                        Err(e) => {
-                            // The row stays for the next process to re-arm.
-                            tracing::warn!(kind, id, error = %e, "could not take the stored delete deadline; not committing now");
+                        tokio::select! {
+                            biased;
+                            // The row stays for the next start to re-arm.
+                            () = stopping.closed() => return,
+                            () = tokio::time::sleep(GRACE_TAKE_RETRY) => {}
                         }
                     }
                 })
@@ -604,9 +622,24 @@ impl OwnedPendingDeletes {
     }
 
     pub(crate) async fn cancel_owned(&self, subject: &PendingDeleteSubject) -> Result<bool> {
-        let Some(claim) = self.take_for_cascade(subject).await? else {
+        let Some(attempt) = self.original_attempt(subject)? else {
             return Ok(false);
         };
+        if attempt.prepared().await.is_none() {
+            return Ok(false);
+        }
+        // Drop the stored deadline first: if that fails the cancel fails and
+        // nothing changed (the timer stays armed), so no later process can
+        // re-arm and commit a delete the user undid. `true` on Postgres
+        // means this call removed it, so the commit (which takes the row
+        // first) will not run even if its timer fired meanwhile.
+        let (kind, id, _) = subject.grace_parts();
+        let took_row = self.inner.store.take_delete_grace(kind, id).await?
+            && self.inner.store.persists_delete_graces();
+        let Some((claim, timer)) = self.inner.take_armed(&attempt) else {
+            return Ok(took_row);
+        };
+        timer.abort();
         claim.settle_confirmed().await?;
         Ok(true)
     }
@@ -626,6 +659,10 @@ impl OwnedPendingDeletes {
         Ok(PendingDeleteClaim { subject, guard })
     }
 }
+
+/// Pause between attempts to take a stored grace deadline after a store
+/// error, while this process still serves the tenant.
+const GRACE_TAKE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Milliseconds from now until the ISO `delete_at` (0 when it passed or
 /// does not parse).

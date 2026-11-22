@@ -25,6 +25,13 @@ pub struct DeleteGrace {
 }
 
 impl Store {
+    /// Whether this backend stores grace deadlines (Postgres): only then
+    /// does [`Store::take_delete_grace`] decide which process commits.
+    #[must_use]
+    pub fn persists_delete_graces(&self) -> bool {
+        !matches!(self.backend, crate::Backend::Sqlite(_))
+    }
+
     /// Records `grace` unless a deadline for the same subject is already
     /// stored; returns the stored deadline (the earlier one wins, so a
     /// re-schedule never extends it). `SQLite` stores nothing and returns
