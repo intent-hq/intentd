@@ -163,6 +163,49 @@ async fn opening_a_tenant_provisions_its_seed_rows_once() {
     assert_eq!(chiefs, 2);
 }
 
+/// Concurrent first opens of one tenant still provision it once: the
+/// tenant writer row lock serializes them (provisioning takes no advisory
+/// lock of its own since migration 0010).
+#[tokio::test]
+async fn concurrent_first_opens_provision_a_tenant_once() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    futures_util::future::join_all((0..6).map(|_| open(&db, "tenant-race"))).await;
+    let primaries: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM principal WHERE tenant_id = 'tenant-race' AND is_primary = 1",
+    )
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert_eq!(primaries, 1);
+}
+
+/// A table-less advisory lock carries no shard key: on Neki sharded by
+/// `tenant_id` the router runs it on another shard than the tenant's, and a
+/// single-shard pool fails with NK313 (0005's `intent_provision_tenant` lock
+/// made every tenant open fail on a non-authoritative shard). No function
+/// the migrations leave behind may take one; the session lock `migrate`
+/// takes on its own cross-shard connection is not in a function.
+#[tokio::test]
+async fn no_migrated_function_takes_an_advisory_lock() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let offenders: Vec<String> = sqlx::query_scalar(
+        "SELECT p.proname::text FROM pg_proc p \
+         WHERE p.pronamespace = current_schema()::regnamespace \
+           AND p.prosrc ILIKE '%pg\\_advisory%' ORDER BY 1",
+    )
+    .fetch_all(&db.admin)
+    .await
+    .unwrap();
+    assert!(
+        offenders.is_empty(),
+        "functions taking an advisory lock: {offenders:?}"
+    );
+}
+
 #[tokio::test]
 async fn row_level_security_policies_work_with_the_guard_mode() {
     let Some(db) = test_db(true).await else {
