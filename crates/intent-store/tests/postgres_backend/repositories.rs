@@ -802,7 +802,8 @@ async fn transfer_tables_export_the_same_columns_on_both_backends() {
         let mut pg: Vec<String> = sqlx::query_scalar(
             "SELECT column_name::text FROM information_schema.columns \
              WHERE table_schema = current_schema() AND table_name = $1 \
-             AND is_generated = 'NEVER' AND column_name NOT IN ('tenant_id', 'row_seq')",
+             AND is_generated = 'NEVER' \
+             AND column_name NOT IN ('tenant_id', 'row_seq', 'claim_epoch', 'claim_token')",
         )
         .bind(table)
         .fetch_all(&db.admin)

@@ -1327,7 +1327,10 @@ fn import_value(table: &str, key: &str, value: &serde_json::Value) -> Result<Imp
 }
 
 impl PgStore {
-    /// Every transfer table's [`TransferColumns`], in one statement.
+    /// Every transfer table's [`TransferColumns`], in one statement. Columns
+    /// that exist only on Postgres and only mean something to the live
+    /// processes of a tenant (`row_seq`, and the delivery `claim_epoch` /
+    /// `claim_token` of batch G 2c) are not exported.
     async fn transfer_columns(&self, conn: &mut PgConnection) -> Result<TransferColumns> {
         let tables: Vec<&str> = TRANSFER_TABLES.iter().map(|(t, _)| *t).collect();
         let rows: Vec<(String, String, String)> = sqlx::query_as(
@@ -1337,7 +1340,7 @@ impl PgStore {
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = current_schema() AND c.relname = ANY($1) \
              AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = '' \
-             AND a.attname NOT IN ('tenant_id', 'row_seq') \
+             AND a.attname NOT IN ('tenant_id', 'row_seq', 'claim_epoch', 'claim_token') \
              ORDER BY c.relname, a.attnum",
         )
         .bind(&tables)

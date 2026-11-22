@@ -33,6 +33,53 @@ pub struct PersistedCompletionWatch {
 }
 
 impl Store {
+    /// Claims the persisted watch `watch_id` for this process's delivery of
+    /// its terminal wake (batch G 2c). `false` means another process holds
+    /// a live claim (same tenant epoch): skip, it is delivering. `true`
+    /// means this process holds the claim, or no row exists (the
+    /// write-through has not landed; the in-process claim decides). A claim
+    /// from an older epoch is stale and taken over; there is no time-based
+    /// expiry, so a slow holder keeps it. Release it with
+    /// [`Store::release_completion_watch_claim`] when delivery does not
+    /// retire the watch. `SQLite` has one process: always `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotOwner` when this process lost the tenant, and
+    /// `Error::Internal` if the database operation fails.
+    pub async fn claim_completion_watch(&self, watch_id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.claim_completion_watch(watch_id).await)
+    }
+
+    /// Releases this process's claim on `watch_id` (a no-op when another
+    /// process holds it or nothing does), so a retry can claim it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn release_completion_watch_claim(&self, watch_id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.release_completion_watch_claim(watch_id).await)
+    }
+
+    /// [`Store::claim_completion_watch`] for a delegation group's aggregate
+    /// wake.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::claim_completion_watch`].
+    pub async fn claim_delegation_group(&self, group_id: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.claim_delegation_group(group_id).await)
+    }
+
+    /// [`Store::release_completion_watch_claim`] for a delegation group.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn release_delegation_group_claim(&self, group_id: &str) -> Result<()> {
+        dispatch!(self, backend => backend.release_delegation_group_claim(group_id).await)
+    }
+
     /// Atomically retire one fired completion watch and record the delivered
     /// completion identity when one exists. The caller invokes this only after
     /// the parent wake is durable, so a failed transaction leaves the watch as
@@ -161,6 +208,27 @@ impl Store {
 }
 
 impl crate::SqliteStore {
+    // One process per database file: nothing to claim against.
+    #[expect(clippy::unused_async, reason = "mirrors the Postgres claim")]
+    pub async fn claim_completion_watch(&self, _watch_id: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    #[expect(clippy::unused_async, reason = "mirrors the Postgres claim")]
+    pub async fn release_completion_watch_claim(&self, _watch_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    #[expect(clippy::unused_async, reason = "mirrors the Postgres claim")]
+    pub async fn claim_delegation_group(&self, _group_id: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    #[expect(clippy::unused_async, reason = "mirrors the Postgres claim")]
+    pub async fn release_delegation_group_claim(&self, _group_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     pub async fn retire_completion_watch_after_delivery(
         &self,
         watch_id: &str,
