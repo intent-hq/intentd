@@ -31,9 +31,6 @@ hex = "0.4"
 zeroize = "1.9"
 uuid = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
-
 [dev-dependencies]
 intentd-test-support = { path = "../intentd-test-support" }
 tokio = { workspace = true, features = ["test-util"] }

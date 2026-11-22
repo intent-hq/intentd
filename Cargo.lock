@@ -2412,7 +2412,6 @@ dependencies = [
  "intent-core",
  "intent-git",
  "intentd-test-support",
- "libc",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -2755,7 +2754,6 @@ dependencies = [
  "uuid",
  "whoami",
  "x509-parser",
- "zeroize",
 ]
 
 [[package]]
