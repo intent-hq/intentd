@@ -63,6 +63,10 @@ const GROK_CLI_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for the Hugging Face `unsloth` catalog HTTP fetch.
 const UNSLOTH_HF_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound on the Hugging Face catalog body, both as downloaded and once
+/// decompressed (~2.3 MB uncompressed as of 2026-11, ~0.5 MB gzipped).
+const UNSLOTH_HF_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// Hugging Face `models` list API, scoped to the `unsloth` org's GGUF repos.
 /// `limit=1000` covers the org's full catalog (~400 repos as of 2026-11) in
 /// one request — HF's default page size (~50) would otherwise require
@@ -940,18 +944,21 @@ pub(crate) async fn fetch_unsloth_models() -> ProviderModelsFetch {
     unsloth_fetch_outcome(&body, crate::agent_manager::total_memory_bytes())
 }
 
-/// GET [`UNSLOTH_HF_API_URL`] with a hard timeout, returning the raw JSON
-/// response body. The timeout is injectable for tests (this function is not
-/// itself unit-tested against the network; see [`unsloth_fetch_outcome`] for
-/// the pure, fixture-driven parsing/filtering logic).
+/// GET [`UNSLOTH_HF_API_URL`] with a hard timeout, returning the JSON
+/// response body. The request asks for gzip, which shrinks the catalog about
+/// 4x; this crate's reqwest build has no automatic decompression (enabling
+/// it would apply to every client in the workspace), so
+/// [`decode_hf_body`] inflates it. Not unit-tested against the network; see
+/// [`decode_hf_body`] and [`unsloth_fetch_outcome`] for the pure logic.
 async fn fetch_unsloth_hf_catalog(timeout: Duration) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
-    let resp = client
+    let mut resp = client
         .get(UNSLOTH_HF_API_URL)
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip")
         .send()
         .await
         .map_err(|e| format!("huggingface request failed: {e}"))?;
@@ -959,9 +966,62 @@ async fn fetch_unsloth_hf_catalog(timeout: Duration) -> Result<String, String> {
     if !status.is_success() {
         return Err(format!("huggingface returned {status}"));
     }
-    resp.text()
+    let encoding = resp
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| format!("failed to read huggingface response: {e}"))
+        .map_err(|e| format!("failed to read huggingface response: {e}"))?
+    {
+        if body.len() + chunk.len() > UNSLOTH_HF_MAX_BODY_BYTES {
+            return Err(format!(
+                "huggingface response exceeds {UNSLOTH_HF_MAX_BODY_BYTES} bytes"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    decode_hf_body(encoding.as_deref(), &body, UNSLOTH_HF_MAX_BODY_BYTES)
+}
+
+/// Decode a Hugging Face response body by its `Content-Encoding`: gzip is
+/// inflated, an absent or `identity` encoding passes through, and any other
+/// encoding (never requested) is an error. The decoded body may not exceed
+/// `max_bytes`, so a small compressed body cannot expand without bound.
+fn decode_hf_body(
+    content_encoding: Option<&str>,
+    body: &[u8],
+    max_bytes: usize,
+) -> Result<String, String> {
+    use std::io::Read as _;
+    let decoded = match content_encoding.map(str::trim) {
+        None | Some("") => body.to_vec(),
+        Some(enc) if enc.eq_ignore_ascii_case("identity") => body.to_vec(),
+        Some(enc) if enc.eq_ignore_ascii_case("gzip") => {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(body)
+                .take(
+                    u64::try_from(max_bytes)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1),
+                )
+                .read_to_end(&mut out)
+                .map_err(|e| format!("failed to decompress huggingface response: {e}"))?;
+            out
+        }
+        Some(other) => {
+            return Err(format!(
+                "huggingface returned unsupported content-encoding {other}"
+            ))
+        }
+    };
+    if decoded.len() > max_bytes {
+        return Err(format!("huggingface response exceeds {max_bytes} bytes"));
+    }
+    Ok(String::from_utf8_lossy(&decoded).into_owned())
 }
 
 /// Map one fetched HF catalog response onto the fetch contract (the pure

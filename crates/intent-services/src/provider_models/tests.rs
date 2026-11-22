@@ -2324,6 +2324,82 @@ fn unsloth_fetch_outcome_all_hidden_degrades_to_unavailable() {
     );
 }
 
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn decode_hf_body_inflates_gzip_in_any_case() {
+    let compressed = gzip(UNSLOTH_HF_EXPANDED_FIXTURE.as_bytes());
+    for encoding in ["gzip", "GZIP", " gzip "] {
+        assert_eq!(
+            super::decode_hf_body(Some(encoding), &compressed, 1 << 20).as_deref(),
+            Ok(UNSLOTH_HF_EXPANDED_FIXTURE),
+            "{encoding:?}"
+        );
+    }
+}
+
+#[test]
+fn decode_hf_body_passes_uncompressed_bodies_through() {
+    let body = UNSLOTH_HF_EXPANDED_FIXTURE.as_bytes();
+    for encoding in [None, Some(""), Some("identity")] {
+        assert_eq!(
+            super::decode_hf_body(encoding, body, 1 << 20).as_deref(),
+            Ok(UNSLOTH_HF_EXPANDED_FIXTURE),
+            "{encoding:?}"
+        );
+    }
+}
+
+#[test]
+fn decode_hf_body_rejects_corrupt_gzip() {
+    let mut compressed = gzip(UNSLOTH_HF_EXPANDED_FIXTURE.as_bytes());
+    compressed.truncate(compressed.len() / 2);
+    let err = super::decode_hf_body(Some("gzip"), &compressed, 1 << 20).unwrap_err();
+    assert!(err.contains("decompress"), "{err}");
+    let err = super::decode_hf_body(Some("gzip"), b"not gzip", 1 << 20).unwrap_err();
+    assert!(err.contains("decompress"), "{err}");
+}
+
+#[test]
+fn decode_hf_body_caps_the_decoded_size() {
+    // 1 MiB of zeros compresses to about 1 KiB: the cap applies to the
+    // inflated size, not the download.
+    let bomb = gzip(&vec![0u8; 1 << 20]);
+    assert!(bomb.len() < 4096);
+    let err = super::decode_hf_body(Some("gzip"), &bomb, 64 * 1024).unwrap_err();
+    assert!(err.contains("exceeds"), "{err}");
+    let err = super::decode_hf_body(None, &[b' '; 2048], 1024).unwrap_err();
+    assert!(err.contains("exceeds"), "{err}");
+    assert!(super::decode_hf_body(None, &[b' '; 1024], 1024).is_ok());
+}
+
+#[test]
+fn decode_hf_body_rejects_unrequested_encodings() {
+    let err = super::decode_hf_body(Some("br"), b"x", 1 << 20).unwrap_err();
+    assert!(err.contains("br"), "{err}");
+}
+
+/// Live end-to-end check of the real request: gzip negotiation, bounded
+/// decoding and catalog parsing against huggingface.co. Run with
+/// `cargo test -p intent-services --lib unsloth_live_catalog -- --ignored`.
+#[tokio::test]
+#[ignore = "requires network access to huggingface.co"]
+async fn unsloth_live_catalog_downloads_gzip_and_lists_inkling() {
+    let body = super::fetch_unsloth_hf_catalog(super::UNSLOTH_HF_TIMEOUT)
+        .await
+        .expect("catalog fetched");
+    let fetch = super::unsloth_fetch_outcome(&body, Some(64 * GIB));
+    let rows = fetch.models.expect("models present");
+    let ids = row_ids(&rows);
+    assert!(rows.len() > 100, "{} rows", rows.len());
+    assert!(ids.contains(&"unsloth/Inkling-2-Mini-GGUF"), "{ids:?}");
+}
+
 #[test]
 fn unsloth_fetch_outcome_empty_catalog_degrades_to_unavailable() {
     let fetch = super::unsloth_fetch_outcome("[]", Some(32 * GIB));
