@@ -765,6 +765,9 @@ async fn unknown_base_profiles_are_kept_unloaded_and_written_back_unchanged() {
     assert!(SecretStore::load(&*fx.secrets, &env_account("pzorbit000001"))
         .unwrap()
         .is_some());
+    let swept: Value =
+        serde_json::from_str(&std::fs::read_to_string(fx.profiles_file()).unwrap()).unwrap();
+    assert!(swept.get("pendingEnvCleanup").is_none(), "{swept}");
 
     let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
     let ids: Vec<&str> = list["profiles"]
@@ -800,6 +803,9 @@ async fn malformed_file_is_left_untouched_and_reported_unreadable() {
             { "id": "p1", "baseProvider": "codex", "name": "x", "createdAt": "", "updatedAt": "" },
             { "id": "p1", "baseProvider": "zorbit" },
         ] }).to_string(),
+        json!({ "version": 1, "profiles": [{ "baseProvider": "zorbit" }] }).to_string(),
+        json!({ "version": 1, "profiles": [{ "id": 7, "baseProvider": "zorbit" }] }).to_string(),
+        json!({ "version": 1, "profiles": ["pzorbit"] }).to_string(),
     ] {
         let fx = Fixture::new().await;
         std::fs::write(fx.profiles_file(), &bad).unwrap();
