@@ -1,5 +1,8 @@
 //! Guard: only a composition root may build the process-wide default secrets
-//! store (`FileSecretStore::new()` / `FileSecretStore::default()`).
+//! store (`FileSecretStore::new()`, the `FileTokenStore::default()` that wraps
+//! it, or a `Services::new` that builds one). `FileSecretStore` has no
+//! `Default` impl, so `Default::default()` / `unwrap_or_default` /
+//! `#[derive(Default)]` cannot build it implicitly.
 //!
 //! Every other reader or writer takes the store its `Services` owns
 //! (`Services::secret_source`), so orchestrator tenants sharing one process
@@ -9,7 +12,11 @@
 use std::path::{Path, PathBuf};
 
 /// Calls that resolve the process-wide default file.
-const DEFAULT_STORE_CALLS: &[&str] = &["FileSecretStore::new()", "FileSecretStore::default()"];
+const DEFAULT_STORE_CALLS: &[&str] = &[
+    "FileSecretStore::new()",
+    "FileTokenStore::default()",
+    "Services::new(",
+];
 
 /// Where non-test code may still build the default store, and how often.
 /// `None` allows any number (the definition, and the `intentd` binary that is
@@ -19,6 +26,9 @@ const ALLOWED: &[(&str, Option<usize>)] = &[
     ("intent-core/src/secrets.rs", None),
     // `Services::new`: the desktop / `intentd` default composition.
     ("intent-services/src/lib.rs", Some(1)),
+    // `FileTokenStore`'s `Default`: the daemon's server auth token, built only
+    // by the `intentd` binary.
+    ("intent-transport/src/auth.rs", Some(1)),
     // The `intentd` binary is the desktop composition root.
     ("intentd/src/", None),
 ];
@@ -39,7 +49,7 @@ fn default_store_calls(source: &str) -> Vec<Hit> {
         .enumerate()
         .filter(|(i, _)| !test_lines.contains(&(i + 1)))
         .filter_map(|(i, line)| {
-            let code = line.split("//").next().unwrap_or_default();
+            let code = strip_line_comment(line);
             DEFAULT_STORE_CALLS
                 .iter()
                 .any(|call| code.contains(call))
@@ -49,6 +59,35 @@ fn default_store_calls(source: &str) -> Vec<Hit> {
                 })
         })
         .collect()
+}
+
+/// `line` without its `//` comment; a `//` inside a string literal (a URL)
+/// is code, not a comment.
+fn strip_line_comment(line: &str) -> &str {
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut prev_slash = false;
+    for (i, c) in line.char_indices() {
+        if in_str {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                prev_slash = false;
+            }
+            '/' if prev_slash => return &line[..i - 1],
+            '/' => prev_slash = true,
+            _ => prev_slash = false,
+        }
+    }
+    line
 }
 
 fn is_test_cfg(attr: &str) -> bool {
@@ -74,7 +113,7 @@ fn test_item_lines(source: &str) -> std::collections::HashSet<usize> {
         let mut opened = false;
         let mut end = lines.len() - 1;
         'scan: for (j, line) in lines.iter().enumerate().skip(start + 1) {
-            let code = line.split("//").next().unwrap_or_default();
+            let code = strip_line_comment(line);
             let mut in_str = false;
             let mut escaped = false;
             for c in code.chars() {
@@ -208,9 +247,20 @@ pub async fn token() -> Option<String> {
         }]
     );
     assert_eq!(
-        default_store_calls("let s = FileSecretStore::default();").len(),
+        default_store_calls("let t = intent_transport::FileTokenStore::default();").len(),
         1
     );
+    assert_eq!(
+        default_store_calls("let s = intent_services::Services::new(store);").len(),
+        1
+    );
+    assert_eq!(
+        default_store_calls(r#"let u = "https://example.com"; let s = FileSecretStore::new();"#)
+            .len(),
+        1,
+        "a URL before the call must not hide it"
+    );
+    assert!(default_store_calls("Services::new_with_secret_file(store, file)").is_empty());
 }
 
 #[test]

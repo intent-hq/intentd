@@ -198,3 +198,91 @@ async fn tenant_credentials_stay_in_their_own_store() {
         );
     }
 }
+
+/// The `auto` chains' host-wide fallbacks (env vars; `gh` is after env, so
+/// never reached here) serve the desktop but never an orchestrator tenant.
+#[intent_test_macros::daemon_test]
+async fn tenant_never_borrows_host_env_credentials() {
+    let _env = EnvGuard::set_all(&[
+        ("GITHUB_TOKEN", "gh-host-env"),
+        ("GITLAB_TOKEN", "glpat-host-env"),
+        ("LINEAR_API_KEY", "lin-host-env"),
+        ("ELEVENLABS_API_KEY", "el-host-env"),
+        ("OPENAI_API_KEY", "sk-host-env"),
+        ("SENTRY_API_TOKEN", "sntry-host-env"),
+        ("SENTRY_ORG", "host-org"),
+    ]);
+    let open = |dir: &std::path::Path| {
+        let dir = dir.to_path_buf();
+        async move {
+            Services::new_with_secret_file(
+                Store::open(&dir.join("db.sqlite"))
+                    .await
+                    .expect("open store"),
+                intent_core::FileSecretStore::with_path(dir.join(".secrets.json")),
+            )
+            .with_settings_registry(Arc::new(
+                SettingsRegistry::load(dir.join("config.toml")).expect("load registry"),
+            ))
+        }
+    };
+    let desktop_dir = test_tempdir("intentd-desktop-env-");
+    let tenant_dir = test_tempdir("intentd-tenant-env-");
+    let desktop = open(desktop_dir.path()).await;
+    let tenant = open(tenant_dir.path()).await.with_orchestrator_mode(true);
+
+    async fn auto(svc: &Services) -> [Option<String>; 5] {
+        let secrets = svc.secret_source();
+        [
+            intent_sourcecontrol::token::resolve(
+                &intent_sourcecontrol::TokenSource::Auto,
+                &secrets,
+            )
+            .await,
+            intent_sourcecontrol::gitlab_token::resolve_gitlab_token(
+                intent_sourcecontrol::GitlabTokenSource::Auto,
+                &secrets,
+            )
+            .await,
+            intent_linear::token::resolve(&intent_linear::TokenSource::Auto, &secrets).await,
+            intent_voice::token::resolve(intent_voice::VoiceProvider::ElevenLabs, &secrets).await,
+            intent_voice::token::resolve(intent_voice::VoiceProvider::OpenAi, &secrets).await,
+        ]
+    }
+    assert_eq!(
+        auto(&desktop).await,
+        [
+            "gh-host-env",
+            "glpat-host-env",
+            "lin-host-env",
+            "el-host-env",
+            "sk-host-env"
+        ]
+        .map(|v| Some(v.to_string())),
+        "desktop keeps its env fallbacks"
+    );
+    assert_eq!(
+        auto(&tenant).await,
+        [None, None, None, None, None],
+        "a tenant borrowed a host env credential"
+    );
+    assert!(desktop.resolve_sentry_engine().await.is_ok());
+    assert!(
+        tenant.resolve_sentry_engine().await.is_err(),
+        "a tenant borrowed the host's SENTRY_* account"
+    );
+    let skipped = intent_sourcecontrol::token::resolve_detailed(
+        &intent_sourcecontrol::TokenSource::GhCli,
+        &tenant.secret_source(),
+    )
+    .await;
+    assert!(skipped.token.is_none());
+    assert!(
+        skipped
+            .skipped
+            .iter()
+            .any(|s| s.contains("orchestrator tenant")),
+        "{:?}",
+        skipped.skipped
+    );
+}

@@ -43,7 +43,26 @@ impl SentryRegistry {
     ///
     /// Returns [`Error::NotConfigured`] when no credential pair is available; propagates client-construction failures.
     pub fn from_settings(settings: &SentrySettings) -> Result<Arc<dyn SentryEngine>> {
-        let creds = resolve_credentials(settings, token::env_parts())?;
+        Self::from_settings_with_host_env(settings, true)
+    }
+
+    /// [`Self::from_settings`], filling a missing half from `SENTRY_API_TOKEN`
+    /// / `SENTRY_ORG` only when `host_env` is set — an orchestrator tenant
+    /// passes `false` so it never borrows the host's Sentry account.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_settings`].
+    pub fn from_settings_with_host_env(
+        settings: &SentrySettings,
+        host_env: bool,
+    ) -> Result<Arc<dyn SentryEngine>> {
+        let env = if host_env {
+            token::env_parts()
+        } else {
+            CredentialParts::default()
+        };
+        let creds = resolve_credentials(settings, env)?;
         let client = SentryClient::new(
             &creds.token,
             &creds.organization,

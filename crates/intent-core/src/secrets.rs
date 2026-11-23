@@ -112,12 +112,6 @@ pub struct FileSecretStore {
     path: PathBuf,
 }
 
-impl Default for FileSecretStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Abstraction over secret persistence, shared by every crate that reads or
 /// writes a credential. Each `Services` owns one (the desktop default is the
 /// file-backed [`FileSecretStore`]; an orchestrator tenant injects its own),
@@ -144,6 +138,38 @@ pub trait SecretStore: Send + Sync {
     ///
     /// Returns an error if the backing store fails; absence is not an error.
     fn delete(&self, account: &str) -> Result<()>;
+    /// Whether credential resolvers may fall back to host-wide sources —
+    /// process env vars (`GITHUB_TOKEN`, `GITLAB_TOKEN`, `LINEAR_API_KEY`, …)
+    /// and the host `gh` CLI login — when this store holds no value. `true`
+    /// for the desktop / `intentd` store; an orchestrator tenant's store
+    /// ([`WithoutHostCredentials`]) says `false`, so a tenant never borrows the
+    /// operator's credentials.
+    fn allows_host_credentials(&self) -> bool {
+        true
+    }
+}
+
+/// A [`SecretStore`] that denies host-wide credential fallbacks (see
+/// [`SecretStore::allows_host_credentials`]) and otherwise delegates: what an
+/// orchestrator tenant's `Services` hands its credential resolvers.
+pub struct WithoutHostCredentials(pub SharedSecretStore);
+
+impl SecretStore for WithoutHostCredentials {
+    fn load(&self, account: &str) -> Result<Option<String>> {
+        self.0.load(account)
+    }
+
+    fn store(&self, account: &str, value: &str) -> Result<()> {
+        self.0.store(account, value)
+    }
+
+    fn delete(&self, account: &str) -> Result<()> {
+        self.0.delete(account)
+    }
+
+    fn allows_host_credentials(&self) -> bool {
+        false
+    }
 }
 
 /// A shared handle to a [`SecretStore`], cheap to clone into a blocking task.
@@ -205,6 +231,12 @@ impl FileSecretStore {
     /// migrated (see [`crate::test_isolation::redirect_default_secrets`]); an
     /// explicit `INTENTD_SECRETS_FILE` into the real home aborts instead.
     #[must_use]
+    #[expect(
+        clippy::new_without_default,
+        reason = "no `Default`: the process-wide file is never built implicitly \
+                  (`Default::default()`, `unwrap_or_default`, `#[derive(Default)]`); \
+                  the `secret_store_roots` guard tracks every explicit `new()`"
+    )]
     pub fn new() -> Self {
         let path = default_secrets_path();
         if env_override_active() {

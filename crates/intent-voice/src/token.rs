@@ -51,7 +51,9 @@ pub(crate) fn env_var(provider: VoiceProvider) -> &'static str {
 pub async fn resolve(provider: VoiceProvider, secrets: &SharedSecretStore) -> Option<String> {
     match file_store_key(provider, secrets.clone()).await {
         Some(v) => Some(v),
-        None => env_key(provider),
+        // An orchestrator tenant never borrows the host's provider keys.
+        None if secrets.allows_host_credentials() => env_key(provider),
+        None => None,
     }
 }
 

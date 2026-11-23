@@ -250,7 +250,7 @@ pub use repository_context::{
 };
 pub use secrets::{
     create_dir_private, write_private, write_private_hidden, FileSecretStore, InMemorySecretStore,
-    SecretStore, SharedSecretStore,
+    SecretStore, SharedSecretStore, WithoutHostCredentials,
 };
 pub use server_control::{
     InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope, ServerControl,
