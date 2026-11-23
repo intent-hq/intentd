@@ -1651,7 +1651,10 @@ async fn home_hooks_reach_the_inbound() {
     .unwrap();
     node.connect().await.unwrap();
     let end = machine.accept().await;
-    assert!(end.link.protocol() >= intent_core::node_link::HOMES_PROTOCOL);
+    intentd_test_support::assert_link_supports(
+        end.link.protocol(),
+        intent_core::node_link::HOMES_PROTOCOL,
+    );
     tokio::time::timeout(wait(), async {
         while inbound.after_binds.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;

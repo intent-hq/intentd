@@ -27,6 +27,9 @@
 //!   instead of racing a fixed `sleep`. A hold gives up on its own (exit
 //!   [`Barrier::ABANDONED_EXIT_CODE`]) once the test's directory is gone or
 //!   its deadline passes, so a fake can never outlive its test.
+//! - [`assert_link_supports`]: a node link's agreed protocol carries a
+//!   feature, as `agreed >= FEATURE_PROTOCOL`; an exact match breaks on the
+//!   next protocol bump (`link_protocol_exact_lint`).
 //! - [`test_timeout`]: the one place test budgets read
 //!   `INTENTD_TEST_TIMEOUT_MULTIPLIER`, so hang guards stretch on slow
 //!   coverage runners instead of flaking (`fixed_deadline_lint`).
@@ -53,6 +56,7 @@
 mod barrier;
 #[cfg(unix)]
 mod guarded_child;
+mod link_protocol;
 #[cfg(unix)]
 mod process_group;
 pub mod source_lint;
@@ -61,6 +65,7 @@ mod timeout;
 pub use barrier::{Barrier, DEFAULT_HOLD_DEADLINE};
 #[cfg(unix)]
 pub use guarded_child::GuardedChild;
+pub use link_protocol::assert_link_supports;
 #[cfg(unix)]
 pub use process_group::{is_running, ProcessGroup};
 pub use timeout::{
