@@ -744,7 +744,8 @@ adds the host to the window's host rail when the rail is on, shows it, and opens
 shows its plain name (no **(connected backend)**). An orchestrator's row shows a hub icon after its name instead of a subtitle. A row whose
 intentd is older than the app's shows an orange dot after its name. Hovering the name
 shows one plain-text tooltip with the row's details: **Host only: sends agents to runners**,
-the outdated version, agent load, **OS** and providers. On the host on screen it also lists
+**Status**, **Version** (with the app's version when it is older), **Address** for a remote,
+agent load, **OS** and providers. On the host on screen it also lists
 **Runner for** (hosts that may run agents on it), and its **…** menu has **Revoke access
 for <host>** for each; there is no separate Hosts with access section (older versions may differ). A saved host stays
 under Hosts even when it also runs agents for the current host. **Add host** under Hosts opens
