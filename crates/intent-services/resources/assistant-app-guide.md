@@ -1290,6 +1290,23 @@ the normal order. Pins are saved by Intent, so they appear on every device
 connected to the same Intent. Only foreground agents that were not started by
 another agent can be pinned.
 
+<!-- Sources: packages/intentd/crates/intent-core/src/conversation_goal.rs; packages/intentd/crates/intent-services/src/conversation_goal.rs (agent.setGoal, /goal); packages/intentd/crates/intent-services/src/harness/v3_17.rs (per-turn goal block); packages/intentd/crates/intent-transport/src/router.rs (interpretCommands). -->
+
+To keep a conversation on track, send **/goal** followed by what done looks like, for
+example `/goal Ship the login fix; done when CI is green.` Intent saves it as the chat's
+goal instead of sending it as a message: the agent is not woken, no turn starts, and a
+short notice in the chat confirms it. Send **/goal** with nothing after it to see the
+current goal. On the desktop the goal appears in a strip at the top of the chat; click it
+to see the whole goal, and use **Edit** or **Remove** to change it. On iOS it appears as a
+goal chip above the composer; tap it to edit or remove the goal. An app, or app version,
+without these goal controls sends **/goal** to the agent as an ordinary message, so do not
+promise that **/goal** avoids starting a turn unless the user's app shows the goal
+controls. While a goal is set, the agent is reminded of it on every turn, and newer
+instructions from the user still take precedence. A goal is up to 1,000 characters, cannot carry attachments, survives
+restarts and is shared across devices. Agents cannot set a goal. Older versions may
+differ: a backend without goal support delivers **/goal** to the agent as an ordinary
+message.
+
 <!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/AgentViewSettingsDropdown.svelte; packages/cloudlands-fe/src/lib/components/chat/InlinePermissionRequest.svelte; packages/intentd/crates/intent-acp/src/permission.rs (option kind/scope); packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update permissionPolicy); packages/intentd/crates/intent-services/src/agent_manager.rs (permission_policy_for, respawn on change); packages/intentd/crates/intent-services/src/settings.rs (agents.permissionPolicy); packages/intentd/crates/intentd/src/main.rs (INTENTD_PERMISSION_POLICY override); packages/intentd/crates/intent-acp/src/spawn.rs (Codex INITIAL_AGENT_MODE); packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte (Agent defaults). -->
 
 By default agents use tools without asking. To approve each tool use in one chat,

@@ -627,6 +627,8 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
 ///   the author projection), never a human row; `agent.respondPermission`
 ///   and `agent.stop` drive turn control without appending a chat row
 ///   (question answers travel as `agent.sendMessage` content).
+/// - `agent.setGoal` (and a `/goal` command) appends only the daemon-authored
+///   `goal_command` system notice, never a human row.
 /// - `discussion.*` uses its own human-only store, never the agent transcript.
 /// - `note.*`, `comment.*`, `task.*`, `github.*` write notes, comments and
 ///   forge objects — never the agent transcript; `accept-changes.*` and
@@ -676,6 +678,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.restore",
     "agent.retire",
     "agent.rpcMethods",
+    "agent.setGoal",
     "agent.setModel",
     "agent.stop",
     "agent.subscribe",
@@ -1806,6 +1809,7 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "agent.update",
         "agent.stop",
         "agent.sendMessage",
+        "agent.setGoal",
         "agent.setModel",
         "hook.list",
         "git.push",

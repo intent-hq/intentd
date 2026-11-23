@@ -6351,6 +6351,15 @@ impl AgentManager {
         // agents; absent for non-specialist agents. Because it fires every turn
         // it also covers the session-recreated case handled by `build_turn_body`.
         let reminder = self.services.agent_role_reminder(agent_id).await;
+        // Conversation goal (PROTOCOL §5.5): resolved next to the role
+        // reminder on every turn (summary read, no transcript load) and
+        // rendered with the latest harness wording, so a session pinned to an
+        // older harness still gets the block. Never persisted.
+        let goal_block = self
+            .services
+            .agent_conversation_goal(agent_id)
+            .await
+            .and_then(|goal| crate::harness::latest().conversation_goal_block(&goal));
         let authoritative_saved_groups = options.delivery_groups.is_some()
             || options.prepend_delivery_groups.is_some()
             || options.flushed_entries.iter().flatten().any(|entry| {
@@ -6487,6 +6496,7 @@ impl AgentManager {
                 stdin_context,
                 naming_nudge: naming.as_deref(),
                 role_reminder: reminder.as_deref(),
+                conversation_goal: goal_block.as_deref(),
                 body: &body,
             });
         let mut blocks = text_prompt(&prompt_text);

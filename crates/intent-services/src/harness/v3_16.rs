@@ -34,8 +34,7 @@ mod tests {
     fn v3_16_is_3_15_with_load_aware_placement_text() {
         let current = super::super::resolve_entry("3.16");
         let prior = super::super::resolve_entry("3.15");
-        assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
+        assert_eq!(current.version, "3.16");
         assert!(std::ptr::addr_eq(current.harness, prior.harness));
         assert!(std::ptr::eq(current.doctrine, prior.doctrine));
         assert_eq!((current.default_features)(), (prior.default_features)());

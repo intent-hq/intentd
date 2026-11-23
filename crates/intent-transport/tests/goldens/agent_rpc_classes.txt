@@ -57,6 +57,7 @@ mutating agent.sendMessage
 mutating agent.sendQueuedMessageNow
 mutating agent.sendQueuedMessagesNow
 mutating agent.sendToTask
+forbidden-to-agent agent.setGoal
 mutating agent.setModel
 mutating agent.stop
 unsupported-on-agent-path agent.subscribe

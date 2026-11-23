@@ -2795,6 +2795,44 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.setGoal` (PROTOCOL §5.5 "Conversation goal"): set, replace
+    /// or remove (`None` / empty) the agent's conversation goal. Returns
+    /// `{ action, goal, noticeMessageId? }`; a write persists one
+    /// `goal_command` notice row and emits `agent:updated { agentId, goal }`.
+    /// `workspace_id`, when given, must be the agent's workspace.
+    fn agent_set_goal(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: AgentId,
+        goal: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, goal);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_set_goal not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// A recognized `/goal` command sent through `agent.sendMessage` /
+    /// `agent.queueMessage` with `interpretCommands: true` (PROTOCOL §5.5
+    /// "Conversation goal"); `statement` is the parsed, untrimmed-safe
+    /// statement (empty shows the current goal). Returns the send result
+    /// `{ success: true, queued: false, command }`.
+    fn agent_goal_command(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: AgentId,
+        statement: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, statement);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_goal_command not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.markSeen`: persist the per-conversation seen marker
     /// (`message_id` — the newest transcript message the user has seen) on
     /// the agent session and emit `agent:updated` (PROTOCOL §5.5). Monotonic:

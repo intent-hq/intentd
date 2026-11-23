@@ -28,6 +28,7 @@ pub mod chief_cwd;
 pub mod cli_env;
 pub mod clock;
 pub mod config;
+pub mod conversation_goal;
 pub mod discovery_cache;
 pub mod discussion;
 pub mod error;

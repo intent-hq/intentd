@@ -61,6 +61,7 @@ pub(crate) mod v3_13;
 pub(crate) mod v3_14;
 pub(crate) mod v3_15;
 pub(crate) mod v3_16;
+pub(crate) mod v3_17;
 pub(crate) mod v3_3;
 pub(crate) mod v3_4;
 pub(crate) mod v3_5;
@@ -111,6 +112,11 @@ pub(crate) struct TurnEnvelopeParams<'a> {
     pub naming_nudge: Option<&'a str>,
     /// Per-turn `[Role Reminder: …]` prefix (specialist agents only).
     pub role_reminder: Option<&'a str>,
+    /// Per-turn conversation goal block (PROTOCOL §5.5 "Conversation
+    /// goal"), rendered by [`Harness::conversation_goal_block`]; present
+    /// while the user has a goal set. Placed after the role reminder,
+    /// directly before the body, by harnesses that have the surface (3.17+).
+    pub conversation_goal: Option<&'a str>,
     /// The turn body: user content, possibly history-wrapped.
     pub body: &'a str,
 }
@@ -206,6 +212,16 @@ pub(crate) trait Harness: Send + Sync {
     ) -> String;
     /// Per-turn `[Role Reminder: You are a {name}. {reminder}]` prefix.
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String;
+    /// Per-turn conversation goal block around the user's verbatim goal
+    /// text (PROTOCOL §5.5 "Conversation goal"), framed so newer explicit
+    /// user instructions take precedence and escaped so the goal cannot end
+    /// the block early. `None` on harnesses older than 3.17, which predate
+    /// the surface; the turn envelope always renders it with
+    /// [`latest`], so pinned sessions still receive the block.
+    fn conversation_goal_block(&self, goal: &str) -> Option<String> {
+        let _ = goal;
+        None
+    }
     /// `[System: workspace setup is still running …]` notice for a turn that
     /// starts while the workspace's setup script is `pending` / `running`:
     /// names the terminal, marks the worktree provisional, and tells the
@@ -713,6 +729,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v3_14::ENTRY,
     &v3_15::ENTRY,
     &v3_16::ENTRY,
+    &v3_17::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row

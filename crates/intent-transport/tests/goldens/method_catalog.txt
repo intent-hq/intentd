@@ -123,6 +123,7 @@ router agent.sendMessage
 router agent.sendQueuedMessageNow
 router agent.sendQueuedMessagesNow
 router agent.sendToTask
+router agent.setGoal
 router agent.setModel
 router agent.stop
 router agent.subscribe

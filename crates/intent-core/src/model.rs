@@ -3866,7 +3866,17 @@ pub const AGENT_LIST_NAME_CAP_BYTES: usize = 128;
 /// paging `agent.list` — separate protocol decisions. The response-level
 /// frame fit ([`fit_agent_list_frame`]) is the non-protocol half of that:
 /// it lowers the preview cap per response when the row count demands it.
-pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 7 * 1024 + 512;
+/// The user-set conversation `goal` (PROTOCOL §5.5 "Conversation goal",
+/// 1–1,000 characters, never truncated) then joined the row so the chat
+/// header and goal strip render from the list without opening each agent.
+/// The worst-case row carries a goal of 1,000 four-byte characters (the
+/// widest printable UTF-8, ≈ 4,010 B serialized): a measured ≈ 11,000 B
+/// worst case, and the budget rose to 11.5 KiB (≈ 7% margin). Only agents
+/// with a goal carry it and typical goals are a sentence or two (an ASCII
+/// goal at the cap adds ≈ 1,010 B). A goal built from control characters
+/// (escaped as 6-byte `\u00XX`) could exceed this; that is not realistic
+/// input, and `agent.list` pages still stop at their 480,000-byte budget.
+pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 11 * 1024 + 512;
 
 /// Response-level byte budget for the serialized `agent.list` rows array
 /// (intent-hq/intent#5531, fourth recurrence of the oversize frame): the
@@ -4029,6 +4039,7 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "pinned",
     "permissionPolicy",
     "effectivePermissionPolicy",
+    "goal",
     "harnessVersion",
     "nodeId",
     "nodeName",
@@ -4195,7 +4206,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.16";
+pub const CURRENT_HARNESS_VERSION: &str = "3.17";
 
 /// A harness experiment while it is built: registered and admitted
 /// like a released one, but stamped only through the eval-only override
@@ -4240,7 +4251,7 @@ const fn version_is_newer(a: &str, b: &str) -> bool {
 /// malformed or unknown stamps are never admitted.
 pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] = &[
     "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10", "3.11", "3.12",
-    "3.13", "3.14", "3.15", "3.16",
+    "3.13", "3.14", "3.15", "3.16", "3.17",
 ];
 
 /// Harness versions that receive monitor-style repository guidance and the
@@ -4248,7 +4259,7 @@ pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] = &[
 /// of [`REPOSITORY_GUIDANCE_HARNESS_VERSIONS`] (checked at compile time).
 pub const REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS: &[&str] = &[
     "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14",
-    "3.15", "3.16",
+    "3.15", "3.16", "3.17",
 ];
 
 const fn const_str_eq(a: &str, b: &str) -> bool {
@@ -4778,6 +4789,14 @@ pub struct AgentSession {
     /// writes never revert it. Applied when the agent's process next starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_policy: Option<String>,
+    /// User-set conversation goal (PROTOCOL §5.5 "Conversation goal"):
+    /// 1–[`crate::conversation_goal::MAX_CHARS`] characters, `None` when
+    /// unset (and then omitted from the wire form). Written only by the
+    /// store's narrow goal writer behind `/goal` and `agent.setGoal`; a user preference like [`Self::pinned`], so it never
+    /// advances `updated_at` and ordinary full-row session writes never
+    /// revert it. Rendered into every outbound turn prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
     /// Harness version this session was stamped with at creation
     /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
     /// upgrade never changes it, and there is no upgrade/migration/pinning
@@ -4851,6 +4870,7 @@ impl Default for AgentSession {
             notifications_muted: false,
             pinned: false,
             permission_policy: None,
+            goal: None,
             harness_version: CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             created_at: String::new(),
@@ -5411,6 +5431,11 @@ pub struct AgentLite {
     /// `remoteAgents.permission`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_permission_policy: Option<String>,
+    /// User-set conversation goal; mirrors [`AgentSession::goal`]. Omitted
+    /// when unset: support is advertised by `conversationGoal: 1`, not by
+    /// this key's presence (PROTOCOL §5.5 "Conversation goal").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
     /// Harness version the session was stamped with at creation; mirrors
     /// [`AgentSession::harness_version`] (intent-hq/monorepo#2459).
     #[serde(default = "default_harness_version")]
@@ -5564,6 +5589,7 @@ impl AgentLite {
             pinned: session.pinned,
             permission_policy: session.permission_policy,
             effective_permission_policy: None,
+            goal: session.goal,
             harness_version: session.harness_version,
             harness_features: session.harness_features,
             node_id: remote

@@ -137,6 +137,7 @@ const COMPARED_SURFACES: &[&str] = &[
     "agent_naming_tool_reference",
     "naming_nudge",
     "role_reminder_prefix",
+    "conversation_goal_block",
     "setup_in_progress_notice",
     "setup_failed_notice",
     "compose_turn_prompt",
@@ -293,6 +294,7 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(naming_nudge(None, Some("ws-ref")));
     same!(naming_nudge(None, None));
     same!(role_reminder_prefix("Implementor", "Stay in scope."));
+    same!(conversation_goal_block("Ship it.\nDone when green."));
     same!(setup_in_progress_notice("Setup Script"));
     same!(setup_failed_notice(Some(3), "Setup Script"));
     same!(setup_failed_notice(None, "Setup Script"));
@@ -303,6 +305,7 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
         stdin_context: Some("ctx"),
         naming_nudge: Some("<system>name it</system>"),
         role_reminder: Some("[Role Reminder: x]"),
+        conversation_goal: None,
         body: "hello",
     };
     let bare = TurnEnvelopeParams {
@@ -312,6 +315,7 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
         stdin_context: None,
         naming_nudge: None,
         role_reminder: None,
+        conversation_goal: None,
         body: "hello",
     };
     same!(compose_turn_prompt(&full));

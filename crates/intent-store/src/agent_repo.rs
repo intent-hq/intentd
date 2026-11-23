@@ -49,7 +49,7 @@ pub(crate) const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, 
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
-    harness_features, retired_at, notifications_muted, pinned, permission_policy";
+    harness_features, retired_at, notifications_muted, pinned, permission_policy, goal";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
@@ -62,7 +62,7 @@ pub(crate) const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_sess
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     context_references, file_blocks, is_background, metadata, \
     stop_reason, stop_reason_timestamp, reasoning_effort, \
-    effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned, permission_policy";
+    effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned, permission_policy, goal";
 
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
 /// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
@@ -1084,7 +1084,7 @@ pub(crate) fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<St
     .transpose()
 }
 
-/// Bind the full 43-column `agent_session` insert value list onto `query`, in
+/// Bind the full 44-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place. The harness stamp (`harness_version` /
@@ -1134,7 +1134,8 @@ fn bind_session_insert<'q>(
         .bind(&s.retired_at)
         .bind(i64::from(s.notifications_muted))
         .bind(i64::from(s.pinned))
-        .bind(&s.permission_policy))
+        .bind(&s.permission_policy)
+        .bind(&s.goal))
 }
 
 /// Per-session boolean user preferences. Each is written only by its narrow
@@ -2087,6 +2088,31 @@ impl Store {
         dispatch!(self, backend => backend.set_agent_permission_policy(workspace_id, id, policy).await)
     }
 
+    /// Compare-and-set the session's conversation goal (0199) — the store
+    /// side of `/goal` and `agent.setGoal` (PROTOCOL §5.5 "Conversation
+    /// goal"). Writes `goal` (`None` clears it) only while the stored value
+    /// still equals `expected` and differs from `goal`, so two concurrent
+    /// writers can never both report the action they computed from the same
+    /// old value. Returns `true` when the row changed; `false` when the
+    /// session exists but the stored goal was not `expected` (a concurrent
+    /// write won; re-read and retry) or already equals `goal`. Same
+    /// preference contract as [`Store::set_agent_pinned`]: never advances the
+    /// activity timestamp, and full-row session writes never touch the
+    /// column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn set_agent_goal(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected: Option<&str>,
+        goal: Option<&str>,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.set_agent_goal(workspace_id, id, expected, goal).await)
+    }
+
     /// Persist a model switch (`agent.setModel`): a narrow write of `model`,
     /// `provider`, and `updated_at` only. This is the ONE writer allowed to
     /// change `provider` after first real use — an intentional cross-provider
@@ -2810,7 +2836,7 @@ impl crate::SqliteStore {
         };
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = bind_session_insert(
             sqlx::query(sqlx::AssertSqlSafe(sql.as_str())),
@@ -2878,7 +2904,7 @@ impl crate::SqliteStore {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(
                 sqlx::query(sqlx::AssertSqlSafe(session_sql.as_str())),
@@ -4228,7 +4254,8 @@ impl crate::SqliteStore {
         // concurrent or long-lived in-memory session persisted here without
         // such a patch can never revert the user's mute. `pinned` (0180) is
         // the same kind of user toggle and is excluded on the same grounds,
-        // as is `permission_policy` (0190).
+        // as are `permission_policy` (0190) and the conversation `goal`
+        // (0199, written only by `Store::set_agent_goal`).
         // The creation-only Assistant marker is monotonic: once absent or
         // invalidated, a stale full-row write cannot resurrect it. Evaluate
         // the stored value in this UPDATE, not in the earlier invariant read.
@@ -4409,6 +4436,43 @@ impl crate::SqliteStore {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("set permission policy failed: {e}")))?
+        .rows_affected();
+        if rows > 0 {
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("verify agent session failed: {e}")))?;
+        if exists.is_none() {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(false)
+    }
+
+    pub async fn set_agent_goal(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected: Option<&str>,
+        goal: Option<&str>,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET goal=? \
+             WHERE id=? AND workspace_id=? AND goal IS ? AND goal IS NOT ?",
+        )
+        .bind(goal)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected)
+        .bind(goal)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set conversation goal failed: {e}")))?
         .rows_affected();
         if rows > 0 {
             return Ok(true);
@@ -5990,6 +6054,7 @@ fn map_session_row_with_heavy_cols(
         notifications_muted: col::<i64>(row, "notifications_muted")? != 0,
         pinned: col::<i64>(row, "pinned")? != 0,
         permission_policy: col(row, "permission_policy")?,
+        goal: col(row, "goal")?,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -7372,17 +7437,19 @@ impl crate::SqliteStore {
         prestaged: bool,
         origin: UsageMessageOrigin,
     ) -> Result<AgentMessage> {
+        // `seq` is NOT read here: the INSERT below allocates it as
+        // `MAX(seq) + 1` on the single write connection, so two concurrent
+        // appends for one agent (a finishing turn and an out-of-turn notice,
+        // or a user send) can never compute the same value and lose a row to
+        // the `UNIQUE(agent_id, seq)` check.
         let row = sqlx::query(
-            "SELECT COALESCE(NULLIF(resolved_model,''), NULLIF(model,''), 'unknown') AS model, \
-             (SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_message WHERE agent_id = ?) AS next \
+            "SELECT COALESCE(NULLIF(resolved_model,''), NULLIF(model,''), 'unknown') AS model \
              FROM agent_session WHERE id = ?",
         )
-        .bind(&agent_id.0)
         .bind(&agent_id.0)
         .fetch_one(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("message provenance read failed: {e}")))?;
-        let seq = row.get::<i64, _>("next");
         let usage_model = row.get::<String, _>("model");
         let metadata_json = match metadata {
             Some(m) => Some(
@@ -7461,26 +7528,27 @@ impl crate::SqliteStore {
         };
         let sql = format!(
             "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}, usage_model, usage_origin) \
-             VALUES (?,?,?,?,?,?,?,?,?)"
+             VALUES (?,?,(SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_message WHERE agent_id = ?),\
+             ?,?,?,?,?,?) RETURNING seq"
         );
-        if preview_update.is_none()
+        let seq = if preview_update.is_none()
             && payload_rows.is_empty()
             && stale_keys.is_empty()
             && origin == UsageMessageOrigin::Excluded
         {
-            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(id)
                 .bind(&agent_id.0)
-                .bind(seq)
+                .bind(&agent_id.0)
                 .bind(role)
                 .bind(&content_json)
                 .bind(metadata_json.as_deref())
                 .bind(created_at)
                 .bind(&usage_model)
                 .bind(origin.as_db())
-                .execute(self.write_pool())
+                .fetch_one(self.write_pool())
                 .await
-                .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?
         } else {
             let pool = self.write_pool();
             // A user/assistant append is by construction the session's
@@ -7498,17 +7566,17 @@ impl crate::SqliteStore {
                 let mut tx = pool.begin().await.map_err(|e| {
                     Error::Internal(format!("append agent message begin failed: {e}"))
                 })?;
-                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                let seq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()))
                     .bind(id)
                     .bind(&agent_id.0)
-                    .bind(seq)
+                    .bind(&agent_id.0)
                     .bind(role)
                     .bind(&content_json)
                     .bind(metadata_json.as_deref())
                     .bind(created_at)
                     .bind(&usage_model)
                     .bind(origin.as_db())
-                    .execute(&mut *tx)
+                    .fetch_one(&mut *tx)
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
                 insert_payload_rows(&mut tx, id, &agent_id.0, &payload_rows).await?;
@@ -7568,10 +7636,10 @@ impl crate::SqliteStore {
                 tx.commit().await.map_err(|e| {
                     Error::Internal(format!("append agent message commit failed: {e}"))
                 })?;
-                Ok(())
+                Ok(seq)
             })
-            .await?;
-        }
+            .await?
+        };
         Ok(AgentMessage {
             id: id.to_string(),
             agent_id: agent_id.clone(),

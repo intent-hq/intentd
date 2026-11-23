@@ -783,6 +783,7 @@ impl Services {
         params: Value,
         wait: Duration,
     ) -> std::result::Result<Value, AgentRpcError> {
+        let params = strip_interpret_commands(method, params);
         match self.resolve_backend(surface, Some(backend))? {
             Target::Local => tokio::time::timeout(wait, surface.call(method.to_string(), params))
                 .await
@@ -802,6 +803,20 @@ fn info_view(backend: &Value, version: &str, protocol_version: &str) -> Value {
         "docsNote": "The protocol docs track the monorepo's intentd pin, not this exact release; the intentd source at v<daemonVersion> is the exact match.",
         "cli": "intentd call <method> --params '<json>' is the equivalent CLI form used in docs. Do not run it; use ws.rpc.call.",
     })
+}
+
+/// Conversation goal (§5.5): `interpretCommands` is ignored on every
+/// agent-origin `agent.sendMessage` / `agent.queueMessage`, local or relayed,
+/// so an agent cannot set a goal with a `/goal` message. Removed here, at the
+/// one seam every `ws.rpc` call passes, before the request leaves the agent
+/// path.
+fn strip_interpret_commands(method: &str, mut params: Value) -> Value {
+    if matches!(method, "agent.sendMessage" | "agent.queueMessage") {
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("interpretCommands");
+        }
+    }
+    params
 }
 
 fn refusal_for(
@@ -863,4 +878,33 @@ fn approved_report(items: &[Value]) -> String {
     }
     text.truncate(end);
     text
+}
+
+#[cfg(test)]
+mod strip_interpret_commands_tests {
+    use serde_json::json;
+
+    use super::strip_interpret_commands;
+
+    /// §5.5 "Conversation goal": an agent cannot set a goal with a `/goal`
+    /// message, so `interpretCommands` never survives the `ws.rpc` seam.
+    #[test]
+    fn agent_sends_lose_interpret_commands() {
+        for method in ["agent.sendMessage", "agent.queueMessage"] {
+            let params = json!({ "agentId": "a", "content": "/goal x", "interpretCommands": true });
+            assert_eq!(
+                strip_interpret_commands(method, params),
+                json!({ "agentId": "a", "content": "/goal x" })
+            );
+        }
+        let other = json!({ "interpretCommands": true });
+        assert_eq!(
+            strip_interpret_commands("agent.update", other.clone()),
+            other
+        );
+        assert_eq!(
+            strip_interpret_commands("agent.sendMessage", json!(null)),
+            json!(null)
+        );
+    }
 }
