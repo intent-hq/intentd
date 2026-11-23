@@ -35,6 +35,15 @@ pub(crate) struct Fixture {
 }
 impl Fixture {
     pub(crate) async fn unadopted(server: &Server) -> Self {
+        Self::unadopted_with(server, Some("stored-pat"), false).await
+    }
+    /// [`Self::unadopted`] with an optional stored PAT, optionally in
+    /// orchestrator mode (a tenant's `Services`).
+    pub(crate) async fn unadopted_with(
+        server: &Server,
+        stored: Option<&str>,
+        orchestrator: bool,
+    ) -> Self {
         let dir = crate::test_support::test_tempdir("repository-secret-reader");
         let db = intent_store::Store::open(&dir.path().join("store.db"))
             .await
@@ -59,10 +68,13 @@ impl Fixture {
             ])
             .unwrap();
         let secrets = FileSecretStore::with_path(dir.path().join("secrets.json"));
-        secrets.store(SECRET_ACCOUNT, "stored-pat").unwrap();
+        if let Some(stored) = stored {
+            secrets.store(SECRET_ACCOUNT, stored).unwrap();
+        }
         let service = Arc::new(
             crate::Services::new_repository_fixture(db, secrets, None)
-                .with_settings_registry(registry.clone()),
+                .with_settings_registry(registry.clone())
+                .with_orchestrator_mode(orchestrator),
         );
         let guard = service.gitlab_credential_gate.lock().await;
         service
@@ -1295,4 +1307,29 @@ async fn refresh_operand_retry_interval_rewrite_is_local_without_post_or_expiry(
 async fn refresh_operand_unchanged_source_initial_and_retry_remain_supported() {
     refresh_operand_interval(false, false).await;
     refresh_operand_interval(true, false).await;
+}
+
+/// The host-side GitLab credential (`invite.prove`, the pin lookup) falls back
+/// to `GITLAB_TOKEN` on desktop but never for an orchestrator tenant.
+#[intent_test_macros::daemon_test]
+async fn own_gitlab_token_env_fallback_is_desktop_only() {
+    let _env =
+        crate::test_support::fixtures::EnvGuard::set_all(&[("GITLAB_TOKEN", "glpat-host-env")]);
+    let server = Server::new().await;
+    let desktop = Fixture::unadopted_with(&server, None, false).await;
+    assert_eq!(
+        desktop
+            .service
+            .own_gitlab_token(&server.host)
+            .await
+            .as_deref(),
+        Some("glpat-host-env"),
+        "desktop keeps the GITLAB_TOKEN fallback"
+    );
+    let tenant = Fixture::unadopted_with(&server, None, true).await;
+    assert_eq!(
+        tenant.service.own_gitlab_token(&server.host).await,
+        None,
+        "a tenant borrowed the host's GITLAB_TOKEN"
+    );
 }

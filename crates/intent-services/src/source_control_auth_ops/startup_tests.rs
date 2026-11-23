@@ -553,3 +553,48 @@ async fn startup_reuse_and_pending_only_cancellation() {
         Some(SAVED_PAT)
     );
 }
+
+/// `sourceControl.authStatus`'s GitLab probe reads the stored token first and
+/// falls back to `GITLAB_TOKEN` only when host credentials are allowed:
+/// desktop yes, an orchestrator tenant never.
+#[intent_test_macros::daemon_test]
+async fn load_gitlab_token_falls_back_to_env_only_with_host_credentials() {
+    let _env =
+        crate::test_support::fixtures::EnvGuard::set_all(&[(GITLAB_TOKEN_ENV, "glpat-host-env")]);
+    let dir = crate::test_support::test_tempdir("load-gitlab-token-");
+    let store = FileSecretStore::with_path(dir.path().join("secrets.json"));
+    assert_eq!(
+        load_gitlab_token(&store, StoredCredential::None, true)
+            .await
+            .unwrap(),
+        Some(("glpat-host-env".to_string(), "env")),
+        "desktop keeps the GITLAB_TOKEN fallback"
+    );
+    assert_eq!(
+        load_gitlab_token(&store, StoredCredential::None, false)
+            .await
+            .unwrap(),
+        None,
+        "a tenant borrowed the host's GITLAB_TOKEN"
+    );
+    store
+        .store(
+            intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,
+            "glpat-saved",
+        )
+        .unwrap();
+    let credential = intent_sourcecontrol::gitlab_auth::stored_credential(store.clone())
+        .await
+        .unwrap();
+    for host_credentials in [true, false] {
+        assert_eq!(
+            load_gitlab_token(&store, credential, host_credentials)
+                .await
+                .unwrap()
+                .map(|(token, _)| token)
+                .as_deref(),
+            Some("glpat-saved"),
+            "a saved token wins over the env either way"
+        );
+    }
+}
