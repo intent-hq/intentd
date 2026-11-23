@@ -1286,9 +1286,11 @@ goal instead of sending it as a message: the agent is not woken, no turn starts,
 short notice in the chat confirms it. Send **/goal** with nothing after it to see the
 current goal. On the desktop the goal appears in a strip at the top of the chat; click it
 to see the whole goal, and use **Edit** or **Remove** to change it. On iOS it appears as a
-goal chip above the composer; tap it to edit or remove the goal. While a goal is set, the
-agent is reminded of it on every turn, and newer instructions from the user still take
-precedence. A goal is up to 1,000 characters, cannot carry attachments, survives
+goal chip above the composer; tap it to edit or remove the goal. An app, or app version,
+without these goal controls sends **/goal** to the agent as an ordinary message, so do not
+promise that **/goal** avoids starting a turn unless the user's app shows the goal
+controls. While a goal is set, the agent is reminded of it on every turn, and newer
+instructions from the user still take precedence. A goal is up to 1,000 characters, cannot carry attachments, survives
 restarts and is shared across devices. Agents cannot set a goal. Older versions may
 differ: a backend without goal support delivers **/goal** to the agent as an ordinary
 message.
