@@ -23,11 +23,16 @@ use crate::registry::VoiceProvider;
 /// Mirrors `intent-linear::token::SECRET_LOAD_TIMEOUT`.
 const SECRET_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Secrets-store account (= sensitive setting path) of the `ElevenLabs` key.
+pub const ELEVENLABS_SECRET_ACCOUNT: &str = "voice.elevenlabs.apiKey";
+/// Secrets-store account (= sensitive setting path) of the `OpenAI` key.
+pub const OPENAI_SECRET_ACCOUNT: &str = "voice.openai.apiKey";
+
 /// Secrets-store account (= sensitive setting path) for a provider's API key.
 pub(crate) fn secret_account(provider: VoiceProvider) -> &'static str {
     match provider {
-        VoiceProvider::ElevenLabs => "voice.elevenlabs.apiKey",
-        VoiceProvider::OpenAi => "voice.openai.apiKey",
+        VoiceProvider::ElevenLabs => ELEVENLABS_SECRET_ACCOUNT,
+        VoiceProvider::OpenAi => OPENAI_SECRET_ACCOUNT,
     }
 }
 

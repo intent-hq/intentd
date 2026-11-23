@@ -93,6 +93,8 @@ mod remote_machine_ops;
 pub use remote_machine_ops::homes_unsupported;
 mod remote_skills;
 mod retire;
+#[cfg(test)]
+mod saved_credentials_tests;
 pub mod session_import;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
@@ -3000,20 +3002,37 @@ impl Services {
         if let Some(engine) = &self.sentry_engine {
             return Ok(engine.clone());
         }
+        sentry_ops::build_engine(&self.saved_sentry_settings().await?).await
+    }
+
+    /// The saved Sentry account as engine settings.
+    pub(crate) async fn saved_sentry_settings(&self) -> Result<intent_sentry::SentrySettings> {
         let token = self
             .secrets
             .load(sentry_ops::TOKEN_SETTING_PATH)
             .await
             .map_err(|e| Error::Internal(format!("sentry: could not read the saved token: {e}")))?;
-        let settings = intent_sentry::SentrySettings {
+        Ok(intent_sentry::SentrySettings {
             organization: self
                 .setting_str(sentry_ops::ORGANIZATION_SETTING_PATH)
                 .await,
             token,
             api_base_url: self.sentry_api_base_url.clone(),
             ..intent_sentry::SentrySettings::default()
-        };
-        sentry_ops::build_engine(&settings).await
+        })
+    }
+
+    /// The saved, non-blank API key of an autocomplete service.
+    pub(crate) async fn saved_autocomplete_key(
+        &self,
+        service: intent_core::settings_file::AutocompleteService,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .secrets
+            .load(autocomplete_ops::key_path(service))
+            .await?
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty()))
     }
 
     /// A string-valued setting's effective value (`None` when unreadable).
@@ -3043,14 +3062,10 @@ impl Services {
         );
         let model =
             autocomplete_ops::parse_model(self.setting_str("autocomplete.model").await.as_deref());
-        let api_key = match self.secrets.load(autocomplete_ops::key_path(service)).await {
-            Ok(Some(key)) if !key.trim().is_empty() => Some(key.trim().to_string()),
-            Ok(_) => None,
-            Err(_) => {
-                // Never fall back to the keyless free tier for a user who saved a key.
-                tracing::debug!("input.autocomplete could not read the service API key");
-                return String::new();
-            }
+        let Ok(api_key) = self.saved_autocomplete_key(service).await else {
+            // Never fall back to the keyless free tier for a user who saved a key.
+            tracing::debug!("input.autocomplete could not read the service API key");
+            return String::new();
         };
         let Some(model_id) = autocomplete_ops::resolve_model_id(service, model, api_key.is_some())
         else {

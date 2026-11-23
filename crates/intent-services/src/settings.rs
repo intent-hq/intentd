@@ -2162,7 +2162,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "auto",
         ),
         secret(
-            "sourceControl.github.token",
+            intent_sourcecontrol::token::SECRET_ACCOUNT,
             "GitHub token",
             "PAT used by the GitHub client",
             "sourceControl",
@@ -2206,7 +2206,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(intent_core::settings_file::DEFAULT_GITLAB_HOST),
         ),
         secret(
-            "sourceControl.gitlab.token",
+            intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,
             "GitLab token",
             "Access token used by the GitLab client (device grant or personal access token)",
             "sourceControl",
@@ -2237,20 +2237,20 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         ),
         // --- Group A: Linear integration --------------------------------------
         secret(
-            "linear.token",
+            intent_linear::token::SECRET_ACCOUNT,
             "Linear API key",
             "API key used by the Linear integration",
             "linear",
         ),
         // --- Group A: Sentry account -----------------------------------------
         secret(
-            "accounts.sentry.token",
+            crate::sentry_ops::TOKEN_SETTING_PATH,
             "Sentry API token",
             "API token used by the Sentry integration",
             "accounts",
         ),
         string(
-            "accounts.sentry.organization",
+            crate::sentry_ops::ORGANIZATION_SETTING_PATH,
             "Sentry organization",
             "Sentry organization slug (non-secret companion of accounts.sentry.token)",
             "accounts",
@@ -2273,13 +2273,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
         ),
         secret(
-            "voice.elevenlabs.apiKey",
+            intent_voice::token::ELEVENLABS_SECRET_ACCOUNT,
             "ElevenLabs API key",
             "API key used by the ElevenLabs Scribe transcription provider",
             "voice",
         ),
         secret(
-            "voice.openai.apiKey",
+            intent_voice::token::OPENAI_SECRET_ACCOUNT,
             "OpenAI API key",
             "API key used by the OpenAI transcription provider",
             "voice",
@@ -2336,14 +2336,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "nvidia/nemotron-3.5-lightning",
         ),
         secret(
-            "autocomplete.kilo.apiKey",
+            crate::autocomplete_ops::KILO_KEY_PATH,
             "Kilo API key",
             "Optional Kilo Gateway API key; with a key, suggestions use the paid model \
              without the hourly free limit",
             "autocomplete",
         ),
         secret(
-            "autocomplete.openrouter.apiKey",
+            crate::autocomplete_ops::OPENROUTER_KEY_PATH,
             "OpenRouter API key",
             "OpenRouter API key; required when the autocomplete service is OpenRouter",
             "autocomplete",
