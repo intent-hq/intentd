@@ -732,7 +732,8 @@ only on a fresh install: re-installing never switches a computer to or from Orch
 remote machine's actions include **Edit** and **Connect**, with **Test connection** inside
 its editing panel.
 Pending frontend release (not in current builds): the page stays **Settings → Machines**
-(some builds called it **Settings → Hosts**; older versions may differ).
+(some builds called it **Settings → Hosts**; older versions may differ), with a **Hosts**
+section and a **Runners** section.
 Hosts are the Intent servers the user connects to. Runners are the computers a host runs
 agents on: other hosts allowed to, runner-only installs (formerly nodes) and cloud entries.
 The machine rail becomes the host rail. A host row's **…** menu has **Switch to** instead of the
@@ -769,7 +770,7 @@ adding it anyway fails with **<machine> is an orchestrator, so it can't run agen
 <backend>. To use it, switch to it as a host.** (older versions may differ).
 Running agents on those machines is experimental. That list is in the user's order of
 preference, and its first row is marked **Preferred**: **This computer** first by default, then machines and cloud entries as they
-were added (pending frontend release: the list is **Runners for <host>**, with no
+were added (pending frontend release: the list is the **Runners** section, with no
 **Preferred** mark, and the host's own row shows its name with **This host**). Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
 menu. In **Where <backend> runs agents**, a row shows a status badge only when it cannot run
 agents (such as **Unreachable**, **Update required** or **Key rejected**). Pending frontend
