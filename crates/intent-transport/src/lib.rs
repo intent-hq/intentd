@@ -10,8 +10,10 @@ pub use intent_services::Services;
 
 pub use agent_rpc::LoopbackAgentRpc;
 pub use auth::{
-    generate_token, get_or_create_token, hash_token, AsyncTokenStore, FileTokenStore, TokenStore,
+    generate_token, get_or_create_token, hash_token, AsyncTokenStore, FileTokenStore,
+    SecretTokenStore, TokenStore,
 };
+pub use connection_set::{ConnectionGuard, ConnectionHook, ConnectionSet};
 pub use context::{
     current_caller, is_tcp_connection, with_caller, with_connection_context, with_request_context,
     Caller,
@@ -25,6 +27,8 @@ pub use host_env::{
 pub use invite::InviteLinkResolver;
 #[cfg(windows)]
 pub use listener::pipe_name_for_socket_path;
+#[cfg(unix)]
+pub use listener::serve_uds_with_connections;
 pub use listener::{serve_uds, serve_uds_with_reverse};
 pub use protocol::{MAX_INBOUND_MESSAGE_BYTES, MAX_OUTBOUND_MESSAGE_BYTES, PROTOCOL_VERSION};
 pub use reverse::{
@@ -68,6 +72,7 @@ pub mod catalog;
 mod client;
 mod conflate;
 mod conn;
+pub mod connection_set;
 pub mod context;
 pub mod control;
 mod drafts;

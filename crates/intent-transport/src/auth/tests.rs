@@ -980,3 +980,22 @@ async fn imported_owner_credential_write_accepts_ready_lease_before_deadline() {
 async fn imported_owner_credential_authorize_accepts_ready_lease_before_deadline() {
     exercise_authorizer_ready_after_wait(Duration::from_secs(1), false).await;
 }
+
+/// The orchestrator's owner token lives in the tenant's secret store, under
+/// the account `FileTokenStore` uses: a token created through one handle is
+/// the token a second handle on the same store (another process serving the
+/// tenant) loads and validates.
+#[tokio::test]
+async fn secret_token_store_keeps_the_owner_token_in_the_secret_store() {
+    let secrets: intent_core::SharedSecretStore =
+        Arc::new(intent_core::InMemorySecretStore::default());
+    let first = AsyncTokenStore::new(Arc::new(SecretTokenStore::new(secrets.clone())));
+    let token = get_or_create_token(&first).await.unwrap();
+    assert_eq!(
+        secrets.load(TOKEN_ACCOUNT).unwrap().as_deref(),
+        Some(token.as_str())
+    );
+    let second = AsyncTokenStore::new(Arc::new(SecretTokenStore::new(secrets)));
+    assert_eq!(get_or_create_token(&second).await.unwrap(), token);
+    assert_eq!(second.load_token().await.as_deref(), Some(token.as_str()));
+}

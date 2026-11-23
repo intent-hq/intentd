@@ -10,6 +10,10 @@
 //! On Ctrl-C or SIGTERM each tenant whose work stopped cleanly releases its
 //! lease, so a restart or standby takes it over at once instead of waiting
 //! out the TTL.
+//!
+//! Once [`DEFAULT_TENANT`] is served, its clients connect over the local
+//! socket and the WSS listener with `intentd`'s auth (see
+//! `intentd_orchestrator::listen` for the environment variables).
 
 use std::process::ExitCode;
 
@@ -153,6 +157,17 @@ async fn run(url: String) -> Result<ExitCode, String> {
         }
     }
 
+    // The default tenant's clients, once it is served (so a process that
+    // does not hold its lease never binds); its fence closes them.
+    #[cfg(unix)]
+    let _listeners = match listen_for_default_tenant(&served, &data_dir).await {
+        Ok(listeners) => listeners,
+        Err(error) => {
+            stop_all(&mut served, &mut stopped).await;
+            return Err(error);
+        }
+    };
+
     loop {
         if served.is_empty() {
             tracing::error!("every tenant stopped");
@@ -173,6 +188,34 @@ fn watch(tenant: &mut ServedTenant, stopped: &tokio::sync::mpsc::UnboundedSender
     let name = tenant.tenant().to_owned();
     let tx = stopped.clone();
     tenant.watch_report(move |report| on_stopped(&name, &report, &tx));
+}
+
+/// Start the client listeners of [`DEFAULT_TENANT`] when this process
+/// serves it ([`intentd_orchestrator::listen`]); `None` when it does not.
+#[cfg(unix)]
+async fn listen_for_default_tenant(
+    served: &[ServedTenant],
+    data_dir: &std::path::Path,
+) -> Result<Option<intentd_orchestrator::listen::ClientListeners>, String> {
+    let Some(tenant) = served
+        .iter()
+        .find(|tenant| tenant.tenant() == DEFAULT_TENANT)
+    else {
+        tracing::info!(
+            tenant = DEFAULT_TENANT,
+            "the default tenant is not served: no client listener"
+        );
+        return Ok(None);
+    };
+    let config = intentd_orchestrator::listen::ListenConfig::from_env(
+        |name| std::env::var(name).ok(),
+        data_dir,
+    )?;
+    tenant
+        .listen(&config)
+        .await
+        .map(Some)
+        .map_err(|e| format!("tenant {DEFAULT_TENANT}: client listeners: {e}"))
 }
 
 /// A tenant's work stopped: exit at once when its fence overran (its work

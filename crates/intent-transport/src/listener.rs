@@ -153,6 +153,44 @@ pub async fn serve_uds_with_reverse<F>(
 where
     F: Future<Output = ()>,
 {
+    serve_uds_with_connections(
+        api,
+        bus,
+        socket_path,
+        control,
+        server_pairing_info,
+        reverse_registry,
+        limiter,
+        None,
+        shutdown,
+    )
+    .await
+}
+
+/// [`serve_uds_with_reverse`] that also joins every accepted connection to
+/// `connections` when set (the orchestrator's tenant connections): closing
+/// the set ends each connection, and a connection accepted after the set
+/// closed ends at once. `None` is exactly [`serve_uds_with_reverse`].
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if binding or serving the local socket fails.
+#[cfg(unix)]
+#[expect(clippy::too_many_arguments)]
+pub async fn serve_uds_with_connections<F>(
+    api: Arc<dyn WorkspaceApi>,
+    bus: EventBus,
+    socket_path: &Path,
+    control: Option<Arc<dyn SystemControl>>,
+    server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
+    reverse_registry: Arc<PrimaryReverseRegistry>,
+    limiter: RpcLimiter,
+    connections: Option<crate::connection_set::ConnectionHook>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()>,
+{
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -186,10 +224,37 @@ where
                         let reverse_registry = reverse_registry.clone();
                         let limiter = limiter.clone();
                         let read_owners = read_listener.0.clone();
+                        // Closing the set ends the connection: the serve
+                        // future (and with it the socket) is dropped.
+                        let closed = Arc::new(tokio::sync::Notify::new());
+                        let membership = match connections.as_ref() {
+                            // A closed set admits nothing: drop the
+                            // connection unread, so none of its frames
+                            // reaches the router.
+                            Some(set) if set.is_closed() => continue,
+                            Some(set) => {
+                                let closed = closed.clone();
+                                match set.register(move || closed.notify_one()) {
+                                    Some(guard) => Some(guard),
+                                    None => continue,
+                                }
+                            }
+                            None => None,
+                        };
                         tokio::spawn(async move {
+                            let _membership = membership;
                             let (read_half, write_half) = stream.into_split();
-                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry, limiter, read_owners).await {
-                                tracing::debug!(error = %e, "uds connection ended");
+                            tokio::select! {
+                                // The close wins over a frame already read.
+                                biased;
+                                () = closed.notified() => {
+                                    tracing::debug!("uds connection closed by its connection set");
+                                }
+                                served = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry, limiter, read_owners) => {
+                                    if let Err(e) = served {
+                                        tracing::debug!(error = %e, "uds connection ended");
+                                    }
+                                }
                             }
                         });
                     }

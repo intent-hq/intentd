@@ -70,6 +70,9 @@ impl WsInner {
                 cmd_tx,
                 last_pong,
                 abort: handle.abort_handle(),
+                // The startup seat runs only before the daemon is ready, and
+                // only `intentd` builds one: it never has a connection set.
+                _connection: None,
             },
         );
         let _ = start_tx.send(());
