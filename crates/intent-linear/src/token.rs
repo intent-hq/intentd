@@ -45,12 +45,14 @@ pub enum TokenSource {
 /// Secrets-store reads run on the blocking pool with a bounded timeout so a
 /// stalled backing store never blocks the async runtime.
 pub async fn resolve(source: &TokenSource, secrets: &SharedSecretStore) -> Option<String> {
+    // An orchestrator tenant never borrows the host's `LINEAR_API_KEY`.
+    let env = || secrets.allows_host_credentials().then(env_token).flatten();
     match source {
         TokenSource::Explicit => file_store_token(secrets.clone()).await,
-        TokenSource::Env => env_token(),
+        TokenSource::Env => env(),
         TokenSource::Auto => match file_store_token(secrets.clone()).await {
             Some(v) => Some(v),
-            None => env_token(),
+            None => env(),
         },
     }
 }

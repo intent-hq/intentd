@@ -599,11 +599,14 @@ async fn stored_access_token(store: &FileSecretStore) -> Result<Option<String>> 
 /// Read the GitLab access token for a probe of the **bound** instance: the
 /// stored slot, then `GITLAB_TOKEN`. Every credential the daemon holds —
 /// stored or environment — belongs to the bound instance only, so callers
-/// never resolve one for another host (see [`probe_gitlab`]). Returns the
-/// token with its provenance; `None` when nothing resolves.
+/// never resolve one for another host (see [`probe_gitlab`]). The
+/// `GITLAB_TOKEN` fallback applies only when `host_credentials` (never for an
+/// orchestrator tenant: [`intent_core::SecretStore::allows_host_credentials`]).
+/// Returns the token with its provenance; `None` when nothing resolves.
 async fn load_gitlab_token(
     store: &FileSecretStore,
     credential: StoredCredential,
+    host_credentials: bool,
 ) -> Result<Option<(String, &'static str)>> {
     if credential != StoredCredential::None {
         if let Some(token) = stored_access_token(store).await? {
@@ -613,6 +616,9 @@ async fn load_gitlab_token(
             };
             return Ok(Some((token, method)));
         }
+    }
+    if !host_credentials {
+        return Ok(None);
     }
     Ok(std::env::var(GITLAB_TOKEN_ENV)
         .ok()
@@ -852,6 +858,7 @@ async fn probe_gitlab_owned(
     store: FileSecretStore,
     gate: &GitlabCredentialGate,
     bus: Option<&EventBus>,
+    host_credentials: bool,
 ) -> Result<ProbeOutcome> {
     let (token, method, refreshed, receipt) = {
         let credential_guard = probe_owner::acquire(gate, retained).await;
@@ -872,7 +879,8 @@ async fn probe_gitlab_owned(
         let Some((credential, refreshed)) = refreshed_credential else {
             return Ok(ProbeOutcome::NotConfigured);
         };
-        let Some((token, method)) = load_gitlab_token(&store, credential).await? else {
+        let Some((token, method)) = load_gitlab_token(&store, credential, host_credentials).await?
+        else {
             return Ok(ProbeOutcome::NotConfigured);
         };
         let Some(receipt) = gate
@@ -984,7 +992,8 @@ async fn probe_gitlab_owned(
         let credential = stored_credential(store.clone())
             .await
             .map_err(crate::pr_ops::map_sc_err)?;
-        let Some((token, method)) = load_gitlab_token(&store, credential).await? else {
+        let Some((token, method)) = load_gitlab_token(&store, credential, host_credentials).await?
+        else {
             return Ok(ProbeOutcome::NotConfigured);
         };
         let Some(retry_receipt) = gate
@@ -1326,7 +1335,8 @@ impl crate::Services {
     }
 
     /// Host half: the daemon's own GitLab credential for `host` — the
-    /// stored slot, then `GITLAB_TOKEN` — when `host` is the bound instance;
+    /// stored slot, then `GITLAB_TOKEN` (never for an orchestrator tenant) —
+    /// when `host` is the bound instance;
     /// `None` otherwise (every credential the daemon holds belongs to the
     /// bound instance only). What `invite.prove` and the pin lookup send so
     /// an instance that restricts anonymous reads still answers the host
@@ -1352,6 +1362,7 @@ impl crate::Services {
         }
         match stored {
             Ok(Some(token)) => Some(token),
+            Ok(None) if !self.secret_source().allows_host_credentials() => None,
             Ok(None) => std::env::var(GITLAB_TOKEN_ENV)
                 .ok()
                 .map(|t| t.trim().to_string())

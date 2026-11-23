@@ -2524,15 +2524,26 @@ impl Services {
 
     /// The store every leaf-crate secret reader (GitHub/GitLab token chains,
     /// Linear, voice) loads from: this `Services`' own secrets, never the
-    /// process-wide default file, so orchestrator tenants stay isolated.
+    /// process-wide default file, so orchestrator tenants stay isolated. In
+    /// orchestrator mode it also denies host-wide fallbacks (env vars, the
+    /// host `gh` login; [`intent_core::SecretStore::allows_host_credentials`]).
     #[must_use]
     pub fn secret_source(&self) -> intent_core::SharedSecretStore {
-        self.secrets.backing_store()
+        let store = self.secrets.backing_store();
+        if self.orchestrator_mode() {
+            Arc::new(intent_core::WithoutHostCredentials(store))
+        } else {
+            store
+        }
     }
 
     /// Point the GitLab credential store at `store` (§5.27 test seam) so
     /// `sourceControl.connect { provider: "gitlab" }` never touches the real
-    /// `~/intent/.secrets.json`.
+    /// `~/intent/.secrets.json`. Test-only: it unpairs the GitLab source from
+    /// [`Self::secret_source`]; production picks the file up front with
+    /// [`Self::new_with_secret_file`].
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
     #[must_use]
     pub fn with_gitlab_secret_store(mut self, store: intent_core::FileSecretStore) -> Self {
         self.retire_repository_before_source_override();
@@ -2575,8 +2586,10 @@ impl Services {
         self
     }
 
-    /// Override the [`SecretStore`] backing sensitive settings (§9.8). The
-    /// composition root keeps the file-backed default
+    /// Override the [`SecretStore`] backing sensitive settings (§9.8). This
+    /// does not move the GitLab credential source, which stays the file this
+    /// `Services` was built with ([`Self::new_with_secret_file`]): choose that
+    /// file per tenant too. The composition root keeps the file-backed default
     /// ([`intent_core::FileSecretStore`]); tests inject an in-memory store so
     /// they never read/write the real secrets file. The injected store
     /// is wrapped in an [`AsyncSecretStore`](settings::AsyncSecretStore) so the
@@ -3028,7 +3041,10 @@ impl Services {
         if let Some(engine) = &self.sentry_engine {
             return Ok(engine.clone());
         }
-        sentry_ops::build_engine(&self.saved_sentry_settings().await?)
+        sentry_ops::build_engine(
+            &self.saved_sentry_settings().await?,
+            self.secret_source().allows_host_credentials(),
+        )
     }
 
     /// The saved Sentry account as engine settings.
@@ -33936,7 +33952,10 @@ impl WorkspaceApi for Services {
                 tokio::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
             // gh CLI sync only makes sense against the production login host
             // (see `github_auth_ops::is_production_login_host`).
-            let sync_gh = github_auth_ops::is_production_login_host(&base_uri);
+            // Never in orchestrator mode: the host `gh` login is the operator's,
+            // not the tenant's.
+            let sync_gh =
+                github_auth_ops::is_production_login_host(&base_uri) && !self.orchestrator_mode();
             let _poll = self
                 .store_tasks
                 .spawn_draining(github_auth_ops::run_poll_loop(

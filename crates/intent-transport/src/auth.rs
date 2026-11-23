@@ -62,9 +62,19 @@ pub trait TokenStore: Send + Sync {
 /// File-backed [`TokenStore`] (the production default): delegates to the
 /// shared [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`) under
 /// account `server.auth.token` — the same entry `settings.*` redacts.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct FileTokenStore {
     secrets: intent_core::FileSecretStore,
+}
+
+/// The daemon's own server auth token in the process-wide secrets file — only
+/// the `intentd` composition root builds one (`secret_store_roots` guard).
+impl Default for FileTokenStore {
+    fn default() -> Self {
+        Self {
+            secrets: intent_core::FileSecretStore::new(),
+        }
+    }
 }
 
 impl TokenStore for FileTokenStore {

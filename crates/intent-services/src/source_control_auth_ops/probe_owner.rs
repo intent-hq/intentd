@@ -82,6 +82,7 @@ impl crate::Services {
                             worker.gitlab_secret_store.clone(),
                             &worker.gitlab_credential_gate,
                             worker.event_bus.as_ref(),
+                            worker.secret_source().allows_host_credentials(),
                         )
                         .await
                         .map(Reply::Probe)

@@ -2,7 +2,7 @@
 //!
 //! Drives the flow described in
 //! <https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow>:
-//! [`start`] asks GitHub for a `user_code` the user types at
+//! [`start_at_with_store`] asks GitHub for a `user_code` the user types at
 //! `github.com/login/device`, then [`DeviceFlow::poll_once`] polls the token
 //! endpoint until the user authorizes (or the code expires / is denied). On
 //! success the access token is persisted straight into the file-backed secret
@@ -123,7 +123,7 @@ pub type GrantPersistence = Arc<
         + Sync,
 >;
 
-/// Opaque in-flight flow handle returned by [`start`]. Holds the secret
+/// Opaque in-flight flow handle returned by [`start_at_with_store`]. Holds the secret
 /// `device_code` privately; intentionally no `Debug`/`Serialize`.
 pub struct DeviceFlow {
     crab: octocrab::Octocrab,
@@ -156,54 +156,24 @@ fn login_client(base_uri: &str) -> Result<octocrab::Octocrab> {
         .build()?)
 }
 
-/// Start a device flow: request codes for `client_id` (a *public* OAuth App
-/// client id, e.g. [`intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID`])
-/// and the given `scopes`.
-/// Returns the user-facing codes plus the opaque poll handle.
+/// Start a device flow against the login `base_uri` (github.com in
+/// production, a local mock in tests): request codes for `client_id` (a
+/// *public* OAuth App client id, e.g.
+/// [`intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID`]) and
+/// `scopes`, persisting into `store` — the caller's secrets file (the
+/// daemon's, or an orchestrator tenant's). There is deliberately no
+/// default-store variant. Returns the user-facing codes plus the opaque poll
+/// handle.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Config`] if `client_id` is empty; propagates HTTP/deserialization failures from the code request.
-pub async fn start(client_id: &str, scopes: &[&str]) -> Result<(DeviceAuthorization, DeviceFlow)> {
-    start_at(DEFAULT_LOGIN_BASE_URI, client_id, scopes).await
-}
-
-/// [`start`] against an explicit login `base_uri` — the test seam that lets
-/// integration tests drive the full connect → poll → authorized path against
-/// a local mock of `/login/device/code` + `/login/oauth/access_token` without
-/// touching github.com. Production callers use [`start`].
-///
-/// # Errors
-///
-/// Returns [`Error::Config`] if `client_id` is empty; propagates HTTP/deserialization failures from the code request.
-pub async fn start_at(
-    base_uri: &str,
-    client_id: &str,
-    scopes: &[&str],
-) -> Result<(DeviceAuthorization, DeviceFlow)> {
-    start_at_store(base_uri, client_id, scopes, None).await
-}
-
-/// Start a flow with its destination fixed before construction, without
-/// consulting or migrating the machine's default secret store.
-///
-/// # Errors
-///
-/// Returns the same configuration and HTTP errors as [`start_at`].
+/// Returns [`Error::Config`] if `client_id` is empty; propagates
+/// HTTP/deserialization failures from the code request.
 pub async fn start_at_with_store(
     base_uri: &str,
     client_id: &str,
     scopes: &[&str],
     store: FileSecretStore,
-) -> Result<(DeviceAuthorization, DeviceFlow)> {
-    start_at_store(base_uri, client_id, scopes, Some(store)).await
-}
-
-async fn start_at_store(
-    base_uri: &str,
-    client_id: &str,
-    scopes: &[&str],
-    store: Option<FileSecretStore>,
 ) -> Result<(DeviceAuthorization, DeviceFlow)> {
     if client_id.trim().is_empty() {
         return Err(Error::Config(
@@ -226,7 +196,7 @@ async fn start_at_store(
         client_id,
         device_code: SecretString::from(codes.device_code),
         interval: codes.interval,
-        store: store.unwrap_or_default(),
+        store,
         identity_guard: None,
         persistence: None,
     };

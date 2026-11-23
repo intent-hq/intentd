@@ -179,6 +179,12 @@ impl std::fmt::Debug for TokenResolution {
     }
 }
 
+/// Skip reason for env / `gh` sources when the caller's store denies host
+/// credentials ([`intent_core::SecretStore::allows_host_credentials`]: an
+/// orchestrator tenant).
+pub(crate) const HOST_CREDENTIALS_DISABLED: &str =
+    "host credentials are disabled for this store (orchestrator tenant)";
+
 /// One source's attempt: the token, or a reason it yielded nothing.
 type SourceResult = std::result::Result<String, String>;
 
@@ -196,12 +202,25 @@ pub async fn resolve_detailed(
     source: &TokenSource,
     secrets: &SharedSecretStore,
 ) -> TokenResolution {
+    let host = secrets.allows_host_credentials();
     let secrets = secrets.clone();
     resolve_detailed_with(
         source,
         || file_store_token(secrets),
-        env_token,
-        gh_cli_token,
+        move || {
+            if host {
+                env_token()
+            } else {
+                Err(format!("env: {HOST_CREDENTIALS_DISABLED}"))
+            }
+        },
+        move || async move {
+            if host {
+                gh_cli_token().await
+            } else {
+                Err(format!("gh-cli: {HOST_CREDENTIALS_DISABLED}"))
+            }
+        },
     )
     .await
 }

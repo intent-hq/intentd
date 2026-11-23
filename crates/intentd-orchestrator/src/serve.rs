@@ -197,6 +197,35 @@ mod tests {
         "voice.openai.apiKey",
     ];
 
+    /// Sets env vars for one test and restores them on drop, even when an
+    /// assertion panics (nextest runs each test in its own process).
+    struct EnvVars(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvVars {
+        fn set(vars: &[(&'static str, &std::ffi::OsStr)]) -> Self {
+            Self(
+                vars.iter()
+                    .map(|(key, value)| {
+                        let old = std::env::var_os(key);
+                        std::env::set_var(key, value);
+                        (*key, old)
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvVars {
+        fn drop(&mut self) {
+            for (key, old) in self.0.drain(..) {
+                match old {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     async fn tenant(root: &Path, name: &str) -> (Services, PathBuf) {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -216,7 +245,7 @@ mod tests {
         for account in CREDENTIALS {
             host.store(account, "host-value").unwrap();
         }
-        std::env::set_var("INTENTD_SECRETS_FILE", &host_file);
+        let _env = EnvVars::set(&[("INTENTD_SECRETS_FILE", host_file.as_os_str())]);
 
         let (a, a_dir) = tenant(root.path(), "a").await;
         let (b, b_dir) = tenant(root.path(), "b").await;
@@ -255,6 +284,15 @@ mod tests {
         for account in CREDENTIALS {
             assert_eq!(host.load(account).unwrap().as_deref(), Some("host-value"));
         }
-        std::env::remove_var("INTENTD_SECRETS_FILE");
+    }
+
+    /// A tenant's resolvers never fall back to host-wide credentials (env
+    /// vars, the host `gh` login).
+    #[tokio::test]
+    async fn tenant_secret_source_denies_host_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, _) = tenant(root.path(), "a").await;
+        assert!(a.orchestrator_mode());
+        assert!(!a.secret_source().allows_host_credentials());
     }
 }

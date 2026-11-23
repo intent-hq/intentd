@@ -72,8 +72,20 @@ pub async fn resolve_gitlab_token_detailed(
     source: GitlabTokenSource,
     secrets: &SharedSecretStore,
 ) -> TokenResolution {
+    let host = secrets.allows_host_credentials();
     let secrets = secrets.clone();
-    resolve_with(source, || file_store_token(secrets), env_token).await
+    resolve_with(
+        source,
+        || file_store_token(secrets),
+        move || {
+            if host {
+                env_token()
+            } else {
+                Err(format!("env: {}", crate::token::HOST_CREDENTIALS_DISABLED))
+            }
+        },
+    )
+    .await
 }
 
 /// The resolution order over injectable source probes (test seam: the mocks

@@ -28,10 +28,14 @@ pub(crate) const ORGANIZATION_SETTING_PATH: &str = "accounts.sentry.organization
 pub(crate) const TOKEN_SETTING_PATH: &str = "accounts.sentry.token";
 
 /// Build the [`SentryEngine`] from `settings` (the saved account, falling
-/// back to `SENTRY_ORG` / `SENTRY_API_TOKEN` per half). A missing pair yields
-/// `Internal` (graceful "not configured"), never a panic.
-pub(crate) fn build_engine(settings: &SentrySettings) -> Result<Arc<dyn SentryEngine>> {
-    SentryRegistry::from_settings(settings).map_err(|e: intent_sentry::Error| map_sentry_err(&e))
+/// back to `SENTRY_ORG` / `SENTRY_API_TOKEN` per half when `host_env`). A
+/// missing pair yields `Internal` (graceful "not configured"), never a panic.
+pub(crate) fn build_engine(
+    settings: &SentrySettings,
+    host_env: bool,
+) -> Result<Arc<dyn SentryEngine>> {
+    SentryRegistry::from_settings_with_host_env(settings, host_env)
+        .map_err(|e: intent_sentry::Error| map_sentry_err(&e))
 }
 
 /// Validate/default the `sentry.listIssues` `status` (default `unresolved`);

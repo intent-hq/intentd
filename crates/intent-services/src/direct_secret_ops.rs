@@ -235,9 +235,13 @@ impl Services {
 
     async fn github_revoke_owned(&self) -> Result<Value> {
         let secrets = &self.secrets;
-        let logout_gh = crate::github_auth_ops::is_production_login_host(
-            &crate::github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref()),
-        );
+        // The host `gh` login is the operator's, never an orchestrator tenant's.
+        let logout_gh = !self.orchestrator_mode()
+            && crate::github_auth_ops::is_production_login_host(
+                &crate::github_auth_ops::resolve_login_base_uri(
+                    self.github_login_base_uri.as_deref(),
+                ),
+            );
         let revoked_token = if logout_gh {
             secrets.load(crate::github_auth_ops::SECRET_ACCOUNT).await.unwrap_or_else(|error| {
                 tracing::debug!(%error, "could not read stored github token before revoke; skipping gh CLI logout");
