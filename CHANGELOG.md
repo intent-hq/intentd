@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.284] - 2026-11-23
+
+### 📚 Documentation
+
+- *(guide)* Describe discussion images and People opening first ([#3590](https://github.com/intent-hq/intentd/pull/3590))
+
+
 ## [0.11.283] - 2026-11-23
 
 ### 🐛 Bug Fixes
