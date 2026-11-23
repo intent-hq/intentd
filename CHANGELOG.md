@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.285] - 2026-11-23
+
+### 📚 Documentation
+
+- *(app-guide)* Settings → Machines with Hosts and Runners sections ([#3728](https://github.com/intent-hq/intentd/pull/3728))
+
+
 ## [0.11.284] - 2026-11-23
 
 ### 📚 Documentation

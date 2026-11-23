@@ -1,6 +1,6 @@
 [package]
 name = "intent-node-link"
-version = "0.11.284"
+version = "0.11.285"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
