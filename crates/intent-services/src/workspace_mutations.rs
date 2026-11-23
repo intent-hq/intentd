@@ -76,8 +76,9 @@ pub fn boxed<'a, T>(future: impl Future<Output = T> + Send + 'a) -> intent_core:
 /// its recovery snapshot. The task keeps the caller identity, the browser
 /// message ingress, the caller's instruction admission, and every live
 /// admission of the caller's scope and `held`, so nested `enter` calls reuse
-/// them and a queued deletion or removal still waits for the work to finish. Once shutdown has closed `tasks`, turn
-/// admission is closed too, so the future runs inline.
+/// them and a queued deletion or removal still waits for the work to finish.
+/// Once shutdown has closed `tasks`, turn admission is closed too, so the
+/// future runs inline.
 ///
 /// The future is boxed so callers' state machines carry only a pointer: the
 /// wake path runs deep in nested deliveries and overflowed the stack of
