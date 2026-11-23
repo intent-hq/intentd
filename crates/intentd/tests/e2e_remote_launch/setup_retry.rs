@@ -108,14 +108,29 @@ async fn a_remote_agents_failed_setup_runs_again_for_the_user_and_the_agent() {
     assert!(first.contains("ws.workspace.retrySetup()"), "{first}");
 
     set_script("echo ran >> setup-runs.txt\necho fixed-by-user\n");
-    let started = rpc(
-        &mut rpc_ws,
-        200,
-        "agent.retrySetup",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
-    assert_eq!(started["id"], 200, "{started}");
+    // The agent's status can still read as working just after its turn
+    // ended: a user's retry is refused `agent-busy` until it settles.
+    let mut id = 200;
+    let started = timeout(wait(), async {
+        loop {
+            id += 1;
+            let response = rpc(
+                &mut rpc_ws,
+                id,
+                "agent.retrySetup",
+                json!({ "workspaceId": ws_id, "agentId": agent_id }),
+            )
+            .await;
+            if response["error"]["data"]["code"] != "agent-busy" {
+                return response;
+            }
+            // timing-guard: poll interval for the agent's turn status to settle (no event is awaited here)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the agent's turn settles");
+    assert_eq!(started["id"], id, "{started}");
     assert!(started.get("error").is_none(), "{started}");
     let result = &started["result"];
     assert_eq!(
