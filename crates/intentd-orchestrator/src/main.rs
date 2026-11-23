@@ -1,6 +1,7 @@
 //! `intentd-orchestrator`: serve every tenant in [`TENANTS_ENV`] from the
 //! Postgres database at [`POSTGRES_URL_ENV`], each under its own lease and
-//! self-fence (see the library docs).
+//! self-fence (see the library docs). With [`TENANTS_ENV`] unset, it serves
+//! the one tenant [`DEFAULT_TENANT`]; a set value must name at least one.
 //!
 //! A tenant whose fence fires stops on its own; the others keep running.
 //! The process exits [`FENCE_OVERRAN_EXIT`] when a fence step overran (its
@@ -11,8 +12,8 @@ use std::process::ExitCode;
 
 use intentd_orchestrator::serve::{serve_tenant, LeaseTiming, ServedTenant};
 use intentd_orchestrator::{
-    instance_id, is_fatal, parse_tenants, FENCE_OVERRAN_EXIT, INSTANCE_ENV, POSTGRES_URL_ENV,
-    TENANTS_ENV,
+    instance_id, is_fatal, tenants_from_env, DEFAULT_TENANT, FENCE_OVERRAN_EXIT, INSTANCE_ENV,
+    POSTGRES_URL_ENV, TENANTS_ENV,
 };
 
 /// Connections the shared pool keeps; each tenant writes through it.
@@ -53,8 +54,22 @@ fn main() -> ExitCode {
 }
 
 async fn run(url: String) -> Result<ExitCode, String> {
-    let tenants =
-        parse_tenants(&std::env::var(TENANTS_ENV).map_err(|_| format!("{TENANTS_ENV} is unset"))?)?;
+    // Unset serves the default tenant; set but not UTF-8 is an error, never
+    // the default.
+    let raw = match std::env::var(TENANTS_ENV) {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{TENANTS_ENV} is not valid UTF-8"));
+        }
+    };
+    let tenants = tenants_from_env(raw.as_deref())?;
+    if raw.is_none() {
+        tracing::info!(
+            tenant = DEFAULT_TENANT,
+            "{TENANTS_ENV} is unset: serving the default tenant"
+        );
+    }
     let data_dir = intent_core::Config::resolve()
         .map_err(|e| format!("data dir: {e}"))?
         .data_dir;

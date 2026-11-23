@@ -35,7 +35,12 @@ pub mod serve;
 pub const POSTGRES_URL_ENV: &str = "INTENTD_POSTGRES_URL";
 
 /// The tenants this process serves: a comma-separated list of tenant ids.
+/// Unset, the process serves [`DEFAULT_TENANT`] alone.
 pub const TENANTS_ENV: &str = "INTENTD_POSTGRES_TENANTS";
+
+/// The one tenant served when [`TENANTS_ENV`] is unset. Until tenant-sticky
+/// routing (and client auth) lands, a deployment serves a single tenant.
+pub const DEFAULT_TENANT: &str = "default";
 
 /// The instance id this process claims its leases as; a fresh one per
 /// start when unset.
@@ -44,6 +49,20 @@ pub const INSTANCE_ENV: &str = "INTENTD_ORCHESTRATOR_INSTANCE";
 /// The exit code when a tenant's self-fence overran: its work may still run
 /// after its lease is gone, and only stopping the process stops it.
 pub const FENCE_OVERRAN_EXIT: i32 = 70;
+
+/// The tenants to serve, from [`TENANTS_ENV`]'s value: `None` (unset)
+/// serves [`DEFAULT_TENANT`] alone; a set value is [`parse_tenants`], so an
+/// empty value, an empty entry or a repeated id is still an error, never the
+/// default.
+///
+/// # Errors
+/// As [`parse_tenants`], for a set value.
+pub fn tenants_from_env(raw: Option<&str>) -> Result<Vec<String>, String> {
+    match raw {
+        None => Ok(vec![DEFAULT_TENANT.to_owned()]),
+        Some(raw) => parse_tenants(raw),
+    }
+}
 
 /// The tenants named by `raw` ([`TENANTS_ENV`]): comma-separated, each
 /// trimmed, none empty or repeated. The ids themselves are checked when
@@ -142,6 +161,23 @@ mod tests {
     use intent_core::tenant_fence::FenceStep;
 
     use super::*;
+
+    #[test]
+    fn an_unset_tenant_list_serves_the_default_tenant_only() {
+        assert_eq!(tenants_from_env(None).unwrap(), [DEFAULT_TENANT]);
+        assert_eq!(DEFAULT_TENANT, "default");
+    }
+
+    #[test]
+    fn a_set_tenant_list_is_parsed_as_before() {
+        assert_eq!(tenants_from_env(Some("a,b")).unwrap(), ["a", "b"]);
+        assert!(
+            tenants_from_env(Some("")).is_err(),
+            "an explicitly empty list is an error, not the default"
+        );
+        assert!(tenants_from_env(Some("a,,b")).is_err());
+        assert!(tenants_from_env(Some("a,a")).is_err());
+    }
 
     #[test]
     fn tenants_are_a_trimmed_comma_list_without_blanks_or_repeats() {
