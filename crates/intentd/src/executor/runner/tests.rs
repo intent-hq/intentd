@@ -3142,6 +3142,48 @@ async fn node_runner_a_stop_during_a_pending_checkouts_removal_is_not_held() {
     h.runner.stop(&AgentId::from("a1"));
 }
 
+/// A relaunch right after a stop that left a `pending` checkout's removal
+/// running waits for that removal, so the removal never deletes the
+/// relaunch's fresh checkout.
+#[tokio::test]
+async fn node_runner_a_relaunch_waits_for_the_stopped_launchs_removal() {
+    use intent_core::node_link::SetupState;
+    let Some(h) = harness(1, &[]) else { return };
+    let script = "echo ran >> setup-runs.txt\n";
+    let worktree = stop_mid_checkout(&h, "a1", script).await;
+
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_discard.lock().unwrap() = Some((reached_tx, release_rx));
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
+    tokio::time::timeout(wait(), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    h.runner.stop(&AgentId::from("a1"));
+    wait_exits(&h.runner, "a1", 2).await;
+
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !records(&h.runner).await.iter().any(setup_started("a1")),
+        "the relaunch waits for the earlier removal"
+    );
+    release.send(()).unwrap();
+    let all = wait_for(&h.runner, "setup recorded", setup_finished("a1")).await;
+    assert_eq!(finished(&all, "a1"), (SetupState::Completed, Some(0), None));
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("setup-runs.txt")).unwrap(),
+        "ran\n",
+        "the relaunch's checkout survives"
+    );
+    h.runner.stop(&AgentId::from("a1"));
+}
+
 /// Launch `id` with setup `script`, hold its fresh checkout once its
 /// directory exists, and stop it there; returns that partial checkout.
 async fn stop_mid_checkout(h: &Harness, id: &str, script: &str) -> PathBuf {

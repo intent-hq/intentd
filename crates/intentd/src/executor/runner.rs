@@ -412,6 +412,9 @@ struct State {
     /// Agents whose checkout the bind sweep is removing now; their launch
     /// waits for it.
     sweeping: HashSet<AgentId>,
+    /// Per agent, held while a `pending` checkout's removal runs (it
+    /// outlives a stopped launch): the next launch waits for it.
+    pending_removals: HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// Every agent launched since start into another agent's checkout
     /// (nodeProtocol 13), with that checkout's owner.
     shares: HashMap<AgentId, AgentId>,
@@ -2279,23 +2282,48 @@ impl Runner {
                 return;
             }
         };
+        // An earlier launch's removal may still run after its stop: wait
+        // for it, so it never deletes this launch's checkout.
+        let removal = lock(&self.inner.state)
+            .pending_removals
+            .entry(agent.id.clone())
+            .or_default()
+            .clone();
+        let held = removal.lock_owned().await;
+        let mut ready = true;
         if self.inner.checkouts.existing(&agent.id).is_some() {
-            if !setup::is_pending(&worktree) {
-                return;
+            if setup::is_pending(&worktree) {
+                // Its own task, holding the removal lock: a stop ends the
+                // launch without waiting on the cache lock, and the
+                // removal still finishes before the next launch goes on.
+                let checkouts = self.inner.checkouts.clone();
+                let agent_id = agent.id.clone();
+                let _ = intent_core::spawn_daemon(async move {
+                    let _held = held;
+                    checkouts.discard_checkout(&agent_id).await;
+                })
+                .await;
+                ready = self.inner.checkouts.existing(&agent.id).is_none();
+            } else {
+                drop(held);
+                ready = false;
             }
-            // Its own task: a stop ends the launch without waiting on the
-            // cache lock, and never leaves a half-done removal.
-            let checkouts = self.inner.checkouts.clone();
-            let agent_id = agent.id.clone();
-            let _ = intent_core::spawn_daemon(async move {
-                checkouts.discard_checkout(&agent_id).await;
-            })
-            .await;
-            if self.inner.checkouts.existing(&agent.id).is_some() {
-                return;
+        } else {
+            drop(held);
+        }
+        {
+            let mut state = lock(&self.inner.state);
+            if state
+                .pending_removals
+                .get(&agent.id)
+                .is_some_and(|removal| Arc::strong_count(removal) == 1)
+            {
+                state.pending_removals.remove(&agent.id);
             }
         }
-        setup::write_status(&worktree, &SetupStatus::pending());
+        if ready {
+            setup::write_status(&worktree, &SetupStatus::pending());
+        }
     }
 
     /// Run or account for the setup of a prepared checkout: a fresh one (or
