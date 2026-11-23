@@ -1564,6 +1564,10 @@ pub struct Services {
     pr_cache: pr_monitor::PrCache,
     automatic_pr_refresh: Arc<Mutex<automatic_pr_refresh::Admission>>,
     pr_discovery: pr_discovery::Discovery,
+    /// Agent-created PRs being listed on their git root
+    /// ([`Services::spawn_link_created_prs`]), so a second report of one
+    /// joins its retry. In-memory only; shared across clones.
+    created_pr_retries: Arc<Mutex<HashSet<(WorkspaceId, intent_sourcecontrol::RepoRef, u64)>>>,
     /// The issue cache behind `github.issues.get`: each issue's last forge
     /// read, served within `prCache.maxAgeSeconds` like the PR cache and
     /// retained under the same unmonitored policy (see
@@ -2047,6 +2051,7 @@ impl Services {
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
             automatic_pr_refresh: Arc::new(Mutex::new(automatic_pr_refresh::Admission::default())),
             pr_discovery: pr_discovery::Discovery::default(),
+            created_pr_retries: Arc::default(),
             issue_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_cache_max_age_seconds: None,
             pr_read_park: None,
@@ -6719,6 +6724,215 @@ impl Services {
             return Err(Error::RateLimited(detail));
         }
         Ok(outcome)
+    }
+
+    /// Record the PRs an agent just opened ([`pr_ops::created_pr_refs`]) on
+    /// the workspace's git roots of the same repository, in the background.
+    /// A root is otherwise linked only by its live branch, which a runner
+    /// agent's submodule branch never reaches: the backend's copy stays
+    /// detached at its pin. A created PR is the only record of it, so a fetch
+    /// the quota gate or the forge defers is kept and retried after the
+    /// pause, at most [`CREATED_PR_RETRY_ATTEMPTS`] times. A PR already
+    /// pending here is not claimed twice: the later report joins that retry.
+    pub(crate) fn spawn_link_created_prs(
+        &self,
+        workspace_id: &WorkspaceId,
+        created: Vec<(intent_sourcecontrol::RepoRef, u64)>,
+    ) {
+        let claimed: Vec<_> = {
+            let mut pending = self.created_pr_retries.lock().unwrap();
+            created
+                .into_iter()
+                .filter(|(repo, n)| pending.insert((workspace_id.clone(), repo.clone(), *n)))
+                .collect()
+        };
+        if claimed.is_empty() {
+            return;
+        }
+        let services = self.clone();
+        let workspace_id = workspace_id.clone();
+        let pending = self.created_pr_retries.clone();
+        // The retry loop sleeps between attempts, so it is not a drained
+        // store task (shutdown would wait out every pause); each finite
+        // attempt is, and the loop stops once the store writers close.
+        intent_core::spawn_daemon(async move {
+            services
+                .link_created_prs_with_retry(&workspace_id, claimed.clone())
+                .await;
+            let mut pending = pending.lock().unwrap();
+            for (repo, n) in claimed {
+                pending.remove(&(workspace_id.clone(), repo, n));
+            }
+        });
+    }
+
+    async fn link_created_prs_with_retry(
+        &self,
+        workspace_id: &WorkspaceId,
+        mut pending: Vec<(intent_sourcecontrol::RepoRef, u64)>,
+    ) {
+        for attempt in 1..=CREATED_PR_RETRY_ATTEMPTS {
+            let services = self.clone();
+            let attempt_workspace = workspace_id.clone();
+            let batch = pending.clone();
+            let Some(handle) = self.store_tasks.spawn_draining(intent_core::with_caller(
+                intent_core::Caller::Daemon,
+                intent_sourcecontrol::traffic::with_caller(
+                    intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+                    async move { services.link_created_prs(&attempt_workspace, &batch).await },
+                ),
+            )) else {
+                tracing::debug!("PR refresh writers are shutting down; created PR not linked");
+                return;
+            };
+            pending = match handle.await {
+                Ok(Ok(deferred)) => deferred,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.as_str(),
+                        %error,
+                        "linking an agent-created PR to its git root failed"
+                    );
+                    return;
+                }
+                Err(_) => return,
+            };
+            if pending.is_empty() {
+                return;
+            }
+            if attempt < CREATED_PR_RETRY_ATTEMPTS {
+                let wait = self
+                    .sweep_rate_limit
+                    .paused_remaining()
+                    .unwrap_or_default()
+                    .max(CREATED_PR_RETRY_DELAY);
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    () = self.store_tasks.closed() => return,
+                }
+            }
+        }
+        tracing::warn!(
+            workspace = %workspace_id.as_str(),
+            prs = ?pending.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+            "agent-created PRs stayed deferred; not listed on their git root"
+        );
+    }
+
+    /// Fetch each created PR whose repository matches a git root of the
+    /// workspace and add it to that root's `pullRequests` only: the write is
+    /// one atomic projection of the stored pool, so a concurrent sweep's
+    /// update is never rolled back, and the linked PR (kept by the sweep
+    /// from the root's live branch) is not touched. Pool entries survive a
+    /// detached or mismatched HEAD, so the PR stays listed after the agent
+    /// resets the submodule to its pin. Returns the PRs to retry: every
+    /// matching one while the sweep's rate-limit pause is open (the gate is
+    /// never bypassed), and each whose fetch was deferred (quota, request
+    /// budget, rate limit or timeout). Another fetch failure is logged and
+    /// skips only that PR.
+    pub(crate) async fn link_created_prs(
+        &self,
+        workspace_id: &WorkspaceId,
+        created: &[(intent_sourcecontrol::RepoRef, u64)],
+    ) -> Result<Vec<(intent_sourcecontrol::RepoRef, u64)>> {
+        let roots = self.store.list_workspace_git_roots(workspace_id).await?;
+        let targets: Vec<_> = roots
+            .into_iter()
+            .filter_map(|root| {
+                let repo = root.repo()?;
+                let numbers: Vec<u64> = created
+                    .iter()
+                    .filter(|(r, _)| *r == repo)
+                    .map(|(_, n)| *n)
+                    .filter(|n| {
+                        !root
+                            .pull_requests
+                            .as_deref()
+                            .is_some_and(|items| items.iter().any(|p| p.number == *n))
+                    })
+                    .collect();
+                (!numbers.is_empty()).then_some((root.id, repo, numbers))
+            })
+            .collect();
+        let mut deferred: Vec<(intent_sourcecontrol::RepoRef, u64)> = Vec::new();
+        let mut defer = |repo: &intent_sourcecontrol::RepoRef, number: u64| {
+            if !deferred.iter().any(|(r, n)| r == repo && *n == number) {
+                deferred.push((repo.clone(), number));
+            }
+        };
+        if targets.is_empty() {
+            return Ok(deferred);
+        }
+        if self.sweeps_rate_limited() {
+            for (_, repo, numbers) in &targets {
+                for n in numbers {
+                    defer(repo, *n);
+                }
+            }
+            return Ok(deferred);
+        }
+        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
+            .await?;
+        for (root_id, repo, numbers) in targets {
+            let mut fetched = Vec::new();
+            for number in numbers {
+                let pr = tokio::time::timeout(
+                    self.pr_refresh_fetch_timeout,
+                    self.linked_pr_record(sc.as_ref(), &repo, number),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(intent_sourcecontrol::Error::Api(
+                        CREATED_PR_FETCH_TIMED_OUT.into(),
+                    ))
+                });
+                match pr {
+                    Ok(pr) => fetched.push(pr_ops::build_pr_info(&pr)),
+                    Err(error) if created_pr_fetch_deferred(&error) => defer(&repo, number),
+                    Err(error) => tracing::warn!(
+                        git_root = %root_id.as_str(),
+                        pr = number,
+                        %error,
+                        "fetching an agent-created PR failed"
+                    ),
+                }
+            }
+            if fetched.is_empty() {
+                continue;
+            }
+            // A root unregistered meanwhile is skipped, not fatal.
+            let written = match self
+                .store
+                .project_workspace_git_root_pull_requests(&root_id, &now_iso(), |pool| {
+                    let mut changed = false;
+                    for info in &fetched {
+                        changed |= pr_ops::upsert_pr_info(pool, &mut info.clone());
+                    }
+                    changed
+                })
+                .await
+            {
+                Ok(written) => written,
+                Err(Error::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            if written.is_none() {
+                continue;
+            }
+            let root = match self.store.get_workspace_git_root(&root_id).await {
+                Ok(root) => root,
+                Err(Error::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            publish_event(
+                self.event_bus.as_ref(),
+                git_root_changed_event(GIT_ROOT_UPDATED, &root),
+            )
+            .await;
+            self.maybe_emit_display_status_changed(&root.workspace_id)
+                .await;
+        }
+        Ok(deferred)
     }
 
     /// Refresh one workspace's PR linkage against the forge (§7.6), persisting
@@ -40063,4 +40277,25 @@ fn assert_pr_monitor_override_honoured(
              would silently read as {ceiling}{unit} instead. {hint}"
         );
     }
+}
+
+/// Retries of an agent-created PR whose fetch was deferred
+/// ([`Services::spawn_link_created_prs`]): enough to outlast a long quota
+/// pause, after which the PR is given up with one warning.
+const CREATED_PR_RETRY_ATTEMPTS: u32 = 30;
+/// The wait between those retries when no quota pause names a later end.
+const CREATED_PR_RETRY_DELAY: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(60)
+};
+const CREATED_PR_FETCH_TIMED_OUT: &str = "agent-created PR fetch timed out";
+
+/// Whether a created PR's fetch failed only for now: a rate limit, the local
+/// request budget or quota pause, or the fetch deadline.
+fn created_pr_fetch_deferred(error: &intent_sourcecontrol::Error) -> bool {
+    matches!(error, intent_sourcecontrol::Error::RateLimited(_))
+        || pr_discovery::is_budget_deferral_sc(error)
+        || pr_discovery::is_quota_pause_sc(error)
+        || matches!(error, intent_sourcecontrol::Error::Api(m) if m == CREATED_PR_FETCH_TIMED_OUT)
 }

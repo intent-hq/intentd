@@ -1522,8 +1522,10 @@ PR, the last menu item is **Open in original workspace**, which opens it; with
 several such workspaces it opens a submenu of their names, most recent first.
 Archived workspaces are included, and the submenu marks them **Archived**. Intent
 links a PR to a workspace when it discovers the PR on that workspace's branch or
-one of its submodules; PRs seen only before this feature shipped are not linked
-until Intent sees them again.
+one of its submodules, or when an agent (on this computer or a remote machine) opens
+it with `gh pr create` in one of its submodules; such a PR stays listed after the
+agent leaves that branch. PRs seen only before this feature shipped are not linked
+until Intent sees them again; older versions may differ.
 
 ## Rename a workspace
 

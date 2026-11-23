@@ -63,12 +63,16 @@ pub(crate) async fn resolve_source_control(
     injected: Option<Arc<dyn SourceControl>>,
     secrets: &intent_core::SharedSecretStore,
 ) -> Result<Arc<dyn SourceControl>> {
-    match injected {
-        Some(sc) => Ok(sc),
-        None => SourceControlRegistry::from_settings(&SourceControlSettings::default(), secrets)
-            .await
-            .map_err(map_sc_err),
+    if let Some(sc) = injected {
+        return Ok(sc);
     }
+    // The identity reads' loopback-only API seam, so an e2e daemon's forge
+    // reads reach its mock and never api.github.com.
+    let mut settings = SourceControlSettings::default();
+    settings.github.api_base_url = crate::invite_ops::resolve_api_base_uri(None);
+    SourceControlRegistry::from_settings(&settings, secrets)
+        .await
+        .map_err(map_sc_err)
 }
 
 /// The workspace's forge repository ([`Workspace::repo`]) for its active
@@ -291,6 +295,71 @@ pub(crate) async fn discover_matching_open_pr(
         }
     }
     Ok(best)
+}
+
+fn collect_strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| collect_strings(v, out)),
+        serde_json::Value::Object(map) => map.values().for_each(|v| collect_strings(v, out)),
+        _ => {}
+    }
+}
+
+/// The shell command of a tool call's input: `command` (or `cmd`) as a
+/// string (Claude Code's Bash) or an argv array (Codex), joined by spaces.
+/// Other input fields (a description, the echoed title) are never read.
+fn tool_command(input: &serde_json::Value) -> Option<String> {
+    let field = input.get("command").or_else(|| input.get("cmd"))?;
+    match field {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+/// The PRs an agent's finished shell tool call opened: its command runs
+/// `gh pr create` and an output line is exactly a github.com PR URL, as `gh`
+/// prints for a new PR and after "already exists:" for an existing one. A
+/// URL inside other text (a log, a grep hit) is not one. Each
+/// `(repo, number)` appears once.
+pub(crate) fn created_pr_refs(
+    input: &serde_json::Value,
+    output: &serde_json::Value,
+) -> Vec<(RepoRef, u64)> {
+    static GH_PR_CREATE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:^|[\s;&|(`])(?:\S*/)?gh\s+pr\s+create\b")
+            .expect("valid gh pr create pattern")
+    });
+    static PR_URL_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/(\d+)$")
+            .expect("valid PR URL pattern")
+    });
+    if !tool_command(input).is_some_and(|command| GH_PR_CREATE.is_match(&command)) {
+        return Vec::new();
+    }
+    let mut outputs = Vec::new();
+    collect_strings(output, &mut outputs);
+    let mut found: Vec<(RepoRef, u64)> = Vec::new();
+    for line in outputs.iter().flat_map(|text| text.lines()) {
+        let Some(caps) = PR_URL_LINE.captures(line.trim()) else {
+            continue;
+        };
+        let Ok(number) = caps[3].parse::<u64>() else {
+            continue;
+        };
+        let repo = RepoRef::new(&caps[1], &caps[2]);
+        if !found.iter().any(|(r, n)| *n == number && *r == repo) {
+            found.push((repo, number));
+        }
+    }
+    found
 }
 
 /// Carry a persisted merge-queue signal onto a REST-only snapshot
@@ -2198,6 +2267,53 @@ pub(crate) fn validate_merge_method(method: Option<&str>) -> Result<MergeMethod>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refs(input: &serde_json::Value, output: &serde_json::Value) -> Vec<(String, u64)> {
+        created_pr_refs(input, output)
+            .into_iter()
+            .map(|(repo, n)| (format!("{}/{}", repo.owner, repo.name), n))
+            .collect()
+    }
+
+    #[test]
+    fn created_pr_refs_reads_the_url_gh_prints_for_each_tool_shape() {
+        let claude =
+            serde_json::json!({ "command": "cd lib && gh pr create --fill", "description": "x" });
+        let printed = serde_json::json!("https://github.com/acme/lib/pull/7\n");
+        assert_eq!(refs(&claude, &printed), [("acme/lib".to_owned(), 7)]);
+        let codex =
+            serde_json::json!({ "command": ["bash", "-lc", "/usr/bin/gh pr create -t t -b b"] });
+        let wrapped = serde_json::json!([{ "type": "content", "content": { "type": "text",
+            "text": "Warning: 2 uncommitted changes\nhttps://github.com/Acme/Lib/pull/8" } }]);
+        assert_eq!(refs(&codex, &wrapped), [("Acme/Lib".to_owned(), 8)]);
+        let cmd = serde_json::json!({ "cmd": "gh pr create" });
+        let exists = serde_json::json!(
+            "a pull request for branch \"fix\" into branch \"main\" already exists:\nhttps://github.com/acme/lib/pull/9\n"
+        );
+        assert_eq!(refs(&cmd, &exists), [("acme/lib".to_owned(), 9)]);
+    }
+
+    #[test]
+    fn created_pr_refs_ignores_other_commands_and_embedded_urls() {
+        let url = serde_json::json!("https://github.com/acme/lib/pull/7");
+        // Only the command field counts, not a description or echoed title.
+        let described = serde_json::json!({ "command": "rg pull docs", "description": "before gh pr create",
+            "_acpTitle": "gh pr create" });
+        for input in [
+            described,
+            serde_json::json!({ "command": "gh pr view 7" }),
+            serde_json::json!({ "command": "mygh pr create" }),
+            serde_json::json!({ "code": "gh pr create" }),
+        ] {
+            assert!(refs(&input, &url).is_empty(), "{input}");
+        }
+        // A URL inside other text, or on another host, is not the created PR.
+        let create = serde_json::json!({ "command": "gh pr create && rg pull/ docs" });
+        let noisy = serde_json::json!(
+            "docs/a.md: see https://github.com/acme/lib/pull/3\nhttps://github.example.com/acme/lib/pull/4\nhttps://github.com/acme/lib/pull/5"
+        );
+        assert_eq!(refs(&create, &noisy), [("acme/lib".to_owned(), 5)]);
+    }
 
     fn pr(state: PrState, draft: bool, mergeable: Option<bool>, ms: Option<&str>) -> PullRequest {
         PullRequest {
