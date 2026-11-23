@@ -7,6 +7,10 @@
 //! The process exits [`FENCE_OVERRAN_EXIT`] when a fence step overran (its
 //! work may outlive the lease), 1 when a tenant cannot be opened at start
 //! or every tenant stopped, and 0 on Ctrl-C or SIGTERM after stopping every tenant.
+//!
+//! Once [`DEFAULT_TENANT`] is served, its clients connect over the local
+//! socket and the WSS listener with `intentd`'s auth (see
+//! `intentd_orchestrator::listen` for the environment variables).
 
 use std::process::ExitCode;
 
@@ -108,6 +112,17 @@ async fn run(url: String) -> Result<ExitCode, String> {
         }
     }
 
+    // The default tenant's clients, once it is served (so a process that
+    // does not hold its lease never binds); its fence closes them.
+    #[cfg(unix)]
+    let _listeners = match listen_for_default_tenant(&served, &data_dir).await {
+        Ok(listeners) => listeners,
+        Err(error) => {
+            stop_all(&mut served, &mut stopped).await;
+            return Err(error);
+        }
+    };
+
     loop {
         if served.is_empty() {
             tracing::error!("every tenant stopped");
@@ -121,6 +136,38 @@ async fn run(url: String) -> Result<ExitCode, String> {
             }
         }
     }
+}
+
+/// Start the client listeners of [`DEFAULT_TENANT`] when this process
+/// serves it ([`intentd_orchestrator::listen`]); `None` when it does not.
+#[cfg(unix)]
+async fn listen_for_default_tenant(
+    served: &[ServedTenant],
+    data_dir: &std::path::Path,
+) -> Result<Option<intentd_orchestrator::listen::ClientListeners>, String> {
+    let Some(tenant) = served
+        .iter()
+        .find(|tenant| tenant.tenant() == DEFAULT_TENANT)
+    else {
+        tracing::info!(
+            tenant = DEFAULT_TENANT,
+            "the default tenant is not served: no client listener"
+        );
+        return Ok(None);
+    };
+    let max_outstanding_rpcs = intent_core::Config::resolve()
+        .map_err(|e| format!("config: {e}"))?
+        .server_max_outstanding_rpcs;
+    let config = intentd_orchestrator::listen::ListenConfig::from_env(
+        |name| std::env::var(name).ok(),
+        data_dir,
+        max_outstanding_rpcs,
+    )?;
+    tenant
+        .listen(&config)
+        .await
+        .map(Some)
+        .map_err(|e| format!("tenant {DEFAULT_TENANT}: client listeners: {e}"))
 }
 
 /// A tenant's work stopped: exit at once when its fence overran (its work
