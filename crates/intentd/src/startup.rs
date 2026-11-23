@@ -133,18 +133,11 @@ impl WorkAdmission {
     pub fn allowed(&self) -> bool {
         self.prerequisites_ok && !self.cancellation.stopping()
     }
+}
 
-    pub fn spawn(
-        &self,
-        start: impl FnOnce() -> tokio::task::JoinHandle<()>,
-    ) -> tokio::task::JoinHandle<()> {
-        if self.allowed() {
-            start()
-        } else {
-            // Keep the normal cleanup join graph without constructing or
-            // polling the rejected operational task.
-            intent_core::spawn_daemon(async {})
-        }
+impl intent_app::tenant::Admission for WorkAdmission {
+    fn allowed(&self) -> bool {
+        WorkAdmission::allowed(self)
     }
 }
 
@@ -177,6 +170,8 @@ pub fn admission_unchanged(
 
 #[cfg(test)]
 mod tests {
+    use intent_app::tenant::Admission as _;
+
     use super::*;
 
     #[tokio::test]
