@@ -3,9 +3,14 @@
 //! A [`Store`](crate::Store) opened with [`Store::open_postgres`](crate::Store::open_postgres)
 //! serves exactly one tenant: every statement binds that tenant's id, so
 //! callers never pass one. Tenants share one database (PlanetScale Neki in
-//! production, sharded by `tenant_id`); the schema lives in
-//! `postgres/migrations/` and `postgres_tenant_schema_lint` keeps every table,
-//! key and trigger tenant-scoped.
+//! production, sharded by `tenant_id`); the schema lives in one file,
+//! `postgres/migrations/0001_schema.sql`, and `postgres_tenant_schema_lint`
+//! keeps every table, key and trigger tenant-scoped.
+//!
+//! **While nobody runs Postgres, change that file in place**: no new
+//! numbered migration files and no data migrations. A schema built from an
+//! earlier version of the file fails the gate ([`check_schema`]) and
+//! [`migrate`]; recreate it, then run `migrate`.
 //!
 //! Release builds never enable this feature. Methods not ported yet go
 //! through `pending_postgres!` and panic ([`unported_panic`]).
@@ -100,8 +105,26 @@ pub use purge::probe as delete_probe;
 #[doc(hidden)]
 pub use read_seam::probe as read_probe;
 
-/// Postgres schema migrations, separate from the `SQLite` ones.
+/// Postgres schema migrations, separate from the `SQLite` ones: one schema
+/// file (version 1), edited in place while nobody runs Postgres (see the
+/// module docs).
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./postgres/migrations");
+
+/// The checksum (SHA-384) of `0001_compat.sql`, the first of the numbered
+/// Postgres migrations (versions 1 to 16) that were folded into
+/// `0001_schema.sql`.
+const FOLDED_COMPAT_CHECKSUM: [u8; 48] = [
+    0xd7, 0x85, 0x8b, 0xa9, 0xe8, 0xb4, 0x15, 0x88, 0x41, 0x76, 0x55, 0xe3, 0x46, 0xf4, 0xc2, 0x56,
+    0x5b, 0x81, 0x2c, 0x94, 0x1e, 0xdf, 0x23, 0x68, 0x11, 0x4b, 0xb6, 0x76, 0x55, 0xef, 0x70, 0x0f,
+    0xb8, 0x5f, 0x8a, 0x20, 0xb8, 0x01, 0x42, 0x1a, 0x57, 0x8d, 0xe1, 0x9c, 0x69, 0x96, 0xba, 0x1f,
+];
+
+/// Whether a ledger row `(version, checksum, description)` is the first of
+/// the folded numbered migrations: a schema built from that history, which
+/// only recreating repairs.
+fn folded_history_row(version: i64, checksum: &[u8], description: &str) -> bool {
+    version == 1 && (checksum == FOLDED_COMPAT_CHECKSUM || description == "compat")
+}
 
 /// The tenant a Postgres store serves: 1-128 characters of ASCII letters,
 /// digits, `-`, `_`, `.` and `:`.
@@ -741,9 +764,10 @@ pub async fn check_schema(pool: &PgPool) -> Result<()> {
     .fetch_one(&mut *tx)
     .await
     .map_err(db)?;
-    let ledger: Vec<(i64, Vec<u8>, bool)> = if has_ledger {
+    let rows: Vec<(i64, Vec<u8>, bool, String)> = if has_ledger {
         sqlx::query_as(
-            "SELECT version, checksum, complete FROM intent_schema_migrations ORDER BY version",
+            "SELECT version, checksum, complete, description \
+             FROM intent_schema_migrations ORDER BY version",
         )
         .fetch_all(&mut *tx)
         .await
@@ -752,6 +776,13 @@ pub async fn check_schema(pool: &PgPool) -> Result<()> {
         Vec::new()
     };
     tx.commit().await.map_err(db)?;
+    let folded_history = rows.iter().any(|(version, checksum, _, description)| {
+        folded_history_row(*version, checksum, description)
+    });
+    let ledger: Vec<(i64, Vec<u8>, bool)> = rows
+        .into_iter()
+        .map(|(version, checksum, complete, _)| (version, checksum, complete))
+        .collect();
     let embedded: Vec<(i64, &[u8])> = MIGRATOR
         .iter()
         .map(|m| (m.version, m.checksum.as_ref()))
@@ -761,6 +792,7 @@ pub async fn check_schema(pool: &PgPool) -> Result<()> {
         Some(mut mismatch) => {
             // As `migrate` decides: a legacy schema only without ledger rows.
             mismatch.legacy_sqlx = legacy_sqlx && ledger.is_empty();
+            mismatch.folded_history = folded_history;
             Err(Error::SchemaMismatch(Box::new(mismatch)))
         }
     }
@@ -805,11 +837,13 @@ fn schema_mismatch(
         changed,
         part_way,
         legacy_sqlx: false,
+        folded_history: false,
     })
 }
 
-/// `(version, checksum, applied_statements, applied_prefix, complete)`.
-type LedgerRow = (i64, Vec<u8>, i32, Vec<u8>, bool);
+/// `(version, checksum, applied_statements, applied_prefix, complete,
+/// description)`.
+type LedgerRow = (i64, Vec<u8>, i32, Vec<u8>, bool, String);
 
 /// Applies what the ledger lacks; appends the versions it completes to
 /// `completed`.
@@ -829,7 +863,7 @@ async fn migrate_locked(
     .await
     .map_err(sql_failure)?;
     let applied: Vec<LedgerRow> = sqlx::query_as(
-        "SELECT version, checksum, applied_statements, applied_prefix, complete \
+        "SELECT version, checksum, applied_statements, applied_prefix, complete, description \
          FROM intent_schema_migrations ORDER BY version",
     )
     .fetch_all(&mut *conn)
@@ -851,6 +885,17 @@ async fn migrate_locked(
             .into());
         }
     }
+    if applied.iter().any(|(version, checksum, .., description)| {
+        folded_history_row(*version, checksum, description)
+    }) {
+        return Err(Error::Internal(
+            "postgres schema was built from the numbered Postgres migrations (0001_compat to \
+             0016_agent_session_goal), which are now one schema file (0001_schema); recreate the \
+             schema, then run migrate"
+                .into(),
+        )
+        .into());
+    }
     if let Some((version, ..)) = applied
         .iter()
         .find(|(v, ..)| !MIGRATOR.iter().any(|m| m.version == *v))
@@ -870,16 +915,18 @@ async fn migrate_locked(
         let version = migration.version;
         let stmts = statements(migration.sql.as_str());
         let start = match applied.iter().find(|row| row.0 == version) {
-            Some((_, checksum, _, _, true)) => {
+            Some((_, checksum, _, _, true, _)) => {
                 if checksum.as_slice() != migration.checksum.as_ref() {
+                    // While nobody runs Postgres the file is edited in place.
                     return Err(Error::Internal(format!(
-                        "postgres migration {version} changed after it was applied"
+                        "postgres migration {version} changed after it was applied; restore \
+                         it, or recreate the schema and run migrate"
                     ))
                     .into());
                 }
                 continue;
             }
-            Some((_, _, done, prefix, false)) => {
+            Some((_, _, done, prefix, false, _)) => {
                 let done = usize::try_from(*done).unwrap_or(usize::MAX);
                 if done > stmts.len() || prefix_hash(&stmts[..done]) != *prefix {
                     return Err(Error::Internal(format!(
@@ -1662,14 +1709,15 @@ impl PgStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        migrate_retry_pause, next_lock_attempt, retry_backoff, schema_mismatch, statements,
-        transient_connection_error, transient_database_error, with_bundled_root_cert, WriterLimits,
-        MIGRATE_ATTEMPTS, MIGRATOR,
+        folded_history_row, migrate_retry_pause, next_lock_attempt, retry_backoff, schema_mismatch,
+        statements, transient_connection_error, transient_database_error, with_bundled_root_cert,
+        WriterLimits, FOLDED_COMPAT_CHECKSUM, MIGRATE_ATTEMPTS, MIGRATOR,
     };
     use std::time::Duration;
 
     /// The Neki router's own socket error, from the failing sharded runs
-    /// (migrations 3 and 12, and before the first statement): an error
+    /// (in the numbered migrations since folded into one file, and before the
+    /// first statement): an error
     /// response, not a broken client connection.
     #[test]
     fn a_neki_router_broken_pipe_is_transient() {
@@ -1822,6 +1870,37 @@ mod tests {
         assert!(parts[2].ends_with("SELECT 1;"));
         assert!(parts[3].contains("RETURN $$q;$$; END") && parts[3].ends_with("$body$;"));
         assert_eq!(parts[4], "SELECT $1::int;");
+    }
+
+    /// One schema file, edited in place while nobody runs Postgres: a second
+    /// numbered file would bring back the upgrade path this replaced.
+    #[test]
+    fn the_postgres_schema_is_one_file() {
+        let migrations: Vec<(i64, &str)> = MIGRATOR
+            .iter()
+            .map(|m| (m.version, m.description.as_ref()))
+            .collect();
+        assert_eq!(
+            migrations,
+            vec![(1, "schema")],
+            "change postgres/migrations/0001_schema.sql in place instead of adding a file"
+        );
+    }
+
+    /// A ledger from the numbered migrations is recognised by its first row,
+    /// and today's file is not mistaken for it.
+    #[test]
+    fn folded_history_is_the_old_first_migration() {
+        assert!(folded_history_row(1, &FOLDED_COMPAT_CHECKSUM, "compat"));
+        assert!(folded_history_row(1, &FOLDED_COMPAT_CHECKSUM, "renamed"));
+        assert!(folded_history_row(1, b"\x00", "compat"));
+        assert!(!folded_history_row(2, &FOLDED_COMPAT_CHECKSUM, "compat"));
+        let current = MIGRATOR.iter().next().expect("one migration");
+        assert!(!folded_history_row(
+            current.version,
+            current.checksum.as_ref(),
+            current.description.as_ref()
+        ));
     }
 
     #[test]

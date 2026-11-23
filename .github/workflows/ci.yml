@@ -2862,6 +2862,10 @@ jobs:
         run: cargo clippy -p intent-store --features postgres --all-targets -- -D warnings
       - name: Postgres backend tests
         run: cargo nextest run -p intent-store --features postgres --test postgres_backend --test postgres_backend_lint --test postgres_tenant_schema_lint
+      # The src/postgres unit tests (migration statement rules, schema gate
+      # helpers) build only with the feature, so no other job runs them.
+      - name: Postgres unit tests
+        run: cargo nextest run -p intent-store --features postgres --lib -E 'test(/^postgres::/)'
 
   # intent-passkey (the WebAuthn sidecar, its own Cargo workspace under
   # intent-passkey/) links libdbus, libudev and libpam, so it stays out of the daemon

@@ -14,7 +14,7 @@
 //!   the same with their `p_tenant` parameter.
 //!
 //! It also pairs migrations: each `SQLite` migration after the baseline needs
-//! a Postgres migration whose header names it (`-- sqlite: <file>`), or an
+//! a `-- sqlite: <file>` line in the Postgres schema where it is ported, or an
 //! entry with a reason in `postgres/sqlite-noop.txt`.
 //!
 //! Limit: a text-level check of the generated DDL shapes, not a SQL parser.
@@ -27,7 +27,8 @@ use std::path::PathBuf;
 mod postgres_sql;
 use postgres_sql::{same_level, table_refs};
 
-/// Last `SQLite` migration folded into the Postgres baseline (`0002_tables.sql`).
+/// Last `SQLite` migration in the generated part of the Postgres schema's
+/// tables (`0001_schema.sql`); later ones carry a `-- sqlite: <file>` line.
 const SQLITE_BASELINE_LAST: u32 = 196;
 
 /// GIN full-text indexes cannot lead with a text column without `btree_gin`;
@@ -311,8 +312,8 @@ fn every_sqlite_migration_after_the_baseline_has_a_postgres_counterpart() {
     let missing: Vec<_> = sqlite.difference(&covered).collect();
     assert!(
         missing.is_empty(),
-        "SQLite migrations without a Postgres counterpart (add a postgres/migrations file \
-         with `-- sqlite: <file>`, or a reasoned line in postgres/sqlite-noop.txt): {missing:?}"
+        "SQLite migrations without a Postgres counterpart (port it in \
+         postgres/migrations/0001_schema.sql with `-- sqlite: <file>`, or a reasoned line in postgres/sqlite-noop.txt): {missing:?}"
     );
 }
 

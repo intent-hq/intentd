@@ -32,12 +32,13 @@
 //! bind one fixed schema in the data topology (every table with `tenant_id`
 //! to a shard group with an xxhash index on `tenant_id` spread over two or
 //! more shards, the migration ledger to the authoritative group) and name
-//! it in `INTENT_STORE_NEKI_SHARDED_SCHEMA`. When a migration adds a tenant
-//! table, `migrate` stops until the topology binds it; the tests then bind
+//! it in `INTENT_STORE_NEKI_SHARDED_SCHEMA`. When the schema file gains a
+//! tenant table, `migrate` stops until the topology binds it; the tests then bind
 //! it to the schema's tenant group (`migrate_bound`, needs `neki_operator`)
-//! and migrate again, so the topology keeps up with new migrations. Each sharded test then drops,
+//! and migrate again, so the topology keeps up with the schema. Each sharded test then drops,
 //! creates and migrates that schema, keeping the topology, and drops it at
-//! the end; a file lock in cargo's target temp directory
+//! the end, so a schema left by an earlier history of the schema file (the
+//! numbered migrations it replaced, or an edit in place) is never reused; a file lock in cargo's target temp directory
 //! (`CARGO_TARGET_TMPDIR`) runs them one at a time on this host (do not
 //! point two hosts at one schema). Only
 //! in that mode do the topology-dependent tests run (routing, identity
