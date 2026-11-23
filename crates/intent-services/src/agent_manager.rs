@@ -538,6 +538,21 @@ const SESSION_CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// an unrelated cancel much later.
 const STALE_CANCEL_WINDOW: Duration = Duration::from_secs(60);
 
+/// The placeholder session id a remote agent's turns run under; its
+/// runtime ignores it, and no ACP session id is stored for it.
+fn remote_session_id(agent_id: &AgentId) -> String {
+    format!("remote:{agent_id}")
+}
+
+/// The session a turn of `session` is cancelled on: its stored ACP session,
+/// or a remote agent's placeholder (its cancel goes to the machine).
+fn cancellable_session_id(agent_id: &AgentId, session: &AgentSession) -> Option<String> {
+    session.acp_session_id.clone().or_else(|| {
+        intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .map(|_| remote_session_id(agent_id))
+    })
+}
+
 /// Settle a hung `session/prompt` after the idle timeout WITHOUT killing the
 /// child: send `session/cancel` so the agent resolves/abandons the hung turn
 /// server-side (its in-flight prompt already had its client-side pending-map
@@ -7432,7 +7447,9 @@ impl AgentManager {
                 interrupted_row_id: None,
             };
         }
-        let acp_session_id = session.as_ref().and_then(|s| s.acp_session_id.clone());
+        let acp_session_id = session
+            .as_ref()
+            .and_then(|s| cancellable_session_id(agent_id, s));
         let Some(acp_session_id) = acp_session_id else {
             return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
         };
@@ -10697,7 +10714,7 @@ impl AgentManager {
                 .get_agent_session_summary(agent_id)
                 .await
                 .ok()
-                .and_then(|s| s.acp_session_id.clone())
+                .and_then(|s| cancellable_session_id(agent_id, &s))
                 .is_some();
         if !cancellable {
             return false;
@@ -12837,7 +12854,7 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
         session: &AgentSession,
     ) -> Result<StartedSession> {
-        let session_id = format!("remote:{agent_id}");
+        let session_id = remote_session_id(agent_id);
         // Backup failover (PROTOCOL §5.54): the identity this attempt starts
         // with — a quota failure only fails over while the session still
         // carries it.
