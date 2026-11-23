@@ -1,15 +1,66 @@
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::time::{Duration, SystemTime};
 
+use intent_core::blob::{BlobEntry, TempSweep, TEMP_SUFFIX as COMPACT_EXT};
 use serde_json::Value;
 
 use super::*;
 use intent_services::feature_api::pagination::paginate_text_lines;
 
+thread_local! {
+    /// Tests set this to make every compaction replace fail, like Windows
+    /// refusing to replace a log another process holds open.
+    static FAIL_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`LocalBlobStorage`] whose `replace` fails while [`FAIL_RENAME`] is set.
+#[derive(Debug)]
+struct RenameGate(LocalBlobStorage);
+
+impl BlobStorage for RenameGate {
+    fn display_path(&self, key: &BlobKey) -> PathBuf {
+        self.0.display_path(key)
+    }
+    fn open_append(&self, key: &BlobKey) -> io::Result<Box<dyn BlobFile>> {
+        self.0.open_append(key)
+    }
+    fn replace(&self, key: &BlobKey, contents: &[u8]) -> io::Result<Box<dyn BlobFile>> {
+        if FAIL_RENAME.with(std::cell::Cell::get) {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        self.0.replace(key, contents)
+    }
+    fn open_read(&self, key: &BlobKey) -> io::Result<Option<Box<dyn BlobFile>>> {
+        self.0.open_read(key)
+    }
+    fn exists(&self, key: &BlobKey) -> io::Result<bool> {
+        self.0.exists(key)
+    }
+    fn modified(&self, key: &BlobKey) -> io::Result<SystemTime> {
+        self.0.modified(key)
+    }
+    fn delete(&self, key: &BlobKey) -> io::Result<()> {
+        self.0.delete(key)
+    }
+    fn delete_prefix(&self, prefix: &BlobKey) -> io::Result<()> {
+        self.0.delete_prefix(prefix)
+    }
+    fn list(&self, prefix: &BlobKey) -> io::Result<Vec<BlobEntry>> {
+        self.0.list(prefix)
+    }
+    fn prune(&self, prefix: &BlobKey) {
+        self.0.prune(prefix);
+    }
+    fn remove_stale_temps(&self, prefix: &BlobKey, cutoff: SystemTime) -> TempSweep {
+        self.0.remove_stale_temps(prefix, cutoff)
+    }
+}
+
 fn store(cap: u64) -> (tempfile::TempDir, ScriptOutputStore) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = ScriptOutputStore::new(dir.path(), cap);
+    let storage = RenameGate(LocalBlobStorage::new(dir.path().join(SCRIPT_OUTPUT_DIR)));
+    let store = ScriptOutputStore::with_storage(Arc::new(storage), cap);
     (dir, store)
 }
 
@@ -416,7 +467,7 @@ fn paginate_never_buffers_a_huge_line_it_does_not_return() {
     body.extend_from_slice(b"\nsmall\n");
     store.open_writer("ws", "s", "r").append(&body);
     let file = File::open(store.run_path("ws", "s", "r").unwrap()).unwrap();
-    let (page, peak) = paginate_file(file, Some(1), None).unwrap();
+    let (page, peak) = paginate_file(Box::new(file), Some(1), None).unwrap();
     assert_eq!(page["items"], serde_json::json!(["small"]));
     assert!(
         peak <= SCAN_CHUNK,
