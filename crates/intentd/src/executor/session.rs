@@ -14,7 +14,7 @@ use intent_core::node_link::{
     FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
     MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, CHECKOUT_FILES_PROTOCOL,
     FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL, HOMES_PROTOCOL, NODE_LINK_PROTOCOLS,
-    ONE_SHOT_PROTOCOL, SKILLS_PROTOCOL,
+    ONE_SHOT_PROTOCOL, SETUP_RETRY_PROTOCOL, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
@@ -242,6 +242,25 @@ async fn apply_secret(
     Some(LinkFrame::SecretReply(reply))
 }
 
+/// Apply a `setupRetry` frame (nodeProtocol 22, node-link.md § Setup
+/// retry) for `binding`'s session and build its one `setupRetryReply`. A
+/// replaced session starts no retry and answers nothing.
+async fn apply_setup_retry(
+    runner: &Runner,
+    binding: &LeaseBinding,
+    closed: impl Fn() -> bool,
+    retry: intent_core::node_link::SetupRetry,
+) -> Option<LinkFrame> {
+    let gate = runner.link_gate().lock().await;
+    if admit(gate.as_ref(), binding, closed()) == Admission::Replaced {
+        tracing::debug!("node: dropping a setup retry from a replaced link");
+        return None;
+    }
+    let reply = runner.setup_retry(retry).await;
+    drop(gate);
+    Some(LinkFrame::SetupRetryReply(reply))
+}
+
 /// Apply a `forgeToken` frame (nodeProtocol 15, node-link.md § Forge token
 /// on the machine) for `binding`'s session and build its one
 /// `forgeTokenReply`. A replaced session holds, drops and answers nothing.
@@ -399,6 +418,20 @@ pub(super) async fn serve_link(
                             error,
                         }))
                         .await;
+                });
+            }
+            // Runs a running agent's setup again in its kept checkout
+            // (nodeProtocol 22); answered once the run has started.
+            LinkEvent::Frame(LinkFrame::SetupRetry(retry)) if protocol >= SETUP_RETRY_PROTOCOL => {
+                let link = link.clone();
+                let runner = runner.clone();
+                let binding = binding.clone();
+                // caller-binding: allow — answers one setup retry on its link
+                tokio::spawn(async move {
+                    let closed = || link.is_closed();
+                    if let Some(reply) = apply_setup_retry(&runner, &binding, closed, retry).await {
+                        let _ = link.send(&reply).await;
+                    }
                 });
             }
             // Reads a piece of an agent's checkout for another agent's pull

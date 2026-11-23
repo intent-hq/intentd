@@ -190,6 +190,9 @@ pub(crate) fn with_runtime_capabilities(
                 // `remoteMachines.order` / `setOrder`: the user-ordered
                 // list that placements without a machine walk.
                 capabilities["machineOrder"] = json!(1);
+                // `agent.retrySetup`: a remote agent's failed setup runs
+                // again in its kept checkout (nodeProtocol 22).
+                capabilities["remoteSetupRetry"] = json!(1);
             }
             // Workspace homes are part of orchestrator mode
             // (`Services::workspace_homes`).

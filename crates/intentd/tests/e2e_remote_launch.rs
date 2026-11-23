@@ -59,6 +59,7 @@ mod push_on_commit;
 mod runner_load;
 mod script_archive;
 mod secrets;
+mod setup_retry;
 mod sub_agents;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";

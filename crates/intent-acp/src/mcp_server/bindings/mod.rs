@@ -59,6 +59,12 @@ pub fn prelude() -> String {
     prelude_for(&AgentFeaturesSettings::default())
 }
 
+/// The prelude line of `ws.workspace.retrySetup()`, which a bridge adds only
+/// when its API offers the setup retry.
+pub(crate) fn setup_retry_prelude() -> &'static str {
+    workspace::RETRY_SETUP_PRELUDE
+}
+
 /// Feature-aware prelude: namespaces disabled in `[agentFeatures]` are
 /// omitted entirely, so agent code touching them fails with a clear
 /// `ws.<ns> is undefined` `TypeError`. With every toggle on — the default —
@@ -393,6 +399,14 @@ async fn dispatch_binding(
         // Live remote-placement discovery on the agent namespace, present
         // only when the daemon has a configured execution node. Remote
         // agents start from a git commit, so plain folders never list it.
+        if help::is_workspace_topic(opt_str(args, "namespace").as_deref())
+            && api.offers_setup_retry()
+        {
+            if let Value::String(text) = &mut help {
+                text.push('\n');
+                text.push_str(workspace::RETRY_SETUP_HELP);
+            }
+        }
         if !plain_folder && help::wants_placement_help(opt_str(args, "namespace").as_deref()) {
             if let (Value::String(text), Some(extra)) = (
                 &mut help,

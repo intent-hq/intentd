@@ -405,6 +405,14 @@ pub struct Shared {
     /// Waiting for the machine's `pushWipReply`, by request id
     /// (nodeProtocol 13).
     push_waiters: Mutex<HashMap<intent_core::node_link::LinkId, oneshot::Sender<PushWipResult>>>,
+    /// Waiting for the machine's `setupRetryReply`, by request id
+    /// (nodeProtocol 22).
+    setup_retry_waiters: Mutex<
+        HashMap<
+            intent_core::node_link::LinkId,
+            oneshot::Sender<intent_core::node_link::SetupRetryReply>,
+        >,
+    >,
     /// `checkoutRead`s waiting for their reply (nodeProtocol 16).
     checkout_waiters: Mutex<
         HashMap<
@@ -600,6 +608,7 @@ impl Shared {
             || !lock(&self.capability_waiters).is_empty()
             || !lock(&self.skills_waiters).is_empty()
             || !lock(&self.push_waiters).is_empty()
+            || !lock(&self.setup_retry_waiters).is_empty()
             || !lock(&self.checkout_waiters).is_empty()
             || !lock(&self.one_shot_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
@@ -624,6 +633,7 @@ impl Shared {
             || !lock(&self.capability_waiters).is_empty()
             || !lock(&self.skills_waiters).is_empty()
             || !lock(&self.push_waiters).is_empty()
+            || !lock(&self.setup_retry_waiters).is_empty()
             || !lock(&self.checkout_waiters).is_empty()
             || !lock(&self.one_shot_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
@@ -1903,6 +1913,7 @@ impl RemoteNode {
             capability_waiters: Mutex::new(Vec::new()),
             skills_waiters: Mutex::new(HashMap::new()),
             push_waiters: Mutex::new(HashMap::new()),
+            setup_retry_waiters: Mutex::new(HashMap::new()),
             checkout_waiters: Mutex::new(HashMap::new()),
             one_shot_waiters: Mutex::new(HashMap::new()),
             home_waiters: Mutex::new(HashMap::new()),
@@ -2230,6 +2241,47 @@ impl RemoteNode {
         }
         .await;
         lock(&self.shared.push_waiters).remove(&request_id);
+        reply
+    }
+
+    /// Ask the machine to run `agent_id`'s setup script `setup` again in its
+    /// kept checkout (`setupRetry`, nodeProtocol 22) and wait up to `wait`
+    /// for its answer. The caller checks the link's protocol first.
+    ///
+    /// # Errors
+    ///
+    /// As [`RemoteNode::connect`]; `node-link-timeout` when the machine
+    /// does not answer in time.
+    pub async fn setup_retry(
+        &self,
+        agent_id: &AgentId,
+        setup: intent_core::node_link::SetupCommand,
+        wait: Duration,
+    ) -> Result<intent_core::node_link::SetupRetryReply> {
+        let request_id = intent_core::node_link::LinkId::new_v4();
+        let (tx, rx) = oneshot::channel();
+        lock(&self.shared.setup_retry_waiters).insert(request_id, tx);
+        let reply = async {
+            self.connect().await?;
+            self.shared
+                .send(&LinkFrame::SetupRetry(intent_core::node_link::SetupRetry {
+                    request_id,
+                    agent_id: agent_id.clone(),
+                    setup,
+                }))
+                .await?;
+            tokio::time::timeout(wait, rx)
+                .await
+                .map_err(|_| {
+                    Error::Internal(format!(
+                        "{}: the machine did not answer the setup retry",
+                        link::codes::TIMEOUT
+                    ))
+                })?
+                .map_err(|_| Error::Internal(link::codes::CLOSED.into()))
+        }
+        .await;
+        lock(&self.shared.setup_retry_waiters).remove(&request_id);
         reply
     }
 
@@ -2993,6 +3045,7 @@ async fn run(
                 lock(&shared.capability_waiters).clear();
                 lock(&shared.skills_waiters).clear();
                 lock(&shared.push_waiters).clear();
+                lock(&shared.setup_retry_waiters).clear();
                 lock(&shared.checkout_waiters).clear();
                 lock(&shared.one_shot_waiters).clear();
                 lock(&shared.home_waiters).clear();
@@ -3085,6 +3138,7 @@ async fn run(
             lock(&shared.capability_waiters).clear();
             lock(&shared.skills_waiters).clear();
             lock(&shared.push_waiters).clear();
+            lock(&shared.setup_retry_waiters).clear();
             lock(&shared.checkout_waiters).clear();
             lock(&shared.one_shot_waiters).clear();
             lock(&shared.home_waiters).clear();
@@ -3220,6 +3274,7 @@ async fn run(
         lock(&shared.capability_waiters).clear();
         lock(&shared.skills_waiters).clear();
         lock(&shared.push_waiters).clear();
+        lock(&shared.setup_retry_waiters).clear();
         lock(&shared.checkout_waiters).clear();
         lock(&shared.one_shot_waiters).clear();
         lock(&shared.home_waiters).clear();
@@ -3400,6 +3455,13 @@ async fn serve(
                     }
                     LinkEvent::Frame(LinkFrame::PushWipReply(reply)) => {
                         if let Some(waiter) = lock(&shared.push_waiters).remove(&reply.request_id) {
+                            let _ = waiter.send(reply);
+                        }
+                    }
+                    LinkEvent::Frame(LinkFrame::SetupRetryReply(reply)) => {
+                        if let Some(waiter) =
+                            lock(&shared.setup_retry_waiters).remove(&reply.request_id)
+                        {
                             let _ = waiter.send(reply);
                         }
                     }

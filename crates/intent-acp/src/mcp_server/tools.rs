@@ -1922,7 +1922,9 @@ mod tests {
         // Installed only when the daemon advertises the capability; its doc
         // line is rendered by the per-session `ws.help("agent")` text instead.
         let capability_gated: HashSet<(&str, &str)> =
-            [("agent", "machineModels")].into_iter().collect();
+            [("agent", "machineModels"), ("workspace", "retrySetup")]
+                .into_iter()
+                .collect();
         let documented = extract_ws_methods(WORKSPACE_API_DESCRIPTION);
         for (ns, src) in all_namespaces() {
             for method in bound_methods(src) {

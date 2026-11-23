@@ -482,6 +482,25 @@ pub struct RemoteSetupStatus {
     pub output_truncated: Option<bool>,
 }
 
+/// `error.data.code` values of `agent.retrySetup` and
+/// `ws.workspace.retrySetup()` (nodes.md "Retrying a remote agent's setup").
+pub mod setup_retry {
+    /// The agent is not a remote agent with a prepared checkout.
+    pub const NOT_REMOTE: &str = "setup-retry-not-remote";
+    /// Its setup is not `failed` (and no retry runs).
+    pub const NOT_FAILED: &str = "setup-retry-not-failed";
+    /// It works in another agent's checkout or in a home.
+    pub const SHARED_CHECKOUT: &str = "setup-retry-shared-checkout";
+    /// The workspace has no setup script now.
+    pub const NO_SCRIPT: &str = "setup-retry-no-script";
+    /// A user's call while the agent runs a turn.
+    pub const AGENT_BUSY: &str = "agent-busy";
+    /// The agent does not run on its machine now.
+    pub const AGENT_NOT_RUNNING: &str = "agent-not-running";
+    /// How long the backend waits for the machine's `setupRetryReply`.
+    pub const REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+}
+
 /// The longest `setup.error` a placement keeps, in bytes.
 pub const SETUP_ERROR_CAP_BYTES: usize = 160;
 

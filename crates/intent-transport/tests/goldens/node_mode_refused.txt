@@ -51,6 +51,7 @@ agent.respondPermission
 agent.restore
 agent.retire
 agent.retry
+agent.retrySetup
 agent.rpcMethods
 agent.sendMessage
 agent.sendQueuedMessageNow

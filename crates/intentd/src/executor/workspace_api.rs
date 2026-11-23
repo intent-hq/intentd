@@ -135,7 +135,7 @@ pub(super) async fn serve(
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     worktree: &Path,
-    (gates, setup_status): (&Gates, Option<Value>),
+    (gates, setup_status): (&Gates, Arc<super::setup::SetupView>),
     (head, push): (HeadLink, PushNow),
     bridge_exe: &Path,
 ) -> std::io::Result<(Bridges, Vec<McpServer>)> {
@@ -144,7 +144,7 @@ pub(super) async fn serve(
             agent_id,
             workspace_id,
             worktree,
-            (gates, setup_status),
+            (gates, Some(setup_status)),
             (head.clone(), Some(push)),
         )
         .await?,
@@ -253,7 +253,7 @@ fn server_with_setup(
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     worktree: &Path,
-    (gates, setup_status): (&Gates, Option<Value>),
+    (gates, setup_status): (&Gates, Option<Arc<super::setup::SetupView>>),
     (head, push): (HeadLink, Option<PushNow>),
 ) -> std::io::Result<WorkspaceMcpServer> {
     let mut features: AgentFeaturesSettings = serde_json::from_value(gates.agent_features.clone())
@@ -271,7 +271,7 @@ fn server_with_setup(
         agent_id: agent_id.clone(),
         head,
         timeout: DEFAULT_TIMEOUT,
-        setup_status: setup_status.map(Arc::new),
+        setup_status,
         checkout: Some(Arc::new(worktree.to_path_buf())),
         push: push.clone(),
     };
@@ -309,7 +309,7 @@ async fn described_server(
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     worktree: &Path,
-    gates: (&Gates, Option<Value>),
+    gates: (&Gates, Option<Arc<super::setup::SetupView>>),
     (head, push): (HeadLink, Option<PushNow>),
 ) -> std::io::Result<WorkspaceMcpServer> {
     let help = Router {
@@ -337,6 +337,10 @@ async fn described_server(
 
 /// The forwarded call whose `setupStatus` the machine replaces.
 const DETAILS_METHOD: &str = "workspace.details";
+
+/// What a setup retry's wait leaves of the `workspace_api` call's budget,
+/// so its answer still reaches the agent.
+const RETRY_SETUP_MARGIN: Duration = Duration::from_secs(5);
 
 /// Head's `git.listRoots` rows with each relative `path` made absolute in
 /// `checkout`, with that repository's branch read there. A relative row
@@ -389,8 +393,9 @@ struct Router {
     head: HeadLink,
     timeout: Duration,
     /// The agent's checkout's setup status, shown as `setupStatus` in
-    /// `workspace.details` (nodeProtocol 10) instead of head's worktree's.
-    setup_status: Option<Arc<Value>>,
+    /// `workspace.details` (nodeProtocol 10) instead of head's worktree's,
+    /// and followed by `workspace.retrySetup` (nodeProtocol 22).
+    setup_status: Option<Arc<super::setup::SetupView>>,
     /// The agent's checkout, where the git roots head lists relative to it
     /// are resolved.
     checkout: Option<Arc<PathBuf>>,
@@ -414,6 +419,9 @@ impl HostFrameRouter for Router {
             Route::Unsupported => {
                 let message = workspace_api::unsupported_message(method);
                 Some(Box::pin(async move { Err(message) }))
+            }
+            Route::Forward if method == workspace_api::RETRY_SETUP_METHOD => {
+                Some(Box::pin(self.retry_setup(args)))
             }
             Route::Forward if method == REPORT_METHOD => {
                 let push = self.push.clone();
@@ -481,8 +489,9 @@ impl Router {
         let timeout = self.timeout;
         let overlay = self
             .setup_status
-            .clone()
-            .filter(|_| method == DETAILS_METHOD);
+            .as_ref()
+            .filter(|_| method == DETAILS_METHOD)
+            .and_then(|view| view.overlay());
         let roots_in = self.checkout.clone().filter(|_| method == GIT_ROOTS_METHOD);
         async move {
             let link = link.ok_or_else(|| {
@@ -498,7 +507,7 @@ impl Router {
                         overlay.filter(|_| link.protocol() >= PREPARED_CHECKOUT_PROTOCOL),
                         value.as_object_mut(),
                     ) {
-                        details.insert("setupStatus".to_owned(), (*status).clone());
+                        details.insert("setupStatus".to_owned(), status);
                     }
                     if let Some(checkout) = roots_in {
                         value =
@@ -511,6 +520,44 @@ impl Router {
                 Ok(LinkOutcome::Err(error)) => Err(error.message),
                 Err(error) => Err(format!("the call did not reach head: {error}")),
             }
+        }
+    }
+
+    /// `ws.workspace.retrySetup()`: head checks and starts the run on this
+    /// machine; a started run is then followed here until it ends or the
+    /// call's budget (less [`RETRY_SETUP_MARGIN`]) does, and answered with
+    /// its result and the last of its output.
+    fn retry_setup(
+        &self,
+        args: &Value,
+    ) -> impl std::future::Future<Output = std::result::Result<Value, String>> + Send + 'static
+    {
+        let deadline =
+            tokio::time::Instant::now() + self.timeout.saturating_sub(RETRY_SETUP_MARGIN);
+        let view = self.setup_status.clone();
+        let forward = self.forward(workspace_api::RETRY_SETUP_METHOD, args);
+        async move {
+            let started = forward.await?;
+            let Some(view) = view else {
+                return Ok(started);
+            };
+            let mut follow = view.subscribe();
+            let ended = |overlay: &Option<Value>| {
+                overlay
+                    .as_ref()
+                    .and_then(|status| status.get("state"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|state| state != "running")
+            };
+            let _ = tokio::time::timeout_at(deadline, follow.wait_for(ended)).await;
+            let mut result = view.overlay().unwrap_or(started);
+            if let Value::Object(fields) = &mut result {
+                fields.remove("unsentSubmodules");
+                if let Some(tail) = view.retry_tail().filter(|tail| !tail.is_empty()) {
+                    fields.insert("output".to_owned(), Value::String(tail));
+                }
+            }
+            Ok(result)
         }
     }
 
@@ -774,6 +821,10 @@ async fn on_blocking<T: Send + 'static>(
 }
 
 impl WorkspaceApi for NodeApi {
+    fn offers_setup_retry(&self) -> bool {
+        self.head.head.last_protocol() >= intent_core::node_link::SETUP_RETRY_PROTOCOL
+    }
+
     fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
         Box::pin(async move {
             self.check(&workspace_id).ok()?;

@@ -254,6 +254,10 @@ pub struct MachineUpdateRequired {
 /// nodeProtocol 10 and the workspace needs a prepared checkout.
 pub const PREPARED_CHECKOUT_REASON: &str = "prepared-checkout";
 
+/// `machine-update-required`'s `reason` when a setup retry needs a machine
+/// linking at nodeProtocol 22 or later.
+pub const SETUP_RETRY_REASON: &str = "setup-retry";
+
 impl MachineUpdateRequired {
     /// Placement's refusal of a machine that cannot prepare the workspace's
     /// checkout (submodules or a setup script).
@@ -269,6 +273,16 @@ impl MachineUpdateRequired {
         }
     }
 
+    /// A setup retry's refusal of a machine whose link is older than the
+    /// setup retry.
+    #[must_use]
+    pub fn setup_retry(machine_name: String, machine_version: String) -> Self {
+        Self {
+            reason: Some(SETUP_RETRY_REASON.to_owned()),
+            ..Self::prepared_checkout(machine_name, machine_version)
+        }
+    }
+
     /// The message, for example `Update Intent on mac-mini (it runs 0.11.0;
     /// this backend needs 0.12.0 or newer).`
     #[must_use]
@@ -281,6 +295,12 @@ impl MachineUpdateRequired {
     }
 
     fn bare_message(&self) -> String {
+        if self.reason.as_deref() == Some(SETUP_RETRY_REASON) {
+            return format!(
+                "Update Intent on {} to retry setup there.",
+                self.machine_name
+            );
+        }
         if self.reason.as_deref() == Some(PREPARED_CHECKOUT_REASON) {
             return format!(
                 "Update Intent on {} to run agents for this workspace: it has submodules or a setup script.",

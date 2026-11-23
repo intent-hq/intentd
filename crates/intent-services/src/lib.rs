@@ -32112,6 +32112,17 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_retry_setup(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.execution_call(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_retry_setup_op(&workspace_id, &agent_id).await
+        })
+    }
+
     fn agent_retry(
         &self,
         workspace_id: WorkspaceId,

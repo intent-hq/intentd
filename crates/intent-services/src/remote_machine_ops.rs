@@ -10,7 +10,8 @@
 //! here before the remote feature's port runs the method.
 
 use intent_core::machines::MachineRoutes;
-use intent_core::{now_iso, Result, WorkspaceId};
+use intent_core::remote_launch::{setup_retry, RemotePlacementView, RemoteSetupState};
+use intent_core::{now_iso, AgentId, Caller, Result, WorkspaceId};
 use serde_json::Value;
 
 use crate::Services;
@@ -25,6 +26,22 @@ pub fn homes_unsupported() -> intent_core::Error {
         "This backend doesn't keep workspace homes.",
         serde_json::json!({ "code": "homes-unsupported" }),
     )
+}
+
+/// `-32602` `setup-retry-not-remote`: `agent.retrySetup` for an agent that
+/// is not a remote agent with a prepared checkout.
+#[must_use]
+pub fn setup_retry_not_remote() -> intent_core::Error {
+    setup_retry_refusal(
+        setup_retry::NOT_REMOTE,
+        "Retry setup is for a remote agent's checkout on its machine; this agent has no setup there.",
+    )
+}
+
+/// A `-32602` refusal of `agent.retrySetup` with `data.code` `code`.
+#[must_use]
+pub fn setup_retry_refusal(code: &str, message: impl Into<String>) -> intent_core::Error {
+    intent_core::Error::remote_machine(false, message, serde_json::json!({ "code": code }))
 }
 
 pub fn remote_machine_token_account(machine_id: &str) -> String {
@@ -65,6 +82,73 @@ pub(crate) fn share_new_cloud_home(
 }
 
 impl Services {
+    /// `agent.retrySetup` (nodes.md "Retrying a remote agent's setup"): the
+    /// agent's own checks, then the machine runs the script again. An agent
+    /// caller (its `ws.workspace.retrySetup()`) may retry only its own
+    /// setup, during its own turn.
+    pub(crate) async fn agent_retry_setup_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> Result<Value> {
+        let by_agent = match intent_core::current_caller() {
+            Some(Caller::Agent { agent_id: caller }) if caller == *agent_id => true,
+            Some(Caller::Agent { .. }) => {
+                return Err(intent_core::Error::Forbidden(
+                    "an agent can retry only its own setup".into(),
+                ))
+            }
+            _ => false,
+        };
+        let session = self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await?;
+        if session.workspace_id != *workspace_id {
+            return Err(intent_core::Error::NotFound(format!(
+                "agent {agent_id} not found"
+            )));
+        }
+        let view = RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .ok_or_else(setup_retry_not_remote)?;
+        if view.shared_checkout_of.is_some() {
+            return Err(setup_retry_refusal(
+                setup_retry::SHARED_CHECKOUT,
+                "This agent works in another agent's checkout; retry setup on the agent that owns it.",
+            ));
+        }
+        if view.home_checkout.is_some() {
+            return Err(setup_retry_refusal(
+                setup_retry::SHARED_CHECKOUT,
+                "This agent works in the workspace home, whose setup is the home's; it cannot be retried here.",
+            ));
+        }
+        if view.setup.is_none() {
+            return Err(setup_retry_not_remote());
+        }
+        let state = view.setup.as_ref().map(|setup| setup.state);
+        if !matches!(
+            state,
+            Some(RemoteSetupState::Failed | RemoteSetupState::Running)
+        ) {
+            return Err(setup_retry_refusal(
+                setup_retry::NOT_FAILED,
+                "Setup has not failed on this agent's machine, so there is nothing to retry.",
+            ));
+        }
+        if !by_agent && session.status.is_running_turn() {
+            return Err(setup_retry_refusal(
+                setup_retry::AGENT_BUSY,
+                "The agent is working; retry setup when its turn ends.",
+            ));
+        }
+        let status = self
+            .feature_remote_launch_port()
+            .retry_setup(self, agent_id, &view)
+            .await?;
+        Ok(serde_json::json!({ "agentId": agent_id, "setup": status }))
+    }
+
     /// `remoteMachines.<method>`: see
     /// [`intent_core::WorkspaceApi::remote_machines`].
     pub(crate) async fn remote_machines_op(

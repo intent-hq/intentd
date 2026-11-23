@@ -29,7 +29,8 @@ use intent_acp::{
 use intent_core::node_link::{
     CheckoutOf, CheckoutRead, CheckoutReadOutcome, CheckoutReadReply, ExitFailure, FinalPush,
     ForgeFetchLaunch, ForgeLaunch, GitIdentity, JournalBody, JournalRecord, LaunchCommand,
-    LeaseBinding, MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
+    LeaseBinding, MachineCapacity, SetupRetry, SetupRetryOutcome, SetupRetryReply, StopOutcome,
+    SETUP_RETRY_PROTOCOL, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -40,7 +41,7 @@ use intent_providers::ProviderConfig;
 
 use super::checkout::{Checkouts, Prepared, FINAL_PUSH_TIMEOUT, WIP_PUSH_TIMEOUT};
 use super::scripts::ScriptProcesses;
-use super::setup::{self, SetupOutput, SetupStatus};
+use super::setup::{self, SetupOutput, SetupStatus, SetupView};
 use super::skills;
 use super::storage::ProviderSession;
 use super::workspace_api::{self, HeadLink};
@@ -607,11 +608,16 @@ struct Agent {
     /// The checkout's progress and setup output while they run, resent
     /// after a reconnect.
     setup_output: Mutex<Option<Arc<SetupOutput>>>,
+    /// Its checkout's setup as its workspace API shows it, and a setup
+    /// retry under way (nodeProtocol 22).
+    setup_view: Arc<SetupView>,
     /// The session's `agentFeatures` snapshot and sub-agent flag, which gate
     /// its workspace API.
     gates: workspace_api::Gates,
     /// The agent's working directory, once prepared.
     worktree: Mutex<Option<PathBuf>>,
+    /// Its private temp folder, once prepared: a setup retry's `TMPDIR`.
+    tmp: Mutex<Option<PathBuf>>,
     /// Prepended to the agent's first turn (see [`Prepared::notice`]).
     notice: Mutex<Option<String>>,
     /// The machine's name, when head says the agent's last run was on
@@ -1713,6 +1719,7 @@ impl Runner {
             prepared,
             setup,
             setup_output: Mutex::new(None),
+            setup_view: Arc::default(),
             gates: workspace_api::Gates {
                 agent_features,
                 is_sub_agent,
@@ -1724,6 +1731,7 @@ impl Runner {
                 git_identity: git_identity.clone(),
             },
             worktree: Mutex::new(None),
+            tmp: Mutex::new(None),
             notice: Mutex::new(None),
             new_machine: new_machine.map(|machine| machine.0),
             resumed_from_disk,
@@ -2013,6 +2021,7 @@ impl Runner {
                 fresh,
             })) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
+                *lock(&agent.tmp) = Some(tmp.clone());
                 let mut settled = match &output {
                     Some(output) => {
                         self.settle_setup(
@@ -2030,6 +2039,9 @@ impl Runner {
                 if output.is_some() && !settled.stopped {
                     unsent_submodules(&mut settled, &cwd).await;
                 }
+                // Shown before a retry can start (it needs `setup_output`
+                // cleared), so the retry's state is never overwritten.
+                agent.setup_view.set_overlay(settled.overlay.take());
                 *lock(&agent.setup_output) = None;
                 if settled.stopped {
                     Err(None)
@@ -2058,7 +2070,7 @@ impl Runner {
                         &agent.id,
                         &agent.workspace_id,
                         &cwd,
-                        (&agent.gates, settled.overlay),
+                        (&agent.gates, agent.setup_view.clone()),
                         (self.inner.head.clone(), self.push_now_for(&agent.id)),
                         &self.inner.mcp_bridge_exe,
                     )
@@ -2136,6 +2148,14 @@ impl Runner {
         *lock(&agent.exit_detail) = Some(detail.clone());
         // Turns still waiting for the session see it is gone.
         drop(ready);
+        // A setup retry ends with its agent: its result is journaled before
+        // the exit record.
+        if let Some(mut run) = agent.setup_view.close() {
+            if let Some(stop) = run.stop.take() {
+                let _ = stop.send(());
+            }
+            let _ = run.done.wait_for(|done| *done).await;
+        }
         // Whatever the agent did is sent back before head hears it exited.
         self.push_wip(&agent, Push::Exit).await;
         {
@@ -2382,7 +2402,10 @@ impl Runner {
         let status = match (fresh, command) {
             (false, _) => match setup::read_status(cwd) {
                 Some(status) if status.state == setup::Recorded::Running => {
-                    setup::exclude_interrupted(cwd, &agent.submodules).await;
+                    // A retry adds no excludes; the agent's files are its own.
+                    if !status.retry {
+                        setup::exclude_interrupted(cwd, &agent.submodules).await;
+                    }
                     status.interrupted()
                 }
                 Some(kept) => {
@@ -2413,25 +2436,11 @@ impl Runner {
                 }
             }
         };
-        setup::write_status(cwd, &status);
-        if let Some(state) = status.finished_state() {
-            self.append(agent_entry(
-                agent,
-                JournalBody::SetupFinished {
-                    state,
-                    exit_code: status.exit_code,
-                    error: status.error.clone(),
-                    finished_at: status
-                        .finished_at
-                        .clone()
-                        .unwrap_or_else(intent_core::now_iso),
-                },
-            ))
-            .await;
-        }
+        self.record_setup(agent, cwd, &status).await;
         let (tail, _) = output.tail();
+        let can_retry = own && self.inner.head.last_protocol() >= SETUP_RETRY_PROTOCOL;
         Settled {
-            notice: setup::failed_notice(&status, cwd, &tail),
+            notice: setup::failed_notice(&status, cwd, &tail, can_retry),
             overlay: Some(status.overlay()),
             stopped: false,
         }
@@ -2451,29 +2460,13 @@ impl Runner {
         let main_checkout = match self.inner.checkouts.main_checkout(&agent.repo_key) {
             Ok(dir) => dir,
             Err(error) => {
-                return setup::Ran::Finished(SetupStatus {
-                    state: setup::Recorded::Failed,
-                    exit_code: None,
-                    error: Some(format!(
-                        "{}: could not create MAIN_CHECKOUT: {error:#}",
-                        setup::codes::FAILED
-                    )),
-                    started_at: None,
-                    finished_at: Some(intent_core::now_iso()),
-                });
+                return setup::Ran::Finished(SetupStatus::could_not_start(&format!(
+                    "could not create MAIN_CHECKOUT: {error:#}"
+                )));
             }
         };
         let started_at = intent_core::now_iso();
-        setup::write_status(
-            cwd,
-            &SetupStatus {
-                state: setup::Recorded::Running,
-                exit_code: None,
-                error: None,
-                started_at: Some(started_at.clone()),
-                finished_at: None,
-            },
-        );
+        setup::write_status(cwd, &SetupStatus::running(started_at.clone(), false));
         self.append(agent_entry(
             agent,
             JournalBody::SetupStarted {
@@ -2489,6 +2482,7 @@ impl Runner {
                 tmp,
                 main_checkout: &main_checkout,
                 pins: &agent.submodules,
+                retry: false,
             },
             output,
             started_at,
@@ -2497,13 +2491,164 @@ impl Runner {
         .await
     }
 
+    /// Run `retry.agent_id`'s setup script again in its own kept checkout
+    /// (`setupRetry`, nodeProtocol 22): answered `started` once the run is
+    /// recorded running and `setupStarted` is journaled; the script runs on
+    /// and journals `setupFinished`. A retry under way is joined.
+    pub(super) async fn setup_retry(&self, retry: SetupRetry) -> SetupRetryReply {
+        use intent_core::node_link::setup_retry_codes as refused;
+        let SetupRetry {
+            request_id,
+            agent_id,
+            setup: command,
+        } = retry;
+        let reply = |outcome, started_at, error| SetupRetryReply {
+            request_id,
+            agent_id: agent_id.clone(),
+            outcome,
+            started_at,
+            error,
+        };
+        let refuse = |code: &str, detail: &str| {
+            reply(
+                SetupRetryOutcome::Refused,
+                None,
+                Some(format!("{code}: {detail}")),
+            )
+        };
+        let agent = lock(&self.inner.state).agents.get(&agent_id).cloned();
+        let Some(agent) = agent else {
+            return refuse(
+                refused::NOT_RUNNING,
+                "the agent does not run on this machine",
+            );
+        };
+        if agent.checkout_of.is_some() || agent.home.is_some() {
+            return refuse(
+                refused::SHARED,
+                "the agent works in another agent's checkout or in a home",
+            );
+        }
+        if !agent.prepared {
+            return refuse(refused::NOT_FAILED, "the agent's launch has no setup");
+        }
+        let (cwd, tmp) = (lock(&agent.worktree).clone(), lock(&agent.tmp).clone());
+        let (Some(cwd), Some(tmp)) = (cwd, tmp) else {
+            return refuse(refused::NOT_RUNNING, "the agent is still starting");
+        };
+        if lock(&agent.setup_output).is_some() || agent.setup_view.overlay().is_none() {
+            return refuse(refused::NOT_RUNNING, "the agent is still starting");
+        }
+        if let Some(started_at) = agent.setup_view.running_retry() {
+            return reply(SetupRetryOutcome::Started, Some(started_at), None);
+        }
+        let recorded = setup::read_status(&cwd);
+        if !recorded
+            .as_ref()
+            .is_some_and(|status| status.state == setup::Recorded::Failed)
+        {
+            return refuse(refused::NOT_FAILED, "the checkout's setup has not failed");
+        }
+        let started_at = intent_core::now_iso();
+        let running = SetupStatus::running(started_at.clone(), true);
+        let output = SetupOutput::new(agent.id.clone(), self.inner.head.clone());
+        let (stop, mut stopped) = oneshot::channel();
+        let (finished, done) = watch::channel(false);
+        match agent.setup_view.begin_retry(setup::RetryRun {
+            started_at: started_at.clone(),
+            output: output.clone(),
+            stop: Some(stop),
+            done,
+        }) {
+            Err(setup::Closed) => return refuse(refused::NOT_RUNNING, "the agent is stopping"),
+            // Another call started one meanwhile: join it.
+            Ok(Some(joined)) => return reply(SetupRetryOutcome::Started, Some(joined), None),
+            Ok(None) => {}
+        }
+        // Sent as `seq` 0 ahead of `setupStarted`, so head drops the last
+        // run's output even if this run fails before the script spawns.
+        output.line("Running the setup script again.");
+        setup::write_status(&cwd, &running);
+        agent.setup_view.show(&running);
+        self.append(agent_entry(
+            &agent,
+            JournalBody::SetupStarted {
+                started_at: started_at.clone(),
+            },
+        ))
+        .await;
+        let runner = self.clone();
+        let run_agent = agent.clone();
+        let run_started = started_at.clone();
+        drop(intent_core::spawn_daemon(async move {
+            let agent = run_agent;
+            let status = match runner.inner.checkouts.main_checkout(&agent.repo_key) {
+                Err(error) => SetupStatus::could_not_start(&format!(
+                    "could not create MAIN_CHECKOUT: {error:#}"
+                )),
+                Ok(main_checkout) => {
+                    let ran = setup::run(
+                        &runner.inner.pty,
+                        setup::SetupRun {
+                            command: &command,
+                            worktree: &cwd,
+                            tmp: &tmp,
+                            main_checkout: &main_checkout,
+                            pins: &agent.submodules,
+                            retry: true,
+                        },
+                        &output,
+                        run_started.clone(),
+                        &mut stopped,
+                    )
+                    .await;
+                    match ran {
+                        setup::Ran::Finished(status) => status,
+                        setup::Ran::Stopped => {
+                            SetupStatus::running(run_started, true).interrupted()
+                        }
+                    }
+                }
+            };
+            runner.record_setup(&agent, &cwd, &status).await;
+            finished.send_replace(true);
+        }));
+        reply(SetupRetryOutcome::Started, Some(started_at), None)
+    }
+
+    /// Record a finished setup with the checkout, show it to the agent and
+    /// journal `setupFinished`.
+    async fn record_setup(&self, agent: &Agent, cwd: &Path, status: &SetupStatus) {
+        setup::write_status(cwd, status);
+        agent.setup_view.show(status);
+        if let Some(state) = status.finished_state() {
+            self.append(agent_entry(
+                agent,
+                JournalBody::SetupFinished {
+                    state,
+                    exit_code: status.exit_code,
+                    error: status.error.clone(),
+                    finished_at: status
+                        .finished_at
+                        .clone()
+                        .unwrap_or_else(intent_core::now_iso),
+                },
+            ))
+            .await;
+        }
+    }
+
     /// A new link to head is up: resend the kept output of every setup
     /// still under way, from `seq` 0.
     pub(super) fn resend_setup_output(&self, link: &intent_transport::node_link::NodeLink) {
         let outputs: Vec<Arc<SetupOutput>> = lock(&self.inner.state)
             .agents
             .values()
-            .filter_map(|agent| lock(&agent.setup_output).clone())
+            .filter_map(|agent| {
+                lock(&agent.setup_output)
+                    .clone()
+                    .or_else(|| agent.setup_view.retry_output())
+            })
             .collect();
         for output in outputs {
             output.resend(link);

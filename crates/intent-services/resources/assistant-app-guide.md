@@ -846,6 +846,17 @@ An agent running on one of those machines uses that machine's skills (its
 `~/.agents/skills` and `~/.claude/skills`, plus the project's), and its **/** menu lists
 them; to give it a skill, add the skill there. A **/name** it lacks still sends, with a
 notice in the chat.
+When the workspace has a setup script, it runs in the agent's own checkout on its machine
+before the agent starts. If it fails, the agent's chat shows **Setup script failed on
+<machine>** with the exit code or timeout and its output, and the agent starts anyway. The
+agent can run it again itself after fixing the cause (`ws.workspace.retrySetup()` runs the
+workspace's current setup script in the same checkout and reports the result). Pending
+frontend release (not in current builds): the card has **Retry setup**, which does the same
+once the agent's turn ends; the card then shows the new run and its output. A retry needs
+the agent to be running on its machine (send it a message first) and that machine to be up
+to date, and a sub-agent that works in its parent's checkout retries on the parent. Older
+versions may differ.
+<!-- Sources: packages/intentd/crates/intentd/src/executor/setup.rs; packages/intentd/crates/intent-svc-remote/src/setup_retry.rs; packages/cloudlands-fe/src/features/remote-machines/AgentPlacementNotice.svelte. -->
 <!-- Labs (remote agents): describe only when the user asks about cloud machines,
 and say it is Labs. The backend can start its own machines from a saved cloud entry:
 an E2B entry (API key) starts a sandbox, a Northflank entry (API token and project id)

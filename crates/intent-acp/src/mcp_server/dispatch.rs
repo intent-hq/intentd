@@ -193,12 +193,15 @@ impl WorkspaceMcpServer {
         // `serde_json::Value` cannot represent on its own. `__k` is `"u"` for
         // an undefined return (prints "(no return value)") and `"v"` for a
         // JSON-serializable value (prints as pretty JSON, including `null`).
-        let bindings_prelude = super::bindings::prelude_for_agent_bridge(
+        let mut bindings_prelude = super::bindings::prelude_for_agent_bridge(
             &effective_features,
             self.is_sub_agent,
             &self.workspace_id,
             self.installs_machine_models(),
         );
+        if self.api.offers_setup_retry() {
+            bindings_prelude.push_str(super::bindings::setup_retry_prelude());
+        }
         let full_code = format!(
             "{bindings_prelude}\n\
              const __wsapi_user = await (async () => {{ {code}\n}})();\n\
