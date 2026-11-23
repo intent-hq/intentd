@@ -30,12 +30,14 @@ use crate::LinkView;
 
 /// A use of the machine in flight. While it is held, [`MachineLifecycle::quiesce`]
 /// waits.
+#[must_use]
 pub struct UseGuard {
     _held: Box<dyn Send + Sync>,
 }
 
 /// The machine's uses are all drained and no new one starts while this is
 /// held.
+#[must_use]
 pub struct QuiesceGuard {
     _held: Box<dyn Send + Sync>,
 }
