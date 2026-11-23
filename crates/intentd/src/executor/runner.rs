@@ -620,6 +620,9 @@ struct Agent {
     /// session (a disk resume): once only, so the start retried after a
     /// provider that died loading it opens a new session.
     load_recorded: std::sync::atomic::AtomicBool,
+    /// The provider session `_meta` head sent (nodeProtocol 21), passed on
+    /// `session/new` and `session/load`.
+    session_meta: intent_core::node_link::LaunchSessionMeta,
     /// The machine's skills catalog block, added to the agent's first turn.
     skills_catalog: Mutex<Option<String>>,
     /// The owner of the checkout the agent works in, when it is not its own
@@ -1562,6 +1565,7 @@ impl Runner {
             new_machine,
             resumed_from_disk,
             harness_version,
+            session_meta,
             labels,
         } = command;
         let git_identity = git_identity.map(|identity| *identity);
@@ -1713,6 +1717,7 @@ impl Runner {
             new_machine: new_machine.map(|machine| machine.0),
             resumed_from_disk,
             load_recorded: std::sync::atomic::AtomicBool::new(resumed_from_disk),
+            session_meta: session_meta.map(|meta| *meta).unwrap_or_default(),
             skills_catalog: Mutex::new(None),
             wip: self.push_lock(checkout_of.as_ref().unwrap_or(&agent_id)),
             checkout_of: checkout_of.clone(),
@@ -2687,7 +2692,13 @@ impl Runner {
                     }
                 }
             }
-            let session = intent_acp::session::new_session(connection, cwd, mcp, None).await?;
+            let session = intent_acp::session::new_session(
+                connection,
+                cwd,
+                mcp,
+                agent.session_meta.new.clone(),
+            )
+            .await?;
             Ok::<_, intent_acp::AcpError>(session.session_id.to_string())
         };
         let session = tokio::select! {
@@ -3559,9 +3570,15 @@ async fn load_recorded(
     // ends the replay, so a retried start's output is journaled.
     let mut replay = ReplayGuard(Some(&agent.marks));
     let _ = acked.await;
-    let loaded = intent_acp::session::load_session(connection, session_id, cwd, mcp, None)
-        .await
-        .map(drop);
+    let loaded = intent_acp::session::load_session(
+        connection,
+        session_id,
+        cwd,
+        mcp,
+        agent.session_meta.load.clone(),
+    )
+    .await
+    .map(drop);
     let (ack, acked) = oneshot::channel();
     if replay.end(Some(ack)) {
         let _ = acked.await;

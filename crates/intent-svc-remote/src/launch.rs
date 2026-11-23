@@ -23,7 +23,8 @@ use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
     FinalPush, ForgeFetchLaunch, ForgeFetchModule, ForgeLaunch, GitIdentity, LaunchCommand,
     LaunchLabels, LaunchProfileEnv, MachineName, PreparedCheckout, SetupCommand, SubmodulePin,
-    MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SHARED_CHECKOUT_PROTOCOL,
+    MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SESSION_META_PROTOCOL,
+    SHARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
     AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
@@ -1509,6 +1510,22 @@ impl RemoteLaunchPort for RemoteLaunch {
             } else {
                 (None, Vec::new())
             };
+            // The provider session `_meta` a local session gets (for Claude
+            // Code its instructions as the system prompt and the native-tool
+            // denylist), on a link that has it; below, the instructions ride
+            // the first prompt. The machine loads a recorded session only
+            // after a disk resume, so `load` rides only then: the frame
+            // carries one copy of the prompt otherwise.
+            let session_meta = if link_protocol(&node).await? >= SESSION_META_PROTOCOL {
+                svc.remote_session_meta(agent_id).await.map(|mut meta| {
+                    if !resumed_from_disk {
+                        meta.load = None;
+                    }
+                    Box::new(meta)
+                })
+            } else {
+                None
+            };
             let workspace_title = svc
                 .store()
                 .get_workspace(&record.workspace_id)
@@ -1548,6 +1565,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     harness_version: Some(
                         harness::launch_harness_version(session.harness_version.as_str()).into(),
                     ),
+                    session_meta,
                     // Every launch, so a rename shows on the machine after
                     // the next one.
                     labels: Box::new(LaunchLabels::new(
@@ -1556,7 +1574,14 @@ impl RemoteLaunchPort for RemoteLaunch {
                     )),
                 })
                 .await?;
-            if !reattach {
+            if reattach {
+                // A run kept across a backend restart holds the session its
+                // launch opened: no first-prompt copy when that one had the
+                // instructions.
+                if session_prompt_recorded(&session) {
+                    runtime.set_session_prompt();
+                }
+            } else {
                 if let Err(error) =
                     crate::view::update(svc.store(), &workspace_id, agent_id, |view| {
                         view.launched_machine_sign_in = Some(machine_sign_in);
@@ -1564,6 +1589,23 @@ impl RemoteLaunchPort for RemoteLaunch {
                     .await
                 {
                     tracing::warn!(agent = %agent_id, %error, "remote launch: could not record its sign-in");
+                }
+                let delivered = intent_core::agent_runtime::AgentRuntime::session_has_system_prompt(
+                    runtime.as_ref(),
+                );
+                if let Err(error) = svc
+                    .store()
+                    .set_agent_session_metadata_key(
+                        &workspace_id,
+                        agent_id,
+                        SESSION_PROMPT_KEY,
+                        if delivered { "true" } else { "false" },
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, %error, "remote launch: could not record where its instructions went");
                 }
             }
             Ok(runtime as Arc<RemoteRuntime>)
@@ -1590,6 +1632,20 @@ impl RemoteLaunchPort for RemoteLaunch {
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         Box::pin(crate::cloud::call(svc, method, params))
     }
+}
+
+/// Session metadata key: whether the agent's current run on its machine got
+/// its instructions as the provider session's system prompt (nodeProtocol
+/// 21), so a run reattached after a backend restart gets no second copy.
+const SESSION_PROMPT_KEY: &str = "remoteSessionPrompt";
+
+fn session_prompt_recorded(session: &intent_core::AgentSession) -> bool {
+    session
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(SESSION_PROMPT_KEY))
+        .and_then(serde_json::Value::as_str)
+        == Some("true")
 }
 
 /// Longest an agent that retired itself during a turn keeps running for

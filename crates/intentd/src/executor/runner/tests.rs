@@ -174,6 +174,7 @@ fn launch(id: &str) -> LaunchCommand {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::default(),
     }
 }
@@ -1226,6 +1227,78 @@ async fn node_runner_gives_each_agent_its_workspace_api_on_the_node() {
     );
     h.runner.stop(&id);
     wait_for(&h.runner, "exit", exited("w1")).await;
+}
+
+/// The provider session `_meta` head sends (nodeProtocol 21) reaches the
+/// provider unchanged, as a local session's does: `new` on `session/new`,
+/// `load` on `session/load` of the recorded session after a disk resume. A
+/// launch without one opens the session with none.
+#[tokio::test]
+async fn node_runner_opens_the_provider_session_with_heads_session_meta() {
+    let sessions = tempfile::tempdir().unwrap();
+    let dir = sessions.path().to_str().unwrap().to_owned();
+    let Some(h) = harness(2, &["--sessions", &dir]) else {
+        return;
+    };
+    let object = |value: Value| match value {
+        Value::Object(map) => map,
+        _ => unreachable!(),
+    };
+    let new = json!({
+        "systemPrompt": "INSTRUCTIONS",
+        "claudeCode": { "options": { "disallowedTools": ["Task"] } },
+    });
+    let load = json!({ "systemPrompt": "INSTRUCTIONS", "loaded": true });
+    let with_meta = |resumed_from_disk: bool| LaunchCommand {
+        session_meta: Some(Box::new(intent_core::node_link::LaunchSessionMeta {
+            new: Some(object(new.clone())),
+            load: Some(object(load.clone())),
+        })),
+        resumed_from_disk,
+        ..launch("a1")
+    };
+    let opened = |id: &str| {
+        let path = h
+            .storage
+            .agent_dir(&AgentId::from(id))
+            .unwrap()
+            .join("session-meta.json");
+        serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap()
+    };
+    h.runner.launch(with_meta(false)).await;
+    h.runner.launch(launch("a2")).await;
+    wait_for(&h.runner, "start", started("a1")).await;
+    wait_for(&h.runner, "start", started("a2")).await;
+    assert_eq!(opened("a1"), new);
+    assert_eq!(opened("a2"), Value::Null);
+
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
+    let before = records(&h.runner)
+        .await
+        .into_iter()
+        .filter(started("a1"))
+        .count();
+    h.runner.launch(with_meta(true)).await;
+    let deadline = tokio::time::Instant::now() + wait();
+    while records(&h.runner)
+        .await
+        .into_iter()
+        .filter(started("a1"))
+        .count()
+        == before
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a1 never started again"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        opened("a1"),
+        load,
+        "the recorded session was loaded with its meta"
+    );
 }
 
 const CANARY: &str = "canary-profile-secret-5b1e";

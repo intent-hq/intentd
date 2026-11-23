@@ -96,7 +96,7 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     // 18 an orchestrator's quick actions on the machine, 19 workspace
     // homes, 20 run exit reasons; a protocol-7 peer still binds and runs
     // agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 20 });
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 21 });
     assert_eq!(ONE_SHOT_PROTOCOL, 18);
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
@@ -111,8 +111,9 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     assert_eq!(FORGE_FETCH_PROTOCOL, 17);
     assert_eq!(HOMES_PROTOCOL, 19);
     assert_eq!(EXIT_REASON_PROTOCOL, 20);
+    assert_eq!(SESSION_META_PROTOCOL, 21);
     assert!(offers_prepared_checkout());
-    for version in 7..=20 {
+    for version in 7..=21 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -502,6 +503,7 @@ fn every_frame() -> Vec<LinkFrame> {
             new_machine: None,
             resumed_from_disk: false,
             harness_version: None,
+            session_meta: None,
             labels: Box::default(),
         }),
         LinkFrame::Prompt {
@@ -1339,6 +1341,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::default(),
     };
     let rendered = format!("{command:?} {:?}", LinkFrame::Launch(command.clone()));
@@ -1374,6 +1377,7 @@ fn launch_without_a_profile_omits_profile_env() {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::default(),
     };
     let wire = serde_json::to_value(&command).unwrap();
@@ -1751,6 +1755,7 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             new_machine: None,
             resumed_from_disk: false,
             harness_version: None,
+            session_meta: None,
             labels: Box::default(),
         })
     };
@@ -1788,6 +1793,7 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             new_machine: None,
             resumed_from_disk: false,
             harness_version: None,
+            session_meta: None,
             labels: Box::default(),
         };
     let proxy = McpProxy {
@@ -1846,6 +1852,7 @@ fn a_launch_carries_the_harness_version_on_any_protocol() {
         new_machine: None,
         resumed_from_disk: false,
         harness_version,
+        session_meta: None,
         labels: Box::default(),
     };
     let with = launch(Some("7.42".into()));
@@ -1886,6 +1893,7 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::default(),
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
@@ -2342,6 +2350,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::default(),
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
@@ -2365,6 +2374,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
             new_machine: None,
             resumed_from_disk: false,
             harness_version: None,
+            session_meta: None,
             labels: Box::default(),
             ..command.clone()
         })
@@ -2417,6 +2427,7 @@ fn labelled_launch(labels: LaunchLabels) -> LaunchCommand {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::new(labels),
     }
 }
@@ -2719,7 +2730,6 @@ fn exit_reasons_need_protocol_20_and_are_stripped_for_older_links() {
         exit_reason: Some(crate::ExitReason::MemoryLimit),
     });
     assert_eq!(EXIT_REASON_PROTOCOL, 20);
-    assert_eq!(EXIT_REASON_PROTOCOL, NODE_LINK_PROTOCOLS.max);
     for frame in [&script, &pty] {
         assert_eq!(frame.min_protocol(), EXIT_REASON_PROTOCOL);
         let encoded = String::from_utf8(frame.encode().unwrap()).unwrap();
@@ -2743,4 +2753,41 @@ fn exit_reasons_need_protocol_20_and_are_stripped_for_older_links() {
     });
     assert!(plain.for_protocol(HOMES_PROTOCOL).is_none());
     assert_eq!(plain.min_protocol(), HOMES_PROTOCOL);
+}
+
+/// A launch keeps its provider session `_meta` only on a link of
+/// [`SESSION_META_PROTOCOL`] or later, and the session holds the
+/// instructions only when `new` carries `systemPrompt`.
+#[test]
+fn a_launch_fits_its_session_meta_to_the_link() {
+    let object = |value: Value| match value {
+        Value::Object(map) => map,
+        _ => unreachable!(),
+    };
+    let with = |new: Option<Value>| {
+        let mut command = labelled_launch(LaunchLabels::default());
+        command.session_meta = Some(Box::new(LaunchSessionMeta {
+            new: new.map(object),
+            load: None,
+        }));
+        command
+    };
+    let prompt = || Some(serde_json::json!({ "systemPrompt": "INSTRUCTIONS" }));
+
+    let mut current = with(prompt());
+    assert!(current.fit_session_meta(SESSION_META_PROTOCOL));
+    assert!(current.session_meta.is_some());
+
+    let mut older = with(prompt());
+    assert!(!older.fit_session_meta(SESSION_META_PROTOCOL - 1));
+    assert_eq!(older.session_meta, None);
+    let encoded = String::from_utf8(LinkFrame::Launch(older).encode().unwrap()).unwrap();
+    assert!(!encoded.contains("sessionMeta"), "{encoded}");
+
+    let mut titled = with(Some(serde_json::json!({ "sessionTitle": "Named" })));
+    assert!(!titled.fit_session_meta(SESSION_META_PROTOCOL));
+    assert!(titled.session_meta.is_some());
+
+    let mut none = labelled_launch(LaunchLabels::default());
+    assert!(!none.fit_session_meta(SESSION_META_PROTOCOL));
 }

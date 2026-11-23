@@ -72,6 +72,12 @@ pub trait AgentRuntime: Send + Sync {
     /// Omit dead or indeterminate roots rather than attributing a recycled PID.
     fn root_pid(&self) -> Option<u32>;
 
+    /// Whether the provider session already holds the agent's instructions
+    /// as its system prompt, so its first prompt needs no copy of them.
+    fn session_has_system_prompt(&self) -> bool {
+        false
+    }
+
     /// Detach execution resources immediately and await their owned cleanup.
     /// Cleanup must continue if the returned future is dropped; repeated calls
     /// are harmless. Dropping the runtime must provide the same cleanup fallback.

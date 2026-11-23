@@ -2561,7 +2561,12 @@ impl RemoteNode {
         if command.forge_fetch.is_none() {
             command.forge_fetch_modules.clear();
         }
+        // On the link it actually goes out on, after any rebind above.
+        let session_prompt = command.fit_session_meta(link.protocol());
         link.send(&LinkFrame::Launch(command)).await?;
+        if session_prompt {
+            runtime.set_session_prompt();
+        }
         Ok(runtime)
     }
 

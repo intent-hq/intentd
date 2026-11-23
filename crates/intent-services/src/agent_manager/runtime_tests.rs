@@ -30,6 +30,8 @@ struct FakeRuntime {
     /// Prompts still to end as stopped before output, the runtime then not
     /// alive: a final stop's close, as on a machine removal.
     final_stops: AtomicUsize,
+    /// The launch put the instructions in the provider session.
+    session_prompt: AtomicBool,
 }
 
 impl FakeRuntime {
@@ -49,6 +51,7 @@ impl FakeRuntime {
             before_quota: Mutex::new(None),
             exited: Mutex::new(None),
             final_stops: AtomicUsize::new(0),
+            session_prompt: AtomicBool::new(false),
         })
     }
 
@@ -98,6 +101,10 @@ impl AgentRuntime for FakeRuntime {
     type Activity = ActivityTracker;
     type Error = AcpError;
     type Notifications = Notifications;
+
+    fn session_has_system_prompt(&self) -> bool {
+        self.session_prompt.load(Ordering::SeqCst)
+    }
 
     fn prompt<'a>(
         &'a self,
@@ -1008,6 +1015,55 @@ async fn a_remote_agents_prompt_matches_what_its_machine_serves() {
         "a provider that reads the full tool description gets no copy: {full}"
     );
     assert!(!full.contains("<available_skills>"), "{full}");
+}
+
+/// A machine that put the instructions in the provider session
+/// (nodeProtocol 21) gets no first-prompt copy of them, as a local Claude
+/// Code session gets none; the first turn still asks for names.
+#[tokio::test]
+async fn a_remote_session_holding_the_instructions_gets_no_first_prompt_copy() {
+    let ws = WorkspaceId::from("ws-remote-session-prompt");
+    let id = AgentId::from("agent-remote-session-prompt");
+    let fake = FakeRuntime::new();
+    fake.session_prompt.store(true, Ordering::SeqCst);
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
+    let store = &mgr.services.store;
+    store
+        .set_agent_session_metadata_key(&ws, &id, "behaviorPrompt", "BEHAVIOR-MARKER", None, None)
+        .await
+        .unwrap();
+    let mut workspace = store.get_workspace(&ws).await.unwrap();
+    workspace.title = String::new();
+    store.update_workspace(&workspace).await.unwrap();
+
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "first".into(),
+        None,
+        super::super::TurnOptions::default(),
+    )
+    .await
+    .unwrap();
+    fake.wait_prompts(1).await;
+    fake.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+    let first = serde_json::to_string(&fake.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(!first.contains("BEHAVIOR-MARKER"), "{first}");
+    assert!(first.contains("ws.workspace.setTitle"), "{first}");
+    let stored = store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap()
+        .system_prompt;
+    assert!(
+        stored.is_some_and(|prompt| prompt.contains("BEHAVIOR-MARKER")),
+        "the machine's session gets the stored instructions"
+    );
 }
 
 /// A runner agent whose first turn failed before any output (a remote
