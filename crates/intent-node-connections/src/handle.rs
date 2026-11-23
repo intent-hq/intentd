@@ -128,6 +128,13 @@ pub trait MachineAgents: Send + Sync {
         wait: Duration,
     ) -> BoxFuture<'_, Result<CheckoutReadReply>>;
     fn one_shot(&self, frame: OneShot, wait: Duration) -> BoxFuture<'_, Result<OneShotReply>>;
+    /// Run an agent's setup again in its kept checkout (`setupRetry`).
+    fn setup_retry<'a>(
+        &'a self,
+        id: &'a AgentId,
+        setup: intent_core::node_link::SetupCommand,
+        wait: Duration,
+    ) -> BoxFuture<'a, Result<intent_core::node_link::SetupRetryReply>>;
 }
 
 /// The machine's homes, and the terminals and scripts that run in them.
@@ -330,6 +337,14 @@ impl MachineAgents for RemoteNode {
     }
     fn one_shot(&self, frame: OneShot, wait: Duration) -> BoxFuture<'_, Result<OneShotReply>> {
         Box::pin(RemoteNode::one_shot(self, frame, wait))
+    }
+    fn setup_retry<'a>(
+        &'a self,
+        id: &'a AgentId,
+        setup: intent_core::node_link::SetupCommand,
+        wait: Duration,
+    ) -> BoxFuture<'a, Result<intent_core::node_link::SetupRetryReply>> {
+        Box::pin(RemoteNode::setup_retry(self, id, setup, wait))
     }
 }
 
