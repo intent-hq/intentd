@@ -190,6 +190,8 @@ pub trait BlobStorage: Send + Sync + fmt::Debug + 'static {
     fn prune(&self, prefix: &BlobKey);
 
     /// Delete the temp blobs [`Self::replace`] left directly below `prefix`
-    /// (a crash mid-replace) that were last written before `cutoff`.
+    /// (a crash mid-replace) that were last written before `cutoff`. Never
+    /// deletes a caller's blob; [`LocalBlobStorage`] names its temps with
+    /// [`TEMP_SUFFIX`], so callers must not end blob names with it.
     fn remove_stale_temps(&self, prefix: &BlobKey, cutoff: SystemTime) -> TempSweep;
 }

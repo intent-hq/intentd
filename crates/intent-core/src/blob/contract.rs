@@ -140,15 +140,39 @@ fn modified_moves_forward_on_write(storage: &dyn BlobStorage) {
     assert!(storage.modified(&k).unwrap() >= start);
 }
 
-fn a_fresh_sweep_keeps_blobs_and_recent_temps(storage: &dyn BlobStorage) {
+fn the_stale_temp_sweep_never_touches_blobs(storage: &dyn BlobStorage) {
     let k = key("ws/s/run.log");
     storage.open_append(&k).unwrap().write_all(b"x\n").unwrap();
     storage.replace(&k, b"y\n").unwrap();
+    storage.open_append(&key("ws/s/other")).unwrap();
+    // Every blob is older than a cutoff in the future: none is a temp.
     let sweep =
-        storage.remove_stale_temps(&key("ws/s"), SystemTime::now() - Duration::from_secs(60));
-    assert_eq!(sweep.deleted, 0);
+        storage.remove_stale_temps(&key("ws/s"), SystemTime::now() + Duration::from_secs(3600));
     assert_eq!(sweep.failed, 0);
     assert_eq!(read_key(storage, &k), b"y\n");
+    assert!(storage.exists(&key("ws/s/other")).unwrap());
+}
+
+/// Compaction reads the newest bytes back through the writer's own handle.
+fn append_and_replace_handles_read_back_what_they_hold(storage: &dyn BlobStorage) {
+    let k = key("a/run.log");
+    let mut w = storage.open_append(&k).unwrap();
+    w.write_all(b"one\ntwo\n").unwrap();
+    w.flush().unwrap();
+    assert_eq!(read_all(&mut *w), b"one\ntwo\n");
+    let mut replaced = storage.replace(&k, b"two\n").unwrap();
+    assert_eq!(read_all(&mut *replaced), b"two\n");
+}
+
+/// After a seek, writes through either handle still land at the end.
+fn writes_after_a_seek_append(storage: &dyn BlobStorage) {
+    let k = key("a/run.log");
+    storage.open_append(&k).unwrap();
+    let mut replaced = storage.replace(&k, b"head\n").unwrap();
+    replaced.seek(SeekFrom::Start(0)).unwrap();
+    replaced.write_all(b"tail\n").unwrap();
+    replaced.flush().unwrap();
+    assert_eq!(read_key(storage, &k), b"head\ntail\n");
 }
 
 /// One contract check over a fresh storage.
@@ -190,9 +214,14 @@ fn run(fresh: impl Fn() -> (tempfile::TempDir, Box<dyn BlobStorage>)) {
             modified_moves_forward_on_write,
         ),
         (
-            "a_fresh_sweep_keeps_blobs_and_recent_temps",
-            a_fresh_sweep_keeps_blobs_and_recent_temps,
+            "the_stale_temp_sweep_never_touches_blobs",
+            the_stale_temp_sweep_never_touches_blobs,
         ),
+        (
+            "append_and_replace_handles_read_back_what_they_hold",
+            append_and_replace_handles_read_back_what_they_hold,
+        ),
+        ("writes_after_a_seek_append", writes_after_a_seek_append),
     ];
     for (name, check) in checks {
         let (_dir, storage) = fresh();
