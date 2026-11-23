@@ -3696,6 +3696,18 @@ async fn run_turn(
     let Some(session) = session else {
         return not_running();
     };
+    // Switch the pump to this turn before anything the prompt causes can
+    // arrive.
+    let (ack, switched) = oneshot::channel();
+    let started = Mark::TurnStarted {
+        turn_id: turn_id.to_owned(),
+        ack,
+    };
+    if agent.marks.send(started).is_err() || switched.await.is_err() {
+        return not_running();
+    }
+    // A cancel since the turn was accepted (while it waited for the
+    // provider or for the pump) ends it before the provider sees it.
     if agent.cancels.load(std::sync::atomic::Ordering::SeqCst) != accepted {
         return ("cancelled".to_owned(), None);
     }
@@ -3716,16 +3728,6 @@ async fn run_turn(
                 tracing::warn!(error = %error, "node: the checkout notice is not a prompt block");
             }
         }
-    }
-    // Switch the pump to this turn before anything the prompt causes can
-    // arrive.
-    let (ack, switched) = oneshot::channel();
-    let started = Mark::TurnStarted {
-        turn_id: turn_id.to_owned(),
-        ack,
-    };
-    if agent.marks.send(started).is_err() || switched.await.is_err() {
-        return not_running();
     }
     agent.activity.touch();
     match intent_acp::session::prompt(
