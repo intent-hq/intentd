@@ -9657,6 +9657,11 @@ impl AgentManager {
     /// exactly the marked entry, bypassing the batch flush and the head pop;
     /// every other gate — busy, ready-to-send, archived, quarantine, retired
     /// — still applies.
+    ///
+    /// Runs detached like `send_message`'s claim (intent-hq/intent#9927): a
+    /// kick whose caller is dropped after the slot claim (a JS budget expiry
+    /// around a child report) must not leave the agent busy with no worker
+    /// while every later delivery queues behind it (intent-hq/intent#9985).
     fn try_drain_queue_inner(
         self: Arc<Self>,
         agent_id: AgentId,
@@ -9664,14 +9669,22 @@ impl AgentManager {
         redrive_error_park: bool,
     ) -> intent_core::BoxFuture<'static, ()> {
         Box::pin(async move {
-            let services = self.services.clone();
-            services
-                .instruction_admission(self.try_drain_queue_authorized(
-                    agent_id,
-                    workspace_id,
-                    redrive_error_park,
-                ))
-                .await;
+            let tasks = self.services.turn_start_tasks.clone();
+            let drain = Box::pin(async move {
+                let services = self.services.clone();
+                services
+                    .instruction_admission(self.try_drain_queue_authorized(
+                        agent_id,
+                        workspace_id,
+                        redrive_error_park,
+                    ))
+                    .await;
+                Ok(())
+            });
+            if let Err(error) = crate::workspace_mutations::run_detached(&tasks, None, drain).await
+            {
+                tracing::debug!(%error, "queue drain not started");
+            }
         })
     }
 

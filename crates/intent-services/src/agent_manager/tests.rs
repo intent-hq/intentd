@@ -10946,6 +10946,9 @@ enum CancelledFrontDoor {
     SendMessage,
     /// `ws.agent.wakeOrCreate` and completion wakes.
     WakeDelivery,
+    /// Every queue kick of an idle agent (`agent.queueMessage`, a child
+    /// report, a hook dispatch) — intent-hq/intent#9985.
+    QueueDrain,
 }
 
 /// intent-hq/intent#9927: a caller dropped after the delivery claimed the
@@ -10974,10 +10977,26 @@ async fn cancelled_caller_after_slot_claim_still_runs_the_turn(door: CancelledFr
         .align_with_mock_for_test();
     let pause = Arc::new(super::TurnStartPause::default());
     *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
+    if matches!(door, CancelledFrontDoor::QueueDrain) {
+        mgr.services.enqueue_message(
+            &id,
+            "child report".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
+    }
     let caller = tokio::spawn({
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         async move {
             match door {
+                CancelledFrontDoor::QueueDrain => {
+                    mgr.try_drain_queue(id, ws).await;
+                    Ok(json!({}))
+                }
                 CancelledFrontDoor::SendMessage => {
                     mgr.send_message(
                         id,
@@ -11054,6 +11073,55 @@ async fn send_message_cancelled_after_slot_claim_still_runs_the_turn() {
 #[tokio::test]
 async fn wake_delivery_cancelled_after_slot_claim_still_runs_the_turn() {
     cancelled_caller_after_slot_claim_still_runs_the_turn(CancelledFrontDoor::WakeDelivery).await;
+}
+
+/// intent-hq/intent#9985: an idle parent's queued child reports, hook wakes
+/// and human messages sat undelivered for 58 minutes. A queue kick whose
+/// caller was dropped after `try_drain_queue` claimed the slot left the
+/// parent busy with no worker, so every later delivery queued behind it.
+#[tokio::test]
+async fn queue_drain_cancelled_after_slot_claim_still_runs_the_turn() {
+    cancelled_caller_after_slot_claim_still_runs_the_turn(CancelledFrontDoor::QueueDrain).await;
+}
+
+/// The detached drain must reuse the caller's instruction admission. A fresh
+/// read inside the detached task would wait behind a queued removal writer,
+/// which in turn waits for the caller's read: neither side could finish.
+#[tokio::test]
+async fn detached_queue_drain_reuses_the_callers_instruction_admission() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-drain-admission");
+    let id = AgentId::from("drain-admission");
+    seed_agent(&mgr, &ws, &id).await;
+    let authority = mgr.services.human_instruction_authority.clone();
+    let services = mgr.services.clone();
+    let drained = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        services.instruction_admission(async {
+            let writer = tokio::spawn({
+                let authority = authority.clone();
+                async move {
+                    let _removal = authority.write().await;
+                }
+            });
+            while authority.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+            writer
+        }),
+    )
+    .await
+    .expect("the drain must not wait behind a removal queued on the caller's admission");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        drained,
+    )
+    .await
+    .expect("the removal proceeds once the caller's admission ends")
+    .unwrap();
 }
 
 /// intentd#3694 review: the detached claim-to-spawn task of a cancelled send
