@@ -1,9 +1,8 @@
 //! Engine selection from settings.
 //!
 //! [`SentryRegistry::from_settings`] resolves the Sentry credential pair
-//! (inline org/token, each missing half from the secrets store or env) and
-//! builds a [`SentryEngine`]. A
-//! missing pair yields a typed [`Error::NotConfigured`] so the daemon stays
+//! (inline org/token, each missing half from env) and builds a
+//! [`SentryEngine`]. A missing pair yields a typed [`Error::NotConfigured`] so the daemon stays
 //! up (graceful, mirroring `intent-linear`).
 
 use std::sync::Arc;
@@ -13,23 +12,21 @@ use serde::{Deserialize, Serialize};
 use crate::client::SentryClient;
 use crate::engine::{SentryEngine, SentryEngineImpl};
 use crate::error::{Error, Result};
-use crate::token::{self, CredentialParts, Credentials, TokenSource};
+use crate::token::{self, CredentialParts, Credentials};
 
 /// Sentry settings (`sentry.*`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SentrySettings {
-    /// Inline organization slug (already resolved). Takes precedence over
-    /// [`Self::token_source`], which only fills a missing half.
+    /// Inline organization slug (the saved account). Takes precedence over
+    /// `SENTRY_ORG`, which only fills a missing half.
     #[serde(default)]
     pub organization: Option<String>,
-    /// Inline API token (already resolved, e.g. read from the secrets store
-    /// by the caller). SECRET — never logged.
+    /// Inline API token (the saved account, read from the secrets store by
+    /// the caller). Takes precedence over `SENTRY_API_TOKEN`. SECRET — never
+    /// logged.
     #[serde(default)]
     pub token: Option<String>,
-    /// How to resolve the credential pair when inline values are absent.
-    #[serde(default)]
-    pub token_source: TokenSource,
     /// Override for the Sentry REST endpoint (defaults to the public API).
     #[serde(default)]
     pub api_base_url: Option<String>,
@@ -40,14 +37,13 @@ pub struct SentryRegistry;
 
 impl SentryRegistry {
     /// Construct the engine, or a typed [`Error::NotConfigured`] when no
-    /// credential pair is available. Async because the secrets-store lookup
-    /// runs on the blocking pool with a bounded timeout (see [`token::resolve`]).
+    /// credential pair is available.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotConfigured`] when no credential pair is available; propagates client-construction failures.
-    pub async fn from_settings(settings: &SentrySettings) -> Result<Arc<dyn SentryEngine>> {
-        let creds = resolve_credentials(settings).await?;
+    pub fn from_settings(settings: &SentrySettings) -> Result<Arc<dyn SentryEngine>> {
+        let creds = resolve_credentials(settings, token::env_parts())?;
         let client = SentryClient::new(
             &creds.token,
             &creds.organization,
@@ -57,19 +53,13 @@ impl SentryRegistry {
     }
 }
 
-/// Resolve credentials from inline settings, filling a missing half from the
-/// configured source.
-async fn resolve_credentials(settings: &SentrySettings) -> Result<Credentials> {
+/// Resolve credentials from inline settings, filling a missing half from `env`.
+fn resolve_credentials(settings: &SentrySettings, env: CredentialParts) -> Result<Credentials> {
     let inline = CredentialParts {
         token: settings.token.as_deref().and_then(token::non_empty),
         organization: settings.organization.as_deref().and_then(token::non_empty),
     };
-    let parts = if inline.token.is_some() && inline.organization.is_some() {
-        inline
-    } else {
-        inline.or(token::resolve_parts(&settings.token_source).await)
-    };
-    parts.complete().ok_or_else(|| {
+    inline.or(env).complete().ok_or_else(|| {
         Error::NotConfigured(
             "sentry: no credentials found (set accounts.sentry.organization + \
              accounts.sentry.token, or SENTRY_ORG + SENTRY_API_TOKEN)"
@@ -82,38 +72,76 @@ async fn resolve_credentials(settings: &SentrySettings) -> Result<Credentials> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn inline_pair_builds_engine() {
+    #[test]
+    fn inline_pair_builds_engine() {
         let settings = SentrySettings {
             organization: Some("acme".into()),
             token: Some("sntrys_test".into()),
             ..SentrySettings::default()
         };
-        let engine = SentryRegistry::from_settings(&settings).await;
-        assert!(engine.is_ok());
+        assert!(SentryRegistry::from_settings(&settings).is_ok());
     }
 
-    #[tokio::test]
-    async fn inline_half_only_falls_through_to_not_configured() {
-        // Use the `Env` source so the tests do not touch the secrets store; a
-        // partial inline pair must still yield the same `NotConfigured`
-        // outcome the wire relies on.
-        let result = resolve_credentials(&SentrySettings {
-            organization: Some("acme".into()),
-            token: Some("   ".into()),
-            token_source: TokenSource::Env,
+    fn settings(organization: Option<&str>, token: Option<&str>) -> SentrySettings {
+        SentrySettings {
+            organization: organization.map(str::to_string),
+            token: token.map(str::to_string),
             api_base_url: None,
-        })
-        .await;
-        assert!(matches!(result, Err(Error::NotConfigured(_))));
+        }
+    }
 
-        let result = resolve_credentials(&SentrySettings {
-            organization: None,
-            token: Some("sntrys_test".into()),
-            token_source: TokenSource::Env,
-            api_base_url: None,
-        })
-        .await;
-        assert!(matches!(result, Err(Error::NotConfigured(_))));
+    fn env(organization: Option<&str>, token: Option<&str>) -> CredentialParts {
+        CredentialParts {
+            token: token.map(str::to_string),
+            organization: organization.map(str::to_string),
+        }
+    }
+
+    fn pair(c: &Credentials) -> (&str, &str) {
+        (c.organization.as_str(), c.token.as_str())
+    }
+
+    #[test]
+    fn saved_pair_wins_over_env() {
+        let c = resolve_credentials(
+            &settings(Some("saved-org"), Some("saved-tok")),
+            env(Some("env-org"), Some("env-tok")),
+        )
+        .unwrap();
+        assert_eq!(pair(&c), ("saved-org", "saved-tok"));
+    }
+
+    #[test]
+    fn each_missing_saved_half_comes_from_env() {
+        let c = resolve_credentials(
+            &settings(Some("saved-org"), Some("   ")),
+            env(Some("env-org"), Some("env-tok")),
+        )
+        .unwrap();
+        assert_eq!(pair(&c), ("saved-org", "env-tok"));
+
+        let c = resolve_credentials(
+            &settings(None, Some("saved-tok")),
+            env(Some("env-org"), None),
+        )
+        .unwrap();
+        assert_eq!(pair(&c), ("env-org", "saved-tok"));
+    }
+
+    #[test]
+    fn a_missing_half_everywhere_is_not_configured() {
+        for (saved, fallback) in [
+            (settings(Some("acme"), Some("   ")), env(None, None)),
+            (
+                settings(None, Some("sntrys_test")),
+                env(None, Some("env-tok")),
+            ),
+            (settings(None, None), env(Some("env-org"), None)),
+        ] {
+            assert!(matches!(
+                resolve_credentials(&saved, fallback),
+                Err(Error::NotConfigured(_))
+            ));
+        }
     }
 }

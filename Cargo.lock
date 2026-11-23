@@ -2510,13 +2510,10 @@ name = "intent-sentry"
 version = "0.11.278"
 dependencies = [
  "async-trait",
- "intent-core",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "tokio",
- "tracing",
 ]
 
 [[package]]
