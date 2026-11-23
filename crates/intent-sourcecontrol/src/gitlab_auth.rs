@@ -2,7 +2,7 @@
 //! **device authorization grant** (RFC 8628), and personal-access-token (PAT)
 //! validation — the `gitlab` sibling of [`crate::device_flow`].
 //!
-//! Device grant: [`start_device_grant`] posts to
+//! Device grant: [`start_device_grant_with_store`] posts to
 //! `https://<host>/oauth/authorize_device` for a `user_code` the user enters
 //! at the returned `verification_uri`, then [`GitlabDeviceFlow::poll_once`]
 //! polls `POST /oauth/token` (`grant_type=urn:ietf:params:oauth:grant-type:device_code`)
@@ -509,7 +509,7 @@ async fn refresh_grant_inner(
 /// `sourceControl.gitlab.oauthClientId` when non-empty, else the compiled
 /// [`GITLAB_COM_OAUTH_CLIENT_ID`] — but only on gitlab.com, and only when it
 /// is filled in. `None` means the device grant is unavailable for this
-/// instance ([`start_device_grant`] reports [`Error::DeviceGrantUnsupported`]).
+/// instance ([`start_device_grant_with_store`] reports [`Error::DeviceGrantUnsupported`]).
 #[must_use]
 pub fn resolve_client_id(configured: &str, host: &GitlabHost) -> Option<String> {
     let configured = configured.trim();
@@ -705,7 +705,7 @@ impl GitlabGrant {
     }
 }
 
-/// Opaque in-flight device-grant handle returned by [`start_device_grant`].
+/// Opaque in-flight device-grant handle returned by [`start_device_grant_with_store`].
 /// Holds the secret `device_code` privately; `Debug` is redacted.
 pub struct GitlabDeviceFlow {
     client: reqwest::Client,
@@ -744,8 +744,9 @@ fn default_interval() -> u64 {
 }
 
 /// Start a device grant against `host` for the public `client_id`, requesting
-/// [`DEVICE_GRANT_SCOPES`]. The token is persisted to the daemon's default
-/// secret store on authorization.
+/// [`DEVICE_GRANT_SCOPES`]. The token is persisted to `store` (the caller's
+/// secrets file — the daemon's, or an orchestrator tenant's) on authorization;
+/// there is deliberately no default-store variant.
 ///
 /// # Errors
 ///
@@ -754,20 +755,6 @@ fn default_interval() -> u64 {
 /// `/oauth/authorize_device` (GitLab < 17.1) or rejects the request with the
 /// OAuth `unauthorized_client` error (application not enabled for the device
 /// grant); propagates other HTTP/decoding failures.
-pub async fn start_device_grant(
-    host: &GitlabHost,
-    client_id: &str,
-) -> Result<(GitlabDeviceAuthorization, GitlabDeviceFlow)> {
-    start_device_grant_with_store(host, client_id, FileSecretStore::new()).await
-}
-
-/// [`start_device_grant`] persisting into an explicit `store` — the seam that
-/// lets tests drive connect → poll → authorized against a loopback mock
-/// without touching the real `~/intent/.secrets.json`.
-///
-/// # Errors
-///
-/// As [`start_device_grant`].
 pub async fn start_device_grant_with_store(
     host: &GitlabHost,
     client_id: &str,

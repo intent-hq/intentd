@@ -3123,6 +3123,7 @@ async fn cmd_serve_owned(
         workspaces_disk,
         watch_health,
         settings_registry: settings_registry.clone(),
+        secret_source: services.secret_source(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
         exact_update: exact_update::ExactUpdate::default(),
         tunnel: tunnel_supervisor.clone(),
@@ -3728,6 +3729,9 @@ struct DaemonControl {
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
+    /// The daemon's secrets (`Services::secret_source`) the
+    /// `system.gitCredential` token chain reads.
+    secret_source: intent_core::SharedSecretStore,
     /// `<data_dir>/sitter/sitter.pid` — the supervising sitter's pidfile,
     /// read by `system.requestUpdate` to find the process to SIGUSR1.
     sitter_pid_path: PathBuf,
@@ -5186,8 +5190,11 @@ impl SystemControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + '_>>
     {
         Box::pin(async move {
-            let credential =
-                intent_services::github_git_credential(Some(&self.settings_registry)).await;
+            let credential = intent_services::github_git_credential(
+                Some(&self.settings_registry),
+                &self.secret_source,
+            )
+            .await;
             // Audit trail (monorepo#884): record every grant/denial with the
             // helper's self-reported pid. The token value is never logged.
             match &credential {

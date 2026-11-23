@@ -2,9 +2,9 @@
 //!
 //! The key is resolved per `linear.tokenSource`:
 //!
-//! 1. `explicit` — stored in the file-backed secrets store
-//!    ([`intent_core::FileSecretStore`], `~/intent/.secrets.json`) under
-//!    account `linear.token` (never in plaintext config or logs).
+//! 1. `explicit` — stored in the caller's [`intent_core::SecretStore`] (the
+//!    daemon's `Services` store: `~/intent/.secrets.json` on desktop, the
+//!    tenant's own store in the orchestrator) under account `linear.token` (never in plaintext config or logs).
 //! 2. `env` — `LINEAR_API_KEY`.
 //!
 //! `auto` (the default) tries the secrets store then env and uses the first hit. A
@@ -16,6 +16,7 @@
 
 use std::time::Duration;
 
+use intent_core::SharedSecretStore;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
@@ -43,24 +44,22 @@ pub enum TokenSource {
 /// Resolve a key for the given strategy, or `None` if none is available.
 /// Secrets-store reads run on the blocking pool with a bounded timeout so a
 /// stalled backing store never blocks the async runtime.
-pub async fn resolve(source: &TokenSource) -> Option<String> {
+pub async fn resolve(source: &TokenSource, secrets: &SharedSecretStore) -> Option<String> {
     match source {
-        TokenSource::Explicit => file_store_token().await,
+        TokenSource::Explicit => file_store_token(secrets.clone()).await,
         TokenSource::Env => env_token(),
-        TokenSource::Auto => match file_store_token().await {
+        TokenSource::Auto => match file_store_token(secrets.clone()).await {
             Some(v) => Some(v),
             None => env_token(),
         },
     }
 }
 
-/// Read the key from the file-backed secrets store
-/// ([`intent_core::FileSecretStore`]). A missing or unreadable entry resolves
+/// Read the key from the caller's secrets store. A missing or unreadable entry resolves
 /// to `None` so resolution can fall through. Runs on the blocking pool with a
 /// bounded timeout so a stalled backing store cannot wedge a tokio worker.
-async fn file_store_token() -> Option<String> {
-    let handle =
-        tokio::task::spawn_blocking(|| intent_core::FileSecretStore::new().load(SECRET_ACCOUNT));
+async fn file_store_token(secrets: SharedSecretStore) -> Option<String> {
+    let handle = tokio::task::spawn_blocking(move || secrets.load(SECRET_ACCOUNT));
     match timeout(SECRET_LOAD_TIMEOUT, handle).await {
         Ok(Ok(Ok(Some(v)))) => non_empty(&v),
         Ok(Ok(Ok(None)) | Err(_)) => None,

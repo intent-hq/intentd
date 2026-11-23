@@ -33,10 +33,11 @@ pub(crate) fn map_linear_err(e: &intent_linear::Error) -> Error {
 /// keychain never blocks the async runtime.
 pub(crate) async fn resolve_engine(
     injected: Option<Arc<dyn LinearEngine>>,
+    secrets: &intent_core::SharedSecretStore,
 ) -> Result<Arc<dyn LinearEngine>> {
     match injected {
         Some(engine) => Ok(engine),
-        None => LinearRegistry::from_settings(&LinearSettings::default())
+        None => LinearRegistry::from_settings(&LinearSettings::default(), secrets)
             .await
             .map_err(|e: intent_linear::Error| map_linear_err(&e)),
     }

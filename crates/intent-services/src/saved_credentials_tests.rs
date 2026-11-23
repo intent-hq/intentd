@@ -35,62 +35,41 @@ const SAVED: &[(&str, &str)] = &[
     ("autocomplete.openrouter.apiKey", "sk-or-saved"),
 ];
 
-#[intent_test_macros::daemon_test]
-async fn saved_credentials_reach_their_integrations() {
-    let dir = test_tempdir("intentd-saved-credentials-");
-    let secrets_path = dir.path().join(".secrets.json");
-    // The module-level token loaders (GitHub, GitLab, Linear, voice) read the
-    // default secrets store; point it at the daemon's file, as in production.
-    let _env = EnvGuard::set_all(&[(
-        SECRETS_FILE_ENV,
-        secrets_path.to_str().expect("utf-8 temp path"),
-    )]);
-    let store = Store::open(&dir.path().join("db.sqlite"))
-        .await
-        .expect("open store");
-    let registry =
-        Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry"));
-    let svc = Services::new_with_file_secrets(
-        store,
-        intent_core::FileSecretStore::with_path(&secrets_path),
-    )
-    .with_settings_registry(registry);
-
-    let changes: Vec<_> = SAVED
-        .iter()
-        .map(|(path, value)| json!({ "path": path, "value": value }))
-        .collect();
-    svc.settings_update(json!(changes))
-        .await
-        .expect("settings.update saves every credential");
-
+/// What each integration's lookup resolves for `svc`: the stored-secret
+/// sources only, so env / `gh` fallbacks never leak into the comparison.
+async fn integration_lookups(svc: &Services) -> BTreeMap<&'static str, Option<String>> {
+    let secrets = svc.secret_source();
     let sentry = svc.saved_sentry_settings().await.expect("sentry account");
-    let found: BTreeMap<&str, Option<String>> = [
+    [
         (
             "sourceControl.github.token",
-            intent_sourcecontrol::token::resolve(&intent_sourcecontrol::TokenSource::Explicit)
-                .await,
+            intent_sourcecontrol::token::resolve(
+                &intent_sourcecontrol::TokenSource::Explicit,
+                &secrets,
+            )
+            .await,
         ),
         (
             "sourceControl.gitlab.token",
             intent_sourcecontrol::gitlab_token::resolve_gitlab_token(
                 intent_sourcecontrol::GitlabTokenSource::Explicit,
+                &secrets,
             )
             .await,
         ),
         (
             "linear.token",
-            intent_linear::token::resolve(&intent_linear::TokenSource::Explicit).await,
+            intent_linear::token::resolve(&intent_linear::TokenSource::Explicit, &secrets).await,
         ),
         ("accounts.sentry.token", sentry.token),
         ("accounts.sentry.organization", sentry.organization),
         (
             "voice.elevenlabs.apiKey",
-            intent_voice::token::resolve(intent_voice::VoiceProvider::ElevenLabs).await,
+            intent_voice::token::resolve(intent_voice::VoiceProvider::ElevenLabs, &secrets).await,
         ),
         (
             "voice.openai.apiKey",
-            intent_voice::token::resolve(intent_voice::VoiceProvider::OpenAi).await,
+            intent_voice::token::resolve(intent_voice::VoiceProvider::OpenAi, &secrets).await,
         ),
         (
             "autocomplete.kilo.apiKey",
@@ -106,7 +85,37 @@ async fn saved_credentials_reach_their_integrations() {
         ),
     ]
     .into_iter()
-    .collect();
+    .collect()
+}
+
+/// A `Services` over its own secrets file and settings registry under `dir`,
+/// with every `SAVED` credential written as `<value><suffix>`.
+async fn services_with_saved(dir: &std::path::Path, suffix: &str) -> Services {
+    let store = Store::open(&dir.join("db.sqlite"))
+        .await
+        .expect("open store");
+    let registry =
+        Arc::new(SettingsRegistry::load(dir.join("config.toml")).expect("load registry"));
+    let svc = Services::new_with_secret_file(
+        store,
+        intent_core::FileSecretStore::with_path(dir.join(".secrets.json")),
+    )
+    .with_settings_registry(registry);
+    let changes: Vec<_> = SAVED
+        .iter()
+        .map(|(path, value)| json!({ "path": path, "value": format!("{value}{suffix}") }))
+        .collect();
+    svc.settings_update(json!(changes))
+        .await
+        .expect("settings.update saves every credential");
+    svc
+}
+
+#[intent_test_macros::daemon_test]
+async fn saved_credentials_reach_their_integrations() {
+    let dir = test_tempdir("intentd-saved-credentials-");
+    let svc = services_with_saved(dir.path(), "").await;
+    let found = integration_lookups(&svc).await;
     let want: BTreeMap<&str, Option<String>> = SAVED
         .iter()
         .map(|(path, value)| (*path, Some((*value).to_string())))
@@ -124,5 +133,68 @@ async fn saved_credentials_reach_their_integrations() {
                 def.path
             );
         }
+    }
+}
+
+/// Two orchestrator tenants in one process, each with its own secrets file,
+/// never see each other's credentials — nor the process-wide default file
+/// (`INTENTD_SECRETS_FILE`), which every integration lookup used to read.
+#[intent_test_macros::daemon_test]
+async fn tenant_credentials_stay_in_their_own_store() {
+    let host = test_tempdir("intentd-host-secrets-");
+    let host_file = host.path().join(".secrets.json");
+    let host_store = intent_core::FileSecretStore::with_path(&host_file);
+    for (path, value) in SAVED {
+        host_store
+            .store(path, &format!("{value}-host"))
+            .expect("seed the host file");
+    }
+    let _env = EnvGuard::set_all(&[(
+        SECRETS_FILE_ENV,
+        host_file.to_str().expect("utf-8 temp path"),
+    )]);
+
+    let a_dir = test_tempdir("intentd-tenant-a-");
+    let b_dir = test_tempdir("intentd-tenant-b-");
+    let a = services_with_saved(a_dir.path(), "-a").await;
+    let b = services_with_saved(b_dir.path(), "-b").await;
+    let empty_dir = test_tempdir("intentd-tenant-empty-");
+    let empty = Services::new_with_secret_file(
+        Store::open(&empty_dir.path().join("db.sqlite"))
+            .await
+            .expect("open store"),
+        intent_core::FileSecretStore::with_path(empty_dir.path().join(".secrets.json")),
+    )
+    .with_settings_registry(Arc::new(
+        SettingsRegistry::load(empty_dir.path().join("config.toml")).expect("load registry"),
+    ));
+
+    for (svc, suffix) in [(&a, "-a"), (&b, "-b")] {
+        let want: BTreeMap<&str, Option<String>> = SAVED
+            .iter()
+            .map(|(path, value)| (*path, Some(format!("{value}{suffix}"))))
+            .collect();
+        assert_eq!(
+            integration_lookups(svc).await,
+            want,
+            "tenant{suffix} resolved a credential that is not its own"
+        );
+    }
+    let none: BTreeMap<&str, Option<String>> =
+        SAVED.iter().map(|(path, _)| (*path, None)).collect();
+    assert_eq!(
+        integration_lookups(&empty).await,
+        none,
+        "a tenant with no credentials resolved the host's"
+    );
+    for (path, value) in SAVED {
+        assert_eq!(
+            host_store
+                .load(path)
+                .expect("read the host file")
+                .as_deref(),
+            Some(format!("{value}-host").as_str()),
+            "a tenant write reached the host file"
+        );
     }
 }

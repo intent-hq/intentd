@@ -1,7 +1,7 @@
 //! GitLab token resolution — the `gitlab` sibling of [`crate::token`].
 //!
-//! The chain is deliberately shorter than GitHub's: the file-backed secrets
-//! store ([`intent_core::FileSecretStore`]) under account
+//! The chain is deliberately shorter than GitHub's: the caller's secrets
+//! store ([`intent_core::SecretStore`]) under account
 //! `sourceControl.gitlab.token`, then the `GITLAB_TOKEN` environment variable.
 //! There is **no CLI fallback** — nothing in the GitLab path may require
 //! `gh` or `glab` to be installed. `auto` (the default) tries both in order.
@@ -14,6 +14,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use intent_core::SharedSecretStore;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
@@ -46,7 +47,7 @@ pub enum GitlabTokenSource {
     /// Try the secrets store, then env (the default).
     #[default]
     Auto,
-    /// Read from the file-backed secrets store only.
+    /// Read from the secrets store only.
     Explicit,
     /// Read from `GITLAB_TOKEN` only.
     Env,
@@ -58,14 +59,21 @@ type SourceResult = std::result::Result<String, String>;
 /// Resolve a GitLab token for the given strategy, or `None` if none is
 /// available. The secrets-store read runs on the blocking pool with a bounded
 /// timeout so a stalled backing store never blocks the async runtime.
-pub async fn resolve_gitlab_token(source: GitlabTokenSource) -> Option<String> {
-    resolve_gitlab_token_detailed(source).await.token
+pub async fn resolve_gitlab_token(
+    source: GitlabTokenSource,
+    secrets: &SharedSecretStore,
+) -> Option<String> {
+    resolve_gitlab_token_detailed(source, secrets).await.token
 }
 
 /// Like [`resolve_gitlab_token`], but reports why each attempted source
 /// yielded nothing (reasons never carry token material).
-pub async fn resolve_gitlab_token_detailed(source: GitlabTokenSource) -> TokenResolution {
-    resolve_with(source, file_store_token, env_token).await
+pub async fn resolve_gitlab_token_detailed(
+    source: GitlabTokenSource,
+    secrets: &SharedSecretStore,
+) -> TokenResolution {
+    let secrets = secrets.clone();
+    resolve_with(source, || file_store_token(secrets), env_token).await
 }
 
 /// The resolution order over injectable source probes (test seam: the mocks
@@ -101,11 +109,10 @@ where
     TokenResolution { token, skipped }
 }
 
-/// Read the token from the file-backed secrets store. A missing or unreadable
+/// Read the token from the caller's secrets store. A missing or unreadable
 /// entry resolves to a skip reason so resolution can fall through.
-async fn file_store_token() -> SourceResult {
-    let handle =
-        tokio::task::spawn_blocking(|| intent_core::FileSecretStore::new().load(SECRET_ACCOUNT));
+async fn file_store_token(secrets: SharedSecretStore) -> SourceResult {
+    let handle = tokio::task::spawn_blocking(move || secrets.load(SECRET_ACCOUNT));
     match timeout(SECRET_LOAD_TIMEOUT, handle).await {
         Ok(Ok(Ok(Some(v)))) => {
             non_empty(&v).ok_or_else(|| format!("secrets store: `{SECRET_ACCOUNT}` entry is empty"))

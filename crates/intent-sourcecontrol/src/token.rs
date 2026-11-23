@@ -2,9 +2,9 @@
 //!
 //! Tokens are resolved per `sourceControl.github.tokenSource`:
 //!
-//! 1. `explicit` — stored in the file-backed secrets store
-//!    ([`intent_core::FileSecretStore`], `~/intent/.secrets.json`) under
-//!    account `sourceControl.github.token` (never in plaintext config or logs).
+//! 1. `explicit` — stored in the caller's [`intent_core::SecretStore`] (the
+//!    daemon's `Services` store: `~/intent/.secrets.json` on desktop, the
+//!    tenant's own store in the orchestrator) under account `sourceControl.github.token` (never in plaintext config or logs).
 //! 2. `env` — `GITHUB_TOKEN` / `GH_TOKEN`.
 //! 3. `gh-cli` — `gh auth token` (shell out to the GitHub CLI). The binary is
 //!    located via the enriched directory list
@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use intent_core::SharedSecretStore;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
@@ -185,14 +186,24 @@ type SourceResult = std::result::Result<String, String>;
 /// Secrets-store and `gh` subprocess reads run on the blocking pool with
 /// bounded timeouts so a stalled backing store or hung child never blocks the
 /// async runtime.
-pub async fn resolve(source: &TokenSource) -> Option<String> {
-    resolve_detailed(source).await.token
+pub async fn resolve(source: &TokenSource, secrets: &SharedSecretStore) -> Option<String> {
+    resolve_detailed(source, secrets).await.token
 }
 
 /// Like [`resolve`], but reports why each attempted source yielded nothing so
 /// callers can surface an actionable "not configured" error (monorepo#3321).
-pub async fn resolve_detailed(source: &TokenSource) -> TokenResolution {
-    resolve_detailed_with(source, file_store_token, env_token, gh_cli_token).await
+pub async fn resolve_detailed(
+    source: &TokenSource,
+    secrets: &SharedSecretStore,
+) -> TokenResolution {
+    let secrets = secrets.clone();
+    resolve_detailed_with(
+        source,
+        || file_store_token(secrets),
+        env_token,
+        gh_cli_token,
+    )
+    .await
 }
 
 /// The resolution order over injectable source probes (test seam: the mocks
@@ -234,14 +245,12 @@ where
     TokenResolution { token, skipped }
 }
 
-/// Read the token from the file-backed secrets store
-/// ([`intent_core::FileSecretStore`]). A missing or unreadable entry resolves
+/// Read the token from the caller's secrets store. A missing or unreadable entry resolves
 /// to a skip reason so resolution can fall through. Runs on the blocking pool
 /// with a bounded timeout so a stalled backing store cannot wedge a tokio
 /// worker.
-async fn file_store_token() -> SourceResult {
-    let handle =
-        tokio::task::spawn_blocking(|| intent_core::FileSecretStore::new().load(SECRET_ACCOUNT));
+async fn file_store_token(secrets: SharedSecretStore) -> SourceResult {
+    let handle = tokio::task::spawn_blocking(move || secrets.load(SECRET_ACCOUNT));
     match timeout(SECRET_LOAD_TIMEOUT, handle).await {
         Ok(Ok(Ok(Some(v)))) => {
             non_empty(&v).ok_or_else(|| format!("secrets store: `{SECRET_ACCOUNT}` entry is empty"))
@@ -578,8 +587,10 @@ esac
             .build()
             .unwrap();
         runtime.block_on(async {
+            let store = intent_core::FileSecretStore::new();
+            let secrets: SharedSecretStore = std::sync::Arc::new(store.clone());
             for _ in 0..2 {
-                let result = resolve_detailed(&TokenSource::GhCli).await;
+                let result = resolve_detailed(&TokenSource::GhCli, &secrets).await;
                 if disabled {
                     assert!(result.token.is_none());
                     assert!(result
@@ -591,17 +602,16 @@ esac
                 }
             }
             if disabled {
-                let result = resolve_detailed(&TokenSource::Auto).await;
+                let result = resolve_detailed(&TokenSource::Auto, &secrets).await;
                 assert!(
                     result.token.is_none(),
                     "auto must not fall back to cached gh"
                 );
                 assert!(find_gh_binary().is_none());
             }
-            let store = intent_core::FileSecretStore::new();
             store.store(SECRET_ACCOUNT, TOKEN).unwrap();
             assert_eq!(
-                resolve(&TokenSource::Explicit).await.as_deref(),
+                resolve(&TokenSource::Explicit, &secrets).await.as_deref(),
                 Some(TOKEN)
             );
             crate::gh_sync::sync_token_to_gh(store).await;
