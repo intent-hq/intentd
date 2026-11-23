@@ -20820,7 +20820,8 @@ pub(crate) mod pr {
         };
         assert!(pool(svc.clone(), ws.id.clone()).await.is_empty());
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
         while pool(svc.clone(), ws.id.clone()).await.is_empty() {
             assert!(
                 tokio::time::Instant::now() < deadline,
