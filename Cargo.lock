@@ -2899,6 +2899,7 @@ dependencies = [
 name = "intentd-orchestrator"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "futures-util",
  "intent-app",
  "intent-core",
@@ -2906,6 +2907,7 @@ dependencies = [
  "intent-store",
  "intent-transport",
  "intentd-test-support",
+ "nix 0.31.3",
  "rustls",
  "rustls-pki-types",
  "serde_json",
@@ -2918,6 +2920,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

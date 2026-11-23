@@ -256,7 +256,8 @@ mod postgres {
     /// A client of a Postgres tenant lists workspaces and creates and lists notes
     /// over WSS and the local socket, the results come from Postgres, and
     /// the tenant's fence closes both connections and refuses new ones.
-    #[tokio::test]
+    // Multi-thread: the tenant's secret store needs it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_postgres_tenant_serves_clients_until_its_fence_closes_them() {
         let Some(pool) = pool().await else { return };
         let dir = tempfile::tempdir().unwrap();
@@ -267,6 +268,9 @@ mod postgres {
             dir.path(),
             &format!("orchestrator-test-{tenant}"),
             LeaseTiming::default(),
+            std::sync::Arc::new(
+                intent_store::postgres::SecretKeyring::new("test", &[0x5a; 32]).unwrap(),
+            ),
             OrchestratorOnly::for_tests(),
         )
         .await

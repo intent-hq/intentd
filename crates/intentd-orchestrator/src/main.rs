@@ -17,6 +17,10 @@
 
 use std::process::ExitCode;
 
+use std::sync::Arc;
+
+use intent_store::postgres::SecretKeyring;
+use intentd_orchestrator::secrets::{keyring_from_env, KEY_ENV};
 use intentd_orchestrator::serve::{serve_tenant, LeaseTiming, ServedTenant};
 use intentd_orchestrator::{
     instance_id, is_fatal, tenants_from_env, DEFAULT_TENANT, FENCE_OVERRAN_EXIT, INSTANCE_ENV,
@@ -38,6 +42,12 @@ const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 const RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn main() -> ExitCode {
+    // Before reading any secret from the environment: same-user processes
+    // (tenant workloads) must not read this one's environ or memory.
+    if let Err(error) = intentd_orchestrator::secrets::harden_process() {
+        eprintln!("intentd-orchestrator: {error}");
+        return ExitCode::FAILURE;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -52,6 +62,17 @@ fn main() -> ExitCode {
         tracing::error!("{POSTGRES_URL_ENV} is unset");
         return ExitCode::FAILURE;
     };
+    // The tenant secret keyring, read before any thread starts; a key in
+    // the environment is cleared the same way. No key: no tenant opens.
+    let keyring = keyring_from_env(|name| std::env::var(name).ok());
+    std::env::remove_var(KEY_ENV);
+    let keyring = match keyring {
+        Ok(keyring) => Arc::new(keyring),
+        Err(error) => {
+            tracing::error!(%error, "tenant secrets");
+            return ExitCode::FAILURE;
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -62,7 +83,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(url)) {
+    match runtime.block_on(run(url, keyring)) {
         Ok(code) => code,
         Err(error) => {
             tracing::error!(%error, "orchestrator stopped");
@@ -71,7 +92,7 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(url: String) -> Result<ExitCode, String> {
+async fn run(url: String, keyring: Arc<SecretKeyring>) -> Result<ExitCode, String> {
     // Unset serves the default tenant; set but not UTF-8 is an error, never
     // the default.
     let raw = match std::env::var(TENANTS_ENV) {
@@ -124,6 +145,7 @@ async fn run(url: String) -> Result<ExitCode, String> {
             &data_dir,
             &instance,
             LeaseTiming::default(),
+            keyring.clone(),
             orchestrator_token(),
         ));
         let opened = tokio::select! {

@@ -29,6 +29,11 @@ async fn pool() -> Option<PgPool> {
     Some(pool)
 }
 
+/// The tenant secret keyring; the tests' tenants hold no secrets.
+fn keyring() -> std::sync::Arc<postgres::SecretKeyring> {
+    std::sync::Arc::new(postgres::SecretKeyring::new("test", &[0x5a; 32]).unwrap())
+}
+
 fn wait() -> Duration {
     intentd_test_support::test_timeout(Duration::from_secs(30))
 }
@@ -39,7 +44,7 @@ async fn settled() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
     let Some(pool) = pool().await else { return };
     let dir = tempfile::tempdir().unwrap();
@@ -57,6 +62,7 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
         dir.path(),
         &instance,
         short,
+        keyring(),
         OrchestratorOnly::for_tests(),
     )
     .await
@@ -67,6 +73,7 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
         dir.path(),
         &instance,
         LeaseTiming::default(),
+        keyring(),
         OrchestratorOnly::for_tests(),
     )
     .await
@@ -129,7 +136,7 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
     blocker.rollback().await.expect("release A's lease row");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tenant_another_instance_holds_is_refused_before_any_write() {
     let Some(pool) = pool().await else { return };
     let dir = tempfile::tempdir().unwrap();
@@ -141,6 +148,7 @@ async fn a_tenant_another_instance_holds_is_refused_before_any_write() {
         dir.path(),
         &format!("first-{run}"),
         LeaseTiming::default(),
+        keyring(),
         OrchestratorOnly::for_tests(),
     )
     .await
@@ -152,6 +160,7 @@ async fn a_tenant_another_instance_holds_is_refused_before_any_write() {
         other.path(),
         &format!("second-{run}"),
         LeaseTiming::default(),
+        keyring(),
         OrchestratorOnly::for_tests(),
     )
     .await;
