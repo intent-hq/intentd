@@ -365,22 +365,29 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
     f.node.shutdown();
 }
 
-/// A Claude Code agent's launch carries the provider session `_meta` a
-/// local session gets: its instructions as the system prompt and `Task`
-/// denied, so it delegates through `ws.agent.*`. Its runtime then reports
-/// the instructions as delivered. A link before nodeProtocol 21 gets none.
+/// A remote agent's launch carries the provider session `_meta` a local
+/// session gets, for `session/new` and `session/load`. Claude Code: its
+/// instructions as the system prompt and `Task` denied on both, so its
+/// runtime reports the instructions as delivered. Codex: the thread title on
+/// `session/new` only, and the instructions still ride the first prompt. A
+/// link before nodeProtocol 21 gets none.
 #[tokio::test]
-async fn a_claude_code_launch_carries_its_session_meta_from_protocol_21() {
+async fn a_launch_carries_the_local_session_meta_from_protocol_21() {
     use intent_core::agent_runtime::AgentRuntime as _;
     let (f, mut link, _machine) = fixture().await;
-    for older in [false, true] {
+    for (provider, older) in [
+        ("claude-code", false),
+        ("codex", false),
+        ("claude-code", true),
+    ] {
         let (agent, _view) = f.placed().await;
         let store = f.services.store();
         let mut session = store
             .get_agent_session_with_transcript(&agent)
             .await
             .unwrap();
-        session.provider = Some("claude-code".into());
+        session.provider = Some(provider.into());
+        session.name = "Named agent".into();
         session.system_prompt = Some("REMOTE-INSTRUCTIONS-MARKER".into());
         store
             .update_agent_session(&workspace(), &session)
@@ -398,23 +405,34 @@ async fn a_claude_code_launch_carries_its_session_meta_from_protocol_21() {
                 _ => None,
             })
             .await;
-        assert_eq!(launch.provider, "claude-code");
+        assert_eq!(launch.provider, provider);
         if older {
             assert_eq!(launch.session_meta, None);
             assert!(!runtime.session_has_system_prompt());
             continue;
         }
         let meta = launch.session_meta.expect("session meta");
-        assert_eq!(
-            meta["systemPrompt"], "REMOTE-INSTRUCTIONS-MARKER",
-            "{meta:?}"
-        );
-        assert!(
-            meta["claudeCode"]["options"]["disallowedTools"]
-                .as_array()
-                .is_some_and(|tools| tools.iter().any(|tool| tool == "Task")),
-            "{meta:?}"
-        );
+        if provider == "codex" {
+            let new = meta.new.expect("new");
+            assert_eq!(new["sessionTitle"], "Named agent", "{new:?}");
+            assert!(!new.contains_key("systemPrompt"), "{new:?}");
+            assert_eq!(meta.load, None, "a loaded Codex thread keeps its title");
+            assert!(!runtime.session_has_system_prompt());
+            continue;
+        }
+        for opened in [meta.new.expect("new"), meta.load.expect("load")] {
+            assert_eq!(
+                opened["systemPrompt"], "REMOTE-INSTRUCTIONS-MARKER",
+                "{opened:?}"
+            );
+            assert!(
+                opened["claudeCode"]["options"]["disallowedTools"]
+                    .as_array()
+                    .is_some_and(|tools| tools.iter().any(|tool| tool == "Task")),
+                "{opened:?}"
+            );
+            assert!(!opened.contains_key("sessionTitle"), "{opened:?}");
+        }
         assert!(runtime.session_has_system_prompt());
     }
     f.node.shutdown();

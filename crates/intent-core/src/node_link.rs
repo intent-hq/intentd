@@ -1636,16 +1636,28 @@ pub struct LaunchCommand {
     /// machine from before ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_version: Option<Box<str>>,
-    /// The provider session `_meta` the machine passes on `session/new` and
-    /// `session/load` unchanged. Sent only on a link of
+    /// The provider session `_meta` the machine passes unchanged on
+    /// `session/new` and `session/load`. Sent only on a link of
     /// [`SESSION_META_PROTOCOL`] or later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_meta: Option<Box<serde_json::Map<String, Value>>>,
+    pub session_meta: Option<Box<LaunchSessionMeta>>,
     /// Display labels for the hosted agent, top-level `agentName` and
     /// `workspaceTitle` on the wire. Needs no protocol: a machine from
     /// before ignores them.
     #[serde(flatten)]
     pub labels: Box<LaunchLabels>,
+}
+
+/// [`LaunchCommand::session_meta`]: the `_meta` of each way the machine
+/// opens the provider session, each as the backend would send it for a
+/// local session; absent for none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchSessionMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new: Option<serde_json::Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<serde_json::Map<String, Value>>,
 }
 
 /// [`LaunchCommand::labels`]: the agent's name and its workspace's title on

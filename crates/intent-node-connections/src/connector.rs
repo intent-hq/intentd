@@ -2567,6 +2567,7 @@ impl RemoteNode {
         let session_prompt = command
             .session_meta
             .as_ref()
+            .and_then(|meta| meta.new.as_ref())
             .is_some_and(|meta| meta.contains_key("systemPrompt"));
         link.send(&LinkFrame::Launch(command)).await?;
         if session_prompt {

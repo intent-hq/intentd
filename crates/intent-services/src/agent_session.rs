@@ -3135,10 +3135,13 @@ impl Services {
 
     /// The provider session `_meta` remote agent `agent_id`'s machine sends
     /// on `session/new` and `session/load` (nodeProtocol 21): what a local
-    /// session gets on `session/load`, from the stored system prompt.
-    /// `None` for a provider with no `_meta` injection, or when the session
-    /// cannot be read (the instructions then ride the first prompt).
-    pub async fn remote_session_meta(&self, agent_id: &AgentId) -> Option<Meta> {
+    /// session gets on each, from the stored system prompt. `None` for a
+    /// provider with no `_meta` injection, or when the session cannot be
+    /// read (the instructions then ride the first prompt).
+    pub async fn remote_session_meta(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<intent_core::node_link::LaunchSessionMeta> {
         let session = match self
             .store
             .get_agent_session_without_messages(agent_id)
@@ -3154,12 +3157,12 @@ impl Services {
         let is_orchestrator = self
             .resolve_session_is_orchestrator(provider_id, &session)
             .await;
-        build_session_meta(
-            provider_id,
-            session.system_prompt.as_deref(),
-            None,
-            is_orchestrator,
-        )
+        let prompt = session.system_prompt.as_deref();
+        // As on a local session: only `session/new` names a Codex thread.
+        let new = build_session_meta(provider_id, prompt, Some(&session.name), is_orchestrator);
+        let load = build_session_meta(provider_id, prompt, None, is_orchestrator);
+        (new.is_some() || load.is_some())
+            .then_some(intent_core::node_link::LaunchSessionMeta { new, load })
     }
 
     /// Resolve whether the stored session's specialist carries the
