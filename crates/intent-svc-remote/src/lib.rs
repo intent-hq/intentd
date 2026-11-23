@@ -278,6 +278,22 @@ impl RemoteFeature {
         }
     }
 
+    /// Run `work` (a connector's dial-gate call: a sandbox resume, a tunnel
+    /// revive) as part of the feature's background work: `None` without
+    /// polling it once the links are closed, and `None` when they close
+    /// while it runs, which drops it where it stands. Counted until it ends,
+    /// so [`Self::background_stopped`] waits for it.
+    pub(crate) async fn until_closed<F: std::future::Future>(&self, work: F) -> Option<F::Output> {
+        let _task = BackgroundTask::of(self);
+        if self.links_closed() {
+            return None;
+        }
+        tokio::select! {
+            () = self.closed() => None,
+            output = work => Some(output),
+        }
+    }
+
     /// Wait until [`Self::close_links`] ran. Cancel-safe.
     pub(crate) async fn closed(&self) {
         let mut closed = self.closed.0.subscribe();

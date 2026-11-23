@@ -176,6 +176,9 @@ impl CloudGate {
     }
 }
 
+/// Why a dial-gate call was refused: the tenant's links are closed.
+const LINKS_CLOSED: &str = "this backend's machine links are closed";
+
 impl crate::link::gate::DialGate for CloudGate {
     /// How many pauses of this machine began, so a dial that binds after
     /// one knows it reached a frozen sandbox.
@@ -201,7 +204,18 @@ impl crate::link::gate::DialGate for CloudGate {
         link: &'a dyn GateLink,
         asked: bool,
     ) -> intent_core::BoxFuture<'a, std::result::Result<Dialable, ConnectFailure>> {
-        Box::pin(self.before_dial_inner(link, asked))
+        Box::pin(async move {
+            // A fenced tenant's connector makes no provider call: the
+            // resume is dropped once the links close, and the fence waits
+            // for it.
+            let Ok(feature) = super::feature(&self.svc) else {
+                return self.before_dial_inner(link, asked).await;
+            };
+            feature
+                .until_closed(self.before_dial_inner(link, asked))
+                .await
+                .unwrap_or_else(|| Err(ConnectFailure::Local(LINKS_CLOSED.to_owned())))
+        })
     }
 
     /// The sandbox runs an intentd this backend shares no link protocol
@@ -219,11 +233,17 @@ impl crate::link::gate::DialGate for CloudGate {
             let Ok(feature) = super::feature(&self.svc) else {
                 return false;
             };
-            let revived = revive(&self.svc, feature, &self.machine_id).await;
-            if revived {
-                self.refresh_address(link).await;
-            }
-            revived
+            // As for before_dial: no provider call once the links close.
+            feature
+                .until_closed(async {
+                    let revived = revive(&self.svc, feature, &self.machine_id).await;
+                    if revived {
+                        self.refresh_address(link).await;
+                    }
+                    revived
+                })
+                .await
+                .unwrap_or(false)
         })
     }
 }
