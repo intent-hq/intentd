@@ -553,6 +553,7 @@ async fn a_release_waits_for_a_write_that_passed_the_fence() {
     let store = old.clone();
     let mut pending = tokio::spawn(async move { store.release_tenant_lease(first.epoch).await });
     // timing-guard: bounded window in which the release must stay blocked behind the open write
+    // fixed-deadline: allow — stays under the queued write's 60 s lock_attempt (options()), which is what keeps the release blocked
     let early = tokio::time::timeout(Duration::from_millis(300), &mut pending).await;
     assert!(early.is_err(), "released while a write was still open");
     assert!(!lease_expired(&db.admin, tenant).await);
