@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.279] - 2026-11-23
+
+### 🚀 Features
+
+- *(orchestrator)* Serve several Postgres tenants in one process (intentd-orchestrator) ([#3682](https://github.com/intent-hq/intentd/pull/3682))
+- *(app)* Run one tenant's work under its self-fence (TenantRuntime) ([#3681](https://github.com/intent-hq/intentd/pull/3681))
+- Record and serve who set the conversation goal (goalSetBy) ([#3699](https://github.com/intent-hq/intentd/pull/3699))
+
+### 🐛 Bug Fixes
+
+- *(provider-profiles)* Keep profiles of unknown bases instead of rejecting the file ([#3698](https://github.com/intent-hq/intentd/pull/3698))
+
+### 🔧 Refactor
+
+- *(sentry)* Drop the legacy secrets-store credential lookup ([#3701](https://github.com/intent-hq/intentd/pull/3701))
+
+### 📚 Documentation
+
+- *(guide)* An orchestrator is never a runner ([#3675](https://github.com/intent-hq/intentd/pull/3675))
+
+### 🧪 Testing
+
+- *(node-link)* Assert link protocol floors, lint exact matches ([#3695](https://github.com/intent-hq/intentd/pull/3695))
+
+
 ## [0.11.278] - 2026-11-23
 
 ### 🚀 Features
