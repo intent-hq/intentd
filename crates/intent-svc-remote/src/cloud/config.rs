@@ -59,7 +59,7 @@ const VERCEL_REGISTRY_URL_ENV: &str = "INTENTD_VERCEL_REGISTRY_URL";
 /// The image Northflank entries start unless the owner sets another.
 pub(crate) const DEFAULT_NORTHFLANK_IMAGE: &str = "ghcr.io/intent-hq/intent-node";
 /// The volume size of a new Northflank service unless the owner sets one.
-pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
+pub(crate) const DEFAULT_DISK_GIB: u32 = intent_nodes::northflank::DEFAULT_DISK_GIB;
 
 /// Longest wait for a release's template manifest.
 const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);

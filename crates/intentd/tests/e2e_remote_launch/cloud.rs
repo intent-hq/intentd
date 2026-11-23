@@ -107,6 +107,21 @@ struct FakeState {
     sandbox_env: Vec<(String, String)>,
 }
 
+/// `cloudMachines.list` `diskSettings`: only Northflank and Agent37 take a
+/// disk, and an Agent37 shape caps it on the `default` type.
+fn disk_settings() -> Value {
+    json!({
+        "northflank": { "minGiB": 6, "maxGiB": 500, "defaultGiB": 20 },
+        "agent37": {
+            "minGiB": 4, "maxGiB": 100, "defaultGiB": 20,
+            "sizeMaxGiB": {
+                "default": { "2x4": 12, "4x8": 20, "4x16": 40, "4x32": 80 },
+                "vm": { "2x4": 100, "4x8": 100, "4x16": 100, "4x32": 100 },
+            },
+        },
+    })
+}
+
 /// The release manifest listing `sizes` for this build's version.
 fn manifest(sizes: &[&str]) -> Value {
     json!({ "schema": 1, "project": "intent", "version": env!("CARGO_PKG_VERSION"), "sizes": sizes })
@@ -1446,7 +1461,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     let after = ok(&mut rpc_ws, 403, "cloudMachines.list", json!({})).await;
     assert_eq!(
         after,
-        json!({ "providers": [], "machines": [], "providerKinds": ["e2b", "northflank", "agent37", "vercel"] }),
+        json!({ "providers": [], "machines": [], "providerKinds": ["e2b", "northflank", "agent37", "vercel"], "diskSettings": disk_settings() }),
         "{after}"
     );
 
