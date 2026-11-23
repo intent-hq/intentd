@@ -63,18 +63,16 @@ pub(crate) async fn resolve_source_control(
     injected: Option<Arc<dyn SourceControl>>,
     secrets: &intent_core::SharedSecretStore,
 ) -> Result<Arc<dyn SourceControl>> {
-    match injected {
-        Some(sc) => Ok(sc),
-        None => {
-            // The identity reads' loopback-only API seam, so an e2e daemon's
-            // forge reads reach its mock and never api.github.com.
-            let mut settings = SourceControlSettings::default();
-            settings.github.api_base_url = crate::invite_ops::resolve_api_base_uri(None);
-            SourceControlRegistry::from_settings(&settings, secrets)
-                .await
-                .map_err(map_sc_err)
-        }
+    if let Some(sc) = injected {
+        return Ok(sc);
     }
+    // The identity reads' loopback-only API seam, so an e2e daemon's forge
+    // reads reach its mock and never api.github.com.
+    let mut settings = SourceControlSettings::default();
+    settings.github.api_base_url = crate::invite_ops::resolve_api_base_uri(None);
+    SourceControlRegistry::from_settings(&settings, secrets)
+        .await
+        .map_err(map_sc_err)
 }
 
 /// The workspace's forge repository ([`Workspace::repo`]) for its active
@@ -2270,8 +2268,8 @@ pub(crate) fn validate_merge_method(method: Option<&str>) -> Result<MergeMethod>
 mod tests {
     use super::*;
 
-    fn refs(input: serde_json::Value, output: serde_json::Value) -> Vec<(String, u64)> {
-        created_pr_refs(&input, &output)
+    fn refs(input: &serde_json::Value, output: &serde_json::Value) -> Vec<(String, u64)> {
+        created_pr_refs(input, output)
             .into_iter()
             .map(|(repo, n)| (format!("{}/{}", repo.owner, repo.name), n))
             .collect()
@@ -2281,26 +2279,18 @@ mod tests {
     fn created_pr_refs_reads_the_url_gh_prints_for_each_tool_shape() {
         let claude =
             serde_json::json!({ "command": "cd lib && gh pr create --fill", "description": "x" });
-        assert_eq!(
-            refs(
-                claude,
-                serde_json::json!("https://github.com/acme/lib/pull/7\n")
-            ),
-            [("acme/lib".to_owned(), 7)]
-        );
+        let printed = serde_json::json!("https://github.com/acme/lib/pull/7\n");
+        assert_eq!(refs(&claude, &printed), [("acme/lib".to_owned(), 7)]);
         let codex =
             serde_json::json!({ "command": ["bash", "-lc", "/usr/bin/gh pr create -t t -b b"] });
         let wrapped = serde_json::json!([{ "type": "content", "content": { "type": "text",
             "text": "Warning: 2 uncommitted changes\nhttps://github.com/Acme/Lib/pull/8" } }]);
-        assert_eq!(refs(codex, wrapped), [("Acme/Lib".to_owned(), 8)]);
-        let exists = "a pull request for branch \"fix\" into branch \"main\" already exists:\nhttps://github.com/acme/lib/pull/9\n";
-        assert_eq!(
-            refs(
-                serde_json::json!({ "cmd": "gh pr create" }),
-                serde_json::json!(exists)
-            ),
-            [("acme/lib".to_owned(), 9)]
+        assert_eq!(refs(&codex, &wrapped), [("Acme/Lib".to_owned(), 8)]);
+        let cmd = serde_json::json!({ "cmd": "gh pr create" });
+        let exists = serde_json::json!(
+            "a pull request for branch \"fix\" into branch \"main\" already exists:\nhttps://github.com/acme/lib/pull/9\n"
         );
+        assert_eq!(refs(&cmd, &exists), [("acme/lib".to_owned(), 9)]);
     }
 
     #[test]
@@ -2309,24 +2299,20 @@ mod tests {
         // Only the command field counts, not a description or echoed title.
         let described = serde_json::json!({ "command": "rg pull docs", "description": "before gh pr create",
             "_acpTitle": "gh pr create" });
-        assert!(refs(described, url.clone()).is_empty());
-        assert!(refs(
+        for input in [
+            described,
             serde_json::json!({ "command": "gh pr view 7" }),
-            url.clone()
-        )
-        .is_empty());
-        assert!(refs(
             serde_json::json!({ "command": "mygh pr create" }),
-            url.clone()
-        )
-        .is_empty());
-        assert!(refs(serde_json::json!({ "code": "gh pr create" }), url).is_empty());
+            serde_json::json!({ "code": "gh pr create" }),
+        ] {
+            assert!(refs(&input, &url).is_empty(), "{input}");
+        }
         // A URL inside other text, or on another host, is not the created PR.
         let create = serde_json::json!({ "command": "gh pr create && rg pull/ docs" });
         let noisy = serde_json::json!(
             "docs/a.md: see https://github.com/acme/lib/pull/3\nhttps://github.example.com/acme/lib/pull/4\nhttps://github.com/acme/lib/pull/5"
         );
-        assert_eq!(refs(create, noisy), [("acme/lib".to_owned(), 5)]);
+        assert_eq!(refs(&create, &noisy), [("acme/lib".to_owned(), 5)]);
     }
 
     fn pr(state: PrState, draft: bool, mergeable: Option<bool>, ms: Option<&str>) -> PullRequest {
