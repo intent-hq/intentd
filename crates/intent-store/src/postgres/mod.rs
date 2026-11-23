@@ -1221,7 +1221,7 @@ const WRITER_LIMITS_SQL: &str = "SELECT set_config('lock_timeout', $1, true), \
 ///
 /// It also sets `intent.writer_tenant` to the tenant for the rest of the
 /// transaction, in the same statement and so on the same shard as the lock.
-/// The `row_seq` trigger (migration 0012) refuses an insert unless it names
+/// The `row_seq` trigger (`0001_schema.sql`) refuses an insert unless it names
 /// the row's tenant, so a row numbered from the tenant counter is always
 /// numbered under the lock. ([`WriterRow`] ignores that column.)
 #[doc(hidden)]

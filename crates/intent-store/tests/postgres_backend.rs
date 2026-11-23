@@ -356,7 +356,7 @@ async fn run_as_writer_of(
         .execute(&mut *tx)
         .await
         .unwrap();
-    // Writes need the tenant's writer lock (migration 0012's row_seq
+    // Writes need the tenant's writer lock (the schema's row_seq
     // trigger); the lock statement is itself tenant-scoped.
     if writer == tenant {
         sqlx::query(postgres::WRITER_LOCK_SQL)

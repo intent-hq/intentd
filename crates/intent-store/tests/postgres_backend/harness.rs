@@ -391,7 +391,7 @@ pub async fn seed_sql(store: &Store, db: Option<&TestDb>, tenant: &str, stmt: &s
 
 /// Runs `sql` on `admin` in one transaction holding `tenant`'s writer lock,
 /// as a store writer would. Inserts into `row_seq` tables need the lock
-/// (migration 0012's trigger refuses them otherwise).
+/// (the schema's `row_seq` trigger refuses them otherwise).
 pub async fn admin_write(admin: &PgPool, tenant: &str, sql: String) {
     let mut tx = hold_writer_lock(admin, tenant).await;
     sqlx::raw_sql(sqlx::AssertSqlSafe(sql))

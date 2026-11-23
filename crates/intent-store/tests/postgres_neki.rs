@@ -1067,8 +1067,8 @@ async fn tenants_route_to_different_shards_in_the_fixed_schema() {
     .expect("tenants route to different shards");
 }
 
-/// `row_seq` comes from the tenant's `tenant_writer` counter (migration
-/// 0012), not a sequence: on sharded Neki each router reserves identity
+/// `row_seq` comes from the tenant's `tenant_writer` counter, not a
+/// sequence: on sharded Neki each router reserves identity
 /// values in batches, so an identity numbered rows out of insertion order.
 /// For tenants on two shards, rows inserted under the writer lock, in one
 /// large statement and then in transactions alternating between two

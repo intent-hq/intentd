@@ -116,40 +116,6 @@ async fn tenants_number_rows_independently() {
     }
 }
 
-/// A tenant whose rows predate the counter (`last_row_seq` NULL) starts
-/// numbering above its largest existing `row_seq`, so new rows sort after
-/// the old ones.
-#[tokio::test]
-async fn a_tenant_counter_starts_above_its_existing_rows() {
-    let Some(db) = test_db(false).await else {
-        return;
-    };
-    let tenant = "row-seq-floor";
-    let store = open(&db, tenant).await;
-    insert_workspace(&store, "old").await;
-    admin_write(
-        &db.admin,
-        tenant,
-        format!(
-            "INSERT INTO known_repo (tenant_id, path, name, owner, added_at, last_used_at, row_seq) \
-             VALUES ('{tenant}', '/r/old', 'old', NULL, '{T0}', '{T0}', 50000); \
-             UPDATE tenant_writer SET last_row_seq = NULL WHERE tenant_id = '{tenant}'"
-        ),
-    )
-    .await;
-    insert_workspace(&store, "new").await;
-    let new = row_seq(&db.admin, "workspace", tenant, "new").await;
-    assert!(new > 50_000, "new row_seq {new} must sort after 50000");
-    let ids: Vec<String> = store
-        .ordinary_workspace_ids()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|w| w.0)
-        .collect();
-    assert_eq!(ids, ["old", "new"]);
-}
-
 /// Every table with a `row_seq` column takes it from the tenant counter:
 /// no identity is left to hand out values, and the trigger fills it.
 #[tokio::test]
@@ -186,26 +152,24 @@ async fn every_row_seq_table_uses_the_tenant_counter() {
         untriggered.is_empty(),
         "row_seq tables without the tenant-counter trigger: {untriggered:?}"
     );
-    // The counter's starting floor reads every row_seq table by name.
-    let floor: String =
-        sqlx::query_scalar("SELECT pg_get_functiondef('intent_row_seq_floor(text)'::regprocedure)")
-            .fetch_one(&db.admin)
-            .await
-            .unwrap();
-    let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT table_name::text FROM information_schema.columns \
-         WHERE table_schema = current_schema() AND column_name = 'row_seq' ORDER BY 1",
+    // The statement trigger persists the counter; without it a later
+    // transaction would hand out the same values again.
+    let unsaved: Vec<String> = sqlx::query_scalar(
+        "SELECT c.table_name::text FROM information_schema.columns c \
+         WHERE c.table_schema = current_schema() AND c.column_name = 'row_seq' \
+           AND NOT EXISTS (SELECT 1 FROM pg_trigger t \
+             JOIN pg_class r ON r.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = r.relnamespace \
+             WHERE n.nspname = c.table_schema AND r.relname = c.table_name \
+               AND t.tgname = 'row_seq_save' AND NOT t.tgisinternal) \
+         ORDER BY 1",
     )
     .fetch_all(&db.admin)
     .await
     .unwrap();
-    let unfloored: Vec<&String> = tables
-        .iter()
-        .filter(|t| !floor.contains(&format!("FROM {t} WHERE {t}.tenant_id = p_tenant")))
-        .collect();
     assert!(
-        unfloored.is_empty(),
-        "row_seq tables missing from intent_row_seq_floor: {unfloored:?}"
+        unsaved.is_empty(),
+        "row_seq tables without the counter save trigger: {unsaved:?}"
     );
 }
 
