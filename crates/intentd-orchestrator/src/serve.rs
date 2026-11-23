@@ -158,19 +158,27 @@ impl ServedTenant {
     }
 
     /// Wait until the tenant's fence fired and its work stopped. Once
-    /// only: later calls wait forever.
+    /// only: later calls (and calls after [`Self::watch_report`]) wait
+    /// forever.
     pub async fn stopped(&mut self) -> SelfFenceReport {
-        let Some(report) = self.report.as_mut() else {
+        let Some(report) = self.report.take() else {
             return std::future::pending().await;
         };
-        let report = report.await;
-        self.report = None;
-        report.unwrap_or_else(|e| SelfFenceReport {
-            reason: format!("the self-fence task ended: {e}"),
-            fenced_at: std::time::Instant::now(),
-            steps: Vec::new(),
-            // Its steps may not have run: treat it as overrun.
-            overran: vec![intent_core::tenant_fence::FenceStep::Tasks],
-        })
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        crate::watch_report(report, move |report| {
+            let _ = tx.send(report);
+        });
+        match rx.await {
+            Ok(report) => report,
+            Err(_) => std::future::pending().await,
+        }
+    }
+
+    /// Hand the tenant's fence report to `on_stop` as soon as it is ready,
+    /// on a task of its own ([`crate::watch_report`]).
+    pub fn watch_report(&mut self, on_stop: impl FnOnce(SelfFenceReport) + Send + 'static) {
+        if let Some(report) = self.report.take() {
+            crate::watch_report(report, on_stop);
+        }
     }
 }

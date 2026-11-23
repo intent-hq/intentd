@@ -63,6 +63,10 @@ async fn run(url: String) -> Result<ExitCode, String> {
         .await
         .map_err(|e| format!("connect: {e}"))?;
 
+    // Every tenant's report is watched from the moment it opens, startup
+    // included: an overrun fence exits at once, whatever the other tenants
+    // are doing.
+    let (stopped_tx, mut stopped) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut served: Vec<ServedTenant> = Vec::new();
     for tenant in &tenants {
         let opened = serve_tenant(
@@ -76,9 +80,14 @@ async fn run(url: String) -> Result<ExitCode, String> {
         .await
         .map_err(|e| format!("tenant {tenant}: {e}"));
         match opened {
-            Ok(tenant) => served.push(tenant),
+            Ok(mut opened) => {
+                let name = opened.tenant().to_owned();
+                let tx = stopped_tx.clone();
+                opened.watch_report(move |report| on_stopped(&name, &report, &tx));
+                served.push(opened);
+            }
             Err(error) => {
-                stop_all(&mut served).await;
+                stop_all(&mut served, &mut stopped).await;
                 return Err(error);
             }
         }
@@ -89,28 +98,33 @@ async fn run(url: String) -> Result<ExitCode, String> {
             tracing::error!("every tenant stopped");
             return Ok(ExitCode::FAILURE);
         }
-        let stopped = {
-            let waits = served.iter_mut().map(|tenant| Box::pin(tenant.stopped()));
-            tokio::select! {
-                (report, index) = first_of(waits) => Some((index, report)),
-                () = shutdown_signal() => None,
+        tokio::select! {
+            Some(tenant) = stopped.recv() => served.retain(|served| served.tenant() != tenant),
+            () = shutdown_signal() => {
+                tracing::info!("stopping every tenant");
+                return Ok(stop_all(&mut served, &mut stopped).await);
             }
-        };
-        let Some((index, report)) = stopped else {
-            tracing::info!("stopping every tenant");
-            return Ok(stop_all(&mut served).await);
-        };
-        let tenant = served.swap_remove(index);
-        tracing::warn!(tenant = tenant.tenant(), reason = %report.reason, "tenant stopped");
-        if is_fatal(&report) {
-            tracing::error!(
-                tenant = tenant.tenant(),
-                overran = ?report.overran,
-                "a self-fence step overran: exiting so no work outlives the lease"
-            );
-            std::process::exit(FENCE_OVERRAN_EXIT);
         }
     }
+}
+
+/// A tenant's work stopped: exit at once when its fence overran (its work
+/// may outlive the lease), else tell the supervisor.
+fn on_stopped(
+    tenant: &str,
+    report: &intent_core::tenant_fence::SelfFenceReport,
+    stopped: &tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    tracing::warn!(tenant, reason = %report.reason, "tenant stopped");
+    if is_fatal(report) {
+        tracing::error!(
+            tenant,
+            overran = ?report.overran,
+            "a self-fence step overran: exiting so no work outlives the lease"
+        );
+        std::process::exit(FENCE_OVERRAN_EXIT);
+    }
+    let _ = stopped.send(tenant.to_owned());
 }
 
 /// Ctrl-C, or SIGTERM on Unix (systemd, `docker stop`, Kubernetes): either
@@ -137,33 +151,22 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// Fire every tenant's fence and wait for its work to stop; the exit code.
-async fn stop_all(served: &mut Vec<ServedTenant>) -> ExitCode {
+/// Fire every tenant's fence and wait until every one stopped; an overrun
+/// exits from its watcher as soon as it is reported. The exit code.
+async fn stop_all(
+    served: &mut Vec<ServedTenant>,
+    stopped: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> ExitCode {
     for tenant in served.iter() {
         tenant.fence().fire("the orchestrator is stopping");
     }
-    for mut tenant in served.drain(..) {
-        if is_fatal(&tenant.stopped().await) {
-            std::process::exit(FENCE_OVERRAN_EXIT);
-        }
+    while !served.is_empty() {
+        let Some(tenant) = stopped.recv().await else {
+            break;
+        };
+        served.retain(|served| served.tenant() != tenant);
     }
     ExitCode::SUCCESS
-}
-
-/// The first of `waits` to finish: its output and index.
-async fn first_of<F: std::future::Future + Unpin>(
-    waits: impl IntoIterator<Item = F>,
-) -> (F::Output, usize) {
-    let mut waits: Vec<F> = waits.into_iter().collect();
-    std::future::poll_fn(move |cx| {
-        for (index, wait) in waits.iter_mut().enumerate() {
-            if let std::task::Poll::Ready(output) = std::pin::Pin::new(wait).poll(cx) {
-                return std::task::Poll::Ready((output, index));
-            }
-        }
-        std::task::Poll::Pending
-    })
-    .await
 }
 
 /// The orchestrator-mode proof the Postgres opener takes: this binary runs

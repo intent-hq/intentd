@@ -65,10 +65,18 @@ pub fn parse_tenants(raw: &str) -> Result<Vec<String>, String> {
     Ok(tenants)
 }
 
-/// Where tenant `tenant` keeps its files: `<data_dir>/tenants/<tenant>`,
-/// with every byte other than an ASCII letter, digit, `-` or `_` written as
-/// `%XX`. So no id (`.`, `..`, `a:b`) names another directory or a path
-/// that some platform refuses, and two ids never share one.
+/// The longest readable directory name [`tenant_dir`] uses; a longer one
+/// is hashed. Well under the 255-byte name limit of common filesystems.
+pub const TENANT_DIR_NAME_MAX: usize = 128;
+
+/// Where tenant `tenant` keeps its files: `<data_dir>/tenants/<name>`. The
+/// name is the id with every byte other than an ASCII letter, digit, `-` or
+/// `_` written as `%XX`, so no id (`.`, `..`, `a:b`) names another directory
+/// or a path some platform refuses. When that is longer than
+/// [`TENANT_DIR_NAME_MAX`] bytes (an accepted id of many `.` or `:` can
+/// reach 384), the name is `~` and the id's SHA-256 instead. The escaping
+/// never writes `~`, so the two forms never collide, and no two ids share a
+/// directory.
 #[must_use]
 pub fn tenant_dir(data_dir: &Path, tenant: &str) -> PathBuf {
     use std::fmt::Write as _;
@@ -78,6 +86,13 @@ pub fn tenant_dir(data_dir: &Path, tenant: &str) -> PathBuf {
             name.push(char::from(byte));
         } else {
             let _ = write!(name, "%{byte:02X}");
+        }
+    }
+    if name.len() > TENANT_DIR_NAME_MAX {
+        use sha2::Digest as _;
+        name = String::from("~");
+        for byte in sha2::Sha256::digest(tenant.as_bytes()) {
+            let _ = write!(name, "{byte:02x}");
         }
     }
     data_dir.join("tenants").join(name)
@@ -91,6 +106,26 @@ pub fn instance_id(configured: Option<&str>) -> String {
         Some(instance) if !instance.is_empty() => instance.to_owned(),
         _ => format!("orchestrator-{}", uuid::Uuid::new_v4()),
     }
+}
+
+/// Wait for `report` (a tenant's self-fence) on a task of its own and hand
+/// the result to `on_stop` as soon as it is ready, whatever the other
+/// tenants are doing: a fatal report ([`is_fatal`]) must not wait behind
+/// another tenant's slow stop. A self-fence task that panicked or was
+/// cancelled counts as overrun: its steps may not have run.
+pub fn watch_report(
+    report: tokio::task::JoinHandle<SelfFenceReport>,
+    on_stop: impl FnOnce(SelfFenceReport) + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let report = report.await.unwrap_or_else(|e| SelfFenceReport {
+            reason: format!("the self-fence task ended: {e}"),
+            fenced_at: std::time::Instant::now(),
+            steps: Vec::new(),
+            overran: vec![intent_core::tenant_fence::FenceStep::Tasks],
+        });
+        on_stop(report);
+    });
 }
 
 /// Whether a tenant's fence report must stop the process: a step overran
@@ -135,6 +170,37 @@ mod tests {
     }
 
     #[test]
+    fn a_long_tenant_id_gets_a_bounded_name_of_its_own() {
+        let root = Path::new("/data");
+        // The longest ids the store accepts, all escaped bytes.
+        let colons = ":".repeat(128);
+        let dots = ".".repeat(128);
+        let mut names = Vec::new();
+        for tenant in [
+            colons.as_str(),
+            dots.as_str(),
+            &"a".repeat(128),
+            &format!("{}a", ".".repeat(127)),
+        ] {
+            let dir = tenant_dir(root, tenant);
+            assert_eq!(dir.parent(), Some(root.join("tenants").as_path()));
+            let name = dir.file_name().unwrap().to_str().unwrap().to_owned();
+            assert!(name.len() <= TENANT_DIR_NAME_MAX, "{name}");
+            assert_eq!(dir, tenant_dir(root, tenant), "stable");
+            names.push(name);
+        }
+        assert!(names[0].starts_with('~') && names[1].starts_with('~'));
+        assert_eq!(
+            names[2],
+            "a".repeat(128),
+            "a short enough id stays readable"
+        );
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 4, "no two ids share a directory");
+    }
+
+    #[test]
     fn a_blank_instance_gets_a_fresh_id() {
         assert_eq!(instance_id(Some(" host-a ")), "host-a");
         let fresh = instance_id(Some("  "));
@@ -149,6 +215,39 @@ mod tests {
             steps: Vec::new(),
             overran,
         }
+    }
+
+    #[tokio::test]
+    async fn a_fatal_report_is_seen_while_another_tenant_is_still_stopping() {
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        // A: still settling its writes (up to a minute in production).
+        let slow = tokio::spawn(std::future::pending::<SelfFenceReport>());
+        // B: done, and fatal.
+        let fatal = tokio::spawn(async { report(vec![FenceStep::Tasks]) });
+        for (tenant, handle) in [("a", slow), ("b", fatal)] {
+            let seen = seen_tx.clone();
+            watch_report(handle, move |report| {
+                let _ = seen.send((tenant, is_fatal(&report)));
+            });
+        }
+        let first = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            seen.recv(),
+        )
+        .await
+        .expect("B's report does not wait behind A's")
+        .unwrap();
+        assert_eq!(first, ("b", true));
+    }
+
+    #[tokio::test]
+    async fn a_self_fence_that_panicked_is_fatal() {
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let panicked = tokio::spawn(async { panic!("self-fence failed") });
+        watch_report(panicked, move |report| {
+            let _ = seen_tx.send(is_fatal(&report));
+        });
+        assert_eq!(seen.recv().await, Some(true));
     }
 
     #[test]
