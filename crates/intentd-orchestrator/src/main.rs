@@ -24,6 +24,10 @@ const POOL_CONNECTIONS: u32 = 16;
 /// Why [`stop_all`] fires every tenant's fence.
 const STOPPING: &str = "the orchestrator is stopping";
 
+/// How long a tenant open in flight when a stop signal arrives may still
+/// take, so it is stopped and released with the others.
+const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How long one tenant's lease release may take on shutdown; past it the
 /// lease lapses after its TTL instead.
 const RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
@@ -70,9 +74,10 @@ async fn run(url: String) -> Result<ExitCode, String> {
         .data_dir;
     let instance = instance_id(std::env::var(INSTANCE_ENV).ok().as_deref());
     // Listen before any tenant opens, and race every startup step against
-    // the signal: a signal during startup stops the tenants already open
-    // (releasing their leases) instead of waiting for a hung step. A tenant
-    // whose open is cut short keeps whatever it claimed until the TTL.
+    // the signal, so a hung step cannot swallow it. On a signal, the open
+    // in flight gets up to OPEN_GRACE to finish; then every open tenant is
+    // stopped and released. An open still running past the grace is
+    // dropped, keeping whatever it claimed until the TTL.
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let pool = tokio::select! {
@@ -91,26 +96,35 @@ async fn run(url: String) -> Result<ExitCode, String> {
     let (stopped_tx, mut stopped) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut served: Vec<ServedTenant> = Vec::new();
     for tenant in &tenants {
-        let opening = serve_tenant(
+        let mut opening = std::pin::pin!(serve_tenant(
             pool.clone(),
             tenant,
             &data_dir,
             &instance,
             LeaseTiming::default(),
             orchestrator_token(),
-        );
+        ));
         let opened = tokio::select! {
-            opened = opening => opened.map_err(|e| format!("tenant {tenant}: {e}")),
+            opened = &mut opening => opened.map_err(|e| format!("tenant {tenant}: {e}")),
             () = &mut shutdown => {
                 tracing::info!(tenant, "stopping every tenant during startup");
+                match tokio::time::timeout(OPEN_GRACE, opening).await {
+                    Ok(Ok(mut opened)) => {
+                        watch(&mut opened, &stopped_tx);
+                        served.push(opened);
+                    }
+                    Ok(Err(error)) => tracing::warn!(tenant, %error, "the tenant did not open"),
+                    Err(_) => tracing::warn!(
+                        tenant,
+                        "the tenant did not open in time; its lease lapses after its TTL"
+                    ),
+                }
                 return Ok(stop_all(&mut served, &mut stopped).await);
             }
         };
         match opened {
             Ok(mut opened) => {
-                let name = opened.tenant().to_owned();
-                let tx = stopped_tx.clone();
-                opened.watch_report(move |report| on_stopped(&name, &report, &tx));
+                watch(&mut opened, &stopped_tx);
                 served.push(opened);
             }
             Err(error) => {
@@ -133,6 +147,13 @@ async fn run(url: String) -> Result<ExitCode, String> {
             }
         }
     }
+}
+
+/// Watch `tenant`'s fence report ([`on_stopped`]).
+fn watch(tenant: &mut ServedTenant, stopped: &tokio::sync::mpsc::UnboundedSender<String>) {
+    let name = tenant.tenant().to_owned();
+    let tx = stopped.clone();
+    tenant.watch_report(move |report| on_stopped(&name, &report, &tx));
 }
 
 /// A tenant's work stopped: exit at once when its fence overran (its work

@@ -744,13 +744,18 @@ impl LeaseHeartbeat {
     /// tenant's work stopped; call it only when this process fired the
     /// fence itself, never after the lease was lost.
     ///
-    /// A renewal that was already committing when the fence fired can still
-    /// land after the release and keep the lease until its TTL: that delays
-    /// the next claim, never lets two owners write.
+    /// It first waits until the heartbeat stopped ([`LeaseState::Lost`],
+    /// set only once its renewal in flight, if any, was dropped), so no
+    /// renewal of this heartbeat starts after the release.
     ///
     /// # Errors
     /// As [`Store::release_tenant_lease`](crate::Store::release_tenant_lease).
     pub async fn release(&self) -> Result<bool> {
+        if self.fence.is_fenced() {
+            // A closed channel means the task already ended.
+            let mut state = self.state.clone();
+            let _ = state.wait_for(|s| matches!(s, LeaseState::Lost(_))).await;
+        }
         self.store.release_tenant_lease(self.epoch).await
     }
 
