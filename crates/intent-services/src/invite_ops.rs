@@ -433,9 +433,7 @@ impl Services {
         if let Some(sc) = self.source_control.clone() {
             return Ok(sc);
         }
-        let mut settings = intent_sourcecontrol::SourceControlSettings::default();
-        settings.github.api_base_url = resolve_api_base_uri(self.github_api_base_uri.as_deref());
-        intent_sourcecontrol::SourceControlRegistry::from_settings(&settings, &self.secret_source())
+        pr_ops::default_forge_registry(self.github_api_base_uri.as_deref(), &self.secret_source())
             .await
             .map_err(pr_ops::map_sc_err)
     }

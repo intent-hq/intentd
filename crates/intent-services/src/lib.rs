@@ -34709,8 +34709,8 @@ impl WorkspaceApi for Services {
                     // is the typed `source-control-unauthorized` error.
                     let sc = match self.source_control.clone() {
                         Some(sc) => sc,
-                        None => match intent_sourcecontrol::SourceControlRegistry::from_settings(
-                            &intent_sourcecontrol::SourceControlSettings::default(),
+                        None => match pr_ops::default_forge_registry(
+                            self.github_api_base_uri.as_deref(),
                             &self.secret_source(),
                         )
                         .await
