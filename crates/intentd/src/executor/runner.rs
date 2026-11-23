@@ -2552,6 +2552,9 @@ impl Runner {
             Ok(Some(joined)) => return reply(SetupRetryOutcome::Started, Some(joined), None),
             Ok(None) => {}
         }
+        // Sent as `seq` 0 ahead of `setupStarted`, so head drops the last
+        // run's output even if this run fails before the script spawns.
+        output.line("Running the setup script again.");
         setup::write_status(&cwd, &running);
         agent.setup_view.show(&running);
         self.append(agent_entry(

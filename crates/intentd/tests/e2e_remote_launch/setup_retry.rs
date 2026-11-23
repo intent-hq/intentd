@@ -149,6 +149,22 @@ async fn a_remote_agents_failed_setup_runs_again_for_the_user_and_the_agent() {
     let agent_dir = agent_home(&node_dir, &machine.credential_id, &agent_id);
     let work = agent_dir.join("work");
     std::fs::write(work.join("agent-new.txt"), "agent work during the retry\n").unwrap();
+    // The retry resets the output before anything that can fail, so a
+    // retry that never spawns cannot show the last run's log.
+    let running = setup_until(&mut rpc_ws, (&ws_id, &agent_id), 300, |setup| {
+        setup["state"] == "running"
+            && setup["output"]
+                .as_str()
+                .is_some_and(|out| out.starts_with("Running the setup script again."))
+    })
+    .await;
+    assert!(
+        !running["output"]
+            .as_str()
+            .unwrap()
+            .contains("not-fixed-yet"),
+        "{running}"
+    );
     std::fs::write(work.join("go"), "").unwrap();
     let setup = setup_until(&mut rpc_ws, (&ws_id, &agent_id), 300, |setup| {
         setup["state"] == "completed"

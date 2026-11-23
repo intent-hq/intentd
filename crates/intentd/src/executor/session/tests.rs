@@ -499,3 +499,54 @@ async fn forge_token_frames_of_a_replaced_session_change_nothing() {
     h.runner.adopt_head(None, &[]);
     assert_eq!(held(), None, "a hello without a session drops it");
 }
+
+/// nodeProtocol 22: a `setupRetry` an old session already received when a
+/// newer generation bound starts no retry and answers nothing; the current
+/// session's retry is answered.
+#[tokio::test]
+async fn setup_retry_frames_of_a_replaced_session_start_nothing() {
+    use intent_core::node_link::{
+        setup_retry_codes, LinkId, SetupCommand, SetupRetry, SetupRetryOutcome,
+    };
+    let h = harness();
+    let old = binding(1, "lease-1");
+    let new = binding(2, "lease-2");
+    assert_eq!(
+        adopt(&h.runner, &old, NodeCounter(0), OPEN).await,
+        Adopted::Ready
+    );
+    assert_eq!(
+        adopt(&h.runner, &new, NodeCounter(0), OPEN).await,
+        Adopted::Ready
+    );
+    let retry = || SetupRetry {
+        request_id: LinkId::new_v4(),
+        agent_id: AgentId::from("a1"),
+        setup: SetupCommand {
+            script: "true\n".into(),
+            branch_name: "feat/x".into(),
+            source_branch: "main".into(),
+            timeout_secs: None,
+        },
+    };
+    assert!(apply_setup_retry(&h.runner, &old, OPEN, retry())
+        .await
+        .is_none());
+    assert!(apply_setup_retry(&h.runner, &new, || true, retry())
+        .await
+        .is_none());
+    let Some(LinkFrame::SetupRetryReply(reply)) =
+        apply_setup_retry(&h.runner, &new, OPEN, retry()).await
+    else {
+        panic!("the current session answers");
+    };
+    assert_eq!(reply.outcome, SetupRetryOutcome::Refused, "{reply:?}");
+    assert!(
+        reply
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with(setup_retry_codes::NOT_RUNNING),
+        "{reply:?}"
+    );
+}
