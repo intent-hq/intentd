@@ -731,18 +731,21 @@ only on a fresh install: re-installing never switches a computer to or from Orch
 (it keeps its current role and says so). A
 remote machine's actions include **Edit** and **Connect**, with **Test connection** inside
 its editing panel.
-Pending frontend release (not in current builds): the page becomes **Settings → Hosts**.
+Pending frontend release (not in current builds): the page stays **Settings → Machines**
+(some builds called it **Settings → Hosts**; older versions may differ).
 Hosts are the Intent servers the user connects to. Runners are the computers a host runs
 agents on: other hosts allowed to, runner-only installs (formerly nodes) and cloud entries.
-The machine rail becomes the host rail. A host row has a **Switch to** button instead of the
+The machine rail becomes the host rail. A host row's **…** menu has **Switch to** instead of the
 **Connect** action (the host on screen shows **Current**; runner-only rows have neither): it
 adds the host to the window's host rail when the rail is on, shows it, and opens its
-**Settings → Hosts**. This computer's row reads **This computer**, and the host on screen
-shows its plain name (no **(connected backend)**). An orchestrator's row shows a hub icon after its name (tooltip **Host
-only: sends agents to runners**) instead of a subtitle. A saved host stays under Hosts even
+**Settings → Machines**. This computer's row reads **This computer**, and the host on screen
+shows its plain name (no **(connected backend)**). An orchestrator's row shows a hub icon after its name instead of a subtitle. A row whose
+intentd is older than the app's shows an orange dot after its name. Hovering the name
+shows one tooltip with the row's details: **Host only: sends agents to runners**, the
+outdated version, agent load, operating system and providers. A saved host stays under Hosts even
 when it also runs agents for the current host. **Set up a new machine** becomes **Set up a
 host or runner**, with **Install a host** and **Install a runner**.
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{HostOnlyMarker,MachineOrderPlainRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{machine-order,start-on}.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{MachineName,MachineOrderPlainRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{machine-order,start-on}.ts. -->
 <!-- Labs (SSH machine setup, desktop app only): describe only when the user asks about
 installing over SSH, and say it is Labs (turn on **SSH machine setup** in
 Settings → Advanced → Labs). With it on, the install cards also offer
@@ -772,7 +775,7 @@ menu. In **Where <backend> runs agents**, a row shows a status badge only when i
 agents (such as **Unreachable**, **Update required** or **Key rejected**). Pending frontend
 release (not in current builds): while a machine is connected, its row shows how many agents
 run on it in total (**3 agents running**), counting other backends' agents and the machine's
-own; hover it for the agent limit and the whole computer's CPU and memory use. The count
+own; hover the machine's name for the agent limit and the whole computer's CPU and memory use. The count
 updates within seconds of an agent starting or stopping; CPU and memory refresh when they
 move noticeably. Older machines show no CPU or memory. Newer agent sessions see the same figures when they choose a machine, so a coordinator can spread
 sub-agents onto the least busy one; nothing balances the load automatically. An agent started without a **Start on** choice runs on the first row that can run
@@ -789,7 +792,7 @@ omit the placement still get the first available runner. A backend choice saved 
 change follows the order too. Also pending: first-run onboarding on an
 orchestrator checks only git (no Node.js), shows each provider card as **Runs on a
 runner** with no install or sign-in step, and keeps **Let's go** disabled with a link to
-**Settings → Hosts** while its runner list is empty (an orchestrator shows **Settings → Hosts**
+**Settings → Machines** while its runner list is empty (an orchestrator shows **Settings → Machines**
 and reads that list without the Labs **Remote agents** switch; if the list can't be read,
 onboarding does not block). Also pending: on an orchestrator, onboarding and **Settings →
 Providers** offer the providers with profiles: Claude Code, Codex, Grok, Cursor, Auggie
