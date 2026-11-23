@@ -733,8 +733,8 @@ remote machine's actions include **Edit** and **Connect**, with **Test connectio
 its editing panel.
 Pending frontend release (not in current builds): the page stays **Settings → Machines**
 (some builds called it **Settings → Hosts**; older versions may differ), with a **Hosts**
-section and a **Runners** section. On a Mac, **Keep hosts in sync between machines** under
-Hosts shares saved hosts through iCloud Keychain (it replaces the separate Backend Sync section).
+section and a **Runners** section. On a Mac, the **Sync** switch under
+Hosts keeps saved hosts in sync between machines through iCloud Keychain (it replaces the separate Backend Sync section).
 Hosts are the Intent servers the user connects to. Runners are the computers a host runs
 agents on: other hosts allowed to, runner-only installs (formerly nodes) and cloud entries.
 The machine rail becomes the host rail. A host row's **…** menu has **Switch to** instead of the
