@@ -105,7 +105,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "sourceControl.gitlab.oauthClientId",
     "sourceControl.gitlab.apiBaseUrl",
     "identity.provider",
-    crate::sentry_ops::ORGANIZATION_SETTING_PATH,
+    "accounts.sentry.organization",
     "voice.provider",
     "voice.language",
     "voice.openai.model",

@@ -7,8 +7,6 @@
 //! credentials.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::path::Path;
 use std::sync::Arc;
 
 use intent_core::settings_file::AutocompleteService;
@@ -16,6 +14,7 @@ use intent_core::WorkspaceApi;
 use intent_store::Store;
 use serde_json::json;
 
+use crate::test_support::fixtures::EnvGuard;
 use crate::test_support::test_tempdir;
 use crate::{Services, SettingsRegistry};
 
@@ -36,33 +35,16 @@ const SAVED: &[(&str, &str)] = &[
     ("autocomplete.openrouter.apiKey", "sk-or-saved"),
 ];
 
-/// Points the default secrets store, which the module-level token loaders
-/// (GitHub, GitLab, Linear, voice) read, at the daemon's own secrets file,
-/// as in production where both resolve to the same default path.
-struct SecretsFileEnv(Option<OsString>);
-
-impl SecretsFileEnv {
-    fn set(path: &Path) -> Self {
-        let saved = std::env::var_os(SECRETS_FILE_ENV);
-        std::env::set_var(SECRETS_FILE_ENV, path);
-        Self(saved)
-    }
-}
-
-impl Drop for SecretsFileEnv {
-    fn drop(&mut self) {
-        match &self.0 {
-            Some(v) => std::env::set_var(SECRETS_FILE_ENV, v),
-            None => std::env::remove_var(SECRETS_FILE_ENV),
-        }
-    }
-}
-
 #[intent_test_macros::daemon_test]
 async fn saved_credentials_reach_their_integrations() {
     let dir = test_tempdir("intentd-saved-credentials-");
     let secrets_path = dir.path().join(".secrets.json");
-    let _env = SecretsFileEnv::set(&secrets_path);
+    // The module-level token loaders (GitHub, GitLab, Linear, voice) read the
+    // default secrets store; point it at the daemon's file, as in production.
+    let _env = EnvGuard::set_all(&[(
+        SECRETS_FILE_ENV,
+        secrets_path.to_str().expect("utf-8 temp path"),
+    )]);
     let store = Store::open(&dir.path().join("db.sqlite"))
         .await
         .expect("open store");
