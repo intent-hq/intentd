@@ -2679,7 +2679,6 @@ dependencies = [
  "intent-store",
  "intent-test-macros",
  "intentd-test-support",
- "libc",
  "nix 0.31.3",
  "regex",
  "serde_json",

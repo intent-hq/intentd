@@ -32,11 +32,12 @@
 //!   root itself may be a symlink, e.g. a relocated data dir).
 
 use std::fmt::Write as _;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use intent_core::blob::{BlobFile, BlobKey, BlobKind, BlobStorage, LocalBlobStorage};
 use intent_core::{Error, Result};
 use serde_json::Value;
 
@@ -46,8 +47,6 @@ pub(crate) const SCRIPT_OUTPUT_DIR: &str = "script-output";
 const LOG_EXT: &str = ".log";
 /// Longest encoded path segment accepted (common filesystem `NAME_MAX`).
 const MAX_SEGMENT_BYTES: usize = 255;
-/// Suffix of compaction temp files (no `.log`, so never read as a run log).
-const COMPACT_EXT: &str = ".compact";
 /// Age past which a compaction temp file is a crash leftover: a live
 /// compaction finishes in well under a second.
 const STALE_COMPACT_AGE: Duration = Duration::from_secs(300);
@@ -85,10 +84,11 @@ pub(crate) struct SweepReport {
     pub stale_temps_deleted: usize,
 }
 
-/// The on-disk script output store rooted at `<data_dir>/script-output`.
+/// The script output store: one log per run, kept in a [`BlobStorage`]
+/// (on the daemon, files under `<data_dir>/script-output`).
 #[derive(Debug, Clone)]
 pub(crate) struct ScriptOutputStore {
-    root: PathBuf,
+    storage: Arc<dyn BlobStorage>,
     max_bytes_per_run: u64,
 }
 
@@ -97,19 +97,25 @@ impl ScriptOutputStore {
     /// past `max_bytes_per_run` bytes (clamped to at least 1). Nothing is
     /// created on disk until a writer opens.
     pub(crate) fn new(data_dir: &Path, max_bytes_per_run: u64) -> Self {
+        Self::with_storage(
+            Arc::new(LocalBlobStorage::new(data_dir.join(SCRIPT_OUTPUT_DIR))),
+            max_bytes_per_run,
+        )
+    }
+
+    /// A store over `storage` whose run logs never grow past
+    /// `max_bytes_per_run` bytes (clamped to at least 1).
+    pub(crate) fn with_storage(storage: Arc<dyn BlobStorage>, max_bytes_per_run: u64) -> Self {
         Self {
-            root: data_dir.join(SCRIPT_OUTPUT_DIR),
+            storage,
             max_bytes_per_run: max_bytes_per_run.max(1),
         }
     }
 
     /// The store root (`<data_dir>/script-output`).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired by the script output cleanup change")
-    )]
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> PathBuf {
+        self.storage.display_path(&BlobKey::root())
     }
 
     /// The per-run byte cap applied to writers opened from now on.
@@ -127,25 +133,21 @@ impl ScriptOutputStore {
         self.max_bytes_per_run = max_bytes_per_run.max(1);
     }
 
-    /// `<root>/<workspaceId>`.
-    pub(crate) fn workspace_dir(&self, workspace_id: &str) -> Result<PathBuf> {
-        Ok(self.root.join(encode_segment(workspace_id)?))
+    /// `<workspaceId>`.
+    fn workspace_key(workspace_id: &str) -> Result<BlobKey> {
+        segment_key(&BlobKey::root(), encode_segment(workspace_id)?)
     }
 
-    /// `<root>/<workspaceId>/<scriptId>`.
-    pub(crate) fn script_dir(&self, workspace_id: &str, script_id: &str) -> Result<PathBuf> {
-        Ok(self
-            .workspace_dir(workspace_id)?
-            .join(encode_segment(script_id)?))
+    /// `<workspaceId>/<scriptId>`.
+    fn script_key(workspace_id: &str, script_id: &str) -> Result<BlobKey> {
+        segment_key(
+            &Self::workspace_key(workspace_id)?,
+            encode_segment(script_id)?,
+        )
     }
 
-    /// `<root>/<workspaceId>/<scriptId>/<runId>.log`.
-    pub(crate) fn run_path(
-        &self,
-        workspace_id: &str,
-        script_id: &str,
-        run_id: &str,
-    ) -> Result<PathBuf> {
+    /// `<workspaceId>/<scriptId>/<runId>.log`.
+    fn run_key(workspace_id: &str, script_id: &str, run_id: &str) -> Result<BlobKey> {
         let run = encode_segment(run_id)?;
         if run.len() + LOG_EXT.len() > MAX_SEGMENT_BYTES {
             return Err(Error::InvalidParams(format!(
@@ -153,9 +155,39 @@ impl ScriptOutputStore {
                 run_id.len()
             )));
         }
+        segment_key(
+            &Self::script_key(workspace_id, script_id)?,
+            format!("{run}{LOG_EXT}"),
+        )
+    }
+
+    /// `<root>/<workspaceId>`.
+    #[cfg(test)]
+    pub(crate) fn workspace_dir(&self, workspace_id: &str) -> Result<PathBuf> {
         Ok(self
-            .script_dir(workspace_id, script_id)?
-            .join(format!("{run}{LOG_EXT}")))
+            .storage
+            .display_path(&Self::workspace_key(workspace_id)?))
+    }
+
+    /// `<root>/<workspaceId>/<scriptId>`.
+    #[cfg(test)]
+    pub(crate) fn script_dir(&self, workspace_id: &str, script_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .storage
+            .display_path(&Self::script_key(workspace_id, script_id)?))
+    }
+
+    /// `<root>/<workspaceId>/<scriptId>/<runId>.log`.
+    #[cfg(test)]
+    pub(crate) fn run_path(
+        &self,
+        workspace_id: &str,
+        script_id: &str,
+        run_id: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .storage
+            .display_path(&Self::run_key(workspace_id, script_id, run_id)?))
     }
 
     /// Open (creating parents) the append writer for one run. Never fails: an
@@ -167,15 +199,23 @@ impl ScriptOutputStore {
         script_id: &str,
         run_id: &str,
     ) -> RunOutputWriter {
-        let path = match self.run_path(workspace_id, script_id, run_id) {
-            Ok(path) => path,
+        let key = match Self::run_key(workspace_id, script_id, run_id) {
+            Ok(key) => key,
             Err(e) => {
                 tracing::warn!(workspace = %workspace_id, script = %script_id, run = %run_id, error = %e, "script output log disabled: invalid id");
-                return RunOutputWriter::disabled(PathBuf::new(), self.max_bytes_per_run);
+                return RunOutputWriter::disabled(
+                    Arc::clone(&self.storage),
+                    BlobKey::root(),
+                    PathBuf::new(),
+                    self.max_bytes_per_run,
+                );
             }
         };
-        match open_append(&self.root, &path, self.max_bytes_per_run) {
+        let path = self.storage.display_path(&key);
+        match open_append(&*self.storage, &key, &path, self.max_bytes_per_run) {
             Ok((file, len)) => RunOutputWriter {
+                storage: Arc::clone(&self.storage),
+                key,
                 path,
                 file: Some(file),
                 len,
@@ -184,7 +224,12 @@ impl ScriptOutputStore {
             },
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "script output log disabled: open failed");
-                RunOutputWriter::disabled(path, self.max_bytes_per_run)
+                RunOutputWriter::disabled(
+                    Arc::clone(&self.storage),
+                    key,
+                    path,
+                    self.max_bytes_per_run,
+                )
             }
         }
     }
@@ -195,9 +240,10 @@ impl ScriptOutputStore {
         expect(dead_code, reason = "wired by the script output cleanup change")
     )]
     pub(crate) fn exists(&self, workspace_id: &str, script_id: &str, run_id: &str) -> Result<bool> {
-        let path = self.run_path(workspace_id, script_id, run_id)?;
-        check_below_root(&self.root, &path, Walk::Read).map_err(|e| io_err(&path, &e))?;
-        Ok(fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()))
+        let key = Self::run_key(workspace_id, script_id, run_id)?;
+        self.storage
+            .exists(&key)
+            .map_err(|e| self.key_err(&key, &e))
     }
 
     /// The last `max_lines` lines (at least 1) of a run's log and its total
@@ -209,14 +255,14 @@ impl ScriptOutputStore {
         run_id: &str,
         max_lines: usize,
     ) -> Result<Option<TailText>> {
-        let path = self.run_path(workspace_id, script_id, run_id)?;
-        let Some(mut file) = open_read(&self.root, &path)? else {
+        let key = Self::run_key(workspace_id, script_id, run_id)?;
+        let Some(mut file) = self.open_read(&key)? else {
             return Ok(None);
         };
-        let text = tail_lines(&mut file, max_lines.max(1)).map_err(|e| io_err(&path, &e))?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| io_err(&path, &e))?;
-        let total_lines = count_newlines(&mut file).map_err(|e| io_err(&path, &e))? + 1;
+        let err = |e: io::Error| self.key_err(&key, &e);
+        let text = tail_lines(&mut *file, max_lines.max(1)).map_err(err)?;
+        file.seek(SeekFrom::Start(0)).map_err(err)?;
+        let total_lines = count_newlines(&mut *file).map_err(err)? + 1;
         Ok(Some(TailText { text, total_lines }))
     }
 
@@ -229,17 +275,16 @@ impl ScriptOutputStore {
         run_id: &str,
         max_bytes: u64,
     ) -> Result<Option<Vec<u8>>> {
-        let path = self.run_path(workspace_id, script_id, run_id)?;
-        let Some(mut file) = open_read(&self.root, &path)? else {
+        let key = Self::run_key(workspace_id, script_id, run_id)?;
+        let Some(mut file) = self.open_read(&key)? else {
             return Ok(None);
         };
-        let len = file.metadata().map_err(|e| io_err(&path, &e))?.len();
+        let err = |e: io::Error| self.key_err(&key, &e);
+        let len = file.len().map_err(err)?;
         file.seek(SeekFrom::Start(len.saturating_sub(max_bytes)))
-            .map_err(|e| io_err(&path, &e))?;
+            .map_err(err)?;
         let mut bytes = Vec::new();
-        file.take(max_bytes)
-            .read_to_end(&mut bytes)
-            .map_err(|e| io_err(&path, &e))?;
+        file.take(max_bytes).read_to_end(&mut bytes).map_err(err)?;
         Ok(Some(bytes))
     }
 
@@ -254,15 +299,15 @@ impl ScriptOutputStore {
         limit: Option<i64>,
         token: Option<&str>,
     ) -> Result<Value> {
-        let path = self.run_path(workspace_id, script_id, run_id)?;
-        let Some(file) = open_read(&self.root, &path)? else {
+        let key = Self::run_key(workspace_id, script_id, run_id)?;
+        let Some(file) = self.open_read(&key)? else {
             return Ok(
                 intent_services::feature_api::pagination::paginate_text_lines("", limit, token),
             );
         };
         paginate_file(file, limit, token)
             .map(|(page, _)| page)
-            .map_err(|e| io_err(&path, &e))
+            .map_err(|e| self.key_err(&key, &e))
     }
 
     /// Delete one run's log. A missing log is not an error.
@@ -276,28 +321,32 @@ impl ScriptOutputStore {
         script_id: &str,
         run_id: &str,
     ) -> Result<()> {
-        let path = self.run_path(workspace_id, script_id, run_id)?;
-        check_below_root(&self.root, &path, Walk::Delete)
-            .and_then(|()| ignore_missing(fs::remove_file(&path)))
-            .map_err(|e| io_err(&path, &e))
+        let key = Self::run_key(workspace_id, script_id, run_id)?;
+        self.storage
+            .delete(&key)
+            .map_err(|e| self.key_err(&key, &e))
     }
 
     /// Delete every log of one script. A missing folder is not an error.
     pub(crate) fn delete_script(&self, workspace_id: &str, script_id: &str) -> Result<()> {
-        let dir = self.script_dir(workspace_id, script_id)?;
-        remove_tree(&self.root, &dir)
+        let key = Self::script_key(workspace_id, script_id)?;
+        self.storage
+            .delete_prefix(&key)
+            .map_err(|e| self.key_err(&key, &e))
     }
 
     /// Delete every log of one workspace. A missing folder is not an error.
     pub(crate) fn delete_workspace(&self, workspace_id: &str) -> Result<()> {
-        let dir = self.workspace_dir(workspace_id)?;
-        remove_tree(&self.root, &dir)
+        let key = Self::workspace_key(workspace_id)?;
+        self.storage
+            .delete_prefix(&key)
+            .map_err(|e| self.key_err(&key, &e))
     }
 
     /// Decoded IDs of every workspace folder under the root (symlinks and
     /// unrecognized entries are skipped). Empty when the root is missing.
     pub(crate) fn workspace_ids(&self) -> Vec<String> {
-        decoded_children(&self.root, true, &mut SweepReport::default())
+        self.decoded_children(&BlobKey::root(), true, &mut SweepReport::default())
             .into_iter()
             .map(|(_, id)| id)
             .collect()
@@ -322,23 +371,25 @@ impl ScriptOutputStore {
             now.checked_sub(max_age)
         };
         let temp_cutoff = now.checked_sub(STALE_COMPACT_AGE);
-        for (ws_dir, workspace_id) in decoded_children(&self.root, true, &mut report) {
-            for (script_dir, script_id) in decoded_children(&ws_dir, true, &mut report) {
+        for (ws_key, workspace_id) in self.decoded_children(&BlobKey::root(), true, &mut report) {
+            for (script_key, script_id) in self.decoded_children(&ws_key, true, &mut report) {
                 if let Some(cutoff) = temp_cutoff {
-                    remove_stale_temps(&script_dir, cutoff, &mut report);
+                    let temps = self.storage.remove_stale_temps(&script_key, cutoff);
+                    report.stale_temps_deleted += temps.deleted;
+                    report.failed += temps.failed;
                 }
                 let Some(cutoff) = log_cutoff else { continue };
-                for (path, run_id) in decoded_children(&script_dir, false, &mut report) {
+                for (log_key, run_id) in self.decoded_children(&script_key, false, &mut report) {
                     let key = RunKey {
                         workspace: workspace_id.clone(),
                         script: script_id.clone(),
                         run: run_id,
                     };
-                    let modified = match fs::metadata(&path).and_then(|m| m.modified()) {
+                    let modified = match self.storage.modified(&log_key) {
                         Ok(t) => t,
                         Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                         Err(e) => {
-                            tracing::warn!(path = %path.display(), error = %e, "script output sweep: stat failed");
+                            tracing::warn!(path = %self.storage.display_path(&log_key).display(), error = %e, "script output sweep: stat failed");
                             report.failed += 1;
                             continue;
                         }
@@ -350,53 +401,82 @@ impl ScriptOutputStore {
                         report.skipped_live += 1;
                         continue;
                     }
-                    match ignore_missing(fs::remove_file(&path)) {
+                    match self.storage.delete(&log_key) {
                         Ok(()) => report.deleted += 1,
                         Err(e) => {
-                            tracing::warn!(path = %path.display(), error = %e, "script output sweep: delete failed");
+                            tracing::warn!(path = %self.storage.display_path(&log_key).display(), error = %e, "script output sweep: delete failed");
                             report.failed += 1;
                         }
                     }
                 }
-                let _ = fs::remove_dir(&script_dir);
+                self.storage.prune(&script_key);
             }
             if log_cutoff.is_some() {
-                let _ = fs::remove_dir(&ws_dir);
+                self.storage.prune(&ws_key);
             }
         }
         report
     }
-}
 
-/// Delete the regular `*.compact` files in `dir` last modified before
-/// `cutoff` (crash leftovers of [`replace_log`]); symlinks are left alone.
-fn remove_stale_temps(dir: &Path, cutoff: SystemTime, report: &mut SweepReport) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let is_temp = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.ends_with(COMPACT_EXT));
-        if !is_temp || !entry.file_type().is_ok_and(|t| t.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        let stale = fs::symlink_metadata(&path)
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t < cutoff);
-        if !stale {
-            continue;
-        }
-        match ignore_missing(fs::remove_file(&path)) {
-            Ok(()) => report.stale_temps_deleted += 1,
+    fn open_read(&self, key: &BlobKey) -> Result<Option<Box<dyn BlobFile>>> {
+        self.storage
+            .open_read(key)
+            .map_err(|e| self.key_err(key, &e))
+    }
+
+    /// Children of `prefix` (folders when `dirs`, else `*.log` blobs) with
+    /// decoded IDs. Unlistable folders are logged and counted; foreign names
+    /// are skipped.
+    fn decoded_children(
+        &self,
+        prefix: &BlobKey,
+        dirs: bool,
+        report: &mut SweepReport,
+    ) -> Vec<(BlobKey, String)> {
+        let entries = match self.storage.list(prefix) {
+            Ok(entries) => entries,
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "script output sweep: temp delete failed");
+                tracing::warn!(path = %self.storage.display_path(prefix).display(), error = %e, "script output sweep: read_dir failed");
                 report.failed += 1;
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let segment = if dirs {
+                if entry.kind != BlobKind::Folder {
+                    continue;
+                }
+                entry.name.as_str()
+            } else {
+                if entry.kind != BlobKind::Blob {
+                    continue;
+                }
+                let Some(stem) = entry.name.strip_suffix(LOG_EXT) else {
+                    continue;
+                };
+                stem
+            };
+            let Some(id) = decode_segment(segment) else {
+                continue;
+            };
+            if let Ok(key) = prefix.child(entry.name.clone()) {
+                out.push((key, id));
             }
         }
+        out
     }
+
+    fn key_err(&self, key: &BlobKey, e: &io::Error) -> Error {
+        io_err(&self.storage.display_path(key), e)
+    }
+}
+
+/// `parent` with the encoded segment `segment` appended.
+fn segment_key(parent: &BlobKey, segment: String) -> Result<BlobKey> {
+    parent
+        .child(segment)
+        .map_err(|e| Error::InvalidParams(format!("script output id: {e}")))
 }
 
 /// Append writer for one run's log. Every [`append`](Self::append) is written
@@ -404,8 +484,10 @@ fn remove_stale_temps(dir: &Path, cutoff: SystemTime, report: &mut SweepReport) 
 /// first one logs a warning and disables the writer.
 #[derive(Debug)]
 pub(crate) struct RunOutputWriter {
+    storage: Arc<dyn BlobStorage>,
+    key: BlobKey,
     path: PathBuf,
-    file: Option<File>,
+    file: Option<Box<dyn BlobFile>>,
     len: u64,
     cap: u64,
     retry: CompactionRetry,
@@ -422,8 +504,10 @@ struct CompactionRetry {
 }
 
 impl RunOutputWriter {
-    fn disabled(path: PathBuf, cap: u64) -> Self {
+    fn disabled(storage: Arc<dyn BlobStorage>, key: BlobKey, path: PathBuf, cap: u64) -> Self {
         Self {
+            storage,
+            key,
             path,
             file: None,
             len: 0,
@@ -468,14 +552,12 @@ impl RunOutputWriter {
         let Some(file) = self.file.as_mut() else {
             return;
         };
-        let result = write_capped(
-            &self.path,
-            file,
-            &mut self.len,
-            self.cap,
-            &mut self.retry,
-            chunk,
-        );
+        let log = Log {
+            storage: &*self.storage,
+            key: &self.key,
+            path: &self.path,
+        };
+        let result = write_capped(log, file, &mut self.len, self.cap, &mut self.retry, chunk);
         if let Err(e) = result {
             tracing::warn!(path = %self.path.display(), error = %e, "script output log write failed; disabling log for this run");
             self.file = None;
@@ -483,18 +565,26 @@ impl RunOutputWriter {
     }
 }
 
-/// Append `chunk` to the log at `path` (open as `file`, read + append, size
-/// `*len`), keeping it within `cap` bytes. Compaction replaces `*file` with
-/// the handle of the renamed-in log (see [`replace_log`]); the open log is
-/// never truncated or rewritten in place, because concurrent readers hold it.
+/// Where one run's log is kept, for [`write_capped`].
+#[derive(Clone, Copy)]
+struct Log<'a> {
+    storage: &'a dyn BlobStorage,
+    key: &'a BlobKey,
+    path: &'a Path,
+}
+
+/// Append `chunk` to `log` (open as `file`, read + append, size `*len`),
+/// keeping it within `cap` bytes. Compaction replaces `*file` with the handle
+/// of the replaced log ([`BlobStorage::replace`]); the open log is never
+/// truncated or rewritten in place, because concurrent readers hold it.
 /// If the replacement fails, the old log is kept and chunks are still appended
 /// while the log stays within twice the cap; a chunk that would pass that is
 /// dropped from disk (the caller's live stream still carries it). Compaction
 /// is retried once another quarter cap of output has gone by, and the first
 /// failure per run logs one warning.
 fn write_capped(
-    path: &Path,
-    file: &mut File,
+    log: Log<'_>,
+    file: &mut Box<dyn BlobFile>,
     len: &mut u64,
     cap: u64,
     retry: &mut CompactionRetry,
@@ -503,13 +593,13 @@ fn write_capped(
     let chunk_len = chunk.len() as u64;
     let new_len = len.saturating_add(chunk_len);
     if new_len <= cap {
-        return append_chunk(file, len, chunk);
+        return append_chunk(&mut **file, len, chunk);
     }
     let fits_fallback = new_len <= cap.saturating_mul(2);
     if retry.credit > 0 {
         retry.credit = retry.credit.saturating_sub(chunk_len);
         return if fits_fallback {
-            append_chunk(file, len, chunk)
+            append_chunk(&mut **file, len, chunk)
         } else {
             Ok(())
         };
@@ -519,7 +609,7 @@ fn write_capped(
         Vec::new()
     } else {
         let budget = (cap / 2).min(cap - chunk_len).min(*len);
-        newest_bytes_at_line_start(file, *len, budget)?
+        newest_bytes_at_line_start(&mut **file, *len, budget)?
     };
     let tail = if chunk_len > cap {
         &chunk[chunk.len() - usize::try_from(cap).expect("cap < chunk length fits in usize")..]
@@ -527,7 +617,7 @@ fn write_capped(
         chunk
     };
     kept.extend_from_slice(tail);
-    match replace_log(path, &kept) {
+    match log.storage.replace(log.key, &kept) {
         Ok(new_file) => {
             *file = new_file;
             *len = kept.len() as u64;
@@ -537,11 +627,11 @@ fn write_capped(
         Err(e) => {
             if !retry.warned {
                 retry.warned = true;
-                tracing::warn!(path = %path.display(), error = %e, "script output log compaction failed; keeping the old log (output past twice the cap is not saved) and retrying");
+                tracing::warn!(path = %log.path.display(), error = %e, "script output log compaction failed; keeping the old log (output past twice the cap is not saved) and retrying");
             }
             retry.credit = (cap / 4).max(1);
             if fits_fallback {
-                append_chunk(file, len, chunk)
+                append_chunk(&mut **file, len, chunk)
             } else {
                 Ok(())
             }
@@ -549,63 +639,20 @@ fn write_capped(
     }
 }
 
-fn append_chunk(file: &mut File, len: &mut u64, chunk: &[u8]) -> io::Result<()> {
+fn append_chunk(file: &mut dyn BlobFile, len: &mut u64, chunk: &[u8]) -> io::Result<()> {
     file.write_all(chunk)?;
     file.flush()?;
     *len += chunk.len() as u64;
     Ok(())
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Tests set this to make [`rename_log`] fail like a refused Windows rename.
-    static FAIL_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-fn rename_log(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    if FAIL_RENAME.with(std::cell::Cell::get) {
-        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
-    }
-    fs::rename(from, to)
-}
-
-/// Atomically replace the log at `path` with `contents` and return a read +
-/// append handle on the new log. The bytes go to a fresh sibling temp file
-/// (never through a symlink) that is then renamed over `path`, so the log is
-/// never observed truncated or partially written: an already-open reader keeps
-/// reading the complete old file through its handle and a new open sees the
-/// complete new one. On Windows, std opens every file with `FILE_SHARE_DELETE`
-/// and `fs::rename` retries a refused `MoveFileExW` with POSIX rename
-/// semantics, so replacing a log that readers (or the old writer handle) hold
-/// open works on Windows 10 1607+ NTFS; elsewhere the rename may still fail,
-/// which callers handle by keeping the old log. The temp name ends in
-/// [`COMPACT_EXT`], never `.log`, so a sweep never reads it as a run log.
-fn replace_log(path: &Path, contents: &[u8]) -> io::Result<File> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| io::Error::other("script output log has no file name"))?;
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_file_name(format!("{name}.{}-{seq}{COMPACT_EXT}", std::process::id()));
-    let mut opts = OpenOptions::new();
-    opts.create_new(true).read(true).append(true);
-    let mut file = no_follow(opts).open(&tmp)?;
-    let result = file
-        .write_all(contents)
-        .and_then(|()| file.flush())
-        .and_then(|()| rename_log(&tmp, path));
-    if let Err(e) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(file)
-}
-
 /// The newest `budget` bytes of a `len`-byte file, starting after the first
 /// newline when the window opens mid-line (and a newline exists to realign on).
-fn newest_bytes_at_line_start(file: &mut File, len: u64, budget: u64) -> io::Result<Vec<u8>> {
+fn newest_bytes_at_line_start(
+    file: &mut dyn BlobFile,
+    len: u64,
+    budget: u64,
+) -> io::Result<Vec<u8>> {
     if budget == 0 {
         return Ok(Vec::new());
     }
@@ -614,9 +661,7 @@ fn newest_bytes_at_line_start(file: &mut File, len: u64, budget: u64) -> io::Res
     let read_from = start.saturating_sub(1);
     file.seek(SeekFrom::Start(read_from))?;
     let mut buf = Vec::with_capacity(usize::try_from(len - read_from).unwrap_or(0));
-    Read::by_ref(file)
-        .take(len - read_from)
-        .read_to_end(&mut buf)?;
+    file.take(len - read_from).read_to_end(&mut buf)?;
     if start == 0 {
         return Ok(buf);
     }
@@ -630,111 +675,22 @@ fn newest_bytes_at_line_start(file: &mut File, len: u64, budget: u64) -> io::Res
     })
 }
 
-/// How [`check_below_root`] treats the components between the root and a path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Walk {
-    /// Create missing folders; the final component must not be a symlink.
-    Create,
-    /// Stop at the first missing folder; the final component must not be a symlink.
-    Read,
-    /// Stop at the first missing folder; the final component may be a symlink
-    /// (removing a link never touches its target).
-    Delete,
-}
-
-/// Refuse to traverse a symlink (or non-folder) at any component between
-/// `root` and `path`. The root itself may be a symlink.
-fn check_below_root(root: &Path, path: &Path, walk: Walk) -> io::Result<()> {
-    let rel = path
-        .strip_prefix(root)
-        .map_err(|_| io::Error::other("path is outside the script output root"))?;
-    if walk == Walk::Create {
-        fs::create_dir_all(root)?;
-    }
-    let parts: Vec<_> = rel.components().collect();
-    let mut cur = root.to_path_buf();
-    for (i, part) in parts.iter().enumerate() {
-        cur.push(part);
-        let last = i + 1 == parts.len();
-        match fs::symlink_metadata(&cur) {
-            Ok(m) if m.file_type().is_symlink() => {
-                if last && walk == Walk::Delete {
-                    return Ok(());
-                }
-                return Err(io::Error::other(format!(
-                    "refusing to follow symlink {}",
-                    cur.display()
-                )));
-            }
-            Ok(m) if !last && !m.is_dir() => {
-                return Err(io::Error::other(format!(
-                    "{} is not a folder",
-                    cur.display()
-                )));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if last || walk != Walk::Create {
-                    return Ok(());
-                }
-                match fs::create_dir(&cur) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                        // Lost a creation race: re-check what now exists.
-                        let m = fs::symlink_metadata(&cur)?;
-                        if m.file_type().is_symlink() || !m.is_dir() {
-                            return Err(io::Error::other(format!(
-                                "{} is not a folder",
-                                cur.display()
-                            )));
-                        }
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-/// Open options that refuse a symlinked final component (`O_NOFOLLOW`).
-fn no_follow(
-    #[cfg_attr(
-        not(unix),
-        expect(unused_mut, reason = "only the unix O_NOFOLLOW block mutates")
-    )]
-    mut opts: OpenOptions,
-) -> OpenOptions {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    opts
-}
-
 /// Open a run's log for append (creating folders, never through a symlink)
 /// and enforce `cap` on what is already there. Returns the file and its size.
-fn open_append(root: &Path, path: &Path, cap: u64) -> io::Result<(File, u64)> {
-    let open = || {
-        check_below_root(root, path, Walk::Create)?;
-        let mut opts = OpenOptions::new();
-        opts.create(true).read(true).append(true);
-        no_follow(opts).open(path)
-    };
-    // A concurrent sweep may prune the freshly created (still empty) folder.
-    let mut file = match open() {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => open()?,
-        other => other?,
-    };
-    let mut len = file.metadata()?.len();
+fn open_append(
+    storage: &dyn BlobStorage,
+    key: &BlobKey,
+    path: &Path,
+    cap: u64,
+) -> io::Result<(Box<dyn BlobFile>, u64)> {
+    let mut file = storage.open_append(key)?;
+    let mut len = file.len()?;
     if len > cap {
         // Reopened under a smaller cap: keep the newest bytes now.
-        // If the rename fails the oversized log is kept; the writer retries
+        // If the replace fails the oversized log is kept; the writer retries
         // compaction on its next append.
-        let kept = newest_bytes_at_line_start(&mut file, len, cap)?;
-        match replace_log(path, &kept) {
+        let kept = newest_bytes_at_line_start(&mut *file, len, cap)?;
+        match storage.replace(key, &kept) {
             Ok(new_file) => {
                 file = new_file;
                 len = kept.len() as u64;
@@ -747,34 +703,9 @@ fn open_append(root: &Path, path: &Path, cap: u64) -> io::Result<(File, u64)> {
     Ok((file, len))
 }
 
-fn open_read(root: &Path, path: &Path) -> Result<Option<File>> {
-    check_below_root(root, path, Walk::Read).map_err(|e| io_err(path, &e))?;
-    let mut opts = OpenOptions::new();
-    opts.read(true);
-    match no_follow(opts).open(path) {
-        Ok(f) => Ok(Some(f)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(io_err(path, &e)),
-    }
-}
-
-/// Remove a folder tree below the root without traversing a symlinked parent.
-/// `remove_dir_all` itself never follows symlinks inside the tree, and a
-/// symlinked `dir` is removed as a link.
-fn remove_tree(root: &Path, dir: &Path) -> Result<()> {
-    check_below_root(root, dir, Walk::Delete)
-        .and_then(|()| match fs::symlink_metadata(dir) {
-            Ok(m) if m.file_type().is_symlink() => fs::remove_file(dir),
-            Ok(_) => fs::remove_dir_all(dir),
-            Err(e) => Err(e),
-        })
-        .or_else(|e| ignore_missing(Err(e)))
-        .map_err(|e| io_err(dir, &e))
-}
-
 /// The trailing `n` `'\n'`-delimited lines, read backwards in chunks.
-fn tail_lines(file: &mut File, n: usize) -> io::Result<String> {
-    let len = file.metadata()?.len();
+fn tail_lines(file: &mut dyn BlobFile, n: usize) -> io::Result<String> {
+    let len = file.len()?;
     let mut pos = len;
     let mut newlines = 0usize;
     let mut cut = 0u64;
@@ -800,7 +731,7 @@ fn tail_lines(file: &mut File, n: usize) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
-fn count_newlines(file: &mut File) -> io::Result<usize> {
+fn count_newlines(file: &mut dyn BlobFile) -> io::Result<usize> {
     let mut buf = vec![0u8; SCAN_CHUNK];
     let mut count = 0;
     loop {
@@ -817,13 +748,13 @@ fn count_newlines(file: &mut File) -> io::Result<usize> {
 /// once to copy out only the page window's lines. Also returns the largest
 /// line buffer held, which is only ever a returned line.
 fn paginate_file(
-    mut file: File,
+    mut file: Box<dyn BlobFile>,
     limit: Option<i64>,
     token: Option<&str>,
 ) -> io::Result<(Value, usize)> {
     let mut kept_len = 0usize;
     let mut probe = BlankProbe::default();
-    scan_lines(&mut file, |index, event| {
+    scan_lines(&mut *file, |index, event| {
         match event {
             LineEvent::Bytes(bytes) => probe.feed(bytes),
             LineEvent::End => {
@@ -841,7 +772,7 @@ fn paginate_file(
     if win.end > win.start {
         file.seek(SeekFrom::Start(0))?;
         let mut line = Vec::new();
-        scan_lines(&mut file, |index, event| {
+        scan_lines(&mut *file, |index, event| {
             if index < win.start {
                 return true;
             }
@@ -881,7 +812,10 @@ enum LineEvent<'a> {
 /// reporting each line as zero or more byte pieces followed by `End`, until
 /// `f` returns false. The final (possibly empty) segment is always ended.
 /// Never buffers a line.
-fn scan_lines(file: &mut File, mut f: impl FnMut(usize, LineEvent<'_>) -> bool) -> io::Result<()> {
+fn scan_lines(
+    file: &mut dyn BlobFile,
+    mut f: impl FnMut(usize, LineEvent<'_>) -> bool,
+) -> io::Result<()> {
     let mut buf = vec![0u8; SCAN_CHUNK];
     let mut index = 0usize;
     loop {
@@ -968,46 +902,6 @@ impl BlankProbe {
     }
 }
 
-/// Children of `dir` (folders when `dirs`, else `*.log` files) with decoded
-/// IDs. Unreadable folders are logged and counted; foreign names are skipped.
-fn decoded_children(dir: &Path, dirs: bool, report: &mut SweepReport) -> Vec<(PathBuf, String)> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => {
-            tracing::warn!(path = %dir.display(), error = %e, "script output sweep: read_dir failed");
-            report.failed += 1;
-            return Vec::new();
-        }
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let segment = if dirs {
-            if !kind.is_dir() {
-                continue;
-            }
-            name
-        } else {
-            if !kind.is_file() {
-                continue;
-            }
-            let Some(stem) = name.strip_suffix(LOG_EXT) else {
-                continue;
-            };
-            stem
-        };
-        if let Some(id) = decode_segment(segment) {
-            out.push((entry.path(), id));
-        }
-    }
-    out
-}
-
 /// Encode an ID as one safe path segment: `[A-Za-z0-9_-]` pass through, every
 /// other byte (including `.`, `/`, `\`) becomes `%XX`. Injective, so distinct
 /// IDs never share a path, and the result can never be `.`, `..` or contain a
@@ -1064,13 +958,6 @@ pub(crate) fn decode_segment(segment: &str) -> Option<String> {
     }
     let id = String::from_utf8(out).ok()?;
     (!id.is_empty()).then_some(id)
-}
-
-fn ignore_missing(r: io::Result<()>) -> io::Result<()> {
-    match r {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
 }
 
 fn io_err(path: &Path, e: &io::Error) -> Error {
