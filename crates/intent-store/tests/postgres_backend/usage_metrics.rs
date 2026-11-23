@@ -8,7 +8,7 @@
 use intent_core::{Error, Workspace, WorkspaceId};
 use intent_store::{LocalStamp, Store, UsageRateDelta, UsageStatsDelta};
 
-use crate::harness::{exec, parity_test};
+use crate::harness::{admin_write, parity_test};
 
 const T0: &str = "2026-01-01T00:00:00.000Z";
 
@@ -443,8 +443,9 @@ parity_test!(usage_stats_round_trip, |store, tenant, db| {
         .await
         .unwrap();
     if let Some(db) = db {
-        exec(
+        admin_write(
             &db.admin,
+            tenant,
             format!(
                 "INSERT INTO usage_stats_hourly (tenant_id, bucket_utc, model, local_date, local_hour) \
                  VALUES ('{tenant}', '2026-07-25T16:00:00Z', 'Opus 4.8', '2026-07-25', 99)"

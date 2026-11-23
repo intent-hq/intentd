@@ -154,6 +154,50 @@ pub(crate) const QUOTA_FAILOVER_CONTINUATION: &str = "The previous provider ran 
 partway through your reply to the last user message above. Continue that reply from where it \
 stopped. The tool calls and results shown above have already happened: do not repeat them.";
 
+/// Transcript windows [`Services::failed_attempt_did_work`] reads, newest
+/// rows first: a failed attempt leaves one assistant row (plus a notice per
+/// earlier hop) after the user's message, so the small window almost always
+/// reaches it without decoding older turns.
+const FAILED_ATTEMPT_SCAN_WINDOWS: [i64; 2] = [8, 64];
+
+/// Longest assistant text still read as a provider's own limit notice.
+const QUOTA_NOTICE_MAX_CHARS: usize = 400;
+
+/// Whether `messages` (oldest first) hold work after the last user row:
+/// any assistant row that is not just a short quota notice such as Claude
+/// Code's "You've hit your weekly limit · resets …" (each failed hop leaves
+/// its own row). `None` when `messages` holds no user row, so the start of
+/// the attempt is not in view.
+pub(crate) fn attempt_did_work(messages: &[intent_core::AgentMessage]) -> Option<bool> {
+    let start = messages.iter().rposition(|m| m.role == "user")? + 1;
+    Some(
+        messages[start..]
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .any(|m| !is_quota_notice_row(m)),
+    )
+}
+
+/// Whether an assistant row is empty or only a short quota notice.
+fn is_quota_notice_row(message: &intent_core::AgentMessage) -> bool {
+    let mut text = String::new();
+    for block in message.content.as_array().into_iter().flatten() {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            return false;
+        }
+        text.push_str(
+            block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        );
+    }
+    let text = text.trim();
+    text.is_empty()
+        || (text.chars().count() <= QUOTA_NOTICE_MAX_CHARS
+            && intent_acp::message_is_quota_exceeded(text))
+}
+
 /// Whether `err` is the swallowed-attempt marker from `run_prompt_turn`.
 pub(crate) fn is_quota_failover_error(err: &intent_core::Error) -> bool {
     matches!(err, intent_core::Error::Internal(msg) if msg.starts_with(PROMPT_QUOTA_FAILOVER_PREFIX))
@@ -821,7 +865,7 @@ impl Services {
             after_failed_attempt,
             "provider quota exhausted; switching to backup profile"
         );
-        if after_failed_attempt {
+        if after_failed_attempt && self.failed_attempt_did_work(agent_id).await {
             self.quota_failover_replays
                 .lock()
                 .unwrap()
@@ -871,6 +915,39 @@ impl Services {
             profiles,
         )
         .await;
+        true
+    }
+
+    /// Whether the attempt that just failed for quota left work after the
+    /// current user message. A provider that only printed its own limit
+    /// notice did nothing: the backup gets the message itself, not an
+    /// instruction to continue a reply. Errs toward continuing.
+    async fn failed_attempt_did_work(&self, agent_id: &AgentId) -> bool {
+        match self
+            .store
+            .agent_has_assistant_after_last_user(agent_id)
+            .await
+        {
+            Ok(false) => return false,
+            Ok(true) => {}
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "quota failover: transcript probe failed; continuing the turn");
+                return true;
+            }
+        }
+        for window in FAILED_ATTEMPT_SCAN_WINDOWS {
+            match self.store.get_agent_messages(agent_id, Some(window)).await {
+                Ok(messages) => {
+                    if let Some(did_work) = attempt_did_work(&messages) {
+                        return did_work;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "quota failover: transcript read failed; continuing the turn");
+                    return true;
+                }
+            }
+        }
         true
     }
 

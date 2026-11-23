@@ -598,12 +598,9 @@ impl Backend {
     }
 
     async fn node(&self, id: &str) -> RemoteNode {
-        self.services
-            .remote_feature()
-            .unwrap()
-            .node(&self.services, id)
-            .await
-            .unwrap()
+        let feature = self.services.remote_feature().unwrap();
+        feature.node(&self.services, id).await.unwrap();
+        feature.connections.0.remote_node(id).unwrap()
     }
 
     async fn target(&self, machine: &Machine) -> MachineTarget {

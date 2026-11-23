@@ -24,7 +24,6 @@ use intent_services::feature_api::Services;
 
 use super::config::{self, ProviderState};
 use super::{bootstrap, StartFailure, StartOutcome};
-use crate::link::gate::GateLink;
 use crate::methods::AddParams;
 use crate::RemoteFeature;
 
@@ -71,7 +70,7 @@ impl EntryRef {
 
 /// The view of an agent placed on cloud machine `node`, or that waits for
 /// its sandbox (`node` `None`), with E2B entry `entry`.
-fn view(node: Option<(&crate::RemoteNode, &str)>, entry: &EntryRef) -> RemotePlacementView {
+fn view(node: Option<(&crate::Node, &str)>, entry: &EntryRef) -> RemotePlacementView {
     let (node_id, lease_id) = match node {
         Some((node, node_id)) => (node_id.to_owned(), node.status().lease_id),
         None => (String::new(), String::new()),

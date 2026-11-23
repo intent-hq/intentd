@@ -14,7 +14,6 @@ use intent_core::{Error, Result, WorkspaceHome, WorkspaceId};
 use intent_services::feature_api::Services;
 use serde_json::{Map, Value};
 
-use crate::connector::RemoteNode;
 use crate::terminals::home_unavailable;
 use crate::RemoteServicesExt as _;
 
@@ -58,21 +57,21 @@ async fn unreached(
     call_unavailable(home, method, &error.to_string())
 }
 
-/// A use of the home's machine, held while a call runs ([`RemoteNode::begin_use`]).
-type Use = tokio::sync::OwnedRwLockReadGuard<()>;
+/// A use of the home's machine, held while a call runs ([`MachineLink::begin_use`]).
+type Use = intent_node_connections::UseGuard;
 
 /// The home's machine, connected and speaking nodeProtocol 19. With
 /// `gated`, the call is a use of the machine: it waits out an idle pause
 /// before it connects (a pause's own pushes are not gated).
 ///
-/// [`RemoteNode::begin_use`]: crate::RemoteNode::begin_use
+/// [`MachineLink::begin_use`]: intent_node_connections::MachineLink::begin_use
 async fn home_node(
     svc: &Services,
     workspace_id: &WorkspaceId,
     home: &WorkspaceHome,
     method: &str,
     gated: bool,
-) -> Result<(RemoteNode, Option<Use>)> {
+) -> Result<(crate::Node, Option<Use>)> {
     // Detached: the call never reached the home, so it may be retried.
     crate::terminals::ensure_attached(svc, home)?;
     let node_id = home

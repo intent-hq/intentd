@@ -23,6 +23,7 @@ mod connections;
 pub mod connector;
 pub mod final_stop;
 pub mod git;
+pub mod handle;
 mod inbound;
 pub mod ingest;
 pub mod lease;
@@ -33,6 +34,10 @@ pub mod runtime;
 pub mod view;
 
 pub use connections::{InProcessNodeConnections, LifecycleGuard, NodeConnections};
+pub use handle::{
+    MachineAgents, MachineConnection, MachineHomes, MachineLifecycle, MachineLink, QuiesceGuard,
+    UseGuard,
+};
 pub use inbound::{LinkView, NodeInbound};
 pub use ownership::{process_head_session, Fenced, LinkClaim, LinkOwnership, LocalOwnership};
 

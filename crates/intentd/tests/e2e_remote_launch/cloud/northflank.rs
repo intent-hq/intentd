@@ -715,6 +715,7 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
         listed["providerKinds"],
         json!(["e2b", "northflank", "agent37", "vercel"])
     );
+    assert_eq!(listed["diskSettings"], disk_settings(), "{listed}");
 
     let saved = ok(
         &mut rpc_ws,

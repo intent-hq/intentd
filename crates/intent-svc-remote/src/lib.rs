@@ -80,9 +80,13 @@ mod view {
     pub(crate) use intent_node_connections::view::*;
 }
 
-pub use intent_node_connections::connector::{NodeStatus, RemoteNode};
+pub use intent_node_connections::connector::NodeStatus;
 pub use intent_node_connections::runtime::RemoteAgentRuntime;
+pub use intent_node_connections::MachineConnection;
 pub use launch::RemoteLaunch;
+
+/// One machine's connection, as the domain holds it.
+pub type Node = Arc<dyn MachineConnection>;
 
 #[cfg(test)]
 mod tests;
@@ -231,13 +235,13 @@ pub(crate) fn git_storage(svc: &Services) -> Arc<dyn GitStorage> {
 impl RemoteFeature {
     /// The running connector to machine `machine_id`, if one was started.
     #[must_use]
-    pub fn running_node(&self, machine_id: &str) -> Option<RemoteNode> {
+    pub fn running_node(&self, machine_id: &str) -> Option<Node> {
         self.connections.0.running(machine_id)
     }
 
     /// Every running connector.
     #[must_use]
-    pub fn running_nodes(&self) -> Vec<RemoteNode> {
+    pub fn running_nodes(&self) -> Vec<Node> {
         self.connections.0.all()
     }
 
@@ -247,7 +251,7 @@ impl RemoteFeature {
         self.connections.0.connected_machines()
     }
 
-    pub(crate) fn take_node(&self, machine_id: &str) -> Option<RemoteNode> {
+    pub(crate) fn take_node(&self, machine_id: &str) -> Option<Node> {
         self.connections.0.take(machine_id)
     }
 
@@ -332,7 +336,7 @@ impl RemoteFeature {
         self.closed.0.send_replace(true);
         let mut closed = 0;
         for node in self.connections.0.all() {
-            if let Some(node) = self.connections.0.take(&node.shared_ref().machine_id()) {
+            if let Some(node) = self.connections.0.take(&node.machine_id()) {
                 node.shutdown();
                 closed += 1;
             }
@@ -373,7 +377,7 @@ impl RemoteFeature {
     ///
     /// `not-found` for an unknown machine; when its token is missing from
     /// the secret store or its lease has ended.
-    pub(crate) async fn node(&self, svc: &Services, machine_id: &str) -> Result<RemoteNode> {
+    pub(crate) async fn node(&self, svc: &Services, machine_id: &str) -> Result<Node> {
         if !svc.node_mode() {
             if let Some(node) = self.running_node(machine_id) {
                 return Ok(node);
@@ -389,7 +393,7 @@ impl RemoteFeature {
     /// # Errors
     ///
     /// As [`Self::node`].
-    pub(crate) async fn node_locked(&self, svc: &Services, machine_id: &str) -> Result<RemoteNode> {
+    pub(crate) async fn node_locked(&self, svc: &Services, machine_id: &str) -> Result<Node> {
         // Node mode turns this daemon's orchestration off, including acting
         // as a backend: no outbound connector, so no remote agent can reach
         // its workspaces through forwarded calls. The inbound executor link

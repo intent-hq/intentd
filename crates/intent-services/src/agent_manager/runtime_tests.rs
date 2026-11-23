@@ -21,6 +21,9 @@ struct FakeRuntime {
     responses: AtomicUsize,
     /// Prompts still to reject with a provider quota error, before output.
     quota_failures: AtomicUsize,
+    /// What a quota-rejected prompt streams before its error: assistant
+    /// text and, optionally, one completed tool call's command.
+    before_quota: Mutex<Option<(String, Option<String>)>>,
     /// When set, the node reported the agent exited before it started:
     /// every prompt fails before output, as the production runtime does.
     exited: Mutex<Option<String>>,
@@ -45,10 +48,37 @@ impl FakeRuntime {
             stops: AtomicUsize::new(0),
             responses: AtomicUsize::new(0),
             quota_failures: AtomicUsize::new(0),
+            before_quota: Mutex::new(None),
             exited: Mutex::new(None),
             final_stops: AtomicUsize::new(0),
             session_prompt: AtomicBool::new(false),
         })
+    }
+
+    fn stream_before_quota(&self, session_id: &str, text: &str, command: Option<&str>) {
+        let mut updates = Vec::new();
+        if let Some(command) = command {
+            updates.push(json!({
+                "sessionUpdate": "tool_call", "toolCallId": "pre-quota-tool", "title": "Bash",
+                "kind": "execute", "status": "in_progress", "rawInput": {"command": command},
+            }));
+            updates.push(json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "pre-quota-tool",
+                "status": "completed", "rawOutput": format!("ran: {command}"),
+            }));
+        }
+        updates.push(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        }));
+        for update in updates {
+            self.updates
+                .send(IncomingNotification {
+                    method: "session/update".into(),
+                    params: json!({"sessionId": session_id, "update": update}),
+                })
+                .unwrap();
+        }
     }
 
     async fn wait_prompts(&self, count: usize) {
@@ -98,6 +128,10 @@ impl AgentRuntime for FakeRuntime {
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
+                let before = self.before_quota.lock().unwrap().clone();
+                if let Some((text, command)) = before {
+                    self.stream_before_quota(session_id, &text, command.as_deref());
+                }
                 self.entered.notify_one();
                 return Err(AcpError::Rpc(intent_acp::JsonRpcError {
                     code: -32603,
@@ -1030,4 +1064,59 @@ async fn a_remote_session_holding_the_instructions_gets_no_first_prompt_copy() {
         stored.is_some_and(|prompt| prompt.contains("BEHAVIOR-MARKER")),
         "the machine's session gets the stored instructions"
     );
+}
+
+/// A runner agent whose first turn failed before any output (a remote
+/// failover that could not start the backup) left an empty assistant row;
+/// its retry is still its first answered turn, so it is still asked to name
+/// itself and its untitled workspace. The transcript is the one recorded on
+/// an affected backend.
+#[tokio::test]
+async fn a_remote_agents_retry_after_an_empty_failed_turn_still_asks_for_names() {
+    let ws = WorkspaceId::from("ws-remote-naming");
+    let id = AgentId::from("agent-remote-naming");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
+    let store = &mgr.services.store;
+    let mut workspace = store.get_workspace(&ws).await.unwrap();
+    workspace.title = String::new();
+    store.update_workspace(&workspace).await.unwrap();
+    let mut session = store.get_agent_session_with_transcript(&id).await.unwrap();
+    session.name = "Agent".into();
+    session.name_explicitly_set = false;
+    store.update_agent_session(&ws, &session).await.unwrap();
+    let text = |t: &str| json!([{ "type": "text", "text": t }]);
+    for (role, content) in [
+        ("user", text("first")),
+        (
+            "system",
+            text("invalid params: remote-failover-unavailable: the backup couldn't start"),
+        ),
+        ("assistant", json!([])),
+    ] {
+        store
+            .append_agent_message(&id, role, &content, &now_iso())
+            .await
+            .unwrap();
+    }
+
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "try again?".into(),
+        None,
+        super::super::TurnOptions::default(),
+    )
+    .await
+    .unwrap();
+    fake.wait_prompts(1).await;
+    fake.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+    let first = serde_json::to_string(&fake.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(first.contains("ws.workspace.setTitle"), "{first}");
+    assert!(first.contains("ws.workspace.setAgentName"), "{first}");
 }

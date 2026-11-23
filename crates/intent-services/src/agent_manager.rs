@@ -6167,7 +6167,9 @@ impl AgentManager {
     /// `agent-backend-handler.service.ts` (`namingInstructions` block):
     ///
     /// * Fires only on the agent's **first** turn — detected by the absence of
-    ///   any prior `assistant` message in the persisted transcript.
+    ///   any prior non-empty `assistant` message in the persisted transcript
+    ///   (a turn that failed before any output, such as a remote failover
+    ///   that could not start, leaves an empty one).
     /// * Agent naming fires only for generated generic/specialist placeholders
     ///   whose name was not explicitly set — plus, in the Assistant (chief)
     ///   workspace, the chat placeholders ([`is_assistant_chat_placeholder_name`]),
@@ -12866,13 +12868,14 @@ impl AgentManager {
         // after a failed start or for a switch made while the agent had no
         // run, opens with the history.
         let switched = self.services.remote_model_switch_pending(agent_id, session);
+        let failover = self.services.remote_failover_pending(agent_id, session);
         let identity_changed = self.handles.lock().unwrap().get(agent_id).is_some_and(|h| {
             Some(h.spawned_provider.as_str()) != session.provider.as_deref()
                 || h.spawned_model != session.model
         });
         if identity_changed {
             boxed_await(|| self.kill_child_only(agent_id)).await;
-            if !switched && !self.services.remote_failover_pending(agent_id, session) {
+            if !switched && !failover {
                 return Err(Error::InvalidParams(
                     "remote-model-change-unsupported: the remote agent's provider or model changed after launch; create a new agent to use another".into(),
                 ));
@@ -13013,7 +13016,7 @@ impl AgentManager {
             Some(h) => h.wake_listener = Some(listener),
             None => listener.abort(),
         }
-        if switched {
+        if switched || failover {
             self.recreated.lock().unwrap().insert(agent_id.clone());
         }
         Ok(StartedSession {
