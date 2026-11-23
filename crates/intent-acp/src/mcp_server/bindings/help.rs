@@ -39,6 +39,11 @@ fn normalize(topic: &str) -> &str {
         .trim_end_matches('.')
 }
 
+/// Whether `ws.help(topic)` is the workspace namespace.
+pub(crate) fn is_workspace_topic(topic: Option<&str>) -> bool {
+    topic.is_some_and(|topic| normalize(topic) == "workspace")
+}
+
 /// Whether `ws.help(topic)` should carry the remote-placement reference.
 pub(crate) fn wants_placement_help(topic: Option<&str>) -> bool {
     topic.is_some_and(|topic| PLACEMENT_HELP_TOPICS.contains(&normalize(topic)))

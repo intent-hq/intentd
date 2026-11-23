@@ -821,6 +821,10 @@ async fn on_blocking<T: Send + 'static>(
 }
 
 impl WorkspaceApi for NodeApi {
+    fn offers_setup_retry(&self) -> bool {
+        self.head.head.last_protocol() >= intent_core::node_link::SETUP_RETRY_PROTOCOL
+    }
+
     fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
         Box::pin(async move {
             self.check(&workspace_id).ok()?;

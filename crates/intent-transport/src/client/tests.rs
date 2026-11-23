@@ -1013,6 +1013,7 @@ fn runtime_capabilities_are_added_only_when_on() {
             "remoteMachineModels": 1,
             "remoteMachineClaim": 1,
             "machineOrder": 1,
+            "remoteSetupRetry": 1,
         })
     );
     assert_eq!(
@@ -1034,6 +1035,7 @@ fn runtime_capabilities_are_added_only_when_on() {
             "remoteMachineModels": 1,
             "remoteMachineClaim": 1,
             "machineOrder": 1,
+            "remoteSetupRetry": 1,
             "startupStatus": 1,
         })
     );

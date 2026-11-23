@@ -118,6 +118,7 @@ router agent.respondPermission
 router agent.restore
 router agent.retire
 router agent.retry
+router agent.retrySetup
 router agent.rpcMethods
 router agent.sendMessage
 router agent.sendQueuedMessageNow

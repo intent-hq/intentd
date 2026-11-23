@@ -52,6 +52,7 @@ forbidden-to-agent agent.respondPermission
 mutating agent.restore
 mutating agent.retire
 mutating agent.retry
+mutating agent.retrySetup
 read agent.rpcMethods
 mutating agent.sendMessage
 mutating agent.sendQueuedMessageNow

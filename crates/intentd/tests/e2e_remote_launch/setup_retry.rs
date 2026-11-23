@@ -202,12 +202,13 @@ async fn a_remote_agents_failed_setup_runs_again_for_the_user_and_the_agent() {
         &mut rpc_ws,
         &mut events,
         (&ws_id, &self_id),
-        r#"wsapi await ws.file.write("fixed", ""); const r = await ws.workspace.retrySetup(); const d = await ws.workspace.details(); return JSON.stringify({ marker: "turn-retry", r, setup: d.setupStatus });"#,
+        r#"wsapi const h = String(await ws.help("workspace")).includes("ws.workspace.retrySetup("); await ws.file.write("fixed", ""); const r = await ws.workspace.retrySetup(); const d = await ws.workspace.details(); return JSON.stringify({ marker: "turn-retry", h, r, setup: d.setupStatus });"#,
         "turn-retry",
         800,
     )
     .await;
     let value = wsapi_value(&retried);
+    assert_eq!(value["h"], true, "ws.help documents the call: {value}");
     assert_eq!(value["r"]["state"], "completed", "{value}");
     assert_eq!(value["r"]["exitCode"], 0, "{value}");
     assert!(value["r"]["startedAt"].is_string(), "{value}");

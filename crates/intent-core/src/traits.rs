@@ -2517,6 +2517,14 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { None })
     }
 
+    /// Whether this agent's `ws.help("workspace")` documents
+    /// `ws.workspace.retrySetup()`: a remote agent on a machine whose link to
+    /// its backend has the setup retry. Only such an agent can use it, so
+    /// the call stays out of every session's tool description.
+    fn offers_setup_retry(&self) -> bool {
+        false
+    }
+
     /// `ws.agent.machineModels` for agents in `workspace_id`: the backend's
     /// `remoteMachines.models` with `params` (`nodeId`, `provider`, `model`),
     /// called in process without the wire's owner check. Only where

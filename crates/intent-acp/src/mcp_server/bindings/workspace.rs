@@ -49,6 +49,11 @@ pub(crate) const PRELUDE: &str = r"
     };
 ";
 
+/// The `ws.help("workspace")` line of `ws.workspace.retrySetup()`, added
+/// only for a remote agent that can use it
+/// ([`intent_core::WorkspaceApi::offers_setup_retry`]).
+pub(crate) const RETRY_SETUP_HELP: &str = "  ws.workspace.retrySetup() → { state, exitCode?, error?, startedAt?, finishedAt?, output? }  // Run the workspace setup script again in your own checkout on this machine after it failed there (fix the cause first). Waits for the result within the call and returns the last 4 KiB of its `output`; `state: \"running\"` means it is still running, so call it again to keep waiting. `ws.workspace.details().setupStatus` follows the run. A refusal starts with its code: `setup-retry-not-failed`, `setup-retry-shared-checkout` (a sub-agent in its parent's checkout), `setup-retry-no-script`, `agent-not-running`, `machine-update-required`.";
+
 const PROPOSE_SIBLING_PRELUDE: &str = "        proposeSibling: (params) =>\n            host({ method: 'workspace.proposeSibling', args: params || {} }),\n";
 const APPLY_PROPOSAL_PRELUDE: &str = "        applyProposal: (proposalId, options) =>\n            host({ method: 'workspace.applyProposal', args: { proposalId, options } }),\n";
 

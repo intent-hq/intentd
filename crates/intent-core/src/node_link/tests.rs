@@ -94,9 +94,9 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     // agent secrets on the machine, 15 the backend's forge token, 16 reads
     // of an agent's checkout files, 17 sub-agent fetch through the backend,
     // 18 an orchestrator's quick actions on the machine, 19 workspace
-    // homes, 20 run exit reasons; a protocol-7 peer still binds and runs
-    // agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 21 });
+    // homes, 20 run exit reasons, 21 the provider session `_meta`, 22 the
+    // setup retry; a protocol-7 peer still binds and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 22 });
     assert_eq!(ONE_SHOT_PROTOCOL, 18);
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
@@ -379,6 +379,7 @@ fn executor_link_requests_golden() {
             "secretForget",
             "secretList",
             "secretPut",
+            "setupRetry",
             "skills",
             "stop",
         ]
@@ -1141,9 +1142,10 @@ fn frames_are_routed_to_their_lane() {
             Control, Control, Control, Control, Control, Control, Control, Control, Control,
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
             Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
-            Control, Control, Control, Control, Control, Control, Control, Control, Script, Script,
-            Script, Rpc, Rpc, Rpc, Control, Control, Control, Control, Control, Control, Control,
-            Control, Control, Control, Control, Script, Script, Rpc, Rpc, Rpc, Script,
+            Control, Control, Control, Control, Control, Control, Control, Control, Control,
+            Control, Script, Script, Script, Rpc, Rpc, Rpc, Control, Control, Control, Control,
+            Control, Control, Control, Control, Control, Control, Control, Script, Script, Rpc,
+            Rpc, Rpc, Script,
         ]
     );
 }
