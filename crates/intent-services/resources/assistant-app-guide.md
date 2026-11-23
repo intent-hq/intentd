@@ -736,18 +736,28 @@ only on a fresh install: re-installing never switches a computer to or from Orch
 (it keeps its current role and says so). A
 remote machine's actions include **Edit** and **Connect**, with **Test connection** inside
 its editing panel.
-Pending frontend release (not in current builds): the page becomes **Settings → Hosts**.
+Pending frontend release (not in current builds): the page stays **Settings → Machines**
+(some builds called it **Settings → Hosts**; older versions may differ), with a **Hosts**
+section and a **Runners** section. On a Mac, **Keep hosts in sync between machines** under
+Hosts syncs saved hosts through iCloud Keychain (it replaces the separate Backend Sync section).
 Hosts are the Intent servers the user connects to. Runners are the computers a host runs
 agents on: other hosts allowed to, runner-only installs (formerly nodes) and cloud entries.
-The machine rail becomes the host rail. A host row has a **Switch to** button instead of the
+The machine rail becomes the host rail. A host row's **…** menu has **Switch to** instead of the
 **Connect** action (the host on screen shows **Current**; runner-only rows have neither): it
 adds the host to the window's host rail when the rail is on, shows it, and opens its
-**Settings → Hosts**. This computer's row reads **This computer**, and the host on screen
-shows its plain name (no **(connected backend)**). An orchestrator's row shows a hub icon after its name (tooltip **Host
-only: sends agents to runners**) instead of a subtitle. A saved host stays under Hosts even
-when it also runs agents for the current host. **Set up a new machine** becomes **Set up a
-host or runner**, with **Install a host** and **Install a runner**.
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{HostOnlyMarker,MachineOrderPlainRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{machine-order,start-on}.ts. -->
+**Settings → Machines**. This computer's row reads **This computer**, and the host on screen
+shows its plain name (no **(connected backend)**). An orchestrator's row shows a hub icon after its name instead of a subtitle. A row whose
+intentd is older than the app's shows an orange dot after its name. Hovering the name
+shows one plain-text tooltip with the row's details: **Host only: sends agents to runners**,
+**Status**, **Version** (with the app's version when it is older), **Address** for a remote,
+agent load, **OS** and providers. On the host on screen it also lists
+**Runner for** (hosts that may run agents on it), and its **…** menu has **Revoke access
+for <host>** for each; there is no separate Hosts with access section (older versions may differ). A saved host stays
+under Hosts even when it also runs agents for the current host. **Add host** under Hosts opens
+setup with the host choices (paste a link, enter details, **Install a host**); **Add runner**
+under Runners offers **Install a runner** and, when cloud runners can be added, the cloud
+providers.
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{MachineName,MachineOrderPlainRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{machine-order,start-on}.ts. -->
 <!-- Labs (SSH machine setup, desktop app only): describe only when the user asks about
 installing over SSH, and say it is Labs (turn on **SSH machine setup** in
 Settings → Advanced → Labs). With it on, the install cards also offer
@@ -771,13 +781,13 @@ adding it anyway fails with **<machine> is an orchestrator, so it can't run agen
 <backend>. To use it, switch to it as a host.** (older versions may differ).
 Running agents on those machines is experimental. That list is in the user's order of
 preference, and its first row is marked **Preferred**: **This computer** first by default, then machines and cloud entries as they
-were added (pending frontend release: the list is **Runners for <host>**, with no
+were added (pending frontend release: the list is the **Runners** section, with no
 **Preferred** mark, and the host's own row shows its name with **This host**). Reorder it by dragging a row, or with **Move up** / **Move down** in the row's
 menu. In **Where <backend> runs agents**, a row shows a status badge only when it cannot run
 agents (such as **Unreachable**, **Update required** or **Key rejected**). Pending frontend
 release (not in current builds): while a machine is connected, its row shows how many agents
 run on it in total (**3 agents running**), counting other backends' agents and the machine's
-own; hover it for the agent limit and the whole computer's CPU and memory use. The count
+own; hover the machine's name for the agent limit and the whole computer's CPU and memory use. The count
 updates within seconds of an agent starting or stopping; CPU and memory refresh when they
 move noticeably. Older machines show no CPU or memory. Newer agent sessions see the same figures when they choose a machine, so a coordinator can spread
 sub-agents onto the least busy one; nothing balances the load automatically. An agent started without a **Start on** choice runs on the first row that can run
@@ -794,7 +804,7 @@ omit the placement still get the first available runner. A backend choice saved 
 change follows the order too. Also pending: first-run onboarding on an
 orchestrator checks only git (no Node.js), shows each provider card as **Runs on a
 runner** with no install or sign-in step, and keeps **Let's go** disabled with a link to
-**Settings → Hosts** while its runner list is empty (an orchestrator shows **Settings → Hosts**
+**Settings → Machines** while its runner list is empty (an orchestrator shows **Settings → Machines**
 and reads that list without the Labs **Remote agents** switch; if the list can't be read,
 onboarding does not block). Also pending: on an orchestrator, onboarding and **Settings →
 Providers** offer the providers with profiles: Claude Code, Codex, Grok, Cursor, Auggie
@@ -1006,7 +1016,7 @@ say it is experimental and being removed, and suggest `@intent-hq/web` instead.
   another public tunnel.
 - If `intentd` is already running on the same machine when `intent-web` starts, it
   appears as **This machine (local)**; if it is missing, restart `intent-web`. Add
-  other machines in **Settings → Machines → Add machine** with the host, port and token
+  other machines in **Settings → Machines → Add host** (older versions: **Add machine**) with the host, port and token
   from `intentd pair` on that machine, then check the fingerprint and choose
   **Confirm & connect**. With no machine yet, the browser shows **Add your first
   machine**.
