@@ -260,6 +260,11 @@ impl ClientListeners {
 /// Start the client listeners for the tenant served by `services` (its
 /// event bus `bus`), joining every connection to `connections`.
 ///
+/// `reverse` must be the registry installed in `services` (and so in every
+/// clone of it) with `Services::with_reverse_dispatch`: the listeners
+/// register their desktops there, which is where agent browser actions
+/// look for them.
+///
 /// # Errors
 /// When the certificate or the owner token cannot be set up, or a listener
 /// cannot bind.
@@ -267,10 +272,10 @@ pub async fn start_client_listeners(
     config: &ListenConfig,
     services: &Services,
     bus: &EventBus,
+    reverse: Arc<PrimaryReverseRegistry>,
     connections: &ClientConnections,
 ) -> Result<ClientListeners, String> {
     let hook = ConnectionHook::new(Arc::new(TenantConnections(connections.clone())));
-    let reverse = Arc::new(PrimaryReverseRegistry::new());
     // The tenant's `server.maxOutstandingRpcs` (its own config.toml), across
     // both listeners, as `intentd` caps its own.
     let limiter = RpcLimiter::new(services.settings_registry().map_or(
