@@ -770,6 +770,7 @@ impl Runner {
                     )),
                     started_at: None,
                     finished_at: Some(intent_core::now_iso()),
+                    retry: false,
                 });
             }
         };
@@ -782,6 +783,7 @@ impl Runner {
                 error: None,
                 started_at: Some(started_at.clone()),
                 finished_at: None,
+                retry: false,
             },
         );
         self.append(home_entry(

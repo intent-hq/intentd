@@ -74,7 +74,10 @@ pub(crate) async fn retry(
         return Err(not_running());
     }
     if node.current_link().is_none() {
-        node.connect().await?;
+        node.connect().await.map_err(|error| match error {
+            Error::MachineUpdateRequired(_) => error,
+            other => unreachable(&status.node_name, &other.to_string()),
+        })?;
     }
     if node.protocol() < SETUP_RETRY_PROTOCOL {
         let status = node.status();

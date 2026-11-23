@@ -3277,9 +3277,11 @@ async fn node_runner_a_stop_during_a_setup_retry_records_it_interrupted() {
     wait_for(&h.runner, "started", started("a1")).await;
     let worktree = h.storage.existing_agent_dir(&AgentId::from("a1")).unwrap();
     std::fs::write(worktree.join("slow"), "").unwrap();
-    let first = h.runner.setup_retry(setup_retry("a1", script)).await;
+    let (first, joined) = tokio::join!(
+        h.runner.setup_retry(setup_retry("a1", script)),
+        h.runner.setup_retry(setup_retry("a1", script)),
+    );
     assert_eq!(first.outcome, SetupRetryOutcome::Started, "{first:?}");
-    let joined = h.runner.setup_retry(setup_retry("a1", script)).await;
     assert_eq!(joined.outcome, SetupRetryOutcome::Started, "{joined:?}");
     assert_eq!(joined.started_at, first.started_at, "the same run");
     let pid_file = worktree.join("child.pid");

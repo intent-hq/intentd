@@ -2026,6 +2026,9 @@ impl Runner {
                 if output.is_some() && !settled.stopped {
                     unsent_submodules(&mut settled, &cwd).await;
                 }
+                // Shown before a retry can start (it needs `setup_output`
+                // cleared), so the retry's state is never overwritten.
+                agent.setup_view.set_overlay(settled.overlay.take());
                 *lock(&agent.setup_output) = None;
                 if settled.stopped {
                     Err(None)
@@ -2050,7 +2053,6 @@ impl Runner {
                         helper_env.extend(Self::forge_fetch_env(&agent, socket));
                     }
                     self.find_skills(&agent, &cwd).await;
-                    agent.setup_view.set_overlay(settled.overlay);
                     match workspace_api::serve(
                         &agent.id,
                         &agent.workspace_id,
@@ -2387,7 +2389,10 @@ impl Runner {
         let status = match (fresh, command) {
             (false, _) => match setup::read_status(cwd) {
                 Some(status) if status.state == setup::Recorded::Running => {
-                    setup::exclude_interrupted(cwd, &agent.submodules).await;
+                    // A retry adds no excludes; the agent's files are its own.
+                    if !status.retry {
+                        setup::exclude_interrupted(cwd, &agent.submodules).await;
+                    }
                     status.interrupted()
                 }
                 Some(kept) => {
@@ -2448,7 +2453,7 @@ impl Runner {
             }
         };
         let started_at = intent_core::now_iso();
-        setup::write_status(cwd, &SetupStatus::running(started_at.clone()));
+        setup::write_status(cwd, &SetupStatus::running(started_at.clone(), false));
         self.append(agent_entry(
             agent,
             JournalBody::SetupStarted {
@@ -2531,31 +2536,21 @@ impl Runner {
         {
             return refuse(refused::NOT_FAILED, "the checkout's setup has not failed");
         }
-        let main_checkout = match self.inner.checkouts.main_checkout(&agent.repo_key) {
-            Ok(dir) => dir,
-            Err(error) => {
-                let status = SetupStatus::could_not_start(&format!(
-                    "could not create MAIN_CHECKOUT: {error:#}"
-                ));
-                return self.finish_retry_early(&agent, &cwd, status, reply).await;
-            }
-        };
         let started_at = intent_core::now_iso();
-        let running = SetupStatus::running(started_at.clone());
+        let running = SetupStatus::running(started_at.clone(), true);
         let output = SetupOutput::new(agent.id.clone(), self.inner.head.clone());
         let (stop, mut stopped) = oneshot::channel();
         let (finished, done) = watch::channel(false);
-        if agent
-            .setup_view
-            .begin_retry(setup::RetryRun {
-                started_at: started_at.clone(),
-                output: output.clone(),
-                stop: Some(stop),
-                done,
-            })
-            .is_err()
-        {
-            return refuse(refused::NOT_RUNNING, "the agent is stopping");
+        match agent.setup_view.begin_retry(setup::RetryRun {
+            started_at: started_at.clone(),
+            output: output.clone(),
+            stop: Some(stop),
+            done,
+        }) {
+            Err(setup::Closed) => return refuse(refused::NOT_RUNNING, "the agent is stopping"),
+            // Another call started one meanwhile: join it.
+            Ok(Some(joined)) => return reply(SetupRetryOutcome::Started, Some(joined), None),
+            Ok(None) => {}
         }
         setup::write_status(&cwd, &running);
         agent.setup_view.show(&running);
@@ -2571,49 +2566,37 @@ impl Runner {
         let run_started = started_at.clone();
         drop(intent_core::spawn_daemon(async move {
             let agent = run_agent;
-            let ran = setup::run(
-                &runner.inner.pty,
-                setup::SetupRun {
-                    command: &command,
-                    worktree: &cwd,
-                    tmp: &tmp,
-                    main_checkout: &main_checkout,
-                    pins: &agent.submodules,
-                    retry: true,
-                },
-                &output,
-                run_started.clone(),
-                &mut stopped,
-            )
-            .await;
-            let status = match ran {
-                setup::Ran::Finished(status) => status,
-                setup::Ran::Stopped => SetupStatus::running(run_started).interrupted(),
+            let status = match runner.inner.checkouts.main_checkout(&agent.repo_key) {
+                Err(error) => SetupStatus::could_not_start(&format!(
+                    "could not create MAIN_CHECKOUT: {error:#}"
+                )),
+                Ok(main_checkout) => {
+                    let ran = setup::run(
+                        &runner.inner.pty,
+                        setup::SetupRun {
+                            command: &command,
+                            worktree: &cwd,
+                            tmp: &tmp,
+                            main_checkout: &main_checkout,
+                            pins: &agent.submodules,
+                            retry: true,
+                        },
+                        &output,
+                        run_started.clone(),
+                        &mut stopped,
+                    )
+                    .await;
+                    match ran {
+                        setup::Ran::Finished(status) => status,
+                        setup::Ran::Stopped => {
+                            SetupStatus::running(run_started, true).interrupted()
+                        }
+                    }
+                }
             };
             runner.record_setup(&agent, &cwd, &status).await;
             finished.send_replace(true);
         }));
-        reply(SetupRetryOutcome::Started, Some(started_at), None)
-    }
-
-    /// A retry that failed before its script could start: recorded,
-    /// journaled and answered as a started run that has already ended.
-    async fn finish_retry_early(
-        &self,
-        agent: &Agent,
-        cwd: &Path,
-        status: SetupStatus,
-        reply: impl FnOnce(SetupRetryOutcome, Option<String>, Option<String>) -> SetupRetryReply,
-    ) -> SetupRetryReply {
-        let started_at = intent_core::now_iso();
-        self.append(agent_entry(
-            agent,
-            JournalBody::SetupStarted {
-                started_at: started_at.clone(),
-            },
-        ))
-        .await;
-        self.record_setup(agent, cwd, &status).await;
         reply(SetupRetryOutcome::Started, Some(started_at), None)
     }
 

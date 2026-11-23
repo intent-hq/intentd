@@ -107,7 +107,12 @@ async fn a_remote_agents_failed_setup_runs_again_for_the_user_and_the_agent() {
     assert!(first.contains("workspace setup failed"), "{first}");
     assert!(first.contains("ws.workspace.retrySetup()"), "{first}");
 
-    set_script("echo ran >> setup-runs.txt\necho fixed-by-user\n");
+    // The retry waits for `go`, so the test can work in the checkout while
+    // it runs, as the agent may.
+    set_script(
+        // timing-guard: the script's own poll for the test's `go` file
+        "echo ran >> setup-runs.txt\nwhile [ ! -f go ]; do sleep 0.1; done\necho fixed-by-user\n",
+    );
     // The agent's status can still read as working just after its turn
     // ended: a user's retry is refused `agent-busy` until it settles.
     let mut id = 200;
@@ -141,6 +146,10 @@ async fn a_remote_agents_failed_setup_runs_again_for_the_user_and_the_agent() {
     assert_eq!(result["agentId"], agent_id.as_str(), "{result}");
     assert_eq!(result["setup"]["state"], "running", "{result}");
     assert!(result["setup"]["startedAt"].is_string(), "{result}");
+    let agent_dir = agent_home(&node_dir, &machine.credential_id, &agent_id);
+    let work = agent_dir.join("work");
+    std::fs::write(work.join("agent-new.txt"), "agent work during the retry\n").unwrap();
+    std::fs::write(work.join("go"), "").unwrap();
     let setup = setup_until(&mut rpc_ws, (&ws_id, &agent_id), 300, |setup| {
         setup["state"] == "completed"
             && setup["output"]
@@ -155,7 +164,17 @@ async fn a_remote_agents_failed_setup_runs_again_for_the_user_and_the_agent() {
         !output.contains("not-fixed-yet"),
         "the output starts over: {output}"
     );
-    let work = agent_home(&node_dir, &machine.credential_id, &agent_id).join("work");
+    // The first run's files stay out of `wip`; a file made during the retry
+    // may be the agent's, so the retry excludes nothing.
+    let excludes = std::fs::read_to_string(agent_dir.join("setup-exclude").join("root")).unwrap();
+    assert!(
+        excludes.lines().any(|l| l == "/setup-runs.txt"),
+        "{excludes}"
+    );
+    assert!(
+        !excludes.lines().any(|l| l == "/agent-new.txt"),
+        "{excludes}"
+    );
     assert_eq!(
         std::fs::read_to_string(work.join("setup-runs.txt")).unwrap(),
         "ran\nran\n",

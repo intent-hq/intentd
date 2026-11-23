@@ -100,6 +100,10 @@ pub(super) struct SetupStatus {
     pub started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
+    /// A retry in a kept checkout (nodeProtocol 22): it adds no excludes,
+    /// so one a restart interrupted adds none either.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry: bool,
 }
 
 impl SetupStatus {
@@ -110,6 +114,7 @@ impl SetupStatus {
             error: None,
             started_at: None,
             finished_at: Some(intent_core::now_iso()),
+            retry: false,
         }
     }
 
@@ -120,6 +125,7 @@ impl SetupStatus {
             error: None,
             started_at: None,
             finished_at: None,
+            retry: false,
         }
     }
 
@@ -130,6 +136,7 @@ impl SetupStatus {
             error: Some(format!("{code}: {detail}")),
             started_at,
             finished_at: Some(intent_core::now_iso()),
+            retry: false,
         }
     }
 
@@ -155,14 +162,16 @@ impl SetupStatus {
         )
     }
 
-    /// A setup script that has started.
-    pub(super) fn running(started_at: String) -> Self {
+    /// A setup script that has started; `retry` for a retry in a kept
+    /// checkout.
+    pub(super) fn running(started_at: String, retry: bool) -> Self {
         Self {
             state: Recorded::Running,
             exit_code: None,
             error: None,
             started_at: Some(started_at),
             finished_at: None,
+            retry,
         }
     }
 
@@ -482,14 +491,18 @@ impl SetupView {
             .map(|run| run.started_at.clone())
     }
 
-    /// Record `run` as the retry under way; `Err(Closed)` once the agent
-    /// is stopping.
-    pub(super) fn begin_retry(&self, run: RetryRun) -> Result<(), Closed> {
+    /// Record `run` as the retry under way: `Ok(None)`. A retry already
+    /// under way is kept and joined: `Ok(Some(its startedAt))`, and `run`
+    /// is dropped unstarted. `Err(Closed)` once the agent is stopping.
+    pub(super) fn begin_retry(&self, run: RetryRun) -> Result<Option<String>, Closed> {
         let mut retry = lock(&self.retry);
         let slot = retry.as_mut().map_err(|closed| *closed)?;
+        if let Some(current) = slot.as_ref().filter(|current| !*current.done.borrow()) {
+            return Ok(Some(current.started_at.clone()));
+        }
         *lock(&self.last_output) = Some(run.output.clone());
         *slot = Some(run);
-        Ok(())
+        Ok(None)
     }
 
     /// The agent is stopping: take the retry under way, to stop it, and
@@ -557,19 +570,26 @@ pub(super) async fn run(
 ) -> Ran {
     let dir = agent_dir(run.worktree);
     let excludes = excludes_dir(run.worktree);
-    // A fresh checkout's excludes replace any earlier run's; a retry adds
-    // to them.
-    if !run.retry {
+    // A retry runs while the agent works: a file it creates meanwhile is
+    // the agent's, not the script's, so a retry keeps the earlier runs'
+    // excludes and adds none. A fresh checkout's run replaces them.
+    let before = if run.retry {
+        None
+    } else {
         let _ = std::fs::remove_dir_all(&excludes);
-    }
-    let before = untracked(run.worktree, run.pins).await;
-    match serde_json::to_vec(&before) {
-        Ok(body) => {
-            if let Err(error) = std::fs::write(dir.join(BEFORE_FILE), body) {
-                tracing::warn!(%error, "node: could not record the untracked paths before setup");
+        let before = untracked(run.worktree, run.pins).await;
+        match serde_json::to_vec(&before) {
+            Ok(body) => {
+                if let Err(error) = std::fs::write(dir.join(BEFORE_FILE), body) {
+                    tracing::warn!(%error, "node: could not record the untracked paths before setup");
+                }
             }
+            Err(error) => tracing::warn!(%error, "node: could not encode the untracked paths"),
         }
-        Err(error) => tracing::warn!(%error, "node: could not encode the untracked paths"),
+        Some(before)
+    };
+    if matches!(stop.try_recv(), Ok(())) {
+        return Ran::Stopped;
     }
     output.start_log(&dir.join(LOG_FILE));
     let script = dir.join(format!(
@@ -579,8 +599,10 @@ pub(super) async fn run(
     let ran = spawn_and_wait(pty, &run, &script, output, started_at, stop).await;
     let _ = std::fs::remove_file(&script);
     output.finish();
-    let after = untracked(run.worktree, run.pins).await;
-    write_excludes(run.worktree, &excludes, &before, after);
+    if let Some(before) = before {
+        let after = untracked(run.worktree, run.pins).await;
+        write_excludes(run.worktree, &excludes, &before, after);
+    }
     output.close_log(&dir.join(LOG_FILE));
     ran
 }
@@ -701,6 +723,7 @@ async fn spawn_and_wait(
                 error: None,
                 started_at: started,
                 finished_at,
+                retry: run.retry,
             }
         }
         Some(_) => SetupStatus::failed(
