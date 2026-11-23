@@ -233,6 +233,7 @@ impl Uds {
 }
 
 /// `response`'s result, failing on an error response.
+#[track_caller]
 pub fn result(response: &Value) -> &Value {
     assert!(response.get("error").is_none(), "{response}");
     &response["result"]
@@ -242,6 +243,7 @@ pub fn result(response: &Value) -> &Value {
 pub async fn until(what: &str, mut done: impl FnMut() -> bool) {
     tokio::time::timeout(wait(), async {
         while !done() {
+            // timing-guard: poll interval of the `until` wait on observable state
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
