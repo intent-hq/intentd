@@ -76,6 +76,10 @@ pub(super) mod codes {
     pub const SHUTTING_DOWN: &str = "node-shutting-down";
 }
 
+/// How long a prompt that arrives while a cancelled turn is ending waits
+/// for that turn to end before it is refused as busy.
+const CANCEL_SETTLE: Duration = Duration::from_secs(30);
+
 /// How long a stopped provider gets to exit after SIGTERM before SIGKILL.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 /// How often a running provider's descendants are snapshotted, so helpers
@@ -655,7 +659,10 @@ struct Agent {
     /// a turn waiting for the session can say why it never came.
     exit_detail: Mutex<Option<String>>,
     /// Whether a turn is running; refuses a second one.
-    busy: Mutex<bool>,
+    busy: watch::Sender<bool>,
+    /// The running turn was cancelled: a prompt that arrives before it ends
+    /// waits for it ([`CANCEL_SETTLE`]) instead of being refused.
+    cancelled: std::sync::atomic::AtomicBool,
     marks: mpsc::UnboundedSender<Mark>,
     activity: ActivityTracker,
     /// The provider's descendants at the latest snapshot.
@@ -1723,7 +1730,8 @@ impl Runner {
             journaled: journaled_rx,
             ready: ready_rx,
             exit_detail: Mutex::new(None),
-            busy: Mutex::new(false),
+            busy: watch::Sender::new(false),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
             descendants: Arc::new(Descendants::default()),
             run_marker: intent_core::node_link::LinkId::new_v4().to_string(),
             marks: marks_tx,
@@ -2774,7 +2782,7 @@ impl Runner {
     /// could not run) is journaled as a turn end, a refusal before this
     /// returns.
     pub(super) async fn prompt(&self, agent_id: &AgentId, turn_id: String, prompt: Vec<Value>) {
-        if let Some(refusal) = self.begin_prompt(agent_id, turn_id, prompt) {
+        if let Some(refusal) = self.begin_prompt(agent_id, turn_id, prompt, true) {
             self.append(refusal).await;
         }
     }
@@ -2785,6 +2793,7 @@ impl Runner {
         agent_id: &AgentId,
         turn_id: String,
         prompt: Vec<Value>,
+        wait_for_cancel: bool,
     ) -> Option<JournalEntry> {
         let (agent, workspace) = {
             let state = lock(&self.inner.state);
@@ -2814,18 +2823,34 @@ impl Runner {
                 .unwrap_or_else(|| exit_detail(None, None));
             return workspace.map(|workspace| refuse(workspace, codes::NOT_RUNNING, &detail));
         };
-        {
-            let mut busy = lock(&agent.busy);
-            if *busy {
-                drop(busy);
+        let claimed = agent
+            .busy
+            .send_if_modified(|busy| !std::mem::replace(busy, true));
+        if !claimed {
+            let ordering = std::sync::atomic::Ordering::SeqCst;
+            if !(wait_for_cancel && agent.cancelled.load(ordering)) {
                 return Some(refuse(
                     agent.workspace_id.clone(),
                     codes::BUSY,
                     "a turn is already running",
                 ));
             }
-            *busy = true;
+            // An interrupt: the cancelled turn is still ending.
+            let runner = self.clone();
+            let agent_id = agent_id.clone();
+            let mut busy = agent.busy.subscribe();
+            // caller-binding: allow — node-local wait for a cancelled ACP turn to end
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(CANCEL_SETTLE, busy.wait_for(|busy| !*busy)).await;
+                if let Some(refusal) = runner.begin_prompt(&agent_id, turn_id, prompt, false) {
+                    runner.append(refusal).await;
+                }
+            });
+            return None;
         }
+        agent
+            .cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let runner = self.clone();
         // caller-binding: allow — node-local ACP turn; the node has no service layer
         tokio::spawn(async move {
@@ -2835,7 +2860,10 @@ impl Runner {
                 stop_reason,
                 error,
             });
-            *lock(&agent.busy) = false;
+            agent
+                .cancelled
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            agent.busy.send_replace(false);
             // The agent is idle: send its work back.
             runner.push_wip(&agent, Push::TurnEnd).await;
         });
@@ -3338,6 +3366,11 @@ impl Runner {
         let Some(agent) = agent else { return };
         let ready = agent.ready.borrow().clone();
         if let Some(ready) = ready {
+            if *agent.busy.borrow() {
+                agent
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if let Err(error) =
                 intent_acp::session::cancel(&ready.connection, &ready.session_id).await
             {

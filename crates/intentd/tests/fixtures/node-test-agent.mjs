@@ -33,7 +33,7 @@
 // On start it writes `agent.pid` (its pid and a same-group `sleep` child's
 // pid) into its working directory, so tests can check that stop kills the
 // whole process tree. A prompt whose text contains "block" parks until
-// session/cancel; "slow" waits 300 ms; "many" streams 200 extra chunks;
+// session/cancel (1.5 s after it when it also contains "slow-cancel"); "slow" waits 300 ms; "many" streams 200 extra chunks;
 // The prompt "exit" (exactly) answers and then exits with code 0, leaving its `sleep` child
 // running; "spawn-exit" starts another `sleep` in its own process group,
 // writes its pid to `late-helper.pid`, answers and exits at once; every turn
@@ -218,7 +218,10 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
   }
   if (msg.id === undefined || msg.method === undefined) {
     if (msg.method === 'session/cancel') {
-      while (parked.length) send({ id: parked.shift(), result: { stopReason: 'cancelled' } });
+      while (parked.length) {
+        const { id, delayMs } = parked.shift();
+        setTimeout(() => send({ id, result: { stopReason: 'cancelled' } }), delayMs);
+      }
     }
     return;
   }
@@ -478,7 +481,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
         return;
       }
       if (text.includes('block')) {
-        parked.push(msg.id);
+        parked.push({ id: msg.id, delayMs: text.includes('slow-cancel') ? 1500 : 0 });
         return;
       }
       if (text.includes('slow')) await new Promise((resolve) => setTimeout(resolve, 300));

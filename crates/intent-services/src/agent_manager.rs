@@ -7595,9 +7595,16 @@ impl AgentManager {
         // `mark_idle` below no-op (handle removed, registry deregistered) —
         // fine, a killed child leaves no stragglers to drain and nothing for
         // the idle sweep to hold.
+        let remote = acp_session_id == remote_session_id(agent_id);
         match tokio::time::timeout(SESSION_CANCEL_WRITE_TIMEOUT, conn.cancel(&acp_session_id)).await
         {
             Ok(Ok(())) => self.arm_stale_cancel(agent_id),
+            // The link to the machine is down: the stop is queued for it
+            // instead, so the turn does not keep running there.
+            Ok(Err(e)) if remote => {
+                tracing::info!(agent = %agent_id, error = %e, "remote cancel undeliverable: stopping the run on its machine");
+                self.kill_original_child(agent_id, &repository_origin).await;
+            }
             Ok(Err(e)) if is_cancel_transport_closed(&e) => {
                 // Child already dead — expected race when cancelling a dead
                 // turn; the run_turn branch surfaces the real failure.

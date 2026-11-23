@@ -14,7 +14,7 @@ async fn reply_becomes(
     want: &str,
 ) -> String {
     let mut last = String::new();
-    let reached = timeout(Duration::from_secs(10), async {
+    let reached = timeout(common::test_timeout(Duration::from_secs(10)), async {
         loop {
             *id += 1;
             let got = ok(
@@ -24,10 +24,10 @@ async fn reply_becomes(
                 json!({ "workspaceId": ws_id, "agentId": agent_id }),
             )
             .await;
-            last = got["agent"]["lastAgentResponse"]
+            got["agent"]["lastAgentResponse"]
                 .as_str()
                 .unwrap_or_default()
-                .to_owned();
+                .clone_into(&mut last);
             if last.contains(want) {
                 return;
             }
@@ -155,9 +155,10 @@ async fn interrupt_and_stop_reach_a_remote_agent_mid_turn() {
     let agent = (ws_id.as_str(), agent_id.as_str());
 
     // 1. An interrupt-priority message cuts a running turn and starts at once.
-    send(&mut rpc_ws, agent, 100, "first block", None).await;
+    // The provider ends the cancelled turn only after a while, as real ones do.
+    send(&mut rpc_ws, agent, 100, "first block slow-cancel", None).await;
     let mut id = 200;
-    delta(&mut events, "echo: first block").await;
+    delta(&mut events, "echo: first block slow-cancel").await;
     let sent = send(&mut rpc_ws, agent, 300, "second", Some("interrupt")).await;
     assert_eq!(sent["queued"], false, "the interrupt is not queued: {sent}");
     reply_becomes(&mut rpc_ws, agent, &mut id, "echo: second").await;
@@ -174,7 +175,7 @@ async fn interrupt_and_stop_reach_a_remote_agent_mid_turn() {
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
     .await;
-    let stopped = timeout(Duration::from_secs(10), async {
+    let stopped = timeout(common::test_timeout(Duration::from_secs(10)), async {
         loop {
             let end = stream_end(&mut events, &agent_id).await;
             if end["data"]["stopReason"] == "interrupted" {
