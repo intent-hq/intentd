@@ -102,8 +102,13 @@ snapshots, not local access.
 An agent author's name or avatar opens that agent beside the discussion. If the
 agent is unavailable, the app reports that it cannot open the reference. Sending
 in an existing discussion preserves its message row while confirmation arrives; failed messages can be
-retried without consuming a newer draft. Discussion composers currently support
-text and references, not image pasting or file attachments. The discussion and
+retried without consuming a newer draft. Discussion composers support text and
+references. With a desktop version that includes discussion image sharing, paste,
+drop or use the image button to attach PNG, JPEG, GIF or WebP images; each shows
+as a removable thumbnail until you send. Click an image in the thread to view it
+full size. Agents addressed in the discussion can open these images. Without
+that version, the composer has no image button and sent images appear as text.
+File attachments are not supported. The discussion and
 agent-chat @ menus have different recipient and delivery rules. Sending a message
 with a selected agent in a workspace-wide discussion explicitly addresses that agent.
 
@@ -129,7 +134,7 @@ without moving the messages or monitor cards.
 
 <!-- Sources: packages/cloudlands-fe/src/features/presence/components/{WorkspacePeopleRoster,WorkspacePeopleActivity,PresenceTypingIndicator}.svelte; packages/cloudlands-fe/src/store/renderer/slices/{presence/presence-selectors,workspace-share/workspace-share-selectors}.ts; packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte. -->
 
-<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-transport/src/retired_gate.rs; packages/intentd/crates/intent-store/src/discussion_management_repo.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/features/layout/tab-types/DiscussionTabType.svelte; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-transport/src/retired_gate.rs; packages/intentd/crates/intent-store/src/discussion_management_repo.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMessageImages,DiscussionComposerImages,DiscussionImagePicker,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-images.ts; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/features/layout/tab-types/DiscussionTabType.svelte; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
@@ -1945,15 +1950,18 @@ In Chief, claims use an administrator’s desktop connection.
 
 ## Add context, run a task, and find results
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,WorkspaceAgentsList,WorkspaceShellList,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,ContextItemRow,NotesPanel,ExpandableFileSearch,SidebarHeaderAction,SidebarActionIcon,ChangesRefreshAction,SidebarPrDropdown}.svelte; src/features/external-editors/components/OpenComboButton.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/lib/components/icons/DisclosureIcon.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/multi-select-sidebar-tabs.ts; src/store/renderer/slices/sidebar-nav/sidebar-nav-selectors.ts; src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,WorkspaceAgentsList,WorkspaceShellList,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,ContextItemRow,NotesPanel,ExpandableFileSearch,SidebarHeaderAction,SidebarActionIcon,ChangesRefreshAction,SidebarPrDropdown}.svelte; src/features/external-editors/components/OpenComboButton.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/lib/components/icons/DisclosureIcon.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
 Use the icon tabs above the expanded sidebar's content panel to switch sections.
 They share available width up to a compact limit, then stay grouped at the left.
 Hover over an icon for its section name; scroll the row horizontally when space
 is tight. Faded edges show where more tabs are hidden and clear when you reach
-that end. **Agents** opens by default; your selected section is remembered. Its
-tab shows the main agent's avatar, or a robot while no main agent is available.
-**People** follows **Agents** in both the expanded row and collapsed rail.
+that end. **Agents** opens by default; your selected section is remembered. With
+a desktop version that opens **People** first, **People** comes first in the
+expanded row and collapsed rail, and in a workspace with other people it opens
+above **Agents** until you choose a section. Otherwise **People** follows
+**Agents**. The **Agents** tab shows the main agent's avatar, or a robot while no
+main agent is available.
 A token-usage total appears beside **Agents** once tokens have been used. It
 excludes cached tokens; its details list cached context as a separate row.
 The workspace status image appears as a compact thumbnail in **Context**; click
