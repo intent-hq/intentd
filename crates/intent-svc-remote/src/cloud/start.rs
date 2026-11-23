@@ -420,7 +420,7 @@ pub(crate) async fn begin_start(
     let svc = svc.clone();
     let workspace_id = workspace_id.clone();
     let agent_id = agent_id.clone();
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let outcome = match start(&svc, &workspace_id, &agent_id, &entry.id, started_by).await {
             Ok(()) => Ok(()),
             Err(error) => {

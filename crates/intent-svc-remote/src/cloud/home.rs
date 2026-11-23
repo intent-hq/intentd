@@ -424,7 +424,7 @@ async fn release_inner(svc: &Services, machine_id: &str, ending: Option<&AgentId
     let svc = svc.clone();
     let ending = ending.cloned();
     // caller-binding: allow — deletes one cloud machine nothing needs any more
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let Some(feature) = svc.remote_feature() else {
             return;
         };
@@ -760,7 +760,7 @@ async fn ensure_started(
     let home_id = home.home_id.clone();
     let node_id = home.node_id.clone();
     // caller-binding: allow — starts one workspace's cloud home in the background
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let started = match &node_id {
             Some(node_id) => {
                 let opened = open(&svc, &workspace_id, &home_id, node_id).await;

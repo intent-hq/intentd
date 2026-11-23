@@ -112,6 +112,74 @@ pub struct RemoteFeature {
     /// and the feature's background work (the cloud supervisor, home-move
     /// runners) ends.
     closed: Closed,
+    /// The feature's background work in flight ([`spawn_until_closed`]).
+    background: Background,
+    /// The workspaces whose home move runs on this backend.
+    pub(crate) home_moves: home_move::Running,
+}
+
+/// [`RemoteFeature::background_tasks`]: how many tasks
+/// [`spawn_until_closed`] started that have not ended.
+#[derive(Default)]
+struct Background {
+    running: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// Held by one background task; counts it out when the task ends.
+pub(crate) struct BackgroundTask<'a>(&'a Background);
+
+impl<'a> BackgroundTask<'a> {
+    /// Count a background task of `feature` in, until this is dropped.
+    pub(crate) fn of(feature: &'a RemoteFeature) -> Self {
+        Self::start(&feature.background)
+    }
+
+    fn start(background: &'a Background) -> Self {
+        background
+            .running
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(background)
+    }
+}
+
+impl Drop for BackgroundTask<'_> {
+    fn drop(&mut self) {
+        if self
+            .0
+            .running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+/// Run `work` in the background for `svc`'s remote feature, until it ends or
+/// the feature's links close ([`RemoteFeature::close_links`]): then it is
+/// dropped where it stands, so it makes no further provider call or link
+/// write. Once the links are closed, `work` never starts.
+/// [`RemoteFeature::background_stopped`] waits until none is left.
+pub(crate) fn spawn_until_closed<F>(svc: Services, work: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    // caller-binding: allow — the remote feature's background work, ended by close_links
+    tokio::spawn(async move {
+        let Some(feature) = svc.remote_feature() else {
+            work.await;
+            return;
+        };
+        let _task = BackgroundTask::start(&feature.background);
+        if feature.links_closed() {
+            return;
+        }
+        tokio::select! {
+            () = feature.closed() => {}
+            () = work => {}
+        }
+    });
 }
 
 /// [`RemoteFeature::closed`]: `true` once the links were closed.
@@ -187,6 +255,27 @@ impl RemoteFeature {
     #[must_use]
     pub fn links_closed(&self) -> bool {
         *self.closed.0.borrow()
+    }
+
+    /// How many of the feature's background tasks are running.
+    #[must_use]
+    pub fn background_tasks(&self) -> usize {
+        self.background
+            .running
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until none of the feature's background tasks is running: after
+    /// [`Self::close_links`], every one has ended and no new one starts.
+    /// Cancel-safe.
+    pub async fn background_stopped(&self) {
+        loop {
+            let idle = self.background.idle.notified();
+            if self.background_tasks() == 0 {
+                return;
+            }
+            idle.await;
+        }
     }
 
     /// Wait until [`Self::close_links`] ran. Cancel-safe.

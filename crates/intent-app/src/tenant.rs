@@ -443,6 +443,9 @@ impl TenantRuntime {
         runner.on_machine_links(move || async move {
             if let Some(feature) = crate::remote::RemoteServicesExt::remote_feature(&links) {
                 feature.close_links();
+                // The cloud supervisor, home moves and detached cloud calls
+                // end with the links: none may call a provider after this.
+                feature.background_stopped().await;
             }
         });
         restore_registries(services, startup_work, orchestration).await;

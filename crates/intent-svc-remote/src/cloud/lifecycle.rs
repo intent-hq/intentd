@@ -735,7 +735,7 @@ pub(crate) fn sandbox_lost(
     }
     let svc = svc.clone();
     let row = row.clone();
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
@@ -768,7 +768,7 @@ fn sandbox_outdated(
     link.drop_stops();
     let svc = svc.clone();
     let machine_id = machine_id.to_owned();
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
@@ -983,6 +983,7 @@ pub(crate) fn spawn_supervisor(svc: &Services) {
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
+        let _task = crate::BackgroundTask::of(feature);
         tokio::select! {
             () = feature.closed() => {}
             () = supervise(&svc) => {}
@@ -1217,7 +1218,7 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, why: PauseFo
     let svc = svc.clone();
     let client = client.clone();
     let machine_id = machine_id.to_owned();
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
@@ -1344,7 +1345,7 @@ fn spawn_kill(svc: &Services, feature: &RemoteFeature, client: &Provider, row: &
     let svc = svc.clone();
     let client = client.clone();
     let row = row.clone();
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let Ok(feature) = super::feature(&svc) else {
             return;
         };

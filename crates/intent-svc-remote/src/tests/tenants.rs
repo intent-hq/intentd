@@ -133,3 +133,66 @@ async fn closing_a_backends_links_ends_its_cloud_supervisor() {
     .await
     .expect("a closed backend's supervisor ends, so it makes no more E2B calls");
 }
+
+#[tokio::test]
+async fn closing_a_backends_links_ends_its_background_work_and_starts_no_more() {
+    let backend = Backend::new().await;
+    let feature = backend.services.remote_feature().unwrap();
+    let (started_tx, started) = tokio::sync::oneshot::channel();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = DropFlag(dropped.clone());
+    crate::spawn_until_closed(backend.services.clone(), async move {
+        let _guard = guard;
+        let _ = started_tx.send(());
+        // A provider call that would outlive the fence.
+        std::future::pending::<()>().await;
+    });
+    tokio::time::timeout(wait(), started)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(feature.background_tasks(), 1);
+
+    feature.close_links();
+    tokio::time::timeout(wait(), feature.background_stopped())
+        .await
+        .expect("closing the links ends the background work");
+
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(feature.background_tasks(), 0);
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let late = ran.clone();
+    crate::spawn_until_closed(backend.services.clone(), async move {
+        late.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "no background work starts once the links are closed"
+    );
+}
+
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn each_backend_runs_its_own_home_move_of_a_shared_workspace_id() {
+    let a = Backend::new().await;
+    let b = Backend::new().await;
+    let workspace = workspace();
+
+    assert!(crate::home_move::claim(&a.services, &workspace));
+    assert!(
+        crate::home_move::claim(&b.services, &workspace),
+        "another tenant's move of the same workspace id is not held up"
+    );
+    assert!(
+        !crate::home_move::claim(&a.services, &workspace),
+        "within one tenant, one runner per workspace"
+    );
+}
