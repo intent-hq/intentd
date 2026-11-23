@@ -171,10 +171,15 @@ impl ServedTenant {
         let fence = self.fence.clone();
         let stop = listeners.stopper();
         let tenant = self.tenant.clone();
+        // Ends with the listeners, whichever comes first.
         tokio::spawn(async move {
-            fence.fenced().await;
-            stop.stop().await;
-            tracing::info!(tenant, "the tenant is fenced: its client listeners stopped");
+            tokio::select! {
+                () = fence.fenced() => {
+                    stop.stop().await;
+                    tracing::info!(tenant, "the tenant is fenced: its client listeners stopped");
+                }
+                () = stop.stopped() => {}
+            }
         });
         Ok(listeners)
     }

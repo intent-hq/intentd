@@ -168,8 +168,12 @@ async fn tunnel_and_invite_connections_join_the_set_too() {
     server.stop().await;
 }
 
+/// The close ends a connection whose client never answers it. (The abort
+/// after `SET_CLOSE_GRACE` is a backstop for a loop stuck on a full socket;
+/// here the `1001` frame fits in the socket buffer and the loop ends on
+/// its own.)
 #[tokio::test]
-async fn a_client_that_never_reads_is_forgotten_after_the_close() {
+async fn a_client_that_never_answers_the_close_is_forgotten() {
     let dir = tempfile::tempdir().unwrap();
     let set = Arc::new(TestSet::default());
     let (server, port) = ws_server(&set, dir.path()).await;

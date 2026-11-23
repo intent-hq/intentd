@@ -198,6 +198,7 @@ pub struct ClientListeners {
 pub struct ListenersStop {
     ws: WsApiServer,
     stop_socket: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    stopped: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl ListenersStop {
@@ -213,6 +214,13 @@ impl ListenersStop {
         if let Some(stop) = stop {
             let _ = stop.send(());
         }
+        self.stopped.send_replace(true);
+    }
+
+    /// Wait until [`Self::stop`] ran. Cancel-safe.
+    pub async fn stopped(&self) {
+        let mut stopped = self.stopped.subscribe();
+        let _ = stopped.wait_for(|stopped| *stopped).await;
     }
 }
 
@@ -371,6 +379,7 @@ pub async fn start_client_listeners(
         stop: ListenersStop {
             ws,
             stop_socket: Arc::new(std::sync::Mutex::new(Some(stop_socket))),
+            stopped: Arc::new(tokio::sync::watch::channel(false).0),
         },
         ws_port,
         socket_path,
