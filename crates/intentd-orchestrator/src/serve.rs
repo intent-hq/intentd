@@ -8,6 +8,7 @@ use std::time::Duration;
 use intent_app::tenant::{Admission, TenantRuntime};
 use intent_core::tenant_fence::{SelfFenceReport, TenantFence};
 use intent_core::{Error, Result};
+use intent_services::retention::TenantSweepTiming;
 use intent_services::{EventBus, Services, SettingsRegistry};
 use intent_store::postgres::{
     LeaseHeartbeat, PgPool, PostgresOptions, TenantId, LEASE_RENEW_INTERVAL, LEASE_TTL,
@@ -74,6 +75,32 @@ pub async fn serve_tenant(
     timing: LeaseTiming,
     orchestrator: OrchestratorOnly,
 ) -> Result<ServedTenant> {
+    serve_tenant_with(
+        pool,
+        tenant,
+        data_dir,
+        instance,
+        timing,
+        TenantSweepTiming::default(),
+        orchestrator,
+    )
+    .await
+}
+
+/// [`serve_tenant`], with the tenant's store sweeps (event retention and
+/// the idempotency reaper) on `sweeps`' timing.
+///
+/// # Errors
+/// As [`serve_tenant`].
+pub async fn serve_tenant_with(
+    pool: PgPool,
+    tenant: &str,
+    data_dir: &Path,
+    instance: &str,
+    timing: LeaseTiming,
+    sweeps: TenantSweepTiming,
+    orchestrator: OrchestratorOnly,
+) -> Result<ServedTenant> {
     let id = TenantId::new(tenant)?;
     let (store, lease) = Store::open_postgres_owned(
         pool,
@@ -95,7 +122,15 @@ pub async fn serve_tenant(
     let mut runner = intent_services::self_fence::tenant_self_fence(services.clone())
         .ok_or_else(|| Error::Internal(format!("tenant {tenant}: the store has no fence")))?;
     let admission = Unfenced(fence.clone());
-    let runtime = TenantRuntime::start(&services, &dir, &admission, &admission, &mut runner).await;
+    let runtime = TenantRuntime::start_with_sweeps(
+        &services,
+        &dir,
+        &admission,
+        &admission,
+        &mut runner,
+        sweeps,
+    )
+    .await;
     tracing::info!(tenant, instance, epoch = lease.epoch, "serving the tenant");
     Ok(ServedTenant {
         tenant: tenant.to_owned(),

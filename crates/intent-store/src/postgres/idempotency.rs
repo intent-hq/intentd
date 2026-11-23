@@ -6,6 +6,12 @@ use crate::idempotency_repo::IdempotencyReservation;
 
 use super::{db, PgStore};
 
+/// One reaper batch: `$1` tenant, `$2` cutoff, `$3` batch size.
+const REAP_IDEMPOTENT_SQL: &str = "DELETE FROM idempotency_key WHERE tenant_id = $1 \
+     AND (workspace_id, idempotency_key) IN (SELECT k.workspace_id, k.idempotency_key \
+       FROM idempotency_key k WHERE k.tenant_id = $1 AND k.created_at < $2 COLLATE \"C\" \
+       LIMIT $3)";
+
 impl PgStore {
     /// Inserts a `pending` row for the key, or takes over one that is this
     /// process's or from an older epoch, under the writer lock; else reports
@@ -170,18 +176,14 @@ impl PgStore {
         Ok(inserted > 0)
     }
 
+    /// Deletes the tenant's keys created before `cutoff`, pending or not,
+    /// in bounded batches (each its own writer transaction, see
+    /// `delete_in_batches`). Each batch's `LIMIT` subquery can use
+    /// `idx_idempotency_created` for the range only where the column's
+    /// collation is `"C"` (the comparison is `COLLATE "C"`); otherwise it
+    /// scans the tenant's keys.
     pub async fn reap_idempotent(&self, cutoff: &str) -> Result<u64> {
-        let mut tx = self.begin_write().await?;
-        let removed = sqlx::query(
-            "DELETE FROM idempotency_key WHERE tenant_id = $1 AND created_at < $2 COLLATE \"C\"",
-        )
-        .bind(self.tenant())
-        .bind(cutoff)
-        .execute(&mut *tx)
-        .await
-        .map_err(db)?
-        .rows_affected();
-        tx.commit().await.map_err(db)?;
-        Ok(removed)
+        self.delete_in_batches(REAP_IDEMPOTENT_SQL, cutoff, super::purge::REAP_BATCH_ROWS)
+            .await
     }
 }

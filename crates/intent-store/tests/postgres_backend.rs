@@ -74,6 +74,8 @@ mod principals;
 mod read_snapshots;
 #[path = "postgres_backend/repositories.rs"]
 mod repositories;
+#[path = "postgres_backend/retention.rs"]
+mod retention;
 #[path = "postgres_backend/row_seq.rs"]
 mod row_seq;
 #[path = "postgres_backend/schema_gate.rs"]

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::tenant_fence::SelfFence;
+use intent_services::retention::TenantSweepTiming;
 use intent_services::Services;
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -44,6 +45,14 @@ pub const LOOPS: usize = 13;
 /// How many of them are the backend's own upkeep (`startup_work`), started
 /// in node mode too.
 pub const UPKEEP_LOOPS: usize = 1;
+
+/// The store sweeps a [`TenantRuntime`] adds to [`start_background`]'s
+/// loops ([`start_store_sweeps`]): event retention and the idempotency
+/// reaper. The desktop daemon starts its own from `intentd` main.
+pub const STORE_SWEEP_LOOPS: usize = 2;
+
+/// How many loops a [`TenantRuntime`] keeps when both admissions allow them.
+pub const TENANT_LOOPS: usize = LOOPS + STORE_SWEEP_LOOPS;
 
 /// Restore the registries a restart left in the store, before any listener
 /// serves: event subscriptions, scripts, background hooks and PR monitors
@@ -287,6 +296,34 @@ pub fn start_background(
     }
 }
 
+/// Start the tenant's store sweeps under `startup_work` (backend upkeep):
+/// the event retention loop and the idempotency reaper loop
+/// (`intent_services::retention`), on `services`' store and settings.
+/// Only a [`TenantRuntime`] starts them; the desktop daemon runs its own
+/// from `intentd` main (with `SQLite` pool maintenance), so
+/// [`start_background`] leaves them out.
+#[must_use]
+pub fn start_store_sweeps(
+    services: &Services,
+    startup_work: &impl Admission,
+    timing: TenantSweepTiming,
+) -> Vec<JoinHandle<()>> {
+    let retention_store = services.store().clone();
+    let settings = services.settings_registry();
+    let reap_store = services.store().clone();
+    vec![
+        startup_work.spawn(|| {
+            intent_services::retention::spawn_tenant_retention_loop(
+                retention_store,
+                settings,
+                timing,
+            )
+        }),
+        startup_work
+            .spawn(|| intent_services::retention::spawn_tenant_reap_loop(reap_store, timing)),
+    ]
+}
+
 /// The handles of what [`start_background`] started.
 pub struct Background {
     /// The boot sweep of expired attachment idempotency keys: finite, and
@@ -426,12 +463,35 @@ impl TenantRuntime {
     /// cloud supervisor and home-move runners), then the tasks (every sweep
     /// and loop started here is cancelled, then the PTYs, the host
     /// commands and the agent manager are shut down).
+    ///
+    /// Beyond [`start_background`] it runs the tenant's store sweeps
+    /// ([`start_store_sweeps`]) on their default timing.
     pub async fn start(
         services: &Services,
         data_dir: &Path,
         startup_work: &impl Admission,
         orchestration: &impl Admission,
         runner: &mut SelfFence,
+    ) -> Self {
+        Self::start_with_sweeps(
+            services,
+            data_dir,
+            startup_work,
+            orchestration,
+            runner,
+            TenantSweepTiming::default(),
+        )
+        .await
+    }
+
+    /// [`Self::start`], with the store sweeps on `sweeps`' timing.
+    pub async fn start_with_sweeps(
+        services: &Services,
+        data_dir: &Path,
+        startup_work: &impl Admission,
+        orchestration: &impl Admission,
+        runner: &mut SelfFence,
+        sweeps: TenantSweepTiming,
     ) -> Self {
         let connections = ClientConnections::default();
         let closing = connections.clone();
@@ -449,7 +509,10 @@ impl TenantRuntime {
             }
         });
         restore_registries(services, startup_work, orchestration).await;
-        let background = start_background(services, data_dir, startup_work, orchestration);
+        let mut background = start_background(services, data_dir, startup_work, orchestration);
+        background
+            .loops
+            .extend(start_store_sweeps(services, startup_work, sweeps));
         let loops = background
             .loops
             .iter()

@@ -74,7 +74,7 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
     assert_ne!(a.dir(), b.dir());
     assert!(a.dir().starts_with(dir.path().join("tenants")));
     settled().await;
-    assert_eq!(b.runtime().loops_running(), tenant::LOOPS);
+    assert_eq!(b.runtime().loops_running(), tenant::TENANT_LOOPS);
     assert!(
         !a.fence().is_fenced(),
         "A's heartbeat renews while nothing blocks it"
@@ -117,7 +117,7 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
     ));
     assert_eq!(
         b.runtime().loops_running(),
-        tenant::LOOPS,
+        tenant::TENANT_LOOPS,
         "B's loops keep running"
     );
     assert!(!b.runtime().connections().is_closed());
