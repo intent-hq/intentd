@@ -255,7 +255,7 @@ pub struct MachineUpdateRequired {
 pub const PREPARED_CHECKOUT_REASON: &str = "prepared-checkout";
 
 /// `machine-update-required`'s `reason` when a setup retry needs a machine
-/// linking at nodeProtocol 21 or later.
+/// linking at nodeProtocol 22 or later.
 pub const SETUP_RETRY_REASON: &str = "setup-retry";
 
 impl MachineUpdateRequired {

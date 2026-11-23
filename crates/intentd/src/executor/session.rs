@@ -402,7 +402,7 @@ pub(super) async fn serve_link(
                 });
             }
             // Runs a running agent's setup again in its kept checkout
-            // (nodeProtocol 21); answered once the run has started.
+            // (nodeProtocol 22); answered once the run has started.
             LinkEvent::Frame(LinkFrame::SetupRetry(retry)) if protocol >= SETUP_RETRY_PROTOCOL => {
                 let link = link.clone();
                 let runner = runner.clone();

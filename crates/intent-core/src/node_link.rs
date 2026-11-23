@@ -1977,7 +1977,7 @@ pub struct PushWipResult {
     pub error: Option<String>,
 }
 
-/// Backend to machine (nodeProtocol 21): run `agent_id`'s setup script
+/// Backend to machine (nodeProtocol 22): run `agent_id`'s setup script
 /// `setup` again in its own kept checkout. The machine answers with one
 /// [`SetupRetryReply`] for `request_id`. The body is closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2008,7 +2008,7 @@ pub mod setup_retry_codes {
     pub const NOT_FAILED: &str = "node-setup-retry-not-failed";
 }
 
-/// Machine to backend (nodeProtocol 21): the answer to a [`SetupRetry`]:
+/// Machine to backend (nodeProtocol 22): the answer to a [`SetupRetry`]:
 /// `started` with the run's `startedAt`, or `refused` with `error`
 /// (`"<code>: <detail>"`, [`setup_retry_codes`]). The body is closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2703,9 +2703,9 @@ pub enum LinkFrame {
     HomeCallReply(HomeCallReply),
     /// Machine to backend (nodeProtocol 19): a home's file and git events.
     HomeEvents(HomeEvents),
-    /// Backend to machine (nodeProtocol 21): run an agent's setup again.
+    /// Backend to machine (nodeProtocol 22): run an agent's setup again.
     SetupRetry(SetupRetry),
-    /// Machine to backend (nodeProtocol 21): the answer to a `setupRetry`.
+    /// Machine to backend (nodeProtocol 22): the answer to a `setupRetry`.
     SetupRetryReply(SetupRetryReply),
 }
 

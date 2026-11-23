@@ -406,7 +406,7 @@ pub struct Shared {
     /// (nodeProtocol 13).
     push_waiters: Mutex<HashMap<intent_core::node_link::LinkId, oneshot::Sender<PushWipResult>>>,
     /// Waiting for the machine's `setupRetryReply`, by request id
-    /// (nodeProtocol 21).
+    /// (nodeProtocol 22).
     setup_retry_waiters: Mutex<
         HashMap<
             intent_core::node_link::LinkId,
@@ -2245,7 +2245,7 @@ impl RemoteNode {
     }
 
     /// Ask the machine to run `agent_id`'s setup script `setup` again in its
-    /// kept checkout (`setupRetry`, nodeProtocol 21) and wait up to `wait`
+    /// kept checkout (`setupRetry`, nodeProtocol 22) and wait up to `wait`
     /// for its answer. The caller checks the link's protocol first.
     ///
     /// # Errors

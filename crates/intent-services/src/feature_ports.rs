@@ -1811,12 +1811,12 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
 
     /// Ask remote agent `agent_id`'s machine (the agent placed with `view`)
     /// to run its setup script again in its kept checkout (`setupRetry`,
-    /// nodeProtocol 21) and wait for the answer: the run's status, `running`
+    /// nodeProtocol 22) and wait for the answer: the run's status, `running`
     /// with `startedAt`. The caller has checked the agent's own state.
     ///
     /// # Errors
     ///
-    /// `machine-update-required` below nodeProtocol 21, the machine's
+    /// `machine-update-required` below nodeProtocol 22, the machine's
     /// refusal, `machine-unreachable`; `setup-retry-not-remote` by default.
     fn retry_setup<'a>(
         &'a self,

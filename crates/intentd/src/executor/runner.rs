@@ -605,7 +605,7 @@ struct Agent {
     /// after a reconnect.
     setup_output: Mutex<Option<Arc<SetupOutput>>>,
     /// Its checkout's setup as its workspace API shows it, and a setup
-    /// retry under way (nodeProtocol 21).
+    /// retry under way (nodeProtocol 22).
     setup_view: Arc<SetupView>,
     /// The session's `agentFeatures` snapshot and sub-agent flag, which gate
     /// its workspace API.
@@ -2474,7 +2474,7 @@ impl Runner {
     }
 
     /// Run `retry.agent_id`'s setup script again in its own kept checkout
-    /// (`setupRetry`, nodeProtocol 21): answered `started` once the run is
+    /// (`setupRetry`, nodeProtocol 22): answered `started` once the run is
     /// recorded running and `setupStarted` is journaled; the script runs on
     /// and journals `setupFinished`. A retry under way is joined.
     pub(super) async fn setup_retry(&self, retry: SetupRetry) -> SetupRetryReply {

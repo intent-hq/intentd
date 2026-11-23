@@ -1,6 +1,6 @@
 //! `agent.retrySetup` on the backend (nodes.md "Retrying a remote agent's
 //! setup"): the remote agent's failed setup script runs again in its kept
-//! checkout on its machine (`setupRetry`, nodeProtocol 21). The services
+//! checkout on its machine (`setupRetry`, nodeProtocol 22). The services
 //! layer has checked the agent's own state; this resolves the script again
 //! and asks the machine.
 

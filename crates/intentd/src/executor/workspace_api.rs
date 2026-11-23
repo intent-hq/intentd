@@ -394,7 +394,7 @@ struct Router {
     timeout: Duration,
     /// The agent's checkout's setup status, shown as `setupStatus` in
     /// `workspace.details` (nodeProtocol 10) instead of head's worktree's,
-    /// and followed by `workspace.retrySetup` (nodeProtocol 21).
+    /// and followed by `workspace.retrySetup` (nodeProtocol 22).
     setup_status: Option<Arc<super::setup::SetupView>>,
     /// The agent's checkout, where the git roots head lists relative to it
     /// are resolved.
