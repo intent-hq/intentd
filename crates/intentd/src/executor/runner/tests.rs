@@ -3184,6 +3184,40 @@ async fn node_runner_a_relaunch_waits_for_the_stopped_launchs_removal() {
     h.runner.stop(&AgentId::from("a1"));
 }
 
+/// A relaunch without `checkout` (an older backend) also waits for a
+/// stopped launch's removal, so it never starts in a checkout that the
+/// removal then deletes.
+#[tokio::test]
+async fn node_runner_a_launch_without_checkout_waits_for_the_removal() {
+    let Some(h) = harness(1, &[]) else { return };
+    let script = "echo ran >> setup-runs.txt\n";
+    let worktree = stop_mid_checkout(&h, "a1", script).await;
+
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_discard.lock().unwrap() = Some((reached_tx, release_rx));
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
+    tokio::time::timeout(wait(), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    h.runner.stop(&AgentId::from("a1"));
+    wait_exits(&h.runner, "a1", 2).await;
+
+    h.runner.launch(launch("a1")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !records(&h.runner).await.iter().any(started("a1")),
+        "the launch waits for the earlier removal"
+    );
+    release.send(()).unwrap();
+    wait_for(&h.runner, "started", started("a1")).await;
+    assert!(worktree.exists(), "the started agent's checkout survives");
+    h.runner.stop(&AgentId::from("a1"));
+}
+
 /// Launch `id` with setup `script`, hold its fresh checkout once its
 /// directory exists, and stop it there; returns that partial checkout.
 async fn stop_mid_checkout(h: &Harness, id: &str, script: &str) -> PathBuf {

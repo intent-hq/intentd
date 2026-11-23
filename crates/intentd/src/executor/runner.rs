@@ -1925,6 +1925,8 @@ impl Runner {
             let prepare = async {
                 if output.is_some() {
                     self.pend_setup(&agent).await;
+                } else {
+                    self.await_pending_removal(&agent.id).await;
                 }
                 self.inner
                     .checkouts
@@ -2311,18 +2313,35 @@ impl Runner {
         } else {
             drop(held);
         }
-        {
-            let mut state = lock(&self.inner.state);
-            if state
-                .pending_removals
-                .get(&agent.id)
-                .is_some_and(|removal| Arc::strong_count(removal) == 1)
-            {
-                state.pending_removals.remove(&agent.id);
-            }
-        }
+        self.forget_pending_removal(&agent.id);
         if ready {
             setup::write_status(&worktree, &SetupStatus::pending());
+        }
+    }
+
+    /// A launch without `checkout` waits for a stopped launch's removal of
+    /// the agent's `pending` checkout, as [`Self::pend_setup`] does.
+    async fn await_pending_removal(&self, agent_id: &AgentId) {
+        let removal = lock(&self.inner.state)
+            .pending_removals
+            .get(agent_id)
+            .cloned();
+        if let Some(removal) = removal {
+            drop(removal.lock().await);
+            drop(removal);
+            self.forget_pending_removal(agent_id);
+        }
+    }
+
+    /// Drop the agent's removal lock once nothing holds or waits on it.
+    fn forget_pending_removal(&self, agent_id: &AgentId) {
+        let mut state = lock(&self.inner.state);
+        if state
+            .pending_removals
+            .get(agent_id)
+            .is_some_and(|removal| Arc::strong_count(removal) == 1)
+        {
+            state.pending_removals.remove(agent_id);
         }
     }
 
