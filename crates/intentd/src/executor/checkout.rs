@@ -771,6 +771,14 @@ pub(super) struct PlainCheckouts {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// Holds the next checkout removal before it removes anything, like
+    /// a cache prune waiting behind another agent's fetch.
+    pub(super) hold_discard: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 /// Beside the test home directories (so it outlives a removed checkout):
@@ -831,6 +839,7 @@ impl PlainCheckouts {
             hold_sweep: std::sync::Mutex::default(),
             prepared_homes: std::sync::Mutex::default(),
             hold_prepare: std::sync::Mutex::default(),
+            hold_discard: std::sync::Mutex::default(),
         })
     }
 
@@ -873,6 +882,11 @@ impl Checkouts for PlainCheckouts {
 
     fn discard_checkout<'a>(&'a self, agent_id: &'a AgentId) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let hold = self.hold_discard.lock().unwrap().take();
+            if let Some((reached, release)) = hold {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
             if let Some(worktree) = self.storage.existing_agent_dir(agent_id) {
                 let _ = std::fs::remove_dir_all(worktree);
             }

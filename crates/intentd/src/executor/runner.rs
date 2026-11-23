@@ -1919,17 +1919,23 @@ impl Runner {
                 _ = &mut stop => None,
             }
         } else {
-            if output.is_some() {
-                self.pend_setup(&agent).await;
-            }
+            let prepare = async {
+                if output.is_some() {
+                    self.pend_setup(&agent).await;
+                }
+                self.inner
+                    .checkouts
+                    .prepare(
+                        &agent.id,
+                        &agent.workspace_id,
+                        (&agent.base_commit, &agent.repo_key),
+                        &agent.submodules,
+                        &progress,
+                    )
+                    .await
+            };
             tokio::select! {
-                prepared = self.inner.checkouts.prepare(
-                    &agent.id,
-                    &agent.workspace_id,
-                    (&agent.base_commit, &agent.repo_key),
-                    &agent.submodules,
-                    &progress,
-                ) => Some(prepared),
+                prepared = prepare => Some(prepared),
                 _ = &mut stop => None,
             }
         };
@@ -2277,7 +2283,14 @@ impl Runner {
             if !setup::is_pending(&worktree) {
                 return;
             }
-            self.inner.checkouts.discard_checkout(&agent.id).await;
+            // Its own task: a stop ends the launch without waiting on the
+            // cache lock, and never leaves a half-done removal.
+            let checkouts = self.inner.checkouts.clone();
+            let agent_id = agent.id.clone();
+            let _ = intent_core::spawn_daemon(async move {
+                checkouts.discard_checkout(&agent_id).await;
+            })
+            .await;
             if self.inner.checkouts.existing(&agent.id).is_some() {
                 return;
             }

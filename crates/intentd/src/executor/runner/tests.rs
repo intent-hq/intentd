@@ -3101,6 +3101,47 @@ async fn node_runner_stop_during_checkout_runs_setup_at_the_next_launch() {
     h.runner.stop(&AgentId::from("a1"));
 }
 
+/// A stop while the next launch removes a `pending` checkout (its cache
+/// prune can wait behind another agent's fetch) ends that launch at once,
+/// and the removal still finishes, so a later launch starts fresh.
+#[tokio::test]
+async fn node_runner_a_stop_during_a_pending_checkouts_removal_is_not_held() {
+    use intent_core::node_link::SetupState;
+    let Some(h) = harness(1, &[]) else { return };
+    let script = "echo ran >> setup-runs.txt\n";
+    let worktree = stop_mid_checkout(&h, "a1", script).await;
+
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_discard.lock().unwrap() = Some((reached_tx, release_rx));
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
+    tokio::time::timeout(wait(), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    h.runner.stop(&AgentId::from("a1"));
+    wait_exits(&h.runner, "a1", 2).await;
+    assert!(worktree.exists(), "the removal is still held");
+    release.send(()).unwrap();
+    let deadline = tokio::time::Instant::now() + wait();
+    while worktree.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stop cancelled the removal"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
+    let all = wait_for(&h.runner, "setup recorded", setup_finished("a1")).await;
+    assert_eq!(finished(&all, "a1"), (SetupState::Completed, Some(0), None));
+    h.runner.stop(&AgentId::from("a1"));
+}
+
 /// Launch `id` with setup `script`, hold its fresh checkout once its
 /// directory exists, and stop it there; returns that partial checkout.
 async fn stop_mid_checkout(h: &Harness, id: &str, script: &str) -> PathBuf {
