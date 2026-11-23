@@ -3133,6 +3133,35 @@ impl Services {
         }
     }
 
+    /// The provider session `_meta` remote agent `agent_id`'s machine sends
+    /// on `session/new` and `session/load` (nodeProtocol 21): what a local
+    /// session gets on `session/load`, from the stored system prompt.
+    /// `None` for a provider with no `_meta` injection, or when the session
+    /// cannot be read (the instructions then ride the first prompt).
+    pub async fn remote_session_meta(&self, agent_id: &AgentId) -> Option<Meta> {
+        let session = match self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, %error, "remote launch: no session meta: the session is unreadable");
+                return None;
+            }
+        };
+        let provider_id = intent_providers::base_provider_id(session.provider.as_deref()?);
+        let is_orchestrator = self
+            .resolve_session_is_orchestrator(provider_id, &session)
+            .await;
+        build_session_meta(
+            provider_id,
+            session.system_prompt.as_deref(),
+            None,
+            is_orchestrator,
+        )
+    }
+
     /// Resolve whether the stored session's specialist carries the
     /// `orchestrator` role — the SAME decision that gates the spawn-time
     /// CLI-side denylist (`derive_is_orchestrator` in `agent_manager`, §18.4),

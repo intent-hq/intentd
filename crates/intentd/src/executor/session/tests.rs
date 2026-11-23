@@ -107,6 +107,7 @@ fn launch(id: &str) -> LinkFrame {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::default(),
     })
 }

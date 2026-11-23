@@ -30,7 +30,7 @@ use intent_core::node_link::{
     MachineCapabilities, MachineSkill, PushWipRequest, PushWipResult, SecretForget, SecretList,
     SecretOutcome, SecretPut, SecretReply, SetupState, SkillsQuery, StopId, StopOutcome,
     FINAL_STOP_PROTOCOL, FORGE_FETCH_PROTOCOL, FORGE_TOKEN_PROTOCOL, SECRETS_PROTOCOL,
-    SKILLS_PROTOCOL,
+    SESSION_META_PROTOCOL, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
@@ -2561,7 +2561,17 @@ impl RemoteNode {
         if command.forge_fetch.is_none() {
             command.forge_fetch_modules.clear();
         }
+        if link.protocol() < SESSION_META_PROTOCOL {
+            command.session_meta = None;
+        }
+        let session_prompt = command
+            .session_meta
+            .as_ref()
+            .is_some_and(|meta| meta.contains_key("systemPrompt"));
         link.send(&LinkFrame::Launch(command)).await?;
+        if session_prompt {
+            runtime.set_session_prompt();
+        }
         Ok(runtime)
     }
 

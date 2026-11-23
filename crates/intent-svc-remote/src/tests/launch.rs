@@ -365,6 +365,61 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
     f.node.shutdown();
 }
 
+/// A Claude Code agent's launch carries the provider session `_meta` a
+/// local session gets: its instructions as the system prompt and `Task`
+/// denied, so it delegates through `ws.agent.*`. Its runtime then reports
+/// the instructions as delivered. A link before nodeProtocol 21 gets none.
+#[tokio::test]
+async fn a_claude_code_launch_carries_its_session_meta_from_protocol_21() {
+    use intent_core::agent_runtime::AgentRuntime as _;
+    let (f, mut link, _machine) = fixture().await;
+    for older in [false, true] {
+        let (agent, _view) = f.placed().await;
+        let store = f.services.store();
+        let mut session = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .unwrap();
+        session.provider = Some("claude-code".into());
+        session.system_prompt = Some("REMOTE-INSTRUCTIONS-MARKER".into());
+        store
+            .update_agent_session(&workspace(), &session)
+            .await
+            .unwrap();
+        if older {
+            f.node
+                .shared_ref()
+                .set_protocol_for_test(intent_core::node_link::SESSION_META_PROTOCOL - 1);
+        }
+        let runtime = f.port().runtime(&f.services, &agent).await.unwrap();
+        let launch = link
+            .expect(|frame| match frame {
+                LinkFrame::Launch(command) if command.agent_id == agent => Some(command),
+                _ => None,
+            })
+            .await;
+        assert_eq!(launch.provider, "claude-code");
+        if older {
+            assert_eq!(launch.session_meta, None);
+            assert!(!runtime.session_has_system_prompt());
+            continue;
+        }
+        let meta = launch.session_meta.expect("session meta");
+        assert_eq!(
+            meta["systemPrompt"], "REMOTE-INSTRUCTIONS-MARKER",
+            "{meta:?}"
+        );
+        assert!(
+            meta["claudeCode"]["options"]["disallowedTools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool == "Task")),
+            "{meta:?}"
+        );
+        assert!(runtime.session_has_system_prompt());
+    }
+    f.node.shutdown();
+}
+
 /// The placement change `Started` records is announced as `agent:updated`,
 /// so the agent channel pushes the agent's list row with `isolated`
 /// instead of leaving it at `pending` until the agent is opened (remote

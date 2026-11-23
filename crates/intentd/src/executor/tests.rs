@@ -530,6 +530,7 @@ fn launch_of(id: &str, provider: &str) -> LinkFrame {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::default(),
     })
 }
@@ -904,6 +905,7 @@ async fn executor_shutdown_settles_launches_arriving_on_a_live_link() {
             new_machine: None,
             resumed_from_disk: false,
             harness_version: None,
+            session_meta: None,
             labels: Box::default(),
         })
     };

@@ -58,6 +58,7 @@ fn launch_frame() -> LinkFrame {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::default(),
         profile_env: Some(LaunchProfileEnv(json!({
             "providerRef": "claude-code@work",

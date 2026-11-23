@@ -47,7 +47,8 @@
 // stdio command of the session/new entry named <server> (as a real provider
 // starts a user MCP server), lists its tools and calls <tool>, and streams
 // "mcp: {tools, result}" (or "mcp-error: ..."). session/new writes the
-// servers it got to `session-mcp.json`. A `<system>` block in the prompt is
+// servers it got to `session-mcp.json`, and session/new and session/load
+// write the `_meta` they got (or null) to `session-meta.json`. A `<system>` block in the prompt is
 // ignored. "echo-skills" streams "skills: <names>" from every `<name>` of an
 // `<available_skills>` catalog anywhere in the raw prompt (or "skills: none").
 // A prompt with a block "echo-raw" streams "raw: {cwd, raw}" with its working
@@ -236,6 +237,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       sessionCwd = msg.params?.cwd;
       mcpServers = msg.params?.mcpServers ?? [];
       fs.writeFileSync('session-mcp.json', JSON.stringify(mcpServers));
+      fs.writeFileSync('session-meta.json', JSON.stringify(msg.params?._meta ?? null));
       if (authRequiredSetup) return send({ id: msg.id, error: AUTH_REQUIRED });
       if (failSetupVar) {
         const value = process.env[failSetupVar];
@@ -259,6 +261,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       if (!stored) return send({ id: msg.id, error: { code: -32002, message: `Resource not found: ${id}` } });
       currentSession = id;
       mcpServers = msg.params?.mcpServers ?? [];
+      fs.writeFileSync('session-meta.json', JSON.stringify(msg.params?._meta ?? null));
       const replay = (text) =>
         send({
           method: 'session/update',

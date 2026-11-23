@@ -17,6 +17,7 @@ fn sharing(id: &str, owner: &str) -> LaunchCommand {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::default(),
         ..launch(id)
     }

@@ -23,7 +23,8 @@ use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
     FinalPush, ForgeFetchLaunch, ForgeFetchModule, ForgeLaunch, GitIdentity, LaunchCommand,
     LaunchLabels, LaunchProfileEnv, MachineName, PreparedCheckout, SetupCommand, SubmodulePin,
-    MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SHARED_CHECKOUT_PROTOCOL,
+    MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SESSION_META_PROTOCOL,
+    SHARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
     AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
@@ -1510,6 +1511,15 @@ impl RemoteLaunchPort for RemoteLaunch {
             } else {
                 (None, Vec::new())
             };
+            // The provider session `_meta` a local session gets (for Claude
+            // Code its instructions as the system prompt and the native-tool
+            // denylist), on a link that has it; below, the instructions ride
+            // the first prompt.
+            let session_meta = if link_protocol(&node).await? >= SESSION_META_PROTOCOL {
+                svc.remote_session_meta(agent_id).await.map(Box::new)
+            } else {
+                None
+            };
             let workspace_title = svc
                 .store()
                 .get_workspace(&record.workspace_id)
@@ -1551,6 +1561,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     ),
                     // Every launch, so a rename shows on the machine after
                     // the next one.
+                    session_meta,
                     labels: Box::new(LaunchLabels::new(
                         Some(&session.name),
                         workspace_title.as_deref(),

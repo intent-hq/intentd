@@ -12897,11 +12897,11 @@ impl AgentManager {
         if self.contains(agent_id) {
             boxed_await(|| self.kill_child_only(agent_id)).await;
         }
-        // The node opens the provider session with no prompt injection, so
-        // the agent's instructions (base prompt, specialist body or explicit
+        // The agent's instructions (base prompt, specialist body or explicit
         // `behaviorPrompt`, rules) ride its first prompt as the
         // `FirstTurnPrepend` `<system>` block, as for local providers without
-        // native injection. Prepared before the node starts anything: a
+        // native injection, unless the machine puts them in the provider
+        // session (nodeProtocol 21, see below). Prepared before the node starts anything: a
         // failure fails this turn, and the next one prepares again.
         let started = async {
             boxed_await(|| self.prepare_remote_system_prompt(agent_id, workspace_id, session))
@@ -12928,6 +12928,12 @@ impl AgentManager {
                 .unwrap_or(e));
             }
         };
+        // The machine put the instructions in the provider session as its
+        // system prompt (nodeProtocol 21), as a local session gets them: no
+        // first-prompt copy.
+        if runtime.session_has_system_prompt() {
+            self.prepend_pending.lock().unwrap().remove(agent_id);
+        }
         let origin = RepositoryOrigin::unavailable();
         let provider = session.provider.clone().unwrap_or_default();
         let handle = AgentHandle {

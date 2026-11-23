@@ -34,6 +34,9 @@ pub struct RemoteAgentRuntime {
     sink: Arc<AgentSink>,
     shared: Arc<Shared>,
     stopped: AtomicBool,
+    /// The launch sent the agent's instructions as the provider session's
+    /// system prompt (nodeProtocol 21).
+    session_prompt: AtomicBool,
 }
 
 impl std::fmt::Debug for RemoteAgentRuntime {
@@ -68,7 +71,13 @@ impl RemoteAgentRuntime {
             sink,
             shared,
             stopped: AtomicBool::new(false),
+            session_prompt: AtomicBool::new(false),
         }
+    }
+
+    /// The launch carries the agent's instructions in the provider session.
+    pub fn set_session_prompt(&self) {
+        self.session_prompt.store(true, Ordering::SeqCst);
     }
 
     /// The agent this runtime drives.
@@ -304,6 +313,10 @@ impl AgentRuntime for RemoteAgentRuntime {
     type Activity = ActivityTracker;
     type Error = AcpError;
     type Notifications = Notifications;
+
+    fn session_has_system_prompt(&self) -> bool {
+        self.session_prompt.load(Ordering::SeqCst)
+    }
 
     fn prompt<'a>(
         &'a self,

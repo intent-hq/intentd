@@ -78,15 +78,16 @@ fn is_false(value: &bool) -> bool {
 /// backend ([`FORGE_FETCH_PROTOCOL`]); 18 adds quick actions
 /// ([`ONE_SHOT_PROTOCOL`]); 19 adds workspace homes ([`HOMES_PROTOCOL`]);
 /// 20 adds the exit reason of a script or terminal ([`EXIT_REASON_PROTOCOL`]);
+/// 21 adds the provider session `_meta` of a launch ([`SESSION_META_PROTOCOL`]);
 /// each keeps everything the one before has. Neither 6 nor the single-node
 /// 5 ever shipped, and a protocol-6 peer cannot confirm a stop, so this
-/// build speaks 7 to 20: a backend never takes a stop as confirmed by a machine
+/// build speaks 7 to 21: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 20 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 21 };
 
 /// The first protocol with reads of an agent's checkout files for
 /// `ws.file.pull`: the [`LinkFrame::CheckoutRead`] /
@@ -124,6 +125,15 @@ pub const HOMES_PROTOCOL: u32 = 19;
 /// intent-hq/intent#9809). A machine sends the field only on a link that
 /// negotiated this protocol ([`LinkFrame::for_protocol`]).
 pub const EXIT_REASON_PROTOCOL: u32 = 20;
+
+/// The first protocol where a launch carries the provider session `_meta`
+/// ([`LaunchCommand::session_meta`]) the machine sends on `session/new` and
+/// `session/load`, as a local agent's session gets it: for Claude Code, the
+/// agent's instructions as its system prompt and the native-tool denylist.
+/// The backend sends it only on a link that negotiated this protocol;
+/// below, the instructions ride the first prompt and the provider keeps its
+/// own system prompt and tools.
+pub const SESSION_META_PROTOCOL: u32 = 21;
 
 /// A home frame for a `homeId` the machine does not hold, or that is not in
 /// the bound hello's `leaseHomes`.
@@ -1626,6 +1636,11 @@ pub struct LaunchCommand {
     /// machine from before ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_version: Option<Box<str>>,
+    /// The provider session `_meta` the machine passes on `session/new` and
+    /// `session/load` unchanged. Sent only on a link of
+    /// [`SESSION_META_PROTOCOL`] or later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_meta: Option<Box<serde_json::Map<String, Value>>>,
     /// Display labels for the hosted agent, top-level `agentName` and
     /// `workspaceTitle` on the wire. Needs no protocol: a machine from
     /// before ignores them.

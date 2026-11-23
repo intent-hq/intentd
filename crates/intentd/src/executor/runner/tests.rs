@@ -174,6 +174,7 @@ fn launch(id: &str) -> LaunchCommand {
         new_machine: None,
         resumed_from_disk: false,
         harness_version: None,
+        session_meta: None,
         labels: Box::default(),
     }
 }
@@ -1226,6 +1227,38 @@ async fn node_runner_gives_each_agent_its_workspace_api_on_the_node() {
     );
     h.runner.stop(&id);
     wait_for(&h.runner, "exit", exited("w1")).await;
+}
+
+/// The provider session `_meta` head sends (nodeProtocol 21) reaches the
+/// provider's `session/new` unchanged, as a local session's does; a launch
+/// without one opens the session with none.
+#[tokio::test]
+async fn node_runner_opens_the_provider_session_with_heads_session_meta() {
+    let Some(h) = harness(2, &[]) else { return };
+    let meta = json!({
+        "systemPrompt": "INSTRUCTIONS",
+        "claudeCode": { "options": { "disallowedTools": ["Task"] } },
+    });
+    let Value::Object(map) = meta.clone() else {
+        unreachable!()
+    };
+    h.runner
+        .launch(LaunchCommand {
+            session_meta: Some(Box::new(map)),
+            ..launch("a1")
+        })
+        .await;
+    h.runner.launch(launch("a2")).await;
+    for (id, expected) in [("a1", meta), ("a2", Value::Null)] {
+        wait_for(&h.runner, "start", started(id)).await;
+        let path = h
+            .storage
+            .agent_dir(&AgentId::from(id))
+            .unwrap()
+            .join("session-meta.json");
+        let got: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(got, expected, "{id}");
+    }
 }
 
 const CANARY: &str = "canary-profile-secret-5b1e";

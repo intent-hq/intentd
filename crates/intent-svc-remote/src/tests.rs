@@ -1843,6 +1843,7 @@ mod stop_acks {
             new_machine: None,
             resumed_from_disk: false,
             harness_version: None,
+            session_meta: None,
             labels: Box::default(),
             profile_env: None,
         }
