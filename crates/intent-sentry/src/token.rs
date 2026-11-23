@@ -1,49 +1,13 @@
-//! Sentry credential resolution.
+//! Sentry credential pair.
 //!
-//! Sentry needs **both** an organization slug and an API token — they are
-//! resolved together as [`Credentials`]. Resolution honours `sentry.tokenSource`:
-//!
-//! 1. `explicit` — read the file-backed secrets store
-//!    ([`intent_core::FileSecretStore`], `~/intent/.secrets.json`) under
-//!    accounts `sentry.token` + `sentry.org`.
-//! 2. `env` — read `SENTRY_API_TOKEN` + `SENTRY_ORG`.
-//!
-//! `auto` (the default) tries the secrets store then env and uses the first
-//! hit that yields **both** values. A missing pair is *not* an error here —
-//! [`resolve`] returns `None`, and the registry turns that into a graceful
-//! `NotConfigured`. The saved account (`accounts.sentry.*`) is read by the
-//! daemon and passed inline; [`resolve_parts`] fills only the missing half.
+//! Sentry needs **both** an organization slug and an API token. The daemon
+//! reads the saved account (`accounts.sentry.*`) and passes it inline; each
+//! missing half falls back to `SENTRY_ORG` / `SENTRY_API_TOKEN`
+//! ([`env_parts`]). A missing pair is *not* an error here — the registry turns
+//! it into a graceful `NotConfigured`.
 //!
 //! GUARDRAIL: the token is a secret. It is only ever read and handed to the
 //! HTTP client — never logged, echoed, or returned across the wire.
-
-use std::time::Duration;
-
-use serde::{Deserialize, Serialize};
-use tokio::time::timeout;
-
-/// Secrets-store account/key for the Sentry API token.
-const SECRET_TOKEN_ACCOUNT: &str = "sentry.token";
-/// Secrets-store account/key for the Sentry organization slug.
-const SECRET_ORG_ACCOUNT: &str = "sentry.org";
-/// Bounded wait for a secrets-store read before treating the entry as absent.
-/// A stalled backing store (e.g. a wedged filesystem) would otherwise block
-/// the caller indefinitely. Mirrors the read budget used by
-/// `intent-services::AsyncSecretStore`.
-const SECRET_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Strategy used to resolve the Sentry credential pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TokenSource {
-    /// Try the secrets store, then env (the default).
-    #[default]
-    Auto,
-    /// Read from the file-backed secrets store only.
-    Explicit,
-    /// Read from `SENTRY_API_TOKEN` + `SENTRY_ORG` only.
-    Env,
-}
 
 /// A resolved Sentry credential pair. The `token` field is secret and is
 /// only handed to the HTTP client.
@@ -62,33 +26,8 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
-/// Resolve a credential pair for the given strategy, or `None` if either half
-/// is missing. Secrets-store reads run on the blocking pool with a bounded
-/// timeout so a stalled backing store never blocks the async runtime.
-pub async fn resolve(source: &TokenSource) -> Option<Credentials> {
-    match source {
-        TokenSource::Explicit => file_store_credentials().await,
-        TokenSource::Env => env_credentials(),
-        TokenSource::Auto => match file_store_credentials().await {
-            Some(c) => Some(c),
-            None => env_credentials(),
-        },
-    }
-}
-
-/// Resolve each half of the credential pair independently for the given
-/// strategy, so a caller holding one half inline can complete it. Under
-/// `auto`, each half comes from the secrets store, else env.
-pub(crate) async fn resolve_parts(source: &TokenSource) -> CredentialParts {
-    match source {
-        TokenSource::Explicit => file_store_parts().await,
-        TokenSource::Env => env_parts(),
-        TokenSource::Auto => file_store_parts().await.or(env_parts()),
-    }
-}
-
-/// Possibly-partial credential pair from [`resolve_parts`]. Halves are
-/// non-empty when present. The `token` field is secret.
+/// Possibly-partial credential pair. Halves are non-empty when present. The
+/// `token` field is secret.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct CredentialParts {
     pub(crate) token: Option<String>,
@@ -124,17 +63,8 @@ impl CredentialParts {
     }
 }
 
-async fn file_store_parts() -> CredentialParts {
-    match file_store_pair().await {
-        Some((token, organization)) => CredentialParts {
-            token: token.as_deref().and_then(non_empty),
-            organization: organization.as_deref().and_then(non_empty),
-        },
-        None => CredentialParts::default(),
-    }
-}
-
-fn env_parts() -> CredentialParts {
+/// The `SENTRY_API_TOKEN` / `SENTRY_ORG` halves that are set and non-empty.
+pub(crate) fn env_parts() -> CredentialParts {
     CredentialParts {
         token: std::env::var("SENTRY_API_TOKEN")
             .ok()
@@ -145,69 +75,6 @@ fn env_parts() -> CredentialParts {
             .as_deref()
             .and_then(non_empty),
     }
-}
-
-/// Read both halves of the credential pair from the file-backed secrets store
-/// ([`intent_core::FileSecretStore`]). Both entries are loaded off the async
-/// runtime on the blocking pool with a bounded timeout so a stalled backing
-/// store cannot wedge a tokio worker.
-async fn file_store_credentials() -> Option<Credentials> {
-    let (token, organization) = file_store_pair().await?;
-    let token = non_empty(&token.unwrap_or_default())?;
-    let organization = non_empty(&organization.unwrap_or_default())?;
-    Some(Credentials {
-        token,
-        organization,
-    })
-}
-
-/// Raw `(token, organization)` entries from the file-backed secrets store,
-/// or `None` when the store cannot be read in time.
-async fn file_store_pair() -> Option<(Option<String>, Option<String>)> {
-    type LoadResult = Result<Option<(Option<String>, Option<String>)>, intent_core::error::Error>;
-    let handle = tokio::task::spawn_blocking(|| -> LoadResult {
-        let store = intent_core::FileSecretStore::new();
-        let token = store.load(SECRET_TOKEN_ACCOUNT)?;
-        let organization = store.load(SECRET_ORG_ACCOUNT)?;
-        Ok(Some((token, organization)))
-    });
-    match timeout(SECRET_LOAD_TIMEOUT, handle).await {
-        Ok(Ok(Ok(Some(pair)))) => Some(pair),
-        Ok(Ok(Ok(None)) | Err(_)) => None,
-        Ok(Ok(Err(e))) => {
-            tracing::warn!(
-                error = %e,
-                "secrets-store load failed for sentry credentials (corrupt/unreadable file)"
-            );
-            None
-        }
-        Err(_) => {
-            tracing::warn!("secrets-store load timed out for sentry credentials");
-            None
-        }
-    }
-}
-
-/// Read both halves of the credential pair from the environment.
-fn env_credentials() -> Option<Credentials> {
-    pick_env_credentials(
-        std::env::var("SENTRY_API_TOKEN").ok().as_deref(),
-        std::env::var("SENTRY_ORG").ok().as_deref(),
-    )
-}
-
-/// Pure selection of env credentials (testable). Both halves must be
-/// non-empty after trimming.
-pub(crate) fn pick_env_credentials(
-    token: Option<&str>,
-    organization: Option<&str>,
-) -> Option<Credentials> {
-    let token = token.and_then(non_empty)?;
-    let organization = organization.and_then(non_empty)?;
-    Some(Credentials {
-        token,
-        organization,
-    })
 }
 
 /// `Some(s)` only when `s` is non-empty after trimming.
@@ -223,28 +90,6 @@ pub(crate) fn non_empty(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn picks_non_empty_env_pair() {
-        let c = pick_env_credentials(Some("tok"), Some("acme")).unwrap();
-        assert_eq!(c.token, "tok");
-        assert_eq!(c.organization, "acme");
-    }
-
-    #[test]
-    fn missing_half_yields_none() {
-        assert!(pick_env_credentials(Some("tok"), None).is_none());
-        assert!(pick_env_credentials(None, Some("acme")).is_none());
-        assert!(pick_env_credentials(Some("   "), Some("acme")).is_none());
-        assert!(pick_env_credentials(Some("tok"), Some("")).is_none());
-    }
-
-    #[test]
-    fn token_source_deserializes_kebab_case() {
-        let s: TokenSource = serde_json::from_str("\"explicit\"").unwrap();
-        assert_eq!(s, TokenSource::Explicit);
-        assert_eq!(TokenSource::default(), TokenSource::Auto);
-    }
 
     fn parts(token: Option<&str>, organization: Option<&str>) -> CredentialParts {
         CredentialParts {
@@ -271,6 +116,13 @@ mod tests {
         assert_eq!((c.token.as_str(), c.organization.as_str()), ("tok", "acme"));
         assert!(parts(Some("tok"), None).complete().is_none());
         assert!(parts(None, Some("acme")).complete().is_none());
+    }
+
+    #[test]
+    fn blank_values_are_absent() {
+        assert_eq!(non_empty("  tok "), Some("tok".to_string()));
+        assert_eq!(non_empty("   "), None);
+        assert_eq!(non_empty(""), None);
     }
 
     #[test]

@@ -3006,7 +3006,7 @@ impl Services {
         if let Some(engine) = &self.sentry_engine {
             return Ok(engine.clone());
         }
-        sentry_ops::build_engine(&self.saved_sentry_settings().await?).await
+        sentry_ops::build_engine(&self.saved_sentry_settings().await?)
     }
 
     /// The saved Sentry account as engine settings.
@@ -3022,7 +3022,6 @@ impl Services {
                 .await,
             token,
             api_base_url: self.sentry_api_base_url.clone(),
-            ..intent_sentry::SentrySettings::default()
         })
     }
 

@@ -14,7 +14,7 @@
 //!
 //! - **Default resolution redirects.** [`FileSecretStore::new`](crate::FileSecretStore::new)
 //!   — reached from module-level token loaders (GitHub, GitLab, Linear,
-//!   Sentry, voice) that have no Services context — gets an empty
+//!   voice) that have no Services context — gets an empty
 //!   per-process scratch file instead ([`redirect_default_secrets`]), so those
 //!   tests behave like a clean CI home and never read the developer's tokens.
 //! - **Explicit paths abort.** A store built with `with_path` into the real

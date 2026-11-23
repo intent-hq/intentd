@@ -29,4 +29,3 @@ pub use model::{
     SentryIssueResult, SentryIssueStatus, SentryProject,
 };
 pub use registry::{SentryRegistry, SentrySettings};
-pub use token::TokenSource;
