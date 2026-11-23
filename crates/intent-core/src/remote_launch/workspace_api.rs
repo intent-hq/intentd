@@ -172,6 +172,7 @@ pub const FORWARDED_METHODS: &[&str] = &[
     "workspace.applyProposal",
     "workspace.archive",
     "workspace.unarchive",
+    "workspace.retrySetup",
     "workspace.context",
     "workspace.referenceDocs",
     "workspace.timeline",
@@ -240,10 +241,16 @@ pub fn forward_min_protocol(method: &str) -> u32 {
         crate::node_link::MCP_PROXY_PROTOCOL
     } else if method.starts_with("secret.") {
         crate::node_link::SECRETS_PROTOCOL
+    } else if method == RETRY_SETUP_METHOD {
+        crate::node_link::SETUP_RETRY_PROTOCOL
     } else {
         crate::node_link::NODE_LINK_PROTOCOLS.min
     }
 }
+
+/// The forwarded call that runs the agent's setup again; the machine then
+/// waits for the run's result (node-link.md § Setup retry).
+pub const RETRY_SETUP_METHOD: &str = "workspace.retrySetup";
 
 /// The error a forwarded `method` fails with on a link older than its
 /// [`forward_min_protocol`].
@@ -252,6 +259,8 @@ pub fn forward_refusal(method: &str) -> String {
     let min = forward_min_protocol(method);
     let feature = if method.starts_with("secret.") {
         "agent secrets on the machine"
+    } else if method == RETRY_SETUP_METHOD {
+        "the setup retry"
     } else if min == crate::node_link::MCP_PROXY_PROTOCOL {
         "MCP server proxies"
     } else if min == crate::node_link::SCRIPT_PROTOCOL {
@@ -277,7 +286,7 @@ pub fn unsupported_message(method: &str) -> String {
         return GIT_ROOTS_MESSAGE.to_owned();
     }
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet (ws.{namespace}.* is not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.secret (node-link protocol 14), ws.git.listRoots, ws.terminal.list and readOutput, ws.search, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet (ws.{namespace}.* is not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.secret (node-link protocol 14), ws.git.listRoots, ws.terminal.list and readOutput, ws.search, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive, retrySetup) through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")

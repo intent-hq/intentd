@@ -79,15 +79,16 @@ fn is_false(value: &bool) -> bool {
 /// ([`ONE_SHOT_PROTOCOL`]); 19 adds workspace homes ([`HOMES_PROTOCOL`]);
 /// 20 adds the exit reason of a script or terminal ([`EXIT_REASON_PROTOCOL`]);
 /// 21 adds the provider session `_meta` of a launch ([`SESSION_META_PROTOCOL`]);
+/// 22 adds the setup retry ([`SETUP_RETRY_PROTOCOL`]);
 /// each keeps everything the one before has. Neither 6 nor the single-node
 /// 5 ever shipped, and a protocol-6 peer cannot confirm a stop, so this
-/// build speaks 7 to 21: a backend never takes a stop as confirmed by a machine
+/// build speaks 7 to 22: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 21 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 22 };
 
 /// The first protocol with reads of an agent's checkout files for
 /// `ws.file.pull`: the [`LinkFrame::CheckoutRead`] /
@@ -134,6 +135,12 @@ pub const EXIT_REASON_PROTOCOL: u32 = 20;
 /// below, the instructions ride the first prompt and the provider keeps its
 /// own system prompt and tools.
 pub const SESSION_META_PROTOCOL: u32 = 21;
+
+/// The first protocol with the setup retry: the [`LinkFrame::SetupRetry`] /
+/// [`LinkFrame::SetupRetryReply`] frames, which run a running agent's setup
+/// script again in its kept checkout. The backend sends no `setupRetry` on a
+/// link that negotiated less.
+pub const SETUP_RETRY_PROTOCOL: u32 = 22;
 
 /// A home frame for a `homeId` the machine does not hold, or that is not in
 /// the bound hello's `leaseHomes`.
@@ -1273,6 +1280,7 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "secretForget",
     "secretList",
     "secretPut",
+    "setupRetry",
     "skills",
     "stop",
 ];
@@ -1969,6 +1977,52 @@ pub struct PushWipResult {
     pub error: Option<String>,
 }
 
+/// Backend to machine (nodeProtocol 21): run `agent_id`'s setup script
+/// `setup` again in its own kept checkout. The machine answers with one
+/// [`SetupRetryReply`] for `request_id`. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetupRetry {
+    pub request_id: LinkId,
+    pub agent_id: AgentId,
+    pub setup: SetupCommand,
+}
+
+/// How a [`SetupRetry`] was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SetupRetryOutcome {
+    /// The script runs (a new run, or one already under way).
+    Started,
+    Refused,
+}
+
+/// `setupRetryReply.error` codes.
+pub mod setup_retry_codes {
+    /// The agent does not run on this binding, or its launch has not
+    /// settled its setup yet.
+    pub const NOT_RUNNING: &str = "node-setup-retry-not-running";
+    /// The agent works in another agent's checkout or in a home.
+    pub const SHARED: &str = "node-setup-retry-shared";
+    /// The checkout's setup is not `failed` and no retry runs.
+    pub const NOT_FAILED: &str = "node-setup-retry-not-failed";
+}
+
+/// Machine to backend (nodeProtocol 21): the answer to a [`SetupRetry`]:
+/// `started` with the run's `startedAt`, or `refused` with `error`
+/// (`"<code>: <detail>"`, [`setup_retry_codes`]). The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetupRetryReply {
+    pub request_id: LinkId,
+    pub agent_id: AgentId,
+    pub outcome: SetupRetryOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// A secret value on the link (nodeProtocol 14): wiped from memory when
 /// dropped, never rendered by `Debug`.
 #[derive(Clone, PartialEq, Eq)]
@@ -2649,6 +2703,10 @@ pub enum LinkFrame {
     HomeCallReply(HomeCallReply),
     /// Machine to backend (nodeProtocol 19): a home's file and git events.
     HomeEvents(HomeEvents),
+    /// Backend to machine (nodeProtocol 21): run an agent's setup again.
+    SetupRetry(SetupRetry),
+    /// Machine to backend (nodeProtocol 21): the answer to a `setupRetry`.
+    SetupRetryReply(SetupRetryReply),
 }
 
 /// A chunk of an agent's or (nodeProtocol 19) a home's checkout progress
@@ -2820,6 +2878,8 @@ impl LinkFrame {
             | Self::HomePushReply(_)
             | Self::HomeStop(_)
             | Self::HomeStopAck(_)
+            | Self::SetupRetry(_)
+            | Self::SetupRetryReply(_)
             // Input first: typing works while output floods.
             | Self::PtyOpen(_)
             | Self::PtyInput(_)
@@ -2870,6 +2930,7 @@ impl LinkFrame {
     #[must_use]
     pub fn min_protocol(&self) -> u32 {
         match self {
+            Self::SetupRetry(_) | Self::SetupRetryReply(_) => SETUP_RETRY_PROTOCOL,
             Self::PtyExited(exited) if exited.exit_reason.is_some() => EXIT_REASON_PROTOCOL,
             Self::ScriptExited(exited) if exited.exit_reason.is_some() => EXIT_REASON_PROTOCOL,
             Self::HomeOpen(_)
@@ -2978,7 +3039,8 @@ impl LinkFrame {
             | Self::PtyKill(_)
             | Self::PtyAck(_)
             | Self::HomeCall(_)
-            | Self::HomeCallCancel(_) => true,
+            | Self::HomeCallCancel(_)
+            | Self::SetupRetry(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
@@ -3002,7 +3064,8 @@ impl LinkFrame {
             | Self::PtyOutput(_)
             | Self::PtyExited(_)
             | Self::HomeCallReply(_)
-            | Self::HomeEvents(_) => false,
+            | Self::HomeEvents(_)
+            | Self::SetupRetryReply(_) => false,
         }
     }
 

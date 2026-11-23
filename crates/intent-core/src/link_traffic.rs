@@ -807,6 +807,18 @@ fn light_frame(frame: &LinkFrame) -> Value {
             &output.owner,
             json!({ "type": "setupOutput", "seq": output.seq }),
         ),
+        LinkFrame::SetupRetry(retry) => json!({
+            "type": "setupRetry",
+            "requestId": retry.request_id,
+            "agentId": agent(&retry.agent_id),
+        }),
+        LinkFrame::SetupRetryReply(reply) => json!({
+            "type": "setupRetryReply",
+            "requestId": reply.request_id,
+            "agentId": agent(&reply.agent_id),
+            "outcome": reply.outcome,
+            "error": reply.error.as_deref().map(field),
+        }),
         LinkFrame::PushWip(request) => json!({
             "type": "pushWip",
             "requestId": request.request_id,

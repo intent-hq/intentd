@@ -3075,6 +3075,20 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.retrySetup`: run a remote agent's failed setup script again in
+    /// its kept checkout (nodes.md "Retrying a remote agent's setup").
+    /// `{ agentId, setup }` once the machine has started it. Called as the
+    /// agent itself (its `ws.workspace.retrySetup()`), only for its own
+    /// checkout and without the turn rule.
+    fn agent_retry_setup(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Err(Error::Unsupported("agent.retrySetup".into())) })
+    }
+
     /// `agent.retry`: redrive a failed agent spawn — only valid when the agent
     /// status is `error`; returns `{ ok: false }` otherwise. Clears the error
     /// status back to pending, tears down any stale child, and attempts to

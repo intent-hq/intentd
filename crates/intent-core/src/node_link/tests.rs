@@ -437,6 +437,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "scriptOutput",
             "scriptStarted",
             "secretReply",
+            "setupRetryReply",
             "skillsReply",
             "stopAck",
             "welcome"
@@ -622,6 +623,23 @@ fn every_frame() -> Vec<LinkFrame> {
                 skills: vec![machine_skill("deploy", "project")],
             },
         )),
+        LinkFrame::SetupRetry(SetupRetry {
+            request_id,
+            agent_id: AgentId::from("a1"),
+            setup: SetupCommand {
+                script: "pnpm install".into(),
+                branch_name: "feat/x".into(),
+                source_branch: "main".into(),
+                timeout_secs: None,
+            },
+        }),
+        LinkFrame::SetupRetryReply(SetupRetryReply {
+            request_id,
+            agent_id: AgentId::from("a1"),
+            outcome: SetupRetryOutcome::Refused,
+            started_at: None,
+            error: Some(format!("{}: not running", setup_retry_codes::NOT_RUNNING)),
+        }),
         LinkFrame::PushWip(PushWipRequest {
             request_id,
             agent_id: AgentId::from("a1"),
@@ -1653,7 +1671,13 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
                 | LinkFrame::HomeCallReply(_)
                 | LinkFrame::HomeEvents(_)
         );
-        let expected = if home {
+        let retry = matches!(
+            frame,
+            LinkFrame::SetupRetry(_) | LinkFrame::SetupRetryReply(_)
+        );
+        let expected = if retry {
+            SETUP_RETRY_PROTOCOL
+        } else if home {
             HOMES_PROTOCOL
         } else if one_shot {
             ONE_SHOT_PROTOCOL
@@ -1674,6 +1698,59 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
         };
         assert_eq!(frame.min_protocol(), expected, "{}", frame_tag(&frame));
     }
+}
+
+/// The wire shapes of the setup retry frames (`node-link.md` § Setup
+/// retry): closed bodies, `outcome` in camelCase, optional members omitted.
+#[test]
+fn setup_retry_frames_have_the_documented_shape() {
+    let id = LinkId::new_v4();
+    let retry = LinkFrame::SetupRetry(SetupRetry {
+        request_id: id,
+        agent_id: AgentId::from("a1"),
+        setup: SetupCommand {
+            script: "make".into(),
+            branch_name: "b".into(),
+            source_branch: "main".into(),
+            timeout_secs: Some(60),
+        },
+    });
+    assert_eq!(
+        serde_json::to_value(&retry).unwrap(),
+        json!({
+            "type": "setupRetry",
+            "requestId": id,
+            "agentId": "a1",
+            "setup": { "script": "make", "branchName": "b", "sourceBranch": "main", "timeoutSecs": 60 },
+        })
+    );
+    let started = LinkFrame::SetupRetryReply(SetupRetryReply {
+        request_id: id,
+        agent_id: AgentId::from("a1"),
+        outcome: SetupRetryOutcome::Started,
+        started_at: Some("2026-01-01T00:00:00Z".into()),
+        error: None,
+    });
+    assert_eq!(
+        serde_json::to_value(&started).unwrap(),
+        json!({
+            "type": "setupRetryReply",
+            "requestId": id,
+            "agentId": "a1",
+            "outcome": "started",
+            "startedAt": "2026-01-01T00:00:00Z",
+        })
+    );
+    let unknown = json!({
+        "type": "setupRetry",
+        "requestId": id,
+        "agentId": "a1",
+        "setup": { "script": "make", "branchName": "b", "sourceBranch": "main" },
+        "extra": true,
+    });
+    assert!(serde_json::from_value::<LinkFrame>(unknown).is_err());
+    assert!(retry.admitted_from_executor());
+    assert!(!started.admitted_from_executor());
 }
 
 fn machine_skill(name: &str, scope: &str) -> MachineSkill {
