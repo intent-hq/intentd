@@ -96,6 +96,8 @@ pub(crate) struct CloudState {
     /// What the supervisor remembers about each running sandbox.
     activity: Mutex<HashMap<String, lifecycle::Activity>>,
     supervisor: AtomicBool,
+    /// While the supervisor's task runs.
+    supervisor_running: Arc<AtomicBool>,
     /// Pauses begun per machine.
     pauses: Mutex<HashMap<String, u64>>,
     /// When the reaper first saw each orphan whose start time it cannot read.
@@ -305,6 +307,12 @@ impl CloudState {
 
     fn supervisor_started(&self) -> bool {
         self.supervisor.swap(true, Ordering::SeqCst)
+    }
+
+    /// Whether the supervisor's task is running.
+    #[cfg(test)]
+    pub(crate) fn supervisor_running(&self) -> bool {
+        self.supervisor_running.load(Ordering::SeqCst)
     }
 
     /// The agents whose sandbox start is in flight (and the keys of

@@ -458,7 +458,8 @@ impl McpHub {
         self.inner.background_stop.send_replace(true);
     }
 
-    pub(crate) fn background_stopping(&self) -> bool {
+    #[must_use]
+    pub fn background_stopping(&self) -> bool {
         *self.inner.background_stop.borrow()
     }
 

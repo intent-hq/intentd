@@ -8,11 +8,14 @@
 //! (agents, workspaces, hooks, scripts, schedulers, PR monitors; also closed
 //! in node mode). A refused step starts nothing.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use intent_core::tenant_fence::SelfFence;
 use intent_services::Services;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::{RuntimeServicesExt as _, StartupExt as _};
 
@@ -122,13 +125,14 @@ pub fn start_background(
     startup_work: &impl Admission,
     orchestration: &impl Admission,
 ) -> Background {
+    let mut sweeps = Vec::new();
     // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
     // prior daemon crashed between the locked detach rename and the unlocked
     // recursive removal (monorepo#473). Spawned so the potentially multi-GB
     // removal never blocks startup; best-effort throughout — a failure never
     // aborts startup, and a missing workspaces root is a silent no-op.
     let services_trash_sweep = services.clone();
-    startup_work.spawn(|| {
+    sweeps.push(startup_work.spawn(|| {
         intent_core::spawn_daemon(async move {
             let removed = services_trash_sweep.sweep_orphaned_worktree_trash().await;
             if removed > 0 {
@@ -138,22 +142,22 @@ pub fn start_background(
                 );
             }
         })
-    });
+    }));
     // Sweep stale export staging dirs (workspace.export.*): export sessions
     // are in-memory only, so after a restart every leftover staging dir is an
     // orphan. Spawned + best-effort like the worktree trash sweep above.
     let services_export_sweep = services.clone();
-    startup_work.spawn(|| {
+    sweeps.push(startup_work.spawn(|| {
         intent_core::spawn_daemon(async move {
             services_export_sweep.sweep_stale_export_staging().await;
         })
-    });
+    }));
     // Agent temp folders persist across an agent's relaunches, so a daemon
     // that runs for days must also reclaim the ones left idle while it runs
     // (deleted agents, agents nobody resumed). Folders a live launch holds
     // are skipped.
     let agent_tmp_sweep_root = intent_core::agent_tmp_root(data_dir);
-    startup_work.spawn(|| {
+    sweeps.push(startup_work.spawn(|| {
         intent_core::spawn_daemon(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60 * 60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -171,16 +175,16 @@ pub fn start_background(
                 }
             }
         })
-    });
+    }));
     // Machines that may still run this backend's agents reconnect on their
     // own after a restart, in the background, so a machine that is down
     // never slows the start.
     let services_remote_resume = services.clone();
-    startup_work.spawn(|| {
+    sweeps.push(startup_work.spawn(|| {
         intent_core::spawn_daemon(async move {
             services_remote_resume.resume_exposed_machines().await;
         })
-    });
+    }));
     // Sweep expired attachment idempotency-key bindings (7-day retention,
     // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
     let services_idempotency_sweep = services.clone();
@@ -264,6 +268,7 @@ pub fn start_background(
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
     Background {
         attachment_retention,
+        sweeps,
         loops: vec![
             pr_refresh,
             pr_monitor_loop,
@@ -282,12 +287,15 @@ pub fn start_background(
     }
 }
 
-/// The handles [`start_background`] keeps. The other sweeps are finite (or,
-/// like the hourly agent temp sweep, end with the process) and are not kept.
+/// The handles of what [`start_background`] started.
 pub struct Background {
     /// The boot sweep of expired attachment idempotency keys: finite, and
     /// joined before the store closes.
     pub attachment_retention: JoinHandle<()>,
+    /// The other startup sweeps (finite, except the hourly agent temp
+    /// sweep): the daemon lets them run until the process ends; a tenant's
+    /// self-fence cancels them.
+    sweeps: Vec<JoinHandle<()>>,
     /// The recurring loops, in start order.
     loops: Vec<JoinHandle<()>>,
 }
@@ -302,6 +310,15 @@ impl Background {
             .count()
     }
 
+    /// Every handle: the sweeps, the attachment sweep and the loops.
+    #[must_use]
+    pub fn into_tasks(self) -> Vec<JoinHandle<()>> {
+        let mut tasks = self.sweeps;
+        tasks.push(self.attachment_retention);
+        tasks.extend(self.loops);
+        tasks
+    }
+
     /// Stop every loop's recurrence, in start order, and wait for each to
     /// end. Each admitted refresh, monitor publication, tally write, or Git
     /// commit retains its finite service writer owner.
@@ -310,5 +327,169 @@ impl Background {
             handle.abort();
             let _ = handle.await;
         }
+    }
+}
+
+/// One tenant's client connections: each registers its close, and the
+/// tenant's self-fence closes them all. Picking the tenant a connection
+/// belongs to is the listener's job.
+#[derive(Clone, Default)]
+pub struct ClientConnections(Arc<Mutex<Connections>>);
+
+#[derive(Default)]
+struct Connections {
+    next: u64,
+    open: HashMap<u64, Box<dyn FnOnce() + Send>>,
+    closed: bool,
+}
+
+/// A registered connection, for [`ClientConnections::remove`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectionId(u64);
+
+impl ClientConnections {
+    /// Register a connection's `close`. After [`Self::close_all`] the
+    /// connection is closed at once and `None` is returned.
+    pub fn register(&self, close: impl FnOnce() + Send + 'static) -> Option<ConnectionId> {
+        let mut connections = lock(&self.0);
+        if connections.closed {
+            drop(connections);
+            close();
+            return None;
+        }
+        connections.next += 1;
+        let id = connections.next;
+        connections.open.insert(id, Box::new(close));
+        Some(ConnectionId(id))
+    }
+
+    /// Forget a connection that ended on its own.
+    pub fn remove(&self, id: ConnectionId) {
+        lock(&self.0).open.remove(&id.0);
+    }
+
+    /// How many connections are open.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        lock(&self.0).open.len()
+    }
+
+    /// Whether none is open.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether [`Self::close_all`] ran.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        lock(&self.0).closed
+    }
+
+    /// Close every connection and refuse new ones. Returns how many were
+    /// closed.
+    #[must_use = "the count says how many connections the close reached"]
+    pub fn close_all(&self) -> usize {
+        let open: Vec<_> = {
+            let mut connections = lock(&self.0);
+            connections.closed = true;
+            connections.open.drain().map(|(_, close)| close).collect()
+        };
+        let closed = open.len();
+        for close in open {
+            close();
+        }
+        closed
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One tenant's running work, handed to its self-fence: what
+/// [`restore_registries`] and [`start_background`] start, the tenant's
+/// client connections and machine links, and its agents and PTYs.
+pub struct TenantRuntime {
+    connections: ClientConnections,
+    tasks: Vec<AbortHandle>,
+    loops: Vec<AbortHandle>,
+}
+
+impl TenantRuntime {
+    /// Restore and start the tenant's work over `services`, as the daemon
+    /// does for its one backend, and register all of it on `runner`, the
+    /// tenant's self-fence, which stops it in the fence's order: the
+    /// client connections, the machine links (with the remote feature's
+    /// cloud supervisor and home-move runners), then the tasks (every sweep
+    /// and loop started here is cancelled, then the PTYs, the host
+    /// commands and the agent manager are shut down).
+    pub async fn start(
+        services: &Services,
+        data_dir: &Path,
+        startup_work: &impl Admission,
+        orchestration: &impl Admission,
+        runner: &mut SelfFence,
+    ) -> Self {
+        let connections = ClientConnections::default();
+        let closing = connections.clone();
+        runner.on_client_connections(move || async move {
+            let closed = closing.close_all();
+            tracing::info!(closed, "self-fence: closed the tenant's client connections");
+        });
+        let links = services.clone();
+        runner.on_machine_links(move || async move {
+            if let Some(feature) = crate::remote::RemoteServicesExt::remote_feature(&links) {
+                feature.close_links();
+                // The cloud supervisor, home moves and detached cloud calls
+                // end with the links: none may call a provider after this.
+                feature.background_stopped().await;
+            }
+        });
+        restore_registries(services, startup_work, orchestration).await;
+        let background = start_background(services, data_dir, startup_work, orchestration);
+        let loops = background
+            .loops
+            .iter()
+            .map(JoinHandle::abort_handle)
+            .collect();
+        let mut tasks = Vec::new();
+        for task in background.into_tasks() {
+            tasks.push(task.abort_handle());
+            runner.adopt_task(task);
+        }
+        let stopping = services.clone();
+        runner.on_tasks(move || async move {
+            stopping.shutdown_pty_sessions().await;
+            stopping.host_exec_runtime().shutdown().await;
+            if let Some(manager) = stopping.agent_manager() {
+                manager.shutdown().await;
+            }
+        });
+        Self {
+            connections,
+            tasks,
+            loops,
+        }
+    }
+
+    /// The tenant's client connections.
+    #[must_use]
+    pub fn connections(&self) -> &ClientConnections {
+        &self.connections
+    }
+
+    /// How many of the tenant's tasks are still running.
+    #[must_use]
+    pub fn tasks_running(&self) -> usize {
+        self.tasks.iter().filter(|task| !task.is_finished()).count()
+    }
+
+    /// How many of the tenant's loops are still running.
+    #[must_use]
+    pub fn loops_running(&self) -> usize {
+        self.loops.iter().filter(|task| !task.is_finished()).count()
     }
 }

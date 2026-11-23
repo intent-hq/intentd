@@ -176,6 +176,9 @@ impl CloudGate {
     }
 }
 
+/// Why a dial-gate call was refused: the tenant's links are closed.
+const LINKS_CLOSED: &str = "this backend's machine links are closed";
+
 impl crate::link::gate::DialGate for CloudGate {
     /// How many pauses of this machine began, so a dial that binds after
     /// one knows it reached a frozen sandbox.
@@ -201,7 +204,18 @@ impl crate::link::gate::DialGate for CloudGate {
         link: &'a dyn GateLink,
         asked: bool,
     ) -> intent_core::BoxFuture<'a, std::result::Result<Dialable, ConnectFailure>> {
-        Box::pin(self.before_dial_inner(link, asked))
+        Box::pin(async move {
+            // A fenced tenant's connector makes no provider call: the
+            // resume is dropped once the links close, and the fence waits
+            // for it.
+            let Ok(feature) = super::feature(&self.svc) else {
+                return self.before_dial_inner(link, asked).await;
+            };
+            feature
+                .until_closed(self.before_dial_inner(link, asked))
+                .await
+                .unwrap_or_else(|| Err(ConnectFailure::Local(LINKS_CLOSED.to_owned())))
+        })
     }
 
     /// The sandbox runs an intentd this backend shares no link protocol
@@ -219,11 +233,17 @@ impl crate::link::gate::DialGate for CloudGate {
             let Ok(feature) = super::feature(&self.svc) else {
                 return false;
             };
-            let revived = revive(&self.svc, feature, &self.machine_id).await;
-            if revived {
-                self.refresh_address(link).await;
-            }
-            revived
+            // As for before_dial: no provider call once the links close.
+            feature
+                .until_closed(async {
+                    let revived = revive(&self.svc, feature, &self.machine_id).await;
+                    if revived {
+                        self.refresh_address(link).await;
+                    }
+                    revived
+                })
+                .await
+                .unwrap_or(false)
         })
     }
 }
@@ -735,7 +755,7 @@ pub(crate) fn sandbox_lost(
     }
     let svc = svc.clone();
     let row = row.clone();
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
@@ -768,7 +788,7 @@ fn sandbox_outdated(
     link.drop_stops();
     let svc = svc.clone();
     let machine_id = machine_id.to_owned();
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
@@ -975,25 +995,57 @@ pub(crate) fn spawn_supervisor(svc: &Services) {
         return;
     }
     let svc = svc.clone();
+    let running = RunningFlag::set(&feature.cloud.supervisor_running);
     intent_core::spawn_daemon(async move {
-        if let Err(error) = config::migrate(&svc).await {
-            tracing::warn!(%error, "cloud machines: could not migrate the saved E2B provider");
-        }
-        if svc.workspace_homes() {
-            super::home::reset_after_restart(&svc).await;
-        }
-        let mut last_reap: Option<Instant> = None;
-        loop {
-            let clock = Clock::current();
-            tokio::time::sleep(clock.tick()).await;
-            let Ok(feature) = super::feature(&svc) else {
-                return;
-            };
-            if let Err(error) = tick(&svc, feature, clock, &mut last_reap).await {
-                tracing::debug!(%error, "cloud machines: lifecycle check failed");
-            }
+        let _running = running;
+        // A fenced tenant's links close: its supervisor ends with them,
+        // mid-check included, so it makes no more E2B calls.
+        let Ok(feature) = super::feature(&svc) else {
+            return;
+        };
+        let _task = crate::BackgroundTask::of(feature);
+        tokio::select! {
+            () = feature.closed() => {}
+            () = supervise(&svc) => {}
         }
     });
+}
+
+/// `true` while held.
+struct RunningFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl RunningFlag {
+    fn set(flag: &Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag.clone())
+    }
+}
+
+impl Drop for RunningFlag {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The supervisor's work: one-time startup steps, then a check every tick.
+async fn supervise(svc: &Services) {
+    if let Err(error) = config::migrate(svc).await {
+        tracing::warn!(%error, "cloud machines: could not migrate the saved E2B provider");
+    }
+    if svc.workspace_homes() {
+        super::home::reset_after_restart(svc).await;
+    }
+    let mut last_reap: Option<Instant> = None;
+    loop {
+        let clock = Clock::current();
+        tokio::time::sleep(clock.tick()).await;
+        let Ok(feature) = super::feature(svc) else {
+            return;
+        };
+        if let Err(error) = tick(svc, feature, clock, &mut last_reap).await {
+            tracing::debug!(%error, "cloud machines: lifecycle check failed");
+        }
+    }
 }
 
 /// One check of every cloud machine, and the reaper when due, per E2B
@@ -1186,7 +1238,7 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, why: PauseFo
     let svc = svc.clone();
     let client = client.clone();
     let machine_id = machine_id.to_owned();
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
@@ -1313,7 +1365,7 @@ fn spawn_kill(svc: &Services, feature: &RemoteFeature, client: &Provider, row: &
     let svc = svc.clone();
     let client = client.clone();
     let row = row.clone();
-    tokio::spawn(async move {
+    crate::spawn_until_closed(svc.clone(), async move {
         let Ok(feature) = super::feature(&svc) else {
             return;
         };

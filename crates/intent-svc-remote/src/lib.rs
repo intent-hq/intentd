@@ -108,8 +108,87 @@ pub struct RemoteFeature {
     /// ([`order`]): one per backend, so two tenants never wait on each
     /// other.
     pub(crate) order_lock: tokio::sync::Mutex<()>,
-    /// Set by [`RemoteFeature::close_links`]: no connector starts again.
-    closed: std::sync::atomic::AtomicBool,
+    /// Set by [`RemoteFeature::close_links`]: no connector starts again,
+    /// and the feature's background work (the cloud supervisor, home-move
+    /// runners) ends.
+    closed: Closed,
+    /// The feature's background work in flight ([`spawn_until_closed`]).
+    background: Background,
+    /// The workspaces whose home move runs on this backend.
+    pub(crate) home_moves: home_move::Running,
+}
+
+/// [`RemoteFeature::background_tasks`]: how many tasks
+/// [`spawn_until_closed`] started that have not ended.
+#[derive(Default)]
+struct Background {
+    running: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// Held by one background task; counts it out when the task ends.
+pub(crate) struct BackgroundTask<'a>(&'a Background);
+
+impl<'a> BackgroundTask<'a> {
+    /// Count a background task of `feature` in, until this is dropped.
+    pub(crate) fn of(feature: &'a RemoteFeature) -> Self {
+        Self::start(&feature.background)
+    }
+
+    fn start(background: &'a Background) -> Self {
+        background
+            .running
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(background)
+    }
+}
+
+impl Drop for BackgroundTask<'_> {
+    fn drop(&mut self) {
+        if self
+            .0
+            .running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+/// Run `work` in the background for `svc`'s remote feature, until it ends or
+/// the feature's links close ([`RemoteFeature::close_links`]): then it is
+/// dropped where it stands, so it makes no further provider call or link
+/// write. Once the links are closed, `work` never starts.
+/// [`RemoteFeature::background_stopped`] waits until none is left.
+pub(crate) fn spawn_until_closed<F>(svc: Services, work: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    // caller-binding: allow — the remote feature's background work, ended by close_links
+    tokio::spawn(async move {
+        let Some(feature) = svc.remote_feature() else {
+            work.await;
+            return;
+        };
+        let _task = BackgroundTask::start(&feature.background);
+        if feature.links_closed() {
+            return;
+        }
+        tokio::select! {
+            () = feature.closed() => {}
+            () = work => {}
+        }
+    });
+}
+
+/// [`RemoteFeature::closed`]: `true` once the links were closed.
+struct Closed(tokio::sync::watch::Sender<bool>);
+
+impl Default for Closed {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
 }
 
 /// [`RemoteFeature::head_session`]: picked once per feature, so each start
@@ -172,8 +251,54 @@ impl RemoteFeature {
         self.connections.0.take(machine_id)
     }
 
-    fn is_closed(&self) -> bool {
-        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    /// Whether [`Self::close_links`] ran: no connector starts again.
+    #[must_use]
+    pub fn links_closed(&self) -> bool {
+        *self.closed.0.borrow()
+    }
+
+    /// How many of the feature's background tasks are running.
+    #[must_use]
+    pub fn background_tasks(&self) -> usize {
+        self.background
+            .running
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until none of the feature's background tasks is running: after
+    /// [`Self::close_links`], every one has ended and no new one starts.
+    /// Cancel-safe.
+    pub async fn background_stopped(&self) {
+        loop {
+            let idle = self.background.idle.notified();
+            if self.background_tasks() == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+
+    /// Run `work` (a connector's dial-gate call: a sandbox resume, a tunnel
+    /// revive) as part of the feature's background work: `None` without
+    /// polling it once the links are closed, and `None` when they close
+    /// while it runs, which drops it where it stands. Counted until it ends,
+    /// so [`Self::background_stopped`] waits for it.
+    pub(crate) async fn until_closed<F: std::future::Future>(&self, work: F) -> Option<F::Output> {
+        let _task = BackgroundTask::of(self);
+        if self.links_closed() {
+            return None;
+        }
+        tokio::select! {
+            () = self.closed() => None,
+            output = work => Some(output),
+        }
+    }
+
+    /// Wait until [`Self::close_links`] ran. Cancel-safe.
+    pub(crate) async fn closed(&self) {
+        let mut closed = self.closed.0.subscribe();
+        // The sender lives in `self`, so the wait cannot end with an error.
+        let _ = closed.wait_for(|closed| *closed).await;
     }
 
     /// Wait for machine `machine_id`'s lifecycle lock.
@@ -204,7 +329,7 @@ impl RemoteFeature {
     /// tenant must, and start no connector again: a start in flight is shut
     /// down instead of kept. Returns how many were shut down.
     pub fn close_links(&self) -> usize {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.closed.0.send_replace(true);
         let mut closed = 0;
         for node in self.connections.0.all() {
             if let Some(node) = self.connections.0.take(&node.shared_ref().machine_id()) {
@@ -277,8 +402,8 @@ impl RemoteFeature {
         if let Some(node) = self.running_node(machine_id) {
             return Ok(node);
         }
-        if self.is_closed() {
-            return Err(links_closed());
+        if self.links_closed() {
+            return Err(closed_links_error());
         }
         let row = svc
             .store()
@@ -323,12 +448,12 @@ impl RemoteFeature {
         // A close that raced this start: it set the flag before this check
         // (so the node is shut down here) or found the node (so it shut it
         // down itself). Either way none outlives the close.
-        if self.is_closed() {
+        if self.links_closed() {
             if let Some(started) = self.connections.0.take(machine_id) {
                 started.shutdown();
             }
             node.shutdown();
-            return Err(links_closed());
+            return Err(closed_links_error());
         }
         Ok(node)
     }
@@ -336,7 +461,7 @@ impl RemoteFeature {
 
 pub(crate) use intent_node_connections::lock;
 
-fn links_closed() -> Error {
+fn closed_links_error() -> Error {
     Error::Internal("this backend's machine links are closed".into())
 }
 

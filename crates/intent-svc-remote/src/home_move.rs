@@ -30,10 +30,34 @@ use serde_json::{json, Value};
 use crate::homes::{Candidate, HomeReply};
 use crate::RemoteServicesExt as _;
 
-/// The workspaces whose move runs in this process: one runner each. `true`
+/// The workspaces whose move runs, per backend: one runner each. `true`
 /// asks the runner to look again before it ends: a move was started while
-/// it was finishing the previous one.
-static RUNNING: LazyLock<Mutex<HashMap<WorkspaceId, bool>>> = LazyLock::new(Mutex::default);
+/// it was finishing the previous one. Each backend's remote feature holds
+/// its own ([`crate::RemoteFeature`]), so two tenants of one process with the
+/// same workspace id never share a runner; without a feature, this one.
+pub(crate) type Running = Mutex<HashMap<WorkspaceId, bool>>;
+
+static UNREGISTERED: LazyLock<Running> = LazyLock::new(Mutex::default);
+
+fn running(svc: &Services) -> std::sync::MutexGuard<'_, HashMap<WorkspaceId, bool>> {
+    match svc.remote_feature() {
+        Some(feature) => crate::lock(&feature.home_moves),
+        None => crate::lock(&UNREGISTERED),
+    }
+}
+
+/// Take the runner of `workspace_id`'s move on `svc`'s backend: `true` when
+/// none ran (the caller starts one), `false` when one runs (it looks again
+/// before it ends).
+pub(crate) fn claim(svc: &Services, workspace_id: &WorkspaceId) -> bool {
+    let mut running = running(svc);
+    if let Some(again) = running.get_mut(workspace_id) {
+        *again = true;
+        return false;
+    }
+    running.insert(workspace_id.clone(), false);
+    true
+}
 
 /// What `to` names.
 #[derive(Debug, PartialEq, Eq)]
@@ -205,21 +229,31 @@ pub(crate) async fn resume(svc: &Services) {
 }
 
 fn spawn(svc: &Services, workspace_id: &WorkspaceId) {
-    {
-        let mut running = crate::lock(&RUNNING);
-        if let Some(again) = running.get_mut(workspace_id) {
-            *again = true;
-            return;
-        }
-        running.insert(workspace_id.clone(), false);
+    if !claim(svc, workspace_id) {
+        return;
     }
     let svc = svc.clone();
     let workspace_id = workspace_id.clone();
-    // Its own task, as the daemon: the move outlives the request.
+    // Its own task, as the daemon: the move outlives the request, but not
+    // the backend's links (a fenced tenant): then the move stays recorded
+    // for whoever serves the tenant next.
     intent_core::spawn_daemon(async move {
+        let _task = svc.remote_feature().map(crate::BackgroundTask::of);
         loop {
-            run(&svc, &workspace_id).await;
-            let mut running = crate::lock(&RUNNING);
+            let closed = if let Some(feature) = svc.remote_feature() {
+                tokio::select! {
+                    () = feature.closed() => true,
+                    () = run(&svc, &workspace_id) => false,
+                }
+            } else {
+                run(&svc, &workspace_id).await;
+                false
+            };
+            let mut running = running(&svc);
+            if closed {
+                running.remove(&workspace_id);
+                return;
+            }
             if running.get(&workspace_id) == Some(&true) {
                 running.insert(workspace_id.clone(), false);
                 continue;

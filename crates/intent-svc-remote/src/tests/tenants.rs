@@ -109,3 +109,134 @@ async fn one_backends_machine_list_change_does_not_wait_for_anothers() {
     set.expect("setOrder");
     drop(held);
 }
+
+#[tokio::test]
+async fn closing_a_backends_links_ends_its_cloud_supervisor() {
+    let backend = Backend::new().await;
+    backend.services.resume_exposed_machines().await;
+    let feature = backend.services.remote_feature().unwrap();
+    tokio::time::timeout(wait(), async {
+        while !feature.cloud.supervisor_running() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the supervisor starts");
+
+    feature.close_links();
+
+    tokio::time::timeout(wait(), async {
+        while feature.cloud.supervisor_running() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a closed backend's supervisor ends, so it makes no more E2B calls");
+}
+
+#[tokio::test]
+async fn closing_a_backends_links_ends_its_background_work_and_starts_no_more() {
+    let backend = Backend::new().await;
+    let feature = backend.services.remote_feature().unwrap();
+    let (started_tx, started) = tokio::sync::oneshot::channel();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = DropFlag(dropped.clone());
+    crate::spawn_until_closed(backend.services.clone(), async move {
+        let _guard = guard;
+        let _ = started_tx.send(());
+        // A provider call that would outlive the fence.
+        std::future::pending::<()>().await;
+    });
+    tokio::time::timeout(wait(), started)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(feature.background_tasks(), 1);
+
+    feature.close_links();
+    tokio::time::timeout(wait(), feature.background_stopped())
+        .await
+        .expect("closing the links ends the background work");
+
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(feature.background_tasks(), 0);
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let late = ran.clone();
+    crate::spawn_until_closed(backend.services.clone(), async move {
+        late.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "no background work starts once the links are closed"
+    );
+}
+
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn each_backend_runs_its_own_home_move_of_a_shared_workspace_id() {
+    let a = Backend::new().await;
+    let b = Backend::new().await;
+    let workspace = workspace();
+
+    assert!(crate::home_move::claim(&a.services, &workspace));
+    assert!(
+        crate::home_move::claim(&b.services, &workspace),
+        "another tenant's move of the same workspace id is not held up"
+    );
+    assert!(
+        !crate::home_move::claim(&a.services, &workspace),
+        "within one tenant, one runner per workspace"
+    );
+}
+
+#[tokio::test]
+async fn a_dial_gate_call_in_flight_ends_with_the_links_and_none_starts_after() {
+    let backend = Backend::new().await;
+    let services = backend.services.clone();
+    let (started_tx, started) = tokio::sync::oneshot::channel();
+    // A connector's gate resuming a sandbox: a provider call in flight.
+    let in_flight = tokio::spawn(async move {
+        let feature = services.remote_feature().unwrap();
+        feature
+            .until_closed(async move {
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .await
+    });
+    tokio::time::timeout(wait(), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let feature = backend.services.remote_feature().unwrap();
+    assert_eq!(feature.background_tasks(), 1, "the gate call is counted");
+
+    feature.close_links();
+    tokio::time::timeout(wait(), feature.background_stopped())
+        .await
+        .expect("the fence waits for the gate call, which ends with the links");
+    assert_eq!(
+        in_flight.await.unwrap(),
+        None,
+        "it was dropped, not finished"
+    );
+
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let late = ran.clone();
+    let after = feature
+        .until_closed(async move { late.store(true, std::sync::atomic::Ordering::SeqCst) })
+        .await;
+    assert_eq!(after, None);
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "no gate call starts once the links are closed"
+    );
+}
