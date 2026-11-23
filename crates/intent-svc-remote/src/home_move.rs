@@ -186,8 +186,7 @@ async fn end_old_terminals(svc: &Services, home: &WorkspaceHome) {
     else {
         return;
     };
-    let shared = node.shared_ref();
-    shared.terminals.end_home(shared, &home.home_id).await;
+    node.end_home_terminals(&home.home_id).await;
 }
 
 /// At start: go on with every move a restart interrupted.
@@ -372,11 +371,8 @@ async fn rollback(svc: &Services, home_move: &HomeMove) {
                 .flatten()
                 .and_then(|home| svc.remote_feature()?.running_node(home.node_id.as_deref()?))
             {
-                let shared = old.shared_ref();
-                if shared.current_link().is_none() {
-                    shared
-                        .home_link
-                        .link_lost(shared.weak(), shared.tuning.link_loss_grace);
+                if old.current_link().is_none() {
+                    old.home_link_lost();
                 } else if home_move.from_state == HomeState::Detached {
                     // Its machine bound during the move, when a moving home
                     // is not opened: open it now, as that bind would have.
@@ -392,10 +388,9 @@ async fn rollback(svc: &Services, home_move: &HomeMove) {
                 .and_then(|node_id| svc.remote_feature()?.running_node(node_id))
             {
                 if let Ok(holds) =
-                    crate::homes::machine_holds_homes(svc.store(), &node.shared_ref().machine_id())
-                        .await
+                    crate::homes::machine_holds_homes(svc.store(), &node.view().machine_id()).await
                 {
-                    node.shared_ref().set_holds_homes(holds);
+                    node.view().set_holds_homes(holds);
                 }
             }
         }

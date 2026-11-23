@@ -54,20 +54,19 @@ pub(crate) async fn open(
     // a dial here. The start is a use of the machine: it waits out an idle
     // pause, and when that pause closed the link meanwhile, it dials once
     // more (bounded), which resumes the sandbox.
-    let shared = node.shared_ref();
-    let _use = shared.begin_use().await;
-    if shared.current_link().is_none() && feature.cloud.is_parked(&node_id) {
+    let _use = node.begin_use().await;
+    if node.current_link().is_none() && feature.cloud.is_parked(&node_id) {
         if let Err(error) = node.connect().await {
             return Err(crate::cloud::home::unreachable(svc, workspace_id, &home, &error).await);
         }
     }
-    if shared.protocol() < HOMES_PROTOCOL {
+    if node.protocol() < HOMES_PROTOCOL {
         return Err(home_unavailable(
             &home,
             "its machine needs an intentd update for workspace homes",
         ));
     }
-    crate::link::home_scripts::start_on(shared, &home, workspace_id, pty, open)
+    node.start_home_script(&home, workspace_id, pty, open)
 }
 
 /// See [`intent_services::feature_api::feature_ports::RemoteLaunchPort::stop_home_script`].
@@ -90,7 +89,7 @@ pub(crate) async fn stop(
     let Ok(node) = feature.node(svc, &node_id).await else {
         return Ok(());
     };
-    match node.shared_ref().home_scripts.stop(pty, id, wait).await {
+    match node.stop_home_script(pty, id, wait).await {
         Stopped::Ended | Stopped::NotHeld => Ok(()),
         Stopped::Unconfirmed => Err(home_unavailable(
             &home,

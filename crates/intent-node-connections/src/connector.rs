@@ -37,7 +37,7 @@ use intent_core::placement::{AgentPlatform, PlatformAvailability};
 use intent_core::remote_launch::{
     EffectiveIsolation, PlacementError, RemoteSetupState, RemoteSetupStatus,
 };
-use intent_core::{AgentId, Error, Result, WorkspaceId};
+use intent_core::{AgentId, Error, HomeId, Result, WorkspaceId};
 use intent_node_link::{
     self as link, Backoff, IncomingRequest, LinkEvent, LinkEvents, NodeEndpoint, NodeLink,
 };
@@ -640,6 +640,7 @@ impl Shared {
 
     /// Begin a use of the machine over its link; it waits while an idle
     /// pause runs, and the guard ends the use.
+    #[must_use = "the use ends when the guard drops"]
     pub async fn begin_use(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.use_gate.clone().read_owned().await
     }
@@ -2502,7 +2503,8 @@ impl RemoteNode {
     }
 
     /// The connector's internal state. Domain code calls the methods on
-    /// `RemoteNode` (and [`GateLink`](crate::link::gate::GateLink)) instead.
+    /// `RemoteNode`, [`GateLink`](crate::link::gate::GateLink) and
+    /// [`view`](Self::view) instead.
     #[must_use]
     pub fn shared_ref(&self) -> &Shared {
         &self.shared
@@ -2569,6 +2571,80 @@ impl RemoteNode {
         if let Some(link) = self.shared.link.borrow().as_ref() {
             link.close();
         }
+    }
+}
+
+/// What workspace homes, home terminals and home scripts ask of their
+/// machine's connector.
+impl RemoteNode {
+    /// Take a use of the machine: an idle pause waits for it to end.
+    #[must_use = "the use ends when the guard drops"]
+    pub async fn begin_use(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.shared.begin_use().await
+    }
+
+    /// The link went away: detach the machine's homes after the link-loss
+    /// grace unless a link comes back.
+    pub fn home_link_lost(&self) {
+        self.shared
+            .home_link
+            .link_lost(self.shared.weak(), self.shared.tuning.link_loss_grace);
+    }
+
+    /// Open a terminal in `home` on the machine.
+    ///
+    /// # Errors
+    ///
+    /// When the machine is not connected or the terminal cannot start.
+    pub fn open_home_terminal(
+        &self,
+        home: &intent_core::WorkspaceHome,
+        workspace_id: &WorkspaceId,
+        pty: &Arc<intent_pty::PtyHost>,
+        open: intent_pty::home::HomeTerminalOpen,
+    ) -> Result<intent_pty::PtyId> {
+        crate::link::terminals::open_on(&self.shared, home, workspace_id, pty, open)
+    }
+
+    /// Run a command in `home` on the machine, without a PTY.
+    #[must_use]
+    pub fn open_home_exec(
+        &self,
+        home: &intent_core::WorkspaceHome,
+        workspace_id: &WorkspaceId,
+        open: intent_pty::home::HomeExecOpen,
+    ) -> intent_pty::home::HomeExec {
+        crate::link::terminals::open_exec_on(&self.shared, home, workspace_id, open)
+    }
+
+    /// End every terminal of `home_id` on the machine.
+    pub async fn end_home_terminals(&self, home_id: &HomeId) {
+        self.shared.terminals.end_home(&self.shared, home_id).await;
+    }
+
+    /// Start a script run in `home` on the machine.
+    ///
+    /// # Errors
+    ///
+    /// When the machine is not connected or the run cannot start.
+    pub fn start_home_script(
+        &self,
+        home: &intent_core::WorkspaceHome,
+        workspace_id: &WorkspaceId,
+        pty: &Arc<intent_pty::PtyHost>,
+        open: intent_pty::home::HomeScriptOpen,
+    ) -> Result<Option<intent_pty::PtyId>> {
+        crate::link::home_scripts::start_on(&self.shared, home, workspace_id, pty, open)
+    }
+
+    /// Stop the home script run `id`, waiting up to `wait`.
+    pub async fn stop_home_script(
+        &self,
+        pty: &Arc<intent_pty::PtyHost>,
+        id: intent_pty::PtyId,
+        wait: Duration,
+    ) -> crate::link::home_scripts::Stopped {
+        self.shared.home_scripts.stop(pty, id, wait).await
     }
 }
 
