@@ -42,27 +42,27 @@ large_futures = "allow"
 # dev-dependencies (test support, dev cycles) stay in the member manifest:
 # cargo package strips them, and releases never touch them. intentd-sitter
 # stays in crates/intentd/Cargo.toml for its major-only requirement.
-intent-acp = { path = "crates/intent-acp", version = "0.11.277" }
-intent-app = { path = "crates/intent-app", version = "0.11.277" }
-intent-context = { path = "crates/intent-context", version = "0.11.277" }
-intent-core = { path = "crates/intent-core", version = "0.11.277" }
-intent-git = { path = "crates/intent-git", version = "0.11.277" }
-intent-js = { path = "crates/intent-js", version = "0.11.277" }
-intent-linear = { path = "crates/intent-linear", version = "0.11.277" }
-intent-node-connections = { path = "crates/intent-node-connections", version = "0.11.277" }
-intent-node-link = { path = "crates/intent-node-link", version = "0.11.277" }
-intent-nodes = { path = "crates/intent-nodes", version = "0.11.277" }
-intent-providers = { path = "crates/intent-providers", version = "0.11.277" }
-intent-pty = { path = "crates/intent-pty", version = "0.11.277" }
-intent-search = { path = "crates/intent-search", version = "0.11.277" }
-intent-sentry = { path = "crates/intent-sentry", version = "0.11.277" }
-intent-services = { path = "crates/intent-services", version = "0.11.277" }
-intent-sourcecontrol = { path = "crates/intent-sourcecontrol", version = "0.11.277" }
-intent-store = { path = "crates/intent-store", version = "0.11.277" }
-intent-svc-remote = { path = "crates/intent-svc-remote", version = "0.11.277" }
-intent-svc-runtime = { path = "crates/intent-svc-runtime", version = "0.11.277" }
-intent-svc-transfer = { path = "crates/intent-svc-transfer", version = "0.11.277" }
-intent-transport = { path = "crates/intent-transport", version = "0.11.277" }
+intent-acp = { path = "crates/intent-acp", version = "0.11.278" }
+intent-app = { path = "crates/intent-app", version = "0.11.278" }
+intent-context = { path = "crates/intent-context", version = "0.11.278" }
+intent-core = { path = "crates/intent-core", version = "0.11.278" }
+intent-git = { path = "crates/intent-git", version = "0.11.278" }
+intent-js = { path = "crates/intent-js", version = "0.11.278" }
+intent-linear = { path = "crates/intent-linear", version = "0.11.278" }
+intent-node-connections = { path = "crates/intent-node-connections", version = "0.11.278" }
+intent-node-link = { path = "crates/intent-node-link", version = "0.11.278" }
+intent-nodes = { path = "crates/intent-nodes", version = "0.11.278" }
+intent-providers = { path = "crates/intent-providers", version = "0.11.278" }
+intent-pty = { path = "crates/intent-pty", version = "0.11.278" }
+intent-search = { path = "crates/intent-search", version = "0.11.278" }
+intent-sentry = { path = "crates/intent-sentry", version = "0.11.278" }
+intent-services = { path = "crates/intent-services", version = "0.11.278" }
+intent-sourcecontrol = { path = "crates/intent-sourcecontrol", version = "0.11.278" }
+intent-store = { path = "crates/intent-store", version = "0.11.278" }
+intent-svc-remote = { path = "crates/intent-svc-remote", version = "0.11.278" }
+intent-svc-runtime = { path = "crates/intent-svc-runtime", version = "0.11.278" }
+intent-svc-transfer = { path = "crates/intent-svc-transfer", version = "0.11.278" }
+intent-transport = { path = "crates/intent-transport", version = "0.11.278" }
 intent-voice = { path = "crates/intent-voice", version = "0.4.1" }
 
 # Terminal column widths for `intentd agents` (already locked through miette).

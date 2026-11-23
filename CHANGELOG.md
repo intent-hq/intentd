@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.278] - 2026-11-23
+
+### 🚀 Features
+
+- Conversation goal (/goal, agent.setGoal, per-turn goal block) ([#3683](https://github.com/intent-hq/intentd/pull/3683))
+
+### 🐛 Bug Fixes
+
+- *(agents)* Finish claimed turn starts when the caller is cancelled ([#3694](https://github.com/intent-hq/intentd/pull/3694))
+
+### 🔧 Refactor
+
+- *(node-connections)* Give homes, home terminals and scripts calls on the connector, not its state ([#3689](https://github.com/intent-hq/intentd/pull/3689))
+- *(settings)* Share saved credential names with their readers ([#3696](https://github.com/intent-hq/intentd/pull/3696))
+- *(store)* Fold the Postgres migrations into one schema file ([#3691](https://github.com/intent-hq/intentd/pull/3691))
+- *(app)* Move one backend's startup restores, sweeps and loops into intent_app::tenant ([#3680](https://github.com/intent-hq/intentd/pull/3680))
+
+### ⚡ Performance
+
+- *(unsloth)* Request the Hugging Face catalog gzipped ([#3688](https://github.com/intent-hq/intentd/pull/3688))
+
+
 ## [0.11.277] - 2026-11-23
 
 ### 🐛 Bug Fixes
