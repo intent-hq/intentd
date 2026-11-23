@@ -53,7 +53,9 @@
 // A prompt with a block "echo-raw" streams "raw: {cwd, raw}" with its working
 // directory and the whole raw prompt (instructions included).
 // "sh <tag> <command>" runs <command> in the working directory with the
-// agent's environment and streams "sh-out <tag> {code, out}".
+// agent's environment and streams "sh-out <tag> {code, out}". "bash <tag>
+// <command>" does the same and also reports the run as a `Bash` tool_call /
+// tool_call_update, shaped as Claude Code reports its shell tool.
 import readline from 'node:readline';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -425,18 +427,52 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       // context) runs <command> with sh in the working directory
       // and the agent's own environment (no terminal prompts), and streams
       // "sh-out <tag> {code, out}" with its exit code and combined output.
-      const shell = text.match(/(?:^|\n)sh (\S+) ([^\n]+)$/);
+      const shell = text.match(/(?:^|\n)(sh|bash) (\S+) ([^\n]+)$/);
       if (shell) {
-        const run = spawnSync('sh', ['-c', shell[2]], {
+        const [, how, tag, command] = shell;
+        const toolCallId = `tc_${process.hrtime.bigint()}`;
+        if (how === 'bash') {
+          send({
+            method: 'session/update',
+            params: {
+              sessionId: SESSION,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId,
+                title: command,
+                kind: 'execute',
+                status: 'pending',
+                rawInput: { command, description: 'node test agent shell' },
+                _meta: { claudeCode: { toolName: 'Bash' } },
+              },
+            },
+          });
+        }
+        const run = spawnSync('sh', ['-c', command], {
           encoding: 'utf8',
           env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
         });
         const out = `${run.stdout ?? ''}${run.stderr ?? ''}`.trim();
+        if (how === 'bash') {
+          send({
+            method: 'session/update',
+            params: {
+              sessionId: SESSION,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId,
+                status: run.status === 0 ? 'completed' : 'failed',
+                rawOutput: out,
+                content: [{ type: 'content', content: { type: 'text', text: out } }],
+              },
+            },
+          });
+        }
         send({
           method: 'session/update',
           params: {
             sessionId: SESSION,
-            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `sh-out ${shell[1]} ${JSON.stringify({ code: run.status, out })}` } },
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `sh-out ${tag} ${JSON.stringify({ code: run.status, out })}` } },
           },
         });
         return send({ id: msg.id, result: { stopReason: 'end_turn' } });

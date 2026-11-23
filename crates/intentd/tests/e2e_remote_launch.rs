@@ -35,6 +35,7 @@ use crate::common;
 
 mod cloud;
 mod create_progress;
+mod created_pr;
 mod file_pull;
 mod first_agent_naming;
 mod forge_fetch;
