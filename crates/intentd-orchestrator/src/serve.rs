@@ -36,6 +36,7 @@ pub struct ServedTenant {
     tenant: String,
     dir: PathBuf,
     services: Services,
+    bus: EventBus,
     runtime: TenantRuntime,
     fence: TenantFence,
     /// Renews the lease; dropping it fires the fence.
@@ -83,7 +84,8 @@ pub async fn serve_tenant(
     let dir = crate::tenant_dir(data_dir, tenant);
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::Internal(format!("tenant {tenant}: create {}: {e}", dir.display())))?;
-    let services = tenant_services(store, &dir)?;
+    let bus = EventBus::new(store.clone());
+    let services = tenant_services(store, bus.clone(), &dir)?;
     let mut runner = intent_services::self_fence::tenant_self_fence(services.clone())
         .ok_or_else(|| Error::Internal(format!("tenant {tenant}: the store has no fence")))?;
     let admission = Unfenced(fence.clone());
@@ -93,6 +95,7 @@ pub async fn serve_tenant(
         tenant: tenant.to_owned(),
         dir,
         services,
+        bus,
         runtime,
         fence,
         heartbeat,
@@ -100,11 +103,11 @@ pub async fn serve_tenant(
     })
 }
 
-/// The tenant's `Services`: every path under `dir`, in orchestrator mode.
-fn tenant_services(store: Store, dir: &Path) -> Result<Services> {
+/// The tenant's `Services` over `bus`: every path under `dir`, in
+/// orchestrator mode.
+fn tenant_services(store: Store, bus: EventBus, dir: &Path) -> Result<Services> {
     let registry = SettingsRegistry::load(dir.join("config.toml"))?;
     let secrets = intent_core::FileSecretStore::with_path(dir.join("secrets.json"));
-    let bus = EventBus::new(store.clone());
     Ok(intent_app::compose(
         Services::new_with_secret_file(store, secrets)
             .with_event_bus(bus)
@@ -136,6 +139,32 @@ impl ServedTenant {
     #[must_use]
     pub fn services(&self) -> &Services {
         &self.services
+    }
+
+    /// The tenant's event bus.
+    #[must_use]
+    pub fn bus(&self) -> &EventBus {
+        &self.bus
+    }
+
+    /// Start the tenant's client listeners ([`crate::listen`]): every
+    /// connection joins the tenant's client connections, which its fence
+    /// closes.
+    ///
+    /// # Errors
+    /// As [`crate::listen::start_client_listeners`].
+    #[cfg(unix)]
+    pub async fn listen(
+        &self,
+        config: &crate::listen::ListenConfig,
+    ) -> std::result::Result<crate::listen::ClientListeners, String> {
+        crate::listen::start_client_listeners(
+            config,
+            &self.services,
+            &self.bus,
+            self.runtime.connections(),
+        )
+        .await
     }
 
     /// The tenant's running work.
@@ -230,7 +259,8 @@ mod tests {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("db.sqlite")).await.unwrap();
-        (tenant_services(store, &dir).unwrap(), dir)
+        let bus = EventBus::new(store.clone());
+        (tenant_services(store, bus, &dir).unwrap(), dir)
     }
 
     /// Every credential a tenant saves — including the GitLab token, which

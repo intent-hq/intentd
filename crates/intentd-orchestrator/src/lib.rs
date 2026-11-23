@@ -20,14 +20,18 @@
 //! 5. the fence, spawned. A fence step that overruns its budget leaves work
 //!    running past the lease, so [`is_fatal`] makes the process exit.
 //!
-//! Choosing the tenant of a client connection, and so listening for
-//! clients, comes with tenant-sticky routing; this binary serves no client
-//! yet.
+//! Clients connect to the default tenant ([`DEFAULT_TENANT`]) only, over
+//! `intentd`'s own local socket and WSS listener with `intentd`'s auth
+//! ([`listen`]); every connection joins that tenant's client connections,
+//! which its self-fence closes. Choosing the tenant of a connection comes
+//! with tenant-sticky routing.
 
 use std::path::{Path, PathBuf};
 
 use intent_core::tenant_fence::SelfFenceReport;
 
+#[cfg(unix)]
+pub mod listen;
 #[cfg(feature = "postgres")]
 pub mod serve;
 

@@ -28,6 +28,7 @@ intent-app = { workspace = true }
 intent-core = { workspace = true }
 intent-services = { workspace = true }
 intent-store = { workspace = true }
+intent-transport = { workspace = true }
 sha2 = "0.11"
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -35,6 +36,12 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+intent-services = { workspace = true, features = ["test-hooks"] }
+rustls = { workspace = true }
+rustls-pki-types = "1"
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
 intent-store = { workspace = true, features = ["test-support"] }
 intentd-test-support = { path = "../intentd-test-support" }
 serde_json = { workspace = true }
