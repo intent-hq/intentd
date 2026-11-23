@@ -74,10 +74,11 @@ pub fn boxed<'a, T>(future: impl Future<Output = T> + Send + 'a) -> intent_core:
 /// half-way (intent-hq/intent#9927: a dropped request left a claimed turn
 /// slot with no worker). `tasks` owns the task so shutdown joins it before
 /// its recovery snapshot. The task keeps the caller identity, the browser
-/// message ingress, and every live admission of the caller's scope and
-/// `held`, so nested `enter` calls reuse them and a queued deletion still
-/// waits for the work to finish. Once shutdown has closed `tasks`, turn
-/// admission is closed too, so the future runs inline.
+/// message ingress, the caller's instruction admission, and every live
+/// admission of the caller's scope and `held`, so nested `enter` calls reuse
+/// them and a queued deletion or removal still waits for the work to finish.
+/// Once shutdown has closed `tasks`, turn admission is closed too, so the
+/// future runs inline.
 ///
 /// The future is boxed so callers' state machines carry only a pointer: the
 /// wake path runs deep in nested deliveries and overflowed the stack of
@@ -97,10 +98,14 @@ pub(crate) async fn run_detached<T: Send + 'static>(
     permits.extend(held.map(|mutation| mutation.permit));
     let admitted = permits.iter().map(Arc::downgrade).collect();
     let ingress = intent_core::browser_message::current_ingress();
+    let authority = crate::member_removal::current_instruction_authority();
     let Some(task) = tasks.spawn_draining_with_current_caller(async move {
         let output = intent_core::browser_message::with_current_ingress(
             ingress,
-            ADMITTED.scope(RefCell::new(admitted), future),
+            crate::member_removal::with_instruction_authority(
+                authority,
+                ADMITTED.scope(RefCell::new(admitted), future),
+            ),
         )
         .await;
         drop(permits);

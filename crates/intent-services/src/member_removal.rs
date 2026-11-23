@@ -38,8 +38,33 @@ impl MutationBarrier {
     }
 }
 
+/// A held read admission. Clones share one guard, so a detached task can
+/// keep its caller's admission alive after the caller is dropped.
+#[derive(Clone)]
+pub(crate) struct InstructionAuthority {
+    identity: usize,
+    _guard: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
 tokio::task_local! {
-    static INSTRUCTION_AUTHORITY: usize;
+    static INSTRUCTION_AUTHORITY: InstructionAuthority;
+}
+
+/// The admission held by the current task, for [`with_instruction_authority`].
+pub(crate) fn current_instruction_authority() -> Option<InstructionAuthority> {
+    INSTRUCTION_AUTHORITY.try_with(Clone::clone).ok()
+}
+
+/// Run `future` under `authority`, so nested admissions reuse it instead of
+/// queueing a second read behind a pending removal writer.
+pub(crate) async fn with_instruction_authority<F: Future>(
+    authority: Option<InstructionAuthority>,
+    future: F,
+) -> F::Output {
+    match authority {
+        Some(authority) => INSTRUCTION_AUTHORITY.scope(authority, future).await,
+        None => future.await,
+    }
 }
 
 impl Services {
@@ -52,14 +77,18 @@ impl Services {
     {
         let identity = std::sync::Arc::as_ptr(&self.human_instruction_authority) as usize;
         if INSTRUCTION_AUTHORITY
-            .try_with(|id| *id == identity)
+            .try_with(|held| held.identity == identity)
             .unwrap_or(false)
         {
             return Box::pin(future);
         }
         Box::pin(async move {
-            let _authority = self.human_instruction_authority.read().await;
-            INSTRUCTION_AUTHORITY.scope(identity, future).await
+            let guard = self.human_instruction_authority.clone().read_owned().await;
+            let authority = InstructionAuthority {
+                identity,
+                _guard: std::sync::Arc::new(guard),
+            };
+            INSTRUCTION_AUTHORITY.scope(authority, future).await
         })
     }
 
