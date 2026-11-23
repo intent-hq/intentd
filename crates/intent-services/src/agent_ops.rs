@@ -18069,12 +18069,26 @@ impl Services {
             // obligation. Public metadata cannot supply that permission.
             return Err(crate::repository_read_source::unsupported());
         }
-        crate::workspace_mutations::boxed(self.deliver_wake_message_admitted(
-            workspace_id,
-            agent_id,
-            content,
-            message_metadata,
-        ))
+        // Detached like `AgentManager::send_message`'s claim (intent-hq/intent#9927):
+        // a `wakeOrCreate` caller cancelled between the slot claim and the
+        // worker spawn must not leave the target busy with no turn.
+        let (services, workspace_id, agent_id) =
+            (self.clone(), workspace_id.clone(), agent_id.clone());
+        let (content, message_metadata) = (content.to_string(), message_metadata.cloned());
+        crate::workspace_mutations::run_detached(
+            &self.turn_start_tasks,
+            None,
+            Box::pin(async move {
+                services
+                    .deliver_wake_message_admitted(
+                        &workspace_id,
+                        &agent_id,
+                        &content,
+                        message_metadata.as_ref(),
+                    )
+                    .await
+            }),
+        )
         .await
     }
 

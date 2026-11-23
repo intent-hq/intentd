@@ -801,6 +801,9 @@ pub struct Services {
     /// primary-auth children may finish after root admission closes.
     primary_auth_admitted: bool,
     terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
+    /// Detached claim-to-spawn deliveries (intent-hq/intent#9927), joined by
+    /// the agent shutdown checkpoint before it snapshots queues and turns.
+    turn_start_tasks: Arc<delivery_tasks::DeliveryTasks>,
     pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
     host_exec_runtime: Arc<host_exec::HostExecRuntime>,
     provider_preparation: Arc<provider_preparation::Preparation>,
@@ -1854,6 +1857,7 @@ impl Services {
             settings_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             primary_auth_admitted: false,
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
+            turn_start_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             pending_delete_tasks,
             host_exec_runtime: Arc::default(),
             provider_preparation: Arc::default(),
