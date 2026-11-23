@@ -12,11 +12,13 @@
 mod common;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use common::{refused_status, result, until, ws_ends, ws_rpc, wss, Uds};
 use intent_app::tenant::ClientConnections;
 use intent_services::{EventBus, Services};
 use intent_transport::auth::TOKEN_ACCOUNT;
+use intent_transport::PrimaryReverseRegistry;
 use intentd_orchestrator::listen::{start_client_listeners, ListenConfig};
 use serde_json::{json, Value};
 
@@ -30,15 +32,17 @@ fn config(dir: &Path, insecure: bool) -> ListenConfig {
     }
 }
 
-async fn sqlite_tenant(dir: &Path) -> (Services, EventBus) {
+async fn sqlite_tenant(dir: &Path) -> (Services, EventBus, Arc<PrimaryReverseRegistry>) {
     let store = intent_store::Store::open(&dir.join("db.sqlite"))
         .await
         .unwrap();
     let bus = EventBus::new(store.clone());
+    let reverse = Arc::new(PrimaryReverseRegistry::new());
     let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
+        .with_reverse_dispatch(reverse.clone())
         .with_workspaces_root(dir.join("workspaces"));
-    (services, bus)
+    (services, bus, reverse)
 }
 
 fn names(listed: &Value, key: &str, field: &str) -> Vec<String> {
@@ -53,12 +57,17 @@ fn names(listed: &Value, key: &str, field: &str) -> Vec<String> {
 #[tokio::test]
 async fn wss_takes_the_tenant_owner_token_and_the_socket_needs_none() {
     let dir = tempfile::tempdir().unwrap();
-    let (services, bus) = sqlite_tenant(dir.path()).await;
+    let (services, bus, reverse) = sqlite_tenant(dir.path()).await;
     let connections = ClientConnections::default();
-    let listeners =
-        start_client_listeners(&config(dir.path(), false), &services, &bus, &connections)
-            .await
-            .unwrap();
+    let listeners = start_client_listeners(
+        &config(dir.path(), false),
+        &services,
+        &bus,
+        reverse,
+        &connections,
+    )
+    .await
+    .unwrap();
     let port = listeners.ws_port();
     assert_ne!(port, 0);
     let fingerprint = listeners.fingerprint().expect("TLS is on").to_owned();
@@ -130,12 +139,17 @@ async fn wss_takes_the_tenant_owner_token_and_the_socket_needs_none() {
 #[tokio::test]
 async fn closing_the_tenant_connections_ends_both_listeners_clients() {
     let dir = tempfile::tempdir().unwrap();
-    let (services, bus) = sqlite_tenant(dir.path()).await;
+    let (services, bus, reverse) = sqlite_tenant(dir.path()).await;
     let connections = ClientConnections::default();
-    let listeners =
-        start_client_listeners(&config(dir.path(), false), &services, &bus, &connections)
-            .await
-            .unwrap();
+    let listeners = start_client_listeners(
+        &config(dir.path(), false),
+        &services,
+        &bus,
+        reverse,
+        &connections,
+    )
+    .await
+    .unwrap();
     let fingerprint = listeners.fingerprint().unwrap().to_owned();
     let token = services
         .secret_source()
@@ -170,12 +184,17 @@ async fn closing_the_tenant_connections_ends_both_listeners_clients() {
 #[tokio::test]
 async fn the_insecure_dev_seat_serves_plain_ws_without_a_token() {
     let dir = tempfile::tempdir().unwrap();
-    let (services, bus) = sqlite_tenant(dir.path()).await;
+    let (services, bus, reverse) = sqlite_tenant(dir.path()).await;
     let connections = ClientConnections::default();
-    let listeners =
-        start_client_listeners(&config(dir.path(), true), &services, &bus, &connections)
-            .await
-            .unwrap();
+    let listeners = start_client_listeners(
+        &config(dir.path(), true),
+        &services,
+        &bus,
+        reverse,
+        &connections,
+    )
+    .await
+    .unwrap();
     assert_eq!(listeners.fingerprint(), None);
     let (mut ws, _) =
         tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", listeners.ws_port()))
@@ -194,14 +213,20 @@ async fn the_insecure_dev_seat_serves_plain_ws_without_a_token() {
 #[tokio::test]
 async fn a_socket_that_cannot_bind_fails_the_start() {
     let dir = tempfile::tempdir().unwrap();
-    let (services, bus) = sqlite_tenant(dir.path()).await;
+    let (services, bus, reverse) = sqlite_tenant(dir.path()).await;
     let mut config = config(dir.path(), true);
     config.socket_path = dir.path().join("missing").join("file").join("o.sock");
     std::fs::write(dir.path().join("missing"), "a file, not a directory").unwrap();
-    let error = start_client_listeners(&config, &services, &bus, &ClientConnections::default())
-        .await
-        .err()
-        .expect("the socket cannot bind");
+    let error = start_client_listeners(
+        &config,
+        &services,
+        &bus,
+        reverse,
+        &ClientConnections::default(),
+    )
+    .await
+    .err()
+    .expect("the socket cannot bind");
     assert!(error.contains("local socket"), "{error}");
 }
 
@@ -258,7 +283,25 @@ mod postgres {
         let mut ws = wss(listeners.ws_port(), &fingerprint, Some(&token))
             .await
             .unwrap();
-        result(&ws_rpc(&mut ws, 1, "client.hello", json!({ "clientId": "web-pg" })).await);
+        let dispatch = served
+            .services()
+            .feature_reverse_dispatch()
+            .cloned()
+            .expect("the tenant's Services carry its reverse registry");
+        assert!(!dispatch.is_connected());
+        result(
+            &ws_rpc(
+                &mut ws,
+                1,
+                "client.hello",
+                json!({ "clientId": "web-pg", "capabilities": { "browserExec": true } }),
+            )
+            .await,
+        );
+        assert!(
+            dispatch.is_connected(),
+            "agent browser actions reach the listener's desktop"
+        );
         // In orchestrator mode `workspace.create` needs a home machine, which
         // this test has none of, so the workspace is put in the tenant's store
         // directly; everything after that goes over the wire.

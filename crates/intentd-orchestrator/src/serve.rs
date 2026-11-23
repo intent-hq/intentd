@@ -13,6 +13,7 @@ use intent_store::postgres::{
     LeaseHeartbeat, PgPool, PostgresOptions, TenantId, LEASE_RENEW_INTERVAL, LEASE_TTL,
 };
 use intent_store::{OrchestratorOnly, Store};
+use intent_transport::PrimaryReverseRegistry;
 
 /// How a tenant's lease is held: claimed for `ttl`, renewed every
 /// `interval`.
@@ -38,6 +39,10 @@ pub struct ServedTenant {
     services: Services,
     bus: EventBus,
     runtime: TenantRuntime,
+    /// The tenant's reverse registry: installed in `services` before any
+    /// clone of it exists, and shared by its client listeners, so agent
+    /// browser actions reach the desktops those listeners connect.
+    reverse: Arc<PrimaryReverseRegistry>,
     fence: TenantFence,
     /// Renews the lease; dropping it fires the fence.
     heartbeat: LeaseHeartbeat,
@@ -85,7 +90,8 @@ pub async fn serve_tenant(
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::Internal(format!("tenant {tenant}: create {}: {e}", dir.display())))?;
     let bus = EventBus::new(store.clone());
-    let services = tenant_services(store, bus.clone(), &dir)?;
+    let reverse = Arc::new(PrimaryReverseRegistry::new());
+    let services = tenant_services(store, bus.clone(), &dir, reverse.clone())?;
     let mut runner = intent_services::self_fence::tenant_self_fence(services.clone())
         .ok_or_else(|| Error::Internal(format!("tenant {tenant}: the store has no fence")))?;
     let admission = Unfenced(fence.clone());
@@ -97,6 +103,7 @@ pub async fn serve_tenant(
         services,
         bus,
         runtime,
+        reverse,
         fence,
         heartbeat,
         report: Some(runner.spawn()),
@@ -104,13 +111,19 @@ pub async fn serve_tenant(
 }
 
 /// The tenant's `Services` over `bus`: every path under `dir`, in
-/// orchestrator mode.
-fn tenant_services(store: Store, bus: EventBus, dir: &Path) -> Result<Services> {
+/// orchestrator mode, dispatching to clients through `reverse`.
+fn tenant_services(
+    store: Store,
+    bus: EventBus,
+    dir: &Path,
+    reverse: Arc<PrimaryReverseRegistry>,
+) -> Result<Services> {
     let registry = SettingsRegistry::load(dir.join("config.toml"))?;
     let secrets = intent_core::FileSecretStore::with_path(dir.join("secrets.json"));
     Ok(intent_app::compose(
         Services::new_with_secret_file(store, secrets)
             .with_event_bus(bus)
+            .with_reverse_dispatch(reverse)
             .with_settings_registry(Arc::new(registry))
             .with_workspaces_root(dir.join("workspaces"))
             .with_assets_root(dir.join("assets"))
@@ -165,6 +178,7 @@ impl ServedTenant {
             config,
             &self.services,
             &self.bus,
+            self.reverse.clone(),
             self.runtime.connections(),
         )
         .await?;
@@ -248,7 +262,83 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("db.sqlite")).await.unwrap();
         let bus = EventBus::new(store.clone());
-        (tenant_services(store, bus, &dir).unwrap(), dir)
+        let reverse = Arc::new(PrimaryReverseRegistry::new());
+        (tenant_services(store, bus, &dir, reverse).unwrap(), dir)
+    }
+
+    /// A desktop that connects through the tenant's listeners is reachable
+    /// from a clone of the tenant's `Services` made before they started —
+    /// as the runtime's and remote calls' clones are — so agent browser
+    /// actions find it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listener_desktop_is_reachable_from_earlier_services_clones() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("db.sqlite")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let reverse = Arc::new(PrimaryReverseRegistry::new());
+        let services = tenant_services(store, bus.clone(), &dir, reverse.clone()).unwrap();
+        let earlier = services.clone();
+        let dispatch = earlier
+            .feature_reverse_dispatch()
+            .cloned()
+            .expect("the tenant's Services carry its reverse registry");
+        assert!(!dispatch.is_connected());
+
+        let connections = intent_app::tenant::ClientConnections::default();
+        let config = crate::listen::ListenConfig {
+            socket_path: dir.join("o.sock"),
+            bind_addresses: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            ws_port: 0,
+            tls_dir: dir.join("tls"),
+            insecure: true,
+        };
+        let listeners =
+            crate::listen::start_client_listeners(&config, &services, &bus, reverse, &connections)
+                .await
+                .unwrap();
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", listeners.ws_port()))
+                .await
+                .unwrap();
+        let hello = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "client.hello",
+            "params": { "clientId": "desktop-a", "capabilities": { "browserExec": true } },
+        });
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            hello.to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(30)),
+            async {
+                loop {
+                    if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                        ws.next().await
+                    {
+                        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if value["id"] == json!(1) {
+                            return value;
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .expect("client.hello reply");
+        assert!(reply.get("error").is_none(), "{reply}");
+        assert!(
+            dispatch.is_connected(),
+            "the earlier clone sees the listener's desktop"
+        );
+        listeners.stop().await;
     }
 
     /// Every credential a tenant saves — including the GitLab token, which
