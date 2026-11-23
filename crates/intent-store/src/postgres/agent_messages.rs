@@ -690,7 +690,8 @@ impl PgStore {
         let mut tx = self.begin().await?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_message \
-             WHERE tenant_id = $1 AND agent_id = $2 AND role = 'assistant')",
+             WHERE tenant_id = $1 AND agent_id = $2 AND role = 'assistant' \
+             AND content <> '[]')",
         )
         .bind(self.tenant())
         .bind(&agent_id.0)

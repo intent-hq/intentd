@@ -75,12 +75,15 @@ pub(crate) const SESSION_MESSAGE_STATS_SQL: &str = "SELECT s.id AS agent_id, \
 
 /// Bounded probe behind [`Store::agent_has_assistant_message`], extracted so
 /// tests can run `EXPLAIN QUERY PLAN` on the exact production statement. It
-/// must stay a single seek of `idx_agent_message_agent_role_seq` (0064): the
+/// must stay a seek of `idx_agent_message_agent_role_seq` (0064): the
 /// per-turn first-turn naming check runs it on every turn, and the
 /// full-transcript read it replaced held read-pool connections for seconds
-/// on long-lived agents.
+/// on long-lived agents. An empty row (`[]`: any turn that ended before any
+/// output, such as a failed start, `max_tokens`, a refusal or a cancel before
+/// the first token) is not an answer; the seek reads past only those. A turn
+/// with only whitespace still counts.
 pub(crate) const AGENT_HAS_ASSISTANT_MESSAGE_SQL: &str = "SELECT EXISTS(\
-    SELECT 1 FROM agent_message WHERE agent_id = ? AND role = 'assistant')";
+    SELECT 1 FROM agent_message WHERE agent_id = ? AND role = 'assistant' AND content <> '[]')";
 
 /// Bounded probe behind [`Store::agent_has_assistant_after_last_user`]:
 /// whether any `assistant` row follows the agent's latest `user` row. Both
@@ -6702,9 +6705,10 @@ impl Store {
         dispatch!(self, backend => backend.delete_prestaged_agent_message_payloads(message_id).await)
     }
 
-    /// Whether `agent_id` has at least one persisted `assistant` message —
-    /// exactly `get_agent_messages(agent_id, None)?.iter().any(|m| m.role ==
-    /// "assistant")`, without reading or decoding the transcript. One seek of
+    /// Whether `agent_id` has at least one persisted non-empty `assistant`
+    /// message — `get_agent_messages(agent_id, None)?.iter().any(|m| m.role ==
+    /// "assistant")` minus the empty rows a turn that failed before any output
+    /// leaves, without reading or decoding the transcript. One seek of
     /// the `(agent_id, role, seq)` index, so the cost does not grow with the
     /// conversation; it answers the per-turn "is this the first turn?" check.
     ///
@@ -16993,11 +16997,11 @@ mod tests {
         }
     }
 
-    /// The per-turn first-turn probe must stay one index seek: a plan that
-    /// scans `agent_message` (or reads its rows instead of the covering
-    /// index) would bring back the per-turn cost that grew with the transcript.
+    /// The per-turn first-turn probe must stay an index seek: a plan that
+    /// scans `agent_message` would bring back the per-turn cost that grew
+    /// with the transcript.
     #[tokio::test]
-    async fn agent_has_assistant_message_is_a_covering_index_seek() {
+    async fn agent_has_assistant_message_is_an_index_seek() {
         let tmp = TempDb::new("test-assistant-probe-plan");
         let store = Store::open(&tmp).await.expect("create test store");
         let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -17013,14 +17017,13 @@ mod tests {
             .filter(|detail| detail.contains("agent_message"))
             .collect();
         assert!(!message_steps.is_empty(), "plan: {details:?}");
-        for detail in message_steps {
-            assert!(
-                detail.starts_with("SEARCH")
-                    && detail.contains("COVERING INDEX idx_agent_message_agent_role_seq"),
-                "probe must seek the (agent_id, role, seq) covering index, got {detail:?} \
-                 (plan: {details:?})"
-            );
-        }
+        // Not covering: the content filter reads each candidate row, but
+        // EXISTS stops at the first non-empty one.
+        assert_eq!(
+            message_steps,
+            ["SEARCH agent_message USING INDEX idx_agent_message_agent_role_seq (agent_id=? AND role=?)"],
+            "probe must seek the (agent_id, role, seq) index (plan: {details:?})"
+        );
     }
 
     /// `agent_has_assistant_message` agrees with the full-transcript check it
@@ -17055,7 +17058,7 @@ mod tests {
                     .await
                     .expect("full read")
                     .iter()
-                    .any(|m| m.role == "assistant")
+                    .any(|m| m.role == "assistant" && m.content != serde_json::json!([]))
             }
         };
         let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
@@ -17068,6 +17071,18 @@ mod tests {
             .expect("append user");
         assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
         assert!(!full_check(&store, &agent).await);
+
+        // A turn that failed before any output leaves an empty row: no answer.
+        let empty = store
+            .append_agent_message(&agent, "assistant", &serde_json::json!([]), &ts)
+            .await
+            .expect("append empty assistant");
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(!full_check(&store, &agent).await);
+        store
+            .truncate_agent_messages_from(&agent, empty.seq)
+            .await
+            .expect("drop empty assistant");
 
         store
             .append_agent_message(&agent, "assistant", &text("a1"), &ts)
@@ -17154,8 +17169,8 @@ mod tests {
         for detail in message_steps {
             assert!(
                 detail.starts_with("SEARCH")
-                    && detail.contains("COVERING INDEX idx_agent_message_agent_role_seq"),
-                "probe must seek the (agent_id, role, seq) covering index, got {detail:?} \
+                    && detail.contains("INDEX idx_agent_message_agent_role_seq"),
+                "probe must seek the (agent_id, role, seq) index, got {detail:?} \
                  (plan: {details:?})"
             );
         }

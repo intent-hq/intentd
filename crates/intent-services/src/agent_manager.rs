@@ -6167,7 +6167,9 @@ impl AgentManager {
     /// `agent-backend-handler.service.ts` (`namingInstructions` block):
     ///
     /// * Fires only on the agent's **first** turn — detected by the absence of
-    ///   any prior `assistant` message in the persisted transcript.
+    ///   any prior non-empty `assistant` message in the persisted transcript
+    ///   (a turn that failed before any output, such as a remote failover
+    ///   that could not start, leaves an empty one).
     /// * Agent naming fires only for generated generic/specialist placeholders
     ///   whose name was not explicitly set — plus, in the Assistant (chief)
     ///   workspace, the chat placeholders ([`is_assistant_chat_placeholder_name`]),

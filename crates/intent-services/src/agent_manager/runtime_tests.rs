@@ -1009,3 +1009,58 @@ async fn a_remote_agents_prompt_matches_what_its_machine_serves() {
     );
     assert!(!full.contains("<available_skills>"), "{full}");
 }
+
+/// A runner agent whose first turn failed before any output (a remote
+/// failover that could not start the backup) left an empty assistant row;
+/// its retry is still its first answered turn, so it is still asked to name
+/// itself and its untitled workspace. The transcript is the one recorded on
+/// an affected backend.
+#[tokio::test]
+async fn a_remote_agents_retry_after_an_empty_failed_turn_still_asks_for_names() {
+    let ws = WorkspaceId::from("ws-remote-naming");
+    let id = AgentId::from("agent-remote-naming");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
+    let store = &mgr.services.store;
+    let mut workspace = store.get_workspace(&ws).await.unwrap();
+    workspace.title = String::new();
+    store.update_workspace(&workspace).await.unwrap();
+    let mut session = store.get_agent_session_with_transcript(&id).await.unwrap();
+    session.name = "Agent".into();
+    session.name_explicitly_set = false;
+    store.update_agent_session(&ws, &session).await.unwrap();
+    let text = |t: &str| json!([{ "type": "text", "text": t }]);
+    for (role, content) in [
+        ("user", text("first")),
+        (
+            "system",
+            text("invalid params: remote-failover-unavailable: the backup couldn't start"),
+        ),
+        ("assistant", json!([])),
+    ] {
+        store
+            .append_agent_message(&id, role, &content, &now_iso())
+            .await
+            .unwrap();
+    }
+
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "try again?".into(),
+        None,
+        super::super::TurnOptions::default(),
+    )
+    .await
+    .unwrap();
+    fake.wait_prompts(1).await;
+    fake.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+    let first = serde_json::to_string(&fake.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(first.contains("ws.workspace.setTitle"), "{first}");
+    assert!(first.contains("ws.workspace.setAgentName"), "{first}");
+}
