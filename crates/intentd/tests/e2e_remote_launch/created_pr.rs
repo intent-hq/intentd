@@ -298,7 +298,9 @@ async fn a_pr_a_remote_agent_opens_from_a_submodule_branch_is_listed_on_its_root
     assert_eq!(git(&lib, &["rev-parse", "HEAD"]), pin);
 
     // The agent resets its submodule to the pin, as the agent in the report
-    // did; the PR stays listed.
+    // did. The listing never depended on the agent's branch, so it stays;
+    // that later sweeps keep pool entries is covered by the intent-services
+    // git-root refresh tests.
     bash_ok(
         &mut rpc_ws,
         &mut events,

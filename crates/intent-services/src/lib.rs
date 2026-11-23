@@ -6742,10 +6742,13 @@ impl Services {
     }
 
     /// Fetch each created PR whose repository matches a git root of the
-    /// workspace and add it to that root's `pullRequests`; an unlinked root
-    /// (or one whose linked PR is merged or closed) also links it. Pool
-    /// entries survive a later detached or mismatched HEAD, so the PR stays
-    /// listed after the agent resets the submodule to its pin.
+    /// workspace and add it to that root's `pullRequests` only: the write is
+    /// one atomic projection of the stored pool, so a concurrent sweep's
+    /// update is never rolled back, and the linked PR (kept by the sweep
+    /// from the root's live branch) is not touched. Pool entries survive a
+    /// detached or mismatched HEAD, so the PR stays listed after the agent
+    /// resets the submodule to its pin. A failed fetch is logged and skips
+    /// only that PR.
     pub(crate) async fn link_created_prs(
         &self,
         workspace_id: &WorkspaceId,
@@ -6760,25 +6763,24 @@ impl Services {
                     .iter()
                     .filter(|(r, _)| *r == repo)
                     .map(|(_, n)| *n)
+                    .filter(|n| {
+                        !root
+                            .pull_requests
+                            .as_deref()
+                            .is_some_and(|items| items.iter().any(|p| p.number == *n))
+                    })
                     .collect();
-                (!numbers.is_empty()).then_some((root, repo, numbers))
+                (!numbers.is_empty()).then_some((root.id, repo, numbers))
             })
             .collect();
         if targets.is_empty() {
             return Ok(());
         }
-        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source()).await?;
-        for (mut root, repo, numbers) in targets {
-            let mut changed = false;
-            let mut fetched_fresh = Vec::new();
+        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
+            .await?;
+        for (root_id, repo, numbers) in targets {
+            let mut fetched = Vec::new();
             for number in numbers {
-                if root
-                    .pull_requests
-                    .as_deref()
-                    .is_some_and(|items| items.iter().any(|p| p.number == number))
-                {
-                    continue;
-                }
                 let pr = tokio::time::timeout(
                     self.pr_refresh_fetch_timeout,
                     self.linked_pr_record(sc.as_ref(), &repo, number),
@@ -6788,39 +6790,34 @@ impl Services {
                     Err(intent_sourcecontrol::Error::Api(
                         "PR fetch timed out".into(),
                     ))
-                })
-                .map_err(pr_ops::map_sc_err)?;
-                let mut info = pr_ops::build_pr_info(&pr);
-                changed |= pr_ops::upsert_pr_info(&mut root.pull_requests, &mut info);
-                fetched_fresh.push(number);
-                let linked_open = root.pr_number.is_some()
-                    && !matches!(
-                        root.pr_status,
-                        Some(
-                            intent_core::PullRequestStatus::Merged
-                                | intent_core::PullRequestStatus::Closed
-                        )
-                    );
-                if !linked_open {
-                    root.pr_number = Some(pr.number);
-                    root.pr_url = Some(pr.url.clone());
-                    root.pr_status = Some(info.status);
-                    changed = true;
+                });
+                match pr {
+                    Ok(pr) => fetched.push(pr_ops::build_pr_info(&pr)),
+                    Err(error) => tracing::warn!(
+                        git_root = %root_id.as_str(),
+                        pr = number,
+                        %error,
+                        "fetching an agent-created PR failed"
+                    ),
                 }
             }
-            if !changed {
+            if fetched.is_empty() {
                 continue;
             }
-            root.updated_at = now_iso();
-            self.store
-                .update_workspace_git_root_pr_rebased(&mut root, |root, persisted| {
-                    pr_ops::rebase_pool_on_persisted(
-                        &mut root.pull_requests,
-                        persisted,
-                        &fetched_fresh,
-                    );
+            let written = self
+                .store
+                .project_workspace_git_root_pull_requests(&root_id, &now_iso(), |pool| {
+                    let mut changed = false;
+                    for info in &fetched {
+                        changed |= pr_ops::upsert_pr_info(pool, &mut info.clone());
+                    }
+                    changed
                 })
                 .await?;
+            if written.is_none() {
+                continue;
+            }
+            let root = self.store.get_workspace_git_root(&root_id).await?;
             publish_event(
                 self.event_bus.as_ref(),
                 git_root_changed_event(GIT_ROOT_UPDATED, &root),

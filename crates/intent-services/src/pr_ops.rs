@@ -308,37 +308,57 @@ fn collect_strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
     }
 }
 
-/// The PRs an agent's finished shell tool call opened: the call's input runs
-/// `gh pr create` and its output prints the new PR's URL (or, when the PR
-/// already exists, the existing one's). Shape-agnostic: every string in the
-/// input and output is read, so Claude Code's `{command}`, Codex's argv
-/// array and a plain-string or content-wrapped output all match. Each
+/// The shell command of a tool call's input: `command` (or `cmd`) as a
+/// string (Claude Code's Bash) or an argv array (Codex), joined by spaces.
+/// Other input fields (a description, the echoed title) are never read.
+fn tool_command(input: &serde_json::Value) -> Option<String> {
+    let field = input.get("command").or_else(|| input.get("cmd"))?;
+    match field {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+/// The PRs an agent's finished shell tool call opened: its command runs
+/// `gh pr create` and an output line is exactly a github.com PR URL, as `gh`
+/// prints for a new PR and after "already exists:" for an existing one. A
+/// URL inside other text (a log, a grep hit) is not one. Each
 /// `(repo, number)` appears once.
 pub(crate) fn created_pr_refs(
     input: &serde_json::Value,
     output: &serde_json::Value,
 ) -> Vec<(RepoRef, u64)> {
-    static PR_URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"https?://[^\s/]+/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/(\d+)")
+    static GH_PR_CREATE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:^|[\s;&|(`])(?:\S*/)?gh\s+pr\s+create\b")
+            .expect("valid gh pr create pattern")
+    });
+    static PR_URL_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/(\d+)$")
             .expect("valid PR URL pattern")
     });
-    let mut inputs = Vec::new();
-    collect_strings(input, &mut inputs);
-    if !inputs.iter().any(|s| s.contains("gh pr create")) {
+    if !tool_command(input).is_some_and(|command| GH_PR_CREATE.is_match(&command)) {
         return Vec::new();
     }
     let mut outputs = Vec::new();
     collect_strings(output, &mut outputs);
     let mut found: Vec<(RepoRef, u64)> = Vec::new();
-    for text in outputs {
-        for caps in PR_URL.captures_iter(text) {
-            let Ok(number) = caps[3].parse::<u64>() else {
-                continue;
-            };
-            let repo = RepoRef::new(&caps[1], &caps[2]);
-            if !found.iter().any(|(r, n)| *n == number && *r == repo) {
-                found.push((repo, number));
-            }
+    for line in outputs.iter().flat_map(|text| text.lines()) {
+        let Some(caps) = PR_URL_LINE.captures(line.trim()) else {
+            continue;
+        };
+        let Ok(number) = caps[3].parse::<u64>() else {
+            continue;
+        };
+        let repo = RepoRef::new(&caps[1], &caps[2]);
+        if !found.iter().any(|(r, n)| *n == number && *r == repo) {
+            found.push((repo, number));
         }
     }
     found
@@ -2249,6 +2269,65 @@ pub(crate) fn validate_merge_method(method: Option<&str>) -> Result<MergeMethod>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refs(input: serde_json::Value, output: serde_json::Value) -> Vec<(String, u64)> {
+        created_pr_refs(&input, &output)
+            .into_iter()
+            .map(|(repo, n)| (format!("{}/{}", repo.owner, repo.name), n))
+            .collect()
+    }
+
+    #[test]
+    fn created_pr_refs_reads_the_url_gh_prints_for_each_tool_shape() {
+        let claude =
+            serde_json::json!({ "command": "cd lib && gh pr create --fill", "description": "x" });
+        assert_eq!(
+            refs(
+                claude,
+                serde_json::json!("https://github.com/acme/lib/pull/7\n")
+            ),
+            [("acme/lib".to_owned(), 7)]
+        );
+        let codex =
+            serde_json::json!({ "command": ["bash", "-lc", "/usr/bin/gh pr create -t t -b b"] });
+        let wrapped = serde_json::json!([{ "type": "content", "content": { "type": "text",
+            "text": "Warning: 2 uncommitted changes\nhttps://github.com/Acme/Lib/pull/8" } }]);
+        assert_eq!(refs(codex, wrapped), [("Acme/Lib".to_owned(), 8)]);
+        let exists = "a pull request for branch \"fix\" into branch \"main\" already exists:\nhttps://github.com/acme/lib/pull/9\n";
+        assert_eq!(
+            refs(
+                serde_json::json!({ "cmd": "gh pr create" }),
+                serde_json::json!(exists)
+            ),
+            [("acme/lib".to_owned(), 9)]
+        );
+    }
+
+    #[test]
+    fn created_pr_refs_ignores_other_commands_and_embedded_urls() {
+        let url = serde_json::json!("https://github.com/acme/lib/pull/7");
+        // Only the command field counts, not a description or echoed title.
+        let described = serde_json::json!({ "command": "rg pull docs", "description": "before gh pr create",
+            "_acpTitle": "gh pr create" });
+        assert!(refs(described, url.clone()).is_empty());
+        assert!(refs(
+            serde_json::json!({ "command": "gh pr view 7" }),
+            url.clone()
+        )
+        .is_empty());
+        assert!(refs(
+            serde_json::json!({ "command": "mygh pr create" }),
+            url.clone()
+        )
+        .is_empty());
+        assert!(refs(serde_json::json!({ "code": "gh pr create" }), url).is_empty());
+        // A URL inside other text, or on another host, is not the created PR.
+        let create = serde_json::json!({ "command": "gh pr create && rg pull/ docs" });
+        let noisy = serde_json::json!(
+            "docs/a.md: see https://github.com/acme/lib/pull/3\nhttps://github.example.com/acme/lib/pull/4\nhttps://github.com/acme/lib/pull/5"
+        );
+        assert_eq!(refs(create, noisy), [("acme/lib".to_owned(), 5)]);
+    }
 
     fn pr(state: PrState, draft: bool, mergeable: Option<bool>, ms: Option<&str>) -> PullRequest {
         PullRequest {
