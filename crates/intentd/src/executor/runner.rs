@@ -1919,6 +1919,9 @@ impl Runner {
                 _ = &mut stop => None,
             }
         } else {
+            if output.is_some() {
+                self.pend_setup(&agent).await;
+            }
             tokio::select! {
                 prepared = self.inner.checkouts.prepare(
                     &agent.id,
@@ -2252,10 +2255,36 @@ impl Runner {
         intent_git::auth::node_helper_env(&exe, socket, inherited.as_deref())
     }
 
-    /// Run or account for the setup of a prepared checkout: a fresh one
-    /// runs `command` (or records `skipped` without one) and journals
-    /// `setupFinished`; a kept one journals only a setup a stop or restart
-    /// interrupted (`failed`, no re-run).
+    /// Before a prepared launch makes the agent's own checkout, record its
+    /// setup `pending`, so a stop or restart before the script starts does
+    /// not leave a kept checkout whose setup never runs. A kept checkout
+    /// still `pending` is such a launch's partial checkout, where no agent
+    /// ran: it is removed, to be made fresh.
+    async fn pend_setup(&self, agent: &Agent) {
+        let worktree = match self.inner.checkouts.worktree(&agent.id) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                tracing::warn!(agent = %agent.id, %error, "node: could not record the setup pending");
+                return;
+            }
+        };
+        if self.inner.checkouts.existing(&agent.id).is_some() {
+            if !setup::read_status(&worktree).is_some_and(|s| s.state == setup::Recorded::Pending) {
+                return;
+            }
+            self.inner.checkouts.discard_checkout(&agent.id).await;
+            if self.inner.checkouts.existing(&agent.id).is_some() {
+                return;
+            }
+        }
+        setup::write_status(&worktree, &SetupStatus::pending());
+    }
+
+    /// Run or account for the setup of a prepared checkout: a fresh one (or
+    /// a kept own checkout still `pending`) runs `command` (or records
+    /// `skipped` without one) and journals `setupFinished`; any other kept
+    /// one journals only a setup a stop or restart interrupted (`failed`,
+    /// no re-run).
     async fn settle_setup(
         &self,
         agent: &Agent,
@@ -2265,6 +2294,10 @@ impl Runner {
         output: &Arc<SetupOutput>,
         stop: &mut oneshot::Receiver<()>,
     ) -> Settled {
+        let own = agent.checkout_of.is_none() && agent.home.is_none();
+        let fresh = fresh
+            || (own
+                && setup::read_status(cwd).is_some_and(|s| s.state == setup::Recorded::Pending));
         let status = match (fresh, command) {
             (false, _) => match setup::read_status(cwd) {
                 Some(status) if status.state == setup::Recorded::Running => {

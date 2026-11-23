@@ -3068,8 +3068,54 @@ async fn node_runner_stop_during_setup_kills_it_and_records_it_interrupted() {
     h.runner.stop(&AgentId::from("a1"));
 }
 
-/// A kept checkout with no recorded setup (its first launch was stopped
-/// before setup, or ran on a machine without it) records one result, so
+/// A stop while the machine makes a fresh checkout, before its setup
+/// starts, leaves a partial checkout. The next launch removes it, makes a
+/// fresh one and runs the setup script, instead of recording it
+/// `node-setup-interrupted` for a script that never ran.
+#[tokio::test]
+async fn node_runner_stop_during_checkout_runs_setup_at_the_next_launch() {
+    use intent_core::node_link::SetupState;
+    let Some(h) = harness(1, &[]) else { return };
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (_release, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_prepare.lock().unwrap() = Some((reached_tx, release_rx));
+    let script = "echo ran >> setup-runs.txt\n";
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
+    tokio::time::timeout(wait(), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    let worktree = h.storage.existing_agent_dir(&AgentId::from("a1")).unwrap();
+    std::fs::write(worktree.join("partial.txt"), "half made\n").unwrap();
+    h.runner.stop(&AgentId::from("a1"));
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    assert!(!all.iter().any(setup_started("a1")), "{all:#?}");
+
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
+    let all = wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+    assert_eq!(finished(&all, "a1"), (SetupState::Completed, Some(0), None));
+    assert_eq!(all.iter().filter(|r| setup_started("a1")(r)).count(), 1);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("setup-runs.txt")).unwrap(),
+        "ran\n"
+    );
+    assert!(
+        !worktree.join("partial.txt").exists(),
+        "the partial checkout is made again"
+    );
+    assert!(!told_setup_failed(&all, "a1", "t1", ""), "{all:#?}");
+    h.runner.stop(&AgentId::from("a1"));
+}
+
+/// A kept checkout with no recorded setup (made by a machine without
+/// setup, or before it recorded a pending one) records one result, so
 /// the backend never waits on a setup that will not come: `failed` without
 /// running a script it carries, `skipped` without one.
 #[tokio::test]
