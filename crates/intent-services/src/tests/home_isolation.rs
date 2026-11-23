@@ -124,7 +124,7 @@ async fn home_isolation_setup_fixture_leaves_home_untouched() {
 /// The production default constructor never resolves the real home's
 /// secrets store under the test harness: it is redirected to an empty
 /// scratch store, so the real tokens are unreadable and writes land outside
-/// the home. The same redirect covers the module-level token loaders.
+/// the home. The token loaders read the same store.
 #[tokio::test]
 async fn home_isolation_default_services_redirect_away_from_forbidden_home() {
     let home = SentinelHome::new();
@@ -156,7 +156,11 @@ async fn home_isolation_default_services_redirect_away_from_forbidden_home() {
         .await
         .expect("store probe secret");
     assert_eq!(
-        intent_sourcecontrol::token::resolve(&intent_sourcecontrol::TokenSource::Explicit).await,
+        intent_sourcecontrol::token::resolve(
+            &intent_sourcecontrol::TokenSource::Explicit,
+            &services.secret_source(),
+        )
+        .await,
         None,
         "the GitHub token loader must not read the forbidden home"
     );

@@ -283,14 +283,18 @@ pub(crate) async fn resolve_engine(
     injected: Option<Arc<dyn VoiceEngine>>,
     provider: VoiceProvider,
     openai_model: Option<String>,
+    secrets: &intent_core::SharedSecretStore,
 ) -> Result<Arc<dyn VoiceEngine>> {
     match injected {
         Some(engine) => Ok(engine),
-        None => VoiceRegistry::from_settings(&VoiceSettings {
-            provider,
-            openai_model,
-            ..VoiceSettings::default()
-        })
+        None => VoiceRegistry::from_settings(
+            &VoiceSettings {
+                provider,
+                openai_model,
+                ..VoiceSettings::default()
+            },
+            secrets,
+        )
         .await
         .map_err(map_voice_err),
     }

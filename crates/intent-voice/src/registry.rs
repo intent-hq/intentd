@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use intent_core::SharedSecretStore;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::VoiceEngine;
@@ -74,15 +75,19 @@ pub struct VoiceRegistry;
 
 impl VoiceRegistry {
     /// Construct the engine for the selected provider, or a typed
-    /// [`Error::NotConfigured`] when no key is available. Async because the
+    /// [`Error::NotConfigured`] when no key is available. A stored key is read
+    /// from `secrets` (the caller's store). Async because the
     /// secrets-store lookup runs on the blocking pool with a bounded timeout
     /// (see [`token::resolve`]).
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotConfigured`] when no API key is available; propagates engine-construction failures.
-    pub async fn from_settings(settings: &VoiceSettings) -> Result<Arc<dyn VoiceEngine>> {
-        let key = resolve_key(settings).await?;
+    pub async fn from_settings(
+        settings: &VoiceSettings,
+        secrets: &SharedSecretStore,
+    ) -> Result<Arc<dyn VoiceEngine>> {
+        let key = resolve_key(settings, secrets).await?;
         let base_url = settings.api_base_url.as_deref();
         Ok(match settings.provider {
             VoiceProvider::ElevenLabs => Arc::new(ElevenLabsEngine::new(&key, base_url)?),
@@ -96,25 +101,31 @@ impl VoiceRegistry {
 }
 
 /// Resolve the API key from inline settings or the store/env chain.
-async fn resolve_key(settings: &VoiceSettings) -> Result<String> {
+async fn resolve_key(settings: &VoiceSettings, secrets: &SharedSecretStore) -> Result<String> {
     if let Some(key) = settings.api_key.as_deref() {
         if !key.trim().is_empty() {
             return Ok(key.trim().to_string());
         }
     }
-    token::resolve(settings.provider).await.ok_or_else(|| {
-        Error::NotConfigured(format!(
-            "voice: no API key found for {} (set {} or {})",
-            settings.provider.as_str(),
-            token::secret_account(settings.provider),
-            token::env_var(settings.provider),
-        ))
-    })
+    token::resolve(settings.provider, secrets)
+        .await
+        .ok_or_else(|| {
+            Error::NotConfigured(format!(
+                "voice: no API key found for {} (set {} or {})",
+                settings.provider.as_str(),
+                token::secret_account(settings.provider),
+                token::env_var(settings.provider),
+            ))
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_secrets() -> SharedSecretStore {
+        Arc::new(intent_core::InMemorySecretStore::default())
+    }
 
     #[test]
     fn provider_round_trips_wire_spellings() {
@@ -135,7 +146,9 @@ mod tests {
             api_key: Some("xi-test".to_string()),
             ..VoiceSettings::default()
         };
-        let engine = VoiceRegistry::from_settings(&settings).await.unwrap();
+        let engine = VoiceRegistry::from_settings(&settings, &test_secrets())
+            .await
+            .unwrap();
         assert_eq!(engine.provider_name(), "elevenlabs");
     }
 
@@ -146,7 +159,9 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             ..VoiceSettings::default()
         };
-        let engine = VoiceRegistry::from_settings(&settings).await.unwrap();
+        let engine = VoiceRegistry::from_settings(&settings, &test_secrets())
+            .await
+            .unwrap();
         assert_eq!(engine.provider_name(), "openai");
     }
 }

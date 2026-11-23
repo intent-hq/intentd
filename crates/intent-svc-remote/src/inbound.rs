@@ -208,7 +208,11 @@ impl NodeInbound for ServicesInbound {
     fn forge_token(&self) -> BoxFuture<'_, Option<String>> {
         Box::pin(async move {
             let registry = self.services.settings_registry();
-            intent_services::github_backend_token(registry.as_deref()).await
+            intent_services::github_backend_token(
+                registry.as_deref(),
+                &self.services.secret_source(),
+            )
+            .await
         })
     }
 

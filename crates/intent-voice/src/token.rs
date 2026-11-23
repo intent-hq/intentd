@@ -2,8 +2,9 @@
 //!
 //! Keys are resolved secrets-store-first, then environment:
 //!
-//! 1. File-backed secrets store ([`intent_core::FileSecretStore`],
-//!    `~/intent/.secrets.json`) under the sensitive setting path as account
+//! 1. The caller's secrets store ([`intent_core::SecretStore`]: the daemon's
+//!    `~/intent/.secrets.json` on desktop, the tenant's own store in the
+//!    orchestrator) under the sensitive setting path as account
 //!    (`voice.elevenlabs.apiKey` / `voice.openai.apiKey`).
 //! 2. Environment fallback: `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`.
 //!
@@ -15,6 +16,7 @@
 
 use std::time::Duration;
 
+use intent_core::SharedSecretStore;
 use tokio::time::timeout;
 
 use crate::registry::VoiceProvider;
@@ -46,21 +48,20 @@ pub(crate) fn env_var(provider: VoiceProvider) -> &'static str {
 
 /// Resolve the API key for `provider`: secrets store first, then env.
 /// `None` when neither yields a non-empty value.
-pub async fn resolve(provider: VoiceProvider) -> Option<String> {
-    match file_store_key(provider).await {
+pub async fn resolve(provider: VoiceProvider, secrets: &SharedSecretStore) -> Option<String> {
+    match file_store_key(provider, secrets.clone()).await {
         Some(v) => Some(v),
         None => env_key(provider),
     }
 }
 
-/// Read the key from the file-backed secrets store. A missing or unreadable
+/// Read the key from the caller's secrets store. A missing or unreadable
 /// entry resolves to `None` so resolution can fall through. Runs on the
 /// blocking pool with a bounded timeout so a stalled backing store cannot
 /// wedge a tokio worker.
-async fn file_store_key(provider: VoiceProvider) -> Option<String> {
+async fn file_store_key(provider: VoiceProvider, secrets: SharedSecretStore) -> Option<String> {
     let account = secret_account(provider);
-    let handle =
-        tokio::task::spawn_blocking(move || intent_core::FileSecretStore::new().load(account));
+    let handle = tokio::task::spawn_blocking(move || secrets.load(account));
     match timeout(SECRET_LOAD_TIMEOUT, handle).await {
         Ok(Ok(Ok(Some(v)))) => non_empty(&v),
         Ok(Ok(Ok(None)) | Err(_)) => None,

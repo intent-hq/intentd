@@ -248,7 +248,10 @@ pub use repository_context::{
     RepositoryUnresolvedReason, ReviewSelectionOutcome, ReviewSelectionRequiredReason,
     ReviewSelectionResolution, ReviewSelectionSource, ReviewTarget, SavedReviewSelection,
 };
-pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
+pub use secrets::{
+    create_dir_private, write_private, write_private_hidden, FileSecretStore, InMemorySecretStore,
+    SecretStore, SharedSecretStore,
+};
 pub use server_control::{
     InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope, ServerControl,
 };

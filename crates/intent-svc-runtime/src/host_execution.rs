@@ -48,16 +48,23 @@ impl HostExecutionExt for Services {
         } else {
             false
         };
+        let secrets = self.secret_source();
         let github_configured = self.feature_source_control().is_some()
             || stored
             || match source {
                 GithubTokenSource::Explicit => false,
                 GithubTokenSource::Auto => {
-                    token::resolve(&TokenSource::Env).await.is_some()
-                        || token::resolve(&TokenSource::GhCli).await.is_some()
+                    token::resolve(&TokenSource::Env, &secrets).await.is_some()
+                        || token::resolve(&TokenSource::GhCli, &secrets)
+                            .await
+                            .is_some()
                 }
-                GithubTokenSource::Env => token::resolve(&TokenSource::Env).await.is_some(),
-                GithubTokenSource::GhCli => token::resolve(&TokenSource::GhCli).await.is_some(),
+                GithubTokenSource::Env => {
+                    token::resolve(&TokenSource::Env, &secrets).await.is_some()
+                }
+                GithubTokenSource::GhCli => token::resolve(&TokenSource::GhCli, &secrets)
+                    .await
+                    .is_some(),
             };
         let mut repository_connections = vec![RepositoryConnection {
             provider: "github".into(),
