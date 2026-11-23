@@ -80,8 +80,8 @@ async fn each_tenant_runs_its_own_loops_and_connections() {
     let b = tenant().await;
     settled().await;
 
-    assert_eq!(a.runtime.loops_running(), tenant::LOOPS);
-    assert_eq!(b.runtime.loops_running(), tenant::LOOPS);
+    assert_eq!(a.runtime.loops_running(), tenant::TENANT_LOOPS);
+    assert_eq!(b.runtime.loops_running(), tenant::TENANT_LOOPS);
     assert_eq!(a.runtime.connections().len(), 2);
     assert_eq!(b.runtime.connections().len(), 2);
     assert_ne!(
@@ -144,7 +144,7 @@ async fn fencing_one_tenant_stops_only_its_work() {
     assert_eq!(b.runtime.connections().len(), 2);
     assert_eq!(
         b.runtime.loops_running(),
-        tenant::LOOPS,
+        tenant::TENANT_LOOPS,
         "B's loops keep running"
     );
     assert!(!b.services.mcp_hub().background_stopping());

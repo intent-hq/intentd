@@ -15,8 +15,9 @@
 //! 3. the tenant's `Services`, with every on-disk path under
 //!    [`tenant_dir`], in orchestrator mode;
 //! 4. `tenant_self_fence` and `TenantRuntime::start` (`intent_app::tenant`):
-//!    the tenant's restores, sweeps and loops, its client connections,
-//!    machine links, PTYs, agents and MCP servers, all stopped by the fence;
+//!    the tenant's restores, sweeps and loops (event retention and the
+//!    idempotency reaper included), its client connections, machine links,
+//!    PTYs, agents and MCP servers, all stopped by the fence;
 //! 5. the fence, spawned. A fence step that overruns its budget leaves work
 //!    running past the lease, so [`is_fatal`] makes the process exit.
 //!

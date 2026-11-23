@@ -11,6 +11,11 @@ use crate::metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 use crate::usage_rate_repo::{UsageRateDelta, UsageRateRow};
 use crate::usage_stats_repo::{LocalStamp, UsageStatsDelta, UsageStatsRow};
 
+/// One usage-rate reaper batch: `$1` tenant, `$2` cutoff, `$3` batch size.
+const DELETE_USAGE_RATE_SQL: &str = "DELETE FROM usage_rate_minutely WHERE tenant_id = $1 \
+     AND bucket_utc IN (SELECT u.bucket_utc FROM usage_rate_minutely u \
+       WHERE u.tenant_id = $1 AND u.bucket_utc COLLATE \"C\" <= $2 LIMIT $3)";
+
 impl PgStore {
     pub async fn upsert_workspace_metrics(
         &self,
@@ -231,19 +236,15 @@ impl PgStore {
             .collect())
     }
 
+    /// Deletes the tenant's minute buckets at or before `cutoff` in bounded
+    /// batches (each its own writer transaction, see `delete_in_batches`).
     pub async fn delete_usage_rate_before(&self, cutoff: &str) -> Result<u64> {
-        let mut tx = self.begin_write().await?;
-        let removed = sqlx::query(
-            "DELETE FROM usage_rate_minutely WHERE tenant_id = $1 AND bucket_utc COLLATE \"C\" <= $2",
+        self.delete_in_batches(
+            DELETE_USAGE_RATE_SQL,
+            cutoff,
+            super::idempotency::REAP_BATCH_ROWS,
         )
-        .bind(self.tenant())
-        .bind(cutoff)
-        .execute(&mut *tx)
         .await
-        .map_err(db)?
-        .rows_affected();
-        tx.commit().await.map_err(db)?;
-        Ok(removed)
     }
 
     pub async fn add_usage_stats(

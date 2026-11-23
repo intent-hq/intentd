@@ -411,14 +411,17 @@ impl PgStore {
             .await
     }
 
-    /// `SQLite`'s chunked retention delete: each chunk of
-    /// [`RETENTION_DELETE_CHUNK`] rows is its own write transaction.
+    /// The chunked retention delete: each chunk of at most
+    /// [`RETENTION_DELETE_CHUNK`] rows is its own writer transaction, so
+    /// the tenant's other writers run between chunks, and a fenced tenant's
+    /// next chunk fails `NotOwner`.
     async fn delete_events_by_type_range_before(
         &self,
         lower: &str,
         upper: Option<&str>,
         cutoff: &str,
     ) -> Result<u64> {
+        let limit = super::purge::probe::batch_rows(self.tenant(), RETENTION_DELETE_CHUNK);
         let mut removed: u64 = 0;
         loop {
             let mut tx = self.begin_write().await?;
@@ -434,7 +437,7 @@ impl PgStore {
                     .bind(lower)
                     .bind(upper)
                     .bind(cutoff)
-                    .bind(RETENTION_DELETE_CHUNK)
+                    .bind(limit)
                     .execute(&mut *tx)
                     .await
                 }
@@ -447,7 +450,7 @@ impl PgStore {
                     .bind(self.tenant())
                     .bind(lower)
                     .bind(cutoff)
-                    .bind(RETENTION_DELETE_CHUNK)
+                    .bind(limit)
                     .execute(&mut *tx)
                     .await
                 }
@@ -456,7 +459,10 @@ impl PgStore {
             tx.commit().await.map_err(db)?;
             let affected = result.rows_affected();
             removed += affected;
-            if affected < RETENTION_DELETE_CHUNK as u64 {
+            if affected > 0 {
+                super::purge::probe::after_table_batch(self.tenant(), "event", affected).await?;
+            }
+            if affected < limit.unsigned_abs() {
                 return Ok(removed);
             }
         }

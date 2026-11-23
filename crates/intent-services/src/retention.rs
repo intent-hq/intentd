@@ -4,10 +4,15 @@
 //! ([`run_incremental_vacuum_drain`]) live here so a single tick can be
 //! driven directly in tests with a fixed `now` and a live [`SettingsFile`]
 //! snapshot.
+//!
+//! An orchestrator tenant has no `intentd` main: its runtime starts
+//! [`spawn_tenant_retention_loop`] and [`spawn_tenant_reap_loop`] instead,
+//! the same sweeps on the tenant's store, stopped by the tenant's fence.
 
 use intent_core::settings_file::SettingsFile;
 use intent_core::Result;
 use intent_store::Store;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -140,6 +145,159 @@ pub async fn run_retention_tick_at(
         Err(e) => tracing::warn!(error = %e, "tool-payload retention sweep failed"),
     }
     outcome
+}
+
+/// How long idempotency keys and per-minute token-rate buckets are kept
+/// before the reaper deletes them (design note TB-0 §5.4, §5.39).
+pub const IDEMPOTENCY_RETENTION_HOURS: u32 = 24;
+
+/// Longest interval between two retention ticks, and the interval while the
+/// event sweep is disabled (the tool-payload sweep still runs).
+pub const RETENTION_MAX_INTERVAL: StdDuration = StdDuration::from_secs(3600);
+
+/// Shortest interval between two retention ticks.
+pub const RETENTION_MIN_INTERVAL: StdDuration = StdDuration::from_secs(300);
+
+/// The retention tick interval for an event TTL of `stream_retention_hours`:
+/// about four ticks per TTL, clamped to
+/// [`RETENTION_MIN_INTERVAL`]..=[`RETENTION_MAX_INTERVAL`]; the maximum when
+/// the event sweep is disabled (`0`).
+#[must_use]
+pub fn retention_tick_interval(stream_retention_hours: u32) -> StdDuration {
+    if stream_retention_hours == 0 {
+        return RETENTION_MAX_INTERVAL;
+    }
+    let ttl = StdDuration::from_secs(u64::from(stream_retention_hours) * 3600);
+    (ttl / 4).clamp(RETENTION_MIN_INTERVAL, RETENTION_MAX_INTERVAL)
+}
+
+/// What one [`run_reap_tick_at`] removed. A failed sweep is logged and
+/// counted as `0`, never aborts the tick.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReapTickOutcome {
+    /// Rows removed by `Store::reap_idempotent`.
+    pub idempotency_keys_removed: u64,
+    /// Rows removed by `Store::delete_usage_rate_before`.
+    pub usage_rate_rows_removed: u64,
+}
+
+/// One idempotency-reaper tick at a fixed `now`: deletes idempotency keys
+/// and per-minute token-rate buckets older than
+/// [`IDEMPOTENCY_RETENTION_HOURS`]. Each sweep failure is logged and the
+/// tick continues with the next sweep.
+pub async fn run_reap_tick_at(store: &Store, now: OffsetDateTime) -> ReapTickOutcome {
+    let cutoff = iso_before(now, Duration::hours(i64::from(IDEMPOTENCY_RETENTION_HOURS)));
+    let mut outcome = ReapTickOutcome::default();
+    match store.reap_idempotent(&cutoff).await {
+        Ok(removed) => {
+            if removed > 0 {
+                tracing::info!(removed, cutoff, "idempotency reaper trimmed dedupe keys");
+            }
+            outcome.idempotency_keys_removed = removed;
+        }
+        Err(e) => tracing::warn!(error = %e, "idempotency reaper sweep failed"),
+    }
+    match store.delete_usage_rate_before(&cutoff).await {
+        Ok(removed) => {
+            if removed > 0 {
+                tracing::info!(removed, cutoff, "usage-rate reaper trimmed minute buckets");
+            }
+            outcome.usage_rate_rows_removed = removed;
+        }
+        Err(e) => tracing::warn!(error = %e, "usage-rate reaper sweep failed"),
+    }
+    outcome
+}
+
+/// When a tenant runtime's store sweeps tick. The default matches the
+/// desktop daemon's loops; tests shorten it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantSweepTiming {
+    /// Delay before the first retention tick, clear of the startup burst.
+    pub retention_start_delay: StdDuration,
+    /// The retention tick interval; `None` derives it from the tenant's
+    /// `events.streamRetentionHours` at start ([`retention_tick_interval`]).
+    pub retention_interval: Option<StdDuration>,
+    /// The reaper tick interval. Its first tick is immediate.
+    pub reap_interval: StdDuration,
+}
+
+impl Default for TenantSweepTiming {
+    fn default() -> Self {
+        Self {
+            retention_start_delay: StdDuration::from_secs(30),
+            retention_interval: None,
+            reap_interval: StdDuration::from_secs(3600),
+        }
+    }
+}
+
+/// Whether `store`'s tenant fence has fired: a fenced tenant writes nothing,
+/// so its sweeps end. `SQLite` stores have no fence.
+fn fenced(store: &Store) -> bool {
+    store.tenant_fence().is_some_and(|fence| fence.is_fenced())
+}
+
+/// Spawn one tenant's event retention loop: each tick runs
+/// [`run_retention_tick`] with `events.streamRetentionHours` and the
+/// tool-payload knobs read live from `settings` (defaults without a
+/// registry). Unlike the desktop daemon's loop it runs no `SQLite` pool
+/// maintenance (vacuum, optimize). Every delete is a bounded batch in its
+/// own writer transaction of the tenant (see the store methods), so a
+/// fenced tenant's sweep fails `NotOwner` having deleted nothing more; the
+/// loop also ends once the fence fired. The tenant's self-fence aborts it.
+#[must_use]
+pub fn spawn_tenant_retention_loop(
+    store: Store,
+    settings: Option<Arc<crate::SettingsRegistry>>,
+    timing: TenantSweepTiming,
+) -> tokio::task::JoinHandle<()> {
+    let current = move || {
+        settings
+            .as_ref()
+            .map_or_else(SettingsFile::default, |s| s.snapshot().effective.clone())
+    };
+    let interval = timing
+        .retention_interval
+        .unwrap_or_else(|| retention_tick_interval(current().events.stream_retention_hours));
+    intent_core::spawn_daemon(async move {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + timing.retention_start_delay,
+            interval,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if fenced(&store) {
+                return;
+            }
+            let settings = current();
+            run_retention_tick(&store, settings.events.stream_retention_hours, &settings).await;
+        }
+    })
+}
+
+/// Spawn one tenant's idempotency reaper loop: [`run_reap_tick_at`] every
+/// `timing.reap_interval`, the first tick at once, as the desktop daemon's
+/// reaper (without its agent-log file sweep: a tenant runs no local
+/// agents). The loop ends once the tenant's fence fired; the tenant's
+/// self-fence aborts it.
+#[must_use]
+pub fn spawn_tenant_reap_loop(
+    store: Store,
+    timing: TenantSweepTiming,
+) -> tokio::task::JoinHandle<()> {
+    intent_core::spawn_daemon(async move {
+        let mut ticker = tokio::time::interval(timing.reap_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if fenced(&store) {
+                return;
+            }
+            run_reap_tick_at(&store, OffsetDateTime::now_utc()).await;
+        }
+    })
 }
 
 /// Longest one `PRAGMA incremental_vacuum` chunk should hold the
@@ -750,5 +908,66 @@ mod tests {
             write_done - write_started,
             outcome.max_chunk
         );
+    }
+
+    #[test]
+    fn retention_tick_interval_is_four_per_ttl_within_bounds() {
+        assert_eq!(retention_tick_interval(0), RETENTION_MAX_INTERVAL);
+        assert_eq!(retention_tick_interval(1), StdDuration::from_secs(900));
+        assert_eq!(retention_tick_interval(24), RETENTION_MAX_INTERVAL);
+        // A TTL under 20 min is not representable in hours; the floor
+        // still holds for the shortest one.
+        assert!(retention_tick_interval(1) >= RETENTION_MIN_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn reap_tick_removes_only_rows_older_than_the_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("reap.db")).await.unwrap();
+        assert!(store.put_idempotent("", "k", "m", "1").await.unwrap());
+
+        let now = OffsetDateTime::now_utc();
+        let kept = run_reap_tick_at(&store, now).await;
+        assert_eq!(kept.idempotency_keys_removed, 0, "a fresh key stays");
+        assert_eq!(
+            store.get_idempotent("", "k").await.unwrap().as_deref(),
+            Some("1")
+        );
+
+        let later = now + Duration::hours(i64::from(IDEMPOTENCY_RETENTION_HOURS) + 1);
+        let reaped = run_reap_tick_at(&store, later).await;
+        assert_eq!(reaped.idempotency_keys_removed, 1);
+        assert_eq!(store.get_idempotent("", "k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_tenant_reap_loop_reaps_on_its_first_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("reap-loop.db")).await.unwrap();
+        let old = iso_before(
+            OffsetDateTime::now_utc(),
+            Duration::hours(i64::from(IDEMPOTENCY_RETENTION_HOURS) + 1),
+        );
+        sqlx::query(
+            "INSERT INTO idempotency_key (workspace_id, idempotency_key, method, result_json, created_at) \
+             VALUES ('', 'old', 'm', '1', ?1)",
+        )
+        .bind(&old)
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+        assert!(store.put_idempotent("", "new", "m", "1").await.unwrap());
+
+        let task = spawn_tenant_reap_loop(store.clone(), TenantSweepTiming::default());
+        tokio::time::timeout(StdDuration::from_secs(10), async {
+            while store.get_idempotent("", "old").await.unwrap().is_some() {
+                // timing-guard: poll until the loop's immediate first tick has run
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first tick reaps the expired key");
+        task.abort();
+        assert!(store.get_idempotent("", "new").await.unwrap().is_some());
     }
 }

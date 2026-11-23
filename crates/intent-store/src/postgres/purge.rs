@@ -278,11 +278,27 @@ impl PgStore {
         Ok(())
     }
 
-    /// Run `sql` (`$1` tenant, `$2` scope, `$3` batch size), each run its
-    /// own writer transaction, until a run changes fewer rows than the
-    /// batch size. The writer lock is free between runs.
-    async fn purge_in_batches(&self, sql: &'static str, scope: &str) -> Result<()> {
-        let limit = probe::batch_rows(self.tenant());
+    /// Run `sql` (`$1` tenant, `$2` scope, `$3` batch size) in batches of
+    /// [`PURGE_BATCH_ROWS`]; see [`Self::delete_in_batches`].
+    async fn purge_in_batches(&self, sql: &'static str, scope: &str) -> Result<u64> {
+        self.delete_in_batches(sql, scope, PURGE_BATCH_ROWS).await
+    }
+
+    /// Run `sql` (`$1` tenant, `$2` scope, `$3` batch size; `batch_rows`
+    /// unless the test probe sets one), each run its own writer
+    /// transaction, until a run changes fewer rows than the batch size, and
+    /// return the rows changed. The writer lock is free between runs, and
+    /// every run passes the fence check again: once the tenant is fenced
+    /// the next run fails `NotOwner`, leaving the rest in place. The
+    /// retention sweeps use it with a cutoff as the scope.
+    pub(super) async fn delete_in_batches(
+        &self,
+        sql: &'static str,
+        scope: &str,
+        batch_rows: i64,
+    ) -> Result<u64> {
+        let limit = probe::batch_rows(self.tenant(), batch_rows);
+        let mut total: u64 = 0;
         loop {
             let mut tx = self.begin_write().await?;
             let changed = sqlx::query(sql)
@@ -294,11 +310,12 @@ impl PgStore {
                 .map_err(db)?
                 .rows_affected();
             tx.commit().await.map_err(db)?;
+            total += changed;
             if changed > 0 {
                 probe::after_batch(self.tenant(), sql, changed).await?;
             }
             if changed < limit.unsigned_abs() {
-                return Ok(());
+                return Ok(total);
             }
             tokio::task::yield_now().await;
         }
@@ -332,9 +349,10 @@ impl PgStore {
     }
 }
 
-/// Test seams for the purge: batch size, a log of batches, a pause after
-/// the first batch and a simulated crash. Keyed by tenant, so parallel
-/// tests on other tenants are unaffected.
+/// Test seams for the purge and the retention sweeps (event retention,
+/// idempotency and usage-rate reapers): batch size, a log of batches, a
+/// pause after the first batch and a simulated crash. Keyed by tenant, so
+/// parallel tests on other tenants are unaffected.
 #[cfg(any(test, feature = "test-support"))]
 pub mod probe {
     use intent_core::{Error, Result};
@@ -391,17 +409,20 @@ pub mod probe {
         };
     }
 
-    pub(super) fn batch_rows(tenant: &str) -> i64 {
-        get(tenant)
-            .and_then(|p| p.batch_rows)
-            .unwrap_or(super::PURGE_BATCH_ROWS)
+    pub(crate) fn batch_rows(tenant: &str, default: i64) -> i64 {
+        get(tenant).and_then(|p| p.batch_rows).unwrap_or(default)
     }
 
-    pub(super) async fn after_batch(tenant: &str, sql: &str, rows: u64) -> Result<()> {
+    pub(crate) async fn after_batch(tenant: &str, sql: &str, rows: u64) -> Result<()> {
+        after_table_batch(tenant, sql.split_whitespace().nth(2).unwrap_or("?"), rows).await
+    }
+
+    /// [`after_batch`] for a batch on `table`, named directly.
+    pub(crate) async fn after_table_batch(tenant: &str, table: &str, rows: u64) -> Result<()> {
         let Some(probe) = get(tenant) else {
             return Ok(());
         };
-        let table = sql.split_whitespace().nth(2).unwrap_or("?").to_owned();
+        let table = table.to_owned();
         let done = {
             let mut batches = probe.batches.lock().unwrap_or_else(PoisonError::into_inner);
             batches.push((table, rows));
@@ -433,15 +454,20 @@ pub mod probe {
 }
 
 #[cfg(not(any(test, feature = "test-support")))]
-pub(super) mod probe {
+pub(crate) mod probe {
     use intent_core::Result;
 
-    pub(super) fn batch_rows(_tenant: &str) -> i64 {
-        super::PURGE_BATCH_ROWS
+    pub(crate) fn batch_rows(_tenant: &str, default: i64) -> i64 {
+        default
     }
 
     #[expect(clippy::unused_async, reason = "same signature as the test probe")]
-    pub(super) async fn after_batch(_tenant: &str, _sql: &str, _rows: u64) -> Result<()> {
+    pub(crate) async fn after_batch(_tenant: &str, _sql: &str, _rows: u64) -> Result<()> {
+        Ok(())
+    }
+
+    #[expect(clippy::unused_async, reason = "same signature as the test probe")]
+    pub(crate) async fn after_table_batch(_tenant: &str, _table: &str, _rows: u64) -> Result<()> {
         Ok(())
     }
 
