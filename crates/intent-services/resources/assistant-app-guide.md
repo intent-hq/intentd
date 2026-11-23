@@ -554,9 +554,9 @@ manager or an external editor (**Reveal in file manager**, **Open in VS Code**, 
 open-in editor list) are not shown, and notifications appear inside Intent as
 messages with an **Open** button instead of system banners. A setting the user
 changed keeps the user's value.
-When the user turns the dock on, it sits at the top-left of the first screen (it
-opens down and to the right, so it stays on screen) and cannot be moved there; the
-dock menu has no move items.
+When the user turns the dock on, it sits at the top-left of the main screen, even
+with a second screen connected (it opens down and to the right, so it stays on
+screen). It cannot be moved there, and the dock menu has no move items.
 
 <!-- Free OpenCode and npm runtimes: packages/cloudlands-fe/src/features/onboarding/utils/order-onboarding-providers.ts; packages/cloudlands-fe/src/features/onboarding/utils/resolve-onboarding-backup-provider.ts; packages/cloudlands-fe/src/features/onboarding/messages/{AgentGrid,ProviderCard}.svelte; packages/cloudlands-fe/src/store/renderer/seeders/provider-status-bridge-seeder.ts; packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/intentd/crates/intent-services/src/{provider_cli_launch,installed_cli,provider_auth}.rs; packages/intentd/crates/intent-services/src/provider_models/parse.rs; packages/intentd/crates/intent-providers/src/config.rs. -->
 OpenCode, Claude Code, Codex and Grok need no install when Node.js
