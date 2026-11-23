@@ -18071,16 +18071,20 @@ impl Services {
         let (services, workspace_id, agent_id) =
             (self.clone(), workspace_id.clone(), agent_id.clone());
         let (content, message_metadata) = (content.to_string(), message_metadata.cloned());
-        crate::workspace_mutations::run_detached(&self.turn_start_tasks, None, async move {
-            services
-                .deliver_wake_message_admitted(
-                    &workspace_id,
-                    &agent_id,
-                    &content,
-                    message_metadata.as_ref(),
-                )
-                .await
-        })
+        crate::workspace_mutations::run_detached(
+            &self.turn_start_tasks,
+            None,
+            Box::pin(async move {
+                services
+                    .deliver_wake_message_admitted(
+                        &workspace_id,
+                        &agent_id,
+                        &content,
+                        message_metadata.as_ref(),
+                    )
+                    .await
+            }),
+        )
         .await
     }
 

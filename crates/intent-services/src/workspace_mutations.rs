@@ -78,15 +78,15 @@ pub fn boxed<'a, T>(future: impl Future<Output = T> + Send + 'a) -> intent_core:
 /// `held`, so nested `enter` calls reuse them and a queued deletion still
 /// waits for the work to finish. Once shutdown has closed `tasks`, turn
 /// admission is closed too, so the future runs inline.
-pub(crate) async fn run_detached<F, T>(
+///
+/// The future is boxed so callers' state machines carry only a pointer: the
+/// wake path runs deep in nested deliveries and overflowed the stack of
+/// coverage-instrumented builds when it was held inline.
+pub(crate) async fn run_detached<T: Send + 'static>(
     tasks: &crate::delivery_tasks::DeliveryTasks,
     held: Option<Mutation>,
-    future: F,
-) -> Result<T>
-where
-    F: Future<Output = Result<T>> + Send + 'static,
-    T: Send + 'static,
-{
+    future: intent_core::BoxFuture<'static, Result<T>>,
+) -> Result<T> {
     if tasks.is_closed() {
         let _held = held;
         return future.await;

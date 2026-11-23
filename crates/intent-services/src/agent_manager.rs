@@ -9331,7 +9331,7 @@ impl AgentManager {
         crate::workspace_mutations::run_detached(
             &self.services.turn_start_tasks,
             Some(mutation),
-            async move {
+            Box::pin(async move {
                 this.send_message_claimed(
                     agent_id,
                     workspace_id,
@@ -9341,7 +9341,7 @@ impl AgentManager {
                     session_status,
                 )
                 .await
-            },
+            }),
         )
         .await
     }
