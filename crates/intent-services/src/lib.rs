@@ -3061,13 +3061,10 @@ impl Services {
         );
         let model =
             autocomplete_ops::parse_model(self.setting_str("autocomplete.model").await.as_deref());
-        let api_key = match self.saved_autocomplete_key(service).await {
-            Ok(key) => key,
-            Err(_) => {
-                // Never fall back to the keyless free tier for a user who saved a key.
-                tracing::debug!("input.autocomplete could not read the service API key");
-                return String::new();
-            }
+        let Ok(api_key) = self.saved_autocomplete_key(service).await else {
+            // Never fall back to the keyless free tier for a user who saved a key.
+            tracing::debug!("input.autocomplete could not read the service API key");
+            return String::new();
         };
         let Some(model_id) = autocomplete_ops::resolve_model_id(service, model, api_key.is_some())
         else {
