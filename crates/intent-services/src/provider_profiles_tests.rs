@@ -760,8 +760,24 @@ async fn unknown_base_profiles_are_kept_unloaded_and_written_back_unchanged() {
     .unwrap();
     // The newer daemon's journaled create landed its metadata: keep the secret.
     SecretStore::store(&*fx.secrets, &env_account("pzorbit000001"), "{}").unwrap();
+    let choices_file = fx.data_dir().join(REMOTE_CHOICES_FILE);
+    std::fs::write(
+        &choices_file,
+        json!({ "version": 1, "profiles": { "pzorbit000001": false } }).to_string(),
+    )
+    .unwrap();
+    let future_choice = |path: &Path| -> Value {
+        let choices: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        choices["profiles"]["pzorbit000001"].clone()
+    };
     let fx = fx.restart().await;
     fx.svc.sweep_provider_profile_secrets().await;
+    fx.svc.migrate_remote_choices().await;
+    assert_eq!(
+        future_choice(&choices_file),
+        false,
+        "migration keeps the refusal"
+    );
     assert!(
         SecretStore::load(&*fx.secrets, &env_account("pzorbit000001"))
             .unwrap()
@@ -788,6 +804,11 @@ async fn unknown_base_profiles_are_kept_unloaded_and_written_back_unchanged() {
     let written = std::fs::read_to_string(fx.profiles_file()).unwrap();
     assert!(written.contains(CODEX), "{written}");
     assert!(written.contains(FUTURE), "{written}");
+    assert_eq!(
+        future_choice(&choices_file),
+        false,
+        "a choice write keeps it"
+    );
 
     let fx = fx.restart().await;
     let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
