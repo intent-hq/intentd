@@ -988,7 +988,12 @@ impl ProviderProfileStore {
 
     /// Whether `id` belongs to a skipped profile of an unknown base.
     fn is_skipped_id(&self, id: &str) -> bool {
-        self.loaded.read().unwrap().skipped.iter().any(|s| s.id == id)
+        self.loaded
+            .read()
+            .unwrap()
+            .skipped
+            .iter()
+            .any(|s| s.id == id)
     }
 
     /// Atomically persist `profiles` + `pending`, then publish the snapshot.
@@ -1009,8 +1014,9 @@ impl ProviderProfileStore {
         defaults.retain(|_, d| !d.is_empty());
         let skipped = self.loaded.read().unwrap().skipped.clone();
         if let Some(path) = &self.path {
-            let encode =
-                |e: serde_json::Error| Error::Internal(format!("encode provider profiles failed: {e}"));
+            let encode = |e: serde_json::Error| {
+                Error::Internal(format!("encode provider profiles failed: {e}"))
+            };
             let rows = profiles
                 .iter()
                 .map(|p| serde_json::to_value(p).map_err(encode))
@@ -1072,9 +1078,9 @@ fn parse_file(bytes: &[u8]) -> Option<ParsedFile> {
         .chain(skipped.iter().map(|s| &s.id))
         .all(|id| is_valid_profile_id(id) && ids.insert(id.clone()))
         && file
-        .pending_env_cleanup
-        .iter()
-        .all(|id| is_valid_profile_id(id))
+            .pending_env_cleanup
+            .iter()
+            .all(|id| is_valid_profile_id(id))
         && file.defaults.values().all(|d| {
             d.env_id
                 .as_ref()

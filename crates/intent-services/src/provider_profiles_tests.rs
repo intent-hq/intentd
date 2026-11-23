@@ -762,9 +762,11 @@ async fn unknown_base_profiles_are_kept_unloaded_and_written_back_unchanged() {
     SecretStore::store(&*fx.secrets, &env_account("pzorbit000001"), "{}").unwrap();
     let fx = fx.restart().await;
     fx.svc.sweep_provider_profile_secrets().await;
-    assert!(SecretStore::load(&*fx.secrets, &env_account("pzorbit000001"))
-        .unwrap()
-        .is_some());
+    assert!(
+        SecretStore::load(&*fx.secrets, &env_account("pzorbit000001"))
+            .unwrap()
+            .is_some()
+    );
     let swept: Value =
         serde_json::from_str(&std::fs::read_to_string(fx.profiles_file()).unwrap()).unwrap();
     assert!(swept.get("pendingEnvCleanup").is_none(), "{swept}");
@@ -777,7 +779,10 @@ async fn unknown_base_profiles_are_kept_unloaded_and_written_back_unchanged() {
         .map(|p| p["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, ["pcodexwork0001"], "{list}");
-    assert!(!fx.svc.provider_profiles.has_reference("zorbit@pzorbit000001"));
+    assert!(!fx
+        .svc
+        .provider_profiles
+        .has_reference("zorbit@pzorbit000001"));
 
     fx.create("codex", "Second", json!([])).await;
     let written = std::fs::read_to_string(fx.profiles_file()).unwrap();
