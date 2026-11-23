@@ -1218,9 +1218,16 @@ const WRITER_LIMITS_SQL: &str = "SELECT set_config('lock_timeout', $1, true), \
 /// COMMITTED a `FOR UPDATE` that waited returns the newest committed
 /// version of the row, so a writer that queued behind a takeover sees the
 /// new owner.
+///
+/// It also sets `intent.writer_tenant` to the tenant for the rest of the
+/// transaction, in the same statement and so on the same shard as the lock.
+/// The `row_seq` trigger (`0001_schema.sql`) refuses an insert unless it names
+/// the row's tenant, so a row numbered from the tenant counter is always
+/// numbered under the lock. ([`WriterRow`] ignores that column.)
 #[doc(hidden)]
-pub const WRITER_LOCK_SQL: &str =
-    "SELECT owner_instance, epoch FROM tenant_writer WHERE tenant_id = $1 FOR UPDATE";
+pub const WRITER_LOCK_SQL: &str = "SELECT owner_instance, epoch, \
+     set_config('intent.writer_tenant', tenant_id, true) AS writer_tenant \
+     FROM tenant_writer WHERE tenant_id = $1 FOR UPDATE";
 
 /// A tenant's fence as its locked `tenant_writer` row holds it: the
 /// instance that owns the tenant (`None`: never claimed) and the tenant's

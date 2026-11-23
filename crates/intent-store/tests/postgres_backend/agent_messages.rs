@@ -14,7 +14,7 @@ use intent_store::{
 };
 use serde_json::{json, Value};
 
-use crate::harness::{exec, TestDb};
+use crate::harness::{admin_write, exec, TestDb};
 
 const WS: &str = "__chief__";
 /// An archived workspace, for the search ranking penalty.
@@ -96,8 +96,9 @@ async fn seed_sqlite(store: &Store) {
 
 async fn seed_postgres(db: &TestDb, store: &Store, tenant: &str) {
     seed_workspace(store).await;
-    exec(
+    admin_write(
         &db.admin,
+        tenant,
         format!(
             "INSERT INTO agent_session (tenant_id, {SESSION_COLUMNS}) VALUES {}",
             session_values(Some(tenant))
@@ -751,6 +752,7 @@ message_test!(compaction_and_prestaged_payloads, |store, tenant, db| {
         append("h3", content.clone()).await;
         // And the replay row the subject's compacted h3 keeps.
         if let Some(db) = db {
+            let mut locked = crate::harness::hold_writer_lock(&db.admin, "decoy").await;
             sqlx::query(
                 "INSERT INTO agent_message_payload \
                  (tenant_id, message_id, agent_id, block_ordinal, kind, encoding, body) \
@@ -759,9 +761,10 @@ message_test!(compaction_and_prestaged_payloads, |store, tenant, db| {
                  FROM agent_message_payload WHERE tenant_id = 'decoy' AND message_id = 'h3' \
                  LIMIT 1 ON CONFLICT DO NOTHING",
             )
-            .execute(&db.admin)
+            .execute(&mut *locked)
             .await
             .unwrap();
+            locked.commit().await.unwrap();
         }
         store
             .prestage_agent_message_payload(&a1, "p1", 0, &heavy)

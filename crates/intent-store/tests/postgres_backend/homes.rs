@@ -13,7 +13,7 @@ use intent_core::node_link::{HomeStopReason, HomeStopRecord};
 use intent_core::{ExecutorCredentialId, HomeId, HomeState, Workspace, WorkspaceHome, WorkspaceId};
 use intent_store::{HomeAutoStart, HomeMove, Store};
 
-use crate::harness::{exec, parity_test, TestDb};
+use crate::harness::{admin_write, exec, parity_test, TestDb};
 
 const T0: &str = "2026-01-01T00:00:00.000Z";
 const T1: &str = "2026-01-02T00:00:00.000Z";
@@ -333,8 +333,9 @@ parity_test!(
 
         if let (Some(db), "decoy") = (db, tenant) {
             seed_cloud_homes(&store, tenant).await;
-            exec(
+            admin_write(
                 &db.admin,
+                tenant,
                 format!(
                     "INSERT INTO home_rebuild (tenant_id, workspace_id, home_id, from_home_id, \
                  recorded_at) VALUES ('decoy', 'ws-r', 'h-decoy', 'h-r', '{T1}')"

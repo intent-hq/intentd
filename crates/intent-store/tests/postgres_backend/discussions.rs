@@ -79,10 +79,10 @@ impl Seed {
                 .execute(pool)
                 .await
                 .map(|_| ()),
-            Self::Pg(pool, _) => sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
-                .execute(pool)
-                .await
-                .map(|_| ()),
+            Self::Pg(pool, tenant) => {
+                crate::harness::admin_write(pool, tenant, sql).await;
+                Ok(())
+            }
         }
         .expect("seed statement");
     }

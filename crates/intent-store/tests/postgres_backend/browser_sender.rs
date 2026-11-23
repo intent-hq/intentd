@@ -2,7 +2,7 @@
 
 use intent_core::{AgentId, AgentSession, ClientId, WorkspaceId};
 
-use crate::harness::{exec, parity_test};
+use crate::harness::{admin_write, exec, parity_test};
 
 parity_test!(
     browser_sender_receipts_preserve_provenance,
@@ -29,7 +29,7 @@ parity_test!(
         }
         for id in ["sender-first", "sender-last"] {
             if let Some(db) = db {
-                exec(&db.admin, format!(
+                admin_write(&db.admin, tenant, format!(
                 "INSERT INTO client (tenant_id, id, first_seen, last_seen) VALUES ('{tenant}', '{id}', 'now', 'now')"
             )).await;
             } else {

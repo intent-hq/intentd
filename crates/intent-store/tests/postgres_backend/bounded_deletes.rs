@@ -19,7 +19,7 @@ use intentd_test_support::test_timeout;
 use serde_json::json;
 use tokio::sync::Notify;
 
-use crate::harness::{exec, open_trapped, sqlite_store, tenant_rows, trapped_db, TestDb};
+use crate::harness::{admin_write, open_trapped, sqlite_store, tenant_rows, trapped_db, TestDb};
 
 const T0: &str = "2026-01-01T00:00:00.000Z";
 const WS: &str = "ws-big";
@@ -69,8 +69,9 @@ async fn seed(db: &TestDb, store: &Store, tenant: &str) {
     }
     for (id, ws) in [("a1", WS), ("a2", WS), ("k1", KEEP)] {
         store.insert_agent_session(&agent(id, ws)).await.unwrap();
-        exec(
+        admin_write(
             &db.admin,
+            tenant,
             format!(
                 "INSERT INTO agent_message (tenant_id, id, agent_id, seq, role, content, created_at) \
                  SELECT '{tenant}', '{id}-m' || g, '{id}', g, 'user', '[]', '{T0}' \
@@ -90,8 +91,9 @@ async fn seed(db: &TestDb, store: &Store, tenant: &str) {
         .await;
     }
     for ws in [WS, KEEP] {
-        exec(
+        admin_write(
             &db.admin,
+            tenant,
             format!(
                 "INSERT INTO note (tenant_id, id, workspace_id, title, content, created_at, \
                  updated_at, parent_id) \
@@ -125,8 +127,9 @@ async fn seed(db: &TestDb, store: &Store, tenant: &str) {
     // statement: per agent, script monitors, notification jobs, queue
     // admissions, and a discussion delivery and activity per message.
     for ws in [WS, KEEP] {
-        exec(
+        admin_write(
             &db.admin,
+            tenant,
             format!(
                 "INSERT INTO workspace_discussion_message (tenant_id, id, workspace_id, sequence, \
                  client_message_id, body, author_json, created_at) \
@@ -137,8 +140,9 @@ async fn seed(db: &TestDb, store: &Store, tenant: &str) {
         .await;
     }
     for (id, ws) in [("a1", WS), ("a2", WS), ("k1", KEEP)] {
-        exec(
+        admin_write(
             &db.admin,
+            tenant,
             format!(
                 "INSERT INTO script_monitor (tenant_id, id, workspace_id, agent_id, script_id, \
                  run_id, state, row_json, created_at) \
@@ -455,8 +459,9 @@ async fn rows_added_while_a_workspace_drains_go_with_it() {
     let deleting = spawn_delete(&store);
     until_paused(&entered).await;
     store.insert_agent_session(&agent("a3", WS)).await.unwrap();
-    exec(
+    admin_write(
         &db.admin,
+        SUBJECT,
         format!(
             "INSERT INTO agent_message (tenant_id, id, agent_id, seq, role, content, created_at) \
              SELECT '{SUBJECT}', 'a3-m' || g, 'a3', g, 'user', '[]', '{T0}' \
@@ -662,8 +667,9 @@ async fn a_record_of_a_workspace_or_agent_already_gone_is_dropped_by_its_next_de
     };
     let store = open_trapped(&db, SUBJECT).await;
     seed(&db, &store, SUBJECT).await;
-    exec(
+    admin_write(
         &db.admin,
+        SUBJECT,
         format!(
             "INSERT INTO delete_purge (tenant_id, kind, workspace_id, agent_id, started_at) \
              VALUES ('{SUBJECT}', 'workspace', 'ws-gone', '', 'T0'), \
@@ -707,8 +713,9 @@ async fn a_foreign_retry_key_fails_the_delete_before_any_batch() {
     };
     let store = open_trapped(&db, SUBJECT).await;
     seed(&db, &store, SUBJECT).await;
-    exec(
+    admin_write(
         &db.admin,
+        SUBJECT,
         format!(
             "INSERT INTO attachment_idempotency_keys (tenant_id, workspace_id, key, \
              attachment_id, fingerprint, created_at) \
