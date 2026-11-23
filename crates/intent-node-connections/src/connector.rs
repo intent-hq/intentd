@@ -58,6 +58,10 @@ const FORGE_BIND_RESOLVE: Duration = Duration::from_secs(10);
 /// `forgeTokenReply` (node-link.md § Forge token on the machine, rule 2).
 const FORGE_LAUNCH_WAIT: Duration = Duration::from_secs(10);
 
+/// Tunnel restarts a dial right after a resume may ask its gate for
+/// ([`crate::link::gate::DialGate::revive`]) when nothing answers.
+const MAX_REVIVES: u32 = 2;
+
 /// JSON-RPC "method not found", for machine requests head cannot serve.
 const UNSUPPORTED_CODE: i32 = -32601;
 
@@ -2808,7 +2812,23 @@ async fn run(
                 let version = version.as_deref();
                 let dialing = async {
                     if seen.is_some_and(|seen| seen.resumed) {
-                        connect_after_resume(&target, tuning, version, next_hello).await
+                        let gate = target.gate.clone();
+                        dial_with_revives(
+                            || {
+                                let target = shared.target();
+                                async move {
+                                    connect_after_resume(&target, tuning, version, next_hello).await
+                                }
+                            },
+                            || async {
+                                match &gate {
+                                    Some(gate) => gate.revive(shared.as_ref()).await,
+                                    None => false,
+                                }
+                            },
+                            &target.id,
+                        )
+                        .await
                     } else {
                         connect(&target, tuning, version, next_hello).await
                     }
@@ -3713,4 +3733,89 @@ async fn sleep_until(due: Option<Instant>) {
 
 async fn wait_true(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|flag| *flag).await;
+}
+
+/// The dials right after a resume. A tunnel restarted at the resume can stay
+/// off its relay for good (intent#9895): when nothing answers, `revive`
+/// restarts it, at most [`MAX_REVIVES`] times, and the machine is dialed
+/// again. A revive that does nothing, or any failure but no answer, ends it.
+async fn dial_with_revives<D, DF, R, RF>(
+    mut dial: D,
+    mut revive: R,
+    machine: &str,
+) -> std::result::Result<Connected, ConnectFailure>
+where
+    D: FnMut() -> DF,
+    DF: std::future::Future<Output = std::result::Result<Connected, ConnectFailure>>,
+    R: FnMut() -> RF,
+    RF: std::future::Future<Output = bool>,
+{
+    let mut connected = dial().await;
+    let mut revived = 0;
+    while matches!(connected, Err(ConnectFailure::Unreachable(_))) && revived < MAX_REVIVES {
+        if !revive().await {
+            break;
+        }
+        revived += 1;
+        tracing::info!(%machine, revived, "remote machine: no answer after the resume; its tunnel was restarted");
+        connected = dial().await;
+    }
+    connected
+}
+
+#[cfg(test)]
+mod revive_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    async fn run(
+        failures: impl Fn(u32) -> ConnectFailure,
+        revives: impl Fn(u32) -> bool,
+    ) -> (bool, u32, u32) {
+        let dials = AtomicU32::new(0);
+        let asked = AtomicU32::new(0);
+        let out = dial_with_revives(
+            || {
+                let n = dials.fetch_add(1, Ordering::SeqCst);
+                let failure = failures(n);
+                async move { Err(failure) }
+            },
+            || {
+                let n = asked.fetch_add(1, Ordering::SeqCst);
+                let answer = revives(n);
+                async move { answer }
+            },
+            "m",
+        )
+        .await;
+        (
+            matches!(out, Err(ConnectFailure::Unreachable(_))),
+            dials.load(Ordering::SeqCst),
+            asked.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_machine_is_revived_at_most_twice() {
+        let (unreachable, dials, revives) =
+            run(|_| ConnectFailure::Unreachable(Vec::new()), |_| true).await;
+        assert!(unreachable);
+        assert_eq!((dials, revives), (MAX_REVIVES + 1, MAX_REVIVES));
+    }
+
+    #[tokio::test]
+    async fn a_revive_that_did_nothing_ends_the_dials() {
+        let (unreachable, dials, revives) =
+            run(|_| ConnectFailure::Unreachable(Vec::new()), |_| false).await;
+        assert!(unreachable);
+        assert_eq!((dials, revives), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn only_no_answer_is_revived() {
+        let (unreachable, dials, revives) =
+            run(|_| ConnectFailure::Revoked(Vec::new()), |_| true).await;
+        assert!(!unreachable);
+        assert_eq!((dials, revives), (1, 0));
+    }
 }

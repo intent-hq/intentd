@@ -211,9 +211,35 @@ impl crate::link::gate::DialGate for CloudGate {
             sandbox_outdated(&self.svc, feature, link, &self.machine_id);
         }
     }
+
+    /// Nothing answered the dials right after a resume: restart the
+    /// sandbox's tunnel through the provider. See [`revive`].
+    fn revive<'a>(&'a self, link: &'a dyn GateLink) -> intent_core::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let Ok(feature) = super::feature(&self.svc) else {
+                return false;
+            };
+            let revived = revive(&self.svc, feature, &self.machine_id).await;
+            if revived {
+                self.refresh_address(link).await;
+            }
+            revived
+        })
+    }
 }
 
 impl CloudGate {
+    /// A relay change gives the sandbox a new tunnel address: dial that.
+    async fn refresh_address(&self, link: &dyn GateLink) {
+        if let Ok(Some(fresh)) = self.svc.store().get_exposed_machine(&self.machine_id).await {
+            let mut target = link.target();
+            if target.tc_address != fresh.tc_address {
+                target.tc_address = fresh.tc_address;
+                link.set_target(target);
+            }
+        }
+    }
+
     async fn before_dial_inner(
         &self,
         link: &dyn GateLink,
@@ -265,16 +291,7 @@ impl CloudGate {
         match resume(&self.svc, feature, &*client, &row).await {
             Ok(resumed) => {
                 forget_relay_refusal(&self.machine_id);
-                // A relay change gives the sandbox a new tunnel address.
-                if let Ok(Some(fresh)) =
-                    self.svc.store().get_exposed_machine(&self.machine_id).await
-                {
-                    let mut target = link.target();
-                    if target.tc_address != fresh.tc_address {
-                        target.tc_address = fresh.tc_address;
-                        link.set_target(target);
-                    }
-                }
+                self.refresh_address(link).await;
                 Ok(Dialable { pauses, resumed })
             }
             Err(Resumed::Lost) => {
@@ -458,6 +475,67 @@ pub(crate) async fn resume(
                 config::Phase::Other,
                 client.kind(),
             )))
+        }
+    }
+}
+
+/// The dials right after a resume of cloud machine `machine_id` got no
+/// answer: restart its sandbox's tunnel through the provider's process API
+/// (the relay step, which turns the tunnel off and on). A tailcat that
+/// starts while its network still looks down never picks its home relay
+/// and, with no peers, never looks again: it serves an address nothing can
+/// reach (intent#9895). Takes the machine's transition lock; a sandbox that
+/// is not running is left alone. Returns whether the tunnel was restarted.
+pub(crate) async fn revive(svc: &Services, feature: &RemoteFeature, machine_id: &str) -> bool {
+    let _transition = feature.cloud.transition(machine_id).await;
+    if feature.cloud.is_parked(machine_id) {
+        return false;
+    }
+    let Ok(Some(row)) = svc.store().get_exposed_machine(machine_id).await else {
+        return false;
+    };
+    let Some(cloud) = row
+        .cloud
+        .as_ref()
+        .filter(|cloud| cloud.state == CloudSandboxState::Running)
+    else {
+        return false;
+    };
+    let Ok(client) = config::saved_client(svc, super::methods::row_entry(&row)).await else {
+        return false;
+    };
+    let connected = match client
+        .connect(&cloud.sandbox_id, SANDBOX_TIMEOUT_SECS)
+        .await
+    {
+        Ok(connected) => connected,
+        Err(error) => {
+            tracing::warn!(machine = %machine_id, %error, "cloud machine: could not reach the sandbox to restart its tunnel");
+            return false;
+        }
+    };
+    let relay = super::bootstrap::wanted_relay(svc);
+    // The relay step turns the tunnel off first: until it is back on, the
+    // next resume must run the relay step again, even if this one is dropped.
+    relay_unsettled(machine_id, Some(true));
+    match super::bootstrap::ensure_relay(
+        &*client,
+        &connected.instance,
+        relay.as_deref(),
+        true,
+        super::bootstrap::Moment::Resume,
+    )
+    .await
+    {
+        Ok(address) => {
+            tracing::info!(machine = %machine_id, "cloud machine: no answer after the resume; the sandbox's tunnel was restarted");
+            relay_unsettled(machine_id, Some(false));
+            record_relay(svc, feature, machine_id, relay, address).await;
+            true
+        }
+        Err(error) => {
+            tracing::warn!(machine = %machine_id, %error, "cloud machine: the sandbox's tunnel could not be restarted");
+            false
         }
     }
 }

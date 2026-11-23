@@ -10,7 +10,8 @@
 //! connections and never answers fails a start and one resume; a changed
 //! setting moves the sandbox to the new relay at its next resume (new
 //! tunnel address, `cloud.relayUrl`); an unreachable relay fails that
-//! resume; and an empty setting brings back the default relay.
+//! resume; an empty setting brings back the default relay; and a resumed
+//! tunnel that never joins its relay is restarted.
 
 use std::sync::atomic::Ordering;
 
@@ -19,7 +20,10 @@ use crate::common::fake_relay::{closing_relay, dead_relay_url, fake_relay, FakeR
 
 /// A tailcat that appends each command line to `$TAILCAT_LOG`, writes a
 /// key named after its path at genkey, and serves an address made from the
-/// key it was given, `$TAILCAT_SERVE_DELAY` seconds after it starts.
+/// key it was given, `$TAILCAT_SERVE_DELAY` seconds after it starts. With
+/// `$TAILCAT_JOINED`, a serve marks its address joined there (see
+/// [`write_tailcat_client`]), unless a `stuck` file there makes it, once, a
+/// tunnel that never joins its relay.
 pub(super) fn write_logging_tailcat(dir: &Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("logging-tailcat.sh");
@@ -37,10 +41,59 @@ case "$1" in
     ;;
   serve)
     sleep "${TAILCAT_SERVE_DELAY:-0}" # // timing-guard: a tunnel that takes a while to come up
-    printf '{"listenAddr":"tc%s"}\n' "$(cat "$key")"
+    addr="tc$(cat "$key")"
+    if [ -n "${TAILCAT_JOINED:-}" ]; then
+      rm -f "$TAILCAT_JOINED/$addr"
+      if [ -f "$TAILCAT_JOINED/stuck" ]; then
+        rm -f "$TAILCAT_JOINED/stuck"
+      else
+        : > "$TAILCAT_JOINED/$addr"
+      fi
+    fi
+    printf '{"listenAddr":"%s"}\n' "$addr"
     exec sleep 600 # // timing-guard: a fake sidecar serves until the daemon kills it
     ;;
 esac
+"#;
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The backend's tailcat pipe client (`tailcat <address> <port>`): it
+/// forwards to the sandbox daemon's local port when the serve of `address`
+/// joined its relay (`$TAILCAT_JOINED/<address>`), and otherwise never
+/// answers, as a tunnel that never joined its relay.
+fn write_tailcat_client(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("tailcat-client.py");
+    let script = r#"#!/usr/bin/env python3
+import os, socket, sys, threading, time
+
+if len(sys.argv) != 3 or sys.argv[1] in ("genkey", "serve") or sys.argv[1].startswith("-"):
+    sys.exit(2)
+address, port = sys.argv[1], int(sys.argv[2])
+if not os.path.exists(os.path.join(os.environ["TAILCAT_JOINED"], address)):
+    time.sleep(600)  # // timing-guard: nothing answers until the backend gives up
+    sys.exit(1)
+conn = socket.create_connection(("127.0.0.1", port))
+
+def upstream():
+    while True:
+        data = os.read(0, 65536)
+        if not data:
+            conn.shutdown(socket.SHUT_WR)
+            return
+        conn.sendall(data)
+
+threading.Thread(target=upstream, daemon=True).start()
+out = sys.stdout.buffer
+while True:
+    data = conn.recv(65536)
+    if not data:
+        break
+    out.write(data)
+    out.flush()
 "#;
     std::fs::write(&path, script).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -81,17 +134,58 @@ fn tailcat_lines(log: &Path, from: usize) -> Vec<String> {
 /// A backend against the fake E2B whose sandboxes run the logging tailcat;
 /// returns it, the tailcat log and a create-params maker.
 async fn relay_backend(prefix: &str) -> Option<(CloudBackend, std::path::PathBuf)> {
-    let backend = CloudBackend::start(prefix, &[]).await?;
+    relay_backend_with(prefix, &[]).await
+}
+
+async fn relay_backend_with(
+    prefix: &str,
+    env: &[(&str, &str)],
+) -> Option<(CloudBackend, std::path::PathBuf)> {
+    let backend = CloudBackend::start(prefix, env).await?;
     let tailcat = write_logging_tailcat(backend.fake.scratch());
     let log = backend.fake.scratch().join("tailcat.log");
-    backend.fake.state().sandbox_env.extend([
-        (
-            "INTENTD_TAILCAT_BIN".to_owned(),
-            tailcat.to_string_lossy().into_owned(),
+    backend.fake.state().sandbox_env.extend(
+        [
+            (
+                "INTENTD_TAILCAT_BIN".to_owned(),
+                tailcat.to_string_lossy().into_owned(),
+            ),
+            ("TAILCAT_LOG".to_owned(), log.to_string_lossy().into_owned()),
+        ]
+        .into_iter()
+        .chain(
+            env.iter()
+                .filter(|(name, _)| *name == "TAILCAT_JOINED")
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
         ),
-        ("TAILCAT_LOG".to_owned(), log.to_string_lossy().into_owned()),
-    ]);
+    );
     Some((backend, log))
+}
+
+/// A [`relay_backend`] that dials its sandboxes only over their tunnel,
+/// through [`write_tailcat_client`]. Also returns the dir where serves mark
+/// their address joined.
+async fn tunneled_backend(
+    prefix: &str,
+) -> Option<(CloudBackend, std::path::PathBuf, tempfile::TempDir)> {
+    if intent_providers::resolve_on_path("python3").is_none() {
+        eprintln!("skipping the tunneled E2B e2e: python3 not on PATH");
+        return None;
+    }
+    let joined = common::test_tempdir_in("/tmp", "itd-tc-joined-");
+    let client = write_tailcat_client(joined.path());
+    let client = client.to_string_lossy().into_owned();
+    let dir = joined.path().to_string_lossy().into_owned();
+    let (backend, log) = relay_backend_with(
+        prefix,
+        &[
+            ("INTENTD_E2B_DIRECT_HOST", ""),
+            ("INTENTD_TAILCAT_BIN", &client),
+            ("TAILCAT_JOINED", &dir),
+        ],
+    )
+    .await?;
+    Some((backend, log, joined))
 }
 
 fn placed(ws_id: &str, provider: &str, name: &str) -> Value {
@@ -447,6 +541,68 @@ async fn a_relay_change_reaches_a_sandbox_at_its_next_resume() {
             .iter()
             .any(|l| l.starts_with("serve") && !l.contains("--derpmap-url")),
         "{lines:?}"
+    );
+    assert_no_secret_logged(&backend.head_dir, &backend.fake);
+}
+
+/// The relay comes back after a resume it refused, and the next resume
+/// starts the sandbox's tunnel again, but that tunnel never joins its relay
+/// and never retries, so no dial is answered (intent#9895). The backend
+/// restarts the tunnel through the provider and the sandbox replies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resumed_tunnel_that_never_joins_its_relay_is_restarted() {
+    let Some((mut backend, log, joined)) = tunneled_backend("itd-e2b-relay-j-").await else {
+        return;
+    };
+    let relay = fake_relay().await;
+    let dead = dead_relay_url().await;
+    let (agent_id, machine, seen) = start_over(&mut backend, &log, &relay, 10).await;
+    let ws_id = backend.ws_id.clone();
+    let agent = (ws_id.as_str(), agent_id.as_str());
+    let rpc_ws = &mut backend.rpc_ws;
+
+    ok(
+        rpc_ws,
+        60,
+        "cloudMachines.pause",
+        json!({ "machineId": machine["id"] }),
+    )
+    .await;
+    set_relay(rpc_ws, 61, &dead).await;
+    let mut events = agent_events(backend.port, backend.cfg.clone(), &ws_id).await;
+    ok(
+        rpc_ws,
+        62,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "while the relay is down" }),
+    )
+    .await;
+    failure_containing(&mut events, &agent_id, &dead).await;
+    drop(events);
+    let seen = seen + tailcat_lines(&log, seen).len();
+
+    // The relay is back: the next resume starts a tunnel that never joins.
+    std::fs::write(joined.path().join("stuck"), "").unwrap();
+    set_relay(rpc_ws, 63, &relay.url).await;
+    ok(
+        rpc_ws,
+        64,
+        "agent.retry",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    reply_containing(rpc_ws, agent, "while the relay is down", 65).await;
+    assert!(
+        !joined.path().join("stuck").exists(),
+        "no tunnel started after the relay came back"
+    );
+    let serves: Vec<String> = tailcat_lines(&log, seen)
+        .into_iter()
+        .filter(|line| line.starts_with("serve"))
+        .collect();
+    assert!(
+        serves.len() == 2,
+        "the tunnel that never joined was not restarted exactly once: {serves:?}"
     );
     assert_no_secret_logged(&backend.head_dir, &backend.fake);
 }
