@@ -38,8 +38,6 @@ use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
 use tokio_tungstenite::tungstenite::extensions::{Extensions, ExtensionsConfig};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-
-use crate::connection_set::ConnectionHook;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Bytes;
@@ -50,6 +48,7 @@ use crate::auth::{
     extract_token, is_allowed_origin, validate_token, AsyncTokenStore, ResolvedCredential,
 };
 use crate::conn::{self, ConnSubs};
+use crate::connection_set::ConnectionHook;
 use crate::context::Caller;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::reverse::{PrimaryReverseRegistry, ReverseChannel, ReverseTransport};
@@ -1226,6 +1225,10 @@ impl WsInner {
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Checked again here: the set may have closed during the upgrade.
+        if self.set_closed() {
+            return;
+        }
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
         let last_pong = Arc::new(AtomicI64::new(mono_ms()));
@@ -1255,6 +1258,10 @@ impl WsInner {
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Checked again here: the set may have closed during the upgrade.
+        if self.set_closed() {
+            return;
+        }
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
         let last_pong = Arc::new(AtomicI64::new(mono_ms()));
@@ -1295,6 +1302,10 @@ impl WsInner {
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Checked again here: the set may have closed during the upgrade.
+        if self.set_closed() {
+            return;
+        }
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
         let last_pong = Arc::new(AtomicI64::new(mono_ms()));
@@ -1488,6 +1499,13 @@ impl WsInner {
                 _connection: connection,
             },
         );
+    }
+
+    /// Whether the installed connection set is closed; `false` without one.
+    fn set_closed(&self) -> bool {
+        self.connections
+            .as_ref()
+            .is_some_and(ConnectionHook::is_closed)
     }
 
     /// Remove a client from the registry (idempotent).
