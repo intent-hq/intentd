@@ -57,7 +57,8 @@ tokio::task_local! {
 /// calls. Scope is polled with the future, so siblings in `join!` do not share
 /// admission and spawned tasks do not inherit it. Weak entries cannot prolong
 /// admission after cancellation; existing background writes carry their own
-/// explicit `Mutation` guards.
+/// explicit `Mutation` guards, and [`run_detached`] deliberately holds the
+/// caller's permits strongly until its task finishes.
 pub(crate) async fn scope<F: Future>(future: F) -> F::Output {
     let inherited = ADMITTED
         .try_with(|held| held.borrow().clone())
