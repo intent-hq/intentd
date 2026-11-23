@@ -61,6 +61,12 @@ async fn sigterm_releases_the_lease_so_a_standby_claims_at_once() {
             .env("INTENTD_ORCHESTRATOR_INSTANCE", &instance)
             .env("INTENTD_DATA_DIR", dir.path())
             .env("RUST_LOG", "info")
+            // The orchestrator refuses to start without a tenant secret key.
+            .env(
+                "INTENTD_SECRETS_KEY",
+                "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+            )
+            .env("INTENTD_SECRETS_KEY_ID", "test")
             .stdin(Stdio::null()),
     )
     .expect("start the orchestrator");

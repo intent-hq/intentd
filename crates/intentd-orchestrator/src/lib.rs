@@ -13,7 +13,8 @@
 //! 2. `LeaseHeartbeat::spawn`: renews the lease and fires the claim's fence
 //!    once it cannot;
 //! 3. the tenant's `Services`, with every on-disk path under
-//!    [`tenant_dir`], in orchestrator mode;
+//!    [`tenant_dir`], in orchestrator mode, and its secrets in its
+//!    Postgres rows, encrypted with the process keyring (`secrets`);
 //! 4. `tenant_self_fence` and `TenantRuntime::start` (`intent_app::tenant`):
 //!    the tenant's restores, sweeps and loops (event retention and the
 //!    idempotency reaper included), its client connections, machine links,
@@ -33,6 +34,8 @@ use intent_core::tenant_fence::SelfFenceReport;
 
 #[cfg(unix)]
 pub mod listen;
+#[cfg(feature = "postgres")]
+pub mod secrets;
 #[cfg(feature = "postgres")]
 pub mod serve;
 

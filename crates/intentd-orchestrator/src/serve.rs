@@ -11,7 +11,8 @@ use intent_core::{Error, Result};
 use intent_services::retention::TenantSweepTiming;
 use intent_services::{EventBus, Services, SettingsRegistry};
 use intent_store::postgres::{
-    LeaseHeartbeat, PgPool, PostgresOptions, TenantId, LEASE_RENEW_INTERVAL, LEASE_TTL,
+    LeaseHeartbeat, PgPool, PostgresOptions, SecretKeyring, TenantId, LEASE_RENEW_INTERVAL,
+    LEASE_TTL,
 };
 use intent_store::{OrchestratorOnly, Store};
 use intent_transport::PrimaryReverseRegistry;
@@ -38,6 +39,7 @@ pub struct ServedTenant {
     tenant: String,
     dir: PathBuf,
     services: Services,
+    secrets: Arc<crate::secrets::TenantSecrets>,
     bus: EventBus,
     runtime: TenantRuntime,
     /// The tenant's reverse registry: installed in `services` before any
@@ -60,19 +62,22 @@ impl Admission for Unfenced {
 }
 
 /// Open tenant `tenant` on `pool` as `instance` and start serving it, with
-/// its files under [`crate::tenant_dir`] of `data_dir`.
+/// its files under [`crate::tenant_dir`] of `data_dir` and its secrets in
+/// its Postgres rows, sealed with `keyring` ([`crate::secrets`]). Call it
+/// on the multi-thread runtime: the secret store needs it.
 ///
 /// # Errors
 /// For an invalid tenant id; `Error::SchemaMismatch` when the schema does
 /// not match this build; `Error::NotOwner` when another instance holds a
 /// live lease (nothing was written); when the tenant's directory or
-/// settings cannot be set up.
+/// settings cannot be set up; when the runtime is not multi-thread.
 pub async fn serve_tenant(
     pool: PgPool,
     tenant: &str,
     data_dir: &Path,
     instance: &str,
     timing: LeaseTiming,
+    keyring: Arc<SecretKeyring>,
     orchestrator: OrchestratorOnly,
 ) -> Result<ServedTenant> {
     serve_tenant_with(
@@ -82,6 +87,7 @@ pub async fn serve_tenant(
         instance,
         timing,
         TenantSweepTiming::default(),
+        keyring,
         orchestrator,
     )
     .await
@@ -92,6 +98,7 @@ pub async fn serve_tenant(
 ///
 /// # Errors
 /// As [`serve_tenant`].
+#[expect(clippy::too_many_arguments)]
 pub async fn serve_tenant_with(
     pool: PgPool,
     tenant: &str,
@@ -99,9 +106,19 @@ pub async fn serve_tenant_with(
     instance: &str,
     timing: LeaseTiming,
     sweeps: TenantSweepTiming,
+    keyring: Arc<SecretKeyring>,
     orchestrator: OrchestratorOnly,
 ) -> Result<ServedTenant> {
     let id = TenantId::new(tenant)?;
+    // The tenant's secret store blocks on the multi-thread runtime; refuse
+    // any other before the lease is claimed, so nothing is set up.
+    if tokio::runtime::Handle::current().runtime_flavor()
+        != tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        return Err(Error::Internal(format!(
+            "tenant {tenant}: serving needs the multi-thread Tokio runtime"
+        )));
+    }
     let (store, lease) = Store::open_postgres_owned(
         pool,
         id,
@@ -118,7 +135,8 @@ pub async fn serve_tenant_with(
         .map_err(|e| Error::Internal(format!("tenant {tenant}: create {}: {e}", dir.display())))?;
     let bus = EventBus::new(store.clone());
     let reverse = Arc::new(PrimaryReverseRegistry::new());
-    let services = tenant_services(store, bus.clone(), &dir, reverse.clone())?;
+    let secrets = Arc::new(crate::secrets::TenantSecrets::new(&store, keyring)?);
+    let services = tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets.clone())?;
     let mut runner = intent_services::self_fence::tenant_self_fence(services.clone())
         .ok_or_else(|| Error::Internal(format!("tenant {tenant}: the store has no fence")))?;
     let admission = Unfenced(fence.clone());
@@ -136,6 +154,7 @@ pub async fn serve_tenant_with(
         tenant: tenant.to_owned(),
         dir,
         services,
+        secrets,
         bus,
         runtime,
         reverse,
@@ -146,20 +165,26 @@ pub async fn serve_tenant_with(
 }
 
 /// The tenant's `Services` over `bus`: every path under `dir`, in
-/// orchestrator mode, dispatching to clients through `reverse`.
+/// orchestrator mode, dispatching to clients through `reverse`, with
+/// `secrets` as the store every secret reader and writer uses (the tenant's
+/// Postgres rows in [`serve_tenant`]). The GitLab credential pair is the one
+/// exception: `Services` keeps it in a concrete file store, here the
+/// tenant's own `secrets.json`, never the process-wide default.
 fn tenant_services(
     store: Store,
     bus: EventBus,
     dir: &Path,
     reverse: Arc<PrimaryReverseRegistry>,
+    secrets: Arc<dyn intent_services::SecretStore>,
 ) -> Result<Services> {
     let registry = SettingsRegistry::load(dir.join("config.toml"))?;
-    let secrets = intent_core::FileSecretStore::with_path(dir.join("secrets.json"));
+    let gitlab_pair = intent_core::FileSecretStore::with_path(dir.join("secrets.json"));
     Ok(intent_app::compose(
-        Services::new_with_secret_file(store, secrets)
+        Services::new_with_secret_file(store, gitlab_pair)
             .with_event_bus(bus)
             .with_reverse_dispatch(reverse)
             .with_settings_registry(Arc::new(registry))
+            .with_secret_store(secrets)
             .with_workspaces_root(dir.join("workspaces"))
             .with_assets_root(dir.join("assets"))
             .with_chief_cwd_root(dir.join("chief-cwd"))
@@ -187,6 +212,13 @@ impl ServedTenant {
     #[must_use]
     pub fn services(&self) -> &Services {
         &self.services
+    }
+
+    /// The secret store the tenant's `Services` were built with: its
+    /// Postgres rows.
+    #[must_use]
+    pub fn secrets(&self) -> &Arc<crate::secrets::TenantSecrets> {
+        &self.secrets
     }
 
     /// The tenant's event bus.
@@ -327,7 +359,13 @@ mod tests {
         let store = Store::open(&dir.join("db.sqlite")).await.unwrap();
         let bus = EventBus::new(store.clone());
         let reverse = Arc::new(PrimaryReverseRegistry::new());
-        (tenant_services(store, bus, &dir, reverse).unwrap(), dir)
+        let secrets = Arc::new(intent_core::FileSecretStore::with_path(
+            dir.join("secrets.json"),
+        ));
+        (
+            tenant_services(store, bus, &dir, reverse, secrets).unwrap(),
+            dir,
+        )
     }
 
     /// A desktop that connects through the tenant's listeners is reachable
@@ -345,7 +383,10 @@ mod tests {
         let store = Store::open(&dir.join("db.sqlite")).await.unwrap();
         let bus = EventBus::new(store.clone());
         let reverse = Arc::new(PrimaryReverseRegistry::new());
-        let services = tenant_services(store, bus.clone(), &dir, reverse.clone()).unwrap();
+        let secrets = Arc::new(intent_core::FileSecretStore::with_path(
+            dir.join("secrets.json"),
+        ));
+        let services = tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets).unwrap();
         let earlier = services.clone();
         let dispatch = earlier
             .feature_reverse_dispatch()

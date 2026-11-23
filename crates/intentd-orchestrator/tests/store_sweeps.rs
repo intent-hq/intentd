@@ -124,7 +124,7 @@ async fn until_swept(pool: &PgPool, tenant: &str, prefix: &str) {
     .unwrap_or_else(|_| panic!("the tenant runtime swept {tenant}'s expired rows"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_served_tenant_sweeps_only_its_own_expired_rows_until_its_fence() {
     let Some(pool) = pool().await else { return };
     let dir = tempfile::tempdir().unwrap();
@@ -142,6 +142,7 @@ async fn a_served_tenant_sweeps_only_its_own_expired_rows_until_its_fence() {
         &format!("orchestrator-test-{run}"),
         LeaseTiming::default(),
         fast(),
+        std::sync::Arc::new(postgres::SecretKeyring::new("test", &[0x5a; 32]).unwrap()),
         OrchestratorOnly::for_tests(),
     )
     .await

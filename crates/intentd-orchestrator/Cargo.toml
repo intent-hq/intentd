@@ -24,6 +24,7 @@ required-features = ["postgres"]
 postgres = ["intent-store/postgres"]
 
 [dependencies]
+base64 = { workspace = true }
 intent-app = { workspace = true }
 intent-core = { workspace = true }
 intent-services = { workspace = true }
@@ -34,6 +35,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+zeroize = "1.9"
+
+# `prctl(PR_SET_DUMPABLE, 0)`: keep same-uid processes out of /proc/<pid>/environ and mem.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
