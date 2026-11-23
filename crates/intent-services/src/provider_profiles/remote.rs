@@ -154,7 +154,7 @@ impl ProviderProfileStore {
         // Prune choices of deleted profiles on every write.
         if let Ok(profiles) = self.profiles() {
             next.profiles
-                .retain(|id, _| profiles.iter().any(|p| &p.id == id));
+                .retain(|id, _| profiles.iter().any(|p| &p.id == id) || self.is_skipped_id(id));
         }
         match key {
             ChoiceKey::Profile(id) => next.profiles.insert(id.to_owned(), marked),
@@ -584,7 +584,7 @@ impl Services {
         };
         let mut next = previous.clone();
         next.profiles
-            .retain(|id, _| profiles.iter().any(|p| &p.id == id));
+            .retain(|id, _| profiles.iter().any(|p| &p.id == id) || store.is_skipped_id(id));
         for meta in profiles.iter() {
             if next.profiles.contains_key(&meta.id) {
                 continue;
