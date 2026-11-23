@@ -270,15 +270,22 @@ fn disk_settings() -> Value {
         };
         let mut setting = json!({ "minGiB": min, "maxGiB": max, "defaultGiB": default });
         if kind == CLOUD_PROVIDER_AGENT37 {
-            let caps = |vm: bool| -> serde_json::Map<String, Value> {
-                CloudMachineSize::AGENT37
-                    .into_iter()
-                    .filter_map(|size| {
-                        Some((size.id().to_owned(), json!(size.agent37_max_disk_gib(vm)?)))
-                    })
-                    .collect()
-            };
-            setting["sizeMaxGiB"] = json!({ "default": caps(false), "vm": caps(true) });
+            let caps: serde_json::Map<String, Value> = intent_nodes::agent37::INSTANCE_TYPES
+                .into_iter()
+                .map(|instance_type| {
+                    let entry = config::Agent37Settings {
+                        instance_type: instance_type.to_owned(),
+                        disk_gib: max,
+                        ..config::Agent37Settings::default()
+                    };
+                    let by_size: serde_json::Map<String, Value> = CloudMachineSize::AGENT37
+                        .into_iter()
+                        .map(|size| (size.id().to_owned(), json!(entry.disk_for(size))))
+                        .collect();
+                    (instance_type.to_owned(), Value::Object(by_size))
+                })
+                .collect();
+            setting["sizeMaxGiB"] = Value::Object(caps);
         }
         settings.insert(kind.to_owned(), setting);
     }
