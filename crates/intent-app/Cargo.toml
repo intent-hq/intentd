@@ -1,6 +1,6 @@
 [package]
 name = "intent-app"
-version = "0.11.281"
+version = "0.11.282"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true

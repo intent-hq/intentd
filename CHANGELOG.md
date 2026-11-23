@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.282] - 2026-11-23
+
+### 🚀 Features
+
+- *(orchestrator)* Serve the default tenant's clients over intentd's UDS and WSS listeners ([#3718](https://github.com/intent-hq/intentd/pull/3718))
+- *(orchestrator)* Release each tenant lease on a clean shutdown ([#3715](https://github.com/intent-hq/intentd/pull/3715))
+- *(store)* Encrypted tenant secrets in Postgres ([#3690](https://github.com/intent-hq/intentd/pull/3690))
+- *(remote)* Retry a remote agent's failed setup in its kept checkout ([#3721](https://github.com/intent-hq/intentd/pull/3721))
+
+### 🐛 Bug Fixes
+
+- Interrupt and stop reach an agent running on a runner ([#3707](https://github.com/intent-hq/intentd/pull/3707))
+- Link a PR an agent opens to its submodule git root ([#3712](https://github.com/intent-hq/intentd/pull/3712))
+
+
 ## [0.11.281] - 2026-11-23
 
 ### 🐛 Bug Fixes
