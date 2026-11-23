@@ -257,7 +257,8 @@ pub(crate) const DEFAULT_NAME: &str = "Default";
 #[serde(rename_all = "camelCase")]
 struct ProfilesFile {
     version: u32,
-    profiles: Vec<ProfileMeta>,
+    /// Raw rows: a base this daemon does not know is kept as written.
+    profiles: Vec<Value>,
     /// Default configuration overrides; omitted when none is saved, so the
     /// steady-state file keeps its original shape. An older daemon ignores
     /// it and drops it on its next write.
@@ -266,6 +267,23 @@ struct ProfilesFile {
     /// Ids whose secret may exist without metadata (see module docs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_env_cleanup: Vec<String>,
+}
+
+/// A profile whose base this daemon does not know (a newer daemon's). It is
+/// never loaded, but every write keeps it unchanged and its id stays taken,
+/// so it is back after an upgrade.
+#[derive(Debug, Clone)]
+struct SkippedProfile {
+    id: String,
+    raw: Value,
+}
+
+/// [`ProfilesFile`] split into loaded and skipped profiles.
+struct ParsedFile {
+    profiles: Vec<ProfileMeta>,
+    skipped: Vec<SkippedProfile>,
+    defaults: Defaults,
+    pending: Vec<String>,
 }
 
 /// One saved environment entry. Deliberately not `Debug`: it carries values.
@@ -820,6 +838,8 @@ struct Loaded {
     /// Default configuration overrides (meaningful only while readable).
     defaults: Arc<Defaults>,
     pending: Vec<String>,
+    /// Profiles of unknown bases, written back as read.
+    skipped: Arc<Vec<SkippedProfile>>,
 }
 
 /// Metadata store + mutation lock + process-local revision watermark.
@@ -849,6 +869,7 @@ impl ProviderProfileStore {
                 profiles: Some(Arc::new(Vec::new())),
                 defaults: Arc::default(),
                 pending: Vec::new(),
+                skipped: Arc::default(),
             }),
             choices: RwLock::new(Some(RemoteChoices::default())),
             choices_path: None,
@@ -865,10 +886,14 @@ impl ProviderProfileStore {
         let loaded = match std::fs::read(&path) {
             Ok(bytes) => {
                 if let Some(file) = parse_file(&bytes) {
+                    if !file.skipped.is_empty() {
+                        tracing::info!(path = %path.display(), skipped = file.skipped.len(), "provider profiles of unknown base providers are kept but not loaded");
+                    }
                     Loaded {
                         profiles: Some(Arc::new(file.profiles)),
                         defaults: Arc::new(file.defaults),
-                        pending: file.pending_env_cleanup,
+                        pending: file.pending,
+                        skipped: Arc::new(file.skipped),
                     }
                 } else {
                     tracing::warn!(path = %path.display(), "provider profiles file is malformed or has an unknown version; profiles are unavailable until it is fixed");
@@ -876,6 +901,7 @@ impl ProviderProfileStore {
                         profiles: None,
                         defaults: Arc::default(),
                         pending: Vec::new(),
+                        skipped: Arc::default(),
                     }
                 }
             }
@@ -883,6 +909,7 @@ impl ProviderProfileStore {
                 profiles: Some(Arc::new(Vec::new())),
                 defaults: Arc::default(),
                 pending: Vec::new(),
+                skipped: Arc::default(),
             },
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "provider profiles file is unreadable");
@@ -890,6 +917,7 @@ impl ProviderProfileStore {
                     profiles: None,
                     defaults: Arc::default(),
                     pending: Vec::new(),
+                    skipped: Arc::default(),
                 }
             }
         };
@@ -958,6 +986,11 @@ impl ProviderProfileStore {
         self.loaded.read().unwrap().pending.clone()
     }
 
+    /// Whether `id` belongs to a skipped profile of an unknown base.
+    fn is_skipped_id(&self, id: &str) -> bool {
+        self.loaded.read().unwrap().skipped.iter().any(|s| s.id == id)
+    }
+
     /// Atomically persist `profiles` + `pending`, then publish the snapshot.
     /// Callers hold the mutation lock.
     fn persist(&self, profiles: Vec<ProfileMeta>, pending: Vec<String>) -> Result<()> {
@@ -974,27 +1007,35 @@ impl ProviderProfileStore {
         pending: Vec<String>,
     ) -> Result<()> {
         defaults.retain(|_, d| !d.is_empty());
+        let skipped = self.loaded.read().unwrap().skipped.clone();
         if let Some(path) = &self.path {
+            let encode =
+                |e: serde_json::Error| Error::Internal(format!("encode provider profiles failed: {e}"));
+            let rows = profiles
+                .iter()
+                .map(|p| serde_json::to_value(p).map_err(encode))
+                .chain(skipped.iter().map(|s| Ok(s.raw.clone())))
+                .collect::<Result<Vec<_>>>()?;
             let file = ProfilesFile {
                 version: FILE_VERSION,
-                profiles: profiles.clone(),
+                profiles: rows,
                 defaults: defaults.clone(),
                 pending_env_cleanup: pending.clone(),
             };
-            let bytes = serde_json::to_vec_pretty(&file)
-                .map_err(|e| Error::Internal(format!("encode provider profiles failed: {e}")))?;
+            let bytes = serde_json::to_vec_pretty(&file).map_err(encode)?;
             write_atomic(path, &bytes)?;
         }
         *self.loaded.write().unwrap() = Loaded {
             profiles: Some(Arc::new(profiles)),
             defaults: Arc::new(defaults),
             pending,
+            skipped,
         };
         Ok(())
     }
 }
 
-fn parse_file(bytes: &[u8]) -> Option<ProfilesFile> {
+fn parse_file(bytes: &[u8]) -> Option<ParsedFile> {
     let mut file: ProfilesFile = serde_json::from_slice(bytes).ok()?;
     // A blank or `Default` name is not a rename (hand edits included).
     for default in file.defaults.values_mut() {
@@ -1011,12 +1052,26 @@ fn parse_file(bytes: &[u8]) -> Option<ProfilesFile> {
     if file.version != FILE_VERSION {
         return None;
     }
+    let mut profiles = Vec::new();
+    let mut skipped = Vec::new();
+    for raw in file.profiles {
+        let known = PROFILE_BASE_PROVIDERS.contains(&raw.get("baseProvider")?.as_str()?);
+        if known {
+            profiles.push(serde_json::from_value::<ProfileMeta>(raw).ok()?);
+        } else {
+            // Like an unknown Default entry, a profile of a newer daemon's
+            // base must not make every other profile unreadable.
+            let id = raw.get("id")?.as_str()?.to_owned();
+            skipped.push(SkippedProfile { id, raw });
+        }
+    }
     let mut ids = std::collections::HashSet::new();
-    let well_formed = file.profiles.iter().all(|p| {
-        is_valid_profile_id(&p.id)
-            && PROFILE_BASE_PROVIDERS.contains(&p.base_provider.as_str())
-            && ids.insert(p.id.clone())
-    }) && file
+    let well_formed = profiles
+        .iter()
+        .map(|p| &p.id)
+        .chain(skipped.iter().map(|s| &s.id))
+        .all(|id| is_valid_profile_id(id) && ids.insert(id.clone()))
+        && file
         .pending_env_cleanup
         .iter()
         .all(|id| is_valid_profile_id(id))
@@ -1025,7 +1080,12 @@ fn parse_file(bytes: &[u8]) -> Option<ProfilesFile> {
                 .as_ref()
                 .is_none_or(|id| is_valid_profile_id(id) && ids.insert(id.clone()))
         });
-    well_formed.then_some(file)
+    well_formed.then_some(ParsedFile {
+        profiles,
+        skipped,
+        defaults: file.defaults,
+        pending: file.pending_env_cleanup,
+    })
 }
 
 /// Temp file in the same directory (mode `0600`, fsynced), then rename.
@@ -1489,6 +1549,7 @@ impl Services {
         let mut remaining = Vec::new();
         for id in pending {
             if profiles.iter().any(|p| p.id == id)
+                || store.is_skipped_id(&id)
                 || defaults
                     .values()
                     .any(|d| d.env_id.as_deref() == Some(id.as_str()))
@@ -2461,6 +2522,7 @@ impl Services {
                     let candidate = format!("d{}", random_token(12));
                     if !profiles.iter().any(|p| p.id == candidate)
                         && !pending.contains(&candidate)
+                        && !store.is_skipped_id(&candidate)
                         && !defaults
                             .values()
                             .any(|d| d.env_id.as_deref() == Some(candidate.as_str()))
@@ -2716,7 +2778,10 @@ impl Services {
         let pending = store.pending();
         let id = loop {
             let candidate = format!("p{}", random_token(12));
-            if !profiles.iter().any(|p| p.id == candidate) && !pending.contains(&candidate) {
+            if !profiles.iter().any(|p| p.id == candidate)
+                && !pending.contains(&candidate)
+                && !store.is_skipped_id(&candidate)
+            {
                 break candidate;
             }
         };

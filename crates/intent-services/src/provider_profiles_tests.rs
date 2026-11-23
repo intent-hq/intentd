@@ -725,12 +725,81 @@ async fn profiles_persist_across_restart_and_revision_resets() {
     assert_eq!(list["revision"], 0, "revision is process-local");
 }
 
+/// A downgraded daemon meets a newer daemon's profile for a base it does not
+/// know: it loads the rest, and every save writes that entry back unchanged.
+#[intent_test_macros::daemon_test]
+async fn unknown_base_profiles_are_kept_unloaded_and_written_back_unchanged() {
+    const CODEX: &str = r#"    {
+      "id": "pcodexwork0001",
+      "baseProvider": "codex",
+      "name": "Work",
+      "createdAt": "2026-01-01T00:00:00Z",
+      "updatedAt": "2026-01-01T00:00:00Z"
+    }"#;
+    const FUTURE: &str = r#"    {
+      "id": "pzorbit000001",
+      "baseProvider": "zorbit",
+      "name": "Work",
+      "createdAt": "2026-01-02T00:00:00Z",
+      "updatedAt": "2026-01-02T00:00:00Z",
+      "backup": true,
+      "futureField": {
+        "nested": [
+          1,
+          "two"
+        ]
+      }
+    }"#;
+    let fx = Fixture::new().await;
+    std::fs::write(
+        fx.profiles_file(),
+        format!(
+            "{{\n  \"version\": 1,\n  \"profiles\": [\n{CODEX},\n{FUTURE}\n  ],\n  \"pendingEnvCleanup\": [\n    \"pzorbit000001\"\n  ]\n}}"
+        ),
+    )
+    .unwrap();
+    // The newer daemon's journaled create landed its metadata: keep the secret.
+    SecretStore::store(&*fx.secrets, &env_account("pzorbit000001"), "{}").unwrap();
+    let fx = fx.restart().await;
+    fx.svc.sweep_provider_profile_secrets().await;
+    assert!(SecretStore::load(&*fx.secrets, &env_account("pzorbit000001"))
+        .unwrap()
+        .is_some());
+
+    let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
+    let ids: Vec<&str> = list["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["pcodexwork0001"], "{list}");
+    assert!(!fx.svc.provider_profiles.has_reference("zorbit@pzorbit000001"));
+
+    fx.create("codex", "Second", json!([])).await;
+    let written = std::fs::read_to_string(fx.profiles_file()).unwrap();
+    assert!(written.contains(CODEX), "{written}");
+    assert!(written.contains(FUTURE), "{written}");
+
+    let fx = fx.restart().await;
+    let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
+    assert_eq!(list["profiles"].as_array().unwrap().len(), 2, "{list}");
+    assert!(std::fs::read_to_string(fx.profiles_file())
+        .unwrap()
+        .contains(FUTURE));
+}
+
 #[intent_test_macros::daemon_test]
 async fn malformed_file_is_left_untouched_and_reported_unreadable() {
     for bad in [
         "{ not json".to_string(),
         json!({ "version": 2, "profiles": [] }).to_string(),
         json!({ "version": 1, "profiles": [{ "id": "BAD", "baseProvider": "codex", "name": "x", "createdAt": "", "updatedAt": "" }] }).to_string(),
+        json!({ "version": 1, "profiles": [{ "id": "BAD", "baseProvider": "zorbit" }] }).to_string(),
+        json!({ "version": 1, "profiles": [
+            { "id": "p1", "baseProvider": "codex", "name": "x", "createdAt": "", "updatedAt": "" },
+            { "id": "p1", "baseProvider": "zorbit" },
+        ] }).to_string(),
     ] {
         let fx = Fixture::new().await;
         std::fs::write(fx.profiles_file(), &bad).unwrap();
