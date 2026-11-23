@@ -8,6 +8,7 @@
 use super::*;
 
 /// The `data.code` of a refused call.
+#[track_caller]
 fn refused_code(response: &Value) -> &str {
     assert_eq!(response["error"]["code"], -32602, "{response}");
     response["error"]["data"]["code"]
