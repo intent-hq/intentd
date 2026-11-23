@@ -24,7 +24,7 @@ use tokio::time::timeout;
 use intent_core::{Caller, Error, Result, WorkspaceApi};
 
 /// Secrets-store account/key for the bearer token (`server.auth.token`).
-const TOKEN_ACCOUNT: &str = "server.auth.token";
+pub const TOKEN_ACCOUNT: &str = "server.auth.token";
 /// Token length in raw bytes; hex-encoded this yields a 64-char token.
 const TOKEN_BYTES: usize = 32;
 
@@ -84,6 +84,31 @@ impl TokenStore for FileTokenStore {
 
     fn store_token(&self, token: &str) -> Result<()> {
         self.secrets.store(TOKEN_ACCOUNT, token)
+    }
+}
+
+/// [`TokenStore`] over any [`intent_core::SecretStore`], under the same
+/// account as [`FileTokenStore`]. The orchestrator keeps each tenant's owner
+/// token in that tenant's secret store, so every process serving the tenant
+/// accepts the same token.
+#[derive(Clone)]
+pub struct SecretTokenStore(intent_core::SharedSecretStore);
+
+impl SecretTokenStore {
+    /// The owner token kept in `secrets`.
+    #[must_use]
+    pub fn new(secrets: intent_core::SharedSecretStore) -> Self {
+        Self(secrets)
+    }
+}
+
+impl TokenStore for SecretTokenStore {
+    fn load_token(&self) -> Option<String> {
+        self.0.load(TOKEN_ACCOUNT).ok().flatten()
+    }
+
+    fn store_token(&self, token: &str) -> Result<()> {
+        self.0.store(TOKEN_ACCOUNT, token)
     }
 }
 

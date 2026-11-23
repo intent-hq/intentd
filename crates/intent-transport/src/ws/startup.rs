@@ -70,6 +70,7 @@ impl WsInner {
                 cmd_tx,
                 last_pong,
                 abort: handle.abort_handle(),
+                _connection: None,
             },
         );
         let _ = start_tx.send(());

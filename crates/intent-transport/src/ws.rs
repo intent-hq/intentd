@@ -373,7 +373,15 @@ pub(crate) struct ClientHandle {
     /// Last pong receipt on the monotonic clock ([`mono_ms`]), NOT wall time.
     pub last_pong: Arc<AtomicI64>,
     pub abort: AbortHandle,
+    /// Membership in the installed [`crate::connection_set::ConnectionSet`]:
+    /// dropped with the handle, when the connection leaves the registry.
+    pub _connection: Option<crate::connection_set::ConnectionGuard>,
 }
+
+/// How long a connection closed through its
+/// [`crate::connection_set::ConnectionSet`] gets to send its `1001` close
+/// before its task is aborted.
+const SET_CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 /// Shared listener state (the TS server instance). Lifecycle methods are in
 /// [`crate::lifecycle`]; transport mechanics are below.
@@ -435,6 +443,9 @@ pub(crate) struct WsInner {
     /// The executor link served on `/node/link` and `/node/git`; `None`
     /// answers those paths with `404`.
     pub executor_links: Option<Arc<crate::node_link::ExecutorLinks>>,
+    /// The set every accepted connection joins
+    /// ([`WsApiServer::install_connection_set`]); `None` in `intentd`.
+    pub connections: Option<crate::connection_set::ConnectionHook>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -497,6 +508,7 @@ impl WsApiServer {
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
             executor_links: None,
+            connections: None,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -547,6 +559,7 @@ impl WsApiServer {
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
             executor_links: None,
+            connections: None,
         };
         Self {
             inner: Arc::new(inner),
@@ -591,6 +604,7 @@ impl WsApiServer {
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
             executor_links: None,
+            connections: None,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -673,6 +687,18 @@ impl WsApiServer {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("WsApiServer inner not yet shared before install_executor_links");
         inner.executor_links = Some(links);
+    }
+
+    /// Join every connection this listener accepts to `set` (the
+    /// orchestrator's tenant connections), so closing the set closes them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (called after `start`).
+    pub fn install_connection_set(&mut self, set: crate::connection_set::ConnectionHook) {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("WsApiServer inner not yet shared before install_connection_set");
+        inner.connections = Some(set);
     }
 
     /// Start the listener, returning the bound port (single-flight).
@@ -1200,15 +1226,7 @@ impl WsInner {
                     .await;
             }
         });
-        let abort = handle.abort_handle();
-        self.clients.lock().expect("ws clients poisoned").insert(
-            id,
-            ClientHandle {
-                cmd_tx,
-                last_pong,
-                abort,
-            },
-        );
+        self.insert_client(id, cmd_tx, last_pong, handle.abort_handle());
     }
 
     /// Register a new `/tunnel` client and spawn its mux loop. Tunnel
@@ -1249,15 +1267,7 @@ impl WsInner {
                 this.deregister(id);
             }
         });
-        let abort = handle.abort_handle();
-        self.clients.lock().expect("ws clients poisoned").insert(
-            id,
-            ClientHandle {
-                cmd_tx,
-                last_pong,
-                abort,
-            },
-        );
+        self.insert_client(id, cmd_tx, last_pong, handle.abort_handle());
     }
 
     /// Register a new `/invite` client and spawn its redemption loop. Invite
@@ -1287,15 +1297,7 @@ impl WsInner {
                 this.deregister(id);
             }
         });
-        let abort = handle.abort_handle();
-        self.clients.lock().expect("ws clients poisoned").insert(
-            id,
-            ClientHandle {
-                cmd_tx,
-                last_pong,
-                abort,
-            },
-        );
+        self.insert_client(id, cmd_tx, last_pong, handle.abort_handle());
     }
 
     /// Drive one `/invite` connection (multiplayer w4). No caller is bound
@@ -1423,6 +1425,51 @@ impl WsInner {
     }
 
     /// Remove a client from the registry (idempotent).
+    /// Add a spawned connection to the registry, after joining it to the
+    /// installed connection set. Closing the set sends the connection its
+    /// `1001` close and aborts its task after [`SET_CLOSE_GRACE`]; a set that
+    /// is already closed closes the connection at once and it is not added.
+    fn insert_client(
+        &self,
+        id: u64,
+        cmd_tx: mpsc::Sender<ConnCmd>,
+        last_pong: Arc<AtomicI64>,
+        abort: AbortHandle,
+    ) {
+        let connection = self.connections.as_ref().map(|set| {
+            let close_tx = cmd_tx.clone();
+            let close_abort = abort.clone();
+            set.register(move || {
+                let _ = close_tx.try_send(ConnCmd::Close);
+                match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) => {
+                        runtime.spawn(async move {
+                            tokio::time::sleep(SET_CLOSE_GRACE).await;
+                            close_abort.abort();
+                        });
+                    }
+                    Err(_) => close_abort.abort(),
+                }
+            })
+        });
+        let connection = match connection {
+            // The set is closed: the close already ran. Never registered, so
+            // a loop that ends before this insert cannot leave a stale entry.
+            Some(None) => return,
+            Some(Some(guard)) => Some(guard),
+            None => None,
+        };
+        self.clients.lock().expect("ws clients poisoned").insert(
+            id,
+            ClientHandle {
+                cmd_tx,
+                last_pong,
+                abort,
+                _connection: connection,
+            },
+        );
+    }
+
     fn deregister(&self, id: u64) {
         self.clients
             .lock()
