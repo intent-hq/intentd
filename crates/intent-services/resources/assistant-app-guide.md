@@ -281,13 +281,18 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspaces | Git, shell, workspace and archiving defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Labs, connection, data, reset | `/settings?tab=advanced#connection` |
 
+To find a setting by name, type in **Search settings** at the top of the Settings
+sidebar (Cmd+F or Ctrl+F focuses it). Matching settings show grouped by section, with
+their usual controls, so the user can change them in the results; click a section
+label to open it. Escape clears the search. Older versions may have no search field.
+
 Starting with the desktop release that reorganizes Settings, the sidebar uses the
 labels above. Earlier releases use **Agent defaults**, **Input and shortcuts** and
 **Workspace setup**, show Token Savings and Performance settings under **Advanced**
 or **Appearance**, and put the Notch dock under **Appearance**. Old links open the
 new location.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/SettingsSidebarNav.svelte; src/routes/(app)/settings/{+page.svelte,settings-hash-tab.ts}; src/shared/app-ui-targets.ts. Test-build behavior pending its frontend release. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/SettingsSidebarNav.svelte; src/routes/(app)/settings/{+page.svelte,settings-hash-tab.ts}; src/features/settings/search/{SettingsSearchField.svelte,settings-search-index.ts}; src/shared/app-ui-targets.ts. Test-build behavior pending its frontend release. -->
 
 Open **Settings → Appearance → Font Style → Font** and type part of a font name
 to search, regardless of case. Use the arrow keys and Enter to choose a result.
