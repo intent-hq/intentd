@@ -432,6 +432,34 @@ async fn quota_failure_after_partial_output_still_fails_over() {
     assert_fails_over_to_first_backup(Some("partial answer from the default")).await;
 }
 
+/// The first turn's provider printed only its own quota notice before the
+/// failure: no work happened, so the backup receives the user's message
+/// itself rather than an instruction to continue a reply.
+#[intent_test_macros::daemon_test]
+async fn a_first_turn_with_only_a_quota_notice_sends_the_message_to_the_backup() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "streamBeforeErrorText": "You've hit your weekly limit \u{b7} resets Nov 25",
+        "response": "answered on the backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+
+    let events = fx.send("default secret requests to on").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    let prompts = fx.prompts();
+    assert_eq!(prompts.len(), 2, "{prompts:#?}");
+    let backup = &prompts[1];
+    assert!(backup.ends_with("default secret requests to on"), "{backup}");
+    assert!(
+        !backup.contains(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
+        "{backup}"
+    );
+}
+
 /// Every backup out of quota: each switch is recorded once, then the turn
 /// fails exactly as today — one `agent:failed` with `quota-exceeded` naming
 /// the last reference tried, the agent parked in Error on it.
