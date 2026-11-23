@@ -50,6 +50,38 @@ pub const DEFAULT_TENANT: &str = "default";
 /// start when unset.
 pub const INSTANCE_ENV: &str = "INTENTD_ORCHESTRATOR_INSTANCE";
 
+/// Set to `1`, a tenant another instance holds is waited for instead of
+/// failing the start: the claim is retried every [`STANDBY_RETRY`] until
+/// the lease is released or lapses, and the tenant is then served (its
+/// client listeners bound only then). A stop signal ends the wait at once.
+pub const STANDBY_ENV: &str = "INTENTD_ORCHESTRATOR_STANDBY";
+
+/// How often a standby retries the claim of a tenant another instance
+/// holds: the lease renew interval, so a lapsed lease (at most its TTL
+/// after its owner stopped renewing) is taken within one more interval.
+#[cfg(feature = "postgres")]
+pub const STANDBY_RETRY: std::time::Duration = intent_store::postgres::LEASE_RENEW_INTERVAL;
+
+/// Whether to wait for held tenants, from [`STANDBY_ENV`]'s value: unset,
+/// `0` or `false` is no; `1` or `true` is yes.
+///
+/// # Errors
+/// For any other value, never a default.
+pub fn standby_from_env(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("0" | "false") => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some(other) => Err(format!("{STANDBY_ENV}: expected 1 or 0, got {other:?}")),
+    }
+}
+
+/// Whether opening a tenant failed only because another instance holds a
+/// live lease on it: nothing was written, so a standby may retry.
+#[must_use]
+pub fn held_elsewhere(error: &intent_core::Error) -> bool {
+    matches!(error, intent_core::Error::NotOwner(_))
+}
+
 /// The exit code when a tenant's self-fence overran: its work may still run
 /// after its lease is gone, and only stopping the process stops it.
 pub const FENCE_OVERRAN_EXIT: i32 = 70;
@@ -170,6 +202,28 @@ mod tests {
     fn an_unset_tenant_list_serves_the_default_tenant_only() {
         assert_eq!(tenants_from_env(None).unwrap(), [DEFAULT_TENANT]);
         assert_eq!(DEFAULT_TENANT, "default");
+    }
+
+    #[test]
+    fn standby_is_off_unless_asked_and_a_bad_value_is_an_error() {
+        for raw in [None, Some("0"), Some("false"), Some(" 0 ")] {
+            assert_eq!(standby_from_env(raw), Ok(false), "{raw:?}");
+        }
+        for raw in [Some("1"), Some("true"), Some(" 1")] {
+            assert_eq!(standby_from_env(raw), Ok(true), "{raw:?}");
+        }
+        for raw in ["", "yes", "2", "TRUE"] {
+            let error = standby_from_env(Some(raw)).expect_err(raw);
+            assert!(error.contains(STANDBY_ENV), "{error}");
+        }
+    }
+
+    #[test]
+    fn only_a_lease_held_elsewhere_is_retried() {
+        assert!(held_elsewhere(&intent_core::Error::NotOwner("held".into())));
+        assert!(!held_elsewhere(&intent_core::Error::Internal(
+            "boom".into()
+        )));
     }
 
     #[test]

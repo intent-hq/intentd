@@ -11,6 +11,8 @@
 //! Once [`DEFAULT_TENANT`] is served, its clients connect over the local
 //! socket and the WSS listener with `intentd`'s auth (see
 //! `intentd_orchestrator::listen` for the environment variables).
+//! With [`STANDBY_ENV`] set, a tenant another instance holds is waited for
+//! (its claim retried every [`STANDBY_RETRY`]) instead of failing the start.
 //! On Ctrl-C or SIGTERM each tenant whose work stopped cleanly releases its
 //! lease, so a restart or standby takes it over at once instead of waiting
 //! out the TTL.
@@ -19,8 +21,8 @@ use std::process::ExitCode;
 
 use intentd_orchestrator::serve::{serve_tenant, LeaseTiming, ServedTenant};
 use intentd_orchestrator::{
-    instance_id, is_fatal, tenants_from_env, DEFAULT_TENANT, FENCE_OVERRAN_EXIT, INSTANCE_ENV,
-    POSTGRES_URL_ENV, TENANTS_ENV,
+    held_elsewhere, instance_id, is_fatal, standby_from_env, tenants_from_env, DEFAULT_TENANT,
+    FENCE_OVERRAN_EXIT, INSTANCE_ENV, POSTGRES_URL_ENV, STANDBY_ENV, STANDBY_RETRY, TENANTS_ENV,
 };
 
 /// Connections the shared pool keeps; each tenant writes through it.
@@ -92,6 +94,7 @@ async fn run(url: String) -> Result<ExitCode, String> {
         .map_err(|e| format!("data dir: {e}"))?
         .data_dir;
     let instance = instance_id(std::env::var(INSTANCE_ENV).ok().as_deref());
+    let standby = standby_from_env(std::env::var(STANDBY_ENV).ok().as_deref())?;
     // Listen before any tenant opens, and race every startup step against
     // the signal, so a hung step cannot swallow it. On a signal, the open
     // in flight gets up to OPEN_GRACE to finish; then every open tenant is
@@ -115,46 +118,42 @@ async fn run(url: String) -> Result<ExitCode, String> {
     let (stopped_tx, mut stopped) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut served: Vec<ServedTenant> = Vec::new();
     for tenant in &tenants {
-        // Boxed so the grace below takes ownership: a timed-out open (and
-        // the heartbeat it may already run) is dropped right there, not
-        // kept renewing while stop_all waits for the other tenants.
-        let mut opening = Box::pin(serve_tenant(
-            pool.clone(),
-            tenant,
-            &data_dir,
-            &instance,
-            LeaseTiming::default(),
-            orchestrator_token(),
-        ));
-        let opened = tokio::select! {
-            opened = &mut opening => opened.map_err(|e| format!("tenant {tenant}: {e}")),
-            () = &mut shutdown => {
-                tracing::info!(tenant, "stopping every tenant during startup");
-                let graced = tokio::time::timeout(OPEN_GRACE, opening).await;
-                match graced {
-                    Ok(Ok(mut opened)) => {
+        // A standby retries a tenant another instance holds. Each attempt is
+        // its own open: only an attempt in flight gets OPEN_GRACE on a
+        // signal, while the wait between attempts ends at once.
+        let mut opened = loop {
+            match open_or_stop(tenant, &pool, &data_dir, &instance, &mut shutdown).await {
+                Opening::Opened(opened) => break opened,
+                Opening::Stopped(opened) => {
+                    if let Some(mut opened) = opened {
                         watch(&mut opened, &stopped_tx);
                         served.push(opened);
                     }
-                    Ok(Err(error)) => tracing::warn!(tenant, %error, "the tenant did not open"),
-                    Err(_) => tracing::warn!(
-                        tenant,
-                        "the tenant did not open in time; its lease lapses after its TTL"
-                    ),
+                    return Ok(stop_all(&mut served, &mut stopped).await);
                 }
-                return Ok(stop_all(&mut served, &mut stopped).await);
+                Opening::Failed(error) if standby && held_elsewhere(&error) => {
+                    tracing::info!(
+                        tenant,
+                        %error,
+                        retry_secs = STANDBY_RETRY.as_secs(),
+                        "standby: another instance holds the tenant; waiting for its lease"
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(STANDBY_RETRY) => {}
+                        () = &mut shutdown => {
+                            tracing::info!(tenant, "standby: stopped while waiting for the lease");
+                            return Ok(stop_all(&mut served, &mut stopped).await);
+                        }
+                    }
+                }
+                Opening::Failed(error) => {
+                    stop_all(&mut served, &mut stopped).await;
+                    return Err(format!("tenant {tenant}: {error}"));
+                }
             }
         };
-        match opened {
-            Ok(mut opened) => {
-                watch(&mut opened, &stopped_tx);
-                served.push(opened);
-            }
-            Err(error) => {
-                stop_all(&mut served, &mut stopped).await;
-                return Err(error);
-            }
-        }
+        watch(&mut opened, &stopped_tx);
+        served.push(opened);
     }
 
     // The default tenant's clients, once it is served (so a process that
@@ -178,6 +177,60 @@ async fn run(url: String) -> Result<ExitCode, String> {
             () = &mut shutdown => {
                 tracing::info!("stopping every tenant");
                 return Ok(stop_all(&mut served, &mut stopped).await);
+            }
+        }
+    }
+}
+
+/// One attempt to open a tenant, raced against the stop signal.
+enum Opening {
+    Opened(ServedTenant),
+    /// The signal arrived; the attempt in flight got [`OPEN_GRACE`] and
+    /// opened in time (`Some`), or did not.
+    Stopped(Option<ServedTenant>),
+    Failed(intent_core::Error),
+}
+
+/// Open `tenant` once, unless `shutdown` fires first: the open in flight
+/// then gets up to [`OPEN_GRACE`] to finish, so it is stopped and released
+/// with the others. Boxed so the grace takes ownership: a timed-out open
+/// (and the heartbeat it may already run) is dropped right there, not kept
+/// renewing while `stop_all` waits for the other tenants.
+async fn open_or_stop(
+    tenant: &str,
+    pool: &intent_store::postgres::PgPool,
+    data_dir: &std::path::Path,
+    instance: &str,
+    shutdown: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+) -> Opening {
+    let mut opening = Box::pin(serve_tenant(
+        pool.clone(),
+        tenant,
+        data_dir,
+        instance,
+        LeaseTiming::default(),
+        orchestrator_token(),
+    ));
+    tokio::select! {
+        opened = &mut opening => match opened {
+            Ok(opened) => Opening::Opened(opened),
+            Err(error) => Opening::Failed(error),
+        },
+        () = shutdown.as_mut() => {
+            tracing::info!(tenant, "stopping every tenant during startup");
+            match tokio::time::timeout(OPEN_GRACE, opening).await {
+                Ok(Ok(opened)) => Opening::Stopped(Some(opened)),
+                Ok(Err(error)) => {
+                    tracing::warn!(tenant, %error, "the tenant did not open");
+                    Opening::Stopped(None)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        tenant,
+                        "the tenant did not open in time; its lease lapses after its TTL"
+                    );
+                    Opening::Stopped(None)
+                }
             }
         }
     }

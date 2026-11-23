@@ -376,4 +376,122 @@ mod postgres {
         assert!(tokio::net::UnixStream::connect(&socket).await.is_err());
         listeners.stop().await;
     }
+
+    /// Serve `tenant` as `instance`, with its files under `data_dir`.
+    async fn open_as(
+        pool: &PgPool,
+        tenant: &str,
+        data_dir: &Path,
+        instance: &str,
+    ) -> intent_core::Result<intentd_orchestrator::serve::ServedTenant> {
+        serve_tenant(
+            pool.clone(),
+            tenant,
+            data_dir,
+            instance,
+            LeaseTiming::default(),
+            OrchestratorOnly::for_tests(),
+        )
+        .await
+    }
+
+    /// A takeover as a standby sees it: B's claim is refused while A serves;
+    /// once A stops and releases its lease, B claims the tenant, binds its
+    /// own listeners, and a client reconnecting to B with the same owner
+    /// token (the tenant's, shared through the tenant's secret store) reads
+    /// what it wrote through A.
+    #[tokio::test]
+    async fn a_released_tenant_is_taken_over_with_its_clients_token_and_data() {
+        let Some(pool) = pool().await else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let tenant = format!("takeover-{}", uuid::Uuid::new_v4().simple());
+        let listen_as = |name: &str| ListenConfig {
+            socket_path: dir.path().join(format!("{name}.sock")),
+            bind_addresses: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            ws_port: 0,
+            tls_dir: dir.path().join("tls"),
+            insecure: false,
+        };
+
+        let mut a = open_as(&pool, &tenant, dir.path(), &format!("a-{tenant}"))
+            .await
+            .expect("A serves the tenant");
+        let a_listeners = a.listen(&listen_as("a")).await.unwrap();
+        let fingerprint = a_listeners.fingerprint().unwrap().to_owned();
+        let token = a
+            .services()
+            .secret_source()
+            .load(TOKEN_ACCOUNT)
+            .unwrap()
+            .unwrap();
+        let workspace = format!("ws-{}", uuid::Uuid::new_v4().simple());
+        let now = intent_core::now_iso();
+        a.services()
+            .store()
+            .insert_workspace(&intent_core::Workspace {
+                id: intent_core::WorkspaceId(workspace.clone()),
+                title: "Taken over".into(),
+                branch: "main".into(),
+                created_at: now.clone(),
+                updated_at: now,
+                ..Default::default()
+            })
+            .await
+            .expect("seed the workspace");
+        let mut ws = wss(a_listeners.ws_port(), &fingerprint, Some(&token))
+            .await
+            .unwrap();
+        result(
+            &ws_rpc(
+                &mut ws,
+                1,
+                "note.create",
+                json!({ "workspaceId": workspace, "title": "Written through A" }),
+            )
+            .await,
+        );
+
+        let refused = open_as(&pool, &tenant, dir.path(), &format!("b-{tenant}"))
+            .await
+            .err()
+            .expect("B cannot claim a tenant A holds");
+        assert!(
+            intentd_orchestrator::held_elsewhere(&refused),
+            "a standby retries this: {refused}"
+        );
+
+        a.fence().fire("test: A stops");
+        let report = tokio::time::timeout(common::wait(), a.stopped())
+            .await
+            .expect("A stops");
+        assert!(report.overran.is_empty(), "{:?}", report.overran);
+        assert!(
+            a.heartbeat().release().await.unwrap(),
+            "A releases its lease"
+        );
+        ws_ends(&mut ws).await;
+
+        let b = open_as(&pool, &tenant, dir.path(), &format!("b-{tenant}"))
+            .await
+            .expect("B claims the released tenant at once");
+        let b_listeners = b.listen(&listen_as("b")).await.unwrap();
+        assert_eq!(
+            b_listeners.fingerprint(),
+            Some(fingerprint.as_str()),
+            "one TLS directory, one certificate"
+        );
+        let mut ws = wss(b_listeners.ws_port(), &fingerprint, Some(&token))
+            .await
+            .expect("A's owner token opens B");
+        let notes = ws_rpc(&mut ws, 1, "note.list", json!({ "workspaceId": workspace })).await;
+        assert!(
+            names(result(&notes), "notes", "title").contains(&"Written through A".to_owned()),
+            "{notes}"
+        );
+
+        b.fence().fire("test: done");
+        ws_ends(&mut ws).await;
+        a_listeners.stop().await;
+        b_listeners.stop().await;
+    }
 }
