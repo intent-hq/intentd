@@ -373,7 +373,6 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
 /// link before nodeProtocol 21 gets none.
 #[tokio::test]
 async fn a_launch_carries_the_local_session_meta_from_protocol_21() {
-    use intent_core::agent_runtime::AgentRuntime as _;
     let (f, mut link, _machine) = fixture().await;
     for (provider, older) in [
         ("claude-code", false),
