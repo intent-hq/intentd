@@ -69,6 +69,39 @@ pub fn boxed<'a, T>(future: impl Future<Output = T> + Send + 'a) -> intent_core:
     Box::pin(scope(future))
 }
 
+/// Run `future` on its own task so a cancelled caller cannot abandon it
+/// half-way (intent-hq/intent#9927: a dropped request left a claimed turn
+/// slot with no worker). The task keeps the caller identity, the browser
+/// message ingress, and every live admission of the caller's scope and
+/// `held`, so nested `enter` calls reuse them and a queued deletion still
+/// waits for the work to finish.
+pub(crate) async fn run_detached<F, T>(held: Option<Mutation>, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut permits: Vec<Arc<Permit>> = ADMITTED
+        .try_with(|admitted| admitted.borrow().iter().filter_map(Weak::upgrade).collect())
+        .unwrap_or_default();
+    permits.extend(held.map(|mutation| mutation._permit));
+    let admitted = permits.iter().map(Arc::downgrade).collect();
+    let ingress = intent_core::browser_message::current_ingress();
+    let task = intent_core::caller::spawn_with_current_caller(async move {
+        let output = intent_core::browser_message::with_current_ingress(
+            ingress,
+            ADMITTED.scope(RefCell::new(admitted), future),
+        )
+        .await;
+        drop(permits);
+        output
+    });
+    match task.await {
+        Ok(output) => output,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(Error::Internal(format!("detached operation cancelled: {error}"))),
+    }
+}
+
 pub(crate) struct Deletion {
     _permit: OwnedRwLockWriteGuard<()>,
     _entry: Entry,

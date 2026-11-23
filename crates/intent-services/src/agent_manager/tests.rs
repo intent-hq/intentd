@@ -10938,6 +10938,124 @@ async fn user_retire_stops_running_target_and_preserves_partial_turn() {
     mgr.end_turn(&id).await;
 }
 
+/// Front door whose caller is cancelled mid-claim in
+/// [`cancelled_caller_after_slot_claim_still_runs_the_turn`].
+#[derive(Clone, Copy, Debug)]
+enum CancelledFrontDoor {
+    /// `agent.delegate`'s child start and `ws.agent.send`.
+    SendMessage,
+    /// `ws.agent.wakeOrCreate` and completion wakes.
+    WakeDelivery,
+}
+
+/// intent-hq/intent#9927: a caller dropped after the delivery claimed the
+/// in-flight slot (the workspace JS 30s budget expiring around
+/// `ws.agent.delegate` or `ws.agent.wakeOrCreate`) must not strand the slot.
+/// Before the fix the claim, the user row and the worker spawn all ran on the
+/// caller's future, so the drop left the agent `busy` with no worker:
+/// `isResponding: true`, `turnInFlight: false`, and every later message
+/// queued behind a turn that never existed.
+async fn cancelled_caller_after_slot_claim_still_runs_the_turn(door: CancelledFrontDoor) {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-cancelled-claim");
+    let id = AgentId::from(format!("cancelled-claim-{door:?}").as_str());
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .align_with_mock_for_test();
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
+    let caller = tokio::spawn({
+        let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
+        async move {
+            match door {
+                CancelledFrontDoor::SendMessage => {
+                    mgr.send_message(
+                        id,
+                        ws,
+                        "delegated task".into(),
+                        None,
+                        super::TurnOptions::default(),
+                    )
+                    .await
+                }
+                CancelledFrontDoor::WakeDelivery => {
+                    mgr.services
+                        .deliver_wake_message(&ws, &id, "recovery wake", None)
+                        .await
+                }
+            }
+        }
+    });
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.reached.notified(),
+    )
+    .await
+    .expect("delivery claimed the slot");
+    assert!(mgr.is_busy(&id));
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    pause.resume.notify_one();
+
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let prompted = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(method, _)| method == "session/prompt");
+                if prompted && !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{door:?}: the claimed turn must run and release its slot after the caller is cancelled \
+             (busy={}, workers={})",
+            mgr.is_busy(&id),
+            mgr.workers.lock().unwrap().len()
+        )
+    });
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.iter().filter(|m| m.role == "user").count(),
+        1,
+        "{door:?}: the claimed message is persisted exactly once"
+    );
+    assert!(mgr.services.queue_snapshot(&id).is_empty());
+}
+
+#[tokio::test]
+async fn send_message_cancelled_after_slot_claim_still_runs_the_turn() {
+    cancelled_caller_after_slot_claim_still_runs_the_turn(CancelledFrontDoor::SendMessage).await;
+}
+
+#[tokio::test]
+async fn wake_delivery_cancelled_after_slot_claim_still_runs_the_turn() {
+    cancelled_caller_after_slot_claim_still_runs_the_turn(CancelledFrontDoor::WakeDelivery).await;
+}
+
 #[tokio::test]
 async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
     let (_tmp, mgr) = manager().await;

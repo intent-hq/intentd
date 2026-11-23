@@ -9138,7 +9138,7 @@ impl AgentManager {
         // `create_agent` workspace-MCP scope) — must key on the workspace
         // the target lives in, not the caller's.
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
-        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+        let mutation = self.services.workspace_mutations.enter(&workspace_id)?;
         if let Some(result) = self.services.submission_replay(
             &agent_id,
             &message_id,
@@ -9326,6 +9326,36 @@ impl AgentManager {
                 park.release.notified().await;
             }
         }
+        let session_status = session.status;
+        let this = Arc::clone(self);
+        crate::workspace_mutations::run_detached(Some(mutation), async move {
+            this.send_message_claimed(
+                agent_id,
+                workspace_id,
+                content,
+                message_id,
+                options,
+                session_status,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// The claim-to-spawn half of [`Self::send_message`]. It runs detached
+    /// because the slot claim, the user-row persist and the worker spawn must
+    /// finish together: a caller dropped between them (a request budget
+    /// expiring, intent-hq/intent#9927) otherwise left the slot claimed with
+    /// no worker, and every later delivery queued behind a turn that never ran.
+    async fn send_message_claimed(
+        self: Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        content: String,
+        message_id: String,
+        mut options: TurnOptions,
+        session_status: AgentStatus,
+    ) -> Result<Value> {
         let Some(admission) = self.try_begin_turn(&agent_id, &workspace_id).await else {
             // A resume may have claimed its durable interruption before closure
             // and awaited store work since the entry check. Refuse here too:
@@ -9347,7 +9377,7 @@ impl AgentManager {
             // still-`Active` turn is an ordinary mid-turn queue entry: if
             // that turn later fails it stays behind the STAB-52 gate for
             // `agent.retry`, exactly as before.
-            let (queued, position) = if session.status == AgentStatus::Error {
+            let (queued, position) = if session_status == AgentStatus::Error {
                 self.services.enqueue_recovery_send(
                     &agent_id,
                     message_id.clone(),

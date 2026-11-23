@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::{AgentId, Caller, ClientId};
 
@@ -29,11 +29,26 @@ impl BrowserMessageIngress {
 }
 
 tokio::task_local! {
-    static INGRESS: Option<BrowserMessageIngress>;
+    static INGRESS: Option<Arc<BrowserMessageIngress>>;
 }
 
 pub fn with_browser_message_ingress<F: Future>(
     ingress: Option<BrowserMessageIngress>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    INGRESS.scope(ingress.map(Arc::new), future)
+}
+
+/// The current request's ingress, for work that must outlive a cancelled
+/// caller yet still belongs to the same request (see [`with_current_ingress`]).
+#[must_use]
+pub fn current_ingress() -> Option<Arc<BrowserMessageIngress>> {
+    INGRESS.try_with(Clone::clone).ok().flatten()
+}
+
+/// Re-enter an ingress captured with [`current_ingress`].
+pub fn with_current_ingress<F: Future>(
+    ingress: Option<Arc<BrowserMessageIngress>>,
     future: F,
 ) -> impl Future<Output = F::Output> {
     INGRESS.scope(ingress, future)
