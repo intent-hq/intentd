@@ -65,9 +65,15 @@ pub(crate) async fn resolve_source_control(
 ) -> Result<Arc<dyn SourceControl>> {
     match injected {
         Some(sc) => Ok(sc),
-        None => SourceControlRegistry::from_settings(&SourceControlSettings::default(), secrets)
-            .await
-            .map_err(map_sc_err),
+        None => {
+            // The identity reads' loopback-only API seam, so an e2e daemon's
+            // forge reads reach its mock and never api.github.com.
+            let mut settings = SourceControlSettings::default();
+            settings.github.api_base_url = crate::invite_ops::resolve_api_base_uri(None);
+            SourceControlRegistry::from_settings(&settings, secrets)
+                .await
+                .map_err(map_sc_err)
+        }
     }
 }
 
@@ -291,6 +297,51 @@ pub(crate) async fn discover_matching_open_pr(
         }
     }
     Ok(best)
+}
+
+fn collect_strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| collect_strings(v, out)),
+        serde_json::Value::Object(map) => map.values().for_each(|v| collect_strings(v, out)),
+        _ => {}
+    }
+}
+
+/// The PRs an agent's finished shell tool call opened: the call's input runs
+/// `gh pr create` and its output prints the new PR's URL (or, when the PR
+/// already exists, the existing one's). Shape-agnostic: every string in the
+/// input and output is read, so Claude Code's `{command}`, Codex's argv
+/// array and a plain-string or content-wrapped output all match. Each
+/// `(repo, number)` appears once.
+pub(crate) fn created_pr_refs(
+    input: &serde_json::Value,
+    output: &serde_json::Value,
+) -> Vec<(RepoRef, u64)> {
+    static PR_URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"https?://[^\s/]+/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/(\d+)")
+            .expect("valid PR URL pattern")
+    });
+    let mut inputs = Vec::new();
+    collect_strings(input, &mut inputs);
+    if !inputs.iter().any(|s| s.contains("gh pr create")) {
+        return Vec::new();
+    }
+    let mut outputs = Vec::new();
+    collect_strings(output, &mut outputs);
+    let mut found: Vec<(RepoRef, u64)> = Vec::new();
+    for text in outputs {
+        for caps in PR_URL.captures_iter(text) {
+            let Ok(number) = caps[3].parse::<u64>() else {
+                continue;
+            };
+            let repo = RepoRef::new(&caps[1], &caps[2]);
+            if !found.iter().any(|(r, n)| *n == number && *r == repo) {
+                found.push((repo, number));
+            }
+        }
+    }
+    found
 }
 
 /// Carry a persisted merge-queue signal onto a REST-only snapshot

@@ -6705,6 +6705,133 @@ impl Services {
         Ok(outcome)
     }
 
+    /// Record the PRs an agent just opened ([`pr_ops::created_pr_refs`]) on
+    /// the workspace's git roots of the same repository, in the background.
+    /// A root is otherwise linked only by its live branch, which a runner
+    /// agent's submodule branch never reaches: the backend's copy stays
+    /// detached at its pin.
+    pub(crate) fn spawn_link_created_prs(
+        &self,
+        workspace_id: &WorkspaceId,
+        created: Vec<(intent_sourcecontrol::RepoRef, u64)>,
+    ) {
+        let services = self.clone();
+        let workspace_id = workspace_id.clone();
+        let spawned = self.store_tasks.spawn_draining(intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            async move {
+                intent_sourcecontrol::traffic::with_caller(
+                    intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+                    async {
+                        if let Err(error) = services.link_created_prs(&workspace_id, &created).await
+                        {
+                            tracing::warn!(
+                                workspace = %workspace_id.as_str(),
+                                %error,
+                                "linking an agent-created PR to its git root failed"
+                            );
+                        }
+                    },
+                )
+                .await;
+            },
+        ));
+        if spawned.is_none() {
+            tracing::debug!("PR refresh writers are shutting down; created PR not linked");
+        }
+    }
+
+    /// Fetch each created PR whose repository matches a git root of the
+    /// workspace and add it to that root's `pullRequests`; an unlinked root
+    /// (or one whose linked PR is merged or closed) also links it. Pool
+    /// entries survive a later detached or mismatched HEAD, so the PR stays
+    /// listed after the agent resets the submodule to its pin.
+    pub(crate) async fn link_created_prs(
+        &self,
+        workspace_id: &WorkspaceId,
+        created: &[(intent_sourcecontrol::RepoRef, u64)],
+    ) -> Result<()> {
+        let roots = self.store.list_workspace_git_roots(workspace_id).await?;
+        let targets: Vec<_> = roots
+            .into_iter()
+            .filter_map(|root| {
+                let repo = root.repo()?;
+                let numbers: Vec<u64> = created
+                    .iter()
+                    .filter(|(r, _)| *r == repo)
+                    .map(|(_, n)| *n)
+                    .collect();
+                (!numbers.is_empty()).then_some((root, repo, numbers))
+            })
+            .collect();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source()).await?;
+        for (mut root, repo, numbers) in targets {
+            let mut changed = false;
+            let mut fetched_fresh = Vec::new();
+            for number in numbers {
+                if root
+                    .pull_requests
+                    .as_deref()
+                    .is_some_and(|items| items.iter().any(|p| p.number == number))
+                {
+                    continue;
+                }
+                let pr = tokio::time::timeout(
+                    self.pr_refresh_fetch_timeout,
+                    self.linked_pr_record(sc.as_ref(), &repo, number),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(intent_sourcecontrol::Error::Api(
+                        "PR fetch timed out".into(),
+                    ))
+                })
+                .map_err(pr_ops::map_sc_err)?;
+                let mut info = pr_ops::build_pr_info(&pr);
+                changed |= pr_ops::upsert_pr_info(&mut root.pull_requests, &mut info);
+                fetched_fresh.push(number);
+                let linked_open = root.pr_number.is_some()
+                    && !matches!(
+                        root.pr_status,
+                        Some(
+                            intent_core::PullRequestStatus::Merged
+                                | intent_core::PullRequestStatus::Closed
+                        )
+                    );
+                if !linked_open {
+                    root.pr_number = Some(pr.number);
+                    root.pr_url = Some(pr.url.clone());
+                    root.pr_status = Some(info.status);
+                    changed = true;
+                }
+            }
+            if !changed {
+                continue;
+            }
+            root.updated_at = now_iso();
+            self.store
+                .update_workspace_git_root_pr_rebased(&mut root, |root, persisted| {
+                    pr_ops::rebase_pool_on_persisted(
+                        &mut root.pull_requests,
+                        persisted,
+                        &fetched_fresh,
+                    );
+                })
+                .await?;
+            publish_event(
+                self.event_bus.as_ref(),
+                git_root_changed_event(GIT_ROOT_UPDATED, &root),
+            )
+            .await;
+            self.maybe_emit_display_status_changed(&root.workspace_id)
+                .await;
+        }
+        Ok(())
+    }
+
     /// Refresh one workspace's PR linkage against the forge (§7.6), persisting
     /// any change and emitting the matching `pr:*` event. Used both on demand
     /// and by the background loop. The matching rule is `pr.head.ref ==

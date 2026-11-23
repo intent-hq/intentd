@@ -6726,6 +6726,15 @@ impl Services {
                     "blockIndex": block_index,
                     "blockId": transcript.block_id(block_index),
                 });
+                let created_prs = match (&tc.output, tc.status) {
+                    (Some(output), "completed" | "error") => {
+                        crate::pr_ops::created_pr_refs(&data["input"], output)
+                    }
+                    _ => Vec::new(),
+                };
+                if !created_prs.is_empty() {
+                    self.spawn_link_created_prs(workspace_id, created_prs);
+                }
                 if let Some(output) = tc.output {
                     data["output"] = output;
                 }
