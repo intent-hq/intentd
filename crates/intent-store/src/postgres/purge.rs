@@ -31,6 +31,10 @@ use intent_core::{AgentId, Error, Result, WorkspaceId};
 /// Most rows one purge batch deletes (`SQLite`'s `DELETE_CASCADE_BATCH`).
 pub(super) const PURGE_BATCH_ROWS: i64 = 500;
 
+/// Most rows one retention reaper batch deletes (idempotency keys,
+/// usage-rate buckets).
+pub(super) const REAP_BATCH_ROWS: i64 = 1000;
+
 /// One agent's heavy children, deleted before its session row, in the
 /// one-shot delete's order, then the rows the session row's delete trigger
 /// (`script_monitor_owner_deleted`) or cascade would otherwise remove in

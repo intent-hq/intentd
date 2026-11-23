@@ -215,8 +215,9 @@ pub async fn run_reap_tick_at(store: &Store, now: OffsetDateTime) -> ReapTickOut
 pub struct TenantSweepTiming {
     /// Delay before the first retention tick, clear of the startup burst.
     pub retention_start_delay: StdDuration,
-    /// The retention tick interval; `None` derives it from the tenant's
-    /// `events.streamRetentionHours` at start ([`retention_tick_interval`]).
+    /// The wait between two retention ticks; `None` derives it from the
+    /// tenant's `events.streamRetentionHours`, read live each tick
+    /// ([`retention_tick_interval`]).
     pub retention_interval: Option<StdDuration>,
     /// The reaper tick interval. Its first tick is immediate.
     pub reap_interval: StdDuration,
@@ -241,11 +242,14 @@ fn fenced(store: &Store) -> bool {
 /// Spawn one tenant's event retention loop: each tick runs
 /// [`run_retention_tick`] with `events.streamRetentionHours` and the
 /// tool-payload knobs read live from `settings` (defaults without a
-/// registry). Unlike the desktop daemon's loop it runs no `SQLite` pool
-/// maintenance (vacuum, optimize). Every delete is a bounded batch in its
-/// own writer transaction of the tenant (see the store methods), so a
-/// fenced tenant's sweep fails `NotOwner` having deleted nothing more; the
-/// loop also ends once the fence fired. The tenant's self-fence aborts it.
+/// registry). The wait before the next tick is derived from the hours read
+/// on that tick ([`retention_tick_interval`], unless `timing` fixes it), so
+/// lowering the event TTL also shortens the cadence. Unlike the desktop
+/// daemon's loop it runs no `SQLite` pool maintenance (vacuum, optimize).
+/// Every delete is a bounded batch in its own writer transaction of the
+/// tenant (see the store methods), so a fenced tenant's sweep fails
+/// `NotOwner` having deleted nothing more. The tenant's self-fence aborts
+/// the loop; the fence check before each tick is only a backstop.
 #[must_use]
 pub fn spawn_tenant_retention_loop(
     store: Store,
@@ -257,22 +261,19 @@ pub fn spawn_tenant_retention_loop(
             .as_ref()
             .map_or_else(SettingsFile::default, |s| s.snapshot().effective.clone())
     };
-    let interval = timing
-        .retention_interval
-        .unwrap_or_else(|| retention_tick_interval(current().events.stream_retention_hours));
     intent_core::spawn_daemon(async move {
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::now() + timing.retention_start_delay,
-            interval,
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::time::sleep(timing.retention_start_delay).await;
         loop {
-            ticker.tick().await;
             if fenced(&store) {
                 return;
             }
             let settings = current();
-            run_retention_tick(&store, settings.events.stream_retention_hours, &settings).await;
+            let hours = settings.events.stream_retention_hours;
+            run_retention_tick(&store, hours, &settings).await;
+            let next = timing
+                .retention_interval
+                .unwrap_or_else(|| retention_tick_interval(hours));
+            tokio::time::sleep(next).await;
         }
     })
 }
@@ -280,8 +281,8 @@ pub fn spawn_tenant_retention_loop(
 /// Spawn one tenant's idempotency reaper loop: [`run_reap_tick_at`] every
 /// `timing.reap_interval`, the first tick at once, as the desktop daemon's
 /// reaper (without its agent-log file sweep: a tenant runs no local
-/// agents). The loop ends once the tenant's fence fired; the tenant's
-/// self-fence aborts it.
+/// agents). The tenant's self-fence aborts the loop; the fence check
+/// before each tick is only a backstop.
 #[must_use]
 pub fn spawn_tenant_reap_loop(
     store: Store,

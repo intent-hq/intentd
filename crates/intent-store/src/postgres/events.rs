@@ -465,6 +465,7 @@ impl PgStore {
             if affected < limit.unsigned_abs() {
                 return Ok(removed);
             }
+            tokio::task::yield_now().await;
         }
     }
 

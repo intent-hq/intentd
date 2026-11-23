@@ -6,10 +6,6 @@ use crate::idempotency_repo::IdempotencyReservation;
 
 use super::{db, PgStore};
 
-/// Most rows one retention reaper batch deletes (the idempotency keys here,
-/// the usage-rate buckets in `usage_metrics`).
-pub(super) const REAP_BATCH_ROWS: i64 = 1000;
-
 /// One reaper batch: `$1` tenant, `$2` cutoff, `$3` batch size.
 const REAP_IDEMPOTENT_SQL: &str = "DELETE FROM idempotency_key WHERE tenant_id = $1 \
      AND (workspace_id, idempotency_key) IN (SELECT k.workspace_id, k.idempotency_key \
@@ -182,9 +178,12 @@ impl PgStore {
 
     /// Deletes the tenant's keys created before `cutoff`, pending or not,
     /// in bounded batches (each its own writer transaction, see
-    /// `delete_in_batches`), driven by `idx_idempotency_created`.
+    /// `delete_in_batches`). Each batch's `LIMIT` subquery can use
+    /// `idx_idempotency_created` for the range only where the column's
+    /// collation is `"C"` (the comparison is `COLLATE "C"`); otherwise it
+    /// scans the tenant's keys.
     pub async fn reap_idempotent(&self, cutoff: &str) -> Result<u64> {
-        self.delete_in_batches(REAP_IDEMPOTENT_SQL, cutoff, REAP_BATCH_ROWS)
+        self.delete_in_batches(REAP_IDEMPOTENT_SQL, cutoff, super::purge::REAP_BATCH_ROWS)
             .await
     }
 }

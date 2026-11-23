@@ -239,12 +239,8 @@ impl PgStore {
     /// Deletes the tenant's minute buckets at or before `cutoff` in bounded
     /// batches (each its own writer transaction, see `delete_in_batches`).
     pub async fn delete_usage_rate_before(&self, cutoff: &str) -> Result<u64> {
-        self.delete_in_batches(
-            DELETE_USAGE_RATE_SQL,
-            cutoff,
-            super::idempotency::REAP_BATCH_ROWS,
-        )
-        .await
+        self.delete_in_batches(DELETE_USAGE_RATE_SQL, cutoff, super::purge::REAP_BATCH_ROWS)
+            .await
     }
 
     pub async fn add_usage_stats(
