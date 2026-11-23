@@ -11097,27 +11097,27 @@ async fn detached_queue_drain_reuses_the_callers_instruction_admission() {
     seed_agent(&mgr, &ws, &id).await;
     let authority = mgr.services.human_instruction_authority.clone();
     let services = mgr.services.clone();
-    let drained = timeout(
+    let mut writer = None;
+    timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         services.instruction_admission(async {
-            let writer = tokio::spawn({
+            writer = Some(tokio::spawn({
                 let authority = authority.clone();
                 async move {
                     let _removal = authority.write().await;
                 }
-            });
+            }));
             while authority.try_read().is_ok() {
                 tokio::task::yield_now().await;
             }
             mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-            writer
         }),
     )
     .await
     .expect("the drain must not wait behind a removal queued on the caller's admission");
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
-        drained,
+        writer.expect("removal writer spawned"),
     )
     .await
     .expect("the removal proceeds once the caller's admission ends")
