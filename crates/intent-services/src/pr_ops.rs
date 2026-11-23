@@ -55,16 +55,17 @@ pub(crate) fn map_sc_err(e: intent_sourcecontrol::Error) -> Error {
 
 /// Resolve the active [`SourceControl`]: the injected handle (tests / explicit
 /// wiring) else the registry-built provider from default settings (token from
-/// env / `gh` / keychain, §7.3). A missing token yields `Internal` (graceful).
+/// `secrets` — the calling `Services`' store — / env / `gh`, §7.3). A missing token yields `Internal` (graceful).
 /// Async because the keychain / `gh` lookups run on the blocking pool with
 /// bounded timeouts so a wedged OS keychain or hung child never blocks the
 /// async runtime.
 pub(crate) async fn resolve_source_control(
     injected: Option<Arc<dyn SourceControl>>,
+    secrets: &intent_core::SharedSecretStore,
 ) -> Result<Arc<dyn SourceControl>> {
     match injected {
         Some(sc) => Ok(sc),
-        None => SourceControlRegistry::from_settings(&SourceControlSettings::default())
+        None => SourceControlRegistry::from_settings(&SourceControlSettings::default(), secrets)
             .await
             .map_err(map_sc_err),
     }

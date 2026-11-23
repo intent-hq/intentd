@@ -14,8 +14,7 @@
 //! warning is logged). Stores built via [`FileSecretStore::with_path`] or an
 //! [`INTENTD_SECRETS_FILE`](SECRETS_FILE_ENV) override never migrate.
 //!
-//! Semantics mirror the `SecretStore` trait in `intent-services` (which this
-//! leaf crate must not depend on): `load` returns `None` for unset **or
+//! Semantics follow the [`SecretStore`] trait: `load` returns `None` for unset **or
 //! empty-string** values, `store` replaces, and `delete` of an absent account
 //! is an idempotent success.
 //!
@@ -116,6 +115,83 @@ pub struct FileSecretStore {
 impl Default for FileSecretStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Abstraction over secret persistence, shared by every crate that reads or
+/// writes a credential. Each `Services` owns one (the desktop default is the
+/// file-backed [`FileSecretStore`]; an orchestrator tenant injects its own),
+/// and leaf crates (source control, Linear, voice) take it as an argument so
+/// a tenant never reads another tenant's or the host's secrets. Re-exported
+/// as `intent_services::settings::SecretStore`.
+pub trait SecretStore: Send + Sync {
+    /// Return the stored secret for `account`. `Ok(None)` when confirmed absent;
+    /// `Err` on timeout / backing-store failure so snapshot capture can fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on timeout or backing-store failure, so snapshot capture can fail closed.
+    fn load(&self, account: &str) -> Result<Option<String>>;
+    /// Persist `value` for `account`, replacing any existing secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secret cannot be persisted.
+    fn store(&self, account: &str, value: &str) -> Result<()>;
+    /// Delete the secret for `account`; absence is an idempotent success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backing store fails; absence is not an error.
+    fn delete(&self, account: &str) -> Result<()>;
+}
+
+/// A shared handle to a [`SecretStore`], cheap to clone into a blocking task.
+pub type SharedSecretStore = std::sync::Arc<dyn SecretStore>;
+
+/// File-backed production default: account = setting path.
+impl SecretStore for FileSecretStore {
+    fn load(&self, account: &str) -> Result<Option<String>> {
+        FileSecretStore::load(self, account)
+    }
+
+    fn store(&self, account: &str, value: &str) -> Result<()> {
+        FileSecretStore::store(self, account, value)
+    }
+
+    fn delete(&self, account: &str) -> Result<()> {
+        FileSecretStore::delete(self, account)
+    }
+}
+
+/// In-memory [`SecretStore`] for tests — never touches a secrets file.
+#[derive(Debug, Default, Clone)]
+pub struct InMemorySecretStore {
+    map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+}
+
+impl SecretStore for InMemorySecretStore {
+    fn load(&self, account: &str) -> Result<Option<String>> {
+        Ok(self
+            .map
+            .lock()
+            .unwrap()
+            .get(account)
+            .filter(|v| !v.is_empty())
+            .cloned())
+    }
+
+    fn store(&self, account: &str, value: &str) -> Result<()> {
+        self.map
+            .lock()
+            .unwrap()
+            .insert(account.to_string(), value.to_string());
+        Ok(())
+    }
+
+    fn delete(&self, account: &str) -> Result<()> {
+        self.map.lock().unwrap().remove(account);
+        Ok(())
     }
 }
 

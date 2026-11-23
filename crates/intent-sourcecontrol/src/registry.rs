@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use intent_core::SharedSecretStore;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -125,18 +126,22 @@ pub struct SourceControlRegistry;
 impl SourceControlRegistry {
     /// Construct the active provider, or a typed error when the provider is
     /// unknown ([`Error::Config`]) or no token is available
-    /// ([`Error::NotConfigured`]). Async because the secrets-store / `gh` lookups
+    /// ([`Error::NotConfigured`]). A stored token is read from `secrets` (the
+    /// caller's store). Async because the secrets-store / `gh` lookups
     /// run on the blocking pool with bounded timeouts (see [`token::resolve`]).
     ///
     /// # Errors
     ///
     /// Returns [`Error::Config`] for an unknown provider; [`Error::NotConfigured`] when no token is available; propagates client-construction failures.
-    pub async fn from_settings(settings: &SourceControlSettings) -> Result<Arc<dyn SourceControl>> {
+    pub async fn from_settings(
+        settings: &SourceControlSettings,
+        secrets: &SharedSecretStore,
+    ) -> Result<Arc<dyn SourceControl>> {
         match settings.active_provider.as_str() {
             "github" => {
                 let generation = crate::cache_scope::generation();
                 let gh = GitHubSourceControl::new(
-                    &resolve_github_token(&settings.github).await?,
+                    &resolve_github_token(&settings.github, secrets).await?,
                     settings.github.api_base_url.as_deref(),
                 )?;
                 if generation != crate::cache_scope::generation() {
@@ -154,13 +159,16 @@ impl SourceControlRegistry {
 }
 
 /// Resolve the GitHub token from inline settings or the configured source.
-async fn resolve_github_token(github: &GithubSettings) -> Result<String> {
+async fn resolve_github_token(
+    github: &GithubSettings,
+    secrets: &SharedSecretStore,
+) -> Result<String> {
     if let Some(token) = github.token.as_deref() {
         if !token.trim().is_empty() {
             return Ok(token.trim().to_string());
         }
     }
-    let resolution = token::resolve_detailed(&github.token_source).await;
+    let resolution = token::resolve_detailed(&github.token_source, secrets).await;
     resolution.token.ok_or_else(|| {
         let mut msg = String::from(
             "github: no token found (set sourceControl.github.token, GITHUB_TOKEN/GH_TOKEN, \
@@ -177,6 +185,10 @@ async fn resolve_github_token(github: &GithubSettings) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_secrets() -> SharedSecretStore {
+        Arc::new(intent_core::InMemorySecretStore::default())
+    }
 
     #[test]
     fn gitlab_logical_instance_settings_preserve_port_prefix_and_legacy_defaults() {
@@ -204,7 +216,7 @@ mod tests {
             active_provider: "gitlab".to_string(),
             ..SourceControlSettings::default()
         };
-        let result = SourceControlRegistry::from_settings(&settings).await;
+        let result = SourceControlRegistry::from_settings(&settings, &test_secrets()).await;
         assert!(matches!(result, Err(Error::Config(_))));
     }
 
@@ -269,7 +281,7 @@ mod tests {
             },
             ..SourceControlSettings::default()
         };
-        let sc = SourceControlRegistry::from_settings(&settings)
+        let sc = SourceControlRegistry::from_settings(&settings, &test_secrets())
             .await
             .expect("should build");
         assert_eq!(sc.provider_id(), "github");
@@ -281,11 +293,14 @@ mod tests {
         // Use the `Env` source so the test does not touch the secrets store or
         // shell out to `gh`; a blank inline token must still yield the same
         // `NotConfigured` outcome the wire relies on.
-        let token = resolve_github_token(&GithubSettings {
-            token: Some("   ".to_string()),
-            token_source: TokenSource::Env,
-            api_base_url: None,
-        })
+        let token = resolve_github_token(
+            &GithubSettings {
+                token: Some("   ".to_string()),
+                token_source: TokenSource::Env,
+                api_base_url: None,
+            },
+            &test_secrets(),
+        )
         .await;
         // The error names the sources tried and why each yielded nothing
         // (monorepo#3321). GITHUB_TOKEN/GH_TOKEN may legitimately be set in

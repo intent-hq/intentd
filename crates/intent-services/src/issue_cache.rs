@@ -245,7 +245,8 @@ impl Services {
             );
             return Ok(issue);
         }
-        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
+        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
+            .await?;
         let issue = sc
             .get_issue(repo_ref, number)
             .await

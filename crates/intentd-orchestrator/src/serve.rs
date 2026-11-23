@@ -106,10 +106,9 @@ fn tenant_services(store: Store, dir: &Path) -> Result<Services> {
     let secrets = intent_core::FileSecretStore::with_path(dir.join("secrets.json"));
     let bus = EventBus::new(store.clone());
     Ok(intent_app::compose(
-        Services::new(store)
+        Services::new_with_secret_file(store, secrets)
             .with_event_bus(bus)
             .with_settings_registry(Arc::new(registry))
-            .with_secret_store(Arc::new(secrets))
             .with_workspaces_root(dir.join("workspaces"))
             .with_assets_root(dir.join("assets"))
             .with_chief_cwd_root(dir.join("chief-cwd"))
@@ -180,5 +179,82 @@ impl ServedTenant {
         if let Some(report) = self.report.take() {
             crate::watch_report(report, on_stop);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use intent_core::WorkspaceApi;
+    use serde_json::json;
+
+    use super::*;
+
+    const CREDENTIALS: &[&str] = &[
+        "sourceControl.github.token",
+        "sourceControl.gitlab.token",
+        "linear.token",
+        "voice.elevenlabs.apiKey",
+        "voice.openai.apiKey",
+    ];
+
+    async fn tenant(root: &Path, name: &str) -> (Services, PathBuf) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("db.sqlite")).await.unwrap();
+        (tenant_services(store, &dir).unwrap(), dir)
+    }
+
+    /// Every credential a tenant saves — including the GitLab token, which
+    /// goes through the paired GitLab source — lands in, and resolves from,
+    /// that tenant's own `secrets.json`; the process-wide default file is
+    /// neither read nor written.
+    #[tokio::test]
+    async fn tenants_keep_credentials_in_their_own_secrets_file() {
+        let root = tempfile::tempdir().unwrap();
+        let host_file = root.path().join("host.secrets.json");
+        let host = intent_core::FileSecretStore::with_path(&host_file);
+        for account in CREDENTIALS {
+            host.store(account, "host-value").unwrap();
+        }
+        std::env::set_var("INTENTD_SECRETS_FILE", &host_file);
+
+        let (a, a_dir) = tenant(root.path(), "a").await;
+        let (b, b_dir) = tenant(root.path(), "b").await;
+        for account in CREDENTIALS {
+            assert_eq!(
+                a.secret_source().load(account).unwrap(),
+                None,
+                "a fresh tenant must not see the host's {account}"
+            );
+        }
+        for (svc, tag) in [(&a, "a"), (&b, "b")] {
+            let changes: Vec<_> = CREDENTIALS
+                .iter()
+                .map(|path| json!({ "path": path, "value": format!("{tag}-{path}") }))
+                .collect();
+            intent_core::with_caller(
+                intent_core::Caller::Daemon,
+                svc.settings_update(json!(changes)),
+            )
+            .await
+            .unwrap();
+        }
+
+        for (svc, dir, tag) in [(&a, &a_dir, "a"), (&b, &b_dir, "b")] {
+            let file = intent_core::FileSecretStore::with_path(dir.join("secrets.json"));
+            for account in CREDENTIALS {
+                let want = format!("{tag}-{account}");
+                assert_eq!(file.load(account).unwrap().as_deref(), Some(want.as_str()));
+                assert_eq!(
+                    svc.secret_source().load(account).unwrap().as_deref(),
+                    Some(want.as_str()),
+                    "tenant {tag} resolves another store's {account}"
+                );
+            }
+        }
+        for account in CREDENTIALS {
+            assert_eq!(host.load(account).unwrap().as_deref(), Some("host-value"));
+        }
+        std::env::remove_var("INTENTD_SECRETS_FILE");
     }
 }

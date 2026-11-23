@@ -138,9 +138,11 @@ impl Services {
                         )
                         .await;
                         if let Err(intent_core::Error::RateLimited(detail)) = &outcome {
-                            if let Ok(sc) =
-                                pr_ops::resolve_source_control(services.source_control.clone())
-                                    .await
+                            if let Ok(sc) = pr_ops::resolve_source_control(
+                                services.source_control.clone(),
+                                &services.secret_source(),
+                            )
+                            .await
                             {
                                 services.pause_sweeps_for_rate_limit(&sc, detail).await;
                             }
@@ -247,7 +249,10 @@ impl Services {
         {
             return;
         }
-        let Ok(sc) = pr_ops::resolve_source_control(self.source_control.clone()).await else {
+        let Ok(sc) =
+            pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
+                .await
+        else {
             return;
         };
         let gate = self.idle_pr_refresh_gate_secs();

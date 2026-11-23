@@ -14,10 +14,12 @@ use crate::link::forge_token::ForgeTokens;
 /// The daemon's own GitHub credential, behind its gate.
 pub(crate) fn for_services(svc: &Services) -> ForgeTokens {
     let registry = svc.settings_registry();
+    let secrets = svc.secret_source();
     ForgeTokens::new(Arc::new(move || {
         let registry = registry.clone();
+        let secrets = secrets.clone();
         Box::pin(async move {
-            intent_services::github_git_credential(registry.as_deref())
+            intent_services::github_git_credential(registry.as_deref(), &secrets)
                 .await
                 .map(|(_, token)| Zeroizing::new(token))
         })

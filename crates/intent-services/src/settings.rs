@@ -119,78 +119,13 @@ pub(crate) fn forge_token_secret_siblings(path: &str) -> &'static [&'static str]
 }
 
 /// Abstraction over secret persistence (the sensitive-setting analog of the
-/// transport's `TokenStore`). Production uses the file-backed
+/// transport's `TokenStore`), defined in `intent-core` so leaf crates can take
+/// the tenant's store. Production uses the file-backed
 /// [`intent_core::FileSecretStore`]; tests inject [`InMemorySecretStore`] so
 /// they never touch the real secrets file.
-pub trait SecretStore: Send + Sync {
-    /// Return the stored secret for `account`. `Ok(None)` when confirmed absent;
-    /// `Err` on timeout / backing-store failure so snapshot capture can fail closed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on timeout or backing-store failure, so snapshot capture can fail closed.
-    fn load(&self, account: &str) -> Result<Option<String>>;
-    /// Persist `value` for `account`, replacing any existing secret.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the secret cannot be persisted.
-    fn store(&self, account: &str, value: &str) -> Result<()>;
-    /// Delete the secret for `account`; absence is an idempotent success.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the backing store fails; absence is not an error.
-    fn delete(&self, account: &str) -> Result<()>;
-}
+pub use intent_core::SecretStore;
 
-/// File-backed production default: delegate to the shared
-/// [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`), whose accounts
-/// are the sensitive setting paths (account = setting path).
-impl SecretStore for intent_core::FileSecretStore {
-    fn load(&self, account: &str) -> Result<Option<String>> {
-        intent_core::FileSecretStore::load(self, account)
-    }
-
-    fn store(&self, account: &str, value: &str) -> Result<()> {
-        intent_core::FileSecretStore::store(self, account, value)
-    }
-
-    fn delete(&self, account: &str) -> Result<()> {
-        intent_core::FileSecretStore::delete(self, account)
-    }
-}
-
-/// In-memory [`SecretStore`] for tests — never touches the real keychain.
-#[derive(Debug, Default, Clone)]
-pub struct InMemorySecretStore {
-    map: Arc<Mutex<HashMap<String, String>>>,
-}
-
-impl SecretStore for InMemorySecretStore {
-    fn load(&self, account: &str) -> Result<Option<String>> {
-        Ok(self
-            .map
-            .lock()
-            .unwrap()
-            .get(account)
-            .filter(|v| !v.is_empty())
-            .cloned())
-    }
-
-    fn store(&self, account: &str, value: &str) -> Result<()> {
-        self.map
-            .lock()
-            .unwrap()
-            .insert(account.to_string(), value.to_string());
-        Ok(())
-    }
-
-    fn delete(&self, account: &str) -> Result<()> {
-        self.map.lock().unwrap().remove(account);
-        Ok(())
-    }
-}
+pub use intent_core::InMemorySecretStore;
 
 /// Default bounded wait for a secret **read** before the caller gives up and the
 /// setting is reported as unset. A stuck backing store (historically, a
@@ -345,6 +280,15 @@ enum Entry {
 }
 
 impl AsyncSecretStore {
+    /// The synchronous store this wrapper fronts: what a leaf-crate reader
+    /// (source control, Linear, voice) loads from on the blocking pool, so it
+    /// sees exactly the secrets this `Services` owns (the host file on desktop,
+    /// the tenant's store in the orchestrator).
+    #[must_use]
+    pub fn backing_store(&self) -> intent_core::SharedSecretStore {
+        self.inner.clone()
+    }
+
     /// Wrap `inner` with the production timeout/TTL defaults.
     pub(crate) fn new(inner: Arc<dyn SecretStore>) -> Self {
         Self::with_timings(

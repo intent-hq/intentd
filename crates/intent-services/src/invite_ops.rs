@@ -435,7 +435,7 @@ impl Services {
         }
         let mut settings = intent_sourcecontrol::SourceControlSettings::default();
         settings.github.api_base_url = resolve_api_base_uri(self.github_api_base_uri.as_deref());
-        intent_sourcecontrol::SourceControlRegistry::from_settings(&settings)
+        intent_sourcecontrol::SourceControlRegistry::from_settings(&settings, &self.secret_source())
             .await
             .map_err(pr_ops::map_sc_err)
     }

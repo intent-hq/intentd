@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use intent_core::SharedSecretStore;
 use serde::{Deserialize, Serialize};
 
 use crate::client::LinearClient;
@@ -36,36 +37,45 @@ pub struct LinearRegistry;
 
 impl LinearRegistry {
     /// Construct the engine, or a typed [`Error::NotConfigured`] when no key is
-    /// available. Async because the secrets-store lookup runs on the blocking pool
+    /// available. A stored key is read from `secrets` (the caller's store). Async because the secrets-store lookup runs on the blocking pool
     /// with a bounded timeout (see [`token::resolve`]).
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotConfigured`] when no API key is available; propagates client-construction failures.
-    pub async fn from_settings(settings: &LinearSettings) -> Result<Arc<dyn LinearEngine>> {
-        let key = resolve_token(settings).await?;
+    pub async fn from_settings(
+        settings: &LinearSettings,
+        secrets: &SharedSecretStore,
+    ) -> Result<Arc<dyn LinearEngine>> {
+        let key = resolve_token(settings, secrets).await?;
         let client = LinearClient::new(&key, settings.api_base_url.as_deref())?;
         Ok(Arc::new(LinearEngineImpl::new(client)))
     }
 }
 
 /// Resolve the API key from inline settings or the configured source.
-async fn resolve_token(settings: &LinearSettings) -> Result<String> {
+async fn resolve_token(settings: &LinearSettings, secrets: &SharedSecretStore) -> Result<String> {
     if let Some(token) = settings.token.as_deref() {
         if !token.trim().is_empty() {
             return Ok(token.trim().to_string());
         }
     }
-    token::resolve(&settings.token_source).await.ok_or_else(|| {
-        Error::NotConfigured(
-            "linear: no API key found (set linear.token or LINEAR_API_KEY)".to_string(),
-        )
-    })
+    token::resolve(&settings.token_source, secrets)
+        .await
+        .ok_or_else(|| {
+            Error::NotConfigured(
+                "linear: no API key found (set linear.token or LINEAR_API_KEY)".to_string(),
+            )
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_secrets() -> SharedSecretStore {
+        Arc::new(intent_core::InMemorySecretStore::default())
+    }
 
     #[tokio::test]
     async fn inline_token_builds_engine() {
@@ -73,17 +83,20 @@ mod tests {
             token: Some("lin_api_test".to_string()),
             ..LinearSettings::default()
         };
-        let engine = LinearRegistry::from_settings(&settings).await;
+        let engine = LinearRegistry::from_settings(&settings, &test_secrets()).await;
         assert!(engine.is_ok());
     }
 
     #[tokio::test]
     async fn blank_inline_token_falls_through_to_not_configured() {
-        let result = resolve_token(&LinearSettings {
-            token: Some("   ".to_string()),
-            token_source: TokenSource::Env,
-            api_base_url: None,
-        })
+        let result = resolve_token(
+            &LinearSettings {
+                token: Some("   ".to_string()),
+                token_source: TokenSource::Env,
+                api_base_url: None,
+            },
+            &test_secrets(),
+        )
         .await;
         assert!(matches!(result, Err(Error::NotConfigured(_))));
     }
