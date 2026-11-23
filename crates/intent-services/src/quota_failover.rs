@@ -154,6 +154,44 @@ pub(crate) const QUOTA_FAILOVER_CONTINUATION: &str = "The previous provider ran 
 partway through your reply to the last user message above. Continue that reply from where it \
 stopped. The tool calls and results shown above have already happened: do not repeat them.";
 
+/// Newest transcript rows [`attempt_did_work`] reads for a failed attempt.
+const FAILED_ATTEMPT_SCAN_ROWS: i64 = 64;
+
+/// Longest assistant text still read as a provider's own limit notice.
+const QUOTA_NOTICE_MAX_CHARS: usize = 400;
+
+/// Whether `messages` (oldest first) hold work after the last user row: any
+/// assistant block other than text, or text that is not just a short quota
+/// notice such as Claude Code's "You've hit your weekly limit · resets …".
+pub(crate) fn attempt_did_work(messages: &[intent_core::AgentMessage]) -> bool {
+    let start = messages
+        .iter()
+        .rposition(|m| m.role == "user")
+        .map_or(0, |index| index + 1);
+    let mut text = String::new();
+    for block in messages[start..]
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .flat_map(|m| m.content.as_array().into_iter().flatten())
+    {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                text.push_str(
+                    block
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                );
+            }
+            _ => return true,
+        }
+    }
+    let text = text.trim();
+    !text.is_empty()
+        && (text.chars().count() > QUOTA_NOTICE_MAX_CHARS
+            || !intent_acp::message_is_quota_exceeded(text))
+}
+
 /// Whether `err` is the swallowed-attempt marker from `run_prompt_turn`.
 pub(crate) fn is_quota_failover_error(err: &intent_core::Error) -> bool {
     matches!(err, intent_core::Error::Internal(msg) if msg.starts_with(PROMPT_QUOTA_FAILOVER_PREFIX))
@@ -821,7 +859,7 @@ impl Services {
             after_failed_attempt,
             "provider quota exhausted; switching to backup profile"
         );
-        if after_failed_attempt {
+        if after_failed_attempt && self.failed_attempt_did_work(agent_id).await {
             self.quota_failover_replays
                 .lock()
                 .unwrap()
@@ -872,6 +910,24 @@ impl Services {
         )
         .await;
         true
+    }
+
+    /// Whether the attempt that just failed for quota left work after the
+    /// current user message. A provider that only printed its own limit
+    /// notice did nothing: the backup gets the message itself, not an
+    /// instruction to continue a reply. Errs toward continuing.
+    async fn failed_attempt_did_work(&self, agent_id: &AgentId) -> bool {
+        match self
+            .store
+            .get_agent_messages(agent_id, Some(FAILED_ATTEMPT_SCAN_ROWS))
+            .await
+        {
+            Ok(messages) => attempt_did_work(&messages),
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "quota failover: transcript read failed; continuing the turn");
+                true
+            }
+        }
     }
 
     /// Record a remote agent's timed return home (`from` → `to`), persisted

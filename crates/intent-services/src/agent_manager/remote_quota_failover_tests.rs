@@ -1480,18 +1480,13 @@ fn prompt_text(run: &FakeRuntime, n: usize) -> String {
 
 /// Turn one of a remote agent fails over after `before_quota` streamed:
 /// returns what the backup run was sent.
-async fn first_turn_remote_failover(
-    name: &str,
-    before_quota: (&str, Option<&str>),
-) -> String {
+async fn first_turn_remote_failover(name: &str, before_quota: (&str, Option<&str>)) -> String {
     let ws = WorkspaceId::from(format!("ws-{name}"));
     let id = AgentId::from(format!("agent-{name}"));
     let primary = FakeRuntime::new();
     primary.quota_failures.store(1, Ordering::SeqCst);
-    *primary.before_quota.lock().unwrap() = Some((
-        before_quota.0.to_owned(),
-        before_quota.1.map(str::to_owned),
-    ));
+    *primary.before_quota.lock().unwrap() =
+        Some((before_quota.0.to_owned(), before_quota.1.map(str::to_owned)));
     let backup_run = FakeRuntime::new();
     let port = ScriptedRemote::new(vec![
         Launch::Runs(primary.clone()),

@@ -453,7 +453,10 @@ async fn a_first_turn_with_only_a_quota_notice_sends_the_message_to_the_backup()
     let prompts = fx.prompts();
     assert_eq!(prompts.len(), 2, "{prompts:#?}");
     let backup = &prompts[1];
-    assert!(backup.ends_with("default secret requests to on"), "{backup}");
+    assert!(
+        backup.ends_with("default secret requests to on"),
+        "{backup}"
+    );
     assert!(
         !backup.contains(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
         "{backup}"
