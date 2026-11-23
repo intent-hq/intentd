@@ -13,7 +13,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{refused_status, result, until, ws_ends, ws_rpc, wss, Uds};
+use common::{refused_late, refused_status, result, until, ws_ends, ws_rpc, wss, Uds};
 use intent_app::tenant::ClientConnections;
 use intent_services::{EventBus, Services};
 use intent_transport::auth::TOKEN_ACCOUNT;
@@ -27,7 +27,6 @@ fn config(dir: &Path, insecure: bool) -> ListenConfig {
         ws_port: 0,
         tls_dir: dir.join("tls"),
         insecure,
-        max_outstanding_rpcs: 0,
     }
 }
 
@@ -157,11 +156,12 @@ async fn closing_the_tenant_connections_ends_both_listeners_clients() {
     ws_ends(&mut ws).await;
     uds.ends().await;
 
-    let mut late_ws = wss(listeners.ws_port(), &fingerprint, Some(&token))
+    let late = wss(listeners.ws_port(), &fingerprint, Some(&token))
         .await
-        .unwrap();
-    ws_ends(&mut late_ws).await;
+        .expect_err("a fenced tenant admits no connection");
+    assert_eq!(refused_status(&late), Some(503), "{late:?}");
     let mut late_uds = Uds::connect(listeners.socket_path()).await;
+    late_uds.send(1, "workspace.list", json!({})).await;
     late_uds.ends().await;
     assert!(connections.is_empty());
     listeners.stop().await;
@@ -315,12 +315,14 @@ mod postgres {
         uds.ends().await;
         assert!(served.runtime().connections().is_closed());
 
-        let mut late_ws = wss(listeners.ws_port(), &fingerprint, Some(&token))
+        // The listeners stop with the fence: nothing answers any more.
+        let socket = listeners.socket_path().to_path_buf();
+        until("the local socket to go", || !socket.exists()).await;
+        let late = wss(listeners.ws_port(), &fingerprint, Some(&token))
             .await
-            .unwrap();
-        ws_ends(&mut late_ws).await;
-        let mut late_uds = Uds::connect(listeners.socket_path()).await;
-        late_uds.ends().await;
+            .expect_err("a fenced tenant admits no connection");
+        assert!(refused_late(&late), "{late:?}");
+        assert!(tokio::net::UnixStream::connect(&socket).await.is_err());
         listeners.stop().await;
     }
 }

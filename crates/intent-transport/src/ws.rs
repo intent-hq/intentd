@@ -38,6 +38,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
 use tokio_tungstenite::tungstenite::extensions::{Extensions, ExtensionsConfig};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+
+use crate::connection_set::ConnectionHook;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Bytes;
@@ -1009,6 +1011,16 @@ impl WsInner {
                 .bootstrap_upgrade(stream, path, target, authorization.as_deref(), ws_key)
                 .await;
         }
+        // A closed connection set (the orchestrator tenant's, after its
+        // fence) admits nothing: refused before the `101`, so no frame of a
+        // late connection reaches the router.
+        if self
+            .connections
+            .as_ref()
+            .is_some_and(ConnectionHook::is_closed)
+        {
+            return reject(&mut stream, 503, "Service Unavailable").await;
+        }
         // `/invite` (multiplayer w4): the ONE unauthenticated endpoint. It
         // has no bearer token by construction — the invitee holds only the
         // link — so it skips credential resolution and gets a dedicated loop
@@ -1424,13 +1436,12 @@ impl WsInner {
         let _ = sink.close().await;
     }
 
-    /// Remove a client from the registry (idempotent).
     /// Add a spawned connection to the registry, after joining it to the
     /// installed connection set. Closing the set sends the connection its
     /// `1001` close and aborts its task after [`SET_CLOSE_GRACE`]; a set that
     /// is already closed closes the connection at once and it is not added.
     fn insert_client(
-        &self,
+        self: &Arc<Self>,
         id: u64,
         cmd_tx: mpsc::Sender<ConnCmd>,
         last_pong: Arc<AtomicI64>,
@@ -1439,16 +1450,25 @@ impl WsInner {
         let connection = self.connections.as_ref().map(|set| {
             let close_tx = cmd_tx.clone();
             let close_abort = abort.clone();
+            let listener = Arc::downgrade(self);
+            // An aborted task never deregisters itself: drop its entry here
+            // so it does not wait for the heartbeat reaper.
+            let abort_and_forget = move || {
+                close_abort.abort();
+                if let Some(listener) = listener.upgrade() {
+                    listener.deregister(id);
+                }
+            };
             set.register(move || {
                 let _ = close_tx.try_send(ConnCmd::Close);
                 match tokio::runtime::Handle::try_current() {
                     Ok(runtime) => {
                         runtime.spawn(async move {
                             tokio::time::sleep(SET_CLOSE_GRACE).await;
-                            close_abort.abort();
+                            abort_and_forget();
                         });
                     }
-                    Err(_) => close_abort.abort(),
+                    Err(_) => abort_and_forget(),
                 }
             })
         });
@@ -1470,6 +1490,7 @@ impl WsInner {
         );
     }
 
+    /// Remove a client from the registry (idempotent).
     fn deregister(&self, id: u64) {
         self.clients
             .lock()

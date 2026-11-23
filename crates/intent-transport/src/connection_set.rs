@@ -13,6 +13,12 @@ pub trait ConnectionSet: Send + Sync {
     /// connection when it is dropped (the connection ended on its own), or
     /// `None` when the set is already closed; `close` has then already run.
     fn register(&self, close: Box<dyn FnOnce() + Send>) -> Option<ConnectionGuard>;
+
+    /// Whether the set is closed: the listeners then refuse a new
+    /// connection before serving it (WSS answers `503` before the upgrade,
+    /// the local socket drops it unread), so no frame of a connection
+    /// accepted after the close reaches the router.
+    fn is_closed(&self) -> bool;
 }
 
 /// Forgets a registered connection when dropped.
@@ -56,6 +62,11 @@ impl ConnectionHook {
         close: impl FnOnce() + Send + 'static,
     ) -> Option<ConnectionGuard> {
         self.0.register(Box::new(close))
+    }
+
+    /// Whether the set is closed (see [`ConnectionSet::is_closed`]).
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.is_closed()
     }
 }
 

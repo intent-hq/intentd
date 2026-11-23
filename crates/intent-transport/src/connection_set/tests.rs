@@ -60,6 +60,10 @@ impl ConnectionSet for Arc<TestSet> {
             set.0.lock().unwrap().open.remove(&id);
         }))
     }
+
+    fn is_closed(&self) -> bool {
+        self.0.lock().unwrap().closed
+    }
 }
 
 fn hook(set: &Arc<TestSet>) -> ConnectionHook {
@@ -132,10 +136,49 @@ async fn closing_the_set_closes_every_ws_connection_and_refuses_new_ones() {
     ws_ends(&mut b).await;
     until("the listener to forget them", || server.client_count() == 0).await;
 
-    let (mut late, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-    ws_ends(&mut late).await;
+    // Refused before the upgrade: no frame of it reaches the router.
+    let late = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect_err("a closed set admits no connection");
+    assert!(
+        matches!(&late, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 503),
+        "{late:?}"
+    );
     assert_eq!(set.len(), 0);
     assert_eq!(server.client_count(), 0, "a refused connection is not kept");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tunnel_and_invite_connections_join_the_set_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let set = Arc::new(TestSet::default());
+    let (server, port) = ws_server(&set, dir.path()).await;
+    let (mut tunnel, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/tunnel"))
+        .await
+        .unwrap();
+    let (mut invite, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/invite"))
+        .await
+        .unwrap();
+    until("both connections to join", || set.len() == 2).await;
+    assert_eq!(set.close_all(), 2);
+    ws_ends(&mut tunnel).await;
+    ws_ends(&mut invite).await;
+    until("the listener to forget them", || server.client_count() == 0).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_client_that_never_reads_is_forgotten_after_the_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let set = Arc::new(TestSet::default());
+    let (server, port) = ws_server(&set, dir.path()).await;
+    let (_silent, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .unwrap();
+    until("the connection to join", || set.len() == 1).await;
+    assert_eq!(set.close_all(), 1);
+    until("the listener to forget it", || server.client_count() == 0).await;
     server.stop().await;
 }
 
@@ -198,7 +241,13 @@ async fn closing_the_set_closes_every_uds_connection_and_refuses_new_ones() {
     uds_ends(&mut a).await;
     uds_ends(&mut b).await;
 
+    // Dropped unread: a request it sends gets no answer.
     let mut late = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let _ = tokio::io::AsyncWriteExt::write_all(
+        &mut late,
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace.list\",\"params\":{}}\n",
+    )
+    .await;
     uds_ends(&mut late).await;
     assert_eq!(set.len(), 0);
     let _ = stop.send(());

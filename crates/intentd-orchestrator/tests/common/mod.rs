@@ -92,7 +92,8 @@ impl ServerCertVerifier for Pinned {
 }
 
 /// Open `/ws` on `port` over TLS pinned to `fingerprint`, with `token` (the
-/// `?token=` form) when given. `Err` carries the refused upgrade.
+/// `?token=` form) when given. `Err` carries the refused upgrade, or the
+/// I/O error when nothing listens.
 pub async fn wss(
     port: u16,
     fingerprint: &str,
@@ -108,11 +109,10 @@ pub async fn wss(
             provider,
         }))
         .with_no_client_auth();
-    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
     let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(ServerName::try_from("localhost").unwrap(), tcp)
-        .await
-        .unwrap();
+        .await?;
     let url = match token {
         Some(token) => format!("wss://localhost:{port}/ws?token={token}"),
         None => format!("wss://localhost:{port}/ws"),
@@ -175,12 +175,27 @@ where
     }
 }
 
+/// Whether a late connection is refused: nothing listens any more, or the
+/// upgrade is answered `503`.
+pub fn refused_late(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    matches!(error, tokio_tungstenite::tungstenite::Error::Io(_))
+        || refused_status(error) == Some(503)
+}
+
 /// A local-socket client.
 pub struct Uds(BufReader<UnixStream>);
 
 impl Uds {
     pub async fn connect(path: &std::path::Path) -> Self {
         Self(BufReader::new(UnixStream::connect(path).await.unwrap()))
+    }
+
+    /// Send `method` without waiting for an answer.
+    pub async fn send(&mut self, id: i64, method: &str, params: Value) {
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let mut line = frame.to_string();
+        line.push('\n');
+        let _ = self.0.get_mut().write_all(line.as_bytes()).await;
     }
 
     /// Call `method` and return the whole response.

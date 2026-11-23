@@ -227,21 +227,33 @@ where
                         // Closing the set ends the connection: the serve
                         // future (and with it the socket) is dropped.
                         let closed = Arc::new(tokio::sync::Notify::new());
-                        let membership = connections.as_ref().map(|set| {
-                            let closed = closed.clone();
-                            set.register(move || closed.notify_one())
-                        });
+                        let membership = match connections.as_ref() {
+                            // A closed set admits nothing: drop the
+                            // connection unread, so none of its frames
+                            // reaches the router.
+                            Some(set) if set.is_closed() => continue,
+                            Some(set) => {
+                                let closed = closed.clone();
+                                match set.register(move || closed.notify_one()) {
+                                    Some(guard) => Some(guard),
+                                    None => continue,
+                                }
+                            }
+                            None => None,
+                        };
                         tokio::spawn(async move {
                             let _membership = membership;
                             let (read_half, write_half) = stream.into_split();
                             tokio::select! {
+                                // The close wins over a frame already read.
+                                biased;
+                                () = closed.notified() => {
+                                    tracing::debug!("uds connection closed by its connection set");
+                                }
                                 served = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry, limiter, read_owners) => {
                                     if let Err(e) = served {
                                         tracing::debug!(error = %e, "uds connection ended");
                                     }
-                                }
-                                () = closed.notified() => {
-                                    tracing::debug!("uds connection closed by its connection set");
                                 }
                             }
                         });

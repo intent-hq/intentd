@@ -155,13 +155,9 @@ async fn listen_for_default_tenant(
         );
         return Ok(None);
     };
-    let max_outstanding_rpcs = intent_core::Config::resolve()
-        .map_err(|e| format!("config: {e}"))?
-        .server_max_outstanding_rpcs;
     let config = intentd_orchestrator::listen::ListenConfig::from_env(
         |name| std::env::var(name).ok(),
         data_dir,
-        max_outstanding_rpcs,
     )?;
     tenant
         .listen(&config)

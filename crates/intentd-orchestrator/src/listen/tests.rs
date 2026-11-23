@@ -7,7 +7,7 @@ fn config(vars: &[(&str, &str)]) -> Result<ListenConfig, String> {
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
         .collect();
-    ListenConfig::from_env(|name| vars.get(name).cloned(), Path::new("/data"), 7)
+    ListenConfig::from_env(|name| vars.get(name).cloned(), Path::new("/data"))
 }
 
 #[test]
@@ -21,7 +21,6 @@ fn unset_listens_on_the_loopback_with_auth() {
             ws_port: DEFAULT_WS_PORT,
             tls_dir: PathBuf::from("/data"),
             insecure: false,
-            max_outstanding_rpcs: 7,
         }
     );
     assert_eq!(DEFAULT_WS_PORT, 5191, "next to intentd's 5181");
