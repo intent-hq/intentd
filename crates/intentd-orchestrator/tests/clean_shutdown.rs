@@ -7,7 +7,7 @@
 //! `INTENT_STORE_REQUIRE_PG=1`.
 #![cfg(all(feature = "postgres", unix))]
 
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use intent_store::postgres::{self, PgPool, PostgresOptions, TenantId, LEASE_TTL};
@@ -41,6 +41,18 @@ async fn lease(pool: &PgPool, tenant: &str) -> Option<(String, i64, bool)> {
     .expect("read tenant_lease")
 }
 
+/// Kills the orchestrator if the test fails before it exits.
+struct KillOnDrop(Option<Child>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[tokio::test]
 async fn sigterm_releases_the_lease_so_a_standby_claims_at_once() {
     let Some(url) = url() else { return };
@@ -51,7 +63,7 @@ async fn sigterm_releases_the_lease_so_a_standby_claims_at_once() {
     let instance = format!("orchestrator-{run}");
     let dir = tempfile::tempdir().unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_intentd-orchestrator"))
+    let child = Command::new(env!("CARGO_BIN_EXE_intentd-orchestrator"))
         .env("INTENTD_POSTGRES_URL", &url)
         .env("INTENTD_POSTGRES_TENANTS", &tenant)
         .env("INTENTD_ORCHESTRATOR_INSTANCE", &instance)
@@ -60,6 +72,8 @@ async fn sigterm_releases_the_lease_so_a_standby_claims_at_once() {
         .stdin(Stdio::null())
         .spawn()
         .expect("start the orchestrator");
+    let mut guard = KillOnDrop(Some(child));
+    let pid = guard.0.as_ref().expect("running").id();
 
     let claimed = tokio::time::timeout(wait(), async {
         loop {
@@ -73,24 +87,28 @@ async fn sigterm_releases_the_lease_so_a_standby_claims_at_once() {
         }
     })
     .await;
-    let Ok((_, epoch, expired)) = claimed else {
-        let _ = child.kill();
-        panic!("the orchestrator never claimed {tenant}");
-    };
+    let (_, epoch, expired) =
+        claimed.unwrap_or_else(|_| panic!("the orchestrator never claimed {tenant}"));
     assert!(!expired, "a fresh claim is live");
 
     let status = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
+        .args(["-TERM", &pid.to_string()])
         .status()
         .expect("send SIGTERM");
     assert!(status.success());
-    let exited = tokio::time::timeout(
-        wait(),
-        tokio::task::spawn_blocking(move || child.wait().expect("wait for the orchestrator")),
-    )
+    let exited = tokio::time::timeout(wait(), async {
+        loop {
+            let child = guard.0.as_mut().expect("running");
+            if let Some(status) = child.try_wait().expect("wait for the orchestrator") {
+                guard.0 = None;
+                return status;
+            }
+            // timing-guard: poll interval while waiting for the orchestrator to exit
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
     .await
-    .expect("the orchestrator exits on SIGTERM")
-    .unwrap();
+    .expect("the orchestrator exits on SIGTERM");
     assert_eq!(exited.code(), Some(0), "a clean stop exits 0: {exited:?}");
 
     // Released: expired now, long before the 30 s TTL, still naming the old

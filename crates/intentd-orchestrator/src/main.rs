@@ -69,13 +69,21 @@ async fn run(url: String) -> Result<ExitCode, String> {
         .map_err(|e| format!("data dir: {e}"))?
         .data_dir;
     let instance = instance_id(std::env::var(INSTANCE_ENV).ok().as_deref());
-    // Listen before any tenant opens: a signal during startup is then a
-    // clean stop once the tenants are up, not the default kill.
+    // Listen before any tenant opens, and race every startup step against
+    // the signal: a signal during startup stops the tenants already open
+    // (releasing their leases) instead of waiting for a hung step. A tenant
+    // whose open is cut short keeps whatever it claimed until the TTL.
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
-    let pool = intent_store::postgres::connect(&url, POOL_CONNECTIONS)
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
+    let pool = tokio::select! {
+        pool = intent_store::postgres::connect(&url, POOL_CONNECTIONS) => {
+            pool.map_err(|e| format!("connect: {e}"))?
+        }
+        () = &mut shutdown => {
+            tracing::info!("stopped before connecting");
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
 
     // Every tenant's report is watched from the moment it opens, startup
     // included: an overrun fence exits at once, whatever the other tenants
@@ -83,16 +91,21 @@ async fn run(url: String) -> Result<ExitCode, String> {
     let (stopped_tx, mut stopped) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut served: Vec<ServedTenant> = Vec::new();
     for tenant in &tenants {
-        let opened = serve_tenant(
+        let opening = serve_tenant(
             pool.clone(),
             tenant,
             &data_dir,
             &instance,
             LeaseTiming::default(),
             orchestrator_token(),
-        )
-        .await
-        .map_err(|e| format!("tenant {tenant}: {e}"));
+        );
+        let opened = tokio::select! {
+            opened = opening => opened.map_err(|e| format!("tenant {tenant}: {e}")),
+            () = &mut shutdown => {
+                tracing::info!(tenant, "stopping every tenant during startup");
+                return Ok(stop_all(&mut served, &mut stopped).await);
+            }
+        };
         match opened {
             Ok(mut opened) => {
                 let name = opened.tenant().to_owned();
@@ -184,8 +197,8 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// Fire every tenant's fence and wait until every one stopped; an overrun
 /// exits from its watcher as soon as it is reported, before any release.
 /// A tenant whose fence this call fired releases its lease once its work
-/// stopped; one already fenced (lease lost, a write met another owner)
-/// keeps it until the TTL. The exit code.
+/// stopped, concurrently with the others; one already fenced (lease lost, a
+/// write met another owner) keeps it until the TTL. The exit code.
 async fn stop_all(
     served: &mut Vec<ServedTenant>,
     stopped: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -195,6 +208,7 @@ async fn stop_all(
         .filter(|tenant| tenant.fence().fire(STOPPING))
         .map(|tenant| tenant.tenant().to_owned())
         .collect();
+    let mut releases = tokio::task::JoinSet::new();
     while !served.is_empty() {
         let Some(tenant) = stopped.recv().await else {
             break;
@@ -204,9 +218,10 @@ async fn stop_all(
         };
         let done = served.swap_remove(at);
         if ours.contains(&tenant) {
-            release(&done).await;
+            releases.spawn(async move { release(&done).await });
         }
     }
+    while releases.join_next().await.is_some() {}
     ExitCode::SUCCESS
 }
 
