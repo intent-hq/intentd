@@ -36,6 +36,14 @@ const RECORD_RESERVATION: usize = 4;
 /// ([`DeferralTally`]) instead of logging it once per consumer.
 const BUDGET_DEFERRED: &str = "background PR refresh deferred by request budget";
 
+/// The local answer while the sweep's rate-limit pause is open.
+const QUOTA_PAUSED: &str = "PR refresh quota paused";
+
+/// True when a source-control read was answered by the open quota pause.
+pub(crate) fn is_quota_pause_sc(error: &Error) -> bool {
+    matches!(error, Error::Api(message) if message == QUOTA_PAUSED)
+}
+
 /// True when a source-control read was deferred by the local request budget.
 pub(crate) fn is_budget_deferral_sc(error: &Error) -> bool {
     matches!(error, Error::Api(message) if message == BUDGET_DEFERRED)
@@ -564,7 +572,7 @@ impl Discovery {
         let mut background_deferred = false;
         let result = async {
             if services.sweeps_rate_limited() {
-                return Err(unknown("PR refresh quota paused"));
+                return Err(unknown(QUOTA_PAUSED));
             }
             // An explicit user refresh has its own demand; background
             // saturation must not defer it. Keep shared concurrency and the

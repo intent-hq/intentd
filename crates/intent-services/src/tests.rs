@@ -20792,6 +20792,49 @@ pub(crate) mod pr {
         assert_eq!(updated.len(), 1);
     }
 
+    /// A PR an agent opens while the forge quota is paused is kept, not
+    /// dropped: a detached root has no branch to rediscover it by, so the
+    /// created PR is retried once the pause ends, and a second report of the
+    /// same PR joins that retry instead of starting another.
+    #[tokio::test]
+    async fn created_pr_deferred_by_a_quota_pause_is_listed_after_it() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("main", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let forge = Arc::new(StubForge::default());
+        let svc = svc.with_source_control(forge.clone());
+        assert!(svc
+            .sweep_rate_limit
+            .pause_for(std::time::Duration::from_millis(300), false));
+
+        let created = vec![(intent_sourcecontrol::RepoRef::new("o", "r"), 42)];
+        svc.spawn_link_created_prs(&ws.id, created.clone());
+        svc.spawn_link_created_prs(&ws.id, created);
+        let pool = |svc: Services, ws_id: WorkspaceId| async move {
+            svc.store().list_workspace_git_roots(&ws_id).await.unwrap()[0]
+                .pull_requests
+                .clone()
+                .unwrap_or_default()
+        };
+        assert!(pool(svc.clone(), ws.id.clone()).await.is_empty());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pool(svc.clone(), ws.id.clone()).await.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the deferred PR was never listed"
+            );
+            // timing-guard: poll interval while the retry waits out the pause
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let listed = pool(svc.clone(), ws.id.clone()).await;
+        assert_eq!(listed.iter().map(|p| p.number).collect::<Vec<_>>(), [42]);
+        // The pause answered locally; after it, one fetch listed the PR.
+        assert_eq!(forge.seen_get_pr.lock().unwrap().as_slice(), [42]);
+    }
+
     /// A root without a detected GitHub repo is skipped before any forge call.
     #[tokio::test]
     async fn root_refresh_skips_without_detected_repo() {
