@@ -412,6 +412,9 @@ struct State {
     /// Agents whose checkout the bind sweep is removing now; their launch
     /// waits for it.
     sweeping: HashSet<AgentId>,
+    /// Per agent, held while a `pending` checkout's removal runs (it
+    /// outlives a stopped launch): the next launch waits for it.
+    pending_removals: HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// Every agent launched since start into another agent's checkout
     /// (nodeProtocol 13), with that checkout's owner.
     shares: HashMap<AgentId, AgentId>,
@@ -1919,14 +1922,25 @@ impl Runner {
                 _ = &mut stop => None,
             }
         } else {
+            let prepare = async {
+                if output.is_some() {
+                    self.pend_setup(&agent).await;
+                } else {
+                    self.await_pending_removal(&agent.id).await;
+                }
+                self.inner
+                    .checkouts
+                    .prepare(
+                        &agent.id,
+                        &agent.workspace_id,
+                        (&agent.base_commit, &agent.repo_key),
+                        &agent.submodules,
+                        &progress,
+                    )
+                    .await
+            };
             tokio::select! {
-                prepared = self.inner.checkouts.prepare(
-                    &agent.id,
-                    &agent.workspace_id,
-                    (&agent.base_commit, &agent.repo_key),
-                    &agent.submodules,
-                    &progress,
-                ) => Some(prepared),
+                prepared = prepare => Some(prepared),
                 _ = &mut stop => None,
             }
         };
@@ -2002,6 +2016,9 @@ impl Runner {
                 if settled.stopped {
                     Err(None)
                 } else {
+                    if agent.checkout_of.is_none() && agent.home.is_none() {
+                        setup::clear_pending(&cwd);
+                    }
                     let forge_notice = self.forge_notice(&agent);
                     let notice = super::checkout::first_turn_notice(
                         agent.new_machine.as_deref(),
@@ -2252,10 +2269,87 @@ impl Runner {
         intent_git::auth::node_helper_env(&exe, socket, inherited.as_deref())
     }
 
-    /// Run or account for the setup of a prepared checkout: a fresh one
-    /// runs `command` (or records `skipped` without one) and journals
-    /// `setupFinished`; a kept one journals only a setup a stop or restart
-    /// interrupted (`failed`, no re-run).
+    /// Before a prepared launch makes the agent's own checkout, record its
+    /// setup `pending`, so a stop or restart before the script starts does
+    /// not leave a kept checkout whose setup never runs. A kept checkout
+    /// still `pending` is such a launch's partial checkout, where no agent
+    /// ran (every own launch drops `pending` before its agent starts, and
+    /// no sharer takes a `pending` checkout): it is removed, to be made
+    /// fresh.
+    async fn pend_setup(&self, agent: &Agent) {
+        let worktree = match self.inner.checkouts.worktree(&agent.id) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                tracing::warn!(agent = %agent.id, %error, "node: could not record the setup pending");
+                return;
+            }
+        };
+        // An earlier launch's removal may still run after its stop: wait
+        // for it, so it never deletes this launch's checkout.
+        let removal = lock(&self.inner.state)
+            .pending_removals
+            .entry(agent.id.clone())
+            .or_default()
+            .clone();
+        let held = removal.lock_owned().await;
+        let mut ready = true;
+        if self.inner.checkouts.existing(&agent.id).is_some() {
+            if setup::is_pending(&worktree) {
+                // Its own task, holding the removal lock: a stop ends the
+                // launch without waiting on the cache lock, and the
+                // removal still finishes before the next launch goes on.
+                let checkouts = self.inner.checkouts.clone();
+                let agent_id = agent.id.clone();
+                let _ = intent_core::spawn_daemon(async move {
+                    let _held = held;
+                    checkouts.discard_checkout(&agent_id).await;
+                })
+                .await;
+                ready = self.inner.checkouts.existing(&agent.id).is_none();
+            } else {
+                drop(held);
+                ready = false;
+            }
+        } else {
+            drop(held);
+        }
+        self.forget_pending_removal(&agent.id);
+        if ready {
+            setup::write_status(&worktree, &SetupStatus::pending());
+        }
+    }
+
+    /// A launch without `checkout` waits for a stopped launch's removal of
+    /// the agent's `pending` checkout, as [`Self::pend_setup`] does.
+    async fn await_pending_removal(&self, agent_id: &AgentId) {
+        let removal = lock(&self.inner.state)
+            .pending_removals
+            .get(agent_id)
+            .cloned();
+        if let Some(removal) = removal {
+            drop(removal.lock().await);
+            drop(removal);
+            self.forget_pending_removal(agent_id);
+        }
+    }
+
+    /// Drop the agent's removal lock once nothing holds or waits on it.
+    fn forget_pending_removal(&self, agent_id: &AgentId) {
+        let mut state = lock(&self.inner.state);
+        if state
+            .pending_removals
+            .get(agent_id)
+            .is_some_and(|removal| Arc::strong_count(removal) == 1)
+        {
+            state.pending_removals.remove(agent_id);
+        }
+    }
+
+    /// Run or account for the setup of a prepared checkout: a fresh one (or
+    /// a kept own checkout still `pending`) runs `command` (or records
+    /// `skipped` without one) and journals `setupFinished`; any other kept
+    /// one journals only a setup a stop or restart interrupted (`failed`,
+    /// no re-run).
     async fn settle_setup(
         &self,
         agent: &Agent,
@@ -2265,6 +2359,8 @@ impl Runner {
         output: &Arc<SetupOutput>,
         stop: &mut oneshot::Receiver<()>,
     ) -> Settled {
+        let own = agent.checkout_of.is_none() && agent.home.is_none();
+        let fresh = fresh || (own && setup::is_pending(cwd));
         let status = match (fresh, command) {
             (false, _) => match setup::read_status(cwd) {
                 Some(status) if status.state == setup::Recorded::Running => {
@@ -2976,7 +3072,9 @@ impl Runner {
             state.sweeping.contains(owner) || state.finalizing.contains_key(owner)
         };
         match self.inner.checkouts.existing(owner) {
-            Some(worktree) if !removing => Ok(Prepared {
+            // A checkout still `pending` is a partial one its owner's next
+            // launch replaces.
+            Some(worktree) if !removing && !setup::is_pending(&worktree) => Ok(Prepared {
                 worktree,
                 tmp: self.inner.checkouts.agent_tmp(agent_id)?,
                 unrestored: Vec::new(),

@@ -71,6 +71,13 @@ pub(super) trait Checkouts: Send + Sync {
     /// stays after the agent's process stops). Saved scripts run in it.
     fn existing(&self, agent_id: &AgentId) -> Option<PathBuf>;
 
+    /// Where the agent's own checkout is, or will be once prepared.
+    fn worktree(&self, agent_id: &AgentId) -> anyhow::Result<PathBuf>;
+
+    /// Remove the agent's own checkout and keep the rest of its directory,
+    /// so the next [`Self::prepare`] makes a fresh one.
+    fn discard_checkout<'a>(&'a self, agent_id: &'a AgentId) -> BoxFuture<'a, ()>;
+
     /// Push the agent's committed `HEAD` to its `head` ref and a commit of
     /// its dirty tree to its `wip` ref, within `timeout`; its pinned
     /// submodules first, deepest first.
@@ -228,6 +235,18 @@ impl Checkouts for GitCheckouts {
     fn existing(&self, agent_id: &AgentId) -> Option<PathBuf> {
         let worktree = self.storage.existing_worktree(agent_id)?;
         worktree.join(".git").exists().then_some(worktree)
+    }
+
+    fn worktree(&self, agent_id: &AgentId) -> anyhow::Result<PathBuf> {
+        self.storage.agent_worktree(agent_id)
+    }
+
+    fn discard_checkout<'a>(&'a self, agent_id: &'a AgentId) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(worktree) = self.storage.existing_worktree(agent_id) {
+                self.discard(&worktree).await;
+            }
+        })
     }
 
     fn prepare<'a>(
@@ -744,6 +763,22 @@ pub(super) struct PlainCheckouts {
     >,
     /// The home checkouts prepared, in order.
     pub(super) prepared_homes: std::sync::Mutex<Vec<HomeId>>,
+    /// Holds the next checkout once its directory exists: signals the
+    /// first sender and waits for the receiver.
+    pub(super) hold_prepare: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    /// Holds the next checkout removal before it removes anything, like
+    /// a cache prune waiting behind another agent's fetch.
+    pub(super) hold_discard: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 /// Beside the test home directories (so it outlives a removed checkout):
@@ -803,6 +838,8 @@ impl PlainCheckouts {
             push_gate: None,
             hold_sweep: std::sync::Mutex::default(),
             prepared_homes: std::sync::Mutex::default(),
+            hold_prepare: std::sync::Mutex::default(),
+            hold_discard: std::sync::Mutex::default(),
         })
     }
 
@@ -839,6 +876,23 @@ impl Checkouts for PlainCheckouts {
         self.storage.existing_agent_dir(agent_id)
     }
 
+    fn worktree(&self, agent_id: &AgentId) -> anyhow::Result<PathBuf> {
+        self.storage.agent_worktree(agent_id)
+    }
+
+    fn discard_checkout<'a>(&'a self, agent_id: &'a AgentId) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let hold = self.hold_discard.lock().unwrap().take();
+            if let Some((reached, release)) = hold {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
+            if let Some(worktree) = self.storage.existing_agent_dir(agent_id) {
+                let _ = std::fs::remove_dir_all(worktree);
+            }
+        })
+    }
+
     fn prepare<'a>(
         &'a self,
         agent_id: &'a AgentId,
@@ -861,8 +915,14 @@ impl Checkouts for PlainCheckouts {
                     .context("fetch the agent's refs from head"));
             }
             let fresh = self.storage.existing_agent_dir(agent_id).is_none();
+            let worktree = self.storage.agent_dir(agent_id)?;
+            let hold = self.hold_prepare.lock().unwrap().take();
+            if let Some((reached, release)) = hold {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
             Ok(Prepared {
-                worktree: self.storage.agent_dir(agent_id)?,
+                worktree,
                 tmp: self.storage.agent_tmp(agent_id)?,
                 unrestored: self.notice.lock().unwrap().take().into_iter().collect(),
                 fresh,

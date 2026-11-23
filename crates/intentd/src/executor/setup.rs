@@ -77,6 +77,9 @@ pub(super) fn excludes_dir(worktree: &Path) -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum Recorded {
+    /// Recorded before a fresh checkout is made: no script has started and
+    /// no agent has run there yet.
+    Pending,
     /// Started and not finished: a stop or restart interrupted it.
     Running,
     Completed,
@@ -110,6 +113,16 @@ impl SetupStatus {
         }
     }
 
+    pub(super) fn pending() -> Self {
+        Self {
+            state: Recorded::Pending,
+            exit_code: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
     fn failed(started_at: Option<String>, code: &str, detail: &str) -> Self {
         Self {
             state: Recorded::Failed,
@@ -130,9 +143,9 @@ impl SetupStatus {
         )
     }
 
-    /// A kept checkout with no recorded setup (a launch stopped before its
-    /// checkout was ready, or one from a machine without setup): the script
-    /// never ran there and does not run now.
+    /// A kept checkout with no recorded setup (one from a machine without
+    /// setup, or from before it recorded `pending`): the script never ran
+    /// there and does not run now.
     pub(super) fn never_ran() -> Self {
         Self::failed(
             None,
@@ -144,7 +157,7 @@ impl SetupStatus {
     /// The `setupFinished` state; `None` while running.
     pub(super) fn finished_state(&self) -> Option<SetupState> {
         match self.state {
-            Recorded::Running => None,
+            Recorded::Pending | Recorded::Running => None,
             Recorded::Completed => Some(SetupState::Completed),
             Recorded::Failed => Some(SetupState::Failed),
             Recorded::Skipped => Some(SetupState::Skipped),
@@ -154,6 +167,7 @@ impl SetupStatus {
     /// The `setupStatus` a remote agent's `workspace.details` shows.
     pub(super) fn overlay(&self) -> Value {
         let state = match self.state {
+            Recorded::Pending => "pending",
             Recorded::Running => "running",
             Recorded::Completed => "completed",
             Recorded::Failed => "failed",
@@ -177,6 +191,23 @@ impl SetupStatus {
 pub(super) fn read_status(worktree: &Path) -> Option<SetupStatus> {
     let body = std::fs::read(agent_dir(worktree).join(STATUS_FILE)).ok()?;
     serde_json::from_slice(&body).ok()
+}
+
+/// The checkout's setup is still recorded `pending`: no script started and
+/// no agent ran there.
+pub(super) fn is_pending(worktree: &Path) -> bool {
+    read_status(worktree).is_some_and(|status| status.state == Recorded::Pending)
+}
+
+/// Before an agent starts in its own checkout: drop a `pending` record
+/// that is still there (a launch without setup, or a failed status write),
+/// so a later launch never removes a checkout an agent worked in.
+pub(super) fn clear_pending(worktree: &Path) {
+    if is_pending(worktree) {
+        if let Err(error) = std::fs::remove_file(agent_dir(worktree).join(STATUS_FILE)) {
+            tracing::warn!(%error, "node: could not clear the pending setup state");
+        }
+    }
 }
 
 /// Record the checkout's setup state.
