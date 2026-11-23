@@ -189,4 +189,36 @@ async fn interrupt_and_stop_reach_a_remote_agent_mid_turn() {
     // The agent takes the next message after the stop.
     send(&mut rpc_ws, agent, 600, "fourth", None).await;
     reply_becomes(&mut rpc_ws, agent, &mut id, "echo: fourth").await;
+
+    // 3. Stop while the interrupting message still waits on the machine for
+    // the cancelled turn to end: that message never runs as its own turn.
+    // (A stop before any output redelivers it with the next message.)
+    send(&mut rpc_ws, agent, 700, "fifth block slow-cancel", None).await;
+    delta(&mut events, "echo: fifth block slow-cancel").await;
+    send(&mut rpc_ws, agent, 800, "sixth", Some("interrupt")).await;
+    // timing-guard: lets the interrupting prompt reach the machine, where it waits out the 1.5 s cancel (no event marks its arrival)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ok(
+        &mut rpc_ws,
+        900,
+        "agent.stop",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    send(&mut rpc_ws, agent, 1000, "seventh", None).await;
+    timeout(wait(), async {
+        loop {
+            let d = event(&mut events, "chat:stream:delta").await;
+            let text = d["data"]["content"].as_str().unwrap_or_default();
+            assert!(
+                !text.contains("echo: sixth") || text.contains("seventh"),
+                "the stopped message ran as its own turn: {d}"
+            );
+            if text.contains("seventh") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the next message runs after the stop");
 }
