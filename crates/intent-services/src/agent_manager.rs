@@ -9328,17 +9328,21 @@ impl AgentManager {
         }
         let session_status = session.status;
         let this = Arc::clone(self);
-        crate::workspace_mutations::run_detached(Some(mutation), async move {
-            this.send_message_claimed(
-                agent_id,
-                workspace_id,
-                content,
-                message_id,
-                options,
-                session_status,
-            )
-            .await
-        })
+        crate::workspace_mutations::run_detached(
+            &self.services.turn_start_tasks,
+            Some(mutation),
+            async move {
+                this.send_message_claimed(
+                    agent_id,
+                    workspace_id,
+                    content,
+                    message_id,
+                    options,
+                    session_status,
+                )
+                .await
+            },
+        )
         .await
     }
 
@@ -13174,6 +13178,10 @@ impl AgentManager {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn checkpoint_shutdown(&self) {
         self.begin_shutdown();
+        // Detached claim-to-spawn deliveries outlive their requests. Join them
+        // before snapshotting: each finishes its append or enqueue now that
+        // admission is closed, so busy slots and queues below are final.
+        self.services.turn_start_tasks.drain_finite().await;
         // A recovered turn can be admitted while its provider is still waiting
         // to spawn. Include those workers, not only installed handles, or their
         // resolved interruption row would be lost at this shutdown.

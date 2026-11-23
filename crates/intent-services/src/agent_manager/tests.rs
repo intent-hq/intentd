@@ -11056,6 +11056,81 @@ async fn wake_delivery_cancelled_after_slot_claim_still_runs_the_turn() {
     cancelled_caller_after_slot_claim_still_runs_the_turn(CancelledFrontDoor::WakeDelivery).await;
 }
 
+/// intentd#3694 review: the detached claim-to-spawn task of a cancelled send
+/// must be joined by the shutdown checkpoint. Otherwise the checkpoint can
+/// snapshot busy slots and queues while the task is still persisting, and the
+/// store closes under it.
+#[tokio::test]
+async fn shutdown_checkpoint_joins_detached_send_of_cancelled_caller() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-cancelled-shutdown");
+    let id = AgentId::from("cancelled-shutdown");
+    seed_agent(&mgr, &ws, &id).await;
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
+    let caller = tokio::spawn({
+        let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
+        async move {
+            mgr.send_message(
+                id,
+                ws,
+                "delegated task".into(),
+                None,
+                super::TurnOptions::default(),
+            )
+            .await
+        }
+    });
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.reached.notified(),
+    )
+    .await
+    .expect("delivery claimed the slot");
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+
+    let mut checkpoint = intent_core::spawn_daemon({
+        let mgr = mgr.clone();
+        async move { mgr.checkpoint_shutdown().await }
+    });
+    let early = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        &mut checkpoint,
+    )
+    .await;
+    assert!(
+        early.is_err(),
+        "checkpoint must wait for the detached claim-to-spawn task"
+    );
+    pause.resume.notify_one();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        checkpoint,
+    )
+    .await
+    .expect("checkpoint finishes once the detached task settles")
+    .unwrap();
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.iter().filter(|m| m.role == "user").count(), 1);
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the claimed turn is captured as interrupted for the next daemon"
+    );
+}
+
 #[tokio::test]
 async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
     let (_tmp, mgr) = manager().await;

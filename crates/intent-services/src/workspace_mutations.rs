@@ -72,22 +72,32 @@ pub fn boxed<'a, T>(future: impl Future<Output = T> + Send + 'a) -> intent_core:
 
 /// Run `future` on its own task so a cancelled caller cannot abandon it
 /// half-way (intent-hq/intent#9927: a dropped request left a claimed turn
-/// slot with no worker). The task keeps the caller identity, the browser
+/// slot with no worker). `tasks` owns the task so shutdown joins it before
+/// its recovery snapshot. The task keeps the caller identity, the browser
 /// message ingress, and every live admission of the caller's scope and
 /// `held`, so nested `enter` calls reuse them and a queued deletion still
-/// waits for the work to finish.
-pub(crate) async fn run_detached<F, T>(held: Option<Mutation>, future: F) -> Result<T>
+/// waits for the work to finish. Once shutdown has closed `tasks`, turn
+/// admission is closed too, so the future runs inline.
+pub(crate) async fn run_detached<F, T>(
+    tasks: &crate::delivery_tasks::DeliveryTasks,
+    held: Option<Mutation>,
+    future: F,
+) -> Result<T>
 where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
+    if tasks.is_closed() {
+        let _held = held;
+        return future.await;
+    }
     let mut permits: Vec<Arc<Permit>> = ADMITTED
         .try_with(|admitted| admitted.borrow().iter().filter_map(Weak::upgrade).collect())
         .unwrap_or_default();
     permits.extend(held.map(|mutation| mutation.permit));
     let admitted = permits.iter().map(Arc::downgrade).collect();
     let ingress = intent_core::browser_message::current_ingress();
-    let task = intent_core::caller::spawn_with_current_caller(async move {
+    let Some(task) = tasks.spawn_draining_with_current_caller(async move {
         let output = intent_core::browser_message::with_current_ingress(
             ingress,
             ADMITTED.scope(RefCell::new(admitted), future),
@@ -95,7 +105,9 @@ where
         .await;
         drop(permits);
         output
-    });
+    }) else {
+        return Err(Error::Internal("daemon is shutting down".into()));
+    };
     match task.await {
         Ok(output) => output,
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
