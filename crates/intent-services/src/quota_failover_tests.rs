@@ -918,38 +918,43 @@ fn text(role: &str, text: &str) -> intent_core::AgentMessage {
     row(role, json!([{ "type": "text", "text": text }]))
 }
 
-/// A failed attempt counts as work unless all it left after the user's
-/// message is a short provider limit notice (or nothing).
+/// A failed attempt counts as work unless every row it left after the
+/// user's message is a short provider limit notice (or empty).
 #[test]
 fn only_a_quota_notice_is_not_work() {
     let notice = "You've hit your weekly limit \u{b7} resets Nov 25";
     let user = text("user", "do it");
-    assert!(!attempt_did_work(std::slice::from_ref(&user)), "no output");
-    assert!(!attempt_did_work(&[
-        user.clone(),
-        text("assistant", notice)
-    ]));
+    let did_work = |rows: &[intent_core::AgentMessage]| attempt_did_work(rows).unwrap();
+    assert!(!did_work(std::slice::from_ref(&user)), "no output");
+    assert!(!did_work(&[user.clone(), text("assistant", notice)]));
     assert!(
-        !attempt_did_work(&[
+        !did_work(&[
             text("assistant", "earlier work"),
             user.clone(),
             text("assistant", notice)
         ]),
         "rows before the user message are not this attempt's"
     );
-    assert!(attempt_did_work(&[
+    let many_hops: Vec<_> = std::iter::once(user.clone())
+        .chain((0..20).flat_map(|_| [text("assistant", notice), text("system", "switched")]))
+        .collect();
+    assert!(
+        !did_work(&many_hops),
+        "each hop's notice is read on its own"
+    );
+    assert!(did_work(&[
         user.clone(),
         text("assistant", "Turning it on now.")
     ]));
     assert!(
-        attempt_did_work(&[
+        did_work(&[
             user.clone(),
             text("assistant", &format!("{} {notice}", "x".repeat(400)))
         ]),
         "a long reply that mentions a limit is work"
     );
     assert!(
-        attempt_did_work(&[
+        did_work(&[
             user.clone(),
             row(
                 "assistant",
@@ -960,10 +965,15 @@ fn only_a_quota_notice_is_not_work() {
         "a tool call is work"
     );
     assert!(
-        attempt_did_work(&[
+        did_work(&[
             user,
             row("assistant", json!([{ "type": "thinking", "text": "hmm" }]))
         ]),
         "reasoning is work"
+    );
+    assert_eq!(
+        attempt_did_work(&[text("assistant", notice)]),
+        None,
+        "the attempt's start is not in view"
     );
 }

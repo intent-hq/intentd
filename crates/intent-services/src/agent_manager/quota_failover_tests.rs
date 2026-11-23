@@ -432,27 +432,30 @@ async fn quota_failure_after_partial_output_still_fails_over() {
     assert_fails_over_to_first_backup(Some("partial answer from the default")).await;
 }
 
-/// The first turn's provider printed only its own quota notice before the
-/// failure: no work happened, so the backup receives the user's message
-/// itself rather than an instruction to continue a reply.
-#[intent_test_macros::daemon_test]
-async fn a_first_turn_with_only_a_quota_notice_sends_the_message_to_the_backup() {
+/// The first turn's provider (and, with `hops` > 1, each backup after it)
+/// printed only its own quota notice before the failure: no work happened,
+/// so the last backup receives the user's message itself rather than an
+/// instruction to continue a reply.
+async fn assert_notice_only_hops_send_the_message(hops: u32) {
     let fx = Fixture::new(json!({
         "promptRpcError": quota_error(),
-        "promptRpcErrorAttempts": 1,
+        "promptRpcErrorAttempts": hops,
         "streamBeforeErrorText": "You've hit your weekly limit \u{b7} resets Nov 25",
         "response": "answered on the backup",
     }))
     .await;
-    let first = fx.profile("First", true).await;
+    let mut backups = Vec::new();
+    for n in 0..hops {
+        backups.push(fx.profile(&format!("Backup {n}"), true).await);
+    }
 
     let events = fx.send("default secret requests to on").await;
 
     assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
-    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    assert_eq!(fx.row().await.provider.as_ref(), backups.last());
     let prompts = fx.prompts();
-    assert_eq!(prompts.len(), 2, "{prompts:#?}");
-    let backup = &prompts[1];
+    assert_eq!(prompts.len(), hops as usize + 1, "{prompts:#?}");
+    let backup = prompts.last().unwrap();
     assert!(
         backup.ends_with("default secret requests to on"),
         "{backup}"
@@ -461,6 +464,16 @@ async fn a_first_turn_with_only_a_quota_notice_sends_the_message_to_the_backup()
         !backup.contains(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
         "{backup}"
     );
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_first_turn_with_only_a_quota_notice_sends_the_message_to_the_backup() {
+    assert_notice_only_hops_send_the_message(1).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn notice_only_hops_through_two_backups_still_send_the_message() {
+    assert_notice_only_hops_send_the_message(2).await;
 }
 
 /// Every backup out of quota: each switch is recorded once, then the turn

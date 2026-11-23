@@ -918,6 +918,12 @@ async fn a_remote_agents_due_return_home_replaces_the_live_backup_run() {
         1,
         "the backup run stops"
     );
+    let sent = prompt_text(&home_run, 0);
+    assert!(
+        sent.contains("hello") && sent.contains("fake runtime reply"),
+        "home's fresh run gets the conversation from the backup: {sent}"
+    );
+    assert!(sent.trim_end().ends_with("back home"), "{sent}");
     let session = mgr
         .services
         .store
