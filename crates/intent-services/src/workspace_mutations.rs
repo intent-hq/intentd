@@ -98,7 +98,9 @@ where
     match task.await {
         Ok(output) => output,
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(error) => Err(Error::Internal(format!("detached operation cancelled: {error}"))),
+        Err(error) => Err(Error::Internal(format!(
+            "detached operation cancelled: {error}"
+        ))),
     }
 }
 
