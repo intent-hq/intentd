@@ -43,7 +43,7 @@ impl SentryRegistry {
     ///
     /// Returns [`Error::NotConfigured`] when no credential pair is available; propagates client-construction failures.
     pub fn from_settings(settings: &SentrySettings) -> Result<Arc<dyn SentryEngine>> {
-        let creds = resolve_credentials(settings)?;
+        let creds = resolve_credentials(settings, token::env_parts())?;
         let client = SentryClient::new(
             &creds.token,
             &creds.organization,
@@ -53,18 +53,13 @@ impl SentryRegistry {
     }
 }
 
-/// Resolve credentials from inline settings, filling a missing half from env.
-fn resolve_credentials(settings: &SentrySettings) -> Result<Credentials> {
+/// Resolve credentials from inline settings, filling a missing half from `env`.
+fn resolve_credentials(settings: &SentrySettings, env: CredentialParts) -> Result<Credentials> {
     let inline = CredentialParts {
         token: settings.token.as_deref().and_then(token::non_empty),
         organization: settings.organization.as_deref().and_then(token::non_empty),
     };
-    let parts = if inline.token.is_some() && inline.organization.is_some() {
-        inline
-    } else {
-        inline.or(token::env_parts())
-    };
-    parts.complete().ok_or_else(|| {
+    inline.or(env).complete().ok_or_else(|| {
         Error::NotConfigured(
             "sentry: no credentials found (set accounts.sentry.organization + \
              accounts.sentry.token, or SENTRY_ORG + SENTRY_API_TOKEN)"
@@ -87,25 +82,66 @@ mod tests {
         assert!(SentryRegistry::from_settings(&settings).is_ok());
     }
 
-    #[test]
-    fn inline_half_only_falls_through_to_not_configured() {
-        if std::env::var_os("SENTRY_API_TOKEN").is_some()
-            || std::env::var_os("SENTRY_ORG").is_some()
-        {
-            return;
+    fn settings(organization: Option<&str>, token: Option<&str>) -> SentrySettings {
+        SentrySettings {
+            organization: organization.map(str::to_string),
+            token: token.map(str::to_string),
+            api_base_url: None,
         }
-        let result = resolve_credentials(&SentrySettings {
-            organization: Some("acme".into()),
-            token: Some("   ".into()),
-            api_base_url: None,
-        });
-        assert!(matches!(result, Err(Error::NotConfigured(_))));
+    }
 
-        let result = resolve_credentials(&SentrySettings {
-            organization: None,
-            token: Some("sntrys_test".into()),
-            api_base_url: None,
-        });
-        assert!(matches!(result, Err(Error::NotConfigured(_))));
+    fn env(organization: Option<&str>, token: Option<&str>) -> CredentialParts {
+        CredentialParts {
+            token: token.map(str::to_string),
+            organization: organization.map(str::to_string),
+        }
+    }
+
+    fn pair(c: &Credentials) -> (&str, &str) {
+        (c.organization.as_str(), c.token.as_str())
+    }
+
+    #[test]
+    fn saved_pair_wins_over_env() {
+        let c = resolve_credentials(
+            &settings(Some("saved-org"), Some("saved-tok")),
+            env(Some("env-org"), Some("env-tok")),
+        )
+        .unwrap();
+        assert_eq!(pair(&c), ("saved-org", "saved-tok"));
+    }
+
+    #[test]
+    fn each_missing_saved_half_comes_from_env() {
+        let c = resolve_credentials(
+            &settings(Some("saved-org"), Some("   ")),
+            env(Some("env-org"), Some("env-tok")),
+        )
+        .unwrap();
+        assert_eq!(pair(&c), ("saved-org", "env-tok"));
+
+        let c = resolve_credentials(
+            &settings(None, Some("saved-tok")),
+            env(Some("env-org"), None),
+        )
+        .unwrap();
+        assert_eq!(pair(&c), ("env-org", "saved-tok"));
+    }
+
+    #[test]
+    fn a_missing_half_everywhere_is_not_configured() {
+        for (saved, fallback) in [
+            (settings(Some("acme"), Some("   ")), env(None, None)),
+            (
+                settings(None, Some("sntrys_test")),
+                env(None, Some("env-tok")),
+            ),
+            (settings(None, None), env(Some("env-org"), None)),
+        ] {
+            assert!(matches!(
+                resolve_credentials(&saved, fallback),
+                Err(Error::NotConfigured(_))
+            ));
+        }
     }
 }
