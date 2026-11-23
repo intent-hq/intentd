@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.281] - 2026-11-23
+
+### 🐛 Bug Fixes
+
+- Ask for names again after a first turn failed with no output ([#3714](https://github.com/intent-hq/intentd/pull/3714))
+- *(secrets)* Keep orchestrator tenants off host credentials ([#3709](https://github.com/intent-hq/intentd/pull/3709))
+- Give runner agents the provider session a local agent gets ([#3717](https://github.com/intent-hq/intentd/pull/3717))
+
+### 🔧 Refactor
+
+- *(blob)* Keep script output logs behind a BlobStorage trait ([#3719](https://github.com/intent-hq/intentd/pull/3719))
+
+### 📚 Documentation
+
+- *(guide)* Disk field for Northflank and Agent37 cloud machine entries ([#3711](https://github.com/intent-hq/intentd/pull/3711))
+
+
 ## [0.11.280] - 2026-11-23
 
 ### 🚀 Features
