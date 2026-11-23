@@ -59,6 +59,12 @@ pub fn prelude() -> String {
     prelude_for(&AgentFeaturesSettings::default())
 }
 
+/// The prelude line of `ws.workspace.retrySetup()`, which a bridge adds only
+/// when its API offers the setup retry.
+pub(crate) fn setup_retry_prelude() -> &'static str {
+    workspace::RETRY_SETUP_PRELUDE
+}
+
 /// Feature-aware prelude: namespaces disabled in `[agentFeatures]` are
 /// omitted entirely, so agent code touching them fails with a clear
 /// `ws.<ns> is undefined` `TypeError`. With every toggle on — the default —

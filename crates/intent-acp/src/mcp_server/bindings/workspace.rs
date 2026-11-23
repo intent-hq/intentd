@@ -34,7 +34,6 @@ pub(crate) const PRELUDE: &str = r"
         setAgentName: (name) => host({ method: 'workspace.setAgentName', args: { name } }),
         archive: () => host({ method: 'workspace.archive' }),
         unarchive: () => host({ method: 'workspace.unarchive' }),
-        retrySetup: () => host({ method: 'workspace.retrySetup' }),
         proposeSibling: (params) =>
             host({ method: 'workspace.proposeSibling', args: params || {} }),
         applyProposal: (proposalId, options) =>
@@ -48,6 +47,11 @@ pub(crate) const PRELUDE: &str = r"
             host({ method: 'workspace.emitNotification', args: { topic, message, metadata } }),
     };
 ";
+
+/// `ws.workspace.retrySetup()`, installed only for a remote agent that can
+/// use it ([`intent_core::WorkspaceApi::offers_setup_retry`]).
+pub(crate) const RETRY_SETUP_PRELUDE: &str =
+    "\n    ws.workspace.retrySetup = () => host({ method: 'workspace.retrySetup' });\n";
 
 /// The `ws.help("workspace")` line of `ws.workspace.retrySetup()`, added
 /// only for a remote agent that can use it
