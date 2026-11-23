@@ -21,6 +21,9 @@ struct FakeRuntime {
     responses: AtomicUsize,
     /// Prompts still to reject with a provider quota error, before output.
     quota_failures: AtomicUsize,
+    /// What a quota-rejected prompt streams before its error: assistant
+    /// text and, optionally, one completed tool call's command.
+    before_quota: Mutex<Option<(String, Option<String>)>>,
     /// When set, the node reported the agent exited before it started:
     /// every prompt fails before output, as the production runtime does.
     exited: Mutex<Option<String>>,
@@ -43,9 +46,36 @@ impl FakeRuntime {
             stops: AtomicUsize::new(0),
             responses: AtomicUsize::new(0),
             quota_failures: AtomicUsize::new(0),
+            before_quota: Mutex::new(None),
             exited: Mutex::new(None),
             final_stops: AtomicUsize::new(0),
         })
+    }
+
+    fn stream_before_quota(&self, session_id: &str, text: &str, command: Option<&str>) {
+        let mut updates = Vec::new();
+        if let Some(command) = command {
+            updates.push(json!({
+                "sessionUpdate": "tool_call", "toolCallId": "pre-quota-tool", "title": "Bash",
+                "kind": "execute", "status": "in_progress", "rawInput": {"command": command},
+            }));
+            updates.push(json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "pre-quota-tool",
+                "status": "completed", "rawOutput": format!("ran: {command}"),
+            }));
+        }
+        updates.push(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        }));
+        for update in updates {
+            self.updates
+                .send(IncomingNotification {
+                    method: "session/update".into(),
+                    params: json!({"sessionId": session_id, "update": update}),
+                })
+                .unwrap();
+        }
     }
 
     async fn wait_prompts(&self, count: usize) {
@@ -91,6 +121,10 @@ impl AgentRuntime for FakeRuntime {
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
+                let before = self.before_quota.lock().unwrap().clone();
+                if let Some((text, command)) = before {
+                    self.stream_before_quota(session_id, &text, command.as_deref());
+                }
                 self.entered.notify_one();
                 return Err(AcpError::Rpc(intent_acp::JsonRpcError {
                     code: -32603,

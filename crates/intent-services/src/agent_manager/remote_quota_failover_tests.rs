@@ -918,6 +918,12 @@ async fn a_remote_agents_due_return_home_replaces_the_live_backup_run() {
         1,
         "the backup run stops"
     );
+    let sent = prompt_text(&home_run, 0);
+    assert!(
+        sent.contains("hello") && sent.contains("fake runtime reply"),
+        "home's fresh run gets the conversation from the backup: {sent}"
+    );
+    assert!(sent.trim_end().ends_with("back home"), "{sent}");
     let session = mgr
         .services
         .store
@@ -1464,4 +1470,114 @@ async fn a_remote_start_failure_is_requeued_but_never_redriven_on_its_own() {
     let queue = mgr.services.queue_snapshot(&id);
     assert_eq!(queue.len(), 1, "{queue:?}");
     assert_eq!(queue[0]["requeuedAfterFailure"], json!(true), "{queue:?}");
+}
+
+/// The text of `run`'s `n`th prompt, its blocks joined.
+fn prompt_text(run: &FakeRuntime, n: usize) -> String {
+    let blocks = serde_json::to_value(&run.prompts.lock().unwrap()[n].1).unwrap();
+    blocks
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Turn one of a remote agent fails over after `before_quota` streamed:
+/// returns what the backup run was sent.
+async fn first_turn_remote_failover(name: &str, before_quota: (&str, Option<&str>)) -> String {
+    let ws = WorkspaceId::from(format!("ws-{name}"));
+    let id = AgentId::from(format!("agent-{name}"));
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    *primary.before_quota.lock().unwrap() =
+        Some((before_quota.0.to_owned(), before_quota.1.map(str::to_owned)));
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+
+    send(&mgr, &id, &ws, "default secret requests to on").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.provider.as_deref(), Some(backup.as_str()));
+    prompt_text(&backup_run, 0)
+}
+
+/// The first turn's provider printed only its quota notice before failing:
+/// nothing happened, so the backup receives the user's message itself, not
+/// an instruction to continue a reply it cannot see.
+#[intent_test_macros::daemon_test]
+async fn a_remote_first_turn_cut_short_by_a_quota_notice_sends_the_message_to_the_backup() {
+    let sent = first_turn_remote_failover(
+        "remote-failover-notice",
+        ("You've hit your weekly limit \u{b7} resets Nov 25", None),
+    )
+    .await;
+    assert!(
+        sent.trim_end().ends_with("default secret requests to on"),
+        "{sent}"
+    );
+    assert!(
+        !sent.contains(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
+        "{sent}"
+    );
+}
+
+/// The first turn's provider did real work before running out: the backup
+/// continues it and sees the user's message and the tool call it made.
+#[intent_test_macros::daemon_test]
+async fn a_remote_first_turn_cut_short_after_work_replays_the_message_to_the_backup() {
+    let sent = first_turn_remote_failover(
+        "remote-failover-partial",
+        ("Turning it on now.", Some("touch partial-marker")),
+    )
+    .await;
+    assert!(sent.contains("default secret requests to on"), "{sent}");
+    assert!(sent.contains("touch partial-marker"), "{sent}");
+    assert!(
+        sent.ends_with(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
+        "{sent}"
+    );
+}
+
+/// A later turn fails over before any output: the backup's fresh provider
+/// session receives the conversation so far ahead of the message.
+#[intent_test_macros::daemon_test]
+async fn a_remote_failover_replays_the_earlier_conversation_to_the_backup() {
+    let ws = WorkspaceId::from("ws-remote-failover-history");
+    let id = AgentId::from("agent-remote-failover-history");
+    let primary = FakeRuntime::new();
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+
+    send(&mgr, &id, &ws, "remember the word kumquat").await;
+    primary.wait_prompts(1).await;
+    primary.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    send(&mgr, &id, &ws, "what was the word?").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    let sent = prompt_text(&backup_run, 0);
+    assert!(sent.contains("kumquat"), "history replayed: {sent}");
+    assert!(sent.trim_end().ends_with("what was the word?"), "{sent}");
 }
