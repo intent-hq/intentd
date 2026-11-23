@@ -17,9 +17,8 @@ use intent_services::feature_api::Services;
 
 use crate::connect::{connect, ConnectFailure, Connected};
 use crate::lease::{new_owner, probe_hello, record_new_lease, HeadLease};
-use crate::link::gate::GateLink;
 use crate::machine::MachineTarget;
-use crate::{RemoteFeature, RemoteNode};
+use crate::{Node, RemoteFeature};
 use intent_node_connections::LinkView;
 
 /// Longest id, name, credential id or route, in UTF-8 bytes.
@@ -202,7 +201,7 @@ async fn list(feature: &RemoteFeature, svc: &Services) -> Result<Value> {
         .iter()
         .map(|row| {
             let live = feature.running_node(&row.id);
-            machine_json(row, live.as_ref().map(RemoteNode::view))
+            machine_json(row, live.as_ref().map(|node| node.view()))
         })
         .collect();
     Ok(json!({ "machines": machines }))
@@ -258,7 +257,7 @@ async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
                 };
                 let live = feature.running_node(&row.id);
                 if let Some(mut machine) =
-                    machine_models_json(row, live.as_ref().map(RemoteNode::view), provider, model)
+                    machine_models_json(row, live.as_ref().map(|node| node.view()), provider, model)
                 {
                     machine["kind"] = json!("machine");
                     machine["rank"] = json!(rank);
@@ -928,8 +927,8 @@ pub(crate) async fn recover_survivors(
     feature: &RemoteFeature,
     svc: &Services,
     row: &ExposedMachine,
-    unbound: Option<RemoteNode>,
-) -> Result<Option<RemoteNode>> {
+    unbound: Option<Node>,
+) -> Result<Option<Node>> {
     let store = svc.store();
     let head_id = store.daemon_id().await?;
     let mut recorded = 0;
@@ -994,7 +993,7 @@ fn survivors_unknown(name: &str, recorded: usize, attempts: &Value) -> Error {
 /// stops still queued and resent. A revoked credential needs no stops.
 pub(crate) async fn deliver_stops(
     feature: &RemoteFeature,
-    node: &RemoteNode,
+    node: &Node,
     agents: &[AgentId],
     name: &str,
 ) -> Result<()> {

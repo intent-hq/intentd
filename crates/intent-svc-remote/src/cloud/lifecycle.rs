@@ -675,8 +675,7 @@ async fn record_relay(
     }
     if let Ok(Some(row)) = svc.store().get_exposed_machine(machine_id).await {
         let live = feature.running_node(machine_id);
-        crate::methods::publish_machine(svc, &row, live.as_ref().map(crate::RemoteNode::view))
-            .await;
+        crate::methods::publish_machine(svc, &row, live.as_ref().map(|node| node.view())).await;
     }
 }
 
@@ -704,7 +703,7 @@ pub(crate) async fn set_state(
         return None;
     }
     let live = feature.running_node(machine_id);
-    crate::methods::publish_machine(svc, &row, live.as_ref().map(crate::RemoteNode::view)).await;
+    crate::methods::publish_machine(svc, &row, live.as_ref().map(|node| node.view())).await;
     Some(row)
 }
 
@@ -747,7 +746,7 @@ pub(crate) fn sandbox_lost(
     tracing::warn!(machine = %row.id, sandbox = %row.cloud.as_ref().map(|c| c.sandbox_id.as_str()).unwrap_or_default(), "cloud machine: E2B removed the sandbox");
     let turn_error = format!("cloud-machine-unavailable (sandbox-lost): {SANDBOX_LOST_MESSAGE}");
     let node = feature.running_node(&row.id);
-    let link = link.or_else(|| node.as_ref().map(|node| node as &dyn GateLink));
+    let link = link.or_else(|| node.as_ref().map(|node| &**node as &dyn GateLink));
     if let Some(link) = link {
         // The sandbox took its agents with it: their stops are moot.
         link.drop_stops();
@@ -1124,8 +1123,8 @@ async fn check(
     let settled = !feature.cloud.in_transition(&row.id);
     match cloud.state {
         CloudSandboxState::Running => {
-            let busy = node.as_ref().is_some_and(crate::RemoteNode::busy);
-            let last_active = node.as_ref().map(crate::RemoteNode::last_activity);
+            let busy = node.as_ref().is_some_and(|node| node.busy());
+            let last_active = node.as_ref().map(|node| node.last_activity());
             let activity = feature.cloud.activity(&row.id, busy, last_active);
             // A provider without a lease has nothing to renew: only the
             // idle pause below stops it. E2B caps a continuous run; Vercel
@@ -1276,7 +1275,7 @@ fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, why: PauseFo
 const USE_WAIT: Duration = Duration::from_secs(5);
 
 /// An idle pause. It holds its machine's use gate exclusively
-/// ([`crate::connector::RemoteNode::quiesce`]): the uses in flight (home calls,
+/// ([`intent_node_connections::MachineLifecycle::quiesce`]): the uses in flight (home calls,
 /// terminal and script opens, turns) end first, and new ones wait until the
 /// link is closed, then dial, which resumes the sandbox. Under the gate it
 /// checks the sandbox is still idle (nothing busy, no activity since the

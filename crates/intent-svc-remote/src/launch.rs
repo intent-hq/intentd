@@ -43,7 +43,6 @@ use intent_services::feature_api::{harness, Services};
 
 use intent_core::machines::{MachineUpdateRequired, RemoteMachineState};
 
-use crate::connector::RemoteNode;
 use crate::link::checkout::{checkout_path, checkout_pins};
 use crate::RemoteServicesExt as _;
 
@@ -151,7 +150,7 @@ fn needs_prepared_checkout(submodules: &[SubmodulePin], setup: Option<&SetupComm
 }
 
 /// The protocol of `node`'s link, connecting first when none is up.
-async fn link_protocol(node: &RemoteNode) -> Result<u32> {
+async fn link_protocol(node: &crate::Node) -> Result<u32> {
     if node.current_link().is_none() {
         node.connect().await?;
     }
@@ -239,7 +238,7 @@ pub(crate) fn mcp_servers_notice(machine: &str) -> String {
 /// than [`PREPARED_CHECKOUT_PROTOCOL`]: it would start the agent with empty
 /// submodules and without the setup script.
 /// Nothing is refused while this build does not offer the prepared checkout.
-fn require_prepared_checkout(node: &RemoteNode, protocol: u32) -> Result<()> {
+fn require_prepared_checkout(node: &crate::Node, protocol: u32) -> Result<()> {
     if protocol >= PREPARED_CHECKOUT_PROTOCOL || !node.offers_prepared_checkout() {
         return Ok(());
     }
@@ -1602,7 +1601,7 @@ const SELF_RETIRE_TURN_BOUND: std::time::Duration = std::time::Duration::from_se
 /// sandbox holds a workspace's home.
 async fn final_stop_placed(
     svc: &Services,
-    node: &RemoteNode,
+    node: &crate::Node,
     agent_id: &AgentId,
     node_id: &str,
     reason: intent_core::remote_launch::FinalStopReason,

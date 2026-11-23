@@ -67,17 +67,17 @@ pub(crate) async fn connect_home(svc: &Services, workspace_id: &WorkspaceId) -> 
 /// 19; `None` when the workspace has no home on a machine.
 /// The workspace's home and its connected machine, with the use of the
 /// machine the caller holds while it opens its terminal
-/// ([`RemoteNode::begin_use`]).
+/// ([`MachineLink::begin_use`]).
 ///
-/// [`RemoteNode::begin_use`]: crate::RemoteNode::begin_use
+/// [`MachineLink::begin_use`]: intent_node_connections::MachineLink::begin_use
 async fn linked_home(
     svc: &Services,
     workspace_id: &WorkspaceId,
 ) -> Result<
     Option<(
         intent_core::WorkspaceHome,
-        crate::connector::RemoteNode,
-        tokio::sync::OwnedRwLockReadGuard<()>,
+        crate::Node,
+        intent_node_connections::UseGuard,
     )>,
 > {
     if !svc.workspace_homes() {

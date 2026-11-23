@@ -11,6 +11,7 @@ use intent_core::{BoxFuture, Result};
 use intent_store::Store;
 
 use crate::connector::{RemoteNode, Tuning};
+use crate::handle::MachineConnection;
 use crate::link::forge_token::ForgeTokens;
 use crate::machine::MachineTarget;
 use crate::{lock, NodeInbound};
@@ -24,10 +25,10 @@ pub type LifecycleGuard = Box<dyn Send + Sync>;
 /// machine's lifecycle changes take turns under.
 pub trait NodeConnections: Send + Sync + 'static {
     /// The running connector to `machine_id`, if one was started.
-    fn running(&self, machine_id: &str) -> Option<RemoteNode>;
+    fn running(&self, machine_id: &str) -> Option<Arc<dyn MachineConnection>>;
 
     /// Every running connector.
-    fn all(&self) -> Vec<RemoteNode>;
+    fn all(&self) -> Vec<Arc<dyn MachineConnection>>;
 
     /// How many machines hold a live link now.
     fn connected_machines(&self) -> usize;
@@ -41,10 +42,14 @@ pub trait NodeConnections: Send + Sync + 'static {
         tuning: Tuning,
         inbound: Option<Arc<dyn NodeInbound>>,
         forge: Option<Arc<ForgeTokens>>,
-    ) -> BoxFuture<'_, Result<RemoteNode>>;
+    ) -> BoxFuture<'_, Result<Arc<dyn MachineConnection>>>;
 
     /// Forget `machine_id`'s connector and hand it back, still running.
-    fn take(&self, machine_id: &str) -> Option<RemoteNode>;
+    fn take(&self, machine_id: &str) -> Option<Arc<dyn MachineConnection>>;
+
+    /// The concrete connector to `machine_id`, for tests that reach into it.
+    #[cfg(any(test, feature = "test-support"))]
+    fn remote_node(&self, machine_id: &str) -> Option<RemoteNode>;
 
     /// Wait for `machine_id`'s lifecycle lock: adding, replacing or
     /// removing a machine and starting an agent on it take turns, so no
@@ -55,17 +60,21 @@ pub trait NodeConnections: Send + Sync + 'static {
 /// [`NodeConnections`] for connectors running in this process.
 #[derive(Default)]
 pub struct InProcessNodeConnections {
-    nodes: Mutex<HashMap<String, RemoteNode>>,
+    nodes: Mutex<HashMap<String, Arc<RemoteNode>>>,
     lifecycles: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl NodeConnections for InProcessNodeConnections {
-    fn running(&self, machine_id: &str) -> Option<RemoteNode> {
-        lock(&self.nodes).get(machine_id).cloned()
+    fn running(&self, machine_id: &str) -> Option<Arc<dyn MachineConnection>> {
+        let node = lock(&self.nodes).get(machine_id).cloned()?;
+        Some(node)
     }
 
-    fn all(&self) -> Vec<RemoteNode> {
-        lock(&self.nodes).values().cloned().collect()
+    fn all(&self) -> Vec<Arc<dyn MachineConnection>> {
+        lock(&self.nodes)
+            .values()
+            .map(|node| node.clone() as Arc<dyn MachineConnection>)
+            .collect()
     }
 
     fn connected_machines(&self) -> usize {
@@ -82,22 +91,30 @@ impl NodeConnections for InProcessNodeConnections {
         tuning: Tuning,
         inbound: Option<Arc<dyn NodeInbound>>,
         forge: Option<Arc<ForgeTokens>>,
-    ) -> BoxFuture<'_, Result<RemoteNode>> {
+    ) -> BoxFuture<'_, Result<Arc<dyn MachineConnection>>> {
         Box::pin(async move {
             let machine_id = target.id.clone();
-            let node = RemoteNode::start(store, target, tuning, inbound, forge).await?;
+            let node = Arc::new(RemoteNode::start(store, target, tuning, inbound, forge).await?);
             let mut nodes = lock(&self.nodes);
             if let Some(existing) = nodes.get(&machine_id) {
                 node.shutdown();
-                return Ok(existing.clone());
+                return Ok(existing.clone() as Arc<dyn MachineConnection>);
             }
             nodes.insert(machine_id, node.clone());
-            Ok(node)
+            Ok(node as Arc<dyn MachineConnection>)
         })
     }
 
-    fn take(&self, machine_id: &str) -> Option<RemoteNode> {
-        lock(&self.nodes).remove(machine_id)
+    fn take(&self, machine_id: &str) -> Option<Arc<dyn MachineConnection>> {
+        let node = lock(&self.nodes).remove(machine_id)?;
+        Some(node)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn remote_node(&self, machine_id: &str) -> Option<RemoteNode> {
+        lock(&self.nodes)
+            .get(machine_id)
+            .map(|node| (**node).clone())
     }
 
     fn lifecycle<'a>(&'a self, machine_id: &'a str) -> BoxFuture<'a, LifecycleGuard> {
@@ -210,16 +227,32 @@ mod tests {
             .start(store, target, Tuning::default(), None, None)
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(&first.shared(), &second.shared()));
-        assert!(Arc::ptr_eq(
-            &connections.running("m1").unwrap().shared(),
-            &first.shared()
-        ));
+        let same = |a: &Arc<dyn MachineConnection>, b: &Arc<dyn MachineConnection>| {
+            std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+        };
+        assert!(same(&first, &second));
+        assert!(same(&connections.running("m1").unwrap(), &first));
         assert_eq!(connections.all().len(), 1);
         let taken = connections.take("m1").unwrap();
-        assert!(Arc::ptr_eq(&taken.shared(), &first.shared()));
+        assert!(same(&taken, &first));
         assert!(connections.running("m1").is_none());
         taken.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_use_held_through_the_handle_holds_off_quiesce() {
+        let (_dir, store, target) = leased_machine().await;
+        let connections = InProcessNodeConnections::default();
+        let node = connections
+            .start(store, target, Tuning::default(), None, None)
+            .await
+            .unwrap();
+        let wait = Duration::from_millis(50);
+        let using = node.begin_use().await;
+        assert!(node.quiesce(wait).await.is_none());
+        drop(using);
+        assert!(node.quiesce(wait).await.is_some());
+        node.shutdown();
     }
 
     #[tokio::test]
