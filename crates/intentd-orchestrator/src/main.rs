@@ -7,6 +7,9 @@
 //! The process exits [`FENCE_OVERRAN_EXIT`] when a fence step overran (its
 //! work may outlive the lease), 1 when a tenant cannot be opened at start
 //! or every tenant stopped, and 0 on Ctrl-C or SIGTERM after stopping every tenant.
+//! On Ctrl-C or SIGTERM each tenant whose work stopped cleanly releases its
+//! lease, so a restart or standby takes it over at once instead of waiting
+//! out the TTL.
 
 use std::process::ExitCode;
 
@@ -18,6 +21,17 @@ use intentd_orchestrator::{
 
 /// Connections the shared pool keeps; each tenant writes through it.
 const POOL_CONNECTIONS: u32 = 16;
+
+/// Why [`stop_all`] fires every tenant's fence.
+const STOPPING: &str = "the orchestrator is stopping";
+
+/// How long a tenant open in flight when a stop signal arrives may still
+/// take, so it is stopped and released with the others.
+const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one tenant's lease release may take on shutdown; past it the
+/// lease lapses after its TTL instead.
+const RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -74,9 +88,22 @@ async fn run(url: String) -> Result<ExitCode, String> {
         .map_err(|e| format!("data dir: {e}"))?
         .data_dir;
     let instance = instance_id(std::env::var(INSTANCE_ENV).ok().as_deref());
-    let pool = intent_store::postgres::connect(&url, POOL_CONNECTIONS)
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
+    // Listen before any tenant opens, and race every startup step against
+    // the signal, so a hung step cannot swallow it. On a signal, the open
+    // in flight gets up to OPEN_GRACE to finish; then every open tenant is
+    // stopped and released. An open still running past the grace is
+    // dropped, keeping whatever it claimed until the TTL.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let pool = tokio::select! {
+        pool = intent_store::postgres::connect(&url, POOL_CONNECTIONS) => {
+            pool.map_err(|e| format!("connect: {e}"))?
+        }
+        () = &mut shutdown => {
+            tracing::info!("stopped before connecting");
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
 
     // Every tenant's report is watched from the moment it opens, startup
     // included: an overrun fence exits at once, whatever the other tenants
@@ -84,21 +111,39 @@ async fn run(url: String) -> Result<ExitCode, String> {
     let (stopped_tx, mut stopped) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut served: Vec<ServedTenant> = Vec::new();
     for tenant in &tenants {
-        let opened = serve_tenant(
+        // Boxed so the grace below takes ownership: a timed-out open (and
+        // the heartbeat it may already run) is dropped right there, not
+        // kept renewing while stop_all waits for the other tenants.
+        let mut opening = Box::pin(serve_tenant(
             pool.clone(),
             tenant,
             &data_dir,
             &instance,
             LeaseTiming::default(),
             orchestrator_token(),
-        )
-        .await
-        .map_err(|e| format!("tenant {tenant}: {e}"));
+        ));
+        let opened = tokio::select! {
+            opened = &mut opening => opened.map_err(|e| format!("tenant {tenant}: {e}")),
+            () = &mut shutdown => {
+                tracing::info!(tenant, "stopping every tenant during startup");
+                let graced = tokio::time::timeout(OPEN_GRACE, opening).await;
+                match graced {
+                    Ok(Ok(mut opened)) => {
+                        watch(&mut opened, &stopped_tx);
+                        served.push(opened);
+                    }
+                    Ok(Err(error)) => tracing::warn!(tenant, %error, "the tenant did not open"),
+                    Err(_) => tracing::warn!(
+                        tenant,
+                        "the tenant did not open in time; its lease lapses after its TTL"
+                    ),
+                }
+                return Ok(stop_all(&mut served, &mut stopped).await);
+            }
+        };
         match opened {
             Ok(mut opened) => {
-                let name = opened.tenant().to_owned();
-                let tx = stopped_tx.clone();
-                opened.watch_report(move |report| on_stopped(&name, &report, &tx));
+                watch(&mut opened, &stopped_tx);
                 served.push(opened);
             }
             Err(error) => {
@@ -115,12 +160,19 @@ async fn run(url: String) -> Result<ExitCode, String> {
         }
         tokio::select! {
             Some(tenant) = stopped.recv() => served.retain(|served| served.tenant() != tenant),
-            () = shutdown_signal() => {
+            () = &mut shutdown => {
                 tracing::info!("stopping every tenant");
                 return Ok(stop_all(&mut served, &mut stopped).await);
             }
         }
     }
+}
+
+/// Watch `tenant`'s fence report ([`on_stopped`]).
+fn watch(tenant: &mut ServedTenant, stopped: &tokio::sync::mpsc::UnboundedSender<String>) {
+    let name = tenant.tenant().to_owned();
+    let tx = stopped.clone();
+    tenant.watch_report(move |report| on_stopped(&name, &report, &tx));
 }
 
 /// A tenant's work stopped: exit at once when its fence overran (its work
@@ -143,45 +195,97 @@ fn on_stopped(
 }
 
 /// Ctrl-C, or SIGTERM on Unix (systemd, `docker stop`, Kubernetes): either
-/// stops every tenant before the process exits.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut term = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ) {
-            Ok(term) => term,
-            Err(error) => {
-                tracing::warn!(%error, "SIGTERM cannot be handled; only Ctrl-C stops the tenants");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
+/// stops every tenant before the process exits. On Unix both handlers are
+/// installed when this is called, not when the future is first polled.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let interrupt = signal(SignalKind::interrupt());
+    let term = signal(SignalKind::terminate());
+    async move {
+        match (interrupt, term) {
+            (Ok(mut interrupt), Ok(mut term)) => {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = term.recv() => {}
+                }
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+            (Ok(mut interrupt), Err(error)) => {
+                tracing::warn!(%error, "SIGTERM cannot be handled; only Ctrl-C stops the tenants");
+                interrupt.recv().await;
+            }
+            (Err(error), Ok(mut term)) => {
+                tracing::warn!(%error, "Ctrl-C cannot be handled; only SIGTERM stops the tenants");
+                term.recv().await;
+            }
+            (Err(error), Err(_)) => {
+                tracing::warn!(%error, "no stop signal can be handled");
+                std::future::pending::<()>().await;
+            }
         }
     }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Ctrl-C: stops every tenant before the process exits.
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Fire every tenant's fence and wait until every one stopped; an overrun
-/// exits from its watcher as soon as it is reported. The exit code.
+/// exits from its watcher as soon as it is reported, before any release.
+/// A tenant whose fence this call fired releases its lease once its work
+/// stopped, concurrently with the others; one already fenced (lease lost, a
+/// write met another owner) keeps it until the TTL. The exit code.
 async fn stop_all(
     served: &mut Vec<ServedTenant>,
     stopped: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> ExitCode {
-    for tenant in served.iter() {
-        tenant.fence().fire("the orchestrator is stopping");
-    }
+    let ours: Vec<String> = served
+        .iter()
+        .filter(|tenant| tenant.fence().fire(STOPPING))
+        .map(|tenant| tenant.tenant().to_owned())
+        .collect();
+    let mut releases = tokio::task::JoinSet::new();
     while !served.is_empty() {
         let Some(tenant) = stopped.recv().await else {
             break;
         };
-        served.retain(|served| served.tenant() != tenant);
+        let Some(at) = served.iter().position(|served| served.tenant() == tenant) else {
+            continue;
+        };
+        let done = served.swap_remove(at);
+        if ours.contains(&tenant) {
+            releases.spawn(async move { release(&done).await });
+        }
     }
+    while releases.join_next().await.is_some() {}
     ExitCode::SUCCESS
+}
+
+/// Release a cleanly stopped tenant's lease, within [`RELEASE_BUDGET`]; a
+/// failure only leaves the lease to lapse after its TTL.
+async fn release(tenant: &ServedTenant) {
+    let name = tenant.tenant();
+    match tokio::time::timeout(RELEASE_BUDGET, tenant.heartbeat().release()).await {
+        Ok(Ok(true)) => tracing::info!(tenant = name, "released the tenant lease"),
+        Ok(Ok(false)) => {
+            tracing::warn!(
+                tenant = name,
+                "the tenant lease was no longer ours; nothing released"
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(tenant = name, %error, "could not release the tenant lease");
+        }
+        Err(_) => tracing::warn!(
+            tenant = name,
+            budget_ms = RELEASE_BUDGET.as_millis(),
+            "releasing the tenant lease timed out; it lapses after its TTL"
+        ),
+    }
 }
 
 /// The orchestrator-mode proof the Postgres opener takes: this binary runs

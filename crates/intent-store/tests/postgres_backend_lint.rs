@@ -218,6 +218,13 @@ const UNLOCKED_TABLE_WRITES: &[(&str, &str, &str, &str)] = &[
         "the lease heartbeat renews outside the writer lock so a busy tenant cannot starve \
          it; it matches owner and epoch, and a claim locks the lease row",
     ),
+    (
+        "lease.rs",
+        "release_lease",
+        "tenant_lease",
+        "a clean shutdown ends the lease outside the writer lock, after the claim's fence fired \
+         and its writes settled; it matches owner and epoch and never extends the lease",
+    ),
 ];
 
 /// Reads allowed to run more than one statement without one snapshot (on
@@ -2442,6 +2449,7 @@ const FENCE_MOVERS: &[(&str, &str)] = &[
     ("LEASE_TAKE_SQL", "claim_lease"),
     ("FENCE_MOVE_SQL", "claim_lease"),
     ("LEASE_RENEW_SQL", "renew_lease"),
+    ("LEASE_RELEASE_SQL", "release_lease"),
 ];
 const FENCE_SKIPPER: &str = "claim_lease";
 
@@ -2545,10 +2553,11 @@ fn fence_problems(sources: &[(PathBuf, String)]) -> Vec<String> {
 }
 
 /// Rule 1 of the lease: only the claim moves the fence (and skips its
-/// check), and only the claim and the renewal write the lease. The renewal
-/// matches the claim's owner and epoch, so it cannot extend a lease it lost.
+/// check), and only the claim, the renewal and the release write the lease.
+/// The renewal and the release match the claim's owner and epoch, so they
+/// cannot touch a lease it lost, and the release never extends it.
 #[test]
-fn only_the_claim_moves_the_fence_and_only_claim_and_renewal_write_the_lease() {
+fn only_the_claim_moves_the_fence_and_only_claim_renewal_and_release_write_the_lease() {
     let mut files = Vec::new();
     rust_files(&src().join("postgres"), &mut files);
     files.sort();
@@ -2563,7 +2572,7 @@ fn only_the_claim_moves_the_fence_and_only_claim_and_renewal_write_the_lease() {
     assert!(
         problems.is_empty(),
         "only lease.rs's claim_lease may move the fence or skip its check, and only \
-         claim_lease and renew_lease may write tenant_lease (FENCE_MOVERS):\n{}",
+         claim_lease, renew_lease and release_lease may write tenant_lease (FENCE_MOVERS):\n{}",
         problems.join("\n")
     );
     let lease = std::fs::read_to_string(src().join("postgres/lease.rs")).expect("read lease.rs");
@@ -2575,6 +2584,17 @@ fn only_the_claim_moves_the_fence_and_only_claim_and_renewal_write_the_lease() {
     assert!(
         renew.contains("owner_instance = $2 AND epoch = $3"),
         "the renewal must match the claim's owner and epoch: {renew}"
+    );
+    let release = lease
+        .split("const LEASE_RELEASE_SQL")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("LEASE_RELEASE_SQL");
+    assert!(
+        release.contains("owner_instance = $2 AND epoch = $3")
+            && release.contains("LEAST(expires_at,"),
+        "the release must match the claim's owner and epoch and never extend the lease: \
+         {release}"
     );
 }
 

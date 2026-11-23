@@ -16,6 +16,14 @@
 //!   writer lock so a busy tenant cannot starve it, matched on owner and
 //!   epoch. A renewal after a takeover matches no row: `NotOwner`.
 //!
+//! - **Release** ([`Store::release_tenant_lease`](crate::Store::release_tenant_lease),
+//!   [`LeaseHeartbeat::release`]): on a clean shutdown, once the claim's
+//!   fence fired and its writes settled, one `UPDATE` of the lease row
+//!   matched on owner and epoch sets `expires_at` to now, so the next claim
+//!   (another process, or this one restarted) succeeds at once with the next
+//!   epoch instead of waiting out the TTL. A release by a process that no
+//!   longer owns the lease matches no row and changes nothing.
+//!
 //! A renewal is accepted while the owner and epoch still match, even past
 //! `expires_at`: until another process claims, no one else has written, so
 //! the fence still holds. A claim locks the lease row, so a renewal racing a
@@ -232,6 +240,12 @@ const LEASE_RENEW_SQL: &str = "UPDATE tenant_lease \
      WHERE tenant_id = $1 AND owner_instance = $2 AND epoch = $3 \
      RETURNING (extract(epoch FROM expires_at) * 1000)::bigint";
 
+/// Ends the lease ($1 tenant) now while it is still ($2 instance, $3
+/// epoch)'s; never extends it. No row once the lease moved on.
+const LEASE_RELEASE_SQL: &str = "UPDATE tenant_lease \
+     SET expires_at = LEAST(expires_at, clock_timestamp()) \
+     WHERE tenant_id = $1 AND owner_instance = $2 AND epoch = $3";
+
 fn ttl_millis(ttl: Duration) -> Result<i64> {
     let ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
     if ms < 1 {
@@ -368,6 +382,46 @@ impl PgStore {
         timestamp(ms)
     }
 
+    /// See [`Store::release_tenant_lease`](crate::Store::release_tenant_lease).
+    /// One statement on the lease row, outside the writer lock.
+    pub(crate) async fn release_lease(&self, epoch: i64) -> Result<bool> {
+        let Some(claim) = self.claim.get() else {
+            return Err(Error::NotOwner(format!(
+                "tenant {}: this process never claimed it, so it has no lease to release",
+                self.tenant()
+            )));
+        };
+        if claim.epoch != epoch {
+            return Err(Error::NotOwner(format!(
+                "tenant {}: the lease at epoch {epoch} was replaced by this process's claim at \
+                 epoch {}; nothing was released",
+                self.tenant(),
+                claim.epoch
+            )));
+        }
+        if !claim.fence.is_fenced() {
+            return Err(Error::InvalidParams(format!(
+                "tenant {}: a lease is released only after its fence fired and the tenant's \
+                 work stopped; nothing was released",
+                self.tenant()
+            )));
+        }
+        // No write of this claim is still open, so none can land after the
+        // next owner claims.
+        claim.fence.settled().await;
+        let mut tx = self.begin().await?;
+        let released = sqlx::query(LEASE_RELEASE_SQL)
+            .bind(self.tenant())
+            .bind(&*claim.instance)
+            .bind(claim.epoch)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        tx.commit().await.map_err(db)?;
+        Ok(released > 0)
+    }
+
     /// See [`Store::tenant_fence`](crate::Store::tenant_fence).
     pub(crate) fn tenant_fence(&self) -> Option<TenantFence> {
         self.claim.fence()
@@ -448,6 +502,32 @@ impl crate::Store {
     pub async fn renew_tenant_lease(&self, ttl: Duration) -> Result<OffsetDateTime> {
         match &self.backend {
             crate::Backend::Postgres(store) => store.renew_lease(ttl, None).await,
+            crate::Backend::Sqlite(_) => Err(no_lease_on_sqlite()),
+        }
+    }
+
+    /// Release this process's lease on the tenant at `epoch` now, for a
+    /// clean shutdown: the next claim (another process, or this one after a
+    /// restart) succeeds at once, with the next epoch, instead of waiting
+    /// out the TTL. One statement on the lease row, matched on this claim's
+    /// owner and epoch; it never extends the lease. Returns whether it
+    /// released: `false` when the lease is no longer this claim's (taken
+    /// over), which changes nothing.
+    ///
+    /// Only after the claim's fence fired, and once every write that passed
+    /// the fence has ended ([`TenantFence::settled`]); the caller must also
+    /// have stopped the tenant's other work. Never release a lease this
+    /// process lost (its fence fired for another reason): its work may not
+    /// have stopped in time.
+    ///
+    /// # Errors
+    /// `Error::NotOwner` when this process never claimed the tenant or a
+    /// newer claim replaced the one at `epoch`; `Error::InvalidParams` on
+    /// `SQLite` or while the claim's fence has not fired; `Error::Internal`
+    /// when the statement fails (the lease then lapses after its TTL).
+    pub async fn release_tenant_lease(&self, epoch: i64) -> Result<bool> {
+        match &self.backend {
+            crate::Backend::Postgres(store) => store.release_lease(epoch).await,
             crate::Backend::Sqlite(_) => Err(no_lease_on_sqlite()),
         }
     }
@@ -551,6 +631,7 @@ pub enum LeaseState {
 /// heartbeat too. Dropping the heartbeat stops renewals and fires the fence:
 /// nothing keeps the lease past its TTL any more. [`Self::stop`] stops
 /// renewals without firing it, for a shutdown that stops writing on its own.
+/// [`Self::release`] ends the lease at once after a clean stop.
 ///
 /// The heartbeat belongs to its lease's epoch: it renews only while the
 /// process's current claim is that epoch's, fires only that claim's fence,
@@ -558,6 +639,9 @@ pub enum LeaseState {
 pub struct LeaseHeartbeat {
     state: watch::Receiver<LeaseState>,
     fence: TenantFence,
+    /// The renewed store and the lease's epoch, for [`Self::release`].
+    store: crate::Store,
+    epoch: i64,
     /// Fire the fence on drop (everything but [`Self::stop`]).
     fire_on_drop: bool,
     /// Kept for the heartbeat's whole life (never moved out), so dropping
@@ -610,7 +694,7 @@ impl LeaseHeartbeat {
             margin: margin.min(ttl / 2),
         };
         let task = tokio::spawn(heartbeat(
-            store,
+            store.clone(),
             timing,
             lease.epoch,
             lease.renew_by,
@@ -620,6 +704,8 @@ impl LeaseHeartbeat {
         Self {
             state: rx,
             fence,
+            store,
+            epoch: lease.epoch,
             fire_on_drop: true,
             task,
             reported: false,
@@ -652,9 +738,31 @@ impl LeaseHeartbeat {
 }
 
 impl LeaseHeartbeat {
+    /// Release the lease now, after a clean stop: see
+    /// [`Store::release_tenant_lease`](crate::Store::release_tenant_lease).
+    /// The fence must have fired (which also stops renewals) and the
+    /// tenant's work stopped; call it only when this process fired the
+    /// fence itself, never after the lease was lost.
+    ///
+    /// It first waits until the heartbeat stopped ([`LeaseState::Lost`],
+    /// set only once its renewal in flight, if any, was dropped), so no
+    /// renewal of this heartbeat starts after the release.
+    ///
+    /// # Errors
+    /// As [`Store::release_tenant_lease`](crate::Store::release_tenant_lease).
+    pub async fn release(&self) -> Result<bool> {
+        if self.fence.is_fenced() {
+            // A closed channel means the task already ended.
+            let mut state = self.state.clone();
+            let _ = state.wait_for(|s| matches!(s, LeaseState::Lost(_))).await;
+        }
+        self.store.release_tenant_lease(self.epoch).await
+    }
+
     /// Stop renewing without firing the fence: for a shutdown that stops
     /// the tenant's work and writes on its own. The lease then lapses after
-    /// its TTL (a clean release is a separate step).
+    /// its TTL ([`Self::release`] ends it at once, but only after the fence
+    /// fired).
     pub fn stop(mut self) {
         self.fire_on_drop = false;
     }
