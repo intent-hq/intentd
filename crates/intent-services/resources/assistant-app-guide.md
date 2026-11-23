@@ -855,7 +855,12 @@ Vercel sandbox in that project. Northflank machines offer sizes 2x4, 4x8 and 8x1
 project's. An Agent37 entry picks Standard (a sandbox, US only) or Full VM (its own
 kernel and Docker, about 2.5 times the price, in the US, the EU or Mumbai), sizes 2x4,
 4x8, 4x16 and 4x32, and a disk; when the region has no room, the start fails and says
-so, and nothing starts in another region. Vercel machines offer sizes 2x4, 4x8 and
+so, and nothing starts in another region. The entry form shows a **Disk** field (GiB)
+only for Northflank (6-500, default 20) and Agent37 (4-100, default 20; on Standard the
+largest disk depends on the size, from 12 GiB at 2x4 to 80 GiB at 4x32, and the field
+lowers its value and says so when a new size or type allows less). A new disk size
+applies to machines started after the save; running and paused ones keep theirs. E2B and
+Vercel entries have no disk field; older versions may not show it. Vercel machines offer sizes 2x4, 4x8 and
 8x16 (larger sizes need a Vercel plan that allows them) and run in the project's region;
 Vercel ends a session after the plan's longest session (24 hours on Pro, 45 minutes on
 Hobby), so the backend stops and resumes such a machine when it is idle. Cloud machines have no sign-in, so only a
