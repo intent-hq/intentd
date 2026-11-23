@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.276] - 2026-11-23
+
+### 🚀 Features
+
+- *(remote)* Give each backend its own link session and machine-list lock ([#3678](https://github.com/intent-hq/intentd/pull/3678))
+- *(memory)* Contain workloads in a memory-limited cgroup on Linux ([#3662](https://github.com/intent-hq/intentd/pull/3662))
+
+### 🐛 Bug Fixes
+
+- *(test-support)* Resolve the source-lint workspace root at run time ([#3673](https://github.com/intent-hq/intentd/pull/3673))
+- *(sentry)* Use the saved Sentry account for sentry.* calls ([#3674](https://github.com/intent-hq/intentd/pull/3674))
+- *(remote)* Detach homes and give a reason when an orchestrator leaves ([#3672](https://github.com/intent-hq/intentd/pull/3672))
+
+### 🔧 Refactor
+
+- *(node-connections)* Give launch and machine methods calls on the connector, not its state ([#3687](https://github.com/intent-hq/intentd/pull/3687))
+
+### 📚 Documentation
+
+- *(guide)* Document View → Darken Websites in the desktop browser ([#3677](https://github.com/intent-hq/intentd/pull/3677))
+- *(guide)* Provider profiles for Grok, Droid, Auggie and Cursor ([#3654](https://github.com/intent-hq/intentd/pull/3654))
+
+
 ## [0.11.275] - 2026-11-22
 
 ### 🐛 Bug Fixes
