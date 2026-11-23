@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.283] - 2026-11-23
+
+### 🐛 Bug Fixes
+
+- *(orchestrator)* Run event retention and the idempotency reaper per Postgres tenant ([#3724](https://github.com/intent-hq/intentd/pull/3724))
+
+
 ## [0.11.282] - 2026-11-23
 
 ### 🚀 Features
