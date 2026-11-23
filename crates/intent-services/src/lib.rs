@@ -6804,7 +6804,8 @@ impl Services {
             if fetched.is_empty() {
                 continue;
             }
-            let written = self
+            // A root unregistered meanwhile is skipped, not fatal.
+            let written = match self
                 .store
                 .project_workspace_git_root_pull_requests(&root_id, &now_iso(), |pool| {
                     let mut changed = false;
@@ -6813,11 +6814,20 @@ impl Services {
                     }
                     changed
                 })
-                .await?;
+                .await
+            {
+                Ok(written) => written,
+                Err(Error::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
             if written.is_none() {
                 continue;
             }
-            let root = self.store.get_workspace_git_root(&root_id).await?;
+            let root = match self.store.get_workspace_git_root(&root_id).await {
+                Ok(root) => root,
+                Err(Error::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
             publish_event(
                 self.event_bus.as_ref(),
                 git_root_changed_event(GIT_ROOT_UPDATED, &root),
