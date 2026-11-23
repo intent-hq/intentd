@@ -849,17 +849,14 @@ fn write_excludes(
             continue;
         }
         let file = intent_git::node_git::exclude_file(dir, repo);
-        let mut body = match std::fs::read_to_string(&file) {
-            Ok(kept) => kept,
-            Err(_) => {
-                let mut body = global.clone();
-                if !body.is_empty() && !body.ends_with('\n') {
-                    body.push('\n');
-                }
-                body.push_str("# Created by the workspace setup script on this machine\n");
-                body
+        let mut body = std::fs::read_to_string(&file).unwrap_or_else(|_| {
+            let mut body = global.clone();
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
             }
-        };
+            body.push_str("# Created by the workspace setup script on this machine\n");
+            body
+        });
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
         }
