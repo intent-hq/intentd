@@ -13,7 +13,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{refused_late, refused_status, result, until, ws_ends, ws_rpc, wss, Uds};
+use common::{refused_status, result, until, ws_ends, ws_rpc, wss, Uds};
 use intent_app::tenant::ClientConnections;
 use intent_services::{EventBus, Services};
 use intent_transport::auth::TOKEN_ACCOUNT;
@@ -212,6 +212,7 @@ mod postgres {
     use intentd_orchestrator::serve::{serve_tenant, LeaseTiming};
 
     use super::*;
+    use common::refused_late;
 
     async fn pool() -> Option<PgPool> {
         let Ok(url) = std::env::var("INTENT_STORE_TEST_PG_URL") else {
@@ -227,7 +228,7 @@ mod postgres {
         Some(pool)
     }
 
-    /// A client of a Postgres tenant creates and lists workspaces and notes
+    /// A client of a Postgres tenant lists workspaces and creates and lists notes
     /// over WSS and the local socket, the results come from Postgres, and
     /// the tenant's fence closes both connections and refuses new ones.
     #[tokio::test]
@@ -258,17 +259,24 @@ mod postgres {
             .await
             .unwrap();
         result(&ws_rpc(&mut ws, 1, "client.hello", json!({ "clientId": "web-pg" })).await);
-        let created = ws_rpc(
-            &mut ws,
-            2,
-            "workspace.create",
-            json!({ "title": "On Postgres" }),
-        )
-        .await;
-        let workspace = result(&created)["workspace"]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        // In orchestrator mode `workspace.create` needs a home machine, which
+        // this test has none of, so the workspace is put in the tenant's store
+        // directly; everything after that goes over the wire.
+        let workspace = format!("ws-{}", uuid::Uuid::new_v4().simple());
+        let now = intent_core::now_iso();
+        served
+            .services()
+            .store()
+            .insert_workspace(&intent_core::Workspace {
+                id: intent_core::WorkspaceId(workspace.clone()),
+                title: "On Postgres".into(),
+                branch: "main".into(),
+                created_at: now.clone(),
+                updated_at: now,
+                ..Default::default()
+            })
+            .await
+            .expect("seed the workspace");
         result(
             &ws_rpc(
                 &mut ws,
