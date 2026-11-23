@@ -175,7 +175,7 @@ async fn open_on_a_legacy_sqlx_schema_says_to_recreate_it() {
     assert!(migrate.contains("recreate the schema"), "{migrate}");
 }
 
-/// The numbered Postgres migrations (versions 1 to 15) are one schema file
+/// The numbered Postgres migrations (versions 1 to 16) are one schema file
 /// now. A schema left at that history must not be reused or "upgraded": the
 /// gate and the migrate job both say to recreate it, and migrate changes
 /// nothing.
@@ -185,10 +185,10 @@ async fn a_schema_left_at_the_numbered_migrations_says_to_recreate_it() {
         return;
     };
     // What a run of the numbered migrations left: `0001_compat.sql`'s
-    // checksum (SHA-384) on version 1, then versions 2 to 15.
+    // checksum (SHA-384) on version 1, then versions 2 to 16.
     let compat_checksum = "d7858ba9e8b41588417655e346f4c2565b812c941edf2368114bb67655ef700f\
                            b85f8a20b801421a578de19c6996ba1f";
-    let rows: Vec<String> = (1..=15)
+    let rows: Vec<String> = (1..=16)
         .map(|v| {
             let (description, checksum) = if v == 1 {
                 ("compat", compat_checksum)
@@ -216,7 +216,7 @@ async fn a_schema_left_at_the_numbered_migrations_says_to_recreate_it() {
 
     let mismatch = refused(&admin, "numbered").await;
     assert!(mismatch.folded_history, "{mismatch:?}");
-    assert_eq!(mismatch.applied, (1..=15).collect::<Vec<i64>>());
+    assert_eq!(mismatch.applied, (1..=16).collect::<Vec<i64>>());
     let message = Error::SchemaMismatch(Box::new(mismatch)).to_string();
     assert!(message.contains("recreate the schema"), "{message}");
 

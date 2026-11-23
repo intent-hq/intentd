@@ -882,7 +882,7 @@ pub struct SchemaMismatch {
     /// migrator (`_sqlx_migrations`), which the migrate job refuses.
     pub legacy_sqlx: bool,
     /// The ledger records the numbered Postgres migrations (`0001_compat`
-    /// to `0015_delete_grace`) that were folded into one schema file. The
+    /// to `0016_agent_session_goal`) that were folded into one schema file. The
     /// migrate job refuses such a schema: recreate it.
     pub folded_history: bool,
 }

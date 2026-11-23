@@ -102,10 +102,10 @@ fn schema_mismatch_code_and_display() {
     assert!(legacy.contains("earlier sqlx migrator"), "{legacy}");
     assert!(legacy.contains("recreate the schema"), "{legacy}");
     // A schema left at the numbered migrations before they were folded into
-    // one file: its versions 2-15 are unknown, but the repair is recreating
+    // one file: its versions 2-16 are unknown, but the repair is recreating
     // it, not a newer build.
     let folded = Error::SchemaMismatch(Box::new(SchemaMismatch {
-        applied: (1..=15).collect(),
+        applied: (1..=16).collect(),
         expected: vec![1],
         changed: vec![1],
         part_way: vec![],

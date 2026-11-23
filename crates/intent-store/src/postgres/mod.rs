@@ -111,7 +111,7 @@ pub use read_seam::probe as read_probe;
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./postgres/migrations");
 
 /// The checksum (SHA-384) of `0001_compat.sql`, the first of the numbered
-/// Postgres migrations (versions 1 to 15) that were folded into
+/// Postgres migrations (versions 1 to 16) that were folded into
 /// `0001_schema.sql`.
 const FOLDED_COMPAT_CHECKSUM: [u8; 48] = [
     0xd7, 0x85, 0x8b, 0xa9, 0xe8, 0xb4, 0x15, 0x88, 0x41, 0x76, 0x55, 0xe3, 0x46, 0xf4, 0xc2, 0x56,
@@ -890,7 +890,7 @@ async fn migrate_locked(
     }) {
         return Err(Error::Internal(
             "postgres schema was built from the numbered Postgres migrations (0001_compat to \
-             0015_delete_grace), which are now one schema file (0001_schema); recreate the \
+             0016_agent_session_goal), which are now one schema file (0001_schema); recreate the \
              schema, then run migrate"
                 .into(),
         )
